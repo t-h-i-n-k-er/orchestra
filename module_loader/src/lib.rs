@@ -74,14 +74,24 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
         // For Windows, a more advanced technique involves CreateFileMapping/MapViewOfFile
         // with SEC_IMAGE, but for simplicity, we'll use a temporary file.
         // This is less secure than memfd but functional.
-        let mut temp_file = tempfile::Builder::new()
+        //
+        // On Windows we MUST close the file handle before calling LoadLibrary,
+        // otherwise the loader fails with "file is being used by another process"
+        // (os error 32). We persist the temp file and clean it up after loading.
+        let temp_file = tempfile::Builder::new()
             .prefix("plugin-")
             .suffix(std::env::consts::DLL_SUFFIX)
             .tempfile()?;
-        temp_file.write_all(&decrypted_blob)?;
-        info!("Loading plugin from temporary file: {:?}", temp_file.path());
+        let temp_path = temp_file.into_temp_path();
+        std::fs::write(&temp_path, &decrypted_blob)?;
+        info!("Loading plugin from temporary file: {:?}", &*temp_path);
         // SAFETY: We trust the decrypted blob.
-        unsafe { Library::new(temp_file.path())? }
+        let lib = unsafe { Library::new(&*temp_path)? };
+        // Persist the file for the lifetime of the loaded library; the OS
+        // will release the file once the process exits. On Windows we cannot
+        // delete a loaded DLL while it is mapped.
+        let _ = temp_path.keep();
+        lib
     };
 
     // 3. Find the `_create_plugin` symbol, call it, and return the Plugin trait object.

@@ -10,12 +10,15 @@
 //! `ORCHESTRA_PERSISTENCE_ROOT` environment variable to redirect filesystem
 //! writes into a temporary directory.
 
-use anyhow::{Context, Result};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use anyhow::Context;
+use anyhow::Result;
 use std::path::PathBuf;
 
 /// Determine where the persistence-related files should live. In production
 /// this is `$XDG_CONFIG_HOME/systemd/user` on Linux. In tests, the root can be
 /// overridden via `ORCHESTRA_PERSISTENCE_ROOT`.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn config_root() -> PathBuf {
     if let Ok(p) = std::env::var("ORCHESTRA_PERSISTENCE_ROOT") {
         return PathBuf::from(p);
