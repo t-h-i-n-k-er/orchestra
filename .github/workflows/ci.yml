@@ -60,9 +60,10 @@ jobs:
       - name: cargo test (persistence + network-discovery + hci-research)
         run: cargo test -p agent --features "persistence network-discovery hci-research"
 
-      - name: cargo test (remote-assist, Linux only)
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo test -p agent --features remote-assist
+      # NOTE: `remote-assist` is currently disabled in CI because the upstream
+      # `x11cap 0.1` crate does not compile on modern rustc (E0614 on
+      # `Unique<_XDisplay>`). Re-enable once we replace x11cap with `xcb` or
+      # similar.
 
   audit:
     name: Security Audit

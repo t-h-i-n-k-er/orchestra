@@ -20,6 +20,7 @@ pub enum HciEvent {
     WindowFocus { timestamp: u64, title: String },
 }
 
+#[allow(dead_code)]
 const MAX_BUFFER_SIZE: usize = 1024;
 
 lazy_static! {
@@ -59,6 +60,7 @@ pub fn get_log_buffer() -> Result<String, String> {
 }
 
 /// Adds an event to the log buffer, enforcing size limits.
+#[allow(dead_code)]
 fn add_log_event(event: HciEvent) {
     if *IS_LOGGING.lock().unwrap() {
         let mut buffer = HCI_LOG_BUFFER.lock().unwrap();
