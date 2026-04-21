@@ -76,7 +76,7 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
         // This is less secure than memfd but functional.
         let mut temp_file = tempfile::Builder::new()
             .prefix("plugin-")
-            .suffix(libloading::consts::EXT)
+            .suffix(std::env::consts::DLL_SUFFIX)
             .tempfile()?;
         temp_file.write_all(&decrypted_blob)?;
         info!("Loading plugin from temporary file: {:?}", temp_file.path());
