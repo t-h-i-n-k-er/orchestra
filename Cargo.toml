@@ -9,6 +9,7 @@ members = [
     "launcher",
     "payload-packager",
     "dev-server",
+    "builder",
     "plugins/hello_plugin",
 ]
 
