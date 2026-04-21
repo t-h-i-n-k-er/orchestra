@@ -94,6 +94,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_validate_path() {
         // This test needs to run in a context where it can create files and directories.
         let dir = tempdir().unwrap();
