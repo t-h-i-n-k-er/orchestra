@@ -80,8 +80,52 @@ package = "launcher"
 ```
 
 The `package` field controls which Cargo crate is built as the deployable
-binary. It defaults to `launcher` (the only binary currently in the
-workspace); set it to `agent` once an `agent` binary front-end exists.
+binary. It defaults to `launcher` (in-memory payload delivery); set
+`package = "agent"` and `bin_name = "agent-standalone"` together with the
+`outbound-c` feature to produce a self-contained agent binary instead.
+
+### Outbound-mode (agent dials the Control Center)
+
+The `outbound-c` feature turns the agent into a binary that automatically
+connects to the Orchestra Control Center and reconnects on disconnection.
+The Builder bakes the server address and PSK directly into the binary at
+compile time so no separate configuration file is required on the endpoint.
+
+When the `configure` wizard detects that you have selected `outbound-c`:
+
+* It prompts for the Control Center pre-shared secret.
+* It automatically switches `package` to `"agent"` and `bin_name` to
+  `"agent-standalone"`.
+* It passes `ORCHESTRA_C_ADDR` and `ORCHESTRA_C_SECRET` as environment
+  variables to `cargo build`, where `option_env!()` in the agent source
+  captures them at compile time.
+
+Example profile (can be created by the wizard or written by hand):
+
+```toml
+target_os         = "linux"
+target_arch       = "x86_64"
+c2_address        = "10.0.0.5:8444"
+encryption_key    = "<base64-32-bytes>"
+c_server_secret   = "REPLACE-ME-same-as-agent_shared_secret-in-server-toml"
+features          = ["outbound-c"]
+package           = "agent"
+bin_name          = "agent-standalone"
+```
+
+Build:
+
+```sh
+orchestra-builder build prod-outbound
+# -> dist/prod-outbound.enc (AES-encrypted agent-standalone binary)
+```
+
+The runtime override env vars (`ORCHESTRA_C` and `ORCHESTRA_SECRET`) take
+precedence over the baked-in values, so you can repurpose a binary without
+rebuilding it.
+
+See [`docs/C_SERVER.md`](../docs/C_SERVER.md) for the full orchestration
+picture and the outbound-agent self-verification test.
 
 ### Inspect & list profiles
 

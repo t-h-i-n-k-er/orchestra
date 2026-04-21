@@ -10,6 +10,7 @@ members = [
     "payload-packager",
     "dev-server",
     "builder",
+    "orchestra-server",
     "plugins/hello_plugin",
 ]
 

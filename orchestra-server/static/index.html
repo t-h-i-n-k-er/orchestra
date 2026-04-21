@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orchestra Control Center</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+         margin: 0; padding: 1.5rem; max-width: 1100px; }
+  h1 { margin-top: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 0.5rem 0 1.5rem; }
+  th, td { border-bottom: 1px solid #ccc4; padding: 0.5rem 0.6rem; text-align: left; font-size: 0.95rem; }
+  th { background: #8881; }
+  input, select, button, textarea { font: inherit; padding: 0.45rem 0.6rem; }
+  button { cursor: pointer; }
+  pre { background: #8881; padding: 0.75rem; border-radius: 6px; overflow-x: auto; max-height: 18rem; }
+  .row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; margin: 0.5rem 0; }
+  .muted { color: #888; font-size: 0.9rem; }
+  .ok { color: #2a7; }
+  .err { color: #c33; }
+  #login { max-width: 22rem; }
+</style>
+</head>
+<body>
+<h1>Orchestra Control Center</h1>
+<p class="muted">Self-hosted management plane for enterprise device orchestration.</p>
+
+<section id="login">
+  <h2>Sign in</h2>
+  <div class="row">
+    <input id="token" type="password" placeholder="Admin bearer token" style="flex:1">
+    <button id="login-btn">Connect</button>
+  </div>
+  <p id="login-err" class="err"></p>
+</section>
+
+<section id="dash" hidden>
+  <h2>Connected agents <span class="muted" id="agent-count"></span></h2>
+  <table>
+    <thead><tr><th>Agent ID</th><th>Hostname / status</th><th>Peer</th><th>Last seen</th></tr></thead>
+    <tbody id="agents-tbody"><tr><td colspan="4" class="muted">No agents connected.</td></tr></tbody>
+  </table>
+
+  <h2>Send command</h2>
+  <div class="row">
+    <label>Agent <select id="agent-select"></select></label>
+    <label>Command
+      <select id="cmd-select">
+        <option value="Ping">Ping</option>
+        <option value="GetSystemInfo">GetSystemInfo</option>
+        <option value="ListProcesses">ListProcesses</option>
+        <option value="ListDirectory">ListDirectory (path)</option>
+        <option value="ReadFile">ReadFile (path)</option>
+        <option value="RunApprovedScript">RunApprovedScript (name)</option>
+      </select>
+    </label>
+    <input id="cmd-arg" placeholder="argument (when applicable)">
+    <button id="send-btn">Send</button>
+  </div>
+  <h3>Last result</h3>
+  <pre id="result" class="muted">—</pre>
+
+  <h2>Audit stream</h2>
+  <pre id="audit"></pre>
+</section>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -37,6 +37,16 @@ persistence = []
 network-discovery = []
 remote-assist = ["dep:x11cap", "dep:enigo", "dep:image"]
 hci-research = []
+# Connect the agent outbound to an Orchestra Control Center instead of waiting
+# for an inbound connection from a console. The server address and PSK are
+# read from the ORCHESTRA_C / ORCHESTRA_SECRET runtime env vars, or baked in
+# at compile time via the ORCHESTRA_C_ADDR / ORCHESTRA_C_SECRET build env vars
+# (set automatically by the Builder when outbound-c is included in a profile).
+outbound-c = []
+
+[[bin]]
+name = "agent-standalone"
+path = "src/main.rs"
 
 [dev-dependencies]
 criterion = "0.8.2"

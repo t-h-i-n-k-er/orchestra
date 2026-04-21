@@ -19,11 +19,17 @@ pub struct PayloadConfig {
     pub target_os: String,
     /// `"x86_64"` or `"aarch64"`.
     pub target_arch: String,
-    /// Address of the C2 / management endpoint, e.g. `"10.0.0.5:7890"`.
+    /// Address of the Control Center / management endpoint, e.g. `"10.0.0.5:8444"`.
     pub c2_address: String,
     /// Either a base64-encoded 32-byte AES key, or `file:/path/to/key.bin`
-    /// (the file is read at build time).
+    /// (the file is read at build time). Used to encrypt the payload binary.
     pub encryption_key: String,
+    /// Pre-shared secret the agent uses for its AES-TCP connection to the
+    /// Control Center. Must match `agent_shared_secret` in `orchestra-server.toml`.
+    /// Required when `outbound-c` is in `features`. If absent the agent will
+    /// look for the `ORCHESTRA_SECRET` runtime environment variable.
+    #[serde(default)]
+    pub c_server_secret: Option<String>,
     /// Cargo feature flags to enable on the agent crate.
     #[serde(default)]
     pub features: Vec<String>,
@@ -31,12 +37,13 @@ pub struct PayloadConfig {
     /// extension). Defaults to the profile name.
     #[serde(default)]
     pub output_name: Option<String>,
-    /// Cargo package to build as the payload. Defaults to `launcher`,
-    /// which is the only deployable binary currently in the workspace.
-    /// Set to `agent` (or a future `agent_standalone`) once a binary
-    /// front-end exists.
+    /// Cargo package to build as the payload. Defaults to `launcher`.
     #[serde(default = "default_package")]
     pub package: String,
+    /// Name of the binary target within `package`. Defaults to `package`.
+    /// Set to `"agent-standalone"` when building with `outbound-c`.
+    #[serde(default)]
+    pub bin_name: Option<String>,
 }
 
 fn default_package() -> String {
@@ -139,11 +146,13 @@ mod tests {
         let cfg = PayloadConfig {
             target_os: "linux".into(),
             target_arch: "x86_64".into(),
-            c2_address: "127.0.0.1:7890".into(),
+            c2_address: "127.0.0.1:8444".into(),
             encryption_key: base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+            c_server_secret: Some("my-secret".into()),
             features: vec!["persistence".into()],
             output_name: None,
             package: "launcher".into(),
+            bin_name: None,
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
         let parsed: PayloadConfig = toml::from_str(&text).unwrap();
@@ -158,9 +167,11 @@ mod tests {
             target_arch: "x86_64".into(),
             c2_address: "x".into(),
             encryption_key: base64::engine::general_purpose::STANDARD.encode([0u8; 16]),
+            c_server_secret: None,
             features: vec![],
             output_name: None,
             package: "launcher".into(),
+            bin_name: None,
         };
         assert!(cfg.resolve_key().is_err());
     }
@@ -172,9 +183,11 @@ mod tests {
             target_arch: "x86_64".into(),
             c2_address: String::new(),
             encryption_key: base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+            c_server_secret: None,
             features: vec![],
             output_name: None,
             package: "launcher".into(),
+            bin_name: None,
         };
         assert!(cfg.target_triple().is_err());
     }

