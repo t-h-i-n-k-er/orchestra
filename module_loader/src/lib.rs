@@ -142,7 +142,8 @@ mod tests {
                 let entry = entry.unwrap();
                 let path = entry.path();
                 let file_name = path.file_name().unwrap().to_str().unwrap();
-                if file_name.starts_with("libhello_plugin")
+                let expected_prefix = format!("{}hello_plugin", std::env::consts::DLL_PREFIX);
+                if file_name.starts_with(&expected_prefix)
                     && file_name.ends_with(std::env::consts::DLL_EXTENSION)
                 {
                     Some(path)

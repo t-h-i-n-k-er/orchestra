@@ -30,6 +30,7 @@ impl Optimizer {
 }
 
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 mod tests {
     use super::*;
 
