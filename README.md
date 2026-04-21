@@ -70,6 +70,25 @@ Two environment variables let you customise without editing the script:
 | `ORCHESTRA_QUICKBUILD_PROFILE` | `quickbuild` | Profile name to create / re-use under `profiles/`. |
 | `ORCHESTRA_QUICKBUILD_PORT`    | `8000`       | Port the bundled `dev-server` binds to. |
 
+### Interactive setup wizard
+
+If you'd rather be walked through every choice (target OS, deployment
+style, address, features, credentials, TLS, server bring-up) instead of
+accepting defaults, use the step-by-step wizard:
+
+```sh
+./scripts/setup.sh
+```
+
+It asks for the target OS (`linux` / `windows` / `macos`), architecture,
+deployment style (self-contained outbound `.exe` vs launcher + payload),
+the Control Center address (LAN IP auto-detected), and any optional
+feature flags. It then mints strong credentials, generates a self-signed
+TLS cert covering the chosen address, writes both the agent profile and
+`orchestra-server.toml`, cross-compiles the payload (falling back to
+`cargo-zigbuild` when `mingw-w64` isn't installed for Windows builds),
+and optionally starts the Control Center.
+
 ### Build the Builder from source
 
 If you prefer to drive each step manually:
