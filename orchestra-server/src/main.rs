@@ -26,6 +26,10 @@ struct Cli {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().init();
 
+    // rustls 0.23 with the `ring` backend requires a process-wide default
+    // CryptoProvider. Install it before any TLS code paths run.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
     let mut cfg = match cli.config.as_deref() {
         Some(p) => ServerConfig::load(p)?,

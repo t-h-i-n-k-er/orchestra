@@ -4,3 +4,9 @@
 **/*.rs.bk
 Cargo.lock.bak
 .DS_Store
+
+# Local runtime / secrets — never commit.
+secrets/
+orchestra-server.toml
+*-audit.jsonl
+**/orchestra-audit.jsonl

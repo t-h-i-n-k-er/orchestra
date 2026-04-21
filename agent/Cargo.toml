@@ -22,10 +22,10 @@ serde = { workspace = true }
 module_loader = { path = "../module_loader" }
 toml = "1.1.2"
 directories = "6.0.0"
-rustls = "0.23.38"
-tokio-rustls = "0.26.4"
+rustls = { version = "0.23.38", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2.2.0"
-rcgen = "0.14.7"
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring", "pem"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11cap = { version = "0.1", optional = true }
