@@ -149,12 +149,12 @@ fn uninstall_persistence_inner() -> Result<()> {
 }
 
 #[cfg(test)]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
     #[test]
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn install_then_uninstall_in_sandbox() {
         let dir = tempdir().unwrap();
         std::env::set_var("ORCHESTRA_PERSISTENCE_ROOT", dir.path());
