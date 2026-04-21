@@ -133,7 +133,7 @@ mod tests {
         let status = cmd.status().expect("Failed to build hello_plugin");
         assert!(status.success(), "hello_plugin build failed");
 
-        let mut path = PathBuf::from(format!("../target/debug/",));
+        let path = PathBuf::from("../target/debug/");
         // The exact filename depends on the OS and cargo's mangling.
         // We find the file with the right extension.
         let lib_file = fs::read_dir(&path)
