@@ -65,4 +65,3 @@ mod tests {
         assert!(!allowed("/home/user/secret"));
     }
 }
-

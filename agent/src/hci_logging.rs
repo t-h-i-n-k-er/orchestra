@@ -10,9 +10,9 @@
 
 #![cfg(feature = "hci-research")]
 
+use lazy_static::lazy_static;
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
-use lazy_static::lazy_static;
 
 #[derive(Serialize, Clone)]
 pub enum HciEvent {

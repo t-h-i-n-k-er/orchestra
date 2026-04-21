@@ -32,10 +32,7 @@ pub trait Plugin: Send + Sync {
 /// must be compiled from trusted source and expose a `_create_plugin` function
 /// that returns a `*mut dyn Plugin`. The loaded code will execute with the same
 /// permissions as the host process.
-pub fn load_plugin(
-    encrypted_blob: &[u8],
-    session: &CryptoSession,
-) -> Result<Box<dyn Plugin>> {
+pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box<dyn Plugin>> {
     // 1. Decrypt the blob. The GCM tag provides authentication.
     let decrypted_blob = session
         .decrypt(encrypted_blob)
@@ -82,10 +79,7 @@ pub fn load_plugin(
             .suffix(libloading::consts::EXT)
             .tempfile()?;
         temp_file.write_all(&decrypted_blob)?;
-        info!(
-            "Loading plugin from temporary file: {:?}",
-            temp_file.path()
-        );
+        info!("Loading plugin from temporary file: {:?}", temp_file.path());
         // SAFETY: We trust the decrypted blob.
         unsafe { Library::new(temp_file.path())? }
     };
@@ -148,7 +142,9 @@ mod tests {
                 let entry = entry.unwrap();
                 let path = entry.path();
                 let file_name = path.file_name().unwrap().to_str().unwrap();
-                if file_name.starts_with("libhello_plugin") && file_name.ends_with(std::env::consts::DLL_EXTENSION) {
+                if file_name.starts_with("libhello_plugin")
+                    && file_name.ends_with(std::env::consts::DLL_EXTENSION)
+                {
                     Some(path)
                 } else {
                     None
@@ -170,14 +166,11 @@ mod tests {
         let encrypted_blob = session.encrypt(&plugin_bytes);
 
         // 3. Load it using the module_loader.
-        let plugin =
-            load_plugin(&encrypted_blob, &session).expect("Failed to load plugin");
+        let plugin = load_plugin(&encrypted_blob, &session).expect("Failed to load plugin");
 
         // 4. Initialize and execute.
         plugin.init().expect("Plugin init failed");
-        let result = plugin
-            .execute("World")
-            .expect("Plugin execution failed");
+        let result = plugin.execute("World").expect("Plugin execution failed");
 
         assert_eq!(result, "Hello, World");
     }

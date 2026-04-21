@@ -7,8 +7,10 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 use clap::{Parser, Subcommand};
-use common::{transport::TcpTransport, tls_transport::TlsTransport, Command, CryptoSession,
-             Message, Transport};
+use common::{
+    tls_transport::TlsTransport, transport::TcpTransport, Command, CryptoSession, Message,
+    Transport,
+};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 use tokio::net::TcpStream;
@@ -79,9 +81,7 @@ enum Commands {
         local: String,
     },
     /// Deploy a capability module by name.
-    Deploy {
-        module_name: String,
-    },
+    Deploy { module_name: String },
     /// Tell the agent to reload its configuration file.
     ReloadConfig,
 }
@@ -91,9 +91,7 @@ enum Commands {
 /// A no-op certificate verifier that accepts any server certificate.
 /// **Only use this for development; never in production.**
 mod danger {
-    use rustls::client::danger::{
-        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-    };
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use rustls::{DigitallySignedStruct, SignatureScheme};
 
@@ -146,9 +144,7 @@ mod danger {
     }
 }
 
-fn load_pem_certs(
-    path: &str,
-) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+fn load_pem_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("Cannot open certificate file: {path}"))?;
     let mut reader = std::io::BufReader::new(file);
@@ -158,8 +154,8 @@ fn load_pem_certs(
 }
 
 fn load_pem_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("Cannot open key file: {path}"))?;
+    let file =
+        std::fs::File::open(path).with_context(|| format!("Cannot open key file: {path}"))?;
     let mut reader = std::io::BufReader::new(file);
     rustls_pemfile::private_key(&mut reader)
         .with_context(|| format!("Failed to parse private key from {path}"))?
@@ -309,9 +305,8 @@ async fn receive_response(
                         let bytes = base64::engine::general_purpose::STANDARD
                             .decode(&payload)
                             .context("Failed to decode file content")?;
-                        std::fs::write(download_dest, &bytes).with_context(|| {
-                            format!("Cannot write download to {download_dest}")
-                        })?;
+                        std::fs::write(download_dest, &bytes)
+                            .with_context(|| format!("Cannot write download to {download_dest}"))?;
                         println!("File saved to {download_dest}");
                     }
                     Ok(payload) => println!("{payload}"),

@@ -13,7 +13,10 @@ pub struct AuditEvent {
 impl AuditEvent {
     pub fn new(agent_id: &str, user: &str, action: &str, details: &str, outcome: Outcome) -> Self {
         Self {
-            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             agent_id: agent_id.to_string(),
             user: user.to_string(),
             action: action.to_string(),

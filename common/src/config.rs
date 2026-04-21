@@ -18,7 +18,9 @@ fn default_allowed_paths() -> Vec<String> {
     vec!["/var/log".into(), "/home".into(), "/tmp".into()]
 }
 
-fn default_heartbeat() -> u64 { 30 }
+fn default_heartbeat() -> u64 {
+    30
+}
 
 fn default_module_repo() -> String {
     "https://updates.example.com/modules".into()

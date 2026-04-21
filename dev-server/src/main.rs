@@ -30,7 +30,10 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let dir = cli.directory.canonicalize().unwrap_or(cli.directory.clone());
+    let dir = cli
+        .directory
+        .canonicalize()
+        .unwrap_or(cli.directory.clone());
     let addr: SocketAddr = ([127, 0, 0, 1], cli.port).into();
 
     tracing::info!(directory = %dir.display(), %addr, "starting dev-server");
@@ -44,11 +47,10 @@ async fn main() -> Result<()> {
         );
     }));
 
-    let (_addr, server) =
-        warp::serve(routes).bind_with_graceful_shutdown(addr, async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutdown signal received");
-        });
+    let (_addr, server) = warp::serve(routes).bind_with_graceful_shutdown(addr, async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutdown signal received");
+    });
     server.await;
     Ok(())
 }

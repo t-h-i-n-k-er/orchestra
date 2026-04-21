@@ -2,7 +2,7 @@
 //! This crate provides runtime function optimization for research purposes.
 
 use anyhow::Result;
-use region::{protect, Protection};
+use region::{Protection, protect};
 use tracing::info;
 
 pub struct Optimizer;

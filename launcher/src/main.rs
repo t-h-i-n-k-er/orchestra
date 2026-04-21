@@ -144,10 +144,7 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
         libc::execv(path.as_ptr(), argv_ptrs.as_ptr());
     }
     // If we reach here, execv failed.
-    Err(anyhow!(
-        "execv failed: {}",
-        std::io::Error::last_os_error()
-    ))
+    Err(anyhow!("execv failed: {}", std::io::Error::last_os_error()))
 }
 
 #[cfg(target_os = "macos")]
@@ -185,5 +182,7 @@ fn execute_in_memory(_payload: &[u8], _args: &[String]) -> Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn execute_in_memory(_payload: &[u8], _args: &[String]) -> Result<()> {
-    Err(anyhow!("Unsupported platform for in-memory agent execution"))
+    Err(anyhow!(
+        "Unsupported platform for in-memory agent execution"
+    ))
 }

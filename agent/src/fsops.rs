@@ -24,7 +24,10 @@ fn get_allowed_roots() -> Vec<PathBuf> {
 
 fn validate_path(path: &str) -> Result<PathBuf> {
     let path = Path::new(path);
-    if path.components().any(|c| c == std::path::Component::ParentDir) {
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
         return Err(anyhow!("Path cannot contain '..'"));
     }
 

@@ -52,9 +52,8 @@ pub fn uninstall_persistence() -> Result<()> {
 fn install_persistence_inner() -> Result<PathBuf> {
     let path = unit_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create unit directory {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create unit directory {}", parent.display()))?;
     }
 
     let unit = "[Unit]\n\
@@ -103,10 +102,14 @@ fn install_persistence_inner() -> Result<PathBuf> {
     if std::env::var("ORCHESTRA_PERSISTENCE_ROOT").is_err() {
         let status = std::process::Command::new("schtasks")
             .args([
-                "/Create", "/F",
-                "/SC", "ONLOGON",
-                "/TN", "OrchestraAgent",
-                "/TR", "C:\\Program Files\\Orchestra\\launcher.exe",
+                "/Create",
+                "/F",
+                "/SC",
+                "ONLOGON",
+                "/TN",
+                "OrchestraAgent",
+                "/TR",
+                "C:\\Program Files\\Orchestra\\launcher.exe",
             ])
             .status()
             .context("Failed to invoke schtasks")?;

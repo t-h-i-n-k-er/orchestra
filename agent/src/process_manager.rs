@@ -50,9 +50,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
         target_pid,
         "MigrateAgent invoked but migration is not yet implemented; returning a controlled error."
     );
-    anyhow::bail!(
-        "Process migration is not implemented in this release (target pid {target_pid})."
-    )
+    anyhow::bail!("Process migration is not implemented in this release (target pid {target_pid}).")
 }
 
 #[cfg(test)]

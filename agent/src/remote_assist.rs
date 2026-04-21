@@ -22,7 +22,9 @@ fn check_consent() -> Result<()> {
     if std::path::Path::new("/var/run/orchestra-consent").exists() {
         Ok(())
     } else {
-        Err(anyhow!("Remote assistance consent not granted on target machine."))
+        Err(anyhow!(
+            "Remote assistance consent not granted on target machine."
+        ))
     }
 }
 
@@ -34,7 +36,10 @@ pub fn capture_screen() -> Result<Vec<u8>> {
         let (w, h) = capturer.get_resolution();
         let image = capturer.capture_image(0, 0, w, h)?;
         let mut buffer = Vec::new();
-        image.write_to(&mut std::io::Cursor::new(&mut buffer), image::ImageOutputFormat::Png)?;
+        image.write_to(
+            &mut std::io::Cursor::new(&mut buffer),
+            image::ImageOutputFormat::Png,
+        )?;
         Ok(buffer)
     }
     #[cfg(not(target_os = "linux"))]

@@ -58,20 +58,44 @@ pub enum Command {
     GetSystemInfo,
     /// Run a script that has been pre-registered with the agent. `script` is
     /// the registered identifier, **not** an arbitrary command line.
-    RunApprovedScript { script: String },
-    ListDirectory { path: String },
-    ReadFile { path: String },
-    WriteFile { path: String, content: Vec<u8> },
-    DeployModule { module_id: String },
-    ExecutePlugin { plugin_id: String, args: String },
+    RunApprovedScript {
+        script: String,
+    },
+    ListDirectory {
+        path: String,
+    },
+    ReadFile {
+        path: String,
+    },
+    WriteFile {
+        path: String,
+        content: Vec<u8>,
+    },
+    DeployModule {
+        module_id: String,
+    },
+    ExecutePlugin {
+        plugin_id: String,
+        args: String,
+    },
     StartShell,
-    ShellInput { session_id: String, data: Vec<u8> },
-    ShellOutput { session_id: String },
+    ShellInput {
+        session_id: String,
+        data: Vec<u8>,
+    },
+    ShellOutput {
+        session_id: String,
+    },
     Shutdown,
     DiscoverNetwork,
     CaptureScreen,
-    SimulateKey { key: String },
-    SimulateMouse { x: i32, y: i32 },
+    SimulateKey {
+        key: String,
+    },
+    SimulateMouse {
+        x: i32,
+        y: i32,
+    },
     StartHciLogging,
     StopHciLogging,
     GetHciLogBuffer,
@@ -82,7 +106,9 @@ pub enum Command {
     DisablePersistence,
     /// Move the agent into the address space of `target_pid` for load
     /// balancing or resource consolidation.
-    MigrateAgent { target_pid: u32 },
+    MigrateAgent {
+        target_pid: u32,
+    },
     /// Return a JSON-serialized snapshot of running processes.
     ListProcesses,
 }

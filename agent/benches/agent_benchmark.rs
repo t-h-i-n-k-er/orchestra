@@ -50,5 +50,9 @@ fn bench_large_payload_encrypt(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_message_encode_encrypt, bench_large_payload_encrypt);
+criterion_group!(
+    benches,
+    bench_message_encode_encrypt,
+    bench_large_payload_encrypt
+);
 criterion_main!(benches);

@@ -1,7 +1,7 @@
 //! Interactive shell session management.
 
 use anyhow::Result;
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem, ChildKiller};
+use portable_pty::{ChildKiller, CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use std::io::{Read, Write};
 
 pub struct ShellSession {

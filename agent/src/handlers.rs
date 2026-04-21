@@ -32,7 +32,10 @@ fn make_audit(action: &str, outcome: Outcome, details: &str) -> AuditEvent {
 }
 
 fn is_path_allowed(path: &str, config: &Config) -> bool {
-    config.allowed_paths.iter().any(|a| path.starts_with(a.as_str()))
+    config
+        .allowed_paths
+        .iter()
+        .any(|a| path.starts_with(a.as_str()))
 }
 
 pub async fn handle_command(
@@ -71,7 +74,10 @@ pub async fn handle_command(
             }
         }
 
-        Command::WriteFile { ref path, ref content } => {
+        Command::WriteFile {
+            ref path,
+            ref content,
+        } => {
             let cfg = config.lock().await;
             if !is_path_allowed(path, &cfg) {
                 Err("Path not permitted by policy".to_string())
@@ -97,7 +103,10 @@ pub async fn handle_command(
             }
         }
 
-        Command::ShellInput { ref session_id, ref data } => {
+        Command::ShellInput {
+            ref session_id,
+            ref data,
+        } => {
             let sessions = SHELL_SESSIONS.lock().unwrap();
             if let Some(session) = sessions.get(session_id) {
                 let mut sess = session.lock().unwrap();
@@ -176,7 +185,10 @@ pub async fn handle_command(
                 Err(e) => Err(format!("Failed to read module blob: {e}")),
                 Ok(blob) => match module_loader::load_plugin(&blob, &crypto) {
                     Ok(plugin) => {
-                        LOADED_PLUGINS.lock().unwrap().insert(module_id.clone(), plugin);
+                        LOADED_PLUGINS
+                            .lock()
+                            .unwrap()
+                            .insert(module_id.clone(), plugin);
                         Ok("Module deployed".to_string())
                     }
                     Err(e) => Err(e.to_string()),
@@ -184,7 +196,10 @@ pub async fn handle_command(
             }
         }
 
-        Command::ExecutePlugin { ref plugin_id, ref args } => {
+        Command::ExecutePlugin {
+            ref plugin_id,
+            ref args,
+        } => {
             let plugins = LOADED_PLUGINS.lock().unwrap();
             match plugins.get(plugin_id) {
                 Some(plugin) => plugin.execute(args).map_err(|e| e.to_string()),
