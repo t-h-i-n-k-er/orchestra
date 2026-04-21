@@ -1,0 +1,12 @@
+[package]
+name = "optimizer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iced-x86 = "1.20"
+region = "3.0"
+memmap2 = "0.9"
+libc = "0.2"
+anyhow = "1.0"
+tracing = { workspace = true }

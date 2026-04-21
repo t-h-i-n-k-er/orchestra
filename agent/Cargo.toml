@@ -1,0 +1,48 @@
+[package]
+name = "agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+log = "0.4"
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sysinfo = { workspace = true }
+anyhow = { workspace = true }
+portable-pty = "0.9"
+dirs = "5.0"
+lazy_static = "1.4"
+uuid = { version = "1.0", features = ["v4"] }
+base64 = { workspace = true }
+serde_json = "1.0"
+serde = { workspace = true }
+module_loader = { path = "../module_loader" }
+toml = "1.1.2"
+directories = "6.0.0"
+rustls = "0.23.38"
+tokio-rustls = "0.26.4"
+rustls-pemfile = "2.2.0"
+rcgen = "0.14.7"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11cap = { version = "0.1", optional = true }
+enigo = { version = "0.2", optional = true }
+image = { version = "0.25", optional = true }
+
+[features]
+persistence = []
+network-discovery = []
+remote-assist = ["dep:x11cap", "dep:enigo", "dep:image"]
+hci-research = []
+
+[dev-dependencies]
+criterion = "0.8.2"
+rcgen = "0.14.7"
+tempfile = "3.27.0"
+
+[[bench]]
+name = "agent_benchmark"
+harness = false
