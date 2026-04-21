@@ -101,7 +101,7 @@ mod tests {
         std::fs::create_dir(&allowed_dir).unwrap();
 
         // Mock get_allowed_roots to use our temp dir
-        let original_roots_fn = super::get_allowed_roots;
+        let _original_roots_fn = super::get_allowed_roots;
         // This is a bit of a hack, but for a test it's ok.
         // In a real scenario, we would inject the roots.
         // For now, we can't easily override the function, so we test against the real roots.
