@@ -1,0 +1,12 @@
+[package]
+name = "keygen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { workspace = true }
+anyhow = { workspace = true }
+ed25519-dalek = { version = "2.1.0", features = ["rand_core"] }
+rand = "0.8"
+base64 = { workspace = true }
+hex = "0.4"

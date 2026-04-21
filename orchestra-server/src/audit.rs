@@ -20,10 +20,7 @@ impl AuditLog {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let (tx, _rx) = broadcast::channel(256);
         Ok(Self {
             path,

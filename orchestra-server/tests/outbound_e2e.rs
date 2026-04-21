@@ -8,7 +8,9 @@
 //! loops) to keep the suite quick; the full round-trip can be run explicitly
 //! with `cargo test -p orchestra-server --test outbound_e2e`.
 
-use orchestra_server::{agent_link, api, audit::AuditLog, config::ServerConfig, state::AppState, tls};
+use orchestra_server::{
+    agent_link, api, audit::AuditLog, config::ServerConfig, state::AppState, tls,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,7 +45,9 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
         let state_a = state.clone();
         let secret = cfg.agent_shared_secret.clone();
         tokio::spawn(async move {
-            agent_link::serve(state_a, agent_listener, secret).await.unwrap();
+            agent_link::serve(state_a, agent_listener, secret)
+                .await
+                .unwrap();
         });
     }
 

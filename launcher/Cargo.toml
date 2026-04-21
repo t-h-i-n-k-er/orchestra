@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 common = { path = "../common" }
+hollowing = { path = "../hollowing" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 clap = { workspace = true }

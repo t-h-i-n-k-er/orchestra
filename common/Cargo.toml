@@ -19,5 +19,13 @@ rustls = { version = "0.23.38", default-features = false, features = ["ring", "s
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2.2.0"
 
+# Optional: ephemeral X25519 key exchange for forward secrecy.
+# Enabled by the `forward-secrecy` feature.
+x25519-dalek = { version = "2", optional = true }
+hkdf = { version = "0.12", optional = true }
+
+[features]
+forward-secrecy = ["dep:x25519-dalek", "dep:hkdf"]
+
 [dev-dependencies]
 serde_json = "1.0"

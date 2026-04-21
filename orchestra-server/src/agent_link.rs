@@ -1,9 +1,18 @@
 //! Agent-facing listener: an AES-encrypted TCP socket that reuses
 //! [`common::CryptoSession`].
 //!
-//! Each connection runs a reader task (driving the registry + pending-task
-//! routing) and a writer task (forwarding [`Message`] values from the API
-//! layer to the agent).
+//! ## Identity binding
+//!
+//! On every `accept()` the server generates a fresh `connection_id`
+//! (`Uuid::new_v4()`).  That UUID becomes the registry key — not the
+//! `agent_id` the agent claims in its `Heartbeat`.  An agent can no longer
+//! hijack another agent's registry slot by spoofing its `agent_id`; the
+//! worst a rogue agent can do is register under a different `agent_id` label
+//! while being tracked under its own, server-assigned `connection_id`.
+//!
+//! Duplicate `agent_id` reports (common during rapid reconnects) are logged
+//! at `WARN` level but allowed; both entries coexist in the registry until
+//! the old socket's TCP EOF cleans up the stale entry.
 
 use crate::state::{now_secs, AgentEntry, AppState};
 use anyhow::Result;
@@ -13,6 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 const CHANNEL_DEPTH: usize = 64;
 const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024; // 16 MiB hard cap
@@ -45,18 +55,24 @@ pub async fn run(state: Arc<AppState>, addr: std::net::SocketAddr, secret: Strin
 }
 
 /// Drive a pre-bound listener. Useful for tests that want an ephemeral port.
-pub async fn serve(
-    state: Arc<AppState>,
-    listener: TcpListener,
-    secret: String,
-) -> Result<()> {
+pub async fn serve(state: Arc<AppState>, listener: TcpListener, secret: String) -> Result<()> {
     loop {
         let (sock, peer) = listener.accept().await?;
         let state_c = state.clone();
         let secret_c = secret.clone();
+        // Assign a server-controlled connection ID before touching the agent.
+        let connection_id = Uuid::new_v4().to_string();
         tokio::spawn(async move {
-            if let Err(e) = handle_agent(sock, peer.to_string(), state_c, secret_c).await {
-                tracing::warn!(%peer, "agent connection ended: {e}");
+            if let Err(e) = handle_agent(
+                sock,
+                peer.to_string(),
+                connection_id.clone(),
+                state_c,
+                secret_c,
+            )
+            .await
+            {
+                tracing::warn!(connection_id = %connection_id, %peer, "agent connection ended: {e}");
             }
         });
     }
@@ -65,6 +81,7 @@ pub async fn serve(
 async fn handle_agent(
     sock: TcpStream,
     peer: String,
+    connection_id: String,
     state: Arc<AppState>,
     secret: String,
 ) -> Result<()> {
@@ -86,13 +103,14 @@ async fn handle_agent(
     });
 
     // Reader loop runs in the connection task.
-    let mut bound_id: Option<String> = None;
+    let conn_id = connection_id.clone();
+    let mut registered = false;
 
     loop {
         let msg = match read_frame(&mut r, &session).await {
             Ok(m) => m,
             Err(e) => {
-                tracing::debug!(%peer, "agent read terminated: {e}");
+                tracing::debug!(connection_id = %conn_id, %peer, "agent read terminated: {e}");
                 break;
             }
         };
@@ -103,15 +121,37 @@ async fn handle_agent(
                 status,
                 timestamp: _,
             } => {
+                // Warn about duplicate agent_id but do not reject — it may be
+                // a legitimate reconnect racing with cleanup of the old socket.
+                if state
+                    .registry
+                    .iter()
+                    .any(|e| e.value().agent_id == agent_id && e.key() != &conn_id)
+                {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        new_connection = %conn_id,
+                        "duplicate agent_id: another connection is already using this agent_id; \
+                         both will remain registered until the old socket closes"
+                    );
+                }
+
                 let entry = AgentEntry {
+                    connection_id: conn_id.clone(),
                     agent_id: agent_id.clone(),
                     hostname: status,
                     last_seen: now_secs(),
                     tx: tx.clone(),
                     peer: peer.clone(),
                 };
-                state.registry.insert(agent_id.clone(), entry);
-                bound_id = Some(agent_id);
+                state.registry.insert(conn_id.clone(), entry);
+                registered = true;
+                tracing::debug!(
+                    connection_id = %conn_id,
+                    agent_id = %agent_id,
+                    %peer,
+                    "agent registered"
+                );
             }
             Message::TaskResponse { task_id, result } => {
                 if let Some((_, sender)) = state.pending.remove(&task_id) {
@@ -131,10 +171,9 @@ async fn handle_agent(
 
     drop(tx);
     let _ = writer.await;
-    if let Some(id) = bound_id {
-        // Only remove if the registry entry still belongs to this connection
-        // (a reconnect may have replaced it already).
-        state.registry.remove_if(&id, |_, e| e.peer == peer);
+    if registered {
+        state.registry.remove(&conn_id);
+        tracing::debug!(connection_id = %conn_id, "agent entry removed from registry");
     }
     Ok(())
 }

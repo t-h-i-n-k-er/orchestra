@@ -11,9 +11,13 @@ use std::path::Path;
 
 pub async fn build(cert: Option<&Path>, key: Option<&Path>) -> Result<RustlsConfig> {
     match (cert, key) {
-        (Some(c), Some(k)) => RustlsConfig::from_pem_file(c, k)
-            .await
-            .with_context(|| format!("loading TLS material from {} / {}", c.display(), k.display())),
+        (Some(c), Some(k)) => RustlsConfig::from_pem_file(c, k).await.with_context(|| {
+            format!(
+                "loading TLS material from {} / {}",
+                c.display(),
+                k.display()
+            )
+        }),
         _ => {
             tracing::warn!(
                 "No TLS cert configured; generating an in-memory self-signed certificate. \

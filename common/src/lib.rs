@@ -15,7 +15,14 @@ pub const NONCE_LEN: usize = 12;
 
 pub mod audit;
 pub mod config;
+pub mod normalized_transport;
 pub mod tls_transport;
+
+/// Optional X25519 ephemeral key exchange for forward secrecy.
+///
+/// Available only when the `forward-secrecy` feature is enabled.
+#[cfg(feature = "forward-secrecy")]
+pub mod crypto;
 
 pub use audit::{AuditEvent, Outcome};
 
@@ -30,6 +37,13 @@ pub enum Message {
     TaskRequest {
         task_id: String,
         command: Command,
+        /// Identity of the operator who issued the command. Populated by the
+        /// Control Center from the authenticated API session; agents use it
+        /// to attribute `AuditEvent` records rather than defaulting to
+        /// `"admin"`.  `None` means the request came directly from a
+        /// console without an operator identity (e.g. integration tests).
+        #[serde(default)]
+        operator_id: Option<String>,
     },
     TaskResponse {
         task_id: String,
@@ -251,11 +265,14 @@ mod tests {
             command: Command::RunApprovedScript {
                 script: "rotate-logs".into(),
             },
+            operator_id: None,
         };
         let bytes = serde_json::to_vec(&msg).unwrap();
         let back: Message = serde_json::from_slice(&bytes).unwrap();
         match back {
-            Message::TaskRequest { task_id, command } => {
+            Message::TaskRequest {
+                task_id, command, ..
+            } => {
                 assert_eq!(task_id, "t-1");
                 assert!(matches!(
                     command,

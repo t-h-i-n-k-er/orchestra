@@ -12,6 +12,8 @@ members = [
     "builder",
     "orchestra-server",
     "plugins/hello_plugin",
+    "keygen",
+    "hollowing",
 ]
 
 [workspace.package]
@@ -34,3 +36,6 @@ base64 = "0.21"
 reqwest = { version = "0.11", features = ["json", "stream"] }
 clap = { version = "4.4", features = ["derive"] }
 sysinfo = "0.30"
+
+[patch.crates-io]
+x11cap = { path = "vendor/x11cap" }

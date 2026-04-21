@@ -120,11 +120,11 @@
 
   function openWs() {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    // Browsers don't allow custom headers on WebSocket, so we pass the token via subprotocol.
-    // The server doesn't require it for the WS endpoint here because the WS endpoint is
-    // fronted by the same auth middleware via the Sec-WebSocket-Protocol fallback. For the
-    // simple build we just don't open a WS if the browser blocks it; periodic REST refresh
-    // keeps the dashboard live.
+    // Browsers don't allow custom headers on WebSocket, so we pass the token
+    // via the Sec-WebSocket-Protocol handshake header. The server's ws_handler
+    // (orchestra-server/src/api.rs) extracts the value beginning with
+    // "bearer." and validates it in constant time before completing the
+    // upgrade; an unknown or missing token causes a 401 response.
     try {
       ws = new WebSocket(proto + "//" + location.host + "/api/ws", ["bearer." + token]);
       ws.onmessage = (ev) => {

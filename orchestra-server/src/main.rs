@@ -9,7 +9,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Orchestra Control Center — self-hosted management plane")]
+#[command(
+    version,
+    about = "Orchestra Control Center — self-hosted management plane"
+)]
 struct Cli {
     /// Path to the server config TOML. If omitted, defaults are used.
     #[arg(long)]

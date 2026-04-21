@@ -10,6 +10,26 @@ This document describes where the project is going next.
 
 ---
 
+## Completed
+
+- ✅ **Trusted Execution Environment enforcement** (`env-validation` feature):
+  debugger detection, hypervisor detection, domain validation.
+- ✅ **Builder runtime feature discovery**: `read_agent_features()` parses
+  `agent/Cargo.toml` dynamically; unknown features are warned and excluded.
+- ✅ **Console CLI extended** with 11 new subcommands: `discover`,
+  `screenshot`, `key`, `mouse`, `hci-start`, `hci-stop`, `hci-log`,
+  `persist-enable`, `persist-disable`, `list-procs`, `migrate`.
+- ✅ **Windows process hollowing** shared crate (`hollowing`), integrated into
+  `launcher` for in-memory payload execution.
+- ✅ **enigo `x11rb` backend**: eliminated `libxdo-dev` system dependency on
+  Linux for remote-assist builds.
+- ✅ **`x11cap` vendor patch**: stable-Rust-compatible fork using `NonNull<T>`.
+- ✅ **`cargo test --workspace --all-features`** passes cleanly on Linux.
+- ✅ **`cargo clippy --workspace --all-features -- -D warnings`** zero warnings.
+- ✅ **`cargo fmt --all`** workspace fully formatted.
+
+---
+
 ## Short term (next 0–3 months)
 
 - **Web GUI console.** A small Axum + React front-end that talks to the
@@ -48,6 +68,7 @@ This document describes where the project is going next.
 - **Hot-reloadable agent core.** Use the in-memory module loader to swap
   the agent binary itself without restarting, keeping shell sessions
   alive across upgrades.
+
 - **Formal verification of `validate_path`.** Prove the path-traversal
   guard correct using `prusti` or `kani`.
 

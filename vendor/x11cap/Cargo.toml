@@ -1,0 +1,9 @@
+[package]
+name = "x11cap"
+version = "0.1.0"
+authors = ["bryal <96.bryal@gmail.com>"]
+edition = "2021"
+
+[dependencies]
+x11 = "*"
+libc = "0.2"

@@ -3,12 +3,24 @@ use common::{config::Config, AuditEvent, Command, CryptoSession, Outcome};
 use lazy_static::lazy_static;
 use module_loader::Plugin;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use sysinfo::System;
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use super::{fsops, shell};
+
+/// Reject any module identifier that contains characters outside the
+/// safe alphabet. Prevents path traversal via the `DeployModule`
+/// command (e.g. `../../etc/passwd`).
+pub(crate) fn is_valid_module_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
 
 lazy_static! {
     static ref SHELL_SESSIONS: Mutex<HashMap<String, Arc<Mutex<shell::ShellSession>>>> =
@@ -26,22 +38,16 @@ fn sanitize_action(cmd: &Command) -> String {
     }
 }
 
-fn make_audit(action: &str, outcome: Outcome, details: &str) -> AuditEvent {
+fn make_audit(action: &str, outcome: Outcome, details: &str, operator_id: &str) -> AuditEvent {
     let agent_id = System::host_name().unwrap_or_else(|| "unknown".to_string());
-    AuditEvent::new(&agent_id, "admin", action, details, outcome)
-}
-
-fn is_path_allowed(path: &str, config: &Config) -> bool {
-    config
-        .allowed_paths
-        .iter()
-        .any(|a| path.starts_with(a.as_str()))
+    AuditEvent::new(&agent_id, operator_id, action, details, outcome)
 }
 
 pub async fn handle_command(
     crypto: Arc<CryptoSession>,
     config: Arc<TokioMutex<Config>>,
     command: Command,
+    operator_id: &str,
 ) -> (Result<String, String>, AuditEvent) {
     let action = sanitize_action(&command);
 
@@ -51,26 +57,18 @@ pub async fn handle_command(
         Command::RunApprovedScript { ref script } => handle_run_approved_script(script),
 
         Command::ListDirectory { ref path } => {
-            let cfg = config.lock().await;
-            if !is_path_allowed(path, &cfg) {
-                Err("Path not permitted by policy".to_string())
-            } else {
-                match fsops::list_directory(path).await {
-                    Ok(entries) => Ok(serde_json::to_string(&entries).unwrap_or_default()),
-                    Err(e) => Err(e.to_string()),
-                }
+            let cfg = config.lock().await.clone();
+            match fsops::list_directory(path, &cfg).await {
+                Ok(entries) => Ok(serde_json::to_string(&entries).unwrap_or_default()),
+                Err(e) => Err(e.to_string()),
             }
         }
 
         Command::ReadFile { ref path } => {
-            let cfg = config.lock().await;
-            if !is_path_allowed(path, &cfg) {
-                Err("Path not permitted by policy".to_string())
-            } else {
-                match fsops::read_file(path).await {
-                    Ok(content) => Ok(base64::engine::general_purpose::STANDARD.encode(&content)),
-                    Err(e) => Err(e.to_string()),
-                }
+            let cfg = config.lock().await.clone();
+            match fsops::read_file(path, &cfg).await {
+                Ok(content) => Ok(base64::engine::general_purpose::STANDARD.encode(&content)),
+                Err(e) => Err(e.to_string()),
             }
         }
 
@@ -78,14 +76,10 @@ pub async fn handle_command(
             ref path,
             ref content,
         } => {
-            let cfg = config.lock().await;
-            if !is_path_allowed(path, &cfg) {
-                Err("Path not permitted by policy".to_string())
-            } else {
-                match fsops::write_file(path, content).await {
-                    Ok(_) => Ok("success".to_string()),
-                    Err(e) => Err(e.to_string()),
-                }
+            let cfg = config.lock().await.clone();
+            match fsops::write_file(path, content, &cfg).await {
+                Ok(_) => Ok("success".to_string()),
+                Err(e) => Err(e.to_string()),
             }
         }
 
@@ -175,24 +169,33 @@ pub async fn handle_command(
         Command::StopHciLogging => Err("hci-research feature not enabled".to_string()),
 
         #[cfg(feature = "hci-research")]
-        Command::GetHciLogBuffer => super::hci_logging::get_log_buffer(),
+        Command::GetHciLogBuffer => match super::hci_logging::get_log_buffer() {
+            Ok(buffer) => serde_json::to_string(&buffer).map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        },
         #[cfg(not(feature = "hci-research"))]
         Command::GetHciLogBuffer => Err("hci-research feature not enabled".to_string()),
 
         Command::DeployModule { ref module_id } => {
-            let path = format!("./target/debug/lib{}.so", module_id);
-            match fsops::read_file(&path).await {
-                Err(e) => Err(format!("Failed to read module blob: {e}")),
-                Ok(blob) => match module_loader::load_plugin(&blob, &crypto) {
-                    Ok(plugin) => {
-                        LOADED_PLUGINS
-                            .lock()
-                            .unwrap()
-                            .insert(module_id.clone(), plugin);
-                        Ok("Module deployed".to_string())
-                    }
-                    Err(e) => Err(e.to_string()),
-                },
+            if !is_valid_module_id(module_id) {
+                Err("Invalid module_id (allowed: [a-zA-Z0-9_-]{1,128})".to_string())
+            } else {
+                let cfg = config.lock().await.clone();
+                let path = Path::new(&cfg.module_cache_dir).join(format!("{}.so", module_id));
+                let path_str = path.to_string_lossy().into_owned();
+                match fsops::read_file(&path_str, &cfg).await {
+                    Err(e) => Err(format!("Failed to read module blob: {e}")),
+                    Ok(blob) => match module_loader::load_plugin(&blob, &crypto) {
+                        Ok(plugin) => {
+                            LOADED_PLUGINS
+                                .lock()
+                                .unwrap()
+                                .insert(module_id.clone(), plugin);
+                            Ok("Module deployed".to_string())
+                        }
+                        Err(e) => Err(e.to_string()),
+                    },
+                }
             }
         }
 
@@ -248,7 +251,7 @@ pub async fn handle_command(
         Ok(s) => (Outcome::Success, s.as_str()),
         Err(e) => (Outcome::Failure, e.as_str()),
     };
-    let audit = make_audit(&action, outcome, details);
+    let audit = make_audit(&action, outcome, details, operator_id);
     (result, audit)
 }
 
@@ -269,5 +272,90 @@ fn handle_run_approved_script(name: &str) -> Result<String, String> {
     match name {
         "health_check" => Ok("Health check OK".to_string()),
         other => Err(format!("'{other}' is not an approved script")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_id_validation_accepts_safe_names() {
+        assert!(is_valid_module_id("hello_plugin"));
+        assert!(is_valid_module_id("net-scan-v2"));
+        assert!(is_valid_module_id("ABC123"));
+    }
+
+    #[test]
+    fn module_id_validation_rejects_traversal_and_path_chars() {
+        assert!(!is_valid_module_id("../../etc/passwd"));
+        assert!(!is_valid_module_id("foo/bar"));
+        assert!(!is_valid_module_id("foo.bar"));
+        assert!(!is_valid_module_id(""));
+        assert!(!is_valid_module_id("foo bar"));
+    }
+
+    #[tokio::test]
+    async fn deploy_module_rejects_traversal_id() {
+        let cfg = Config::default();
+        let crypto = Arc::new(CryptoSession::from_key([0u8; 32]));
+        let cfg_arc = Arc::new(TokioMutex::new(cfg));
+        let (res, audit) = handle_command(
+            crypto,
+            cfg_arc,
+            Command::DeployModule {
+                module_id: "../../etc/passwd".into(),
+            },
+            "admin",
+        )
+        .await;
+        assert!(res.is_err(), "expected rejection, got {res:?}");
+        assert!(matches!(audit.outcome, Outcome::Failure));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn deploy_module_reads_from_configured_cache_dir() {
+        // Stage a fake (and intentionally invalid as a real plugin) blob in
+        // a writable cache dir, then verify the handler reaches the
+        // module_loader stage rather than failing at path validation.
+        let cache = tempfile::tempdir().unwrap();
+        let blob_path = cache.path().join("test_mod.so");
+        std::fs::write(&blob_path, b"not-a-real-plugin").unwrap();
+
+        let cfg = Config {
+            allowed_paths: vec![cache.path().to_string_lossy().into_owned()],
+            module_cache_dir: cache.path().to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        let crypto = Arc::new(CryptoSession::from_key([0u8; 32]));
+        let cfg_arc = Arc::new(TokioMutex::new(cfg));
+
+        let (res, _audit) = handle_command(
+            crypto,
+            cfg_arc,
+            Command::DeployModule {
+                module_id: "test_mod".into(),
+            },
+            "admin",
+        )
+        .await;
+
+        // Path validation must pass; the loader will reject the bogus blob.
+        // What matters is that the failure is NOT a "Failed to read module
+        // blob" / policy error.
+        match res {
+            Ok(_) => {} // unlikely with junk bytes, but acceptable
+            Err(e) => {
+                assert!(
+                    !e.contains("Failed to read module blob"),
+                    "validation should have allowed the read: {e}"
+                );
+                assert!(
+                    !e.contains("Path is outside"),
+                    "module_cache_dir should be allowed: {e}"
+                );
+            }
+        }
     }
 }

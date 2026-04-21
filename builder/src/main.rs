@@ -11,7 +11,8 @@ use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Select};
 use tracing::info;
 
 use crate::config::{
-    list_profiles, load_profile, profile_path, save_profile, PayloadConfig, PROFILES_DIR,
+    list_profiles, load_profile, profile_path, read_agent_features, save_profile, PayloadConfig,
+    PROFILES_DIR,
 };
 
 #[derive(Parser, Debug)]
@@ -153,21 +154,28 @@ fn cmd_configure(name: Option<String>) -> Result<()> {
         }
     };
 
-    let feature_choices = [
-        "persistence",
-        "network-discovery",
-        "hci-research",
-        "perf-optimize",
-        "direct-syscalls",
-        "manual-map",
-        "traffic-normalization",
-        "env-validation",
-        "outbound-c",
-    ];
-    let selected = MultiSelect::with_theme(&theme)
-        .with_prompt("Cargo features (space to toggle, enter to confirm)")
-        .items(&feature_choices)
-        .interact()?;
+    let feature_choices_owned = match read_agent_features() {
+        Ok(v) if !v.is_empty() => v,
+        Ok(_) => {
+            eprintln!(
+                "warning: agent/Cargo.toml has no [features] section; no feature flags offered"
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            eprintln!("warning: could not parse agent/Cargo.toml ({e}); no feature flags offered");
+            Vec::new()
+        }
+    };
+    let feature_choices: Vec<&str> = feature_choices_owned.iter().map(|s| s.as_str()).collect();
+    let selected = if feature_choices.is_empty() {
+        Vec::new()
+    } else {
+        MultiSelect::with_theme(&theme)
+            .with_prompt("Cargo features (space to toggle, enter to confirm)")
+            .items(&feature_choices)
+            .interact()?
+    };
     let features: Vec<String> = selected
         .into_iter()
         .map(|i| feature_choices[i].to_string())
@@ -191,7 +199,11 @@ fn cmd_configure(name: Option<String>) -> Result<()> {
             )
             .allow_empty(true)
             .interact_text()?;
-        if s.trim().is_empty() { None } else { Some(s) }
+        if s.trim().is_empty() {
+            None
+        } else {
+            Some(s)
+        }
     } else {
         None
     };

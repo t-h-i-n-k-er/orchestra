@@ -4,11 +4,7 @@
 
 use common::{Command, CryptoSession, Message};
 use orchestra_server::{
-    agent_link, api,
-    audit::AuditLog,
-    config::ServerConfig,
-    state::AppState,
-    tls,
+    agent_link, api, audit::AuditLog, config::ServerConfig, state::AppState, tls,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,7 +40,9 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
         let state_a = state.clone();
         let secret = cfg.agent_shared_secret.clone();
         tokio::spawn(async move {
-            agent_link::serve(state_a, agent_listener, secret).await.unwrap();
+            agent_link::serve(state_a, agent_listener, secret)
+                .await
+                .unwrap();
         });
     }
 
@@ -121,7 +119,11 @@ async fn agent_registers_and_ping_round_trips() {
     let agents_url = format!("https://127.0.0.1:{http_port}/api/agents");
 
     let unauth = client.get(&agents_url).send().await.unwrap();
-    assert_eq!(unauth.status(), 401, "unauthenticated requests must be rejected");
+    assert_eq!(
+        unauth.status(),
+        401,
+        "unauthenticated requests must be rejected"
+    );
 
     let mut found = false;
     for _ in 0..40 {
@@ -155,8 +157,13 @@ async fn agent_registers_and_ping_round_trips() {
     let agent_handle = tokio::spawn(async move {
         let req = agent.recv().await;
         let task_id = match req {
-            Message::TaskRequest { task_id, command } => {
-                assert!(matches!(command, Command::Ping), "expected Ping, got {command:?}");
+            Message::TaskRequest {
+                task_id, command, ..
+            } => {
+                assert!(
+                    matches!(command, Command::Ping),
+                    "expected Ping, got {command:?}"
+                );
                 task_id
             }
             other => panic!("unexpected message to agent: {other:?}"),

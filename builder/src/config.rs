@@ -66,6 +66,10 @@ impl PayloadConfig {
     }
 
     /// Resolve the encryption key into raw 32 bytes.
+    ///
+    /// Logs a warning if the key is trivially weak (all-identical bytes or
+    /// sequential bytes — patterns that indicate a placeholder or zero-filled
+    /// key rather than cryptographically random material).
     pub fn resolve_key(&self) -> Result<Vec<u8>> {
         use base64::Engine;
 
@@ -83,8 +87,28 @@ impl PayloadConfig {
                 raw.len()
             ));
         }
+
+        if is_weak_key(&raw) {
+            tracing::warn!(
+                "The configured encryption_key appears to be a weak placeholder \
+                 (all-zero or all-identical bytes). Generate a random key with \
+                 `orchestra-builder configure` before deploying."
+            );
+        }
+
         Ok(raw)
     }
+}
+
+/// Return `true` if `key` looks like a placeholder rather than random material:
+/// all bytes are identical, or every byte equals the previous + 1 (sequential).
+pub fn is_weak_key(key: &[u8]) -> bool {
+    if key.is_empty() {
+        return true;
+    }
+    let all_same = key.iter().all(|&b| b == key[0]);
+    let sequential = key.windows(2).all(|w| w[1] == w[0].wrapping_add(1));
+    all_same || sequential
 }
 
 /// Path to the profile file for a given name.
@@ -134,6 +158,52 @@ pub fn list_profiles() -> Result<Vec<String>> {
     }
     names.sort();
     Ok(names)
+}
+
+/// Path to the agent crate's `Cargo.toml`, relative to the workspace root.
+pub const AGENT_CARGO_TOML: &str = "agent/Cargo.toml";
+
+/// Return the list of `[features]` declared in `agent/Cargo.toml`, sorted.
+///
+/// The Builder reads this at runtime so its interactive wizard can only
+/// offer feature flags that the agent crate actually understands. If the
+/// file is missing or malformed we fall back to an empty list and the
+/// caller surfaces a helpful error.
+pub fn read_agent_features() -> Result<Vec<String>> {
+    read_agent_features_from(Path::new(AGENT_CARGO_TOML))
+}
+
+pub fn read_agent_features_from(path: &Path) -> Result<Vec<String>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let parsed: toml::Value =
+        toml::from_str(&text).with_context(|| format!("Invalid TOML in {}", path.display()))?;
+    let mut feats: Vec<String> = parsed
+        .get("features")
+        .and_then(|v| v.as_table())
+        .map(|t| t.keys().filter(|k| *k != "default").cloned().collect())
+        .unwrap_or_default();
+    feats.sort();
+    Ok(feats)
+}
+
+/// Split `requested` into (known, unknown) buckets against `available`.
+/// Used by the build pipeline to drop features that no longer exist in the
+/// agent crate (e.g. profiles saved by an older Builder version).
+pub fn partition_features(
+    requested: &[String],
+    available: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut known = Vec::new();
+    let mut unknown = Vec::new();
+    for f in requested {
+        if available.iter().any(|a| a == f) {
+            known.push(f.clone());
+        } else {
+            unknown.push(f.clone());
+        }
+    }
+    (known, unknown)
 }
 
 #[cfg(test)]
@@ -190,5 +260,65 @@ mod tests {
             bin_name: None,
         };
         assert!(cfg.target_triple().is_err());
+    }
+
+    #[test]
+    fn is_weak_key_detects_all_zeros() {
+        assert!(is_weak_key(&[0u8; 32]));
+    }
+
+    #[test]
+    fn is_weak_key_detects_all_same_nonzero() {
+        assert!(is_weak_key(&[0xffu8; 32]));
+    }
+
+    #[test]
+    fn is_weak_key_detects_sequential() {
+        let key: Vec<u8> = (0u8..32).collect();
+        assert!(is_weak_key(&key));
+    }
+
+    #[test]
+    fn is_weak_key_accepts_random_looking_bytes() {
+        // A non-degenerate key should not be flagged.
+        let key = [
+            0x9b, 0x4e, 0xa1, 0x3c, 0x77, 0x02, 0xf8, 0x5d, 0x1a, 0xce, 0x43, 0xb6, 0x8f, 0x20,
+            0x7e, 0xd9, 0x52, 0x0b, 0xc4, 0x67, 0x3a, 0xfe, 0x91, 0x28, 0xe5, 0x74, 0x19, 0xad,
+            0x60, 0x35, 0x8c, 0xf0,
+        ];
+        assert!(!is_weak_key(&key));
+    }
+
+    #[test]
+    fn read_agent_features_matches_real_cargo_toml() {
+        // The wizard's offered features must come straight from the agent
+        // crate; this test pins the contract so adding/removing a feature
+        // in agent/Cargo.toml is reflected immediately.
+        let path = std::path::PathBuf::from("..").join(AGENT_CARGO_TOML);
+        let feats = read_agent_features_from(&path).expect("agent/Cargo.toml parsed");
+        assert!(
+            !feats.is_empty(),
+            "agent crate should declare at least one feature"
+        );
+        // Known stable features.
+        for required in ["persistence", "network-discovery", "outbound-c"] {
+            assert!(
+                feats.iter().any(|f| f == required),
+                "expected feature `{required}` in agent/Cargo.toml, got {feats:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_features_splits_known_and_unknown() {
+        let available = vec!["persistence".to_string(), "outbound-c".to_string()];
+        let requested = vec![
+            "persistence".to_string(),
+            "this-was-removed".to_string(),
+            "outbound-c".to_string(),
+        ];
+        let (known, unknown) = partition_features(&requested, &available);
+        assert_eq!(known, vec!["persistence", "outbound-c"]);
+        assert_eq!(unknown, vec!["this-was-removed"]);
     }
 }

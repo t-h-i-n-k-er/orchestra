@@ -1,12 +1,22 @@
 [package]
 name = "optimizer"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
-iced-x86 = "1.20"
-region = "3.0"
-memmap2 = "0.9"
-libc = "0.2"
-anyhow = "1.0"
+iced-x86 = { version = "1.20", default-features = false, features = ["std", "decoder", "encoder", "block_encoder"] }
+anyhow = { workspace = true }
 tracing = { workspace = true }
+libc = "0.2"
+region = "3.0"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["memoryapi", "processthreadsapi", "libloaderapi"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "optimizer_benchmark"
+harness = false

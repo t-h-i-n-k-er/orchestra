@@ -45,6 +45,10 @@ mod tests {
             persistence_enabled: false,
             module_repo_url: "https://example.com".into(),
             module_signing_key: None,
+            module_cache_dir: common::config::default_module_cache_dir(),
+            traffic_profile: Default::default(),
+            required_domain: None,
+            refuse_in_vm: false,
         };
         let serialized = toml::to_string(&original).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();

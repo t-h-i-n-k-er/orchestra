@@ -1,4 +1,6 @@
+use crate::normalized_transport::TrafficProfile;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
@@ -12,6 +14,24 @@ pub struct Config {
     pub module_repo_url: String,
     /// Base64-encoded AES-256 key used to decrypt signed capability modules.
     pub module_signing_key: Option<String>,
+    /// Directory from which `DeployModule` loads pre-staged module blobs.
+    /// Defaults to `~/.cache/orchestra/modules` on Unix and
+    /// `%LOCALAPPDATA%\Orchestra\modules` on Windows.
+    #[serde(default = "default_module_cache_dir")]
+    pub module_cache_dir: String,
+    /// Wire-level traffic shaping profile. See [`TrafficProfile`] and
+    /// [`crate::normalized_transport`] for details.
+    #[serde(default)]
+    pub traffic_profile: TrafficProfile,
+    /// If set, the agent will refuse to start unless the host machine is
+    /// joined to this DNS domain (case-insensitive).
+    #[serde(default)]
+    pub required_domain: Option<String>,
+    /// When `true`, the agent refuses to start when virtualization or
+    /// sandbox artifacts are detected. Defaults to `false` because most
+    /// legitimate enterprise endpoints today are virtualized.
+    #[serde(default)]
+    pub refuse_in_vm: bool,
 }
 
 fn default_allowed_paths() -> Vec<String> {
@@ -26,6 +46,27 @@ fn default_module_repo() -> String {
     "https://updates.example.com/modules".into()
 }
 
+pub fn default_module_cache_dir() -> String {
+    if cfg!(windows) {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
+        base.join("Orchestra")
+            .join("modules")
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        home.join(".cache")
+            .join("orchestra")
+            .join("modules")
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -34,6 +75,10 @@ impl Default for Config {
             persistence_enabled: false,
             module_repo_url: default_module_repo(),
             module_signing_key: None,
+            module_cache_dir: default_module_cache_dir(),
+            traffic_profile: TrafficProfile::default(),
+            required_domain: None,
+            refuse_in_vm: false,
         }
     }
 }

@@ -235,7 +235,7 @@ on per profile only when you need them.
 | `outbound-c` | Switches the agent into outbound mode so it dials the Control Center automatically and reconnects with exponential backoff. See [docs/C_SERVER.md](docs/C_SERVER.md). |
 | `traffic-normalization` | Normalises packet timing/sizes on the agent ↔ console transport for environments with strict QoS or DPI middleboxes. |
 | `direct-syscalls` / `manual-map` | Compatibility shims for environments where the standard `libc` / loader paths trip endpoint-protection heuristics. |
-| `env-validation` | Runs a startup self-check that aborts the agent if the host environment doesn't match an allow-list of expected attributes. |
+| `env-validation` | Runs a startup Trusted Execution Environment (TEE) check on every launch. If a debugger, known hypervisor, or a domain mismatch is detected the agent enters a dormant sleep loop instead of running. Controlled via `required_domain` and `refuse_in_vm` in `agent.toml`. See [docs/USER_GUIDE.md §10](docs/USER_GUIDE.md) for full details. |
 
 Run `orchestra-builder show-profile <name>` to inspect which features a
 profile enables.
@@ -276,9 +276,12 @@ profile enables.
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture and protocol notes.
 - [docs/C_SERVER.md](docs/C_SERVER.md) — Control Center deployment
   reference (REST API, audit, outbound agents).
+- [docs/LAUNCHER.md](docs/LAUNCHER.md) — Launcher in-memory execution,
+  Windows process hollowing, and per-platform primitives.
 - [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md) — internal security
   review notes.
 - [builder/README.md](builder/README.md) — Builder CLI reference.
+- [console/README.md](console/README.md) — Console subcommand reference.
 - [ROADMAP.md](ROADMAP.md) — planned work.
 
 ## Disclaimer

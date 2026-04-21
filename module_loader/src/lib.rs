@@ -14,6 +14,25 @@ use std::io::Write;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use tracing::info;
 
+#[cfg(all(windows, feature = "manual-map"))]
+mod manual_map;
+
+#[cfg(feature = "module-signatures")]
+use ed25519_dalek::{Signature, VerifyingKey};
+
+#[cfg(feature = "module-signatures")]
+const MODULE_SIGNING_PUBKEY: [u8; 32] = [
+    0xc4, 0x5a, 0x22, 0x2a, 0x6a, 0x94, 0x86, 0xa5, 0xef, 0x72, 0xa7, 0xee, 0x2e, 0xb2, 0x4d, 0xf3,
+    0x2e, 0xe5, 0x8c, 0x14, 0x0a, 0xe4, 0x09, 0x7f, 0x2e, 0x56, 0x96, 0xf9, 0x46, 0x7b, 0x26, 0x79,
+];
+
+// Signing seed whose verifying key equals MODULE_SIGNING_PUBKEY (test use only).
+#[cfg(all(test, feature = "module-signatures"))]
+const MODULE_TEST_SIGNING_SEED: [u8; 32] = [
+    0x3, 0x6a, 0x2e, 0x3c, 0x3a, 0x3e, 0x5c, 0x1d, 0x5a, 0x4, 0x1b, 0x2, 0x1d, 0x5e, 0x4, 0x4, 0x4,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+];
+
 /// The trait that all Orchestra plugins must implement.
 pub trait Plugin: Send + Sync {
     /// Called once after the plugin is loaded. Use for initialization.
@@ -43,7 +62,59 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
         decrypted_blob.len()
     );
 
+    #[cfg(feature = "module-signatures")]
+    let module_data = {
+        if decrypted_blob.len() < 64 {
+            return Err(anyhow!("Module is too small to contain a signature."));
+        }
+        let (signature_bytes, module_bytes) = decrypted_blob.split_at(64);
+        let signature = Signature::from_bytes(signature_bytes.try_into()?);
+        let public_key = VerifyingKey::from_bytes(&MODULE_SIGNING_PUBKEY)?;
+        public_key.verify_strict(module_bytes, &signature)?;
+        info!("Module signature verified successfully.");
+        module_bytes
+    };
+
+    #[cfg(not(feature = "module-signatures"))]
+    let module_data = decrypted_blob.as_slice();
+
     // 2. Load the library from memory.
+    #[cfg(all(windows, feature = "manual-map"))]
+    let library = {
+        info!("Loading plugin using manual map loader.");
+        let image_base = unsafe { manual_map::load_dll_in_memory(module_data)? };
+        // For manual mapping, we don't get a `Library` object in the same way.
+        // We need to find the export manually.
+        // This is a simplification; a real implementation would parse the export table.
+        let create_func_addr = unsafe {
+            let pe = goblin::pe::PE::parse(module_data)?;
+            let export_dir = pe
+                .exports
+                .get(0)
+                .ok_or_else(|| anyhow!("No exports found"))?;
+            let func_name = "_create_plugin";
+            let mut func_rva = 0;
+            for export in pe.exports {
+                if let Some(name) = export.name {
+                    if name == func_name {
+                        func_rva = export.rva;
+                        break;
+                    }
+                }
+            }
+            if func_rva == 0 {
+                return Err(anyhow!("Could not find _create_plugin export"));
+            }
+            image_base.add(func_rva)
+        };
+
+        let create_func: unsafe extern "C" fn() -> *mut dyn Plugin =
+            unsafe { std::mem::transmute(create_func_addr) };
+        let plugin_ptr = unsafe { create_func() };
+        let plugin = unsafe { Box::from_raw(plugin_ptr) };
+        return Ok(plugin);
+    };
+
     #[cfg(target_os = "linux")]
     let library = {
         // On Linux, we use `memfd_create` to get an in-memory file descriptor.
@@ -60,7 +131,7 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
         }
 
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        file.write_all(&decrypted_blob)?;
+        file.write_all(module_data)?;
 
         let path = format!("/proc/self/fd/{}", file.as_raw_fd());
         info!("Loading plugin from in-memory path: {}", path);
@@ -69,7 +140,33 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
         unsafe { Library::new(path)? }
     };
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(windows, not(feature = "manual-map")))]
+    let library = {
+        // Fallback for non-Linux OSs (e.g., macOS, Windows).
+        // For Windows, a more advanced technique involves CreateFileMapping/MapViewOfFile
+        // with SEC_IMAGE, but for simplicity, we'll use a temporary file.
+        // This is less secure than memfd but functional.
+        //
+        // On Windows we MUST close the file handle before calling LoadLibrary,
+        // otherwise the loader fails with "file is being used by another process"
+        // (os error 32). We persist the temp file and clean it up after loading.
+        let temp_file = tempfile::Builder::new()
+            .prefix("plugin-")
+            .suffix(std::env::consts::DLL_SUFFIX)
+            .tempfile()?;
+        let temp_path = temp_file.into_temp_path();
+        std::fs::write(&temp_path, &decrypted_blob)?;
+        info!("Loading plugin from temporary file: {:?}", &*temp_path);
+        // SAFETY: We trust the decrypted blob.
+        let lib = unsafe { Library::new(&*temp_path)? };
+        // Persist the file for the lifetime of the loaded library; the OS
+        // will release the file once the process exits. On Windows we cannot
+        // delete a loaded DLL while it is mapped.
+        let _ = temp_path.keep();
+        lib
+    };
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let library = {
         // Fallback for non-Linux OSs (e.g., macOS, Windows).
         // For Windows, a more advanced technique involves CreateFileMapping/MapViewOfFile
@@ -173,9 +270,21 @@ mod tests {
         let plugin_path = build_test_plugin();
         let plugin_bytes = fs::read(plugin_path).unwrap();
 
-        // 2. Encrypt it.
+        // 2. Sign + encrypt (or just encrypt when signatures are not enabled).
         let session = CryptoSession::from_shared_secret(b"test-key");
-        let encrypted_blob = session.encrypt(&plugin_bytes);
+        #[cfg(feature = "module-signatures")]
+        let payload = {
+            use ed25519_dalek::Signer;
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(&MODULE_TEST_SIGNING_SEED);
+            let sig = signing_key.sign(&plugin_bytes);
+            let mut signed = Vec::with_capacity(64 + plugin_bytes.len());
+            signed.extend_from_slice(sig.to_bytes().as_ref());
+            signed.extend_from_slice(&plugin_bytes);
+            signed
+        };
+        #[cfg(not(feature = "module-signatures"))]
+        let payload = plugin_bytes;
+        let encrypted_blob = session.encrypt(&payload);
 
         // 3. Load it using the module_loader.
         let plugin = load_plugin(&encrypted_blob, &session).expect("Failed to load plugin");
@@ -185,5 +294,49 @@ mod tests {
         let result = plugin.execute("World").expect("Plugin execution failed");
 
         assert_eq!(result, "Hello, World");
+    }
+
+    #[cfg(all(windows, feature = "manual-map"))]
+    #[tokio::test]
+    async fn test_manual_map_load() {
+        let plugin_path = build_test_plugin();
+        let plugin_bytes = fs::read(plugin_path).unwrap();
+        let session = CryptoSession::from_shared_secret(b"test-key");
+        let encrypted_blob = session.encrypt(&plugin_bytes);
+        let plugin =
+            load_plugin(&encrypted_blob, &session).expect("Failed to load plugin with manual map");
+        plugin.init().expect("Plugin init failed");
+        let result = plugin
+            .execute("ManualMap")
+            .expect("Plugin execution failed");
+        assert_eq!(result, "Hello, ManualMap");
+    }
+
+    #[cfg(feature = "module-signatures")]
+    #[tokio::test]
+    async fn test_tampered_module_fails_verification() {
+        // 1. Build the plugin shared library.
+        let plugin_path = build_test_plugin();
+        let mut plugin_bytes = fs::read(plugin_path).unwrap();
+
+        // 2. Sign it
+        use ed25519_dalek::Signer;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&MODULE_TEST_SIGNING_SEED);
+        let signature = signing_key.sign(&plugin_bytes);
+        let mut signed_payload = Vec::with_capacity(64 + plugin_bytes.len());
+        signed_payload.extend_from_slice(signature.to_bytes().as_ref());
+        signed_payload.append(&mut plugin_bytes);
+
+        // 3. Encrypt it.
+        let session = CryptoSession::from_shared_secret(b"test-key");
+        let mut encrypted_blob = session.encrypt(&signed_payload);
+
+        // 4. Tamper with the encrypted blob
+        let last_byte_index = encrypted_blob.len() - 1;
+        encrypted_blob[last_byte_index] ^= 0x01;
+
+        // 5. Try to load it. It should fail decryption or signature verification.
+        let result = load_plugin(&encrypted_blob, &session);
+        assert!(result.is_err());
     }
 }

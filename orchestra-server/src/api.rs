@@ -34,16 +34,27 @@ pub struct CommandReply {
 }
 
 pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
-    let api = Router::new()
+    // Routes that require the standard `Authorization: Bearer <token>` header.
+    let api_authed = Router::new()
         .route("/agents", get(list_agents))
-        .route("/agents/:id/command", post(send_command))
+        // Route by reported agent_id (most-recently-seen wins when duplicates exist).
+        .route("/agents/:id/command", post(send_command_by_agent_id))
+        // Unambiguous routing by server-assigned connection_id.
+        .route(
+            "/connections/:id/command",
+            post(send_command_by_connection_id),
+        )
         .route("/audit", get(recent_audit))
-        .route("/ws", get(ws_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
         ))
         .with_state(state.clone());
+
+    // The WebSocket endpoint authenticates inside the handler because
+    // browsers cannot set custom headers on WebSocket upgrade requests;
+    // the token is carried in the `Sec-WebSocket-Protocol` header.
+    let api = api_authed.route("/ws", get(ws_handler).with_state(state.clone()));
 
     Router::new()
         .nest("/api", api)
@@ -58,17 +69,39 @@ async fn recent_audit(State(state): State<Arc<AppState>>) -> Json<Vec<common::Au
     Json(state.audit.recent(200))
 }
 
-async fn send_command(
+async fn send_command_by_agent_id(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(agent_id): Path<String>,
     Json(req): Json<CommandRequest>,
 ) -> Result<Json<CommandReply>, (StatusCode, String)> {
     let entry = state
-        .registry
-        .get(&agent_id)
-        .ok_or((StatusCode::NOT_FOUND, "no such agent".into()))?
-        .clone();
+        .find_by_agent_id(&agent_id)
+        .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
+    dispatch_command(state, user, entry, req).await
+}
+
+async fn send_command_by_connection_id(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(connection_id): Path<String>,
+    Json(req): Json<CommandRequest>,
+) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    let entry = state.find_by_connection_id(&connection_id).ok_or((
+        StatusCode::NOT_FOUND,
+        "no agent with that connection_id".into(),
+    ))?;
+    dispatch_command(state, user, entry, req).await
+}
+
+async fn dispatch_command(
+    state: Arc<AppState>,
+    user: AuthenticatedUser,
+    entry: crate::state::AgentEntry,
+    req: CommandRequest,
+) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    // Use the reported agent_id for audit and response labelling.
+    let agent_id = entry.agent_id.clone();
 
     let task_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = oneshot::channel();
@@ -80,17 +113,14 @@ async fn send_command(
     let request = Message::TaskRequest {
         task_id: task_id.clone(),
         command: req.command,
+        operator_id: Some(user.0.clone()),
     };
 
     if entry.tx.send(request).await.is_err() {
         state.pending.remove(&task_id);
-        state.audit.record_simple(
-            &agent_id,
-            &user.0,
-            cmd_label,
-            &cmd_detail,
-            Outcome::Failure,
-        );
+        state
+            .audit
+            .record_simple(&agent_id, &user.0, cmd_label, &cmd_detail, Outcome::Failure);
         return Err((StatusCode::BAD_GATEWAY, "agent disconnected".into()));
     }
 
@@ -99,13 +129,9 @@ async fn send_command(
 
     match result {
         Ok(Ok(Ok(output))) => {
-            state.audit.record_simple(
-                &agent_id,
-                &user.0,
-                cmd_label,
-                &cmd_detail,
-                Outcome::Success,
-            );
+            state
+                .audit
+                .record_simple(&agent_id, &user.0, cmd_label, &cmd_detail, Outcome::Success);
             Ok(Json(CommandReply {
                 task_id,
                 outcome: "ok",
@@ -114,13 +140,9 @@ async fn send_command(
             }))
         }
         Ok(Ok(Err(err))) => {
-            state.audit.record_simple(
-                &agent_id,
-                &user.0,
-                cmd_label,
-                &cmd_detail,
-                Outcome::Failure,
-            );
+            state
+                .audit
+                .record_simple(&agent_id, &user.0, cmd_label, &cmd_detail, Outcome::Failure);
             Ok(Json(CommandReply {
                 task_id,
                 outcome: "error",
@@ -130,7 +152,10 @@ async fn send_command(
         }
         Ok(Err(_canceled)) => {
             state.pending.remove(&task_id);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "response channel closed".into()))
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response channel closed".into(),
+            ))
         }
         Err(_elapsed) => {
             state.pending.remove(&task_id);
@@ -141,7 +166,10 @@ async fn send_command(
                 &format!("{cmd_detail} [timeout]"),
                 Outcome::Failure,
             );
-            Err((StatusCode::GATEWAY_TIMEOUT, "agent did not respond in time".into()))
+            Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                "agent did not respond in time".into(),
+            ))
         }
     }
 }
@@ -178,8 +206,40 @@ fn command_label(c: &Command) -> &'static str {
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |sock| ws_loop(sock, state))
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    // Browsers can't attach `Authorization` to a WebSocket handshake,
+    // so the dashboard sends the bearer token as a subprotocol value
+    // of the form `bearer.<token>`. Validate it here in constant time
+    // before accepting the upgrade.
+    let presented = headers
+        .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_bearer_subprotocol);
+
+    let token = match presented {
+        Some(t) => t,
+        None => return (StatusCode::UNAUTHORIZED, "missing bearer subprotocol").into_response(),
+    };
+
+    use subtle::ConstantTimeEq;
+    let ok: bool = token.as_bytes().ct_eq(state.admin_token.as_bytes()).into();
+    if !ok {
+        return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+    }
+
+    // Echo the chosen subprotocol back so the browser accepts the
+    // upgrade (otherwise the handshake fails).
+    let subprotocol = format!("bearer.{}", token);
+    ws.protocols([subprotocol])
+        .on_upgrade(move |sock| ws_loop(sock, state))
+}
+
+fn extract_bearer_subprotocol(header: &str) -> Option<String> {
+    header
+        .split(',')
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix("bearer.").map(|t| t.to_string()))
 }
 
 #[derive(Serialize)]
@@ -224,10 +284,7 @@ async fn ws_loop(mut socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
-async fn send_snapshot(
-    socket: &mut WebSocket,
-    state: &AppState,
-) -> Result<(), axum::Error> {
+async fn send_snapshot(socket: &mut WebSocket, state: &AppState) -> Result<(), axum::Error> {
     let payload = DashboardEvent::Agents {
         agents: state.list_agents(),
         ts: now_secs(),

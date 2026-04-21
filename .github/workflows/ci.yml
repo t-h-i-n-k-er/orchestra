@@ -42,7 +42,17 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb1-dev libxrandr-dev libdbus-1-dev pkg-config
+          sudo apt-get install -y \
+            libxcb1-dev \
+            libxrandr-dev \
+            libdbus-1-dev \
+            libx11-dev \
+            libxi-dev \
+            libxtst-dev \
+            libx11-xcb-dev \
+            libxcb-render-util0-dev \
+            pkg-config
+          # Note: enigo uses the x11rb backend (no libxdo-dev required)
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -53,17 +63,11 @@ jobs:
       - name: cargo clippy (default features)
         run: cargo clippy --workspace -- -D warnings
 
-      - name: cargo test (default features)
-        run: cargo test --workspace
+      - name: cargo test (all features)
+        run: cargo test --workspace --all-features
 
-      # Optional features. `remote-assist` is Linux/X11 only; skip on others.
-      - name: cargo test (persistence + network-discovery + hci-research)
-        run: cargo test -p agent --features "persistence network-discovery hci-research"
-
-      # NOTE: `remote-assist` is currently disabled in CI because the upstream
-      # `x11cap 0.1` crate does not compile on modern rustc (E0614 on
-      # `Unique<_XDisplay>`). Re-enable once we replace x11cap with `xcb` or
-      # similar.
+      - name: cargo clippy (all features)
+        run: cargo clippy --workspace --all-features -- -D warnings
 
   audit:
     name: Security Audit

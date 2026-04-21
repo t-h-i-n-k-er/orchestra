@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tracing::{info, warn};
 
-use crate::config::PayloadConfig;
+use crate::config::{partition_features, read_agent_features, PayloadConfig};
 
 const LAUNCHER_PACKAGE: &str = "launcher";
 const DIST_DIR: &str = "dist";
@@ -18,10 +18,23 @@ pub fn build_payload(profile_name: &str, cfg: &PayloadConfig) -> Result<PathBuf>
     let triple = cfg.target_triple()?;
     let package = cfg.package.as_str();
 
+    // Drop any feature flag that no longer exists in agent/Cargo.toml so a
+    // profile saved by an older Builder still builds (Task 2.3).
+    let available = read_agent_features().unwrap_or_default();
+    let (effective_features, unknown_features) = if available.is_empty() {
+        // Couldn't read agent/Cargo.toml – pass through and let cargo decide.
+        (cfg.features.clone(), Vec::new())
+    } else {
+        partition_features(&cfg.features, &available)
+    };
+    for f in &unknown_features {
+        warn!("profile feature `{f}` is not declared in agent/Cargo.toml; ignoring it");
+    }
+
     // When outbound-c is requested, bake the server address (and optionally
     // the PSK) into the binary at compile time.
     let mut extra_env: Vec<(String, String)> = Vec::new();
-    if cfg.features.iter().any(|f| f == "outbound-c") {
+    if effective_features.iter().any(|f| f == "outbound-c") {
         extra_env.push(("ORCHESTRA_C_ADDR".into(), cfg.c2_address.clone()));
         if let Some(ref secret) = cfg.c_server_secret {
             extra_env.push(("ORCHESTRA_C_SECRET".into(), secret.clone()));
@@ -34,13 +47,10 @@ pub fn build_payload(profile_name: &str, cfg: &PayloadConfig) -> Result<PathBuf>
     }
 
     // Determine the binary target name (package name unless overridden).
-    let bin_name = cfg
-        .bin_name
-        .as_deref()
-        .unwrap_or(package);
+    let bin_name = cfg.bin_name.as_deref().unwrap_or(package);
 
     info!(target_triple = %triple, package, bin = %bin_name, "Building agent payload");
-    let bin_path = cargo_build(package, bin_name, &triple, &cfg.features, &extra_env)?;
+    let bin_path = cargo_build(package, bin_name, &triple, &effective_features, &extra_env)?;
 
     // Best-effort strip — only meaningful for native / matching strip tool.
     if let Err(e) = strip_if_available(&bin_path) {
@@ -88,7 +98,13 @@ pub fn build_launcher_for_profile(profile_name: &str, cfg: &PayloadConfig) -> Re
         .cloned()
         .collect();
 
-    let bin_path = cargo_build(LAUNCHER_PACKAGE, LAUNCHER_PACKAGE, &triple, &launcher_features, &[])?;
+    let bin_path = cargo_build(
+        LAUNCHER_PACKAGE,
+        LAUNCHER_PACKAGE,
+        &triple,
+        &launcher_features,
+        &[],
+    )?;
 
     std::fs::create_dir_all(DIST_DIR)?;
     let out_name = cfg
@@ -141,7 +157,9 @@ fn cargo_build(
         .status()
         .with_context(|| format!("Failed to invoke cargo for {package}"))?;
     if !status.success() {
-        return Err(anyhow!("cargo build failed for {package}/{bin_name} ({status})"));
+        return Err(anyhow!(
+            "cargo build failed for {package}/{bin_name} ({status})"
+        ));
     }
 
     let mut bin = PathBuf::from("target")

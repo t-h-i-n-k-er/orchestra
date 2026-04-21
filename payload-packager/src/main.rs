@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use clap::Parser;
 use common::CryptoSession;
+use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
@@ -45,6 +46,10 @@ struct Cli {
     /// Base64-encoded 32-byte AES-256 key.
     #[arg(long)]
     key: String,
+
+    /// Path to a file containing a 32-byte Ed25519 private key for signing.
+    #[arg(long)]
+    signing_key: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -64,8 +69,19 @@ fn main() -> Result<()> {
         );
     }
 
-    let plaintext = std::fs::read(&cli.input)
+    let mut plaintext = std::fs::read(&cli.input)
         .with_context(|| format!("Failed to read input file {}", cli.input.display()))?;
+
+    if let Some(signing_key_path) = cli.signing_key {
+        let signing_key_bytes = std::fs::read(signing_key_path)?;
+        let signing_key = SigningKey::from_bytes(signing_key_bytes.as_slice().try_into()?);
+        let signature = signing_key.sign(&plaintext);
+
+        let mut signed_payload = Vec::with_capacity(64 + plaintext.len());
+        signed_payload.extend_from_slice(signature.to_bytes().as_ref());
+        signed_payload.append(&mut plaintext);
+        plaintext = signed_payload;
+    }
 
     let plaintext_hash = {
         let mut h = Sha256::new();

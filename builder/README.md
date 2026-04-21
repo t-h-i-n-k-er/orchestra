@@ -173,3 +173,36 @@ ls -lh dist/                                    # see the .enc
 
 The encrypted payload can then be served by `cargo run -p dev-server -- --port 8000`
 and consumed by `cargo run -p launcher -- --url http://127.0.0.1:8000/linux_demo.enc --key <base64-key>`.
+
+## Feature flags are discovered at runtime
+
+The interactive `configure` wizard does **not** ship with a hard-coded list
+of Cargo feature flags. Instead it reads `agent/Cargo.toml` at the moment
+you run it and offers exactly the features the agent crate currently
+declares. Adding or removing a `[features]` entry there is reflected in the
+wizard with no Builder change required.
+
+If a profile saved by an older Builder version refers to a feature that no
+longer exists (for example a `[features]` entry that was renamed or
+deleted), `orchestra-builder build` logs a warning and silently drops the
+unknown flag rather than failing the build.
+
+```sh
+$ orchestra-builder build win_lan
+WARN profile feature `legacy-something` is not declared in agent/Cargo.toml; ignoring it
+INFO Building agent payload …
+```
+
+### Self-verification
+
+Run `orchestra-builder configure --name probe` and compare the offered
+features against `[features]` in `agent/Cargo.toml`:
+
+```sh
+grep -E '^[a-z][a-z0-9-]*\s*=' agent/Cargo.toml \
+  | sed -n '/^\[features\]/,/^\[/p' agent/Cargo.toml \
+  | grep -oE '^[a-z][a-z0-9-]*' | sort -u
+```
+
+The two lists must match. The unit test `read_agent_features_matches_real_cargo_toml`
+in `builder/src/config.rs` enforces this contract in CI.

@@ -34,6 +34,7 @@ pub async fn require_bearer(
     }
 
     // Tag the request with a synthetic user identity for audit logs.
-    req.extensions_mut().insert(AuthenticatedUser("admin".into()));
+    req.extensions_mut()
+        .insert(AuthenticatedUser("admin".into()));
     Ok(next.run(req).await)
 }

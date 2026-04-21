@@ -7,10 +7,10 @@
 //!
 //! See `docs/C_SERVER.md` for the deployment guide.
 
-pub mod audit;
-pub mod auth;
 pub mod agent_link;
 pub mod api;
+pub mod audit;
+pub mod auth;
 pub mod config;
 pub mod state;
 pub mod tls;

