@@ -8,6 +8,7 @@
 use anyhow::{anyhow, Result};
 use common::CryptoSession;
 use libloading::{Library, Symbol};
+#[cfg(target_os = "linux")]
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, FromRawFd};
