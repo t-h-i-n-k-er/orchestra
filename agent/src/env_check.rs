@@ -47,14 +47,12 @@ impl EnvReport {
     /// enforced. We always treat a debugger or a domain mismatch as a
     /// failure; VM detection is informational unless the caller opts in.
     pub fn should_refuse(&self, refuse_in_vm: bool) -> bool {
-        if self.debugger_present || self.ld_preload_set || self.tracer_process_found || self.timing_anomaly_detected {
+        if self.debugger_present || self.tracer_process_found {
             return true;
         }
         if matches!(self.domain_match, Some(false)) {
             return true;
         }
-        // The hypervisor bit is now a soft indicator, contributing to vm_detected
-        // but not a hard stop on its own.
         if refuse_in_vm && self.vm_detected {
             return true;
         }

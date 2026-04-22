@@ -156,7 +156,7 @@ pub fn cmd_configure(name: Option<String>) -> Result<()> {
 
     let c2_address = Input::with_theme(&theme)
         .with_prompt("C2 Address (e.g., 10.0.0.5:8444)")
-        .default("127.0.0.1:8443")
+        .default("127.0.0.1:8443".to_string())
         .interact_text()?;
 
     let all_features = read_agent_features().unwrap_or_default();

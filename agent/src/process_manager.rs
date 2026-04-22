@@ -57,10 +57,12 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
 }
 
 #[cfg(windows)]
-pub fn migrate_to_process(_target_pid: u32) -> Result<()> {
-    tracing::info!("Attempting to migrate agent via process hollowing.");
-    let payload = std::fs::read(std::env::current_exe()?)?;
-    hollowing::hollow_and_execute(&payload)
+pub fn migrate_to_process(target_pid: u32) -> Result<()> {
+    tracing::warn!(
+        target_pid,
+        "Injection into an existing process is not yet implemented; returning a controlled error."
+    );
+    anyhow::bail!("Injection into an existing process is not yet implemented.")
 }
 
 #[cfg(test)]

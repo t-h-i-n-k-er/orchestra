@@ -58,6 +58,7 @@ fn check_consent() -> Result<()> {
 pub fn capture_screen() -> Result<Vec<u8>> {
     #[cfg(target_os = "linux")]
     {
+        check_consent()?;
         use image::{ImageBuffer, Rgb};
         let mut capturer =
             Capturer::new(Screen::Default).map_err(|_| anyhow!("failed to open X11 display"))?;

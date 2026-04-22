@@ -40,6 +40,8 @@ mod tests {
     #[test]
     fn toml_round_trip() {
         let original = Config {
+            port_scan_timeout_ms: 1000,
+            port_scan_concurrency: 10,
             allowed_paths: vec!["/tmp".into(), "/var/log".into()],
             heartbeat_interval_secs: 60,
             persistence_enabled: false,

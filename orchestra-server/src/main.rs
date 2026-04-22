@@ -58,20 +58,22 @@ async fn main() -> Result<()> {
         cfg.command_timeout_secs,
     ));
 
-    // Agent listener (AES-encrypted TCP).
+    let tls_cfg = tls::build(cfg.tls_cert_path.as_deref(), cfg.tls_key_path.as_deref()).await?;
+
+    // Agent listener (TLS-encrypted TCP).
     {
         let state_a = state.clone();
         let secret = cfg.agent_shared_secret.clone();
         let addr = cfg.agent_addr;
+        let tls_c = tls_cfg.get_inner();
         tokio::spawn(async move {
-            if let Err(e) = agent_link::run(state_a, addr, secret).await {
+            if let Err(e) = agent_link::run(state_a, addr, secret, tls_c).await {
                 tracing::error!("agent listener exited: {e}");
             }
         });
     }
 
     // Operator HTTPS server.
-    let tls_cfg = tls::build(cfg.tls_cert_path.as_deref(), cfg.tls_key_path.as_deref()).await?;
     let app = api::router(state.clone(), cfg.static_dir.clone());
     tracing::info!(addr = %cfg.http_addr, "operator HTTPS listening");
     axum_server::bind_rustls(cfg.http_addr, tls_cfg)

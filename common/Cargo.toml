@@ -22,14 +22,15 @@ rustls-pemfile = "2.2.0"
 # Optional: ephemeral X25519 key exchange for forward secrecy.
 # Enabled by the `forward-secrecy` feature.
 x25519-dalek = { version = "2", optional = true }
-hkdf = { version = "0.12", optional = true }
+hkdf = { version = "0.12" }
+hmac = { version = "0.12", optional = true }
 
 # Optional: Ed25519 signatures for module verification.
 # Enabled by the `module-signatures` feature.
 ed25519-dalek = { version = "2", optional = true }
 
 [features]
-forward-secrecy = ["dep:x25519-dalek", "dep:hkdf"]
+forward-secrecy = ["dep:x25519-dalek", "dep:hmac"]
 module-signatures = ["dep:ed25519-dalek"]
 
 [dev-dependencies]

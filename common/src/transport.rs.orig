@@ -16,9 +16,9 @@ impl TcpTransport {
     }
 }
 
+#[async_trait]
 pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
-#[async_trait]
 impl Transport for TcpTransport {
     async fn send(&mut self, msg: Message) -> Result<()> {
         let serialized = serde_json::to_vec(&msg)?;

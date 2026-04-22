@@ -169,8 +169,10 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
     let path = dir.join(format!("orchestra-agent-{}", std::process::id()));
     std::fs::write(&path, payload)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
-    let err = std::process::Command::new(&path).args(args).exec();
-    Err(anyhow!("exec failed: {err}"))
+    let mut child = std::process::Command::new(&path).args(args).spawn()?;
+    let _ = std::fs::remove_file(&path);
+    let status = child.wait()?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 #[cfg(target_os = "windows")]

@@ -27,6 +27,7 @@ lazy_static! {
         Mutex::new(HashMap::new());
     static ref LOADED_PLUGINS: Mutex<HashMap<String, Box<dyn Plugin + Send + Sync>>> =
         Mutex::new(HashMap::new());
+    pub static ref SHUTDOWN_NOTIFY: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
 }
 
 fn sanitize_action(cmd: &Command) -> String {
@@ -244,7 +245,7 @@ pub async fn handle_command(
         #[cfg(not(feature = "persistence"))]
         Command::DisablePersistence => Err("persistence feature not enabled".to_string()),
 
-        Command::Shutdown => std::process::exit(0),
+        Command::Shutdown => { SHUTDOWN_NOTIFY.notify_one(); Ok("Agent shutdown sequence initiated".to_string()) },
     };
 
     let (outcome, details) = match &result {

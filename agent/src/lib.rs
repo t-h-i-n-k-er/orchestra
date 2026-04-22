@@ -70,6 +70,14 @@ impl Agent {
         {
             let cfg = self.config.lock().await;
             let decision = env_check::enforce(cfg.required_domain.as_deref(), cfg.refuse_in_vm);
+            
+            if decision.report.ld_preload_set {
+                log::warn!("LD_PRELOAD is set in the environment (soft warning)");
+            }
+            if decision.report.timing_anomaly_detected {
+                log::warn!("Timing anomaly detected (soft warning, possibly high load)");
+            }
+
             if decision.refuse {
                 error!(
                     "environment validation failed (debugger={}, vm={}, domain_match={:?}); agent entering dormant state",
@@ -108,11 +116,22 @@ impl Agent {
         }
 
         info!("Agent started, waiting for commands...");
+        let mut tasks = tokio::task::JoinSet::new();
+
         loop {
-            let msg = {
+            let msg_fut = async {
                 let mut transport = self.transport.lock().await;
                 transport.recv().await
             };
+
+            let msg = tokio::select! {
+                res = msg_fut => res,
+                _ = crate::handlers::SHUTDOWN_NOTIFY.notified() => {
+                    info!("Shutdown signal received, draining tasks and shutting down.");
+                    break;
+                }
+            };
+
             match msg {
                 Ok(Message::TaskRequest {
                     task_id,
@@ -123,7 +142,7 @@ impl Agent {
                     let crypto = self.crypto.clone();
                     let config = self.config.clone();
                     let transport = self.transport.clone();
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         let (response, audit_event) = handlers::handle_command(
                             crypto,
                             config,
@@ -153,13 +172,14 @@ impl Agent {
                 Ok(_) => {} // ignore heartbeats etc.
                 Err(e) => {
                     error!("Transport error: {}", e);
-                    // Return the error so the caller (e.g. outbound reconnect
-                    // loop) can detect disconnection and re-establish the
-                    // session, rather than spinning forever on a dead socket.
+                    // Drain tasks before returning error
+                    while let Some(_) = tasks.join_next().await {}
                     return Err(e);
                 }
             }
         }
+
+        while let Some(_) = tasks.join_next().await {}
         Ok(())
     }
 }
