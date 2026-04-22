@@ -39,9 +39,37 @@ fn sanitize_action(cmd: &Command) -> String {
     }
 }
 
-fn make_audit(action: &str, outcome: Outcome, details: &str, operator_id: &str) -> AuditEvent {
+pub(crate) fn make_audit(action: &str, outcome: Outcome, details: &str, operator_id: &str) -> AuditEvent {
     let agent_id = System::host_name().unwrap_or_else(|| "unknown".to_string());
     AuditEvent::new(&agent_id, operator_id, action, details, outcome)
+}
+
+/// Handle a server-initiated module push: decrypt, verify signature (when the
+/// `module-signatures` feature is active), and register the loaded plugin.
+///
+/// The module name must pass the same validation applied to `DeployModule` to
+/// prevent a malicious server from injecting arbitrary plugin IDs.
+pub(crate) fn push_module(
+    module_name: String,
+    encrypted_blob: &[u8],
+    crypto: &CryptoSession,
+) -> Result<String, String> {
+    if !is_valid_module_id(&module_name) {
+        return Err(format!(
+            "ModulePush rejected: invalid module_name '{}' (allowed: [a-zA-Z0-9_-]{{1,128}})",
+            module_name
+        ));
+    }
+    match module_loader::load_plugin(encrypted_blob, crypto) {
+        Ok(plugin) => {
+            LOADED_PLUGINS
+                .lock()
+                .unwrap()
+                .insert(module_name.clone(), plugin);
+            Ok(format!("Module '{}' loaded via push", module_name))
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 pub async fn handle_command(

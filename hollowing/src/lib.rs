@@ -13,6 +13,9 @@ mod windows_impl;
 #[cfg(windows)]
 pub use windows_impl::hollow_and_execute;
 
+#[cfg(windows)]
+pub use windows_impl::inject_into_process;
+
 #[cfg(not(windows))]
 pub fn hollow_and_execute(_payload: &[u8]) -> Result<()> {
     anyhow::bail!("process hollowing is only available on Windows targets");

@@ -32,6 +32,14 @@ pub struct Config {
     /// legitimate enterprise endpoints today are virtualized.
     #[serde(default)]
     pub refuse_in_vm: bool,
+    /// SHA-256 fingerprint (64 lowercase hex chars) of the Orchestra Control
+    /// Center's TLS certificate. When set, `outbound-c` mode pins the server
+    /// certificate instead of accepting any certificate.
+    ///
+    /// Generate with:
+    ///   openssl x509 -in server.crt -outform DER | sha256sum
+    #[serde(default)]
+    pub server_cert_fingerprint: Option<String>,
     /// Maximum number of concurrent connections for port scanning.
     #[serde(default = "default_port_scan_concurrency")]
     pub port_scan_concurrency: usize,

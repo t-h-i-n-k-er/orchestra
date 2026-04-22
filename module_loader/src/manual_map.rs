@@ -192,6 +192,16 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         return Err(anyhow!("VirtualAlloc failed"));
     }
 
+    // 1b. Copy PE headers (DOS header, NT headers, section table) so that
+    //     DLLs which inspect their own headers at runtime (resource lookup,
+    //     TLS callbacks, etc.) find the expected data rather than zeroed memory.
+    let size_of_headers = optional_header.windows_fields.size_of_headers as usize;
+    std::ptr::copy_nonoverlapping(
+        dll_bytes.as_ptr(),
+        image_base as *mut u8,
+        size_of_headers.min(dll_bytes.len()),
+    );
+
     // 2. Copy sections
     for section in &pe.sections {
         let dest = image_base.add(section.virtual_address as usize);
@@ -261,6 +271,55 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                 }
                 offset += block_size;
             }
+            }
+        }
+    }
+
+    // 4b. Invoke TLS callbacks (if any) before calling DllMain.
+    //
+    // Some DLLs compiled with MSVC __declspec(thread) register one or more
+    // PIMAGE_TLS_CALLBACK functions in the TLS directory (data directory 9).
+    // The loader must call every callback in the null-terminated array with
+    // (DllHandle, DLL_PROCESS_ATTACH, Reserved=0) before the entry point.
+    //
+    // IMAGE_DIRECTORY_ENTRY_TLS = 9
+    const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
+    if let Some(tls_entry) = optional_header.data_directories.data_directories
+        [IMAGE_DIRECTORY_ENTRY_TLS]
+    {
+        if tls_entry.virtual_address != 0 && tls_entry.size > 0 {
+            // The TLS directory layout (pointer-width fields match the target):
+            //   StartAddressOfRawData  : usize
+            //   EndAddressOfRawData    : usize
+            //   AddressOfIndex         : usize
+            //   AddressOfCallBacks     : usize  ← VA of null-terminated callback array
+            //   SizeOfZeroFill         : u32
+            //   Characteristics        : u32
+            #[repr(C)]
+            struct ImageTlsDirectory {
+                _start_address_of_raw_data: usize,
+                _end_address_of_raw_data: usize,
+                _address_of_index: usize,
+                address_of_callbacks: usize,
+                _size_of_zero_fill: u32,
+                _characteristics: u32,
+            }
+            let tls_dir = &*(image_base.add(tls_entry.virtual_address as usize)
+                as *const ImageTlsDirectory);
+            if tls_dir.address_of_callbacks != 0 {
+                // address_of_callbacks is a VA pointing into our mapped image;
+                // after relocation it already reflects the allocation address.
+                let mut cb_ptr = tls_dir.address_of_callbacks as *const usize;
+                loop {
+                    let cb_va = *cb_ptr;
+                    if cb_va == 0 {
+                        break;
+                    }
+                    let callback: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) =
+                        std::mem::transmute(cb_va);
+                    callback(image_base, DLL_PROCESS_ATTACH, std::ptr::null_mut());
+                    cb_ptr = cb_ptr.add(1);
+                }
             }
         }
     }

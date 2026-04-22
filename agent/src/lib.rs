@@ -68,9 +68,11 @@ impl Agent {
         // Trusted Execution Environment Enforcement (env_check.rs):
         // refuse to start under a debugger or on the wrong domain.
         {
-            let cfg = self.config.lock().await;
-            let decision = env_check::enforce(cfg.required_domain.as_deref(), cfg.refuse_in_vm);
-            
+            let decision = {
+                let cfg = self.config.lock().await;
+                env_check::enforce(cfg.required_domain.as_deref(), cfg.refuse_in_vm)
+            };
+
             if decision.report.ld_preload_set {
                 log::warn!("LD_PRELOAD is set in the environment (soft warning)");
             }
@@ -85,10 +87,33 @@ impl Agent {
                     decision.report.vm_detected,
                     decision.report.domain_match,
                 );
-                // Dormant state: sleep forever instead of exiting, so process
-                // supervisors do not restart us in a tight loop.
+                // Dormant state: periodically re-evaluate the environment so
+                // that transient conditions (e.g. a debugger attached briefly
+                // during IT maintenance) do not permanently disable the agent.
+                // After MAX_RETRIES failed re-checks the agent exits cleanly
+                // so the process supervisor can restart it.
+                const RECHECK_INTERVAL_SECS: u64 = 2 * 3600; // 2 hours
+                const MAX_RETRIES: u32 = 3;
+                let mut retries = 0u32;
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(RECHECK_INTERVAL_SECS)).await;
+                    let recheck = {
+                        let cfg = self.config.lock().await;
+                        env_check::enforce(cfg.required_domain.as_deref(), cfg.refuse_in_vm)
+                    };
+                    if !recheck.refuse {
+                        info!("environment re-check passed; resuming normal operation");
+                        break;
+                    }
+                    retries += 1;
+                    if retries >= MAX_RETRIES {
+                        info!("maximum dormant retries ({}) reached; exiting for supervisor restart", MAX_RETRIES);
+                        return Ok(());
+                    }
+                    error!(
+                        "environment re-check failed ({}/{}); remaining dormant",
+                        retries, MAX_RETRIES
+                    );
                 }
             } else {
                 info!(
@@ -168,6 +193,40 @@ impl Agent {
                 Ok(Message::Shutdown) => {
                     info!("Shutdown received, exiting.");
                     break;
+                }
+                Ok(Message::ModulePush {
+                    module_name,
+                    version,
+                    encrypted_blob,
+                }) => {
+                    info!(
+                        "ModulePush received: module='{}' version='{}'",
+                        module_name, version
+                    );
+                    let crypto = self.crypto.clone();
+                    let transport = self.transport.clone();
+                    let name_clone = module_name.clone();
+                    let ver_clone = version.clone();
+                    tasks.spawn(async move {
+                        let result =
+                            handlers::push_module(name_clone.clone(), &encrypted_blob, &crypto);
+                        let (outcome, details) = match &result {
+                            Ok(s) => {
+                                info!("ModulePush '{}': {}", name_clone, s);
+                                (common::Outcome::Success, s.as_str().to_owned())
+                            }
+                            Err(e) => {
+                                error!("ModulePush '{}' failed: {}", name_clone, e);
+                                (common::Outcome::Failure, e.as_str().to_owned())
+                            }
+                        };
+                        let action = format!("ModulePush(module={name_clone:?},version={ver_clone:?})");
+                        let audit = handlers::make_audit(&action, outcome, &details, "server");
+                        let mut t = transport.lock().await;
+                        if let Err(e) = t.send(Message::AuditLog(audit)).await {
+                            error!("Failed to send ModulePush audit log: {}", e);
+                        }
+                    });
                 }
                 Ok(_) => {} // ignore heartbeats etc.
                 Err(e) => {

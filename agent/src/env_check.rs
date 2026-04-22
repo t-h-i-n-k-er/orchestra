@@ -329,9 +329,11 @@ fn detect_timing_anomaly() -> bool {
     let start = Instant::now();
     std::thread::sleep(Duration::from_millis(100));
     let elapsed = start.elapsed();
-    // If sleeping for 100ms takes more than 500ms, something is slowing
-    // down execution, which could be a debugger or emulator.
-    elapsed > Duration::from_millis(500)
+    // If sleeping for 100ms takes more than 2000ms, something is significantly
+    // slowing down execution (debugger, emulator, or extreme scheduler pressure).
+    // The previous 500ms threshold produced false positives on heavily loaded
+    // cloud VMs and under hypervisor scheduling; 2000ms is more conservative.
+    elapsed > Duration::from_millis(2000)
 }
 
 // -------------------------------------------------------------------- domain

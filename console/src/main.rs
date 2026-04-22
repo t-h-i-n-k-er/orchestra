@@ -24,8 +24,8 @@ struct Cli {
     #[clap(short, long)]
     target: String,
 
-    /// Pre-shared AES-256 key (Base64-encoded). Required unless --tls is used.
-    #[clap(short, long, conflicts_with = "tls")]
+    /// Pre-shared AES-256 key (Base64-encoded). Required for both TCP and TLS transports.
+    #[clap(short, long)]
     key: Option<String>,
 
     /// Use a mutual-TLS transport instead of the pre-shared-key TCP transport.
@@ -272,7 +272,15 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Invalid SNI hostname: {e}"))?;
 
         let tls_stream = connector.connect(sni, stream).await?;
-        Box::new(TlsTransport::new(tls_stream))
+        let key_b64 = cli
+            .key
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--key is required to derive the application-layer session key"))?;
+        let key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(key_b64)
+            .context("--key is not valid Base64")?;
+        let session = CryptoSession::from_shared_secret(&key_bytes);
+        Box::new(TlsTransport::new(tls_stream, session))
     } else {
         let key_b64 = cli
             .key

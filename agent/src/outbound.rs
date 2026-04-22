@@ -51,22 +51,38 @@ async fn connect_once(addr: &str, secret: &str, agent_id: &str) -> Result<()> {
     let mut stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true)?;
 
-    // Integrate TLS into the default connection path.
-    // For now, accept any cert (or pin self-signed). We'll use a dangerous/dummy root store for self-signed.
-    let mut root_store = rustls::RootCertStore::empty();
-    // This is a naive dangerous verifier for testing/self-signed.
-    let config = rustls::ClientConfig::builder()
+    // Build a TLS client config. When `server_cert_fingerprint` is configured
+    // in agent.toml, pin the server's end-entity certificate by its SHA-256
+    // fingerprint to prevent MITM attacks. Without a fingerprint, fall back to
+    // `NoCertificateVerification` so existing deployments keep working, but log
+    // a prominent warning.
+    let cert_verifier: std::sync::Arc<dyn rustls::client::danger::ServerCertVerifier> = {
+        let cfg = crate::config::load_config()?;
+        if let Some(fp) = cfg.server_cert_fingerprint {
+            info!("outbound-c: using certificate pinning (fingerprint configured)");
+            std::sync::Arc::new(
+                common::tls_transport::PinnedCertVerifier::from_hex(&fp)
+                    .map_err(|e| anyhow::anyhow!("invalid server_cert_fingerprint: {e}"))?,
+            )
+        } else {
+            warn!(
+                "outbound-c: server_cert_fingerprint not configured — TLS certificate \
+                 verification is DISABLED. Set server_cert_fingerprint in agent.toml."
+            );
+            std::sync::Arc::new(common::tls_transport::NoCertificateVerification)
+        }
+    };
+    let tls_config = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(std::sync::Arc::new(
-            common::tls_transport::NoCertificateVerification,
-        ))
+        .with_custom_certificate_verifier(cert_verifier)
         .with_no_client_auth();
 
-    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
     let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap().to_owned();
     let tls_stream = connector.connect(domain, stream).await?;
 
-    let mut tls_transport = common::tls_transport::TlsTransport::new(tls_stream);
+    let session = CryptoSession::from_shared_secret(secret.as_bytes());
+    let mut tls_transport = common::tls_transport::TlsTransport::new(tls_stream, session);
 
     // Announce ourselves before handing the transport to the Agent.
     let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());

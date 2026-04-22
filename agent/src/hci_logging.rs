@@ -18,6 +18,7 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -48,7 +49,14 @@ lazy_static! {
         Mutex::new("/var/run/orchestra-consent".to_string());
     static ref HCI_LOG_BUFFER: Arc<Mutex<VecDeque<HciEvent>>> =
         Arc::new(Mutex::new(VecDeque::with_capacity(MAX_BUFFER_SIZE)));
-    static ref IS_LOGGING: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    /// Gates event processing and controls the window-title polling thread.
+    /// AtomicBool allows lock-free access from the rdev callback.
+    static ref IS_LOGGING: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    /// Prevents spawning more than one rdev listener thread.
+    /// rdev::listen blocks indefinitely with no cancellation API; once started
+    /// the thread runs for the process lifetime and we gate event delivery via
+    /// IS_LOGGING instead of stopping and restarting the thread.
+    static ref LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 }
 
 fn check_consent() -> bool {
@@ -62,53 +70,63 @@ pub fn start_logging() -> Result<(), String> {
         return Err("HCI research consent not found. Aborting.".to_string());
     }
 
-    let mut is_logging = IS_LOGGING.lock().unwrap();
-    if *is_logging {
+    // Atomically transition false → true; fail if already logging.
+    if IS_LOGGING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return Err("Logging is already in progress.".to_string());
     }
-    *is_logging = true;
 
-    let logging_handle = Arc::clone(&IS_LOGGING);
-    let buffer_handle = Arc::clone(&HCI_LOG_BUFFER);
-
-    thread::spawn(move || {
-        let callback = move |event: Event| {
-            if !*logging_handle.lock().unwrap() {
-                return;
-            }
-            let timestamp = Utc::now().timestamp_micros() as u64;
-            match event.event_type {
-                EventType::KeyPress(_) => {
-                    add_log_event(
-                        &buffer_handle,
-                        HciEvent::Keyboard(KeyEvent {
-                            timestamp,
-                            pressed: true,
-                        }),
-                    );
+    // Spawn the rdev listener thread at most once for the process lifetime.
+    // rdev::listen has no cancellation API, so the thread cannot be cleanly
+    // terminated; IS_LOGGING gates whether events are actually recorded.
+    if !LISTENER_STARTED.swap(true, Ordering::SeqCst) {
+        let logging_flag = Arc::clone(&IS_LOGGING);
+        let buffer_handle = Arc::clone(&HCI_LOG_BUFFER);
+        thread::spawn(move || {
+            let callback = move |event: Event| {
+                if !logging_flag.load(Ordering::Relaxed) {
+                    return;
                 }
-                EventType::KeyRelease(_) => {
-                    add_log_event(
-                        &buffer_handle,
-                        HciEvent::Keyboard(KeyEvent {
-                            timestamp,
-                            pressed: false,
-                        }),
-                    );
+                let timestamp = Utc::now().timestamp_micros() as u64;
+                match event.event_type {
+                    EventType::KeyPress(_) => {
+                        add_log_event(
+                            &buffer_handle,
+                            HciEvent::Keyboard(KeyEvent {
+                                timestamp,
+                                pressed: true,
+                            }),
+                        );
+                    }
+                    EventType::KeyRelease(_) => {
+                        add_log_event(
+                            &buffer_handle,
+                            HciEvent::Keyboard(KeyEvent {
+                                timestamp,
+                                pressed: false,
+                            }),
+                        );
+                    }
+                    _ => {}
                 }
-                _ => {}
+            };
+
+            if let Err(error) = listen(callback) {
+                eprintln!("Error while listening for HCI events: {:?}", error);
+                // Allow a subsequent start_logging call to re-attempt listener setup.
+                LISTENER_STARTED.store(false, Ordering::SeqCst);
             }
-        };
+        });
+    }
 
-        if let Err(error) = listen(callback) {
-            eprintln!("Error while listening for HCI events: {:?}", error);
-        }
-    });
-
-    let logging_handle_win = Arc::clone(&IS_LOGGING);
+    // The window-title polling thread exits on its own when IS_LOGGING becomes
+    // false, so it is safe to re-spawn it on each start_logging call.
+    let logging_flag = Arc::clone(&IS_LOGGING);
     let buffer_handle_win = Arc::clone(&HCI_LOG_BUFFER);
     thread::spawn(move || {
-        while *logging_handle_win.lock().unwrap() {
+        while logging_flag.load(Ordering::Relaxed) {
             if let Ok(title) = get_active_window_title() {
                 let timestamp = Utc::now().timestamp_micros() as u64;
                 let mut hasher = XxHash64::default();
@@ -129,14 +147,20 @@ pub fn start_logging() -> Result<(), String> {
     println!("HCI logging started.");
     Ok(())
 }
+        };
 
+        if let Err(error) = listen(callback) {
+            eprintln!("Error while listening for HCI events: {:?}", error);
+        }
 /// Stops the HCI logging process.
 pub fn stop_logging() -> Result<(), String> {
-    let mut is_logging = IS_LOGGING.lock().unwrap();
-    if !*is_logging {
+    // Atomically transition true → false; fail if not logging.
+    if IS_LOGGING
+        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return Err("Logging is not in progress.".to_string());
     }
-    *is_logging = false;
     println!("HCI logging stopped.");
     Ok(())
 }

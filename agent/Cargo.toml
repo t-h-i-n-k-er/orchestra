@@ -41,7 +41,7 @@ winreg = "0.52"
 image = { version = "0.25", optional = true }
 ntapi = { version = "0.4", optional = true }
 windows = { version = "0.52", features = ["Win32_System_SystemServices", "Win32_Foundation"], optional = true }
-winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "winbase", "winnt", "libloaderapi", "wow64apiset"] }
+winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "winbase", "winnt", "libloaderapi", "wow64apiset", "handleapi"] }
 hollowing = { path = "../hollowing" }
 
 [features]
@@ -55,7 +55,7 @@ remote-assist = ["dep:enigo", "dep:image", "dep:x11cap"]
 module-signatures = ["common/module-signatures"]
 forward-secrecy = ["common/forward-secrecy"]
 direct-syscalls = []
-hci-research = []
+hci-research = ["dep:rdev", "dep:chrono", "dep:twox-hash"]
 # Connect the agent outbound to an Orchestra Control Center instead of waiting
 # for an inbound connection from a console. The server address and PSK are
 # read from the ORCHESTRA_C / ORCHESTRA_SECRET runtime env vars, or baked in

