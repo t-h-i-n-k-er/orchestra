@@ -24,8 +24,13 @@ rustls-pemfile = "2.2.0"
 x25519-dalek = { version = "2", optional = true }
 hkdf = { version = "0.12", optional = true }
 
+# Optional: Ed25519 signatures for module verification.
+# Enabled by the `module-signatures` feature.
+ed25519-dalek = { version = "2", optional = true }
+
 [features]
 forward-secrecy = ["dep:x25519-dalek", "dep:hkdf"]
+module-signatures = ["dep:ed25519-dalek"]
 
 [dev-dependencies]
 serde_json = "1.0"

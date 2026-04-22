@@ -63,6 +63,7 @@ dependencies = [
  "ntapi",
  "optimizer",
  "portable-pty",
+ "rand 0.8.6",
  "rcgen 0.14.7",
  "rdev",
  "rustls",
@@ -563,19 +564,23 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.21.7",
+ "built 0.7.7",
  "clap",
  "common",
  "dialoguer",
- "reqwest 0.11.27",
+ "optimizer",
  "serde",
- "serde_json",
- "tempfile",
- "tokio",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "which",
 ]
+
+[[package]]
+name = "built"
+version = "0.7.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56ed6191a7e78c36abdb16ab65341eefd73d64d303fffccdbb00d51e4205967b"
 
 [[package]]
 name = "built"
@@ -782,6 +787,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "async-trait",
+ "ed25519-dalek",
  "hkdf",
  "rand 0.8.6",
  "rustls",
@@ -2336,6 +2342,7 @@ dependencies = [
  "libc",
  "nix",
  "predicates",
+ "rand 0.8.6",
  "reqwest 0.11.27",
  "tempfile",
  "tokio",
@@ -2850,6 +2857,7 @@ dependencies = [
  "criterion 0.5.1",
  "iced-x86",
  "libc",
+ "rand 0.8.6",
  "region",
  "tracing",
  "winapi",
@@ -3350,7 +3358,7 @@ dependencies = [
  "av-scenechange",
  "av1-grain",
  "bitstream-io",
- "built",
+ "built 0.8.0",
  "cfg-if",
  "interpolate_name",
  "itertools 0.14.0",

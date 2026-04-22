@@ -49,30 +49,59 @@ enum Cmd {
     },
     /// Build the agent for a profile and emit `dist/<name>.enc`.
     Build {
-        /// Profile name or path.
-        profile: String,
-    },
-    /// Build the launcher binary that pairs with a profile.
-    BuildLauncher {
-        /// Profile name or path.
-        profile: String,
+        /// Profile name (without `.toml`).
+        name: String,
+        /// Apply code diversification passes to the agent binary before encryption.
+        #[arg(long)]
+        diversify: bool,
     },
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_target(false)
-        .init();
-
+    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
+
     match cli.cmd {
-        Cmd::Setup { auto_install } => cmd_setup(auto_install),
-        Cmd::Configure { name } => cmd_configure(name),
-        Cmd::ListProfiles => cmd_list_profiles(),
-        Cmd::ShowProfile { name } => cmd_show_profile(&name),
-        Cmd::Build { profile } => cmd_build(&profile),
-        Cmd::BuildLauncher { profile } => cmd_build_launcher(&profile),
+        Cmd::Setup { auto_install } => deps::cmd_setup(auto_install),
+        Cmd::Configure { name } => config::cmd_configure(name),
+        Cmd::ListProfiles => {
+            for profile in list_profiles()? {
+                println!("{}", profile);
+            }
+            Ok(())
+        }
+        Cmd::ShowProfile { name } => {
+            let profile = load_profile(&name)?;
+            println!("{}", toml::to_string_pretty(&profile)?);
+            Ok(())
+        }
+        Cmd::Build { name, diversify } => {
+            let profile = load_profile(&name)?;
+            let (enc_key, hmac_key) = profile.encryption_keys()?;
+
+            let agent_bytes =
+                build::build_agent_for_profile(&profile).context("Failed to build agent")?;
+
+            let final_agent_bytes = if diversify {
+                info!("Applying code diversification passes...");
+                optimizer::diversify_code(&agent_bytes)
+                    .context("Failed to diversify agent code")?
+            } else {
+                agent_bytes
+            };
+
+            let encrypted_bytes =
+                common::crypto::encrypt_aes_gcm(&final_agent_bytes, &enc_key, &hmac_key)?;
+
+            let dist_dir = std::path::PathBuf::from("dist");
+            if !dist_dir.exists() {
+                std::fs::create_dir(&dist_dir)?;
+            }
+            let out_path = dist_dir.join(format!("{}.enc", name));
+            std::fs::write(&out_path, encrypted_bytes)?;
+            info!("Encrypted payload written to {}", out_path.display());
+            Ok(())
+        }
     }
 }
 

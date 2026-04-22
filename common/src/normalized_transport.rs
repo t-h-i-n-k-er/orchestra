@@ -38,7 +38,7 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use rand::{Rng, RngCore};
+use rand::{seq::SliceRandom, Rng, RngCore};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{CryptoSession, Message, Transport};
@@ -58,6 +58,15 @@ const FAKE_CIPHER_SUITES: &[u16] = &[
     0x1301, // TLS_AES_128_GCM_SHA256
     0x1302, // TLS_AES_256_GCM_SHA384
     0x1303, // TLS_CHACHA20_POLY1305_SHA256
+    0xCCA8, // TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+    0xC02F, // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    0xC030, // TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+];
+
+// GREASE (Generate Random Extensions And Sustain Extensibility) values.
+const GREASE_VALUES: &[u16] = &[
+    0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A, 0x8A8A, 0x9A9A, 0xAAAA,
+    0xBABA, 0xCACA, 0xDADA, 0xEAEA, 0xFAFA,
 ];
 
 /// Role of the local endpoint in the fake handshake.
@@ -196,15 +205,12 @@ async fn write_fake_hello<S>(stream: &mut S, hs_type: u8) -> Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    // Build the entire handshake payload up front so that the (non-Send)
-    // thread-local RNG handle does not cross an `.await` point.
     let payload = {
         let mut rng = rand::thread_rng();
-        let mut payload = Vec::with_capacity(256);
+        let mut payload = Vec::with_capacity(512);
 
         // legacy_version (TLS 1.2 = 0x0303)
-        payload.push(0x03);
-        payload.push(0x03);
+        payload.extend_from_slice(&[0x03, 0x03]);
 
         // 32‑byte random
         let mut random = [0u8; 32];
@@ -217,23 +223,87 @@ where
         rng.fill_bytes(&mut sid);
         payload.extend_from_slice(&sid);
 
-        // cipher_suites (u16 length + entries)
-        let cs_len: u16 = (FAKE_CIPHER_SUITES.len() * 2) as u16;
+        // cipher_suites (u16 length + randomized entries)
+        let mut suites = FAKE_CIPHER_SUITES.to_vec();
+        suites.shuffle(&mut rng);
+        // Insert a GREASE value at a random position.
+        if let Some(grease) = GREASE_VALUES.choose(&mut rng) {
+            suites.insert(rng.gen_range(0..=suites.len()), *grease);
+        }
+        let cs_len = (suites.len() * 2) as u16;
         payload.extend_from_slice(&cs_len.to_be_bytes());
-        for cs in FAKE_CIPHER_SUITES {
+        for cs in suites {
             payload.extend_from_slice(&cs.to_be_bytes());
         }
 
         // compression_methods: 1 byte length, single value 0x00 (null)
-        payload.push(1);
-        payload.push(0);
+        payload.extend_from_slice(&[1, 0]);
 
-        // extensions blob (u16 length + random bytes)
-        let ext_len: u16 = rng.gen_range(32..=128);
-        payload.extend_from_slice(&ext_len.to_be_bytes());
-        let mut ext = vec![0u8; ext_len as usize];
-        rng.fill_bytes(&mut ext);
-        payload.extend_from_slice(&ext);
+        // --- Extensions ---
+        let mut extensions = Vec::new();
+
+        // GREASE Extension
+        if let Some(grease) = GREASE_VALUES.choose(&mut rng) {
+            extensions.extend_from_slice(&grease.to_be_bytes()); // type
+            extensions.extend_from_slice(&[0x00, 0x00]); // length 0
+        }
+
+        // SNI Extension
+        let sni_domains = ["www.google.com", "www.microsoft.com", "www.apple.com"];
+        let domain = sni_domains.choose(&mut rng).unwrap();
+        let sni_ext = {
+            let mut ext = Vec::new();
+            ext.extend_from_slice(&[0x00, 0x00]); // type: server_name
+            let name_bytes = domain.as_bytes();
+            let list_entry_len = (name_bytes.len() + 3) as u16;
+            let ext_len = (list_entry_len + 2) as u16;
+            ext.extend_from_slice(&ext_len.to_be_bytes());
+            ext.extend_from_slice(&list_entry_len.to_be_bytes());
+            ext.push(0x00); // name_type: host_name
+            ext.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
+            ext.extend_from_slice(name_bytes);
+            ext
+        };
+        extensions.extend_from_slice(&sni_ext);
+
+        // Supported Groups Extension
+        let groups: &[u16] = &[0x001d, 0x0017, 0x0018]; // x25519, secp256r1, secp384r1
+        let groups_ext = {
+            let mut ext = Vec::new();
+            ext.extend_from_slice(&[0x00, 0x0a]); // type: supported_groups
+            let groups_len = (groups.len() * 2) as u16;
+            let ext_len = (groups_len + 2) as u16;
+            ext.extend_from_slice(&ext_len.to_be_bytes());
+            ext.extend_from_slice(&groups_len.to_be_bytes());
+            for group in groups {
+                ext.extend_from_slice(&group.to_be_bytes());
+            }
+            ext
+        };
+        extensions.extend_from_slice(&groups_ext);
+
+        // Signature Algorithms Extension
+        let sig_algs: &[u16] = &[
+            0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+        ]; // e.g., ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256, etc.
+        let sig_algs_ext = {
+            let mut ext = Vec::new();
+            ext.extend_from_slice(&[0x00, 0x0d]); // type: signature_algorithms
+            let algs_len = (sig_algs.len() * 2) as u16;
+            let ext_len = (algs_len + 2) as u16;
+            ext.extend_from_slice(&ext_len.to_be_bytes());
+            ext.extend_from_slice(&algs_len.to_be_bytes());
+            for alg in sig_algs {
+                ext.extend_from_slice(&alg.to_be_bytes());
+            }
+            ext
+        };
+        extensions.extend_from_slice(&sig_algs_ext);
+
+        // Add extensions to payload
+        payload.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&extensions);
+
         payload
     };
 

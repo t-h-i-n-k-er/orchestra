@@ -79,14 +79,24 @@ pub async fn serve(state: Arc<AppState>, listener: TcpListener, secret: String) 
 }
 
 async fn handle_agent(
-    sock: TcpStream,
+    mut sock: TcpStream,
     peer: String,
     connection_id: String,
     state: Arc<AppState>,
     secret: String,
 ) -> Result<()> {
     sock.set_nodelay(true).ok();
+
+    #[cfg(feature = "forward-secrecy")]
+    let session = {
+        use common::crypto::fs_handshake_server;
+        tracing::info!(%peer, "performing forward-secrecy key exchange");
+        Arc::new(fs_handshake_server(&mut sock, secret.as_bytes()).await?)
+    };
+
+    #[cfg(not(feature = "forward-secrecy"))]
     let session = Arc::new(CryptoSession::from_shared_secret(secret.as_bytes()));
+
     let (mut r, mut w) = sock.into_split();
 
     let (tx, mut rx) = mpsc::channel::<Message>(CHANNEL_DEPTH);

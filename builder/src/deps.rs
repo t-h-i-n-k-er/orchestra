@@ -50,28 +50,57 @@ const RUST_TARGETS: &[&str] = &[
     "x86_64-apple-darwin",
 ];
 
-/// Inspect the host environment and report what's missing. Returns `Ok(())`
-/// only if every required tool is present.
-pub fn ensure_dependencies() -> Result<()> {
+/// Entry point for `builder setup` command.
+pub fn cmd_setup(auto_install: bool) -> Result<()> {
+    let missing = ensure_dependencies(false)?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    if auto_install {
+        info!("Attempting to install missing dependencies...");
+        install_missing_dependencies(&missing)?;
+        info!("Re-running dependency check...");
+        ensure_dependencies(true)?;
+    } else {
+        anyhow::bail!("Dependencies missing. Re-run with `--auto-install` to attempt installation.");
+    }
+    Ok(())
+}
+
+/// Inspect the host environment and report what's missing. Returns a list of
+/// missing dependency descriptions. If `fatal` is true, returns an error on
+/// the first missing dependency.
+fn ensure_dependencies(fatal: bool) -> Result<Vec<String>> {
     let mut missing: Vec<String> = Vec::new();
 
     if which::which("cargo").is_err() {
-        missing.push(
-            "cargo (install via https://rustup.rs/ — `curl https://sh.rustup.rs -sSf | sh`)".into(),
-        );
+        let msg = "cargo (install via https://rustup.rs/ — `curl https://sh.rustup.rs -sSf | sh`)";
+        if fatal {
+            return Err(anyhow!(msg.to_string()));
+        }
+        missing.push(msg.into());
     } else {
         info!("✓ cargo present");
     }
 
     if which::which("rustup").is_err() {
-        missing.push("rustup (https://rustup.rs/)".into());
+        let msg = "rustup (https://rustup.rs/)";
+        if fatal {
+            return Err(anyhow!(msg.to_string()));
+        }
+        missing.push(msg.into());
     } else {
         info!("✓ rustup present");
     }
 
     for (bin, hint) in required_system_packages() {
         if which::which(bin).is_err() {
-            missing.push(format!("{bin} — install with: {hint}"));
+            let msg = format!("{bin} — install with: {hint}");
+            if fatal {
+                return Err(anyhow!(msg));
+            }
+            missing.push(msg);
         } else {
             info!("✓ {bin} present");
         }
@@ -84,59 +113,60 @@ pub fn ensure_dependencies() -> Result<()> {
             if installed.iter().any(|i| i == t) {
                 info!("✓ rust target {t} installed");
             } else {
-                missing.push(format!(
-                    "rust target {t} — install with: rustup target add {t}"
-                ));
+                let msg = format!("rust target {t} — install with: rustup target add {t}");
+                if fatal {
+                    return Err(anyhow!(msg));
+                }
+                missing.push(msg);
             }
         }
     }
 
     if missing.is_empty() {
         info!("All build dependencies satisfied.");
-        Ok(())
-    } else {
+    } else if !fatal {
         eprintln!("\nMissing dependencies:");
         for m in &missing {
             eprintln!("  - {m}");
         }
-        Err(anyhow!(
-            "{} dependency item(s) missing — see instructions above",
-            missing.len()
-        ))
     }
+
+    Ok(missing)
 }
 
-/// Try to add any missing rust targets via `rustup target add`. Requires
-/// network access; user must have already approved this action.
-pub fn auto_install_rust_targets() -> Result<()> {
-    let installed = installed_rust_targets().unwrap_or_default();
-    for t in RUST_TARGETS {
-        if installed.iter().any(|i| i == t) {
-            continue;
-        }
-        info!("Adding rust target {t} ...");
-        let status = Command::new("rustup")
-            .args(["target", "add", t])
-            .status()
-            .with_context(|| format!("Failed to invoke rustup target add {t}"))?;
-        if !status.success() {
-            warn!("rustup target add {t} exited with {status}");
+fn install_missing_dependencies(missing: &[String]) -> Result<()> {
+    for m in missing {
+        if m.contains("rust target") {
+            let target = m.split(' ').nth(2).unwrap();
+            info!("Installing rust target {}...", target);
+            let status = Command::new("rustup")
+                .args(["target", "add", target])
+                .status()
+                .context("Failed to run `rustup target add`")?;
+            if !status.success() {
+                return Err(anyhow!("`rustup target add {}` failed", target));
+            }
+        } else {
+            warn!("Cannot auto-install: {}", m);
         }
     }
     Ok(())
 }
 
+/// Query `rustup` for a list of installed targets.
 fn installed_rust_targets() -> Result<Vec<String>> {
-    let out = Command::new("rustup")
-        .args(["target", "list", "--installed"])
+    let output = Command::new("rustup")
+        .arg("target")
+        .arg("list")
+        .arg("--installed")
         .output()
-        .context("Failed to run `rustup target list --installed`")?;
-    if !out.status.success() {
-        return Err(anyhow!("rustup target list exited with {}", out.status));
+        .context("Failed to query installed rust targets")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "rustup target list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect())
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().map(|s| s.to_string()).collect())
 }

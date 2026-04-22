@@ -48,10 +48,19 @@ pub fn resolve_secret() -> Option<String> {
 async fn connect_once(addr: &str, secret: &str, agent_id: &str) -> Result<()> {
     info!("outbound-c: connecting to Control Center addr={addr} agent_id={agent_id}");
 
-    let stream = TcpStream::connect(addr).await?;
+    let mut stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true)?;
 
+    #[cfg(feature = "forward-secrecy")]
+    let session = {
+        use common::crypto::fs_handshake_client;
+        info!("outbound-c: performing forward-secrecy key exchange");
+        fs_handshake_client(&mut stream, secret.as_bytes()).await?
+    };
+
+    #[cfg(not(feature = "forward-secrecy"))]
     let session = CryptoSession::from_shared_secret(secret.as_bytes());
+
     let mut tcp_transport = TcpTransport::new(stream, session);
 
     // Announce ourselves before handing the transport to the Agent.

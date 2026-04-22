@@ -14,7 +14,7 @@ use std::io::Write;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use tracing::info;
 
-#[cfg(all(windows, feature = "manual-map"))]
+#[cfg(windows)]
 mod manual_map;
 
 #[cfg(feature = "module-signatures")]
@@ -79,7 +79,7 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
     let module_data = decrypted_blob.as_slice();
 
     // 2. Load the library from memory.
-    #[cfg(all(windows, feature = "manual-map"))]
+    #[cfg(windows)]
     let library = {
         info!("Loading plugin using manual map loader.");
         let image_base = unsafe { manual_map::load_dll_in_memory(module_data)? };
@@ -138,32 +138,6 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
         // The library is dropped when `file` is dropped, closing the fd.
         // SAFETY: The path is valid and we trust the decrypted blob.
         unsafe { Library::new(path)? }
-    };
-
-    #[cfg(all(windows, not(feature = "manual-map")))]
-    let library = {
-        // Fallback for non-Linux OSs (e.g., macOS, Windows).
-        // For Windows, a more advanced technique involves CreateFileMapping/MapViewOfFile
-        // with SEC_IMAGE, but for simplicity, we'll use a temporary file.
-        // This is less secure than memfd but functional.
-        //
-        // On Windows we MUST close the file handle before calling LoadLibrary,
-        // otherwise the loader fails with "file is being used by another process"
-        // (os error 32). We persist the temp file and clean it up after loading.
-        let temp_file = tempfile::Builder::new()
-            .prefix("plugin-")
-            .suffix(std::env::consts::DLL_SUFFIX)
-            .tempfile()?;
-        let temp_path = temp_file.into_temp_path();
-        std::fs::write(&temp_path, &decrypted_blob)?;
-        info!("Loading plugin from temporary file: {:?}", &*temp_path);
-        // SAFETY: We trust the decrypted blob.
-        let lib = unsafe { Library::new(&*temp_path)? };
-        // Persist the file for the lifetime of the loaded library; the OS
-        // will release the file once the process exits. On Windows we cannot
-        // delete a loaded DLL while it is mapped.
-        let _ = temp_path.keep();
-        lib
     };
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]

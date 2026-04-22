@@ -240,17 +240,41 @@ fn subnet_hosts(subnet: &str) -> Result<Vec<IpAddr>, String> {
 
 /// Scan `host` for open TCP ports.
 ///
-/// Connections are attempted sequentially with a 500 ms timeout each.
-pub async fn tcp_port_scan(host: IpAddr, ports: &[u16]) -> Result<Vec<u16>, String> {
-    let mut open_ports = Vec::new();
+/// Connections are attempted concurrently up to `concurrency_limit` with the specified `timeout`.
+pub async fn tcp_port_scan(
+    host: IpAddr,
+    ports: &[u16],
+    concurrency_limit: usize,
+    timeout: Duration,
+) -> Result<Vec<u16>, String> {
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    let sem = Arc::new(Semaphore::new(concurrency_limit));
+    let mut handles = Vec::with_capacity(ports.len());
+
     for &port in ports {
-        if tokio::time::timeout(Duration::from_millis(500), TcpStream::connect((host, port)))
-            .await
-            .is_ok_and(|r| r.is_ok())
-        {
+        let permit = sem.clone().acquire_owned().await.map_err(|e| e.to_string())?;
+        handles.push(tokio::spawn(async move {
+            let is_open = tokio::time::timeout(timeout, TcpStream::connect((host, port)))
+                .await
+                .is_ok_and(|r| r.is_ok());
+            drop(permit);
+            if is_open {
+                Some(port)
+            } else {
+                None
+            }
+        }));
+    }
+
+    let mut open_ports = Vec::new();
+    for h in handles {
+        if let Ok(Some(port)) = h.await {
             open_ports.push(port);
         }
     }
+    open_ports.sort_unstable();
     Ok(open_ports)
 }
 

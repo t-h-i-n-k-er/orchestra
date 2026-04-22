@@ -74,13 +74,21 @@ struct FakeAgent {
 
 impl FakeAgent {
     async fn connect(port: u16) -> Self {
-        let s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+
+        #[cfg(feature = "forward-secrecy")]
+        let session = {
+            use common::crypto::fs_handshake_client;
+            fs_handshake_client(&mut s, SECRET.as_bytes())
+                .await
+                .unwrap()
+        };
+
+        #[cfg(not(feature = "forward-secrecy"))]
+        let session = CryptoSession::from_shared_secret(SECRET.as_bytes());
+
         let (r, w) = s.into_split();
-        Self {
-            r,
-            w,
-            session: CryptoSession::from_shared_secret(SECRET.as_bytes()),
-        }
+        Self { r, w, session }
     }
 
     async fn send(&mut self, m: &Message) {

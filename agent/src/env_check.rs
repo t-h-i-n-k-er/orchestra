@@ -10,6 +10,7 @@
 //! See [`enforce`] for the wiring used by the agent's startup path.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// Outcome of all individual environment probes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -21,6 +22,12 @@ pub struct EnvReport {
     /// `Some(true)` if a domain requirement was configured and matched,
     /// `Some(false)` if configured and unmatched, `None` if not configured.
     pub domain_match: Option<bool>,
+    /// `LD_PRELOAD` is set, which can indicate library-level hooking.
+    pub ld_preload_set: bool,
+    /// A known tracer process (like `strace` or `gdbserver`) is running.
+    pub tracer_process_found: bool,
+    /// A simple timing check took significantly longer than expected.
+    pub timing_anomaly_detected: bool,
 }
 
 impl EnvReport {
@@ -30,6 +37,9 @@ impl EnvReport {
             debugger_present: is_debugger_present(),
             vm_detected: detect_vm(),
             domain_match: required_domain.map(validate_domain),
+            ld_preload_set: is_ld_preload_set(),
+            tracer_process_found: is_tracer_process_running(),
+            timing_anomaly_detected: detect_timing_anomaly(),
         }
     }
 
@@ -37,12 +47,14 @@ impl EnvReport {
     /// enforced. We always treat a debugger or a domain mismatch as a
     /// failure; VM detection is informational unless the caller opts in.
     pub fn should_refuse(&self, refuse_in_vm: bool) -> bool {
-        if self.debugger_present {
+        if self.debugger_present || self.ld_preload_set || self.tracer_process_found || self.timing_anomaly_detected {
             return true;
         }
         if matches!(self.domain_match, Some(false)) {
             return true;
         }
+        // The hypervisor bit is now a soft indicator, contributing to vm_detected
+        // but not a hard stop on its own.
         if refuse_in_vm && self.vm_detected {
             return true;
         }
@@ -144,36 +156,31 @@ fn windows_is_debugger_present() -> bool {
 
 /// True if the host appears to be a virtual machine or analysis sandbox.
 ///
-/// Heuristics:
-/// * **CPUID hypervisor bit** — leaf `0x1`, ECX bit 31 is set when the
-///   process is running under any hypervisor that follows the standard
-///   convention (KVM, Hyper‑V, VMware, VirtualBox, Xen, …).
-/// * **DMI / SMBIOS strings** (Linux) — `sys_vendor`, `product_name`, and
-///   `bios_vendor` matching well‑known hypervisor identifiers.
-/// * **Registry artifacts** (Windows) — `HKLM\HARDWARE\Description\System`
-///   `SystemBiosVersion` containing `VBOX`, `VMWARE`, `QEMU`, …
-/// * **Network MAC prefix** — common VM OUI prefixes (08:00:27 VirtualBox,
-///   00:0C:29 / 00:50:56 VMware, 52:54:00 KVM/QEMU).
+/// This is a collection of soft indicators. The CPUID hypervisor bit is no
+/// longer a hard failure, but contributes to the overall `vm_detected` score.
 pub fn detect_vm() -> bool {
+    // The hypervisor bit is now just one of several indicators.
+    let mut indicators = 0;
     if cpuid_hypervisor_bit() {
-        return true;
+        indicators += 1;
     }
     #[cfg(target_os = "linux")]
     {
         if linux_dmi_indicates_vm() {
-            return true;
+            indicators += 1;
         }
     }
     #[cfg(windows)]
     {
         if windows_registry_indicates_vm() {
-            return true;
+            indicators += 1;
         }
     }
     if mac_prefix_indicates_vm() {
-        return true;
+        indicators += 1;
     }
-    false
+    // Consider it a VM if at least two indicators are present.
+    indicators >= 2
 }
 
 fn cpuid_hypervisor_bit() -> bool {
@@ -286,6 +293,47 @@ fn mac_prefix_indicates_vm() -> bool {
     let _ = prefixes;
     let _ = Path::new("/dev/null");
     false
+}
+
+// ------------------------------------------------ anti-analysis (Linux)
+
+#[cfg(target_os = "linux")]
+fn is_ld_preload_set() -> bool {
+    std::env::var("LD_PRELOAD").is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_ld_preload_set() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn is_tracer_process_running() -> bool {
+    let tracers = ["strace", "gdb", "ltrace", "gdbserver"];
+    if let Ok(procs) = std::fs::read_dir("/proc") {
+        for proc in procs.flatten() {
+            if let Ok(name) = std::fs::read_to_string(proc.path().join("comm")) {
+                if tracers.contains(&name.trim()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_tracer_process_running() -> bool {
+    false
+}
+
+fn detect_timing_anomaly() -> bool {
+    let start = Instant::now();
+    std::thread::sleep(Duration::from_millis(100));
+    let elapsed = start.elapsed();
+    // If sleeping for 100ms takes more than 500ms, something is slowing
+    // down execution, which could be a debugger or emulator.
+    elapsed > Duration::from_millis(500)
 }
 
 // -------------------------------------------------------------------- domain

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rand = "0.8"
 common = { path = "../common" }
 hollowing = { path = "../hollowing" }
 tokio = { workspace = true }

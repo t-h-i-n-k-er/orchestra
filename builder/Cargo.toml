@@ -9,17 +9,17 @@ name = "orchestra-builder"
 path = "src/main.rs"
 
 [dependencies]
-clap = { workspace = true }
-tokio = { workspace = true }
-reqwest = { workspace = true }
-serde = { workspace = true }
-serde_json = "1.0"
-toml = "0.8"
+clap = { workspace = true, features = ["derive"] }
 anyhow = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+dialoguer = { workspace = true }
+base64 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-dialoguer = "0.11"
-which = "6"
-tempfile = "3"
-base64 = { workspace = true }
 common = { path = "../common" }
+optimizer = { path = "../optimizer" }
+which = "6.0"
+
+[build-dependencies]
+built = "0.7"

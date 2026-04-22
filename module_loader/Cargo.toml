@@ -18,14 +18,12 @@ tempfile = "3.3"
 ed25519-dalek = { version = "2.1.0", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-goblin = { version = "0.7", optional = true }
-winapi = { version = "0.3", features = ["memoryapi", "libloaderapi", "winnt"], optional = true }
-
+goblin = { version = "0.7" }
+winapi = { version = "0.3", features = ["memoryapi", "libloaderapi", "winnt"] }
 
 [features]
 default = ["module-signatures"]
 module-signatures = ["dep:ed25519-dalek"]
-manual-map = ["dep:goblin", "dep:winapi"]
 
 [dev-dependencies]
 tokio = { workspace = true }

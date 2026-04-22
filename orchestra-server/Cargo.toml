@@ -37,3 +37,8 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 tempfile = "3"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
+
+[features]
+default = []
+# Enable the forward-secrecy key exchange for agent connections.
+forward-secrecy = ["common/forward-secrecy"]

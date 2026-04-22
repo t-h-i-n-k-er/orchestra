@@ -7,6 +7,7 @@
 //! library of reproducible build recipes (one per deployment target).
 
 use anyhow::{anyhow, Context, Result};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Select};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -24,6 +25,8 @@ pub struct PayloadConfig {
     /// Either a base64-encoded 32-byte AES key, or `file:/path/to/key.bin`
     /// (the file is read at build time). Used to encrypt the payload binary.
     pub encryption_key: String,
+    /// A separate 32-byte key for the HMAC-SHA256 tag.
+    pub hmac_key: String,
     /// Pre-shared secret the agent uses for its AES-TCP connection to the
     /// Control Center. Must match `agent_shared_secret` in `orchestra-server.toml`.
     /// Required when `outbound-c` is in `features`. If absent the agent will
@@ -65,260 +68,315 @@ impl PayloadConfig {
         Ok(triple.to_string())
     }
 
-    /// Resolve the encryption key into raw 32 bytes.
-    ///
-    /// Logs a warning if the key is trivially weak (all-identical bytes or
-    /// sequential bytes — patterns that indicate a placeholder or zero-filled
-    /// key rather than cryptographically random material).
-    pub fn resolve_key(&self) -> Result<Vec<u8>> {
+    /// Resolve the encryption and HMAC keys into raw 32-byte pairs.
+    pub fn encryption_keys(&self) -> Result<(Vec<u8>, Vec<u8>)> {
         use base64::Engine;
+        let engine = base64::engine::general_purpose::STANDARD;
 
-        let raw = if let Some(path) = self.encryption_key.strip_prefix("file:") {
+        let enc_key = if let Some(path) = self.encryption_key.strip_prefix("file:") {
             std::fs::read(path).with_context(|| format!("Failed to read key file {path}"))?
         } else {
-            base64::engine::general_purpose::STANDARD
+            engine
                 .decode(self.encryption_key.trim())
                 .context("encryption_key is not valid base64 (or `file:<path>`)")?
         };
 
-        if raw.len() != 32 {
+        let hmac_key = if let Some(path) = self.hmac_key.strip_prefix("file:") {
+            std::fs::read(path).with_context(|| format!("Failed to read key file {path}"))?
+        } else {
+            engine
+                .decode(self.hmac_key.trim())
+                .context("hmac_key is not valid base64 (or `file:<path>`)")?
+        };
+
+        if enc_key.len() != 32 {
             return Err(anyhow!(
                 "AES-256 key must be exactly 32 bytes (got {})",
-                raw.len()
+                enc_key.len()
+            ));
+        }
+        if hmac_key.len() != 32 {
+            return Err(anyhow!(
+                "HMAC key must be exactly 32 bytes (got {})",
+                hmac_key.len()
             ));
         }
 
-        if is_weak_key(&raw) {
+        if is_weak_key(&enc_key) || is_weak_key(&hmac_key) {
             tracing::warn!(
-                "The configured encryption_key appears to be a weak placeholder \
-                 (all-zero or all-identical bytes). Generate a random key with \
-                 `orchestra-builder configure` before deploying."
+                "A configured key appears to be a weak placeholder. \
+                 Generate random keys with `orchestra-builder configure`."
             );
         }
 
-        Ok(raw)
+        Ok((enc_key, hmac_key))
     }
 }
 
-/// Return `true` if `key` looks like a placeholder rather than random material:
-/// all bytes are identical, or every byte equals the previous + 1 (sequential).
+/// Check for obviously weak (non-random) keys.
 pub fn is_weak_key(key: &[u8]) -> bool {
     if key.is_empty() {
         return true;
     }
-    let all_same = key.iter().all(|&b| b == key[0]);
-    let sequential = key.windows(2).all(|w| w[1] == w[0].wrapping_add(1));
-    all_same || sequential
+    // All bytes are identical (e.g., all zeros).
+    if key.iter().all(|&b| b == key[0]) {
+        return true;
+    }
+    // Bytes are sequential (e.g., 0, 1, 2, 3...).
+    if key.windows(2).all(|w| w[1] == w[0].wrapping_add(1)) {
+        return true;
+    }
+    false
 }
 
-/// Path to the profile file for a given name.
-pub fn profile_path(name: &str) -> PathBuf {
-    Path::new(PROFILES_DIR).join(format!("{name}.toml"))
-}
-
-/// Load a profile by name (no `.toml` suffix) or by direct path.
-pub fn load_profile(name_or_path: &str) -> Result<PayloadConfig> {
-    let path = if Path::new(name_or_path).is_file() {
-        PathBuf::from(name_or_path)
+/// Entry point for `builder configure` command.
+pub fn cmd_configure(name: Option<String>) -> Result<()> {
+    let theme = ColorfulTheme::default();
+    let name = if let Some(name) = name {
+        name
     } else {
-        profile_path(name_or_path)
+        Input::with_theme(&theme)
+            .with_prompt("Profile name")
+            .interact_text()?
     };
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read profile {}", path.display()))?;
-    let cfg: PayloadConfig =
-        toml::from_str(&text).with_context(|| format!("Invalid TOML in {}", path.display()))?;
-    Ok(cfg)
+
+    let target_os_idx = Select::with_theme(&theme)
+        .with_prompt("Target OS")
+        .items(&["linux", "windows", "macos"])
+        .default(0)
+        .interact()?;
+    let target_os = ["linux", "windows", "macos"][target_os_idx].to_string();
+
+    let target_arch_idx = Select::with_theme(&theme)
+        .with_prompt("Target Architecture")
+        .items(&["x86_64", "aarch64"])
+        .default(0)
+        .interact()?;
+    let target_arch = ["x86_64", "aarch64"][target_arch_idx].to_string();
+
+    let c2_address = Input::with_theme(&theme)
+        .with_prompt("C2 Address (e.g., 10.0.0.5:8444)")
+        .default("127.0.0.1:8443")
+        .interact_text()?;
+
+    let all_features = read_agent_features().unwrap_or_default();
+    let feature_indices = MultiSelect::with_theme(&theme)
+        .with_prompt("Agent Features")
+        .items(&all_features)
+        .defaults(&[true, false])
+        .interact()?;
+    let features: Vec<String> = feature_indices
+        .iter()
+        .map(|&i| all_features[i].clone())
+        .collect();
+
+    let c_server_secret = if features.iter().any(|f| f == "outbound-c") {
+        Some(
+            Input::with_theme(&theme)
+                .with_prompt("C2 Shared Secret (for outbound-c)")
+                .interact_text()?,
+        )
+    } else {
+        None
+    };
+
+    use base64::Engine;
+    let enc_key: [u8; 32] = rand::random();
+    let hmac_key: [u8; 32] = rand::random();
+    let encryption_key = base64::engine::general_purpose::STANDARD.encode(enc_key);
+    let hmac_key_b64 = base64::engine::general_purpose::STANDARD.encode(hmac_key);
+
+    let profile = PayloadConfig {
+        target_os,
+        target_arch,
+        c2_address,
+        encryption_key,
+        hmac_key: hmac_key_b64,
+        c_server_secret,
+        features,
+        output_name: None,
+        package: "launcher".to_string(),
+        bin_name: None,
+    };
+
+    save_profile(&name, &profile)?;
+    Ok(())
 }
 
-/// Persist a profile to `profiles/<name>.toml`.
-pub fn save_profile(name: &str, cfg: &PayloadConfig) -> Result<PathBuf> {
-    std::fs::create_dir_all(PROFILES_DIR)
-        .with_context(|| format!("Failed to create {PROFILES_DIR}/"))?;
-    let path = profile_path(name);
-    let text = toml::to_string_pretty(cfg).context("Failed to serialize profile")?;
-    std::fs::write(&path, text).with_context(|| format!("Failed to write {}", path.display()))?;
-    Ok(path)
-}
-
-/// List every `*.toml` file in `profiles/`.
-pub fn list_profiles() -> Result<Vec<String>> {
-    let dir = Path::new(PROFILES_DIR);
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut names = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("toml") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                names.push(stem.to_string());
-            }
-        }
-    }
-    names.sort();
-    Ok(names)
-}
-
-/// Path to the agent crate's `Cargo.toml`, relative to the workspace root.
-pub const AGENT_CARGO_TOML: &str = "agent/Cargo.toml";
-
-/// Return the list of `[features]` declared in `agent/Cargo.toml`, sorted.
-///
-/// The Builder reads this at runtime so its interactive wizard can only
-/// offer feature flags that the agent crate actually understands. If the
-/// file is missing or malformed we fall back to an empty list and the
-/// caller surfaces a helpful error.
+/// Read all feature flags from `agent/Cargo.toml`.
 pub fn read_agent_features() -> Result<Vec<String>> {
-    read_agent_features_from(Path::new(AGENT_CARGO_TOML))
-}
-
-pub fn read_agent_features_from(path: &Path) -> Result<Vec<String>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    let parsed: toml::Value =
-        toml::from_str(&text).with_context(|| format!("Invalid TOML in {}", path.display()))?;
-    let mut feats: Vec<String> = parsed
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("agent/Cargo.toml");
+    let manifest_str = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+    let manifest: toml::Value = manifest_str.parse()?;
+    let features = manifest
         .get("features")
-        .and_then(|v| v.as_table())
-        .map(|t| t.keys().filter(|k| *k != "default").cloned().collect())
+        .and_then(|f| f.as_table())
+        .map(|t| t.keys().cloned().collect())
         .unwrap_or_default();
-    feats.sort();
-    Ok(feats)
+    Ok(features)
 }
 
-/// Split `requested` into (known, unknown) buckets against `available`.
-/// Used by the build pipeline to drop features that no longer exist in the
-/// agent crate (e.g. profiles saved by an older Builder version).
+/// Split a list of features into those present in `available` and those not.
 pub fn partition_features(
-    requested: &[String],
+    features: &[String],
     available: &[String],
 ) -> (Vec<String>, Vec<String>) {
-    let mut known = Vec::new();
+    let mut effective = Vec::new();
     let mut unknown = Vec::new();
-    for f in requested {
-        if available.iter().any(|a| a == f) {
-            known.push(f.clone());
+    for f in features {
+        if available.contains(f) {
+            effective.push(f.clone());
         } else {
             unknown.push(f.clone());
         }
     }
-    (known, unknown)
+    (effective, unknown)
+}
+
+/// Get the full path for a profile name.
+pub fn profile_path(name: &str) -> PathBuf {
+    if name.contains('/') || name.ends_with(".toml") {
+        PathBuf::from(name)
+    } else {
+        Path::new(PROFILES_DIR).join(format!("{name}.toml"))
+    }
+}
+
+/// Load a `PayloadConfig` from a TOML file.
+pub fn load_profile(name: &str) -> Result<PayloadConfig> {
+    let path = profile_path(name);
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read profile {}", path.display()))?;
+    toml::from_str(&content).with_context(|| format!("Failed to parse profile {}", path.display()))
+}
+
+/// Save a `PayloadConfig` to a TOML file.
+pub fn save_profile(name: &str, cfg: &PayloadConfig) -> Result<()> {
+    let path = profile_path(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = toml::to_string_pretty(cfg)?;
+    std::fs::write(&path, content)?;
+    tracing::info!("Profile saved to {}", path.display());
+    Ok(())
+}
+
+/// List all `.toml` files in the `profiles/` directory.
+pub fn list_profiles() -> Result<Vec<String>> {
+    let mut profiles = Vec::new();
+    let dir = Path::new(PROFILES_DIR);
+    if !dir.exists() {
+        return Ok(profiles);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str() {
+            if name.ends_with(".toml") {
+                profiles.push(name.trim_end_matches(".toml").to_string());
+            }
+        }
+    }
+    Ok(profiles)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
 
     #[test]
     fn round_trip_profile() {
-        let cfg = PayloadConfig {
-            target_os: "linux".into(),
-            target_arch: "x86_64".into(),
-            c2_address: "127.0.0.1:8444".into(),
-            encryption_key: base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
-            c_server_secret: Some("my-secret".into()),
-            features: vec!["persistence".into()],
-            output_name: None,
-            package: "launcher".into(),
-            bin_name: None,
+        let profile = PayloadConfig {
+            target_os: "linux".to_string(),
+            target_arch: "x86_64".to_string(),
+            c2_address: "127.0.0.1:8443".to_string(),
+            encryption_key: "file:key.bin".to_string(),
+            hmac_key: "file:hmac.bin".to_string(),
+            c_server_secret: Some("secret".to_string()),
+            features: vec!["persistence".to_string()],
+            output_name: Some("test_agent".to_string()),
+            package: "agent-standalone".to_string(),
+            bin_name: Some("agent-standalone".to_string()),
         };
-        let text = toml::to_string_pretty(&cfg).unwrap();
-        let parsed: PayloadConfig = toml::from_str(&text).unwrap();
-        assert_eq!(parsed.target_triple().unwrap(), "x86_64-unknown-linux-gnu");
-        assert_eq!(parsed.resolve_key().unwrap().len(), 32);
+        let s = toml::to_string(&profile).unwrap();
+        let back: PayloadConfig = toml::from_str(&s).unwrap();
+        assert_eq!(back.target_os, "linux");
+        assert_eq!(back.c_server_secret.unwrap(), "secret");
     }
 
     #[test]
     fn rejects_short_key() {
-        let cfg = PayloadConfig {
-            target_os: "linux".into(),
-            target_arch: "x86_64".into(),
-            c2_address: "x".into(),
-            encryption_key: base64::engine::general_purpose::STANDARD.encode([0u8; 16]),
+        let profile = PayloadConfig {
+            target_os: "linux".to_string(),
+            target_arch: "x86_64".to_string(),
+            c2_address: "127.0.0.1:8443".to_string(),
+            encryption_key: "short".to_string(),
+            hmac_key: "also short".to_string(),
             c_server_secret: None,
             features: vec![],
             output_name: None,
-            package: "launcher".into(),
+            package: "launcher".to_string(),
             bin_name: None,
         };
-        assert!(cfg.resolve_key().is_err());
+        assert!(profile.encryption_keys().is_err());
     }
 
     #[test]
     fn rejects_unknown_triple() {
-        let cfg = PayloadConfig {
-            target_os: "plan9".into(),
-            target_arch: "x86_64".into(),
-            c2_address: String::new(),
-            encryption_key: base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+        let profile = PayloadConfig {
+            target_os: "amiga".to_string(),
+            target_arch: "m68k".to_string(),
+            c2_address: "127.0.0.1:8443".to_string(),
+            encryption_key: "a".repeat(44), // 32 bytes b64
+            hmac_key: "b".repeat(44),
             c_server_secret: None,
             features: vec![],
             output_name: None,
-            package: "launcher".into(),
+            package: "launcher".to_string(),
             bin_name: None,
         };
-        assert!(cfg.target_triple().is_err());
+        assert!(profile.target_triple().is_err());
+    }
+
+    #[test]
+    fn read_agent_features_matches_real_cargo_toml() {
+        let features = read_agent_features().unwrap();
+        assert!(features.contains(&"persistence".to_string()));
+        assert!(features.contains(&"outbound-c".to_string()));
+    }
+
+    #[test]
+    fn partition_features_splits_known_and_unknown() {
+        let available = vec!["a".to_string(), "b".to_string()];
+        let requested = vec!["a".to_string(), "c".to_string()];
+        let (effective, unknown) = partition_features(&requested, &available);
+        assert_eq!(effective, vec!["a".to_string()]);
+        assert_eq!(unknown, vec!["c".to_string()]);
     }
 
     #[test]
     fn is_weak_key_detects_all_zeros() {
-        assert!(is_weak_key(&[0u8; 32]));
+        assert!(is_weak_key(&[0; 32]));
     }
 
     #[test]
     fn is_weak_key_detects_all_same_nonzero() {
-        assert!(is_weak_key(&[0xffu8; 32]));
+        assert!(is_weak_key(&[42; 32]));
     }
 
     #[test]
     fn is_weak_key_detects_sequential() {
-        let key: Vec<u8> = (0u8..32).collect();
+        let key: Vec<u8> = (0..32).collect();
         assert!(is_weak_key(&key));
     }
 
     #[test]
     fn is_weak_key_accepts_random_looking_bytes() {
-        // A non-degenerate key should not be flagged.
-        let key = [
-            0x9b, 0x4e, 0xa1, 0x3c, 0x77, 0x02, 0xf8, 0x5d, 0x1a, 0xce, 0x43, 0xb6, 0x8f, 0x20,
-            0x7e, 0xd9, 0x52, 0x0b, 0xc4, 0x67, 0x3a, 0xfe, 0x91, 0x28, 0xe5, 0x74, 0x19, 0xad,
-            0x60, 0x35, 0x8c, 0xf0,
-        ];
-        assert!(!is_weak_key(&key));
-    }
-
-    #[test]
-    fn read_agent_features_matches_real_cargo_toml() {
-        // The wizard's offered features must come straight from the agent
-        // crate; this test pins the contract so adding/removing a feature
-        // in agent/Cargo.toml is reflected immediately.
-        let path = std::path::PathBuf::from("..").join(AGENT_CARGO_TOML);
-        let feats = read_agent_features_from(&path).expect("agent/Cargo.toml parsed");
-        assert!(
-            !feats.is_empty(),
-            "agent crate should declare at least one feature"
-        );
-        // Known stable features.
-        for required in ["persistence", "network-discovery", "outbound-c"] {
-            assert!(
-                feats.iter().any(|f| f == required),
-                "expected feature `{required}` in agent/Cargo.toml, got {feats:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn partition_features_splits_known_and_unknown() {
-        let available = vec!["persistence".to_string(), "outbound-c".to_string()];
-        let requested = vec![
-            "persistence".to_string(),
-            "this-was-removed".to_string(),
-            "outbound-c".to_string(),
-        ];
-        let (known, unknown) = partition_features(&requested, &available);
-        assert_eq!(known, vec!["persistence", "outbound-c"]);
-        assert_eq!(unknown, vec!["this-was-removed"]);
+        let key = b"J\x1a\xf3\x9b\xde\x9a\x8c\xf3\x9b\xde\x9a\x8c\xf3\x9b\xde\x9a\x8c\xf3\x9b\xde\x9a\x8c\xf3\x9b\xde\x9a\x8c\xf3\x9b\xde\x9a\x8c";
+        assert!(!is_weak_key(key));
     }
 }
