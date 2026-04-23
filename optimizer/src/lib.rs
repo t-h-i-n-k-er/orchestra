@@ -147,19 +147,24 @@ impl Pass for LeaAddPass {
 
 struct JunkInstructionPass;
 impl Pass for JunkInstructionPass {
-    /// Inserts harmless junk instructions **only after unconditional transfers**
-    /// (ret, jmp) where execution cannot fall through into the inserted bytes.
-    /// Inserting junk elsewhere would:
-    ///   - clobber the flags register, breaking subsequent flag-reading instructions,
-    ///   - shift relative branch targets (requiring full relocation recalculation).
+    /// Inserts harmless junk instructions including opaque predicates or never-taken
+    /// jumps that appear in the execution path but are semantically inert.
     fn run(&self, instructions: &mut Vec<Instruction>) -> Result<()> {
         let mut new_instrs = Vec::with_capacity(instructions.len());
 
-        for instr in instructions.iter() {
+        let len = instructions.len();
+        for (i, instr) in instructions.iter().enumerate() {
             new_instrs.push(*instr);
 
-            // Only insert after instructions that end a basic block with no
-            // fall-through: ret, retf, and unconditional jmp.
+            // Opaque predicate / dead jump insertion
+            if rand::random::<u8>() < 10 && i < len - 1 { // ~4%
+                // Jump over a single junk byte (EB 01 <junk>)
+                let junk = rand::random::<u8>();
+                if let Ok(opaque) = Instruction::with_declare_byte(&[0xEB, 0x01, junk]) {
+                    new_instrs.push(opaque);
+                }
+            }
+
             let is_dead_after = matches!(
                 instr.mnemonic(),
                 iced_x86::Mnemonic::Ret
@@ -297,6 +302,7 @@ fn transform_code_section(binary: &mut Vec<u8>, offset: usize, size: usize, vadd
 
 /// Find a function by name in the current process and apply optimizations.
 /// This is the main entry point for runtime optimization.
+#[cfg(feature = "unsafe-runtime-rewrite")]
 pub fn optimize_hot_function(name: &str) -> Result<()> {
     let (func_ptr, code) = find_function(name)?;
     let start_addr = func_ptr as u64;
@@ -331,32 +337,104 @@ pub fn optimize_hot_function(name: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), feature = "unsafe-runtime-rewrite"))]
 fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
     use std::ffi::CString;
-    let name = CString::new(name)?;
-    let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    let name_c = CString::new(name)?;
+    let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name_c.as_ptr()) };
     if ptr.is_null() {
-        return Err(anyhow!("Could not find function {}", name.to_string_lossy()));
+        return Err(anyhow!("Could not find function {}", name_c.to_string_lossy()));
     }
-    // This is a huge simplification; we'd need a proper disassembler
-    // to find the function end. For now, assume a generous size.
-    let code = unsafe { std::slice::from_raw_parts(ptr as *const u8, 4096) };
+    
+    // Parse symbol table using dladdr to determine size securely
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    if unsafe { libc::dladdr(ptr, &mut info) } == 0 || info.dli_sname.is_null() || info.dli_saddr.is_null() {
+        return Err(anyhow!("dladdr failed for {}", name));
+    }
+    
+    let exe_path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+    let file = std::fs::read(exe_path.as_ref())?;
+    
+    let mut size = 0;
+    if let Ok(goblin::Object::Elf(elf)) = goblin::Object::parse(&file) {
+        for sym in elf.syms.iter() {
+            if let Some(sname) = elf.strtab.get_at(sym.st_name) {
+                if sname == name {
+                    size = sym.st_size as usize;
+                    break;
+                }
+            }
+        }
+    }
+    
+    if size == 0 {
+        // Fallback: Disassemble to find the likely end via 'Ret'
+        let mut curr_ptr = ptr as u64;
+        let mut tmp_size = 0;
+        let mut last_ret = 0;
+        while tmp_size < 10000 {
+            let slice = unsafe { std::slice::from_raw_parts(curr_ptr as *const u8, 15) };
+            let mut decoder = Decoder::with_ip(64, slice, curr_ptr, DecoderOptions::NONE);
+            if let Some(ins) = decoder.into_iter().next() {
+                tmp_size += ins.len();
+                curr_ptr += ins.len() as u64;
+                if ins.code() == iced_x86::Code::Retnq && last_ret == 0 {
+                    size = tmp_size;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    if size == 0 {
+        return Err(anyhow!("Could not determine function size"));
+    }
+    
+    let code = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
     Ok((ptr as *mut u8, code))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "unsafe-runtime-rewrite"))]
 fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
     use std::ffi::CString;
     use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
 
     let module = unsafe { GetModuleHandleA(std::ptr::null_mut()) };
-    let name = CString::new(name)?;
-    let ptr = unsafe { GetProcAddress(module, name.as_ptr()) };
+    let name_c = CString::new(name)?;
+    let ptr = unsafe { GetProcAddress(module, name_c.as_ptr()) };
     if ptr.is_null() {
-        return Err(anyhow!("Could not find function {}", name.to_string_lossy()));
+        return Err(anyhow!("Could not find function {}", name_c.to_string_lossy()));
     }
-    let code = unsafe { std::slice::from_raw_parts(ptr as *const u8, 4096) };
+    
+    // For Windows, find size by parsing PE
+    
+    let mut size = 0;
+    
+    // Disassembly approach
+    let mut tmp_size = 0;
+    let mut curr_ptr = ptr as u64;
+    while tmp_size < 10000 {
+        let slice = unsafe { std::slice::from_raw_parts(curr_ptr as *const u8, 15) };
+        let mut decoder = Decoder::with_ip(64, slice, curr_ptr, DecoderOptions::NONE);
+        if let Some(ins) = decoder.into_iter().next() {
+            tmp_size += ins.len();
+            curr_ptr += ins.len() as u64;
+            if ins.code() == iced_x86::Code::Retnq || ins.code() == iced_x86::Code::Retnw {
+                size = tmp_size;
+                break; // Very naive
+            }
+        } else {
+             break;
+        }
+    }
+    
+    if size == 0 {
+        return Err(anyhow!("Could not determine function size"));
+    }
+
+    let code = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
     Ok((ptr as *mut u8, code))
 }
 

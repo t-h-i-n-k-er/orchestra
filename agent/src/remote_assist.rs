@@ -140,20 +140,17 @@ pub fn capture_screen() -> Result<Vec<u8>> {
     {
         check_consent()?;
         // Use the bundled `screencapture` CLI to grab a PNG screenshot.
-        let path = std::env::temp_dir()
-            .join(format!("orchestra-screen-{}.png", std::process::id()));
-        let status = std::process::Command::new("screencapture")
-            .args(["-x", "-t", "png"])
-            .arg(&path)
-            .status()
+        // Pipe to stdout using `-` avoiding temporary files
+        let output = std::process::Command::new("screencapture")
+            .args(["-x", "-t", "png", "-"])
+            .output()
             .map_err(|e| anyhow!("screencapture invocation failed: {e}"))?;
-        if !status.success() {
+            
+        if !output.status.success() {
             return Err(anyhow!("screencapture exited with non-zero status"));
         }
-        let data = std::fs::read(&path)
-            .map_err(|e| anyhow!("failed to read screenshot file: {e}"))?;
-        let _ = std::fs::remove_file(&path);
-        Ok(data)
+        
+        Ok(output.stdout)
     }
     #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {

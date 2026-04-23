@@ -294,23 +294,33 @@ fn uninstall_persistence_inner() -> Result<()> {
 
 
 #[cfg(target_os = "macos")]
-fn plist_path() -> PathBuf {
+fn plist_path(system_level: bool) -> PathBuf {
     if let Ok(p) = std::env::var("ORCHESTRA_PERSISTENCE_ROOT") {
         return PathBuf::from(p).join(format!("{}.plist", get_service_name()));
     }
-    if let Some(dir) = directories::BaseDirs::new() {
+    if system_level {
+        PathBuf::from("/Library/LaunchDaemons").join(format!("{}.plist", get_service_name()))
+    } else if let Some(dir) = directories::BaseDirs::new() {
         dir.home_dir().join("Library").join("LaunchAgents").join(format!("{}.plist", get_service_name()))
     } else {
+        // Fallback for user path
         PathBuf::from(format!("{}.plist", get_service_name()))
     }
 }
 
 #[cfg(target_os = "macos")]
+fn is_root() -> bool {
+    // geteuid() is safer since it indicates effective uid
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(target_os = "macos")]
 fn install_persistence_inner() -> Result<PathBuf> {
-    let path = plist_path();
+    let system_level = is_root();
+    let path = plist_path(system_level);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create LaunchAgents directory {}", parent.display()))?;
+            .with_context(|| format!("Failed to create Launch agents/daemons directory {}", parent.display()))?;
     }
 
     let exe_path = std::env::current_exe()
@@ -344,19 +354,19 @@ fn install_persistence_inner() -> Result<PathBuf> {
         .with_context(|| format!("Failed to write plist file {}", path.display()))?;
 
     if std::env::var("ORCHESTRA_PERSISTENCE_ROOT").is_err() {
-        // Obtain the current user's UID for the `gui/<uid>` service target.
-        // `launchctl bootstrap` is the modern replacement for `launchctl load`
-        // (deprecated since macOS 10.10).
-        let uid_out = std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .context("Failed to get UID for launchctl bootstrap")?;
-        let uid = String::from_utf8_lossy(&uid_out.stdout)
-            .trim()
-            .to_string();
-        let target = format!("gui/{uid}");
+        let (target, target_path) = if system_level {
+            ("system".to_string(), path.to_string_lossy().to_string())
+        } else {
+            let uid_out = std::process::Command::new("id")
+                .arg("-u")
+                .output()
+                .context("Failed to get UID for launchctl bootstrap")?;
+            let uid = String::from_utf8_lossy(&uid_out.stdout).trim().to_string();
+            (format!("gui/{uid}"), path.to_string_lossy().to_string())
+        };
+
         let status = std::process::Command::new("launchctl")
-            .args(["bootstrap", &target, &path.to_string_lossy().to_string()])
+            .args(["bootstrap", &target, &target_path])
             .status()?;
         if !status.success() {
             anyhow::bail!("launchctl bootstrap failed with status: {status}");
@@ -367,21 +377,39 @@ fn install_persistence_inner() -> Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn uninstall_persistence_inner() -> Result<()> {
-    let path = plist_path();
+    let system_level = is_root();
+    let path = plist_path(system_level);
+    
+    if !path.exists() && system_level {
+        // We are root, but system level didn't exist, try user fallback in uninstall
+        let upath = plist_path(false);
+        if upath.exists() {
+            return uninstall_persistence_actual(upath, false);
+        }
+    }
+    
+    uninstall_persistence_actual(path, system_level)
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_persistence_actual(path: PathBuf, system_level: bool) -> Result<()> {
     if path.exists() {
         if std::env::var("ORCHESTRA_PERSISTENCE_ROOT").is_err() {
-            // `launchctl bootout` is the modern replacement for `launchctl unload`
-            // (deprecated since macOS 10.10).
-            let uid_out = std::process::Command::new("id")
-                .arg("-u")
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_else(|| "501".to_string());
-            let target = format!("gui/{uid_out}");
-            let label = get_service_name();
+            let target_spec = if system_level {
+                let label = get_service_name();
+                format!("system/{}", label)
+            } else {
+                let uid_out = std::process::Command::new("id")
+                    .arg("-u")
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_else(|| "501".to_string());
+                let label = get_service_name();
+                format!("gui/{}/{}", uid_out, label)
+            };
             let _ = std::process::Command::new("launchctl")
-                .args(["bootout", &format!("{target}/{label}")])
+                .args(["bootout", &target_spec])
                 .status();
         }
         std::fs::remove_file(&path)

@@ -58,6 +58,7 @@ dependencies = [
  "hollowing",
  "image",
  "lazy_static",
+ "libc",
  "log",
  "module_loader",
  "optimizer",

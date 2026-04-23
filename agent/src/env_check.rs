@@ -217,6 +217,12 @@ pub fn detect_vm() -> bool {
             indicators += 1;
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        if macos_system_profiler_indicates_vm() {
+            indicators += 1;
+        }
+    }
     #[cfg(windows)]
     {
         if windows_registry_indicates_vm() {
@@ -286,6 +292,36 @@ fn linux_dmi_indicates_vm() -> bool {
         }
     }
     ms_vendor && virt_product
+}
+
+#[cfg(target_os = "macos")]
+fn macos_system_profiler_indicates_vm() -> bool {
+    let mut is_vm = false;
+
+    // Check sysctl hw.model and kern.hv_support
+    if let Ok(output) = std::process::Command::new("sysctl").arg("-n").arg("hw.model").output() {
+        let model = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        if model.contains("virtual") || model.contains("vmware") || model.contains("pxe") {
+            is_vm = true;
+        }
+    }
+
+    if let Ok(output) = std::process::Command::new("sysctl").arg("-n").arg("kern.hv_support").output() {
+        let support = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if support == "1" {
+            // Native hypervisor framework is supported, which might mean we are the host, or a guest that supports nested.
+            // But let's check ioreg for specific virtual devices
+        }
+    }
+
+    if let Ok(output) = std::process::Command::new("ioreg").arg("-l").output() {
+        let ioreg = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        if ioreg.contains("virtualbox") || ioreg.contains("vmware") || ioreg.contains("parallels") || ioreg.contains("qemu") {
+            is_vm = true;
+        }
+    }
+
+    is_vm
 }
 
 #[cfg(windows)]

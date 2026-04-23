@@ -1,10 +1,17 @@
-//! Direct syscalls for Windows.
-#![cfg(all(windows, target_arch = "x86_64", feature = "direct-syscalls"))]
+//! Direct syscalls for Windows and Linux.
+#![cfg(all(
+    any(windows, target_os = "linux"),
+    target_arch = "x86_64",
+    feature = "direct-syscalls"
+))]
 
 use anyhow::{anyhow, Result};
 use std::arch::asm;
+
+#[cfg(windows)]
 use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
 
+#[cfg(windows)]
 /// Retrieves the syscall number (SSN) for a given NT function.
 ///
 /// **Disk-first strategy**: reads `ntdll.dll` from the `System32` directory on
@@ -18,6 +25,7 @@ use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
 /// that the function continues to work in environments where disk access is
 /// restricted.
 #[doc(hidden)]
+#[cfg(windows)]
 pub fn get_syscall_id(func_name: &str) -> Result<u32> {
     // Try the clean disk copy first.
     if let Ok(ssn) = get_syscall_id_from_disk(func_name) {
@@ -314,6 +322,50 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> i32 {
         // compiler can treat the stack as untouched.  Without this the
         // compiler may insert a stack realignment that would corrupt the
         // shadow-space layout we set up above.
+        options(nostack),
+    );
+
+    status
+}
+
+#[cfg(target_os = "linux")]
+#[macro_export]
+macro_rules! syscall {
+    ($sysno:expr $(, $args:expr)* $(,)?) => {{
+        let ssn: u32 = $sysno;
+        let args: &[u64] = &[$($args as u64),*];
+        unsafe { $crate::syscalls::do_syscall(ssn, args) }
+    }};
+}
+
+#[cfg(target_os = "linux")]
+pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> u64 {
+    let mut status: u64;
+    let a1 = *args.get(0).unwrap_or(&0);
+    let a2 = *args.get(1).unwrap_or(&0);
+    let a3 = *args.get(2).unwrap_or(&0);
+    let a4 = *args.get(3).unwrap_or(&0);
+    let a5 = *args.get(4).unwrap_or(&0);
+    let a6 = *args.get(5).unwrap_or(&0);
+
+    asm!(
+        "mov rax, {ssn:e}",
+        "mov rdi, {a1}",
+        "mov rsi, {a2}",
+        "mov rdx, {a3}",
+        "mov r10, {a4}",
+        "mov r8, {a5}",
+        "mov r9, {a6}",
+        "syscall",
+        ssn = in(reg) ssn,
+        a1 = in(reg) a1,
+        a2 = in(reg) a2,
+        a3 = in(reg) a3,
+        a4 = in(reg) a4,
+        a5 = in(reg) a5,
+        a6 = in(reg) a6,
+        lateout("rax") status,
+        out("rcx") _, out("r11") _, // syscall clobbers rcx and r11
         options(nostack),
     );
 
