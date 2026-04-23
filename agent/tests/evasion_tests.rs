@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 fn test_clean_ntdll_mapping() {
     // Mock simulation: the clean ntdll mapping should differ from the loaded module
     // since hooks are absent.
-    let loaded_address = 0x7FFA0000; // Mock loaded module address
-    let mapped_address = 0x8FFA0000; // Mock newly mapped address from disk
+    let loaded_address: u64 = 0x7FFA0000; // Mock loaded module address
+    let mapped_address: u64 = 0x8FFA0000; // Mock newly mapped address from disk
     assert_ne!(loaded_address, mapped_address, "Mapped NTDLL should reside at a different base address");
 }
 

@@ -541,7 +541,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
             // Make IAT writable
             let mut num_thunks = 0;
             let mut temp_thunk = first_thunk;
-            while (*temp_thunk).u1.AddressOfData() != &0 {
+            while !(*temp_thunk).u1.AddressOfData().is_null() {
                 num_thunks += 1;
                 temp_thunk = temp_thunk.add(1);
             }
@@ -550,10 +550,11 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
             let mut old_protect = 0;
             winapi::um::memoryapi::VirtualProtect(first_thunk as *mut _, iat_size, winapi::um::winnt::PAGE_READWRITE, &mut old_protect);
             
-            while (*original_thunk).u1.AddressOfData() != &0 {
-                let addr_of_data = *(*original_thunk).u1.AddressOfData();
+            while !(*original_thunk).u1.AddressOfData().is_null() {
+                let addr_of_data = *(*original_thunk).u1.AddressOfData() as u64;
                 let proc_addr = if (addr_of_data & winapi::um::winnt::IMAGE_ORDINAL_FLAG64) != 0 {
-                    0 // Ordinal imports bypass not implemented here seamlessly in pure manual lookup, fallback removed
+                    let ordinal = (addr_of_data & 0xFFFF) as u16;
+                    winapi::um::libloaderapi::GetProcAddress(dep_handle as *mut _, ordinal as winapi::um::winnt::LPCSTR) as usize
                 } else {
                     let import_by_name = (base + addr_of_data as usize) as *const winapi::um::winnt::IMAGE_IMPORT_BY_NAME;
                     let name_ptr = (*import_by_name).Name.as_ptr();

@@ -128,7 +128,7 @@ fn install_systemd_unit() -> Result<PathBuf> {
     if std::env::var("ORCHESTRA_PERSISTENCE_ROOT").is_err() {
         let status = std::process::Command::new("systemctl")
             .args(["--user", "enable", &format!("{service_name}.service")])
-            ?;
+            .status()?;
         if !status.success() {
             anyhow::bail!("systemctl enable failed with status: {status}");
         }
@@ -367,7 +367,7 @@ fn install_persistence_inner() -> Result<PathBuf> {
 
         let status = std::process::Command::new("launchctl")
             .args(["bootstrap", &target, &target_path])
-            ?;
+            .status()?;
         if !status.success() {
             anyhow::bail!("launchctl bootstrap failed with status: {status}");
         }

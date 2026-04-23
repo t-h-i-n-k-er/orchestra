@@ -10,3 +10,9 @@ secrets/
 orchestra-server.toml
 *-audit.jsonl
 **/orchestra-audit.jsonl
+*.patch
+*.orig
+*.rej
+*.swp
+*.swo
+*~

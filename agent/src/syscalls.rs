@@ -102,7 +102,7 @@ fn get_bootstrap_ssn(raw_bytes: &[u8], func_name: &str) -> Option<SyscallTarget>
 fn map_clean_ntdll() -> Result<usize> {
     use std::os::windows::ffi::OsStrExt;
     
-    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\Windows".to_string());
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| rr"C:\Windows".to_string());
     let ntdll_disk_path = format!("{}\System32\ntdll.dll", sysroot);
     
     // Read raw unmapped bytes to parse SSNs for NtOpenFile, NtCreateSection, NtMapViewOfSection
@@ -112,7 +112,7 @@ fn map_clean_ntdll() -> Result<usize> {
     let sys_ntcreatesection = get_bootstrap_ssn(&raw_bytes, "NtCreateSection").ok_or_else(|| anyhow!("No NtCreateSection SSN"))?;
     let sys_ntmapview = get_bootstrap_ssn(&raw_bytes, "NtMapViewOfSection").ok_or_else(|| anyhow!("No NtMapView SSN"))?;
     
-    let mut ntdll_nt_path = format!("\??\{}\System32\ntdll.dll", sysroot).encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let mut ntdll_nt_path = format!(r"\??\{}\System32\ntdll.dll", sysroot).encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
     
     unsafe {
         // Need to find *any* mapped syscall gadget we can use. We can just use the loaded ntdll's gadget dynamically, or build one in memory.
@@ -409,28 +409,47 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
 
         let sys_ntcreatesection = get_syscall_id("NtCreateSection")?;
         let sys_ntmapview = get_syscall_id("NtMapViewOfSection")?;
+        let sys_ntopenfile = get_syscall_id("NtOpenFile")?;
 
-        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\Windows".to_string());
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| rr"C:\Windows".to_string());
         
         let path_str = if dll_lower.contains("\") {
             dll_lower.clone()
         } else {
-            format!("{}\System32\{}", sysroot, dll_name)
+            format!(r"{}\System32\{}", sysroot, dll_name)
         };
         let c_path = std::ffi::CString::new(path_str).unwrap();
         
         // Use CreateFile for non-ntdll clean maps. NtOpenFile can also be used if preferred, but for now we follow the script
-        let h_file = CreateFileA(
-            c_path.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ,
-            std::ptr::null_mut(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        );
-        if h_file == winapi::um::handleapi::INVALID_HANDLE_VALUE {
-            return Err(anyhow!("Failed to open {} from system directory. Refusing to initialize.", dll_name));
+        let sys_ntopenfile = get_syscall_id("NtOpenFile")?;
+        
+        use std::os::windows::ffi::OsStrExt;
+        let mut nt_path = format!(r"\??\{}\System32\{}", sysroot, dll_name).encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        
+        let mut obj_name: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
+        obj_name.Length = ((nt_path.len() - 1) * 2) as u16;
+        obj_name.MaximumLength = (nt_path.len() * 2) as u16;
+        obj_name.Buffer = nt_path.as_mut_ptr();
+        
+        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        obj_attr.ObjectName = &mut obj_name;
+        obj_attr.Attributes = 0x00000040; // OBJ_CASE_INSENSITIVE
+        
+        let mut io_status: [u64; 2] = [0, 0];
+        let mut h_file: winapi::shared::ntdef::HANDLE = std::ptr::null_mut();
+        
+        let status = do_syscall(sys_ntopenfile.ssn, sys_ntopenfile.gadget_addr, &[
+            &mut h_file as *mut _ as u64,
+            0x80100000, // SYNCHRONIZE | FILE_READ_DATA (GENERIC_READ)
+            &mut obj_attr as *mut _ as u64,
+            &mut io_status as *mut _ as u64,
+            1, // FILE_SHARE_READ
+            0x20, // FILE_SYNCHRONOUS_IO_NONALERT
+        ]);
+        
+        if status != 0 {
+            return Err(anyhow!("Failed to open {} with NtOpenFile. Status: {:x}", dll_name, status));
         }
         
         let mut h_section: winapi::shared::ntdef::HANDLE = std::ptr::null_mut();
@@ -536,7 +555,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
             // Make IAT writable
             let mut num_thunks = 0;
             let mut temp_thunk = first_thunk;
-            while (*temp_thunk).u1.AddressOfData() != &0 {
+            while !(*temp_thunk).u1.AddressOfData().is_null() {
                 num_thunks += 1;
                 temp_thunk = temp_thunk.add(1);
             }
@@ -545,10 +564,11 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
             let mut old_protect = 0;
             winapi::um::memoryapi::VirtualProtect(first_thunk as *mut _, iat_size, winapi::um::winnt::PAGE_READWRITE, &mut old_protect);
             
-            while (*original_thunk).u1.AddressOfData() != &0 {
-                let addr_of_data = *(*original_thunk).u1.AddressOfData();
+            while !(*original_thunk).u1.AddressOfData().is_null() {
+                let addr_of_data = *(*original_thunk).u1.AddressOfData() as u64;
                 let proc_addr = if (addr_of_data & winapi::um::winnt::IMAGE_ORDINAL_FLAG64) != 0 {
-                    0 // Ordinal imports bypass not implemented here seamlessly in pure manual lookup, fallback removed
+                    let ordinal = (addr_of_data & 0xFFFF) as u16;
+                    winapi::um::libloaderapi::GetProcAddress(dep_handle as *mut _, ordinal as winapi::um::winnt::LPCSTR) as usize
                 } else {
                     let import_by_name = (base + addr_of_data as usize) as *const winapi::um::winnt::IMAGE_IMPORT_BY_NAME;
                     let name_ptr = (*import_by_name).Name.as_ptr();
@@ -658,19 +678,265 @@ macro_rules! syscall {
     }};
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, feature = "direct-syscalls"))]
 #[doc(hidden)]
 #[inline(never)]
 pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<i32, i32> {
-    // Basic linux syscall impl
-    Ok(0)
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut ret: i64;
+        match args.len() {
+            0 => std::arch::asm!("syscall", in("rax") ssn as u64, lateout("rax") ret, options(nostack)),
+            1 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], lateout("rax") ret, options(nostack)),
+            2 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], lateout("rax") ret, options(nostack)),
+            3 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], in("rdx") args[2], lateout("rax") ret, options(nostack)),
+            4 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], in("rdx") args[2], in("r10") args[3], lateout("rax") ret, options(nostack)),
+            5 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], in("rdx") args[2], in("r10") args[3], in("r8") args[4], lateout("rax") ret, options(nostack)),
+            6 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], in("rdx") args[2], in("r10") args[3], in("r8") args[4], in("r9") args[5], lateout("rax") ret, options(nostack)),
+            _ => panic!("too many syscall arguments"),
+        }
+        if ret < 0 { Err(-ret as i32) } else { Ok(ret as i32) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut ret: i64;
+        match args.len() {
+            0 => std::arch::asm!("svc 0", in("x8") ssn as u64, lateout("x0") ret, options(nostack)),
+            1 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], lateout("x0") ret, options(nostack)),
+            2 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], lateout("x0") ret, options(nostack)),
+            3 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], lateout("x0") ret, options(nostack)),
+            4 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], in("x3") args[3], lateout("x0") ret, options(nostack)),
+            5 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], in("x3") args[3], in("x4") args[4], lateout("x0") ret, options(nostack)),
+            6 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], in("x3") args[3], in("x4") args[4], in("x5") args[5], lateout("x0") ret, options(nostack)),
+            _ => panic!("too many syscall arguments"),
+        }
+        if ret < 0 { Err(-ret as i32) } else { Ok(ret as i32) }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    compile_error!("Unsupported architecture for direct syscalls");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, feature = "direct-syscalls"))]
 pub fn get_syscall_id(name: &str) -> anyhow::Result<u32> {
-    // For brevity keeping the same mapping or simplified. We'll just preserve the original linux get_syscall_id.
-    Ok(0)
+    #[cfg(target_arch = "x86_64")]
+    match name {
+        "read" => Ok(0), "write" => Ok(1), "open" => Ok(2), "close" => Ok(3), "stat" => Ok(4),
+        "fstat" => Ok(5), "lstat" => Ok(6), "poll" => Ok(7), "lseek" => Ok(8), "mmap" => Ok(9),
+        "mprotect" => Ok(10), "munmap" => Ok(11), "brk" => Ok(12), "rt_sigaction" => Ok(13),
+        "rt_sigprocmask" => Ok(14), "rt_sigreturn" => Ok(15), "ioctl" => Ok(16), "pread64" => Ok(17),
+        "pwrite64" => Ok(18), "readv" => Ok(19), "writev" => Ok(20), "access" => Ok(21),
+        "pipe" => Ok(22), "select" => Ok(23), "sched_yield" => Ok(24), "mremap" => Ok(25),
+        "msync" => Ok(26), "mincore" => Ok(27), "madvise" => Ok(28), "shmget" => Ok(29),
+        "shmat" => Ok(30), "shmctl" => Ok(31), "dup" => Ok(32), "dup2" => Ok(33), "pause" => Ok(34),
+        "nanosleep" => Ok(35), "getitimer" => Ok(36), "alarm" => Ok(37), "setitimer" => Ok(38),
+        "getpid" => Ok(39), "sendfile" => Ok(40), "socket" => Ok(41), "connect" => Ok(42),
+        "accept" => Ok(43), "sendto" => Ok(44), "recvfrom" => Ok(45), "sendmsg" => Ok(46),
+        "recvmsg" => Ok(47), "shutdown" => Ok(48), "bind" => Ok(49), "listen" => Ok(50),
+        "getsockname" => Ok(51), "getpeername" => Ok(52), "socketpair" => Ok(53), "setsockopt" => Ok(54),
+        "getsockopt" => Ok(55), "clone" => Ok(56), "fork" => Ok(57), "vfork" => Ok(58), "execve" => Ok(59),
+        "exit" => Ok(60), "wait4" => Ok(61), "kill" => Ok(62), "uname" => Ok(63), "semget" => Ok(64),
+        "semop" => Ok(65), "semctl" => Ok(66), "shmdt" => Ok(67), "msgget" => Ok(68), "msgsnd" => Ok(69),
+        "msgrcv" => Ok(70), "msgctl" => Ok(71), "fcntl" => Ok(72), "flock" => Ok(73), "fsync" => Ok(74),
+        "fdatasync" => Ok(75), "truncate" => Ok(76), "ftruncate" => Ok(77), "getdents" => Ok(78),
+        "getcwd" => Ok(79), "chdir" => Ok(80), "fchdir" => Ok(81), "rename" => Ok(82), "mkdir" => Ok(83),
+        "rmdir" => Ok(84), "creat" => Ok(85), "link" => Ok(86), "unlink" => Ok(87), "symlink" => Ok(88),
+        "readlink" => Ok(89), "chmod" => Ok(90), "fchmod" => Ok(91), "chown" => Ok(92), "fchown" => Ok(93),
+        "lchown" => Ok(94), "umask" => Ok(95), "gettimeofday" => Ok(96), "getrlimit" => Ok(97),
+        "getrusage" => Ok(98), "sysinfo" => Ok(99), "times" => Ok(100), "ptrace" => Ok(101),
+        "getuid" => Ok(102), "syslog" => Ok(103), "getgid" => Ok(104), "setuid" => Ok(105),
+        "setgid" => Ok(106), "geteuid" => Ok(107), "getegid" => Ok(108), "setpgid" => Ok(109),
+        "getppid" => Ok(110), "getpgrp" => Ok(111), "setsid" => Ok(112), "setreuid" => Ok(113),
+        "setregid" => Ok(114), "getgroups" => Ok(115), "setgroups" => Ok(116), "setresuid" => Ok(117),
+        "getresuid" => Ok(118), "setresgid" => Ok(119), "getresgid" => Ok(120), "getpgid" => Ok(121),
+        "setfsuid" => Ok(122), "setfsgid" => Ok(123), "getsid" => Ok(124), "capget" => Ok(125),
+        "capset" => Ok(126), "rt_sigpending" => Ok(127), "rt_sigtimedwait" => Ok(128),
+        "rt_sigqueueinfo" => Ok(129), "rt_sigsuspend" => Ok(130), "sigaltstack" => Ok(131),
+        "utime" => Ok(132), "mknod" => Ok(133), "uselib" => Ok(134), "personality" => Ok(135),
+        "ustat" => Ok(136), "statfs" => Ok(137), "fstatfs" => Ok(138), "sysfs" => Ok(139),
+        "getpriority" => Ok(140), "setpriority" => Ok(141), "sched_setparam" => Ok(142),
+        "sched_getparam" => Ok(143), "sched_setscheduler" => Ok(144), "sched_getscheduler" => Ok(145),
+        "sched_get_priority_max" => Ok(146), "sched_get_priority_min" => Ok(147),
+        "sched_rr_get_interval" => Ok(148), "mlock" => Ok(149), "munlock" => Ok(150),
+        "mlockall" => Ok(151), "munlockall" => Ok(152), "vhangup" => Ok(153), "modify_ldt" => Ok(154),
+        "pivot_root" => Ok(155), "_sysctl" => Ok(156), "prctl" => Ok(157), "arch_prctl" => Ok(158),
+        "adjtimex" => Ok(159), "setrlimit" => Ok(160), "chroot" => Ok(161), "sync" => Ok(162),
+        "acct" => Ok(163), "settimeofday" => Ok(164), "mount" => Ok(165), "umount2" => Ok(166),
+        "swapon" => Ok(167), "swapoff" => Ok(168), "reboot" => Ok(169), "sethostname" => Ok(170),
+        "setdomainname" => Ok(171), "iopl" => Ok(172), "ioperm" => Ok(173), "create_module" => Ok(174),
+        "init_module" => Ok(175), "delete_module" => Ok(176), "get_kernel_syms" => Ok(177),
+        "query_module" => Ok(178), "quotactl" => Ok(179), "nfsservctl" => Ok(180), "getpmsg" => Ok(181),
+        "putpmsg" => Ok(182), "afs_syscall" => Ok(183), "tuxcall" => Ok(184), "security" => Ok(185),
+        "gettid" => Ok(186), "readahead" => Ok(187), "setxattr" => Ok(188), "lsetxattr" => Ok(189),
+        "fsetxattr" => Ok(190), "getxattr" => Ok(191), "lgetxattr" => Ok(192), "fgetxattr" => Ok(193),
+        "listxattr" => Ok(194), "llistxattr" => Ok(195), "flistxattr" => Ok(196), "removexattr" => Ok(197),
+        "lremovexattr" => Ok(198), "fremovexattr" => Ok(199), "tkill" => Ok(200), "time" => Ok(201),
+        "futex" => Ok(202), "sched_setaffinity" => Ok(203), "sched_getaffinity" => Ok(204),
+        "set_thread_area" => Ok(205), "io_setup" => Ok(206), "io_destroy" => Ok(207),
+        "io_getevents" => Ok(208), "io_submit" => Ok(209), "io_cancel" => Ok(210),
+        "get_thread_area" => Ok(211), "lookup_dcookie" => Ok(212), "epoll_create" => Ok(213),
+        "epoll_ctl_old" => Ok(214), "epoll_wait_old" => Ok(215), "remap_file_pages" => Ok(216),
+        "getdents64" => Ok(217), "set_tid_address" => Ok(218), "restart_syscall" => Ok(219),
+        "semtimedop" => Ok(220), "fadvise64" => Ok(221), "timer_create" => Ok(222),
+        "timer_settime" => Ok(223), "timer_gettime" => Ok(224), "timer_getoverrun" => Ok(225),
+        "timer_delete" => Ok(226), "clock_settime" => Ok(227), "clock_gettime" => Ok(228),
+        "clock_getres" => Ok(229), "clock_nanosleep" => Ok(230), "exit_group" => Ok(231),
+        "epoll_wait" => Ok(232), "epoll_ctl" => Ok(233), "tgkill" => Ok(234), "utimes" => Ok(235),
+        "vserver" => Ok(236), "mbind" => Ok(237), "set_mempolicy" => Ok(238), "get_mempolicy" => Ok(239),
+        "mq_open" => Ok(240), "mq_unlink" => Ok(241), "mq_timedsend" => Ok(242),
+        "mq_timedreceive" => Ok(243), "mq_notify" => Ok(244), "mq_getsetattr" => Ok(245),
+        "kexec_load" => Ok(246), "waitid" => Ok(247), "add_key" => Ok(248), "request_key" => Ok(249),
+        "keyctl" => Ok(250), "ioprio_set" => Ok(251), "ioprio_get" => Ok(252), "inotify_init" => Ok(253),
+        "inotify_add_watch" => Ok(254), "inotify_rm_watch" => Ok(255), "migrate_pages" => Ok(256),
+        "openat" => Ok(257), "mkdirat" => Ok(258), "mknodat" => Ok(259), "fchownat" => Ok(260),
+        "futimesat" => Ok(261), "newfstatat" => Ok(262), "unlinkat" => Ok(263), "renameat" => Ok(264),
+        "linkat" => Ok(265), "symlinkat" => Ok(266), "readlinkat" => Ok(267), "fchmodat" => Ok(268),
+        "faccessat" => Ok(269), "pselect6" => Ok(270), "ppoll" => Ok(271), "unshare" => Ok(272),
+        "set_robust_list" => Ok(273), "get_robust_list" => Ok(274), "splice" => Ok(275), "tee" => Ok(276),
+        "sync_file_range" => Ok(277), "vmsplice" => Ok(278), "move_pages" => Ok(279),
+        "utimensat" => Ok(280), "epoll_pwait" => Ok(281), "signalfd" => Ok(282),
+        "timerfd_create" => Ok(283), "eventfd" => Ok(284), "fallocate" => Ok(285),
+        "timerfd_settime" => Ok(286), "timerfd_gettime" => Ok(287), "accept4" => Ok(288),
+        "signalfd4" => Ok(289), "eventfd2" => Ok(290), "epoll_create1" => Ok(291), "dup3" => Ok(292),
+        "pipe2" => Ok(293), "inotify_init1" => Ok(294), "preadv" => Ok(295), "pwritev" => Ok(296),
+        "rt_tgsigqueueinfo" => Ok(297), "perf_event_open" => Ok(298), "recvmmsg" => Ok(299),
+        "fanotify_init" => Ok(300), "fanotify_mark" => Ok(301), "prlimit64" => Ok(302),
+        "name_to_handle_at" => Ok(303), "open_by_handle_at" => Ok(304), "clock_adjtime" => Ok(305),
+        "syncfs" => Ok(306), "sendmmsg" => Ok(307), "setns" => Ok(308), "getcpu" => Ok(309),
+        "process_vm_readv" => Ok(310), "process_vm_writev" => Ok(311), "kcmp" => Ok(312),
+        "finit_module" => Ok(313), "sched_setattr" => Ok(314), "sched_getattr" => Ok(315),
+        "renameat2" => Ok(316), "seccomp" => Ok(317), "getrandom" => Ok(318), "memfd_create" => Ok(319),
+        "kexec_file_load" => Ok(320), "bpf" => Ok(321), "execveat" => Ok(322),
+        "userfaultfd" => Ok(323), "membarrier" => Ok(324), "mlock2" => Ok(325),
+        "copy_file_range" => Ok(326), "preadv2" => Ok(327), "pwritev2" => Ok(328),
+        "pkey_mprotect" => Ok(329), "pkey_alloc" => Ok(330), "pkey_free" => Ok(331), "statx" => Ok(332),
+        "io_pgetevents" => Ok(333), "rseq" => Ok(334),
+        _ => anyhow::bail!("unknown x86_64 syscall: {}", name),
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    match name {
+        "io_setup" => Ok(0), "io_destroy" => Ok(1), "io_submit" => Ok(2), "io_cancel" => Ok(3),
+        "io_getevents" => Ok(4), "setxattr" => Ok(5), "lsetxattr" => Ok(6), "fsetxattr" => Ok(7),
+        "getxattr" => Ok(8), "lgetxattr" => Ok(9), "fgetxattr" => Ok(10), "listxattr" => Ok(11),
+        "llistxattr" => Ok(12), "flistxattr" => Ok(13), "removexattr" => Ok(14),
+        "lremovexattr" => Ok(15), "fremovexattr" => Ok(16), "getcwd" => Ok(17),
+        "lookup_dcookie" => Ok(18), "eventfd2" => Ok(19), "epoll_create1" => Ok(20),
+        "epoll_ctl" => Ok(21), "epoll_pwait" => Ok(22), "dup" => Ok(23), "dup3" => Ok(24),
+        "fcntl" => Ok(25), "inotify_init1" => Ok(26), "inotify_add_watch" => Ok(27),
+        "inotify_rm_watch" => Ok(28), "ioctl" => Ok(29), "ioprio_set" => Ok(30), "ioprio_get" => Ok(31),
+        "flock" => Ok(32), "mknodat" => Ok(33), "mkdirat" => Ok(34), "unlinkat" => Ok(35),
+        "symlinkat" => Ok(36), "linkat" => Ok(37), "renameat" => Ok(38), "umount2" => Ok(39),
+        "mount" => Ok(40), "pivot_root" => Ok(41), "nfsservctl" => Ok(42), "statfs" => Ok(43),
+        "fstatfs" => Ok(44), "truncate" => Ok(45), "ftruncate" => Ok(46), "fallocate" => Ok(47),
+        "faccessat" => Ok(48), "chdir" => Ok(49), "fchdir" => Ok(50), "chroot" => Ok(51),
+        "fchmod" => Ok(52), "fchmodat" => Ok(53), "fchownat" => Ok(54), "fchown" => Ok(55),
+        "openat" => Ok(56), "close" => Ok(57), "vhangup" => Ok(58), "pipe2" => Ok(59),
+        "quotactl" => Ok(60), "getdents64" => Ok(61), "lseek" => Ok(62), "read" => Ok(63),
+        "write" => Ok(64), "readv" => Ok(65), "writev" => Ok(66), "pread64" => Ok(67),
+        "pwrite64" => Ok(68), "preadv" => Ok(69), "pwritev" => Ok(70), "sendfile" => Ok(71),
+        "pselect6" => Ok(72), "ppoll" => Ok(73), "signalfd4" => Ok(74), "vmsplice" => Ok(75),
+        "splice" => Ok(76), "tee" => Ok(77), "readlinkat" => Ok(78), "newfstatat" => Ok(79),
+        "fstat" => Ok(80), "sync" => Ok(81), "fsync" => Ok(82), "fdatasync" => Ok(83),
+        "sync_file_range" => Ok(84), "timerfd_create" => Ok(85), "timerfd_settime" => Ok(86),
+        "timerfd_gettime" => Ok(87), "utimensat" => Ok(88), "acct" => Ok(89), "capget" => Ok(90),
+        "capset" => Ok(91), "personality" => Ok(92), "exit" => Ok(93), "exit_group" => Ok(94),
+        "waitid" => Ok(95), "set_tid_address" => Ok(96), "unshare" => Ok(97), "futex" => Ok(98),
+        "set_robust_list" => Ok(99), "get_robust_list" => Ok(100), "nanosleep" => Ok(101),
+        "getitimer" => Ok(102), "setitimer" => Ok(103), "kexec_load" => Ok(104),
+        "init_module" => Ok(105), "delete_module" => Ok(106), "timer_create" => Ok(107),
+        "timer_gettime" => Ok(108), "timer_getoverrun" => Ok(109), "timer_settime" => Ok(110),
+        "timer_delete" => Ok(111), "clock_settime" => Ok(112), "clock_gettime" => Ok(113),
+        "clock_getres" => Ok(114), "clock_nanosleep" => Ok(115), "syslog" => Ok(116),
+        "ptrace" => Ok(117), "sched_setparam" => Ok(118), "sched_setscheduler" => Ok(119),
+        "sched_getscheduler" => Ok(120), "sched_getparam" => Ok(121), "sched_setaffinity" => Ok(122),
+        "sched_getaffinity" => Ok(123), "sched_yield" => Ok(124), "sched_get_priority_max" => Ok(125),
+        "sched_get_priority_min" => Ok(126), "sched_rr_get_interval" => Ok(127),
+        "restart_syscall" => Ok(128), "kill" => Ok(129), "tkill" => Ok(130), "tgkill" => Ok(131),
+        "sigaltstack" => Ok(132), "rt_sigsuspend" => Ok(133), "rt_sigaction" => Ok(134),
+        "rt_sigprocmask" => Ok(135), "rt_sigpending" => Ok(136), "rt_sigtimedwait" => Ok(137),
+        "rt_sigqueueinfo" => Ok(138), "rt_sigreturn" => Ok(139), "setpriority" => Ok(140),
+        "getpriority" => Ok(141), "reboot" => Ok(142), "setregid" => Ok(143), "setgid" => Ok(144),
+        "setreuid" => Ok(145), "setuid" => Ok(146), "setresuid" => Ok(147), "getresuid" => Ok(148),
+        "setresgid" => Ok(149), "getresgid" => Ok(150), "setfsuid" => Ok(151), "setfsgid" => Ok(152),
+        "times" => Ok(153), "setpgid" => Ok(154), "getpgid" => Ok(155), "getsid" => Ok(156),
+        "setsid" => Ok(157), "getgroups" => Ok(158), "setgroups" => Ok(159), "uname" => Ok(160),
+        "sethostname" => Ok(161), "setdomainname" => Ok(162), "getrlimit" => Ok(163),
+        "setrlimit" => Ok(164), "getrusage" => Ok(165), "umask" => Ok(166), "prctl" => Ok(167),
+        "getcpu" => Ok(168), "gettimeofday" => Ok(169), "settimeofday" => Ok(170),
+        "adjtimex" => Ok(171), "getpid" => Ok(172), "getppid" => Ok(173), "getuid" => Ok(174),
+        "geteuid" => Ok(175), "getgid" => Ok(176), "getegid" => Ok(177), "gettid" => Ok(178),
+        "sysinfo" => Ok(179), "mq_open" => Ok(180), "mq_unlink" => Ok(181), "mq_timedsend" => Ok(182),
+        "mq_timedreceive" => Ok(183), "mq_notify" => Ok(184), "mq_getsetattr" => Ok(185),
+        "msgget" => Ok(186), "msgctl" => Ok(187), "msgrcv" => Ok(188), "msgsnd" => Ok(189),
+        "semget" => Ok(190), "semctl" => Ok(191), "semtimedop" => Ok(192), "semop" => Ok(193),
+        "shmget" => Ok(194), "shmctl" => Ok(195), "shmat" => Ok(196), "shmdt" => Ok(197),
+        "socket" => Ok(198), "socketpair" => Ok(199), "bind" => Ok(200), "listen" => Ok(201),
+        "accept" => Ok(202), "connect" => Ok(203), "getsockname" => Ok(204), "getpeername" => Ok(205),
+        "sendto" => Ok(206), "recvfrom" => Ok(207), "setsockopt" => Ok(208), "getsockopt" => Ok(209),
+        "shutdown" => Ok(210), "sendmsg" => Ok(211), "recvmsg" => Ok(212), "readahead" => Ok(213),
+        "brk" => Ok(214), "munmap" => Ok(215), "mremap" => Ok(216), "add_key" => Ok(217),
+        "request_key" => Ok(218), "keyctl" => Ok(219), "clone" => Ok(220), "execve" => Ok(221),
+        "mmap" => Ok(222), "fadvise64" => Ok(223), "swapon" => Ok(224), "swapoff" => Ok(225),
+        "mprotect" => Ok(226), "msync" => Ok(227), "mlock" => Ok(228), "munlock" => Ok(229),
+        "mlockall" => Ok(230), "munlockall" => Ok(231), "mincore" => Ok(232), "madvise" => Ok(233),
+        "remap_file_pages" => Ok(234), "mbind" => Ok(235), "get_mempolicy" => Ok(236),
+        "set_mempolicy" => Ok(237), "migrate_pages" => Ok(238), "move_pages" => Ok(239),
+        "rt_tgsigqueueinfo" => Ok(240), "perf_event_open" => Ok(241), "accept4" => Ok(242),
+        "recvmmsg" => Ok(243), "arch_specific_syscall" => Ok(244), "wait4" => Ok(260),
+        "prlimit64" => Ok(261), "fanotify_init" => Ok(262), "fanotify_mark" => Ok(263),
+        "name_to_handle_at" => Ok(264), "open_by_handle_at" => Ok(265), "clock_adjtime" => Ok(266),
+        "syncfs" => Ok(267), "setns" => Ok(268), "sendmmsg" => Ok(269), "process_vm_readv" => Ok(270),
+        "process_vm_writev" => Ok(271), "kcmp" => Ok(272), "finit_module" => Ok(273),
+        "sched_setattr" => Ok(274), "sched_getattr" => Ok(275), "renameat2" => Ok(276),
+        "seccomp" => Ok(277), "getrandom" => Ok(278), "memfd_create" => Ok(279), "bpf" => Ok(280),
+        "execveat" => Ok(281), "userfaultfd" => Ok(282), "membarrier" => Ok(283), "mlock2" => Ok(284),
+        "copy_file_range" => Ok(285), "preadv2" => Ok(286), "pwritev2" => Ok(287),
+        "pkey_mprotect" => Ok(288), "pkey_alloc" => Ok(289), "pkey_free" => Ok(290), "statx" => Ok(291),
+        "io_pgetevents" => Ok(292), "rseq" => Ok(293),
+        _ => anyhow::bail!("unknown aarch64 syscall: {}", name),
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    compile_error!("Unsupported architecture for direct syscalls");
 }
+
+#[cfg(all(unix, feature = "direct-syscalls"))]
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct dirent64 {
+    pub d_ino: u64,
+    pub d_off: i64,
+    pub d_reclen: u16,
+    pub d_type: u8,
+    pub d_name: [u8; 256],
+}
+
+#[cfg(all(unix, feature = "direct-syscalls"))]
+#[allow(non_camel_case_types)]
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct stat64 {
+    pub st_dev: u64,
+    pub st_ino: u64,
+    pub st_nlink: u64,
+    pub st_mode: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub __pad0: u32,
+    pub st_rdev: u64,
+    pub st_size: i64,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
+    pub st_atime: i64,
+    pub st_atime_nsec: u64,
+    pub st_mtime: i64,
+    pub st_mtime_nsec: u64,
+    pub st_ctime: i64,
+    pub st_ctime_nsec: u64,
+    pub __unused: [i64; 3],
+}
+
 
 #[cfg(windows)]
 thread_local! {
@@ -781,7 +1047,7 @@ pub unsafe fn spoof_call(api_addr: usize, gadget_addr: usize, arg1: u64, arg2: u
         status_out = out(reg) status,
         out("rcx") _, out("rdx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _, out("rax") _,
         out("rsi") _, out("rdi") _,
-        options(att_syntax),
+        
     );
     status
 }

@@ -87,8 +87,6 @@ fn arp_scan_linux() -> Result<Vec<ArpEntry>, String> {
 #[allow(dead_code)] // used only on non-Linux platforms
 fn arp_scan_cmd() -> Result<Vec<ArpEntry>, String> {
     let output = crate::process_spoof::execute_command("arp", &["-a"], true)
-        .arg("-a")
-        
         .map_err(|e| format!("failed to run arp -a: {e}"))?;
     if !output.status.success() {
         return Err(format!("arp -a exited with status {}", output.status));

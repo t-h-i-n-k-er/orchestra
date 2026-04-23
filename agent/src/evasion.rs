@@ -11,9 +11,12 @@
 //! # Compatibility
 //! Windows 10+ only (relies on specific offsets and newer thread context manipulation APIs).
 
+#[cfg(windows)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(windows)]
 static AMSI_ADDR: AtomicUsize = AtomicUsize::new(0);
+#[cfg(windows)]
 static ETW_ADDR: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(windows)]
