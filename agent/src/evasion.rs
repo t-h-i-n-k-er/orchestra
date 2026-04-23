@@ -1,4 +1,3 @@
-use std::ffi::c_void;
 
 #[cfg(windows)]
 pub unsafe fn patch_amsi() {

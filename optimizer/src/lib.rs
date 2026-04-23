@@ -324,20 +324,30 @@ fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
         let mut curr_ptr = ptr as u64;
         let mut tmp_size = 0;
         let mut consecutive_padding = 0;
+        let mut saw_ret = false;
         while tmp_size < 10000 {
             let slice = unsafe { std::slice::from_raw_parts(curr_ptr as *const u8, 15) };
             let decoder = iced_x86::Decoder::with_ip(64, slice, curr_ptr, iced_x86::DecoderOptions::NONE);
             if let Some(ins) = decoder.into_iter().next() {
                 tmp_size += ins.len();
                 curr_ptr += ins.len() as u64;
+                if ins.code() == iced_x86::Code::Retnw || ins.code() == iced_x86::Code::Retnq || ins.code() == iced_x86::Code::Retnd {
+                    saw_ret = true;
+                }
+                
                 if ins.code() == iced_x86::Code::Int3 || ins.code() == iced_x86::Code::Nopd || ins.code() == iced_x86::Code::Nopq || ins.code() == iced_x86::Code::Nopw {
-                    consecutive_padding += ins.len();
-                    if consecutive_padding >= 2 {
-                        size = tmp_size - consecutive_padding;
-                        break;
+                    if saw_ret {
+                        consecutive_padding += ins.len();
+                        if consecutive_padding >= 4 { // require at least 4 bytes of padding
+                            size = tmp_size - consecutive_padding;
+                            break;
+                        }
                     }
                 } else {
                     consecutive_padding = 0;
+                    if !format!("{:?}", ins.code()).starts_with("Ret") {
+                        saw_ret = false;
+                    }
                 }
             } else {
                 break;
@@ -376,20 +386,30 @@ fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
     let mut tmp_size = 0;
     let mut curr_ptr = ptr as u64;
         let mut consecutive_padding = 0;
+        let mut saw_ret = false;
         while tmp_size < 10000 {
             let slice = unsafe { std::slice::from_raw_parts(curr_ptr as *const u8, 15) };
             let decoder = iced_x86::Decoder::with_ip(64, slice, curr_ptr, iced_x86::DecoderOptions::NONE);
             if let Some(ins) = decoder.into_iter().next() {
                 tmp_size += ins.len();
                 curr_ptr += ins.len() as u64;
+                if ins.code() == iced_x86::Code::Retnw || ins.code() == iced_x86::Code::Retnq || ins.code() == iced_x86::Code::Retnd {
+                    saw_ret = true;
+                }
+                
                 if ins.code() == iced_x86::Code::Int3 || ins.code() == iced_x86::Code::Nopd || ins.code() == iced_x86::Code::Nopq || ins.code() == iced_x86::Code::Nopw {
-                    consecutive_padding += ins.len();
-                    if consecutive_padding >= 2 {
-                        size = tmp_size - consecutive_padding;
-                        break;
+                    if saw_ret {
+                        consecutive_padding += ins.len();
+                        if consecutive_padding >= 4 {
+                            size = tmp_size - consecutive_padding;
+                            break;
+                        }
                     }
                 } else {
                     consecutive_padding = 0;
+                    if !format!("{:?}", ins.code()).starts_with("Ret") {
+                        saw_ret = false;
+                    }
                 }
             } else {
                 break;
