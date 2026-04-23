@@ -33,6 +33,9 @@ pub struct PayloadConfig {
     /// look for the `ORCHESTRA_SECRET` runtime environment variable.
     #[serde(default)]
     pub c_server_secret: Option<String>,
+    /// Optional fingerprint to compile into the agent for TLS pinning.
+    #[serde(default)]
+    pub server_cert_fingerprint: Option<String>,
     /// Cargo feature flags to enable on the agent crate.
     #[serde(default)]
     pub features: Vec<String>,
@@ -193,6 +196,7 @@ pub fn cmd_configure(name: Option<String>) -> Result<()> {
         encryption_key,
         hmac_key: hmac_key_b64,
         c_server_secret,
+        server_cert_fingerprint: None,
         features,
         output_name: None,
         package: "launcher".to_string(),
@@ -294,6 +298,7 @@ mod tests {
             encryption_key: "file:key.bin".to_string(),
             hmac_key: "file:hmac.bin".to_string(),
             c_server_secret: Some("secret".to_string()),
+            server_cert_fingerprint: None,
             features: vec!["persistence".to_string()],
             output_name: Some("test_agent".to_string()),
             package: "agent-standalone".to_string(),
@@ -314,6 +319,7 @@ mod tests {
             encryption_key: "short".to_string(),
             hmac_key: "also short".to_string(),
             c_server_secret: None,
+            server_cert_fingerprint: None,
             features: vec![],
             output_name: None,
             package: "launcher".to_string(),
@@ -331,6 +337,7 @@ mod tests {
             encryption_key: "a".repeat(44), // 32 bytes b64
             hmac_key: "b".repeat(44),
             c_server_secret: None,
+            server_cert_fingerprint: None,
             features: vec![],
             output_name: None,
             package: "launcher".to_string(),

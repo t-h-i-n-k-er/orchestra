@@ -9,6 +9,7 @@
 //! the dashboard and clean up by closing the rogue connection.
 
 use crate::audit::AuditLog;
+use crate::config::ServerConfig;
 use common::Message;
 use dashmap::DashMap;
 use serde::Serialize;
@@ -59,16 +60,18 @@ pub struct AppState {
     pub audit: Arc<AuditLog>,
     pub admin_token: String,
     pub command_timeout_secs: u64,
+    pub config: ServerConfig,
 }
 
 impl AppState {
-    pub fn new(audit: Arc<AuditLog>, admin_token: String, command_timeout_secs: u64) -> Self {
+    pub fn new(audit: Arc<AuditLog>, admin_token: String, command_timeout_secs: u64, config: ServerConfig) -> Self {
         Self {
             registry: DashMap::new(),
             pending: DashMap::new(),
             audit,
             admin_token,
             command_timeout_secs,
+            config,
         }
     }
 

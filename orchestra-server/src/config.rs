@@ -24,11 +24,20 @@ pub struct ServerConfig {
     pub tls_key_path: Option<PathBuf>,
     /// Filesystem path to the static dashboard assets directory.
     pub static_dir: PathBuf,
+    #[serde(default = "default_builds_dir")]
+    pub builds_output_dir: PathBuf,
+    #[serde(default = "default_build_retention_days")]
+    pub build_retention_days: u32,
+    #[serde(default = "default_max_concurrent_builds")]
+    pub max_concurrent_builds: usize,
     /// How long (seconds) to wait for an agent to reply before timing out a command.
     #[serde(default = "default_command_timeout")]
     pub command_timeout_secs: u64,
 }
 
+fn default_builds_dir() -> PathBuf { PathBuf::from("/var/lib/orchestra/builds") }
+fn default_build_retention_days() -> u32 { 7 }
+fn default_max_concurrent_builds() -> usize { 1 }
 fn default_command_timeout() -> u64 {
     30
 }
@@ -44,6 +53,9 @@ impl Default for ServerConfig {
             tls_cert_path: None,
             tls_key_path: None,
             static_dir: PathBuf::from("orchestra-server/static"),
+            builds_output_dir: default_builds_dir(),
+            build_retention_days: 7,
+            max_concurrent_builds: 1,
             command_timeout_secs: 30,
         }
     }

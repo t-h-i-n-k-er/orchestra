@@ -119,7 +119,7 @@ impl Drop for ShellSession {
             self.is_running
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
+            crate::evasion::spawn_hidden_thread(move || {
                 let _ = handle.join();
                 let _ = tx.send(());
             });

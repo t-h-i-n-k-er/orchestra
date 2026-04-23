@@ -56,7 +56,14 @@ async fn main() -> Result<()> {
         audit.clone(),
         cfg.admin_token.clone(),
         cfg.command_timeout_secs,
+        cfg.clone(),
     ));
+
+    orchestra_server::build_handler::init_build_queue(
+        cfg.max_concurrent_builds,
+        cfg.builds_output_dir.clone(),
+        cfg.build_retention_days,
+    );
 
     let tls_cfg = tls::build(cfg.tls_cert_path.as_deref(), cfg.tls_key_path.as_deref()).await?;
 
