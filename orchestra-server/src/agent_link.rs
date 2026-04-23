@@ -19,9 +19,6 @@ use anyhow::Result;
 use common::{CryptoSession, Message};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::io::{ReadHalf, WriteHalf};
-use tokio_rustls::server::TlsStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -42,17 +39,11 @@ async fn read_frame<S: AsyncReadExt + Unpin>(r: &mut S, sess: &CryptoSession) ->
     Ok(serde_json::from_slice(&plain)?)
 }
 
-async fn read_frame_tls<S: AsyncReadExt + Unpin>(r: &mut S) -> Result<Message> {
-    let len = r.read_u32_le().await?;
-    if len > MAX_FRAME_BYTES {
-        anyhow::bail!("agent frame too large: {len} bytes");
-    }
-    let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf).await?;
-    Ok(serde_json::from_slice(&buf)?)
-}
-
-async fn write_frame<S: AsyncWriteExt + Unpin>(w: &mut S, sess: &CryptoSession, msg: &Message) -> Result<()> {
+async fn write_frame<S: AsyncWriteExt + Unpin>(
+    w: &mut S,
+    sess: &CryptoSession,
+    msg: &Message,
+) -> Result<()> {
     let plain = serde_json::to_vec(msg)?;
     let enc = sess.encrypt(&plain);
     w.write_u32_le(enc.len() as u32).await?;
@@ -60,21 +51,24 @@ async fn write_frame<S: AsyncWriteExt + Unpin>(w: &mut S, sess: &CryptoSession, 
     Ok(())
 }
 
-async fn write_frame_tls<S: AsyncWriteExt + Unpin>(w: &mut S, msg: &Message) -> Result<()> {
-    let plain = serde_json::to_vec(msg)?;
-    w.write_u32_le(plain.len() as u32).await?;
-    w.write_all(&plain).await?;
-    Ok(())
-}
-
-pub async fn run(state: Arc<AppState>, addr: std::net::SocketAddr, secret: String, tls: Arc<rustls::ServerConfig>) -> Result<()> {
+pub async fn run(
+    state: Arc<AppState>,
+    addr: std::net::SocketAddr,
+    secret: String,
+    tls: Arc<rustls::ServerConfig>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "agent listener bound");
     serve(state, listener, secret, tls).await
 }
 
 /// Drive a pre-bound listener. Useful for tests that want an ephemeral port.
-pub async fn serve(state: Arc<AppState>, listener: TcpListener, secret: String, tls: Arc<rustls::ServerConfig>) -> Result<()> {
+pub async fn serve(
+    state: Arc<AppState>,
+    listener: TcpListener,
+    secret: String,
+    tls: Arc<rustls::ServerConfig>,
+) -> Result<()> {
     loop {
         let (sock, peer) = listener.accept().await?;
         let state_c = state.clone();
@@ -100,7 +94,7 @@ pub async fn serve(state: Arc<AppState>, listener: TcpListener, secret: String, 
 }
 
 async fn handle_agent(
-    mut sock: TcpStream,
+    sock: TcpStream,
     peer: String,
     connection_id: String,
     state: Arc<AppState>,
@@ -110,16 +104,18 @@ async fn handle_agent(
     sock.set_nodelay(true).ok();
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-    let mut tls_stream = acceptor.accept(sock).await?;
+    let tls_stream = acceptor.accept(sock).await?;
 
     let (mut r, mut w) = tokio::io::split(tls_stream);
 
     let (tx, mut rx) = mpsc::channel::<Message>(CHANNEL_DEPTH);
+    let session = Arc::new(CryptoSession::from_shared_secret(secret.as_bytes()));
 
     // Writer task drains commands from the API layer onto the wire.
+    let writer_session = session.clone();
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if let Err(e) = write_frame_tls(&mut w, &msg).await {
+            if let Err(e) = write_frame(&mut w, &writer_session, &msg).await {
                 tracing::warn!("agent write error: {e}");
                 break;
             }
@@ -131,7 +127,7 @@ async fn handle_agent(
     let mut registered = false;
 
     loop {
-        let msg = match read_frame_tls(&mut r).await {
+        let msg = match read_frame(&mut r, &session).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::debug!(connection_id = %conn_id, %peer, "agent read terminated: {e}");

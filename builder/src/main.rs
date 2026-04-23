@@ -5,14 +5,11 @@ mod config;
 mod deps;
 
 use anyhow::{Context, Result};
-use base64::Engine;
 use clap::{Parser, Subcommand};
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Select};
 use tracing::info;
 
 use crate::config::{
-    list_profiles, load_profile, profile_path, read_agent_features, save_profile, PayloadConfig,
-    PROFILES_DIR,
+    list_profiles, load_profile,
 };
 
 #[derive(Parser, Debug)]
@@ -111,4 +108,3 @@ fn main() -> Result<()> {
         }
     }
 }
-

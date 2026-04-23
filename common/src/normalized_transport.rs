@@ -79,8 +79,8 @@ const FAKE_CIPHER_SUITES: &[u16] = &[
 
 // GREASE (Generate Random Extensions And Sustain Extensibility) values.
 const GREASE_VALUES: &[u16] = &[
-    0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A, 0x8A8A, 0x9A9A, 0xAAAA,
-    0xBABA, 0xCACA, 0xDADA, 0xEAEA, 0xFAFA,
+    0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A, 0x8A8A, 0x9A9A, 0xAAAA, 0xBABA,
+    0xCACA, 0xDADA, 0xEAEA, 0xFAFA,
 ];
 
 /// Role of the local endpoint in the fake handshake.
@@ -151,7 +151,10 @@ where
 
         let body_len = 2 + pad.len() + chunk.len();
         // Guaranteed ≤ u16::MAX because chunk.len() ≤ MAX_FRAG_PAYLOAD.
-        debug_assert!(body_len <= u16::MAX as usize, "fragment body exceeds u16 max");
+        debug_assert!(
+            body_len <= u16::MAX as usize,
+            "fragment body exceeds u16 max"
+        );
 
         // 5-byte TLS record header.
         let mut header = [0u8; 5];
@@ -364,10 +367,10 @@ where
                 ext.extend_from_slice(&[0x00, 0x33]); // type: key_share
                 let mut key = [0u8; 32];
                 rng.fill_bytes(&mut key);
-                
+
                 let share_len: u16 = 2 + 2 + 32; // group + key_len + key
                 let ext_len = share_len + 2; // + list length
-                
+
                 ext.extend_from_slice(&ext_len.to_be_bytes());
                 ext.extend_from_slice(&share_len.to_be_bytes());
                 ext.extend_from_slice(&0x001du16.to_be_bytes()); // group: x25519
@@ -393,9 +396,9 @@ where
                 ext.extend_from_slice(&[0x00, 0x33]); // type: key_share
                 let mut key = [0u8; 32];
                 rng.fill_bytes(&mut key);
-                
+
                 let ext_len: u16 = 2 + 2 + 32; // group + key_len + key
-                
+
                 ext.extend_from_slice(&ext_len.to_be_bytes());
                 ext.extend_from_slice(&0x001du16.to_be_bytes()); // group: x25519
                 ext.extend_from_slice(&32u16.to_be_bytes()); // key_exchange length

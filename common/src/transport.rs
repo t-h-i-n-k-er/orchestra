@@ -32,7 +32,11 @@ impl Transport for TcpTransport {
     async fn recv(&mut self) -> Result<Message> {
         let len = self.stream.read_u32_le().await?;
         if len > MAX_FRAME_BYTES {
-            anyhow::bail!("Frame length {} exceeds maximum allowed {}", len, MAX_FRAME_BYTES);
+            anyhow::bail!(
+                "Frame length {} exceeds maximum allowed {}",
+                len,
+                MAX_FRAME_BYTES
+            );
         }
         let mut buffer = vec![0; len as usize];
         self.stream.read_exact(&mut buffer).await?;

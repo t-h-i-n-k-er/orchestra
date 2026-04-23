@@ -40,9 +40,24 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
         let state_a = state.clone();
         let secret = cfg.agent_shared_secret.clone();
         tokio::spawn(async move {
-            agent_link::serve(state_a, agent_listener, secret, Arc::new(rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![], rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(vec![]))).unwrap()))
-                .await
-                .unwrap();
+            agent_link::serve(
+                state_a,
+                agent_listener,
+                secret,
+                Arc::new(
+                    rustls::ServerConfig::builder()
+                        .with_no_client_auth()
+                        .with_single_cert(
+                            vec![],
+                            rustls::pki_types::PrivateKeyDer::Pkcs8(
+                                rustls::pki_types::PrivatePkcs8KeyDer::from(vec![]),
+                            ),
+                        )
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
         });
     }
 

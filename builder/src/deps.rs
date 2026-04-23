@@ -15,7 +15,10 @@ fn required_system_packages() -> &'static [(&'static str, &'static str)] {
     {
         &[
             ("cc", "sudo apt-get install -y build-essential"),
-            ("pkg-config", "sudo apt-get install -y pkg-config"),
+            (
+                "pkg-config",
+                "sudo apt-get install -y pkg-config libxi-dev libxtst-dev libx11-dev",
+            ),
             (
                 "x86_64-w64-mingw32-gcc",
                 "sudo apt-get install -y mingw-w64  # for cross-compiling to Windows",
@@ -63,7 +66,9 @@ pub fn cmd_setup(auto_install: bool) -> Result<()> {
         info!("Re-running dependency check...");
         ensure_dependencies(true)?;
     } else {
-        anyhow::bail!("Dependencies missing. Re-run with `--auto-install` to attempt installation.");
+        anyhow::bail!(
+            "Dependencies missing. Re-run with `--auto-install` to attempt installation."
+        );
     }
     Ok(())
 }

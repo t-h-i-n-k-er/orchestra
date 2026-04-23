@@ -254,7 +254,11 @@ pub async fn tcp_port_scan(
     let mut handles = Vec::with_capacity(ports.len());
 
     for &port in ports {
-        let permit = sem.clone().acquire_owned().await.map_err(|e| e.to_string())?;
+        let permit = sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| e.to_string())?;
         handles.push(tokio::spawn(async move {
             let is_open = tokio::time::timeout(timeout, TcpStream::connect((host, port)))
                 .await

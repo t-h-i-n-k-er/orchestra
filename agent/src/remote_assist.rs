@@ -42,8 +42,7 @@ where
         let mut borrow = cell.borrow_mut();
         if borrow.is_none() {
             *borrow = Some(
-                Enigo::new(&Settings::default())
-                    .map_err(|e| anyhow!("enigo init failed: {e}"))?,
+                Enigo::new(&Settings::default()).map_err(|e| anyhow!("enigo init failed: {e}"))?,
             );
         }
         f(borrow.as_mut().unwrap())
@@ -51,13 +50,29 @@ where
 }
 
 /// Checks for the existence of a consent flag.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn check_consent() -> Result<()> {
     if std::path::Path::new("/var/run/orchestra-consent").exists() {
         Ok(())
     } else {
         Err(anyhow!(
             "Remote assistance consent not granted on target machine. Missing /var/run/orchestra-consent."
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn check_consent() -> Result<()> {
+    // macOS requires root to write to /var/run by default.
+    // Instead use the system user's temporary consent file or preferences flag.
+    let consent_path = std::env::var("HOME")
+        .map(|h| format!("{}/.orchestra-consent", h))
+        .unwrap_or_else(|_| "/tmp/orchestra-consent".to_string());
+    if std::path::Path::new(&consent_path).exists() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "Remote assistance consent not granted on target machine. Missing macOS consent flag."
         ))
     }
 }
@@ -88,9 +103,7 @@ pub fn capture_screen() -> Result<Vec<u8>> {
         check_consent()?;
         // On Wayland without an X11 socket, x11cap will fail silently.
         // Detect and report this explicitly so callers receive a useful error.
-        if std::env::var_os("WAYLAND_DISPLAY").is_some()
-            && std::env::var_os("DISPLAY").is_none()
-        {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_none() {
             return Err(anyhow!(
                 "Screen capture is not supported on a pure Wayland session. \
                  Enable XWayland (set DISPLAY) or use an XDG Desktop Portal-compatible tool."
@@ -145,11 +158,11 @@ pub fn capture_screen() -> Result<Vec<u8>> {
             .args(["-x", "-t", "png", "-"])
             .output()
             .map_err(|e| anyhow!("screencapture invocation failed: {e}"))?;
-            
+
         if !output.status.success() {
             return Err(anyhow!("screencapture exited with non-zero status"));
         }
-        
+
         Ok(output.stdout)
     }
     #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]

@@ -39,7 +39,12 @@ fn sanitize_action(cmd: &Command) -> String {
     }
 }
 
-pub(crate) fn make_audit(action: &str, outcome: Outcome, details: &str, operator_id: &str) -> AuditEvent {
+pub(crate) fn make_audit(
+    action: &str,
+    outcome: Outcome,
+    details: &str,
+    operator_id: &str,
+) -> AuditEvent {
     let agent_id = System::host_name().unwrap_or_else(|| "unknown".to_string());
     AuditEvent::new(&agent_id, operator_id, action, details, outcome)
 }
@@ -218,7 +223,11 @@ pub async fn handle_command(
                 Err("Invalid module_id (allowed: [a-zA-Z0-9_-]{1,128})".to_string())
             } else {
                 let cfg = config.lock().await.clone();
-                let path = Path::new(&cfg.module_cache_dir).join(format!("{}.so", module_id));
+                let path = Path::new(&cfg.module_cache_dir).join(format!(
+                    "{}.{}",
+                    module_id,
+                    std::env::consts::DLL_EXTENSION
+                ));
                 let path_str = path.to_string_lossy().into_owned();
                 match fsops::read_file(&path_str, &cfg).await {
                     Err(e) => Err(format!("Failed to read module blob: {e}")),
@@ -288,7 +297,10 @@ pub async fn handle_command(
         #[cfg(not(feature = "persistence"))]
         Command::DisablePersistence => Err("persistence feature not enabled".to_string()),
 
-        Command::Shutdown => { SHUTDOWN_NOTIFY.notify_one(); Ok("Agent shutdown sequence initiated".to_string()) },
+        Command::Shutdown => {
+            SHUTDOWN_NOTIFY.notify_one();
+            Ok("Agent shutdown sequence initiated".to_string())
+        }
     };
 
     let (outcome, details) = match &result {
@@ -364,7 +376,9 @@ mod tests {
         // a writable cache dir, then verify the handler reaches the
         // module_loader stage rather than failing at path validation.
         let cache = tempfile::tempdir().unwrap();
-        let blob_path = cache.path().join("test_mod.so");
+        let blob_path = cache
+            .path()
+            .join(format!("test_mod.{}", std::env::consts::DLL_EXTENSION));
         std::fs::write(&blob_path, b"not-a-real-plugin").unwrap();
 
         let cfg = Config {

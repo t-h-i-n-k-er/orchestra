@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use tracing::{info, warn};
 
 use crate::config::{partition_features, read_agent_features, PayloadConfig};
@@ -86,10 +86,7 @@ fn cargo_build(
     }
 
     // The final binary is in `target/<triple>/release/<bin_name>`.
-    let path = Path::new("target")
-        .join(triple)
-        .join("release")
-        .join(bin);
+    let path = Path::new("target").join(triple).join("release").join(bin);
     Ok(path)
 }
 

@@ -48,6 +48,7 @@ winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memory
 hollowing = { path = "../hollowing" }
 
 [features]
+dev = []
 persistence = []
 network-discovery = []
 # `dep:x11cap` only resolves when compiling for Linux (see

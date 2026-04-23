@@ -11,7 +11,6 @@
 
 use std::path::Path;
 
-
 /// Outcome of all individual environment probes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvReport {
@@ -156,7 +155,7 @@ fn windows_is_debugger_present() -> bool {
 ///
 /// This is a collection of soft indicators. The CPUID hypervisor bit is no
 /// longer a hard failure, but contributes to the overall `vm_detected` score.
-fn is_cloud_provider() -> bool {
+fn is_expected_hypervisor() -> bool {
     #[cfg(target_os = "linux")]
     {
         const DMI: &[&str] = &[
@@ -167,20 +166,20 @@ fn is_cloud_provider() -> bool {
         for path in DMI {
             if let Ok(s) = std::fs::read_to_string(path) {
                 let s = s.to_ascii_lowercase();
-                if s.contains("amazon ec2") || s.contains("google") || s.contains("microsoft corporation") {
+                if s.contains("amazon ec2") || s.contains("google compute") {
                     return true;
                 }
             }
         }
-        
         if let Ok(s) = std::fs::read_to_string("/proc/version") {
             let s = s.to_ascii_lowercase();
+            // Don't flag WSL as a VM
             if s.contains("microsoft") || s.contains("wsl") {
                 return true;
             }
         }
     }
-    
+
     #[cfg(windows)]
     {
         use winreg::enums::HKEY_LOCAL_MACHINE;
@@ -189,7 +188,11 @@ fn is_cloud_provider() -> bool {
         if let Ok(k) = hklm.open_subkey("HARDWARE\\DESCRIPTION\\System\\BIOS") {
             if let Ok(v) = k.get_value::<String, _>("SystemManufacturer") {
                 let s = v.to_ascii_lowercase();
-                if s.contains("amazon") || s.contains("google") || s.contains("microsoft corporation") {
+                // "microsoft corporation" means Surface in many contexts, allowing hypervisor for features without flagging VM
+                if s.contains("amazon")
+                    || s.contains("google")
+                    || s.contains("microsoft corporation")
+                {
                     return true;
                 }
             }
@@ -201,14 +204,14 @@ fn is_cloud_provider() -> bool {
             }
         }
     }
-    
+
     false
 }
 
 pub fn detect_vm() -> bool {
     // The hypervisor bit is now just one of several indicators.
     let mut indicators = 0;
-    if cpuid_hypervisor_bit() && !is_cloud_provider() {
+    if cpuid_hypervisor_bit() && !is_expected_hypervisor() {
         indicators += 1;
     }
     #[cfg(target_os = "linux")]
@@ -299,14 +302,22 @@ fn macos_system_profiler_indicates_vm() -> bool {
     let mut is_vm = false;
 
     // Check sysctl hw.model and kern.hv_support
-    if let Ok(output) = std::process::Command::new("sysctl").arg("-n").arg("hw.model").output() {
+    if let Ok(output) = std::process::Command::new("sysctl")
+        .arg("-n")
+        .arg("hw.model")
+        .output()
+    {
         let model = String::from_utf8_lossy(&output.stdout).to_lowercase();
         if model.contains("virtual") || model.contains("vmware") || model.contains("pxe") {
             is_vm = true;
         }
     }
 
-    if let Ok(output) = std::process::Command::new("sysctl").arg("-n").arg("kern.hv_support").output() {
+    if let Ok(output) = std::process::Command::new("sysctl")
+        .arg("-n")
+        .arg("kern.hv_support")
+        .output()
+    {
         let support = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if support == "1" {
             // Native hypervisor framework is supported, which might mean we are the host, or a guest that supports nested.
@@ -316,7 +327,11 @@ fn macos_system_profiler_indicates_vm() -> bool {
 
     if let Ok(output) = std::process::Command::new("ioreg").arg("-l").output() {
         let ioreg = String::from_utf8_lossy(&output.stdout).to_lowercase();
-        if ioreg.contains("virtualbox") || ioreg.contains("vmware") || ioreg.contains("parallels") || ioreg.contains("qemu") {
+        if ioreg.contains("virtualbox")
+            || ioreg.contains("vmware")
+            || ioreg.contains("parallels")
+            || ioreg.contains("qemu")
+        {
             is_vm = true;
         }
     }
@@ -405,7 +420,8 @@ fn mac_prefix_indicates_vm() -> bool {
                     let addr = (*curr).ifa_addr;
                     if !addr.is_null() && (*addr).sa_family as libc::c_int == libc::AF_LINK {
                         let sdl = addr as *const libc::sockaddr_dl;
-                        let ptr = (*sdl).sdl_data.as_ptr().offset((*sdl).sdl_nlen as isize) as *const u8;
+                        let ptr =
+                            (*sdl).sdl_data.as_ptr().offset((*sdl).sdl_nlen as isize) as *const u8;
                         let alen = (*sdl).sdl_alen as usize;
                         if alen >= 3 {
                             let mac = std::slice::from_raw_parts(ptr, 3);
@@ -520,9 +536,15 @@ fn is_tracer_process_running() -> bool {
     if let Ok(procs) = std::fs::read_dir("/proc") {
         for proc in procs.flatten() {
             if let Ok(cmdline) = std::fs::read_to_string(proc.path().join("cmdline")) {
-                let cmdline = cmdline.replace('\0', " ");
-                if tracers.iter().any(|t| cmdline.contains(t)) {
-                    return true;
+                let parts: Vec<&str> = cmdline.split('\0').collect();
+                if let Some(prog) = parts.first() {
+                    let prog_name = Path::new(prog)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("");
+                    if tracers.contains(&prog_name) {
+                        return true;
+                    }
                 }
             }
         }
@@ -542,17 +564,16 @@ fn detect_timing_anomaly() -> bool {
         std::thread::sleep(std::time::Duration::from_millis(10));
         times.push(start.elapsed().as_millis() as f64);
     }
-    
+
     let sum: f64 = times.iter().sum();
     let mean = sum / 10.0;
-    
+
     let variance: f64 = times.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / 10.0;
-    
-    // Large single spikes (like breakpoint hits) or huge slowdowns (emulation) 
-    // Usually a 10ms sleep takes ~10-15ms.
-    let mean_anomaly = mean > 50.0;
-    let var_anomaly = variance > 2500.0;
-    
+
+    // Loosen constraints for heavily loaded servers
+    let mean_anomaly = mean > 250.0;
+    let var_anomaly = variance > 10000.0;
+
     // Flag if either the mean is outrageously high (slow execution overall, e.g., heavy tracing)
     // or variance is high (e.g., hit a breakpoint on a single iteration and spent time paused)
     mean_anomaly || var_anomaly

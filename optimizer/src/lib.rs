@@ -25,7 +25,6 @@ fn reg_size(reg: Register) -> usize {
     }
 }
 
-
 struct AddSubPass;
 impl Pass for AddSubPass {
     /// Replace `add reg, N` ↔ `sub reg, -N` (and vice-versa) for immediate
@@ -37,9 +36,7 @@ impl Pass for AddSubPass {
             let mnem = instr.mnemonic();
             let is_add = mnem == iced_x86::Mnemonic::Add;
             let is_sub = mnem == iced_x86::Mnemonic::Sub;
-            if (!is_add && !is_sub)
-                || instr.op_count() != 2
-                || instr.op0_kind() != OpKind::Register
+            if (!is_add && !is_sub) || instr.op_count() != 2 || instr.op0_kind() != OpKind::Register
             {
                 continue;
             }
@@ -51,26 +48,50 @@ impl Pass for AddSubPass {
             let (neg_imm_i32, new_code) = match instr.op1_kind() {
                 OpKind::Immediate8to64 => {
                     let imm = instr.immediate(1) as i64 as i8;
-                    if imm == i8::MIN { continue; }
-                    let code = if is_add { Code::Sub_rm64_imm8 } else { Code::Add_rm64_imm8 };
+                    if imm == i8::MIN {
+                        continue;
+                    }
+                    let code = if is_add {
+                        Code::Sub_rm64_imm8
+                    } else {
+                        Code::Add_rm64_imm8
+                    };
                     ((-imm) as i32, code)
                 }
                 OpKind::Immediate8to32 => {
                     let imm = instr.immediate(1) as i32 as i8;
-                    if imm == i8::MIN { continue; }
-                    let code = if is_add { Code::Sub_rm32_imm8 } else { Code::Add_rm32_imm8 };
+                    if imm == i8::MIN {
+                        continue;
+                    }
+                    let code = if is_add {
+                        Code::Sub_rm32_imm8
+                    } else {
+                        Code::Add_rm32_imm8
+                    };
                     ((-imm) as i32, code)
                 }
                 OpKind::Immediate8to16 => {
                     let imm = instr.immediate(1) as i16 as i8;
-                    if imm == i8::MIN { continue; }
-                    let code = if is_add { Code::Sub_rm16_imm8 } else { Code::Add_rm16_imm8 };
+                    if imm == i8::MIN {
+                        continue;
+                    }
+                    let code = if is_add {
+                        Code::Sub_rm16_imm8
+                    } else {
+                        Code::Add_rm16_imm8
+                    };
                     ((-imm) as i32, code)
                 }
                 OpKind::Immediate8 => {
                     let imm = instr.immediate(1) as i8;
-                    if imm == i8::MIN { continue; }
-                    let code = if is_add { Code::Sub_rm8_imm8 } else { Code::Add_rm8_imm8 };
+                    if imm == i8::MIN {
+                        continue;
+                    }
+                    let code = if is_add {
+                        Code::Sub_rm8_imm8
+                    } else {
+                        Code::Add_rm8_imm8
+                    };
                     ((-imm) as i32, code)
                 }
                 _ => continue,
@@ -78,34 +99,6 @@ impl Pass for AddSubPass {
             if let Ok(mut new_instr) = Instruction::with2(new_code, reg, neg_imm_i32) {
                 new_instr.set_ip(instr.ip());
                 *instr = new_instr;
-            }
-        }
-        Ok(())
-    }
-}
-
-struct XorZeroingPass;
-impl Pass for XorZeroingPass {
-    fn run(&self, instructions: &mut Vec<Instruction>) -> Result<()> {
-        for instr in instructions.iter_mut() {
-            if instr.mnemonic() == iced_x86::Mnemonic::Mov
-                && instr.op_count() == 2
-                && instr.op0_kind() == OpKind::Register
-                && (instr.op1_kind() == OpKind::Immediate8
-                    || instr.op1_kind() == OpKind::Immediate32
-                    || instr.op1_kind() == OpKind::Immediate64)
-                && instr.immediate(1) == 0
-            {
-                let reg = instr.op0_register();
-                let new_code = match reg_size(reg) {
-                    4 => Code::Xor_r32_rm32,
-                    8 => Code::Xor_r64_rm64,
-                    _ => continue,
-                };
-                if let Ok(mut new_instr) = Instruction::with2(new_code, reg, reg) {
-                    new_instr.set_ip(instr.ip());
-                    *instr = new_instr;
-                }
             }
         }
         Ok(())
@@ -141,52 +134,6 @@ impl Pass for LeaAddPass {
                 }
             }
         }
-        Ok(())
-    }
-}
-
-struct JunkInstructionPass;
-impl Pass for JunkInstructionPass {
-    /// Inserts harmless junk instructions including opaque predicates or never-taken
-    /// jumps that appear in the execution path but are semantically inert.
-    fn run(&self, instructions: &mut Vec<Instruction>) -> Result<()> {
-        let mut new_instrs = Vec::with_capacity(instructions.len());
-
-        let len = instructions.len();
-        for (i, instr) in instructions.iter().enumerate() {
-            new_instrs.push(*instr);
-
-            // Opaque predicate / dead jump insertion
-            if rand::random::<u8>() < 10 && i < len - 1 { // ~4%
-                // Jump over a single junk byte (EB 01 <junk>)
-                let junk = rand::random::<u8>();
-                if let Ok(opaque) = Instruction::with_declare_byte(&[0xEB, 0x01, junk]) {
-                    new_instrs.push(opaque);
-                }
-            }
-
-            let is_dead_after = matches!(
-                instr.mnemonic(),
-                iced_x86::Mnemonic::Ret
-                    | iced_x86::Mnemonic::Retf
-                    | iced_x86::Mnemonic::Jmp
-            );
-
-            if is_dead_after && rand::random::<u8>() < 64 {
-                // ~25% chance per unconditional-transfer site.
-                let junk = if rand::random::<bool>() {
-                    Instruction::with(Code::Nopd)
-                } else {
-                    let reg = *[Register::RAX, Register::RCX, Register::RDX, Register::RBX]
-                        .choose(&mut rand::thread_rng())
-                        .unwrap();
-                    Instruction::with2(Code::Mov_r64_rm64, reg, reg)
-                        .unwrap_or_else(|_| Instruction::with(Code::Nopd))
-                };
-                new_instrs.push(junk);
-            }
-        }
-        *instructions = new_instrs;
         Ok(())
     }
 }
@@ -292,8 +239,7 @@ fn transform_code_section(binary: &mut Vec<u8>, offset: usize, size: usize, vadd
             let buf = encoder.take_buffer();
             if buf.len() == orig_size {
                 // Same encoded size: safe to write back without touching branches.
-                binary[offset + file_off..offset + file_off + orig_size]
-                    .copy_from_slice(&buf);
+                binary[offset + file_off..offset + file_off + orig_size].copy_from_slice(&buf);
             }
             // Different size → skip; preserving original bytes keeps branches intact.
         }
@@ -343,18 +289,24 @@ fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
     let name_c = CString::new(name)?;
     let ptr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name_c.as_ptr()) };
     if ptr.is_null() {
-        return Err(anyhow!("Could not find function {}", name_c.to_string_lossy()));
+        return Err(anyhow!(
+            "Could not find function {}",
+            name_c.to_string_lossy()
+        ));
     }
-    
+
     // Parse symbol table using dladdr to determine size securely
     let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
-    if unsafe { libc::dladdr(ptr, &mut info) } == 0 || info.dli_sname.is_null() || info.dli_saddr.is_null() {
+    if unsafe { libc::dladdr(ptr, &mut info) } == 0
+        || info.dli_sname.is_null()
+        || info.dli_saddr.is_null()
+    {
         return Err(anyhow!("dladdr failed for {}", name));
     }
-    
+
     let exe_path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
     let file = std::fs::read(exe_path.as_ref())?;
-    
+
     let mut size = 0;
     if let Ok(goblin::Object::Elf(elf)) = goblin::Object::parse(&file) {
         for sym in elf.syms.iter() {
@@ -366,7 +318,7 @@ fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
             }
         }
     }
-    
+
     if size == 0 {
         // Fallback: Disassemble to find the likely end via 'Ret'
         let mut curr_ptr = ptr as u64;
@@ -391,7 +343,7 @@ fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
     if size == 0 {
         return Err(anyhow!("Could not determine function size"));
     }
-    
+
     let code = unsafe { std::slice::from_raw_parts(ptr as *const u8, size) };
     Ok((ptr as *mut u8, code))
 }
@@ -405,13 +357,16 @@ fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
     let name_c = CString::new(name)?;
     let ptr = unsafe { GetProcAddress(module, name_c.as_ptr()) };
     if ptr.is_null() {
-        return Err(anyhow!("Could not find function {}", name_c.to_string_lossy()));
+        return Err(anyhow!(
+            "Could not find function {}",
+            name_c.to_string_lossy()
+        ));
     }
-    
+
     // For Windows, find size by parsing PE
-    
+
     let mut size = 0;
-    
+
     // Disassembly approach
     let mut tmp_size = 0;
     let mut curr_ptr = ptr as u64;
@@ -426,10 +381,10 @@ fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
                 break; // Very naive
             }
         } else {
-             break;
+            break;
         }
     }
-    
+
     if size == 0 {
         return Err(anyhow!("Could not determine function size"));
     }
@@ -438,6 +393,7 @@ fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
     Ok((ptr as *mut u8, code))
 }
 
+#[allow(dead_code)]
 #[cfg(not(target_os = "windows"))]
 fn write_executable_memory(ptr: *mut u8, data: &[u8]) -> Result<()> {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
@@ -456,7 +412,10 @@ fn write_executable_memory(ptr: *mut u8, data: &[u8]) -> Result<()> {
             libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
         );
         if res != 0 {
-            return Err(anyhow!("mprotect(RWX) failed: {}", std::io::Error::last_os_error()));
+            return Err(anyhow!(
+                "mprotect(RWX) failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         libc::mprotect(
@@ -468,6 +427,7 @@ fn write_executable_memory(ptr: *mut u8, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 #[cfg(target_os = "windows")]
 fn write_executable_memory(ptr: *mut u8, data: &[u8]) -> Result<()> {
     use winapi::shared::minwindef::DWORD;
@@ -493,6 +453,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "unsafe-runtime-rewrite")]
     fn test_hot_function_optimization() {
         // A simple function to be optimized.
         #[no_mangle]

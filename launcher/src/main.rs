@@ -154,35 +154,15 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
-    // Development-only fallback: macOS does not expose a stable
-    // anonymous-fd-exec primitive comparable to memfd_create + execv, and a
-    // real production deployment would use a code-signed launcher. For the
-    // dev workflow we materialise the payload into a temporary file and exec it.
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::process::CommandExt;
-    tracing::warn!(
-        "macOS: in-memory exec not available; using temp-file fallback (development only)"
-    );
-    // Use a random component in the filename to mitigate symlink attacks, and
-    // create the file with mode 0o700 atomically so it is never world-readable.
-    let random_suffix: u64 = rand::random();
-    let path = std::env::temp_dir()
-        .join(format!("orchestra-agent-{:x}", random_suffix));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)   // fails if path already exists → no TOCTOU race
-        .mode(0o700)        // owner-execute only, set atomically on create
-        .open(&path)
-        .with_context(|| format!("failed to create temp file {}", path.display()))?;
-    file.write_all(payload)
-        .with_context(|| "failed to write payload to temp file")?;
-    drop(file); // close before exec
-    let mut child = std::process::Command::new(&path).args(args).spawn()?;
-    let _ = std::fs::remove_file(&path);
-    let status = child.wait()?;
-    std::process::exit(status.code().unwrap_or(1));
+fn execute_in_memory(_payload: &[u8], _args: &[String]) -> Result<()> {
+    // macOS does not expose a stable anonymous-fd-exec primitive comparable
+    // to memfd_create + execv. Writing to a temp file defeats the zero-disk-footprint 
+    // requirement and leaves traces in fs_usage.
+    // A production macOS deployment would either require a custom dyld in-memory
+    // loader or execution via task_for_pid.
+    Err(anyhow!(
+        "macOS in-memory execution is not supported without a custom loader"
+    ))
 }
 
 #[cfg(target_os = "windows")]

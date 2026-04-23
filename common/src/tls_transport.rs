@@ -25,7 +25,10 @@ impl PinnedCertVerifier {
     /// Returns an error if the string is not exactly 64 valid hex digits.
     pub fn from_hex(hex: &str) -> Result<Self> {
         if hex.len() != 64 {
-            anyhow::bail!("certificate fingerprint must be 64 hex characters, got {}", hex.len());
+            anyhow::bail!(
+                "certificate fingerprint must be 64 hex characters, got {}",
+                hex.len()
+            );
         }
         let mut bytes = [0u8; 32];
         for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
@@ -196,8 +199,12 @@ fn cert_validity_period(der: &[u8]) -> Option<(i64, i64)> {
     // Navigate: Certificate → TBSCertificate → (skip fields) → Validity.
     let p = enter(der, 0, 0x30)?; // outer Certificate SEQUENCE
     let p = enter(der, p, 0x30)?; // TBSCertificate SEQUENCE
-    // optional [0] version
-    let p = if der.get(p)? == &0xa0 { skip(der, p)? } else { p };
+                                  // optional [0] version
+    let p = if der.get(p)? == &0xa0 {
+        skip(der, p)?
+    } else {
+        p
+    };
     let p = skip(der, p)?; // serialNumber INTEGER
     let p = skip(der, p)?; // signature AlgorithmIdentifier SEQUENCE
     let p = skip(der, p)?; // issuer Name SEQUENCE
@@ -258,16 +265,16 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 
 pub struct TlsTransport<S> {
     stream: S,
+    session: crate::CryptoSession,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsTransport<S> {
     /// Create a new `TlsTransport` wrapping an established TLS stream.
     ///
-    /// TLS already provides authenticated encryption, so no additional
-    /// application-layer cipher is applied.  Messages are framed with a
-    /// 4-byte little-endian length prefix followed by JSON.
-    pub fn new(stream: S) -> Self {
-        Self { stream }
+    /// Even though TLS provides encryption, we apply application-layer
+    /// cryptographic framing to ensure defense in depth, matching TcpTransport.
+    pub fn new(stream: S, session: crate::CryptoSession) -> Self {
+        Self { stream, session }
     }
 }
 
@@ -276,20 +283,26 @@ pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 #[async_trait]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport for TlsTransport<S> {
     async fn send(&mut self, msg: Message) -> Result<()> {
-        let payload = serde_json::to_vec(&msg)?;
-        let len = payload.len() as u32;
+        let serialized = serde_json::to_vec(&msg)?;
+        let encrypted = self.session.encrypt(&serialized);
+        let len = encrypted.len() as u32;
         self.stream.write_u32_le(len).await?;
-        self.stream.write_all(&payload).await?;
+        self.stream.write_all(&encrypted).await?;
         Ok(())
     }
 
     async fn recv(&mut self) -> Result<Message> {
         let len = self.stream.read_u32_le().await?;
         if len > MAX_FRAME_BYTES {
-            anyhow::bail!("Frame length {} exceeds maximum allowed {}", len, MAX_FRAME_BYTES);
+            anyhow::bail!(
+                "Frame length {} exceeds maximum allowed {}",
+                len,
+                MAX_FRAME_BYTES
+            );
         }
-        let mut buf = vec![0u8; len as usize];
-        self.stream.read_exact(&mut buf).await?;
-        Ok(serde_json::from_slice(&buf)?)
+        let mut buffer = vec![0u8; len as usize];
+        self.stream.read_exact(&mut buffer).await?;
+        let decrypted = self.session.decrypt(&buffer)?;
+        Ok(serde_json::from_slice(&decrypted)?)
     }
 }

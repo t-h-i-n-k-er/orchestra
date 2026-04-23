@@ -16,7 +16,7 @@
 //! 2. `ORCHESTRA_C_SECRET` baked in at compile time.
 
 use anyhow::{anyhow, Result};
-use common::{transport::TcpTransport, Message, Transport};
+use common::{Message, Transport};
 use log::{error, info, warn};
 use sysinfo::System;
 use tokio::net::TcpStream;
@@ -74,9 +74,19 @@ async fn connect_once(addr: &str, secret: &str, agent_id: &str) -> Result<()> {
                  Set server_cert_fingerprint in agent.toml for certificate pinning."
             );
             let mut root_store = rustls::RootCertStore::empty();
-            for cert in rustls_native_certs::load_native_certs()
-                .map_err(|e| anyhow::anyhow!("failed to load native root certificates: {e}"))?
-            {
+            let certs = rustls_native_certs::load_native_certs();
+            if let Some(err) = certs.errors.first() {
+                warn!(
+                    "Some errors occurred compiling system root certificates: {}",
+                    err
+                );
+            }
+            if certs.certs.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "failed to load any native root certificates"
+                ));
+            }
+            for cert in certs.certs {
                 root_store.add(cert).ok(); // skip individual malformed certs
             }
             rustls::ClientConfig::builder()
@@ -94,7 +104,8 @@ async fn connect_once(addr: &str, secret: &str, agent_id: &str) -> Result<()> {
         .to_owned();
     let tls_stream = connector.connect(domain, stream).await?;
 
-    let mut tls_transport = common::tls_transport::TlsTransport::new(tls_stream);
+    let session = common::CryptoSession::from_shared_secret(secret.as_bytes());
+    let mut tls_transport = common::tls_transport::TlsTransport::new(tls_stream, session);
 
     // Announce ourselves before handing the transport to the Agent.
     let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());

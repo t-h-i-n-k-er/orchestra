@@ -57,7 +57,7 @@ impl ShellSession {
         // the child exits, allowing the reader thread to observe EOF
         // and terminate cleanly.
         let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        
+
         drop(pair.master);
         drop(pair.slave);
 
@@ -116,7 +116,8 @@ impl Drop for ShellSession {
             killer.kill().ok();
         }
         if let Some(handle) = self.reader_thread.take() {
-            self.is_running.store(false, std::sync::atomic::Ordering::Relaxed);
+            self.is_running
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let _ = handle.join();

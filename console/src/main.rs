@@ -253,6 +253,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // --- Build transport -------------------------------------------------------
+    let key_b64 = cli
+        .key
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--key must be provided for cryptographic framing"))?;
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(key_b64)
+        .context("--key is not valid Base64")?;
+    let session = CryptoSession::from_shared_secret(&key_bytes);
+
     let mut transport: Box<dyn Transport + Send> = if cli.tls {
         let tls_cfg = build_tls_config(&cli)?;
         let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_cfg));
@@ -272,17 +281,8 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Invalid SNI hostname: {e}"))?;
 
         let tls_stream = connector.connect(sni, stream).await?;
-        // TLS provides authenticated encryption; no application-layer session key needed.
-        Box::new(TlsTransport::new(tls_stream))
+        Box::new(TlsTransport::new(tls_stream, session))
     } else {
-        let key_b64 = cli
-            .key
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Either --key or --tls must be provided"))?;
-        let key_bytes = base64::engine::general_purpose::STANDARD
-            .decode(key_b64)
-            .context("--key is not valid Base64")?;
-        let session = CryptoSession::from_shared_secret(&key_bytes);
         let stream = TcpStream::connect(&cli.target)
             .await
             .with_context(|| format!("Cannot connect to {}", cli.target))?;

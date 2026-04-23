@@ -5,16 +5,15 @@ use anyhow::{anyhow, Result};
 use goblin::pe::PE;
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
-use winapi::um::libloaderapi::{LoadLibraryA, GetProcAddress};
+use winapi::shared::ntdef::{LIST_ENTRY, UNICODE_STRING};
+use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
 use winapi::um::memoryapi::{VirtualAlloc, VirtualProtect};
 use winapi::um::winnt::{
-    DLL_PROCESS_ATTACH, IMAGE_DIRECTORY_ENTRY_BASERELOC,
-    IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RESERVE,
-    PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY,
-    PAGE_READWRITE, IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY,
-    IMAGE_DIRECTORY_ENTRY_EXPORT,
+    DLL_PROCESS_ATTACH, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT,
+    IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
+    IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ,
+    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
 };
-use winapi::shared::ntdef::{LIST_ENTRY, UNICODE_STRING};
 
 // RUNTIME_FUNCTION (IMAGE_RUNTIME_FUNCTION_ENTRY) – 12 bytes, x64 only.
 #[cfg(target_arch = "x86_64")]
@@ -101,7 +100,7 @@ unsafe fn get_module_handle_peb(module_name: &str) -> *mut c_void {
     while current != list_head && !current.is_null() {
         let entry = current as *mut LDR_DATA_TABLE_ENTRY;
         let base_dll_name = &(*entry).BaseDllName;
-        
+
         if base_dll_name.Length > 0 && !base_dll_name.Buffer.is_null() {
             let slice = std::slice::from_raw_parts(
                 base_dll_name.Buffer,
@@ -130,19 +129,22 @@ unsafe fn get_proc_address_manual(module: *mut c_void, proc_name: &str) -> *mut 
     }
 
     let e_lfanew = dos_header.e_lfanew as usize;
-    
-    #[cfg(target_arch = "x86_64")]
-    use winapi::um::winnt::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
+
     #[cfg(target_arch = "x86")]
     use winapi::um::winnt::IMAGE_NT_HEADERS32 as IMAGE_NT_HEADERS;
+    #[cfg(target_arch = "x86_64")]
+    use winapi::um::winnt::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
 
     let nt_headers = &*(base.add(e_lfanew) as *const IMAGE_NT_HEADERS);
     if nt_headers.Signature != 0x4550 {
         return std::ptr::null_mut();
     }
 
-    let export_dir_rva = nt_headers.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT as usize].VirtualAddress;
-    let export_dir_size = nt_headers.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT as usize].Size;
+    let export_dir_rva = nt_headers.OptionalHeader.DataDirectory
+        [IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
+        .VirtualAddress;
+    let export_dir_size =
+        nt_headers.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT as usize].Size;
     if export_dir_rva == 0 {
         if let Ok(cname) = CString::new(proc_name) {
             return GetProcAddress(module as _, cname.as_ptr() as _) as *mut c_void;
@@ -194,7 +196,8 @@ unsafe fn get_proc_address_manual(module: *mut c_void, proc_name: &str) -> *mut 
                                 let mut mod_handle = get_module_handle_peb(target_mod);
                                 if mod_handle.is_null() {
                                     let mod_name = format!("{}\0", target_mod);
-                                    mod_handle = LoadLibraryA(mod_name.as_ptr() as _) as *mut c_void;
+                                    mod_handle =
+                                        LoadLibraryA(mod_name.as_ptr() as _) as *mut c_void;
                                 }
                                 if !mod_handle.is_null() {
                                     return get_proc_address_manual(mod_handle, target_fn);
@@ -208,7 +211,7 @@ unsafe fn get_proc_address_manual(module: *mut c_void, proc_name: &str) -> *mut 
             }
         }
     }
-    
+
     if let Ok(cname) = CString::new(proc_name) {
         return GetProcAddress(module as _, cname.as_ptr() as _) as *mut c_void;
     }
@@ -296,54 +299,50 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
             [IMAGE_DIRECTORY_ENTRY_BASERELOC as usize]
         {
             if reloc_entry.virtual_address != 0 && reloc_entry.size > 0 {
-            let reloc_size = reloc_entry.size as usize;
-            let block_rva = reloc_entry.virtual_address as usize;
-            // Snapshot the entire relocation directory into a local buffer
-            // *before* applying any patches.  Without this, a relocation
-            // entry whose target falls inside the .reloc section itself
-            // (or whose patch happens to overlap the next block header due
-            // to merged/overlapping sections) could rewrite the headers we
-            // are about to read on the next iteration, leading to
-            // unpredictable behaviour.  Reading from a pristine copy makes
-            // the iteration deterministic.
-            let reloc_data: Vec<u8> = std::slice::from_raw_parts(
-                image_base.add(block_rva),
-                reloc_size,
-            )
-            .to_vec();
+                let reloc_size = reloc_entry.size as usize;
+                let block_rva = reloc_entry.virtual_address as usize;
+                // Snapshot the entire relocation directory into a local buffer
+                // *before* applying any patches.  Without this, a relocation
+                // entry whose target falls inside the .reloc section itself
+                // (or whose patch happens to overlap the next block header due
+                // to merged/overlapping sections) could rewrite the headers we
+                // are about to read on the next iteration, leading to
+                // unpredictable behaviour.  Reading from a pristine copy makes
+                // the iteration deterministic.
+                let reloc_data: Vec<u8> =
+                    std::slice::from_raw_parts(image_base.add(block_rva), reloc_size).to_vec();
 
-            let mut offset = 0usize;
-            while offset + 8 <= reloc_size {
-                let page_rva = u32::from_le_bytes(
-                    reloc_data[offset..offset + 4].try_into().unwrap(),
-                ) as usize;
-                let block_size = u32::from_le_bytes(
-                    reloc_data[offset + 4..offset + 8].try_into().unwrap(),
-                ) as usize;
-                if block_size < 8 || offset + block_size > reloc_size {
-                    break;
-                }
-                let entries_count = (block_size - 8) / 2;
-                let entries_start = offset + 8;
-                for i in 0..entries_count {
-                    let off = entries_start + i * 2;
-                    let entry = u16::from_le_bytes(
-                        reloc_data[off..off + 2].try_into().unwrap(),
-                    );
-                    let reloc_type = (entry >> 12) as u8;
-                    let reloc_offset = (entry & 0x0FFF) as usize;
-                    if reloc_type == 10 {
-                        // IMAGE_REL_BASED_DIR64
-                        let addr = image_base.add(page_rva + reloc_offset) as *mut isize;
-                        *addr += base_delta;
-                    } else if reloc_type == 3 {
-                        // IMAGE_REL_BASED_HIGHLOW
-                        let addr = image_base.add(page_rva + reloc_offset) as *mut i32;
-                        *addr = (*addr as isize + base_delta) as i32;
+                let mut offset = 0usize;
+                while offset + 8 <= reloc_size {
+                    let page_rva =
+                        u32::from_le_bytes(reloc_data[offset..offset + 4].try_into().unwrap())
+                            as usize;
+                    let block_size =
+                        u32::from_le_bytes(reloc_data[offset + 4..offset + 8].try_into().unwrap())
+                            as usize;
+                    if block_size < 8 || offset + block_size > reloc_size {
+                        break;
                     }
+                    let entries_count = (block_size - 8) / 2;
+                    let entries_start = offset + 8;
+                    for i in 0..entries_count {
+                        let off = entries_start + i * 2;
+                        let entry =
+                            u16::from_le_bytes(reloc_data[off..off + 2].try_into().unwrap());
+                        let reloc_type = (entry >> 12) as u8;
+                        let reloc_offset = (entry & 0x0FFF) as usize;
+                        if reloc_type == 10 {
+                            // IMAGE_REL_BASED_DIR64
+                            let addr = image_base.add(page_rva + reloc_offset) as *mut isize;
+                            *addr += base_delta;
+                        } else if reloc_type == 3 {
+                            // IMAGE_REL_BASED_HIGHLOW
+                            let addr = image_base.add(page_rva + reloc_offset) as *mut i32;
+                            *addr = (*addr as isize + base_delta) as i32;
+                        }
+                    }
+                    offset += block_size;
                 }
-                offset += block_size;
-            }
             }
         }
     }
@@ -357,8 +356,8 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
     //
     // IMAGE_DIRECTORY_ENTRY_TLS = 9
     const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
-    if let Some(tls_entry) = optional_header.data_directories.data_directories
-        [IMAGE_DIRECTORY_ENTRY_TLS]
+    if let Some(tls_entry) =
+        optional_header.data_directories.data_directories[IMAGE_DIRECTORY_ENTRY_TLS]
     {
         if tls_entry.virtual_address != 0 && tls_entry.size > 0 {
             // The TLS directory layout (pointer-width fields match the target):
@@ -377,8 +376,8 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                 _size_of_zero_fill: u32,
                 _characteristics: u32,
             }
-            let tls_dir = &*(image_base.add(tls_entry.virtual_address as usize)
-                as *const ImageTlsDirectory);
+            let tls_dir =
+                &*(image_base.add(tls_entry.virtual_address as usize) as *const ImageTlsDirectory);
             if tls_dir.address_of_callbacks != 0 {
                 // address_of_callbacks is a VA pointing into our mapped image;
                 // after relocation it already reflects the allocation address.

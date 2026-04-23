@@ -7,7 +7,7 @@
 //! library of reproducible build recipes (one per deployment target).
 
 use anyhow::{anyhow, Context, Result};
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Select};
+use dialoguer::{theme::ColorfulTheme, Input, MultiSelect, Select};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -221,10 +221,7 @@ pub fn read_agent_features() -> Result<Vec<String>> {
 }
 
 /// Split a list of features into those present in `available` and those not.
-pub fn partition_features(
-    features: &[String],
-    available: &[String],
-) -> (Vec<String>, Vec<String>) {
+pub fn partition_features(features: &[String], available: &[String]) -> (Vec<String>, Vec<String>) {
     let mut effective = Vec::new();
     let mut unknown = Vec::new();
     for f in features {
