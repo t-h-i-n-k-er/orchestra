@@ -492,7 +492,7 @@ fn windows_mac_prefix_indicates_vm(prefixes: &[[u8; 3]]) -> bool {
         while !adapter.is_null() {
             let phy_len = (*adapter).PhysicalAddressLength as usize;
             if phy_len >= 3 {
-                let mac = &(*adapter).PhysicalAddress[..phy_len];
+                let mac = &(&(*adapter).PhysicalAddress)[..phy_len];
                 let prefix = [mac[0], mac[1], mac[2]];
                 if prefixes.contains(&prefix) {
                     return true;

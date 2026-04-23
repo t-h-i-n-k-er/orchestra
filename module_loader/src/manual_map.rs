@@ -323,7 +323,7 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                 // unpredictable behaviour.  Reading from a pristine copy makes
                 // the iteration deterministic.
                 let reloc_data: Vec<u8> =
-                    std::slice::from_raw_parts(image_base.add(block_rva), reloc_size).to_vec();
+                    std::slice::from_raw_parts(image_base.add(block_rva) as *const u8, reloc_size).to_vec();
 
                 let mut offset = 0usize;
                 while offset + 8 <= reloc_size {

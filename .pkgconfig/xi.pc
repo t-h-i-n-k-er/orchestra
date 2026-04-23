@@ -1,0 +1,5 @@
+Name: xi
+Description: fake xi
+Version: 1.0
+Libs:
+Cflags:
