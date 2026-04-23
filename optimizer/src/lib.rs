@@ -256,7 +256,7 @@ pub fn optimize_hot_function(name: &str) -> Result<()> {
     let mut instructions: Vec<Instruction> = decoder.iter().collect();
     let original_len = instructions.len();
 
-    let passes: Vec<Box<dyn Pass>> = vec![Box::new(XorZeroingPass), Box::new(LeaAddPass)];
+    let passes: Vec<Box<dyn Pass>> = vec![Box::new(LeaAddPass)];
     for pass in passes {
         pass.run(&mut instructions)?;
     }
