@@ -265,20 +265,20 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> i32 {
     let status: i32;
 
     asm!(
-        // Stash caller-provided register args that our stack-copy code will
-        // clobber (rcx/rdx are used by `rep movsq`).
-        "mov r12, rcx",
-        "mov r13, rdx",
-        // Save original rsp so we can restore it regardless of alignment.
+        // Save the original rsp so we can restore it regardless of how much
+        // we subtract for stack arguments and ABI alignment.
         "mov r14, rsp",
-        // Compute bytes to reserve: 0x28 (shadow + fake-ret slot) + 8*nstack,
-        // rounded up to 16 for ABI alignment.
+        // Compute bytes to reserve: 0x28 (32-byte shadow space + 8-byte
+        // fake-return slot) + 8 * nstack, rounded up to 16 for ABI alignment.
         "mov rax, {nstack}",
         "shl rax, 3",
         "add rax, 0x28 + 15",
         "and rax, -16",
         "sub rsp, rax",
-        // Copy stack args to [rsp + 0x28 ..] if any.
+        // Copy stack args to [rsp + 0x28 ..] if any.  This clobbers rcx, rsi,
+        // rdi, so a1/a2 are deliberately *not* passed via "rcx"/"rdx"
+        // constraints — they are bound to compiler-chosen GPRs (`{a1}`/`{a2}`)
+        // and only moved into rcx/rdx *after* the rep movsq below.
         "test {nstack}, {nstack}",
         "jz 2f",
         "mov rcx, {nstack}",
@@ -287,26 +287,34 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> i32 {
         "cld",
         "rep movsq",
         "2:",
-        // Restore register args (r8/r9 were never touched).
-        "mov rcx, r12",
-        "mov rdx, r13",
+        // Now load the syscall register arguments.  r8/r9 came from their
+        // dedicated "r8"/"r9" constraints and were never disturbed.
+        "mov rcx, {a1}",
+        "mov rdx, {a2}",
         "mov r10, rcx",
         "mov eax, {ssn:e}",
         "syscall",
-        // Restore rsp.
+        // Restore rsp.  Net effect of this asm block on the stack pointer is
+        // zero, but the compiler is informed via `options(nostack)` that it
+        // need not maintain stack-relative invariants across this block.
         "mov rsp, r14",
         ssn        = in(reg) ssn,
         nstack     = in(reg) nstack,
         stack_ptr  = in(reg) stack_ptr,
-        in("rcx") a1,
-        in("rdx") a2,
+        a1         = in(reg) a1,
+        a2         = in(reg) a2,
         in("r8")  a3,
         in("r9")  a4,
         lateout("rax") status,
-        // Clobbers:
-        out("r10") _, out("r11") _,
-        out("r12") _, out("r13") _, out("r14") _,
+        // Clobbers (everything we touch that isn't an input/output).
+        out("rcx") _, out("rdx") _, out("r10") _, out("r11") _,
+        out("r14") _,
         out("rsi") _, out("rdi") _,
+        // The asm restores rsp to its entry value before returning, so the
+        // compiler can treat the stack as untouched.  Without this the
+        // compiler may insert a stack realignment that would corrupt the
+        // shadow-space layout we set up above.
+        options(nostack),
     );
 
     status

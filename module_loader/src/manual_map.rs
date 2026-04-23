@@ -296,21 +296,40 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
             [IMAGE_DIRECTORY_ENTRY_BASERELOC as usize]
         {
             if reloc_entry.virtual_address != 0 && reloc_entry.size > 0 {
-            let mut offset = 0usize;
             let reloc_size = reloc_entry.size as usize;
+            let block_rva = reloc_entry.virtual_address as usize;
+            // Snapshot the entire relocation directory into a local buffer
+            // *before* applying any patches.  Without this, a relocation
+            // entry whose target falls inside the .reloc section itself
+            // (or whose patch happens to overlap the next block header due
+            // to merged/overlapping sections) could rewrite the headers we
+            // are about to read on the next iteration, leading to
+            // unpredictable behaviour.  Reading from a pristine copy makes
+            // the iteration deterministic.
+            let reloc_data: Vec<u8> = std::slice::from_raw_parts(
+                image_base.add(block_rva),
+                reloc_size,
+            )
+            .to_vec();
+
+            let mut offset = 0usize;
             while offset + 8 <= reloc_size {
-                let block_rva = reloc_entry.virtual_address as usize;
-                let page_rva = *(image_base.add(block_rva + offset) as *const u32) as usize;
-                let block_size = *(image_base.add(block_rva + offset + 4) as *const u32) as usize;
-                if block_size < 8 {
+                let page_rva = u32::from_le_bytes(
+                    reloc_data[offset..offset + 4].try_into().unwrap(),
+                ) as usize;
+                let block_size = u32::from_le_bytes(
+                    reloc_data[offset + 4..offset + 8].try_into().unwrap(),
+                ) as usize;
+                if block_size < 8 || offset + block_size > reloc_size {
                     break;
                 }
                 let entries_count = (block_size - 8) / 2;
-                let entries = std::slice::from_raw_parts(
-                    image_base.add(block_rva + offset + 8) as *const u16,
-                    entries_count,
-                );
-                for &entry in entries {
+                let entries_start = offset + 8;
+                for i in 0..entries_count {
+                    let off = entries_start + i * 2;
+                    let entry = u16::from_le_bytes(
+                        reloc_data[off..off + 2].try_into().unwrap(),
+                    );
                     let reloc_type = (entry >> 12) as u8;
                     let reloc_offset = (entry & 0x0FFF) as usize;
                     if reloc_type == 10 {

