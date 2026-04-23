@@ -66,7 +66,10 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             std::ptr::null_mut::<libc::c_void>(),
         ) < 0
         {
-            anyhow::bail!("ptrace attach failed: {}", std::io::Error::last_os_error());
+            return Err(anyhow::anyhow!(
+                "ptrace attach failed: not implemented: {}",
+                std::io::Error::last_os_error()
+            ));
         }
 
         let mut status = 0;
