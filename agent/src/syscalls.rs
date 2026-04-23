@@ -252,6 +252,8 @@ macro_rules! syscall {
 #[doc(hidden)]
 #[inline(never)]
 pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
     let a1 = args.get(0).copied().unwrap_or(0);
     let a2 = args.get(1).copied().unwrap_or(0);
     let a3 = args.get(2).copied().unwrap_or(0);
@@ -314,10 +316,13 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> i32 {
         options(nostack),
     );
 
-    if status > 0xfffffffffffff000 {
-        Err((!status + 1) as i32)
-    } else {
-        Ok(status)
+    status
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Direct syscalls currently unsupported on Windows ARM64
+        tracing::error!("Direct syscalls not yet implemented for aarch64 Windows");
+        -1
     }
 }
 

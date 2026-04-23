@@ -153,6 +153,7 @@ impl Agent {
         }
 
         // Optimize hot functions at startup
+        #[cfg(feature = "unsafe-runtime-rewrite")]
         if let Err(e) = optimizer::optimize_hot_function("crypto_session_encrypt") {
             tracing::warn!("Runtime optimization failed: {}", e);
         }
