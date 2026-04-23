@@ -174,7 +174,7 @@ fn is_expected_hypervisor() -> bool {
         if let Ok(s) = std::fs::read_to_string("/proc/version") {
             let s = s.to_ascii_lowercase();
             // Don't flag WSL as a VM
-            if s.contains("microsoft") || s.contains("wsl") {
+            if s.contains("microsoft") {
                 return true;
             }
         }

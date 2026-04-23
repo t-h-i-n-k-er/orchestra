@@ -314,7 +314,11 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> i32 {
         options(nostack),
     );
 
-    status
+    if status > 0xfffffffffffff000 {
+        Err((!status + 1) as i32)
+    } else {
+        Ok(status)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -323,7 +327,10 @@ macro_rules! syscall {
     ($func_name:expr $(, $args:expr)* $(,)?) => {{
         let ssn = $crate::syscalls::get_syscall_id($func_name).expect("unknown linux syscall");
         let args: &[u64] = &[$($args as u64),*];
-        unsafe { $crate::syscalls::do_syscall(ssn as u32, args) }
+        unsafe { $crate::syscalls::do_syscall(ssn as u32, args).unwrap_or_else(|e| {
+            // caller can handle Err or panic, returning !0 to signal caller as typically done
+            (u64::MAX - (e as u64) + 1)
+        }) }
     }};
 }
 
@@ -645,6 +652,12 @@ pub fn get_syscall_id(name: &str) -> anyhow::Result<u32> {
         "process_vm_writev" => Ok(311),
         "kcmp" => Ok(312),
         "finit_module" => Ok(313),
+        "memfd_create" => Ok(319),
+        "execveat" => Ok(322),
+        "userfaultfd" => Ok(323),
+        "copy_file_range" => Ok(326),
+        "bpf" => Ok(321),
+        "getrandom" => Ok(318),
         _ => Err(anyhow::anyhow!("Unknown syscall: {}", name)),
     }
     
@@ -714,13 +727,18 @@ pub fn get_syscall_id(name: &str) -> anyhow::Result<u32> {
         "faccessat" => Ok(48),
         "gettimeofday" => Ok(169),
         "sysinfo" => Ok(179),
+        "bpf" => Ok(280),
+        "userfaultfd" => Ok(282),
+        "memfd_create" => Ok(279),
+        "copy_file_range" => Ok(285),
+        "getrandom" => Ok(278),
         _ => Err(anyhow::anyhow!("Unknown aarch64 syscall: {}", name)),
     }
 }
 
 
 #[cfg(target_os = "linux")]
-pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> u64 {
+pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
     let mut status: u64;
     let a1 = *args.get(0).unwrap_or(&0);
     let a2 = *args.get(1).unwrap_or(&0);
@@ -769,7 +787,11 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> u64 {
         );
     }
 
-    status
+    if status > 0xfffffffffffff000 {
+        Err((!status + 1) as i32)
+    } else {
+        Ok(status)
+    }
 }
 
 #[cfg(target_os = "linux")]

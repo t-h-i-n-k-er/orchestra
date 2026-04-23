@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+rand.workspace = true
 tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

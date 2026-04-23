@@ -7,7 +7,6 @@ use tracing::{info, warn};
 
 use crate::config::{partition_features, read_agent_features, PayloadConfig};
 
-const DIST_DIR: &str = "dist";
 
 /// Build the agent for the given profile and return the raw binary bytes.
 pub fn build_agent_for_profile(cfg: &PayloadConfig) -> Result<Vec<u8>> {
