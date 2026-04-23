@@ -212,8 +212,10 @@ fn cert_validity_period(der: &[u8]) -> Option<(i64, i64)> {
 /// Using this in production makes the connection vulnerable to MITM attacks.
 #[doc(hidden)]
 #[derive(Debug)]
+#[cfg(any(test, feature = "dangerous-tls"))]
 pub struct NoCertificateVerification;
 
+#[cfg(any(test, feature = "dangerous-tls"))]
 impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
     fn verify_server_cert(
         &self,

@@ -452,6 +452,10 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                     let reloc_type = entry >> 12;
                     let reloc_offset = entry & 0x0FFF;
 
+                    // The relocation directory (and headers) is NOT written to the remote process's
+                    // memory. Therefore, we MUST read reloc_block_header.VirtualAddress and the 
+                    // relocation entries from our local `payload` buffer, combining it with the remote 
+                    // image base to calculate the remote patch address.
                     let patch_base = image_base as usize
                         + reloc_block_header.VirtualAddress as usize
                         + reloc_offset as usize;
@@ -1035,6 +1039,9 @@ pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
                     let entry = unsafe { *(payload.as_ptr().add(entry_off) as *const u16) };
                     let reloc_type = entry >> 12;
                     let reloc_offset = entry & 0x0FFF;
+
+                    // The relocation directory is strictly read from our local `payload` buffer 
+                    // because it is never written into the remote process headers.
                     let patch_base = image_base as usize
                         + block.VirtualAddress as usize
                         + reloc_offset as usize;

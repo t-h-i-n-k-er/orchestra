@@ -84,8 +84,15 @@ fn main() -> Result<()> {
 
             let final_agent_bytes = if diversify {
                 info!("Applying code diversification passes...");
-                optimizer::diversify_code(&agent_bytes)
-                    .context("Failed to diversify agent code")?
+                #[cfg(feature = "diversification")]
+                {
+                    optimizer::diversify_code(&agent_bytes)
+                        .context("Failed to diversify agent code")?
+                }
+                #[cfg(not(feature = "diversification"))]
+                {
+                    anyhow::bail!("diversification requested but builder not compiled with `diversification` feature");
+                }
             } else {
                 agent_bytes
             };

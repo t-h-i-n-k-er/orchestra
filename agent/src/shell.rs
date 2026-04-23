@@ -29,6 +29,7 @@ pub struct ShellSession {
     buffer: Arc<Mutex<Vec<u8>>>,
     child_killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     reader_thread: Option<JoinHandle<()>>,
+    is_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ShellSession {
@@ -55,16 +56,22 @@ impl ShellSession {
         // Drop the master and slave handles so the PTY is closed when
         // the child exits, allowing the reader thread to observe EOF
         // and terminate cleanly.
+        let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        
         drop(pair.master);
         drop(pair.slave);
 
         let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let buf_clone = buffer.clone();
+        let running_clone = is_running.clone();
         let reader_thread = std::thread::Builder::new()
             .name("orchestra-pty-reader".into())
             .spawn(move || {
                 let mut chunk = [0u8; READ_CHUNK];
                 loop {
+                    if !running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     match reader.read(&mut chunk) {
                         Ok(0) => break, // EOF
                         Ok(n) => {
@@ -83,6 +90,7 @@ impl ShellSession {
             buffer,
             child_killer,
             reader_thread: Some(reader_thread),
+            is_running,
         })
     }
 
@@ -108,10 +116,14 @@ impl Drop for ShellSession {
             killer.kill().ok();
         }
         if let Some(handle) = self.reader_thread.take() {
-            // The reader will observe EOF once the child exits and the
-            // PTY master is closed (which happens when the writer is
-            // dropped at the end of this Drop). Don't wait forever.
-            let _ = handle.join();
+            self.is_running.store(false, std::sync::atomic::Ordering::Relaxed);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = handle.join();
+                let _ = tx.send(());
+            });
+            // Give the thread a little bit of time to tidy up
+            let _ = rx.recv_timeout(std::time::Duration::from_millis(500));
         }
     }
 }
