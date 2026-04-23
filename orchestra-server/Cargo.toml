@@ -41,5 +41,3 @@ futures-util = "0.3"
 
 [features]
 default = []
-# Enable the forward-secrecy key exchange for agent connections.
-forward-secrecy = ["common/forward-secrecy"]

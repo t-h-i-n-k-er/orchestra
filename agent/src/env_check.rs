@@ -214,18 +214,29 @@ fn linux_dmi_indicates_vm() -> bool {
         "vbox",
         "xen",
         "hyperv",
-        "microsoft corporation",
         "innotek",
     ];
+    // "microsoft corporation" in sys_vendor appears on physical Microsoft hardware
+    // (e.g., Surface devices) as well as on Hyper-V guests. Only treat it as a VM
+    // indicator when the product_name is also "virtual machine", which is the
+    // definitive fingerprint of a Hyper-V guest and not present on bare-metal hardware.
+    let mut ms_vendor = false;
+    let mut virt_product = false;
     for path in DMI {
         if let Ok(s) = std::fs::read_to_string(path) {
             let s = s.to_ascii_lowercase();
             if NEEDLES.iter().any(|n| s.contains(n)) {
                 return true;
             }
+            if path.ends_with("sys_vendor") && s.contains("microsoft corporation") {
+                ms_vendor = true;
+            }
+            if path.ends_with("product_name") && s.contains("virtual machine") {
+                virt_product = true;
+            }
         }
     }
-    false
+    ms_vendor && virt_product
 }
 
 #[cfg(windows)]
@@ -233,7 +244,11 @@ fn windows_registry_indicates_vm() -> bool {
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let needles = ["VBOX", "VMWARE", "QEMU", "VIRTUAL", "XEN"];
+    // "VIRTUAL" removed: Windows machines with VBS/HVCI or Hyper-V role enabled
+    // may have registry values containing "VIRTUAL" (e.g., "VIRTUAL TPM",
+    // "VIRTUALIZATION-BASED SECURITY") on physical hardware. Use only
+    // hypervisor-vendor-specific strings to avoid false positives.
+    let needles = ["VBOX", "VMWARE", "QEMU", "XEN"];
     for path in [
         "HARDWARE\\DESCRIPTION\\System",
         "HARDWARE\\DESCRIPTION\\System\\BIOS",
@@ -264,8 +279,7 @@ fn mac_prefix_indicates_vm() -> bool {
         [0x52, 0x54, 0x00],   // KVM/QEMU
         [0x00, 0x15, 0x5d],   // Hyper-V
     ];
-    // Read /sys/class/net on Linux; on other OSes return false (the CPUID /
-    // registry checks above will dominate).
+    // Read /sys/class/net on Linux.
     #[cfg(target_os = "linux")]
     {
         let net = Path::new("/sys/class/net");
@@ -288,8 +302,76 @@ fn mac_prefix_indicates_vm() -> bool {
             }
         }
     }
+    // On Windows use GetAdaptersAddresses to read physical MAC addresses.
+    #[cfg(windows)]
+    {
+        if windows_mac_prefix_indicates_vm(&prefixes) {
+            return true;
+        }
+    }
     let _ = prefixes;
     let _ = Path::new("/dev/null");
+    false
+}
+
+/// Windows implementation: walk the adapter list via `GetAdaptersAddresses`
+/// and check whether any interface has a MAC prefix matching a known hypervisor.
+#[cfg(windows)]
+fn windows_mac_prefix_indicates_vm(prefixes: &[[u8; 3]]) -> bool {
+    use winapi::shared::winerror::ERROR_SUCCESS;
+    use winapi::um::iphlpapi::GetAdaptersAddresses;
+    use winapi::um::iptypes::IP_ADAPTER_ADDRESSES;
+
+    // AF_UNSPEC = 0; skip address lists we don't need.
+    const AF_UNSPEC: u32 = 0;
+    const GAA_FLAG_SKIP_UNICAST: u32 = 0x0001;
+    const GAA_FLAG_SKIP_ANYCAST: u32 = 0x0002;
+    const GAA_FLAG_SKIP_MULTICAST: u32 = 0x0004;
+    const GAA_FLAG_SKIP_DNS_SERVER: u32 = 0x0008;
+    let flags = GAA_FLAG_SKIP_UNICAST
+        | GAA_FLAG_SKIP_ANYCAST
+        | GAA_FLAG_SKIP_MULTICAST
+        | GAA_FLAG_SKIP_DNS_SERVER;
+
+    unsafe {
+        // First call with a null buffer to obtain the required size.
+        let mut buf_size: u32 = 0;
+        GetAdaptersAddresses(
+            AF_UNSPEC,
+            flags,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut buf_size,
+        );
+        if buf_size == 0 {
+            return false;
+        }
+
+        let mut buf: Vec<u8> = vec![0u8; buf_size as usize];
+        let ret = GetAdaptersAddresses(
+            AF_UNSPEC,
+            flags,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES,
+            &mut buf_size,
+        );
+        if ret != ERROR_SUCCESS {
+            return false;
+        }
+
+        let mut adapter = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES;
+        while !adapter.is_null() {
+            let phy_len = (*adapter).PhysicalAddressLength as usize;
+            if phy_len >= 3 {
+                let mac = &(*adapter).PhysicalAddress[..phy_len];
+                let prefix = [mac[0], mac[1], mac[2]];
+                if prefixes.contains(&prefix) {
+                    return true;
+                }
+            }
+            adapter = (*adapter).Next;
+        }
+    }
     false
 }
 

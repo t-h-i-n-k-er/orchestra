@@ -110,29 +110,41 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
         {
             info!("Attempting to load plugin using manual map loader.");
             if let Ok(image_base) = unsafe { manual_map::load_dll_in_memory(module_data) } {
-                let func_addr = unsafe {
-                    let pe = goblin::pe::PE::parse(module_data).ok();
-                    let mut rva = 0;
-                    if let Some(pe) = pe {
-                        for export in pe.exports {
-                            if let Some(name) = export.name {
-                                if name == "_create_plugin" {
-                                    rva = export.rva;
-                                    break;
-                                }
-                            }
+                // Resolve the _create_plugin export RVA from the original flat
+                // file (goblin parses the on-disk layout, not the mapped image).
+                let mut rva = 0usize;
+                if let Some(pe) = goblin::pe::PE::parse(module_data).ok() {
+                    for export in &pe.exports {
+                        if export.name == Some("_create_plugin") {
+                            rva = export.rva;
+                            break;
                         }
                     }
-                    if rva != 0 {
+                }
+                if rva != 0 {
+                    unsafe {
                         let create_func: unsafe extern "C" fn() -> *mut dyn Plugin =
                             std::mem::transmute(image_base.add(rva));
                         let plugin_ptr = create_func();
                         let plugin = Box::from_raw(plugin_ptr);
                         return Ok(plugin);
                     }
-                };
+                }
+                // The export was not found. Free the mapped image (best-effort)
+                // and return an error rather than falling back to the temp-file
+                // path with an already-initialised DLL in memory.
+                unsafe {
+                    winapi::um::memoryapi::VirtualFree(
+                        image_base,
+                        0,
+                        winapi::um::winnt::MEM_RELEASE,
+                    );
+                }
+                return Err(anyhow!(
+                    "DLL mapped successfully but the required '_create_plugin' export is missing"
+                ));
             }
-            info!("Manual map failed or _create_plugin not found, falling back to temp file.");
+            info!("Manual map failed, falling back to temp file.");
         }
         // Fallback for non-Linux OSs (e.g., macOS, Windows).
         // For Windows, a more advanced technique involves CreateFileMapping/MapViewOfFile

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+goblin = { version = "0.7", default-features = false, features = ["elf64", "elf32", "pe64", "pe32"] }
 iced-x86 = { version = "1.20", default-features = false, features = ["std", "decoder", "encoder", "block_encoder"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }

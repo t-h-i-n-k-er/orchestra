@@ -89,7 +89,7 @@ fn build_agent_standalone(addr: &str, secret: &str) -> anyhow::Result<std::path:
             "--bin",
             "agent-standalone",
             "--features",
-            "outbound-c,forward-secrecy",
+            "outbound-c",
         ])
         .env("ORCHESTRA_C_ADDR", addr)
         .env("ORCHESTRA_C_SECRET", secret)

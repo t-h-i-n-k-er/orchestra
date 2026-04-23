@@ -16,6 +16,27 @@ use winapi::um::winnt::{
 };
 use winapi::shared::ntdef::{LIST_ENTRY, UNICODE_STRING};
 
+// RUNTIME_FUNCTION (IMAGE_RUNTIME_FUNCTION_ENTRY) – 12 bytes, x64 only.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct RuntimeFunction {
+    begin_address: u32,
+    end_address: u32,
+    unwind_info_address: u32,
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "system" {
+    /// Registers a dynamic function table so the OS can unwind exceptions
+    /// inside memory-mapped code.  Declared here because winapi 0.3 does not
+    /// expose it at a stable path.
+    fn RtlAddFunctionTable(
+        function_table: *const RuntimeFunction,
+        entry_count: u32,
+        base_address: u64,
+    ) -> u8; // BOOLEAN
+}
+
 // 1. Defining PEB and LDR structures to walk PEB
 
 #[repr(C)]
@@ -157,10 +178,30 @@ unsafe fn get_proc_address_manual(module: *mut c_void, proc_name: &str) -> *mut 
                 if func_rva != 0 {
                     let addr = base.add(func_rva as usize) as *mut c_void;
                     if func_rva >= export_dir_rva && func_rva < export_dir_rva + export_dir_size {
-                        // Forwarded export, fallback to native GetProcAddress
-                        if let Ok(cname) = CString::new(proc_name) {
-                            return GetProcAddress(module as _, cname.as_ptr() as _) as *mut c_void;
+                        // Forwarded export: bytes at func_rva are a null-terminated ASCII
+                        // string of the form "ModuleName.FunctionName".
+                        let fwd_ptr = base.add(func_rva as usize) as *const u8;
+                        let mut fwd_len = 0;
+                        while *fwd_ptr.add(fwd_len) != 0 {
+                            fwd_len += 1;
                         }
+                        let fwd_slice = std::slice::from_raw_parts(fwd_ptr, fwd_len);
+                        if let Ok(fwd_str) = std::str::from_utf8(fwd_slice) {
+                            if let Some(dot) = fwd_str.find('.') {
+                                let target_mod = &fwd_str[..dot];
+                                let target_fn = &fwd_str[dot + 1..];
+                                // Try PEB walk first, then LoadLibrary.
+                                let mut mod_handle = get_module_handle_peb(target_mod);
+                                if mod_handle.is_null() {
+                                    let mod_name = format!("{}\0", target_mod);
+                                    mod_handle = LoadLibraryA(mod_name.as_ptr() as _) as *mut c_void;
+                                }
+                                if !mod_handle.is_null() {
+                                    return get_proc_address_manual(mod_handle, target_fn);
+                                }
+                            }
+                        }
+                        return std::ptr::null_mut();
                     }
                     return addr;
                 }
@@ -204,9 +245,22 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
 
     // 2. Copy sections
     for section in &pe.sections {
+        let raw_offset = section.pointer_to_raw_data as usize;
+        let raw_size = section.size_of_raw_data as usize;
+        if raw_size == 0 {
+            continue;
+        }
+        if raw_offset.saturating_add(raw_size) > dll_bytes.len() {
+            return Err(anyhow!(
+                "PE section data (offset {:#x} + size {:#x}) exceeds DLL buffer length {}; PE is corrupt",
+                raw_offset,
+                raw_size,
+                dll_bytes.len()
+            ));
+        }
         let dest = image_base.add(section.virtual_address as usize);
-        let src = dll_bytes.as_ptr().add(section.pointer_to_raw_data as usize);
-        std::ptr::copy_nonoverlapping(src, dest as *mut u8, section.size_of_raw_data as usize);
+        let src = dll_bytes.as_ptr().add(raw_offset);
+        std::ptr::copy_nonoverlapping(src, dest as *mut u8, raw_size);
     }
 
     // 3. Process imports
@@ -347,6 +401,28 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
             prot,
             &mut old_prot,
         );
+    }
+
+    // 5b. Register the .pdata section (exception handling directory) so the OS
+    //     can correctly unwind the stack for exceptions thrown inside the DLL.
+    //     Without this, any C++ try/catch or SEH block in the DLL terminates
+    //     the process instead of propagating to a handler.
+    #[cfg(target_arch = "x86_64")]
+    {
+        for section in &pe.sections {
+            // Section names are a fixed 8-byte array; trim null bytes for comparison.
+            let end = section.name.iter().position(|&b| b == 0).unwrap_or(8);
+            if &section.name[..end] == b".pdata" && section.size_of_raw_data > 0 {
+                let pdata_ptr =
+                    image_base.add(section.virtual_address as usize) as *const RuntimeFunction;
+                // Each RUNTIME_FUNCTION entry is exactly 12 bytes.
+                let entry_count = (section.size_of_raw_data as usize / 12) as u32;
+                if entry_count > 0 {
+                    RtlAddFunctionTable(pdata_ptr, entry_count, image_base as u64);
+                }
+                break;
+            }
+        }
     }
 
     // 6. Call entry point

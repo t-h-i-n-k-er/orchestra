@@ -16,7 +16,7 @@
 //! 2. `ORCHESTRA_C_SECRET` baked in at compile time.
 
 use anyhow::{anyhow, Result};
-use common::{transport::TcpTransport, CryptoSession, Message, Transport};
+use common::{transport::TcpTransport, Message, Transport};
 use log::{error, info, warn};
 use sysinfo::System;
 use tokio::net::TcpStream;
@@ -51,38 +51,50 @@ async fn connect_once(addr: &str, secret: &str, agent_id: &str) -> Result<()> {
     let mut stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true)?;
 
-    // Build a TLS client config. When `server_cert_fingerprint` is configured
+    // Build a TLS client config.  When `server_cert_fingerprint` is configured
     // in agent.toml, pin the server's end-entity certificate by its SHA-256
-    // fingerprint to prevent MITM attacks. Without a fingerprint, fall back to
-    // `NoCertificateVerification` so existing deployments keep working, but log
-    // a prominent warning.
-    let cert_verifier: std::sync::Arc<dyn rustls::client::danger::ServerCertVerifier> = {
+    // fingerprint (prevents MITM even without a trusted CA).  Without a
+    // fingerprint the agent falls back to validating the certificate against the
+    // system's native root CA store, which prevents trivial interception while
+    // remaining compatible with certificates issued by enterprise PKIs.
+    let tls_config: rustls::ClientConfig = {
         let cfg = crate::config::load_config()?;
         if let Some(fp) = cfg.server_cert_fingerprint {
             info!("outbound-c: using certificate pinning (fingerprint configured)");
-            std::sync::Arc::new(
-                common::tls_transport::PinnedCertVerifier::from_hex(&fp)
-                    .map_err(|e| anyhow::anyhow!("invalid server_cert_fingerprint: {e}"))?,
-            )
+            let verifier = common::tls_transport::PinnedCertVerifier::from_hex(&fp)
+                .map_err(|e| anyhow::anyhow!("invalid server_cert_fingerprint: {e}"))?;
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+                .with_no_client_auth()
         } else {
             warn!(
-                "outbound-c: server_cert_fingerprint not configured — TLS certificate \
-                 verification is DISABLED. Set server_cert_fingerprint in agent.toml."
+                "outbound-c: server_cert_fingerprint not configured — \
+                 falling back to system root CA verification. \
+                 Set server_cert_fingerprint in agent.toml for certificate pinning."
             );
-            std::sync::Arc::new(common::tls_transport::NoCertificateVerification)
+            let mut root_store = rustls::RootCertStore::empty();
+            for cert in rustls_native_certs::load_native_certs()
+                .map_err(|e| anyhow::anyhow!("failed to load native root certificates: {e}"))?
+            {
+                root_store.add(cert).ok(); // skip individual malformed certs
+            }
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
         }
     };
-    let tls_config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(cert_verifier)
-        .with_no_client_auth();
 
     let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
-    let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap().to_owned();
+    // Extract the hostname from `addr` (host:port) for SNI so the server can
+    // select the correct certificate and we avoid false-positive monitoring alerts.
+    let sni_host = addr.split(':').next().unwrap_or(addr);
+    let domain = rustls::pki_types::ServerName::try_from(sni_host.to_string())
+        .map_err(|e| anyhow::anyhow!("invalid server hostname '{sni_host}' for TLS SNI: {e}"))?
+        .to_owned();
     let tls_stream = connector.connect(domain, stream).await?;
 
-    let session = CryptoSession::from_shared_secret(secret.as_bytes());
-    let mut tls_transport = common::tls_transport::TlsTransport::new(tls_stream, session);
+    let mut tls_transport = common::tls_transport::TlsTransport::new(tls_stream);
 
     // Announce ourselves before handing the transport to the Agent.
     let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());

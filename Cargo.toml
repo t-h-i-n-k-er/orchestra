@@ -38,7 +38,6 @@ clap = { version = "4.4", features = ["derive"] }
 sysinfo = "0.30"
 dialoguer = "0.11"
 toml = "0.8"
-hmac = "0.12"
 
 [patch.crates-io]
 x11cap = { path = "vendor/x11cap" }

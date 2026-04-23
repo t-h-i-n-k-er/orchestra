@@ -101,6 +101,7 @@ impl Default for Config {
             traffic_profile: TrafficProfile::default(),
             required_domain: None,
             refuse_in_vm: false,
+            server_cert_fingerprint: None,
             port_scan_concurrency: default_port_scan_concurrency(),
             port_scan_timeout_ms: default_port_scan_timeout(),
         }

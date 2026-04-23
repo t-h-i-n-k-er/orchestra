@@ -57,6 +57,10 @@ lazy_static! {
     /// the thread runs for the process lifetime and we gate event delivery via
     /// IS_LOGGING instead of stopping and restarting the thread.
     static ref LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
+    /// Prevents accumulating window-title polling threads across repeated
+    /// start/stop cycles.  The flag is cleared when the thread exits so that
+    /// the next start_logging call can re-spawn it.
+    static ref WINDOW_POLLER_STARTED: AtomicBool = AtomicBool::new(false);
 }
 
 fn check_consent() -> bool {
@@ -122,36 +126,45 @@ pub fn start_logging() -> Result<(), String> {
     }
 
     // The window-title polling thread exits on its own when IS_LOGGING becomes
-    // false, so it is safe to re-spawn it on each start_logging call.
-    let logging_flag = Arc::clone(&IS_LOGGING);
-    let buffer_handle_win = Arc::clone(&HCI_LOG_BUFFER);
-    thread::spawn(move || {
-        while logging_flag.load(Ordering::Relaxed) {
-            if let Ok(title) = get_active_window_title() {
-                let timestamp = Utc::now().timestamp_micros() as u64;
-                let mut hasher = XxHash64::default();
-                title.hash(&mut hasher);
-                let title_hash = hasher.finish();
-                add_log_event(
-                    &buffer_handle_win,
-                    HciEvent::Window(WindowEvent {
-                        timestamp,
-                        title_hash,
-                    }),
-                );
+    // false.  Guard against accumulating threads across rapid start/stop cycles
+    // with WINDOW_POLLER_STARTED; the thread clears the flag when it exits.
+    if !WINDOW_POLLER_STARTED.swap(true, Ordering::SeqCst) {
+        let logging_flag = Arc::clone(&IS_LOGGING);
+        let buffer_handle_win = Arc::clone(&HCI_LOG_BUFFER);
+        thread::spawn(move || {
+            // Debounce: track the last-logged title hash and skip duplicate
+            // events.  Rapid window switching otherwise generates excessive
+            // log entries for every 1-second poll tick.
+            let mut last_logged_hash: Option<u64> = None;
+            while logging_flag.load(Ordering::Relaxed) {
+                if let Ok(title) = get_active_window_title() {
+                    let timestamp = Utc::now().timestamp_micros() as u64;
+                    let mut hasher = XxHash64::default();
+                    title.hash(&mut hasher);
+                    let title_hash = hasher.finish();
+                    // Only log when the active window has actually changed.
+                    if last_logged_hash != Some(title_hash) {
+                        last_logged_hash = Some(title_hash);
+                        add_log_event(
+                            &buffer_handle_win,
+                            HciEvent::Window(WindowEvent {
+                                timestamp,
+                                title_hash,
+                            }),
+                        );
+                    }
+                }
+                thread::sleep(Duration::from_secs(1));
             }
-            thread::sleep(Duration::from_secs(1));
-        }
-    });
+            // Allow a subsequent start_logging call to spawn a fresh thread.
+            WINDOW_POLLER_STARTED.store(false, Ordering::SeqCst);
+        });
+    }
 
     println!("HCI logging started.");
     Ok(())
 }
-        };
 
-        if let Err(error) = listen(callback) {
-            eprintln!("Error while listening for HCI events: {:?}", error);
-        }
 /// Stops the HCI logging process.
 pub fn stop_logging() -> Result<(), String> {
     // Atomically transition true → false; fail if not logging.
@@ -218,7 +231,27 @@ fn get_active_window_title() -> Result<String, String> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(target_os = "macos")]
+fn get_active_window_title() -> Result<String, String> {
+    use std::process::Command;
+    // Use AppleScript via `osascript` to retrieve the frontmost application
+    // name.  This requires no additional crate dependencies and works on all
+    // modern macOS versions without accessibility permissions.
+    let output = Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"System Events\" to get name of first process whose frontmost is true",
+        ])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn get_active_window_title() -> Result<String, String> {
     Err("Active window title not supported on this platform".to_string())
 }

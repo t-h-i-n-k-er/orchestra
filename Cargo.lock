@@ -60,13 +60,13 @@ dependencies = [
  "lazy_static",
  "log",
  "module_loader",
- "ntapi",
  "optimizer",
  "portable-pty",
  "rand 0.8.6",
  "rcgen 0.14.7",
  "rdev",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile 2.2.0",
  "serde",
  "serde_json",
@@ -80,7 +80,6 @@ dependencies = [
  "twox-hash",
  "uuid",
  "winapi",
- "windows 0.52.0",
  "windows-capture",
  "winreg 0.52.0",
  "x11cap",
@@ -790,7 +789,6 @@ dependencies = [
  "async-trait",
  "ed25519-dalek",
  "hkdf",
- "hmac",
  "rand 0.8.6",
  "rustls",
  "rustls-pemfile 2.2.0",
@@ -801,7 +799,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml 1.1.2+spec-1.1.0",
- "x25519-dalek",
 ]
 
 [[package]]
@@ -2857,6 +2854,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "criterion 0.5.1",
+ "goblin",
  "iced-x86",
  "libc",
  "rand 0.8.6",
@@ -3697,6 +3695,18 @@ dependencies = [
  "rustls-webpki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rustls-native-certs"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "612460d5f7bea540c490b2b6395d8e34a953e52b491accd6c86c8164c5932a63"
+dependencies = [
+ "openssl-probe",
+ "rustls-pki-types",
+ "schannel",
+ "security-framework",
 ]
 
 [[package]]
@@ -5583,18 +5593,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 
 [[package]]
-name = "x25519-dalek"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
-dependencies = [
- "curve25519-dalek",
- "rand_core 0.6.4",
- "serde",
- "zeroize",
-]
-
-[[package]]
 name = "x509-parser"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5713,20 +5711,6 @@ name = "zeroize"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
-dependencies = [
- "zeroize_derive",
-]
-
-[[package]]
-name = "zeroize_derive"
-version = "1.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85a5b4158499876c763cb03bc4e49185d3cccbabb15b33c627f7884f43db852e"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
 
 [[package]]
 name = "zerotrie"

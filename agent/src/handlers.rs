@@ -25,7 +25,7 @@ pub(crate) fn is_valid_module_id(id: &str) -> bool {
 lazy_static! {
     static ref SHELL_SESSIONS: Mutex<HashMap<String, Arc<Mutex<shell::ShellSession>>>> =
         Mutex::new(HashMap::new());
-    static ref LOADED_PLUGINS: Mutex<HashMap<String, Box<dyn Plugin + Send + Sync>>> =
+    static ref LOADED_PLUGINS: Mutex<HashMap<String, Arc<Box<dyn Plugin + Send + Sync>>>> =
         Mutex::new(HashMap::new());
     pub static ref SHUTDOWN_NOTIFY: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
 }
@@ -65,7 +65,7 @@ pub(crate) fn push_module(
             LOADED_PLUGINS
                 .lock()
                 .unwrap()
-                .insert(module_name.clone(), plugin);
+                .insert(module_name.clone(), Arc::new(plugin));
             Ok(format!("Module '{}' loaded via push", module_name))
         }
         Err(e) => Err(e.to_string()),
@@ -153,6 +153,14 @@ pub async fn handle_command(
             }
         }
 
+        Command::CloseShell { ref session_id } => {
+            let removed = SHELL_SESSIONS.lock().unwrap().remove(session_id);
+            // Dropping the Arc (and thus ShellSession) kills the child process
+            // and frees the PTY file descriptors via ShellSession::drop().
+            drop(removed);
+            Ok("Shell session closed".to_string())
+        }
+
         #[cfg(feature = "network-discovery")]
         Command::DiscoverNetwork => {
             let hosts = super::net_discovery::arp_scan().unwrap_or_default();
@@ -219,7 +227,7 @@ pub async fn handle_command(
                             LOADED_PLUGINS
                                 .lock()
                                 .unwrap()
-                                .insert(module_id.clone(), plugin);
+                                .insert(module_id.clone(), Arc::new(plugin));
                             Ok("Module deployed".to_string())
                         }
                         Err(e) => Err(e.to_string()),
@@ -232,9 +240,16 @@ pub async fn handle_command(
             ref plugin_id,
             ref args,
         } => {
-            let plugins = LOADED_PLUGINS.lock().unwrap();
-            match plugins.get(plugin_id) {
-                Some(plugin) => plugin.execute(args).map_err(|e| e.to_string()),
+            // Clone the Arc while holding the lock, then release the lock
+            // before calling execute() so other plugin operations (DeployModule,
+            // subsequent ExecutePlugin calls) are not serialised behind a
+            // long-running plugin execution.
+            let maybe_plugin = {
+                let plugins = LOADED_PLUGINS.lock().unwrap();
+                plugins.get(plugin_id).map(Arc::clone)
+            };
+            match maybe_plugin {
+                Some(plugin) => (**plugin).execute(args).map_err(|e| e.to_string()),
                 None => Err(format!("Plugin '{plugin_id}' not loaded")),
             }
         }

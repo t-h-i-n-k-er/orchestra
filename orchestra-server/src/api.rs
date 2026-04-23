@@ -187,6 +187,7 @@ fn command_label(c: &Command) -> &'static str {
         Command::StartShell => "StartShell",
         Command::ShellInput { .. } => "ShellInput",
         Command::ShellOutput { .. } => "ShellOutput",
+        Command::CloseShell { .. } => "CloseShell",
         Command::Shutdown => "Shutdown",
         Command::DiscoverNetwork => "DiscoverNetwork",
         Command::CaptureScreen => "CaptureScreen",

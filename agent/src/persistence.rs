@@ -13,7 +13,6 @@
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 use anyhow::Context;
 use anyhow::Result;
-use rand::seq::SliceRandom;
 use std::path::PathBuf;
 
 #[cfg(target_os = "windows")]
@@ -334,7 +333,7 @@ fn install_persistence_inner() -> Result<PathBuf> {
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <false/>
 </dict>
 </plist>
 "#,
@@ -345,11 +344,22 @@ fn install_persistence_inner() -> Result<PathBuf> {
         .with_context(|| format!("Failed to write plist file {}", path.display()))?;
 
     if std::env::var("ORCHESTRA_PERSISTENCE_ROOT").is_err() {
+        // Obtain the current user's UID for the `gui/<uid>` service target.
+        // `launchctl bootstrap` is the modern replacement for `launchctl load`
+        // (deprecated since macOS 10.10).
+        let uid_out = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .context("Failed to get UID for launchctl bootstrap")?;
+        let uid = String::from_utf8_lossy(&uid_out.stdout)
+            .trim()
+            .to_string();
+        let target = format!("gui/{uid}");
         let status = std::process::Command::new("launchctl")
-            .args(["load", &path.to_string_lossy().to_string()])
+            .args(["bootstrap", &target, &path.to_string_lossy().to_string()])
             .status()?;
         if !status.success() {
-            anyhow::bail!("launchctl load failed with status: {status}");
+            anyhow::bail!("launchctl bootstrap failed with status: {status}");
         }
     }
     Ok(path)
@@ -360,8 +370,18 @@ fn uninstall_persistence_inner() -> Result<()> {
     let path = plist_path();
     if path.exists() {
         if std::env::var("ORCHESTRA_PERSISTENCE_ROOT").is_err() {
+            // `launchctl bootout` is the modern replacement for `launchctl unload`
+            // (deprecated since macOS 10.10).
+            let uid_out = std::process::Command::new("id")
+                .arg("-u")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_else(|| "501".to_string());
+            let target = format!("gui/{uid_out}");
+            let label = get_service_name();
             let _ = std::process::Command::new("launchctl")
-                .args(["unload", &path.to_string_lossy().to_string()])
+                .args(["bootout", &format!("{target}/{label}")])
                 .status();
         }
         std::fs::remove_file(&path)

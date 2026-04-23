@@ -53,6 +53,20 @@ const HANDSHAKE_SERVER_HELLO: u8 = 0x02;
 /// Maximum random pad bytes added per record.
 const MAX_PAD: usize = 64;
 
+/// High bit of the `pad_len` field used to signal that more fragments follow.
+/// Since `MAX_PAD = 64` only needs 7 bits, bit 15 is always zero in a normal
+/// (unfragmented) record, making the flag backward-compatible with peers that
+/// do not implement fragmentation (they will reject continuation records with
+/// an "overflow" error rather than silently misreading them).
+const FRAG_MORE: u16 = 0x8000;
+
+/// Maximum ciphertext bytes per TLS-shaped record.  Leaves room for the 5-byte
+/// TLS header, the 2-byte `pad_len` field, and up to `MAX_PAD` bytes of padding.
+const MAX_FRAG_PAYLOAD: usize = (u16::MAX as usize) - 2 - MAX_PAD;
+
+/// Maximum number of bytes accepted after reassembling all fragments.
+const MAX_ASSEMBLED_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
 /// Common TLS 1.3 cipher suite IDs we advertise in the fake ClientHello.
 const FAKE_CIPHER_SUITES: &[u16] = &[
     0x1301, // TLS_AES_128_GCM_SHA256
@@ -120,24 +134,26 @@ where
         Self { stream, session }
     }
 
-    async fn send_record(&mut self, ciphertext: &[u8]) -> Result<()> {
-        let (pad_len, pad) = {
+    async fn send_record(&mut self, chunk: &[u8], has_more: bool) -> Result<()> {
+        let (actual_pad_len, pad) = {
             let mut rng = rand::thread_rng();
-            let pad_len: u16 = rng.gen_range(0..=MAX_PAD as u16);
-            let mut pad = vec![0u8; pad_len as usize];
+            let actual_pad: u16 = rng.gen_range(0..=MAX_PAD as u16);
+            let mut pad = vec![0u8; actual_pad as usize];
             rng.fill_bytes(&mut pad);
-            (pad_len, pad)
+            (actual_pad, pad)
+        };
+        // Encode the fragmentation flag in the high bit of the pad_len field.
+        let pad_len_field: u16 = if has_more {
+            actual_pad_len | FRAG_MORE
+        } else {
+            actual_pad_len
         };
 
-        let body_len = 2 + pad.len() + ciphertext.len();
-        if body_len > u16::MAX as usize {
-            return Err(anyhow!(
-                "record body too large for TLS framing: {} bytes",
-                body_len
-            ));
-        }
+        let body_len = 2 + pad.len() + chunk.len();
+        // Guaranteed ≤ u16::MAX because chunk.len() ≤ MAX_FRAG_PAYLOAD.
+        debug_assert!(body_len <= u16::MAX as usize, "fragment body exceeds u16 max");
 
-        // 5‑byte TLS record header.
+        // 5-byte TLS record header.
         let mut header = [0u8; 5];
         header[0] = TLS_CONTENT_TYPE_APPLICATION_DATA;
         header[1] = TLS_VERSION_HI;
@@ -146,39 +162,56 @@ where
         header[4] = (body_len & 0xff) as u8;
 
         self.stream.write_all(&header).await?;
-        self.stream.write_all(&pad_len.to_be_bytes()).await?;
+        self.stream.write_all(&pad_len_field.to_be_bytes()).await?;
         self.stream.write_all(&pad).await?;
-        self.stream.write_all(ciphertext).await?;
+        self.stream.write_all(chunk).await?;
         self.stream.flush().await?;
         Ok(())
     }
 
     async fn recv_record(&mut self) -> Result<Vec<u8>> {
-        let mut header = [0u8; 5];
-        self.stream.read_exact(&mut header).await?;
-        if header[0] != TLS_CONTENT_TYPE_APPLICATION_DATA {
-            return Err(anyhow!("unexpected TLS content type: 0x{:02x}", header[0]));
-        }
-        if header[1] != TLS_VERSION_HI || header[2] != TLS_VERSION_LO {
-            return Err(anyhow!(
-                "unexpected TLS version: 0x{:02x}{:02x}",
-                header[1],
-                header[2]
-            ));
-        }
-        let body_len = ((header[3] as usize) << 8) | header[4] as usize;
-        if body_len < 2 {
-            return Err(anyhow!("record body too small"));
-        }
-        let mut body = vec![0u8; body_len];
-        self.stream.read_exact(&mut body).await?;
+        let mut assembled: Vec<u8> = Vec::new();
+        loop {
+            let mut header = [0u8; 5];
+            self.stream.read_exact(&mut header).await?;
+            if header[0] != TLS_CONTENT_TYPE_APPLICATION_DATA {
+                return Err(anyhow!("unexpected TLS content type: 0x{:02x}", header[0]));
+            }
+            if header[1] != TLS_VERSION_HI || header[2] != TLS_VERSION_LO {
+                return Err(anyhow!(
+                    "unexpected TLS version: 0x{:02x}{:02x}",
+                    header[1],
+                    header[2]
+                ));
+            }
+            let body_len = ((header[3] as usize) << 8) | header[4] as usize;
+            if body_len < 2 {
+                return Err(anyhow!("record body too small"));
+            }
+            let mut body = vec![0u8; body_len];
+            self.stream.read_exact(&mut body).await?;
 
-        let pad_len = ((body[0] as usize) << 8) | body[1] as usize;
-        let payload_start = 2 + pad_len;
-        if payload_start > body.len() {
-            return Err(anyhow!("declared pad length overflows record body"));
+            // Decode the fragmentation flag and the real pad length.
+            let pad_len_field = ((body[0] as u16) << 8) | body[1] as u16;
+            let has_more = (pad_len_field & FRAG_MORE) != 0;
+            let actual_pad_len = (pad_len_field & !FRAG_MORE) as usize;
+
+            let payload_start = 2 + actual_pad_len;
+            if payload_start > body.len() {
+                return Err(anyhow!("declared pad length overflows record body"));
+            }
+            assembled.extend_from_slice(&body[payload_start..]);
+            if assembled.len() > MAX_ASSEMBLED_BYTES {
+                return Err(anyhow!(
+                    "reassembled message exceeds limit of {} bytes",
+                    MAX_ASSEMBLED_BYTES
+                ));
+            }
+            if !has_more {
+                break;
+            }
         }
-        Ok(body[payload_start..].to_vec())
+        Ok(assembled)
     }
 }
 
@@ -190,7 +223,20 @@ where
     async fn send(&mut self, msg: Message) -> Result<()> {
         let serialized = serde_json::to_vec(&msg)?;
         let ciphertext = self.session.encrypt(&serialized);
-        self.send_record(&ciphertext).await
+        // Fragment large messages across multiple TLS-shaped records so that
+        // the 2-byte record-length field is never exceeded.
+        if ciphertext.len() <= MAX_FRAG_PAYLOAD {
+            self.send_record(&ciphertext, false).await
+        } else {
+            let mut offset = 0;
+            while offset < ciphertext.len() {
+                let end = (offset + MAX_FRAG_PAYLOAD).min(ciphertext.len());
+                let has_more = end < ciphertext.len();
+                self.send_record(&ciphertext[offset..end], has_more).await?;
+                offset = end;
+            }
+            Ok(())
+        }
     }
 
     async fn recv(&mut self) -> Result<Message> {

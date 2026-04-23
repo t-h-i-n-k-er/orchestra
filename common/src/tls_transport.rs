@@ -1,4 +1,4 @@
-use crate::{CryptoSession, Message, Transport};
+use crate::{Message, Transport};
 use anyhow::Result;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -53,16 +53,29 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
         _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
+        now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let fingerprint: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
-        if fingerprint == self.expected {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::InvalidCertificate(
+        if fingerprint != self.expected {
+            return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::ApplicationVerificationFailure,
-            ))
+            ));
         }
+        // Reject certificates outside their validity window.
+        if let Some((not_before, not_after)) = cert_validity_period(end_entity.as_ref()) {
+            let now_secs = now.as_secs() as i64;
+            if now_secs < not_before {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::NotValidYet,
+                ));
+            }
+            if now_secs > not_after {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::Expired,
+                ));
+            }
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -98,6 +111,101 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+/// Parse the X.509 `Validity` interval from a DER-encoded certificate.
+/// Returns `(not_before, not_after)` as seconds since the Unix epoch, or
+/// `None` when the structure cannot be navigated.
+///
+/// Handles both `UTCTime` (2-digit year) and `GeneralizedTime` (4-digit year).
+fn cert_validity_period(der: &[u8]) -> Option<(i64, i64)> {
+    // Minimal DER TLV decoder.
+    fn read_len(buf: &[u8], pos: usize) -> Option<(usize, usize)> {
+        let first = *buf.get(pos)?;
+        if first & 0x80 == 0 {
+            Some((pos + 1, first as usize))
+        } else {
+            let n = (first & 0x7f) as usize;
+            if n == 0 || n > 4 || pos + 1 + n > buf.len() {
+                return None;
+            }
+            let mut l = 0usize;
+            for i in 0..n {
+                l = (l << 8) | buf[pos + 1 + i] as usize;
+            }
+            Some((pos + 1 + n, l))
+        }
+    }
+    fn skip(buf: &[u8], pos: usize) -> Option<usize> {
+        let (val, len) = read_len(buf, pos + 1)?;
+        Some(val + len)
+    }
+    fn enter(buf: &[u8], pos: usize, tag: u8) -> Option<usize> {
+        if buf.get(pos)? != &tag {
+            return None;
+        }
+        let (val, _) = read_len(buf, pos + 1)?;
+        Some(val)
+    }
+    /// Parse a UTCTime (0x17) or GeneralizedTime (0x18), return Unix seconds.
+    fn parse_time(buf: &[u8], pos: usize) -> Option<i64> {
+        let tag = *buf.get(pos)?;
+        let (val, len) = read_len(buf, pos + 1)?;
+        if val + len > buf.len() {
+            return None;
+        }
+        let s = std::str::from_utf8(&buf[val..val + len]).ok()?;
+        let s = s.trim_end_matches('Z');
+        let (year, rest) = match tag {
+            0x17 => {
+                // UTCTime: YYMMDDHHMMSS
+                if s.len() < 12 {
+                    return None;
+                }
+                let yy: i64 = s[0..2].parse().ok()?;
+                (if yy >= 50 { 1900 + yy } else { 2000 + yy }, &s[2..])
+            }
+            0x18 => {
+                // GeneralizedTime: YYYYMMDDHHMMSS
+                if s.len() < 14 {
+                    return None;
+                }
+                (s[0..4].parse().ok()?, &s[4..])
+            }
+            _ => return None,
+        };
+        if rest.len() < 10 {
+            return None;
+        }
+        let mo: i64 = rest[0..2].parse().ok()?;
+        let day: i64 = rest[2..4].parse().ok()?;
+        let hr: i64 = rest[4..6].parse().ok()?;
+        let mn: i64 = rest[6..8].parse().ok()?;
+        let sc: i64 = rest[8..10].parse().ok()?;
+        // Gregorian date → days since 1970-01-01 (civil calendar algorithm).
+        let y = if mo <= 2 { year - 1 } else { year };
+        let m = if mo <= 2 { mo + 9 } else { mo - 3 };
+        let era = y.div_euclid(400);
+        let yoe = y.rem_euclid(400);
+        let doy = (153 * m + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146097 + doe - 719468;
+        Some(days * 86400 + hr * 3600 + mn * 60 + sc)
+    }
+
+    // Navigate: Certificate → TBSCertificate → (skip fields) → Validity.
+    let p = enter(der, 0, 0x30)?; // outer Certificate SEQUENCE
+    let p = enter(der, p, 0x30)?; // TBSCertificate SEQUENCE
+    // optional [0] version
+    let p = if der.get(p)? == &0xa0 { skip(der, p)? } else { p };
+    let p = skip(der, p)?; // serialNumber INTEGER
+    let p = skip(der, p)?; // signature AlgorithmIdentifier SEQUENCE
+    let p = skip(der, p)?; // issuer Name SEQUENCE
+    let p = enter(der, p, 0x30)?; // Validity SEQUENCE
+    let not_before = parse_time(der, p)?;
+    let p = skip(der, p)?;
+    let not_after = parse_time(der, p)?;
+    Some((not_before, not_after))
 }
 
 /// **Testing only.** Accepts any server certificate without verification.
@@ -148,12 +256,16 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 
 pub struct TlsTransport<S> {
     stream: S,
-    session: CryptoSession,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsTransport<S> {
-    pub fn new(stream: S, session: CryptoSession) -> Self {
-        Self { stream, session }
+    /// Create a new `TlsTransport` wrapping an established TLS stream.
+    ///
+    /// TLS already provides authenticated encryption, so no additional
+    /// application-layer cipher is applied.  Messages are framed with a
+    /// 4-byte little-endian length prefix followed by JSON.
+    pub fn new(stream: S) -> Self {
+        Self { stream }
     }
 }
 
@@ -162,11 +274,10 @@ pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 #[async_trait]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport for TlsTransport<S> {
     async fn send(&mut self, msg: Message) -> Result<()> {
-        let serialized = serde_json::to_vec(&msg)?;
-        let encrypted = self.session.encrypt(&serialized);
-        let len = encrypted.len() as u32;
+        let payload = serde_json::to_vec(&msg)?;
+        let len = payload.len() as u32;
         self.stream.write_u32_le(len).await?;
-        self.stream.write_all(&encrypted).await?;
+        self.stream.write_all(&payload).await?;
         Ok(())
     }
 
@@ -177,7 +288,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport for TlsTransport<S> {
         }
         let mut buf = vec![0u8; len as usize];
         self.stream.read_exact(&mut buf).await?;
-        let decrypted = self.session.decrypt(&buf)?;
-        Ok(serde_json::from_slice(&decrypted)?)
+        Ok(serde_json::from_slice(&buf)?)
     }
 }

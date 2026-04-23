@@ -26,6 +26,7 @@ directories = "6.0.0"
 rustls = { version = "0.23.38", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2.2.0"
+rustls-native-certs = "0.8"
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring", "pem"] }
 rand = "0.8"
 
@@ -34,14 +35,15 @@ x11cap = { version = "0.1", optional = true }
 enigo = { version = "0.2", optional = true, default-features = false, features = ["x11rb"] }
 image = { version = "0.25", optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+enigo = { version = "0.2", optional = true }
+
 [target.'cfg(windows)'.dependencies]
 enigo = { version = "0.2", optional = true }
 windows-capture = { version = "2", optional = true }
 winreg = "0.52"
 image = { version = "0.25", optional = true }
-ntapi = { version = "0.4", optional = true }
-windows = { version = "0.52", features = ["Win32_System_SystemServices", "Win32_Foundation"], optional = true }
-winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "winbase", "winnt", "libloaderapi", "wow64apiset", "handleapi"] }
+winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "winbase", "winnt", "libloaderapi", "wow64apiset", "handleapi", "iphlpapi", "iptypes"] }
 hollowing = { path = "../hollowing" }
 
 [features]
@@ -53,7 +55,6 @@ network-discovery = []
 # target-specific dependency table.
 remote-assist = ["dep:enigo", "dep:image", "dep:x11cap"]
 module-signatures = ["common/module-signatures"]
-forward-secrecy = ["common/forward-secrecy"]
 direct-syscalls = []
 hci-research = ["dep:rdev", "dep:chrono", "dep:twox-hash"]
 # Connect the agent outbound to an Orchestra Control Center instead of waiting

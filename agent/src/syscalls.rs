@@ -1,13 +1,9 @@
 //! Direct syscalls for Windows.
-#![cfg(all(windows, feature = "direct-syscalls"))]
+#![cfg(all(windows, target_arch = "x86_64", feature = "direct-syscalls"))]
 
 use anyhow::{anyhow, Result};
 use std::arch::asm;
-use std::ffi::c_void;
-use winapi::shared::minwindef::ULONG;
-use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
 use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
-use winapi::um::winnt::{HANDLE, PVOID};
 
 /// Retrieves the syscall number (SSN) for a given NT function.
 ///
@@ -223,7 +219,7 @@ fn get_syscall_id_from_memory(func_name: &str) -> Result<u32> {
             if bytes[i] == 0x0f && bytes[i + 1] == 0x05 {
                 // Found syscall, now search backwards for `mov eax, <ssn>` (0xb8, ....)
                 for j in (0..i).rev() {
-                    if bytes[j] == 0xb8 {
+                    if bytes[j] == 0xb8 && j + 5 <= bytes.len() {
                         let ssn_bytes: [u8; 4] =
                             bytes[j + 1..j + 5].try_into().map_err(|_| {
                                 anyhow!("Failed to read SSN bytes for {}", func_name)
@@ -316,120 +312,6 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> i32 {
     status
 }
 
-pub fn allocate_virtual_memory(
-    process_handle: HANDLE,
-    base_address: &mut *mut c_void,
-    region_size: &mut usize,
-    allocation_type: u32,
-    protect: u32,
-) -> Result<()> {
-    let status = unsafe {
-        syscall!(
-            "NtAllocateVirtualMemory",
-            process_handle,
-            base_address as *mut _ as isize,
-            0,
-            region_size as *mut _ as isize,
-            allocation_type,
-            protect
-        )
-    };
-    if status >= 0 {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "NtAllocateVirtualMemory failed with status {:#x}",
-            status
-        ))
-    }
-}
 
-pub fn write_virtual_memory(
-    process_handle: HANDLE,
-    base_address: PVOID,
-    buffer: PVOID,
-    number_of_bytes_to_write: usize,
-    number_of_bytes_written: *mut usize,
-) -> Result<()> {
-    let status = unsafe {
-        syscall!(
-            "NtWriteVirtualMemory",
-            process_handle,
-            base_address as usize,
-            buffer as usize,
-            number_of_bytes_to_write,
-            number_of_bytes_written as usize
-        )
-    };
-    if status >= 0 {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "NtWriteVirtualMemory failed with status {:#x}",
-            status
-        ))
-    }
-}
 
-pub fn protect_virtual_memory(
-    process_handle: HANDLE,
-    base_address: &mut PVOID,
-    region_size: &mut usize,
-    new_protect: ULONG,
-    old_protect: *mut ULONG,
-) -> Result<()> {
-    let status = unsafe {
-        syscall!(
-            "NtProtectVirtualMemory",
-            process_handle,
-            base_address as *mut _ as usize,
-            region_size as *mut _ as usize,
-            new_protect,
-            old_protect as usize
-        )
-    };
-    if status >= 0 {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "NtProtectVirtualMemory failed with status {:#x}",
-            status
-        ))
-    }
-}
 
-pub fn create_thread_ex(
-    thread_handle: *mut HANDLE,
-    desired_access: u32,
-    object_attributes: *mut OBJECT_ATTRIBUTES,
-    process_handle: HANDLE,
-    start_routine: *mut c_void,
-    argument: *mut c_void,
-    create_flags: u32,
-    zero_bits: usize,
-    stack_size: usize,
-    maximum_stack_size: usize,
-    attribute_list: *mut c_void,
-) -> Result<()> {
-    let status = unsafe {
-        syscall!(
-            "NtCreateThreadEx",
-            thread_handle as isize,
-            desired_access,
-            object_attributes as isize,
-            process_handle,
-            start_routine as isize,
-            argument as isize,
-            create_flags,
-            zero_bits,
-            stack_size,
-            maximum_stack_size,
-            attribute_list as isize
-        )
-    };
-    if status >= 0 {
-        Ok(())
-    } else {
-        Err(anyhow!("NtCreateThreadEx failed with status {:#x}", status))
-    }
-}

@@ -2,6 +2,7 @@
 //! transformations to hot code paths at runtime.
 
 use anyhow::{anyhow, Result};
+use goblin;
 use iced_x86::{Code, Decoder, DecoderOptions, Encoder, Instruction, OpKind, Register};
 use rand::seq::SliceRandom;
 
@@ -27,14 +28,56 @@ fn reg_size(reg: Register) -> usize {
 
 struct AddSubPass;
 impl Pass for AddSubPass {
+    /// Replace `add reg, N` ↔ `sub reg, -N` (and vice-versa) for immediate
+    /// operands.  Only 8-bit signed immediates are handled; these always
+    /// produce the same encoding size, so relative branch targets are
+    /// unaffected.
     fn run(&self, instructions: &mut Vec<Instruction>) -> Result<()> {
         for instr in instructions.iter_mut() {
-            if instr.mnemonic() == iced_x86::Mnemonic::Add 
-               && instr.op1_kind() == OpKind::Immediate8 {
-                let reg = instr.op0_register();
-                let imm = instr.immediate(1);
-                // a simple conceptual example: sub reg, -imm
-                // Since this breaks some edge cases, we won't fully implement it on raw bytes reliably
+            let mnem = instr.mnemonic();
+            let is_add = mnem == iced_x86::Mnemonic::Add;
+            let is_sub = mnem == iced_x86::Mnemonic::Sub;
+            if (!is_add && !is_sub)
+                || instr.op_count() != 2
+                || instr.op0_kind() != OpKind::Register
+            {
+                continue;
+            }
+            let reg = instr.op0_register();
+            // Determine the instruction code for the opposite operation and
+            // the negated immediate value.  We restrict to 8-bit-signed
+            // immediates (sign-extended to the operand size) because those
+            // always encode to the same byte width as the original.
+            let (neg_imm_i32, new_code) = match instr.op1_kind() {
+                OpKind::Immediate8to64 => {
+                    let imm = instr.immediate(1) as i64 as i8;
+                    if imm == i8::MIN { continue; }
+                    let code = if is_add { Code::Sub_rm64_imm8 } else { Code::Add_rm64_imm8 };
+                    ((-imm) as i32, code)
+                }
+                OpKind::Immediate8to32 => {
+                    let imm = instr.immediate(1) as i32 as i8;
+                    if imm == i8::MIN { continue; }
+                    let code = if is_add { Code::Sub_rm32_imm8 } else { Code::Add_rm32_imm8 };
+                    ((-imm) as i32, code)
+                }
+                OpKind::Immediate8to16 => {
+                    let imm = instr.immediate(1) as i16 as i8;
+                    if imm == i8::MIN { continue; }
+                    let code = if is_add { Code::Sub_rm16_imm8 } else { Code::Add_rm16_imm8 };
+                    ((-imm) as i32, code)
+                }
+                OpKind::Immediate8 => {
+                    let imm = instr.immediate(1) as i8;
+                    if imm == i8::MIN { continue; }
+                    let code = if is_add { Code::Sub_rm8_imm8 } else { Code::Add_rm8_imm8 };
+                    ((-imm) as i32, code)
+                }
+                _ => continue,
+            };
+            if let Ok(mut new_instr) = Instruction::with2(new_code, reg, neg_imm_i32) {
+                new_instr.set_ip(instr.ip());
+                *instr = new_instr;
             }
         }
         Ok(())
@@ -104,31 +147,38 @@ impl Pass for LeaAddPass {
 
 struct JunkInstructionPass;
 impl Pass for JunkInstructionPass {
+    /// Inserts harmless junk instructions **only after unconditional transfers**
+    /// (ret, jmp) where execution cannot fall through into the inserted bytes.
+    /// Inserting junk elsewhere would:
+    ///   - clobber the flags register, breaking subsequent flag-reading instructions,
+    ///   - shift relative branch targets (requiring full relocation recalculation).
     fn run(&self, instructions: &mut Vec<Instruction>) -> Result<()> {
-        let mut new_instrs = Vec::with_capacity(instructions.len() * 2);
-        let junk_options = [
-            (Code::Nopd, 1),         // 1-byte NOP
-            (Code::Mov_r64_rm64, 3), // mov rax, rax (3 bytes)
-        ];
+        let mut new_instrs = Vec::with_capacity(instructions.len());
 
         for instr in instructions.iter() {
-            new_instrs.push(instr.clone());
+            new_instrs.push(*instr);
 
-            // Insert junk code periodically.
-            if rand::random::<u8>() < 30 {
-                // ~12% chance
-                let (code, _) = junk_options.choose(&mut rand::thread_rng()).unwrap();
-                let junk_instr = match *code {
-                    Code::Nopd => Instruction::with(Code::Nopd),
-                    Code::Mov_r64_rm64 => {
-                        let reg = [Register::RAX, Register::RCX, Register::RDX, Register::RBX]
-                            .choose(&mut rand::thread_rng())
-                            .unwrap();
-                        Instruction::with2(Code::Mov_r64_rm64, *reg, *reg).unwrap()
-                    }
-                    _ => continue,
+            // Only insert after instructions that end a basic block with no
+            // fall-through: ret, retf, and unconditional jmp.
+            let is_dead_after = matches!(
+                instr.mnemonic(),
+                iced_x86::Mnemonic::Ret
+                    | iced_x86::Mnemonic::Retf
+                    | iced_x86::Mnemonic::Jmp
+            );
+
+            if is_dead_after && rand::random::<u8>() < 64 {
+                // ~25% chance per unconditional-transfer site.
+                let junk = if rand::random::<bool>() {
+                    Instruction::with(Code::Nopd)
+                } else {
+                    let reg = *[Register::RAX, Register::RCX, Register::RDX, Register::RBX]
+                        .choose(&mut rand::thread_rng())
+                        .unwrap();
+                    Instruction::with2(Code::Mov_r64_rm64, reg, reg)
+                        .unwrap_or_else(|_| Instruction::with(Code::Nopd))
                 };
-                new_instrs.push(junk_instr);
+                new_instrs.push(junk);
             }
         }
         *instructions = new_instrs;
@@ -136,61 +186,113 @@ impl Pass for JunkInstructionPass {
     }
 }
 
-struct RegisterSwapPass;
-impl Pass for RegisterSwapPass {
-    fn run(&self, instructions: &mut Vec<Instruction>) -> Result<()> {
-        // A simple, safe swap: RAX <-> RCX. These are volatile registers.
-        let reg1 = Register::RAX;
-        let reg2 = Register::RCX;
+// RegisterSwapPass was removed: unconditionally swapping RAX↔RCX across an
+// entire function body without liveness analysis breaks the Windows x64
+// calling convention (RAX = return value, RCX = first parameter), corrupts
+// syscall conventions, and violates fixed-register instruction semantics.
+// A safe implementation would require full dataflow / liveness analysis;
+// that is out of scope for this runtime optimizer.
 
-        for instr in instructions.iter_mut() {
-            let mut op0_reg = instr.op0_register();
-            let mut op1_reg = instr.op1_register();
-            let mut op2_reg = instr.op2_register();
+/// Parse `binary` as an ELF or PE executable, locate its `.text` section, and
+/// apply size-preserving instruction-level transforms (`LeaAddPass`,
+/// `AddSubPass`) to the code bytes in place.  Returns the rewritten binary.
+///
+/// If `binary` cannot be parsed as ELF or PE (e.g. raw machine code in tests)
+/// the transforms are applied directly to the raw bytes.
+///
+/// Only size-preserving passes are used so that relative branch targets remain
+/// valid without a full relocation pass.
+pub fn diversify_code(binary: &[u8]) -> Result<Vec<u8>> {
+    let mut output = binary.to_vec();
 
-            if op0_reg == reg1 {
-                op0_reg = reg2;
-            } else if op0_reg == reg2 {
-                op0_reg = reg1;
+    // --- Try ELF ---
+    if let Ok(elf) = goblin::elf::Elf::parse(binary) {
+        let mut found = false;
+        for sh in &elf.section_headers {
+            if sh.sh_type != goblin::elf::section_header::SHT_PROGBITS {
+                continue;
             }
-
-            if op1_reg == reg1 {
-                op1_reg = reg2;
-            } else if op1_reg == reg2 {
-                op1_reg = reg1;
+            if elf.shdr_strtab.get_at(sh.sh_name) != Some(".text") {
+                continue;
             }
-
-            if op2_reg == reg1 {
-                op2_reg = reg2;
-            } else if op2_reg == reg2 {
-                op2_reg = reg1;
-            }
-
-            if instr.op0_kind() == OpKind::Register {
-                instr.set_op0_register(op0_reg);
-            }
-            if instr.op1_kind() == OpKind::Register {
-                instr.set_op1_register(op1_reg);
-            }
-            if instr.op2_kind() == OpKind::Register {
-                instr.set_op2_register(op2_reg);
+            let file_off = sh.sh_offset as usize;
+            let size = sh.sh_size as usize;
+            let vaddr = sh.sh_addr;
+            if file_off.saturating_add(size) <= binary.len() {
+                transform_code_section(&mut output, file_off, size, vaddr);
+                found = true;
+                break;
             }
         }
-
-        Ok(())
+        if found {
+            return Ok(output);
+        }
     }
+
+    // --- Try PE ---
+    if let Ok(pe) = goblin::pe::PE::parse(binary) {
+        let mut found = false;
+        for section in &pe.sections {
+            let name = std::str::from_utf8(&section.name)
+                .unwrap_or("")
+                .trim_matches('\0');
+            if name != ".text" {
+                continue;
+            }
+            let file_off = section.pointer_to_raw_data as usize;
+            let size = section.size_of_raw_data as usize;
+            let vaddr = pe.image_base as u64 + section.virtual_address as u64;
+            if file_off.saturating_add(size) <= binary.len() {
+                transform_code_section(&mut output, file_off, size, vaddr);
+                found = true;
+                break;
+            }
+        }
+        if found {
+            return Ok(output);
+        }
+    }
+
+    // --- Fallback: raw x86-64 machine code (used in tests / pre-linked blobs) ---
+    let len = output.len();
+    transform_code_section(&mut output, 0, len, 0);
+    Ok(output)
 }
 
-/// Given a slice of raw machine code, apply a series of diversifying
-/// transformations and return the new machine code.
-pub fn diversify_code(code: &[u8]) -> Result<Vec<u8>> {
-    // In our context, applying full static binary rewriting over raw bytes is complex and
-    // typically requires proper PE/ELF parsing to not corrupt relative jump offsets.
-    // As a simple placeholder for the request, we apply basic obfuscation passes directly
-    // and append a random junk block. In a real system, this would use LIEF/goblin.
-    let mut res = code.to_vec();
-    res.extend_from_slice(&[0x90, 0x90, 0x90, 0x90]); // append NOPs as proof-of-concept
-    Ok(res)
+/// Apply size-preserving instruction transforms to `binary[offset..offset+size]`
+/// decoded at virtual address `vaddr`.  Transforms each instruction in-place;
+/// instructions that fail to re-encode at the same byte width are left unchanged,
+/// preserving all relative branch targets.
+fn transform_code_section(binary: &mut Vec<u8>, offset: usize, size: usize, vaddr: u64) {
+    let code: Vec<u8> = binary[offset..offset + size].to_vec();
+    let mut decoder = Decoder::with_ip(64, &code, vaddr, DecoderOptions::NONE);
+    let original: Vec<Instruction> = decoder.iter().collect();
+    let mut transformed = original.clone();
+
+    // Apply only size-preserving passes.
+    let _ = LeaAddPass.run(&mut transformed);
+    let _ = AddSubPass.run(&mut transformed);
+
+    let mut encoder = Encoder::new(64);
+    for (orig, new_instr) in original.iter().zip(transformed.iter()) {
+        if orig == new_instr {
+            continue; // no change
+        }
+        let orig_size = orig.len();
+        let file_off = (orig.ip().wrapping_sub(vaddr)) as usize;
+        if file_off.saturating_add(orig_size) > size {
+            continue;
+        }
+        if encoder.encode(new_instr, new_instr.ip()).is_ok() {
+            let buf = encoder.take_buffer();
+            if buf.len() == orig_size {
+                // Same encoded size: safe to write back without touching branches.
+                binary[offset + file_off..offset + file_off + orig_size]
+                    .copy_from_slice(&buf);
+            }
+            // Different size → skip; preserving original bytes keeps branches intact.
+        }
+    }
 }
 
 /// Find a function by name in the current process and apply optimizations.
@@ -206,10 +308,6 @@ pub fn optimize_hot_function(name: &str) -> Result<()> {
     let passes: Vec<Box<dyn Pass>> = vec![Box::new(XorZeroingPass), Box::new(LeaAddPass)];
     for pass in passes {
         pass.run(&mut instructions)?;
-    }
-
-    if instructions.len() == original_len {
-        return Ok(());
     }
 
     let mut encoder = Encoder::new(64);
@@ -266,21 +364,26 @@ fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
 fn write_executable_memory(ptr: *mut u8, data: &[u8]) -> Result<()> {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
     let start = ptr as usize;
+    let end = start + data.len();
     let page_start = start & !(page_size - 1);
+    // Round the end address up to the next page boundary so that patches
+    // spanning multiple pages all receive the temporary write permission.
+    let page_end = (end + page_size - 1) & !(page_size - 1);
+    let mprotect_len = page_end - page_start;
 
     unsafe {
         let res = libc::mprotect(
             page_start as *mut libc::c_void,
-            page_size,
+            mprotect_len,
             libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
         );
         if res != 0 {
-            return Err(anyhow!("mprotect failed"));
+            return Err(anyhow!("mprotect(RWX) failed: {}", std::io::Error::last_os_error()));
         }
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         libc::mprotect(
             page_start as *mut libc::c_void,
-            page_size,
+            mprotect_len,
             libc::PROT_READ | libc::PROT_EXEC,
         );
     }

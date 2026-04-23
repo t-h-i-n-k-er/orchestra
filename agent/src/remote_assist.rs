@@ -10,10 +10,10 @@
 #![cfg(feature = "remote-assist")]
 
 use anyhow::{anyhow, Result};
-#[cfg(target_os = "linux")]
-use enigo::{Coordinate, Enigo, Keyboard, Mouse, Settings};
-#[cfg(windows)]
-use enigo::{Coordinate, Enigo, Keyboard, Mouse, Settings};
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+use enigo::{Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+use std::cell::RefCell;
 #[cfg(windows)]
 use windows_capture::{
     capture::GraphicsCaptureApi,
@@ -22,6 +22,33 @@ use windows_capture::{
 };
 #[cfg(target_os = "linux")]
 use x11cap::{Capturer, Screen};
+
+/// Thread-local `Enigo` instance shared across input-simulation calls.
+/// Avoids the overhead of re-initialising the platform input backend on every
+/// call; `Enigo` is not `Send` so a thread-local is the right storage class.
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+thread_local! {
+    static ENIGO_INSTANCE: RefCell<Option<Enigo>> = const { RefCell::new(None) };
+}
+
+/// Obtain a mutable reference to the thread-local `Enigo`, initialising it
+/// on first use, and call `f` with it.
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+fn with_enigo<F, R>(f: F) -> Result<R>
+where
+    F: FnOnce(&mut Enigo) -> Result<R>,
+{
+    ENIGO_INSTANCE.with(|cell| -> Result<R> {
+        let mut borrow = cell.borrow_mut();
+        if borrow.is_none() {
+            *borrow = Some(
+                Enigo::new(&Settings::default())
+                    .map_err(|e| anyhow!("enigo init failed: {e}"))?,
+            );
+        }
+        f(borrow.as_mut().unwrap())
+    })
+}
 
 /// Checks for the existence of a consent flag.
 #[cfg(unix)]
@@ -59,6 +86,16 @@ pub fn capture_screen() -> Result<Vec<u8>> {
     #[cfg(target_os = "linux")]
     {
         check_consent()?;
+        // On Wayland without an X11 socket, x11cap will fail silently.
+        // Detect and report this explicitly so callers receive a useful error.
+        if std::env::var_os("WAYLAND_DISPLAY").is_some()
+            && std::env::var_os("DISPLAY").is_none()
+        {
+            return Err(anyhow!(
+                "Screen capture is not supported on a pure Wayland session. \
+                 Enable XWayland (set DISPLAY) or use an XDG Desktop Portal-compatible tool."
+            ));
+        }
         use image::{ImageBuffer, Rgb};
         let mut capturer =
             Capturer::new(Screen::Default).map_err(|_| anyhow!("failed to open X11 display"))?;
@@ -99,32 +136,104 @@ pub fn capture_screen() -> Result<Vec<u8>> {
         )?;
         Ok(buffer)
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        check_consent()?;
+        // Use the bundled `screencapture` CLI to grab a PNG screenshot.
+        let path = std::env::temp_dir()
+            .join(format!("orchestra-screen-{}.png", std::process::id()));
+        let status = std::process::Command::new("screencapture")
+            .args(["-x", "-t", "png"])
+            .arg(&path)
+            .status()
+            .map_err(|e| anyhow!("screencapture invocation failed: {e}"))?;
+        if !status.success() {
+            return Err(anyhow!("screencapture exited with non-zero status"));
+        }
+        let data = std::fs::read(&path)
+            .map_err(|e| anyhow!("failed to read screenshot file: {e}"))?;
+        let _ = std::fs::remove_file(&path);
+        Ok(data)
+    }
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {
         Err(anyhow!("Screen capture not implemented for this platform."))
+    }
+}
+
+/// Map a string key name to an enigo `Key` variant.
+///
+/// Returns `None` for single characters (caller should use `enigo.text()`) and
+/// unknown names.
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+fn map_key_name(name: &str) -> Option<enigo::Key> {
+    match name {
+        "Return" | "Enter" => Some(enigo::Key::Return),
+        "Tab" => Some(enigo::Key::Tab),
+        "Escape" | "Esc" => Some(enigo::Key::Escape),
+        "Backspace" | "BackSpace" => Some(enigo::Key::Backspace),
+        "Delete" | "Del" => Some(enigo::Key::Delete),
+        "Home" => Some(enigo::Key::Home),
+        "End" => Some(enigo::Key::End),
+        "PageUp" => Some(enigo::Key::PageUp),
+        "PageDown" => Some(enigo::Key::PageDown),
+        "Up" | "UpArrow" => Some(enigo::Key::UpArrow),
+        "Down" | "DownArrow" => Some(enigo::Key::DownArrow),
+        "Left" | "LeftArrow" => Some(enigo::Key::LeftArrow),
+        "Right" | "RightArrow" => Some(enigo::Key::RightArrow),
+        "F1" => Some(enigo::Key::F1),
+        "F2" => Some(enigo::Key::F2),
+        "F3" => Some(enigo::Key::F3),
+        "F4" => Some(enigo::Key::F4),
+        "F5" => Some(enigo::Key::F5),
+        "F6" => Some(enigo::Key::F6),
+        "F7" => Some(enigo::Key::F7),
+        "F8" => Some(enigo::Key::F8),
+        "F9" => Some(enigo::Key::F9),
+        "F10" => Some(enigo::Key::F10),
+        "F11" => Some(enigo::Key::F11),
+        "F12" => Some(enigo::Key::F12),
+        "Space" => Some(enigo::Key::Space),
+        "CapsLock" => Some(enigo::Key::CapsLock),
+        "Shift" => Some(enigo::Key::Shift),
+        "Control" | "Ctrl" => Some(enigo::Key::Control),
+        "Alt" => Some(enigo::Key::Alt),
+        "Meta" | "Super" | "Win" | "Command" => Some(enigo::Key::Meta),
+        _ => None,
     }
 }
 
 /// Simulates a key press / key sequence.
 pub fn simulate_key(key: &str) -> Result<()> {
     check_consent()?;
-    let mut enigo =
-        Enigo::new(&Settings::default()).map_err(|e| anyhow!("enigo init failed: {e}"))?;
-    enigo
-        .text(key)
-        .map_err(|e| anyhow!("key simulation failed: {e}"))?;
-    Ok(())
+    with_enigo(|enigo| {
+        if let Some(k) = map_key_name(key) {
+            enigo
+                .key(k, Direction::Click)
+                .map_err(|e| anyhow!("key simulation failed: {e}"))
+        } else if key.chars().count() == 1 {
+            // Single character — type it as text.
+            enigo
+                .text(key)
+                .map_err(|e| anyhow!("key simulation failed: {e}"))
+        } else {
+            Err(anyhow!(
+                "Unknown key name '{}'. Expected a named key (e.g. 'Enter', 'Tab', 'F1') \
+                 or a single character.",
+                key
+            ))
+        }
+    })
 }
 
 /// Simulates mouse movement to a given (x, y) coordinate.
 pub fn simulate_mouse_move(x: i32, y: i32) -> Result<()> {
     check_consent()?;
-    let mut enigo =
-        Enigo::new(&Settings::default()).map_err(|e| anyhow!("enigo init failed: {e}"))?;
-    enigo
-        .move_mouse(x, y, Coordinate::Abs)
-        .map_err(|e| anyhow!("mouse move failed: {e}"))?;
-    Ok(())
+    with_enigo(|enigo| {
+        enigo
+            .move_mouse(x, y, Coordinate::Abs)
+            .map_err(|e| anyhow!("mouse move failed: {e}"))
+    })
 }
 
 #[cfg(test)]

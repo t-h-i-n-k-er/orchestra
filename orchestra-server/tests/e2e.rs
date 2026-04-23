@@ -72,14 +72,6 @@ impl FakeAgent {
     async fn connect(port: u16) -> Self {
         let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
 
-        #[cfg(feature = "forward-secrecy")]
-        let session = {
-            use common::crypto::fs_handshake_client;
-            fs_handshake_client(&mut s, SECRET.as_bytes())
-                .await
-                .unwrap()
-        };
-
         #[cfg(not(feature = "forward-secrecy"))]
         let session = CryptoSession::from_shared_secret(SECRET.as_bytes());
 
