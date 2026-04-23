@@ -7,12 +7,12 @@ use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use winapi::shared::ntdef::{LIST_ENTRY, UNICODE_STRING};
 use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
-use winapi::um::memoryapi::{VirtualAlloc, VirtualProtect};
+use winapi::um::memoryapi::{VirtualAlloc, VirtualFree, VirtualProtect};
 use winapi::um::winnt::{
     DLL_PROCESS_ATTACH, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT,
     IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
     IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ,
-    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, MEM_RELEASE, PAGE_READWRITE,
 };
 
 // RUNTIME_FUNCTION (IMAGE_RUNTIME_FUNCTION_ENTRY) – 12 bytes, x64 only.
@@ -230,11 +230,24 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         std::ptr::null_mut(),
         optional_header.windows_fields.size_of_image as usize,
         MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE,
+        MEM_RELEASE, PAGE_READWRITE,
     );
     if image_base.is_null() {
         return Err(anyhow!("VirtualAlloc failed"));
     }
+
+    struct AllocGuard {
+        ptr: *mut c_void,
+        success: bool,
+    }
+    impl Drop for AllocGuard {
+        fn drop(&mut self) {
+            if !self.success {
+                unsafe { VirtualFree(self.ptr, 0, MEM_RELEASE); }
+            }
+        }
+    }
+    let mut _guard = AllocGuard { ptr: image_base, success: false };
 
     // 1b. Copy PE headers (DOS header, NT headers, section table) so that
     //     DLLs which inspect their own headers at runtime (resource lookup,
@@ -408,7 +421,7 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
             (true, _, true) => PAGE_EXECUTE_READWRITE,
             (true, true, false) => PAGE_EXECUTE_READ,
             (true, false, false) => PAGE_EXECUTE,
-            (false, _, true) => PAGE_READWRITE,
+            (false, _, true) => MEM_RELEASE, PAGE_READWRITE,
             (false, true, false) => PAGE_READONLY,
             (false, false, false) => PAGE_NOACCESS,
         };
@@ -452,5 +465,6 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         return Err(anyhow!("DLL entry point failed"));
     }
 
+    _guard.success = true;
     Ok(image_base)
 }

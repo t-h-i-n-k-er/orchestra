@@ -5,7 +5,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use thiserror::Error;
 
 /// Length in bytes of the AES-256 key used by [`CryptoSession`].

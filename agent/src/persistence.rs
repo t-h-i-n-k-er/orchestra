@@ -412,8 +412,7 @@ fn uninstall_persistence_actual(path: PathBuf, system_level: bool) -> Result<()>
                 .args(["bootout", &target_spec])
                 .status();
         }
-        let _ = std::fs::remove_file(&path);
-            .with_context(|| format!("Failed to remove {}", path.display()))?;
+        std::fs::remove_file(&path).with_context(|| format!("Failed to remove {}", path.display()))?;
     }
     Ok(())
 }

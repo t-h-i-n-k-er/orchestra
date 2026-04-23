@@ -254,7 +254,7 @@ pub fn optimize_hot_function(name: &str) -> Result<()> {
 
     let mut decoder = Decoder::with_ip(64, code, start_addr, DecoderOptions::NONE);
     let mut instructions: Vec<Instruction> = decoder.iter().collect();
-    let original_len = instructions.len();
+    let _original_len = instructions.len();
 
     let passes: Vec<Box<dyn Pass>> = vec![Box::new(LeaAddPass)];
     for pass in passes {
@@ -322,14 +322,13 @@ fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
         // Fallback: Disassemble to find the likely end via 'Ret'
         let mut curr_ptr = ptr as u64;
         let mut tmp_size = 0;
-        let mut last_ret = 0;
         while tmp_size < 10000 {
             let slice = unsafe { std::slice::from_raw_parts(curr_ptr as *const u8, 15) };
-            let mut decoder = Decoder::with_ip(64, slice, curr_ptr, DecoderOptions::NONE);
+            let decoder = Decoder::with_ip(64, slice, curr_ptr, DecoderOptions::NONE);
             if let Some(ins) = decoder.into_iter().next() {
                 tmp_size += ins.len();
                 curr_ptr += ins.len() as u64;
-                if ins.code() == iced_x86::Code::Retnq && last_ret == 0 {
+                if ins.code() == iced_x86::Code::Retnq || ins.code() == iced_x86::Code::Retnw {
                     size = tmp_size;
                     break;
                 }
@@ -371,7 +370,7 @@ fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
     let mut curr_ptr = ptr as u64;
     while tmp_size < 10000 {
         let slice = unsafe { std::slice::from_raw_parts(curr_ptr as *const u8, 15) };
-        let mut decoder = Decoder::with_ip(64, slice, curr_ptr, DecoderOptions::NONE);
+        let decoder = Decoder::with_ip(64, slice, curr_ptr, DecoderOptions::NONE);
         if let Some(ins) = decoder.into_iter().next() {
             tmp_size += ins.len();
             curr_ptr += ins.len() as u64;
