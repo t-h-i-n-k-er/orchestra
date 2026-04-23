@@ -137,9 +137,38 @@ pub enum CryptoError {
 
 /// AES-256-GCM symmetric session keyed from a pre-shared secret.
 ///
-/// The development build derives the key by SHA-256 hashing the supplied
-/// secret. A future revision will replace this with an authenticated key
-/// exchange (X25519 + HKDF); see `docs/DESIGN.md`.
+/// # Forward Secrecy Upgrade Plan (Roadmap to X25519 + HKDF)
+///
+/// Currently, `CryptoSession` derives a static symmetric key via HKDF from a pre-shared 
+/// secret. This provides no forward secrecy: if the PSK is compromised, all past traffic 
+/// can be decrypted. We will transition to an Ephemeral Diffie-Hellman (X25519) key exchange.
+///
+/// ## Transition Plan & Backward Compatibility
+///
+/// 1. **Protocol Negotiation / Versioning:**
+///    - Introduce a new handshake message or a version flag in the initial connection. 
+///    - Clients capable of Forward Secrecy will send an `X25519` key share in their first 
+///      message. 
+///    - Legacy clients will simply send data encrypted under the current static PSK.
+///
+/// 2. **Authentication via PSK:**
+///    - To prevent Man-In-The-Middle (MITM) attacks during the DH exchange, the static 
+///      PSK will be repurposed as a MAC/signature key (or injected into the HKDF 
+///      extractor) to mutually authenticate the ephemeral `X25519` public keys before 
+///      deriving the final session keys.
+///
+/// 3. **HKDF Key Derivation:**
+///    - The new session key will be derived as: 
+///      `HKDF(IKM = DH_shared_secret, salt = random_nonce, info = PSK)`
+///    - This binds the X25519 ephemeral exchange to the trusted identity.
+///
+/// 4. **Deprecation Phases:**
+///    - **Phase 1 (Dual Support):** Servers support both static AES-GCM (legacy) and 
+///      X25519 ephemeral (modern) to allow seamless agent upgrades.
+///    - **Phase 2 (Warning):** Connections using the old static scheme log a security 
+///      warning and require a specific `--allow-legacy-crypto` flag.
+///    - **Phase 3 (Removal):** Static PSK code paths are entirely dropped, and the PSK 
+///      is used exclusively for authenticating the ephemeral DH exchange.
 pub struct CryptoSession {
     cipher: Aes256Gcm,
 }

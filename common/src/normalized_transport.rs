@@ -288,63 +288,122 @@ where
         // --- Extensions ---
         let mut extensions = Vec::new();
 
-        // GREASE Extension
-        if let Some(grease) = GREASE_VALUES.choose(&mut rng) {
-            extensions.extend_from_slice(&grease.to_be_bytes()); // type
-            extensions.extend_from_slice(&[0x00, 0x00]); // length 0
+        if hs_type == HANDSHAKE_CLIENT_HELLO {
+            // GREASE Extension
+            if let Some(grease) = GREASE_VALUES.choose(&mut rng) {
+                extensions.extend_from_slice(&grease.to_be_bytes()); // type
+                extensions.extend_from_slice(&[0x00, 0x00]); // length 0
+            }
+
+            // SNI Extension
+            let sni_domains = ["www.google.com", "www.microsoft.com", "www.apple.com"];
+            let domain = sni_domains.choose(&mut rng).unwrap();
+            let sni_ext = {
+                let mut ext = Vec::new();
+                ext.extend_from_slice(&[0x00, 0x00]); // type: server_name
+                let name_bytes = domain.as_bytes();
+                let list_entry_len = (name_bytes.len() + 3) as u16;
+                let ext_len = (list_entry_len + 2) as u16;
+                ext.extend_from_slice(&ext_len.to_be_bytes());
+                ext.extend_from_slice(&list_entry_len.to_be_bytes());
+                ext.push(0x00); // name_type: host_name
+                ext.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
+                ext.extend_from_slice(name_bytes);
+                ext
+            };
+            extensions.extend_from_slice(&sni_ext);
+
+            // Supported Groups Extension
+            let groups: &[u16] = &[0x001d, 0x0017, 0x0018]; // x25519, secp256r1, secp384r1
+            let groups_ext = {
+                let mut ext = Vec::new();
+                ext.extend_from_slice(&[0x00, 0x0a]); // type: supported_groups
+                let groups_len = (groups.len() * 2) as u16;
+                let ext_len = (groups_len + 2) as u16;
+                ext.extend_from_slice(&ext_len.to_be_bytes());
+                ext.extend_from_slice(&groups_len.to_be_bytes());
+                for group in groups {
+                    ext.extend_from_slice(&group.to_be_bytes());
+                }
+                ext
+            };
+            extensions.extend_from_slice(&groups_ext);
+
+            // Signature Algorithms Extension
+            let sig_algs: &[u16] = &[
+                0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+            ];
+            let sig_algs_ext = {
+                let mut ext = Vec::new();
+                ext.extend_from_slice(&[0x00, 0x0d]); // type: signature_algorithms
+                let algs_len = (sig_algs.len() * 2) as u16;
+                let ext_len = (algs_len + 2) as u16;
+                ext.extend_from_slice(&ext_len.to_be_bytes());
+                ext.extend_from_slice(&algs_len.to_be_bytes());
+                for alg in sig_algs {
+                    ext.extend_from_slice(&alg.to_be_bytes());
+                }
+                ext
+            };
+            extensions.extend_from_slice(&sig_algs_ext);
+
+            // Supported Versions (Client)
+            let supp_vers_ext = {
+                let mut ext = Vec::new();
+                ext.extend_from_slice(&[0x00, 0x2b]); // type: supported_versions
+                ext.extend_from_slice(&[0x00, 0x03]); // ext length
+                ext.extend_from_slice(&[0x02]); // list length (1 version, 2 bytes)
+                ext.extend_from_slice(&[0x03, 0x04]); // TLS 1.3
+                ext
+            };
+            extensions.extend_from_slice(&supp_vers_ext);
+
+            // Key Share (Client)
+            let key_share_ext = {
+                let mut ext = Vec::new();
+                ext.extend_from_slice(&[0x00, 0x33]); // type: key_share
+                let mut key = [0u8; 32];
+                rng.fill_bytes(&mut key);
+                
+                let share_len: u16 = 2 + 2 + 32; // group + key_len + key
+                let ext_len = share_len + 2; // + list length
+                
+                ext.extend_from_slice(&ext_len.to_be_bytes());
+                ext.extend_from_slice(&share_len.to_be_bytes());
+                ext.extend_from_slice(&0x001du16.to_be_bytes()); // group: x25519
+                ext.extend_from_slice(&32u16.to_be_bytes()); // key_exchange length
+                ext.extend_from_slice(&key);
+                ext
+            };
+            extensions.extend_from_slice(&key_share_ext);
+        } else if hs_type == HANDSHAKE_SERVER_HELLO {
+            // Supported Versions (Server)
+            let supp_vers_ext = {
+                let mut ext = Vec::new();
+                ext.extend_from_slice(&[0x00, 0x2b]); // type: supported_versions
+                ext.extend_from_slice(&[0x00, 0x02]); // ext length
+                ext.extend_from_slice(&[0x03, 0x04]); // TLS 1.3
+                ext
+            };
+            extensions.extend_from_slice(&supp_vers_ext);
+
+            // Key Share (Server)
+            let key_share_ext = {
+                let mut ext = Vec::new();
+                ext.extend_from_slice(&[0x00, 0x33]); // type: key_share
+                let mut key = [0u8; 32];
+                rng.fill_bytes(&mut key);
+                
+                let ext_len: u16 = 2 + 2 + 32; // group + key_len + key
+                
+                ext.extend_from_slice(&ext_len.to_be_bytes());
+                ext.extend_from_slice(&0x001du16.to_be_bytes()); // group: x25519
+                ext.extend_from_slice(&32u16.to_be_bytes()); // key_exchange length
+                ext.extend_from_slice(&key);
+                ext
+            };
+            extensions.extend_from_slice(&key_share_ext);
         }
-
-        // SNI Extension
-        let sni_domains = ["www.google.com", "www.microsoft.com", "www.apple.com"];
-        let domain = sni_domains.choose(&mut rng).unwrap();
-        let sni_ext = {
-            let mut ext = Vec::new();
-            ext.extend_from_slice(&[0x00, 0x00]); // type: server_name
-            let name_bytes = domain.as_bytes();
-            let list_entry_len = (name_bytes.len() + 3) as u16;
-            let ext_len = (list_entry_len + 2) as u16;
-            ext.extend_from_slice(&ext_len.to_be_bytes());
-            ext.extend_from_slice(&list_entry_len.to_be_bytes());
-            ext.push(0x00); // name_type: host_name
-            ext.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
-            ext.extend_from_slice(name_bytes);
-            ext
-        };
-        extensions.extend_from_slice(&sni_ext);
-
-        // Supported Groups Extension
-        let groups: &[u16] = &[0x001d, 0x0017, 0x0018]; // x25519, secp256r1, secp384r1
-        let groups_ext = {
-            let mut ext = Vec::new();
-            ext.extend_from_slice(&[0x00, 0x0a]); // type: supported_groups
-            let groups_len = (groups.len() * 2) as u16;
-            let ext_len = (groups_len + 2) as u16;
-            ext.extend_from_slice(&ext_len.to_be_bytes());
-            ext.extend_from_slice(&groups_len.to_be_bytes());
-            for group in groups {
-                ext.extend_from_slice(&group.to_be_bytes());
-            }
-            ext
-        };
-        extensions.extend_from_slice(&groups_ext);
-
-        // Signature Algorithms Extension
-        let sig_algs: &[u16] = &[
-            0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
-        ]; // e.g., ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256, etc.
-        let sig_algs_ext = {
-            let mut ext = Vec::new();
-            ext.extend_from_slice(&[0x00, 0x0d]); // type: signature_algorithms
-            let algs_len = (sig_algs.len() * 2) as u16;
-            let ext_len = (algs_len + 2) as u16;
-            ext.extend_from_slice(&ext_len.to_be_bytes());
-            ext.extend_from_slice(&algs_len.to_be_bytes());
-            for alg in sig_algs {
-                ext.extend_from_slice(&alg.to_be_bytes());
-            }
-            ext
-        };
-        extensions.extend_from_slice(&sig_algs_ext);
 
         // Add extensions to payload
         payload.extend_from_slice(&(extensions.len() as u16).to_be_bytes());

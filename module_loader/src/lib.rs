@@ -149,24 +149,49 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
         // Fallback for non-Linux OSs (e.g., macOS, Windows).
         // For Windows, a more advanced technique involves CreateFileMapping/MapViewOfFile
         // with SEC_IMAGE, but for simplicity, we'll use a temporary file.
-        // This is less secure than memfd but functional.
-        //
-        // On Windows we MUST close the file handle before calling LoadLibrary,
-        // otherwise the loader fails with "file is being used by another process"
-        // (os error 32). We persist the temp file and clean it up after loading.
-        let temp_file = tempfile::Builder::new()
-            .prefix("plugin-")
-            .suffix(std::env::consts::DLL_SUFFIX)
-            .tempfile()?;
-        let temp_path = temp_file.into_temp_path();
-        std::fs::write(&temp_path, module_data)?;
-        info!("Loading plugin from temporary file: {:?}", &*temp_path);
+        // We use FILE_FLAG_DELETE_ON_CLOSE to minimize the disk footprint, ensuring
+        // the file is securely deleted by the OS as soon as the handle and mapping close.
+        #[cfg(target_os = "windows")]
+        let temp_path = {
+            use std::os::windows::fs::OpenOptionsExt;
+            let temp_dir = std::env::temp_dir();
+            let file_name = format!(
+                "plugin-{}.{}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+                std::env::consts::DLL_EXTENSION
+            );
+            let tp = temp_dir.join(file_name);
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .share_mode(0x00000001 | 0x00000004) // FILE_SHARE_READ | FILE_SHARE_DELETE
+                .custom_flags(0x04000000) // FILE_FLAG_DELETE_ON_CLOSE
+                .open(&tp)?;
+            std::io::Write::write_all(&mut file, module_data)?;
+            // We must leak the file handle. It stays active inside the OS, keeping the file valid.
+            // When the process terminates or the library unmaps, the OS deletes it.
+            Box::leak(Box::new(file));
+            tp
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let temp_path = {
+            let temp_file = tempfile::Builder::new()
+                .prefix("plugin-")
+                .suffix(std::env::consts::DLL_SUFFIX)
+                .tempfile()?;
+            let tp = temp_file.into_temp_path();
+            std::fs::write(&tp, module_data)?;
+            let tp_path = tp.to_path_buf();
+            // UNIX fallback leak logic if needed.
+            let _ = tp.keep();
+            tp_path
+        };
+
+        info!("Loading plugin from temporary file: {:?}", &temp_path);
         // SAFETY: We trust the decrypted blob.
-        let lib = unsafe { Library::new(&*temp_path)? };
-        // Persist the file for the lifetime of the loaded library; the OS
-        // will release the file once the process exits. On Windows we cannot
-        // delete a loaded DLL while it is mapped.
-        let _ = temp_path.keep();
+        let lib = unsafe { Library::new(&temp_path)? };
         lib
     };
 
