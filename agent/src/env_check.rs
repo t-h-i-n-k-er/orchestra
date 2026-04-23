@@ -10,7 +10,7 @@
 //! See [`enforce`] for the wiring used by the agent's startup path.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+
 
 /// Outcome of all individual environment probes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -156,10 +156,59 @@ fn windows_is_debugger_present() -> bool {
 ///
 /// This is a collection of soft indicators. The CPUID hypervisor bit is no
 /// longer a hard failure, but contributes to the overall `vm_detected` score.
+fn is_cloud_provider() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        const DMI: &[&str] = &[
+            "/sys/class/dmi/id/board_vendor",
+            "/sys/class/dmi/id/sys_vendor",
+            "/sys/class/dmi/id/product_name",
+        ];
+        for path in DMI {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                let s = s.to_ascii_lowercase();
+                if s.contains("amazon ec2") || s.contains("google") || s.contains("microsoft corporation") {
+                    return true;
+                }
+            }
+        }
+        
+        if let Ok(s) = std::fs::read_to_string("/proc/version") {
+            let s = s.to_ascii_lowercase();
+            if s.contains("microsoft") || s.contains("wsl") {
+                return true;
+            }
+        }
+    }
+    
+    #[cfg(windows)]
+    {
+        use winreg::enums::HKEY_LOCAL_MACHINE;
+        use winreg::RegKey;
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        if let Ok(k) = hklm.open_subkey("HARDWARE\\DESCRIPTION\\System\\BIOS") {
+            if let Ok(v) = k.get_value::<String, _>("SystemManufacturer") {
+                let s = v.to_ascii_lowercase();
+                if s.contains("amazon") || s.contains("google") || s.contains("microsoft corporation") {
+                    return true;
+                }
+            }
+            if let Ok(v) = k.get_value::<String, _>("SystemProductName") {
+                let s = v.to_ascii_lowercase();
+                if s.contains("amazon ec2") || s.contains("google compute") {
+                    return true;
+                }
+            }
+        }
+    }
+    
+    false
+}
+
 pub fn detect_vm() -> bool {
     // The hypervisor bit is now just one of several indicators.
     let mut indicators = 0;
-    if cpuid_hypervisor_bit() {
+    if cpuid_hypervisor_bit() && !is_cloud_provider() {
         indicators += 1;
     }
     #[cfg(target_os = "linux")]
@@ -309,6 +358,34 @@ fn mac_prefix_indicates_vm() -> bool {
             return true;
         }
     }
+    // On macOS use getifaddrs to read physical MAC addresses.
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+            if libc::getifaddrs(&mut ifap) == 0 {
+                let mut curr = ifap;
+                while !curr.is_null() {
+                    let addr = (*curr).ifa_addr;
+                    if !addr.is_null() && (*addr).sa_family as libc::c_int == libc::AF_LINK {
+                        let sdl = addr as *const libc::sockaddr_dl;
+                        let ptr = (*sdl).sdl_data.as_ptr().offset((*sdl).sdl_nlen as isize) as *const u8;
+                        let alen = (*sdl).sdl_alen as usize;
+                        if alen >= 3 {
+                            let mac = std::slice::from_raw_parts(ptr, 3);
+                            let prefix = [mac[0], mac[1], mac[2]];
+                            if prefixes.contains(&prefix) {
+                                libc::freeifaddrs(ifap);
+                                return true;
+                            }
+                        }
+                    }
+                    curr = (*curr).ifa_next;
+                }
+                libc::freeifaddrs(ifap);
+            }
+        }
+    }
     let _ = prefixes;
     let _ = Path::new("/dev/null");
     false
@@ -389,11 +466,26 @@ fn is_ld_preload_set() -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_tracer_process_running() -> bool {
+    // Primary check: Check for a ptrace attachment on our own process
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("TracerPid:") {
+                let pid = line.trim_start_matches("TracerPid:").trim();
+                // A TracerPid other than 0 means we are actively being debugged/traced
+                if pid != "0" {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Secondary check: look for tracer processes system-wide by examining their command lines
     let tracers = ["strace", "gdb", "ltrace", "gdbserver"];
     if let Ok(procs) = std::fs::read_dir("/proc") {
         for proc in procs.flatten() {
-            if let Ok(name) = std::fs::read_to_string(proc.path().join("comm")) {
-                if tracers.contains(&name.trim()) {
+            if let Ok(cmdline) = std::fs::read_to_string(proc.path().join("cmdline")) {
+                let cmdline = cmdline.replace('\0', " ");
+                if tracers.iter().any(|t| cmdline.contains(t)) {
                     return true;
                 }
             }
@@ -408,14 +500,26 @@ fn is_tracer_process_running() -> bool {
 }
 
 fn detect_timing_anomaly() -> bool {
-    let start = Instant::now();
-    std::thread::sleep(Duration::from_millis(100));
-    let elapsed = start.elapsed();
-    // If sleeping for 100ms takes more than 2000ms, something is significantly
-    // slowing down execution (debugger, emulator, or extreme scheduler pressure).
-    // The previous 500ms threshold produced false positives on heavily loaded
-    // cloud VMs and under hypervisor scheduling; 2000ms is more conservative.
-    elapsed > Duration::from_millis(2000)
+    let mut times = Vec::new();
+    for _ in 0..10 {
+        let start = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        times.push(start.elapsed().as_millis() as f64);
+    }
+    
+    let sum: f64 = times.iter().sum();
+    let mean = sum / 10.0;
+    
+    let variance: f64 = times.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / 10.0;
+    
+    // Large single spikes (like breakpoint hits) or huge slowdowns (emulation) 
+    // Usually a 10ms sleep takes ~10-15ms.
+    let mean_anomaly = mean > 50.0;
+    let var_anomaly = variance > 2500.0;
+    
+    // Flag if either the mean is outrageously high (slow execution overall, e.g., heavy tracing)
+    // or variance is high (e.g., hit a breakpoint on a single iteration and spent time paused)
+    mean_anomaly || var_anomaly
 }
 
 // -------------------------------------------------------------------- domain
