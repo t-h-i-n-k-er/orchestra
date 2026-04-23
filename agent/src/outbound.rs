@@ -48,7 +48,7 @@ pub fn resolve_secret() -> Option<String> {
 async fn connect_once(addr: &str, secret: &str, agent_id: &str) -> Result<()> {
     info!("outbound-c: connecting to Control Center addr={addr} agent_id={agent_id}");
 
-    let mut stream = TcpStream::connect(addr).await?;
+    let stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true)?;
 
     // Build a TLS client config.  When `server_cert_fingerprint` is configured

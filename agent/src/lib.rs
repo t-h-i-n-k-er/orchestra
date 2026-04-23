@@ -146,7 +146,9 @@ impl Agent {
         }
 
         // Optimize hot functions at startup
-        // optimizer::optimize_hot_function("crypto_session_encrypt").unwrap_or_else(|e| tracing::warn!("opt failed: {}", e));
+        if let Err(e) = optimizer::optimize_hot_function("crypto_session_encrypt") {
+            tracing::warn!("Runtime optimization failed: {}", e);
+        }
 
         // Honour opt-in persistence (Prompt H).
         #[cfg(feature = "persistence")]

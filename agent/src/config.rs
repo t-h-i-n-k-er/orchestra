@@ -51,6 +51,8 @@ mod tests {
             traffic_profile: Default::default(),
             required_domain: None,
             refuse_in_vm: false,
+            server_cert_fingerprint: None,
+            ..Default::default()
         };
         let serialized = toml::to_string(&original).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();

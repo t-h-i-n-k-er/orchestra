@@ -4,7 +4,6 @@
 use anyhow::{anyhow, Result};
 use goblin;
 use iced_x86::{Code, Decoder, DecoderOptions, Encoder, Instruction, OpKind, Register};
-use rand::seq::SliceRandom;
 
 trait Pass {
     fn run(&self, instructions: &mut Vec<Instruction>) -> Result<()>;

