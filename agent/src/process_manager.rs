@@ -141,7 +141,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
     // Read the current agent's own executable so we can re-inject ourselves.
     let agent_path =
         std::env::current_exe().map_err(|e| anyhow::anyhow!("current_exe() failed: {e}"))?;
-    let _payload = std::fs::read(&agent_path).map_err(|e| {
+    let payload = std::fs::read(&agent_path).map_err(|e| {
         anyhow::anyhow!("failed to read agent binary {}: {e}", agent_path.display())
     })?;
 

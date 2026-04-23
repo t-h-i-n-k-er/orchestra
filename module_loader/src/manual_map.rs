@@ -230,7 +230,7 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         std::ptr::null_mut(),
         optional_header.windows_fields.size_of_image as usize,
         MEM_COMMIT | MEM_RESERVE,
-        MEM_RELEASE, PAGE_READWRITE,
+        PAGE_READWRITE,
     );
     if image_base.is_null() {
         return Err(anyhow!("VirtualAlloc failed"));
@@ -421,7 +421,7 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
             (true, _, true) => PAGE_EXECUTE_READWRITE,
             (true, true, false) => PAGE_EXECUTE_READ,
             (true, false, false) => PAGE_EXECUTE,
-            (false, _, true) => MEM_RELEASE, PAGE_READWRITE,
+            (false, _, true) => PAGE_READWRITE,
             (false, true, false) => PAGE_READONLY,
             (false, false, false) => PAGE_NOACCESS,
         };

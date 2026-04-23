@@ -455,7 +455,8 @@ mod tests {
     fn test_hot_function_optimization() {
         // A simple function to be optimized.
         #[no_mangle]
-        pub fn hot_function() -> i32 {
+        #[export_name = "hot_function"]
+        pub extern "C" fn hot_function() -> i32 {
             let mut x = 0;
             for i in 0..10 {
                 x += i;
