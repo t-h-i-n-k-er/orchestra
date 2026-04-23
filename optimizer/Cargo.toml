@@ -16,6 +16,7 @@ tracing = { workspace = true }
 libc = "0.2"
 region = "3.0"
 rand = "0.8"
+memmap2 = "0.9.10"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["memoryapi", "processthreadsapi", "libloaderapi"] }

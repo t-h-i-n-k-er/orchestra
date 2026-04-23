@@ -304,10 +304,11 @@ fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
     }
 
     let exe_path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
-    let file = std::fs::read(exe_path.as_ref())?;
+    let file = std::fs::File::open(exe_path.as_ref())?;
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
 
     let mut size = 0;
-    if let Ok(goblin::Object::Elf(elf)) = goblin::Object::parse(&file) {
+    if let Ok(goblin::Object::Elf(elf)) = goblin::Object::parse(&mmap) {
         for sym in elf.syms.iter() {
             if let Some(sname) = elf.strtab.get_at(sym.st_name) {
                 if sname == name {
@@ -322,15 +323,21 @@ fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
         // Fallback: Disassemble to find the likely end via 'Ret'
         let mut curr_ptr = ptr as u64;
         let mut tmp_size = 0;
+        let mut consecutive_padding = 0;
         while tmp_size < 10000 {
             let slice = unsafe { std::slice::from_raw_parts(curr_ptr as *const u8, 15) };
-            let decoder = Decoder::with_ip(64, slice, curr_ptr, DecoderOptions::NONE);
+            let decoder = iced_x86::Decoder::with_ip(64, slice, curr_ptr, iced_x86::DecoderOptions::NONE);
             if let Some(ins) = decoder.into_iter().next() {
                 tmp_size += ins.len();
                 curr_ptr += ins.len() as u64;
-                if ins.code() == iced_x86::Code::Retnq || ins.code() == iced_x86::Code::Retnw {
-                    size = tmp_size;
-                    break;
+                if ins.code() == iced_x86::Code::Int3 || ins.code() == iced_x86::Code::Nopd || ins.code() == iced_x86::Code::Nopq || ins.code() == iced_x86::Code::Nopw {
+                    consecutive_padding += ins.len();
+                    if consecutive_padding >= 2 {
+                        size = tmp_size - consecutive_padding;
+                        break;
+                    }
+                } else {
+                    consecutive_padding = 0;
                 }
             } else {
                 break;
@@ -368,20 +375,26 @@ fn find_function(name: &str) -> Result<(*mut u8, &'static [u8])> {
     // Disassembly approach
     let mut tmp_size = 0;
     let mut curr_ptr = ptr as u64;
-    while tmp_size < 10000 {
-        let slice = unsafe { std::slice::from_raw_parts(curr_ptr as *const u8, 15) };
-        let decoder = Decoder::with_ip(64, slice, curr_ptr, DecoderOptions::NONE);
-        if let Some(ins) = decoder.into_iter().next() {
-            tmp_size += ins.len();
-            curr_ptr += ins.len() as u64;
-            if ins.code() == iced_x86::Code::Retnq || ins.code() == iced_x86::Code::Retnw {
-                size = tmp_size;
-                break; // Very naive
+        let mut consecutive_padding = 0;
+        while tmp_size < 10000 {
+            let slice = unsafe { std::slice::from_raw_parts(curr_ptr as *const u8, 15) };
+            let decoder = iced_x86::Decoder::with_ip(64, slice, curr_ptr, iced_x86::DecoderOptions::NONE);
+            if let Some(ins) = decoder.into_iter().next() {
+                tmp_size += ins.len();
+                curr_ptr += ins.len() as u64;
+                if ins.code() == iced_x86::Code::Int3 || ins.code() == iced_x86::Code::Nopd || ins.code() == iced_x86::Code::Nopq || ins.code() == iced_x86::Code::Nopw {
+                    consecutive_padding += ins.len();
+                    if consecutive_padding >= 2 {
+                        size = tmp_size - consecutive_padding;
+                        break;
+                    }
+                } else {
+                    consecutive_padding = 0;
+                }
+            } else {
+                break;
             }
-        } else {
-            break;
         }
-    }
 
     if size == 0 {
         return Err(anyhow!("Could not determine function size"));
