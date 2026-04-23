@@ -352,7 +352,7 @@ fn install_persistence_inner() -> Result<PathBuf> {
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <false/>
+    <true/>
 </dict>
 </plist>
 "#,
@@ -404,20 +404,15 @@ fn uninstall_persistence_actual(path: PathBuf, system_level: bool) -> Result<()>
                 let label = get_service_name();
                 format!("system/{}", label)
             } else {
-                let uid_out = std::process::Command::new("id")
-                    .arg("-u")
-                    .output()
-                    .ok()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .unwrap_or_else(|| "501".to_string());
+                let uid = unsafe { libc::getuid() };
                 let label = get_service_name();
-                format!("gui/{}/{}", uid_out, label)
+                format!("gui/{}/{}", uid, label)
             };
             let _ = std::process::Command::new("launchctl")
                 .args(["bootout", &target_spec])
                 .status();
         }
-        std::fs::remove_file(&path)
+        let _ = std::fs::remove_file(&path);
             .with_context(|| format!("Failed to remove {}", path.display()))?;
     }
     Ok(())
