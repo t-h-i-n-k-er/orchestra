@@ -224,7 +224,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     async fn send(&mut self, msg: Message) -> Result<()> {
-        let serialized = serde_json::to_vec(&msg)?;
+        let serialized = bincode::serialize(&msg)?;
         let ciphertext = self.session.encrypt(&serialized);
         // Fragment large messages across multiple TLS-shaped records so that
         // the 2-byte record-length field is never exceeded.
@@ -245,7 +245,7 @@ where
     async fn recv(&mut self) -> Result<Message> {
         let ciphertext = self.recv_record().await?;
         let plaintext = self.session.decrypt(&ciphertext)?;
-        let msg: Message = serde_json::from_slice(&plaintext)?;
+        let msg: Message = bincode::deserialize(&plaintext)?;
         Ok(msg)
     }
 }

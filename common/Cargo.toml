@@ -23,6 +23,7 @@ hkdf = { version = "0.12" }
 # Optional: Ed25519 signatures for module verification.
 # Enabled by the `module-signatures` feature.
 ed25519-dalek = { version = "2", optional = true }
+bincode = "1.3.3"
 
 [features]
 module-signatures = ["dep:ed25519-dalek"]

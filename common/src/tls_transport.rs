@@ -283,7 +283,7 @@ pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 #[async_trait]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport for TlsTransport<S> {
     async fn send(&mut self, msg: Message) -> Result<()> {
-        let serialized = serde_json::to_vec(&msg)?;
+        let serialized = bincode::serialize(&msg)?;
         let encrypted = self.session.encrypt(&serialized);
         let len = encrypted.len() as u32;
         self.stream.write_u32_le(len).await?;
@@ -303,6 +303,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport for TlsTransport<S> {
         let mut buffer = vec![0u8; len as usize];
         self.stream.read_exact(&mut buffer).await?;
         let decrypted = self.session.decrypt(&buffer)?;
-        Ok(serde_json::from_slice(&decrypted)?)
+        Ok(bincode::deserialize(&decrypted)?)
     }
 }

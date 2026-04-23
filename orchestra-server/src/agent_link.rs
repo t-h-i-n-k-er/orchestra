@@ -36,7 +36,7 @@ async fn read_frame<S: AsyncReadExt + Unpin>(r: &mut S, sess: &CryptoSession) ->
     let plain = sess
         .decrypt(&buf)
         .map_err(|e| anyhow::anyhow!("decrypt failed: {e:?}"))?;
-    Ok(serde_json::from_slice(&plain)?)
+    Ok(bincode::deserialize(&plain)?)
 }
 
 async fn write_frame<S: AsyncWriteExt + Unpin>(
@@ -44,7 +44,7 @@ async fn write_frame<S: AsyncWriteExt + Unpin>(
     sess: &CryptoSession,
     msg: &Message,
 ) -> Result<()> {
-    let plain = serde_json::to_vec(msg)?;
+    let plain = bincode::serialize(msg)?;
     let enc = sess.encrypt(&plain);
     w.write_u32_le(enc.len() as u32).await?;
     w.write_all(&enc).await?;

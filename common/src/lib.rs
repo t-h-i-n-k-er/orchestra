@@ -296,8 +296,8 @@ mod tests {
             },
             operator_id: None,
         };
-        let bytes = serde_json::to_vec(&msg).unwrap();
-        let back: Message = serde_json::from_slice(&bytes).unwrap();
+        let bytes = bincode::serialize(&msg).unwrap();
+        let back: Message = bincode::deserialize(&bytes).unwrap();
         match back {
             Message::TaskRequest {
                 task_id, command, ..

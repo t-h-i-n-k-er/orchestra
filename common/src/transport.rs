@@ -21,7 +21,7 @@ pub const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 #[async_trait]
 impl Transport for TcpTransport {
     async fn send(&mut self, msg: Message) -> Result<()> {
-        let serialized = serde_json::to_vec(&msg)?;
+        let serialized = bincode::serialize(&msg)?;
         let encrypted = self.session.encrypt(&serialized);
         let len = encrypted.len() as u32;
         self.stream.write_u32_le(len).await?;
@@ -41,7 +41,7 @@ impl Transport for TcpTransport {
         let mut buffer = vec![0; len as usize];
         self.stream.read_exact(&mut buffer).await?;
         let decrypted = self.session.decrypt(&buffer)?;
-        let msg: Message = serde_json::from_slice(&decrypted)?;
+        let msg: Message = bincode::deserialize(&decrypted)?;
         Ok(msg)
     }
 }
