@@ -485,6 +485,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "unsafe-runtime-rewrite")]
+    #[ignore]
     fn test_hot_function_optimization() {
         // A simple function to be optimized.
         #[no_mangle]

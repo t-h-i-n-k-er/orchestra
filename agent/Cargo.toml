@@ -20,7 +20,7 @@ base64 = { workspace = true }
 serde_json = "1.0"
 serde = { workspace = true }
 module_loader = { path = "../module_loader" }
-optimizer = { path = "../optimizer", features = ["unsafe-runtime-rewrite"] }
+optimizer = { path = "../optimizer" }
 toml = "1.1.2"
 directories = "6.0.0"
 rustls = { version = "0.23.38", default-features = false, features = ["ring", "std", "logging", "tls12"] }
@@ -65,6 +65,7 @@ hci-research = ["dep:rdev", "dep:chrono", "dep:twox-hash"]
 # at compile time via the ORCHESTRA_C_ADDR / ORCHESTRA_C_SECRET build env vars
 # (set automatically by the Builder when outbound-c is included in a profile).
 outbound-c = []
+unsafe-runtime-rewrite = ["optimizer/unsafe-runtime-rewrite"]
 
 [[bin]]
 name = "agent-standalone"
