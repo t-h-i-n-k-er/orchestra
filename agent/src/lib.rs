@@ -301,3 +301,8 @@ pub fn polymorph() {
 }
 #[cfg(windows)]
 pub mod injection;
+
+pub mod obfuscated_sleep;
+
+pub mod c2_http;
+pub mod c2_doh;

