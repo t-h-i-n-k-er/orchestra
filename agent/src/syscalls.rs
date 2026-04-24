@@ -102,8 +102,8 @@ fn get_bootstrap_ssn(raw_bytes: &[u8], func_name: &str) -> Option<SyscallTarget>
 fn map_clean_ntdll() -> Result<usize> {
     use std::os::windows::ffi::OsStrExt;
     
-    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| rr"C:\Windows".to_string());
-    let ntdll_disk_path = format!("{}\System32\ntdll.dll", sysroot);
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let ntdll_disk_path = format!(r"{}\System32\ntdll.dll", sysroot);
     
     // Read raw unmapped bytes to parse SSNs for NtOpenFile, NtCreateSection, NtMapViewOfSection
     let raw_bytes = std::fs::read(&ntdll_disk_path).map_err(|e| anyhow!("Failed to read ntdll from disk: {e}"))?;
@@ -377,8 +377,27 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        tracing::error!("Direct syscalls not yet implemented for aarch64 Windows");
-        -1
+        let status: i32;
+        std::arch::asm!(
+            "mov x8, {ssn}",
+            "mov x0, {a1}",
+            "mov x1, {a2}",
+            "mov x2, {a3}",
+            "mov x3, {a4}",
+            "blr {gadget}",
+            "mov {status}, x0",
+            ssn = in(reg) ssn,
+            a1 = in(reg) a1,
+            a2 = in(reg) a2,
+            a3 = in(reg) a3,
+            a4 = in(reg) a4,
+            gadget = in(reg) gadget_addr,
+            status = out(reg) status,
+            out("x8") _,
+            out("x0") _, out("x1") _, out("x2") _, out("x3") _,
+            options(nostack),
+        );
+        status
     }
 }
 
@@ -395,7 +414,6 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
         return Ok(base);
     }
     
-    use winapi::um::fileapi::{CreateFileA, OPEN_EXISTING};
     use winapi::um::winnt::{FILE_SHARE_READ, GENERIC_READ, PAGE_EXECUTE_READ, SEC_IMAGE, SECTION_MAP_READ, SECTION_MAP_EXECUTE};
     use winapi::um::handleapi::CloseHandle;
 
@@ -409,18 +427,15 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
 
         let sys_ntcreatesection = get_syscall_id("NtCreateSection")?;
         let sys_ntmapview = get_syscall_id("NtMapViewOfSection")?;
-        let sys_ntopenfile = get_syscall_id("NtOpenFile")?;
 
-        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| rr"C:\Windows".to_string());
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
         
-        let path_str = if dll_lower.contains("\") {
+        let path_str = if dll_lower.contains(r"\") {
             dll_lower.clone()
         } else {
             format!(r"{}\System32\{}", sysroot, dll_name)
         };
-        let c_path = std::ffi::CString::new(path_str).unwrap();
         
-        // Use CreateFile for non-ntdll clean maps. NtOpenFile can also be used if preferred, but for now we follow the script
         let sys_ntopenfile = get_syscall_id("NtOpenFile")?;
         
         use std::os::windows::ffi::OsStrExt;

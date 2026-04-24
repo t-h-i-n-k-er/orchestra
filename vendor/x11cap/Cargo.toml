@@ -5,5 +5,5 @@ authors = ["bryal <96.bryal@gmail.com>"]
 edition = "2021"
 
 [dependencies]
-x11 = "*"
+x11 = { version = "*", default-features = false, features = ["xlib"] }
 libc = "0.2"

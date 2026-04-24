@@ -50,45 +50,7 @@ pub fn list_processes() -> Vec<ProcessInfo> {
 #[cfg(target_os = "linux")]
 pub fn migrate_to_process(target_pid: u32) -> Result<()> {
     tracing::info!("MigrateAgent invoked for Linux pid {target_pid}");
-    let agent_path = std::env::current_exe()?;
-    let _payload = std::fs::read(&agent_path)?;
-
-    unsafe {
-        let pid = libc::fork();
-        if pid < 0 {
-            return Err(anyhow::anyhow!("fork failed: {}", std::io::Error::last_os_error()));
-        }
-        
-        if pid == 0 {
-            // Child process
-            if libc::ptrace(libc::PTRACE_TRACEME, 0, std::ptr::null_mut::<libc::c_void>(), std::ptr::null_mut::<libc::c_void>()) < 0 {
-                libc::_exit(1);
-            }
-            
-            // Extract the path of the target process
-            let target_proc_path = format!("/proc/{}/exe", target_pid);
-            let target_exe = std::fs::read_link(&target_proc_path).unwrap_or_else(|_| agent_path.clone());
-            let c_path = std::ffi::CString::new(target_exe.to_string_lossy().into_owned()).unwrap();
-            
-            let args: [*const libc::c_char; 2] = [c_path.as_ptr(), std::ptr::null()];
-            libc::execve(c_path.as_ptr(), args.as_ptr(), std::ptr::null());
-            libc::_exit(1);
-        }
-        
-        // Parent process
-        let mut status = 0;
-        if libc::waitpid(pid, &mut status, 0) < 0 {
-            return Err(anyhow::anyhow!("waitpid failed: {}", std::io::Error::last_os_error()));
-        }
-        
-        tracing::warn!("process_vm_writev mapping deferred. Releasing process.");
-        
-        if libc::ptrace(libc::PTRACE_DETACH, pid, std::ptr::null_mut::<libc::c_void>(), std::ptr::null_mut::<libc::c_void>()) < 0 {
-            return Err(anyhow::anyhow!("ptrace detach failed: {}", std::io::Error::last_os_error()));
-        }
-    }
-
-    Ok(())
+    Err(anyhow::anyhow!("process migration on Linux not implemented"))
 }
 
 #[cfg(target_os = "macos")]

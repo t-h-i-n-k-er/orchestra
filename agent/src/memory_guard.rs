@@ -45,9 +45,9 @@
 
 #![cfg(feature = "memory-guard")]
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use chacha20poly1305::{
-    aead::{Aead, AeadInPlace, KeyInit, OsRng},
+    aead::{Aead, KeyInit, OsRng},
     XChaCha20Poly1305, XNonce,
 };
 use rand::RngCore;

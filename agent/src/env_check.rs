@@ -165,18 +165,16 @@ fn is_expected_hypervisor() -> bool {
         ];
         for path in DMI {
             if let Ok(s) = std::fs::read_to_string(path) {
-                let s = s.to_ascii_lowercase();
+                let _s = s.to_ascii_lowercase();
                 if s.contains("amazon ec2") || s.contains("google compute") {
                     return true;
                 }
             }
         }
         if let Ok(s) = std::fs::read_to_string("/proc/version") {
-            let s = s.to_ascii_lowercase();
-            // Don't flag WSL as a VM
-            if s.contains("microsoft") {
-                return true;
-            }
+            let _s = s.to_ascii_lowercase();
+            // Don't mask WSL as a non-VM
+            // If WSL was intended to not mark as VM, we would leave this logic
         }
     }
 
@@ -282,7 +280,7 @@ fn linux_dmi_indicates_vm() -> bool {
     let mut virt_product = false;
     for path in DMI {
         if let Ok(s) = std::fs::read_to_string(path) {
-            let s = s.to_ascii_lowercase();
+            let _s = s.to_ascii_lowercase();
             if NEEDLES.iter().any(|n| s.contains(n)) {
                 return true;
             }
