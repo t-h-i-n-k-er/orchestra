@@ -48,3 +48,11 @@ toml = "0.8"
 
 [patch.crates-io]
 x11cap = { path = "vendor/x11cap" }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false

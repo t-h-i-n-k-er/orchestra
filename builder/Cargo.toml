@@ -30,3 +30,7 @@ serde_json = "1.0.149"
 
 [build-dependencies]
 built = "0.7"
+
+[[bin]]
+name = "orchestra-pe-hardener"
+path = "src/bin/orchestra-pe-hardener.rs"
