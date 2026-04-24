@@ -164,15 +164,14 @@ fn is_expected_hypervisor() -> bool {
             "/sys/class/dmi/id/product_name",
         ];
         for path in DMI {
-            if let Ok(s) = std::fs::read_to_string(path) {
-                let _s = s.to_ascii_lowercase();
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let s = content.to_ascii_lowercase();
                 if s.contains("amazon ec2") || s.contains("google compute") {
                     return true;
                 }
             }
         }
-        if let Ok(s) = std::fs::read_to_string("/proc/version") {
-            let _s = s.to_ascii_lowercase();
+        if let Ok(_content) = std::fs::read_to_string("/proc/version") {
             // Don't mask WSL as a non-VM
             // If WSL was intended to not mark as VM, we would leave this logic
         }
@@ -186,11 +185,7 @@ fn is_expected_hypervisor() -> bool {
         if let Ok(k) = hklm.open_subkey("HARDWARE\\DESCRIPTION\\System\\BIOS") {
             if let Ok(v) = k.get_value::<String, _>("SystemManufacturer") {
                 let s = v.to_ascii_lowercase();
-                // "microsoft corporation" means Surface in many contexts, allowing hypervisor for features without flagging VM
-                if s.contains("amazon")
-                    || s.contains("google")
-                    || s.contains("microsoft corporation")
-                {
+                if s.contains("amazon") || s.contains("google") {
                     return true;
                 }
             }
@@ -279,8 +274,8 @@ fn linux_dmi_indicates_vm() -> bool {
     let mut ms_vendor = false;
     let mut virt_product = false;
     for path in DMI {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            let _s = s.to_ascii_lowercase();
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let s = content.to_ascii_lowercase();
             if NEEDLES.iter().any(|n| s.contains(n)) {
                 return true;
             }

