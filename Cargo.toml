@@ -15,8 +15,11 @@ members = [
     "keygen",
     "hollowing",
     "string_crypt",
-    "pe_resolve", "string_crypt",
-    "pe_resolve", "pe_resolve",
+    "pe_resolve",
+    "junk_macro", "string_crypt",
+    "pe_resolve",
+    "junk_macro", "pe_resolve",
+    "junk_macro", "junk_macro",
 ]
 
 [workspace.package]

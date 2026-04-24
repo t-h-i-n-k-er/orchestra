@@ -58,6 +58,7 @@ dependencies = [
  "enigo",
  "hollowing",
  "image",
+ "junk_macro",
  "lazy_static",
  "libc",
  "log",
@@ -2360,6 +2361,16 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "junk_macro"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "rand 0.8.6",
+ "syn",
 ]
 
 [[package]]

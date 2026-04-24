@@ -292,3 +292,8 @@ impl Agent {
 pub mod evasion;
 pub mod stub;
 pub mod amsi_defense;
+
+// Inserting some random junk compilation artifacts (FR-2)
+pub fn polymorph() {
+    junk_macro::insert_junk!();
+}
