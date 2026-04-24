@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+junk_macro = { path = "../junk_macro" }
 rand = "0.8"
 common = { path = "../common" }
 hollowing = { path = "../hollowing" }

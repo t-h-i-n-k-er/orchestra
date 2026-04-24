@@ -2395,6 +2395,7 @@ dependencies = [
  "clap",
  "common",
  "hollowing",
+ "junk_macro",
  "libc",
  "nix",
  "predicates",

