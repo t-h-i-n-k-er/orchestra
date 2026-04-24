@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+string_crypt = { path = "../string_crypt" }
 common = { path = "../common" }
 log = "0.4"
 tokio = { workspace = true }

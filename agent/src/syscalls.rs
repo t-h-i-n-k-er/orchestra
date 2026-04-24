@@ -972,7 +972,7 @@ pub unsafe extern "C" fn get_spoof_ret() -> usize {
 
 #[cfg(windows)]
 pub fn find_jmp_rbx_gadget() -> usize {
-    let base = unsafe { winapi::um::libloaderapi::GetModuleHandleA(b"kernel32.dll\0".as_ptr() as *const i8) } as usize;
+    let base = unsafe { winapi::um::libloaderapi::GetModuleHandleA(string_crypt::enc_str!("kernel32.dll").as_ptr() as *const i8) } as usize;
     if base == 0 { return 0; }
     let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
     let nt_headers = (base + unsafe { *dos_header }.e_lfanew as usize) as *const winapi::um::winnt::IMAGE_NT_HEADERS64;

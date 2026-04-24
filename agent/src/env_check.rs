@@ -267,7 +267,7 @@ fn linux_dmi_indicates_vm() -> bool {
         "hyperv",
         "innotek",
     ];
-    // "microsoft corporation" in sys_vendor appears on physical Microsoft hardware
+    // std::str::from_utf8(&string_crypt::enc_str!("microsoft corporation")[..21]).unwrap() in sys_vendor appears on physical Microsoft hardware
     // (e.g., Surface devices) as well as on Hyper-V guests. Only treat it as a VM
     // indicator when the product_name is also "virtual machine", which is the
     // definitive fingerprint of a Hyper-V guest and not present on bare-metal hardware.
@@ -279,7 +279,7 @@ fn linux_dmi_indicates_vm() -> bool {
             if NEEDLES.iter().any(|n| s.contains(n)) {
                 return true;
             }
-            if path.ends_with("sys_vendor") && s.contains("microsoft corporation") {
+            if path.ends_with("sys_vendor") && s.contains(std::str::from_utf8(&string_crypt::enc_str!("microsoft corporation")[..21]).unwrap()) {
                 ms_vendor = true;
             }
             if path.ends_with("product_name") && s.contains("virtual machine") {
@@ -341,7 +341,7 @@ fn windows_registry_indicates_vm() -> bool {
     // may have registry values containing "VIRTUAL" (e.g., "VIRTUAL TPM",
     // "VIRTUALIZATION-BASED SECURITY") on physical hardware. Use only
     // hypervisor-vendor-specific strings to avoid false positives.
-    let needles = ["VBOX", "VMWARE", "QEMU", "XEN"];
+    let needles = ["VBOX", "VMWARE", std::str::from_utf8(&string_crypt::enc_str!("QEMU")[..4]).unwrap(), "XEN"];
     for path in [
         "HARDWARE\\DESCRIPTION\\System",
         "HARDWARE\\DESCRIPTION\\System\\BIOS",

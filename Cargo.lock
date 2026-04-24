@@ -73,6 +73,7 @@ dependencies = [
  "rustls-pemfile 2.2.0",
  "serde",
  "serde_json",
+ "string_crypt",
  "sysinfo",
  "tempfile",
  "tokio",
@@ -1862,6 +1863,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rand 0.8.6",
+ "string_crypt",
  "tracing",
  "winapi",
 ]
@@ -4148,6 +4150,16 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "string_crypt"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "rand 0.8.6",
+ "syn",
+]
 
 [[package]]
 name = "strsim"

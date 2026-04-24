@@ -1,0 +1,16 @@
+[package]
+name = "string_crypt"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+
+[build-dependencies]
+rand = "0.8"
+
+[dependencies]
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+rand = "0.8"

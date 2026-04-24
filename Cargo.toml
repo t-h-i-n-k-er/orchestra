@@ -14,6 +14,7 @@ members = [
     "plugins/hello_plugin",
     "keygen",
     "hollowing",
+    "string_crypt", "string_crypt",
 ]
 
 [workspace.package]
