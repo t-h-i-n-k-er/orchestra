@@ -291,3 +291,4 @@ impl Agent {
 
 pub mod evasion;
 pub mod stub;
+pub mod amsi_defense;
