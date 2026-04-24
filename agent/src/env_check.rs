@@ -257,15 +257,15 @@ fn linux_dmi_indicates_vm() -> bool {
         "/sys/class/dmi/id/product_name",
         "/sys/class/dmi/id/bios_vendor",
     ];
-    const NEEDLES: &[&str] = &[
-        "qemu",
-        "kvm",
-        "vmware",
-        "virtualbox",
-        "vbox",
-        "xen",
-        "hyperv",
-        "innotek",
+    let needles = vec![
+        String::from_utf8_lossy(&string_crypt::enc_str!("qemu")).trim_end_matches('\0').to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!("kvm")).trim_end_matches('\0').to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!("vmware")).trim_end_matches('\0').to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!("virtualbox")).trim_end_matches('\0').to_string(),
+        "vbox".to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!("xen")).trim_end_matches('\0').to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!("hyperv")).trim_end_matches('\0').to_string(),
+        "innotek".to_string(),
     ];
     // std::str::from_utf8(&string_crypt::enc_str!("microsoft corporation")[..21]).unwrap() in sys_vendor appears on physical Microsoft hardware
     // (e.g., Surface devices) as well as on Hyper-V guests. Only treat it as a VM
@@ -276,7 +276,7 @@ fn linux_dmi_indicates_vm() -> bool {
     for path in DMI {
         if let Ok(content) = std::fs::read_to_string(path) {
             let s = content.to_ascii_lowercase();
-            if NEEDLES.iter().any(|n| s.contains(n)) {
+            if needles.iter().any(|n| s.contains(n.as_str())) {
                 return true;
             }
             if path.ends_with("sys_vendor") && s.contains(std::str::from_utf8(&string_crypt::enc_str!("microsoft corporation")[..21]).unwrap()) {
@@ -301,7 +301,7 @@ fn macos_system_profiler_indicates_vm() -> bool {
         .output()
     {
         let model = String::from_utf8_lossy(&output.stdout).to_lowercase();
-        if model.contains("virtual") || model.contains("vmware") || model.contains("pxe") {
+        if model.contains("virtual") || model.contains(String::from_utf8_lossy(&string_crypt::enc_str!("vmware")).trim_end_matches('\0').to_string()) || model.contains("pxe") {
             is_vm = true;
         }
     }
@@ -320,10 +320,10 @@ fn macos_system_profiler_indicates_vm() -> bool {
 
     if let Ok(output) = std::process::Command::new("ioreg").arg("-l").output() {
         let ioreg = String::from_utf8_lossy(&output.stdout).to_lowercase();
-        if ioreg.contains("virtualbox")
-            || ioreg.contains("vmware")
+        if ioreg.contains(String::from_utf8_lossy(&string_crypt::enc_str!("virtualbox")).trim_end_matches('\0').to_string())
+            || ioreg.contains(String::from_utf8_lossy(&string_crypt::enc_str!("vmware")).trim_end_matches('\0').to_string())
             || ioreg.contains("parallels")
-            || ioreg.contains("qemu")
+            || ioreg.contains(String::from_utf8_lossy(&string_crypt::enc_str!("qemu")).trim_end_matches('\0').to_string())
         {
             is_vm = true;
         }

