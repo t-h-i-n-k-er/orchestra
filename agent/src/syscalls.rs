@@ -1067,3 +1067,19 @@ pub unsafe fn spoof_call(api_addr: usize, gadget_addr: usize, arg1: u64, arg2: u
     status
 }
 
+
+#[cfg(windows)]
+pub fn do_syscall_with_strategy(func_name: &str, args: &[u64]) -> i32 {
+    let target = get_syscall_id(func_name).unwrap();
+    // Let's pretend we pull from config
+    let strat = common::config::ExecStrategy::Indirect; 
+    match strat {
+        common::config::ExecStrategy::Direct => unsafe {
+            // direct syscall fallback
+            crate::syscalls::do_syscall(target.ssn, 0, args) // needs handling
+        },
+        _ => unsafe {
+            crate::syscalls::do_syscall(target.ssn, target.gadget_addr, args)
+        }
+    }
+}

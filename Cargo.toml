@@ -14,6 +14,7 @@ members = [
     "plugins/hello_plugin",
     "keygen",
     "hollowing",
+    "orchestra-side-load-gen",
     "string_crypt",
     "pe_resolve",
     "junk_macro", "string_crypt",

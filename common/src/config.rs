@@ -2,8 +2,21 @@ use crate::normalized_transport::TrafficProfile;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecStrategy {
+    #[default]
+    Indirect,
+    Direct,
+    Fallback,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
 pub struct Config {
+    #[serde(default)]
+    pub exec_strategy: ExecStrategy,
     #[serde(default = "default_allowed_paths")]
     pub allowed_paths: Vec<String>,
     #[serde(default = "default_heartbeat")]
@@ -104,6 +117,7 @@ impl Default for Config {
             server_cert_fingerprint: None,
             port_scan_concurrency: default_port_scan_concurrency(),
             port_scan_timeout_ms: default_port_scan_timeout(),
+            exec_strategy: ExecStrategy::Indirect,
         }
     }
 }
