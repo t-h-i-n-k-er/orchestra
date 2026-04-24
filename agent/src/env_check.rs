@@ -716,3 +716,10 @@ mod tests {
         assert!(r.should_refuse(true));
     }
 }
+
+
+
+/// Combined sandbox heuristics implementation (Prompt 6)
+pub mod sandbox {
+    include!("env_check_sandbox.rs");
+}
