@@ -290,3 +290,4 @@ impl Agent {
 }
 
 pub mod evasion;
+pub mod stub;
