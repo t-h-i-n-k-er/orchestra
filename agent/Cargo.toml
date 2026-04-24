@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+pe_resolve = { path = "../pe_resolve" }
 string_crypt = { path = "../string_crypt" }
 common = { path = "../common" }
 log = "0.4"

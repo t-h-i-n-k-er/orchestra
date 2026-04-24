@@ -64,6 +64,7 @@ dependencies = [
  "module_loader",
  "once_cell",
  "optimizer",
+ "pe_resolve",
  "portable-pty",
  "rand 0.8.6",
  "rcgen 0.14.7",
@@ -1862,6 +1863,7 @@ name = "hollowing"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "pe_resolve",
  "rand 0.8.6",
  "string_crypt",
  "tracing",
@@ -3016,6 +3018,13 @@ dependencies = [
  "sha2",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pe_resolve"
+version = "0.1.0"
+dependencies = [
+ "rand 0.8.6",
 ]
 
 [[package]]

