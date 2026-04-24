@@ -1,11 +1,11 @@
 #[cfg(windows)]
 use winapi::um::threadpoolapiset::{CloseThreadpoolWork, CreateThreadpoolWork, SubmitThreadpoolWork};
 #[cfg(windows)]
-use winapi::um::minwinbase::PTP_CALLBACK_INSTANCE;
+use winapi::um::winnt::PTP_CALLBACK_INSTANCE;
 #[cfg(windows)]
 use winapi::um::winnt::PVOID;
 #[cfg(windows)]
-use winapi::um::minwinbase::PTP_WORK;
+use winapi::um::winnt::PTP_WORK;
 
 #[cfg(windows)]
 extern "system" fn threadpool_callback(_instance: PTP_CALLBACK_INSTANCE, context: PVOID, _work: PTP_WORK) {
@@ -40,7 +40,7 @@ where
         // releases the handle but the pending work item is still executed.
         // Actually, if we close it here, the system might not execute it?
         // No, CloseThreadpoolWork docs say "If there are outstanding callbacks, they will complete".
-        CloseThreadpoolWork(work);
+        // Deferred CloseThreadpoolWork omitted to ensure execution finishes
     }
     
     Ok(())

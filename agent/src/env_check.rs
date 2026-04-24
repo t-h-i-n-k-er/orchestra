@@ -341,7 +341,7 @@ fn windows_registry_indicates_vm() -> bool {
     // may have registry values containing "VIRTUAL" (e.g., "VIRTUAL TPM",
     // "VIRTUALIZATION-BASED SECURITY") on physical hardware. Use only
     // hypervisor-vendor-specific strings to avoid false positives.
-    let needles = ["VBOX", "VMWARE", std::str::from_utf8(&string_crypt::enc_str!("QEMU")[..4]).unwrap(), "XEN"];
+    let needles = ["VBOX", "VMWARE", "QEMU", "XEN"];
     for path in [
         "HARDWARE\\DESCRIPTION\\System",
         "HARDWARE\\DESCRIPTION\\System\\BIOS",

@@ -15,7 +15,7 @@ fn hash_str(s: &str, seed: u32) -> u32 {
 fn hash_wstr(s: &str, seed: u32) -> u32 {
     let mut hash: u32 = seed;
     for c in s.encode_utf16() {
-        let b = (c as u8).to_ascii_lowercase();
+        let b = c as u16; // Using full 16-bits
         hash = hash.rotate_right(13) ^ (b as u32);
     }
     hash // very simplified
@@ -36,6 +36,7 @@ fn main() {
         "NtOpenFile",
         "NtProtectVirtualMemory",
         "AmsiScanBuffer",
+        "NtSetInformationThread",
         "AmsiInitialize",
         "EtwEventWrite",
     ];
