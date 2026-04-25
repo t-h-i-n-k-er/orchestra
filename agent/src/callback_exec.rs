@@ -9,8 +9,7 @@ use winapi::um::threadpoollegacyapiset::CreateTimerQueueTimer;
 #[cfg(windows)]
 use winapi::um::synchapi::WaitForSingleObject;
 #[cfg(windows)]
-use winapi::um::winnls::EnumSystemLocalesA;
-use winapi::um::winnt::LCID;
+use winapi::um::winnls::EnumSystemLocalesEx;
 #[cfg(windows)]
 use winapi::shared::minwindef::{BOOL, LPARAM, TRUE, FALSE};
 #[cfg(windows)]
@@ -100,14 +99,41 @@ where F: FnOnce() + Send + 'static {
 }
 
 #[cfg(windows)]
-extern "system" fn enum_locales_callback(locale_str: *mut i8) -> BOOL {
-    // We can't realistically pass a context to standard EnumSystemLocalesA gracefully without
-    // global state unless we use EnumSystemLocalesEx with lParam. 
-    // Wait, let's use EnumSystemLocalesEx for context passing, or TLS. 
-    // To strictly follow standard: Thread safety via TLS is required.
-    // Or we can just use EnumSystemLocalesA with a global static Option if strictly asked, 
-    // but EnumSystemLocalesEx is better. We'll simulate passing by executing if TLS has a value.
-    FALSE
+thread_local! {
+    static LOCALE_CALLBACK_CTX: std::cell::Cell<*mut Box<dyn FnOnce() + Send>> =
+        std::cell::Cell::new(std::ptr::null_mut());
+}
+
+#[cfg(windows)]
+extern "system" fn enum_locales_ex_callback(
+    _locale_name: *mut u16,
+    _flags: u32,
+    lparam: LPARAM,
+) -> BOOL {
+    // lparam holds the raw Box pointer.  Execute once then signal done by
+    // returning FALSE (stop enumeration).
+    if lparam != 0 {
+        let closure: Box<Box<dyn FnOnce() + Send>> = unsafe { Box::from_raw(lparam as *mut _) };
+        closure();
+    }
+    FALSE // Stop enumeration after first callback — payload runs once
+}
+
+#[cfg(windows)]
+pub fn execute_enum_system_locales<F>(f: F) -> Result<(), anyhow::Error>
+where F: FnOnce() + Send + 'static {
+    use winapi::um::winnls::EnumSystemLocalesEx;
+    let closure: Box<Box<dyn FnOnce() + Send>> = Box::new(Box::new(f));
+    let lparam = Box::into_raw(closure) as LPARAM;
+    unsafe {
+        // LOCALE_ALL = 0; EnumSystemLocalesEx passes lparam to the callback.
+        if EnumSystemLocalesEx(Some(enum_locales_ex_callback), 0, lparam, std::ptr::null_mut()) == FALSE {
+            // Reclaim the closure if the API failed before any callback.
+            let _ = Box::from_raw(lparam as *mut Box<dyn FnOnce() + Send>);
+            anyhow::bail!("EnumSystemLocalesEx failed");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -117,6 +143,6 @@ where F: FnOnce() + Send + 'static {
         CallbackType::ThreadpoolWork => execute_in_threadpool(f),
         CallbackType::EnumChildWindows => execute_enum_child_windows(f),
         CallbackType::CreateTimerQueueTimer => execute_timer_queue(f),
-        _ => execute_in_threadpool(f),
+        CallbackType::EnumSystemLocalesA => execute_enum_system_locales(f),
     }
 }

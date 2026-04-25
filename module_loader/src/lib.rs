@@ -15,7 +15,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use tracing::info;
 
 #[cfg(windows)]
-mod manual_map;
+pub mod manual_map;
 
 #[cfg(feature = "module-signatures")]
 use ed25519_dalek::{Signature, VerifyingKey};

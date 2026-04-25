@@ -163,17 +163,32 @@ fn is_expected_hypervisor() -> bool {
             "/sys/class/dmi/id/sys_vendor",
             "/sys/class/dmi/id/product_name",
         ];
+        // Well-known cloud / hosting provider strings in DMI fields.
+        // Deliberately broad so Azure, DigitalOcean, Linode, Vultr, Hetzner,
+        // OVH, and other legitimate cloud infrastructure all pass.
+        const CLOUD_NEEDLES: &[&str] = &[
+            "amazon ec2",
+            "google compute",
+            "microsoft corporation", // Azure (Hyper-V guest) and Surface hardware
+            "digitalocean",
+            "linode",
+            "vultr",
+            "hetzner",
+            "ovh",
+            "cloudstack",
+            "openstack",
+            "upcloud",
+            "scaleway",
+            "exoscale",
+            "oracle cloud",
+        ];
         for path in DMI {
             if let Ok(content) = std::fs::read_to_string(path) {
                 let s = content.to_ascii_lowercase();
-                if s.contains("amazon ec2") || s.contains("google compute") {
+                if CLOUD_NEEDLES.iter().any(|n| s.contains(n)) {
                     return true;
                 }
             }
-        }
-        if let Ok(_content) = std::fs::read_to_string("/proc/version") {
-            // Don't mask WSL as a non-VM
-            // If WSL was intended to not mark as VM, we would leave this logic
         }
     }
 
@@ -181,18 +196,30 @@ fn is_expected_hypervisor() -> bool {
     {
         use winreg::enums::HKEY_LOCAL_MACHINE;
         use winreg::RegKey;
+        const CLOUD_NEEDLES: &[&str] = &[
+            "amazon",
+            "google",
+            "microsoft corporation",
+            "digitalocean",
+            "linode",
+            "vultr",
+            "hetzner",
+            "ovh",
+            "cloudstack",
+            "openstack",
+            "upcloud",
+            "scaleway",
+            "exoscale",
+            "oracle cloud",
+        ];
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
         if let Ok(k) = hklm.open_subkey("HARDWARE\\DESCRIPTION\\System\\BIOS") {
-            if let Ok(v) = k.get_value::<String, _>("SystemManufacturer") {
-                let s = v.to_ascii_lowercase();
-                if s.contains("amazon") || s.contains("google") {
-                    return true;
-                }
-            }
-            if let Ok(v) = k.get_value::<String, _>("SystemProductName") {
-                let s = v.to_ascii_lowercase();
-                if s.contains("amazon ec2") || s.contains("google compute") {
-                    return true;
+            for val_name in &["SystemManufacturer", "SystemProductName", "BaseBoardManufacturer"] {
+                if let Ok(v) = k.get_value::<String, _>(val_name) {
+                    let s = v.to_ascii_lowercase();
+                    if CLOUD_NEEDLES.iter().any(|n| s.contains(n)) {
+                        return true;
+                    }
                 }
             }
         }

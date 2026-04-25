@@ -17,10 +17,7 @@ members = [
     "orchestra-side-load-gen",
     "string_crypt",
     "pe_resolve",
-    "junk_macro", "string_crypt",
-    "pe_resolve",
-    "junk_macro", "pe_resolve",
-    "junk_macro", "junk_macro",
+    "junk_macro",
 ]
 
 [workspace.package]
