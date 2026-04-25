@@ -16,3 +16,12 @@ orchestra-server.toml
 *.swp
 *.swo
 *~
+
+# Automated fixing/patching scripts — working artifacts, not part of the project
+fix_*.py
+fix_*.sh
+patch_*.py
+rewrite_*.py
+orchestrate_*.py
+payload_enc_build.py
+*_patch.py
