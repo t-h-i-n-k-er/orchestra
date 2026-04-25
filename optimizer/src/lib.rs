@@ -1,7 +1,7 @@
 // Optimizer
 use rand::seq::SliceRandom;
 use rand::{thread_rng, Rng};
-use iced_x86::{Code, Decoder, DecoderOptions, Encoder, Instruction};
+use iced_x86::{Code, Decoder, DecoderOptions, Encoder, Instruction, OpKind, Register};
 
 pub trait Pass {
     fn run(&self, instrs: &mut Vec<Instruction>);
@@ -18,6 +18,15 @@ pub fn apply_passes(code: &[u8]) -> Vec<u8> {
         Box::new(NopInsertionPass),
         Box::new(InstructionSchedulingPass),
     ];
+    // Metamorphic passes: instruction-level substitution and opaque dead-code
+    // insertion.  Gated behind the `diversification` feature so callers can
+    // opt in explicitly; these passes change encoded sizes which requires the
+    // branch-target fixup below to run correctly.
+    #[cfg(feature = "diversification")]
+    {
+        passes.push(Box::new(InstructionSubstitutionPass) as Box<dyn Pass>);
+        passes.push(Box::new(OpaqueDeadCodePass) as Box<dyn Pass>);
+    }
     let mut rng = thread_rng();
     passes.shuffle(&mut rng);
 
@@ -182,6 +191,172 @@ impl Pass for InstructionSchedulingPass {
 /// span (default 256 bytes), apply the registered passes, then write the
 /// result back into executable memory after temporarily lowering page
 /// protections via `VirtualProtect` (Windows) or `mprotect` (Unix).
+/// Without the `unsafe-runtime-rewrite` feature this is a metadata-only
+/// no-op — the optimizer passes can still be exercised via `apply_passes`
+/// from tests.
+///
+/// With `unsafe-runtime-rewrite` enabled, the function performs in-place
+/// rewriting of the named function: locate the symbol, decode an estimated
+/// span (default 256 bytes), apply the registered passes, then write the
+/// result back into executable memory after temporarily lowering page
+/// protections via `VirtualProtect` (Windows) or `mprotect` (Unix).
+
+// ── Instruction substitution pass ────────────────────────────────────────────
+
+/// Replace instructions with semantically equivalent alternatives to produce
+/// different binary patterns across builds (metamorphism).
+///
+/// Substitution table (applied with ~50 % probability each):
+/// * `ADD r64, 1`  ↔  `INC r64`
+/// * `SUB r64, 1`  ↔  `DEC r64`
+/// * `MOV r64, 0`  →   `XOR r64, r64`
+/// * `XOR r64, r64` (same reg) ↔ `SUB r64, r64`
+/// * `TEST r64, r64` (same reg) ↔ `CMP r64, 0`
+/// * `AND r64, 0`  →   `XOR r64, r64`
+///
+/// Note: INC/DEC differ from ADD/SUB in that they do **not** update CF.  This
+/// substitution is safe wherever CF is not observed after the instruction,
+/// which covers the vast majority of loop-counter and pointer-increment
+/// patterns.  Enable only when you accept this caveat.
+#[cfg(feature = "diversification")]
+pub struct InstructionSubstitutionPass;
+
+#[cfg(feature = "diversification")]
+impl Pass for InstructionSubstitutionPass {
+    fn run(&self, instrs: &mut Vec<Instruction>) {
+        let mut rng = thread_rng();
+        for ins in instrs.iter_mut() {
+            if !rng.gen_bool(0.5) {
+                continue;
+            }
+            let orig_ip = ins.ip();
+            if let Some(mut new_ins) = try_substitute(ins, &mut rng) {
+                new_ins.set_ip(orig_ip);
+                *ins = new_ins;
+            }
+        }
+    }
+}
+
+/// Return a semantically-equivalent replacement for `ins`, or `None` to keep
+/// the original unchanged.
+#[cfg(feature = "diversification")]
+fn try_substitute(ins: &Instruction, rng: &mut impl Rng) -> Option<Instruction> {
+    match ins.code() {
+        // ADD r/m64, 1  →  INC r/m64
+        Code::Add_rm64_imm8
+            if ins.op0_kind() == OpKind::Register && ins.immediate8() == 1 =>
+        {
+            Instruction::with1(Code::Inc_rm64, ins.op0_register()).ok()
+        }
+        // INC r/m64  →  ADD r/m64, 1  (restores CF behaviour)
+        Code::Inc_rm64 if ins.op0_kind() == OpKind::Register && rng.gen_bool(0.5) => {
+            Instruction::with2(Code::Add_rm64_imm8, ins.op0_register(), 1u32).ok()
+        }
+        // SUB r/m64, 1  →  DEC r/m64
+        Code::Sub_rm64_imm8
+            if ins.op0_kind() == OpKind::Register && ins.immediate8() == 1 =>
+        {
+            Instruction::with1(Code::Dec_rm64, ins.op0_register()).ok()
+        }
+        // DEC r/m64  →  SUB r/m64, 1
+        Code::Dec_rm64 if ins.op0_kind() == OpKind::Register && rng.gen_bool(0.5) => {
+            Instruction::with2(Code::Sub_rm64_imm8, ins.op0_register(), 1u32).ok()
+        }
+        // MOV r64, 0  →  XOR r64, r64  (sets identical flags; saves 3-4 bytes)
+        Code::Mov_rm64_imm32 | Code::Mov_r64_imm64
+            if ins.op0_kind() == OpKind::Register && ins.immediate64() == 0 =>
+        {
+            let r = ins.op0_register();
+            Instruction::with2(Code::Xor_r64_rm64, r, r).ok()
+        }
+        // XOR r64, r64 (same reg)  →  SUB r64, r64  (identical semantics + flags)
+        Code::Xor_r64_rm64
+            if ins.op0_kind() == OpKind::Register
+                && ins.op1_kind() == OpKind::Register
+                && ins.op0_register() == ins.op1_register()
+                && rng.gen_bool(0.5) =>
+        {
+            let r = ins.op0_register();
+            Instruction::with2(Code::Sub_r64_rm64, r, r).ok()
+        }
+        // AND r64, 0  →  XOR r64, r64  (both zero reg; flag effects identical)
+        Code::And_rm64_imm8
+            if ins.op0_kind() == OpKind::Register && ins.immediate8() == 0 =>
+        {
+            let r = ins.op0_register();
+            Instruction::with2(Code::Xor_r64_rm64, r, r).ok()
+        }
+        // TEST r64, r64  →  CMP r64, 0  (identical flag outputs)
+        Code::Test_rm64_r64
+            if ins.op0_kind() == OpKind::Register
+                && ins.op1_kind() == OpKind::Register
+                && ins.op0_register() == ins.op1_register() =>
+        {
+            Instruction::with2(Code::Cmp_rm64_imm8, ins.op0_register(), 0i32).ok()
+        }
+        // CMP r64, 0  →  TEST r64, r64
+        Code::Cmp_rm64_imm8
+            if ins.op0_kind() == OpKind::Register && ins.immediate8() == 0 =>
+        {
+            let r = ins.op0_register();
+            Instruction::with2(Code::Test_rm64_r64, r, r).ok()
+        }
+        _ => None,
+    }
+}
+
+// ── Opaque dead-code insertion pass ──────────────────────────────────────────
+
+/// Insert opaque dead-store sequences at basic-block boundaries.
+///
+/// Before ~35 % of block-entry instructions, inserts:
+/// ```asm
+///   PUSH <scratch_reg>
+///   MOV  <scratch_reg>, <random_imm64>
+///   POP  <scratch_reg>
+/// ```
+/// This sequence preserves all flags and all registers (RSP nets to zero) but
+/// produces a different binary fingerprint every build.  The scratch register
+/// is chosen randomly from the caller-saved set so no callee-save epilogue is
+/// needed.
+#[cfg(feature = "diversification")]
+pub struct OpaqueDeadCodePass;
+
+#[cfg(feature = "diversification")]
+impl Pass for OpaqueDeadCodePass {
+    fn run(&self, instrs: &mut Vec<Instruction>) {
+        // Caller-saved registers on both SysV AMD64 and Windows x64 ABI.
+        const SCRATCH: &[Register] = &[
+            Register::RAX, Register::RCX, Register::RDX,
+            Register::R8,  Register::R9,  Register::R10, Register::R11,
+        ];
+        let mut rng = thread_rng();
+        let mut result = Vec::with_capacity(instrs.len() + instrs.len() / 4);
+        let mut at_block_start = true;
+
+        for &ins in instrs.iter() {
+            if at_block_start && rng.gen_bool(0.35) {
+                let reg = *SCRATCH.choose(&mut rng).unwrap();
+                let dead_val: u64 = rng.gen();
+                // PUSH / MOV / POP — EFLAGS unchanged, RSP net change = 0.
+                if let (Ok(push), Ok(mov), Ok(pop)) = (
+                    Instruction::with1(Code::Push_r64, reg),
+                    Instruction::with2(Code::Mov_r64_imm64, reg, dead_val),
+                    Instruction::with1(Code::Pop_r64, reg),
+                ) {
+                    result.push(push);
+                    result.push(mov);
+                    result.push(pop);
+                }
+            }
+            at_block_start = is_block_terminator(&ins);
+            result.push(ins);
+        }
+        *instrs = result;
+    }
+}
+
 pub fn optimize_hot_function(name: &str) -> Result<(), String> {
     tracing::debug!("optimize_hot_function: requested for '{}'", name);
 

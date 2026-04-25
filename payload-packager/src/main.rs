@@ -28,6 +28,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
+mod poly;
+
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -43,13 +45,27 @@ struct Cli {
     #[arg(long)]
     output: PathBuf,
 
-    /// Base64-encoded 32-byte AES-256 key.
+    /// Base64-encoded 32-byte AES-256 key (required for standard mode; omit with --poly).
     #[arg(long)]
-    key: String,
+    key: Option<String>,
 
     /// Path to a file containing a 32-byte Ed25519 private key for signing.
     #[arg(long)]
     signing_key: Option<PathBuf>,
+
+    /// Polymorphic mode: randomly select an encryption scheme and key each run.
+    ///
+    /// Produces a POLY-format blob (see payload-packager/src/poly.rs for the
+    /// wire format).  The --key argument is ignored in this mode.
+    #[arg(long, conflicts_with = "key")]
+    poly: bool,
+
+    /// Write the generated Rust decryption stub to this file (only with --poly).
+    ///
+    /// The emitted source defines `pub fn poly_decrypt(ciphertext: &[u8]) -> Vec<u8>`
+    /// with the scheme and key hardcoded; the code structure varies per build.
+    #[arg(long, requires = "poly")]
+    stub_out: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -59,16 +75,6 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&cli.key)
-        .context("--key is not valid Base64")?;
-    if key_bytes.len() != 32 {
-        anyhow::bail!(
-            "--key must decode to exactly 32 bytes (got {})",
-            key_bytes.len()
-        );
-    }
-
     let mut plaintext = std::fs::read(&cli.input)
         .with_context(|| format!("Failed to read input file {}", cli.input.display()))?;
 
@@ -76,11 +82,53 @@ fn main() -> Result<()> {
         let signing_key_bytes = std::fs::read(signing_key_path)?;
         let signing_key = SigningKey::from_bytes(signing_key_bytes.as_slice().try_into()?);
         let signature = signing_key.sign(&plaintext);
-
         let mut signed_payload = Vec::with_capacity(64 + plaintext.len());
         signed_payload.extend_from_slice(signature.to_bytes().as_ref());
         signed_payload.append(&mut plaintext);
         plaintext = signed_payload;
+    }
+
+    if cli.poly {
+        // ── Polymorphic mode ────────────────────────────────────────────────
+        let blob = poly::poly_wrap(&plaintext);
+        let serialized = poly::poly_serialize(&blob);
+
+        std::fs::write(&cli.output, &serialized)
+            .with_context(|| format!("Failed to write poly output {}", cli.output.display()))?;
+
+        tracing::info!(
+            input  = %cli.input.display(),
+            output = %cli.output.display(),
+            scheme = ?blob.scheme,
+            key_bytes = blob.key.len(),
+            payload_bytes = serialized.len(),
+            "polymorphic payload packaged"
+        );
+        println!("poly scheme: {:?}", blob.scheme);
+        println!("key length:  {} bytes", blob.key.len());
+        println!("output size: {} bytes", serialized.len());
+
+        if let Some(stub_path) = cli.stub_out {
+            let stub_source = poly::poly_emit_stub(&blob);
+            std::fs::write(&stub_path, &stub_source)
+                .with_context(|| format!("Failed to write stub to {}", stub_path.display()))?;
+            tracing::info!(stub = %stub_path.display(), "decryption stub written");
+            println!("stub written: {}", stub_path.display());
+        }
+
+        return Ok(());
+    }
+
+    // ── Standard AES-256-GCM mode ───────────────────────────────────────────
+    let key_str = cli.key.ok_or_else(|| anyhow::anyhow!("--key is required in standard mode"))?;
+    let key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&key_str)
+        .context("--key is not valid Base64")?;
+    if key_bytes.len() != 32 {
+        anyhow::bail!(
+            "--key must decode to exactly 32 bytes (got {})",
+            key_bytes.len()
+        );
     }
 
     let plaintext_hash = {
