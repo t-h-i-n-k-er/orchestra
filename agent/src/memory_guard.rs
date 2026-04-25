@@ -261,18 +261,21 @@ pub fn unguard_memory() -> Result<()> {
 
 /// Opaque handle that holds the 32-byte encryption key in CPU registers.
 ///
-/// On x86-64 the key bytes are packed into two 128-bit XMM registers (`xmm14`
-/// and `xmm15`) using `movdqu`.  On all other targets a locked heap page is
-/// used as fallback.
+/// On x86-64 **Windows** the key bytes are packed into two 128-bit XMM registers
+/// (`xmm14` and `xmm15`) using `movdqu`.  Those registers are non-volatile
+/// (callee-saved) in the Windows x64 ABI so they survive across async suspension
+/// points.  On Linux / all other targets a locked heap page is used instead,
+/// because xmm14/15 are caller-saved in the System V AMD64 ABI and would be
+/// clobbered by the Tokio executor between stash and retrieve.
 pub struct KeyHandle {
-    #[cfg(all(target_arch = "x86_64", feature = "memory-guard"))]
+    #[cfg(all(target_arch = "x86_64", target_os = "windows", feature = "memory-guard"))]
     _marker: (),
-    /// Fallback: locked heap page on non-x86-64.
-    #[cfg(not(target_arch = "x86_64"))]
+    /// Fallback: locked heap page on Linux x86-64 and all non-x86-64 targets.
+    #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
     locked_page: LockedKeyPage,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 impl Drop for KeyHandle {
     fn drop(&mut self) {
         // Zero the XMM register stash unconditionally on drop so that a
@@ -287,14 +290,14 @@ impl Drop for KeyHandle {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 impl KeyHandle {
     fn stash(mut key: [u8; 32]) -> Self {
         unsafe {
             // Load the two halves of the key into xmm14 and xmm15.
-            // SAFETY: These are caller-saved on Linux (System V AMD64 ABI) and
-            // non-volatile (callee-saved) on Windows x64 ABI.  We use them here
-            // solely as a temporary stash for the duration of the idle sleep.
+            // SAFETY: On the Windows x64 ABI xmm14/15 are non-volatile
+            // (callee-saved), so they are preserved across function calls and
+            // async suspension points within the same OS thread.
             std::arch::asm!(
                 "movdqu xmm14, [{lo}]",
                 "movdqu xmm15, [{hi}]",
@@ -328,14 +331,29 @@ impl KeyHandle {
     }
 }
 
-// ── Fallback for non-x86-64 ──────────────────────────────────────────────────
+// On Linux x86_64 xmm14/15 are caller-saved (System V ABI), so we use the
+// LockedKeyPage fallback to avoid corruption across await points.
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+impl KeyHandle {
+    fn stash(key: [u8; 32]) -> Self {
+        KeyHandle { locked_page: LockedKeyPage::new(key) }
+    }
 
-#[cfg(not(target_arch = "x86_64"))]
+    fn retrieve(mut self) -> [u8; 32] {
+        let k = *self.locked_page.key;
+        self.locked_page.key.zeroize();
+        k
+    }
+}
+
+// ── Fallback: locked heap page (non-Windows x86-64 and all non-x86-64 targets)
+
+#[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
 struct LockedKeyPage {
     key: Box<[u8; 32]>,
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
 impl LockedKeyPage {
     fn new(key: [u8; 32]) -> Self {
         let mut b = Box::new(key);
@@ -348,7 +366,7 @@ impl LockedKeyPage {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
 impl Drop for LockedKeyPage {
     fn drop(&mut self) {
         self.key.zeroize();
@@ -359,7 +377,7 @@ impl Drop for LockedKeyPage {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
 impl KeyHandle {
     fn stash(key: [u8; 32]) -> Self {
         KeyHandle {

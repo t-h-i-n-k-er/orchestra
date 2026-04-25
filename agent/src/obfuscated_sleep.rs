@@ -70,6 +70,10 @@ pub mod crypto {
 
     thread_local! {
         static SESSION_KEY: std::cell::RefCell<[u8; 32]> = std::cell::RefCell::new([0; 32]);
+        /// Per-session random nonce for ChaCha20.  Generated alongside the key
+        /// in encrypt_sections() and consumed in decrypt_sections().  A fresh
+        /// nonce each cycle eliminates any keystream-reuse risk.
+        static SESSION_NONCE: std::cell::RefCell<[u8; 12]> = std::cell::RefCell::new([0; 12]);
         /// Set to true after a successful encrypt_sections() so decrypt_sections()
         /// can refuse to run with a zero key.
         static SESSION_INITIALIZED: std::cell::Cell<bool> = std::cell::Cell::new(false);
@@ -149,14 +153,17 @@ pub mod crypto {
         unsafe {
             let mut key = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut key);
+            let mut nonce = [0u8; 12];
+            rand::thread_rng().fill_bytes(&mut nonce);
             SESSION_KEY.with(|k| { *k.borrow_mut() = key; });
+            SESSION_NONCE.with(|n| { *n.borrow_mut() = nonce; });
             SESSION_INITIALIZED.with(|c| c.set(true));
 
-            let nonce = [0u8; 12];
             let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
 
-            // Zero local key variable
+            // Zero local key/nonce variables
             std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
+            std::ptr::write_volatile(&mut nonce as *mut _, [0u8; 12]);
 
             for (addr, mut size) in get_code_sections() {
                 let mut old_protect = 0u32;
@@ -212,11 +219,13 @@ pub mod crypto {
             SESSION_INITIALIZED.with(|c| c.set(false));
             let mut key = [0u8; 32];
             SESSION_KEY.with(|k| { key = *k.borrow(); });
+            let mut nonce = [0u8; 12];
+            SESSION_NONCE.with(|n| { nonce = *n.borrow(); });
 
-            let nonce = [0u8; 12];
             let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
             
             std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
+            std::ptr::write_volatile(&mut nonce as *mut _, [0u8; 12]);
 
             for (addr, mut size) in get_code_sections() {
                 let mut old_protect = 0u32;
@@ -261,9 +270,12 @@ pub mod crypto {
             rand::thread_rng().fill_bytes(&mut key);
             SESSION_KEY.with(|k| { *k.borrow_mut() = key; });
             SESSION_INITIALIZED.with(|c| c.set(true));
-            let nonce = [0u8; 12];
+            let mut nonce = [0u8; 12];
+            rand::thread_rng().fill_bytes(&mut nonce);
+            SESSION_NONCE.with(|n| { *n.borrow_mut() = nonce; });
             let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
             std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
+            std::ptr::write_volatile(&mut nonce as *mut _, [0u8; 12]);
             let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             for (addr, size) in get_code_sections() {
                 let aligned = (addr as usize) & !(page_size - 1);
@@ -288,9 +300,11 @@ pub mod crypto {
             SESSION_INITIALIZED.with(|c| c.set(false));
             let mut key = [0u8; 32];
             SESSION_KEY.with(|k| { key = *k.borrow(); });
-            let nonce = [0u8; 12];
+            let mut nonce = [0u8; 12];
+            SESSION_NONCE.with(|n| { nonce = *n.borrow(); });
             let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
             std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
+            std::ptr::write_volatile(&mut nonce as *mut _, [0u8; 12]);
             let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             for (addr, size) in get_code_sections() {
                 let aligned = (addr as usize) & !(page_size - 1);

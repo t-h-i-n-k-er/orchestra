@@ -432,7 +432,9 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             status = out(reg) status,
             out("x8") _,
             out("x0") _, out("x1") _, out("x2") _, out("x3") _,
-            options(nostack),
+            // blr modifies lr (x30) and the callee may use the stack,
+            // so we must NOT use options(nostack) here.
+            out("x30") _,
         );
         status
     }
@@ -697,6 +699,19 @@ pub fn get_clean_api_addr(dll_name: &str, func_name: &str) -> Result<usize> {
 }
 
 #[cfg(windows)]
+#[inline]
+/// Safely cast a `u64` return value from `spoof_call` to the target type `D`.
+/// Fails at compile time if `D` is larger than 8 bytes, preventing silent data
+/// loss or undefined behaviour from an over-sized transmute.
+pub unsafe fn bounded_transmute<D>(val: u64) -> D {
+    const { assert!(
+        std::mem::size_of::<D>() <= std::mem::size_of::<u64>(),
+        "clean_call!: return type exceeds 8 bytes; use a different calling convention"
+    ) };
+    std::mem::transmute_copy::<u64, D>(&val)
+}
+
+#[cfg(windows)]
 #[macro_export]
 macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
@@ -721,7 +736,7 @@ macro_rules! clean_call {
         } else {
             let res = unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) };
             // cast result back
-            unsafe { std::mem::transmute_copy(&res) }
+            unsafe { $crate::syscalls::bounded_transmute(res) }
         }
     }};
 }

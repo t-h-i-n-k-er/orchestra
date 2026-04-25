@@ -79,11 +79,17 @@ pub struct MalleableProfile {
     /// at startup if this is empty and cdn_relay is false.
     #[serde(default)]
     pub direct_c2_endpoint: String,
+    /// IP address returned by the C2 DNS server to signal that tasking is
+    /// available.  Defaults to "1.2.3.4"; override per server so that
+    /// multiple deployments can use different sentinels to avoid fingerprinting.
+    #[serde(default = "default_doh_beacon_sentinel")]
+    pub doh_beacon_sentinel: String,
 }
 
 fn default_user_agent() -> String { "Mozilla/5.0 (Windows NT 10.0; Win64; x64)".to_string() }
 fn default_uri() -> String { "/api/v1/update".to_string() }
 fn default_host_header() -> String { "cdn.example.com".to_string() }
+fn default_doh_beacon_sentinel() -> String { "1.2.3.4".to_string() }
 
 impl Default for MalleableProfile {
     fn default() -> Self {
@@ -94,6 +100,7 @@ impl Default for MalleableProfile {
             cdn_relay: false,
             dns_over_https: false,
             direct_c2_endpoint: String::new(),
+            doh_beacon_sentinel: default_doh_beacon_sentinel(),
         }
     }
 }

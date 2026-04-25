@@ -2,8 +2,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use common::{Message, Transport, CryptoSession};
 use common::config::MalleableProfile;
-use tokio::time::{sleep, Duration};
-use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::Duration;
 
 pub struct HttpTransport {
     profile: MalleableProfile,

