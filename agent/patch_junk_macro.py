@@ -1,11 +1,15 @@
+import re
 
+path = '/home/replicant/la/junk_macro/src/lib.rs'
+
+code = """
 extern crate proc_macro;
 use proc_macro::TokenStream;
 use quote::quote;
 use rand::Rng;
 
 #[proc_macro]
-pub fn insert_junk(_item: TokenStream) -> TokenStream {
+pub fn inject_junk(_item: TokenStream) -> TokenStream {
     let mut rng = rand::thread_rng();
     let num_statements = rng.gen_range(3..8);
     let mut stmts = Vec::new();
@@ -53,3 +57,9 @@ pub fn insert_junk(_item: TokenStream) -> TokenStream {
     };
     expanded.into()
 }
+"""
+
+with open(path, 'w') as f:
+    f.write(code)
+
+print("junk_macro patched")

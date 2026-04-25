@@ -1,4 +1,10 @@
-use goblin::pe::{PE, options::ParseOptions};
+import os
+
+path = '/home/replicant/la/builder/src/bin/orchestra-pe-hardener.rs'
+os.makedirs(os.path.dirname(path), exist_ok=True)
+
+with open(path, 'w') as f:
+    f.write("""use goblin::pe::{PE, options::ParseOptions};
 use std::fs;
 use std::path::PathBuf;
 use std::env;
@@ -22,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rng = thread_rng();
 
     // 1. TimeDateStamp zeroing
-    let file_header_offset = pe.header.dos_header.pe_pointer as usize + 4; // after 'PE\0\0'
+    let file_header_offset = pe.header.dos_header.pe_pointer as usize + 4; // after 'PE\\0\\0'
     if file_header_offset + 20 <= buffer_len {
         for i in 0..4 {
             buffer[file_header_offset + 4 + i] = 0; // TimeDateStamp is at offset 4 from file header
@@ -79,3 +85,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("PE Hardened successfully.");
     Ok(())
 }
+""")
+

