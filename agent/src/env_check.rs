@@ -306,8 +306,14 @@ fn linux_dmi_indicates_vm() -> bool {
             if needles.iter().any(|n| s.contains(n.as_str())) {
                 return true;
             }
-            if path.ends_with("sys_vendor") && s.contains(std::str::from_utf8(&string_crypt::enc_str!("microsoft corporation")[..21]).unwrap()) {
-                ms_vendor = true;
+            if path.ends_with("sys_vendor") {
+                // Trim null bytes before comparing to avoid fragile byte-count slicing (4.1)
+                let trimmed = String::from_utf8_lossy(&string_crypt::enc_str!("microsoft corporation"))
+                    .trim_end_matches('\0')
+                    .to_ascii_lowercase();
+                if s.contains(trimmed.as_str()) {
+                    ms_vendor = true;
+                }
             }
             if path.ends_with("product_name") && s.contains("virtual machine") {
                 virt_product = true;
@@ -551,11 +557,21 @@ fn is_tracer_process_running() -> bool {
         }
     }
 
-    // Secondary check: look for tracer processes system-wide by examining their command lines
+    // Secondary check: look for tracer processes owned by the current user,
+    // avoiding false positives from other users' debuggers on shared systems (4.5)
     let tracers = ["strace", "gdb", "ltrace", "gdbserver"];
+    let my_uid = unsafe { libc::getuid() };
     if let Ok(procs) = std::fs::read_dir("/proc") {
         for proc in procs.flatten() {
-            if let Ok(cmdline) = std::fs::read_to_string(proc.path().join("cmdline")) {
+            // Only consider processes owned by the current UID
+            let proc_path = proc.path();
+            if let Ok(meta) = std::fs::metadata(&proc_path) {
+                use std::os::unix::fs::MetadataExt;
+                if meta.uid() != my_uid { continue; }
+            } else {
+                continue;
+            }
+            if let Ok(cmdline) = std::fs::read_to_string(proc_path.join("cmdline")) {
                 let parts: Vec<&str> = cmdline.split('\0').collect();
                 if let Some(prog) = parts.first() {
                     let prog_name = Path::new(prog)

