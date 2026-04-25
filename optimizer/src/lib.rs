@@ -8,7 +8,10 @@ pub trait Pass {
 }
 
 pub fn apply_passes(code: &[u8]) -> Vec<u8> {
-    let decoder = Decoder::new(64, code, DecoderOptions::NONE);
+    // Decode retaining original IPs so we can remap branch targets after
+    // passes insert NOPs or reorder instructions.
+    const BASE: u64 = 0x1000;
+    let decoder = Decoder::with_ip(64, code, BASE, DecoderOptions::NONE);
     let mut instrs: Vec<Instruction> = decoder.into_iter().collect();
 
     let mut passes: Vec<Box<dyn Pass>> = vec![
@@ -22,9 +25,58 @@ pub fn apply_passes(code: &[u8]) -> Vec<u8> {
         p.run(&mut instrs);
     }
 
+    // Helper: compute the IP each instruction will be placed at by doing a
+    // trial encode.  We need this to rewrite near-branch targets correctly.
+    let compute_ips = |instrs: &[Instruction]| -> Vec<u64> {
+        let mut ips = Vec::with_capacity(instrs.len());
+        let mut cur = BASE;
+        let mut enc = Encoder::new(64);
+        for ins in instrs {
+            ips.push(cur);
+            // encode at `cur` to get the correct encoded size for this IP;
+            // the result might be inaccurate if the branch target changed later,
+            // but a second pass corrects that.
+            cur += enc.encode(ins, cur).unwrap_or(1) as u64;
+            enc.take_buffer();
+        }
+        ips
+    };
+
+    // First pass: approximate new IPs.
+    let approx_ips = compute_ips(&instrs);
+
+    // Build old_ip → new_ip map so branch targets can be remapped.
+    use std::collections::HashMap;
+    let mut ip_map: HashMap<u64, u64> = HashMap::new();
+    for (ins, &new_ip) in instrs.iter().zip(approx_ips.iter()) {
+        // NOP instructions inserted by NopInsertionPass have ip()==0; they
+        // carry no branch targets so we can skip duplicate-key entries.
+        ip_map.entry(ins.ip()).or_insert(new_ip);
+    }
+
+    // Rewrite near branch targets using the new IP map.
+    use iced_x86::OpKind;
+    for ins in &mut instrs {
+        let needs_fix = (0..ins.op_count()).any(|i| {
+            matches!(
+                ins.op_kind(i),
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+            )
+        });
+        if needs_fix {
+            let old_target = ins.near_branch64();
+            if let Some(&new_target) = ip_map.get(&old_target) {
+                ins.set_near_branch64(new_target);
+            }
+        }
+    }
+
+    // Recompute IPs now that branch targets (and therefore branch sizes) are
+    // final, then encode at those IPs.
+    let final_ips = compute_ips(&instrs);
     let mut encoder = Encoder::new(64);
-    for ins in &instrs {
-        let _ = encoder.encode(ins, 0);
+    for (ins, &ip) in instrs.iter().zip(final_ips.iter()) {
+        let _ = encoder.encode(ins, ip);
     }
     encoder.take_buffer()
 }
@@ -87,7 +139,11 @@ fn is_block_terminator(ins: &Instruction) -> bool {
 pub struct InstructionSchedulingPass;
 impl Pass for InstructionSchedulingPass {
     fn run(&self, instrs: &mut Vec<Instruction>) {
-        // Split into basic blocks (blocks end at branch/ret), shuffle middle blocks.
+        // Split into basic blocks (blocks end at branch/ret).
+        // IMPORTANT: we do NOT reorder blocks — that would invalidate
+        // inter-block relative branches and fall-through edges.
+        // We only shuffle the *body* of each block (non-terminator instructions)
+        // to obscure intra-block patterns while preserving control flow.
         let mut blocks: Vec<Vec<Instruction>> = Vec::new();
         let mut current: Vec<Instruction> = Vec::new();
         for ins in instrs.iter() {
@@ -99,11 +155,17 @@ impl Pass for InstructionSchedulingPass {
         if !current.is_empty() {
             blocks.push(current);
         }
-        // Shuffle non-entry, non-exit basic blocks to obscure control flow
-        if blocks.len() > 2 {
-            let mut rng = thread_rng();
-            let last = blocks.len() - 1;
-            blocks[1..last].shuffle(&mut rng);
+        let mut rng = thread_rng();
+        for block in &mut blocks {
+            // Keep the terminator pinned at the end; shuffle the body only.
+            let body_end = if block.last().map(|i| is_block_terminator(i)).unwrap_or(false) {
+                block.len() - 1
+            } else {
+                block.len()
+            };
+            if body_end > 1 {
+                block[..body_end].shuffle(&mut rng);
+            }
         }
         *instrs = blocks.into_iter().flatten().collect();
     }

