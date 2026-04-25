@@ -7,6 +7,10 @@
     feature = "direct-syscalls"
 ))]
 
+// PEB / LDR structures are only used by the Windows PEB-walk code.
+// On Linux the file compiles for its syscall-number tables, but winapi types
+// are unavailable there.  Gate these definitions to Windows only (B-03 fix).
+#[cfg(windows)]
 #[repr(C)]
 struct PEB {
     InheritedAddressSpace: u8,
@@ -18,6 +22,7 @@ struct PEB {
     Ldr: *mut PEB_LDR_DATA,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct PEB_LDR_DATA {
     Length: u32,
@@ -28,6 +33,7 @@ struct PEB_LDR_DATA {
     InInitializationOrderModuleList: winapi::shared::ntdef::LIST_ENTRY,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct LDR_DATA_TABLE_ENTRY {
     InLoadOrderLinks: winapi::shared::ntdef::LIST_ENTRY,

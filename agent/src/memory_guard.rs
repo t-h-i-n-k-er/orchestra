@@ -377,7 +377,11 @@ impl Drop for LockedKeyPage {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+// Fallback: locked heap page for non-x86-64 targets only.
+// Linux x86_64 is handled by the explicit impl block above; the
+// `not(all(x86_64, windows))` predicate used to also match Linux x86_64 and
+// created a duplicate impl error (B-01). Narrowed to `not(x86_64)`.
+#[cfg(not(target_arch = "x86_64"))]
 impl KeyHandle {
     fn stash(key: [u8; 32]) -> Self {
         KeyHandle {

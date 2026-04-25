@@ -98,6 +98,10 @@ path = "src/main.rs"
 [dependencies.rdev]
 version = "0.5"
 optional = true
+# Use the Linux evdev kernel interface instead of the Xlib/X11 backend so that
+# the crate builds without system X11 development headers (B-05 fix).
+# On Windows the evdev-rs feature is a no-op.
+features = ["evdev-rs"]
 
 [dependencies.chrono]
 version = "0.4"
