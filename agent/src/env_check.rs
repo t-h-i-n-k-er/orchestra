@@ -339,20 +339,52 @@ fn macos_system_profiler_indicates_vm() -> bool {
         }
     }
 
+    // On physical Macs kern.hv_support is always 1 (CPU supports Hypervisor.framework).
+    // A VM that does not expose nested virtualisation reports 0, making this a
+    // reliable guest-VM indicator on x86_64 Apple hardware.
     if let Ok(output) = std::process::Command::new("sysctl")
         .arg("-n")
         .arg("kern.hv_support")
         .output()
     {
         let support = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if support == "1" {
-            // Native hypervisor framework is supported, which might mean we are the host, or a guest that supports nested.
-            // But let's check ioreg for specific virtual devices
+        if support != "1" {
+            // Physical Macs always expose kern.hv_support = 1; any other value
+            // means nested virtualisation is not available — likely a VM guest.
+            is_vm = true;
         }
     }
 
-    if let Ok(output) = std::process::Command::new("ioreg").arg("-l").output() {
-        let ioreg = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    // ioreg -l can output 100–500 KB and stall for several seconds on a busy
+    // system.  Bound execution to 5 s to avoid blocking agent startup.
+    if let Some(stdout) = {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let mut child = Command::new("ioreg")
+            .arg("-l")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok();
+        if let Some(ref mut c) = child {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match c.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() >= deadline => {
+                        let _ = c.kill();
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                    Err(_) => break,
+                }
+            }
+            c.wait_with_output().ok().map(|o| o.stdout)
+        } else {
+            None
+        }
+    } {
+        let ioreg = String::from_utf8_lossy(&stdout).to_lowercase();
         if ioreg.contains(String::from_utf8_lossy(&string_crypt::enc_str!("virtualbox")).trim_end_matches('\0').to_string())
             || ioreg.contains(String::from_utf8_lossy(&string_crypt::enc_str!("vmware")).trim_end_matches('\0').to_string())
             || ioreg.contains("parallels")

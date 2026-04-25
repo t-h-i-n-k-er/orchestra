@@ -5,7 +5,7 @@ use winapi::um::winnt::{PTP_CALLBACK_INSTANCE, PVOID, PTP_WORK, WT_EXECUTEINTIME
 #[cfg(windows)]
 use winapi::um::winuser::{EnumChildWindows, FindWindowA};
 #[cfg(windows)]
-use winapi::um::threadpoollegacyapiset::CreateTimerQueueTimer;
+use winapi::um::threadpoollegacyapiset::{CreateTimerQueueTimer, DeleteTimerQueueTimer};
 #[cfg(windows)]
 use winapi::um::synchapi::WaitForSingleObject;
 #[cfg(windows)]
@@ -75,25 +75,65 @@ where F: FnOnce() + Send + 'static {
     Ok(())
 }
 
+/// Context block passed to the timer-queue callback.
+/// The `timer_handle` field is written by `execute_timer_queue` immediately
+/// after `CreateTimerQueueTimer` returns; the callback spins until that store
+/// is visible, then calls `DeleteTimerQueueTimer` to release the kernel object.
+#[cfg(windows)]
+struct TimerQueueCtx {
+    timer_handle: std::sync::atomic::AtomicUsize,
+    closure: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
 #[cfg(windows)]
 extern "system" fn timer_queue_callback(param: PVOID, _timer_or_wait_fired: winapi::um::winnt::BOOLEAN) {
-    if !param.is_null() {
-        let closure: Box<Box<dyn FnOnce() + Send>> = unsafe { Box::from_raw(param as *mut _) };
-        closure();
+    if param.is_null() { return; }
+    // SAFETY: execute_timer_queue gives us sole ownership of this allocation;
+    // Box::from_raw reclaims it when this function returns.
+    let ctx = unsafe { Box::from_raw(param as *mut TimerQueueCtx) };
+    // Run the user closure.
+    if let Ok(mut g) = ctx.closure.lock() {
+        if let Some(f) = g.take() { f(); }
     }
+    // Spin-wait until execute_timer_queue writes the timer handle (the race
+    // window is extremely narrow: dwDueTime=0 still requires a scheduler
+    // round-trip before this thread runs).
+    let mut h = 0usize;
+    for _ in 0..10_000 {
+        h = ctx.timer_handle.load(std::sync::atomic::Ordering::Acquire);
+        if h != 0 { break; }
+        std::hint::spin_loop();
+    }
+    // Delete the one-shot timer to release its kernel object.
+    if h != 0 {
+        unsafe {
+            DeleteTimerQueueTimer(
+                std::ptr::null_mut(),
+                h as HANDLE,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+    // ctx is dropped here, freeing the heap allocation.
 }
 
 #[cfg(windows)]
 pub fn execute_timer_queue<F>(f: F) -> Result<(), anyhow::Error>
 where F: FnOnce() + Send + 'static {
-    let closure: Box<Box<dyn FnOnce() + Send>> = Box::new(Box::new(f));
-    let context = Box::into_raw(closure) as PVOID;
+    let ctx = Box::new(TimerQueueCtx {
+        timer_handle: std::sync::atomic::AtomicUsize::new(0),
+        closure: std::sync::Mutex::new(Some(Box::new(f) as Box<dyn FnOnce() + Send>)),
+    });
+    let ctx_ptr = Box::into_raw(ctx);
     unsafe {
         let mut handle: HANDLE = std::ptr::null_mut();
-        if CreateTimerQueueTimer(&mut handle, std::ptr::null_mut(), Some(timer_queue_callback), context, 0, 0, WT_EXECUTEINTIMERTHREAD) == 0 {
-            let _ = Box::from_raw(context as *mut Box<dyn FnOnce() + Send>);
+        if CreateTimerQueueTimer(&mut handle, std::ptr::null_mut(), Some(timer_queue_callback), ctx_ptr as PVOID, 0, 0, WT_EXECUTEINTIMERTHREAD) == 0 {
+            // Reclaim the allocation since no callback will free it.
+            drop(Box::from_raw(ctx_ptr));
             anyhow::bail!("CreateTimerQueueTimer failed");
         }
+        // Store the handle so the callback can call DeleteTimerQueueTimer.
+        (*ctx_ptr).timer_handle.store(handle as usize, std::sync::atomic::Ordering::Release);
     }
     Ok(())
 }

@@ -387,13 +387,80 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                         let reloc_type = (entry >> 12) as u8;
                         let reloc_offset = (entry & 0x0FFF) as usize;
                         if reloc_type == 10 {
-                            // IMAGE_REL_BASED_DIR64
+                            // IMAGE_REL_BASED_DIR64: 64-bit absolute VA (x64, ARM64)
                             let addr = image_base.add(page_rva + reloc_offset) as *mut isize;
                             *addr += base_delta;
                         } else if reloc_type == 3 {
-                            // IMAGE_REL_BASED_HIGHLOW
+                            // IMAGE_REL_BASED_HIGHLOW: 32-bit absolute VA (x86, ARM32)
                             let addr = image_base.add(page_rva + reloc_offset) as *mut i32;
                             *addr = (*addr as isize + base_delta) as i32;
+                        } else if reloc_type == 5 || reloc_type == 7 {
+                            // IMAGE_REL_BASED_ARM_MOV32 (5) / IMAGE_REL_BASED_THUMB_MOV32 (7):
+                            // A MOVW + MOVT instruction pair encodes a 32-bit absolute VA.
+                            // ARM32 instruction encoding (ARM_MOV32, type 5):
+                            //   bits[19:16] = imm4, bits[11:0] = imm12  → imm16 = (imm4<<12)|imm12
+                            // Thumb-2 T3 encoding (THUMB_MOV32, type 7):
+                            //   upper word: bits[19:16]=imm4, bit[26]=i
+                            //   lower word: bits[14:12]=imm3, bits[7:0]=imm8 → imm16 = (imm4<<12)|(i<<11)|(imm3<<8)|imm8
+                            let is_thumb = reloc_type == 7;
+                            let movw_ptr = image_base.add(page_rva + reloc_offset) as *mut u32;
+                            let movt_ptr = movw_ptr.add(1);
+                            let movw = u32::from_le(*movw_ptr);
+                            let movt = u32::from_le(*movt_ptr);
+                            let (lo16, hi16) = if is_thumb {
+                                let extract_t = |v: u32| -> u16 {
+                                    let imm4 = ((v >> 16) & 0xF) as u16;
+                                    let i    = ((v >> 26) & 0x1) as u16;
+                                    let imm3 = ((v >> 12) & 0x7) as u16;
+                                    let imm8 = ( v        & 0xFF) as u16;
+                                    (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8
+                                };
+                                (extract_t(movw), extract_t(movt))
+                            } else {
+                                let extract_a = |v: u32| -> u16 {
+                                    let imm4  = ((v >> 16) & 0xF) as u16;
+                                    let imm12 = ( v        & 0xFFF) as u16;
+                                    (imm4 << 12) | imm12
+                                };
+                                (extract_a(movw), extract_a(movt))
+                            };
+                            let orig_va = (lo16 as u32) | ((hi16 as u32) << 16);
+                            let new_va  = ((orig_va as isize).wrapping_add(base_delta)) as u32;
+                            let new_lo  = (new_va & 0xFFFF) as u16;
+                            let new_hi  = (new_va >> 16) as u16;
+                            if is_thumb {
+                                let patch_t = |v: u32, val: u16| -> u32 {
+                                    let imm4 = ((val >> 12) & 0xF) as u32;
+                                    let i    = ((val >> 11) & 0x1) as u32;
+                                    let imm3 = ((val >>  8) & 0x7) as u32;
+                                    let imm8 = ( val        & 0xFF) as u32;
+                                    (v & !((0xF << 16) | (1 << 26) | (0x7 << 12) | 0xFF))
+                                        | (imm4 << 16) | (i << 26) | (imm3 << 12) | imm8
+                                };
+                                *movw_ptr = patch_t(movw, new_lo).to_le();
+                                *movt_ptr = patch_t(movt, new_hi).to_le();
+                            } else {
+                                let patch_a = |v: u32, val: u16| -> u32 {
+                                    let imm4  = ((val >> 12) & 0xF) as u32;
+                                    let imm12 = ( val        & 0xFFF) as u32;
+                                    (v & !((0xF << 16) | 0xFFF)) | (imm4 << 16) | imm12
+                                };
+                                *movw_ptr = patch_a(movw, new_lo).to_le();
+                                *movt_ptr = patch_a(movt, new_hi).to_le();
+                            }
+                        } else if reloc_type == 11 || reloc_type == 12 || reloc_type == 13 {
+                            // ARM64 PC-relative entries (ADRP / ADD page-offset / LDR page-offset):
+                            // these are self-relative and require no patch for a uniform image rebase
+                            // because both the instruction's page and its target move by the same delta.
+                        } else if reloc_type != 0 {
+                            // Type 0 = IMAGE_REL_BASED_ABSOLUTE — padding, no action.
+                            // Anything else is an unrecognised type; log at debug level so callers
+                            // can diagnose partial-relocation issues without crashing.
+                            #[cfg(debug_assertions)]
+                            tracing::debug!(
+                                "manual_map: skipping unhandled relocation type {} at rva+offset {:#x}",
+                                reloc_type, page_rva + reloc_offset
+                            );
                         }
                     }
                     offset += block_size;

