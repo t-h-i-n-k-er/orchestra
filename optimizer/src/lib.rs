@@ -110,12 +110,173 @@ impl Pass for InstructionSchedulingPass {
 }
 
 /// Apply registered optimizer passes to the named hot function.
-/// With the `unsafe-runtime-rewrite` feature this is gated by the caller.
-/// Returns Ok(()) after applying passes (or if the function is not found in
-/// the optimizer's registry — this is best-effort and non-fatal).
+///
+/// Without the `unsafe-runtime-rewrite` feature this is a metadata-only
+/// no-op — the optimizer passes can still be exercised via `apply_passes`
+/// from tests.
+///
+/// With `unsafe-runtime-rewrite` enabled, the function performs in-place
+/// rewriting of the named function: locate the symbol, decode an estimated
+/// span (default 256 bytes), apply the registered passes, then write the
+/// result back into executable memory after temporarily lowering page
+/// protections via `VirtualProtect` (Windows) or `mprotect` (Unix).
 pub fn optimize_hot_function(name: &str) -> Result<(), String> {
-    // No runtime patching is performed here; the function exists so that
-    // call-sites compile and the optimizer passes can be exercised in tests.
-    tracing::debug!("optimize_hot_function: applying passes for '{}'", name);
-    Ok(())
+    tracing::debug!("optimize_hot_function: requested for '{}'", name);
+
+    #[cfg(not(feature = "unsafe-runtime-rewrite"))]
+    {
+        let _ = name;
+        return Ok(());
+    }
+
+    #[cfg(feature = "unsafe-runtime-rewrite")]
+    {
+        runtime_rewrite::rewrite(name)
+    }
+}
+
+#[cfg(feature = "unsafe-runtime-rewrite")]
+mod runtime_rewrite {
+    use super::*;
+
+    /// Default rewrite span: 256 bytes is enough for most short hot functions
+    /// without risking decoding past the function's end into other code.
+    const DEFAULT_SPAN: usize = 256;
+
+    pub fn rewrite(name: &str) -> Result<(), String> {
+        let addr = locate_symbol(name)
+            .ok_or_else(|| format!("symbol '{}' not found in this process", name))?;
+        // Snapshot the current bytes
+        let original = unsafe { std::slice::from_raw_parts(addr as *const u8, DEFAULT_SPAN) }.to_vec();
+        // Apply optimizer passes
+        let new_bytes = apply_passes(&original);
+        // Refuse if size changed — would clobber adjacent code
+        if new_bytes.len() != original.len() {
+            return Err(format!(
+                "rewrite would change size ({} -> {}); refusing",
+                original.len(),
+                new_bytes.len()
+            ));
+        }
+        // Lower protection, copy, restore.
+        unsafe {
+            let mut old = make_writable(addr, DEFAULT_SPAN)?;
+            std::ptr::copy_nonoverlapping(new_bytes.as_ptr(), addr as *mut u8, DEFAULT_SPAN);
+            restore_protection(addr, DEFAULT_SPAN, &mut old)?;
+            flush_icache(addr, DEFAULT_SPAN);
+        }
+        tracing::info!("optimize_hot_function: rewrote {} bytes at {:p} for '{}'",
+            DEFAULT_SPAN, addr as *const u8, name);
+        Ok(())
+    }
+
+    fn locate_symbol(_name: &str) -> Option<usize> {
+        // In a fully self-contained binary we cannot easily resolve symbols
+        // by name without dlsym/GetProcAddress against the current module.
+        // Use platform-specific lookup against the main module.
+        #[cfg(unix)]
+        unsafe {
+            let cname = std::ffi::CString::new(_name).ok()?;
+            let addr = libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr());
+            if addr.is_null() { None } else { Some(addr as usize) }
+        }
+        #[cfg(windows)]
+        unsafe {
+            extern "system" {
+                fn GetModuleHandleA(name: *const i8) -> *mut std::ffi::c_void;
+                fn GetProcAddress(h: *mut std::ffi::c_void, name: *const i8) -> *mut std::ffi::c_void;
+            }
+            let h = GetModuleHandleA(std::ptr::null());
+            if h.is_null() { return None; }
+            let cname = std::ffi::CString::new(_name).ok()?;
+            let addr = GetProcAddress(h, cname.as_ptr());
+            if addr.is_null() { None } else { Some(addr as usize) }
+        }
+        #[cfg(not(any(unix, windows)))]
+        { None }
+    }
+
+    pub struct ProtSnapshot(pub u32);
+
+    #[cfg(windows)]
+    unsafe fn make_writable(addr: usize, len: usize) -> Result<ProtSnapshot, String> {
+        extern "system" {
+            fn VirtualProtect(addr: *mut std::ffi::c_void, size: usize, new_protect: u32, old: *mut u32) -> i32;
+        }
+        const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+        let mut old = 0u32;
+        if VirtualProtect(addr as *mut _, len, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return Err("VirtualProtect(RWX) failed".into());
+        }
+        Ok(ProtSnapshot(old))
+    }
+
+    #[cfg(windows)]
+    unsafe fn restore_protection(addr: usize, len: usize, old: &mut ProtSnapshot) -> Result<(), String> {
+        extern "system" {
+            fn VirtualProtect(addr: *mut std::ffi::c_void, size: usize, new_protect: u32, old: *mut u32) -> i32;
+        }
+        let mut tmp = 0u32;
+        if VirtualProtect(addr as *mut _, len, old.0, &mut tmp) == 0 {
+            return Err("VirtualProtect(restore) failed".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    unsafe fn flush_icache(addr: usize, len: usize) {
+        extern "system" {
+            fn FlushInstructionCache(h: *mut std::ffi::c_void, addr: *const std::ffi::c_void, size: usize) -> i32;
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        }
+        FlushInstructionCache(GetCurrentProcess(), addr as *const _, len);
+    }
+
+    #[cfg(unix)]
+    unsafe fn make_writable(addr: usize, len: usize) -> Result<ProtSnapshot, String> {
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let aligned = addr & !(page - 1);
+        let aligned_len = ((addr + len) - aligned + page - 1) & !(page - 1);
+        if libc::mprotect(
+            aligned as *mut libc::c_void,
+            aligned_len,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+        ) != 0 {
+            return Err(format!("mprotect(RWX) failed: {}", std::io::Error::last_os_error()));
+        }
+        // We don't read original protection on unix; assume PROT_READ|PROT_EXEC for restore.
+        Ok(ProtSnapshot(0))
+    }
+
+    #[cfg(unix)]
+    unsafe fn restore_protection(addr: usize, len: usize, _old: &mut ProtSnapshot) -> Result<(), String> {
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let aligned = addr & !(page - 1);
+        let aligned_len = ((addr + len) - aligned + page - 1) & !(page - 1);
+        if libc::mprotect(
+            aligned as *mut libc::c_void,
+            aligned_len,
+            libc::PROT_READ | libc::PROT_EXEC,
+        ) != 0 {
+            return Err(format!("mprotect(restore) failed: {}", std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    unsafe fn flush_icache(_addr: usize, _len: usize) {
+        // x86_64/aarch64 Linux uses coherent I-cache; mprotect already
+        // serializes.  For other arches we'd call __builtin___clear_cache.
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    unsafe fn make_writable(_a: usize, _l: usize) -> Result<ProtSnapshot, String> {
+        Err("unsupported platform".into())
+    }
+    #[cfg(not(any(windows, unix)))]
+    unsafe fn restore_protection(_a: usize, _l: usize, _o: &mut ProtSnapshot) -> Result<(), String> {
+        Err("unsupported platform".into())
+    }
+    #[cfg(not(any(windows, unix)))]
+    unsafe fn flush_icache(_a: usize, _l: usize) {}
 }

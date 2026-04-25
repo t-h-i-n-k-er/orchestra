@@ -148,6 +148,26 @@ unsafe fn get_module_handle_peb(module_name: &str) -> *mut c_void {
 }
 
 unsafe fn get_proc_address_manual(module: *mut c_void, proc_name: &str) -> *mut c_void {
+    // Bounded recursion guard: forwarded exports can chain across modules
+    // (kernel32!HeapAlloc -> ntdll!RtlAllocateHeap -> ...).  A pathological
+    // or malicious export table could form a cycle; cap the depth.
+    thread_local! {
+        static FORWARDER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    const MAX_FORWARDER_DEPTH: u32 = 8;
+    let depth = FORWARDER_DEPTH.with(|c| c.get());
+    if depth >= MAX_FORWARDER_DEPTH {
+        return std::ptr::null_mut();
+    }
+    FORWARDER_DEPTH.with(|c| c.set(depth + 1));
+    struct DepthGuard;
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            FORWARDER_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+        }
+    }
+    let _g = DepthGuard;
+
     if module.is_null() {
         return std::ptr::null_mut();
     }
@@ -416,10 +436,30 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
             if tls_dir.address_of_callbacks != 0 {
                 // address_of_callbacks is a VA pointing into our mapped image;
                 // after relocation it already reflects the allocation address.
+                let image_size = optional_header.windows_fields.size_of_image as usize;
+                let image_start = image_base as usize;
+                let image_end = image_start.saturating_add(image_size);
                 let mut cb_ptr = tls_dir.address_of_callbacks as *const usize;
+                // Defensive cap: TLS callback arrays are typically a handful of
+                // entries; refuse to follow more than 32 to bound runaway loops.
+                let mut remaining = 32u32;
                 loop {
+                    if remaining == 0 {
+                        break;
+                    }
+                    remaining -= 1;
+                    // Validate that the callback-array slot itself is inside the image.
+                    let slot = cb_ptr as usize;
+                    if slot < image_start || slot.saturating_add(std::mem::size_of::<usize>()) > image_end {
+                        break;
+                    }
                     let cb_va = *cb_ptr;
                     if cb_va == 0 {
+                        break;
+                    }
+                    // Validate that the callback target is inside the image we just
+                    // mapped — refuse to dispatch to anything outside it.
+                    if cb_va < image_start || cb_va >= image_end {
                         break;
                     }
                     let callback: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) =

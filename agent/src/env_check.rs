@@ -398,12 +398,15 @@ fn windows_registry_indicates_vm() -> bool {
 }
 
 fn mac_prefix_indicates_vm() -> bool {
+    // Only flag MAC prefixes that strongly indicate a *desktop* hypervisor
+    // typically used by analysts (VirtualBox, VMware Workstation/Fusion).
+    // KVM/QEMU (52:54:00) and Hyper-V (00:15:5d) are excluded because they
+    // are also used by AWS, Azure, GCP, Hetzner, OVH, and most other cloud
+    // providers and would yield massive false-positive rates.
     let prefixes = [
         [0x08u8, 0x00, 0x27], // VirtualBox
         [0x00, 0x0C, 0x29],   // VMware
         [0x00, 0x50, 0x56],   // VMware
-        [0x52, 0x54, 0x00],   // KVM/QEMU
-        [0x00, 0x15, 0x5d],   // Hyper-V
     ];
     // Read /sys/class/net on Linux.
     #[cfg(target_os = "linux")]

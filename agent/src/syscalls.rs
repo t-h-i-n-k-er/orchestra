@@ -161,7 +161,7 @@ fn map_clean_ntdll() -> Result<usize> {
             asm!(
                 "mov {}, gs:[0x60]",
                 out(reg) peb,
-                options(pure, nomem, nostack)
+                options(nostack, readonly)
             );
             let ldr = (*peb).Ldr;
             let head = &(*ldr).InMemoryOrderModuleList as *const _ as *mut winapi::shared::ntdef::LIST_ENTRY;
@@ -585,7 +585,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
 
         let dep_handle = if is_critical {
             // Fast-path: already in cache? Use it without recursing.
-            let cached = cache_lock.lock().unwrap().get(&dll_lower).copied();
+            let cached = CLEAN_MODULES.get().and_then(|m| m.lock().unwrap().get(&dll_lower).copied());
             if let Some(b) = cached {
                 b as *mut winapi::shared::minwindef::HINSTANCE__
             } else {
@@ -746,13 +746,13 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<i32, i32> {
     {
         let mut ret: i64;
         match args.len() {
-            0 => std::arch::asm!("syscall", in("rax") ssn as u64, lateout("rax") ret, options(nostack)),
-            1 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], lateout("rax") ret, options(nostack)),
-            2 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], lateout("rax") ret, options(nostack)),
-            3 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], in("rdx") args[2], lateout("rax") ret, options(nostack)),
-            4 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], in("rdx") args[2], in("r10") args[3], lateout("rax") ret, options(nostack)),
-            5 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], in("rdx") args[2], in("r10") args[3], in("r8") args[4], lateout("rax") ret, options(nostack)),
-            6 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], in("rdx") args[2], in("r10") args[3], in("r8") args[4], in("r9") args[5], lateout("rax") ret, options(nostack)),
+            0 => std::arch::asm!("syscall", in("rax") ssn as u64, lateout("rax") ret, lateout("rcx") _, lateout("r11") _, options(nostack)),
+            1 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], lateout("rax") ret, lateout("rcx") _, lateout("r11") _, options(nostack)),
+            2 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], lateout("rax") ret, lateout("rcx") _, lateout("r11") _, options(nostack)),
+            3 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], in("rdx") args[2], lateout("rax") ret, lateout("rcx") _, lateout("r11") _, options(nostack)),
+            4 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], in("rdx") args[2], in("r10") args[3], lateout("rax") ret, lateout("rcx") _, lateout("r11") _, options(nostack)),
+            5 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], in("rdx") args[2], in("r10") args[3], in("r8") args[4], lateout("rax") ret, lateout("rcx") _, lateout("r11") _, options(nostack)),
+            6 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], in("rdx") args[2], in("r10") args[3], in("r8") args[4], in("r9") args[5], lateout("rax") ret, lateout("rcx") _, lateout("r11") _, options(nostack)),
             _ => panic!("too many syscall arguments"),
         }
         if ret < 0 { Err(-ret as i32) } else { Ok(ret as i32) }
@@ -761,13 +761,13 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<i32, i32> {
     {
         let mut ret: i64;
         match args.len() {
-            0 => std::arch::asm!("svc 0", in("x8") ssn as u64, lateout("x0") ret, options(nostack)),
-            1 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], lateout("x0") ret, options(nostack)),
-            2 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], lateout("x0") ret, options(nostack)),
-            3 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], lateout("x0") ret, options(nostack)),
-            4 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], in("x3") args[3], lateout("x0") ret, options(nostack)),
-            5 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], in("x3") args[3], in("x4") args[4], lateout("x0") ret, options(nostack)),
-            6 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], in("x3") args[3], in("x4") args[4], in("x5") args[5], lateout("x0") ret, options(nostack)),
+            0 => std::arch::asm!("svc 0", in("x8") ssn as u64, lateout("x0") ret, lateout("x1") _, lateout("x2") _, lateout("x3") _, lateout("x4") _, lateout("x5") _, lateout("x6") _, lateout("x7") _, options(nostack)),
+            1 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], lateout("x0") ret, lateout("x1") _, lateout("x2") _, lateout("x3") _, lateout("x4") _, lateout("x5") _, lateout("x6") _, lateout("x7") _, options(nostack)),
+            2 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], lateout("x0") ret, lateout("x2") _, lateout("x3") _, lateout("x4") _, lateout("x5") _, lateout("x6") _, lateout("x7") _, options(nostack)),
+            3 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], lateout("x0") ret, lateout("x3") _, lateout("x4") _, lateout("x5") _, lateout("x6") _, lateout("x7") _, options(nostack)),
+            4 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], in("x3") args[3], lateout("x0") ret, lateout("x4") _, lateout("x5") _, lateout("x6") _, lateout("x7") _, options(nostack)),
+            5 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], in("x3") args[3], in("x4") args[4], lateout("x0") ret, lateout("x5") _, lateout("x6") _, lateout("x7") _, options(nostack)),
+            6 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], in("x3") args[3], in("x4") args[4], in("x5") args[5], lateout("x0") ret, lateout("x6") _, lateout("x7") _, options(nostack)),
             _ => panic!("too many syscall arguments"),
         }
         if ret < 0 { Err(-ret as i32) } else { Ok(ret as i32) }

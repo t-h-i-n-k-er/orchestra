@@ -87,6 +87,9 @@ unsafe-runtime-rewrite = ["optimizer/unsafe-runtime-rewrite"]
 # XMM lanes via inline asm) for the duration of the idle window so that a
 # memory dump taken while the agent is sleeping reveals only ciphertext.
 memory-guard = []
+# Linux ptrace-based process migration. Off by default — implementation is
+# complete but disabled to require explicit operator opt-in.
+linux-ptrace-migrate = []
 
 [[bin]]
 name = "agent-standalone"

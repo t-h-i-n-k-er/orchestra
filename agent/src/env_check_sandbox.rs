@@ -170,9 +170,12 @@ pub fn check_hardware_plausibility() -> u8 {
     let cpus = sys_info.dwNumberOfProcessors;
     
     let mut below_threshold_count = 0;
-    if disk_gb <= 60 { below_threshold_count += 1; }
-    if ram_gb <= 4 { below_threshold_count += 1; }
-    if cpus <= 2 { below_threshold_count += 1; }
+    // Thresholds tuned to avoid false positives on small cloud VMs (DO/Linode
+    // 1 GB instances, AWS t3.micro, etc.).  Sandboxes typically use far less
+    // than these values.
+    if disk_gb <= 20 { below_threshold_count += 1; }
+    if ram_gb <= 1 { below_threshold_count += 1; }
+    if cpus <= 1 { below_threshold_count += 1; }
     
     match below_threshold_count {
         0 => 0,
@@ -192,7 +195,7 @@ pub fn check_hardware_plausibility() -> u8 {
             disk_gb = (stat.f_blocks as u64 * stat.f_frsize as u64) / (1024 * 1024 * 1024);
         }
     }
-    if disk_gb <= 60 { below_threshold_count += 1; }
+    if disk_gb <= 20 { below_threshold_count += 1; }
     
     let mut ram_gb = 0;
     if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
@@ -204,10 +207,10 @@ pub fn check_hardware_plausibility() -> u8 {
             }
         }
     }
-    if ram_gb <= 4 { below_threshold_count += 1; }
+    if ram_gb <= 1 { below_threshold_count += 1; }
     
     let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-    if cpus <= 2 { below_threshold_count += 1; }
+    if cpus <= 1 { below_threshold_count += 1; }
     
     match below_threshold_count {
         0 => 0,

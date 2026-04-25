@@ -73,22 +73,15 @@ pub unsafe fn decrypt_payload() {
 /// (must be 64 hex characters = 32 bytes).  Falls back to a non-trivial
 /// derived constant so the binary is still functional without the env var.
 /// Operators MUST set ORCHESTRA_KEY in the build pipeline for per-build
-/// uniqueness (issue 2.12).
+/// uniqueness (issue 2.12).  If absent, the build fails — there is no
+/// hardcoded fallback because that would embed an extractable key in
+/// every binary (issue 33).
 #[inline(always)]
 const fn build_key() -> [u8; 32] {
-    // Try to read ORCHESTRA_KEY at compile time (hex-encoded 32 bytes = 64 chars).
-    // option_env! returns None if the variable is not set, so we fall back to
-    // the default constant below.  The compiler evaluates this at build time,
-    // so the plaintext seed never appears in the final binary.
-    match option_env!("ORCHESTRA_KEY") {
-        Some(hex) => parse_hex_key(hex),
-        None => [
-            0xA3, 0x7F, 0x12, 0xE8, 0x4B, 0xC9, 0x56, 0x2D,
-            0x88, 0x1E, 0x73, 0xF4, 0x0A, 0xBC, 0x67, 0x39,
-            0xD5, 0x44, 0x9A, 0x21, 0x7C, 0xEB, 0x05, 0x96,
-            0x3B, 0xF8, 0x60, 0x17, 0xCA, 0x52, 0x8E, 0x2F,
-        ],
-    }
+    // Read ORCHESTRA_KEY at compile time (hex-encoded 32 bytes = 64 chars).
+    // env! aborts compilation if the variable is missing, which is the
+    // intended behaviour: operators must supply a per-build key.
+    parse_hex_key(env!("ORCHESTRA_KEY"))
 }
 
 /// Decode a 64-character ASCII hex string into a 32-byte key at compile time.
