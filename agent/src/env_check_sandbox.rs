@@ -49,9 +49,92 @@ pub fn check_mouse_movement() -> u8 {
     }
 }
 
-#[cfg(not(windows))]
+/// Linux implementation: sample mouse position via `xdotool getmouselocation`.
+/// Requires X11 / DISPLAY.  If the display is not available (headless server)
+/// we return 0 so that legitimate non-interactive deployments are not penalised.
+#[cfg(target_os = "linux")]
 pub fn check_mouse_movement() -> u8 {
-    0 // Placeholder for Linux X11 tracking
+    if std::env::var_os("DISPLAY").is_none() {
+        return 0; // Headless / Wayland-only — can't reliably track mouse
+    }
+    _sample_mouse_positions(|_| {
+        std::process::Command::new("xdotool")
+            .args(["getmouselocation", "--shell"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                let out = String::from_utf8_lossy(&o.stdout);
+                let x = out.lines()
+                    .find(|l| l.starts_with("X="))?
+                    .trim_start_matches("X=").trim().parse::<i32>().ok()?;
+                let y = out.lines()
+                    .find(|l| l.starts_with("Y="))?
+                    .trim_start_matches("Y=").trim().parse::<i32>().ok()?;
+                Some((x, y))
+            })
+    })
+}
+
+/// macOS implementation: sample mouse position via a small Python3/Quartz one-liner.
+/// On headless macOS (CI runners without a WindowServer) this command will fail
+/// and we return 0 (neutral).
+#[cfg(target_os = "macos")]
+pub fn check_mouse_movement() -> u8 {
+    _sample_mouse_positions(|_| {
+        std::process::Command::new("python3")
+            .args(["-c",
+                "import Quartz; e=Quartz.CGEventCreate(None); \
+                 p=Quartz.CGEventGetLocation(e); print(int(p.x), int(p.y))"
+            ])
+            .output()
+            .ok()
+            .and_then(|o| {
+                let out = String::from_utf8_lossy(&o.stdout);
+                let mut parts = out.split_whitespace();
+                let x = parts.next()?.parse::<i32>().ok()?;
+                let y = parts.next()?.parse::<i32>().ok()?;
+                Some((x, y))
+            })
+    })
+}
+
+/// Shared sampling loop: calls `probe` 4 times with 250 ms intervals and
+/// scores based on number of distinct positions seen and total travel distance.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn _sample_mouse_positions<F>(mut probe: F) -> u8
+where
+    F: FnMut(usize) -> Option<(i32, i32)>,
+{
+    let mut positions = Vec::with_capacity(4);
+    let mut total_distance = 0.0f64;
+    for i in 0..4 {
+        if let Some(pos) = probe(i) {
+            positions.push(pos);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    if positions.is_empty() {
+        return 0; // Can't determine — neutral
+    }
+    let unique: std::collections::HashSet<_> = positions.iter().copied().collect();
+    for w in positions.windows(2) {
+        let dx = (w[1].0 - w[0].0) as f64;
+        let dy = (w[1].1 - w[0].1) as f64;
+        total_distance += (dx * dx + dy * dy).sqrt();
+    }
+    if unique.len() < 2 || total_distance < 5.0 {
+        20
+    } else if unique.len() < 4 || total_distance < 50.0 {
+        10
+    } else {
+        0
+    }
+}
+
+/// Catch-all for non-Linux, non-macOS, non-Windows platforms.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub fn check_mouse_movement() -> u8 {
+    0
 }
 
 #[cfg(windows)]
@@ -85,9 +168,85 @@ pub fn check_desktop_windows() -> u8 {
     }
 }
 
-#[cfg(not(windows))]
+/// Linux: count visible windows via `wmctrl -l` (falls back to xdotool or
+/// process counting if wmctrl is unavailable).  Headless / no-DISPLAY → 0.
+#[cfg(target_os = "linux")]
 pub fn check_desktop_windows() -> u8 {
-    0 // Placeholder for Linux X11 window enum
+    if std::env::var_os("DISPLAY").is_none() {
+        return 0;
+    }
+    // Try wmctrl first — it lists all managed windows.
+    let count = std::process::Command::new("wmctrl")
+        .arg("-l")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+        .or_else(|| {
+            // Fallback: xdotool search returns one line per matching window
+            std::process::Command::new("xdotool")
+                .args(["search", "--onlyvisible", "--name", ""])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
+        })
+        .or_else(|| {
+            // Last resort: count processes that hold an open connection to X11
+            // by looking for ":0" or "DISPLAY" in their /proc/*/environ.
+            let mut cnt = 0usize;
+            if let Ok(entries) = std::fs::read_dir("/proc") {
+                for entry in entries.flatten() {
+                    let env_path = entry.path().join("environ");
+                    if let Ok(env) = std::fs::read(&env_path) {
+                        // environ is NUL-separated KEY=VALUE pairs.
+                        if env.windows(8).any(|w| w == b"DISPLAY=") {
+                            cnt += 1;
+                        }
+                    }
+                }
+            }
+            Some(cnt)
+        })
+        .unwrap_or(0);
+
+    if count < 3 {
+        20
+    } else if count < 8 {
+        10
+    } else {
+        0
+    }
+}
+
+/// macOS: count visible applications via AppleScript.
+#[cfg(target_os = "macos")]
+pub fn check_desktop_windows() -> u8 {
+    let count = std::process::Command::new("osascript")
+        .args(["-e",
+            "tell application \"System Events\" to count (every process whose visible is true)"
+        ])
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<usize>()
+                .ok()
+        })
+        .unwrap_or(0);
+
+    if count < 3 {
+        20
+    } else if count < 8 {
+        10
+    } else {
+        0
+    }
+}
+
+/// Catch-all for unsupported platforms.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub fn check_desktop_windows() -> u8 {
+    0
 }
 
 #[cfg(windows)]
