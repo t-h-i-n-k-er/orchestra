@@ -9,7 +9,8 @@ use winapi::um::threadpoollegacyapiset::CreateTimerQueueTimer;
 #[cfg(windows)]
 use winapi::um::synchapi::WaitForSingleObject;
 #[cfg(windows)]
-use winapi::um::winnls::{EnumSystemLocalesA, LCID};
+use winapi::um::winnls::EnumSystemLocalesA;
+use winapi::um::winnt::LCID;
 #[cfg(windows)]
 use winapi::shared::minwindef::{BOOL, LPARAM, TRUE, FALSE};
 #[cfg(windows)]

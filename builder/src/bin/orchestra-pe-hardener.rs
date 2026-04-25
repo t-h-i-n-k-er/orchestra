@@ -17,36 +17,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = fs::read(input_path)?;
     let buffer_len = buffer.len();
 
-    let pe = PE::parse(&buffer)?;
-    
+    // Extract all the offsets we need from the PE *before* taking any mutable
+    // references to buffer, so we avoid conflicting borrows (E0502).
+    let (file_header_offset, pe_start, sections_offset, num_sections) = {
+        let pe = PE::parse(&buffer)?;
+        let fh_off = pe.header.dos_header.pe_pointer as usize + 4;
+        let pe_s = pe.header.dos_header.pe_pointer as usize;
+        let sec_off = fh_off + 20 + pe.header.coff_header.size_of_optional_header as usize;
+        let nsec = pe.header.coff_header.number_of_sections as usize;
+        (fh_off, pe_s, sec_off, nsec)
+        // `pe` is dropped here, releasing the immutable borrow of `buffer`
+    };
+
     let mut rng = thread_rng();
 
     // 1. TimeDateStamp zeroing
-    let file_header_offset = pe.header.dos_header.pe_pointer as usize + 4; // after 'PE\0\0'
     if file_header_offset + 20 <= buffer_len {
         for i in 0..4 {
-            buffer[file_header_offset + 4 + i] = 0; // TimeDateStamp is at offset 4 from file header
+            buffer[file_header_offset + 4 + i] = 0;
         }
     }
 
-    // 2. Rich Header Removal
-    // Look for 'DanS' (Rich header signature) backwards from PE header
-    let pe_start = pe.header.dos_header.pe_pointer as usize;
-    let mut rich_start = 0;
+    // 2. Rich Header Removal — scan backwards from PE header for 'DanS'
+    let mut rich_start = 0usize;
     for i in (0..pe_start).rev() {
-        if i + 4 <= buffer_len && &buffer[i..i+4] == b"DanS" {
-            // Find XOR key
-            let xor_key = &buffer[i+4..i+8];
-            // Find 'Rich' string (before DanS mapped XOR'd)
+        if i + 4 <= buffer_len && &buffer[i..i + 4] == b"DanS" {
             for j in (0..i).rev() {
-                if j + 4 <= buffer_len && &buffer[j..j+4] == b"Rich" {
+                if j + 4 <= buffer_len && &buffer[j..j + 4] == b"Rich" {
                     rich_start = j;
                     break;
                 }
             }
             if rich_start > 0 {
-                // Zero out from rich_start down to just after DOS stub
-                let dos_stub_end = 0x40; // Approx
+                let dos_stub_end = 0x40;
                 for k in dos_stub_end..pe_start {
                     buffer[k] = 0;
                 }
@@ -55,22 +58,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 3. Section name randomization & 4. Entropy padding
-    let sections_offset = file_header_offset + 20 + pe.header.coff_header.size_of_optional_header as usize;
-    let num_sections = pe.header.coff_header.number_of_sections as usize;
-    
+    // 3. Section name randomization
     let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     for i in 0..num_sections {
-        let section_offset = sections_offset + (i * 40); // 40 bytes per section header
+        let section_offset = sections_offset + (i * 40);
         if section_offset + 8 <= buffer_len {
-            // Randomize name
             for j in 0..8 {
                 buffer[section_offset + j] = chars[rng.gen_range(0..chars.len())];
             }
         }
     }
 
-    // Entropy padding
+    // 4. Entropy padding
     let mut padding = vec![0u8; rng.gen_range(1024..4096)];
     rng.fill(padding.as_mut_slice());
     buffer.extend(padding);

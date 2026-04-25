@@ -22,4 +22,7 @@ winapi = { version = "0.3", features = [
     "handleapi",
     "synchapi",
     "errhandlingapi",
+    "tlhelp32",
+    "minwinbase",
+    "basetsd",
 ] }

