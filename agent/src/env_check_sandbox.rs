@@ -142,6 +142,36 @@ pub fn check_desktop_windows() -> u8 {
     use winapi::um::winuser::{EnumWindows, GetWindowTextLengthW, IsWindowVisible};
     use winapi::shared::minwindef::{BOOL, LPARAM, TRUE, FALSE};
     use winapi::shared::windef::HWND;
+
+    // On Windows Server Core (headless) there is no desktop shell, so the
+    // visible window count will be 0-2 regardless of whether we are in a VM.
+    // Penalising a Server Core deployment is a false positive.  Detect it
+    // via the InstallationType registry value and return neutral (0) instead.
+    #[cfg(windows)]
+    {
+        use winapi::um::winreg::{RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY_LOCAL_MACHINE};
+        use winapi::um::winnt::{KEY_READ, REG_SZ};
+        let subkey: Vec<u16> = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\0".encode_utf16().collect();
+        let value: Vec<u16> = "InstallationType\0".encode_utf16().collect();
+        unsafe {
+            let mut hkey = std::ptr::null_mut();
+            if RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut hkey) == 0 {
+                let mut buf = vec![0u16; 64];
+                let mut buf_len = (buf.len() * 2) as u32;
+                let mut val_type: u32 = 0;
+                if RegQueryValueExW(hkey, value.as_ptr(), std::ptr::null_mut(), &mut val_type, buf.as_mut_ptr() as _, &mut buf_len) == 0 && val_type == REG_SZ {
+                    RegCloseKey(hkey);
+                    let nul = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                    let install_type = String::from_utf16_lossy(&buf[..nul]);
+                    if install_type == "Server Core" {
+                        return 0; // neutral — headless by design, not a sandbox
+                    }
+                } else {
+                    RegCloseKey(hkey);
+                }
+            }
+        }
+    }
     
     unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let count = &mut *(lparam as *mut usize);

@@ -555,9 +555,13 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
             (false, false, false) => PAGE_NOACCESS,
         };
         let mut old_prot = 0;
+        // Use the larger of virtual_size and size_of_raw_data: a linker may
+        // set VirtualSize to 0 (optimisation), which would make VirtualProtect
+        // a no-op and leave the section with the wrong permissions.
+        let prot_size = std::cmp::max(section.virtual_size as usize, section.size_of_raw_data as usize);
         VirtualProtect(
             image_base.add(section.virtual_address as usize),
-            section.virtual_size as usize,
+            prot_size,
             prot,
             &mut old_prot,
         );

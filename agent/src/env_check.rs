@@ -235,9 +235,23 @@ fn is_expected_hypervisor() -> bool {
     false
 }
 
+/// Check whether we are running on a cloud instance by probing the Link-Local
+/// Instance Metadata Service (IMDS) endpoint shared by AWS, Azure, and GCP.
+/// Uses a short 100 ms connection timeout to avoid stalling the check.
+/// Returns `true` if the IMDS responds, indicating a cloud environment.
+fn is_cloud_instance() -> bool {
+    // The 169.254.169.254 address is non-routable on premises; only cloud
+    // hypervisors intercept it.  A successful TCP connect (even without a
+    // valid HTTP response) is sufficient evidence of a cloud deployment.
+    use std::net::{TcpStream, SocketAddr, IpAddr, Ipv4Addr};
+    use std::time::Duration;
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 80);
+    TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok()
+}
+
 pub fn detect_vm() -> bool {
     // The hypervisor bit is now just one of several indicators.
-    let mut indicators = 0;
+    let mut indicators = 0i32;
     if cpuid_hypervisor_bit() && !is_expected_hypervisor() {
         indicators += 1;
     }
@@ -261,6 +275,13 @@ pub fn detect_vm() -> bool {
     }
     if mac_prefix_indicates_vm() {
         indicators += 1;
+    }
+    // 7.1: If the cloud instance metadata service (IMDS) responds, we are
+    // running on a legitimate cloud provider.  Cloud VMs inherently show VM
+    // indicators (hypervisor bit, cloud DMI), so subtract one indicator to
+    // avoid a false-positive sandbox detection against cloud infrastructure.
+    if is_cloud_instance() {
+        indicators -= 1;
     }
     // Consider it a VM if at least two indicators are present.
     indicators >= 2
@@ -346,18 +367,19 @@ fn macos_system_profiler_indicates_vm() -> bool {
         }
     }
 
-    // On physical Macs kern.hv_support is always 1 (CPU supports Hypervisor.framework).
-    // A VM that does not expose nested virtualisation reports 0, making this a
-    // reliable guest-VM indicator on x86_64 Apple hardware.
+    // `kern.hv_support` only indicates CPU *capability* for virtualisation
+    // (Hypervisor.framework), not that we are running *inside* a VM.  Physical
+    // Macs with an Intel/Apple Silicon CPU always report kern.hv_support=1.
+    // The correct sysctl is `kern.hv_vmm_present` which is set to 1 only when
+    // the kernel detects it is running as a guest inside a hypervisor.
     if let Ok(output) = std::process::Command::new("sysctl")
         .arg("-n")
-        .arg("kern.hv_support")
+        .arg("kern.hv_vmm_present")
         .output()
     {
-        let support = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if support != "1" {
-            // Physical Macs always expose kern.hv_support = 1; any other value
-            // means nested virtualisation is not available — likely a VM guest.
+        let present = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if present == "1" {
+            // kern.hv_vmm_present=1 means we are a VM guest.
             is_vm = true;
         }
     }
@@ -653,6 +675,62 @@ fn detect_timing_anomaly() -> bool {
                 if cpu_count > 0.0 && load > cpu_count * 2.0 {
                     // System is overloaded; timing check would be unreliable.
                     return false;
+                }
+            }
+        }
+    }
+
+    // 7.2: On Windows, check CPU utilisation via GetSystemTimes.  If the
+    // system is under heavy load (>80 % busy) the timing check would produce
+    // spurious positives — skip it.
+    #[cfg(windows)]
+    {
+        use winapi::um::processthreadsapi::GetSystemTimes;
+        use winapi::um::minwinbase::FILETIME;
+        let mut idle = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut kernel = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut user = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user); }
+        let to_u64 = |ft: FILETIME| -> u64 {
+            ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
+        };
+        let idle0 = to_u64(idle);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut idle2 = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut kernel2 = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let mut user2 = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        unsafe { GetSystemTimes(&mut idle2, &mut kernel2, &mut user2); }
+        let idle_delta = to_u64(idle2).saturating_sub(idle0);
+        let kernel_delta = to_u64(kernel2).saturating_sub(to_u64(kernel));
+        let user_delta = to_u64(user2).saturating_sub(to_u64(user));
+        let total = kernel_delta + user_delta;
+        if total > 0 {
+            // idle_delta counts the total idle time across all cores in 100ns units.
+            // busy_pct is the fraction of time NOT idle.
+            let busy_pct = 1.0 - (idle_delta as f64 / total as f64);
+            if busy_pct > 0.80 {
+                return false; // System overloaded; skip timing check.
+            }
+        }
+    }
+
+    // 7.2: On macOS, use sysctl kern.cpuload (or host_statistics) to check
+    // system-wide CPU utilisation before running the timing test.
+    #[cfg(target_os = "macos")]
+    {
+        // vm_stat provides CPU idle ticks via sysctl; use a simpler approach:
+        // read the 1-minute load average and compare to CPU count (same
+        // heuristic as the Linux path above).
+        if let Ok(output) = std::process::Command::new("sysctl").args(["-n", "vm.loadavg"]).output() {
+            let s = String::from_utf8_lossy(&output.stdout);
+            // Output: "{ 0.50 0.42 0.35 }" — first number is 1-min avg
+            let trimmed = s.trim_matches(|c: char| c == '{' || c == '}' || c.is_whitespace());
+            if let Some(first) = trimmed.split_whitespace().next() {
+                if let Ok(load) = first.parse::<f64>() {
+                    let cpu_count = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as f64;
+                    if cpu_count > 0.0 && load > cpu_count * 2.0 {
+                        return false;
+                    }
                 }
             }
         }

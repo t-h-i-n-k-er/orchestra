@@ -173,9 +173,7 @@ impl Injector for ModuleStompInjector {
                 return Err(anyhow!("VirtualAllocEx failed for LdrLoadDll stub"));
             }
             let stub_va = stub_region as u64;
-            let us_region = VirtualAllocEx(h_proc, std::ptr::null_mut(), total_remote, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            // Re-use remote_buf we already wrote into for the UNICODE_STRING args
-            // Actually we already have remote_buf — just build the stub to reference it.
+            // Use remote_buf (already written) for the UNICODE_STRING args.
             let us_va = remote_buf as u64;
             let us_struct_va = us_va + us_offset as u64;
             let base_out_va = us_va + base_addr_offset as u64;
@@ -223,10 +221,6 @@ impl Injector for ModuleStompInjector {
                 // Free the stub region and remote argument buffer now that LdrLoadDll has returned.
                 winapi::um::memoryapi::VirtualFreeEx(h_proc, stub_region, 0, winapi::um::winnt::MEM_RELEASE);
                 winapi::um::memoryapi::VirtualFreeEx(h_proc, remote_buf, 0, winapi::um::winnt::MEM_RELEASE);
-                // Free the unused us_region allocation as well (2.6)
-                if !us_region.is_null() {
-                    winapi::um::memoryapi::VirtualFreeEx(h_proc, us_region, 0, winapi::um::winnt::MEM_RELEASE);
-                }
             } else {
                 winapi::um::memoryapi::VirtualFreeEx(h_proc, stub_region, 0, winapi::um::winnt::MEM_RELEASE);
                 winapi::um::memoryapi::VirtualFreeEx(h_proc, remote_buf, 0, winapi::um::winnt::MEM_RELEASE);

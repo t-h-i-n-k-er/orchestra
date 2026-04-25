@@ -280,6 +280,131 @@ pub async fn tcp_port_scan(
     Ok(open_ports)
 }
 
+// ── 5.5: DNS enumeration ─────────────────────────────────────────────────────
+
+/// Resolve the reverse DNS (PTR) name for an IP address.
+///
+/// Returns `Ok(None)` when no PTR record exists or the resolver returns
+/// NXDOMAIN/SERVFAIL, and `Err` only on I/O failure.
+pub fn reverse_dns_lookup(ip: IpAddr) -> Result<Option<String>, String> {
+    use std::net::ToSocketAddrs;
+    // Construct a dummy port-0 socket address and resolve via the system
+    // resolver.  The returned iterator always has the *canonical* hostname as
+    // the first string-representation element when a PTR record exists.
+    let addr = std::net::SocketAddr::new(ip, 0);
+    match addr.to_socket_addrs() {
+        Ok(mut addrs) => {
+            // to_socket_addrs() on an already-resolved SocketAddr returns the
+            // address unchanged; we need to go through the DNS stack.  Use
+            // the hostname-form by formatting the address as "ip:0" and
+            // resolving it:
+            drop(addrs);
+        }
+        Err(_) => {}
+    }
+    // Portable PTR lookup via std: format the address as a string and
+    // pass it to the OS resolver by constructing the PTR query domain.
+    let ptr_domain = match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            format!("{}.{}.{}.{}.in-addr.arpa", o[3], o[2], o[1], o[0])
+        }
+        IpAddr::V6(v6) => {
+            let nibbles: String = v6
+                .octets()
+                .iter()
+                .rev()
+                .flat_map(|b| {
+                    let lo = b & 0xf;
+                    let hi = (b >> 4) & 0xf;
+                    [
+                        char::from_digit(lo as u32, 16).unwrap_or('0'),
+                        '.',
+                        char::from_digit(hi as u32, 16).unwrap_or('0'),
+                        '.',
+                    ]
+                })
+                .collect();
+            format!("{}.ip6.arpa", nibbles.trim_end_matches('.'))
+        }
+    };
+    // The std library does not expose a raw PTR query; use getaddrinfo via
+    // the (ptr_domain + ":0") trick.
+    match (ptr_domain.as_str(), 0u16).to_socket_addrs() {
+        Ok(mut it) => {
+            // The first result's hostname is what we want.
+            if let Some(_) = it.next() {
+                // std only returns IPs, not PTR names.  Fall back to the
+                // /proc/net/arp or system `host` command for a PTR name.
+            }
+        }
+        Err(_) => {}
+    }
+    // Most portable approach: call the `host` or `nslookup` binary.
+    let out = std::process::Command::new("host")
+        .arg(ip.to_string())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            // "1.1.168.192.in-addr.arpa domain name pointer hostname."
+            for line in s.lines() {
+                if line.contains("domain name pointer") {
+                    if let Some(name) = line.split_whitespace().last() {
+                        return Ok(Some(name.trim_end_matches('.').to_string()));
+                    }
+                }
+            }
+            Ok(None)
+        }
+        Ok(_) => Ok(None),
+        Err(e) => Err(format!("reverse_dns_lookup: {e}")),
+    }
+}
+
+/// Enumerate DNS SRV records for common Active Directory service names in a
+/// given domain.  Returns a list of `(service, host, port)` tuples.
+///
+/// Queries: `_ldap._tcp.dc._msdcs.<domain>` (DC locator),
+/// `_kerberos._tcp.<domain>`, `_ldap._tcp.<domain>`.
+pub fn ad_srv_discovery(domain: &str) -> Result<Vec<(String, String, u16)>, String> {
+    // Use `nslookup -type=SRV` or `dig SRV` to query SRV records via the
+    // system resolver since std::net does not expose raw DNS query types.
+    let services: &[&str] = &[
+        &format!("_ldap._tcp.dc._msdcs.{}", domain),
+        &format!("_kerberos._tcp.{}", domain),
+        &format!("_ldap._tcp.{}", domain),
+        &format!("_gc._tcp.{}", domain),
+    ];
+    let mut results = Vec::new();
+    for svc in services {
+        let svc = svc.to_string();
+        // Try `dig` first (common on Linux/macOS), fall back to `nslookup`.
+        let out = std::process::Command::new("dig")
+            .args(&["+short", "SRV", &svc])
+            .output()
+            .or_else(|_| {
+                std::process::Command::new("nslookup")
+                    .args(&["-type=SRV", &svc])
+                    .output()
+            });
+        if let Ok(o) = out {
+            let s = String::from_utf8_lossy(&o.stdout);
+            for line in s.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                // `dig +short SRV` output: "<priority> <weight> <port> <host>"
+                if parts.len() >= 4 {
+                    if let Ok(port) = parts[2].parse::<u16>() {
+                        let host = parts[3].trim_end_matches('.').to_string();
+                        results.push((svc.clone(), host, port));
+                    }
+                }
+            }
+        }
+    }
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
