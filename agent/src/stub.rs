@@ -7,7 +7,10 @@ use winapi::um::winnt::{PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
 
 /// In-memory .data section decryptor using ChaCha20.
 /// The key is derived at compile time; there is no hardcoded seed string.
-/// On x86_64 Windows, PEB is accessed directly via gs:[0x60].
+/// # Safety
+///
+/// Performs raw pointer arithmetic and inline assembly on x86_64 Windows.
+/// On other platforms this is a no-op and always safe.
 #[link_section = ".text"]
 pub unsafe fn decrypt_payload() {
     #[cfg(all(windows, target_arch = "x86_64"))]
@@ -182,8 +185,8 @@ unsafe fn chacha20_xor(data: *mut u8, len: usize, key: &[u8; 32], nonce: &[u8; 1
         state[12] = state[12].wrapping_add(1);
 
         let chunk = (len - offset).min(64);
-        for j in 0..chunk {
-            *data.add(offset + j) ^= keystream[j];
+        for (j, k) in keystream[..chunk].iter().enumerate() {
+            *data.add(offset + j) ^= k;
         }
         offset += chunk;
     }

@@ -348,7 +348,7 @@ fn linux_dmi_indicates_vm() -> bool {
         "/sys/class/dmi/id/product_name",
         "/sys/class/dmi/id/bios_vendor",
     ];
-    let needles = vec![
+    let needles = [
         String::from_utf8_lossy(&string_crypt::enc_str!("qemu"))
             .trim_end_matches('\0')
             .to_string(),

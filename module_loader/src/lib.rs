@@ -189,6 +189,8 @@ fn initialized_plugin(plugin_ptr: *mut PluginObject) -> Result<Box<dyn Plugin>> 
 ///
 /// * `encrypted_blob`: The raw bytes of the plugin, encrypted with AES-256-GCM.
 /// * `session`: The `CryptoSession` to use for decryption.
+/// * `verify_key`: Optional base64-encoded Ed25519 verifying key.  When `None`
+///   the compile-time constant `MODULE_SIGNING_PUBKEY` is used.
 ///
 /// # Safety
 ///
@@ -196,7 +198,11 @@ fn initialized_plugin(plugin_ptr: *mut PluginObject) -> Result<Box<dyn Plugin>> 
 /// from trusted source and must export `_create_plugin() -> *mut PluginObject`
 /// using the stable C ABI defined by [`PluginVTable`] and [`PluginObject`].
 /// The loaded code executes with the same privileges as the host process.
-pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box<dyn Plugin>> {
+pub fn load_plugin(
+    encrypted_blob: &[u8],
+    session: &CryptoSession,
+    verify_key: Option<&str>,
+) -> Result<Box<dyn Plugin>> {
     // 1. Decrypt the blob. The GCM tag provides authentication.
     let decrypted_blob = session
         .decrypt(encrypted_blob)
@@ -213,7 +219,18 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
         }
         let (signature_bytes, module_bytes) = decrypted_blob.split_at(64);
         let signature = Signature::from_bytes(signature_bytes.try_into()?);
-        let public_key = VerifyingKey::from_bytes(&MODULE_SIGNING_PUBKEY)?;
+        let pub_key_bytes: [u8; 32] = if let Some(b64) = verify_key {
+            let raw = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                b64.trim(),
+            )
+            .map_err(|e| anyhow!("module_verify_key is not valid base64: {e}"))?;
+            raw.try_into()
+                .map_err(|_| anyhow!("module_verify_key must be exactly 32 bytes"))?
+        } else {
+            MODULE_SIGNING_PUBKEY
+        };
+        let public_key = VerifyingKey::from_bytes(&pub_key_bytes)?;
         public_key.verify_strict(module_bytes, &signature)?;
         info!("Module signature verified successfully.");
         module_bytes
@@ -433,7 +450,7 @@ mod tests {
         let encrypted_blob = session.encrypt(&payload);
 
         // 3. Load it using the module_loader.
-        let plugin = load_plugin(&encrypted_blob, &session).expect("Failed to load plugin");
+        let plugin = load_plugin(&encrypted_blob, &session, None).expect("Failed to load plugin");
 
         // 4. Loading initializes the plugin; execute verifies it is usable.
         let result = plugin.execute("World").expect("Plugin execution failed");
@@ -449,7 +466,7 @@ mod tests {
         let session = CryptoSession::from_shared_secret(b"test-key");
         let encrypted_blob = session.encrypt(&plugin_bytes);
         let plugin =
-            load_plugin(&encrypted_blob, &session).expect("Failed to load plugin with manual map");
+            load_plugin(&encrypted_blob, &session, None).expect("Failed to load plugin with manual map");
         let result = plugin
             .execute("ManualMap")
             .expect("Plugin execution failed");
@@ -480,7 +497,7 @@ mod tests {
         encrypted_blob[last_byte_index] ^= 0x01;
 
         // 5. Try to load it. It should fail decryption or signature verification.
-        let result = load_plugin(&encrypted_blob, &session);
+        let result = load_plugin(&encrypted_blob, &session, None);
         assert!(result.is_err());
     }
 }

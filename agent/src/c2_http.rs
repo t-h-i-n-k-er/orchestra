@@ -1,3 +1,26 @@
+//! HTTP/S malleable-profile transport for the Orchestra agent.
+//!
+//! # Status: EXPERIMENTAL — not wired into the default startup path
+//!
+//! This module implements a `Transport` that tunnels agent messages over
+//! HTTP/S using a malleable C2 profile (custom User-Agent, Host header,
+//! URI staging, etc.).
+//!
+//! ## How to enable
+//!
+//! 1. Set `malleable_profile` in `agent.toml`.
+//! 2. In `agent/src/lib.rs` `Agent::new()`, replace the default TLS transport
+//!    with `c2_http::HttpTransport::new(&profile, session).await?`.
+//!
+//! The server side must expose the staging URI via its reverse proxy; see
+//! `docs/C_SERVER.md` for configuration details.
+//!
+//! ## Security warning
+//!
+//! This transport does **not** enforce certificate pinning by itself; pinning
+//! is handled by the underlying `reqwest` client when `danger_accept_invalid_certs`
+//! is `false` and a `server_cert_fingerprint` is configured.
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use common::config::MalleableProfile;

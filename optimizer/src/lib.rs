@@ -1,5 +1,7 @@
 // Optimizer
-use iced_x86::{Code, Decoder, DecoderOptions, Encoder, Instruction, OpKind, Register};
+use iced_x86::{Code, Decoder, DecoderOptions, Encoder, Instruction};
+#[cfg(feature = "diversification")]
+use iced_x86::{OpKind, Register};
 use rand::seq::SliceRandom;
 use rand::{thread_rng, Rng};
 
@@ -46,7 +48,7 @@ pub fn apply_passes(code: &[u8]) -> Vec<u8> {
             // the result might be inaccurate if the branch target changed later,
             // but a second pass corrects that.
             cur += enc.encode(ins, cur).unwrap_or(1) as u64;
-            enc.take_buffer();
+            let _ = enc.take_buffer();
         }
         ips
     };
@@ -180,7 +182,7 @@ impl Pass for InstructionSchedulingPass {
             // Keep the terminator pinned at the end; shuffle the body only.
             let body_end = if block
                 .last()
-                .map(|i| is_block_terminator(i))
+                .map(is_block_terminator)
                 .unwrap_or(false)
             {
                 block.len() - 1
@@ -375,7 +377,7 @@ pub fn optimize_hot_function(name: &str) -> Result<(), String> {
     #[cfg(not(feature = "unsafe-runtime-rewrite"))]
     {
         let _ = name;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(feature = "unsafe-runtime-rewrite")]

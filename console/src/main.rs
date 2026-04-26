@@ -1,8 +1,31 @@
 //! Orchestra administrator console.
 //!
-//! Connects to a managed agent using either a TCP+pre-shared-key transport
-//! (original / development mode) or a full mutual-TLS transport for
-//! production deployments.
+//! # Deployment models
+//!
+//! ## Model A — Direct connection (this binary)
+//!
+//! ```text
+//! orchestra-console --target <agent-addr> --key <psk>  [--tls ...]
+//! ```
+//!
+//! Connects directly to a running agent over TCP (PSK) or mTLS.  Useful for
+//! development, lab testing, or when the agent is in "inbound" (listening) mode.
+//! **Not recommended for production** — there is no audit trail on the server,
+//! and multi-agent management is not supported.
+//!
+//! ## Model B — Via Orchestra Server (recommended for production)
+//!
+//! ```text
+//! curl -H "Authorization: Bearer <token>" \
+//!      -d '{"command":"Ping"}' \
+//!      https://<server>:8443/agents/<id>/command
+//! ```
+//!
+//! Or use the built-in web UI at `https://<server>:8443`.  Agents must be
+//! configured with `outbound-c` mode so they register with the server.
+//!
+//! The `orchestra-console` binary uses **Model A** only.  For production
+//! multi-agent orchestration, use the server's HTTPS API or the web UI.
 
 use anyhow::{Context, Result};
 use base64::Engine;

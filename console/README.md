@@ -1,8 +1,12 @@
 # Orchestra Console
 
-Legacy command-line client for Orchestra protocol testing against custom
-listeners. Stock `agent-standalone` builds use the outbound Control Center
-path and do not expose a direct console listener.
+Direct command-line client for the Orchestra agent.
+
+> **Deployment model note:** This tool implements **direct connection** (Model A)
+> — it connects straight to an agent's TCP/TLS listener.  For production
+> multi-agent deployments where agents are registered with `orchestra-server`,
+> use the server's HTTPS API (`POST /agents/<id>/command`) or the web UI
+> at `https://<server>:8443` instead.  See `docs/USER_GUIDE.md` for details.
 
 ```text
 orchestra-console --target HOST:PORT --key BASE64 <SUBCOMMAND>

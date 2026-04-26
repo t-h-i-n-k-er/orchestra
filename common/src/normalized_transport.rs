@@ -322,7 +322,7 @@ where
                 let mut ext = Vec::new();
                 ext.extend_from_slice(&[0x00, 0x0a]); // type: supported_groups
                 let groups_len = (groups.len() * 2) as u16;
-                let ext_len = (groups_len + 2) as u16;
+                let ext_len = groups_len + 2;
                 ext.extend_from_slice(&ext_len.to_be_bytes());
                 ext.extend_from_slice(&groups_len.to_be_bytes());
                 for group in groups {
@@ -340,7 +340,7 @@ where
                 let mut ext = Vec::new();
                 ext.extend_from_slice(&[0x00, 0x0d]); // type: signature_algorithms
                 let algs_len = (sig_algs.len() * 2) as u16;
-                let ext_len = (algs_len + 2) as u16;
+                let ext_len = algs_len + 2;
                 ext.extend_from_slice(&ext_len.to_be_bytes());
                 ext.extend_from_slice(&algs_len.to_be_bytes());
                 for alg in sig_algs {

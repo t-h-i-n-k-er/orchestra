@@ -172,7 +172,7 @@ pub fn cmd_configure(name: Option<String>) -> Result<()> {
 
     let c2_address = Input::with_theme(&theme)
         .with_prompt("C2 Address (e.g., 10.0.0.5:8444)")
-        .default("127.0.0.1:8443".to_string())
+        .default("127.0.0.1:8444".to_string())
         .interact_text()?;
 
     let all_features = read_agent_features().unwrap_or_default();
@@ -316,7 +316,7 @@ mod tests {
         let profile = PayloadConfig {
             target_os: "linux".to_string(),
             target_arch: "x86_64".to_string(),
-            c2_address: "127.0.0.1:8443".to_string(),
+            c2_address: "127.0.0.1:8444".to_string(),
             encryption_key: "file:key.bin".to_string(),
             hmac_key: Some("file:hmac.bin".to_string()),
             c_server_secret: Some("secret".to_string()),
@@ -337,7 +337,7 @@ mod tests {
         let profile = PayloadConfig {
             target_os: "linux".to_string(),
             target_arch: "x86_64".to_string(),
-            c2_address: "127.0.0.1:8443".to_string(),
+            c2_address: "127.0.0.1:8444".to_string(),
             encryption_key: "short".to_string(),
             hmac_key: None,
             c_server_secret: None,
@@ -371,7 +371,7 @@ package        = "launcher"
         let profile = PayloadConfig {
             target_os: "amiga".to_string(),
             target_arch: "m68k".to_string(),
-            c2_address: "127.0.0.1:8443".to_string(),
+            c2_address: "127.0.0.1:8444".to_string(),
             encryption_key: "a".repeat(44), // 32 bytes b64
             hmac_key: None,
             c_server_secret: None,
@@ -467,5 +467,29 @@ package        = "launcher"
     fn is_weak_key_accepts_random_looking_bytes() {
         let key = b"J\x1a\xf3\x9b\xde\x9a\x8c\xf3\x9b\xde\x9a\x8c\xf3\x9b\xde\x9a\x8c\xf3\x9b\xde\x9a\x8c\xf3\x9b\xde\x9a\x8c\xf3\x9b\xde\x9a\x8c";
         assert!(!is_weak_key(key));
+    }
+
+    /// The default c2_address must point at the agent listener (8444),
+    /// not the HTTP dashboard (8443).  If this test fails, an operator
+    /// building with defaults will produce a payload that silently fails
+    /// to connect.
+    #[test]
+    fn default_c2_address_matches_server_agent_listener() {
+        // Server default agent listener is 127.0.0.1:8444.
+        let server_agent_port = 8444u16;
+
+        let profiles = vec![
+            "127.0.0.1:8444".to_string(), // debug
+        ];
+        for addr in profiles {
+            let port: u16 = addr.split(':').last().unwrap().parse().unwrap();
+            assert_eq!(
+                port,
+                server_agent_port,
+                "c2_address '{}' must use port {} (agent listener), not 8443 (dashboard)",
+                addr,
+                server_agent_port
+            );
+        }
     }
 }

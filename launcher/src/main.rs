@@ -45,6 +45,11 @@ struct Cli {
     #[arg(long)]
     key: String,
 
+    /// Allow an HTTP (non-TLS) download URL.
+    /// **INSECURE** — for development and testing only; never use in production.
+    #[arg(long, default_value_t = false)]
+    allow_insecure_http: bool,
+
     /// Optional arguments to pass to the launched agent process.
     #[arg(last = true)]
     agent_args: Vec<String>,
@@ -83,6 +88,21 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Enforce HTTPS unless the explicit insecure override is passed.
+    if !cli.url.starts_with("https://") && !cli.allow_insecure_http {
+        anyhow::bail!(
+            "--url must use HTTPS (got: {}). \
+             Pass --allow-insecure-http to override (development/testing only).",
+            &cli.url[..cli.url.len().min(40)]
+        );
+    }
+    if cli.allow_insecure_http {
+        tracing::warn!(
+            "WARNING: --allow-insecure-http is set. \
+             The payload URL is NOT using TLS. Do not use this flag in production."
+        );
+    }
 
     let key_bytes = base64::engine::general_purpose::STANDARD
         .decode(&cli.key)

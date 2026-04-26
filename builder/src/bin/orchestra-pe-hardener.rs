@@ -1,8 +1,7 @@
-use goblin::pe::{options::ParseOptions, PE};
+use goblin::pe::PE;
 use rand::{thread_rng, Rng};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
@@ -50,9 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if rich_start > 0 {
                 let dos_stub_end = 0x40;
-                for k in dos_stub_end..pe_start {
-                    buffer[k] = 0;
-                }
+                buffer[dos_stub_end..pe_start].fill(0);
             }
             break;
         }

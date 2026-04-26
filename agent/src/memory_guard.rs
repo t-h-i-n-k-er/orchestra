@@ -123,6 +123,43 @@ pub unsafe fn register(buf: &'static mut [u8], label: &'static str) {
     );
 }
 
+/// Register the AES-256-GCM session key with the memory guard so it is
+/// encrypted in-place whenever `guarded_sleep` is called.
+///
+/// This function allocates a static 32-byte buffer on the first call and
+/// registers it once. Subsequent calls update the buffer's contents with the
+/// new key bytes (in case of reconnect) without growing the registry.
+pub fn register_session_key(session: &common::CryptoSession) {
+    use std::sync::OnceLock;
+
+    // The key buffer lives for the entire process lifetime.
+    static KEY_BUF: OnceLock<Mutex<&'static mut [u8; 32]>> = OnceLock::new();
+
+    let registered = KEY_BUF.get().is_some();
+
+    let guard = KEY_BUF.get_or_init(|| {
+        // SAFETY: We immediately register this buffer; it is never freed.
+        let boxed: Box<[u8; 32]> = Box::new([0u8; 32]);
+        let static_ref: &'static mut [u8; 32] = Box::leak(boxed);
+        // SAFETY: We hold the only reference to `static_ref` here and will
+        // protect concurrent access via the Mutex we're about to create.
+        unsafe {
+            register(static_ref, "crypto-session-key");
+        }
+        Mutex::new(static_ref)
+    });
+
+    // Update the buffer with the current key bytes.
+    if let Ok(mut buf) = guard.lock() {
+        buf.copy_from_slice(session.key_bytes());
+        if !registered {
+            tracing::debug!("[memory-guard] session key registered for protection");
+        } else {
+            tracing::debug!("[memory-guard] session key updated");
+        }
+    }
+}
+
 /// Encrypt all registered regions in-place and stash the key in CPU registers.
 ///
 /// After this call returns the 32-byte key is held *only* in XMM14/XMM15 (x86-64)

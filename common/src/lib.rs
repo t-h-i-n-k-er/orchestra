@@ -7,6 +7,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
+use zeroize::Zeroize;
 
 /// Length in bytes of the AES-256 key used by [`CryptoSession`].
 pub const KEY_LEN: usize = 32;
@@ -173,6 +174,14 @@ pub enum CryptoError {
 ///      is used exclusively for authenticating the ephemeral DH exchange.
 pub struct CryptoSession {
     cipher: Aes256Gcm,
+    /// Copy of the raw key bytes, zeroed on drop.
+    key: [u8; KEY_LEN],
+}
+
+impl Drop for CryptoSession {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
 }
 
 impl CryptoSession {
@@ -186,6 +195,7 @@ impl CryptoSession {
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
         Self {
             cipher: Aes256Gcm::new(key),
+            key: key_bytes,
         }
     }
 
@@ -194,7 +204,18 @@ impl CryptoSession {
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
         Self {
             cipher: Aes256Gcm::new(key),
+            key: key_bytes,
         }
+    }
+
+    /// Return a reference to the raw 32-byte AES-256-GCM key.
+    ///
+    /// Intended for registering the key with the memory-guard subsystem so it
+    /// is encrypted while the agent is idle.  Prefer calling
+    /// `memory_guard::register_session_key` rather than reading these bytes
+    /// directly.
+    pub fn key_bytes(&self) -> &[u8; KEY_LEN] {
+        &self.key
     }
 
     /// Encrypt `plaintext` and return `nonce || ciphertext_with_tag`.

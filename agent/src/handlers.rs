@@ -58,6 +58,7 @@ pub(crate) fn push_module(
     module_name: String,
     encrypted_blob: &[u8],
     crypto: &CryptoSession,
+    verify_key: Option<&str>,
 ) -> Result<String, String> {
     if !is_valid_module_id(&module_name) {
         return Err(format!(
@@ -65,7 +66,7 @@ pub(crate) fn push_module(
             module_name
         ));
     }
-    match module_loader::load_plugin(encrypted_blob, crypto) {
+    match module_loader::load_plugin(encrypted_blob, crypto, verify_key) {
         Ok(plugin) => {
             LOADED_PLUGINS
                 .lock()
@@ -168,8 +169,22 @@ pub async fn handle_command(
 
         #[cfg(feature = "network-discovery")]
         Command::DiscoverNetwork => {
+            let cfg = config.lock().await.clone();
             let hosts = super::net_discovery::arp_scan().unwrap_or_default();
-            Ok(serde_json::json!({ "arp_hosts": hosts }).to_string())
+            // `arp_scan` reads the local ARP cache — it shows hosts this
+            // machine has recently communicated with.  For a proactive sweep
+            // of a subnet, use `ping_sweep` with an explicit CIDR configured
+            // via `port_scan_concurrency` / `port_scan_timeout_ms` in agent.toml.
+            Ok(serde_json::json!({
+                "arp_hosts": hosts,
+                "scan_config": {
+                    "concurrency": cfg.port_scan_concurrency,
+                    "timeout_ms": cfg.port_scan_timeout_ms,
+                },
+                "note": "arp_hosts reflects the local ARP cache only; \
+                         to probe a subnet proactively use the PortScan handler."
+            })
+            .to_string())
         }
         #[cfg(not(feature = "network-discovery"))]
         Command::DiscoverNetwork => Err("network-discovery feature not enabled".to_string()),
@@ -231,7 +246,7 @@ pub async fn handle_command(
                 let path_str = path.to_string_lossy().into_owned();
                 match fsops::read_file(&path_str, &cfg).await {
                     Err(e) => Err(format!("Failed to read module blob: {e}")),
-                    Ok(blob) => match module_loader::load_plugin(&blob, &crypto) {
+                    Ok(blob) => match module_loader::load_plugin(&blob, &crypto, cfg.module_verify_key.as_deref()) {
                         Ok(plugin) => {
                             LOADED_PLUGINS
                                 .lock()

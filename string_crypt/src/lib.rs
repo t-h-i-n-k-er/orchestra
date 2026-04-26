@@ -88,8 +88,8 @@ pub fn enc_str(input: TokenStream) -> TokenStream {
         // RC4-like
         let key = deterministic_bytes(b"enc_str:rc4", &pt_with_null, 16);
         let mut s = [0u8; 256];
-        for i in 0..=255 {
-            s[i] = i as u8;
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = i as u8;
         }
         let mut j: usize = 0;
         for i in 0..=255 {

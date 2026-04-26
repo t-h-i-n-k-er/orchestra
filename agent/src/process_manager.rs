@@ -886,11 +886,49 @@ mod tests {
         );
     }
 
+    /// Without the `linux-ptrace-migrate` feature, migration on Linux must return
+    /// the documented "not implemented without … feature" error (not a panic or
+    /// an OS-level failure).
     #[test]
-    #[cfg(not(windows))]
-    fn migrate_returns_controlled_error() {
+    #[cfg(all(target_os = "linux", not(feature = "linux-ptrace-migrate")))]
+    fn migrate_without_feature_returns_unsupported_error() {
         let err = migrate_to_process(1).unwrap_err();
-        assert!(err.to_string().contains("not implemented"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("linux-ptrace-migrate"),
+            "error should mention the feature name; got: {msg}"
+        );
+        assert!(
+            msg.contains("not implemented") || msg.contains("not enabled"),
+            "error should say the feature is not enabled; got: {msg}"
+        );
+    }
+
+    /// With the `linux-ptrace-migrate` feature enabled, the validation path must
+    /// reject obviously invalid PIDs (0 and the agent's own PID) without
+    /// attempting a ptrace attach.  This tests the guard logic only — no real
+    /// system process is touched.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "linux-ptrace-migrate"))]
+    fn migrate_with_feature_rejects_invalid_pids() {
+        // pid=0 is always invalid.
+        let err_zero = migrate_to_process(0).unwrap_err();
+        assert!(
+            err_zero.to_string().contains("invalid migration target")
+                || err_zero.to_string().contains("pid 0"),
+            "pid=0 should be rejected; got: {}",
+            err_zero
+        );
+
+        // Migrating into our own process is also rejected.
+        let our_pid = std::process::id();
+        let err_self = migrate_to_process(our_pid).unwrap_err();
+        assert!(
+            err_self.to_string().contains("invalid migration target")
+                || err_self.to_string().contains("self"),
+            "self-migration should be rejected; got: {}",
+            err_self
+        );
     }
 
     #[test]

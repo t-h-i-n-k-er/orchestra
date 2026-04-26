@@ -1,6 +1,5 @@
 use std::env;
 use std::fs;
-use std::path::Path;
 
 fn encrypt_payload(data: &[u8]) -> (Vec<u8>, u8) {
     let key = 0xAA; // Simple XOR key for demonstration

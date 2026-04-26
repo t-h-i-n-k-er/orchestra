@@ -28,6 +28,15 @@ pub fn hash_wstr(bytes: &[u16]) -> u32 {
     hash
 }
 
+/// Walk the Windows PEB loader list and return the base address of the module
+/// whose name hashes to `target_hash` using [`hash_wstr`].
+///
+/// # Safety
+///
+/// Must only be called on Windows x86-64.  The function dereferences raw
+/// pointers derived from the TEB (`gs:[0x30]`) and the PEB loader data
+/// structure — these are valid for the lifetime of the process but are
+/// inherently unsafe raw-pointer reads.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn get_module_handle_by_hash(target_hash: u32) -> Option<usize> {
     use core::arch::asm;
@@ -37,11 +46,11 @@ pub unsafe fn get_module_handle_by_hash(target_hash: u32) -> Option<usize> {
     let ldr = *(peb.add(0x18) as *const usize) as *const u8;
     let mut module_list = *(ldr.add(0x20) as *const usize) as *const u8;
 
-    while module_list as usize != ldr.add(0x20) as usize {
+    while !core::ptr::eq(module_list, ldr.add(0x20)) {
         let base_dll_name_ptr = *(module_list.add(0x48) as *const usize) as *const u16;
         let base_dll_name_len = *(module_list.add(0x40) as *const u16) as usize / 2;
 
-        if base_dll_name_ptr != core::ptr::null() && base_dll_name_len > 0 {
+        if !base_dll_name_ptr.is_null() && base_dll_name_len > 0 {
             let slice = core::slice::from_raw_parts(base_dll_name_ptr, base_dll_name_len);
             if hash_wstr(slice) == target_hash {
                 return Some(*(module_list.add(0x20) as *const usize));
@@ -52,6 +61,14 @@ pub unsafe fn get_module_handle_by_hash(target_hash: u32) -> Option<usize> {
     None
 }
 
+/// Walk the PE export directory at `dll_base` and return the address of the
+/// export whose name hashes to `target_hash` using [`hash_str`].
+///
+/// # Safety
+///
+/// `dll_base` must be a valid, fully-mapped PE image base with a correct DOS
+/// and NT header.  The export directory and all name/ordinal arrays must be
+/// accessible and not mutated for the duration of the call.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Option<usize> {
     let dos_magic = *(dll_base as *const u16);

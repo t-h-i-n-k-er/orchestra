@@ -1,6 +1,8 @@
 use anyhow::Result;
 use log::{info, warn};
+#[cfg(windows)]
 use string_crypt::enc_str;
+
 
 #[derive(Debug, Default)]
 pub struct SandboxMetrics {
@@ -435,7 +437,7 @@ pub fn check_hardware_plausibility() -> u8 {
     let mut disk_gb = 0;
     unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(b"/\0".as_ptr() as *const libc::c_char, &mut stat) == 0 {
+        if libc::statvfs(c"/".as_ptr(), &mut stat) == 0 {
             disk_gb = (stat.f_blocks as u64 * stat.f_frsize as u64) / (1024 * 1024 * 1024);
         }
     }
@@ -472,7 +474,7 @@ pub fn check_hardware_plausibility() -> u8 {
     // Disk size via statvfs (works on macOS, same as Linux).
     let disk_gb: u64 = unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(b"/\0".as_ptr() as *const libc::c_char, &mut stat) == 0 {
+        if libc::statvfs(c"/".as_ptr(), &mut stat) == 0 {
             (stat.f_blocks as u64 * stat.f_frsize as u64) / (1024 * 1024 * 1024)
         } else {
             0
@@ -507,17 +509,28 @@ pub fn check_hardware_plausibility() -> u8 {
 }
 
 /// FR-5: Combined Heuristic Scoring and Decision Framework
+///
+/// Each signal is weighted but **capped** to prevent a single signal from
+/// saturating the total score.  The caps ensure that reaching the "high
+/// probability" threshold (> 60) requires at least **three** elevated signals,
+/// and the "moderate" threshold (> 30) requires at least **two** signals.
+///
+/// Signal caps and max contributions:
+/// * Mouse movement  (weight ×5, cap 30) — max total contribution: 30
+/// * Desktop richness (weight ×3, cap 25) — max total contribution: 25
+/// * Uptime artifacts (weight ×2, cap 25) — max total contribution: 25
+/// * Hardware plausibility (weight ×1, cap 20) — max total contribution: 20
+///
+/// Total maximum: 100.
 pub fn sandbox_probability_score(metrics: &SandboxMetrics) -> u32 {
-    let mut score = 0;
-    
-    // Weights assignment based on spoofing difficulty
-    score += (metrics.mouse_movement_score as u32) * 5; // Very hard to spoof perfectly
-    score += (metrics.desktop_richness_score as u32) * 3;
-    score += (metrics.uptime_score as u32) * 2;
-    score += (metrics.hardware_plausibility_score as u32) * 1; // Easily spoofed by configs
-    
-    score = std::cmp::min(score, 100);
-    score
+    // Cap each signal contribution individually.
+    let mouse_contrib   = std::cmp::min((metrics.mouse_movement_score as u32) * 5, 30);
+    let desktop_contrib = std::cmp::min((metrics.desktop_richness_score as u32) * 3, 25);
+    let uptime_contrib  = std::cmp::min((metrics.uptime_score as u32) * 2, 25);
+    let hw_contrib      = std::cmp::min(metrics.hardware_plausibility_score as u32, 20);
+
+    let score = mouse_contrib + desktop_contrib + uptime_contrib + hw_contrib;
+    std::cmp::min(score, 100)
 }
 
 /// Run all sandbox heuristics and return a combined probability score (0–100).
@@ -541,4 +554,53 @@ pub fn evaluate_sandbox() -> Result<u32> {
         warn!("Moderate Sandbox Probability (Score {}).", score);
     }
     Ok(score)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metrics(mouse: u8, desktop: u8, uptime: u8, hw: u8) -> SandboxMetrics {
+        SandboxMetrics {
+            mouse_movement_score: mouse,
+            desktop_richness_score: desktop,
+            uptime_score: uptime,
+            hardware_plausibility_score: hw,
+        }
+    }
+
+    /// A headless server (no mouse, no display) should NOT trigger a false
+    /// positive even though mouse_movement_score is maxed out.
+    #[test]
+    fn headless_server_single_signal_below_high_threshold() {
+        // mouse=20 → capped at 30; all other signals 0
+        let score = sandbox_probability_score(&metrics(20, 0, 0, 0));
+        assert!(
+            score <= 30,
+            "single elevated signal should not exceed moderate threshold: got {score}"
+        );
+    }
+
+    /// Two elevated signals should reach "moderate" but not "high".
+    #[test]
+    fn two_signals_moderate_not_high() {
+        // mouse=20 (cap 30) + desktop=20 (cap 25) = 55
+        let score = sandbox_probability_score(&metrics(20, 20, 0, 0));
+        assert!(score > 30, "two signals should exceed moderate threshold: got {score}");
+        assert!(score <= 60, "two signals should not exceed high threshold: got {score}");
+    }
+
+    /// All four signals at maximum should reach 100.
+    #[test]
+    fn all_signals_max_reaches_high() {
+        let score = sandbox_probability_score(&metrics(20, 20, 20, 20));
+        assert!(score > 60, "all max signals must exceed high threshold: got {score}");
+        assert!(score <= 100, "score must not exceed 100: got {score}");
+    }
+
+    /// Zero scores produce zero total.
+    #[test]
+    fn all_zero_scores_produces_zero() {
+        assert_eq!(sandbox_probability_score(&metrics(0, 0, 0, 0)), 0);
+    }
 }

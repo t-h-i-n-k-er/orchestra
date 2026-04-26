@@ -2,6 +2,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+#[allow(clippy::ptr_arg)]
 pub trait Persist {
     fn install(&self, executable_path: &PathBuf) -> Result<()>;
     fn remove(&self) -> Result<()>;
@@ -203,7 +204,7 @@ pub mod windows {
                 );
 
                 let status = std::process::Command::new("cmd")
-                    .args(&["/C", &ps_cmd])
+                    .args(["/C", &ps_cmd])
                     .status()
                     .map_err(|e| anyhow!("WmiSubscription: failed to spawn powershell: {}", e))?;
 
@@ -228,7 +229,7 @@ pub mod windows {
                 self.subscription_name
             );
             let _ = std::process::Command::new("cmd")
-                .args(&["/C", &ps_cmd])
+                .args(["/C", &ps_cmd])
                 .status();
             log::info!(
                 "WmiSubscription::remove: removed '{}'",
@@ -242,7 +243,7 @@ pub mod windows {
                 "powershell -NonInteractive -Command \"(Get-WmiObject __EventFilter -Namespace root\\subscription | Where-Object {{$_.Name -eq '{}'}}) -ne $null\""
             , self.subscription_name);
             let out = std::process::Command::new("cmd")
-                .args(&["/C", &ps_cmd])
+                .args(["/C", &ps_cmd])
                 .output()
                 .map_err(|e| anyhow!("WmiSubscription::verify: {}", e))?;
             let stdout = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
@@ -497,7 +498,7 @@ pub mod macos {
             {
                 let uid = unsafe { libc::getuid() };
                 let _ = std::process::Command::new("launchctl")
-                    .args(&[
+                    .args([
                         "bootstrap",
                         &format!("gui/{}", uid),
                         &plist_path.to_string_lossy(),
@@ -506,7 +507,7 @@ pub mod macos {
             }
             #[cfg(not(target_os = "macos"))]
             let _ = std::process::Command::new("launchctl")
-                .args(&["load", "-w", &plist_path.to_string_lossy()])
+                .args(["load", "-w", &plist_path.to_string_lossy()])
                 .status();
             log::info!("LaunchAgent::install: installed '{}'", plist_path.display());
             Ok(())
@@ -523,7 +524,7 @@ pub mod macos {
             {
                 let uid = unsafe { libc::getuid() };
                 let _ = std::process::Command::new("launchctl")
-                    .args(&[
+                    .args([
                         "bootout",
                         &format!("gui/{}", uid),
                         &plist_path.to_string_lossy(),
@@ -532,7 +533,7 @@ pub mod macos {
             }
             #[cfg(not(target_os = "macos"))]
             let _ = std::process::Command::new("launchctl")
-                .args(&["unload", &plist_path.to_string_lossy()])
+                .args(["unload", &plist_path.to_string_lossy()])
                 .status();
             let _ = std::fs::remove_file(&plist_path);
             log::info!("LaunchAgent::remove: unloaded '{}'", self.label);
@@ -662,7 +663,7 @@ pub mod macos {
             #[cfg(target_os = "macos")]
             {
                 let _ = std::process::Command::new("launchctl")
-                    .args(&["bootstrap", "system", &plist_path.to_string_lossy()])
+                    .args(["bootstrap", "system", &plist_path.to_string_lossy()])
                     .status();
             }
             log::info!(
@@ -678,7 +679,7 @@ pub mod macos {
             #[cfg(target_os = "macos")]
             {
                 let _ = std::process::Command::new("launchctl")
-                    .args(&["bootout", "system", &plist_path.to_string_lossy()])
+                    .args(["bootout", "system", &plist_path.to_string_lossy()])
                     .status();
             }
             let _ = std::fs::remove_file(&plist_path);
@@ -718,7 +719,7 @@ pub mod macos {
                 path = exe,
             );
             let status = std::process::Command::new("osascript")
-                .args(&["-e", &script])
+                .args(["-e", &script])
                 .status()
                 .map_err(|e| anyhow!("LoginItem::install: osascript: {}", e))?;
             if !status.success() {
@@ -734,7 +735,7 @@ pub mod macos {
                 name = self.app_name
             );
             let _ = std::process::Command::new("osascript")
-                .args(&["-e", &script])
+                .args(["-e", &script])
                 .status();
             log::info!("LoginItem::remove: removed login item '{}'", self.app_name);
             Ok(())
@@ -744,7 +745,7 @@ pub mod macos {
             let script =
                 format!(r#"tell application "System Events" to get the name of every login item"#);
             let out = std::process::Command::new("osascript")
-                .args(&["-e", &script])
+                .args(["-e", &script])
                 .output()
                 .map_err(|e| anyhow!("LoginItem::verify: {}", e))?;
             Ok(String::from_utf8_lossy(&out.stdout).contains(&self.app_name))
@@ -798,10 +799,10 @@ pub mod linux {
             std::fs::write(&unit_path, unit)
                 .map_err(|e| anyhow!("SystemdService: write: {}", e))?;
             let _ = std::process::Command::new("systemctl")
-                .args(&["--user", "daemon-reload"])
+                .args(["--user", "daemon-reload"])
                 .status();
             let _ = std::process::Command::new("systemctl")
-                .args(&["--user", "enable", "--now", &self.service_name])
+                .args(["--user", "enable", "--now", &self.service_name])
                 .status();
             log::info!("SystemdService::install: enabled '{}'", self.service_name);
             Ok(())
@@ -809,7 +810,7 @@ pub mod linux {
 
         fn remove(&self) -> Result<()> {
             let _ = std::process::Command::new("systemctl")
-                .args(&["--user", "disable", "--now", &self.service_name])
+                .args(["--user", "disable", "--now", &self.service_name])
                 .status();
             let unit_dir = match dirs::home_dir() {
                 Some(h) => h.join(".config/systemd/user"),
@@ -817,7 +818,7 @@ pub mod linux {
             };
             let _ = std::fs::remove_file(unit_dir.join(format!("{}.service", self.service_name)));
             let _ = std::process::Command::new("systemctl")
-                .args(&["--user", "daemon-reload"])
+                .args(["--user", "daemon-reload"])
                 .status();
             log::info!("SystemdService::remove: removed '{}'", self.service_name);
             Ok(())
@@ -825,7 +826,7 @@ pub mod linux {
 
         fn verify(&self) -> Result<bool> {
             let out = std::process::Command::new("systemctl")
-                .args(&["--user", "is-enabled", &self.service_name])
+                .args(["--user", "is-enabled", &self.service_name])
                 .output()
                 .map_err(|e| anyhow!("SystemdService::verify: {}", e))?;
             Ok(String::from_utf8_lossy(&out.stdout).trim() == "enabled")
@@ -1007,10 +1008,10 @@ pub mod linux {
             std::fs::write(&unit_path, unit)
                 .map_err(|e| anyhow!("SystemdSystemService: write: {}", e))?;
             let _ = std::process::Command::new("systemctl")
-                .args(&["daemon-reload"])
+                .args(["daemon-reload"])
                 .status();
             let _ = std::process::Command::new("systemctl")
-                .args(&["enable", "--now", &self.service_name])
+                .args(["enable", "--now", &self.service_name])
                 .status();
             log::info!(
                 "SystemdSystemService::install: enabled '{}'",
@@ -1021,13 +1022,13 @@ pub mod linux {
 
         fn remove(&self) -> Result<()> {
             let _ = std::process::Command::new("systemctl")
-                .args(&["disable", "--now", &self.service_name])
+                .args(["disable", "--now", &self.service_name])
                 .status();
             let path = std::path::Path::new("/etc/systemd/system")
                 .join(format!("{}.service", self.service_name));
             let _ = std::fs::remove_file(&path);
             let _ = std::process::Command::new("systemctl")
-                .args(&["daemon-reload"])
+                .args(["daemon-reload"])
                 .status();
             log::info!(
                 "SystemdSystemService::remove: removed '{}'",
@@ -1038,7 +1039,7 @@ pub mod linux {
 
         fn verify(&self) -> Result<bool> {
             let out = std::process::Command::new("systemctl")
-                .args(&["is-enabled", &self.service_name])
+                .args(["is-enabled", &self.service_name])
                 .output()
                 .map_err(|e| anyhow!("SystemdSystemService::verify: {}", e))?;
             Ok(String::from_utf8_lossy(&out.stdout).trim() == "enabled")

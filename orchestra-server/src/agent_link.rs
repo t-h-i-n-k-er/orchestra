@@ -20,10 +20,8 @@ use common::{CryptoSession, Message};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 use uuid::Uuid;
 
-const CHANNEL_DEPTH: usize = 64;
 const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024; // 16 MiB hard cap
 
 async fn read_frame<S: AsyncReadExt + Unpin>(r: &mut S, sess: &CryptoSession) -> Result<Message> {
@@ -104,7 +102,7 @@ async fn handle_agent(
     sock.set_nodelay(true).ok();
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-    let mut tls_stream = acceptor.accept(sock).await?;
+    let tls_stream = acceptor.accept(sock).await?;
 
     // When forward-secrecy is enabled, perform an X25519 ECDH exchange before
     // the first application message.  The derived per-session key replaces the

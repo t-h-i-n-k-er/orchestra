@@ -58,7 +58,11 @@ async fn launcher_downloads_decrypts_and_executes() {
 
     let url = format!("http://{addr}/agent.enc");
     let mut cmd = Command::cargo_bin("launcher").expect("launcher binary built");
-    cmd.arg("--url").arg(&url).arg("--key").arg(&key_b64);
+    cmd.arg("--url")
+        .arg(&url)
+        .arg("--key")
+        .arg(&key_b64)
+        .arg("--allow-insecure-http"); // test server uses plain HTTP
 
     // The launcher replaces its process image via execv on success, so the
     // child *is* the dummy script. Wait for it to finish writing the marker.
@@ -79,4 +83,27 @@ async fn launcher_downloads_decrypts_and_executes() {
     );
 
     server_handle.abort();
+}
+
+#[test]
+fn http_url_without_flag_is_rejected() {
+    let key_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+    let output = Command::cargo_bin("launcher")
+        .expect("launcher binary built")
+        .arg("--url")
+        .arg("http://example.com/agent.enc")
+        .arg("--key")
+        .arg(&key_b64)
+        .output()
+        .expect("spawn launcher");
+
+    assert!(
+        !output.status.success(),
+        "launcher should fail on HTTP URL without --allow-insecure-http"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("HTTPS") || stderr.contains("insecure"),
+        "error message should mention HTTPS enforcement; got: {stderr}"
+    );
 }

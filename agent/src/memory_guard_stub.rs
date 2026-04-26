@@ -7,7 +7,11 @@
 
 use anyhow::Result;
 
-/// Register a sensitive region.  No-op when `memory-guard` is disabled.
+/// Register a sensitive region.
+///
+/// # Safety
+///
+/// No-op when `memory-guard` is disabled. The pointer is never dereferenced.
 #[inline(always)]
 pub unsafe fn register(_buf: &'static mut [u8], _label: &'static str) {}
 
@@ -44,3 +48,7 @@ pub async fn guarded_sleep(
     }
     Ok(())
 }
+
+/// Register the session key for memory protection.  No-op when `memory-guard` is disabled.
+#[inline(always)]
+pub fn register_session_key(_session: &common::CryptoSession) {}

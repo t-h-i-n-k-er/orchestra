@@ -19,6 +19,7 @@ rustls = { version = "0.23.38", default-features = false, features = ["ring", "s
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2.2.0"
 hkdf = { version = "0.12" }
+zeroize = "1"
 
 # Optional: Ed25519 signatures for module verification.
 # Enabled by the `module-signatures` feature.
