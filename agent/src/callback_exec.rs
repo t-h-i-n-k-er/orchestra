@@ -1,19 +1,21 @@
 #[cfg(windows)]
-use winapi::um::threadpoolapiset::{CloseThreadpoolWork, CreateThreadpoolWork, SubmitThreadpoolWork};
+use winapi::shared::minwindef::{BOOL, FALSE, LPARAM, TRUE};
 #[cfg(windows)]
-use winapi::um::winnt::{PTP_CALLBACK_INSTANCE, PVOID, PTP_WORK, WT_EXECUTEINTIMERTHREAD};
-#[cfg(windows)]
-use winapi::um::winuser::{EnumChildWindows, FindWindowA};
-#[cfg(windows)]
-use winapi::um::threadpoollegacyapiset::{CreateTimerQueueTimer, DeleteTimerQueueTimer};
+use winapi::shared::ntdef::HANDLE;
 #[cfg(windows)]
 use winapi::um::synchapi::WaitForSingleObject;
 #[cfg(windows)]
+use winapi::um::threadpoolapiset::{
+    CloseThreadpoolWork, CreateThreadpoolWork, SubmitThreadpoolWork,
+};
+#[cfg(windows)]
+use winapi::um::threadpoollegacyapiset::{CreateTimerQueueTimer, DeleteTimerQueueTimer};
+#[cfg(windows)]
 use winapi::um::winnls::EnumSystemLocalesEx;
 #[cfg(windows)]
-use winapi::shared::minwindef::{BOOL, LPARAM, TRUE, FALSE};
+use winapi::um::winnt::{PTP_CALLBACK_INSTANCE, PTP_WORK, PVOID, WT_EXECUTEINTIMERTHREAD};
 #[cfg(windows)]
-use winapi::shared::ntdef::HANDLE;
+use winapi::um::winuser::{EnumChildWindows, FindWindowA};
 
 pub enum CallbackType {
     ThreadpoolWork,
@@ -23,7 +25,11 @@ pub enum CallbackType {
 }
 
 #[cfg(windows)]
-extern "system" fn threadpool_callback(_instance: PTP_CALLBACK_INSTANCE, context: PVOID, work: PTP_WORK) {
+extern "system" fn threadpool_callback(
+    _instance: PTP_CALLBACK_INSTANCE,
+    context: PVOID,
+    work: PTP_WORK,
+) {
     if !context.is_null() {
         let closure: Box<Box<dyn FnOnce() + Send>> = unsafe { Box::from_raw(context as *mut _) };
         closure();
@@ -35,7 +41,9 @@ extern "system" fn threadpool_callback(_instance: PTP_CALLBACK_INSTANCE, context
 
 #[cfg(windows)]
 pub fn execute_in_threadpool<F>(f: F) -> Result<(), anyhow::Error>
-where F: FnOnce() + Send + 'static {
+where
+    F: FnOnce() + Send + 'static,
+{
     let closure: Box<Box<dyn FnOnce() + Send>> = Box::new(Box::new(f));
     let context = Box::into_raw(closure) as PVOID;
     unsafe {
@@ -50,7 +58,10 @@ where F: FnOnce() + Send + 'static {
 }
 
 #[cfg(windows)]
-extern "system" fn child_windows_callback(_hwnd: winapi::shared::windef::HWND, lparam: LPARAM) -> BOOL {
+extern "system" fn child_windows_callback(
+    _hwnd: winapi::shared::windef::HWND,
+    lparam: LPARAM,
+) -> BOOL {
     if lparam != 0 {
         let closure: Box<Box<dyn FnOnce() + Send>> = unsafe { Box::from_raw(lparam as *mut _) };
         closure();
@@ -60,7 +71,9 @@ extern "system" fn child_windows_callback(_hwnd: winapi::shared::windef::HWND, l
 
 #[cfg(windows)]
 pub fn execute_enum_child_windows<F>(f: F) -> Result<(), anyhow::Error>
-where F: FnOnce() + Send + 'static {
+where
+    F: FnOnce() + Send + 'static,
+{
     let closure: Box<Box<dyn FnOnce() + Send>> = Box::new(Box::new(f));
     let lparam = Box::into_raw(closure) as LPARAM;
     unsafe {
@@ -86,14 +99,21 @@ struct TimerQueueCtx {
 }
 
 #[cfg(windows)]
-extern "system" fn timer_queue_callback(param: PVOID, _timer_or_wait_fired: winapi::um::winnt::BOOLEAN) {
-    if param.is_null() { return; }
+extern "system" fn timer_queue_callback(
+    param: PVOID,
+    _timer_or_wait_fired: winapi::um::winnt::BOOLEAN,
+) {
+    if param.is_null() {
+        return;
+    }
     // SAFETY: execute_timer_queue gives us sole ownership of this allocation;
     // Box::from_raw reclaims it when this function returns.
     let ctx = unsafe { Box::from_raw(param as *mut TimerQueueCtx) };
     // Run the user closure.
     if let Ok(mut g) = ctx.closure.lock() {
-        if let Some(f) = g.take() { f(); }
+        if let Some(f) = g.take() {
+            f();
+        }
     }
     // Spin-wait until execute_timer_queue writes the timer handle (the race
     // window is extremely narrow: dwDueTime=0 still requires a scheduler
@@ -101,17 +121,15 @@ extern "system" fn timer_queue_callback(param: PVOID, _timer_or_wait_fired: wina
     let mut h = 0usize;
     for _ in 0..10_000 {
         h = ctx.timer_handle.load(std::sync::atomic::Ordering::Acquire);
-        if h != 0 { break; }
+        if h != 0 {
+            break;
+        }
         std::hint::spin_loop();
     }
     // Delete the one-shot timer to release its kernel object.
     if h != 0 {
         unsafe {
-            DeleteTimerQueueTimer(
-                std::ptr::null_mut(),
-                h as HANDLE,
-                std::ptr::null_mut(),
-            );
+            DeleteTimerQueueTimer(std::ptr::null_mut(), h as HANDLE, std::ptr::null_mut());
         }
     }
     // ctx is dropped here, freeing the heap allocation.
@@ -119,7 +137,9 @@ extern "system" fn timer_queue_callback(param: PVOID, _timer_or_wait_fired: wina
 
 #[cfg(windows)]
 pub fn execute_timer_queue<F>(f: F) -> Result<(), anyhow::Error>
-where F: FnOnce() + Send + 'static {
+where
+    F: FnOnce() + Send + 'static,
+{
     let ctx = Box::new(TimerQueueCtx {
         timer_handle: std::sync::atomic::AtomicUsize::new(0),
         closure: std::sync::Mutex::new(Some(Box::new(f) as Box<dyn FnOnce() + Send>)),
@@ -127,13 +147,24 @@ where F: FnOnce() + Send + 'static {
     let ctx_ptr = Box::into_raw(ctx);
     unsafe {
         let mut handle: HANDLE = std::ptr::null_mut();
-        if CreateTimerQueueTimer(&mut handle, std::ptr::null_mut(), Some(timer_queue_callback), ctx_ptr as PVOID, 0, 0, WT_EXECUTEINTIMERTHREAD) == 0 {
+        if CreateTimerQueueTimer(
+            &mut handle,
+            std::ptr::null_mut(),
+            Some(timer_queue_callback),
+            ctx_ptr as PVOID,
+            0,
+            0,
+            WT_EXECUTEINTIMERTHREAD,
+        ) == 0
+        {
             // Reclaim the allocation since no callback will free it.
             drop(Box::from_raw(ctx_ptr));
             anyhow::bail!("CreateTimerQueueTimer failed");
         }
         // Store the handle so the callback can call DeleteTimerQueueTimer.
-        (*ctx_ptr).timer_handle.store(handle as usize, std::sync::atomic::Ordering::Release);
+        (*ctx_ptr)
+            .timer_handle
+            .store(handle as usize, std::sync::atomic::Ordering::Release);
     }
     Ok(())
 }
@@ -161,13 +192,21 @@ extern "system" fn enum_locales_ex_callback(
 
 #[cfg(windows)]
 pub fn execute_enum_system_locales<F>(f: F) -> Result<(), anyhow::Error>
-where F: FnOnce() + Send + 'static {
+where
+    F: FnOnce() + Send + 'static,
+{
     use winapi::um::winnls::EnumSystemLocalesEx;
     let closure: Box<Box<dyn FnOnce() + Send>> = Box::new(Box::new(f));
     let lparam = Box::into_raw(closure) as LPARAM;
     unsafe {
         // LOCALE_ALL = 0; EnumSystemLocalesEx passes lparam to the callback.
-        if EnumSystemLocalesEx(Some(enum_locales_ex_callback), 0, lparam, std::ptr::null_mut()) == FALSE {
+        if EnumSystemLocalesEx(
+            Some(enum_locales_ex_callback),
+            0,
+            lparam,
+            std::ptr::null_mut(),
+        ) == FALSE
+        {
             // Reclaim the closure if the API failed before any callback.
             let _ = Box::from_raw(lparam as *mut Box<dyn FnOnce() + Send>);
             anyhow::bail!("EnumSystemLocalesEx failed");
@@ -178,7 +217,9 @@ where F: FnOnce() + Send + 'static {
 
 #[cfg(windows)]
 pub fn execute_task<F>(cb_type: CallbackType, f: F) -> Result<(), anyhow::Error>
-where F: FnOnce() + Send + 'static {
+where
+    F: FnOnce() + Send + 'static,
+{
     match cb_type {
         CallbackType::ThreadpoolWork => execute_in_threadpool(f),
         CallbackType::EnumChildWindows => execute_enum_child_windows(f),

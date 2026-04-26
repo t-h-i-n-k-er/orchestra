@@ -11,7 +11,7 @@ pub mod agent_link;
 pub mod api;
 pub mod audit;
 pub mod auth;
+pub mod build_handler;
 pub mod config;
 pub mod state;
 pub mod tls;
-pub mod build_handler;

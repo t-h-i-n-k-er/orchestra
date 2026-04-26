@@ -1,8 +1,8 @@
 //! Self-verification test for the `outbound-c` feature.
 //!
 //! Starts the orchestra-server's agent listener, builds the `agent-standalone`
-//! binary with `outbound-c` + `ORCHESTRA_C_ADDR`/`ORCHESTRA_C_SECRET` baked
-//! in, spawns it, and verifies it registers with the server.
+//! binary with `outbound-c` + address/secret/certificate pin baked in, spawns
+//! it, and verifies it registers with the server.
 //!
 //! The build step is skipped when `SKIP_BUILD_TEST` is set (e.g. in fast CI
 //! loops) to keep the suite quick; the full round-trip can be run explicitly
@@ -11,6 +11,7 @@
 use orchestra_server::{
     agent_link, api, audit::AuditLog, config::ServerConfig, state::AppState, tls,
 };
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ const TOKEN: &str = "outbound-test-token";
 
 // Starts only the agent-facing TCP listener and the HTTPS API on ephemeral
 // ports.
-async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
+async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16, String) {
     let cfg = ServerConfig {
         http_addr: "127.0.0.1:0".parse().unwrap(),
         agent_addr: "127.0.0.1:0".parse().unwrap(),
@@ -42,15 +43,14 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
 
     let agent_listener = tokio::net::TcpListener::bind(cfg.agent_addr).await.unwrap();
     let agent_port = agent_listener.local_addr().unwrap().port();
-    {
+    let agent_cert_fp = {
         let state_a = state.clone();
         let secret = cfg.agent_shared_secret.clone();
         // Generate a proper self-signed cert for the agent TLS listener.
-        let agent_tls = {
-            let cert = rcgen::generate_simple_self_signed(
-                vec!["localhost".into(), "127.0.0.1".into()],
-            )
-            .unwrap();
+        let (agent_tls, agent_cert_fp) = {
+            let cert =
+                rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+                    .unwrap();
             let cert_pem = cert.cert.pem();
             let key_pem = cert.key_pair.serialize_pem();
             let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
@@ -60,19 +60,22 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
                 .ok()
                 .flatten()
                 .unwrap();
-            Arc::new(
+            let fp = hex_lower(&Sha256::digest(certs[0].as_ref()));
+            let tls = Arc::new(
                 rustls::ServerConfig::builder()
                     .with_no_client_auth()
                     .with_single_cert(certs, key)
                     .unwrap(),
-            )
+            );
+            (tls, fp)
         };
         tokio::spawn(async move {
             agent_link::serve(state_a, agent_listener, secret, agent_tls)
                 .await
                 .unwrap();
         });
-    }
+        agent_cert_fp
+    };
 
     let http_listener = std::net::TcpListener::bind(cfg.http_addr).unwrap();
     http_listener.set_nonblocking(true).unwrap();
@@ -87,7 +90,17 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
     });
 
     tokio::time::sleep(Duration::from_millis(150)).await;
-    (http_port, agent_port)
+    (http_port, agent_port, agent_cert_fp)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn http_client() -> reqwest::Client {
@@ -97,7 +110,11 @@ fn http_client() -> reqwest::Client {
         .unwrap()
 }
 
-fn build_agent_standalone(addr: &str, secret: &str) -> anyhow::Result<std::path::PathBuf> {
+fn build_agent_standalone(
+    addr: &str,
+    secret: &str,
+    cert_fp: &str,
+) -> anyhow::Result<std::path::PathBuf> {
     // Locate the workspace root from CARGO_MANIFEST_DIR (which points to the
     // orchestra-server crate during tests) by going two levels up.
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -116,6 +133,7 @@ fn build_agent_standalone(addr: &str, secret: &str) -> anyhow::Result<std::path:
         ])
         .env("ORCHESTRA_C_ADDR", addr)
         .env("ORCHESTRA_C_SECRET", secret)
+        .env("ORCHESTRA_C_CERT_FP", cert_fp)
         .status()?;
     if !status.success() {
         anyhow::bail!("cargo build agent-standalone failed");
@@ -136,11 +154,11 @@ async fn outbound_agent_connects_and_registers() {
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let tmp = tempfile::tempdir().unwrap();
-    let (_http_port, agent_port) = start_server(&tmp).await;
+    let (_http_port, agent_port, cert_fp) = start_server(&tmp).await;
     let addr = format!("127.0.0.1:{agent_port}");
 
-    // Build the agent with the address baked in.
-    let bin = match build_agent_standalone(&addr, SECRET) {
+    // Build the agent with address, secret, and the TLS certificate pin baked in.
+    let bin = match build_agent_standalone(&addr, SECRET, &cert_fp) {
         Ok(p) => p,
         Err(e) => {
             panic!("Failed to build agent-standalone: {e:#}");

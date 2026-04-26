@@ -32,7 +32,7 @@ and similar IT estates.
 | Crate | Kind | Purpose |
 |-------|------|---------|
 | `agent` | lib + bin | Agent service that runs on managed endpoints. Can be embedded by the launcher or built standalone via the `agent-standalone` binary. |
-| `console` | bin | Operator CLI for direct point-to-point sessions with a single agent. |
+| `console` | bin | Legacy protocol-test CLI for custom listeners; stock agents use the Control Center. |
 | `orchestra-server` | bin | **Orchestra Control Center** — self-hosted management plane fronting a fleet of agents over an HTTPS dashboard and REST/WebSocket API. See [docs/C_SERVER.md](docs/C_SERVER.md). |
 | `builder` | bin | One-stop CLI for dependency setup, profile management, cross-compilation, and AES-encrypting payloads. See [builder/README.md](builder/README.md). |
 | `launcher` | bin | Tiny stub that fetches and decrypts an agent payload at runtime. |
@@ -138,11 +138,12 @@ host is fine.
 |--------|------------------|
 | `target_os` | Operating system to compile for (`linux`/`windows`/`macos`). |
 | `target_arch` | CPU architecture (`x86_64`/`aarch64`). |
-| `c2_address` | `host:port` the agent should connect or listen on. |
+| `c2_address` | `host:port` the outbound agent should connect to. |
 | `encryption_key` | Base64 AES-256 key used to encrypt the payload at rest. The wizard can generate one for you. |
 | `features` | Cargo feature flags to enable on the agent (see "Feature flags" below). |
 | `package` / `bin_name` | Which workspace crate/binary to build (defaults to `launcher`; set to `agent` / `agent-standalone` for outbound mode). |
 | `c_server_secret` | Pre-shared secret used by `outbound-c` agents to authenticate to the Control Center. |
+| `server_cert_fingerprint` | Optional SHA-256 DER fingerprint pinned by `outbound-c` agents. |
 
 The result is written to `profiles/my_agent.toml` and can be edited by hand
 or re-used in CI.
@@ -205,7 +206,7 @@ compile time:
 # On the target endpoint:
 ./agent-standalone
 # (No flags needed — address is already baked in.
-#  Override at runtime with ORCHESTRA_C / ORCHESTRA_SECRET if required.)
+#  Debug builds can override with ORCHESTRA_C / ORCHESTRA_SECRET.)
 ```
 
 ### 6. Issue commands from the dashboard
@@ -227,18 +228,31 @@ on per profile only when you need them.
 
 | Feature | Purpose |
 |---------|---------|
-| `persistence` | Re-launches the agent across reboots using the platform-native auto-start mechanism (systemd user unit / launchd / scheduled task). Useful for fleet endpoints that should reconnect without operator intervention. |
-| `network-discovery` | Enables passive subnet enumeration so the agent can report neighbouring hosts back to the Control Center for inventory. |
-| `remote-assist` | Adds optional screen-share/keyboard-forwarding capability for IT support sessions (Linux only; pulls in `x11cap`/`enigo`/`image`). |
+| `ppid-spoofing` | Windows-only compatibility flag for parent-process metadata experiments; disabled by default. |
+| `stealth` | Convenience bundle for experimental low-level compatibility flags. Use only in controlled testing and review its expanded feature set before enabling. |
+| `dev` | Development-only build flag for local test workflows that allow insecure defaults rejected by production builds. |
+| `persistence` | Re-launches the agent across reboots using conservative platform defaults (systemd user unit / launchd LaunchAgent / Windows Run key). Broader persistence primitives are not enabled automatically and return explicit guardrail errors for incompatible inputs. |
+| `network-discovery` | Enables bounded subnet enumeration so the agent can report neighbouring hosts back to the Control Center for inventory. CIDR sweeps reject overly broad ranges by default. |
+| `remote-assist` | Adds optional consent-gated screen-share/keyboard-forwarding capability for IT support sessions. Linux X11 capture is supported; macOS uses `screencapture` with PNG validation; Windows capture currently returns an explicit unsupported error until its integration is updated and tested. |
+| `module-signatures` | Enables Ed25519 signature verification for dynamically loaded capability modules. |
 | `hci-research` | Instruments human-computer-interaction telemetry (input latency, focus changes) for usability studies — disabled in normal IT deployments. |
-| `perf-optimize` | Enables CPU-microarchitecture-aware tuning paths in `optimizer`. Improves throughput on modern x86_64 hosts. |
+| `perf-optimize` | Experimental compatibility flag reserved for optimizer-backed tuning. It is accepted by profiles so builds fail early only on truly unknown features; production builds should leave it disabled until validated. |
 | `outbound-c` | Switches the agent into outbound mode so it dials the Control Center automatically and reconnects with exponential backoff. See [docs/C_SERVER.md](docs/C_SERVER.md). |
-| `traffic-normalization` | Normalises packet timing/sizes on the agent ↔ console transport for environments with strict QoS or DPI middleboxes. |
-| `direct-syscalls` / `manual-map` | Compatibility shims for environments where the standard `libc` / loader paths trip endpoint-protection heuristics. |
-| `env-validation` | Runs a startup Trusted Execution Environment (TEE) check on every launch. If a debugger, known hypervisor, or a domain mismatch is detected the agent enters a dormant sleep loop instead of running. Controlled via `required_domain` and `refuse_in_vm` in `agent.toml`. See [docs/USER_GUIDE.md §10](docs/USER_GUIDE.md) for full details. |
+| `forward-secrecy` | Adds an X25519 session-key negotiation layer to outbound Control Center connections. |
+| `traffic-normalization` | Experimental compatibility flag for the shared `NormalizedTransport` library. It is not a documented stock-agent deployment mode. |
+| `direct-syscalls` | Experimental Windows compatibility path for direct syscall wrappers. It is compiled only when explicitly enabled. |
+| `manual-map` | Experimental Windows manual-map compile flag that exposes `module_loader/manual-map`; unsupported runtime paths return explicit errors when the flag is absent. |
+| `unsafe-runtime-rewrite` | Experimental runtime-rewrite compatibility flag. Leave disabled unless a specific test plan requires it. |
+| `memory-guard` | Enables guarded sleep and memory-protection helpers used around reconnect/dormant waits. |
+| `linux-ptrace-migrate` | Experimental Linux x86_64 process-migration path. Disabled by default and not part of normal deployment profiles. |
+| `env-validation` | Runs startup environment checks when explicitly enabled. Refusal is controlled by runtime policy fields such as `required_domain`, `refuse_in_vm`, `refuse_when_debugged`, and `sandbox_score_threshold`; otherwise signals are informational. See [docs/USER_GUIDE.md §10](docs/USER_GUIDE.md) for full details. |
 
 Run `orchestra-builder show-profile <name>` to inspect which features a
 profile enables.
+
+Proc-macro build helpers are deterministic by default. Set
+`ORCHESTRA_STRING_CRYPT_SEED` only when you intentionally want a different,
+but still reproducible, string-obfuscation expansion.
 
 ## Security best practices
 
@@ -247,10 +261,9 @@ profile enables.
   `tls_cert_path` / `tls_key_path` and front the dashboard with a
   reverse proxy (nginx, Caddy, Traefik) that terminates a publicly
   trusted certificate.
-- **Prefer mTLS for agent ↔ server traffic.** The
-  `common::tls_transport::TlsTransport` module is a drop-in replacement
-  for the AES-only path and validates client certificates against your
-  internal CA. Keep the AES-PSK transport for lab/test only.
+- **Pin agent ↔ server TLS.** Bake `server_cert_fingerprint` into outbound
+  profiles or use production TLS material on the Control Center. Rotate
+  fingerprints deliberately when replacing certificates.
 - **Rotate keys.** Profiles store an AES-256 key; treat it as a secret
   and rotate it periodically. The Builder accepts `file:/path/to/key.bin`
   references so you can keep the key out of the profile TOML and source
@@ -296,21 +309,3 @@ without explicit authorisation from their owner — is prohibited.
 
 Apache-2.0. See each crate's `Cargo.toml` for the per-crate licence
 declaration.
-# Orchestra
-
-Orchestra is a secure, lightweight remote automation framework for enterprise IT management. It enables system administrators to execute approved maintenance tasks, deploy software updates, and collect diagnostic data across a heterogeneous fleet of devices without persistent installation or file-system clutter.
-
-## Workspace Layout
-
-| Crate | Kind | Purpose |
-|-------|------|---------|
-| `agent` | lib | Lightweight resident service running on managed endpoints. |
-| `console` | bin | Operator CLI used by system administrators. |
-| `orchestra-server` | bin | **Orchestra Control Center** — self-hosted management plane that fronts a fleet of agents over an authenticated HTTPS dashboard. See [`docs/C_SERVER.md`](docs/C_SERVER.md). |
-| `common` | lib | Shared data structures, protocol definitions, and encryption utilities. |
-| `optimizer` | lib | Runtime performance tuning for hot code paths based on detected CPU microarchitecture. |
-| `module_loader` | lib | Securely fetches, verifies, and loads signed capability plugins. |
-
-## Status
-
-Early-stage scaffolding. See [`docs/DESIGN.md`](docs/DESIGN.md) for architecture notes.

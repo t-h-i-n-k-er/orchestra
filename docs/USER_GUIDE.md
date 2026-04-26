@@ -1,36 +1,26 @@
 # Orchestra User Guide
 
 > A practical manual for IT administrators deploying and operating the
-> **Orchestra** remote management framework.
+> **Orchestra** remote management framework on systems they own or manage.
 
 ---
 
 ## 1. Introduction
 
-Orchestra is a lightweight, cross-platform remote-administration framework
-written in Rust. It is intended for **authorized system administrators** who
-need to:
+Orchestra is a lightweight, cross-platform remote-management framework for
+authorized administration. It supports fleet inventory, approved maintenance
+commands, diagnostic collection, signed module deployment, and audited
+operator actions through the Orchestra Control Center.
 
-- Inventory a fleet of servers, workstations, and IoT edge devices.
-- Run pre-approved maintenance scripts.
-- Collect diagnostic information (system info, log files).
-- Push out signed configuration changes and capability plugins.
-- Perform interactive troubleshooting via a remote shell — when authorized.
-
-Orchestra is **not** an exploitation tool. Every operation is gated by either
-a pre-shared secret or a mutually-authenticated TLS session, and every action
-is recorded to a local audit log. Use of Orchestra against systems you do not
-own or do not have written authorization to manage is forbidden by the
-project license.
+Orchestra is not an exploitation tool. Use it only on systems you own or have
+written authorization to manage.
 
 ---
 
 ## 2. Installation
 
-### 2.1 Building from source
-
-Requirements: Rust **1.76+**, `pkg-config`, `libxcb-dev`, `libxrandr-dev`
-(Linux only, for `remote-assist`), and a C compiler.
+Requirements: Rust **1.76+**, `pkg-config`, a C compiler, and platform
+development packages for any optional features you enable.
 
 ```bash
 git clone https://github.com/example/orchestra
@@ -38,102 +28,95 @@ cd orchestra
 cargo build --release --workspace
 ```
 
-The binaries land in `target/release/`:
+Important binaries:
 
-| Binary               | Purpose                                  |
-|----------------------|------------------------------------------|
-| `console`            | Operator CLI                              |
-| `agent` (lib only)   | Library used by your own service wrapper  |
-
-### 2.2 Pre-built binaries
-
-Pre-built binaries for Linux x86_64, Windows x86_64, and macOS aarch64 are
-attached to each tagged release on GitHub.
+| Binary | Purpose |
+|--------|---------|
+| `orchestra-server` | HTTPS dashboard and agent listener. |
+| `agent-standalone` | Endpoint agent that dials the server when built with `outbound-c`. |
+| `orchestra-builder` | Profile-driven builder for encrypted payloads. |
+| `console` | Legacy protocol-test CLI for custom listeners; stock agents use the Control Center. |
 
 ---
 
-## 3. Setting up mTLS
+## 3. TLS and certificate pinning
 
-For production use you should always operate with mutual TLS. Generate a
-private CA, an agent certificate, and one client certificate per operator:
+For production use, supply real TLS material to the Control Center and bake
+the server certificate fingerprint into outbound agents.
 
 ```bash
-# CA
+# Private CA
 openssl req -x509 -newkey ed25519 -keyout ca.key -out ca.pem -days 365 \
     -nodes -subj "/CN=OrchestraCA"
 
-# Agent server cert
-openssl req -newkey ed25519 -keyout agent.key -out agent.csr -nodes \
-    -subj "/CN=agent.example.com"
-openssl x509 -req -in agent.csr -CA ca.pem -CAkey ca.key \
-    -CAcreateserial -out agent.pem -days 365
+# Server cert
+openssl req -newkey ed25519 -keyout server.key -out server.csr -nodes \
+    -subj "/CN=orchestra.example.com"
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key \
+    -CAcreateserial -out server.pem -days 365
 
-# Operator client cert
-openssl req -newkey ed25519 -keyout alice.key -out alice.csr -nodes \
-    -subj "/CN=alice@example.com"
-openssl x509 -req -in alice.csr -CA ca.pem -CAkey ca.key \
-    -CAcreateserial -out alice.pem -days 365
+# SHA-256 fingerprint to set as server_cert_fingerprint
+openssl x509 -in server.pem -outform DER | sha256sum | awk '{print $1}'
 ```
 
-Distribute `ca.pem` to every operator's workstation, install
-`agent.pem`/`agent.key` on each managed endpoint, and give each operator
-their own client cert/key pair.
+Set `tls_cert_path` and `tls_key_path` in `orchestra-server.toml`.
 
 ---
 
 ## 4. Deploying the agent
 
-Currently the agent is consumed as a library; embed it in a small wrapper
-binary you build for your own organization. The wrapper is responsible for
-configuring the listener and supplying the TLS credentials. A reference
-launcher implementation is described in `docs/DESIGN.md` §"Agent Launcher
-and In-Memory Deployment".
+The supported packaged deployment path is an outbound agent built with
+`features = ["outbound-c"]`. The agent dials the Control Center's
+`agent_addr`, authenticates with `agent_shared_secret`, and pins the server
+certificate when `server_cert_fingerprint` is present.
 
-A minimal `~/.config/orchestra/agent.toml` looks like:
+Use the setup wizard for an end-to-end local deployment:
 
-```toml
-allowed_paths = ["/var/log", "/etc/orchestra", "/home"]
-heartbeat_interval_secs = 30
-persistence_enabled = false
-module_repo_url = "https://updates.internal.example.com/modules"
-# module_signing_key = "<base64 AES-256 key>"
+```bash
+./scripts/setup.sh
 ```
 
-If the file does not exist the agent uses safe defaults.
+Or write a profile by hand:
+
+```toml
+target_os         = "linux"
+target_arch       = "x86_64"
+c2_address        = "10.0.0.5:8444"
+encryption_key    = "<base64-32-bytes>"
+c_server_secret   = "<same as agent_shared_secret>"
+server_cert_fingerprint = "<sha256-der-fingerprint>"
+features          = ["outbound-c"]
+package           = "agent"
+bin_name          = "agent-standalone"
+```
+
+Then build:
+
+```bash
+cargo run --release -p builder -- build my_agent
+```
+
+The Builder writes `dist/<profile>.enc` unless `output_name` overrides the
+filename.
 
 ---
 
-## 5. Basic commands
+## 5. Basic operations
 
-```bash
-# TCP + pre-shared key (development)
-console --target 10.0.0.5:7890 --key $(cat orchestra.key) ping
+Open the dashboard at `https://<server>:<http_port>/`, authenticate with
+`admin_token`, then select a connected agent and submit an approved command.
+The stock `agent-standalone` binary does not listen for direct console
+connections.
 
-# mTLS (production)
-console --target agent.example.com:7890 --tls \
-        --ca-cert ca.pem \
-        --client-cert alice.pem --client-key alice.key \
-        info
-```
+Common command families:
 
-| Subcommand                           | Description                                                  |
-|--------------------------------------|--------------------------------------------------------------|
-| `ping`                               | Round-trip liveness check                                    |
-| `info`                               | OS, hostname, CPU, memory, process count                     |
-| `shell`                              | Interactive PTY session                                      |
-| `upload <local> <remote>`            | Push a file (subject to `allowed_paths`)                     |
-| `download <remote> <local>`          | Pull a file                                                  |
-| `deploy <module-name>`               | Fetch + verify + load a capability plugin                    |
-| `reload-config`                      | Re-read `agent.toml` without restarting                      |
-| `discover`                           | LAN/host enumeration on the agent's network segment          |
-| `screenshot [--out FILE]`            | Capture and save the primary display (`screenshot.png`)      |
-| `key <K>` / `key --repl`             | Single key press, or stdin REPL (one key per line)           |
-| `mouse X Y` / `mouse --repl`         | Mouse move, or stdin REPL (`x y` pairs per line)             |
-| `hci-start` / `hci-stop`             | Start or stop the Bluetooth HCI log buffer                   |
-| `hci-log`                            | Drain buffered HCI events                                    |
-| `persist-enable` / `persist-disable` | Install or remove the agent's auto-start service             |
-| `list-procs`                         | JSON snapshot of the running process table                   |
-| `migrate <pid>`                      | Migrate the agent into `<pid>` via Windows process hollowing |
+| Command family | Purpose |
+|----------------|---------|
+| `Ping`, `GetSystemInfo` | Liveness and inventory. |
+| File operations | Read/write within configured `allowed_paths`. |
+| Approved scripts | Run administrator-approved maintenance tasks. |
+| Module deployment | Fetch, verify, and load signed capability modules. |
+| Optional features | Persistence, network discovery, remote assistance, and HCI research only when compiled in and authorized. |
 
 ---
 
@@ -141,85 +124,52 @@ console --target agent.example.com:7890 --tls \
 
 ### 6.1 Plugin deployment
 
-Plugins are signed shared libraries decrypted and loaded entirely in
-process memory (`memfd_create` on Linux, mapped file on Windows/macOS).
-See `docs/DESIGN.md` §"Secure Module Loading".
+Plugins are signed shared libraries decrypted and loaded in process memory.
+See `docs/DESIGN.md` for the module-loader design.
 
 ### 6.2 Persistence (opt-in)
 
-Enable with `persistence_enabled = true` in `agent.toml`. The agent will
-install a per-user systemd unit (Linux) or a scheduled task (Windows) at
-startup. Disable by setting the flag to `false` and re-running
-`reload-config`.
+Enable with `persistence_enabled = true` in `agent.toml`. The agent installs
+a per-user systemd unit, launchd entry, or scheduled task depending on the
+platform. Disable by setting the flag to `false` and reloading config.
 
 ### 6.3 Remote assistance (opt-in, consent-gated)
 
 Compile the agent with `--features remote-assist`. Input simulation is
-**only** permitted while the consent file
-`/var/run/orchestra-consent` (Linux) or registry value
-`HKLM\Software\Orchestra\Consent` (Windows) exists.
+permitted only while the platform consent marker is present.
 
 ### 6.4 Network discovery (opt-in)
 
-Compile with `--features network-discovery`.  Adds the `DiscoverNetwork`
-command, which returns ARP-table entries for the local segment parsed
-directly from `/proc/net/arp` (Linux) or from `arp -a` on other
-platforms.  A separate TCP-based "ping sweep" is available via the
-`net_discovery` module API for automated inventory tasks.  Only complete
-ARP entries (flag `0x2` on Linux) are returned; incomplete and static
-placeholder entries are skipped.
+Compile with `--features network-discovery`. The agent reports local network
+inventory for authorized troubleshooting and asset management.
 
 ### 6.5 Forward secrecy (opt-in)
 
-Compile with `--features forward-secrecy`.  Before any application
-message is sent, the agent and server perform an ephemeral X25519 key
-exchange (see `C_SERVER.md` §"Forward secrecy").  This ensures that a
-passive observer who later learns the pre-shared secret cannot decrypt
-previously recorded traffic.
-
-### 6.6 HCI logging (opt-in, research builds)
-
-Compile with `--features hci-research`.  Logs key-press *timestamps*
-(no content) and active window titles to a bounded ring buffer.  Must
-be explicitly started with `StartHciLogging` and is disabled on every
-restart.  Use only in compliance with applicable privacy regulations and
-with explicit written consent from the affected users.
+Compile both agent and server with `--features forward-secrecy` to add an
+ephemeral X25519 key exchange before application messages.
 
 ---
 
-## 7. Encryption keys and the Builder
+## 7. Key management
 
-The Builder (`orchestra-builder configure`) generates a
-**cryptographically random 32-byte AES-256 key** using `/dev/urandom`
-and stores it as base64 in the profile TOML.  You should never copy a
-key from an example, documentation, or test file into a production
-profile.
-
-The Builder will emit a `WARN`-level log message during `build` if it
-detects an obviously weak key (all-zero bytes, all-identical bytes, or
-sequential bytes).  That warning is a hard signal to regenerate the key
-before deploying:
+Profiles store an AES-256 key for payload encryption. The Builder accepts a
+base64 key or `file:/path/to/key.bin` and warns about obvious placeholders.
 
 ```bash
 cargo run --release -p builder -- configure --name my-profile
-# -> generates a random key automatically
 cargo run --release -p builder -- build my-profile
 ```
 
-To regenerate only the key for an existing profile:
-
-```bash
-cargo run --release -p builder -- key-rotate my-profile
-```
+Keep `c_server_secret`, `admin_token`, and payload encryption keys out of
+source control.
 
 ---
 
 ## 8. Audit logging and monitoring
 
-Every command produces an `AuditEvent` that is delivered to the console as
-a separate `AuditLog` message and appended to `audit.log` (JSON-lines).
-The `user` field contains the operator identity propagated from the Control
-Center session (or `"admin"` for direct console connections).
+Every command produces an `AuditEvent` appended to the Control Center audit
+log. The `user` field contains the authenticated Control Center operator.
+
 Sample entry:
 
 ```json
@@ -228,168 +178,74 @@ Sample entry:
  "outcome":"Success"}
 ```
 
-Pipe `audit.log` into your SIEM of choice (Splunk, Elastic, Loki, …).
+Forward the JSONL audit log to your SIEM.
 
 ---
 
 ## 9. Troubleshooting
 
-| Symptom                                        | Likely cause                                                       |
-|-----------------------------------------------|--------------------------------------------------------------------|
-| `connection refused`                          | Agent not listening, firewall, or wrong port                       |
-| `AES-GCM authentication failed`               | Pre-shared key mismatch                                            |
-| `tls handshake failure: unknown ca`           | `--ca-cert` does not match the cert that signed the agent          |
-| `Path is not under any allowed root`          | Add the directory to `allowed_paths` in `agent.toml`               |
-| Plugin load fails with `ELF magic`            | Plugin built for the wrong target triple                           |
+| Symptom | Likely cause |
+|---------|--------------|
+| `connection refused` | Control Center agent port unreachable, firewall, or wrong port. |
+| `AES-GCM authentication failed` | Pre-shared key mismatch. |
+| `tls handshake failure` | Server certificate pin mismatch or TLS material problem. |
+| `Path is not under any allowed root` | Add the directory to `allowed_paths` in `agent.toml`. |
+| Plugin load fails with `ELF magic` | Plugin built for the wrong target triple. |
 
-For deeper diagnostics, run the agent wrapper with
-`RUST_LOG=debug,orchestra=trace` and check `audit.log` on the console
-side.
+For deeper diagnostics, run agent and server with
+`RUST_LOG=debug,orchestra=trace` and inspect the server audit log.
 
 ---
 
-## 10. Trusted Execution Environment Enforcement
+## 10. Environment validation
 
-Orchestra can abort startup if the agent detects it is running in an
-untrustworthy environment — a debugger, a hypervisor, or a domain it was not
-provisioned for.  This feature is intended for deployments where an operator
-needs confidence that a captured binary cannot be trivially reverse-engineered
-in an instrumented sandbox.
-
-### Configuration knobs
-
-Add either or both of the following keys to `agent.toml`:
+The `env-validation` Cargo feature collects startup environment signals and,
+when explicitly configured, can refuse startup on selected policy violations.
+Defaults are low-false-positive: VM, tracer-process, debugger, timing, and
+sandbox signals are informational unless a matching config knob is enabled.
 
 ```toml
-# Only start normally if the machine's DNS/AD domain matches this string
-# (case-insensitive).  Leave unset to skip the domain check.
+# Only start normally if the machine's DNS/AD domain matches this string.
+# Leave unset to skip the domain check.
 required_domain = "corp.example.com"
 
-# If true the agent enters dormant mode when a hypervisor is detected.
-# If false (the default) a VM is allowed — useful if you deploy agents
-# inside your own virtual estate.
+# Refuse startup when a hypervisor is detected. Defaults to false because many
+# legitimate enterprise endpoints are virtualized.
 refuse_in_vm = false
+
+# Refuse only when a debugger is attached to the agent process itself.
+# Unrelated same-user processes named gdb/strace remain informational.
+refuse_when_debugged = false
+
+# Optional combined sandbox score threshold. Leave unset to make the score
+# telemetry-only.
+sandbox_score_threshold = 80
 ```
 
-### What the enforcement module checks
+| Signal | Enforcement behavior |
+|--------|----------------------|
+| Domain mismatch | Refuses only when `required_domain` is set and does not match. |
+| Debugger attached | Refuses only when `refuse_when_debugged = true`. |
+| VM/cloud indicators | Refuses only when `refuse_in_vm = true`. |
+| Sandbox score | Refuses only when `sandbox_score_threshold` is set and met. |
+| Tracer process names | Informational; unrelated same-user `gdb`/`strace` processes do not refuse startup. |
 
-| Check | Method |
-|-------|--------|
-| **Debugger present** | Linux: reads `TracerPid` from `/proc/self/status`; Windows: `IsDebuggerPresent()`, PEB.BeingDebugged, and PEB.NtGlobalFlag via inline assembly. |
-| **Hypervisor / VM** | CPUID hypervisor bit (leaf 1, ECX bit 31); Linux: DMI strings (`vmware`, `virtualbox`, `kvm`, `qemu`, `xen`, `hyper-v`) from `/sys/class/dmi/id/`; Windows: registry entries under `HKLM\SYSTEM\CurrentControlSet\Services\{vmci,vboxguest,xen}`; MAC OUI prefixes associated with known VM vendors. |
-| **Domain match** | Case-insensitive string comparison against `USERDNSDOMAIN` (Windows), `HKLM\…\Tcpip\Parameters\Domain` (Windows registry), or `/proc/sys/kernel/domainname` (Linux). |
-
-### Dormant state
-
-If any active check fails the agent logs a single error line and enters a
-dormant sleep loop (waking every 3600 s, doing nothing) rather than exiting.
-A sleeping process attracts less scrutiny than one that terminates with a
-non-zero exit code.
-
-```
-[ERROR] environment check failed — entering dormant state
-```
-
-Normal startup is logged at `INFO` level:
-
-```
-[INFO]  environment check passed (debugger=false vm=false domain=Some(true))
-```
-
-### Integration with the Builder
-
-The `env-validation` Cargo feature enables the enforcement at compile time.
-Enable it in your profile to bake the check into a payload:
-
-```sh
-orchestra-builder configure --name hardened_windows
-# → select `env-validation` in the feature picker
-orchestra-builder build hardened_windows
-```
-
-`required_domain` and `refuse_in_vm` are runtime config; they do not need to
-be set at build time.
+If a configured refusal policy fails, the agent logs an error and enters a
+dormant sleep loop rather than continuing management actions.
 
 ---
 
-## 11. Reporting security issues
+## 11. Transport compatibility
 
-Please email `security@example.com` with reproduction steps. Do **not**
-file public issues for unfixed vulnerabilities.
+The supported agent transport is the outbound Control Center channel:
+`agent-standalone` connects to `orchestra-server`, validates TLS with
+certificate pinning when configured, then uses the authenticated message
+protocol. The `traffic-normalization` feature remains an experimental library
+compatibility flag and is not a documented deployment mode for stock agents.
 
 ---
 
-## Network Compatibility Layer
+## 12. Reporting security issues
 
-Some corporate networks deploy **deep packet inspection (DPI)** middleboxes
-that flag, throttle, or drop opaque encrypted traffic. Orchestra ships with
-an optional traffic normalization layer that frames its already‑encrypted
-wire bytes as TLS 1.2 application‑data records, so such middleboxes will
-classify the flow as ordinary TLS.
-
-The layer lives in [`common::normalized_transport`](../common/src/normalized_transport.rs)
-and is selected per agent via the `traffic_profile` field in `agent.toml`:
-
-```toml
-# ~/.config/orchestra/agent.toml
-
-# "raw" (default) — length‑prefixed AES‑GCM ciphertext.
-# "tls"           — wrap each record as a TLS 1.2 application_data record
-#                   (0x17 0x03 0x03 <len>) and perform a fake
-#                   ClientHello/ServerHello handshake at connect time.
-traffic_profile = "tls"
-```
-
-### What gets sent on the wire
-
-With `traffic_profile = "tls"` the agent and controller exchange:
-
-1. A `ClientHello` (record type `0x16`, version `0x0303`, handshake type `0x01`)
-   carrying a 32‑byte random, a random session id, the cipher suites
-   `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`,
-   `TLS_CHACHA20_POLY1305_SHA256`, and a random extensions blob.
-2. A symmetric `ServerHello` (handshake type `0x02`).
-3. Subsequent application messages, each as one TLS 1.2 application‑data
-   record: `0x17 0x03 0x03 <u16 length> <u16 pad_len> <pad> <ciphertext>`.
-
-The pad length is uniformly random in `[0, 64]` bytes per record so the
-record‑size distribution matches real TLS sessions rather than the
-fixed‑shape distribution of the underlying serialized messages.
-
-> **Security note.** The normalization layer is for traffic *classification*,
-> not confidentiality. Message confidentiality and integrity are still
-> provided by the inner AES‑GCM session (`CryptoSession`). The fake
-> handshake is intentionally not validated by the peer beyond its wire
-> structure — both sides know they are not actually negotiating TLS.
-
-### Self‑verification with `tcpdump` / Wireshark
-
-The included unit tests in `common/src/normalized_transport.rs` assert that
-the on‑wire bytes have the exact byte‑for‑byte structure of TLS 1.2
-records, which is the same heuristic Wireshark uses to classify a flow as
-`tls`. To verify on a live link:
-
-```bash
-# On the agent host (root required for raw capture).
-sudo tcpdump -i any -w /tmp/orchestra.pcap 'host <controller-ip> and port 8443'
-
-# Run a few commands from the console, then stop the capture.
-
-# Confirm Wireshark/tshark classifies the flow as TLS.
-tshark -r /tmp/orchestra.pcap -Y tls -T fields \
-       -e _ws.col.Protocol -e tls.record.content_type -e tls.handshake.type \
-   | head
-```
-
-Expected output with `traffic_profile = "tls"`:
-
-```text
-TLS  22  1   <- handshake / ClientHello
-TLS  22  2   <- handshake / ServerHello
-TLS  23      <- application_data
-TLS  23      <- application_data
-...
-```
-
-The Protocol column reports `TLS`, confirming Wireshark classifies the flow
-as TLS based purely on its byte structure.
+Please email `security@example.com` with reproduction steps. Do **not** file
+public issues for unfixed vulnerabilities.

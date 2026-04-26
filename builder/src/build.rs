@@ -7,21 +7,13 @@ use tracing::{info, warn};
 
 use crate::config::{partition_features, read_agent_features, PayloadConfig};
 
-
 /// Build the agent for the given profile and return the raw binary bytes.
 pub fn build_agent_for_profile(cfg: &PayloadConfig) -> Result<Vec<u8>> {
     let triple = cfg.target_triple()?;
     let package = cfg.package.as_str();
+    let bin_name = cfg.bin_name.as_deref().unwrap_or(package);
 
-    let available = read_agent_features().unwrap_or_default();
-    let (effective_features, unknown_features) = if available.is_empty() {
-        (cfg.features.clone(), Vec::new())
-    } else {
-        partition_features(&cfg.features, &available)
-    };
-    for f in &unknown_features {
-        warn!("profile feature `{f}` is not declared in agent/Cargo.toml; ignoring it");
-    }
+    let effective_features = features_for_package(package, &cfg.features)?;
 
     let mut extra_env: Vec<(String, String)> = Vec::new();
     if effective_features.iter().any(|f| f == "outbound-c") {
@@ -39,17 +31,47 @@ pub fn build_agent_for_profile(cfg: &PayloadConfig) -> Result<Vec<u8>> {
         }
     }
 
-    let bin_name = cfg.bin_name.as_deref().unwrap_or(package);
-
     info!(target_triple = %triple, package, bin = %bin_name, "Building agent payload");
     let bin_path = cargo_build(package, bin_name, &triple, &effective_features, &extra_env)?;
 
-    if let Err(e) = strip_if_available(&bin_path) {
+    if let Err(e) = strip_if_available(&bin_path, &triple) {
         warn!("strip step skipped: {e:#}");
     }
 
     std::fs::read(&bin_path)
         .with_context(|| format!("Failed to read built binary {}", bin_path.display()))
+}
+
+fn features_for_package(package: &str, requested: &[String]) -> Result<Vec<String>> {
+    match package {
+        "agent" => {
+            let available = read_agent_features().unwrap_or_default();
+            let (effective_features, unknown_features) = if available.is_empty() {
+                (requested.to_vec(), Vec::new())
+            } else {
+                partition_features(requested, &available)
+            };
+            if !unknown_features.is_empty() {
+                anyhow::bail!(
+                    "profile references feature(s) not declared in agent/Cargo.toml: {}",
+                    unknown_features.join(", ")
+                );
+            }
+            Ok(effective_features)
+        }
+        "launcher" => {
+            if !requested.is_empty() {
+                anyhow::bail!(
+                    "profile package `launcher` does not declare Cargo features; requested agent feature(s): {}. Set package = \"agent\" and bin_name = \"agent-standalone\" for outbound agents.",
+                    requested.join(", ")
+                );
+            }
+            Ok(Vec::new())
+        }
+        other => anyhow::bail!(
+            "unsupported payload package `{other}`; supported packages are `agent` and `launcher`"
+        ),
+    }
 }
 
 /// Run `cargo build --release` for the specified package and target.
@@ -87,14 +109,36 @@ fn cargo_build(
         return Err(anyhow!("cargo build for {package} failed"));
     }
 
-    // The final binary is in `target/<triple>/release/<bin_name>`.
-    let path = Path::new("target").join(triple).join("release").join(bin);
+    // The final binary is in `target/<triple>/release/<bin_name>[.exe]`.
+    let artifact_name = if triple.contains("windows") {
+        format!("{bin}.exe")
+    } else {
+        bin.to_string()
+    };
+    let path = Path::new("target")
+        .join(triple)
+        .join("release")
+        .join(artifact_name);
+    if !path.exists() {
+        anyhow::bail!("expected built binary at {}", path.display());
+    }
     Ok(path)
 }
 
-/// Run `strip` on the binary if the tool is available.
-fn strip_if_available(path: &Path) -> Result<()> {
-    let strip = which::which("strip").map_err(|e| anyhow!("`strip` not on PATH: {e}"))?;
+/// Run a target-compatible `strip` on the binary if the tool is available.
+fn strip_if_available(path: &Path, triple: &str) -> Result<()> {
+    let host = host_triple();
+    let is_cross_target = host.as_deref() != Some(triple);
+    let strip = if triple.contains("windows") {
+        which::which(format!("{triple}-strip"))
+            .or_else(|_| which::which("x86_64-w64-mingw32-strip"))
+            .map_err(|_| anyhow!("no Windows-compatible strip tool on PATH"))?
+    } else if is_cross_target {
+        which::which(format!("{triple}-strip"))
+            .map_err(|_| anyhow!("no target-compatible {triple}-strip tool on PATH"))?
+    } else {
+        which::which("strip").map_err(|e| anyhow!("`strip` not on PATH: {e}"))?
+    };
     info!("Stripping binary with {}", strip.display());
     let status = Command::new(strip)
         .arg(path)
@@ -104,4 +148,33 @@ fn strip_if_available(path: &Path) -> Result<()> {
         warn!("strip command failed");
     }
     Ok(())
+}
+
+fn host_triple() -> Option<String> {
+    let output = Command::new("rustc").arg("-vV").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launcher_rejects_agent_features() {
+        let requested = vec!["persistence".to_string()];
+        let err = features_for_package("launcher", &requested).unwrap_err();
+        assert!(err.to_string().contains("launcher"));
+    }
+
+    #[test]
+    fn unsupported_package_is_rejected() {
+        let err = features_for_package("not-a-package", &[]).unwrap_err();
+        assert!(err.to_string().contains("unsupported payload package"));
+    }
 }

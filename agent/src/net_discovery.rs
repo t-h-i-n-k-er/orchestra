@@ -9,7 +9,7 @@
 
 #![cfg(feature = "network-discovery")]
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 use tokio::net::TcpStream;
 
@@ -155,12 +155,23 @@ pub async fn ping_sweep(
     timeout: Duration,
     max_concurrent: usize,
 ) -> Result<Vec<IpAddr>, String> {
+    const PROBE_PORTS: &[u16] = &[80, 443, 22, 7];
+    ping_sweep_with_ports(subnet, PROBE_PORTS, timeout, max_concurrent).await
+}
+
+/// Probe a subnet using caller-provided ports. This is primarily useful for
+/// deterministic tests and tightly-scoped inventory checks.
+pub async fn ping_sweep_with_ports(
+    subnet: &str,
+    ports: &[u16],
+    timeout: Duration,
+    max_concurrent: usize,
+) -> Result<Vec<IpAddr>, String> {
     let targets = subnet_hosts(subnet)?;
     if targets.is_empty() {
         return Ok(vec![]);
     }
 
-    const PROBE_PORTS: &[u16] = &[80, 443, 22, 7];
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
     let mut handles = Vec::with_capacity(targets.len());
 
@@ -170,8 +181,9 @@ pub async fn ping_sweep(
             .acquire_owned()
             .await
             .map_err(|e| e.to_string())?;
+        let ports = ports.to_vec();
         let handle = tokio::spawn(async move {
-            let live = probe_host(ip, PROBE_PORTS, timeout).await;
+            let live = probe_host(ip, &ports, timeout).await;
             drop(permit);
             if live {
                 Some(ip)
@@ -206,30 +218,80 @@ async fn probe_host(ip: IpAddr, ports: &[u16], timeout: Duration) -> bool {
     false
 }
 
-/// Enumerate the host addresses within a subnet string such as
-/// `"192.168.1.0/24"` or `"10.0.0"`.
+/// Enumerate the IPv4 host addresses within a subnet string such as
+/// `"192.168.1.0/24"` or a bare `/24` prefix like `"10.0.0"`.
 ///
-/// Only IPv4 `/24` sweeps are supported (hosts `.1`–`.254`).
+/// Prefixes broader than `/20` are rejected to avoid accidental wide network
+/// scans from a typo. `/31` and `/32` are treated per RFC 3021/host-route
+/// semantics and include all addresses in the range.
 fn subnet_hosts(subnet: &str) -> Result<Vec<IpAddr>, String> {
-    // Strip CIDR suffix — we only handle /24 for now.
-    let base = subnet
-        .split('/')
-        .next()
-        .unwrap_or(subnet)
-        .trim_end_matches('.');
+    const MAX_HOSTS: u32 = 4096;
+
+    let subnet = subnet.trim();
+    if let Some((addr, prefix)) = subnet.split_once('/') {
+        let base: Ipv4Addr = addr
+            .parse()
+            .map_err(|e| format!("invalid IPv4 CIDR address '{addr}': {e}"))?;
+        let prefix: u32 = prefix
+            .parse()
+            .map_err(|e| format!("invalid CIDR prefix '{prefix}': {e}"))?;
+        if prefix > 32 {
+            return Err(format!("CIDR prefix must be <= 32; got {prefix}"));
+        }
+        let mask = if prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix)
+        };
+        let network = u32::from(base) & mask;
+        let broadcast = network | !mask;
+        let (first, last) = match prefix {
+            0..=20 => {
+                return Err(format!(
+                    "CIDR prefix /{prefix} contains too many hosts for a bounded sweep"
+                ));
+            }
+            21..=30 => (network + 1, broadcast.saturating_sub(1)),
+            31 | 32 => (network, broadcast),
+            _ => unreachable!(),
+        };
+        if last < first {
+            return Ok(Vec::new());
+        }
+        let count = last - first + 1;
+        if count > MAX_HOSTS {
+            return Err(format!(
+                "CIDR range contains {count} hosts, exceeding safety cap {MAX_HOSTS}"
+            ));
+        }
+        return Ok((first..=last)
+            .map(|raw| IpAddr::V4(Ipv4Addr::from(raw)))
+            .collect());
+    }
+
+    let base = subnet.trim_end_matches('.');
     let parts: Vec<&str> = base.split('.').collect();
-    if parts.len() < 3 {
+    if parts.len() != 3 {
         return Err(format!(
-            "subnet must have at least 3 octets; got '{subnet}'"
+            "subnet must be CIDR notation or exactly 3 octets for a /24 prefix; got '{subnet}'"
         ));
     }
-    let prefix = format!("{}.{}.{}", parts[0], parts[1], parts[2]);
+    let octets = [
+        parts[0]
+            .parse::<u8>()
+            .map_err(|e| format!("invalid first octet: {e}"))?,
+        parts[1]
+            .parse::<u8>()
+            .map_err(|e| format!("invalid second octet: {e}"))?,
+        parts[2]
+            .parse::<u8>()
+            .map_err(|e| format!("invalid third octet: {e}"))?,
+    ];
     let mut hosts = Vec::with_capacity(254);
     for i in 1u8..=254 {
-        let addr: IpAddr = format!("{prefix}.{i}")
-            .parse()
-            .map_err(|e| format!("invalid address: {e}"))?;
-        hosts.push(addr);
+        hosts.push(IpAddr::V4(Ipv4Addr::new(
+            octets[0], octets[1], octets[2], i,
+        )));
     }
     Ok(hosts)
 }
@@ -293,7 +355,7 @@ pub fn reverse_dns_lookup(ip: IpAddr) -> Result<Option<String>, String> {
     // the first string-representation element when a PTR record exists.
     let addr = std::net::SocketAddr::new(ip, 0);
     match addr.to_socket_addrs() {
-        Ok(mut addrs) => {
+        Ok(addrs) => {
             // to_socket_addrs() on an already-resolved SocketAddr returns the
             // address unchanged; we need to go through the DNS stack.  Use
             // the hostname-form by formatting the address as "ip:0" and
@@ -358,7 +420,7 @@ pub fn reverse_dns_lookup(ip: IpAddr) -> Result<Option<String>, String> {
             Ok(None)
         }
         Ok(_) => Ok(None),
-        Err(e) => Err(format!("reverse_dns_lookup: {e}")),
+        Err(_) => Ok(None),
     }
 }
 
@@ -418,6 +480,25 @@ mod tests {
     }
 
     #[test]
+    fn subnet_hosts_honors_small_cidr_ranges() {
+        let hosts = subnet_hosts("10.0.0.8/30").unwrap();
+        assert_eq!(
+            hosts,
+            vec![
+                "10.0.0.9".parse::<IpAddr>().unwrap(),
+                "10.0.0.10".parse::<IpAddr>().unwrap()
+            ]
+        );
+        let host_route = subnet_hosts("10.0.0.42/32").unwrap();
+        assert_eq!(host_route, vec!["10.0.0.42".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn subnet_hosts_rejects_overbroad_cidr() {
+        assert!(subnet_hosts("10.0.0.0/16").is_err());
+    }
+
+    #[test]
     fn subnet_hosts_parses_bare_prefix() {
         let hosts = subnet_hosts("192.168.1").unwrap();
         assert_eq!(hosts.len(), 254);
@@ -463,19 +544,15 @@ mod tests {
 
     #[tokio::test]
     async fn ping_sweep_finds_localhost() {
-        // 127.0.0.x — only .1 should be reachable (loopback).
-        // We spin up a listener on 127.0.0.1:9878 and verify that address
-        // appears in the sweep results.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:9878")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             loop {
                 let _ = listener.accept().await;
             }
         });
 
-        let result = ping_sweep("127.0.0.1/24", Duration::from_millis(200), 50)
+        let result = ping_sweep_with_ports("127.0.0.1/32", &[port], Duration::from_millis(200), 4)
             .await
             .unwrap();
         // The loopback listener we started should be discovered.

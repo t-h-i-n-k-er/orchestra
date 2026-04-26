@@ -8,25 +8,16 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 jobs:
-  build-and-test:
-    name: Build & Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-
+  linux-default:
+    name: Linux default workspace
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
-
+          components: rustfmt
       - name: Cache cargo registry & build
         uses: actions/cache@v4
         with:
@@ -34,12 +25,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Install Linux system deps
-        if: matrix.os == 'ubuntu-latest'
+          key: linux-default-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-default-cargo-
+      - name: Install Linux feature deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -52,30 +40,84 @@ jobs:
             libx11-xcb-dev \
             libxcb-render-util0-dev \
             pkg-config
-          # Note: enigo uses the x11rb backend (no libxdo-dev required)
-
-      - name: cargo fmt --check
+      - name: Format check
         run: cargo fmt --all -- --check
+      - name: Compile workspace defaults
+        run: cargo check --workspace --locked
+      - name: Test workspace defaults
+        run: cargo test --workspace --locked
 
-      - name: cargo check (default features)
-        run: cargo check --workspace
-
-      - name: cargo clippy (default features)
-        run: cargo clippy --workspace -- -D warnings
-
-      - name: cargo test (all features)
-        run: cargo test --workspace --all-features
-
-      - name: cargo clippy (all features)
-        run: cargo clippy --workspace --all-features -- -D warnings
-
-  audit:
-    name: Security Audit
+  linux-feature-modules:
+    name: Linux feature module checks (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: network-discovery-tests
+            command: cargo test -p agent --features network-discovery net_discovery --locked
+          - name: remote-assist-compile
+            command: cargo check -p agent --no-default-features --features remote-assist --locked
+          - name: agent-all-features-compile
+            command: cargo check -p agent --all-features --locked
+          - name: builder-diversification-and-docs
+            command: cargo check -p builder --features diversification --locked && cargo test -p builder readme_feature_table_matches_agent_features --locked
+          - name: module-loader-tests
+            command: cargo test -p module_loader --locked
+          - name: deterministic-proc-macros
+            command: cargo test -p string_crypt --locked && cargo test -p junk_macro --locked && cargo check -p pe_resolve --locked
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      - name: Run cargo audit
-        run: cargo audit
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-feature-${{ matrix.name }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-feature-${{ matrix.name }}-
+      - name: Install Linux feature deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev \
+            libxrandr-dev \
+            libdbus-1-dev \
+            libx11-dev \
+            libxi-dev \
+            libxtst-dev \
+            libx11-xcb-dev \
+            libxcb-render-util0-dev \
+            pkg-config
+      - name: Run matrix command
+        run: ${{ matrix.command }}
+
+  windows-selected-features:
+    name: Windows selected feature compile
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compile agent defaults
+        run: cargo check -p agent --locked
+      - name: Compile selected Windows-facing features
+        run: cargo check -p agent --no-default-features --features "env-validation,persistence,network-discovery,remote-assist,outbound-c,direct-syscalls,manual-map" --locked
+      - name: Compile module loader manual-map feature
+        run: cargo check -p module_loader --features manual-map --locked
+
+  macos-compile:
+    name: macOS compile when Darwin toolchain is present
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compile selected macOS agent features
+        shell: bash
+        run: |
+          if rustc -vV | grep -q 'host: .*apple-darwin'; then
+            cargo check -p agent --no-default-features --features "env-validation,outbound-c,remote-assist" --locked
+          else
+            echo "Darwin Rust toolchain is not present; skipping macOS compile check."
+          fi

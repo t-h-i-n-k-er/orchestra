@@ -1,7 +1,7 @@
 // Optimizer
+use iced_x86::{Code, Decoder, DecoderOptions, Encoder, Instruction, OpKind, Register};
 use rand::seq::SliceRandom;
 use rand::{thread_rng, Rng};
-use iced_x86::{Code, Decoder, DecoderOptions, Encoder, Instruction, OpKind, Register};
 
 pub trait Pass {
     fn run(&self, instrs: &mut Vec<Instruction>);
@@ -112,19 +112,30 @@ impl Pass for NopInsertionPass {
 /// the leading opcode byte(s).
 fn is_block_terminator(ins: &Instruction) -> bool {
     let mut enc = Encoder::new(64);
-    if enc.encode(ins, 0).is_err() { return false; }
+    if enc.encode(ins, 0).is_err() {
+        return false;
+    }
     let bytes = enc.take_buffer();
-    if bytes.is_empty() { return false; }
+    if bytes.is_empty() {
+        return false;
+    }
     // Skip legacy prefixes / REX to find the real opcode
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        if matches!(b, 0x26|0x2E|0x36|0x3E|0x64|0x65|0x66|0x67|0xF0|0xF2|0xF3) || (b & 0xF0 == 0x40) {
-            i += 1; continue;
+        if matches!(
+            b,
+            0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3
+        ) || (b & 0xF0 == 0x40)
+        {
+            i += 1;
+            continue;
         }
         break;
     }
-    if i >= bytes.len() { return false; }
+    if i >= bytes.len() {
+        return false;
+    }
     let b0 = bytes[i];
     match b0 {
         // ret near/far, iret
@@ -167,7 +178,11 @@ impl Pass for InstructionSchedulingPass {
         let mut rng = thread_rng();
         for block in &mut blocks {
             // Keep the terminator pinned at the end; shuffle the body only.
-            let body_end = if block.last().map(|i| is_block_terminator(i)).unwrap_or(false) {
+            let body_end = if block
+                .last()
+                .map(|i| is_block_terminator(i))
+                .unwrap_or(false)
+            {
                 block.len() - 1
             } else {
                 block.len()
@@ -244,9 +259,7 @@ impl Pass for InstructionSubstitutionPass {
 fn try_substitute(ins: &Instruction, rng: &mut impl Rng) -> Option<Instruction> {
     match ins.code() {
         // ADD r/m64, 1  →  INC r/m64
-        Code::Add_rm64_imm8
-            if ins.op0_kind() == OpKind::Register && ins.immediate8() == 1 =>
-        {
+        Code::Add_rm64_imm8 if ins.op0_kind() == OpKind::Register && ins.immediate8() == 1 => {
             Instruction::with1(Code::Inc_rm64, ins.op0_register()).ok()
         }
         // INC r/m64  →  ADD r/m64, 1  (restores CF behaviour)
@@ -254,9 +267,7 @@ fn try_substitute(ins: &Instruction, rng: &mut impl Rng) -> Option<Instruction> 
             Instruction::with2(Code::Add_rm64_imm8, ins.op0_register(), 1u32).ok()
         }
         // SUB r/m64, 1  →  DEC r/m64
-        Code::Sub_rm64_imm8
-            if ins.op0_kind() == OpKind::Register && ins.immediate8() == 1 =>
-        {
+        Code::Sub_rm64_imm8 if ins.op0_kind() == OpKind::Register && ins.immediate8() == 1 => {
             Instruction::with1(Code::Dec_rm64, ins.op0_register()).ok()
         }
         // DEC r/m64  →  SUB r/m64, 1
@@ -281,9 +292,7 @@ fn try_substitute(ins: &Instruction, rng: &mut impl Rng) -> Option<Instruction> 
             Instruction::with2(Code::Sub_r64_rm64, r, r).ok()
         }
         // AND r64, 0  →  XOR r64, r64  (both zero reg; flag effects identical)
-        Code::And_rm64_imm8
-            if ins.op0_kind() == OpKind::Register && ins.immediate8() == 0 =>
-        {
+        Code::And_rm64_imm8 if ins.op0_kind() == OpKind::Register && ins.immediate8() == 0 => {
             let r = ins.op0_register();
             Instruction::with2(Code::Xor_r64_rm64, r, r).ok()
         }
@@ -296,9 +305,7 @@ fn try_substitute(ins: &Instruction, rng: &mut impl Rng) -> Option<Instruction> 
             Instruction::with2(Code::Cmp_rm64_imm8, ins.op0_register(), 0i32).ok()
         }
         // CMP r64, 0  →  TEST r64, r64
-        Code::Cmp_rm64_imm8
-            if ins.op0_kind() == OpKind::Register && ins.immediate8() == 0 =>
-        {
+        Code::Cmp_rm64_imm8 if ins.op0_kind() == OpKind::Register && ins.immediate8() == 0 => {
             let r = ins.op0_register();
             Instruction::with2(Code::Test_rm64_r64, r, r).ok()
         }
@@ -328,8 +335,13 @@ impl Pass for OpaqueDeadCodePass {
     fn run(&self, instrs: &mut Vec<Instruction>) {
         // Caller-saved registers on both SysV AMD64 and Windows x64 ABI.
         const SCRATCH: &[Register] = &[
-            Register::RAX, Register::RCX, Register::RDX,
-            Register::R8,  Register::R9,  Register::R10, Register::R11,
+            Register::RAX,
+            Register::RCX,
+            Register::RDX,
+            Register::R8,
+            Register::R9,
+            Register::R10,
+            Register::R11,
         ];
         let mut rng = thread_rng();
         let mut result = Vec::with_capacity(instrs.len() + instrs.len() / 4);
@@ -384,7 +396,8 @@ mod runtime_rewrite {
         let addr = locate_symbol(name)
             .ok_or_else(|| format!("symbol '{}' not found in this process", name))?;
         // Snapshot the current bytes
-        let original = unsafe { std::slice::from_raw_parts(addr as *const u8, DEFAULT_SPAN) }.to_vec();
+        let original =
+            unsafe { std::slice::from_raw_parts(addr as *const u8, DEFAULT_SPAN) }.to_vec();
         // Apply optimizer passes
         let new_bytes = apply_passes(&original);
         // Refuse if size changed — would clobber adjacent code
@@ -402,8 +415,12 @@ mod runtime_rewrite {
             restore_protection(addr, DEFAULT_SPAN, &mut old)?;
             flush_icache(addr, DEFAULT_SPAN);
         }
-        tracing::info!("optimize_hot_function: rewrote {} bytes at {:p} for '{}'",
-            DEFAULT_SPAN, addr as *const u8, name);
+        tracing::info!(
+            "optimize_hot_function: rewrote {} bytes at {:p} for '{}'",
+            DEFAULT_SPAN,
+            addr as *const u8,
+            name
+        );
         Ok(())
     }
 
@@ -415,22 +432,37 @@ mod runtime_rewrite {
         unsafe {
             let cname = std::ffi::CString::new(_name).ok()?;
             let addr = libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr());
-            if addr.is_null() { None } else { Some(addr as usize) }
+            if addr.is_null() {
+                None
+            } else {
+                Some(addr as usize)
+            }
         }
         #[cfg(windows)]
         unsafe {
             extern "system" {
                 fn GetModuleHandleA(name: *const i8) -> *mut std::ffi::c_void;
-                fn GetProcAddress(h: *mut std::ffi::c_void, name: *const i8) -> *mut std::ffi::c_void;
+                fn GetProcAddress(
+                    h: *mut std::ffi::c_void,
+                    name: *const i8,
+                ) -> *mut std::ffi::c_void;
             }
             let h = GetModuleHandleA(std::ptr::null());
-            if h.is_null() { return None; }
+            if h.is_null() {
+                return None;
+            }
             let cname = std::ffi::CString::new(_name).ok()?;
             let addr = GetProcAddress(h, cname.as_ptr());
-            if addr.is_null() { None } else { Some(addr as usize) }
+            if addr.is_null() {
+                None
+            } else {
+                Some(addr as usize)
+            }
         }
         #[cfg(not(any(unix, windows)))]
-        { None }
+        {
+            None
+        }
     }
 
     pub struct ProtSnapshot(pub u32);
@@ -438,7 +470,12 @@ mod runtime_rewrite {
     #[cfg(windows)]
     unsafe fn make_writable(addr: usize, len: usize) -> Result<ProtSnapshot, String> {
         extern "system" {
-            fn VirtualProtect(addr: *mut std::ffi::c_void, size: usize, new_protect: u32, old: *mut u32) -> i32;
+            fn VirtualProtect(
+                addr: *mut std::ffi::c_void,
+                size: usize,
+                new_protect: u32,
+                old: *mut u32,
+            ) -> i32;
         }
         const PAGE_EXECUTE_READWRITE: u32 = 0x40;
         let mut old = 0u32;
@@ -449,9 +486,18 @@ mod runtime_rewrite {
     }
 
     #[cfg(windows)]
-    unsafe fn restore_protection(addr: usize, len: usize, old: &mut ProtSnapshot) -> Result<(), String> {
+    unsafe fn restore_protection(
+        addr: usize,
+        len: usize,
+        old: &mut ProtSnapshot,
+    ) -> Result<(), String> {
         extern "system" {
-            fn VirtualProtect(addr: *mut std::ffi::c_void, size: usize, new_protect: u32, old: *mut u32) -> i32;
+            fn VirtualProtect(
+                addr: *mut std::ffi::c_void,
+                size: usize,
+                new_protect: u32,
+                old: *mut u32,
+            ) -> i32;
         }
         let mut tmp = 0u32;
         if VirtualProtect(addr as *mut _, len, old.0, &mut tmp) == 0 {
@@ -463,7 +509,11 @@ mod runtime_rewrite {
     #[cfg(windows)]
     unsafe fn flush_icache(addr: usize, len: usize) {
         extern "system" {
-            fn FlushInstructionCache(h: *mut std::ffi::c_void, addr: *const std::ffi::c_void, size: usize) -> i32;
+            fn FlushInstructionCache(
+                h: *mut std::ffi::c_void,
+                addr: *const std::ffi::c_void,
+                size: usize,
+            ) -> i32;
             fn GetCurrentProcess() -> *mut std::ffi::c_void;
         }
         FlushInstructionCache(GetCurrentProcess(), addr as *const _, len);
@@ -478,15 +528,23 @@ mod runtime_rewrite {
             aligned as *mut libc::c_void,
             aligned_len,
             libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-        ) != 0 {
-            return Err(format!("mprotect(RWX) failed: {}", std::io::Error::last_os_error()));
+        ) != 0
+        {
+            return Err(format!(
+                "mprotect(RWX) failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         // We don't read original protection on unix; assume PROT_READ|PROT_EXEC for restore.
         Ok(ProtSnapshot(0))
     }
 
     #[cfg(unix)]
-    unsafe fn restore_protection(addr: usize, len: usize, _old: &mut ProtSnapshot) -> Result<(), String> {
+    unsafe fn restore_protection(
+        addr: usize,
+        len: usize,
+        _old: &mut ProtSnapshot,
+    ) -> Result<(), String> {
         let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
         let aligned = addr & !(page - 1);
         let aligned_len = ((addr + len) - aligned + page - 1) & !(page - 1);
@@ -494,8 +552,12 @@ mod runtime_rewrite {
             aligned as *mut libc::c_void,
             aligned_len,
             libc::PROT_READ | libc::PROT_EXEC,
-        ) != 0 {
-            return Err(format!("mprotect(restore) failed: {}", std::io::Error::last_os_error()));
+        ) != 0
+        {
+            return Err(format!(
+                "mprotect(restore) failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         Ok(())
     }
@@ -511,7 +573,11 @@ mod runtime_rewrite {
         Err("unsupported platform".into())
     }
     #[cfg(not(any(windows, unix)))]
-    unsafe fn restore_protection(_a: usize, _l: usize, _o: &mut ProtSnapshot) -> Result<(), String> {
+    unsafe fn restore_protection(
+        _a: usize,
+        _l: usize,
+        _o: &mut ProtSnapshot,
+    ) -> Result<(), String> {
         Err("unsupported platform".into())
     }
     #[cfg(not(any(windows, unix)))]

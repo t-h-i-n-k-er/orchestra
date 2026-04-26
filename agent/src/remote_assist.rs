@@ -9,23 +9,19 @@
 
 #![cfg(feature = "remote-assist")]
 
+#[cfg(windows)]
+use anyhow::bail;
 use anyhow::{anyhow, Result};
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 use enigo::{Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 use std::cell::RefCell;
-#[cfg(windows)]
-use windows_capture::{
-    capture::GraphicsCaptureApi,
-    monitor::Monitor,
-    settings::{Color, CursorCaptureSettings, DrawBorderSettings, Settings as CaptureSettings},
-};
 #[cfg(target_os = "linux")]
 use x11cap::{Capturer, Screen};
 
-/// Thread-local `Enigo` instance shared across input-simulation calls.
-/// Avoids the overhead of re-initialising the platform input backend on every
-/// call; `Enigo` is not `Send` so a thread-local is the right storage class.
+// Thread-local `Enigo` instance shared across input-simulation calls.
+// Avoids the overhead of re-initialising the platform input backend on every
+// call; `Enigo` is not `Send` so a thread-local is the right storage class.
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 thread_local! {
     static ENIGO_INSTANCE: RefCell<Option<Enigo>> = const { RefCell::new(None) };
@@ -128,26 +124,9 @@ pub fn capture_screen() -> Result<Vec<u8>> {
     #[cfg(windows)]
     {
         check_consent()?;
-        let primary_monitor = Monitor::primary()?;
-        let settings = CaptureSettings::new(
-            primary_monitor,
-            CursorCaptureSettings::Default,
-            DrawBorderSettings::Default,
-            Color::default(),
-            false,
-        )?;
-        let mut capturer = GraphicsCaptureApi::new(settings)?;
-        let frame = capturer.next_frame()?;
-        let mut buffer = Vec::new();
-        image::save_buffer_with_format(
-            &mut std::io::Cursor::new(&mut buffer),
-            &frame.buffer(),
-            frame.width(),
-            frame.height(),
-            image::ColorType::Rgba8,
-            image::ImageFormat::Png,
-        )?;
-        Ok(buffer)
+        bail!(
+            "Windows screen capture is not enabled in this build; this platform path is gated until it is updated and tested"
+        )
     }
     #[cfg(target_os = "macos")]
     {
@@ -160,7 +139,17 @@ pub fn capture_screen() -> Result<Vec<u8>> {
             .map_err(|e| anyhow!("screencapture invocation failed: {e}"))?;
 
         if !output.status.success() {
-            return Err(anyhow!("screencapture exited with non-zero status"));
+            return Err(anyhow!(
+                "screencapture exited with non-zero status: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+        if !output.stdout.starts_with(PNG_MAGIC) {
+            return Err(anyhow!(
+                "macOS screencapture did not return PNG bytes; check Screen Recording permission for this process"
+            ));
         }
 
         Ok(output.stdout)

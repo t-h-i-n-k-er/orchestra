@@ -1,8 +1,8 @@
 # Orchestra Console
 
-Command-line client for an Orchestra agent. Connects either with the
-pre-shared-key TCP transport (development / lab) or with a fully
-mutual-TLS transport (production).
+Legacy command-line client for Orchestra protocol testing against custom
+listeners. Stock `agent-standalone` builds use the outbound Control Center
+path and do not expose a direct console listener.
 
 ```text
 orchestra-console --target HOST:PORT --key BASE64 <SUBCOMMAND>
@@ -35,25 +35,9 @@ orchestra-console --target HOST:PORT --tls --ca-cert CA.pem \
 
 ## Self-verification
 
-Spin up a local agent and exercise every subcommand:
-
-```sh
-# Terminal 1: agent
-cargo run -p agent --bin agent-standalone --features outbound-c
-
-# Terminal 2: console (PSK mode for local development)
-KEY=$(head -c32 /dev/urandom | base64)
-orchestra-console --target 127.0.0.1:7890 --key "$KEY" ping
-orchestra-console --target 127.0.0.1:7890 --key "$KEY" info
-orchestra-console --target 127.0.0.1:7890 --key "$KEY" list-procs
-orchestra-console --target 127.0.0.1:7890 --key "$KEY" discover
-echo Hello | orchestra-console --target 127.0.0.1:7890 --key "$KEY" key --repl
-echo "100 200" | orchestra-console --target 127.0.0.1:7890 --key "$KEY" mouse --repl
-```
-
-Each subcommand prints the agent's `TaskResponse.result` to stdout (or the
-error from a refused command) and persists `AuditLog` events to
-`audit.log` in the working directory.
+Use `cargo test -p orchestra-server --test outbound_e2e` for the supported
+agent/server happy path. Console subcommands require a custom test listener
+that speaks the shared `Message` protocol.
 
 ## REPL mode
 

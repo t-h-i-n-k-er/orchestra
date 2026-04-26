@@ -13,18 +13,16 @@ use orchestra_server::{
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio_rustls::client::TlsStream;
 use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
 
 const SECRET: &str = "identity-test-secret";
 const TOKEN: &str = "identity-test-token";
 
 /// Generate a self-signed TLS certificate for test use.
 fn make_test_tls_server_config() -> Arc<rustls::ServerConfig> {
-    let cert = rcgen::generate_simple_self_signed(
-        vec!["localhost".into(), "127.0.0.1".into()],
-    )
-    .unwrap();
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
     let cert_pem = cert.cert.pem();
     let key_pem = cert.key_pair.serialize_pem();
     let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
@@ -114,8 +112,7 @@ impl FakeAgent {
             ))
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_cfg));
-        let domain =
-            rustls::pki_types::ServerName::try_from("localhost".to_owned()).unwrap();
+        let domain = rustls::pki_types::ServerName::try_from("localhost".to_owned()).unwrap();
         let mut tls_stream = connector.connect(domain, tcp).await.unwrap();
 
         #[cfg(not(feature = "forward-secrecy"))]

@@ -64,7 +64,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(audit: Arc<AuditLog>, admin_token: String, command_timeout_secs: u64, config: ServerConfig) -> Self {
+    pub fn new(
+        audit: Arc<AuditLog>,
+        admin_token: String,
+        command_timeout_secs: u64,
+        config: ServerConfig,
+    ) -> Self {
         Self {
             registry: DashMap::new(),
             pending: DashMap::new(),

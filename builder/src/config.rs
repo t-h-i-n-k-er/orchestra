@@ -25,8 +25,10 @@ pub struct PayloadConfig {
     /// Either a base64-encoded 32-byte AES key, or `file:/path/to/key.bin`
     /// (the file is read at build time). Used to encrypt the payload binary.
     pub encryption_key: String,
-    /// A separate 32-byte key for the HMAC-SHA256 tag.
-    pub hmac_key: String,
+    /// Legacy profile field from the previous HMAC design. The current
+    /// payload format uses AES-GCM and does not require a separate HMAC key.
+    #[serde(default)]
+    pub hmac_key: Option<String>,
     /// Pre-shared secret the agent uses for its AES-TCP connection to the
     /// Control Center. Must match `agent_shared_secret` in `orchestra-server.toml`.
     /// Required when `outbound-c` is in `features`. If absent the agent will
@@ -71,8 +73,8 @@ impl PayloadConfig {
         Ok(triple.to_string())
     }
 
-    /// Resolve the encryption and HMAC keys into raw 32-byte pairs.
-    pub fn encryption_keys(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+    /// Resolve the encryption key into raw 32 bytes.
+    pub fn encryption_key_bytes(&self) -> Result<Vec<u8>> {
         use base64::Engine;
         let engine = base64::engine::general_purpose::STANDARD;
 
@@ -84,36 +86,47 @@ impl PayloadConfig {
                 .context("encryption_key is not valid base64 (or `file:<path>`)")?
         };
 
-        let hmac_key = if let Some(path) = self.hmac_key.strip_prefix("file:") {
-            std::fs::read(path).with_context(|| format!("Failed to read key file {path}"))?
-        } else {
-            engine
-                .decode(self.hmac_key.trim())
-                .context("hmac_key is not valid base64 (or `file:<path>`)")?
-        };
-
         if enc_key.len() != 32 {
             return Err(anyhow!(
                 "AES-256 key must be exactly 32 bytes (got {})",
                 enc_key.len()
             ));
         }
-        if hmac_key.len() != 32 {
-            return Err(anyhow!(
-                "HMAC key must be exactly 32 bytes (got {})",
-                hmac_key.len()
-            ));
-        }
 
-        if is_weak_key(&enc_key) || is_weak_key(&hmac_key) {
+        if is_weak_key(&enc_key) {
             tracing::warn!(
                 "A configured key appears to be a weak placeholder. \
                  Generate random keys with `orchestra-builder configure`."
             );
         }
 
-        Ok((enc_key, hmac_key))
+        if let Some(hmac_key) = &self.hmac_key {
+            validate_legacy_hmac_key(hmac_key)?;
+            tracing::warn!(
+                "profile contains legacy `hmac_key`; the current AES-GCM payload format ignores it"
+            );
+        }
+
+        Ok(enc_key)
     }
+}
+
+fn validate_legacy_hmac_key(hmac_key: &str) -> Result<()> {
+    use base64::Engine;
+    let bytes = if let Some(path) = hmac_key.strip_prefix("file:") {
+        std::fs::read(path).with_context(|| format!("Failed to read key file {path}"))?
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(hmac_key.trim())
+            .context("legacy hmac_key is not valid base64 (or `file:<path>`)")?
+    };
+    if bytes.len() != 32 {
+        return Err(anyhow!(
+            "legacy hmac_key must decode to exactly 32 bytes when present (got {})",
+            bytes.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Check for obviously weak (non-random) keys.
@@ -185,16 +198,14 @@ pub fn cmd_configure(name: Option<String>) -> Result<()> {
 
     use base64::Engine;
     let enc_key: [u8; 32] = rand::random();
-    let hmac_key: [u8; 32] = rand::random();
     let encryption_key = base64::engine::general_purpose::STANDARD.encode(enc_key);
-    let hmac_key_b64 = base64::engine::general_purpose::STANDARD.encode(hmac_key);
 
     let profile = PayloadConfig {
         target_os,
         target_arch,
         c2_address,
         encryption_key,
-        hmac_key: hmac_key_b64,
+        hmac_key: None,
         c_server_secret,
         server_cert_fingerprint: None,
         features: features.clone(),
@@ -307,7 +318,7 @@ mod tests {
             target_arch: "x86_64".to_string(),
             c2_address: "127.0.0.1:8443".to_string(),
             encryption_key: "file:key.bin".to_string(),
-            hmac_key: "file:hmac.bin".to_string(),
+            hmac_key: Some("file:hmac.bin".to_string()),
             c_server_secret: Some("secret".to_string()),
             server_cert_fingerprint: None,
             features: vec!["persistence".to_string()],
@@ -328,7 +339,7 @@ mod tests {
             target_arch: "x86_64".to_string(),
             c2_address: "127.0.0.1:8443".to_string(),
             encryption_key: "short".to_string(),
-            hmac_key: "also short".to_string(),
+            hmac_key: None,
             c_server_secret: None,
             server_cert_fingerprint: None,
             features: vec![],
@@ -336,7 +347,23 @@ mod tests {
             package: "launcher".to_string(),
             bin_name: None,
         };
-        assert!(profile.encryption_keys().is_err());
+        assert!(profile.encryption_key_bytes().is_err());
+    }
+
+    #[test]
+    fn quickbuild_profile_without_hmac_key_parses() {
+        let content = r#"
+target_os      = "linux"
+target_arch    = "x86_64"
+c2_address     = "127.0.0.1:7890"
+encryption_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+features       = []
+package        = "launcher"
+"#;
+        let profile: PayloadConfig = toml::from_str(content).unwrap();
+        assert!(profile.hmac_key.is_none());
+        assert_eq!(profile.package, "launcher");
+        assert_eq!(profile.encryption_key_bytes().unwrap().len(), 32);
     }
 
     #[test]
@@ -346,7 +373,7 @@ mod tests {
             target_arch: "m68k".to_string(),
             c2_address: "127.0.0.1:8443".to_string(),
             encryption_key: "a".repeat(44), // 32 bytes b64
-            hmac_key: "b".repeat(44),
+            hmac_key: None,
             c_server_secret: None,
             server_cert_fingerprint: None,
             features: vec![],
@@ -362,6 +389,53 @@ mod tests {
         let features = read_agent_features().unwrap();
         assert!(features.contains(&"persistence".to_string()));
         assert!(features.contains(&"outbound-c".to_string()));
+    }
+
+    #[test]
+    fn readme_feature_table_matches_agent_features() {
+        let features = read_agent_features().unwrap();
+        let readme_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("README.md");
+        let readme = std::fs::read_to_string(&readme_path).unwrap();
+        let mut documented = Vec::new();
+        let mut in_feature_table = false;
+        for line in readme.lines() {
+            let line = line.trim_start();
+            if line == "| Feature | Purpose |" {
+                in_feature_table = true;
+                continue;
+            }
+            if !in_feature_table {
+                continue;
+            }
+            if !line.starts_with('|') {
+                break;
+            }
+            if line.starts_with("|---------") {
+                continue;
+            }
+            if let Some(feature) = line.split('`').nth(1) {
+                documented.push(feature.to_string());
+            }
+        }
+
+        let missing: Vec<_> = features
+            .iter()
+            .filter(|feature| !documented.contains(feature))
+            .cloned()
+            .collect();
+        let unknown: Vec<_> = documented
+            .iter()
+            .filter(|feature| !features.contains(feature))
+            .cloned()
+            .collect();
+
+        assert!(
+            missing.is_empty() && unknown.is_empty(),
+            "README feature table drift: missing={missing:?} unknown={unknown:?}"
+        );
     }
 
     #[test]

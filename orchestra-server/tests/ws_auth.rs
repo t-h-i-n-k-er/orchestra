@@ -41,10 +41,9 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
         let secret = cfg.agent_shared_secret.clone();
         // Generate a proper self-signed cert so the agent listener TLS config is valid.
         let agent_tls = {
-            let cert = rcgen::generate_simple_self_signed(
-                vec!["localhost".into(), "127.0.0.1".into()],
-            )
-            .unwrap();
+            let cert =
+                rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+                    .unwrap();
             let cert_pem = cert.cert.pem();
             let key_pem = cert.key_pair.serialize_pem();
             let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())

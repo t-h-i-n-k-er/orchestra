@@ -35,9 +35,15 @@ pub struct ServerConfig {
     pub command_timeout_secs: u64,
 }
 
-fn default_builds_dir() -> PathBuf { PathBuf::from("/var/lib/orchestra/builds") }
-fn default_build_retention_days() -> u32 { 7 }
-fn default_max_concurrent_builds() -> usize { 1 }
+fn default_builds_dir() -> PathBuf {
+    PathBuf::from("/var/lib/orchestra/builds")
+}
+fn default_build_retention_days() -> u32 {
+    7
+}
+fn default_max_concurrent_builds() -> usize {
+    1
+}
 fn default_command_timeout() -> u64 {
     30
 }

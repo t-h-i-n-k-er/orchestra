@@ -26,8 +26,7 @@ unsafe extern "C" fn plugin_execute(
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
 ) -> i32 {
-    let args = std::str::from_utf8(std::slice::from_raw_parts(args_ptr, args_len))
-        .unwrap_or("");
+    let args = std::str::from_utf8(std::slice::from_raw_parts(args_ptr, args_len)).unwrap_or("");
     let result = format!("Hello, {}", args);
     let bytes = result.into_bytes();
     *out_len = bytes.len();
@@ -68,7 +67,9 @@ static HELLO_VTABLE: PluginVTable = PluginVTable {
 #[no_mangle]
 pub extern "C" fn _create_plugin() -> *mut PluginObject {
     let obj = Box::new(HelloPluginObj {
-        hdr: PluginObject { vtable: &HELLO_VTABLE },
+        hdr: PluginObject {
+            vtable: &HELLO_VTABLE,
+        },
     });
     // Cast to *mut PluginObject — safe because `hdr` is the first field and
     // HelloPluginObj is #[repr(C)].

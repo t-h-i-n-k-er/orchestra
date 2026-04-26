@@ -11,8 +11,8 @@ use winapi::um::memoryapi::{VirtualAlloc, VirtualFree, VirtualProtect};
 use winapi::um::winnt::{
     DLL_PROCESS_ATTACH, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT,
     IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
-    IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ,
-    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, MEM_RELEASE, PAGE_READWRITE,
+    IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ,
+    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
 };
 
 // RUNTIME_FUNCTION (IMAGE_RUNTIME_FUNCTION_ENTRY) – 12 bytes, x64 only.
@@ -75,9 +75,13 @@ struct LDR_DATA_TABLE_ENTRY {
 unsafe fn load_via_ldr(module_name: &str) -> *mut c_void {
     // Resolve LdrLoadDll from the already-loaded ntdll via PEB walk.
     let ntdll = get_module_handle_peb("ntdll.dll");
-    if ntdll.is_null() { return std::ptr::null_mut(); }
+    if ntdll.is_null() {
+        return std::ptr::null_mut();
+    }
     let ldr_load_dll_ptr = get_proc_address_manual(ntdll, "LdrLoadDll");
-    if ldr_load_dll_ptr.is_null() { return std::ptr::null_mut(); }
+    if ldr_load_dll_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
 
     type LdrLoadDllFn = unsafe extern "system" fn(
         search_path: *const u16,
@@ -88,7 +92,10 @@ unsafe fn load_via_ldr(module_name: &str) -> *mut c_void {
     let ldr_load_dll: LdrLoadDllFn = std::mem::transmute(ldr_load_dll_ptr);
 
     // Build a UNICODE_STRING for the module name.
-    let mut wide: Vec<u16> = module_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut wide: Vec<u16> = module_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut us = winapi::shared::ntdef::UNICODE_STRING {
         Length: ((wide.len() - 1) * 2) as u16,
         MaximumLength: (wide.len() * 2) as u16,
@@ -97,7 +104,11 @@ unsafe fn load_via_ldr(module_name: &str) -> *mut c_void {
 
     let mut base: *mut c_void = std::ptr::null_mut();
     let status = ldr_load_dll(std::ptr::null(), std::ptr::null(), &us, &mut base);
-    if status < 0 { std::ptr::null_mut() } else { base }
+    if status < 0 {
+        std::ptr::null_mut()
+    } else {
+        base
+    }
 }
 
 unsafe fn get_module_handle_peb(module_name: &str) -> *mut c_void {
@@ -287,11 +298,16 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
     impl Drop for AllocGuard {
         fn drop(&mut self) {
             if !self.success {
-                unsafe { VirtualFree(self.ptr, 0, MEM_RELEASE); }
+                unsafe {
+                    VirtualFree(self.ptr, 0, MEM_RELEASE);
+                }
             }
         }
     }
-    let mut _guard = AllocGuard { ptr: image_base, success: false };
+    let mut _guard = AllocGuard {
+        ptr: image_base,
+        success: false,
+    };
 
     // 1b. Copy PE headers (DOS header, NT headers, section table) so that
     //     DLLs which inspect their own headers at runtime (resource lookup,
@@ -365,7 +381,8 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                 // unpredictable behaviour.  Reading from a pristine copy makes
                 // the iteration deterministic.
                 let reloc_data: Vec<u8> =
-                    std::slice::from_raw_parts(image_base.add(block_rva) as *const u8, reloc_size).to_vec();
+                    std::slice::from_raw_parts(image_base.add(block_rva) as *const u8, reloc_size)
+                        .to_vec();
 
                 let mut offset = 0usize;
                 while offset + 8 <= reloc_size {
@@ -410,39 +427,42 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                             let (lo16, hi16) = if is_thumb {
                                 let extract_t = |v: u32| -> u16 {
                                     let imm4 = ((v >> 16) & 0xF) as u16;
-                                    let i    = ((v >> 26) & 0x1) as u16;
+                                    let i = ((v >> 26) & 0x1) as u16;
                                     let imm3 = ((v >> 12) & 0x7) as u16;
-                                    let imm8 = ( v        & 0xFF) as u16;
+                                    let imm8 = (v & 0xFF) as u16;
                                     (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8
                                 };
                                 (extract_t(movw), extract_t(movt))
                             } else {
                                 let extract_a = |v: u32| -> u16 {
-                                    let imm4  = ((v >> 16) & 0xF) as u16;
-                                    let imm12 = ( v        & 0xFFF) as u16;
+                                    let imm4 = ((v >> 16) & 0xF) as u16;
+                                    let imm12 = (v & 0xFFF) as u16;
                                     (imm4 << 12) | imm12
                                 };
                                 (extract_a(movw), extract_a(movt))
                             };
                             let orig_va = (lo16 as u32) | ((hi16 as u32) << 16);
-                            let new_va  = ((orig_va as isize).wrapping_add(base_delta)) as u32;
-                            let new_lo  = (new_va & 0xFFFF) as u16;
-                            let new_hi  = (new_va >> 16) as u16;
+                            let new_va = ((orig_va as isize).wrapping_add(base_delta)) as u32;
+                            let new_lo = (new_va & 0xFFFF) as u16;
+                            let new_hi = (new_va >> 16) as u16;
                             if is_thumb {
                                 let patch_t = |v: u32, val: u16| -> u32 {
                                     let imm4 = ((val >> 12) & 0xF) as u32;
-                                    let i    = ((val >> 11) & 0x1) as u32;
-                                    let imm3 = ((val >>  8) & 0x7) as u32;
-                                    let imm8 = ( val        & 0xFF) as u32;
+                                    let i = ((val >> 11) & 0x1) as u32;
+                                    let imm3 = ((val >> 8) & 0x7) as u32;
+                                    let imm8 = (val & 0xFF) as u32;
                                     (v & !((0xF << 16) | (1 << 26) | (0x7 << 12) | 0xFF))
-                                        | (imm4 << 16) | (i << 26) | (imm3 << 12) | imm8
+                                        | (imm4 << 16)
+                                        | (i << 26)
+                                        | (imm3 << 12)
+                                        | imm8
                                 };
                                 *movw_ptr = patch_t(movw, new_lo).to_le();
                                 *movt_ptr = patch_t(movt, new_hi).to_le();
                             } else {
                                 let patch_a = |v: u32, val: u16| -> u32 {
-                                    let imm4  = ((val >> 12) & 0xF) as u32;
-                                    let imm12 = ( val        & 0xFFF) as u32;
+                                    let imm4 = ((val >> 12) & 0xF) as u32;
+                                    let imm12 = (val & 0xFFF) as u32;
                                     (v & !((0xF << 16) | 0xFFF)) | (imm4 << 16) | imm12
                                 };
                                 *movw_ptr = patch_a(movw, new_lo).to_le();
@@ -517,7 +537,9 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                     remaining -= 1;
                     // Validate that the callback-array slot itself is inside the image.
                     let slot = cb_ptr as usize;
-                    if slot < image_start || slot.saturating_add(std::mem::size_of::<usize>()) > image_end {
+                    if slot < image_start
+                        || slot.saturating_add(std::mem::size_of::<usize>()) > image_end
+                    {
                         break;
                     }
                     let cb_va = *cb_ptr;
@@ -558,7 +580,10 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         // Use the larger of virtual_size and size_of_raw_data: a linker may
         // set VirtualSize to 0 (optimisation), which would make VirtualProtect
         // a no-op and leave the section with the wrong permissions.
-        let prot_size = std::cmp::max(section.virtual_size as usize, section.size_of_raw_data as usize);
+        let prot_size = std::cmp::max(
+            section.virtual_size as usize,
+            section.size_of_raw_data as usize,
+        );
         VirtualProtect(
             image_base.add(section.virtual_address as usize),
             prot_size,

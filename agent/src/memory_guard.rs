@@ -116,7 +116,11 @@ pub unsafe fn register(buf: &'static mut [u8], label: &'static str) {
         nonce: [0u8; 24],
         tag: [0u8; 16],
     });
-    tracing::debug!("[memory-guard] registered region '{}' ({} bytes)", label, buf.len());
+    tracing::debug!(
+        "[memory-guard] registered region '{}' ({} bytes)",
+        label,
+        buf.len()
+    );
 }
 
 /// Encrypt all registered regions in-place and stash the key in CPU registers.
@@ -138,7 +142,10 @@ pub fn lock() -> Result<KeyHandle> {
 
         for region in reg.iter_mut() {
             if region.locked {
-                tracing::warn!("[memory-guard] region '{}' already locked, skipping", region.label);
+                tracing::warn!(
+                    "[memory-guard] region '{}' already locked, skipping",
+                    region.label
+                );
                 continue;
             }
             // Generate a fresh 24-byte nonce for each region.
@@ -147,8 +154,7 @@ pub fn lock() -> Result<KeyHandle> {
             let nonce = XNonce::from_slice(&nonce_bytes);
 
             // SAFETY: We hold the registry mutex; no other code accesses the region.
-            let buf =
-                unsafe { std::slice::from_raw_parts_mut(region.ptr, region.len) };
+            let buf = unsafe { std::slice::from_raw_parts_mut(region.ptr, region.len) };
 
             // Encrypt in-place.  chacha20poly1305 appends the 16-byte tag.
             // We store the buf as plaintext then call encrypt_in_place which
@@ -204,15 +210,13 @@ pub fn unlock(handle: KeyHandle) -> Result<()> {
             combined.extend_from_slice(buf);
             combined.extend_from_slice(&region.tag);
 
-            let pt = cipher
-                .decrypt(nonce, combined.as_slice())
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "[memory-guard] authentication tag mismatch for region '{}': \
+            let pt = cipher.decrypt(nonce, combined.as_slice()).map_err(|_| {
+                anyhow::anyhow!(
+                    "[memory-guard] authentication tag mismatch for region '{}': \
                          memory may have been tampered with",
-                        region.label
-                    )
-                })?;
+                    region.label
+                )
+            })?;
 
             // Copy plaintext back.
             let dst = unsafe { std::slice::from_raw_parts_mut(region.ptr, region.len) };
@@ -258,7 +262,6 @@ pub fn unguard_memory() -> Result<()> {
 // KeyHandle — register stash
 // ──────────────────────────────────────────────────────────────────────────────
 
-
 /// Opaque handle that holds the 32-byte encryption key in CPU registers.
 ///
 /// On x86-64 **Windows** the key bytes are packed into two 128-bit XMM registers
@@ -268,7 +271,11 @@ pub fn unguard_memory() -> Result<()> {
 /// because xmm14/15 are caller-saved in the System V AMD64 ABI and would be
 /// clobbered by the Tokio executor between stash and retrieve.
 pub struct KeyHandle {
-    #[cfg(all(target_arch = "x86_64", target_os = "windows", feature = "memory-guard"))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_os = "windows",
+        feature = "memory-guard"
+    ))]
     _marker: (),
     /// Fallback: locked heap page on Linux x86-64 and all non-x86-64 targets.
     #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
@@ -336,7 +343,9 @@ impl KeyHandle {
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 impl KeyHandle {
     fn stash(key: [u8; 32]) -> Self {
-        KeyHandle { locked_page: LockedKeyPage::new(key) }
+        KeyHandle {
+            locked_page: LockedKeyPage::new(key),
+        }
     }
 
     fn retrieve(mut self) -> [u8; 32] {
@@ -519,7 +528,11 @@ mod tests {
         // First lock encrypts the region and stashes the key in XMM14/15.
         let h1 = lock().unwrap();
         let after_first = unsafe { read_bytes(ptr, len) };
-        assert_ne!(after_first.as_slice(), content.as_ref(), "region must be encrypted after lock");
+        assert_ne!(
+            after_first.as_slice(),
+            content.as_ref(),
+            "region must be encrypted after lock"
+        );
 
         // Second lock: region is already marked locked, so it must be skipped.
         // The XMM stash is overwritten with h2's (unused) key.

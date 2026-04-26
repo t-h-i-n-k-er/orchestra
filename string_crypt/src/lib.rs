@@ -2,16 +2,55 @@ extern crate proc_macro;
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, LitStr};
-use rand::Rng;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
 
-fn get_build_rotation() -> usize {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let mut hasher = DefaultHasher::new();
-    now.hash(&mut hasher);
-    (hasher.finish() % 3) as usize
+const DEFAULT_SEED: &str = "orchestra-string-crypt-v1";
+
+fn seed_material() -> String {
+    std::env::var("ORCHESTRA_STRING_CRYPT_SEED").unwrap_or_else(|_| DEFAULT_SEED.to_string())
+}
+
+fn deterministic_seed(label: &[u8], input: &[u8], seed: &str) -> u64 {
+    // FNV-1a over explicit seed material and macro input. This is not a
+    // cryptographic PRNG; it is only used to keep proc-macro expansion stable
+    // across reproducible builds unless ORCHESTRA_STRING_CRYPT_SEED is changed.
+    let mut hash = 0xcbf29ce484222325u64;
+    for b in seed
+        .as_bytes()
+        .iter()
+        .chain(label.iter())
+        .chain(input.iter())
+    {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    if hash == 0 {
+        0x9e3779b97f4a7c15
+    } else {
+        hash
+    }
+}
+
+fn deterministic_bytes_with_seed(label: &[u8], input: &[u8], seed: &str, len: usize) -> Vec<u8> {
+    let mut state = deterministic_seed(label, input, seed);
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+fn deterministic_bytes(label: &[u8], input: &[u8], len: usize) -> Vec<u8> {
+    let seed = seed_material();
+    deterministic_bytes_with_seed(label, input, &seed, len)
+}
+
+fn get_build_rotation(input: &[u8]) -> usize {
+    let seed = seed_material();
+    (deterministic_seed(b"method", input, &seed) % 3) as usize
 }
 
 #[proc_macro]
@@ -22,14 +61,17 @@ pub fn enc_str(input: TokenStream) -> TokenStream {
     pt_with_null.push(0); // Null-terminate for C APIs
     let len = pt_with_null.len();
 
-    let method = get_build_rotation();
-    let mut rng = rand::thread_rng();
+    let method = get_build_rotation(&pt_with_null);
 
     if method == 0 {
         // XOR
-        let key: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
-        let ct: Vec<u8> = pt_with_null.iter().zip(key.iter()).map(|(p, k)| p ^ k).collect();
-        
+        let key = deterministic_bytes(b"enc_str:xor", &pt_with_null, len);
+        let ct: Vec<u8> = pt_with_null
+            .iter()
+            .zip(key.iter())
+            .map(|(p, k)| p ^ k)
+            .collect();
+
         let expanded = quote! {
             {
                 let ct = [#(#ct),*];
@@ -44,12 +86,17 @@ pub fn enc_str(input: TokenStream) -> TokenStream {
         expanded.into()
     } else if method == 1 {
         // RC4-like
-        let key: [u8; 16] = rng.gen();
+        let key = deterministic_bytes(b"enc_str:rc4", &pt_with_null, 16);
         let mut s = [0u8; 256];
-        for i in 0..=255 { s[i] = i as u8; }
+        for i in 0..=255 {
+            s[i] = i as u8;
+        }
         let mut j: usize = 0;
         for i in 0..=255 {
-            j = (j.wrapping_add(s[i] as usize).wrapping_add(key[i % 16] as usize)) % 256;
+            j = (j
+                .wrapping_add(s[i] as usize)
+                .wrapping_add(key[i % 16] as usize))
+                % 256;
             s.swap(i, j);
         }
         let mut ct = Vec::with_capacity(len);
@@ -90,10 +137,14 @@ pub fn enc_str(input: TokenStream) -> TokenStream {
         expanded.into()
     } else {
         // AES-CTR conceptually, or a fallback to multi-key XOR for simplicity
-        let key1: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
-        let key2: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
-        let ct: Vec<u8> = pt_with_null.iter().enumerate().map(|(i, p)| p ^ key1[i] ^ key2[i]).collect();
-        
+        let key1 = deterministic_bytes(b"enc_str:mkxor:key1", &pt_with_null, len);
+        let key2 = deterministic_bytes(b"enc_str:mkxor:key2", &pt_with_null, len);
+        let ct: Vec<u8> = pt_with_null
+            .iter()
+            .enumerate()
+            .map(|(i, p)| p ^ key1[i] ^ key2[i])
+            .collect();
+
         let expanded = quote! {
             {
                 let ct = [#(#ct),*];
@@ -119,10 +170,13 @@ pub fn enc_wstr(input: TokenStream) -> TokenStream {
     let len = pt_bytes.len();
     let wlen = pt.len();
 
-    let mut rng = rand::thread_rng();
-    let key: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
-    let ct: Vec<u8> = pt_bytes.iter().zip(key.iter()).map(|(p, k)| p ^ k).collect();
-    
+    let key = deterministic_bytes(b"enc_wstr:xor", &pt_bytes, len);
+    let ct: Vec<u8> = pt_bytes
+        .iter()
+        .zip(key.iter())
+        .map(|(p, k)| p ^ k)
+        .collect();
+
     let expanded = quote! {
         {
             let ct = [#(#ct),*];
@@ -131,7 +185,7 @@ pub fn enc_wstr(input: TokenStream) -> TokenStream {
             for i in 0..#len {
                 pt_bytes[i] = ct[i] ^ key[i];
             }
-            
+
             // Reconstruct the u16 array
             let mut pt_w = [0u16; #wlen];
             for i in 0..#wlen {
@@ -143,15 +197,46 @@ pub fn enc_wstr(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_bytes_are_stable_for_same_seed() {
+        let a = deterministic_bytes_with_seed(b"label", b"input", "seed", 32);
+        let b = deterministic_bytes_with_seed(b"label", b"input", "seed", 32);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn deterministic_bytes_change_with_seed() {
+        let a = deterministic_bytes_with_seed(b"label", b"input", "seed-a", 32);
+        let b = deterministic_bytes_with_seed(b"label", b"input", "seed-b", 32);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn build_rotation_is_derived_from_input_and_seed() {
+        let first = deterministic_seed(b"method", b"hello\0", DEFAULT_SEED) % 3;
+        let second = deterministic_seed(b"method", b"hello\0", DEFAULT_SEED) % 3;
+        assert_eq!(first, second);
+    }
+}
+
 #[proc_macro]
 pub fn stack_str(input: TokenStream) -> TokenStream {
     let lit = parse_macro_input!(input as LitStr);
-    let pt: Vec<u8> = lit.value().into_bytes().into_iter().chain(std::iter::once(0)).collect();
-    
+    let pt: Vec<u8> = lit
+        .value()
+        .into_bytes()
+        .into_iter()
+        .chain(std::iter::once(0))
+        .collect();
+
     let assigns = pt.iter().enumerate().map(|(i, &b)| {
         quote! { pt[#i] = #b; }
     });
-    
+
     let len = pt.len();
 
     // Use assignments to defeat basic string extraction of static data

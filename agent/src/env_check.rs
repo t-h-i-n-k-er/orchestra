@@ -51,14 +51,21 @@ impl EnvReport {
     }
 
     /// True when the host fails any check that has been *configured* to be
-    /// enforced. We always treat a debugger or a domain mismatch as a
-    /// failure; VM detection is informational unless the caller opts in.
+    /// enforced. Domain mismatch is enforced only when a required domain was
+    /// configured. Debugger, VM, tracer-process, timing, and sandbox-score
+    /// signals are informational unless their explicit policy knobs are set.
     ///
+    /// * `refuse_when_debugged`: if `true`, an attached debugger triggers refusal.
     /// * `refuse_in_vm`: if `true`, a positive `vm_detected` also triggers refusal.
     /// * `sandbox_score_threshold`: if `Some(n)`, a `sandbox_score >= n` also
     ///   triggers refusal.  Pass `None` to leave the sandbox score informational.
-    pub fn should_refuse(&self, refuse_in_vm: bool) -> bool {
-        if self.debugger_present || self.tracer_process_found {
+    pub fn should_refuse(
+        &self,
+        refuse_when_debugged: bool,
+        refuse_in_vm: bool,
+        sandbox_score_threshold: Option<u32>,
+    ) -> bool {
+        if refuse_when_debugged && self.debugger_present {
             return true;
         }
         if matches!(self.domain_match, Some(false)) {
@@ -66,6 +73,11 @@ impl EnvReport {
         }
         if refuse_in_vm && self.vm_detected {
             return true;
+        }
+        if let Some(threshold) = sandbox_score_threshold {
+            if self.sandbox_score >= threshold {
+                return true;
+            }
         }
         false
     }
@@ -184,9 +196,9 @@ fn is_expected_hypervisor() -> bool {
         // for GCP sole-tenant nodes, and "bare metal" for Azure/GCP bare-metal.
         const CLOUD_NEEDLES: &[&str] = &[
             "amazon ec2",
-            "ec2",             // AWS bare-metal chassis_asset_tag
+            "ec2", // AWS bare-metal chassis_asset_tag
             "google compute",
-            "google",          // GCP sole-tenant board_vendor
+            "google",                // GCP sole-tenant board_vendor
             "microsoft corporation", // Azure (Hyper-V guest) and Surface hardware
             "digitalocean",
             "linode",
@@ -199,7 +211,7 @@ fn is_expected_hypervisor() -> bool {
             "scaleway",
             "exoscale",
             "oracle cloud",
-            "bare metal",      // Azure/GCP bare-metal product names
+            "bare metal", // Azure/GCP bare-metal product names
         ];
         for path in DMI {
             if let Ok(content) = std::fs::read_to_string(path) {
@@ -233,7 +245,11 @@ fn is_expected_hypervisor() -> bool {
         ];
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
         if let Ok(k) = hklm.open_subkey("HARDWARE\\DESCRIPTION\\System\\BIOS") {
-            for val_name in &["SystemManufacturer", "SystemProductName", "BaseBoardManufacturer"] {
+            for val_name in &[
+                "SystemManufacturer",
+                "SystemProductName",
+                "BaseBoardManufacturer",
+            ] {
                 if let Ok(v) = k.get_value::<String, _>(val_name) {
                     let s = v.to_ascii_lowercase();
                     if CLOUD_NEEDLES.iter().any(|n| s.contains(n)) {
@@ -255,7 +271,7 @@ fn is_cloud_instance() -> bool {
     // The 169.254.169.254 address is non-routable on premises; only cloud
     // hypervisors intercept it.  A successful TCP connect (even without a
     // valid HTTP response) is sufficient evidence of a cloud deployment.
-    use std::net::{TcpStream, SocketAddr, IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
     use std::time::Duration;
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 80);
     TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok()
@@ -333,13 +349,25 @@ fn linux_dmi_indicates_vm() -> bool {
         "/sys/class/dmi/id/bios_vendor",
     ];
     let needles = vec![
-        String::from_utf8_lossy(&string_crypt::enc_str!("qemu")).trim_end_matches('\0').to_string(),
-        String::from_utf8_lossy(&string_crypt::enc_str!("kvm")).trim_end_matches('\0').to_string(),
-        String::from_utf8_lossy(&string_crypt::enc_str!("vmware")).trim_end_matches('\0').to_string(),
-        String::from_utf8_lossy(&string_crypt::enc_str!("virtualbox")).trim_end_matches('\0').to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!("qemu"))
+            .trim_end_matches('\0')
+            .to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!("kvm"))
+            .trim_end_matches('\0')
+            .to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!("vmware"))
+            .trim_end_matches('\0')
+            .to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!("virtualbox"))
+            .trim_end_matches('\0')
+            .to_string(),
         "vbox".to_string(),
-        String::from_utf8_lossy(&string_crypt::enc_str!("xen")).trim_end_matches('\0').to_string(),
-        String::from_utf8_lossy(&string_crypt::enc_str!("hyperv")).trim_end_matches('\0').to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!("xen"))
+            .trim_end_matches('\0')
+            .to_string(),
+        String::from_utf8_lossy(&string_crypt::enc_str!("hyperv"))
+            .trim_end_matches('\0')
+            .to_string(),
         "innotek".to_string(),
     ];
     // std::str::from_utf8(&string_crypt::enc_str!("microsoft corporation")[..21]).unwrap() in sys_vendor appears on physical Microsoft hardware
@@ -356,9 +384,10 @@ fn linux_dmi_indicates_vm() -> bool {
             }
             if path.ends_with("sys_vendor") {
                 // Trim null bytes before comparing to avoid fragile byte-count slicing (4.1)
-                let trimmed = String::from_utf8_lossy(&string_crypt::enc_str!("microsoft corporation"))
-                    .trim_end_matches('\0')
-                    .to_ascii_lowercase();
+                let trimmed =
+                    String::from_utf8_lossy(&string_crypt::enc_str!("microsoft corporation"))
+                        .trim_end_matches('\0')
+                        .to_ascii_lowercase();
                 if s.contains(trimmed.as_str()) {
                     ms_vendor = true;
                 }
@@ -382,7 +411,14 @@ fn macos_system_profiler_indicates_vm() -> bool {
         .output()
     {
         let model = String::from_utf8_lossy(&output.stdout).to_lowercase();
-        if model.contains("virtual") || model.contains(String::from_utf8_lossy(&string_crypt::enc_str!("vmware")).trim_end_matches('\0').to_string()) || model.contains("pxe") {
+        if model.contains("virtual")
+            || model.contains(
+                String::from_utf8_lossy(&string_crypt::enc_str!("vmware"))
+                    .trim_end_matches('\0')
+                    .to_string(),
+            )
+            || model.contains("pxe")
+        {
             is_vm = true;
         }
     }
@@ -434,10 +470,20 @@ fn macos_system_profiler_indicates_vm() -> bool {
         }
     } {
         let ioreg = String::from_utf8_lossy(&stdout).to_lowercase();
-        if ioreg.contains(String::from_utf8_lossy(&string_crypt::enc_str!("virtualbox")).trim_end_matches('\0').to_string())
-            || ioreg.contains(String::from_utf8_lossy(&string_crypt::enc_str!("vmware")).trim_end_matches('\0').to_string())
-            || ioreg.contains("parallels")
-            || ioreg.contains(String::from_utf8_lossy(&string_crypt::enc_str!("qemu")).trim_end_matches('\0').to_string())
+        if ioreg.contains(
+            String::from_utf8_lossy(&string_crypt::enc_str!("virtualbox"))
+                .trim_end_matches('\0')
+                .to_string(),
+        ) || ioreg.contains(
+            String::from_utf8_lossy(&string_crypt::enc_str!("vmware"))
+                .trim_end_matches('\0')
+                .to_string(),
+        ) || ioreg.contains("parallels")
+            || ioreg.contains(
+                String::from_utf8_lossy(&string_crypt::enc_str!("qemu"))
+                    .trim_end_matches('\0')
+                    .to_string(),
+            )
         {
             is_vm = true;
         }
@@ -655,7 +701,9 @@ fn is_tracer_process_running() -> bool {
             let proc_path = proc.path();
             if let Ok(meta) = std::fs::metadata(&proc_path) {
                 use std::os::unix::fs::MetadataExt;
-                if meta.uid() != my_uid { continue; }
+                if meta.uid() != my_uid {
+                    continue;
+                }
             } else {
                 continue;
             }
@@ -690,8 +738,7 @@ fn detect_timing_anomaly() -> bool {
     if let Ok(la) = std::fs::read_to_string("/proc/loadavg") {
         if let Some(first) = la.split_whitespace().next() {
             if let Ok(load) = first.parse::<f64>() {
-                let cpu_count =
-                    unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as f64;
+                let cpu_count = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as f64;
                 if cpu_count > 0.0 && load > cpu_count * 2.0 {
                     // System is overloaded; timing check would be unreliable.
                     return false;
@@ -705,21 +752,42 @@ fn detect_timing_anomaly() -> bool {
     // spurious positives — skip it.
     #[cfg(windows)]
     {
+        use winapi::shared::minwindef::FILETIME;
         use winapi::um::processthreadsapi::GetSystemTimes;
-        use winapi::um::minwinbase::FILETIME;
-        let mut idle = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-        let mut kernel = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-        let mut user = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-        unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user); }
-        let to_u64 = |ft: FILETIME| -> u64 {
-            ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
+        let mut idle = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
         };
+        let mut kernel = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut user = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        unsafe {
+            GetSystemTimes(&mut idle, &mut kernel, &mut user);
+        }
+        let to_u64 =
+            |ft: FILETIME| -> u64 { ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64 };
         let idle0 = to_u64(idle);
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let mut idle2 = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-        let mut kernel2 = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-        let mut user2 = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-        unsafe { GetSystemTimes(&mut idle2, &mut kernel2, &mut user2); }
+        let mut idle2 = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut kernel2 = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut user2 = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        unsafe {
+            GetSystemTimes(&mut idle2, &mut kernel2, &mut user2);
+        }
         let idle_delta = to_u64(idle2).saturating_sub(idle0);
         let kernel_delta = to_u64(kernel2).saturating_sub(to_u64(kernel));
         let user_delta = to_u64(user2).saturating_sub(to_u64(user));
@@ -741,7 +809,10 @@ fn detect_timing_anomaly() -> bool {
         // vm_stat provides CPU idle ticks via sysctl; use a simpler approach:
         // read the 1-minute load average and compare to CPU count (same
         // heuristic as the Linux path above).
-        if let Ok(output) = std::process::Command::new("sysctl").args(["-n", "vm.loadavg"]).output() {
+        if let Ok(output) = std::process::Command::new("sysctl")
+            .args(["-n", "vm.loadavg"])
+            .output()
+        {
             let s = String::from_utf8_lossy(&output.stdout);
             // Output: "{ 0.50 0.42 0.35 }" — first number is 1-min avg
             let trimmed = s.trim_matches(|c: char| c == '{' || c == '}' || c.is_whitespace());
@@ -871,9 +942,7 @@ fn windows_aad_domain() -> Option<String> {
     use winreg::RegKey;
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     let join_info = hklm
-        .open_subkey(
-            "SYSTEM\\CurrentControlSet\\Control\\CloudDomainJoin\\JoinInfo",
-        )
+        .open_subkey("SYSTEM\\CurrentControlSet\\Control\\CloudDomainJoin\\JoinInfo")
         .ok()?;
     // Enumerate tenant subkeys (each is a GUID-formatted key).
     for name in join_info.enum_keys().filter_map(|r| r.ok()) {
@@ -901,10 +970,16 @@ fn windows_aad_domain() -> Option<String> {
 
 /// Run every probe and either return `Ok(())` or refuse to start.
 ///
-/// `required_domain` and `refuse_in_vm` come from `agent.toml`.
-pub fn enforce(required_domain: Option<&str>, refuse_in_vm: bool) -> EnvDecision {
+/// Policy inputs come from `agent.toml`; any unset policy leaves the
+/// corresponding signal informational.
+pub fn enforce(
+    required_domain: Option<&str>,
+    refuse_when_debugged: bool,
+    refuse_in_vm: bool,
+    sandbox_score_threshold: Option<u32>,
+) -> EnvDecision {
     let report = EnvReport::collect(required_domain);
-    let refuse = report.should_refuse(refuse_in_vm);
+    let refuse = report.should_refuse(refuse_when_debugged, refuse_in_vm, sandbox_score_threshold);
     EnvDecision { report, refuse }
 }
 
@@ -924,7 +999,7 @@ mod tests {
         let r = EnvReport::collect(None);
         assert!(r.domain_match.is_none());
         // Refusal must not fire from a missing required_domain alone.
-        assert!(!r.should_refuse(false));
+        assert!(!r.should_refuse(false, false, None));
     }
 
     #[test]
@@ -973,20 +1048,43 @@ mod tests {
     #[test]
     fn refusal_policy_combines_signals() {
         let mut r = EnvReport::default();
-        assert!(!r.should_refuse(false));
+        assert!(!r.should_refuse(false, false, None));
         r.debugger_present = true;
-        assert!(r.should_refuse(false));
+        assert!(!r.should_refuse(false, false, None));
+        assert!(r.should_refuse(true, false, None));
         r.debugger_present = false;
         r.domain_match = Some(false);
-        assert!(r.should_refuse(false));
+        assert!(r.should_refuse(false, false, None));
         r.domain_match = Some(true);
         r.vm_detected = true;
-        assert!(!r.should_refuse(false));
-        assert!(r.should_refuse(true));
+        assert!(!r.should_refuse(false, false, None));
+        assert!(r.should_refuse(false, true, None));
+    }
+
+    #[test]
+    fn unrelated_tracer_process_is_informational() {
+        let mut r = EnvReport::default();
+        r.tracer_process_found = true;
+        assert!(!r.should_refuse(false, false, None));
+    }
+
+    #[test]
+    fn cloud_vm_indicators_are_informational_by_default() {
+        let mut r = EnvReport::default();
+        r.vm_detected = true;
+        assert!(!r.should_refuse(false, false, None));
+        assert!(r.should_refuse(false, true, None));
+    }
+
+    #[test]
+    fn sandbox_score_threshold_is_explicit() {
+        let mut r = EnvReport::default();
+        r.sandbox_score = 80;
+        assert!(!r.should_refuse(false, false, None));
+        assert!(!r.should_refuse(false, false, Some(81)));
+        assert!(r.should_refuse(false, false, Some(80)));
     }
 }
-
-
 
 /// Combined sandbox heuristics implementation (Prompt 6)
 pub mod sandbox {

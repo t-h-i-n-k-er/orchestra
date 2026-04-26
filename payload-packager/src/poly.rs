@@ -32,8 +32,8 @@ use rand::Rng;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolyScheme {
-    XorStream  = 0,
-    Rc4        = 1,
+    XorStream = 0,
+    Rc4 = 1,
     LfsrStream = 2,
 }
 
@@ -54,8 +54,8 @@ impl PolyScheme {
 // ── Blob ──────────────────────────────────────────────────────────────────────
 
 pub struct PolyBlob {
-    pub scheme:     PolyScheme,
-    pub key:        Vec<u8>,
+    pub scheme: PolyScheme,
+    pub key: Vec<u8>,
     pub ciphertext: Vec<u8>,
 }
 
@@ -72,19 +72,31 @@ pub fn poly_wrap(plaintext: &[u8]) -> PolyBlob {
             let key_len: usize = rng.gen_range(16..=64);
             let key: Vec<u8> = (0..key_len).map(|_| rng.gen()).collect();
             let ct = xor_stream(plaintext, &key);
-            PolyBlob { scheme, key, ciphertext: ct }
+            PolyBlob {
+                scheme,
+                key,
+                ciphertext: ct,
+            }
         }
         PolyScheme::Rc4 => {
             let key_len: usize = rng.gen_range(16..=256);
             let key: Vec<u8> = (0..key_len).map(|_| rng.gen()).collect();
             let ct = rc4(plaintext, &key);
-            PolyBlob { scheme, key, ciphertext: ct }
+            PolyBlob {
+                scheme,
+                key,
+                ciphertext: ct,
+            }
         }
         PolyScheme::LfsrStream => {
             // 8-byte seed — fed into a 64-bit Galois LFSR.
             let key: Vec<u8> = (0..8).map(|_| rng.gen()).collect();
             let ct = lfsr_stream(plaintext, &key);
-            PolyBlob { scheme, key, ciphertext: ct }
+            PolyBlob {
+                scheme,
+                key,
+                ciphertext: ct,
+            }
         }
     }
 }
@@ -120,18 +132,18 @@ pub fn poly_emit_stub(blob: &PolyBlob) -> String {
     let build_token: u64 = rng.gen();
 
     // Pre-generate all random identifiers up-front to avoid closure/borrow conflicts.
-    let suf_ct   = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
-    let suf_out  = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
-    let suf_key  = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
-    let suf_idx  = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
+    let suf_ct = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
+    let suf_out = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
+    let suf_key = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
+    let suf_idx = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
     let suf_klen = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
     let suf_dead = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
     let dead_val: u64 = rng.gen();
 
-    let v_ct   = format!("ct_{suf_ct}");
-    let v_out  = format!("out_{suf_out}");
-    let v_key  = format!("key_{suf_key}");
-    let v_idx  = format!("i_{suf_idx}");
+    let v_ct = format!("ct_{suf_ct}");
+    let v_out = format!("out_{suf_out}");
+    let v_key = format!("key_{suf_key}");
+    let v_idx = format!("i_{suf_idx}");
     let v_klen = format!("kl_{suf_klen}");
     let v_dead = format!("_dead_{suf_dead}");
 
@@ -139,23 +151,31 @@ pub fn poly_emit_stub(blob: &PolyBlob) -> String {
 
     let body = match blob.scheme {
         PolyScheme::XorStream => emit_xor_body(
-            &v_ct, &v_key, &v_out, &v_idx, &v_klen, &key_literal, &mut rng,
+            &v_ct,
+            &v_key,
+            &v_out,
+            &v_idx,
+            &v_klen,
+            &key_literal,
+            &mut rng,
         ),
-        PolyScheme::Rc4 => emit_rc4_body(
-            &v_ct, &v_key, &v_out, &key_literal, &mut rng,
-        ),
-        PolyScheme::LfsrStream => emit_lfsr_body(
-            &v_ct, &v_key, &v_out, &v_idx, &key_literal, &mut rng,
-        ),
+        PolyScheme::Rc4 => emit_rc4_body(&v_ct, &v_key, &v_out, &key_literal, &mut rng),
+        PolyScheme::LfsrStream => {
+            emit_lfsr_body(&v_ct, &v_key, &v_out, &v_idx, &key_literal, &mut rng)
+        }
     };
 
     // Vary whether dead code appears before or after the key assignment.
     let (before_dead, after_dead) = if rng.gen_bool(0.5) {
-        (format!("    let {v_dead}: u64 = {dead_val}u64;\n    let _ = {v_dead};\n"),
-         String::new())
+        (
+            format!("    let {v_dead}: u64 = {dead_val}u64;\n    let _ = {v_dead};\n"),
+            String::new(),
+        )
     } else {
-        (String::new(),
-         format!("    let {v_dead}: u64 = {dead_val}u64;\n    let _ = {v_dead};\n"))
+        (
+            String::new(),
+            format!("    let {v_dead}: u64 = {dead_val}u64;\n    let _ = {v_dead};\n"),
+        )
     };
 
     format!(
@@ -211,13 +231,17 @@ fn rc4(data: &[u8], key: &[u8]) -> Vec<u8> {
 fn lfsr_stream(data: &[u8], key: &[u8]) -> Vec<u8> {
     assert!(key.len() >= 8);
     let mut state = u64::from_le_bytes(key[..8].try_into().unwrap());
-    if state == 0 { state = 0xace1_ace1_ace1_ace1; } // avoid all-zero state
+    if state == 0 {
+        state = 0xace1_ace1_ace1_ace1;
+    } // avoid all-zero state
     const POLY: u64 = 0x8000_0000_0000_000b; // taps at 64,4,3,1 (Galois form)
     data.iter()
         .map(|&b| {
             let bit = state & 1;
             state >>= 1;
-            if bit != 0 { state ^= POLY; }
+            if bit != 0 {
+                state ^= POLY;
+            }
             b ^ (state as u8)
         })
         .collect()
@@ -226,8 +250,13 @@ fn lfsr_stream(data: &[u8], key: &[u8]) -> Vec<u8> {
 // ── Stub body emitters ────────────────────────────────────────────────────────
 
 fn emit_xor_body(
-    v_ct: &str, v_key: &str, v_out: &str, v_idx: &str, v_klen: &str,
-    key_lit: &str, rng: &mut impl Rng,
+    v_ct: &str,
+    v_key: &str,
+    v_out: &str,
+    v_idx: &str,
+    v_klen: &str,
+    key_lit: &str,
+    rng: &mut impl Rng,
 ) -> String {
     if rng.gen_bool(0.5) {
         // Style A: indexed for-loop
@@ -252,15 +281,19 @@ fn emit_xor_body(
 }
 
 fn emit_rc4_body(
-    v_ct: &str, v_key: &str, v_out: &str, key_lit: &str, rng: &mut impl Rng,
+    v_ct: &str,
+    v_key: &str,
+    v_out: &str,
+    key_lit: &str,
+    rng: &mut impl Rng,
 ) -> String {
     // Variable names for internal RC4 state
     let mut suf = || format!("{:04x}", rng.gen::<u16>());
-    let vs  = format!("s_{}", suf());
-    let vj  = format!("j_{}", suf());
-    let vi  = format!("i_{}", suf());
-    let vk  = format!("k_{}", suf());
-    let vb  = format!("b_{}", suf());
+    let vs = format!("s_{}", suf());
+    let vj = format!("j_{}", suf());
+    let vi = format!("i_{}", suf());
+    let vk = format!("k_{}", suf());
+    let vb = format!("b_{}", suf());
 
     format!(
         "    let {v_key}: &[u8] = &[{key_lit}];\n    \
@@ -284,7 +317,11 @@ fn emit_rc4_body(
 }
 
 fn emit_lfsr_body(
-    v_ct: &str, v_key: &str, v_out: &str, v_idx: &str, key_lit: &str,
+    v_ct: &str,
+    v_key: &str,
+    v_out: &str,
+    v_idx: &str,
+    key_lit: &str,
     rng: &mut impl Rng,
 ) -> String {
     let mut suf = || format!("{:04x}", rng.gen::<u16>());
@@ -334,7 +371,8 @@ fn emit_lfsr_body(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn byte_array_literal(bytes: &[u8]) -> String {
-    bytes.iter()
+    bytes
+        .iter()
         .map(|b| format!("0x{:02x}u8", b))
         .collect::<Vec<_>>()
         .join(", ")

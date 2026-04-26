@@ -15,8 +15,8 @@ fn bench_apply_passes_larger(c: &mut Criterion) {
         0x31, 0xC0, // xor  eax, eax
         0x85, 0xC0, // test eax, eax
         0x74, 0x01, // jz   +1  (skip nop)
-        0x90,       // nop
-        0xC3,       // ret
+        0x90, // nop
+        0xC3, // ret
     ];
     c.bench_function("apply_passes branch block", |b| {
         b.iter(|| optimizer::apply_passes(black_box(code)))

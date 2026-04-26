@@ -46,8 +46,14 @@ pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
         )
         .route("/audit", get(recent_audit))
         .route("/build", post(crate::build_handler::handle_build))
-        .route("/build/status/:id", get(crate::build_handler::handle_build_status))
-        .route("/build/:id/download", get(crate::build_handler::handle_download))
+        .route(
+            "/build/status/:id",
+            get(crate::build_handler::handle_build_status),
+        )
+        .route(
+            "/build/:id/download",
+            get(crate::build_handler::handle_download),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,

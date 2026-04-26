@@ -27,11 +27,14 @@
 //! `PluginObject` contains a pointer to a `PluginVTable` — a `#[repr(C)]`
 //! struct of function pointers — so the ABI is fully defined at the C level
 //! and does not depend on Rust fat-pointer or vtable layout stability.
+//!
+//! `load_plugin` calls `Plugin::init` exactly once before returning the boxed
+//! plugin, so callers can register or execute the returned plugin immediately.
 
 use anyhow::{anyhow, Result};
 use common::CryptoSession;
 use libloading::{Library, Symbol};
-#[cfg(target_os = "linux")]
+#[cfg(not(windows))]
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -173,6 +176,15 @@ impl Drop for FfiPlugin {
     }
 }
 
+fn initialized_plugin(plugin_ptr: *mut PluginObject) -> Result<Box<dyn Plugin>> {
+    if plugin_ptr.is_null() {
+        return Err(anyhow!("_create_plugin() returned a null pointer"));
+    }
+    let plugin = Box::new(FfiPlugin(plugin_ptr)) as Box<dyn Plugin>;
+    plugin.init()?;
+    Ok(plugin)
+}
+
 /// Loads a decrypted, signed plugin from a byte slice into a `Box<dyn Plugin>`.
 ///
 /// * `encrypted_blob`: The raw bytes of the plugin, encrypted with AES-256-GCM.
@@ -260,18 +272,8 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
                             std::mem::transmute(image_base.add(rva));
                         create_func()
                     };
-                    if plugin_ptr.is_null() {
-                        unsafe {
-                            winapi::um::memoryapi::VirtualFree(
-                                image_base,
-                                0,
-                                winapi::um::winnt::MEM_RELEASE,
-                            );
-                        }
-                        return Err(anyhow!("_create_plugin returned null pointer"));
-                    }
                     // Library memory is leaked intentionally (plugin lifetime = process lifetime).
-                    return Ok(Box::new(FfiPlugin(plugin_ptr)) as Box<dyn Plugin>);
+                    return initialized_plugin(plugin_ptr);
                 }
                 // Export not found — free the mapped image rather than falling
                 // through to the temp-file path with a partially-initialised DLL.
@@ -292,7 +294,7 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
         // The file is written to disk for the duration of the dlopen() call.
         // On Windows we use FILE_FLAG_DELETE_ON_CLOSE to minimise on-disk lifetime.
         #[cfg(windows)]
-        let temp_path = {
+        let lib = {
             use std::os::windows::fs::OpenOptionsExt;
             let temp_dir = std::env::temp_dir();
             let file_name = format!(
@@ -315,26 +317,29 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
             // We must leak the file handle. It stays active inside the OS, keeping the file valid.
             // When the process terminates or the library unmaps, the OS deletes it.
             Box::leak(Box::new(file));
-            tp
+            info!("Loading plugin from temporary file: {:?}", &tp);
+            unsafe { Library::new(&tp)? }
         };
 
         #[cfg(not(target_os = "windows"))]
-        let temp_path = {
-            let temp_file = tempfile::Builder::new()
+        let lib = {
+            let mut temp_file = tempfile::Builder::new()
                 .prefix("plugin-")
                 .suffix(std::env::consts::DLL_SUFFIX)
                 .tempfile()?;
-            let tp = temp_file.into_temp_path();
-            std::fs::write(&tp, module_data)?;
-            let tp_path = tp.to_path_buf();
-            // UNIX fallback leak logic if needed.
-            let _ = tp.keep();
-            tp_path
+            temp_file.write_all(module_data)?;
+            let temp_path = temp_file.path().to_path_buf();
+            info!(
+                "Loading plugin from temporary file that will be unlinked after dlopen: {:?}",
+                &temp_path
+            );
+            // POSIX `dlopen` keeps the mapped image alive after the pathname is
+            // unlinked, so dropping `temp_file` after `Library::new` restores
+            // temporary-file semantics.
+            let lib = unsafe { Library::new(&temp_path)? };
+            drop(temp_file);
+            lib
         };
-
-        info!("Loading plugin from temporary file: {:?}", &temp_path);
-        // SAFETY: We trust the decrypted blob.
-        let lib = unsafe { Library::new(&temp_path)? };
         lib
     };
 
@@ -344,14 +349,11 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
         unsafe { library.get(b"_create_plugin")? };
 
     let plugin_ptr = unsafe { create_func() };
-    if plugin_ptr.is_null() {
-        return Err(anyhow!("_create_plugin() returned a null pointer"));
-    }
 
     // Leak the library so the plugin's code remains mapped for the process lifetime.
     std::mem::forget(library);
 
-    Ok(Box::new(FfiPlugin(plugin_ptr)) as Box<dyn Plugin>)
+    initialized_plugin(plugin_ptr)
 }
 
 #[cfg(test)]
@@ -433,8 +435,7 @@ mod tests {
         // 3. Load it using the module_loader.
         let plugin = load_plugin(&encrypted_blob, &session).expect("Failed to load plugin");
 
-        // 4. Initialize and execute.
-        plugin.init().expect("Plugin init failed");
+        // 4. Loading initializes the plugin; execute verifies it is usable.
         let result = plugin.execute("World").expect("Plugin execution failed");
 
         assert_eq!(result, "Hello, World");
@@ -449,7 +450,6 @@ mod tests {
         let encrypted_blob = session.encrypt(&plugin_bytes);
         let plugin =
             load_plugin(&encrypted_blob, &session).expect("Failed to load plugin with manual map");
-        plugin.init().expect("Plugin init failed");
         let result = plugin
             .execute("ManualMap")
             .expect("Plugin execution failed");

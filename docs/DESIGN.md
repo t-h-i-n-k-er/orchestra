@@ -409,22 +409,19 @@ orchestra-console --target 127.0.0.1:7890 --tls --insecure ping
 Orchestra is built and tested on three operating systems by the CI
 workflow at `.github/workflows/ci.yml`:
 
-| OS               | Default tests | Optional features tested                       |
-|------------------|---------------|-----------------------------------------------|
-| `ubuntu-latest`  | yes           | `persistence`, `network-discovery`, `hci-research`, `remote-assist`, `direct-syscalls`, `manual-map` |
-| `windows-latest` | yes           | `persistence`, `network-discovery`, `hci-research` |
-| `macos-latest`   | yes           | `persistence`, `network-discovery`, `hci-research` |
-
-A separate `audit` job runs `cargo audit` against the latest RustSec
-advisory database on every push.
+| OS               | Default tests | Optional checks                                 |
+|------------------|---------------|-------------------------------------------------|
+| `ubuntu-latest`  | yes           | feature-module compile/tests, doc/feature drift, deterministic proc-macro tests |
+| `windows-latest` | compile       | selected Windows-facing agent features and `module_loader/manual-map` compile |
+| `macos-latest`   | compile       | selected macOS agent features when the Darwin toolchain is present |
 
 ### Platform-specific code
 
 - `module_loader` uses `memfd_create` only when `cfg(target_os = "linux")`. On Windows, it can use a manual PE loader (`manual-map` feature) or fall back to a tempfile.
 - `agent::persistence` switches between systemd unit files (Linux) and
   `schtasks` (Windows) via `cfg(target_os)`.
-- `agent::remote_assist` is gated on Linux and Windows. On Linux it uses `x11cap` and `enigo`. On Windows it uses `windows-capture` and `enigo`.
-- `agent::process_manager` on Windows implements process hollowing for agent migration. This can optionally use direct syscalls (`direct-syscalls` feature).
+- `agent::remote_assist` is gated by the `remote-assist` feature. Linux X11 capture uses `x11cap`; macOS capture shells out to `screencapture` and validates PNG output; Windows capture currently returns an explicit unsupported error while input simulation remains consent-gated.
+- `agent::process_manager` exposes process enumeration on all platforms. Migration paths are experimental, feature/permission-gated, and return explicit errors when prerequisites are not met.
 
 Every platform-specific symbol is hidden behind a `#[cfg]` attribute so
 that `cargo check --workspace` succeeds on all three platforms without
@@ -445,12 +442,10 @@ This functionality is integrated into the agent's startup sequence, where `optim
 
 ### Low-Level System Interface (Direct Syscalls)
 
-To improve compatibility with security software that hooks standard Win32 APIs, Orchestra provides an optional feature (`direct-syscalls`) to invoke Windows kernel services directly.
-
-1.  **Syscall Number (SSN) Retrieval**: A macro, `syscall!`, dynamically retrieves the SSN for a given NT function from the in-memory `ntdll.dll` by parsing the function's stub.
-2.  **Inline Assembly**: It uses inline assembly (`asm!`) to set up the correct registers and execute the `syscall` instruction, bypassing the standard library's API call.
-3.  **Safe Wrappers**: Safe Rust wrappers are provided for `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, etc.
-4.  **Integration**: The process hollowing implementation uses these direct syscalls for memory operations when the `direct-syscalls` feature is enabled.
+Orchestra keeps the optional `direct-syscalls` feature as an experimental
+Windows compatibility compile path. CI verifies that the feature compiles; the
+strategy dispatcher routes through a shared bounded wrapper so stack arguments
+and unsupported ABIs fail consistently.
 
 ### In-Memory Plugin Deployment (Manual PE Mapping)
 
@@ -468,23 +463,16 @@ On Windows, the `module_loader` can use a true in-memory DLL loader when the `ma
 
 ### Windows Support for Remote Assistance
 
-The `remote-assist` feature is now supported on Windows.
-- **Consent Check**: The implementation checks for a registry value `HKLM\Software\Orchestra\Consent` (DWORD) set to `1`.
-- **Input Simulation**: The `enigo` crate is used for keyboard and mouse simulation via the `SendInput` API.
-- **Screen Capture**: Screen capture is implemented using the `windows-capture` crate.
+The `remote-assist` feature compiles on Windows for consent-gated input
+simulation. Screen capture returns a controlled unsupported error until the
+platform capture integration is updated and covered by CI.
 
 ### Process Migration for Load Balancing (Process Hollowing)
 
-On Windows, the `MigrateAgent` command is implemented using a technique called process hollowing. This allows the agent to migrate itself into a newly created, trusted system process.
-
-The implementation in `agent/srcs/process_hollowing.rs` (guarded by `#[cfg(windows)]`) performs the following steps:
-1.  Creates a suspended process of a legitimate binary (e.g., `C:\Windows\System32\svchost.exe`) using `CreateProcessW` with the `CREATE_SUSPENDED` flag.
-2.  Allocates memory in the target process using `VirtualAllocEx`.
-3.  Writes the current agent's executable image into the allocated memory.
-4.  Updates the thread context of the new process to point to the entry point of the injected payload.
-5.  Resumes the thread, causing the agent's code to execute within the hollowed `svchost.exe` process.
-
-This technique is used for "Process Migration for Load Balancing," allowing the agent to move to a different process to potentially evade detection or change its resource footprint. An integration test, marked `#[ignore]`, is available to verify this functionality locally.
+`MigrateAgent` is treated as an experimental maintenance capability rather than
+a default load-balancing path. Normal builds rely on process enumeration only;
+migration-specific code is platform/permission gated and expected to fail
+closed with a clear diagnostic when prerequisites are absent.
 
 ---
 

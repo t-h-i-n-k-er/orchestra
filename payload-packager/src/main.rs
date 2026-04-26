@@ -120,7 +120,9 @@ fn main() -> Result<()> {
     }
 
     // ── Standard AES-256-GCM mode ───────────────────────────────────────────
-    let key_str = cli.key.ok_or_else(|| anyhow::anyhow!("--key is required in standard mode"))?;
+    let key_str = cli
+        .key
+        .ok_or_else(|| anyhow::anyhow!("--key is required in standard mode"))?;
     let key_bytes = base64::engine::general_purpose::STANDARD
         .decode(&key_str)
         .context("--key is not valid Base64")?;

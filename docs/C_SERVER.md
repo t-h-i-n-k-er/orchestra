@@ -8,7 +8,7 @@
 ## Architecture
 
 ```
-+----------------+   AES-256-GCM TCP   +----------------------+   HTTPS / WS    +-----------+
++----------------+   TLS + AES-GCM PSK  +----------------------+   HTTPS / WS    +-----------+
 |  agent (×N)    | <-----------------> |  orchestra-server    | <-------------> |  browser  |
 | (managed host) |   length-prefixed   |  (control center)    |  Bearer token   | dashboard |
 +----------------+   JSON frames       +----------+-----------+                 +-----------+
@@ -17,12 +17,10 @@
                                        JSONL audit log (append-only)
 ```
 
-- **Agent channel.** Reuses `common::CryptoSession` (AES-256-GCM with
-  random per-frame nonces) and the `Message` enum from the existing
-  protocol. The wire format is the same length-prefixed JSON used by
-  `common::transport::TcpTransport`. mTLS termination via
-  `common::tls_transport::TlsTransport` is a drop-in replacement for the
-  AES path; see "Hardening" below.
+- **Agent channel.** Stock agents use the outbound Control Center path:
+   TLS to `agent_addr` (certificate-pinned when configured), followed by
+   `common::CryptoSession` (AES-256-GCM with random per-frame nonces) and
+   the shared `Message` protocol.
 - **Operator channel.** `axum` 0.7 + `axum-server` (`rustls`) serving
   REST under `/api/*`, a WebSocket under `/api/ws`, and the static
   dashboard from `static/`.
@@ -41,7 +39,7 @@
 | [src/main.rs](../orchestra-server/src/main.rs) | Binary entry point, CLI, listener bring-up |
 | [src/config.rs](../orchestra-server/src/config.rs) | TOML config struct |
 | [src/state.rs](../orchestra-server/src/state.rs) | `AppState`, agent registry, pending-task table |
-| [src/agent_link.rs](../orchestra-server/src/agent_link.rs) | AES-TCP agent listener and per-connection driver |
+| [src/agent_link.rs](../orchestra-server/src/agent_link.rs) | TLS + AES-GCM agent listener and per-connection driver |
 | [src/api.rs](../orchestra-server/src/api.rs) | REST + WebSocket router |
 | [src/auth.rs](../orchestra-server/src/auth.rs) | Bearer-token middleware |
 | [src/audit.rs](../orchestra-server/src/audit.rs) | Append-only JSONL audit log + broadcast |
@@ -150,7 +148,7 @@ cargo test -p orchestra-server --test e2e
 ```
 
 The test boots the server with self-signed TLS on ephemeral ports,
-connects a fake agent over the AES-TCP socket, asserts that
+connects a fake agent over the TLS + AES-GCM agent channel, asserts that
 `GET /api/agents` requires auth and lists the agent, sends a `Ping`
 through the REST API, has the fake agent reply `pong`, and checks the
 audit log contains the resulting entry.
@@ -168,20 +166,24 @@ cargo run -p orchestra-server -- \
 
 ## Outbound agents (`outbound-c`)
 
-By default Orchestra agents wait for an inbound connection from the console.
-For managed endpoints behind NAT or firewall egress rules, the **outbound-c**
-feature compiles the agent into a standalone binary that dials the Control
-Center automatically and reconnects on disconnection.
+The supported packaged deployment model is the **outbound-c** feature. It
+compiles the agent into a standalone binary that dials the Control Center
+automatically and reconnects on disconnection. The legacy `console` binary is
+a protocol-testing client for custom listeners; stock `agent-standalone` does
+not expose a direct console listener.
 
 ### How it works
 
-1. The Builder sets `ORCHESTRA_C_ADDR=<host:port>` and
-   `ORCHESTRA_C_SECRET=<psk>` as environment variables during `cargo build`.
+1. The Builder sets `ORCHESTRA_C_ADDR=<host:port>`,
+   `ORCHESTRA_C_SECRET=<psk>`, and optionally
+   `ORCHESTRA_C_CERT_FP=<sha256-der-fingerprint>` as environment variables
+   during `cargo build`.
 2. `option_env!("ORCHESTRA_C_ADDR")` in `agent/src/outbound.rs` captures
    those values as compile-time string literals baked into the binary.
-3. At runtime the agent connects to the baked address (overridable with the
-   `ORCHESTRA_C` environment variable), sends a `Heartbeat` to register,
-   then runs the standard command loop.
+3. At runtime the agent connects to the baked address, sends a `Heartbeat` to
+   register, then runs the standard command loop. Debug builds may override
+   the baked address/secret with `ORCHESTRA_C` and `ORCHESTRA_SECRET`; release
+   builds use the baked values.
 4. On any transport error the agent sleeps with exponential back-off (1 s → 64 s)
    and reconnects. A clean `Shutdown` command from the server stops the loop.
 
@@ -199,21 +201,22 @@ cargo run --release -p builder -- configure --name prod-linux-outbound
 cargo run --release -p builder -- build prod-linux-outbound
 ```
 
-The output is an encrypted `dist/prod-linux-outbound.enc`. Deploy with
-the launcher or decrypt manually for testing (see `builder/README.md`).
+The output is an encrypted `dist/prod-linux-outbound.enc` suitable for the
+launcher flow or for your internal deployment packaging.
 
 **Manual (for development/testing):**
 
 ```bash
 ORCHESTRA_C_ADDR=127.0.0.1:8444 \
 ORCHESTRA_C_SECRET=devsecret \
+ORCHESTRA_C_CERT_FP=<sha256-der-fingerprint> \
 cargo build -p agent --bin agent-standalone --features outbound-c
 
 # Then run it; it connects back to the server immediately:
 ./target/debug/agent-standalone
 ```
 
-You can also override the address at runtime without rebuilding:
+Debug builds can also override the address at runtime without rebuilding:
 
 ```bash
 ORCHESTRA_C=10.0.0.5:8444 ORCHESTRA_SECRET=devsecret ./agent-standalone
@@ -229,11 +232,13 @@ bin_name          = "agent-standalone"
 features          = ["outbound-c"]
 c2_address        = "10.0.0.5:8444"   # baked as ORCHESTRA_C_ADDR
 c_server_secret   = "REPLACE-ME"      # baked as ORCHESTRA_C_SECRET
+server_cert_fingerprint = "<64-hex-sha256>" # baked as ORCHESTRA_C_CERT_FP
 ```
 
 `c_server_secret` must match `agent_shared_secret` in
-`orchestra-server.toml`. If omitted the agent requires the
-`ORCHESTRA_SECRET` environment variable at runtime.
+`orchestra-server.toml`. If omitted, release builds have no baked secret and
+will fail closed; debug builds may supply `ORCHESTRA_SECRET` at runtime for
+local testing.
 
 ### Self-verification
 
@@ -332,10 +337,9 @@ See `common/src/crypto.rs` for the implementation and its unit tests.
    server behind an SSO-aware reverse proxy and require
    `X-Forwarded-User` to be present (configurable extension point in
    `auth.rs`).
-2. **Replace the AES-PSK agent channel with mTLS** by swapping
-   `common::transport::TcpTransport` for `common::tls_transport::TlsTransport`
-   in `agent_link::handle_agent`. The wire format is identical except for
-   the cipher; the registry/pending logic does not change.
+2. **Pin or replace test certificates.** The setup and server-side build
+   paths can bake `server_cert_fingerprint` into outbound agents. Use a
+   production certificate and rotate pinned fingerprints deliberately.
 3. **Pin the dashboard's CSP** if you customise `static/index.html`. The
    shipped page loads no third-party scripts.
 4. **Forward the audit log** to your SIEM. The JSONL format is one event
