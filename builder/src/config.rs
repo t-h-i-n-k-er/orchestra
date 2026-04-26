@@ -197,10 +197,21 @@ pub fn cmd_configure(name: Option<String>) -> Result<()> {
         hmac_key: hmac_key_b64,
         c_server_secret,
         server_cert_fingerprint: None,
-        features,
+        features: features.clone(),
         output_name: None,
-        package: "launcher".to_string(),
-        bin_name: None,
+        // When outbound-c is selected, the payload is the agent standalone
+        // binary, not the launcher.  The launcher waits for inbound console
+        // connections; the agent-standalone binary dials the server directly.
+        package: if features.iter().any(|f| f == "outbound-c") {
+            "agent".to_string()
+        } else {
+            "launcher".to_string()
+        },
+        bin_name: if features.iter().any(|f| f == "outbound-c") {
+            Some("agent-standalone".to_string())
+        } else {
+            None
+        },
     };
 
     save_profile(&name, &profile)?;

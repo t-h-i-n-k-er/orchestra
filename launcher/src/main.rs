@@ -236,9 +236,21 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
     #[cfg(debug_assertions)]
     tracing::info!("executing payload via fexecve(fd={})", fd);
 
-    // SAFETY: fd is a valid open file descriptor pointing at a valid Mach-O/ELF
+    // `libc::fexecve` is not exposed by the Rust `libc` crate for macOS
+    // because Apple's libSystem does not document it through the usual POSIX
+    // headers.  We declare it directly — it IS available since macOS 10.7 as
+    // an undocumented-but-stable syscall wrapper in /usr/lib/libSystem.B.dylib.
+    extern "C" {
+        fn fexecve(
+            fd: libc::c_int,
+            argv: *const *const libc::c_char,
+            envp: *const *const libc::c_char,
+        ) -> libc::c_int;
+    }
+
+    // SAFETY: fd is a valid open file descriptor pointing at a valid Mach-O
     // binary; argv_ptrs and envp are null-terminated pointer arrays.
-    let ret = unsafe { libc::fexecve(fd, argv_ptrs.as_mut_ptr(), envp.as_ptr() as *mut _) };
+    let ret = unsafe { fexecve(fd, argv_ptrs.as_mut_ptr(), envp.as_ptr() as *mut _) };
     // fexecve only returns on failure.
     let _ = ret;
     Err(anyhow!(

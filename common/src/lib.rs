@@ -17,6 +17,8 @@ pub mod audit;
 pub mod config;
 pub mod normalized_transport;
 pub mod tls_transport;
+#[cfg(feature = "forward-secrecy")]
+pub mod forward_secrecy;
 
 pub use audit::{AuditEvent, Outcome};
 

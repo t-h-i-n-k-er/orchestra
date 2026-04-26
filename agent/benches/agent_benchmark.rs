@@ -16,6 +16,7 @@ fn bench_message_encode_encrypt(c: &mut Criterion) {
     let msg = Message::TaskRequest {
         task_id: "00000000-0000-0000-0000-000000000000".into(),
         command: Command::Ping,
+        operator_id: None,
     };
     let bytes = serde_json::to_vec(&msg).unwrap();
 

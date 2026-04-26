@@ -24,6 +24,9 @@ winapi = { version = "0.3", features = ["memoryapi", "libloaderapi", "winnt"] }
 [features]
 default = ["module-signatures"]
 module-signatures = ["dep:ed25519-dalek"]
+# Enable reflective PE loading on Windows (no temp file written to disk).
+# Requires the Windows-only `goblin` + `winapi` dependencies declared above.
+manual-map = []
 
 [dev-dependencies]
 tokio = { workspace = true }

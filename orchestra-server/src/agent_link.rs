@@ -104,12 +104,27 @@ async fn handle_agent(
     sock.set_nodelay(true).ok();
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-    let tls_stream = acceptor.accept(sock).await?;
+    let mut tls_stream = acceptor.accept(sock).await?;
+
+    // When forward-secrecy is enabled, perform an X25519 ECDH exchange before
+    // the first application message.  The derived per-session key replaces the
+    // static PSK-derived key, providing PFS at the application layer.
+    #[cfg(feature = "forward-secrecy")]
+    let session = Arc::new(
+        common::forward_secrecy::negotiate_session_key(
+            &mut tls_stream,
+            secret.as_bytes(),
+            false, // server reads client key first
+        )
+        .await?,
+    );
+    #[cfg(not(feature = "forward-secrecy"))]
+    let session = Arc::new(CryptoSession::from_shared_secret(secret.as_bytes()));
 
     let (mut r, mut w) = tokio::io::split(tls_stream);
 
-    let (tx, mut rx) = mpsc::channel::<Message>(CHANNEL_DEPTH);
-    let session = Arc::new(CryptoSession::from_shared_secret(secret.as_bytes()));
+    // Bounded channel for the API layer to push commands to this connection.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(32);
 
     // Writer task drains commands from the API layer onto the wire.
     let writer_session = session.clone();

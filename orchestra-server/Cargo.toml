@@ -42,6 +42,12 @@ chrono = "0.4.44"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
+rustls-pemfile = "2"
+# Enable dangerous-tls so tests can use NoCertificateVerification.
+common = { path = "../common", features = ["dangerous-tls"] }
 
 [features]
 default = []
+# Application-layer forward secrecy via X25519 ECDH. Must also be enabled on
+# the agent side for the exchange to succeed.
+forward-secrecy = ["common/forward-secrecy"]

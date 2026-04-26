@@ -81,6 +81,10 @@ hci-research = ["dep:rdev", "dep:chrono", "dep:twox-hash"]
 # at compile time via the ORCHESTRA_C_ADDR / ORCHESTRA_C_SECRET build env vars
 # (set automatically by the Builder when outbound-c is included in a profile).
 outbound-c = []
+# Application-layer perfect forward secrecy via X25519 ECDH + HKDF.
+# When enabled, each session derives a unique AES-256-GCM key from an
+# ephemeral DH exchange authenticated by the PSK.
+forward-secrecy = ["common/forward-secrecy"]
 unsafe-runtime-rewrite = ["optimizer/unsafe-runtime-rewrite"]
 # Encrypt all designated sensitive memory regions while the agent is idle.
 # Uses XChaCha20-Poly1305.  The 32-byte key is held in CPU registers (x86-64

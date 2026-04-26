@@ -1,9 +1,32 @@
-//! Secure, in-memory loading for dynamically deployed capability plugins.
-//
+//! Capability plugin loading for dynamically-deployed Orchestra modules.
+//!
 //! This module handles fetching, decrypting, verifying, and loading shared
-//! libraries (`.so`, `.dll`) entirely in memory, without writing the plugin to
-//! the filesystem. This is a security and hygiene feature, preventing disk
-//! clutter and reducing the attack surface.
+//! libraries (`.so`, `.dll`) into the agent process.  The loading strategy
+//! varies by platform and build configuration:
+//!
+//! * **Linux**: Uses `memfd_create(2)` + `/proc/self/fd/<fd>` — the plugin
+//!   bytes are never written to any mounted filesystem.  This is the only
+//!   truly in-memory path.
+//!
+//! * **Windows (with `manual-map` feature)**: Performs a reflective PE load
+//!   via `manual_map::load_dll_in_memory`.  The DLL image lives in a private
+//!   heap allocation; no filesystem write occurs.  Requires the `manual-map`
+//!   feature to be enabled at build time.
+//!
+//! * **Windows (without `manual-map`) / macOS / other**: Falls back to a
+//!   temporary file with the shortest possible lifetime (`FILE_FLAG_DELETE_ON_CLOSE`
+//!   on Windows; `tempfile` on UNIX).  The file is visible on-disk during
+//!   load and is **not** an in-memory operation.
+//!
+//! ## Plugin ABI
+//!
+//! Plugins export a single C-ABI symbol `_create_plugin` whose signature is:
+//! ```c
+//! PluginObject* _create_plugin(void);
+//! ```
+//! `PluginObject` contains a pointer to a `PluginVTable` — a `#[repr(C)]`
+//! struct of function pointers — so the ABI is fully defined at the C level
+//! and does not depend on Rust fat-pointer or vtable layout stability.
 
 use anyhow::{anyhow, Result};
 use common::CryptoSession;
@@ -14,7 +37,8 @@ use std::io::Write;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use tracing::info;
 
-#[cfg(windows)]
+/// Manual PE-map loader (Windows only, requires the `manual-map` feature).
+#[cfg(all(windows, feature = "manual-map"))]
 pub mod manual_map;
 
 #[cfg(feature = "module-signatures")]
@@ -33,12 +57,120 @@ const MODULE_TEST_SIGNING_SEED: [u8; 32] = [
     0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
 ];
 
-/// The trait that all Orchestra plugins must implement.
+// ──────────────────────────────────────────────────────────────────────────────
+// Stable plugin ABI
+//
+// `*mut dyn Plugin` is a Rust fat pointer whose vtable layout is an
+// implementation detail of rustc — it is not stable across compiler versions,
+// optimisation settings, or separately-compiled crates.  We replace it with an
+// explicit `#[repr(C)]` vtable struct so that the calling convention is
+// well-defined at the C level and therefore safe across build environments.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Function-pointer table that each plugin must populate.
+///
+/// All fields use `extern "C"` so the layout and calling convention are stable.
+#[repr(C)]
+pub struct PluginVTable {
+    /// One-time initialisation.  Returns 0 on success, non-zero on failure.
+    pub init: unsafe extern "C" fn(this: *mut PluginObject) -> i32,
+
+    /// Execute the plugin.  On success returns 0 and writes a heap-allocated
+    /// UTF-8 byte buffer into `*out_ptr` / `*out_len`; the caller must release
+    /// it via `free_result`.  On error returns non-zero.
+    pub execute: unsafe extern "C" fn(
+        this: *mut PluginObject,
+        args_ptr: *const u8,
+        args_len: usize,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> i32,
+
+    /// Free a result buffer previously written by `execute`.  Must use the
+    /// allocator of the *plugin* library (not the loader's allocator).
+    pub free_result: unsafe extern "C" fn(ptr: *mut u8, len: usize),
+
+    /// Destroy the plugin instance and release all associated resources.
+    pub destroy: unsafe extern "C" fn(this: *mut PluginObject),
+}
+
+/// Header that every plugin instance must start with (first field, `#[repr(C)]`).
+///
+/// This allows a `*mut ConcretePlugin` to be safely cast to `*mut PluginObject`
+/// and back.
+#[repr(C)]
+pub struct PluginObject {
+    /// Pointer to the plugin's static vtable.  Valid for the lifetime of the object.
+    pub vtable: *const PluginVTable,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Host-side `Plugin` trait and FFI adapter
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// The trait that all Orchestra plugins must implement on the host side.
+///
+/// Plugin libraries do **not** implement this trait directly — they export
+/// `_create_plugin() -> *mut PluginObject`.  The loader wraps the returned
+/// object in the private [`FfiPlugin`] adapter which then implements this trait.
 pub trait Plugin: Send + Sync {
-    /// Called once after the plugin is loaded. Use for initialization.
+    /// Called once after the plugin is loaded.
     fn init(&self) -> Result<()>;
     /// The main entry point for executing the plugin's logic.
     fn execute(&self, args: &str) -> Result<String>;
+}
+
+/// Adapter that wraps a raw [`PluginObject`] and exposes it as `dyn Plugin`.
+///
+/// This is an implementation detail of the loader and is not part of the public API.
+struct FfiPlugin(*mut PluginObject);
+
+// SAFETY: We are the sole owner after creation; the underlying plugin is
+// required to be Send+Sync by construction.
+unsafe impl Send for FfiPlugin {}
+unsafe impl Sync for FfiPlugin {}
+
+impl Plugin for FfiPlugin {
+    fn init(&self) -> Result<()> {
+        let rc = unsafe { ((*(*self.0).vtable).init)(self.0) };
+        if rc != 0 {
+            Err(anyhow!("plugin init() returned error code {}", rc))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn execute(&self, args: &str) -> Result<String> {
+        let mut out_ptr: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let rc = unsafe {
+            ((*(*self.0).vtable).execute)(
+                self.0,
+                args.as_ptr(),
+                args.len(),
+                &mut out_ptr,
+                &mut out_len,
+            )
+        };
+        if rc != 0 {
+            return Err(anyhow!("plugin execute() returned error code {}", rc));
+        }
+        if out_ptr.is_null() {
+            return Err(anyhow!("plugin execute() returned a null output buffer"));
+        }
+        // Copy bytes out before we release the plugin-owned allocation.
+        let bytes = unsafe { std::slice::from_raw_parts(out_ptr, out_len).to_vec() };
+        unsafe { ((*(*self.0).vtable).free_result)(out_ptr, out_len) };
+        String::from_utf8(bytes)
+            .map_err(|e| anyhow!("plugin execute() returned non-UTF-8 output: {}", e))
+    }
+}
+
+impl Drop for FfiPlugin {
+    fn drop(&mut self) {
+        // SAFETY: We own the object; destroy() frees it using the plugin's allocator.
+        unsafe { ((*(*self.0).vtable).destroy)(self.0) };
+    }
 }
 
 /// Loads a decrypted, signed plugin from a byte slice into a `Box<dyn Plugin>`.
@@ -48,10 +180,10 @@ pub trait Plugin: Send + Sync {
 ///
 /// # Safety
 ///
-/// This function uses `libloading` to load a native shared library. The library
-/// must be compiled from trusted source and expose a `_create_plugin` function
-/// that returns a `*mut dyn Plugin`. The loaded code will execute with the same
-/// permissions as the host process.
+/// This function loads a native shared library. The library must be compiled
+/// from trusted source and must export `_create_plugin() -> *mut PluginObject`
+/// using the stable C ABI defined by [`PluginVTable`] and [`PluginObject`].
+/// The loaded code executes with the same privileges as the host process.
 pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box<dyn Plugin>> {
     // 1. Decrypt the blob. The GCM tag provides authentication.
     let decrypted_blob = session
@@ -106,7 +238,7 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
 
     #[cfg(not(target_os = "linux"))]
     let library = {
-        #[cfg(target_os = "windows")]
+        #[cfg(all(windows, feature = "manual-map"))]
         {
             info!("Attempting to load plugin using manual map loader.");
             if let Ok(image_base) = unsafe { manual_map::load_dll_in_memory(module_data) } {
@@ -122,17 +254,27 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
                     }
                 }
                 if rva != 0 {
-                    unsafe {
-                        let create_func: unsafe extern "C" fn() -> *mut dyn Plugin =
+                    // Use the stable C ABI: _create_plugin returns *mut PluginObject.
+                    let plugin_ptr = unsafe {
+                        let create_func: unsafe extern "C" fn() -> *mut PluginObject =
                             std::mem::transmute(image_base.add(rva));
-                        let plugin_ptr = create_func();
-                        let plugin = Box::from_raw(plugin_ptr);
-                        return Ok(plugin);
+                        create_func()
+                    };
+                    if plugin_ptr.is_null() {
+                        unsafe {
+                            winapi::um::memoryapi::VirtualFree(
+                                image_base,
+                                0,
+                                winapi::um::winnt::MEM_RELEASE,
+                            );
+                        }
+                        return Err(anyhow!("_create_plugin returned null pointer"));
                     }
+                    // Library memory is leaked intentionally (plugin lifetime = process lifetime).
+                    return Ok(Box::new(FfiPlugin(plugin_ptr)) as Box<dyn Plugin>);
                 }
-                // The export was not found. Free the mapped image (best-effort)
-                // and return an error rather than falling back to the temp-file
-                // path with an already-initialised DLL in memory.
+                // Export not found — free the mapped image rather than falling
+                // through to the temp-file path with a partially-initialised DLL.
                 unsafe {
                     winapi::um::memoryapi::VirtualFree(
                         image_base,
@@ -146,12 +288,10 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
             }
             info!("Manual map failed, falling back to temp file.");
         }
-        // Fallback for non-Linux OSs (e.g., macOS, Windows).
-        // For Windows, a more advanced technique involves CreateFileMapping/MapViewOfFile
-        // with SEC_IMAGE, but for simplicity, we'll use a temporary file.
-        // We use FILE_FLAG_DELETE_ON_CLOSE to minimize the disk footprint, ensuring
-        // the file is securely deleted by the OS as soon as the handle and mapping close.
-        #[cfg(target_os = "windows")]
+        // Temp-file fallback for non-Linux platforms (or Windows without `manual-map`).
+        // The file is written to disk for the duration of the dlopen() call.
+        // On Windows we use FILE_FLAG_DELETE_ON_CLOSE to minimise on-disk lifetime.
+        #[cfg(windows)]
         let temp_path = {
             use std::os::windows::fs::OpenOptionsExt;
             let temp_dir = std::env::temp_dir();
@@ -198,22 +338,20 @@ pub fn load_plugin(encrypted_blob: &[u8], session: &CryptoSession) -> Result<Box
         lib
     };
 
-    // 3. Find the `_create_plugin` symbol, call it, and return the Plugin trait object.
-    // SAFETY: The loaded library must have this exact symbol.
-    let create_func: Symbol<unsafe extern "C" fn() -> *mut dyn Plugin> =
+    // 3. Load `_create_plugin` using the stable C ABI and wrap in FfiPlugin.
+    //    The symbol must return *mut PluginObject (not *mut dyn Plugin).
+    let create_func: Symbol<unsafe extern "C" fn() -> *mut PluginObject> =
         unsafe { library.get(b"_create_plugin")? };
 
-    // SAFETY: The function returns a valid pointer to a Box'd Plugin.
     let plugin_ptr = unsafe { create_func() };
-    // SAFETY: We are converting the raw pointer back into a Box, taking ownership.
-    let plugin = unsafe { Box::from_raw(plugin_ptr) };
+    if plugin_ptr.is_null() {
+        return Err(anyhow!("_create_plugin() returned a null pointer"));
+    }
 
-    // The library must be kept alive for the plugin to be valid.
-    // We leak it here, which is acceptable as plugins are loaded for the
-    // lifetime of the agent process.
+    // Leak the library so the plugin's code remains mapped for the process lifetime.
     std::mem::forget(library);
 
-    Ok(plugin)
+    Ok(Box::new(FfiPlugin(plugin_ptr)) as Box<dyn Plugin>)
 }
 
 #[cfg(test)]

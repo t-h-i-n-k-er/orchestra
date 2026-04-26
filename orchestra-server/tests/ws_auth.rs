@@ -23,7 +23,7 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
         tls_cert_path: None,
         tls_key_path: None,
         static_dir: tmp.path().to_path_buf(),
-        command_timeout_secs: 5,
+        ..ServerConfig::default()
     };
 
     let audit = Arc::new(AuditLog::open(cfg.audit_log_path.clone()).unwrap());
@@ -31,6 +31,7 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
         audit,
         cfg.admin_token.clone(),
         cfg.command_timeout_secs,
+        cfg.clone(),
     ));
 
     let agent_listener = tokio::net::TcpListener::bind(cfg.agent_addr).await.unwrap();
@@ -38,25 +39,32 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
     {
         let state_a = state.clone();
         let secret = cfg.agent_shared_secret.clone();
-        tokio::spawn(async move {
-            agent_link::serve(
-                state_a,
-                agent_listener,
-                secret,
-                Arc::new(
-                    rustls::ServerConfig::builder()
-                        .with_no_client_auth()
-                        .with_single_cert(
-                            vec![],
-                            rustls::pki_types::PrivateKeyDer::Pkcs8(
-                                rustls::pki_types::PrivatePkcs8KeyDer::from(vec![]),
-                            ),
-                        )
-                        .unwrap(),
-                ),
+        // Generate a proper self-signed cert so the agent listener TLS config is valid.
+        let agent_tls = {
+            let cert = rcgen::generate_simple_self_signed(
+                vec!["localhost".into(), "127.0.0.1".into()],
             )
-            .await
             .unwrap();
+            let cert_pem = cert.cert.pem();
+            let key_pem = cert.key_pair.serialize_pem();
+            let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+                .filter_map(|r| r.ok())
+                .collect();
+            let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+                .ok()
+                .flatten()
+                .unwrap();
+            Arc::new(
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)
+                    .unwrap(),
+            )
+        };
+        tokio::spawn(async move {
+            agent_link::serve(state_a, agent_listener, secret, agent_tls)
+                .await
+                .unwrap();
         });
     }
 

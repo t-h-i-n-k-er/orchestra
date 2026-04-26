@@ -301,7 +301,9 @@ pub fn check_system_uptime_artifacts() -> u8 {
     }
 }
 
-#[cfg(not(windows))]
+/// Linux implementation: reads `/proc/uptime` for system uptime and counts
+/// entries in `/tmp` as a proxy for usage history.
+#[cfg(target_os = "linux")]
 pub fn check_system_uptime_artifacts() -> u8 {
     let mut temp_files_count = 0;
     if let Ok(temp_dir) = std::fs::read_dir("/tmp") {
@@ -320,6 +322,57 @@ pub fn check_system_uptime_artifacts() -> u8 {
     } else {
         0
     }
+}
+
+/// macOS implementation: derives uptime from `sysctl kern.boottime` and uses
+/// the count of files in `$TMPDIR` as a usage proxy.
+#[cfg(target_os = "macos")]
+pub fn check_system_uptime_artifacts() -> u8 {
+    // kern.boottime gives a timeval of when the system last booted.  We
+    // compare it to the current time to compute uptime in seconds.
+    let uptime_secs: f64 = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        std::process::Command::new("sysctl")
+            .args(["-n", "kern.boottime"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                // Output looks like: "{ sec = 1713000000, usec = 0 } ..."
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.split("sec = ")
+                    .nth(1)
+                    .and_then(|rest| rest.split(',').next())
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+            })
+            .map(|boot_sec| (now - boot_sec).max(0.0))
+            .unwrap_or(0.0)
+    };
+    let uptime_mins = uptime_secs / 60.0;
+    let uptime_hours = uptime_mins / 60.0;
+
+    let temp_files_count = std::env::var("TMPDIR")
+        .ok()
+        .and_then(|p| std::fs::read_dir(p).ok())
+        .map(|d| d.count())
+        .unwrap_or(0);
+
+    if uptime_mins < 10.0 && temp_files_count < 5 {
+        20
+    } else if uptime_hours < 24.0 || temp_files_count < 20 {
+        10
+    } else {
+        0
+    }
+}
+
+/// Catch-all for platforms other than Windows, Linux, and macOS.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub fn check_system_uptime_artifacts() -> u8 {
+    0 // Cannot determine; neutral score.
 }
 
 #[cfg(windows)]
@@ -373,7 +426,9 @@ pub fn check_hardware_plausibility() -> u8 {
     }
 }
 
-#[cfg(not(windows))]
+/// Linux implementation: reads disk size from `statvfs("/")`, RAM from
+/// `/proc/meminfo`, and CPU count from `sysconf(_SC_NPROCESSORS_ONLN)`.
+#[cfg(target_os = "linux")]
 pub fn check_hardware_plausibility() -> u8 {
     let mut below_threshold_count = 0;
     
@@ -408,6 +463,49 @@ pub fn check_hardware_plausibility() -> u8 {
     }
 }
 
+/// macOS implementation: reads disk size from `statvfs("/")`, RAM from
+/// `sysctl hw.memsize`, and CPU count from `sysconf(_SC_NPROCESSORS_ONLN)`.
+#[cfg(target_os = "macos")]
+pub fn check_hardware_plausibility() -> u8 {
+    let mut below_threshold_count = 0;
+
+    // Disk size via statvfs (works on macOS, same as Linux).
+    let disk_gb: u64 = unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(b"/\0".as_ptr() as *const libc::c_char, &mut stat) == 0 {
+            (stat.f_blocks as u64 * stat.f_frsize as u64) / (1024 * 1024 * 1024)
+        } else {
+            0
+        }
+    };
+    if disk_gb <= 20 { below_threshold_count += 1; }
+
+    // RAM via `sysctl hw.memsize` (returns total bytes as a 64-bit integer).
+    let ram_gb: u64 = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
+        .map(|bytes| bytes / (1024 * 1024 * 1024))
+        .unwrap_or(0);
+    if ram_gb <= 1 { below_threshold_count += 1; }
+
+    let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    if cpus <= 1 { below_threshold_count += 1; }
+
+    match below_threshold_count {
+        0 => 0,
+        1 => 10,
+        _ => 20,
+    }
+}
+
+/// Catch-all for platforms other than Windows, Linux, and macOS.
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub fn check_hardware_plausibility() -> u8 {
+    0 // Cannot determine; neutral score.
+}
+
 /// FR-5: Combined Heuristic Scoring and Decision Framework
 pub fn sandbox_probability_score(metrics: &SandboxMetrics) -> u32 {
     let mut score = 0;
@@ -422,7 +520,11 @@ pub fn sandbox_probability_score(metrics: &SandboxMetrics) -> u32 {
     score
 }
 
-pub fn evaluate_sandbox() -> Result<bool> {
+/// Run all sandbox heuristics and return a combined probability score (0–100).
+///
+/// Higher scores indicate a greater likelihood of a sandbox environment.
+/// The caller decides what to do with the score — see `EnvReport::sandbox_score`.
+pub fn evaluate_sandbox() -> Result<u32> {
     let metrics = SandboxMetrics {
         mouse_movement_score: check_mouse_movement(),
         desktop_richness_score: check_desktop_windows(),
@@ -435,11 +537,8 @@ pub fn evaluate_sandbox() -> Result<bool> {
     
     if score > 60 {
         warn!("High probability of sandbox (Score {} > 60)", score);
-        Ok(true) // Sandbox detected
     } else if score > 30 {
-        warn!("Moderate Sandbox Probability (Score {}). Proceeding with caution using enhanced anti-detection profiling.", score);
-        Ok(false)
-    } else {
-        Ok(false) // Safe
+        warn!("Moderate Sandbox Probability (Score {}).", score);
     }
+    Ok(score)
 }

