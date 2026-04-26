@@ -9,8 +9,6 @@
 
 #![cfg(feature = "remote-assist")]
 
-#[cfg(windows)]
-use anyhow::bail;
 use anyhow::{anyhow, Result};
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 use enigo::{Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
@@ -46,48 +44,62 @@ where
 }
 
 /// Checks for the existence of a consent flag.
-#[cfg(target_os = "linux")]
+///
+/// Consent storage is intentionally user-level on all platforms so that no
+/// elevated privileges are required to grant or revoke consent:
+///
+/// * Linux/macOS: `$HOME/.orchestra-consent` (falls back to
+///   `$XDG_RUNTIME_DIR/orchestra-consent` on Linux if HOME is unavailable).
+/// * Windows: `HKCU\Software\Orchestra\Consent` (DWORD == 1) — current user
+///   only; does not require administrator rights.
+
+/// Returns the platform-specific consent file path.
+#[cfg(not(windows))]
+fn consent_path() -> Option<std::path::PathBuf> {
+    // Prefer $HOME for a portable, user-level location.
+    if let Some(home) = std::env::var_os("HOME") {
+        return Some(std::path::PathBuf::from(home).join(".orchestra-consent"));
+    }
+    // Fallback: XDG_RUNTIME_DIR (Linux) or /tmp (macOS).
+    #[cfg(target_os = "linux")]
+    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return Some(std::path::PathBuf::from(xdg).join("orchestra-consent"));
+    }
+    Some(std::path::PathBuf::from("/tmp/orchestra-consent"))
+}
+
+#[cfg(not(windows))]
 fn check_consent() -> Result<()> {
-    if std::path::Path::new("/var/run/orchestra-consent").exists() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "Remote assistance consent not granted on target machine. Missing /var/run/orchestra-consent."
-        ))
+    match consent_path() {
+        Some(p) if p.exists() => Ok(()),
+        Some(p) => Err(anyhow!(
+            "Remote assistance consent not granted. \
+             Create {:?} to enable remote assistance.",
+            p
+        )),
+        None => Err(anyhow!(
+            "Remote assistance consent not granted: could not determine consent file path"
+        )),
     }
 }
 
-#[cfg(target_os = "macos")]
-fn check_consent() -> Result<()> {
-    // macOS requires root to write to /var/run by default.
-    // Instead use the system user's temporary consent file or preferences flag.
-    let consent_path = std::env::var("HOME")
-        .map(|h| format!("{}/.orchestra-consent", h))
-        .unwrap_or_else(|_| "/tmp/orchestra-consent".to_string());
-    if std::path::Path::new(&consent_path).exists() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "Remote assistance consent not granted on target machine. Missing macOS consent flag."
-        ))
-    }
-}
-
-/// On Windows, this checks for a registry key.
-/// `HKLM\Software\Orchestra\Consent` (DWORD) must be `1`.
+/// On Windows, consent is stored in the current user's registry hive
+/// (`HKCU`) so that no administrator privileges are needed.
+/// `HKCU\Software\Orchestra\Consent` (DWORD) must be `1`.
 #[cfg(windows)]
 fn check_consent() -> Result<()> {
     use winreg::enums::*;
     use winreg::RegKey;
 
-    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let orchestra_key = hklm.open_subkey("Software\\Orchestra")?;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let orchestra_key = hkcu.open_subkey("Software\\Orchestra")?;
     let consent: u32 = orchestra_key.get_value("Consent")?;
     if consent == 1 {
         Ok(())
     } else {
         Err(anyhow!(
-            "Remote assistance consent not granted via registry key."
+            "Remote assistance consent not granted. \
+             Set HKCU\\Software\\Orchestra\\Consent (DWORD) = 1 to enable remote assistance."
         ))
     }
 }
@@ -124,9 +136,116 @@ pub fn capture_screen() -> Result<Vec<u8>> {
     #[cfg(windows)]
     {
         check_consent()?;
-        bail!(
-            "Windows screen capture is not enabled in this build; this platform path is gated until it is updated and tested"
-        )
+        use std::io::Cursor;
+        use winapi::shared::windef::HBITMAP;
+        use winapi::um::wingdi::{
+            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits,
+            SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+        };
+        use winapi::um::winuser::{GetDC, GetSystemMetrics, ReleaseDC, SM_CXSCREEN, SM_CYSCREEN};
+
+        // SAFETY: All Win32 handles are checked for null before use and are
+        // released in reverse-acquisition order even on early returns.
+        let png_bytes = unsafe {
+            let width = GetSystemMetrics(SM_CXSCREEN);
+            let height = GetSystemMetrics(SM_CYSCREEN);
+            if width <= 0 || height <= 0 {
+                return Err(anyhow!(
+                    "GetSystemMetrics returned invalid screen dimensions: {}x{}",
+                    width,
+                    height
+                ));
+            }
+
+            let hdc_screen = GetDC(std::ptr::null_mut());
+            if hdc_screen.is_null() {
+                return Err(anyhow!("GetDC failed — no desktop DC available"));
+            }
+
+            let hdc_mem = CreateCompatibleDC(hdc_screen);
+            if hdc_mem.is_null() {
+                ReleaseDC(std::ptr::null_mut(), hdc_screen);
+                return Err(anyhow!("CreateCompatibleDC failed"));
+            }
+
+            let hbm: HBITMAP = CreateCompatibleBitmap(hdc_screen, width, height);
+            if hbm.is_null() {
+                DeleteDC(hdc_mem);
+                ReleaseDC(std::ptr::null_mut(), hdc_screen);
+                return Err(anyhow!("CreateCompatibleBitmap failed"));
+            }
+
+            let old_obj = SelectObject(hdc_mem, hbm as _);
+            let blt_ok = BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, 0, 0, SRCCOPY);
+
+            if blt_ok == 0 {
+                SelectObject(hdc_mem, old_obj);
+                DeleteObject(hbm as _);
+                DeleteDC(hdc_mem);
+                ReleaseDC(std::ptr::null_mut(), hdc_screen);
+                return Err(anyhow!("BitBlt failed — screen capture blocked"));
+            }
+
+            // Request 32-bit top-down BGRA pixels (BI_RGB with biBitCount=32).
+            let bmi_header = BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height, // negative → top-down row order
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            };
+            let mut bmi = BITMAPINFO {
+                bmiHeader: bmi_header,
+                bmiColors: [std::mem::zeroed(); 1],
+            };
+
+            let pixel_count = (width as usize) * (height as usize);
+            // Each pixel is 4 bytes (BGRA).
+            let mut pixels: Vec<u8> = vec![0u8; pixel_count * 4];
+
+            let scan_lines = GetDIBits(
+                hdc_mem,
+                hbm,
+                0,
+                height as u32,
+                pixels.as_mut_ptr() as *mut _,
+                &mut bmi,
+                DIB_RGB_COLORS,
+            );
+
+            SelectObject(hdc_mem, old_obj);
+            DeleteObject(hbm as _);
+            DeleteDC(hdc_mem);
+            ReleaseDC(std::ptr::null_mut(), hdc_screen);
+
+            if scan_lines == 0 {
+                return Err(anyhow!("GetDIBits failed — could not read screen pixels"));
+            }
+
+            // GDI returns BGRA; the `image` crate RGBA buffer expects R at index 0.
+            // Swap B (index 0) and R (index 2) in every 4-byte pixel.
+            for chunk in pixels.chunks_exact_mut(4) {
+                chunk.swap(0, 2);
+            }
+
+            let img =
+                image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width as u32, height as u32, pixels)
+                    .ok_or_else(|| anyhow!("failed to construct RGBA image buffer from GDI pixels"))?;
+
+            let mut png_buf: Vec<u8> = Vec::new();
+            img.write_to(
+                &mut Cursor::new(&mut png_buf),
+                image::ImageFormat::Png,
+            )?;
+            png_buf
+        };
+        Ok(png_bytes)
     }
     #[cfg(target_os = "macos")]
     {
@@ -242,14 +361,15 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_consent_check_fails_by_default() {
-        // This test assumes the consent file does not exist.
+        // This test assumes the consent file does not exist at the user-level path.
+        // It should fail because the consent file is absent.
         assert!(check_consent().is_err());
     }
 
     #[test]
     #[cfg(windows)]
     fn test_consent_check_fails_by_default_win() {
-        // This test assumes the consent registry key is not set.
+        // This test assumes the consent registry key is not set under HKCU.
         assert!(check_consent().is_err());
     }
 }

@@ -411,7 +411,7 @@ struct LockedKeyPage {
 #[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
 impl LockedKeyPage {
     fn new(key: [u8; 32]) -> Self {
-        let mut b = Box::new(key);
+        let b = Box::new(key);
         // mlock the page so it is not swapped out.
         #[cfg(unix)]
         unsafe {

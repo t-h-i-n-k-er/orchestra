@@ -65,8 +65,24 @@ pub enum HciEvent {
 }
 
 lazy_static! {
-    static ref CONSENT_FILE_PATH: Mutex<String> =
-        Mutex::new("/var/run/orchestra-consent".to_string());
+    static ref CONSENT_FILE_PATH: Mutex<String> = Mutex::new(
+        // Default to a user-level path consistent with remote_assist.rs:
+        // prefer $HOME so no elevated privileges are needed.
+        std::env::var("HOME")
+            .map(|h| format!("{}/.orchestra-consent", h))
+            .unwrap_or_else(|_| {
+                #[cfg(target_os = "linux")]
+                {
+                    std::env::var("XDG_RUNTIME_DIR")
+                        .map(|d| format!("{}/orchestra-consent", d))
+                        .unwrap_or_else(|_| "/tmp/orchestra-consent".to_string())
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    "/tmp/orchestra-consent".to_string()
+                }
+            })
+    );
     static ref HCI_LOG_BUFFER: Arc<Mutex<VecDeque<HciEvent>>> =
         Arc::new(Mutex::new(VecDeque::with_capacity(MAX_BUFFER_SIZE)));
     /// Gates event processing and controls the window-title polling thread.
@@ -219,18 +235,112 @@ fn add_log_event(buffer_handle: &Arc<Mutex<VecDeque<HciEvent>>>, event: HciEvent
     buffer.push_back(event);
 }
 
+/// Returns `true` when `cmd` is found as an executable file in any directory
+/// listed in the `PATH` environment variable.  Used to avoid depending on the
+/// `which` crate for a single binary-existence check.
+#[cfg(target_os = "linux")]
+fn command_available(cmd: &str) -> bool {
+    let path_var = match std::env::var("PATH") {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    path_var.split(':').any(|dir| {
+        let p = std::path::Path::new(dir).join(cmd);
+        p.is_file()
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn get_active_window_title() -> Result<String, String> {
     use std::process::Command;
-    let output = Command::new("xdotool")
-        .arg("getactivewindow")
-        .arg("getwindowname")
-        .output()
-        .map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
+
+    // On a pure Wayland session (no X11 socket), xdotool cannot connect.
+    // Try Wayland-native approaches first.
+    let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let on_x11 = std::env::var_os("DISPLAY").is_some();
+
+    if on_wayland && !on_x11 {
+        // GNOME Shell (mutter): query via gdbus.
+        if let Ok(out) = Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                "org.gnome.Shell",
+                "--object-path",
+                "/org/gnome/Shell",
+                "--method",
+                "org.gnome.Shell.Eval",
+                "global.display.focus_window?.title ?? ''",
+            ])
+            .output()
+        {
+            if out.status.success() {
+                let raw = String::from_utf8_lossy(&out.stdout);
+                // gdbus returns: (true, 'Window Title\n')
+                if let Some(inner) = raw
+                    .split('\'')
+                    .nth(1)
+                    .map(|s| s.trim_end_matches('\'').trim().to_string())
+                {
+                    if !inner.is_empty() {
+                        return Ok(inner);
+                    }
+                }
+            }
+        }
+
+        // KDE Plasma (kwin): use qdbus.
+        if let Ok(out) = Command::new("qdbus")
+            .args(["org.kde.KWin", "/KWin", "queryWindowInfo"])
+            .output()
+        {
+            if out.status.success() {
+                let raw = String::from_utf8_lossy(&out.stdout);
+                // Output is a newline-separated "key: value" list; find caption.
+                for line in raw.lines() {
+                    if let Some(rest) = line.strip_prefix("caption: ") {
+                        let title = rest.trim().to_string();
+                        if !title.is_empty() {
+                            return Ok(title);
+                        }
+                    }
+                }
+            }
+        }
+
+        // No Wayland compositor interface was reachable.
+        return Err("Wayland session detected but no compositor IPC is available (tried gdbus/qdbus)".to_string());
+    }
+
+    // X11 path: use xdotool if available.
+    if !on_x11 {
+        return Err("No display available (DISPLAY and WAYLAND_DISPLAY are both unset)".to_string());
+    }
+
+    // Check that xdotool is installed before attempting to call it.
+    if !command_available("xdotool") {
+        return Err("xdotool not found on PATH; install it to enable X11 window-title tracking".to_string());
+    }
+
+    // Use a thread-based timeout so we don't depend on the GNU `timeout`
+    // command.  If xdotool hangs (e.g. broken X server), the thread is
+    // abandoned after 2 s and we return a neutral error.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = Command::new("xdotool")
+            .args(["getactivewindow", "getwindowname"])
+            .output();
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(Ok(output)) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+        Ok(Ok(output)) => Err(String::from_utf8_lossy(&output.stderr).to_string()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("xdotool timed out after 2 s".to_string()),
     }
 }
 

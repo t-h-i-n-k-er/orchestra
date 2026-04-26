@@ -55,36 +55,60 @@ pub fn check_mouse_movement() -> u8 {
 /// Requires X11 / DISPLAY.  If the display is not available (headless server)
 /// we return 0 so that legitimate non-interactive deployments are not penalised.
 ///
-/// If DISPLAY is set but no window manager is running, xdotool can hang
-/// waiting for an X connection.  We bound execution to 2 s via `timeout(1)`
-/// so a broken X environment doesn't stall agent startup.
+/// Uses a Rust-native thread-based 2-second timeout rather than the GNU
+/// `timeout` command so that minimal containers (BusyBox, Alpine) and non-GNU
+/// userlands are handled correctly without an external dependency.
+///
+/// If xdotool is not on PATH, or DISPLAY is not set, the function returns 0
+/// (neutral score) so that legitimate headless or Wayland-only deployments
+/// are not falsely penalised.
 #[cfg(target_os = "linux")]
 pub fn check_mouse_movement() -> u8 {
     if std::env::var_os("DISPLAY").is_none() {
         return 0; // Headless / Wayland-only — can't reliably track mouse
     }
+    // Check xdotool availability without shelling out to `which`.
+    let xdotool_on_path = std::env::var("PATH").map_or(false, |p| {
+        p.split(':')
+            .any(|dir| std::path::Path::new(dir).join("xdotool").is_file())
+    });
+    if !xdotool_on_path {
+        return 0; // xdotool absent — neutral, don't penalise the deployment
+    }
     _sample_mouse_positions(|_| {
-        // Wrap xdotool with `timeout 2` so a broken X server (DISPLAY set but
-        // no WM running) does not hang the sampling loop indefinitely.
-        std::process::Command::new("timeout")
-            .args(["2", "xdotool", "getmouselocation", "--shell"])
-            .output()
-            .ok()
-            .and_then(|o| {
-                // timeout exits with code 124 when the child is killed;
-                // `output()` still returns Ok() in that case so check stdout.
-                if o.stdout.is_empty() {
-                    return None;
-                }
-                let out = String::from_utf8_lossy(&o.stdout);
-                let x = out.lines()
-                    .find(|l| l.starts_with("X="))?
-                    .trim_start_matches("X=").trim().parse::<i32>().ok()?;
-                let y = out.lines()
-                    .find(|l| l.starts_with("Y="))?
-                    .trim_start_matches("Y=").trim().parse::<i32>().ok()?;
-                Some((x, y))
-            })
+        // Spawn xdotool in a thread and join with a 2-second deadline.
+        // This replaces the previous `timeout 2 xdotool …` invocation, which
+        // required GNU coreutils and was incompatible with BusyBox/musl systems.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = std::process::Command::new("xdotool")
+                .args(["getmouselocation", "--shell"])
+                .output();
+            let _ = tx.send(out);
+        });
+        let output = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .ok()? // timeout or channel closed
+            .ok()?; // Command::output error
+        if output.stdout.is_empty() {
+            return None;
+        }
+        let out = String::from_utf8_lossy(&output.stdout);
+        let x = out
+            .lines()
+            .find(|l| l.starts_with("X="))?
+            .trim_start_matches("X=")
+            .trim()
+            .parse::<i32>()
+            .ok()?;
+        let y = out
+            .lines()
+            .find(|l| l.starts_with("Y="))?
+            .trim_start_matches("Y=")
+            .trim()
+            .parse::<i32>()
+            .ok()?;
+        Some((x, y))
     })
 }
 

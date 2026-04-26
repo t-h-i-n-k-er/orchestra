@@ -424,16 +424,34 @@ pub mod windows {
 
     pub fn install_persistence() -> Result<PathBuf> {
         let exe = std::env::current_exe()?;
-        let reg = RegistryRunKey::default();
-        reg.install(&exe)?;
+        let cfg = crate::config::load_config()
+            .unwrap_or_default()
+            .persistence;
+
+        if cfg.registry_run_key {
+            if let Err(e) = RegistryRunKey::default().install(&exe) {
+                log::warn!("RegistryRunKey install failed (non-fatal): {}", e);
+            }
+        }
+        if cfg.startup_folder {
+            if let Err(e) = StartupFolder.install(&exe) {
+                log::warn!("StartupFolder install failed (non-fatal): {}", e);
+            }
+        }
+        if cfg.wmi_subscription {
+            if let Err(e) = WmiSubscription::default().install(&exe) {
+                log::warn!("WmiSubscription install failed (non-fatal): {}", e);
+            }
+        }
 
         Ok(exe)
     }
 
     pub fn uninstall_persistence() -> Result<PathBuf> {
         let exe = std::env::current_exe()?;
-        let _ = RegistryRunKey::default().remove(); // best effort
-        let _ = WmiSubscription::default().remove(); // cleanup legacy installs
+        let _ = RegistryRunKey::default().remove();
+        let _ = StartupFolder.remove();
+        let _ = WmiSubscription::default().remove();
         Ok(exe)
     }
 }
@@ -612,7 +630,21 @@ pub mod macos {
     /// Install both LaunchAgent (preferred) and cron fallback.
     pub fn install_persistence() -> Result<PathBuf> {
         let exe = std::env::current_exe()?;
-        LaunchAgent::default().install(&exe)?;
+        let cfg = crate::config::load_config()
+            .unwrap_or_default()
+            .persistence;
+
+        if cfg.launch_agent {
+            if let Err(e) = LaunchAgent::default().install(&exe) {
+                log::warn!("LaunchAgent install failed (non-fatal): {}", e);
+            }
+        }
+        if cfg.cron_job {
+            if let Err(e) = CronJob.install(&exe) {
+                log::warn!("CronJob install failed (non-fatal): {}", e);
+            }
+        }
+
         Ok(exe)
     }
 
@@ -992,7 +1024,26 @@ pub mod linux {
     /// platform-specific failure modes.
     pub fn install_persistence() -> Result<PathBuf> {
         let exe = std::env::current_exe()?;
-        SystemdService::default().install(&exe)?;
+        let cfg = crate::config::load_config()
+            .unwrap_or_default()
+            .persistence;
+
+        if cfg.systemd_service {
+            if let Err(e) = SystemdService::default().install(&exe) {
+                log::warn!("SystemdService install failed (non-fatal): {}", e);
+            }
+        }
+        if cfg.cron_job {
+            if let Err(e) = CronJob.install(&exe) {
+                log::warn!("CronJob install failed (non-fatal): {}", e);
+            }
+        }
+        if cfg.shell_profile {
+            if let Err(e) = ShellProfile.install(&exe) {
+                log::warn!("ShellProfile install failed (non-fatal): {}", e);
+            }
+        }
+
         Ok(exe)
     }
 

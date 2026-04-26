@@ -7,13 +7,21 @@ use std::collections::HashMap;
 // Use winapi's c_void throughout to avoid type mismatches with winapi return values.
 use winapi::ctypes::c_void;
 use winapi::shared::ntdef::{LIST_ENTRY, UNICODE_STRING};
-use winapi::um::memoryapi::{VirtualAlloc, VirtualFree, VirtualProtect};
+use winapi::um::memoryapi::{
+    VirtualAlloc, VirtualAllocEx, VirtualFree, VirtualProtect, WriteProcessMemory,
+    ReadProcessMemory,
+};
 use winapi::um::winnt::{
     DLL_PROCESS_ATTACH, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT,
     IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
-    IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ,
-    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+    IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+    PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+    PROCESS_ALL_ACCESS,
 };
+use winapi::um::processthreadsapi::{CreateRemoteThread, OpenProcess};
+use winapi::um::handleapi::CloseHandle;
+use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
+
 
 // RUNTIME_FUNCTION (IMAGE_RUNTIME_FUNCTION_ENTRY) – 12 bytes, x64 only.
 #[cfg(target_arch = "x86_64")]
@@ -630,3 +638,272 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
     _guard.success = true;
     Ok(image_base)
 }
+
+// ── Remote manual-map injection ──────────────────────────────────────────────
+
+/// Map a PE DLL into a remote process without writing any file to disk.
+///
+/// # What this does
+///
+/// 1. **Allocates** a region in the target process large enough for the
+///    complete mapped image (`VirtualAllocEx`).
+/// 2. **Copies** the PE headers and each raw section into the remote region
+///    with `WriteProcessMemory`.
+/// 3. **Applies base relocations** for the remote allocation address
+///    (all arithmetic is done in local memory, then the patched words are
+///    written into the remote image).
+/// 4. **Resolves the Import Address Table** using the Win32 `GetModuleHandleA`
+///    / `GetProcAddress` pair.  On Windows, NTDLL and kernel32 are mapped at
+///    the same base address in every process (per-boot ASLR, shared between
+///    all processes via copy-on-write), so the resolved function addresses are
+///    correct for the remote process.
+/// 5. **Starts the DLL entry point** via `CreateRemoteThread`.  The call is
+///    fire-and-forget: the returned thread handle is closed immediately after
+///    creation.
+///
+/// # Arguments
+///
+/// * `target_process` — A `HANDLE` with at least `PROCESS_VM_OPERATION |
+///   PROCESS_VM_WRITE | PROCESS_CREATE_THREAD` access rights.  The caller is
+///   responsible for opening and closing the handle.
+/// * `dll_bytes` — The raw PE DLL bytes to inject (in-memory, not a path).
+///
+/// # Returns
+///
+/// The virtual address of the remote image base on success.
+pub unsafe fn load_dll_in_remote_process(
+    target_process: winapi::um::winnt::HANDLE,
+    dll_bytes: &[u8],
+) -> Result<*mut c_void> {
+    let pe = PE::parse(dll_bytes)?;
+    let opt = pe
+        .header
+        .optional_header
+        .ok_or_else(|| anyhow!("PE has no optional header"))?;
+
+    let image_size = opt.windows_fields.size_of_image as usize;
+    let preferred_base = opt.windows_fields.image_base as isize;
+
+    // ── Step 1: allocate in the remote process ────────────────────────────
+    let remote_base = VirtualAllocEx(
+        target_process,
+        std::ptr::null_mut(),
+        image_size,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE,
+    );
+    if remote_base.is_null() {
+        return Err(anyhow!(
+            "VirtualAllocEx failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Helper: write a local buffer slice into the remote process at an offset
+    // from remote_base.  Wraps WriteProcessMemory and checks for errors.
+    let write_remote = |rva: usize, data: &[u8]| -> Result<()> {
+        let dest = (remote_base as usize + rva) as *mut c_void;
+        let mut written = 0usize;
+        let ok = WriteProcessMemory(
+            target_process,
+            dest,
+            data.as_ptr() as *const c_void,
+            data.len(),
+            &mut written,
+        );
+        if ok == 0 || written != data.len() {
+            return Err(anyhow!(
+                "WriteProcessMemory failed at rva {rva:#x}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    };
+
+    // ── Step 2: copy PE headers ────────────────────────────────────────────
+    let header_size = opt.windows_fields.size_of_headers as usize;
+    write_remote(0, &dll_bytes[..header_size.min(dll_bytes.len())])?;
+
+    // ── Step 3: copy sections ──────────────────────────────────────────────
+    for section in &pe.sections {
+        let raw_offset = section.pointer_to_raw_data as usize;
+        let raw_size = section.size_of_raw_data as usize;
+        if raw_size == 0 {
+            continue;
+        }
+        if raw_offset.saturating_add(raw_size) > dll_bytes.len() {
+            return Err(anyhow!(
+                "section at raw offset {raw_offset:#x}+{raw_size:#x} exceeds dll_bytes length"
+            ));
+        }
+        let section_data = &dll_bytes[raw_offset..raw_offset + raw_size];
+        write_remote(section.virtual_address as usize, section_data)?;
+    }
+
+    // ── Step 4a: compute and apply base relocations ────────────────────────
+    // All patches are computed in a local buffer then written remotely.
+    let base_delta = remote_base as isize - preferred_base;
+    if base_delta != 0 {
+        if let Some(reloc_dir) = opt.data_directories.data_directories
+            [IMAGE_DIRECTORY_ENTRY_BASERELOC as usize]
+        {
+            if reloc_dir.virtual_address != 0 && reloc_dir.size > 0 {
+                let reloc_rva = reloc_dir.virtual_address as usize;
+                let reloc_size = reloc_dir.size as usize;
+
+                // Read the relocation directory from the remote image.
+                let mut reloc_data = vec![0u8; reloc_size];
+                let mut bytes_read = 0usize;
+                let ok = ReadProcessMemory(
+                    target_process,
+                    (remote_base as usize + reloc_rva) as *const c_void,
+                    reloc_data.as_mut_ptr() as *mut c_void,
+                    reloc_size,
+                    &mut bytes_read,
+                );
+                if ok == 0 || bytes_read != reloc_size {
+                    return Err(anyhow!(
+                        "ReadProcessMemory for reloc directory failed: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+
+                let mut offset = 0usize;
+                while offset + 8 <= reloc_size {
+                    let page_rva = u32::from_le_bytes(
+                        reloc_data[offset..offset + 4].try_into().unwrap(),
+                    ) as usize;
+                    let block_size = u32::from_le_bytes(
+                        reloc_data[offset + 4..offset + 8].try_into().unwrap(),
+                    ) as usize;
+                    if block_size < 8 || offset + block_size > reloc_size {
+                        break;
+                    }
+                    let entries_count = (block_size - 8) / 2;
+                    let entries_start = offset + 8;
+                    for i in 0..entries_count {
+                        let off = entries_start + i * 2;
+                        let entry =
+                            u16::from_le_bytes(reloc_data[off..off + 2].try_into().unwrap());
+                        let reloc_type = (entry >> 12) as u8;
+                        let reloc_offset = (entry & 0x0FFF) as usize;
+                        let field_rva = page_rva + reloc_offset;
+
+                        match reloc_type {
+                            // IMAGE_REL_BASED_DIR64: 64-bit absolute VA (x64, ARM64)
+                            10 => {
+                                let mut buf = [0u8; 8];
+                                let mut n = 0usize;
+                                let src = (remote_base as usize + field_rva) as *const c_void;
+                                ReadProcessMemory(
+                                    target_process,
+                                    src,
+                                    buf.as_mut_ptr() as *mut c_void,
+                                    8,
+                                    &mut n,
+                                );
+                                let val = i64::from_le_bytes(buf);
+                                let patched = (val as isize + base_delta).to_le_bytes();
+                                write_remote(field_rva, &patched)?;
+                            }
+                            // IMAGE_REL_BASED_HIGHLOW: 32-bit absolute VA (x86)
+                            3 => {
+                                let mut buf = [0u8; 4];
+                                let mut n = 0usize;
+                                let src = (remote_base as usize + field_rva) as *const c_void;
+                                ReadProcessMemory(
+                                    target_process,
+                                    src,
+                                    buf.as_mut_ptr() as *mut c_void,
+                                    4,
+                                    &mut n,
+                                );
+                                let val = i32::from_le_bytes(buf);
+                                let patched =
+                                    ((val as isize + base_delta) as i32).to_le_bytes();
+                                write_remote(field_rva, &patched)?;
+                            }
+                            0 => {} // padding
+                            _ => {
+                                #[cfg(debug_assertions)]
+                                tracing::debug!(
+                                    "remote_manual_map: skipping unhandled reloc type \
+                                     {reloc_type} at page_rva+offset {field_rva:#x}"
+                                );
+                            }
+                        }
+                    }
+                    offset += block_size;
+                }
+            }
+        }
+    }
+
+    // ── Step 4b: resolve IAT ──────────────────────────────────────────────
+    // On Windows, system DLLs (ntdll, kernel32, kernelbase, …) are mapped at
+    // the same virtual address in every process per-boot (they share a single
+    // ASLR base due to copy-on-write physical pages).  Resolving via
+    // GetModuleHandleA + GetProcAddress in OUR process therefore yields the
+    // correct address for the remote process.  User-mode DLLs that are NOT
+    // system DLLs may differ; those are relatively rare as DLL imports.
+    for import in &pe.imports {
+        let dll_name_cstr = std::ffi::CString::new(import.dll)
+            .map_err(|_| anyhow!("import DLL name contains NUL: {}", import.dll))?;
+        let fn_name_cstr = std::ffi::CString::new(import.name.as_str())
+            .map_err(|_| anyhow!("import function name contains NUL: {}", import.name))?;
+
+        let mod_handle = GetModuleHandleA(dll_name_cstr.as_ptr() as *const i8);
+        if mod_handle.is_null() {
+            return Err(anyhow!(
+                "GetModuleHandleA failed for '{}': not loaded in current process",
+                import.dll
+            ));
+        }
+        let proc_addr = GetProcAddress(mod_handle, fn_name_cstr.as_ptr() as *const i8);
+        if proc_addr.is_null() {
+            return Err(anyhow!(
+                "GetProcAddress failed for '{}' in '{}'",
+                import.name,
+                import.dll
+            ));
+        }
+
+        // Write the resolved function pointer into the remote IAT slot.
+        let iat_addr_bytes = (proc_addr as usize).to_le_bytes();
+        write_remote(import.rva, &iat_addr_bytes)?;
+    }
+
+    // ── Step 5: invoke the DLL entry point via a remote thread ────────────
+    // DllMain signature: BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID).
+    // CreateRemoteThread passes a single LPVOID argument.  We use NULL for the
+    // lpParameter (reserved third argument) because DllMain only uses it for
+    // DLL_THREAD_DETACH / DLL_PROCESS_DETACH paths, which we don't trigger.
+    let entry_rva = opt.standard_fields.address_of_entry_point as usize;
+    if entry_rva != 0 {
+        let entry_va = remote_base as usize + entry_rva;
+        // lpStartAddress must be an LPTHREAD_START_ROUTINE (u64 → u32 return);
+        // the DLL_PROCESS_ATTACH return value is discarded here.
+        let thread_start: winapi::um::minwinbase::LPTHREAD_START_ROUTINE =
+            std::mem::transmute(entry_va);
+        let thread = CreateRemoteThread(
+            target_process,
+            std::ptr::null_mut(),
+            0,
+            thread_start,
+            std::ptr::null_mut(), // lpParameter = NULL
+            0,
+            std::ptr::null_mut(),
+        );
+        if thread.is_null() {
+            return Err(anyhow!(
+                "CreateRemoteThread failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // Close the thread handle immediately; we don't wait for it.
+        CloseHandle(thread);
+    }
+
+    Ok(remote_base)
+}
+

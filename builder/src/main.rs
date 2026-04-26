@@ -81,14 +81,15 @@ fn main() -> Result<()> {
                 info!("Applying code diversification passes...");
                 #[cfg(feature = "diversification")]
                 {
-                    let _ = &agent_bytes;
-                    anyhow::bail!(
-                        "diversification is currently disabled: the previous whole-binary optimizer entry point is not available"
-                    );
+                    optimizer::apply_passes_to_binary(&agent_bytes)
+                        .map_err(|e| anyhow::anyhow!("diversification failed: {e}"))?
                 }
                 #[cfg(not(feature = "diversification"))]
                 {
-                    anyhow::bail!("diversification requested but builder not compiled with `diversification` feature");
+                    anyhow::bail!(
+                        "code diversification is not compiled in; rebuild the builder with \
+                         `cargo build --features diversification` to enable this feature"
+                    );
                 }
             } else {
                 agent_bytes

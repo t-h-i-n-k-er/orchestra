@@ -10,10 +10,16 @@ pub trait Pass {
 }
 
 pub fn apply_passes(code: &[u8]) -> Vec<u8> {
+    apply_passes_at(0x1000, code)
+}
+
+/// Apply diversification passes to raw code bytes decoded at the given virtual
+/// base address.  Callers that know the section's actual load address should
+/// pass it here so that RIP-relative operands are decoded with the correct IP.
+pub fn apply_passes_at(base: u64, code: &[u8]) -> Vec<u8> {
     // Decode retaining original IPs so we can remap branch targets after
     // passes insert NOPs or reorder instructions.
-    const BASE: u64 = 0x1000;
-    let decoder = Decoder::with_ip(64, code, BASE, DecoderOptions::NONE);
+    let decoder = Decoder::with_ip(64, code, base, DecoderOptions::NONE);
     let mut instrs: Vec<Instruction> = decoder.into_iter().collect();
 
     let mut passes: Vec<Box<dyn Pass>> = vec![
@@ -40,7 +46,7 @@ pub fn apply_passes(code: &[u8]) -> Vec<u8> {
     // trial encode.  We need this to rewrite near-branch targets correctly.
     let compute_ips = |instrs: &[Instruction]| -> Vec<u64> {
         let mut ips = Vec::with_capacity(instrs.len());
-        let mut cur = BASE;
+        let mut cur = base;
         let mut enc = Encoder::new(64);
         for ins in instrs {
             ips.push(cur);
@@ -91,6 +97,107 @@ pub fn apply_passes(code: &[u8]) -> Vec<u8> {
     }
     encoder.take_buffer()
 }
+
+/// Apply diversification passes to every executable section of a compiled PE
+/// or ELF binary and return the modified binary.
+///
+/// For each executable section the function:
+/// 1. Applies `apply_passes_at` using the section's actual virtual address so
+///    that RIP-relative operands are decoded correctly.
+/// 2. If the transformed section fits in the section's raw file allocation,
+///    patches it in and zero-fills any slack with `INT3` (0xCC) bytes — those
+///    bytes are in unreachable territory beyond the last `RET`/`JMP`.
+/// 3. If the transformed section is larger than the raw allocation, logs a
+///    warning and skips that section rather than producing a corrupt binary.
+pub fn apply_passes_to_binary(binary: &[u8]) -> Result<Vec<u8>, String> {
+    use goblin::Object;
+
+    let parsed = Object::parse(binary).map_err(|e| format!("binary parse failed: {e}"))?;
+
+    // Collect (file_offset, raw_size, virtual_address) for each executable section.
+    let sections: Vec<(usize, usize, u64)> = match parsed {
+        Object::PE(pe) => {
+            let image_base = pe.image_base as u64;
+            pe.sections
+                .iter()
+                .filter(|s| {
+                    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+                    s.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
+                        && s.size_of_raw_data > 0
+                        && s.pointer_to_raw_data > 0
+                })
+                .map(|s| {
+                    (
+                        s.pointer_to_raw_data as usize,
+                        s.size_of_raw_data as usize,
+                        image_base + s.virtual_address as u64,
+                    )
+                })
+                .collect()
+        }
+        Object::Elf(elf) => {
+            const SHF_EXECINSTR: u64 = 0x4;
+            elf.section_headers
+                .iter()
+                .filter(|s| {
+                    s.sh_flags & SHF_EXECINSTR != 0
+                        && s.sh_size > 0
+                        && s.sh_offset > 0
+                })
+                .map(|s| (s.sh_offset as usize, s.sh_size as usize, s.sh_addr))
+                .collect()
+        }
+        Object::Mach(_) | Object::Archive(_) | Object::Unknown(_) => {
+            return Err(
+                "unsupported binary format; only PE and ELF are supported for diversification"
+                    .into(),
+            );
+        }
+    };
+
+    if sections.is_empty() {
+        return Err("no executable sections found in binary".into());
+    }
+
+    let mut out = binary.to_vec();
+    let mut patched = 0usize;
+
+    for (file_offset, raw_size, va) in sections {
+        if file_offset + raw_size > binary.len() {
+            tracing::warn!(
+                "diversify: section at offset {file_offset:#x} extends past binary end; skipping"
+            );
+            continue;
+        }
+        let code = &binary[file_offset..file_offset + raw_size];
+        let new_bytes = apply_passes_at(va, code);
+
+        match new_bytes.len().cmp(&raw_size) {
+            std::cmp::Ordering::Equal => {
+                out[file_offset..file_offset + raw_size].copy_from_slice(&new_bytes);
+                patched += 1;
+            }
+            std::cmp::Ordering::Less => {
+                // Fits — fill the remaining slack with INT3 guard bytes.
+                out[file_offset..file_offset + new_bytes.len()].copy_from_slice(&new_bytes);
+                out[file_offset + new_bytes.len()..file_offset + raw_size].fill(0xCC);
+                patched += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                tracing::warn!(
+                    "diversify: transformed section at {va:#x} grew from {raw_size} to {} bytes; \
+                     skipping (re-run for a different randomisation that stays within budget)",
+                    new_bytes.len()
+                );
+            }
+        }
+    }
+
+    tracing::info!("diversify: applied passes to {patched} executable section(s)");
+    Ok(out)
+}
+
+
 
 pub struct NopInsertionPass;
 impl Pass for NopInsertionPass {
@@ -390,16 +497,32 @@ pub fn optimize_hot_function(name: &str) -> Result<(), String> {
 mod runtime_rewrite {
     use super::*;
 
-    /// Default rewrite span: 256 bytes is enough for most short hot functions
-    /// without risking decoding past the function's end into other code.
-    const DEFAULT_SPAN: usize = 256;
+    /// Upper-bound span used when no symbol-size information is available.
+    /// 4096 bytes is large enough to cover most functions while staying within
+    /// a single page, so the mprotect/VirtualProtect call never spans more than
+    /// two pages.
+    const FALLBACK_SPAN: usize = 4096;
 
     pub fn rewrite(name: &str) -> Result<(), String> {
         let addr = locate_symbol(name)
             .ok_or_else(|| format!("symbol '{}' not found in this process", name))?;
+
+        // Determine the function's actual byte span from the symbol table or
+        // the PE exception directory.  Fall back to FALLBACK_SPAN only if all
+        // platform-specific methods fail.
+        let span = find_function_size(name, addr).unwrap_or_else(|| {
+            tracing::warn!(
+                "optimize_hot_function: could not determine size of '{}'; \
+                 using fallback span of {} bytes",
+                name,
+                FALLBACK_SPAN
+            );
+            FALLBACK_SPAN
+        });
+
         // Snapshot the current bytes
         let original =
-            unsafe { std::slice::from_raw_parts(addr as *const u8, DEFAULT_SPAN) }.to_vec();
+            unsafe { std::slice::from_raw_parts(addr as *const u8, span) }.to_vec();
         // Apply optimizer passes
         let new_bytes = apply_passes(&original);
         // Refuse if size changed — would clobber adjacent code
@@ -412,18 +535,120 @@ mod runtime_rewrite {
         }
         // Lower protection, copy, restore.
         unsafe {
-            let mut old = make_writable(addr, DEFAULT_SPAN)?;
-            std::ptr::copy_nonoverlapping(new_bytes.as_ptr(), addr as *mut u8, DEFAULT_SPAN);
-            restore_protection(addr, DEFAULT_SPAN, &mut old)?;
-            flush_icache(addr, DEFAULT_SPAN);
+            let mut old = make_writable(addr, span)?;
+            std::ptr::copy_nonoverlapping(new_bytes.as_ptr(), addr as *mut u8, span);
+            restore_protection(addr, span, &mut old)?;
+            flush_icache(addr, span);
         }
         tracing::info!(
             "optimize_hot_function: rewrote {} bytes at {:p} for '{}'",
-            DEFAULT_SPAN,
+            span,
             addr as *const u8,
             name
         );
         Ok(())
+    }
+
+    /// Resolve the byte size of the named function using platform-specific
+    /// metadata.
+    ///
+    /// * **Windows x86-64**: queries `RtlLookupFunctionEntry` which returns the
+    ///   `RUNTIME_FUNCTION` entry from the `.pdata` exception directory; its
+    ///   `EndAddress − BeginAddress` is the exact encoded function size.
+    /// * **Linux**: reads `/proc/self/exe`, parses the ELF static symbol table
+    ///   with `goblin`, and returns the `st_size` field of the matching symbol.
+    /// * Returns `None` if neither method can determine the size.
+    fn find_function_size(name: &str, #[allow(unused_variables)] addr: usize) -> Option<usize> {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        {
+            find_function_size_pdata(addr)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            find_function_size_elf(name)
+        }
+        #[cfg(not(any(all(windows, target_arch = "x86_64"), target_os = "linux")))]
+        {
+            let _ = (name, addr);
+            None
+        }
+    }
+
+    /// Windows x86-64: ask the OS for the RUNTIME_FUNCTION covering `addr`.
+    /// `RtlLookupFunctionEntry` is present in ntdll.dll on all modern Windows
+    /// versions and requires no extra imports beyond what is already linked.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn find_function_size_pdata(addr: usize) -> Option<usize> {
+        #[repr(C)]
+        struct RuntimeFunction {
+            begin_address: u32,
+            end_address: u32,
+            unwind_info_address: u32,
+        }
+
+        extern "system" {
+            /// Returns a pointer to the RUNTIME_FUNCTION covering `control_pc`,
+            /// or NULL if none exists (e.g., leaf functions with no unwind info).
+            fn RtlLookupFunctionEntry(
+                control_pc: u64,
+                image_base: *mut u64,
+                history_table: *mut std::ffi::c_void,
+            ) -> *const RuntimeFunction;
+        }
+
+        unsafe {
+            let mut image_base: u64 = 0;
+            let rf = RtlLookupFunctionEntry(
+                addr as u64,
+                &mut image_base,
+                std::ptr::null_mut(),
+            );
+            if rf.is_null() {
+                return None;
+            }
+            let begin = (*rf).begin_address as usize;
+            let end = (*rf).end_address as usize;
+            if end > begin {
+                Some(end - begin)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Linux: parse the ELF static symbol table of `/proc/self/exe` to look
+    /// up the `st_size` of the named symbol.  Goblin is already a dependency
+    /// of this crate so no additional dependency is added.
+    ///
+    /// This works correctly for both PIE and non-PIE binaries because we match
+    /// on the symbol *name* rather than on a virtual address that would require
+    /// knowing the ASLR slide.
+    #[cfg(target_os = "linux")]
+    fn find_function_size_elf(name: &str) -> Option<usize> {
+        let data = std::fs::read("/proc/self/exe").ok()?;
+        let elf = goblin::elf::Elf::parse(&data).ok()?;
+
+        // Prefer the static symbol table (.symtab) as it is more complete.
+        // Fall back to the dynamic symbol table (.dynsym) for stripped binaries.
+        for sym in elf.syms.iter() {
+            if sym.st_size > 0 {
+                if let Some(sym_name) = elf.strtab.get_at(sym.st_name) {
+                    if sym_name == name {
+                        return Some(sym.st_size as usize);
+                    }
+                }
+            }
+        }
+        for sym in elf.dynsyms.iter() {
+            if sym.st_size > 0 {
+                if let Some(sym_name) = elf.dynstrtab.get_at(sym.st_name) {
+                    if sym_name == name {
+                        return Some(sym.st_size as usize);
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn locate_symbol(_name: &str) -> Option<usize> {
@@ -467,6 +692,7 @@ mod runtime_rewrite {
         }
     }
 
+    #[allow(dead_code)]
     pub struct ProtSnapshot(pub u32);
 
     #[cfg(windows)]

@@ -52,10 +52,34 @@ pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> 
 }
 
 #[cfg(all(windows, feature = "manual-map"))]
-fn manual_map_inject(pid: u32, _payload: &[u8]) -> anyhow::Result<()> {
-    Err(anyhow::anyhow!(
-        "ManualMap injection for pid {pid} is not wired to a remote-process loader; refusing to ignore the target PID"
-    ))
+fn manual_map_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
+    unsafe {
+        // Open the target process with the access rights required for remote
+        // manual-map: VM operations, VM write, and thread creation.
+        let process = winapi::um::processthreadsapi::OpenProcess(
+            winapi::um::winnt::PROCESS_VM_OPERATION
+                | winapi::um::winnt::PROCESS_VM_WRITE
+                | winapi::um::winnt::PROCESS_VM_READ
+                | winapi::um::winnt::PROCESS_CREATE_THREAD,
+            0, // bInheritHandle = FALSE
+            pid,
+        );
+        if process.is_null() {
+            return Err(anyhow::anyhow!(
+                "OpenProcess({pid}) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        struct HandleGuard(*mut winapi::ctypes::c_void);
+        impl Drop for HandleGuard {
+            fn drop(&mut self) {
+                unsafe { winapi::um::handleapi::CloseHandle(self.0); }
+            }
+        }
+        let _guard = HandleGuard(process);
+        module_loader::manual_map::load_dll_in_remote_process(process, payload)
+            .map(|_| ())
+    }
 }
 
 #[cfg(all(windows, not(feature = "manual-map")))]

@@ -80,6 +80,13 @@ pub struct MalleableProfile {
     /// multiple deployments can use different sentinels to avoid fingerprinting.
     #[serde(default = "default_doh_beacon_sentinel")]
     pub doh_beacon_sentinel: String,
+    /// URL of the server-side DNS-to-C2 bridge that receives the DoH queries
+    /// and routes them to the agent session.  **Required** when
+    /// `dns_over_https = true`; the agent will refuse to activate the DoH
+    /// transport if this field is absent or empty.  Example:
+    /// `"https://c2.example.com/doh-bridge"`.
+    #[serde(default)]
+    pub doh_server_url: Option<String>,
 }
 
 fn default_user_agent() -> String {
@@ -105,6 +112,7 @@ impl Default for MalleableProfile {
             dns_over_https: false,
             direct_c2_endpoint: String::new(),
             doh_beacon_sentinel: default_doh_beacon_sentinel(),
+            doh_server_url: None,
         }
     }
 }
@@ -179,6 +187,68 @@ pub struct Config {
     /// Timeout in milliseconds for each port connection during scans.
     #[serde(default = "default_port_scan_timeout")]
     pub port_scan_timeout_ms: u64,
+    /// Fine-grained control over which persistence mechanisms are enabled.
+    /// Defaults to all mechanisms on; operators can selectively disable
+    /// individual mechanisms without rebuilding the agent.
+    #[serde(default)]
+    pub persistence: PersistenceConfig,
+}
+
+/// Per-platform list of persistence mechanisms to install.
+///
+/// Sensible defaults enable multiple mechanisms so that removal of one does
+/// not drop persistence entirely.  Operators can disable individual mechanisms
+/// (e.g., `wmi_subscription = false` on locked-down endpoints where WMI
+/// commands are monitored) without rebuilding the agent.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct PersistenceConfig {
+    // ── Windows ───────────────────────────────────────────────────────────────
+    /// HKCU\Software\Microsoft\Windows\CurrentVersion\Run entry (Windows).
+    #[serde(default = "default_true")]
+    pub registry_run_key: bool,
+    /// Copy to the user Startup folder (Windows).
+    #[serde(default = "default_true")]
+    pub startup_folder: bool,
+    /// WMI __EventFilter + CommandLineEventConsumer subscription (Windows).
+    /// Requires PowerShell and WMI access; disable on heavily-locked endpoints.
+    #[serde(default = "default_true")]
+    pub wmi_subscription: bool,
+
+    // ── macOS ─────────────────────────────────────────────────────────────────
+    /// ~/Library/LaunchAgents plist loaded at user login (macOS).
+    #[serde(default = "default_true")]
+    pub launch_agent: bool,
+    /// @reboot crontab entry as a fallback (macOS / Linux).
+    #[serde(default = "default_true")]
+    pub cron_job: bool,
+
+    // ── Linux ─────────────────────────────────────────────────────────────────
+    /// ~/.config/systemd/user service enabled at login (Linux).
+    #[serde(default = "default_true")]
+    pub systemd_service: bool,
+    /// Append a backgrounded exec block to ~/.bashrc / ~/.profile (Linux).
+    /// Disable if the shell profiles are monitored by an EDR.
+    #[serde(default = "default_true")]
+    pub shell_profile: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self {
+            registry_run_key: true,
+            startup_folder: true,
+            wmi_subscription: true,
+            launch_agent: true,
+            cron_job: true,
+            systemd_service: true,
+            shell_profile: true,
+        }
+    }
 }
 
 fn default_allowed_paths() -> Vec<String> {
@@ -275,6 +345,7 @@ impl Default for Config {
             sleep: SleepConfig::default(),
             malleable_profile: MalleableProfile::default(),
             exec_strategy: ExecStrategy::Indirect,
+            persistence: PersistenceConfig::default(),
         }
     }
 }

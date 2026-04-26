@@ -44,7 +44,8 @@ struct LDR_DATA_TABLE_ENTRY {
     BaseDllName: winapi::shared::ntdef::UNICODE_STRING,
 }
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
+#[cfg(windows)]
 use std::arch::asm;
 
 #[cfg(windows)]
@@ -901,13 +902,31 @@ macro_rules! clean_call {
 
 #[cfg(target_os = "linux")]
 #[macro_export]
+/// Invoke a Linux syscall by name via the direct-syscall path.
+///
+/// Returns `anyhow::Result<u64>`:
+/// * `Ok(retval)` on success (kernel return value ≥ 0).
+/// * `Err(e)` when the kernel returns a negative errno, where `e` is an
+///   `anyhow::Error` that includes both the syscall name and the raw errno
+///   value.
+///
+/// # Example
+/// ```rust,ignore
+/// let fd = syscall!("openat", libc::AT_FDCWD, path_ptr, libc::O_RDONLY)?;
+/// ```
 macro_rules! syscall {
     ($func_name:expr $(, $args:expr)* $(,)?) => {{
         let ssn = $crate::syscalls::get_syscall_id($func_name).expect("unknown linux syscall");
         let args: &[u64] = &[$($args as u64),*];
-        unsafe { $crate::syscalls::do_syscall(ssn as u32, args).unwrap_or_else(|e| {
-            (u64::MAX - (e as u64) + 1)
-        }) }
+        unsafe {
+            $crate::syscalls::do_syscall(ssn as u32, args)
+                .map_err(|errno| anyhow::anyhow!(
+                    "syscall `{}` failed: errno {} ({})",
+                    $func_name,
+                    errno,
+                    std::io::Error::from_raw_os_error(errno)
+                ))
+        }
     }};
 }
 

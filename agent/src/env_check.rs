@@ -182,43 +182,67 @@ fn windows_is_debugger_present() -> bool {
 fn is_expected_hypervisor() -> bool {
     #[cfg(target_os = "linux")]
     {
-        const DMI: &[&str] = &[
-            "/sys/class/dmi/id/board_vendor",
-            "/sys/class/dmi/id/sys_vendor",
-            "/sys/class/dmi/id/product_name",
-            "/sys/class/dmi/id/chassis_asset_tag", // AWS bare-metal reports "EC2" here
-            "/sys/class/dmi/id/board_name",
-        ];
-        // Well-known cloud / hosting provider strings in DMI fields.
-        // Deliberately broad so Azure, DigitalOcean, Linode, Vultr, Hetzner,
-        // OVH, and other legitimate cloud infrastructure all pass.
-        // E-01: Added "ec2" for AWS bare-metal chassis_asset_tag, "google"
-        // for GCP sole-tenant nodes, and "bare metal" for Azure/GCP bare-metal.
-        const CLOUD_NEEDLES: &[&str] = &[
-            "amazon ec2",
-            "ec2", // AWS bare-metal chassis_asset_tag
-            "google compute",
-            "google",                // GCP sole-tenant board_vendor
-            "microsoft corporation", // Azure (Hyper-V guest) and Surface hardware
+        // Read relevant DMI fields once and check combinations rather than
+        // scanning every field with a broad needle list.  This avoids false
+        // positives on physical hardware that happens to share a manufacturer
+        // name with a cloud provider (e.g. Microsoft Surface, Google Chromebook).
+        let sys_vendor = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let product_name = std::fs::read_to_string("/sys/class/dmi/id/product_name")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let chassis_tag = std::fs::read_to_string("/sys/class/dmi/id/chassis_asset_tag")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let board_vendor = std::fs::read_to_string("/sys/class/dmi/id/board_vendor")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let board_name = std::fs::read_to_string("/sys/class/dmi/id/board_name")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        // AWS: sys_vendor = "Amazon EC2" or chassis_asset_tag contains "ec2"
+        // (bare-metal instances report "EC2" in chassis_asset_tag).
+        if sys_vendor.contains("amazon ec2") || chassis_tag.contains("ec2") {
+            return true;
+        }
+        // Azure: sys_vendor = "Microsoft Corporation" AND product_name contains
+        // "virtual machine".  Physical Microsoft hardware (Surface, HoloLens)
+        // never sets product_name to "Virtual Machine".
+        if sys_vendor.contains("microsoft corporation") && product_name.contains("virtual machine")
+        {
+            return true;
+        }
+        // GCP: sys_vendor = "Google" AND product_name contains "google compute".
+        // Bare-metal GCP sole-tenant nodes use sys_vendor="Google" and
+        // product_name="Google Compute Engine" or similar.
+        if sys_vendor.contains("google") && product_name.contains("google compute") {
+            return true;
+        }
+        // GCP bare-metal: board_vendor or board_name may contain the tag.
+        if board_vendor.contains("google") && board_name.contains("google") {
+            return true;
+        }
+
+        // Unambiguous cloud-only strings — these do not appear on consumer hardware.
+        const UNAMBIGUOUS_CLOUD: &[&str] = &[
             "digitalocean",
             "linode",
             "vultr",
             "hetzner",
-            "ovh",
             "cloudstack",
             "openstack",
             "upcloud",
             "scaleway",
             "exoscale",
             "oracle cloud",
-            "bare metal", // Azure/GCP bare-metal product names
+            "ovhcloud",
+            "ovh sas",
         ];
-        for path in DMI {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                let s = content.to_ascii_lowercase();
-                if CLOUD_NEEDLES.iter().any(|n| s.contains(n)) {
-                    return true;
-                }
+        for field in &[&sys_vendor, &product_name, &board_vendor, &chassis_tag] {
+            if UNAMBIGUOUS_CLOUD.iter().any(|n| field.contains(n)) {
+                return true;
             }
         }
     }
@@ -227,34 +251,55 @@ fn is_expected_hypervisor() -> bool {
     {
         use winreg::enums::HKEY_LOCAL_MACHINE;
         use winreg::RegKey;
-        const CLOUD_NEEDLES: &[&str] = &[
-            "amazon",
-            "google",
-            "microsoft corporation",
-            "digitalocean",
-            "linode",
-            "vultr",
-            "hetzner",
-            "ovh",
-            "cloudstack",
-            "openstack",
-            "upcloud",
-            "scaleway",
-            "exoscale",
-            "oracle cloud",
-        ];
+
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
         if let Ok(k) = hklm.open_subkey("HARDWARE\\DESCRIPTION\\System\\BIOS") {
-            for val_name in &[
-                "SystemManufacturer",
-                "SystemProductName",
-                "BaseBoardManufacturer",
-            ] {
-                if let Ok(v) = k.get_value::<String, _>(val_name) {
-                    let s = v.to_ascii_lowercase();
-                    if CLOUD_NEEDLES.iter().any(|n| s.contains(n)) {
-                        return true;
-                    }
+            let manufacturer: String = k
+                .get_value("SystemManufacturer")
+                .unwrap_or_default();
+            let product: String = k
+                .get_value("SystemProductName")
+                .unwrap_or_default();
+            let board_mfr: String = k
+                .get_value("BaseBoardManufacturer")
+                .unwrap_or_default();
+            let mfr = manufacturer.to_ascii_lowercase();
+            let prod = product.to_ascii_lowercase();
+            let board = board_mfr.to_ascii_lowercase();
+
+            // AWS: manufacturer contains "amazon" and either manufacturer or
+            // product mentions "ec2".
+            if mfr.contains("amazon") && (mfr.contains("ec2") || prod.contains("ec2")) {
+                return true;
+            }
+            // Azure: manufacturer = "Microsoft Corporation" AND product = "Virtual Machine".
+            // Physical Windows systems from Microsoft never have product "Virtual Machine".
+            if mfr.contains("microsoft corporation") && prod.contains("virtual machine") {
+                return true;
+            }
+            // GCP: manufacturer or product contains "google compute".
+            if mfr.contains("google") && prod.contains("google compute") {
+                return true;
+            }
+
+            // Unambiguous cloud-only strings.
+            const UNAMBIGUOUS_CLOUD: &[&str] = &[
+                "digitalocean",
+                "linode",
+                "vultr",
+                "hetzner",
+                "cloudstack",
+                "openstack",
+                "upcloud",
+                "scaleway",
+                "exoscale",
+                "oracle cloud",
+                "ovhcloud",
+                "ovh sas",
+            ];
+            for field in &[&mfr, &prod, &board] {
+                if UNAMBIGUOUS_CLOUD.iter().any(|n| field.contains(n)) {
+                    return true;
                 }
             }
         }
@@ -347,23 +392,38 @@ pub fn detect_vm() -> bool {
     if mac_prefix_indicates_vm() {
         indicators += 1;
     }
-    // Subtract an indicator when we can confirm this is a legitimate cloud
-    // deployment.  We accept *either* evidence to handle locked-down cloud
-    // environments where the IMDS endpoint is firewalled:
+
+    // Cloud VMs (AWS, Azure, GCP, DigitalOcean, …) inherently present multiple
+    // VM indicators: the CPUID hypervisor bit, cloud-specific MAC prefixes, and
+    // cloud-vendor strings in DMI tables.  These are genuine signs of
+    // virtualisation but NOT of a hostile analysis environment.
     //
-    //   • is_expected_hypervisor(): checks local DMI/registry for cloud-vendor
-    //     strings (AWS, Azure, GCP, etc.) — works even without network access.
-    //   • is_cloud_instance(): probes the IMDS link-local address (169.254.169.254)
-    //     via a 100 ms TCP connect — works on clouds where IMDS is enabled.
+    // Strategy: check both independent confirmation paths and adjust the
+    // threshold to ensure a legitimate cloud deployment is never refused.
     //
-    // Cloud VMs inherently exhibit VM indicators (hypervisor CPUID bit, cloud
-    // MAC prefixes) so subtracting one counter prevents legitimate cloud
-    // deployments from being incorrectly refused.
-    if is_expected_hypervisor() || is_cloud_instance() {
-        indicators -= 1;
-    }
-    // Consider it a VM if at least two indicators are present.
-    indicators >= 2
+    //   • is_expected_hypervisor(): inspects local DMI/registry for known
+    //     cloud-vendor strings — works even when IMDS is firewalled.
+    //   • is_cloud_instance(): probes the IMDS link-local endpoint
+    //     (169.254.169.254) — works when IMDS is enabled and reachable.
+    //
+    // When either check confirms this is a cloud host:
+    //   - If BOTH checks agree (strongest confidence), we raise the threshold
+    //     from 2 to 4, ensuring that the typical cloud fingerprint of 3–4
+    //     indicators (CPUID + DMI + MAC + IMDS) never crosses the threshold.
+    //   - If only ONE check fires (e.g., IMDS firewalled or an exotic cloud
+    //     whose DMI strings aren't in our list), we raise the threshold to 3,
+    //     so a standard 3-indicator cloud VM (CPUID + DMI + MAC) is not flagged
+    //     while a heavily-instrumented analysis VM with 4+ indicators still is.
+    let cloud_hypervisor = is_expected_hypervisor();
+    let cloud_imds = is_cloud_instance();
+    let threshold = if cloud_hypervisor && cloud_imds {
+        4 // Strong confirmation: both local DMI *and* IMDS agree → cloud
+    } else if cloud_hypervisor || cloud_imds {
+        3 // Moderate confidence: one signal present → likely cloud
+    } else {
+        2 // No cloud signal: standard analysis-VM threshold
+    };
+    indicators >= threshold
 }
 
 fn cpuid_hypervisor_bit() -> bool {

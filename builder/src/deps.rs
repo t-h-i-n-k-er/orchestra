@@ -56,6 +56,10 @@ const RUST_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
 ];
 
+/// macOS cross-compilation targets — these require more than just a Rust
+/// target installation when cross-compiling from Linux or Windows.
+const MACOS_TARGETS: &[&str] = &["x86_64-apple-darwin", "aarch64-apple-darwin"];
+
 /// Entry point for `builder setup` command.
 pub fn cmd_setup(auto_install: bool) -> Result<()> {
     let missing = ensure_dependencies(false)?;
@@ -130,6 +134,35 @@ fn ensure_dependencies(fatal: bool) -> Result<Vec<String>> {
         }
     }
 
+    // On non-macOS hosts, installing the Rust macOS target is necessary but
+    // not sufficient: the `ring` crate (and any other crate with a C/C++ build
+    // script) requires a macOS-compatible C compiler on PATH.  Check for one
+    // of the known cross-compilation setups and emit a clear warning rather
+    // than letting the user discover the failure mid-build.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let has_macos_cc = check_macos_cross_cc();
+        if !has_macos_cc {
+            for t in MACOS_TARGETS {
+                let installed = installed_rust_targets().unwrap_or_default();
+                if installed.iter().any(|i| i.as_str() == *t) {
+                    // Rust target is installed but no compatible C compiler.
+                    let msg = format!(
+                        "macOS cross-compiler for {t}: Rust target is installed but no \
+                         compatible C cross-compiler was found on PATH. \
+                         Install osxcross (provides `o64-clang`) or cargo-zigbuild \
+                         (requires `zig` on PATH). Without this, crates with C build \
+                         scripts (e.g. `ring`) will fail to compile for {t}."
+                    );
+                    if fatal {
+                        return Err(anyhow!(msg));
+                    }
+                    missing.push(msg);
+                }
+            }
+        }
+    }
+
     if missing.is_empty() {
         info!("All build dependencies satisfied.");
     } else if !fatal {
@@ -177,4 +210,53 @@ fn installed_rust_targets() -> Result<Vec<String>> {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(stdout.lines().map(|s| s.to_string()).collect())
+}
+
+/// Check whether a macOS-compatible C cross-compiler is available on the
+/// current host.  This is needed in addition to the Rust target for crates
+/// that invoke `cc` during their build script (e.g. `ring`, `openssl-sys`).
+///
+/// Accepts any of the following setups:
+///
+/// 1. **osxcross**: provides wrappers such as `o64-clang`,
+///    `x86_64-apple-darwin21-clang`, or `aarch64-apple-darwin21-clang`.
+/// 2. **cargo-zigbuild** / **zig**: the `zig` binary can act as a drop-in
+///    C cross-compiler for any target via `zig cc`.
+/// 3. **Explicit env vars**: if the caller has set
+///    `CC_x86_64_apple_darwin` or `CC_aarch64_apple_darwin`, the
+///    configured compiler is assumed to be functional.
+#[cfg(not(target_os = "macos"))]
+fn check_macos_cross_cc() -> bool {
+    // 1. osxcross wrapper binaries
+    const OSXCROSS_BINS: &[&str] = &[
+        "o64-clang",
+        "o64-clang++",
+        "x86_64-apple-darwin21-clang",
+        "aarch64-apple-darwin21-clang",
+        "x86_64-apple-darwin20-clang",
+        "aarch64-apple-darwin20-clang",
+        // Older osxcross releases use the macOS SDK version directly
+        "x86_64-apple-darwin19-clang",
+        "x86_64-apple-darwin18-clang",
+    ];
+    if OSXCROSS_BINS.iter().any(|b| which::which(b).is_ok()) {
+        info!("✓ osxcross macOS C cross-compiler found");
+        return true;
+    }
+
+    // 2. zig (cargo-zigbuild relies on `zig cc`)
+    if which::which("zig").is_ok() {
+        info!("✓ zig found (usable as macOS C cross-compiler via cargo-zigbuild)");
+        return true;
+    }
+
+    // 3. Explicit CC env var overrides
+    if std::env::var_os("CC_x86_64_apple_darwin").is_some()
+        || std::env::var_os("CC_aarch64_apple_darwin").is_some()
+    {
+        info!("✓ CC_*_apple_darwin env var set; assuming macOS cross-compiler is configured");
+        return true;
+    }
+
+    false
 }
