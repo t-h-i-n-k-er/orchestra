@@ -361,5 +361,20 @@ pub mod injection;
 
 pub mod obfuscated_sleep;
 
+/// EXPERIMENTAL — inactive transport modules.
+///
+/// `c2_doh` and `c2_http` are prototype implementations of DNS-over-HTTPS
+/// and HTTP malleable-profile transports respectively.  **Neither module is
+/// wired into the default startup path** (`Agent::run`); the agent always
+/// uses the default TLS transport at runtime.
+///
+/// These modules are compiled in unconditionally so that CI catches type
+/// errors, but they do nothing unless explicitly integrated.  At runtime,
+/// if the operator sets `dns_over_https = true` or `cdn_relay = true` in the
+/// malleable profile, the agent emits a `log::warn!` and continues using the
+/// TLS transport — it does NOT activate `DohTransport` or `HttpTransport`.
+///
+/// Do not add code here that activates these transports without a full
+/// reviewed test suite covering the network startup path.
 pub mod c2_doh;
 pub mod c2_http;

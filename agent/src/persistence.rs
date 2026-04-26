@@ -62,7 +62,7 @@ pub mod windows {
                         ret
                     ));
                 }
-                RegSetValueExW(
+                let set_ret = RegSetValueExW(
                     hkey,
                     val_name.as_ptr(),
                     0,
@@ -71,6 +71,12 @@ pub mod windows {
                     (val_wide.len() * 2) as u32,
                 );
                 RegCloseKey(hkey);
+                if set_ret != 0 {
+                    return Err(anyhow!(
+                        "RegistryRunKey::install: RegSetValueExW failed: {}",
+                        set_ret
+                    ));
+                }
             }
             log::info!(
                 "RegistryRunKey::install: set '{}' = '{}'",
@@ -210,11 +216,14 @@ pub mod windows {
 
                 CoUninitialize();
 
-                if status.success() {
-                    log::info!("WmiSubscription::install: registered successfully");
-                } else {
-                    log::warn!("WmiSubscription::install: powershell returned non-zero exit code");
+                CoUninitialize();
+
+                if !status.success() {
+                    return Err(anyhow!(
+                        "WmiSubscription::install: powershell returned non-zero exit code"
+                    ));
                 }
+                log::info!("WmiSubscription::install: registered successfully");
             }
             Ok(())
         }
@@ -497,18 +506,28 @@ pub mod macos {
             #[cfg(target_os = "macos")]
             {
                 let uid = unsafe { libc::getuid() };
-                let _ = std::process::Command::new("launchctl")
+                let status = std::process::Command::new("launchctl")
                     .args([
                         "bootstrap",
                         &format!("gui/{}", uid),
                         &plist_path.to_string_lossy(),
                     ])
-                    .status();
+                    .status()
+                    .map_err(|e| anyhow!("LaunchAgent::install: launchctl: {}", e))?;
+                if !status.success() {
+                    // launchctl bootstrap returns 37 (ESRCH) when the service
+                    // is already loaded; treat that as a non-fatal warning.
+                    log::warn!(
+                        "LaunchAgent::install: launchctl bootstrap returned non-zero (service may already be loaded)"
+                    );
+                }
             }
             #[cfg(not(target_os = "macos"))]
-            let _ = std::process::Command::new("launchctl")
-                .args(["load", "-w", &plist_path.to_string_lossy()])
-                .status();
+            {
+                let _ = std::process::Command::new("launchctl")
+                    .args(["load", "-w", &plist_path.to_string_lossy()])
+                    .status();
+            }
             log::info!("LaunchAgent::install: installed '{}'", plist_path.display());
             Ok(())
         }
@@ -798,12 +817,23 @@ pub mod linux {
             let unit_path = unit_dir.join(format!("{}.service", self.service_name));
             std::fs::write(&unit_path, unit)
                 .map_err(|e| anyhow!("SystemdService: write: {}", e))?;
-            let _ = std::process::Command::new("systemctl")
+            let reload = std::process::Command::new("systemctl")
                 .args(["--user", "daemon-reload"])
-                .status();
-            let _ = std::process::Command::new("systemctl")
+                .status()
+                .map_err(|e| anyhow!("SystemdService: daemon-reload: {}", e))?;
+            if !reload.success() {
+                log::warn!("SystemdService::install: daemon-reload returned non-zero");
+            }
+            let enable = std::process::Command::new("systemctl")
                 .args(["--user", "enable", "--now", &self.service_name])
-                .status();
+                .status()
+                .map_err(|e| anyhow!("SystemdService: enable --now: {}", e))?;
+            if !enable.success() {
+                return Err(anyhow!(
+                    "SystemdService::install: enable --now '{}' failed",
+                    self.service_name
+                ));
+            }
             log::info!("SystemdService::install: enabled '{}'", self.service_name);
             Ok(())
         }

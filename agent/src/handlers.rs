@@ -39,6 +39,28 @@ fn sanitize_action(cmd: &Command) -> String {
     }
 }
 
+/// Sanitize the result string before it appears in the audit log.
+///
+/// Successful `ReadFile`, `ShellOutput`, and `CaptureScreen` results contain
+/// base64-encoded file/shell/screen data.  Logging that verbatim would write
+/// potentially sensitive content to the audit trail (contradicting the claim
+/// in `SECURITY_AUDIT.md §8`).  Replace those payloads with a size summary.
+fn sanitize_result(cmd: &Command, result: &Result<String, String>) -> String {
+    match (cmd, result) {
+        (Command::ReadFile { .. }, Ok(b64)) => {
+            format!("[file content redacted, {} base64 bytes]", b64.len())
+        }
+        (Command::ShellOutput { .. }, Ok(b64)) => {
+            format!("[shell output redacted, {} base64 bytes]", b64.len())
+        }
+        (Command::CaptureScreen, Ok(b64)) => {
+            format!("[screenshot redacted, {} base64 bytes]", b64.len())
+        }
+        (_, Ok(s)) => s.clone(),
+        (_, Err(e)) => e.clone(),
+    }
+}
+
 pub(crate) fn make_audit(
     action: &str,
     outcome: Outcome,
@@ -319,10 +341,10 @@ pub async fn handle_command(
     };
 
     let (outcome, details) = match &result {
-        Ok(s) => (Outcome::Success, s.as_str()),
-        Err(e) => (Outcome::Failure, e.as_str()),
+        Ok(_) => (Outcome::Success, sanitize_result(&command, &result)),
+        Err(e) => (Outcome::Failure, e.clone()),
     };
-    let audit = make_audit(&action, outcome, details, operator_id);
+    let audit = make_audit(&action, outcome, &details, operator_id);
     (result, audit)
 }
 
@@ -430,5 +452,124 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── SECURITY_AUDIT.md §8 compliance tests ────────────────────────────────
+
+    /// AuditEvent.details must NOT contain base64-encoded file contents for a
+    /// successful ReadFile command.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn audit_event_does_not_contain_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_file = dir.path().join("secret.txt");
+        let secret = b"super-secret-password-data";
+        std::fs::write(&secret_file, secret).unwrap();
+
+        let cfg = Config {
+            allowed_paths: vec![dir.path().to_string_lossy().into_owned()],
+            ..Config::default()
+        };
+        let crypto = Arc::new(CryptoSession::from_key([0u8; 32]));
+        let (res, audit) = handle_command(
+            crypto,
+            Arc::new(TokioMutex::new(cfg)),
+            Command::ReadFile {
+                path: secret_file.to_string_lossy().into_owned(),
+            },
+            "admin",
+        )
+        .await;
+
+        // The command must succeed.
+        assert!(res.is_ok(), "ReadFile should succeed: {res:?}");
+
+        // The audit details must NOT contain the file content (raw or base64).
+        let b64_content = base64::engine::general_purpose::STANDARD.encode(secret);
+        assert!(
+            !audit.details.contains(&b64_content),
+            "audit.details must not contain base64 file contents"
+        );
+        assert!(
+            !audit.details.contains("super-secret"),
+            "audit.details must not contain plaintext file contents"
+        );
+        // The redacted marker must be present.
+        assert!(
+            audit.details.contains("redacted"),
+            "audit.details should contain redaction marker, got: {:?}",
+            audit.details
+        );
+    }
+
+    /// AuditEvent.details must NOT contain shell output for a ShellOutput result.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shell_io_is_redacted_in_audit() {
+        // Start a shell, send a command, read output.
+        let crypto = Arc::new(CryptoSession::from_key([0u8; 32]));
+        let cfg_arc = Arc::new(TokioMutex::new(Config::default()));
+
+        let (start_res, _) = handle_command(
+            crypto.clone(),
+            cfg_arc.clone(),
+            Command::StartShell,
+            "admin",
+        )
+        .await;
+        let session_id = start_res.expect("StartShell should succeed");
+
+        // Send a command that produces predictable output.
+        handle_command(
+            crypto.clone(),
+            cfg_arc.clone(),
+            Command::ShellInput {
+                session_id: session_id.clone(),
+                data: b"echo ORCHESTRA_TEST_SENTINEL\n".to_vec(),
+            },
+            "admin",
+        )
+        .await;
+
+        // Give the shell a moment to produce output.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (out_res, audit) = handle_command(
+            crypto.clone(),
+            cfg_arc.clone(),
+            Command::ShellOutput {
+                session_id: session_id.clone(),
+            },
+            "admin",
+        )
+        .await;
+        assert!(out_res.is_ok(), "ShellOutput should succeed");
+
+        // The raw sentinel text must not appear in the audit log.
+        assert!(
+            !audit.details.contains("ORCHESTRA_TEST_SENTINEL"),
+            "audit.details must not contain raw shell output"
+        );
+        // The base64-encoded output must also be absent.
+        if let Ok(ref b64) = out_res {
+            assert!(
+                !audit.details.contains(b64.as_str()),
+                "audit.details must not contain base64 shell output"
+            );
+        }
+        assert!(
+            audit.details.contains("redacted"),
+            "audit.details should contain redaction marker, got: {:?}",
+            audit.details
+        );
+
+        // Clean up.
+        handle_command(
+            crypto,
+            cfg_arc,
+            Command::CloseShell { session_id },
+            "admin",
+        )
+        .await;
     }
 }

@@ -24,6 +24,11 @@ winapi = { version = "0.3", features = ["memoryapi", "libloaderapi", "winnt"] }
 [features]
 default = ["module-signatures"]
 module-signatures = ["dep:ed25519-dalek"]
+# Reject a missing runtime `module_verify_key` instead of silently falling
+# back to the compile-time `MODULE_SIGNING_PUBKEY` constant.  Enable in
+# production builds to ensure every plugin load is validated against a key
+# supplied by the operator rather than one baked into the binary.
+strict-module-key = ["module-signatures"]
 # Enable reflective PE loading on Windows (no temp file written to disk).
 # Requires the Windows-only `goblin` + `winapi` dependencies declared above.
 manual-map = []

@@ -233,7 +233,12 @@ if [[ "$DEPLOY" == "outbound" ]]; then
     PACKAGE="agent"
     BIN_NAME="agent-standalone"
 else
-    PACKAGE="launcher"
+    # Launcher mode: the profile builds the *agent payload* to be served by the
+    # dev-server (package="agent", no outbound-c so the agent waits for inbound
+    # server connections).  The launcher stub itself is compiled separately below
+    # and deployed directly to the endpoint — it is NOT encrypted as a payload
+    # because that would require another launcher to download it (circular).
+    PACKAGE="agent"
     BIN_NAME=""
 fi
 
@@ -328,11 +333,32 @@ build_payload_with_zig() {
 if need_zig; then
     build_payload_with_zig
 else
-    say "Building payload via orchestra-builder…"
+    say "Building agent payload via orchestra-builder…"
     "$BUILDER" build "$PROFILE_NAME"
     PAYLOAD_PATH="dist/${PROFILE_NAME}.enc"
-    [[ "$DEPLOY" == "outbound" ]] && PAYLOAD_PATH="dist/${PROFILE_NAME}.enc"
-    ok "payload: $PAYLOAD_PATH"
+    ok "agent payload: $PAYLOAD_PATH"
+fi
+
+# For launcher mode, also build the launcher stub (deployed directly to the
+# endpoint out-of-band; NOT served as the downloadable payload).
+if [[ "$DEPLOY" == "launcher" ]]; then
+    say "Building launcher stub (deployed directly to endpoint — not served as payload)…"
+    LAUNCHER_TRIPLE="x86_64-unknown-linux-gnu"
+    case "$TARGET_OS" in
+        linux)   LAUNCHER_TRIPLE="x86_64-unknown-linux-gnu" ;;
+        windows) LAUNCHER_TRIPLE="x86_64-pc-windows-gnu" ;;
+        macos)   LAUNCHER_TRIPLE="x86_64-apple-darwin" ;;
+        *) LAUNCHER_TRIPLE="" ;;
+    esac
+    [[ "$TARGET_ARCH" == "aarch64" ]] && LAUNCHER_TRIPLE="${LAUNCHER_TRIPLE/x86_64/aarch64}"
+    if [[ -n "$LAUNCHER_TRIPLE" ]]; then
+        rustup target add "$LAUNCHER_TRIPLE" >/dev/null 2>&1 || true
+        cargo build --release -p launcher --target "$LAUNCHER_TRIPLE" 2>/dev/null \
+            && ok "launcher stub: target/${LAUNCHER_TRIPLE}/release/launcher" \
+            || warn "launcher stub build failed for $LAUNCHER_TRIPLE; cross-compile toolchain may be missing"
+    else
+        warn "Unknown TARGET_OS '${TARGET_OS}'; skipping launcher stub build"
+    fi
 fi
 
 # -------- 10. optionally start the server -----------------------------------

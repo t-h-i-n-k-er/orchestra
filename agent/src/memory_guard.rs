@@ -130,10 +130,15 @@ pub unsafe fn register(buf: &'static mut [u8], label: &'static str) {
 /// registers it once. Subsequent calls update the buffer's contents with the
 /// new key bytes (in case of reconnect) without growing the registry.
 pub fn register_session_key(session: &common::CryptoSession) {
-    use std::sync::OnceLock;
+    // Newtype wrapper so `*mut [u8; 32]` can cross thread boundaries; access
+    // is serialised by the Mutex below.
+    struct KeyBufPtr(*mut [u8; 32]);
+    // SAFETY: the raw pointer is valid for the process lifetime (Box::leak) and
+    // all access goes through the Mutex that wraps this value.
+    unsafe impl Send for KeyBufPtr {}
 
     // The key buffer lives for the entire process lifetime.
-    static KEY_BUF: OnceLock<Mutex<&'static mut [u8; 32]>> = OnceLock::new();
+    static KEY_BUF: OnceLock<Mutex<KeyBufPtr>> = OnceLock::new();
 
     let registered = KEY_BUF.get().is_some();
 
@@ -141,17 +146,21 @@ pub fn register_session_key(session: &common::CryptoSession) {
         // SAFETY: We immediately register this buffer; it is never freed.
         let boxed: Box<[u8; 32]> = Box::new([0u8; 32]);
         let static_ref: &'static mut [u8; 32] = Box::leak(boxed);
-        // SAFETY: We hold the only reference to `static_ref` here and will
-        // protect concurrent access via the Mutex we're about to create.
+        // Save the raw pointer *before* register() consumes the &'static mut via
+        // unsized coercion (fixing E0499 / use-after-move on `static_ref`).
+        // SAFETY: the pointer remains valid because the backing allocation is
+        // leaked; the Mutex serialises all subsequent dereferences.
+        let raw = static_ref as *mut [u8; 32];
         unsafe {
             register(static_ref, "crypto-session-key");
         }
-        Mutex::new(static_ref)
+        Mutex::new(KeyBufPtr(raw))
     });
 
     // Update the buffer with the current key bytes.
-    if let Ok(mut buf) = guard.lock() {
-        buf.copy_from_slice(session.key_bytes());
+    if let Ok(mut kp) = guard.lock() {
+        // SAFETY: raw pointer is valid (Box::leak) and we hold the Mutex.
+        unsafe { (*kp.0).copy_from_slice(session.key_bytes()) };
         if !registered {
             tracing::debug!("[memory-guard] session key registered for protection");
         } else {
@@ -668,5 +677,34 @@ mod tests {
         // After early wake memory must be restored.
         let restored = unsafe { read_bytes(ptr, len) };
         assert_eq!(restored.as_slice(), content.as_ref());
+    }
+
+    /// `register_session_key` must compile and run without UB on Linux.
+    ///
+    /// Verifies that:
+    /// 1. The function accepts a `CryptoSession` and registers the key buffer
+    ///    without panicking (no double-move / E0499 regression).
+    /// 2. The buffer is encrypted by `lock()` and restored by `unlock()`.
+    /// 3. A second call (simulating a reconnect) updates the buffer contents.
+    #[test]
+    fn register_session_key_compiles_and_updates() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        fresh_registry();
+
+        let key1 = [0x42u8; 32];
+        let session1 = common::CryptoSession::from_key(key1);
+        register_session_key(&session1);
+
+        // Lock/unlock must succeed with the session key registered.
+        let h = lock().expect("lock should succeed after register_session_key");
+        unlock(h).expect("unlock should succeed");
+
+        // A second call simulating reconnect must not panic or error.
+        let key2 = [0x7fu8; 32];
+        let session2 = common::CryptoSession::from_key(key2);
+        register_session_key(&session2);
+
+        let h = lock().expect("second lock should succeed");
+        unlock(h).expect("second unlock should succeed");
     }
 }

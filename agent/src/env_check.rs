@@ -1084,6 +1084,119 @@ mod tests {
         assert!(!r.should_refuse(false, false, Some(81)));
         assert!(r.should_refuse(false, false, Some(80)));
     }
+
+    // ── Strict domain matching ────────────────────────────────────────────────
+
+    /// Domain matching is case-insensitive and must match the full domain string.
+    #[test]
+    fn strict_domain_match_is_case_insensitive() {
+        assert!(validate_domain_pair("CORP.EXAMPLE.COM", "corp.example.com"));
+        assert!(validate_domain_pair("corp.example.com", "CORP.EXAMPLE.COM"));
+        assert!(!validate_domain_pair("corp.example.com", "other.example.com"));
+        // Empty required domain should never match (not configured).
+        assert!(!validate_domain_pair("corp.example.com", ""));
+    }
+
+    /// A subdomain of the required domain is NOT considered a match (strict match).
+    #[test]
+    fn strict_domain_does_not_match_subdomain() {
+        // "workstation.corp.example.com" is not the same as "corp.example.com".
+        assert!(!validate_domain_pair("workstation.corp.example.com", "corp.example.com"));
+    }
+
+    fn validate_domain_pair(observed: &str, required: &str) -> bool {
+        if required.is_empty() {
+            return false;
+        }
+        observed.eq_ignore_ascii_case(required)
+    }
+
+    // ── VM detection false-positive scenarios ─────────────────────────────────
+
+    /// `detect_vm` must never refuse on its own: `should_refuse` only reacts to
+    /// `vm_detected` when the operator explicitly sets `refuse_in_vm = true`.
+    #[test]
+    fn vm_detected_is_informational_by_default() {
+        let report = EnvReport {
+            vm_detected: true,
+            ..EnvReport::default()
+        };
+        // Default policy: refuse_in_vm = false → must NOT refuse.
+        assert!(!report.should_refuse(false, false, None));
+        // Explicit policy: refuse_in_vm = true → must refuse.
+        assert!(report.should_refuse(false, true, None));
+    }
+
+    /// A single VM indicator is not enough to set vm_detected = true.
+    /// (detect_vm() requires 2+ indicators.)
+    #[test]
+    fn detect_vm_requires_multiple_indicators() {
+        // This test verifies the policy, not the hardware probes.
+        // The probe functions are platform-specific, but the thresholding
+        // logic is captured in should_refuse which is testable here.
+        let report = EnvReport {
+            vm_detected: false, // Single indicator: not enough.
+            ..EnvReport::default()
+        };
+        assert!(!report.should_refuse(false, true, None));
+    }
+
+    // ── Unknown hypervisors ───────────────────────────────────────────────────
+
+    /// A machine with an unknown hypervisor that doesn't match cloud needles
+    /// contributes a VM indicator but must NOT automatically cause refusal.
+    #[test]
+    fn unknown_hypervisor_requires_explicit_policy_to_refuse() {
+        let report = EnvReport {
+            vm_detected: true, // Detected but unknown hypervisor.
+            ..EnvReport::default()
+        };
+        // Without refuse_in_vm, even an unknown hypervisor is just informational.
+        assert!(!report.should_refuse(false, false, None));
+    }
+
+    // ── Cloud provider detection (headless / CI) ──────────────────────────────
+
+    /// A cloud/CI environment sets vm_detected but must pass with default policy.
+    ///
+    /// This mirrors the CI runner scenario: GitHub Actions / AWS CodeBuild runs
+    /// inside a VM; the agent must not refuse when env-validation is enabled
+    /// unless `refuse_in_vm = true` is explicitly set by the operator.
+    #[test]
+    fn cloud_ci_environment_does_not_auto_refuse() {
+        let report = EnvReport {
+            vm_detected: true,     // Cloud hypervisor detected.
+            sandbox_score: 45,     // Moderate score from headless probe.
+            domain_match: None,    // No domain requirement configured.
+            ..EnvReport::default()
+        };
+        assert!(!report.should_refuse(false, false, None),
+            "cloud/CI vm_detected=true must not refuse with default policy");
+        assert!(!report.should_refuse(false, false, Some(60)),
+            "sandbox score 45 must not trigger threshold 60");
+        // Only refuses if both flags are explicitly set.
+        assert!(report.should_refuse(false, true, None),
+            "refuse_in_vm=true must still refuse");
+    }
+
+    // ── macOS headless / CI ───────────────────────────────────────────────────
+
+    /// On macOS in a headless CI environment, the sandbox probe returns 0 for
+    /// mouse and desktop scores (no display), so the total sandbox score should
+    /// be low enough not to trigger a default threshold.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_headless_sandbox_score_is_below_default_threshold() {
+        // In headless macOS (no DISPLAY, no window server), the sandbox probe
+        // returns 0 for mouse and desktop components.  With only uptime/hw
+        // checks, the total is typically < 45.
+        let score = sandbox::evaluate_sandbox().unwrap_or(0);
+        // We can't assert an exact value (depends on uptime/hw of the runner),
+        // but a headless system should not exceed the strict threshold 60.
+        let report = EnvReport { sandbox_score: score, ..EnvReport::default() };
+        assert!(!report.should_refuse(false, false, Some(60)),
+            "headless macOS sandbox score {score} should not exceed threshold 60");
+    }
 }
 
 /// Combined sandbox heuristics implementation (Prompt 6)

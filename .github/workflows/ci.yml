@@ -46,6 +46,8 @@ jobs:
         run: cargo check --workspace --locked
       - name: Test workspace defaults
         run: cargo test --workspace --locked
+      - name: Doc check (no private items)
+        run: cargo doc --workspace --no-deps --locked 2>&1 | tee /tmp/cargo-doc.txt; grep -c "^warning\[" /tmp/cargo-doc.txt || true
 
   linux-feature-modules:
     name: Linux feature module checks (${{ matrix.name }})
@@ -54,16 +56,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # memory-guard feature must compile and its tests must pass on Linux.
+          - name: memory-guard-tests
+            command: cargo test -p agent --features memory-guard --locked -- memory_guard
+          # stealth bundles memory-guard; verify the bundle compiles.
+          - name: stealth-compile
+            command: cargo check -p agent --features stealth --locked
+          # network-discovery integration.
           - name: network-discovery-tests
             command: cargo test -p agent --features network-discovery net_discovery --locked
+          # remote-assist compile (X11 display not available in CI; compile only).
           - name: remote-assist-compile
             command: cargo check -p agent --no-default-features --features remote-assist --locked
+          # All agent features together (requires memory-guard fix to pass).
           - name: agent-all-features-compile
             command: cargo check -p agent --all-features --locked
+          # forward-secrecy on the server side.
+          - name: server-forward-secrecy-compile
+            command: cargo check -p orchestra-server --features forward-secrecy --locked
+          # forward-secrecy on the agent side.
+          - name: agent-forward-secrecy-compile
+            command: cargo check -p agent --features forward-secrecy --locked
+          # builder diversification + README table consistency.
           - name: builder-diversification-and-docs
             command: cargo check -p builder --features diversification --locked && cargo test -p builder readme_feature_table_matches_agent_features --locked
+          # module-loader tests including module-signatures.
           - name: module-loader-tests
-            command: cargo test -p module_loader --locked
+            command: cargo test -p module_loader --locked && cargo test -p module_loader --features module-signatures --locked
+          # Deterministic proc-macros and PE resolver.
           - name: deterministic-proc-macros
             command: cargo test -p string_crypt --locked && cargo test -p junk_macro --locked && cargo check -p pe_resolve --locked
     steps:
@@ -94,8 +114,33 @@ jobs:
       - name: Run matrix command
         run: ${{ matrix.command }}
 
-  windows-selected-features:
-    name: Windows selected feature compile
+  # Windows GNU — uses the mingw-w64 cross-compiler available on ubuntu-latest.
+  # This is NOT the same as compiling with MSVC; MSVC targets require a Windows
+  # runner (windows-latest) with the Visual C++ Build Tools installed and the
+  # aws-lc-sys / ring C dependencies compiled via cl.exe. Failures on this job
+  # indicate Rust/mingw-w64 issues, NOT MSVC issues.
+  windows-gnu-cross:
+    name: Windows GNU cross-compile (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Compile agent defaults (GNU target)
+        run: cargo check -p agent --target x86_64-pc-windows-gnu --locked
+      - name: Compile selected Windows features (GNU target)
+        run: cargo check -p agent --target x86_64-pc-windows-gnu --no-default-features --features "env-validation,persistence,network-discovery,outbound-c,direct-syscalls" --locked
+
+  # Windows MSVC — native runner with Visual C++ Build Tools and MSVC CRT.
+  # This job is the only valid way to verify aws-lc-sys, ring, and other
+  # C-based crates on the x86_64-pc-windows-msvc target. Cross-compiling
+  # MSVC targets from a Linux host is NOT supported and will produce C
+  # toolchain errors that are not project-code failures.
+  windows-msvc-native:
+    name: Windows MSVC native compile
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -107,8 +152,11 @@ jobs:
       - name: Compile module loader manual-map feature
         run: cargo check -p module_loader --features manual-map --locked
 
+  # macOS — requires the Apple SDKs and Darwin Rust toolchain.
+  # Cross-compiling macOS targets from a Linux host is NOT supported;
+  # failures on a Linux host are toolchain/SDK issues, not project-code failures.
   macos-compile:
-    name: macOS compile when Darwin toolchain is present
+    name: macOS compile (Darwin toolchain required)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -117,7 +165,8 @@ jobs:
         shell: bash
         run: |
           if rustc -vV | grep -q 'host: .*apple-darwin'; then
-            cargo check -p agent --no-default-features --features "env-validation,outbound-c,remote-assist" --locked
+            cargo check -p agent --no-default-features --features "env-validation,outbound-c,remote-assist,persistence" --locked
           else
             echo "Darwin Rust toolchain is not present; skipping macOS compile check."
           fi
+

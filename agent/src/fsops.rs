@@ -10,11 +10,26 @@
 //!    an allowed directory still succeed.
 //! 3. Verifies the resulting absolute path lives under one of the
 //!    canonicalised entries in `config.allowed_paths`.
+//!
+//! ## Symlink-race hardening for writes
+//!
+//! `validate_path` canonicalises the path at validation time.  A TOCTOU
+//! window exists between validation and the actual file-system operation:
+//! an attacker with write access to the directory could create a symlink at
+//! the final path component after validation, redirecting the write.
+//!
+//! [`write_file`] defends against this by opening the target with
+//! `O_NOFOLLOW` (Linux/macOS) so that if the final component is a symlink
+//! the `open()` call fails instead of following it.  On other platforms
+//! (Windows, etc.) a post-open `symlink_metadata` check is used to detect
+//! a newly-appeared symlink before writing.
 
 use anyhow::{anyhow, Result};
 use common::config::Config;
 use std::path::{Component, Path, PathBuf};
 use tokio::fs as afs;
+#[cfg(unix)]
+use libc;
 
 #[derive(serde::Serialize)]
 pub struct FileEntry {
@@ -104,7 +119,57 @@ pub async fn read_file(path: &str, config: &Config) -> Result<Vec<u8>> {
 
 pub async fn write_file(path: &str, data: &[u8], config: &Config) -> Result<()> {
     let path = validate_path(path, config).await?;
-    afs::write(path, data).await?;
+    // Use O_NOFOLLOW on Unix so that if the final path component is a symlink
+    // (introduced between validate_path and here), open() returns ELOOP/ENOENT
+    // instead of following the link.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let data_owned = data.to_vec();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                // O_NOFOLLOW: refuse to open the path if it is a symlink.
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+                .map_err(|e| {
+                    if e.raw_os_error() == Some(libc::ELOOP)
+                        || e.raw_os_error() == Some(libc::ENOTDIR)
+                    {
+                        anyhow!(
+                            "write_file: final path component is a symlink; write refused ({})",
+                            path.display()
+                        )
+                    } else {
+                        anyhow!("write_file: open failed: {e}")
+                    }
+                })?;
+            f.write_all(&data_owned)
+                .map_err(|e| anyhow!("write_file: write failed: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow!("write_file task panicked: {e}"))??;
+    }
+    #[cfg(not(unix))]
+    {
+        // On non-Unix platforms (Windows), open the file and perform a
+        // post-open metadata check to detect a symlink that appeared after
+        // validate_path returned.
+        afs::write(&path, data).await?;
+        let meta = tokio::fs::symlink_metadata(&path).await?;
+        if meta.file_type().is_symlink() {
+            // Remove the file we just wrote through the symlink and refuse.
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(anyhow!(
+                "write_file: path became a symlink after validation; write refused ({})",
+                path.display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -197,5 +262,49 @@ mod tests {
         std::fs::write(&f, b"x").unwrap();
         let cfg = cfg_with(&[]);
         assert!(validate_path(f.to_str().unwrap(), &cfg).await.is_err());
+    }
+
+    /// A symlink planted at the final path component after validate_path but
+    /// before write_file must cause write_file to fail (TOCTOU hardening).
+    ///
+    /// This test is Linux-only because the O_NOFOLLOW defence is Unix-specific
+    /// and the race window cannot be reliably reproduced on other platforms.
+    #[tokio::test]
+    async fn write_file_refuses_final_component_symlink() {
+        let allowed = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, b"original").unwrap();
+
+        // Create a legitimate target path inside the allowed dir.
+        let link_path = allowed.path().join("data.txt");
+
+        // Pre-create a symlink pointing outside before write_file runs.
+        std::os::unix::fs::symlink(&victim, &link_path).unwrap();
+
+        let cfg = cfg_with(&[allowed.path()]);
+        let err = write_file(link_path.to_str().unwrap(), b"malicious", &cfg)
+            .await
+            .unwrap_err();
+        // The write must be refused.  The exact message depends on which
+        // guard fires first: validate_path (detects symlink-outside-allowed)
+        // or the O_NOFOLLOW open (catches a symlink planted between validate
+        // and open).  Both are correct behaviours.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("symlink")
+                || msg.contains("ELOOP")
+                || msg.contains("outside")
+                || msg.contains("allowed"),
+            "expected write to be refused due to symlink, got: {msg}"
+        );
+
+        // The victim file must NOT have been overwritten.
+        let contents = std::fs::read(&victim).unwrap();
+        assert_eq!(
+            contents,
+            b"original",
+            "victim file must not be overwritten via symlink"
+        );
     }
 }

@@ -141,7 +141,7 @@ host is fine.
 | `c2_address` | `host:port` the outbound agent should connect to. |
 | `encryption_key` | Base64 AES-256 key used to encrypt the payload at rest. The wizard can generate one for you. |
 | `features` | Cargo feature flags to enable on the agent (see "Feature flags" below). |
-| `package` / `bin_name` | Which workspace crate/binary to build (defaults to `launcher`; set to `agent` / `agent-standalone` for outbound mode). |
+| `package` / `bin_name` | Which workspace crate/binary to build. Use `agent` with `bin_name = "agent-standalone"` for outbound agents; `agent` (no `outbound-c`) for the served agent payload in launcher mode. The `launcher` package is not a valid payload target — see §5a above. |
 | `c_server_secret` | Pre-shared secret used by `outbound-c` agents to authenticate to the Control Center. |
 | `server_cert_fingerprint` | Optional SHA-256 DER fingerprint pinned by `outbound-c` agents. |
 
@@ -182,16 +182,37 @@ pasting the bearer token from the config file.
 
 You have two deployment styles, picked by the profile:
 
-#### a) Launcher + payload (default)
+#### a) Launcher + payload (recommended for in-memory delivery)
 
-The launcher is a small stub; the agent payload is downloaded and
-decrypted in memory. This is the default profile output.
+The launcher + payload model has **two separate artifacts**:
+
+1. **Agent payload** (`dist/my_agent.enc`) — the encrypted agent binary
+   served by the dev-server. Build this with `package = "agent"` (no
+   `outbound-c`, so the server dials the agent after it registers).
+
+2. **Launcher stub** — a small downloader binary that is **deployed
+   directly** to the endpoint (via MDM, rsync, or any out-of-band
+   mechanism). It downloads and decrypts the agent payload entirely in
+   memory. Build it with `cargo build --release -p launcher`.
+
+> **Important:** the launcher stub must *not* be used as the downloadable
+> payload itself. Encrypting the launcher as the agent payload would
+> require a second launcher to download it — an unresolvable circular
+> dependency. `orchestra-builder` rejects `package = "launcher"` profiles
+> for exactly this reason.
 
 ```sh
-# Serve dist/my_agent.enc over HTTP on port 8000.
+# Step 1 – build the agent payload.
+orchestra-builder build my_agent       # package="agent" in profile
+# -> dist/my_agent.enc
+
+# Step 2 – serve the agent payload.
 cargo run --release -p dev-server -- --port 8000
 
-# On the target endpoint:
+# Step 3 – build the launcher stub for the target platform.
+cargo build --release -p launcher --target x86_64-unknown-linux-gnu
+
+# Step 4 – deploy the launcher stub to the endpoint (out-of-band) and run it.
 launcher --url http://YOUR-HOST:8000/my_agent.enc \
          --key '<base64-key-from-profile>'
 ```

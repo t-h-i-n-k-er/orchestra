@@ -102,7 +102,7 @@ async fn handle_agent(
     sock.set_nodelay(true).ok();
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-    let tls_stream = acceptor.accept(sock).await?;
+    let mut tls_stream = acceptor.accept(sock).await?;
 
     // When forward-secrecy is enabled, perform an X25519 ECDH exchange before
     // the first application message.  The derived per-session key replaces the

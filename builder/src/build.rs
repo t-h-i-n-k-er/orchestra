@@ -60,13 +60,33 @@ fn features_for_package(package: &str, requested: &[String]) -> Result<Vec<Strin
             Ok(effective_features)
         }
         "launcher" => {
-            if !requested.is_empty() {
-                anyhow::bail!(
-                    "profile package `launcher` does not declare Cargo features; requested agent feature(s): {}. Set package = \"agent\" and bin_name = \"agent-standalone\" for outbound agents.",
-                    requested.join(", ")
-                );
-            }
-            Ok(Vec::new())
+            // The launcher binary is a *downloader stub* that the operator
+            // deploys directly to the endpoint (via MDM, rsync, etc.).  It
+            // fetches and runs the encrypted agent payload at runtime, so it
+            // must not itself be encrypted and served as a downloadable payload
+            // (that would require another launcher to download it — circular).
+            //
+            // If you are trying to build the agent payload to be served on the
+            // payload-server, use:
+            //   package = "agent"
+            //   (no outbound-c: agent waits for inbound server connection)
+            //   (outbound-c: agent dials the Control Center automatically)
+            //
+            // The launcher binary is built with `cargo build -p launcher` and
+            // deployed out-of-band; it does not go through the profile/encrypt
+            // pipeline.
+            anyhow::bail!(
+                "package `launcher` cannot be used as a downloadable payload target.\n\
+                 The launcher binary is a downloader stub that is deployed directly to \
+                 the endpoint — encrypting it as a payload would require another launcher \
+                 to download it, creating a circular dependency.\n\
+                 \n\
+                 To build the agent payload served by the dev-server, set:\n\
+                 \n  package = \"agent\"\n\
+                 \n\
+                 Then build the launcher stub separately with:\n\
+                 \n  cargo build --release -p launcher --target <triple>"
+            )
         }
         other => anyhow::bail!(
             "unsupported payload package `{other}`; supported packages are `agent` and `launcher`"

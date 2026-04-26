@@ -189,8 +189,14 @@ fn initialized_plugin(plugin_ptr: *mut PluginObject) -> Result<Box<dyn Plugin>> 
 ///
 /// * `encrypted_blob`: The raw bytes of the plugin, encrypted with AES-256-GCM.
 /// * `session`: The `CryptoSession` to use for decryption.
-/// * `verify_key`: Optional base64-encoded Ed25519 verifying key.  When `None`
-///   the compile-time constant `MODULE_SIGNING_PUBKEY` is used.
+/// * `verify_key`: Optional base64-encoded Ed25519 verifying key.
+///   - When `Some(b64)`, the blob signature is verified against the decoded key.
+///   - When `None` and the `strict-module-key` feature is **disabled**, the
+///     compile-time constant `MODULE_SIGNING_PUBKEY` is used as a fallback.
+///     This is convenient for tests and development builds.
+///   - When `None` and the `strict-module-key` feature is **enabled**, this
+///     function returns `Err` immediately.  Production builds should enable
+///     `strict-module-key` to prevent silent fallback to the embedded key.
 ///
 /// # Safety
 ///
@@ -228,6 +234,22 @@ pub fn load_plugin(
             raw.try_into()
                 .map_err(|_| anyhow!("module_verify_key must be exactly 32 bytes"))?
         } else {
+            // When the `strict-module-key` feature is enabled, a missing
+            // runtime key is a hard error.  This prevents an attacker who can
+            // modify the binary from substituting a different embedded key
+            // while silently accepting modules signed with the new key.
+            //
+            // The compile-time fallback is only available without
+            // `strict-module-key` — useful for the test suite and development
+            // builds where a full key-management setup is not yet in place.
+            #[cfg(feature = "strict-module-key")]
+            {
+                return Err(anyhow!(
+                    "module_verify_key must be supplied at runtime when `strict-module-key` \
+                     is enabled.  Pass a base64-encoded Ed25519 public key to `load_plugin`."
+                ));
+            }
+            #[cfg(not(feature = "strict-module-key"))]
             MODULE_SIGNING_PUBKEY
         };
         let public_key = VerifyingKey::from_bytes(&pub_key_bytes)?;
@@ -499,5 +521,52 @@ mod tests {
         // 5. Try to load it. It should fail decryption or signature verification.
         let result = load_plugin(&encrypted_blob, &session, None);
         assert!(result.is_err());
+    }
+
+    /// When `strict-module-key` is enabled, passing `verify_key = None` must
+    /// return an error immediately — it must not silently fall back to the
+    /// compile-time `MODULE_SIGNING_PUBKEY`.
+    ///
+    /// This test is gated on `strict-module-key` and verifies the policy
+    /// defined in §11 of `docs/SECURITY_AUDIT.md`.
+    #[cfg(feature = "strict-module-key")]
+    #[test]
+    fn strict_module_key_rejects_none_verify_key() {
+        // We do not need a valid blob — the key check happens before any
+        // decryption, so an empty blob is sufficient to trigger the error.
+        let session = CryptoSession::from_shared_secret(b"test-key");
+        // Provide a minimal 64-byte "blob" so we get past the size check and
+        // reach the key-selection code.
+        let dummy_blob = session.encrypt(&[0u8; 128]);
+        let result = load_plugin(&dummy_blob, &session, None);
+        assert!(
+            result.is_err(),
+            "strict-module-key must reject verify_key = None"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("module_verify_key must be supplied"),
+            "error message should explain the strict-module-key requirement, got: {msg}"
+        );
+    }
+
+    /// When `module-signatures` is enabled but `strict-module-key` is NOT,
+    /// passing `verify_key = None` must fall back to the compile-time key
+    /// rather than returning an error.  The load will still fail (the dummy
+    /// data is not a real module) but the failure must NOT be the
+    /// "must be supplied" error from strict-module-key.
+    #[cfg(all(feature = "module-signatures", not(feature = "strict-module-key")))]
+    #[test]
+    fn non_strict_mode_allows_none_verify_key() {
+        let session = CryptoSession::from_shared_secret(b"test-key");
+        let dummy_blob = session.encrypt(&[0u8; 128]);
+        let result = load_plugin(&dummy_blob, &session, None);
+        // The load will fail (invalid module), but not with the strict-key message.
+        if let Err(e) = result {
+            assert!(
+                !e.to_string().contains("module_verify_key must be supplied"),
+                "non-strict mode must not produce strict-key error, got: {e}"
+            );
+        }
     }
 }

@@ -376,13 +376,47 @@ fn execute_build_safely(
     }
 
     // Choose output directory
-    let mut out_dir = base_build_dir;
+    let mut out_dir = base_build_dir.clone();
     if let Some(user_dir) = req.output_dir {
         if !user_dir.trim().is_empty() {
-            let temp_p = PathBuf::from(user_dir.trim());
-            // In a real system, you'd check write permissions robustly
-            if temp_p.is_absolute() {
-                out_dir = temp_p;
+            let requested = PathBuf::from(user_dir.trim());
+            // Restrict build artifacts to subdirectories of the configured
+            // build directory.  Accepting an arbitrary absolute path would
+            // allow an authenticated operator to write artifacts to any
+            // location writable by the server process (e.g. /etc, /tmp/evil).
+            //
+            // Canonicalize both sides so that `../` traversal sequences are
+            // resolved before comparison.  If the requested path does not yet
+            // exist (canonicalize returns Err), fall back to normalizing the
+            // lexical path to catch obvious traversal attempts.
+            let canonical_base = std::fs::canonicalize(&base_build_dir)
+                .unwrap_or_else(|_| base_build_dir.clone());
+            let canonical_requested = std::fs::canonicalize(&requested)
+                .unwrap_or_else(|_| {
+                    // Path doesn't exist yet; normalize lexically by resolving
+                    // `.` and `..` components from the path root so that e.g.
+                    // `/builds/../etc` correctly resolves to `/etc` (outside
+                    // the build dir) rather than appearing to be a subdirectory.
+                    let mut acc = PathBuf::new();
+                    for component in requested.components() {
+                        match component {
+                            std::path::Component::RootDir => acc.push("/"),
+                            std::path::Component::Prefix(p) => acc.push(p.as_os_str()),
+                            std::path::Component::CurDir => {} // skip `.`
+                            std::path::Component::ParentDir => { acc.pop(); }
+                            std::path::Component::Normal(p) => acc.push(p),
+                        }
+                    }
+                    acc
+                });
+            if canonical_requested.starts_with(&canonical_base) {
+                out_dir = requested;
+            } else {
+                anyhow::bail!(
+                    "output_dir '{}' must be within the configured builds directory '{}'",
+                    user_dir.trim(),
+                    base_build_dir.display()
+                );
             }
         }
     }
@@ -593,5 +627,102 @@ mod tests {
         assert!(dst.path().join("Cargo.toml").exists());
         assert!(dst.path().join("agent/src/lib.rs").exists());
         assert!(!dst.path().join("target").exists());
+    }
+
+    // ── output_dir restriction tests ────────────────────────────────────────
+
+    /// Helper: call only the output_dir validation logic extracted from
+    /// `execute_build_safely` without running an actual build.
+    ///
+    /// Returns `Ok(resolved_out_dir)` on success or `Err(msg)` on rejection.
+    fn check_output_dir(
+        base_build_dir: &std::path::Path,
+        user_dir: Option<&str>,
+    ) -> anyhow::Result<PathBuf> {
+        let mut out_dir = base_build_dir.to_path_buf();
+
+        if let Some(user_dir) = user_dir {
+            if !user_dir.trim().is_empty() {
+                let requested = PathBuf::from(user_dir.trim());
+                let canonical_base = std::fs::canonicalize(base_build_dir)
+                    .unwrap_or_else(|_| base_build_dir.to_path_buf());
+                let canonical_requested = std::fs::canonicalize(&requested).unwrap_or_else(|_| {
+                    let mut acc = PathBuf::new();
+                    for component in requested.components() {
+                        match component {
+                            std::path::Component::RootDir => acc.push("/"),
+                            std::path::Component::Prefix(p) => acc.push(p.as_os_str()),
+                            std::path::Component::CurDir => {}
+                            std::path::Component::ParentDir => {
+                                acc.pop();
+                            }
+                            std::path::Component::Normal(p) => acc.push(p),
+                        }
+                    }
+                    acc
+                });
+                if canonical_requested.starts_with(&canonical_base) {
+                    out_dir = requested;
+                } else {
+                    anyhow::bail!(
+                        "output_dir '{}' must be within the configured builds directory '{}'",
+                        user_dir.trim(),
+                        base_build_dir.display()
+                    );
+                }
+            }
+        }
+
+        Ok(out_dir)
+    }
+
+    /// A subdirectory of the configured build dir must be accepted.
+    #[test]
+    fn output_dir_accepts_subdirectory_of_build_dir() {
+        let base = tempfile::tempdir().unwrap();
+        let sub = base.path().join("2024-01-01_job");
+        std::fs::create_dir_all(&sub).unwrap();
+        let result = check_output_dir(base.path(), Some(sub.to_str().unwrap()));
+        assert!(result.is_ok(), "subdirectory of build dir must be accepted");
+    }
+
+    /// An absolute path that is NOT under the configured build dir must be
+    /// rejected with a clear error.
+    #[test]
+    fn output_dir_rejects_absolute_path_outside_build_dir() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // outside is a completely different temp dir — not a subdir of base.
+        let result = check_output_dir(base.path(), Some(outside.path().to_str().unwrap()));
+        assert!(
+            result.is_err(),
+            "absolute path outside build dir must be rejected"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("must be within"),
+            "error message must explain the restriction"
+        );
+    }
+
+    /// A path-traversal attempt using `../` must be rejected even if the
+    /// resulting path is not the same as passing an absolute outside path.
+    #[test]
+    fn output_dir_rejects_parent_dir_traversal() {
+        let base = tempfile::tempdir().unwrap();
+        // Construct a traversal path: <base>/../evil — resolves to the parent of base.
+        let traversal = format!("{}/../evil", base.path().display());
+        let result = check_output_dir(base.path(), Some(&traversal));
+        assert!(
+            result.is_err(),
+            "parent-dir traversal in output_dir must be rejected"
+        );
+    }
+
+    /// `None` (not supplied) must silently default to the configured build dir.
+    #[test]
+    fn output_dir_defaults_to_base_when_none() {
+        let base = tempfile::tempdir().unwrap();
+        let result = check_output_dir(base.path(), None).unwrap();
+        assert_eq!(result, base.path());
     }
 }
