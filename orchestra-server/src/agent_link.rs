@@ -102,7 +102,14 @@ async fn handle_agent(
     sock.set_nodelay(true).ok();
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+    // `mut` is only needed when the forward-secrecy feature is enabled
+    // (negotiate_session_key takes &mut tls_stream).  In the default build
+    // the warning fires because the non-forward-secrecy path never mutates
+    // the stream, so we gate the binding mutability on the feature.
+    #[cfg(feature = "forward-secrecy")]
     let mut tls_stream = acceptor.accept(sock).await?;
+    #[cfg(not(feature = "forward-secrecy"))]
+    let tls_stream = acceptor.accept(sock).await?;
 
     // When forward-secrecy is enabled, perform an X25519 ECDH exchange before
     // the first application message.  The derived per-session key replaces the
@@ -149,6 +156,33 @@ async fn handle_agent(
         };
 
         match msg {
+            // ── Protocol version handshake (M-2) ─────────────────────────────
+            // Agent sends VersionHandshake as its first message.  Echo back our
+            // version so the agent can detect a server/agent version mismatch
+            // and refuse to proceed if they differ.
+            Message::VersionHandshake { version } => {
+                if version != common::PROTOCOL_VERSION {
+                    tracing::warn!(
+                        connection_id = %conn_id,
+                        agent_version = version,
+                        server_version = common::PROTOCOL_VERSION,
+                        "agent/server protocol version mismatch; \
+                         the connection may be unstable — update to matching releases"
+                    );
+                }
+                // Echo our version regardless of match so the agent can decide.
+                if tx
+                    .send(Message::VersionHandshake {
+                        version: common::PROTOCOL_VERSION,
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(connection_id = %conn_id, "writer task closed during version handshake");
+                    break;
+                }
+                tracing::debug!(connection_id = %conn_id, version, "version handshake completed");
+            }
             Message::Heartbeat {
                 agent_id,
                 status,

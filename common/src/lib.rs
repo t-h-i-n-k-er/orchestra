@@ -14,6 +14,14 @@ pub const KEY_LEN: usize = 32;
 /// Length in bytes of the AES-GCM nonce prepended to each ciphertext.
 pub const NONCE_LEN: usize = 12;
 
+/// Wire-protocol version for the agent ↔ server channel.
+///
+/// Bump this whenever a breaking change is made to the [`Message`] encoding or
+/// the connection-establishment sequence.  The agent sends a
+/// [`Message::VersionHandshake`] as its first message and refuses to proceed
+/// if the server's echo carries a different version.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 pub mod audit;
 pub mod config;
 #[cfg(feature = "forward-secrecy")]
@@ -26,6 +34,15 @@ pub use audit::{AuditEvent, Outcome};
 /// Top-level wire message exchanged between a console and an agent.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Message {
+    /// First message exchanged on every new connection.
+    ///
+    /// The agent sends this before the registration [`Heartbeat`]; the server
+    /// echoes back its own version.  Either side SHOULD log a warning and MAY
+    /// close the connection when the received version differs from
+    /// [`PROTOCOL_VERSION`].
+    VersionHandshake {
+        version: u32,
+    },
     Heartbeat {
         timestamp: u64,
         agent_id: String,

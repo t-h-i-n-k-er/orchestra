@@ -448,17 +448,25 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         let status: i32;
 
         asm!(
+            // Save RSP so we can restore it cleanly after the call.
             "mov r14, rsp",
+            // Allocate shadow space (0x20) + stack args.  The 5th argument
+            // must be at [rsp + 0x20] BEFORE the `call` instruction, because
+            // `call` pushes the 8-byte return address, shifting rsp down by 8;
+            // the callee then sees the 5th argument at [rsp + 0x28] (= our
+            // pre-call [rsp + 0x20]).  Using 0x28 here would shift all stack
+            // args by one slot — a calling-convention violation.
             "mov rax, {nstack}",
             "shl rax, 3",
-            "add rax, 0x28 + 15",
+            "add rax, 0x20 + 15",
             "and rax, -16",
             "sub rsp, rax",
+            // Copy stack arguments (args[4..]) into [rsp + 0x20 .. rsp + 0x20 + nstack*8].
             "test {nstack}, {nstack}",
             "jz 4f",
             "mov rcx, {nstack}",
             "mov rsi, {stack_ptr}",
-            "lea rdi, [rsp + 0x28]",
+            "lea rdi, [rsp + 0x20]",
             "cld",
             "rep movsq",
             "4:",
@@ -467,7 +475,7 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             "mov r10, rcx",
             "mov eax, {ssn:e}",
             "mov r11, {gadget}",
-            "call r11", // indirect syscall!
+            "call r11", // indirect syscall
             "mov rsp, r14",
             ssn        = in(reg) ssn,
             gadget     = in(reg) gadget_addr,
@@ -475,40 +483,88 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             stack_ptr  = in(reg) stack_ptr,
             a1         = in(reg) a1,
             a2         = in(reg) a2,
-            in("r8")  a3,
-            in("r9")  a4,
+            // r8/r9 are both inputs (args 3 and 4) and caller-saved (the called
+            // function may overwrite them).  Declare as inlateout so the compiler
+            // knows the values are gone after the asm block.
+            inlateout("r8")  a3 => _,
+            inlateout("r9")  a4 => _,
             lateout("rax") status,
             out("rcx") _, out("rdx") _, out("r10") _, out("r11") _,
             out("r14") _,
             out("rsi") _, out("rdi") _,
-            // NOTE: nostack intentionally removed – the asm block modifies RSP
+            // NOTE: nostack intentionally absent — this asm block modifies RSP.
         );
 
         status
     }
     #[cfg(target_arch = "aarch64")]
     {
+        // Windows ARM64 syscall convention: x0-x7 hold the first 8 arguments,
+        // x8 is the syscall number.  Stack arguments (beyond 8) are not handled
+        // here; virtually all NT syscalls fit in 8 registers.
+        let a1 = args.get(0).copied().unwrap_or(0);
+        let a2 = args.get(1).copied().unwrap_or(0);
+        let a3 = args.get(2).copied().unwrap_or(0);
+        let a4 = args.get(3).copied().unwrap_or(0);
+        let a5 = args.get(4).copied().unwrap_or(0);
+        let a6 = args.get(5).copied().unwrap_or(0);
+        let a7 = args.get(6).copied().unwrap_or(0);
+        let a8 = args.get(7).copied().unwrap_or(0);
         let status: i32;
         std::arch::asm!(
+            // Load syscall number into x8 (Windows/Linux ARM64 convention).
+            // Cast ssn to u64 so that {ssn} expands to the 64-bit Xn form;
+            // u32 defaults to the 32-bit Wn form, which makes `mov x8, wN`
+            // an invalid ARM64 instruction.
             "mov x8, {ssn}",
+            // Place all 8 register arguments.
             "mov x0, {a1}",
             "mov x1, {a2}",
             "mov x2, {a3}",
             "mov x3, {a4}",
+            "mov x4, {a5}",
+            "mov x5, {a6}",
+            "mov x6, {a7}",
+            "mov x7, {a8}",
+            // Indirect call to the syscall gadget (e.g. `svc #0; ret` in ntdll).
+            // `blr` writes the return address into x30 (LR); the gadget's
+            // trailing `ret` uses x30 to return here.  We declare x30 as a
+            // clobber so the compiler saves any live value before this block.
             "blr {gadget}",
-            "mov {status}, x0",
-            ssn = in(reg) ssn,
-            a1 = in(reg) a1,
-            a2 = in(reg) a2,
-            a3 = in(reg) a3,
-            a4 = in(reg) a4,
-            gadget = in(reg) gadget_addr,
+            // Copy the 32-bit NTSTATUS from w0 to the compiler-chosen output
+            // register.  Use the :w modifier so both sides are W-registers;
+            // `mov Xd, Ws` is not a valid ARM64 encoding.
+            "mov {status:w}, w0",
+            ssn    = in(reg) ssn as u64,
+            a1     = in(reg) a1,
+            a2     = in(reg) a2,
+            a3     = in(reg) a3,
+            a4     = in(reg) a4,
+            a5     = in(reg) a5,
+            a6     = in(reg) a6,
+            a7     = in(reg) a7,
+            a8     = in(reg) a8,
+            gadget = in(reg) gadget_addr as u64,
             status = out(reg) status,
-            out("x8") _,
-            out("x0") _, out("x1") _, out("x2") _, out("x3") _,
-            // blr modifies lr (x30) and the callee may use the stack,
-            // so we must NOT use options(nostack) here.
+            // Declare all caller-saved integer registers (Windows ARM64 ABI).
+            // x0-x7 hold args and may be modified by the syscall stub or kernel;
+            // x8 holds the syscall number; x9-x17 are volatile scratch registers;
+            // x30 (LR) is overwritten by `blr`.
+            out("x0")  _, out("x1")  _, out("x2")  _, out("x3")  _,
+            out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
+            out("x8")  _,
+            out("x9")  _, out("x10") _, out("x11") _,
+            out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+            out("x16") _, out("x17") _,
             out("x30") _,
+            // Caller-saved NEON/FP registers (v0-v7, v16-v31 per ABI).
+            out("v0")  _, out("v1")  _, out("v2")  _, out("v3")  _,
+            out("v4")  _, out("v5")  _, out("v6")  _, out("v7")  _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            // `blr` may use the stack freely; do not use options(nostack).
         );
         status
     }
