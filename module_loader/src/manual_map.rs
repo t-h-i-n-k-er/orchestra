@@ -12,7 +12,7 @@ use winapi::um::winnt::{
     DLL_PROCESS_ATTACH, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT,
     IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
     IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ,
-    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+    PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
 };
 
 // RUNTIME_FUNCTION (IMAGE_RUNTIME_FUNCTION_ENTRY) – 12 bytes, x64 only.
@@ -569,7 +569,11 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         let read = section.characteristics & IMAGE_SCN_MEM_READ != 0;
         let write = section.characteristics & IMAGE_SCN_MEM_WRITE != 0;
         let prot: u32 = match (exec, read, write) {
-            (true, _, true) => PAGE_EXECUTE_READWRITE,
+            // Downgrade W+X to PAGE_EXECUTE_READ.  No legitimate section
+            // needs RWX at load time; RWX pages are a major EDR detection
+            // signal.  If a section's own code needs temporary write access
+            // after load it should call VirtualProtect itself.
+            (true, _, true) => PAGE_EXECUTE_READ,
             (true, true, false) => PAGE_EXECUTE_READ,
             (true, false, false) => PAGE_EXECUTE,
             (false, _, true) => PAGE_READWRITE,

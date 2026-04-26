@@ -214,8 +214,7 @@ pub mod windows {
                     .status()
                     .map_err(|e| anyhow!("WmiSubscription: failed to spawn powershell: {}", e))?;
 
-                CoUninitialize();
-
+                // One CoInitializeEx → one CoUninitialize.
                 CoUninitialize();
 
                 if !status.success() {

