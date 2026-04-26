@@ -54,17 +54,28 @@ pub fn check_mouse_movement() -> u8 {
 /// Linux implementation: sample mouse position via `xdotool getmouselocation`.
 /// Requires X11 / DISPLAY.  If the display is not available (headless server)
 /// we return 0 so that legitimate non-interactive deployments are not penalised.
+///
+/// If DISPLAY is set but no window manager is running, xdotool can hang
+/// waiting for an X connection.  We bound execution to 2 s via `timeout(1)`
+/// so a broken X environment doesn't stall agent startup.
 #[cfg(target_os = "linux")]
 pub fn check_mouse_movement() -> u8 {
     if std::env::var_os("DISPLAY").is_none() {
         return 0; // Headless / Wayland-only — can't reliably track mouse
     }
     _sample_mouse_positions(|_| {
-        std::process::Command::new("xdotool")
-            .args(["getmouselocation", "--shell"])
+        // Wrap xdotool with `timeout 2` so a broken X server (DISPLAY set but
+        // no WM running) does not hang the sampling loop indefinitely.
+        std::process::Command::new("timeout")
+            .args(["2", "xdotool", "getmouselocation", "--shell"])
             .output()
             .ok()
             .and_then(|o| {
+                // timeout exits with code 124 when the child is killed;
+                // `output()` still returns Ok() in that case so check stdout.
+                if o.stdout.is_empty() {
+                    return None;
+                }
                 let out = String::from_utf8_lossy(&o.stdout);
                 let x = out.lines()
                     .find(|l| l.starts_with("X="))?
@@ -223,15 +234,27 @@ pub fn check_desktop_windows() -> u8 {
         })
         .or_else(|| {
             // Last resort: count processes that hold an open connection to X11
-            // by looking for ":0" or "DISPLAY" in their /proc/*/environ.
+            // by looking for "DISPLAY=" in their /proc/*/environ.
+            // Cap at 256 entries to bound execution time on systems with many
+            // processes; we only need to distinguish "0 or a few" vs "many".
             let mut cnt = 0usize;
+            const MAX_ENTRIES: usize = 256;
             if let Ok(entries) = std::fs::read_dir("/proc") {
-                for entry in entries.flatten() {
+                for entry in entries.flatten().take(MAX_ENTRIES) {
+                    // Only numeric entries are processes.
+                    if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+                        continue;
+                    }
                     let env_path = entry.path().join("environ");
+                    // environ files on Linux are small (<16 KiB) but reading
+                    // them for every process is still O(n).  Early-exit once
+                    // we have a result that will push count above threshold (8).
                     if let Ok(env) = std::fs::read(&env_path) {
-                        // environ is NUL-separated KEY=VALUE pairs.
                         if env.windows(8).any(|w| w == b"DISPLAY=") {
                             cnt += 1;
+                            if cnt >= 8 {
+                                break; // Already past the highest threshold
+                            }
                         }
                     }
                 }

