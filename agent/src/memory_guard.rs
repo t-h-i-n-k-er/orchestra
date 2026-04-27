@@ -146,6 +146,11 @@ pub fn register_session_key(session: &common::CryptoSession) {
         // SAFETY: We immediately register this buffer; it is never freed.
         let boxed: Box<[u8; 32]> = Box::new([0u8; 32]);
         let static_ref: &'static mut [u8; 32] = Box::leak(boxed);
+        // mlock the session-key buffer so it cannot be swapped to disk.
+        #[cfg(unix)]
+        unsafe {
+            libc::mlock(static_ref.as_ptr() as *const _, 32);
+        }
         // Save the raw pointer *before* register() consumes the &'static mut via
         // unsized coercion (fixing E0499 / use-after-move on `static_ref`).
         // SAFETY: the pointer remains valid because the backing allocation is
@@ -395,40 +400,143 @@ impl KeyHandle {
     }
 
     fn retrieve(mut self) -> [u8; 32] {
-        let k = *self.locked_page.key;
-        self.locked_page.key.zeroize();
-        k
+        self.locked_page.retrieve_key()
     }
 }
 
-// ── Fallback: locked heap page (non-Windows x86-64 and all non-x86-64 targets)
+// ── Fallback: locked memory page ───────────────────────────────────────────
+//
+// On Unix targets (Linux, macOS, *BSD) we allocate a dedicated page with
+// mmap(MAP_PRIVATE|MAP_ANONYMOUS), mlock it, copy the key in, and immediately
+// mprotect(PROT_NONE).  This means the key is:
+//   * not in the regular heap (no neighbouring allocations to leak via
+//     adjacent reads),
+//   * not swappable to disk,
+//   * not readable at all while at rest (any access faults).
+// retrieve_key() temporarily makes it PROT_READ, copies out, and restores
+// PROT_NONE.  Drop zeroes, munlocks, and munmaps the page.
 
-#[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+#[cfg(unix)]
+struct LockedKeyPage {
+    /// mmap'd page-aligned region (at least one page) when `page_size != 0`.
+    /// Heap-allocated `[u8; 32]` when `page_size == 0` (mmap fallback path).
+    ptr: *mut u8,
+    /// 0 means "this is a heap fallback (Box::into_raw of [u8; 32])".
+    page_size: usize,
+}
+
+// SAFETY: the raw pointer is owned by this struct; access is single-threaded
+// per KeyHandle (no shared access across threads without external sync).
+#[cfg(unix)]
+unsafe impl Send for LockedKeyPage {}
+
+#[cfg(unix)]
+impl LockedKeyPage {
+    fn new(key: [u8; 32]) -> Self {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let alloc_size = page_size.max(32);
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                alloc_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            tracing::warn!(
+                "[memory-guard] mmap failed, falling back to heap allocation for key page"
+            );
+            let heap_ptr = Box::into_raw(Box::new([0u8; 32])) as *mut u8;
+            unsafe {
+                std::ptr::copy_nonoverlapping(key.as_ptr(), heap_ptr, 32);
+                libc::mlock(heap_ptr as *const _, 32);
+            }
+            return LockedKeyPage {
+                ptr: heap_ptr,
+                page_size: 0,
+            };
+        }
+        unsafe {
+            libc::mlock(ptr as *const _, alloc_size);
+            std::ptr::copy_nonoverlapping(key.as_ptr(), ptr as *mut u8, 32);
+            // Re-protect to PROT_NONE so the key is inaccessible at rest.
+            libc::mprotect(ptr, alloc_size, libc::PROT_NONE);
+        }
+        LockedKeyPage {
+            ptr: ptr as *mut u8,
+            page_size: alloc_size,
+        }
+    }
+
+    /// Make the key page readable, copy the key out, then re-protect to
+    /// PROT_NONE.  The caller owns the returned bytes and must zeroize them.
+    fn retrieve_key(&mut self) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        if self.page_size == 0 {
+            // Heap fallback path
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.ptr, key.as_mut_ptr(), 32);
+            }
+        } else {
+            unsafe {
+                libc::mprotect(
+                    self.ptr as *mut _,
+                    self.page_size,
+                    libc::PROT_READ,
+                );
+                std::ptr::copy_nonoverlapping(self.ptr, key.as_mut_ptr(), 32);
+                libc::mprotect(self.ptr as *mut _, self.page_size, libc::PROT_NONE);
+            }
+        }
+        key
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LockedKeyPage {
+    fn drop(&mut self) {
+        if self.page_size == 0 {
+            unsafe {
+                std::ptr::write_bytes(self.ptr, 0, 32);
+                libc::munlock(self.ptr as *const _, 32);
+                let _ = Box::from_raw(self.ptr as *mut [u8; 32]);
+            }
+        } else {
+            unsafe {
+                // Restore RW so we can zeroize, then munlock + munmap.
+                libc::mprotect(
+                    self.ptr as *mut _,
+                    self.page_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                );
+                std::ptr::write_bytes(self.ptr, 0, self.page_size);
+                libc::munlock(self.ptr as *const _, self.page_size);
+                libc::munmap(self.ptr as *mut _, self.page_size);
+            }
+        }
+    }
+}
+
+// Non-Unix non-Windows targets keep the simple Box-based fallback.
+#[cfg(all(not(unix), not(all(target_arch = "x86_64", target_os = "windows"))))]
 struct LockedKeyPage {
     key: Box<[u8; 32]>,
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+#[cfg(all(not(unix), not(all(target_arch = "x86_64", target_os = "windows"))))]
 impl LockedKeyPage {
     fn new(key: [u8; 32]) -> Self {
-        let b = Box::new(key);
-        // mlock the page so it is not swapped out.
-        #[cfg(unix)]
-        unsafe {
-            libc::mlock(b.as_ptr() as *const _, 32);
-        }
-        LockedKeyPage { key: b }
+        LockedKeyPage { key: Box::new(key) }
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_os = "windows")))]
+#[cfg(all(not(unix), not(all(target_arch = "x86_64", target_os = "windows"))))]
 impl Drop for LockedKeyPage {
     fn drop(&mut self) {
         self.key.zeroize();
-        #[cfg(unix)]
-        unsafe {
-            libc::munlock(self.key.as_ptr() as *const _, 32);
-        }
     }
 }
 
@@ -436,7 +544,20 @@ impl Drop for LockedKeyPage {
 // Linux x86_64 is handled by the explicit impl block above; the
 // `not(all(x86_64, windows))` predicate used to also match Linux x86_64 and
 // created a duplicate impl error (B-01). Narrowed to `not(x86_64)`.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(all(not(target_arch = "x86_64"), unix))]
+impl KeyHandle {
+    fn stash(key: [u8; 32]) -> Self {
+        KeyHandle {
+            locked_page: LockedKeyPage::new(key),
+        }
+    }
+
+    fn retrieve(mut self) -> [u8; 32] {
+        self.locked_page.retrieve_key()
+    }
+}
+
+#[cfg(all(not(target_arch = "x86_64"), not(unix)))]
 impl KeyHandle {
     fn stash(key: [u8; 32]) -> Self {
         KeyHandle {
