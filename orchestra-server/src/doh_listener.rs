@@ -4,7 +4,7 @@ use crate::state::{now_secs, AgentEntry, AppState};
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::{header, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::get,
@@ -21,7 +21,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
     io,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -34,6 +34,7 @@ const TYPE_A: u16 = 1;
 const TYPE_TXT: u16 = 16;
 const DOH_SESSION_SWEEP_INTERVAL_SECS: u64 = 60;
 const DOH_SESSION_TIMEOUT_DEFAULT_SECS: u64 = 300;
+const DOH_RATE_LIMIT_DEFAULT_QPS: u32 = 10;
 
 #[derive(Clone)]
 struct DohRuntime {
@@ -44,6 +45,13 @@ struct DohRuntime {
     idle_ip: Ipv4Addr,
     crypto: Arc<CryptoSession>,
     sessions: Arc<DashMap<String, Arc<Mutex<DohSession>>>>,
+    rate_limit_qps: u32,
+    rate_buckets: Arc<DashMap<IpAddr, IpRateBucket>>,
+}
+
+struct IpRateBucket {
+    window_start: Instant,
+    count: u32,
 }
 
 struct DohSession {
@@ -53,6 +61,7 @@ struct DohSession {
     outbound_rx: mpsc::Receiver<Message>,
     outbound_queue: VecDeque<Message>,
     last_activity: Instant,
+    authenticated: bool,
 }
 
 impl DohRuntime {
@@ -74,6 +83,7 @@ impl DohRuntime {
         let idle_ip = idle_ip
             .parse::<Ipv4Addr>()
             .map_err(|e| anyhow!("invalid doh_idle_ip: {e}"))?;
+        let rate_limit_qps = doh_rate_limit_qps();
 
         Ok(Self {
             app,
@@ -83,6 +93,8 @@ impl DohRuntime {
             idle_ip,
             crypto: Arc::new(CryptoSession::from_shared_secret(agent_secret.as_bytes())),
             sessions: Arc::new(DashMap::new()),
+            rate_limit_qps,
+            rate_buckets: Arc::new(DashMap::new()),
         })
     }
 
@@ -112,9 +124,38 @@ impl DohRuntime {
                     outbound_rx: rx,
                     outbound_queue: VecDeque::new(),
                     last_activity: Instant::now(),
+                    authenticated: false,
                 }));
                 v.insert(session.clone());
                 session
+            }
+        }
+    }
+
+    fn allow_query_from_ip(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let window = Duration::from_secs(1);
+
+        match self.rate_buckets.entry(ip) {
+            Entry::Occupied(mut occupied) => {
+                let bucket = occupied.get_mut();
+                if now.saturating_duration_since(bucket.window_start) >= window {
+                    bucket.window_start = now;
+                    bucket.count = 1;
+                    true
+                } else if bucket.count < self.rate_limit_qps {
+                    bucket.count += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(IpRateBucket {
+                    window_start: now,
+                    count: 1,
+                });
+                true
             }
         }
     }
@@ -223,6 +264,9 @@ impl DohRuntime {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if !guard.authenticated {
+            return false;
+        }
         Self::drain_outbound_queue(&mut guard);
         !guard.outbound_queue.is_empty()
     }
@@ -234,6 +278,9 @@ impl DohRuntime {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            if !guard.authenticated {
+                return Vec::new();
+            }
             Self::drain_outbound_queue(&mut guard);
             guard.outbound_queue.pop_front()
         };
@@ -263,6 +310,10 @@ impl DohRuntime {
     }
 
     fn handle_fragment(&self, session_id: &str, seq: u32, chunk: &str) {
+        if !is_base32_fragment(chunk) {
+            return;
+        }
+
         let session = self.get_or_create_session(session_id);
         let msgs = {
             let mut guard = match session.lock() {
@@ -274,7 +325,14 @@ impl DohRuntime {
             if guard.next_seq.is_none() {
                 guard.next_seq = Some(seq);
             }
-            try_reassemble_messages(&mut guard, &self.crypto)
+            let msgs = try_reassemble_messages(&mut guard, &self.crypto);
+            if !msgs.is_empty() {
+                // A successfully decrypted + deserialized message proves the
+                // sender holds the shared DoH secret. Only then is tasking
+                // released via beacon/task polling.
+                guard.authenticated = true;
+            }
+            msgs
         };
 
         for msg in msgs {
@@ -439,6 +497,14 @@ fn doh_session_timeout() -> Duration {
     match raw.and_then(|s| s.parse::<u64>().ok()) {
         Some(0) | None => Duration::from_secs(DOH_SESSION_TIMEOUT_DEFAULT_SECS),
         Some(secs) => Duration::from_secs(secs),
+    }
+}
+
+fn doh_rate_limit_qps() -> u32 {
+    let raw = std::env::var("ORCHESTRA_DOH_RATE_LIMIT_QPS").ok();
+    match raw.and_then(|s| s.parse::<u32>().ok()) {
+        Some(0) | None => DOH_RATE_LIMIT_DEFAULT_QPS,
+        Some(qps) => qps,
     }
 }
 
@@ -616,6 +682,7 @@ pub async fn run(
         domain = %state.domain,
         tls = use_tls,
         session_timeout_secs = stale_after.as_secs(),
+        rate_limit_qps = state.rate_limit_qps,
         "DoH listener bound"
     );
 
@@ -633,23 +700,53 @@ pub async fn run(
 
         axum_server::bind(listen_addr)
             .acceptor(acceptor)
-            .serve(router(state).into_make_service())
+            .serve(router(state).into_make_service_with_connect_info::<SocketAddr>())
             .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-        axum::serve(listener, router(state).into_make_service()).await?;
+        axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
     }
     Ok(())
 }
 
 async fn handle_get(
     State(state): State<Arc<DohRuntime>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(query): Query<DnsGetQuery>,
 ) -> impl IntoResponse {
     let qtype = match parse_qtype(&query.qtype) {
         Some(t) => t,
         None => return (StatusCode::BAD_REQUEST, "unsupported query type").into_response(),
     };
+
+    if !state.allow_query_from_ip(peer.ip()) {
+        let payload = DnsJsonResponse {
+            status: 0,
+            tc: false,
+            rd: true,
+            ra: true,
+            ad: false,
+            cd: false,
+            question: vec![DnsJsonQuestion {
+                name: query.name,
+                qtype,
+            }],
+            answer: Vec::new(),
+        };
+
+        return (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/dns-json"),
+            )],
+            Json(payload),
+        )
+            .into_response();
+    }
 
     let resolved = state.resolve_query(&query.name, qtype);
     let answer = resolved
@@ -695,7 +792,11 @@ async fn handle_get(
         .into_response()
 }
 
-async fn handle_post(State(state): State<Arc<DohRuntime>>, body: Bytes) -> impl IntoResponse {
+async fn handle_post(
+    State(state): State<Arc<DohRuntime>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: Bytes,
+) -> impl IntoResponse {
     let query = match parse_dns_wire_query(&body) {
         Ok(q) => q,
         Err(e) => {
@@ -703,6 +804,25 @@ async fn handle_post(State(state): State<Arc<DohRuntime>>, body: Bytes) -> impl 
             return (StatusCode::BAD_REQUEST, "invalid dns-message payload").into_response();
         }
     };
+
+    if !state.allow_query_from_ip(peer.ip()) {
+        let packet = build_dns_wire_response(
+            &query,
+            &ResolveResult {
+                rcode: 0,
+                answers: Vec::new(),
+            },
+        );
+
+        return (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/dns-message"),
+            )],
+            packet,
+        )
+            .into_response();
+    }
 
     let resolved = state.resolve_query(&query.qname, query.qtype);
     let packet = build_dns_wire_response(&query, &resolved);
@@ -854,6 +974,13 @@ fn has_suffix(labels: &[String], suffix: &[String]) -> bool {
 
 fn is_hex(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_base32_fragment(s: &str) -> bool {
+    !s.is_empty()
+        && s
+            .bytes()
+            .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'2'..=b'7'))
 }
 
 const B32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";

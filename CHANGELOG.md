@@ -33,9 +33,9 @@ All notable changes to Orchestra are documented here.
   excluded from the build invocation.
 - **Software Diversification** - The `optimizer` crate and `builder` CLI have been enhanced to support build-time code diversification. This feature helps evade static signature-based detection by producing a unique binary on each build.
     - `optimizer` - Added several new transformation passes:
-        - `LeaAddPass`: Substitutes `add` instructions with equivalent `lea` instructions.
-        - `JunkInstructionPass`: Inserts random, non-functional instructions (`nop`, `mov rax, rax`) into the code.
-        - `RegisterSwapPass`: Performs a safe swap of volatile registers (`rax` <-> `rcx`) to change instruction encoding.
+    - `InstructionSubstitutionPass`: Substitutes instructions with semantically equivalent forms (6 patterns: `ADD<->INC`, `SUB<->DEC`, `MOV->XOR`, `XOR<->SUB`, `TEST<->CMP`, `AND->XOR`).
+    - `OpaqueDeadCodePass`: Inserts dead-code blocks with opaque predicates.
+    - `InstructionSchedulingPass`: Currently disabled (no-op) and planned to be enabled in a future release after dependency-safe scheduling is implemented.
     - `builder` - A new `--diversify` flag was added to the `build` command. When used, it applies the full set of optimizer passes to the agent binary before encryption, ensuring each build has a unique byte pattern.
 
 ### Changed
