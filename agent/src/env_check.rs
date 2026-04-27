@@ -618,20 +618,35 @@ fn macos_system_profiler_indicates_vm() -> bool {
         }
     } {
         let ioreg = String::from_utf8_lossy(&stdout).to_lowercase();
+        // Docker Desktop on macOS injects "qemu" virtual NICs into ioreg.
+        // Check for Docker-specific identifiers and discount them to avoid
+        // false positives on developer machines.
+        let is_docker_desktop = ioreg.contains("docker")
+            || ioreg.contains("com.docker")
+            || ioreg.contains("docker.desktop");
         if ioreg.contains(
             String::from_utf8_lossy(&string_crypt::enc_str!("virtualbox"))
                 .trim_end_matches('\0')
                 .to_string(),
-        ) || ioreg.contains(
+        ) {
+            is_vm = true;
+        }
+        if ioreg.contains(
             String::from_utf8_lossy(&string_crypt::enc_str!("vmware"))
                 .trim_end_matches('\0')
                 .to_string(),
-        ) || ioreg.contains("parallels")
-            || ioreg.contains(
-                String::from_utf8_lossy(&string_crypt::enc_str!("qemu"))
-                    .trim_end_matches('\0')
-                    .to_string(),
-            )
+        ) {
+            is_vm = true;
+        }
+        if ioreg.contains("parallels") {
+            is_vm = true;
+        }
+        // Only flag qemu if Docker Desktop is NOT present — Docker uses QEMU NICs.
+        if ioreg.contains(
+            String::from_utf8_lossy(&string_crypt::enc_str!("qemu"))
+                .trim_end_matches('\0')
+                .to_string(),
+        ) && !is_docker_desktop
         {
             is_vm = true;
         }
