@@ -38,6 +38,14 @@ pub fn execute_command(
 
         let mut size = 0;
         InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size);
+        // InitializeProcThreadAttributeList may leave `size = 0` on failure
+        // (e.g. invalid parameters), which would make the subsequent
+        // `vec![0u8; 0]` allocation produce a dangling pointer that the second
+        // call would then write through.  Fall back to a reasonable default
+        // (H-7).
+        if size == 0 {
+            size = 1024;
+        }
         let mut attr_list_buf = vec![0u8; size];
         let attr_list = attr_list_buf.as_mut_ptr() as *mut _;
 
@@ -79,10 +87,23 @@ pub fn execute_command(
         }
 
         let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        // Quote arguments that contain whitespace or shell-meta characters so
+        // the spawned process receives them as a single token (H-7).  The
+        // previous bare concatenation broke any argument with a space.
+        fn quote_arg(s: &str) -> String {
+            if s.is_empty()
+                || s.chars()
+                    .any(|c| matches!(c, ' ' | '\t' | '"' | '&' | '|' | '<' | '>' | '^'))
+            {
+                format!("\"{}\"", s.replace('"', "\\\""))
+            } else {
+                s.to_string()
+            }
+        }
         let mut cmd_str = String::from(program);
         for a in args {
             cmd_str.push(' ');
-            cmd_str.push_str(a); // Needs quoting in real systems, but fine for arp/schtasks
+            cmd_str.push_str(&quote_arg(a));
         }
         let mut cmd_w: Vec<u16> = std::ffi::OsStr::new(&cmd_str)
             .encode_wide()
