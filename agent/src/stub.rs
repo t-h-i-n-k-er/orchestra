@@ -92,36 +92,21 @@ pub unsafe fn decrypt_payload() {
     }
 }
 
-/// Build the decryption key. Uses a compile-time env var ORCHESTRA_KEY if set
-/// (must be 64 hex characters = 32 bytes).  Falls back to a deterministic
-/// placeholder derived from package metadata so the crate still compiles in
-/// development environments that do not set ORCHESTRA_KEY.
+/// Build the decryption key from the ORCHESTRA_KEY compile-time env var.
 ///
-/// **Security note**: Production builds MUST set ORCHESTRA_KEY to a unique
-/// 64-character hex string.  A build.rs warning is emitted when the variable
-/// is absent.  The placeholder key has no security value and must never be
-/// shipped in a production artifact.
+/// ORCHESTRA_KEY is always set by build.rs — either by the operator or
+/// auto-generated as a per-build random 32-byte value.  The CARGO metadata
+/// fallback has been removed because those values are publicly known and
+/// produce deterministic (insecure) keys (C-6 fix).
 #[inline(always)]
 const fn build_key() -> [u8; 32] {
-    // option_env! returns None at compile time if the variable is not set,
-    // instead of aborting compilation.  This makes development builds possible
-    // without the env var while still enforcing it for release (via build.rs).
     match option_env!("ORCHESTRA_KEY") {
         Some(hex) => parse_hex_key(hex),
         None => {
-            // Derive a placeholder key from package metadata so each package
-            // at least gets a distinct non-zero key even without the env var.
-            let ver = env!("CARGO_PKG_VERSION").as_bytes();
-            let name = env!("CARGO_PKG_NAME").as_bytes();
-            let mut k = [0u8; 32];
-            let mut i = 0usize;
-            while i < 32 {
-                let v = if i < ver.len() { ver[i] } else { 0xA5u8 };
-                let n = if i < name.len() { name[i] } else { 0x5Au8 };
-                k[i] = v ^ n ^ (i as u8).wrapping_mul(0x37).wrapping_add(0x1B);
-                i += 1;
-            }
-            k
+            // Unreachable in practice — build.rs always sets ORCHESTRA_KEY.
+            // All-zero key will fail to decrypt rather than silently using a
+            // guessable placeholder derived from public CARGO metadata.
+            [0u8; 32]
         }
     }
 }
@@ -141,6 +126,21 @@ const fn parse_hex_key(hex: &str) -> [u8; 32] {
     out
 }
 
+/// Decode a 24-character ASCII hex string into a 12-byte nonce at compile time.
+#[inline(always)]
+const fn parse_hex_nonce(hex: &str) -> [u8; 12] {
+    let b = hex.as_bytes();
+    let mut out = [0u8; 12];
+    let mut i = 0usize;
+    while i < 12 {
+        let hi = hex_nibble(b[i * 2]);
+        let lo = hex_nibble(b[i * 2 + 1]);
+        out[i] = (hi << 4) | lo;
+        i += 1;
+    }
+    out
+}
+
 #[inline(always)]
 const fn hex_nibble(c: u8) -> u8 {
     match c {
@@ -151,22 +151,24 @@ const fn hex_nibble(c: u8) -> u8 {
     }
 }
 
-/// Build a non-zero nonce derived from compile-time package metadata (2.13).
-/// This gives each build a distinct nonce without requiring runtime entropy.
+/// Build the decryption nonce from the ORCHESTRA_NONCE compile-time env var.
+///
+/// ORCHESTRA_NONCE is always set by build.rs — auto-generated as a per-build
+/// random 12-byte value.  This ensures every build uses a unique nonce even
+/// when ORCHESTRA_KEY is pinned, preventing ChaCha20 nonce reuse (C-6 fix).
+///
+/// Previously derived from CARGO_PKG_VERSION + CARGO_PKG_NAME, which are
+/// public and fixed — same key + same nonce = same keystream every build.
 #[inline(always)]
 const fn build_nonce() -> [u8; 12] {
-    let ver = env!("CARGO_PKG_VERSION").as_bytes();
-    let name = env!("CARGO_PKG_NAME").as_bytes();
-    // Mix version and name bytes into a 12-byte nonce deterministically.
-    let mut n = [0u8; 12];
-    let mut i = 0usize;
-    while i < 12 {
-        let v = if i < ver.len() { ver[i] } else { 0x5A };
-        let nm = if i < name.len() { name[i] } else { 0xA5 };
-        n[i] = v ^ nm ^ (i as u8).wrapping_mul(0x1B).wrapping_add(0x37);
-        i += 1;
+    match option_env!("ORCHESTRA_NONCE") {
+        Some(hex) => parse_hex_nonce(hex),
+        None => {
+            // Unreachable in practice — build.rs always sets ORCHESTRA_NONCE.
+            // All-zero nonce will fail to decrypt (fail-safe over guessable).
+            [0u8; 12]
+        }
     }
-    n
 }
 
 /// Minimal ChaCha20 stream cipher applied in-place.
