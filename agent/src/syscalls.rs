@@ -137,6 +137,9 @@ fn map_clean_ntdll() -> Result<usize> {
                         // by arbitrary code.
                         let candidate = start + j;
                         let gadget_len = if code[j + 2] == 0xc3 { 3 } else { 2 };
+                        // Cross-reference: this is the primary gadget_is_valid
+                        // call site (around line 140 in this file).
+                        // See gadget_is_valid defined near do_syscall below.
                         if gadget_is_valid(candidate, gadget_len) {
                             gadget_addr = candidate;
                             break;
@@ -276,6 +279,70 @@ macro_rules! syscall {
         let args: &[u64] = &[$($args as u64),*];
         $crate::syscalls::do_syscall(target.ssn, target.gadget_addr, args)
     }};
+}
+
+/// Verify that a gadget at `addr` of `len` bytes is safe to execute:
+///   1. The entire gadget falls within a single committed memory region.
+///   2. The region is executable.
+///   3. The gadget does not straddle a 4KB page boundary.
+///
+/// Returns `true` if the gadget is safe, `false` otherwise.
+///
+/// Cross-reference:
+/// - Primary call site: map_clean_ntdll gadget scan around line 140.
+/// - Secondary call site: find_jmp_rbx_gadget near the stack-spoofing helpers.
+/// - Related syscall dispatch entry: do_syscall immediately below.
+#[cfg(windows)]
+unsafe fn gadget_is_valid(addr: usize, len: usize) -> bool {
+    use winapi::um::memoryapi::VirtualQuery;
+    use winapi::um::winnt::{MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+
+    let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    let result = VirtualQuery(
+        addr as *const _,
+        &mut mbi,
+        std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+    );
+    if result == 0 {
+        return false; // VirtualQuery failed - cannot verify
+    }
+
+    // Region must be committed
+    if mbi.State != MEM_COMMIT {
+        return false;
+    }
+
+    // Region must be executable (PAGE_EXECUTE_*, including execute-read variants)
+    const PAGE_EXECUTE: u32 = 0x10;
+    const PAGE_EXECUTE_READ: u32 = 0x20;
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+    let prot = mbi.Protect;
+    let is_exec = prot == PAGE_EXECUTE
+        || prot == PAGE_EXECUTE_READ
+        || prot == PAGE_EXECUTE_READWRITE
+        || prot == PAGE_EXECUTE_WRITECOPY;
+    if !is_exec {
+        return false;
+    }
+
+    // The entire gadget must fit within this memory region
+    let region_end = mbi.BaseAddress as usize + mbi.RegionSize;
+    if addr + len > region_end {
+        return false;
+    }
+
+    // The gadget must not straddle a 4KB page boundary.
+    // This is a stronger check: even if both pages are in the same region,
+    // a gadget crossing a page boundary can cause issues if the second page
+    // has different TLB entries or is guarded.
+    let page_start = addr & !0xFFF;
+    let page_end = page_start + 0x1000;
+    if addr + len > page_end {
+        return false;
+    }
+
+    true
 }
 
 #[cfg(windows)]
@@ -976,6 +1043,8 @@ macro_rules! clean_call {
         let arg4 = args.get(3).copied().unwrap_or(0);
         let stack_args = if args.len() > 4 { &args[4..] } else { &[] };
 
+        // Cross-reference: primary find_jmp_rbx_gadget call site is here.
+        // See find_jmp_rbx_gadget near the bottom Windows helpers section.
         let gadget = $crate::syscalls::find_jmp_rbx_gadget();
         if gadget == 0 {
             // No stack-spoofing gadget is available.  Refuse to silently fall
@@ -985,6 +1054,8 @@ macro_rules! clean_call {
             // to attempt a different gadget search, accept the risk, or abort.
             Err($crate::syscalls::SyscallError::NoGadgetAvailable)
         } else {
+            // Cross-reference: primary spoof_call call site is here.
+            // See spoof_call near the bottom Windows helpers section.
             let res = unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) };
             // cast result back
             Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
@@ -1091,7 +1162,10 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
             6 => {
                 std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], in("x3") args[3], in("x4") args[4], in("x5") args[5], lateout("x0") ret, lateout("x6") _, lateout("x7") _)
             }
-            _ => panic!("too many syscall arguments"),
+            // Linux syscalls accept at most 6 register arguments on aarch64.
+            // Return EINVAL instead of panicking so callers can handle this
+            // invalid input path without generating a crash dump.
+            _ => return Err(libc::EINVAL),
         }
         if ret < 0 {
             Err(-ret as i32)
@@ -1886,66 +1960,10 @@ pub unsafe extern "C" fn get_spoof_ret() -> usize {
     REAL_RET_ADDR.with(|r| r.get())
 }
 
-/// Verify that a gadget at `addr` of `len` bytes is safe to execute:
-///   1. The entire gadget falls within a single committed memory region.
-///   2. The region is executable.
-///   3. The gadget does not straddle a 4KB page boundary.
-///
-/// Returns `true` if the gadget is safe, `false` otherwise.
 #[cfg(windows)]
-unsafe fn gadget_is_valid(addr: usize, len: usize) -> bool {
-    use winapi::um::memoryapi::VirtualQuery;
-    use winapi::um::winnt::{MEMORY_BASIC_INFORMATION, MEM_COMMIT};
-
-    let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-    let result = VirtualQuery(
-        addr as *const _,
-        &mut mbi,
-        std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-    );
-    if result == 0 {
-        return false; // VirtualQuery failed — cannot verify
-    }
-
-    // Region must be committed
-    if mbi.State != MEM_COMMIT {
-        return false;
-    }
-
-    // Region must be executable (PAGE_EXECUTE_*, including execute-read variants)
-    const PAGE_EXECUTE: u32 = 0x10;
-    const PAGE_EXECUTE_READ: u32 = 0x20;
-    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
-    const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
-    let prot = mbi.Protect;
-    let is_exec = prot == PAGE_EXECUTE
-        || prot == PAGE_EXECUTE_READ
-        || prot == PAGE_EXECUTE_READWRITE
-        || prot == PAGE_EXECUTE_WRITECOPY;
-    if !is_exec {
-        return false;
-    }
-
-    // The entire gadget must fit within this memory region
-    let region_end = mbi.BaseAddress as usize + mbi.RegionSize;
-    if addr + len > region_end {
-        return false;
-    }
-
-    // The gadget must not straddle a 4KB page boundary.
-    // This is a stronger check: even if both pages are in the same region,
-    // a gadget crossing a page boundary can cause issues if the second page
-    // has different TLB entries or is guarded.
-    let page_start = addr & !0xFFF;
-    let page_end = page_start + 0x1000;
-    if addr + len > page_end {
-        return false;
-    }
-
-    true
-}
-
-#[cfg(windows)]
+/// Cross-reference:
+/// - Primary call site: clean_call macro around line 979.
+/// - Gadget is passed into spoof_call from clean_call around line 988.
 pub fn find_jmp_rbx_gadget() -> usize {
     let base = unsafe {
         pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL).unwrap_or(0)
@@ -1976,6 +1994,9 @@ pub fn find_jmp_rbx_gadget() -> usize {
 #[cfg(windows)]
 #[doc(hidden)]
 #[inline(never)]
+/// Cross-reference:
+/// - Primary call site: clean_call macro around line 988.
+/// - Receives gadget addresses from find_jmp_rbx_gadget.
 pub unsafe fn spoof_call(
     api_addr: usize,
     gadget_addr: usize,
