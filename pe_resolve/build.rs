@@ -38,6 +38,8 @@ fn main() {
         "NtSetInformationThread",
         "AmsiInitialize",
         "EtwEventWrite",
+        "EtwEventWriteEx",
+        "NtTraceEvent",
     ];
     let dlls = ["ntdll.dll", "amsi.dll", "kernel32.dll"];
 

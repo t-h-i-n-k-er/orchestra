@@ -380,6 +380,7 @@ impl Agent {
 pub mod amsi_defense;
 #[cfg(windows)]
 pub mod callback_exec;
+pub mod etw_patch;
 pub mod evasion;
 pub mod stub;
 
