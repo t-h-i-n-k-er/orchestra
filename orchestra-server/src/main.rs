@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 use orchestra_server::{
-    agent_link, api, audit::AuditLog, config::ServerConfig, state::AppState, tls,
+    agent_link, api, audit::AuditLog, config::ServerConfig, doh_listener, state::AppState, tls,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -76,6 +76,30 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             if let Err(e) = agent_link::run(state_a, addr, secret, tls_c).await {
                 tracing::error!("agent listener exited: {e}");
+            }
+        });
+    }
+
+    // DoH listener bridge (optional).
+    if cfg.doh_enabled {
+        let state_d = state.clone();
+        let addr = cfg.doh_listen_addr;
+        let secret = cfg.agent_shared_secret.clone();
+        let domain = cfg.doh_domain.clone();
+        let beacon_sentinel = cfg.doh_beacon_sentinel.clone();
+        let idle_ip = cfg.doh_idle_ip.clone();
+        tokio::spawn(async move {
+            if let Err(e) = doh_listener::run(
+                state_d,
+                addr,
+                secret,
+                domain,
+                beacon_sentinel,
+                idle_ip,
+            )
+            .await
+            {
+                tracing::error!("DoH listener exited: {e}");
             }
         });
     }

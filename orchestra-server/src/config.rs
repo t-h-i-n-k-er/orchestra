@@ -33,6 +33,21 @@ pub struct ServerConfig {
     /// How long (seconds) to wait for an agent to reply before timing out a command.
     #[serde(default = "default_command_timeout")]
     pub command_timeout_secs: u64,
+    /// Enable the DNS-over-HTTPS bridge listener.
+    #[serde(default)]
+    pub doh_enabled: bool,
+    /// Address the DoH listener binds to.
+    #[serde(default = "default_doh_listen_addr")]
+    pub doh_listen_addr: SocketAddr,
+    /// Domain suffix expected in DoH query names.
+    #[serde(default = "default_doh_domain")]
+    pub doh_domain: String,
+    /// Sentinel IP returned for beacon A queries when tasking is available.
+    #[serde(default = "default_doh_beacon_sentinel")]
+    pub doh_beacon_sentinel: String,
+    /// Benign-looking IP returned for beacon A queries when no tasking exists.
+    #[serde(default = "default_doh_idle_ip")]
+    pub doh_idle_ip: String,
 }
 
 fn default_builds_dir() -> PathBuf {
@@ -46,6 +61,18 @@ fn default_max_concurrent_builds() -> usize {
 }
 fn default_command_timeout() -> u64 {
     30
+}
+fn default_doh_listen_addr() -> SocketAddr {
+    "127.0.0.1:8445".parse().unwrap()
+}
+fn default_doh_domain() -> String {
+    "c2.example.com".to_string()
+}
+fn default_doh_beacon_sentinel() -> String {
+    "1.2.3.4".to_string()
+}
+fn default_doh_idle_ip() -> String {
+    "104.18.5.22".to_string()
 }
 
 impl Default for ServerConfig {
@@ -63,6 +90,11 @@ impl Default for ServerConfig {
             build_retention_days: 7,
             max_concurrent_builds: 1,
             command_timeout_secs: 30,
+            doh_enabled: false,
+            doh_listen_addr: default_doh_listen_addr(),
+            doh_domain: default_doh_domain(),
+            doh_beacon_sentinel: default_doh_beacon_sentinel(),
+            doh_idle_ip: default_doh_idle_ip(),
         }
     }
 }
