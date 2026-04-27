@@ -3,7 +3,7 @@
 #[cfg(windows)]
 use winapi::um::memoryapi::VirtualProtect;
 #[cfg(windows)]
-use winapi::um::winnt::{PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
+use winapi::um::winnt::{PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
 
 /// In-memory .data section decryptor using ChaCha20.
 /// The key is derived at compile time; there is no hardcoded seed string.
@@ -78,10 +78,13 @@ pub unsafe fn decrypt_payload() {
             // Apply ChaCha20 keystream in-place
             chacha20_xor(section_ptr, virtual_size, &key, &nonce);
 
+            // Restore .data to PAGE_READWRITE so the loaded process can write
+            // global variables at runtime; making it PAGE_EXECUTE_READ would
+            // crash on the first write to a static (H-8).
             VirtualProtect(
                 section_ptr as _,
                 virtual_size,
-                PAGE_EXECUTE_READ,
+                PAGE_READWRITE,
                 &mut old_protect,
             );
             break;
