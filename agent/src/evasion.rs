@@ -87,7 +87,6 @@ unsafe extern "system" fn veh_handler(
 pub unsafe fn setup_hardware_breakpoints() {
     use winapi::um::errhandlingapi::AddVectoredExceptionHandler;
     use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-    use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress, LoadLibraryA};
     use winapi::um::processthreadsapi::{
         GetCurrentProcessId, GetThreadContext, OpenThread, ResumeThread, SetThreadContext,
         SuspendThread,
@@ -127,8 +126,13 @@ pub unsafe fn setup_hardware_breakpoints() {
         return;
     }
 
-    // Register our VEH first
-    AddVectoredExceptionHandler(1, Some(veh_handler));
+    // Register our VEH first; store the handle so it can be removed later
+    // via RemoveVectoredExceptionHandler if needed (M-25 fix).
+    static VEH_HANDLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let veh = AddVectoredExceptionHandler(1, Some(veh_handler));
+    if !veh.is_null() {
+        VEH_HANDLE.get_or_init(|| veh as usize);
+    }
 
     // Propagate hardware breakpoints to all existing threads in the process
     let pid = GetCurrentProcessId();

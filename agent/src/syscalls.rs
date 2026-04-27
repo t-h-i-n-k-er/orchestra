@@ -397,7 +397,7 @@ fn map_clean_ntdll() -> Result<usize> {
             ],
         );
 
-        winapi::um::handleapi::CloseHandle(h_file);
+        pe_resolve::close_handle(h_file);
         if status != 0 {
             return Err(anyhow!("NtCreateSection failed: {:x}", status));
         }
@@ -422,7 +422,7 @@ fn map_clean_ntdll() -> Result<usize> {
             ],
         );
 
-        winapi::um::handleapi::CloseHandle(h_section);
+        pe_resolve::close_handle(h_section);
         if status != 0 {
             return Err(anyhow!("NtMapViewOfSection failed: {:x}", status));
         }
@@ -674,7 +674,6 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
         return Ok(base);
     }
 
-    use winapi::um::handleapi::CloseHandle;
     use winapi::um::winnt::{
         FILE_SHARE_READ, GENERIC_READ, PAGE_EXECUTE_READ, SECTION_MAP_EXECUTE, SECTION_MAP_READ,
         SEC_IMAGE,
@@ -755,7 +754,7 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
                 h_file as u64,
             ],
         );
-        CloseHandle(h_file);
+        pe_resolve::close_handle(h_file);
 
         if status != 0 || h_section.is_null() {
             return Err(anyhow!(
@@ -783,7 +782,7 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
                 0x20, // PAGE_EXECUTE_READ
             ],
         );
-        CloseHandle(h_section);
+        pe_resolve::close_handle(h_section);
 
         if status != 0 || base_addr.is_null() {
             return Err(anyhow!(

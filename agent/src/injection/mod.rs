@@ -73,7 +73,7 @@ fn manual_map_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         struct HandleGuard(*mut winapi::ctypes::c_void);
         impl Drop for HandleGuard {
             fn drop(&mut self) {
-                unsafe { winapi::um::handleapi::CloseHandle(self.0); }
+                unsafe { pe_resolve::close_handle(self.0); }
             }
         }
         let _guard = HandleGuard(process);

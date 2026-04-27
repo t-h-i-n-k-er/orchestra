@@ -126,19 +126,19 @@ pub fn execute_command(
 
         // Clean up writer handle in parent immediately
         if !stdout_wr.is_null() {
-            CloseHandle(stdout_wr);
+            pe_resolve::close_handle(stdout_wr);
         }
 
         if !si.lpAttributeList.is_null() {
             DeleteProcThreadAttributeList(si.lpAttributeList);
         }
         if !p_handle.is_null() {
-            CloseHandle(p_handle);
+            pe_resolve::close_handle(p_handle);
         }
 
         if success == 0 {
             if !stdout_rd.is_null() {
-                CloseHandle(stdout_rd);
+                pe_resolve::close_handle(stdout_rd);
             }
             return Err(anyhow::anyhow!(
                 "CreateProcessW failed with {}",
@@ -163,14 +163,14 @@ pub fn execute_command(
                 }
                 output_bytes.extend_from_slice(&buf[..bytes_read as usize]);
             }
-            CloseHandle(stdout_rd);
+            pe_resolve::close_handle(stdout_rd);
         }
 
         WaitForSingleObject(pi.hProcess, INFINITE);
         let mut exit_code: u32 = 0;
         GetExitCodeProcess(pi.hProcess, &mut exit_code);
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
+        pe_resolve::close_handle(pi.hThread);
+        pe_resolve::close_handle(pi.hProcess);
 
         use std::os::windows::process::ExitStatusExt;
         Ok(std::process::Output {
