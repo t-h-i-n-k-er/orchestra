@@ -32,6 +32,67 @@ pub fn hash_wstr(bytes: &[u16]) -> u32 {
     hash
 }
 
+#[inline(always)]
+fn is_forwarder(func_rva: usize, export_dir_rva: usize, export_dir_size: usize) -> bool {
+    func_rva >= export_dir_rva && func_rva < export_dir_rva.saturating_add(export_dir_size)
+}
+
+unsafe fn resolve_forwarded_export(dll_base: usize, func_rva: usize) -> Option<usize> {
+    const MAX_FORWARDER_STR_LEN: usize = 512;
+    const MAX_MODULE_WIDE_LEN: usize = 260;
+
+    let forwarder_ptr = (dll_base + func_rva) as *const u8;
+    let mut forwarder_len = 0usize;
+    while forwarder_len < MAX_FORWARDER_STR_LEN && *forwarder_ptr.add(forwarder_len) != 0 {
+        forwarder_len += 1;
+    }
+    if forwarder_len == 0 || forwarder_len >= MAX_FORWARDER_STR_LEN {
+        return None;
+    }
+
+    let forwarder = core::slice::from_raw_parts(forwarder_ptr, forwarder_len);
+    let mut dot_index = None;
+    for i in 0..forwarder_len {
+        if forwarder[i] == b'.' {
+            dot_index = Some(i);
+            break;
+        }
+    }
+    let dot = dot_index?;
+    if dot == 0 || dot + 1 >= forwarder_len {
+        return None;
+    }
+
+    let module_name = &forwarder[..dot];
+    let function_name = &forwarder[dot + 1..];
+
+    if module_name.len() >= MAX_MODULE_WIDE_LEN {
+        return None;
+    }
+
+    let mut module_wide = [0u16; MAX_MODULE_WIDE_LEN];
+    for i in 0..module_name.len() {
+        module_wide[i] = module_name[i] as u16;
+    }
+
+    // Forwarder module names are typically extensionless (e.g. "NTDLL"),
+    // while PEB BaseDllName entries include ".dll".
+    let module_base = get_module_handle_by_hash(hash_wstr(&module_wide[..module_name.len()]))
+        .or_else(|| {
+            if module_name.len() + 4 >= MAX_MODULE_WIDE_LEN {
+                return None;
+            }
+            module_wide[module_name.len()] = b'.' as u16;
+            module_wide[module_name.len() + 1] = b'd' as u16;
+            module_wide[module_name.len() + 2] = b'l' as u16;
+            module_wide[module_name.len() + 3] = b'l' as u16;
+            get_module_handle_by_hash(hash_wstr(&module_wide[..module_name.len() + 4]))
+        })?;
+
+    let function_hash = hash_str(function_name);
+    get_proc_address_by_hash(module_base, function_hash)
+}
+
 /// Walk the Windows PEB loader list and return the base address of the module
 /// whose name hashes to `target_hash` using [`hash_wstr`].
 ///
@@ -41,7 +102,7 @@ pub fn hash_wstr(bytes: &[u16]) -> u32 {
 /// pointers derived from the TEB (`gs:[0x30]`) and the PEB loader data
 /// structure — these are valid for the lifetime of the process but are
 /// inherently unsafe raw-pointer reads.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 pub unsafe fn get_module_handle_by_hash(target_hash: u32) -> Option<usize> {
     use core::arch::asm;
     let teb: usize;
@@ -78,7 +139,7 @@ pub unsafe fn get_module_handle_by_hash(target_hash: u32) -> Option<usize> {
 /// `dll_base` must be a valid, fully-mapped PE image base with a correct DOS
 /// and NT header.  The export directory and all name/ordinal arrays must be
 /// accessible and not mutated for the duration of the call.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Option<usize> {
     let dos_magic = *(dll_base as *const u16);
     if dos_magic != 0x5A4D {
@@ -99,6 +160,7 @@ pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Opt
     }
 
     let export_dir = dll_base + export_dir_rva;
+    let export_dir_size = *((export_dir + 0x14) as *const u32) as usize;
     let num_names = *((export_dir + 0x18) as *const u32);
     let rva_funcs = *((export_dir + 0x1C) as *const u32) as usize;
     let rva_names = *((export_dir + 0x20) as *const u32) as usize;
@@ -119,9 +181,22 @@ pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Opt
         if hash_str(slice) == target_hash {
             let ord = *ords.add(i as usize) as usize;
             let func_rva = *funcs.add(ord) as usize;
+            if is_forwarder(func_rva, export_dir_rva, export_dir_size) {
+                return resolve_forwarded_export(dll_base, func_rva);
+            }
             return Some(dll_base + func_rva);
         }
     }
+    None
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+pub unsafe fn get_module_handle_by_hash(_target_hash: u32) -> Option<usize> {
+    None
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+pub unsafe fn get_proc_address_by_hash(_dll_base: usize, _target_hash: u32) -> Option<usize> {
     None
 }
 
@@ -182,6 +257,7 @@ pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Opt
     }
 
     let export_dir = dll_base + export_dir_rva;
+    let export_dir_size = *((export_dir + 0x14) as *const u32) as usize;
     let num_names = *((export_dir + 0x18) as *const u32);
     let rva_funcs = *((export_dir + 0x1C) as *const u32) as usize;
     let rva_names = *((export_dir + 0x20) as *const u32) as usize;
@@ -202,6 +278,9 @@ pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Opt
         if hash_str(slice) == target_hash {
             let ord = *ords.add(i as usize) as usize;
             let func_rva = *funcs.add(ord) as usize;
+            if is_forwarder(func_rva, export_dir_rva, export_dir_size) {
+                return resolve_forwarded_export(dll_base, func_rva);
+            }
             return Some(dll_base + func_rva);
         }
     }
@@ -244,7 +323,7 @@ pub unsafe fn get_proc_address_by_hash(_dll_base: usize, _target_hash: u32) -> O
 // leaked handle is a process-lifetime resource at worst, whereas a hooked
 // API call may report the agent to a security product.
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 pub unsafe fn close_handle(handle: *mut core::ffi::c_void) {
     use core::sync::atomic::{AtomicUsize, Ordering};
     static NT_CLOSE_ADDR: AtomicUsize = AtomicUsize::new(0);
@@ -268,6 +347,11 @@ pub unsafe fn close_handle(handle: *mut core::ffi::c_void) {
         let nt_close: NtCloseFn = core::mem::transmute(resolved as *const ());
         nt_close(handle);
     }
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+pub unsafe fn close_handle(_handle: *mut core::ffi::c_void) {
+    // No-op on non-Windows targets; CloseHandle is a Windows-only concept.
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
@@ -296,7 +380,11 @@ pub unsafe fn close_handle(handle: *mut core::ffi::c_void) {
     }
 }
 
-#[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_os = "windows"))))]
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_os = "windows"),
+    all(target_arch = "x86_64", not(target_os = "windows")),
+    all(target_arch = "aarch64", target_os = "windows")
+)))]
 pub unsafe fn close_handle(_handle: *mut core::ffi::c_void) {
     // No-op on non-Windows targets; CloseHandle is a Windows-only concept.
 }

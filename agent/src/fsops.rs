@@ -96,6 +96,63 @@ fn canonicalize_existing(path: &Path) -> Result<PathBuf> {
     Ok(canon_parent.join(tail))
 }
 
+/// Returns `true` if `path` names a Windows reparse point (symlink or
+/// junction).  Opens the path with `FILE_FLAG_OPEN_REPARSE_POINT` so the
+/// check itself never follows the link, then confirms the attribute with
+/// `GetFileAttributesW`.
+///
+/// On non-Windows platforms this is always `Ok(false)`.
+#[cfg(windows)]
+fn is_reparse_point(path: &Path) -> Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::um::fileapi::{CreateFileW, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING};
+    use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+    use winapi::um::winbase::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT};
+    use winapi::um::winnt::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GENERIC_READ,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0u16))
+        .collect();
+
+    // Open without following the reparse point.
+    // FILE_FLAG_BACKUP_SEMANTICS is required when the path is a directory.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        // Path does not exist yet — cannot be a reparse point.
+        return Ok(false);
+    }
+    unsafe { CloseHandle(handle) };
+
+    // GetFileAttributesW does not follow reparse points; it reports the
+    // attributes of the reparse point entry itself.
+    let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attrs == INVALID_FILE_ATTRIBUTES {
+        return Ok(false);
+    }
+    Ok((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+}
+
+#[cfg(all(not(windows), not(unix)))]
+fn is_reparse_point(_path: &Path) -> Result<bool> {
+    Ok(false)
+}
+
 pub async fn list_directory(path: &str, config: &Config) -> Result<Vec<FileEntry>> {
     let path = validate_path(path, config).await?;
     let mut entries = Vec::new();
@@ -156,19 +213,46 @@ pub async fn write_file(path: &str, data: &[u8], config: &Config) -> Result<()> 
     }
     #[cfg(not(unix))]
     {
-        // On non-Unix platforms (Windows), open the file and perform a
-        // post-open metadata check to detect a symlink that appeared after
-        // validate_path returned.
-        afs::write(&path, data).await?;
-        let meta = tokio::fs::symlink_metadata(&path).await?;
-        if meta.file_type().is_symlink() {
-            // Remove the file we just wrote through the symlink and refuse.
-            let _ = tokio::fs::remove_file(&path).await;
-            return Err(anyhow!(
-                "write_file: path became a symlink after validation; write refused ({})",
-                path.display()
-            ));
-        }
+        // On Windows, check for a reparse point (symlink or junction) BEFORE
+        // writing.  Opening with FILE_FLAG_OPEN_REPARSE_POINT ensures the
+        // check itself never follows the link.  If the path is a reparse
+        // point we resolve its target for the warning, delete the reparse
+        // point, and create a regular file at the same path.
+        use std::io::Write;
+        let data_owned = data.to_vec();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            if is_reparse_point(&path)? {
+                // Resolve the target via read_link (works for symlinks and
+                // NTFS junctions alike on Windows).
+                let target = std::fs::read_link(&path)
+                    .map(|t| t.display().to_string())
+                    .unwrap_or_else(|_| "<unresolvable reparse point>".to_owned());
+                log::warn!(
+                    "write_file: {} is a reparse point pointing to {}; \
+                     removing reparse point and writing a regular file",
+                    path.display(),
+                    target
+                );
+                std::fs::remove_file(&path).map_err(|e| {
+                    anyhow!(
+                        "write_file: failed to remove reparse point {}: {e}",
+                        path.display()
+                    )
+                })?;
+            }
+            // Write a regular file.  The symlink (if any) was just removed,
+            // so this open cannot follow one.
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .map_err(|e| anyhow!("write_file: open failed: {e}"))?;
+            f.write_all(&data_owned)
+                .map_err(|e| anyhow!("write_file: write failed: {e}"))
+        })
+        .await
+        .map_err(|e| anyhow!("write_file task panicked: {e}"))??;
     }
     Ok(())
 }
