@@ -228,9 +228,10 @@ impl Pass for NopInsertionPass {
         for ins in instrs.iter() {
             new_instrs.push(*ins);
             if rng.gen_bool(0.1) {
-                let mut nop = Instruction::default();
-                nop.set_code(Code::Nopd);
-                new_instrs.push(nop);
+                // Use a multi-byte NOP form (0F 1F /0) to avoid obvious 0x90 padding.
+                if let Ok(nop) = Instruction::with1(Code::Nop_rm64, iced_x86::Register::RAX) {
+                    new_instrs.push(nop);
+                }
             }
         }
         *instrs = new_instrs;

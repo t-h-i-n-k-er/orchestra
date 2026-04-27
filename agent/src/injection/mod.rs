@@ -10,7 +10,7 @@ pub mod module_stomp;
 #[cfg(windows)]
 pub mod remote_thread;
 #[cfg(windows)]
-pub mod thread_hijack;
+pub mod nt_create_thread;
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -39,7 +39,7 @@ pub trait Injector {
 #[cfg(windows)]
 pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> anyhow::Result<()> {
     match method {
-        InjectionMethod::NtCreateThread => thread_hijack::NtCreateThreadInjector.inject(pid, payload),
+        InjectionMethod::NtCreateThread => nt_create_thread::NtCreateThreadInjector.inject(pid, payload),
         InjectionMethod::ModuleStomp => module_stomp::ModuleStompInjector.inject(pid, payload),
         InjectionMethod::RemoteThread => remote_thread::RemoteThreadInjector.inject(pid, payload),
         InjectionMethod::EarlyBird => early_bird::EarlyBirdInjector.inject(pid, payload),

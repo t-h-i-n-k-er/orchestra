@@ -48,7 +48,13 @@ impl ShellSession {
             let shell_path = std::env::var("SHELL")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "/bin/sh".to_string());
+                .unwrap_or_else(|| {
+                    if std::path::Path::new("/bin/bash").exists() {
+                        "/bin/bash".to_string()
+                    } else {
+                        "/bin/sh".to_string()
+                    }
+                });
             log::info!("Shell session started with: {}", shell_path);
             CommandBuilder::new(shell_path)
         };

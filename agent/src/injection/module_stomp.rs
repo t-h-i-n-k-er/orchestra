@@ -229,12 +229,12 @@ impl Injector for ModuleStompInjector {
                 // very common/high-visibility choices and are filtered at runtime
                 // by remote .text size before selection.
                 let candidates = [
-                    "msxml3.dll",
-                    "msfte.dll",
+                    "dwmapi.dll",
+                    "uxtheme.dll",
                     "netprofm.dll",
                     "devobj.dll",
                     "cryptbase.dll",
-                    "dbgeng.dll",
+                    "version.dll",
                     "wer.dll",
                 ];
                 const PREFERRED_TEXT_MIN: usize = 256 * 1024;

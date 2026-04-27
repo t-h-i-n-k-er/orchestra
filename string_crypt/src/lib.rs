@@ -187,12 +187,19 @@ pub fn enc_str(input: TokenStream) -> TokenStream {
                 if kstate == 0 { kstate = 0x9e3779b97f4a7c15u64; }
                 let mut rc4_key = [0u8; 16];
                 let mut _ki = 0usize;
-                while _ki < 16 {
+                let mut _round = 0usize;
+                while _round < 2 {
                     kstate ^= kstate << 13;
                     kstate ^= kstate >> 7;
                     kstate ^= kstate << 17;
-                    rc4_key[_ki] = kstate as u8;
-                    _ki += 1;
+                    let _kbytes = kstate.to_le_bytes();
+                    let mut _kb = 0usize;
+                    while _kb < 8 && _ki < 16 {
+                        rc4_key[_ki] = _kbytes[_kb];
+                        _ki += 1;
+                        _kb += 1;
+                    }
+                    _round += 1;
                 }
                 let mut s = [0u8; 256];
                 for i in 0..=255usize { s[i] = i as u8; }

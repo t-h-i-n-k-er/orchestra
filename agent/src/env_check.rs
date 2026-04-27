@@ -307,17 +307,97 @@ fn is_expected_hypervisor() -> bool {
 
     #[cfg(target_os = "macos")]
     {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc::{self, RecvTimeoutError};
+        use std::time::{Duration, Instant};
+
         // macOS cloud VM detection: probe IOKit registry and system_profiler
         // for known cloud/virtualisation indicators.
 
-        // Check IOKit for VirtIO devices (AWS EC2 Mac uses AppleVirtIO).
-        if let Ok(out) = std::process::Command::new("ioreg").args(["-l"]).output() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if stdout.contains("AppleVirtIO")
-                || stdout.contains("VMwareVirtual")
-                || stdout.contains("PrlVirtual")
-            {
-                return true;
+        // Check IOKit for VirtIO devices (AWS EC2 Mac uses AppleVirtIO)
+        // without blocking startup on loaded systems.
+        if let Ok(mut child) = Command::new("ioreg")
+            .args(["-l"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(stdout) = child.stdout.take() {
+                let (tx, rx) = mpsc::channel::<String>();
+                let reader = std::thread::spawn(move || {
+                    let mut buf = BufReader::new(stdout);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match buf.read_line(&mut line) {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let _ = tx.send(line.to_ascii_lowercase());
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut found_hypervisor = false;
+                let mut timed_out = false;
+
+                loop {
+                    if Instant::now() >= deadline {
+                        timed_out = true;
+                        let _ = child.kill();
+                        break;
+                    }
+
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let wait_for = std::cmp::min(remaining, Duration::from_millis(100));
+
+                    match rx.recv_timeout(wait_for) {
+                        Ok(line) => {
+                            if line.contains("applevirtio")
+                                || line.contains("vmwarevirtual")
+                                || line.contains("prlvirtual")
+                            {
+                                found_hypervisor = true;
+                                let _ = child.kill();
+                                break;
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) => match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) => {}
+                            Err(_) => break,
+                        },
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+
+                if !found_hypervisor {
+                    while let Ok(line) = rx.try_recv() {
+                        if line.contains("applevirtio")
+                            || line.contains("vmwarevirtual")
+                            || line.contains("prlvirtual")
+                        {
+                            found_hypervisor = true;
+                            break;
+                        }
+                    }
+                }
+
+                let _ = child.wait();
+                let _ = reader.join();
+
+                if found_hypervisor {
+                    return true;
+                }
+
+                if timed_out {
+                    log::debug!(
+                        "env_check: is_expected_hypervisor ioreg -l timed out after 2s"
+                    );
+                }
             }
         }
 
@@ -1157,6 +1237,7 @@ fn is_ld_preload_set() -> bool {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn linux_has_cap_sys_ptrace() -> bool {
     // CAP_SYS_PTRACE is capability bit 19.
     const CAP_SYS_PTRACE_BIT: u32 = 19;
@@ -1178,6 +1259,7 @@ fn linux_has_cap_sys_ptrace() -> bool {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn linux_proc_real_uid(proc_path: &Path) -> Option<u32> {
     let status = std::fs::read_to_string(proc_path.join("status")).ok()?;
     let uid_line = status.lines().find(|line| line.starts_with("Uid:"))?;
@@ -1189,12 +1271,12 @@ fn linux_proc_real_uid(proc_path: &Path) -> Option<u32> {
 
 #[cfg(target_os = "linux")]
 fn is_tracer_process_running() -> bool {
-    // Primary check: Check for a ptrace attachment on our own process
+    // Primary check: TracerPid in our own status — fast and reliable.
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
             if line.starts_with("TracerPid:") {
                 let pid = line.trim_start_matches("TracerPid:").trim();
-                // A TracerPid other than 0 means we are actively being debugged/traced
+                // A TracerPid other than 0 means we are actively being traced.
                 if pid != "0" {
                     return true;
                 }
@@ -1202,18 +1284,19 @@ fn is_tracer_process_running() -> bool {
         }
     }
 
-    // Secondary check: look for tracer processes owned by the current user,
-    // avoiding false positives from other users' debuggers on shared systems (4.5)
-    let tracers = ["strace", "gdb", "ltrace", "gdbserver"];
+    // Secondary check: scan /proc/<pid>/status (world-readable, no
+    // CAP_SYS_PTRACE required, no environ reads) for known tracer names.
+    // Each status file is only a few hundred bytes; Name: is always the
+    // second line, so reads terminate early in practice.
+    const TRACERS: &[&str] = &["strace", "gdb", "ltrace", "gdbserver"];
     let my_uid = unsafe { libc::getuid() };
-    let can_ptrace_cross_uid = unsafe { libc::geteuid() == 0 } || linux_has_cap_sys_ptrace();
     let mut scanned = 0usize;
 
     if let Ok(procs) = std::fs::read_dir("/proc") {
-        for proc in procs.flatten() {
-            let proc_path = proc.path();
+        for entry in procs.flatten() {
+            let proc_path = entry.path();
 
-            // /proc contains non-PID entries (net, fs, sys, ...). Skip them.
+            // Skip non-PID entries (/proc/net, /proc/sys, etc.)
             let is_pid_dir = proc_path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -1226,45 +1309,50 @@ fn is_tracer_process_running() -> bool {
             scanned += 1;
             if scanned > 200 {
                 log::debug!(
-                    "env_check: /proc tracer scan reached 200 processes without a GUI marker; stopping early"
+                    "env_check: /proc tracer scan reached 200-process limit; stopping"
                 );
                 break;
             }
 
-            // Read /proc/<pid>/status first to get the process UID and avoid
-            // predictable EACCES errors on /proc/<pid>/environ for other users.
-            let proc_uid = match linux_proc_real_uid(&proc_path) {
-                Some(uid) => uid,
-                None => continue,
+            let status_text = match std::fs::read_to_string(proc_path.join("status")) {
+                Ok(s) => s,
+                Err(_) => continue,
             };
-            let same_uid = proc_uid == my_uid;
 
-            if let Ok(cmdline) = std::fs::read_to_string(proc_path.join("cmdline")) {
-                let parts: Vec<&str> = cmdline.split('\0').collect();
-                if let Some(prog) = parts.first() {
-                    let prog_name = Path::new(prog)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("");
-                    if tracers.contains(&prog_name) {
-                        return true;
-                    }
+            // Extract Name: and Uid: from status in a single pass.
+            let mut proc_name: Option<&str> = None;
+            let mut proc_uid: Option<u32> = None;
+
+            for line in status_text.lines() {
+                if let Some(name) = line.strip_prefix("Name:") {
+                    proc_name = Some(name.trim());
+                } else if let Some(uid_field) = line.strip_prefix("Uid:") {
+                    // Uid: real  effective  saved  fs
+                    proc_uid = uid_field.split_whitespace().next()
+                        .and_then(|s| s.parse::<u32>().ok());
+                }
+                if proc_name.is_some() && proc_uid.is_some() {
+                    break;
                 }
             }
 
-            if !same_uid && !can_ptrace_cross_uid {
+            let name = match proc_name {
+                Some(n) => n,
+                None => continue,
+            };
+            let uid = match proc_uid {
+                Some(u) => u,
+                None => continue,
+            };
+
+            // Only flag tracers belonging to the same user (avoids false
+            // positives from another user's legitimate debugger session).
+            if uid != my_uid {
                 continue;
             }
 
-            // Early-exit optimization: if we observe a GUI session marker in
-            // a process environment (`DISPLAY=`), stop scanning immediately.
-            if let Ok(environ) = std::fs::read(proc_path.join("environ")) {
-                if environ
-                    .split(|&b| b == 0)
-                    .any(|entry| entry.starts_with(b"DISPLAY="))
-                {
-                    return false;
-                }
+            if TRACERS.contains(&name) {
+                return true;
             }
         }
     }
