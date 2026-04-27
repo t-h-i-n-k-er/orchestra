@@ -293,6 +293,28 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         let stack_ptr: *const u64 = stack_args.as_ptr();
         let status: i32;
 
+        // SAFETY: Register allocation constraints are explicit to guarantee that
+        // `nstack` and `stack_ptr` can never share a register with `a1` or `a2`.
+        //
+        // The rep movsq trio uses:
+        //   rcx – count (decremented to zero by the instruction)
+        //   rsi – source pointer (advanced past the last copied qword)
+        //   rdi – destination pointer (also advanced)
+        //
+        // `nstack` is bound to rcx via `inout("rcx") nstack => _` and
+        // `stack_ptr` is bound to rsi via `inout("rsi") stack_ptr => _`.
+        // Because those two physical registers are already claimed as named
+        // operands, LLVM cannot use them for any other `in(reg)` operand.
+        // In particular, `a1` and `a2` are guaranteed to land on registers
+        // outside {rcx, rsi, rdi, rax, rdx, r8, r9, r10, r11, r14} (all of
+        // which are declared), leaving only {rbx, r12, r13, r15} as candidates
+        // — none of which are read or written by this asm block.
+        //
+        // Consequently the rep movsq path is fully consumed and rcx/rsi/rdi
+        // are all advanced/zeroed BEFORE `mov rcx, {a1}` reads the first
+        // syscall argument.  There is no longer any dependency on template
+        // string ordering for correctness: the constraint declarations alone
+        // enforce the required sequencing.
         asm!(
             // Save RSP so we can restore it cleanly after the call.
             "mov r14, rsp",
@@ -302,20 +324,26 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             // the callee then sees the 5th argument at [rsp + 0x28] (= our
             // pre-call [rsp + 0x20]).  Using 0x28 here would shift all stack
             // args by one slot — a calling-convention violation.
-            "mov rax, {nstack}",
+            //
+            // rcx already holds nstack (explicit inout("rcx") constraint).
+            "mov rax, rcx",
             "shl rax, 3",
             "add rax, 0x20 + 15",
             "and rax, -16",
             "sub rsp, rax",
             // Copy stack arguments (args[4..]) into [rsp + 0x20 .. rsp + 0x20 + nstack*8].
-            "test {nstack}, {nstack}",
+            // rcx = count (nstack), rsi = source (stack_ptr), rdi = destination.
+            // All three are consumed by rep movsq; a1/a2 are in separate registers
+            // and cannot be touched by this loop (see SAFETY comment above).
+            "test rcx, rcx",
             "jz 4f",
-            "mov rcx, {nstack}",
-            "mov rsi, {stack_ptr}",
             "lea rdi, [rsp + 0x20]",
             "cld",
             "rep movsq",
             "4:",
+            // Load syscall arguments.  {a1} is in a compiler-chosen register
+            // distinct from every named register above; it is safe to read here
+            // now that the rep movsq trio (rcx/rsi/rdi) has been fully consumed.
             "mov rcx, {a1}",
             "mov rdx, {a2}",
             "mov r10, rcx",
@@ -323,21 +351,23 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             "mov r11, {gadget}",
             "call r11", // indirect syscall
             "mov rsp, r14",
-            ssn        = in(reg) ssn,
-            gadget     = in(reg) gadget_addr,
-            nstack     = in(reg) nstack,
-            stack_ptr  = in(reg) stack_ptr,
-            a1         = in(reg) a1,
-            a2         = in(reg) a2,
+            ssn    = in(reg) ssn,
+            gadget = in(reg) gadget_addr,
+            // nstack → rcx; stack_ptr → rsi.  Explicit inout constraints prevent
+            // the compiler from co-allocating either with a1/a2/ssn/gadget.
+            inout("rcx") nstack => _,
+            inout("rsi") stack_ptr => _,
+            a1 = in(reg) a1,
+            a2 = in(reg) a2,
             // r8/r9 are both inputs (args 3 and 4) and caller-saved (the called
             // function may overwrite them).  Declare as inlateout so the compiler
             // knows the values are gone after the asm block.
             inlateout("r8")  a3 => _,
             inlateout("r9")  a4 => _,
             lateout("rax") status,
-            out("rcx") _, out("rdx") _, out("r10") _, out("r11") _,
+            out("rdx") _, out("r10") _, out("r11") _,
             out("r14") _,
-            out("rsi") _, out("rdi") _,
+            out("rdi") _,
             // NOTE: nostack intentionally absent — this asm block modifies RSP.
         );
 
