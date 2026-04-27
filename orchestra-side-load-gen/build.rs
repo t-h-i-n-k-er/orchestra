@@ -1,36 +1,70 @@
 use std::path::Path;
 
+struct Sm64 {
+    state: u64,
+}
+
+impl Sm64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    fn fill_bytes(&mut self, out: &mut [u8]) {
+        let mut i = 0usize;
+        while i < out.len() {
+            let word = self.next_u64().to_le_bytes();
+            let take = (out.len() - i).min(8);
+            out[i..i + take].copy_from_slice(&word[..take]);
+            i += take;
+        }
+    }
+}
+
+fn fmt_hex_array(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("0x{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn main() {
-    // Generate a random 4-byte XOR key at build time so every build produces
-    // a different encrypted payload without requiring a runtime secret.
-    let key: [u8; 4] = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-        // Use a mix of time and process ID to get per-build randomness without
-        // pulling the `rand` crate into build-script dependencies.
-        let t = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
-        let pid = std::process::id();
+    // M-39: Generate 44 bytes of key material via SplitMix64:
+    //   32-byte ChaCha20 key + 12-byte nonce.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let pid = std::process::id() as u64;
+    let seed = nanos ^ pid.wrapping_mul(0x9E3779B97F4A7C15);
 
-        let mut h = DefaultHasher::new();
-        t.hash(&mut h);
-        pid.hash(&mut h);
-        let v = h.finish();
-        let bytes = v.to_le_bytes();
-        [bytes[0], bytes[1], bytes[2], bytes[3]]
-    };
+    let mut sm = Sm64::new(seed);
+    let mut material = [0u8; 44];
+    sm.fill_bytes(&mut material);
+
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&material[..32]);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&material[32..44]);
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let dest = Path::new(&out_dir).join("side_key.rs");
     std::fs::write(
         &dest,
         format!(
-            "const SIDE_XOR_KEY: [u8; 4] = [0x{:02X}, 0x{:02X}, 0x{:02X}, 0x{:02X}];\n",
-            key[0], key[1], key[2], key[3]
+            "const SIDE_CHACHA_KEY: [u8; 32] = [{}];\nconst SIDE_CHACHA_NONCE: [u8; 12] = [{}];\n",
+            fmt_hex_array(&key),
+            fmt_hex_array(&nonce),
         ),
     )
     .unwrap();
