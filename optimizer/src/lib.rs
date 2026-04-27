@@ -306,15 +306,6 @@ impl Pass for InstructionSchedulingPass {
 /// span (default 256 bytes), apply the registered passes, then write the
 /// result back into executable memory after temporarily lowering page
 /// protections via `VirtualProtect` (Windows) or `mprotect` (Unix).
-/// Without the `unsafe-runtime-rewrite` feature this is a metadata-only
-/// no-op — the optimizer passes can still be exercised via `apply_passes`
-/// from tests.
-///
-/// With `unsafe-runtime-rewrite` enabled, the function performs in-place
-/// rewriting of the named function: locate the symbol, decode an estimated
-/// span (default 256 bytes), apply the registered passes, then write the
-/// result back into executable memory after temporarily lowering page
-/// protections via `VirtualProtect` (Windows) or `mprotect` (Unix).
 
 // ── Instruction substitution pass ────────────────────────────────────────────
 
@@ -521,14 +512,19 @@ mod runtime_rewrite {
         let original =
             unsafe { std::slice::from_raw_parts(addr as *const u8, span) }.to_vec();
         // Apply optimizer passes
-        let new_bytes = apply_passes(&original);
-        // Refuse if size changed — would clobber adjacent code
-        if new_bytes.len() != original.len() {
+        let mut new_bytes = apply_passes(&original);
+        // If the new code is longer than the original span, refuse — we cannot
+        // safely overwrite into adjacent code.  If shorter, NOP-pad to fill
+        // the gap so we don't leave stale bytes that could confuse a disassembler.
+        if new_bytes.len() > original.len() {
             return Err(format!(
-                "rewrite would change size ({} -> {}); refusing",
+                "rewrite would grow code ({} -> {} bytes); refusing",
                 original.len(),
                 new_bytes.len()
             ));
+        }
+        if new_bytes.len() < original.len() {
+            new_bytes.resize(original.len(), 0x90); // NOP-pad to original size
         }
         // Lower protection, copy, restore.
         unsafe {

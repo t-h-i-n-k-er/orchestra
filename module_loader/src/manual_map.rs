@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use winapi::ctypes::c_void;
 use winapi::shared::ntdef::{LIST_ENTRY, UNICODE_STRING};
 use winapi::um::memoryapi::{
-    VirtualAlloc, VirtualAllocEx, VirtualFree, VirtualProtect, WriteProcessMemory,
-    ReadProcessMemory,
+    VirtualAlloc, VirtualAllocEx, VirtualFree, VirtualProtect, VirtualProtectEx,
+    WriteProcessMemory, ReadProcessMemory,
 };
 use winapi::um::winnt::{
     DLL_PROCESS_ATTACH, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT,
@@ -690,7 +690,7 @@ pub unsafe fn load_dll_in_remote_process(
         std::ptr::null_mut(),
         image_size,
         MEM_COMMIT | MEM_RESERVE,
-        PAGE_EXECUTE_READWRITE,
+        PAGE_READWRITE, // RW initially; per-section protections applied after sections are written
     );
     if remote_base.is_null() {
         return Err(anyhow!(
@@ -738,6 +738,41 @@ pub unsafe fn load_dll_in_remote_process(
         }
         let section_data = &dll_bytes[raw_offset..raw_offset + raw_size];
         write_remote(section.virtual_address as usize, section_data)?;
+    }
+
+    // ── Step 3b: apply per-section memory protections ─────────────────────
+    // The allocation was made as PAGE_READWRITE so we could write sections.
+    // Now apply the correct per-section protections so executable sections
+    // are not unnecessarily writable (removes the RWX exposure).
+    for section in &pe.sections {
+        let virt_size = section.virtual_size as usize;
+        if virt_size == 0 {
+            continue;
+        }
+        let rva = section.virtual_address as usize;
+        let ch = section.characteristics;
+        let protect = if ch & IMAGE_SCN_MEM_EXECUTE != 0 {
+            if ch & IMAGE_SCN_MEM_WRITE != 0 {
+                PAGE_EXECUTE_READWRITE
+            } else if ch & IMAGE_SCN_MEM_READ != 0 {
+                PAGE_EXECUTE_READ
+            } else {
+                PAGE_EXECUTE_READ
+            }
+        } else if ch & IMAGE_SCN_MEM_WRITE != 0 {
+            if ch & IMAGE_SCN_MEM_READ != 0 {
+                PAGE_READWRITE
+            } else {
+                PAGE_READWRITE
+            }
+        } else if ch & IMAGE_SCN_MEM_READ != 0 {
+            PAGE_READONLY
+        } else {
+            PAGE_READONLY
+        };
+        let target = (remote_base as usize + rva) as *mut c_void;
+        let mut old = 0u32;
+        VirtualProtectEx(target_process, target, virt_size, protect, &mut old);
     }
 
     // ── Step 4a: compute and apply base relocations ────────────────────────
@@ -873,24 +908,75 @@ pub unsafe fn load_dll_in_remote_process(
         write_remote(import.rva, &iat_addr_bytes)?;
     }
 
-    // ── Step 5: invoke the DLL entry point via a remote thread ────────────
-    // DllMain signature: BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID).
-    // CreateRemoteThread passes a single LPVOID argument.  We use NULL for the
-    // lpParameter (reserved third argument) because DllMain only uses it for
-    // DLL_THREAD_DETACH / DLL_PROCESS_DETACH paths, which we don't trigger.
+    // ── Step 5: invoke DllMain via a shellcode stub ───────────────────────
+    // DllMain expects (HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved).
+    // CreateRemoteThread only passes a single LPVOID parameter, so calling the
+    // entry point directly would give DllMain garbage in rcx/rdx/r8.  We write
+    // a small position-independent x86-64 stub that sets up the correct
+    // calling-convention arguments before jumping to DllMain.
     let entry_rva = opt.standard_fields.address_of_entry_point as usize;
     if entry_rva != 0 {
         let entry_va = remote_base as usize + entry_rva;
-        // lpStartAddress must be an LPTHREAD_START_ROUTINE (u64 → u32 return);
-        // the DLL_PROCESS_ATTACH return value is discarded here.
+
+        // Shellcode (x86-64, position-independent):
+        //   mov rcx, <remote_base>      ; HINSTANCE hinstDLL
+        //   mov edx, 1                  ; DLL_PROCESS_ATTACH
+        //   xor r8d, r8d                ; lpvReserved = NULL
+        //   mov rax, <entry_va>         ; entry point address
+        //   call rax
+        //   ret
+        let mut stub: Vec<u8> = Vec::with_capacity(30);
+        stub.extend_from_slice(&[0x48, 0xB9]);
+        stub.extend_from_slice(&(remote_base as u64).to_le_bytes());
+        stub.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]);
+        stub.extend_from_slice(&[0x45, 0x31, 0xC0]);
+        stub.extend_from_slice(&[0x48, 0xB8]);
+        stub.extend_from_slice(&(entry_va as u64).to_le_bytes());
+        stub.extend_from_slice(&[0xFF, 0xD0]);
+        stub.extend_from_slice(&[0xC3]);
+
+        // Allocate memory for the stub (RW first so we can write it).
+        let stub_mem = VirtualAllocEx(
+            target_process,
+            std::ptr::null_mut(),
+            stub.len(),
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
+        if stub_mem.is_null() {
+            return Err(anyhow!(
+                "VirtualAllocEx for DllMain stub failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let mut written = 0usize;
+        WriteProcessMemory(
+            target_process,
+            stub_mem,
+            stub.as_ptr() as *const c_void,
+            stub.len(),
+            &mut written,
+        );
+
+        // Make the stub executable (RX only — no need for write after writing).
+        let mut old_prot = 0u32;
+        VirtualProtectEx(
+            target_process,
+            stub_mem,
+            stub.len(),
+            PAGE_EXECUTE_READ,
+            &mut old_prot,
+        );
+
         let thread_start: winapi::um::minwinbase::LPTHREAD_START_ROUTINE =
-            std::mem::transmute(entry_va);
+            std::mem::transmute(stub_mem as usize);
         let thread = CreateRemoteThread(
             target_process,
             std::ptr::null_mut(),
             0,
             thread_start,
-            std::ptr::null_mut(), // lpParameter = NULL
+            std::ptr::null_mut(),
             0,
             std::ptr::null_mut(),
         );

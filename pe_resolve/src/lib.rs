@@ -22,8 +22,12 @@ pub fn hash_wstr(bytes: &[u16]) -> u32 {
         if c == 0 {
             break;
         }
-        let b = (c as u8).to_ascii_lowercase(); // simplified
-        hash = hash.rotate_right(13) ^ (b as u32);
+        // Fold each UTF-16 code unit to lowercase and mix both bytes into the
+        // hash.  Truncating to u8 breaks for non-ASCII module names (CJK, etc.).
+        let lo = (c as u8).to_ascii_lowercase();
+        let hi = ((c >> 8) as u8).to_ascii_lowercase();
+        hash = hash.rotate_right(13) ^ (lo as u32);
+        hash = hash.rotate_right(13) ^ (hi as u32);
     }
     hash
 }
@@ -47,8 +51,13 @@ pub unsafe fn get_module_handle_by_hash(target_hash: u32) -> Option<usize> {
     let mut module_list = *(ldr.add(0x20) as *const usize) as *const u8;
 
     while !core::ptr::eq(module_list, ldr.add(0x20)) {
-        let base_dll_name_ptr = *(module_list.add(0x48) as *const usize) as *const u16;
-        let base_dll_name_len = *(module_list.add(0x40) as *const u16) as usize / 2;
+        // LDR_DATA_TABLE_ENTRY offsets when walking via InMemoryOrderLinks.Flink
+        // (module_list points to InMemoryOrderLinks at struct +0x10):
+        //   +0x20  DllBase
+        //   +0x48  BaseDllName.Length (u16, byte count)
+        //   +0x50  BaseDllName.Buffer (pointer to UTF-16)
+        let base_dll_name_ptr = *(module_list.add(0x50) as *const usize) as *const u16;
+        let base_dll_name_len = *(module_list.add(0x48) as *const u16) as usize / 2;
 
         if !base_dll_name_ptr.is_null() && base_dll_name_len > 0 {
             let slice = core::slice::from_raw_parts(base_dll_name_ptr, base_dll_name_len);
@@ -132,8 +141,13 @@ pub unsafe fn get_module_handle_by_hash(target_hash: u32) -> Option<usize> {
     let mut module_list = *(ldr.add(0x20) as *const usize) as *const u8;
 
     while module_list as usize != ldr.add(0x20) as usize {
-        let base_dll_name_ptr = *(module_list.add(0x48) as *const usize) as *const u16;
-        let base_dll_name_len = *(module_list.add(0x40) as *const u16) as usize / 2;
+        // LDR_DATA_TABLE_ENTRY offsets when walking via InMemoryOrderLinks.Flink
+        // (module_list points to InMemoryOrderLinks at struct +0x10):
+        //   +0x20  DllBase
+        //   +0x48  BaseDllName.Length (u16, byte count)
+        //   +0x50  BaseDllName.Buffer (pointer to UTF-16)
+        let base_dll_name_ptr = *(module_list.add(0x50) as *const usize) as *const u16;
+        let base_dll_name_len = *(module_list.add(0x48) as *const u16) as usize / 2;
 
         if !base_dll_name_ptr.is_null() && base_dll_name_len > 0 {
             let slice = core::slice::from_raw_parts(base_dll_name_ptr, base_dll_name_len);

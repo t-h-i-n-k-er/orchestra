@@ -205,7 +205,7 @@ impl CryptoSession {
     /// Build a session by hashing `pre_shared_secret` with SHA-256 to produce
     /// the 32-byte AES key.
     pub fn from_shared_secret(pre_shared_secret: &[u8]) -> Self {
-        let hk = hkdf::Hkdf::<Sha256>::new(None, pre_shared_secret);
+        let hk = hkdf::Hkdf::<Sha256>::new(Some(b"orchestra-crypto-session-v1"), pre_shared_secret);
         let mut key_bytes = [0u8; KEY_LEN];
         hk.expand(b"orchestra-aes-gcm", &mut key_bytes)
             .expect("HKDF-SHA256 expand must succeed");

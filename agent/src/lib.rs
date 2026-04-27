@@ -55,6 +55,11 @@ impl Agent {
 
         let cfg = config::load_config()?;
 
+        // Enforce kill date from malleable profile at agent startup (4-2).
+        if !cfg.malleable_profile.kill_date.is_empty() {
+            crate::c2_http::check_kill_date_pub(&cfg.malleable_profile.kill_date)?;
+        }
+
         // Derive the module-decryption key from configuration.
         // In production this key must be set in agent.toml.
         let crypto_key: [u8; 32] = if let Some(ref b64) = cfg.module_aes_key {

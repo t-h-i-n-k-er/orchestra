@@ -65,6 +65,16 @@ unsafe extern "system" fn veh_handler(
             if *ptr != 0xC3 && *ptr != 0xC2 {
                 return winapi::vc::excpt::EXCEPTION_CONTINUE_SEARCH;
             }
+
+            // Stack corruption mitigation: redirect RIP to the ret gadget.
+            // For a bare `ret` (0xC3) the CPU will pop [Rsp] into Rip and
+            // add 8, which is safe provided the HWBP fires at the function
+            // entry before any prologue has shifted Rsp.  For `ret N` (0xC2)
+            // the CPU additionally adds N to Rsp after the pop, cleaning up
+            // the stack arguments — this is generally the safer variant.
+            // In both cases we set Rip to the gadget and let the CPU handle
+            // the stack adjustment; we do NOT manually touch Rsp here to
+            // avoid double-adjusting it.
             (*context).Rip = ptr as u64;
 
             return winapi::vc::excpt::EXCEPTION_CONTINUE_EXECUTION;

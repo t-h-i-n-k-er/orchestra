@@ -914,10 +914,17 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                 let addr_of_data = *(*original_thunk).u1.AddressOfData() as u64;
                 let proc_addr = if (addr_of_data & winapi::um::winnt::IMAGE_ORDINAL_FLAG64) != 0 {
                     let ordinal = (addr_of_data & 0xffff) as u16;
-                    winapi::um::libloaderapi::GetProcAddress(
-                        dep_handle as *mut _,
-                        ordinal as winapi::um::winnt::LPCSTR,
-                    ) as usize
+                    // Resolve via clean export table instead of hookable GetProcAddress (M-24).
+                    let addr = get_export_addr_by_ordinal(dep_handle as usize, ordinal as u32);
+                    if !addr.is_null() {
+                        addr as usize
+                    } else {
+                        // Fallback to GetProcAddress when clean resolution fails (e.g. no clean map).
+                        winapi::um::libloaderapi::GetProcAddress(
+                            dep_handle as *mut _,
+                            ordinal as winapi::um::winnt::LPCSTR,
+                        ) as usize
+                    }
                 } else {
                     let import_by_name = (base + addr_of_data as usize)
                         as *const winapi::um::winnt::IMAGE_IMPORT_BY_NAME;
@@ -980,12 +987,60 @@ unsafe fn get_export_addr(base: usize, func_name_ptr: *const i8) -> usize {
 
         if c_name == target_name {
             let ord = *ords.add(i);
-            let func_rva = *funcs.add(ord as usize);
-            return base + func_rva as usize;
+            let func_rva = *funcs.add(ord as usize) as usize;
+
+            // Forwarded export check: if the function RVA falls within the
+            // export directory itself, it points to an ASCII "DLL.FuncName"
+            // forward string — not executable code.  Skip it.
+            let export_dir_start = export_dir_rva as usize;
+            let export_dir_end = export_dir_start
+                + (*export_dir).NumberOfFunctions as usize * 4;
+            if func_rva >= export_dir_start && func_rva < export_dir_end {
+                // Forwarded export — cannot resolve here without loading the
+                // target DLL.  Return 0 to indicate unresolved.
+                return 0;
+            }
+
+            return base + func_rva;
         }
     }
 
     0
+}
+
+/// Resolve an export by ordinal from a clean-mapped DLL.
+/// This avoids calling the hookable GetProcAddress for ordinal imports (M-24).
+#[cfg(windows)]
+unsafe fn get_export_addr_by_ordinal(base: usize, ordinal: u32) -> *mut std::ffi::c_void {
+    let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
+    if (*dos_header).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
+        return std::ptr::null_mut();
+    }
+    let nt_headers = (base + (*dos_header).e_lfanew as usize)
+        as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
+    let export_dir_rva = (*nt_headers).OptionalHeader.DataDirectory
+        [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
+        .VirtualAddress;
+    if export_dir_rva == 0 {
+        return std::ptr::null_mut();
+    }
+    let ed =
+        (base + export_dir_rva as usize) as *const winapi::um::winnt::IMAGE_EXPORT_DIRECTORY;
+    let base_ordinal = (*ed).Base;
+    let num_funcs = (*ed).NumberOfFunctions;
+    let funcs = (base + (*ed).AddressOfFunctions as usize) as *const u32;
+    if ordinal < base_ordinal {
+        return std::ptr::null_mut();
+    }
+    let idx = (ordinal - base_ordinal) as usize;
+    if idx >= num_funcs as usize {
+        return std::ptr::null_mut();
+    }
+    let func_rva = *funcs.add(idx) as usize;
+    if func_rva == 0 {
+        return std::ptr::null_mut();
+    }
+    (base + func_rva) as *mut std::ffi::c_void
 }
 
 /// Errors that can arise from the `clean_call!` macro.

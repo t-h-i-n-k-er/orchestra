@@ -589,15 +589,19 @@ pub mod macos {
     /// prevent cron from mailing the user.
     pub struct CronJob;
 
+    /// Marker appended to the cron entry so that only Orchestra's own @reboot
+    /// entry is removed, never any pre-existing @reboot entries (H-15 fix).
+    const MAC_CRON_MARKER: &str = "# orchestra-persist";
+
     impl Persist for CronJob {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
             let exe = executable_path.to_string_lossy();
-            let entry = format!("@reboot {} >/dev/null 2>&1", exe);
+            let entry = format!("@reboot {} >/dev/null 2>&1 {}", exe, MAC_CRON_MARKER);
             let out = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!(
                     "(crontab -l 2>/dev/null | grep -v '{}'; echo '{}') | crontab -",
-                    exe, entry
+                    MAC_CRON_MARKER, entry
                 ))
                 .status()
                 .map_err(|e| anyhow!("CronJob::install: {}", e))?;
@@ -611,9 +615,12 @@ pub mod macos {
         fn remove(&self) -> Result<()> {
             let _ = std::process::Command::new("sh")
                 .arg("-c")
-                .arg("crontab -l 2>/dev/null | grep -v '@reboot' | crontab -")
+                .arg(format!(
+                    "crontab -l 2>/dev/null | grep -v '{}' | crontab -",
+                    MAC_CRON_MARKER
+                ))
                 .status();
-            log::info!("CronJob::remove: removed @reboot entries");
+            log::info!("CronJob::remove: removed orchestra @reboot entry");
             Ok(())
         }
 
@@ -623,7 +630,7 @@ pub mod macos {
                 .arg("crontab -l 2>/dev/null")
                 .output()
                 .map_err(|e| anyhow!("CronJob::verify: {}", e))?;
-            Ok(String::from_utf8_lossy(&out.stdout).contains("@reboot"))
+            Ok(String::from_utf8_lossy(&out.stdout).contains(MAC_CRON_MARKER))
         }
     }
 
@@ -773,44 +780,37 @@ pub mod macos {
 
     impl Persist for LoginItem {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            let exe = executable_path.to_string_lossy();
-            // Use osascript to add a login item via System Events API.
-            let script = format!(
-                r#"tell application "System Events" to make login item at end with properties {{name:"{name}", path:"{path}", hidden:true}}"#,
-                name = self.app_name,
-                path = exe,
-            );
-            let status = std::process::Command::new("osascript")
-                .args(["-e", &script])
-                .status()
-                .map_err(|e| anyhow!("LoginItem::install: osascript: {}", e))?;
-            if !status.success() {
-                return Err(anyhow!("LoginItem::install: osascript returned non-zero"));
-            }
-            log::info!("LoginItem::install: added login item '{}'", self.app_name);
-            Ok(())
+            // The System Events "make login item" API was deprecated in
+            // macOS 10.11 and is non-functional on macOS 12+.  Delegate to
+            // LaunchAgent which uses launchctl and is the modern supported
+            // mechanism for login-time persistence (H-16 fix).
+            let la = LaunchAgent {
+                label: format!(
+                    "com.{}.helper",
+                    self.app_name.to_ascii_lowercase().replace(' ', "-")
+                ),
+            };
+            la.install(executable_path)
         }
 
         fn remove(&self) -> Result<()> {
-            let script = format!(
-                r#"tell application "System Events" to delete login item "{name}""#,
-                name = self.app_name
-            );
-            let _ = std::process::Command::new("osascript")
-                .args(["-e", &script])
-                .status();
-            log::info!("LoginItem::remove: removed login item '{}'", self.app_name);
-            Ok(())
+            let la = LaunchAgent {
+                label: format!(
+                    "com.{}.helper",
+                    self.app_name.to_ascii_lowercase().replace(' ', "-")
+                ),
+            };
+            la.remove()
         }
 
         fn verify(&self) -> Result<bool> {
-            let script =
-                format!(r#"tell application "System Events" to get the name of every login item"#);
-            let out = std::process::Command::new("osascript")
-                .args(["-e", &script])
-                .output()
-                .map_err(|e| anyhow!("LoginItem::verify: {}", e))?;
-            Ok(String::from_utf8_lossy(&out.stdout).contains(&self.app_name))
+            let la = LaunchAgent {
+                label: format!(
+                    "com.{}.helper",
+                    self.app_name.to_ascii_lowercase().replace(' ', "-")
+                ),
+            };
+            la.verify()
         }
     }
 }
@@ -961,7 +961,7 @@ pub mod linux {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
             let exe = executable_path.to_string_lossy();
             let home = dirs::home_dir().ok_or_else(|| anyhow!("ShellProfile: no home dir"))?;
-            for profile_name in &[".bashrc", ".profile", ".bash_profile"] {
+            for profile_name in &[".zshrc", ".bashrc", ".profile", ".bash_profile"] {
                 let path = home.join(profile_name);
                 if path.exists() {
                     let existing = std::fs::read_to_string(&path).unwrap_or_default();
@@ -998,7 +998,7 @@ pub mod linux {
                 Some(h) => h,
                 None => return Ok(()),
             };
-            for profile_name in &[".bashrc", ".profile", ".bash_profile"] {
+            for profile_name in &[".zshrc", ".bashrc", ".profile", ".bash_profile"] {
                 let path = home.join(profile_name);
                 if !path.exists() {
                     continue;
@@ -1017,7 +1017,7 @@ pub mod linux {
                 Some(h) => h,
                 None => return Ok(false),
             };
-            for profile_name in &[".bashrc", ".profile", ".bash_profile"] {
+            for profile_name in &[".zshrc", ".bashrc", ".profile", ".bash_profile"] {
                 let path = home.join(profile_name);
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if content.contains(SHELL_MARKER_BEGIN) || content.contains("# system-update-")

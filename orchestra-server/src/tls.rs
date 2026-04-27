@@ -42,7 +42,7 @@ fn cert_fingerprint(pem_bytes: &[u8]) -> Option<String> {
         .collect();
     let der = base64::engine::general_purpose::STANDARD.decode(&b64).ok()?;
     let digest = Sha256::digest(&der);
-    Some(digest.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(":"))
+    Some(digest.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(""))
 }
 
 pub async fn build(cert: Option<&Path>, key: Option<&Path>) -> Result<RustlsConfig> {

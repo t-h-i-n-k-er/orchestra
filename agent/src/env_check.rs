@@ -305,6 +305,47 @@ fn is_expected_hypervisor() -> bool {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        // macOS cloud VM detection: probe IOKit registry and system_profiler
+        // for known cloud/virtualisation indicators.
+
+        // Check IOKit for VirtIO devices (AWS EC2 Mac uses AppleVirtIO).
+        if let Ok(out) = std::process::Command::new("ioreg").args(["-l"]).output() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if stdout.contains("AppleVirtIO")
+                || stdout.contains("VMwareVirtual")
+                || stdout.contains("PrlVirtual")
+            {
+                return true;
+            }
+        }
+
+        // Check hardware model via system_profiler.
+        if let Ok(out) = std::process::Command::new("system_profiler")
+            .args(["SPHardwareDataType"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+            if stdout.contains("vmware")
+                || stdout.contains("parallels")
+                || stdout.contains("ec2")
+            {
+                return true;
+            }
+        }
+
+        // Check sysctl hypervisor flag (Apple Silicon and later x86 kernels).
+        if let Ok(out) = std::process::Command::new("sysctl")
+            .args(["-n", "kern.hv_vmm_present"])
+            .output()
+        {
+            if String::from_utf8_lossy(&out.stdout).trim() == "1" {
+                return true;
+            }
+        }
+    }
+
     false
 }
 
@@ -912,10 +953,9 @@ fn detect_timing_anomaly() -> bool {
         let idle_delta = to_u64(idle2).saturating_sub(idle0);
         let kernel_delta = to_u64(kernel2).saturating_sub(to_u64(kernel));
         let user_delta = to_u64(user2).saturating_sub(to_u64(user));
-        let total = kernel_delta + user_delta;
+        let total = idle_delta + kernel_delta + user_delta;
         if total > 0 {
-            // idle_delta counts the total idle time across all cores in 100ns units.
-            // busy_pct is the fraction of time NOT idle.
+            // total includes idle time so busy_pct is correctly 1 - idle/total.
             let busy_pct = 1.0 - (idle_delta as f64 / total as f64);
             if busy_pct > 0.80 {
                 return false; // System overloaded; skip timing check.
