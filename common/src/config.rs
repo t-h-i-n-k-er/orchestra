@@ -97,6 +97,32 @@ pub struct MalleableProfile {
     /// will refuse to connect after this date.  Leave empty to disable.
     #[serde(default)]
     pub kill_date: String,
+    /// SSH relay hostname for the `ssh-transport` feature.
+    #[serde(default)]
+    pub ssh_host: Option<String>,
+    /// SSH relay port (default 22).
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    /// SSH username for authentication.
+    #[serde(default)]
+    pub ssh_username: Option<String>,
+    /// SSH authentication configuration.
+    #[serde(default)]
+    pub ssh_auth: Option<SshAuthConfig>,
+}
+
+/// Authentication method for the SSH covert transport.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "type")]
+pub enum SshAuthConfig {
+    /// Authenticate with an SSH private key loaded from disk at runtime.
+    Key { key_path: String },
+    /// Authenticate with a password (less secure; use key-based auth in
+    /// production).
+    Password { password: String },
+    /// Delegate to the running ssh-agent process via the `SSH_AUTH_SOCK`
+    /// environment variable.  Not available on Windows.
+    Agent,
 }
 
 fn default_user_agent() -> String {
@@ -125,6 +151,10 @@ impl Default for MalleableProfile {
             doh_server_url: None,
             cdn_endpoint: String::new(),
             kill_date: String::new(),
+            ssh_host: None,
+            ssh_port: None,
+            ssh_username: None,
+            ssh_auth: None,
         }
     }
 }

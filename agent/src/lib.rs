@@ -9,6 +9,9 @@ pub mod shell;
 #[cfg(feature = "outbound-c")]
 pub mod outbound;
 
+#[cfg(feature = "ssh-transport")]
+pub mod c2_ssh;
+
 #[cfg(feature = "persistence")]
 pub mod persistence;
 
