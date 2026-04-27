@@ -288,40 +288,10 @@ fn is_block_terminator(ins: &Instruction) -> bool {
 
 pub struct InstructionSchedulingPass;
 impl Pass for InstructionSchedulingPass {
-    fn run(&self, instrs: &mut Vec<Instruction>) {
-        // Split into basic blocks (blocks end at branch/ret).
-        // IMPORTANT: we do NOT reorder blocks — that would invalidate
-        // inter-block relative branches and fall-through edges.
-        // We only shuffle the *body* of each block (non-terminator instructions)
-        // to obscure intra-block patterns while preserving control flow.
-        let mut blocks: Vec<Vec<Instruction>> = Vec::new();
-        let mut current: Vec<Instruction> = Vec::new();
-        for ins in instrs.iter() {
-            current.push(*ins);
-            if is_block_terminator(ins) {
-                blocks.push(std::mem::take(&mut current));
-            }
-        }
-        if !current.is_empty() {
-            blocks.push(current);
-        }
-        let mut rng = thread_rng();
-        for block in &mut blocks {
-            // Keep the terminator pinned at the end; shuffle the body only.
-            let body_end = if block
-                .last()
-                .map(is_block_terminator)
-                .unwrap_or(false)
-            {
-                block.len() - 1
-            } else {
-                block.len()
-            };
-            if body_end > 1 {
-                block[..body_end].shuffle(&mut rng);
-            }
-        }
-        *instrs = blocks.into_iter().flatten().collect();
+    fn run(&self, _instrs: &mut Vec<Instruction>) {
+        // Disabled: shuffling without data-dependency analysis produces
+        // incorrect code (C-5).  Re-enable only after implementing SSA-based
+        // scheduling that respects read-after-write / write-after-write hazards.
     }
 }
 
