@@ -748,6 +748,215 @@ unsafe fn get_remote_ntdll_base(target_process: winapi::shared::ntdef::HANDLE) -
     None
 }
 
+/// Build a lowercase DLL-name → remote base-address map for every module loaded
+/// in `target_process`, using `CreateToolhelp32Snapshot` / `Module32First` /
+/// `Module32Next`.
+///
+/// Called when the shared-ASLR assumption does not hold (local and remote
+/// `ntdll.dll` bases differ), so that subsequent IAT resolution can use actual
+/// remote-process module bases rather than the local PEB-walk results.
+///
+/// # Errors
+///
+/// Returns `Err` if snapshot creation, `GetProcessId`, or the initial
+/// `Module32First` enumeration fails.  In that case the caller must **not**
+/// proceed with local import addresses.
+unsafe fn build_remote_module_map(
+    target_process: winapi::um::winnt::HANDLE,
+) -> Result<HashMap<String, usize>> {
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::GetProcessId;
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, Module32First, Module32Next, MODULEENTRY32,
+        TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
+    };
+
+    let pid = GetProcessId(target_process);
+    if pid == 0 {
+        return Err(anyhow!(
+            "build_remote_module_map: GetProcessId failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if snapshot == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+        return Err(anyhow!(
+            "build_remote_module_map: CreateToolhelp32Snapshot failed for pid={pid}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut map = HashMap::new();
+    let mut entry: MODULEENTRY32 = std::mem::zeroed();
+    entry.dwSize = std::mem::size_of::<MODULEENTRY32>() as u32;
+
+    if Module32First(snapshot, &mut entry) == 0 {
+        let err = std::io::Error::last_os_error();
+        CloseHandle(snapshot);
+        return Err(anyhow!(
+            "build_remote_module_map: Module32First failed for pid={pid}: {err}"
+        ));
+    }
+
+    loop {
+        // szModule is a null-terminated ANSI char (i8) array; cast each byte to u8
+        // before UTF-8 conversion — ASCII DLL names are unchanged by the cast.
+        let name_bytes: Vec<u8> = entry
+            .szModule
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        let dll_name = String::from_utf8_lossy(&name_bytes).to_ascii_lowercase();
+        map.insert(dll_name, entry.modBaseAddr as usize);
+
+        entry = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<MODULEENTRY32>() as u32;
+        if Module32Next(snapshot, &mut entry) == 0 {
+            break;
+        }
+    }
+
+    CloseHandle(snapshot);
+    Ok(map)
+}
+
+/// Resolve the address of an exported function in a DLL that is loaded at
+/// `remote_dll_base` inside `target_process`.
+///
+/// Reads the PE export table from the remote process address space via
+/// `ReadProcessMemory` so that the returned address is correct even when the
+/// remote process has a different ASLR layout from the current process.
+///
+/// Only PE32+ (64-bit) DLLs are supported; returns `Err` for PE32 images.
+///
+/// # Returns
+///
+/// The absolute virtual address of `fn_name` in the *remote* process on
+/// success.
+///
+/// # Errors
+///
+/// Returns `Err` if:
+/// - the PE headers cannot be read or are malformed,
+/// - the DLL has no export directory,
+/// - `fn_name` is not found in the export table.
+unsafe fn resolve_remote_export(
+    target_process: winapi::um::winnt::HANDLE,
+    remote_dll_base: usize,
+    fn_name: &str,
+) -> Result<usize> {
+    // Helper: read exactly `n` bytes from the remote process at `addr`.
+    let read_bytes = |addr: usize, n: usize| -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        let mut bytes_read = 0usize;
+        let ok = ReadProcessMemory(
+            target_process,
+            addr as *const c_void,
+            buf.as_mut_ptr() as *mut c_void,
+            n,
+            &mut bytes_read,
+        );
+        if ok == 0 || bytes_read != n {
+            return Err(anyhow!(
+                "resolve_remote_export: ReadProcessMemory at {addr:#x} len={n} failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(buf)
+    };
+
+    // ── Parse IMAGE_DOS_HEADER (64 bytes) ─────────────────────────────────
+    let dos = read_bytes(remote_dll_base, 64)?;
+    let e_magic = u16::from_le_bytes(dos[0..2].try_into().unwrap());
+    if e_magic != 0x5A4D {
+        // "MZ"
+        return Err(anyhow!(
+            "resolve_remote_export: bad DOS magic at {remote_dll_base:#x}: {e_magic:#x}"
+        ));
+    }
+    let e_lfanew = u32::from_le_bytes(dos[0x3C..0x40].try_into().unwrap()) as usize;
+
+    // ── Parse IMAGE_NT_HEADERS64 (144 bytes covers DataDirectory[0]) ──────
+    //
+    // Byte layout from the NT headers base address:
+    //   +0   Signature                  (4 bytes)  = "PE\0\0" = 0x00004550
+    //   +4   IMAGE_FILE_HEADER          (20 bytes)
+    //   +24  IMAGE_OPTIONAL_HEADER64:
+    //          [0..112)  pre-DataDirectory fields
+    //          [112..116) DataDirectory[0].VirtualAddress  ← export RVA
+    //          [116..120) DataDirectory[0].Size             ← export size
+    //   Total needed: 4 + 20 + 112 + 8 = 144 bytes.
+    let nt = read_bytes(remote_dll_base + e_lfanew, 144)?;
+    if u32::from_le_bytes(nt[0..4].try_into().unwrap()) != 0x0000_4550 {
+        return Err(anyhow!(
+            "resolve_remote_export: bad PE signature at {remote_dll_base:#x}"
+        ));
+    }
+    // Optional-header magic: 0x020B = PE32+ (64-bit).
+    let opt_magic = u16::from_le_bytes(nt[24..26].try_into().unwrap());
+    if opt_magic != 0x020B {
+        return Err(anyhow!(
+            "resolve_remote_export: unsupported optional-header magic {opt_magic:#x} \
+             at {remote_dll_base:#x} (expected PE32+ / 0x020B)"
+        ));
+    }
+    let export_rva = u32::from_le_bytes(nt[136..140].try_into().unwrap()) as usize;
+    let export_size = u32::from_le_bytes(nt[140..144].try_into().unwrap()) as usize;
+    if export_rva == 0 || export_size < 40 {
+        return Err(anyhow!(
+            "resolve_remote_export: DLL at {remote_dll_base:#x} has no export directory"
+        ));
+    }
+
+    // ── Read and walk the export directory ───────────────────────────────
+    // IMAGE_EXPORT_DIRECTORY field offsets (all DWORDs unless noted):
+    //   +20  NumberOfFunctions
+    //   +24  NumberOfNames
+    //   +28  AddressOfFunctions     RVA → DWORD[] of function RVAs
+    //   +32  AddressOfNames         RVA → DWORD[] of name RVAs
+    //   +36  AddressOfNameOrdinals  RVA → WORD[]  of hint ordinals
+    let exp = read_bytes(remote_dll_base + export_rva, export_size)?;
+    let num_names = u32::from_le_bytes(exp[24..28].try_into().unwrap()) as usize;
+    let fn_table_rva = u32::from_le_bytes(exp[28..32].try_into().unwrap()) as usize;
+    let name_table_rva = u32::from_le_bytes(exp[32..36].try_into().unwrap()) as usize;
+    let ordinal_table_rva = u32::from_le_bytes(exp[36..40].try_into().unwrap()) as usize;
+
+    if num_names == 0 {
+        return Err(anyhow!(
+            "resolve_remote_export: DLL at {remote_dll_base:#x} has no named exports"
+        ));
+    }
+
+    // Read name-pointer and ordinal tables in bulk to minimise round-trips.
+    let name_ptrs = read_bytes(remote_dll_base + name_table_rva, num_names * 4)?;
+    let ordinals = read_bytes(remote_dll_base + ordinal_table_rva, num_names * 2)?;
+
+    for i in 0..num_names {
+        let name_rva =
+            u32::from_le_bytes(name_ptrs[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+        // Read the null-terminated export name (cap at 256 bytes to bound I/O).
+        let name_raw = read_bytes(remote_dll_base + name_rva, 256)
+            .unwrap_or_else(|_| vec![0u8; 256]);
+        let nul = name_raw.iter().position(|&b| b == 0).unwrap_or(256);
+        let name = std::str::from_utf8(&name_raw[..nul]).unwrap_or("");
+        if name == fn_name {
+            let ordinal =
+                u16::from_le_bytes(ordinals[i * 2..i * 2 + 2].try_into().unwrap()) as usize;
+            let fn_rva_bytes =
+                read_bytes(remote_dll_base + fn_table_rva + ordinal * 4, 4)?;
+            let fn_rva = u32::from_le_bytes(fn_rva_bytes.try_into().unwrap()) as usize;
+            return Ok(remote_dll_base + fn_rva);
+        }
+    }
+
+    Err(anyhow!(
+        "resolve_remote_export: '{}' not found in DLL at {remote_dll_base:#x}",
+        fn_name
+    ))
+}
+
 /// Map a PE DLL into a remote process without writing any file to disk.
 ///
 /// # What this does
@@ -759,11 +968,14 @@ unsafe fn get_remote_ntdll_base(target_process: winapi::shared::ntdef::HANDLE) -
 /// 3. **Applies base relocations** for the remote allocation address
 ///    (all arithmetic is done in local memory, then the patched words are
 ///    written into the remote image).
-/// 4. **Resolves the Import Address Table** from local module/export data.
+/// 4. **Resolves the Import Address Table** from local or remote module data.
 ///    Before import resolution, the loader verifies the shared-ASLR assumption
 ///    by comparing local and remote `ntdll.dll` bases via
 ///    `NtQueryInformationProcess` + `ReadProcessMemory`. If they differ, a
-///    warning is emitted and mapping continues (addresses may be wrong).
+///    warning is emitted and imports are resolved from the remote process's
+///    actual module addresses (via `CreateToolhelp32Snapshot` + per-DLL PE
+///    export-table reads).  If remote module enumeration fails, an error is
+///    returned rather than proceeding with incorrect local addresses.
 /// 5. **Starts the DLL entry point** via `NtCreateThreadEx` (resolved via PEB walk).
 ///    fire-and-forget: the returned thread handle is closed immediately after
 ///    creation.
@@ -807,19 +1019,33 @@ pub unsafe fn load_dll_in_remote_process(
     let preferred_base = opt.windows_fields.image_base as isize;
 
     // Verify the shared-ASLR assumption used by local import resolution.
+    // When ntdll bases differ, all system-DLL addresses resolved in our
+    // process will be wrong in the remote process.  In that case we build
+    // a remote module map via Toolhelp and resolve each IAT entry from the
+    // actual remote module addresses.  Failing to enumerate the remote
+    // modules is a hard error: proceeding with local addresses would cause
+    // silent import corruption in the target process.
     let local_ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"));
     let remote_ntdll = get_remote_ntdll_base(target_process);
-    if let (Some(local), Some(remote)) = (local_ntdll, remote_ntdll) {
-        if local != remote {
-            log::warn!(
-                "remote_manual_map: NTDLL base mismatch (local={:#x}, remote={:#x}). \
-                 Shared ASLR assumption does not hold — import resolution may produce \
-                 incorrect addresses. Proceeding anyway, but some imports may be wrong.",
-                local,
-                remote
-            );
-        }
-    }
+    let remote_module_map: Option<HashMap<String, usize>> =
+        if let (Some(local), Some(remote)) = (local_ntdll, remote_ntdll) {
+            if local != remote {
+                log::warn!(
+                    "remote_manual_map: NTDLL base mismatch (local={:#x}, remote={:#x}). \
+                     Shared ASLR assumption does not hold — resolving imports from \
+                     remote process module list.",
+                    local,
+                    remote
+                );
+                // Build the remote module map; fail immediately if enumeration
+                // fails rather than proceeding with incorrect local addresses.
+                Some(build_remote_module_map(target_process)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
     // ── Step 1: allocate in the remote process ────────────────────────────
     let remote_base = VirtualAllocEx(
@@ -1063,37 +1289,58 @@ pub unsafe fn load_dll_in_remote_process(
     }
 
     // ── Step 4b: resolve IAT ──────────────────────────────────────────────
-    // On Windows, system DLLs (ntdll, kernel32, kernelbase, …) are mapped at
-    // the same virtual address in every process per-boot (they share a single
-    // ASLR base due to copy-on-write physical pages).  Resolving via
-    // GetModuleHandleA + GetProcAddress in OUR process therefore yields the
-    // correct address for the remote process.  User-mode DLLs that are NOT
-    // system DLLs may differ; those are relatively rare as DLL imports.
+    // Two resolution paths:
+    //
+    // Fast path (remote_module_map is None):
+    //   The shared-ASLR assumption holds — system DLLs share a single
+    //   per-boot ASLR base across all processes (copy-on-write physical pages).
+    //   Resolving via PEB walk in OUR process yields correct remote addresses.
+    //
+    // Safe path (remote_module_map is Some):
+    //   ntdll bases differ (e.g. different integrity levels / sessions).
+    //   Use the Toolhelp module map to obtain each DLL's actual remote base,
+    //   then read its export table via ReadProcessMemory to find function RVAs.
+    //   This ensures every IAT entry holds a valid remote-process address.
     for import in &pe.imports {
-        let dll_name_cstr = std::ffi::CString::new(import.dll)
-            .map_err(|_| anyhow!("import DLL name contains NUL: {}", import.dll))?;
-        let fn_name_cstr = std::ffi::CString::new(import.name.as_str())
-            .map_err(|_| anyhow!("import function name contains NUL: {}", import.name))?;
+        let proc_addr: usize = if let Some(ref rmod) = remote_module_map {
+            // Safe path: resolve from the remote process's actual module base.
+            let dll_lower = import.dll.to_ascii_lowercase();
+            let &remote_dll_base = rmod.get(&dll_lower).ok_or_else(|| {
+                anyhow!(
+                    "remote_manual_map: import DLL '{}' not found in remote process \
+                     module list; cannot resolve '{}'",
+                    import.dll,
+                    import.name
+                )
+            })?;
+            resolve_remote_export(target_process, remote_dll_base, import.name.as_str())?
+        } else {
+            // Fast path: resolve locally via PEB walk + clean export table.
+            // M-26: avoid hookable GetModuleHandleA / GetProcAddress IAT entries.
+            let dll_name_cstr = std::ffi::CString::new(import.dll)
+                .map_err(|_| anyhow!("import DLL name contains NUL: {}", import.dll))?;
+            let fn_name_cstr = std::ffi::CString::new(import.name.as_str())
+                .map_err(|_| anyhow!("import function name contains NUL: {}", import.name))?;
 
-        // M-26: resolve via PEB walk + clean export table instead of the
-        // hookable GetModuleHandleA / GetProcAddress IAT entries.
-        let dll_hash = pe_resolve::hash_str(dll_name_cstr.to_bytes_with_nul());
-        let mod_base = pe_resolve::get_module_handle_by_hash(dll_hash).unwrap_or(0);
-        if mod_base == 0 {
-            return Err(anyhow!(
-                "PEB-walk failed for '{}': not loaded in current process",
-                import.dll
-            ));
-        }
-        let fn_hash = pe_resolve::hash_str(fn_name_cstr.to_bytes_with_nul());
-        let proc_addr = pe_resolve::get_proc_address_by_hash(mod_base, fn_hash).unwrap_or(0);
-        if proc_addr == 0 {
-            return Err(anyhow!(
-                "PEB-walk export resolution failed for '{}' in '{}'",
-                import.name,
-                import.dll
-            ));
-        }
+            let dll_hash = pe_resolve::hash_str(dll_name_cstr.to_bytes_with_nul());
+            let mod_base = pe_resolve::get_module_handle_by_hash(dll_hash).unwrap_or(0);
+            if mod_base == 0 {
+                return Err(anyhow!(
+                    "PEB-walk failed for '{}': not loaded in current process",
+                    import.dll
+                ));
+            }
+            let fn_hash = pe_resolve::hash_str(fn_name_cstr.to_bytes_with_nul());
+            let addr = pe_resolve::get_proc_address_by_hash(mod_base, fn_hash).unwrap_or(0);
+            if addr == 0 {
+                return Err(anyhow!(
+                    "PEB-walk export resolution failed for '{}' in '{}'",
+                    import.name,
+                    import.dll
+                ));
+            }
+            addr
+        };
 
         // Write the resolved function pointer into the remote IAT slot.
         let iat_addr_bytes = (proc_addr as usize).to_le_bytes();

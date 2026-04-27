@@ -19,7 +19,7 @@ ed25519-dalek = { version = "2.1.0", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 goblin = { version = "0.7" }
-winapi = { version = "0.3", features = ["memoryapi", "libloaderapi", "winnt", "processthreadsapi", "handleapi", "psapi", "minwinbase"] }
+winapi = { version = "0.3", features = ["memoryapi", "libloaderapi", "winnt", "processthreadsapi", "handleapi", "psapi", "minwinbase", "tlhelp32"] }
 pe_resolve = { path = "../pe_resolve" }
 
 [features]
