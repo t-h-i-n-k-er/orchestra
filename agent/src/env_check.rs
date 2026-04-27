@@ -322,9 +322,9 @@ fn is_expected_hypervisor() -> bool {
 ///      slightly slower hypervisor routing on some Azure SKUs).
 ///   2. Write a minimal HTTP/1.0 GET and read the first 12 bytes of the
 ///      response.  Accept only status codes that an IMDS genuinely returns:
-///        200 (OK — IMDSv1 enabled)
-///        400 (Bad Request — IMDSv2 token check, proves IMDS exists)
-///        401 (Unauthorized — same as 400 on some providers)
+///      200 (OK — IMDSv1 enabled)
+///      400 (Bad Request — IMDSv2 token check, proves IMDS exists)
+///      401 (Unauthorized — same as 400 on some providers)
 ///      Corporate proxies return 301, 302, 200 with an HTML body,
 ///      or 404 — none of which begin with "HTTP/1." followed by " 200",
 ///      " 400", or " 401".

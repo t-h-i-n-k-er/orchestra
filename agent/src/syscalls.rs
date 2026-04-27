@@ -388,7 +388,7 @@ fn map_clean_ntdll() -> Result<usize> {
             gadget_addr,
             &[
                 &mut h_section as *mut _ as u64,
-                0x000F0000 | 0x0004 | 0x0008, // SECTION_MAP_READ | SECTION_MAP_EXECUTE | STANDARD_RIGHTS_REQUIRED
+                0x000f0000 | 0x0004 | 0x0008, // SECTION_MAP_READ | SECTION_MAP_EXECUTE | STANDARD_RIGHTS_REQUIRED
                 std::ptr::null_mut::<u64>() as u64,
                 std::ptr::null_mut::<u64>() as u64,
                 0x20,      // PAGE_EXECUTE_READ
@@ -747,7 +747,7 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
             sys_ntcreatesection.gadget_addr,
             &[
                 &mut h_section as *mut _ as u64,
-                0x000F0000 | 0x0004 | 0x0008, // SECTION_MAP_READ | SECTION_MAP_EXECUTE | STANDARD_RIGHTS_REQUIRED
+                0x000f0000 | 0x0004 | 0x0008, // SECTION_MAP_READ | SECTION_MAP_EXECUTE | STANDARD_RIGHTS_REQUIRED
                 std::ptr::null_mut::<u64>() as u64,
                 std::ptr::null_mut::<u64>() as u64,
                 0x20,      // PAGE_EXECUTE_READ
@@ -913,7 +913,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
             while (*original_thunk).u1.AddressOfData() != &0 {
                 let addr_of_data = *(*original_thunk).u1.AddressOfData() as u64;
                 let proc_addr = if (addr_of_data & winapi::um::winnt::IMAGE_ORDINAL_FLAG64) != 0 {
-                    let ordinal = (addr_of_data & 0xFFFF) as u16;
+                    let ordinal = (addr_of_data & 0xffff) as u16;
                     winapi::um::libloaderapi::GetProcAddress(
                         dep_handle as *mut _,
                         ordinal as winapi::um::winnt::LPCSTR,

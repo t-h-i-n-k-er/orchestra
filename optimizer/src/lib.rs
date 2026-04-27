@@ -5,6 +5,7 @@ use iced_x86::{OpKind, Register};
 use rand::seq::SliceRandom;
 use rand::{thread_rng, Rng};
 
+#[cfg(feature = "diversification")]
 include!(concat!(env!("OUT_DIR"), "/stub_seed.rs"));
 
 /// Derive an 8-byte dead-code value from the build-time STUB_SEED and a

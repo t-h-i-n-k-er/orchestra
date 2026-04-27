@@ -68,7 +68,7 @@ pub fn check_mouse_movement() -> u8 {
         return 0; // Headless / Wayland-only — can't reliably track mouse
     }
     // Check xdotool availability without shelling out to `which`.
-    let xdotool_on_path = std::env::var("PATH").map_or(false, |p| {
+    let xdotool_on_path = std::env::var("PATH").is_ok_and(|p| {
         p.split(':')
             .any(|dir| std::path::Path::new(dir).join("xdotool").is_file())
     });
