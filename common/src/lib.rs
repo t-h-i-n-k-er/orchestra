@@ -11,6 +11,8 @@ use zeroize::Zeroize;
 
 /// Length in bytes of the AES-256 key used by [`CryptoSession`].
 pub const KEY_LEN: usize = 32;
+/// Length in bytes of the HKDF salt prepended to each encrypted message.
+pub const SALT_LEN: usize = 32;
 /// Length in bytes of the AES-GCM nonce prepended to each ciphertext.
 pub const NONCE_LEN: usize = 12;
 
@@ -20,7 +22,10 @@ pub const NONCE_LEN: usize = 12;
 /// the connection-establishment sequence.  The agent sends a
 /// [`Message::VersionHandshake`] as its first message and refuses to proceed
 /// if the server's echo carries a different version.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Version 2 prefixes encrypted payloads with a per-session HKDF salt:
+/// `salt(32) || nonce(12) || ciphertext_with_tag`.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub mod audit;
 pub mod config;
@@ -193,35 +198,76 @@ pub struct CryptoSession {
     cipher: Aes256Gcm,
     /// Copy of the raw key bytes, zeroed on drop.
     key: [u8; KEY_LEN],
+    /// HKDF salt associated with this session.
+    salt: [u8; SALT_LEN],
+    /// Optional pre-shared secret used to derive per-message keys from wire salts.
+    pre_shared_secret: Option<Vec<u8>>,
 }
 
 impl Drop for CryptoSession {
     fn drop(&mut self) {
         self.key.zeroize();
+        if let Some(psk) = self.pre_shared_secret.as_mut() {
+            psk.zeroize();
+        }
     }
 }
 
 impl CryptoSession {
-    /// Build a session by hashing `pre_shared_secret` with SHA-256 to produce
-    /// the 32-byte AES key.
-    pub fn from_shared_secret(pre_shared_secret: &[u8]) -> Self {
-        let hk = hkdf::Hkdf::<Sha256>::new(Some(b"orchestra-crypto-session-v1"), pre_shared_secret);
+    fn derive_key_bytes(pre_shared_secret: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
+        let hk = hkdf::Hkdf::<Sha256>::new(Some(salt), pre_shared_secret);
         let mut key_bytes = [0u8; KEY_LEN];
         hk.expand(b"orchestra-aes-gcm", &mut key_bytes)
             .expect("HKDF-SHA256 expand must succeed");
+        key_bytes
+    }
+
+    fn decrypt_nonce_prefixed(cipher: &Aes256Gcm, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        if ciphertext.len() < NONCE_LEN {
+            return Err(CryptoError::Truncated);
+        }
+        let (nonce_bytes, body) = ciphertext.split_at(NONCE_LEN);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        cipher
+            .decrypt(nonce, body)
+            .map_err(|_| CryptoError::AuthenticationFailed)
+    }
+
+    /// Build a session from a pre-shared secret using HKDF-SHA256 and a random
+    /// per-session salt.
+    pub fn from_shared_secret(pre_shared_secret: &[u8]) -> Self {
+        let mut salt = [0u8; SALT_LEN];
+        rand::thread_rng().fill_bytes(&mut salt);
+        Self::from_shared_secret_with_salt(pre_shared_secret, &salt)
+    }
+
+    /// Build a session from a pre-shared secret and an explicit HKDF salt.
+    pub fn from_shared_secret_with_salt(pre_shared_secret: &[u8], salt: &[u8]) -> Self {
+        let key_bytes = Self::derive_key_bytes(pre_shared_secret, salt);
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+
+        let mut salt_bytes = [0u8; SALT_LEN];
+        let copy_len = salt.len().min(SALT_LEN);
+        salt_bytes[..copy_len].copy_from_slice(&salt[..copy_len]);
+
         Self {
             cipher: Aes256Gcm::new(key),
             key: key_bytes,
+            salt: salt_bytes,
+            pre_shared_secret: Some(pre_shared_secret.to_vec()),
         }
     }
 
     /// Build a session directly from a 32-byte key.
     pub fn from_key(key_bytes: [u8; KEY_LEN]) -> Self {
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+        let mut salt = [0u8; SALT_LEN];
+        rand::thread_rng().fill_bytes(&mut salt);
         Self {
             cipher: Aes256Gcm::new(key),
             key: key_bytes,
+            salt,
+            pre_shared_secret: None,
         }
     }
 
@@ -235,7 +281,7 @@ impl CryptoSession {
         &self.key
     }
 
-    /// Encrypt `plaintext` and return `nonce || ciphertext_with_tag`.
+    /// Encrypt `plaintext` and return `salt || nonce || ciphertext_with_tag`.
     pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
@@ -245,22 +291,55 @@ impl CryptoSession {
             .encrypt(nonce, plaintext)
             .expect("AES-GCM encryption is infallible for valid inputs");
 
-        let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        let mut out = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
+        out.extend_from_slice(&self.salt);
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);
         out
     }
 
-    /// Decrypt a buffer produced by [`Self::encrypt`].
+    /// Decrypt a nonce-prefixed buffer (`nonce || ciphertext_with_tag`).
+    ///
+    /// This method assumes `self` was already built with the correct key/salt
+    /// context. Callers receiving full wire-format payloads prefixed with salt
+    /// SHOULD use [`Self::decrypt_with_psk`].
     pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        if ciphertext.len() < NONCE_LEN {
+        // New format: salt || nonce || ciphertext_with_tag.
+        // Try this path first for backward compatibility with existing callers
+        // that pass encrypt() output directly to decrypt().
+        if ciphertext.len() >= SALT_LEN + NONCE_LEN {
+            let (salt, rest) = ciphertext.split_at(SALT_LEN);
+
+            // If this session was created from a PSK, derive the per-message
+            // key from the embedded salt so independently-created sessions
+            // sharing the same PSK can still interoperate.
+            if let Some(psk) = self.pre_shared_secret.as_ref() {
+                let key_bytes = Self::derive_key_bytes(psk, salt);
+                let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+                let cipher = Aes256Gcm::new(key);
+                if let Ok(plain) = Self::decrypt_nonce_prefixed(&cipher, rest) {
+                    return Ok(plain);
+                }
+            } else if let Ok(plain) = Self::decrypt_nonce_prefixed(&self.cipher, rest) {
+                // from_key sessions don't have a PSK; fall back to decrypting
+                // the salt-stripped payload with the session key.
+                return Ok(plain);
+            }
+        }
+
+        // Legacy format: nonce || ciphertext_with_tag.
+        Self::decrypt_nonce_prefixed(&self.cipher, ciphertext)
+    }
+
+    /// Decrypt a full wire-format message produced by [`Self::encrypt`]:
+    /// `salt || nonce || ciphertext_with_tag`.
+    pub fn decrypt_with_psk(psk: &[u8], wire_data: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        if wire_data.len() < SALT_LEN + NONCE_LEN {
             return Err(CryptoError::Truncated);
         }
-        let (nonce_bytes, body) = ciphertext.split_at(NONCE_LEN);
-        let nonce = Nonce::from_slice(nonce_bytes);
-        self.cipher
-            .decrypt(nonce, body)
-            .map_err(|_| CryptoError::AuthenticationFailed)
+        let (salt, rest) = wire_data.split_at(SALT_LEN);
+        let session = Self::from_shared_secret_with_salt(psk, salt);
+        session.decrypt(rest)
     }
 }
 
@@ -293,30 +372,35 @@ mod tests {
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        let session = CryptoSession::from_shared_secret(b"orchestra-dev-secret");
+        let psk = b"orchestra-dev-secret";
+        let session = CryptoSession::from_shared_secret(psk);
         let plaintext = b"hello orchestra";
         let ct = session.encrypt(plaintext);
-        assert!(ct.len() > NONCE_LEN);
-        let pt = session.decrypt(&ct).expect("decrypt");
+        assert!(ct.len() > SALT_LEN + NONCE_LEN);
+        let pt = CryptoSession::decrypt_with_psk(psk, &ct).expect("decrypt");
         assert_eq!(pt, plaintext);
     }
 
     #[test]
     fn nonces_are_unique_per_encryption() {
-        let session = CryptoSession::from_shared_secret(b"k");
-        let a = session.encrypt(b"same");
-        let b = session.encrypt(b"same");
-        assert_ne!(a[..NONCE_LEN], b[..NONCE_LEN]);
+        let a = CryptoSession::from_shared_secret(b"k").encrypt(b"same");
+        let b = CryptoSession::from_shared_secret(b"k").encrypt(b"same");
+        assert_ne!(a[..SALT_LEN], b[..SALT_LEN]);
+        assert_ne!(a[SALT_LEN..SALT_LEN + NONCE_LEN], b[SALT_LEN..SALT_LEN + NONCE_LEN]);
         assert_ne!(a, b);
     }
 
     #[test]
     fn tampered_ciphertext_is_rejected() {
-        let session = CryptoSession::from_shared_secret(b"k");
+        let psk = b"k";
+        let session = CryptoSession::from_shared_secret(psk);
         let mut ct = session.encrypt(b"payload");
-        let last = ct.len() - 1;
-        ct[last] ^= 0x01;
-        let err = session.decrypt(&ct).unwrap_err();
+        let mut idx = SALT_LEN + NONCE_LEN;
+        if idx >= ct.len() {
+            idx = ct.len() - 1;
+        }
+        ct[idx] ^= 0x01;
+        let err = CryptoSession::decrypt_with_psk(psk, &ct).unwrap_err();
         assert!(matches!(err, CryptoError::AuthenticationFailed));
     }
 

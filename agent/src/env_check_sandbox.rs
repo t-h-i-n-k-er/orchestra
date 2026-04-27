@@ -424,6 +424,108 @@ pub fn check_system_uptime_artifacts() -> u8 {
     0 // Cannot determine; neutral score.
 }
 
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn is_cloud_instance_sandbox() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(v) = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor") {
+            let v = v.trim().to_lowercase();
+            if v.contains("amazon")
+                || v.contains("microsoft")
+                || v.contains("google")
+                || v.contains("digitalocean")
+                || v.contains("vmware")
+                || v.contains("xen")
+                || v.contains("ovm")
+            {
+                return true;
+            }
+        }
+        if let Ok(p) = std::fs::read_to_string("/sys/class/dmi/id/product_name") {
+            let p = p.trim().to_lowercase();
+            if p.contains("kvm")
+                || p.contains("cloud")
+                || p.contains("compute")
+                || p.contains("virtual")
+                || p.contains("vmware")
+            {
+                return true;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use winapi::um::winnt::{KEY_READ, REG_SZ};
+        use winapi::um::winreg::{
+            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE,
+        };
+
+        let subkey: Vec<u16> =
+            "HARDWARE\\DESCRIPTION\\System\\BIOS\0".encode_utf16().collect();
+        let value_name: Vec<u16> = "SystemManufacturer\0".encode_utf16().collect();
+
+        unsafe {
+            let mut hkey = std::ptr::null_mut();
+            if RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                subkey.as_ptr(),
+                0,
+                KEY_READ,
+                &mut hkey,
+            ) == 0
+            {
+                let mut buf = vec![0u16; 256];
+                let mut buf_len = (buf.len() * 2) as u32;
+                let mut val_type: u32 = 0;
+                if RegQueryValueExW(
+                    hkey,
+                    value_name.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut val_type,
+                    buf.as_mut_ptr() as _,
+                    &mut buf_len,
+                ) == 0
+                    && val_type == REG_SZ
+                {
+                    RegCloseKey(hkey);
+                    let nul = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                    let vendor = String::from_utf16_lossy(&buf[..nul]).to_lowercase();
+                    if vendor.contains("amazon")
+                        || vendor.contains("microsoft")
+                        || vendor.contains("google")
+                        || vendor.contains("digitalocean")
+                    {
+                        return true;
+                    }
+                } else {
+                    RegCloseKey(hkey);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("sysctl")
+            .args(["-n", "kern.hv_vmm_present"])
+            .output()
+            .ok();
+        if let Some(o) = output {
+            if String::from_utf8_lossy(&o.stdout).trim() == "1" {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn is_cloud_instance_sandbox() -> bool {
+    false
+}
+
 #[cfg(windows)]
 pub fn check_hardware_plausibility() -> u8 {
     use winapi::um::fileapi::GetDiskFreeSpaceExW;
@@ -468,10 +570,17 @@ pub fn check_hardware_plausibility() -> u8 {
     if ram_gb <= 1 { below_threshold_count += 1; }
     if cpus <= 1 { below_threshold_count += 1; }
     
-    match below_threshold_count {
+    let raw_score = match below_threshold_count {
         0 => 0,
         1 => 10,
         _ => 20,
+    };
+
+    // Cloud VMs often have minimal hardware; don't penalize them heavily.
+    if is_cloud_instance_sandbox() {
+        raw_score / 2
+    } else {
+        raw_score
     }
 }
 
@@ -505,10 +614,17 @@ pub fn check_hardware_plausibility() -> u8 {
     let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
     if cpus <= 1 { below_threshold_count += 1; }
     
-    match below_threshold_count {
+    let raw_score = match below_threshold_count {
         0 => 0,
         1 => 10,
         _ => 20,
+    };
+
+    // Cloud VMs often have minimal hardware; don't penalize them heavily.
+    if is_cloud_instance_sandbox() {
+        raw_score / 2
+    } else {
+        raw_score
     }
 }
 
@@ -542,10 +658,17 @@ pub fn check_hardware_plausibility() -> u8 {
     let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
     if cpus <= 1 { below_threshold_count += 1; }
 
-    match below_threshold_count {
+    let raw_score = match below_threshold_count {
         0 => 0,
         1 => 10,
         _ => 20,
+    };
+
+    // Cloud VMs often have minimal hardware; don't penalize them heavily.
+    if is_cloud_instance_sandbox() {
+        raw_score / 2
+    } else {
+        raw_score
     }
 }
 

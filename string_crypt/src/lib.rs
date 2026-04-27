@@ -43,14 +43,15 @@ fn derive_key_from_seed(seed: &str, label: &[u8], len: usize) -> Vec<u8> {
     if state == 0 {
         state = 0x9e3779b97f4a7c15;
     }
-    // Expand via xorshift64, one byte per round.
+    // Expand via xorshift64, emitting all 8 bytes per round.
     let mut out = Vec::with_capacity(len);
     while out.len() < len {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        out.push(state as u8);
+        out.extend_from_slice(&state.to_le_bytes());
     }
+    out.truncate(len);
     out
 }
 
@@ -120,11 +121,18 @@ pub fn enc_str(input: TokenStream) -> TokenStream {
                 if state == 0 { state = 0x9e3779b97f4a7c15u64; }
                 let mut pt = [0u8; #len];
                 let mut _j = 0usize;
+                let mut _buf = [0u8; 8];
+                let mut _buf_idx = 8usize;
                 while _j < #len {
-                    state ^= state << 13;
-                    state ^= state >> 7;
-                    state ^= state << 17;
-                    pt[_j] = CT[_j] ^ (state as u8);
+                    if _buf_idx >= 8 {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        _buf = state.to_le_bytes();
+                        _buf_idx = 0;
+                    }
+                    pt[_j] = CT[_j] ^ _buf[_buf_idx];
+                    _buf_idx += 1;
                     _j += 1;
                 }
                 pt
@@ -245,10 +253,24 @@ pub fn enc_str(input: TokenStream) -> TokenStream {
 
                 let mut pt = [0u8; #len];
                 let mut _j = 0usize;
+                let mut _buf1 = [0u8; 8];
+                let mut _buf2 = [0u8; 8];
+                let mut _buf1_idx = 8usize;
+                let mut _buf2_idx = 8usize;
                 while _j < #len {
-                    s1 ^= s1 << 13; s1 ^= s1 >> 7; s1 ^= s1 << 17;
-                    s2 ^= s2 << 13; s2 ^= s2 >> 7; s2 ^= s2 << 17;
-                    pt[_j] = CT[_j] ^ (s1 as u8) ^ (s2 as u8);
+                    if _buf1_idx >= 8 {
+                        s1 ^= s1 << 13; s1 ^= s1 >> 7; s1 ^= s1 << 17;
+                        _buf1 = s1.to_le_bytes();
+                        _buf1_idx = 0;
+                    }
+                    if _buf2_idx >= 8 {
+                        s2 ^= s2 << 13; s2 ^= s2 >> 7; s2 ^= s2 << 17;
+                        _buf2 = s2.to_le_bytes();
+                        _buf2_idx = 0;
+                    }
+                    pt[_j] = CT[_j] ^ _buf1[_buf1_idx] ^ _buf2[_buf2_idx];
+                    _buf1_idx += 1;
+                    _buf2_idx += 1;
                     _j += 1;
                 }
                 pt
@@ -303,11 +325,18 @@ pub fn enc_wstr(input: TokenStream) -> TokenStream {
             if state == 0 { state = 0x9e3779b97f4a7c15u64; }
             let mut pt_bytes = [0u8; #len];
             let mut _j = 0usize;
+            let mut _buf = [0u8; 8];
+            let mut _buf_idx = 8usize;
             while _j < #len {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                pt_bytes[_j] = CT[_j] ^ (state as u8);
+                if _buf_idx >= 8 {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    _buf = state.to_le_bytes();
+                    _buf_idx = 0;
+                }
+                pt_bytes[_j] = CT[_j] ^ _buf[_buf_idx];
+                _buf_idx += 1;
                 _j += 1;
             }
             let mut pt_w = [0u16; #wlen];
@@ -356,6 +385,15 @@ mod tests {
         // Different label → different key (counter ensures uniqueness).
         let key_for_next = derive_key_from_seed("seed", b"enc_str:agent:1", 32);
         assert_ne!(key_for_hello, key_for_next);
+    }
+
+    #[test]
+    fn derive_key_bytes_are_not_all_identical() {
+        let key = derive_key_from_seed("seed-non-identical-check", b"enc_str:test:0", 64);
+        assert!(
+            key.windows(2).any(|w| w[0] != w[1]),
+            "derived key bytes should not all be identical"
+        );
     }
 
     #[test]

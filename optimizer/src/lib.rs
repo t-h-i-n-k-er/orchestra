@@ -240,7 +240,7 @@ impl Pass for NopInsertionPass {
 /// Returns true if the instruction is a branch, call, or return that ends a
 /// basic block, determined by re-encoding the instruction and inspecting
 /// the leading opcode byte(s).
-#[allow(dead_code)] // TODO: used by future scheduling pass
+#[cfg_attr(not(feature = "diversification"), allow(dead_code))]
 fn is_block_terminator(ins: &Instruction) -> bool {
     let mut enc = Encoder::new(64);
     if enc.encode(ins, 0).is_err() {
@@ -417,23 +417,22 @@ fn try_substitute(ins: &Instruction, rng: &mut impl Rng) -> Option<Instruction> 
 /// ```
 /// This sequence preserves all flags and all registers (RSP nets to zero) but
 /// produces a different binary fingerprint every build.  The scratch register
-/// is chosen randomly from the caller-saved set so no callee-save epilogue is
-/// needed.
+/// is chosen randomly from a callee-saved register set to avoid clobber risk
+/// across block boundaries.
 #[cfg(feature = "diversification")]
 pub struct OpaqueDeadCodePass;
 
 #[cfg(feature = "diversification")]
 impl Pass for OpaqueDeadCodePass {
     fn run(&self, instrs: &mut Vec<Instruction>) {
-        // Caller-saved registers on both SysV AMD64 and Windows x64 ABI.
+        // Callee-saved registers on both SysV AMD64 and Windows x64 ABI.
+        // RBP is intentionally excluded because frame-pointer code may rely on it.
         const SCRATCH: &[Register] = &[
-            Register::RAX,
-            Register::RCX,
-            Register::RDX,
-            Register::R8,
-            Register::R9,
-            Register::R10,
-            Register::R11,
+            Register::RBX,
+            Register::R12,
+            Register::R13,
+            Register::R14,
+            Register::R15,
         ];
         let mut rng = thread_rng();
         let mut result = Vec::with_capacity(instrs.len() + instrs.len() / 4);
@@ -515,8 +514,9 @@ mod runtime_rewrite {
         // Apply optimizer passes
         let mut new_bytes = apply_passes(&original);
         // If the new code is longer than the original span, refuse — we cannot
-        // safely overwrite into adjacent code.  If shorter, NOP-pad to fill
-        // the gap so we don't leave stale bytes that could confuse a disassembler.
+        // safely overwrite into adjacent code.  If shorter, INT3-pad to fill
+        // the gap so stray execution traps immediately instead of running through
+        // silent NOPs.
         if new_bytes.len() > original.len() {
             return Err(format!(
                 "rewrite would grow code ({} -> {} bytes); refusing",
@@ -525,7 +525,7 @@ mod runtime_rewrite {
             ));
         }
         if new_bytes.len() < original.len() {
-            new_bytes.resize(original.len(), 0x90); // NOP-pad to original size
+            new_bytes.resize(original.len(), 0xCC); // INT3-pad to original size (trap on stray execution)
         }
         // Lower protection, copy, restore.
         unsafe {

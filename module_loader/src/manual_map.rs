@@ -639,6 +639,115 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
 
 // ── Remote manual-map injection ──────────────────────────────────────────────
 
+#[repr(C)]
+struct ProcessBasicInformation {
+    reserved1: *mut c_void,
+    peb_base_address: *mut PEB,
+    reserved2: [*mut c_void; 2],
+    unique_process_id: usize,
+    reserved3: *mut c_void,
+}
+
+unsafe fn read_remote_struct<T>(
+    process: winapi::shared::ntdef::HANDLE,
+    remote: *const c_void,
+) -> Option<T> {
+    let mut value: T = std::mem::zeroed();
+    let mut bytes_read = 0usize;
+    let ok = ReadProcessMemory(
+        process,
+        remote,
+        &mut value as *mut _ as *mut c_void,
+        std::mem::size_of::<T>(),
+        &mut bytes_read,
+    );
+    if ok == 0 || bytes_read != std::mem::size_of::<T>() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+unsafe fn get_remote_ntdll_base(target_process: winapi::shared::ntdef::HANDLE) -> Option<usize> {
+    type NtQueryInformationProcessFn = unsafe extern "system" fn(
+        winapi::shared::ntdef::HANDLE,
+        u32,
+        *mut c_void,
+        u32,
+        *mut u32,
+    ) -> i32;
+
+    let local_ntdll =
+        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))?;
+    let ntqip_addr = pe_resolve::get_proc_address_by_hash(
+        local_ntdll,
+        pe_resolve::hash_str(b"NtQueryInformationProcess\0"),
+    )?;
+    let ntqip: NtQueryInformationProcessFn = std::mem::transmute(ntqip_addr as *const ());
+
+    let mut pbi: ProcessBasicInformation = std::mem::zeroed();
+    let mut return_len = 0u32;
+    let status = ntqip(
+        target_process,
+        0, // ProcessBasicInformation
+        &mut pbi as *mut _ as *mut c_void,
+        std::mem::size_of::<ProcessBasicInformation>() as u32,
+        &mut return_len,
+    );
+    if status < 0 || pbi.peb_base_address.is_null() {
+        return None;
+    }
+
+    let peb: PEB = read_remote_struct(target_process, pbi.peb_base_address as *const c_void)?;
+    if peb.Ldr.is_null() {
+        return None;
+    }
+
+    let ldr: PEB_LDR_DATA = read_remote_struct(target_process, peb.Ldr as *const c_void)?;
+    let list_head = (peb.Ldr as usize + 0x10) as *mut LIST_ENTRY; // InLoadOrderModuleList
+    let mut current = ldr.InLoadOrderModuleList.Flink;
+    let mut guard = 0usize;
+
+    while !current.is_null() && current != list_head && guard < 1024 {
+        guard += 1;
+
+        let entry: LDR_DATA_TABLE_ENTRY =
+            match read_remote_struct(target_process, current as *const c_void) {
+                Some(e) => e,
+                None => break,
+            };
+
+        let dll_base = entry.DllBase as usize;
+        let base_name = entry.BaseDllName;
+        if dll_base != 0
+            && !base_name.Buffer.is_null()
+            && base_name.Length >= 2
+            && (base_name.Length as usize) <= 520
+        {
+            let chars = (base_name.Length / 2) as usize;
+            let mut wide = vec![0u16; chars];
+            let mut bytes_read = 0usize;
+            let ok = ReadProcessMemory(
+                target_process,
+                base_name.Buffer as *const c_void,
+                wide.as_mut_ptr() as *mut c_void,
+                base_name.Length as usize,
+                &mut bytes_read,
+            );
+            if ok != 0 && bytes_read == base_name.Length as usize {
+                let name = String::from_utf16_lossy(&wide).to_ascii_lowercase();
+                if name == "ntdll.dll" || name == "ntdll" {
+                    return Some(dll_base);
+                }
+            }
+        }
+
+        current = entry.InLoadOrderLinks.Flink;
+    }
+
+    None
+}
+
 /// Map a PE DLL into a remote process without writing any file to disk.
 ///
 /// # What this does
@@ -650,11 +759,11 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
 /// 3. **Applies base relocations** for the remote allocation address
 ///    (all arithmetic is done in local memory, then the patched words are
 ///    written into the remote image).
-/// 4. **Resolves the Import Address Table** using the Win32 `GetModuleHandleA`
-///    / `GetProcAddress` pair.  On Windows, NTDLL and kernel32 are mapped at
-///    the same base address in every process (per-boot ASLR, shared between
-///    all processes via copy-on-write), so the resolved function addresses are
-///    correct for the remote process.
+/// 4. **Resolves the Import Address Table** from local module/export data.
+///    Before import resolution, the loader verifies the shared-ASLR assumption
+///    by comparing local and remote `ntdll.dll` bases via
+///    `NtQueryInformationProcess` + `ReadProcessMemory`. If they differ, a
+///    warning is emitted and mapping continues (addresses may be wrong).
 /// 5. **Starts the DLL entry point** via `NtCreateThreadEx` (resolved via PEB walk).
 ///    fire-and-forget: the returned thread handle is closed immediately after
 ///    creation.
@@ -696,6 +805,21 @@ pub unsafe fn load_dll_in_remote_process(
 
     let image_size = opt.windows_fields.size_of_image as usize;
     let preferred_base = opt.windows_fields.image_base as isize;
+
+    // Verify the shared-ASLR assumption used by local import resolution.
+    let local_ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"));
+    let remote_ntdll = get_remote_ntdll_base(target_process);
+    if let (Some(local), Some(remote)) = (local_ntdll, remote_ntdll) {
+        if local != remote {
+            log::warn!(
+                "remote_manual_map: NTDLL base mismatch (local={:#x}, remote={:#x}). \
+                 Shared ASLR assumption does not hold — import resolution may produce \
+                 incorrect addresses. Proceeding anyway, but some imports may be wrong.",
+                local,
+                remote
+            );
+        }
+    }
 
     // ── Step 1: allocate in the remote process ────────────────────────────
     let remote_base = VirtualAllocEx(

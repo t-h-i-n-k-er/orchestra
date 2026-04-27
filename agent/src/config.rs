@@ -2,12 +2,19 @@
 
 use anyhow::{Context as _, Result};
 use common::config::Config;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::UNIX_EPOCH;
 use tokio::sync::RwLock;
+
+type HmacSha256 = Hmac<Sha256>;
+
+// Dependency note: this module expects `hmac` and `hex` in agent/Cargo.toml.
+// Prompt scope is limited to config.rs, so dependency additions are tracked
+// here as a reminder when applying this change set.
 
 static LAST_MTIME: AtomicU64 = AtomicU64::new(0);
 static LAST_CONFIG: once_cell::sync::Lazy<StdRwLock<Option<Config>>> =
@@ -69,10 +76,50 @@ pub fn config_path() -> PathBuf {
         .join("agent.toml")
 }
 
+fn compute_config_hmac(raw_toml: &[u8]) -> [u8; 32] {
+    let key_material =
+        option_env!("ORCHESTRA_C_SECRET").unwrap_or("orchestra-config-integrity-v1");
+    let mut mac = HmacSha256::new_from_slice(key_material.as_bytes())
+        .expect("HMAC key length is valid");
+    mac.update(raw_toml);
+    mac.finalize().into_bytes().into()
+}
+
+fn verify_config_hmac(raw_toml: &[u8], expected_hmac_hex: &str) -> bool {
+    let key_material =
+        option_env!("ORCHESTRA_C_SECRET").unwrap_or("orchestra-config-integrity-v1");
+    let mut mac = HmacSha256::new_from_slice(key_material.as_bytes())
+        .expect("HMAC key length is valid");
+    mac.update(raw_toml);
+    match hex::decode(expected_hmac_hex.trim()) {
+        Ok(expected) => mac.verify_slice(&expected).is_ok(),
+        Err(_) => false,
+    }
+}
+
+pub fn append_config_hmac(config_path: &std::path::Path) -> anyhow::Result<()> {
+    // NOTE: this function requires the `hex` crate in the `agent` crate deps.
+    let raw = std::fs::read_to_string(config_path)?;
+    let content = raw
+        .lines()
+        .filter(|l| !l.starts_with("# hmac = "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let hmac_bytes = compute_config_hmac(content.as_bytes());
+    let hmac_hex = hex::encode(hmac_bytes);
+    let signed = format!("{}\n# hmac = {}\n", content, hmac_hex);
+    std::fs::write(config_path, signed)?;
+    Ok(())
+}
+
 /// Load agent configuration from `~/.config/orchestra/agent.toml`.
 /// Returns a default [`Config`] when the file does not exist yet.
+/// If the last line is `# hmac = <hex>`, the HMAC-SHA256 is verified against
+/// the file contents excluding that tag line. A mismatch aborts loading.
+/// If no tag exists, loading continues for backward compatibility.
+///
 /// If a `.sha256` companion file exists, its contents are checked against the
-/// SHA-256 digest of the config file and loading is aborted on mismatch (M-37).
+/// SHA-256 digest of the config file and loading is aborted on mismatch.
 pub fn load_config() -> Result<Config> {
     let path = config_path();
     if !path.exists() {
@@ -88,7 +135,38 @@ pub fn load_config() -> Result<Config> {
         }
     }
 
-    let content = std::fs::read_to_string(&path)?;
+    let raw = std::fs::read(&path)?;
+    let content = std::str::from_utf8(&raw)
+        .with_context(|| format!("config file is not valid UTF-8: {}", path.display()))?;
+
+    let lines: Vec<&str> = content.lines().collect();
+    let (content_for_parse, hmac_tag) = if let Some(last) = lines.last() {
+        if let Some(tag) = last.strip_prefix("# hmac = ") {
+            (lines[..lines.len().saturating_sub(1)].join("\n"), Some(tag))
+        } else {
+            (content.to_string(), None)
+        }
+    } else {
+        (String::new(), None)
+    };
+
+    if let Some(expected_hmac) = hmac_tag {
+        if !verify_config_hmac(content_for_parse.as_bytes(), expected_hmac) {
+            tracing::warn!(
+                path = %path.display(),
+                "config integrity verification failed for embedded hmac tag"
+            );
+            anyhow::bail!(
+                "Config integrity check failed: HMAC mismatch for {}",
+                path.display()
+            );
+        }
+    } else {
+        tracing::info!(
+            path = %path.display(),
+            "Config file has no integrity tag - set one with orchestra-keygen config-hmac <path>"
+        );
+    }
 
     // Integrity check: if agent.toml.sha256 is present, verify before parsing.
     let sha_path = sha256_path(&path);
@@ -105,7 +183,7 @@ pub fn load_config() -> Result<Config> {
         }
     }
 
-    let config: Config = toml::from_str(&content)?;
+    let config: Config = toml::from_str(&content_for_parse)?;
     update_cache(&config, mtime_token);
     Ok(config)
 }
