@@ -361,49 +361,97 @@ fn is_expected_hypervisor() -> bool {
 /// This function uses a two-step validation:
 ///   1. TCP connect within 150 ms (conservative vs. the old 100 ms, to handle
 ///      slightly slower hypervisor routing on some Azure SKUs).
-///   2. Write a minimal HTTP/1.0 GET and read the first 12 bytes of the
-///      response.  Accept only status codes that an IMDS genuinely returns:
+///   2. Write a minimal HTTP/1.0 GET and read the response.  Accept only status
+///      codes that an IMDS genuinely returns:
 ///      200 (OK — IMDSv1 enabled)
 ///      400 (Bad Request — IMDSv2 token check, proves IMDS exists)
 ///      401 (Unauthorized — same as 400 on some providers)
 ///      Corporate proxies return 301, 302, 200 with an HTML body,
 ///      or 404 — none of which begin with "HTTP/1." followed by " 200",
 ///      " 400", or " 401".
+///
+/// **macOS**: Always returns `false`.  macOS uses the 169.254.0.0/16 range for
+/// link-local networking (Bonjour/mDNS, Internet Sharing, AwDL) and the
+/// CaptiveNetworkSupport daemon can intercept HTTP probes to any IP.  This
+/// produces false positives on physical Macs.  macOS cloud VMs (AWS EC2 Mac)
+/// are already identified by `is_expected_hypervisor()` via ioreg AppleVirtIO.
 fn is_cloud_instance() -> bool {
-    use std::io::{Read, Write};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-    use std::time::Duration;
-
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 80);
-    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(150)) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-
-    // Set a tight read deadline so we don't stall if the host accepts the
-    // connection but never sends a response.
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
-
-    // Send a minimal IMDSv1-style request.  Intentionally use HTTP/1.0 (no
-    // keep-alive) so the server closes the connection after responding.
-    let req = b"GET /latest/meta-data/ HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n";
-    if stream.write_all(req).is_err() {
+    // M-29: Skip IMDS probe on macOS — link-local/mDNS and captive portal
+    // detection cause false positives.  Cloud Mac instances are already
+    // detected by is_expected_hypervisor() via ioreg AppleVirtIO.
+    #[cfg(target_os = "macos")]
+    {
         return false;
     }
 
-    // Read first 12 bytes: "HTTP/1.x NNN"
-    let mut buf = [0u8; 12];
-    if stream.read_exact(&mut buf).is_err() {
-        return false;
-    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::io::{Read, Write};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+        use std::time::Duration;
 
-    // buf must start with "HTTP/1." (7 bytes) followed by a space and a 3-digit
-    // status code.  Accept only 200, 400, and 401 as cloud-IMDS responses.
-    if !buf.starts_with(b"HTTP/1.") {
-        return false;
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 80);
+        let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        // Tighter read timeout: genuine IMDS responds in <5ms; 100ms is generous.
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+
+        // Send a minimal IMDSv1-style request.  Intentionally use HTTP/1.0 (no
+        // keep-alive) so the server closes the connection after responding.
+        let req = b"GET /latest/meta-data/ HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n";
+        if stream.write_all(req).is_err() {
+            return false;
+        }
+
+        // Read enough bytes to validate both status line AND partial body.
+        let mut buf = [0u8; 256];
+        let n = match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => n,
+        };
+
+        if !buf.starts_with(b"HTTP/1.") {
+            return false;
+        }
+
+        if n < 12 {
+            return false;
+        }
+        let status = &buf[9..12];
+        if !matches!(status, b"200" | b"400" | b"401") {
+            return false;
+        }
+
+        // M-29 enhancement: for HTTP 200 responses, verify the body contains
+        // known IMDS content.  AWS IMDS returns directory-style listings like
+        // "ami-id\ninstance-id\n...".  If the body looks like HTML (a captive
+        // portal page), reject it.
+        if status == b"200" && n > 16 {
+            let header_end = buf[..n]
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|p| p + 4);
+            if let Some(body_start) = header_end {
+                let body = &buf[body_start..n];
+                // If body starts with "<" it's HTML — not IMDS
+                if body.starts_with(b"<") || body.starts_with(b"<!") {
+                    return false;
+                }
+                // IMDS body typically contains lowercase directory names
+                // separated by newlines.  Check for at least one known key.
+                let body_str = String::from_utf8_lossy(body);
+                let known_keys = ["ami-id", "instance-id", "hostname", "local-ipv4"];
+                if !known_keys.iter().any(|k| body_str.contains(k)) {
+                    return false;
+                }
+            }
+        }
+
+        true
     }
-    let status = &buf[9..12]; // "NNN"
-    matches!(status, b"200" | b"400" | b"401")
 }
 
 pub fn detect_vm() -> bool {
