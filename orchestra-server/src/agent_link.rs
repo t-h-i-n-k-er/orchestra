@@ -15,7 +15,7 @@
 //! the old socket's TCP EOF cleans up the stale entry.
 
 use crate::state::{now_secs, AgentEntry, AppState};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use common::{CryptoSession, Message};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,6 +55,15 @@ pub async fn run(
     secret: String,
     tls: Arc<rustls::ServerConfig>,
 ) -> Result<()> {
+    // If mTLS is enabled, rebuild the ServerConfig with a client certificate
+    // verifier.  The HTTPS dashboard keeps the original config (no client
+    // cert required so browsers can reach the operator GUI).
+    let tls = if state.config.mtls_enabled {
+        crate::tls::build_agent_tls_config(&state.config)
+            .context("building mTLS ServerConfig for agent listener")?
+    } else {
+        tls
+    };
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "agent listener bound");
     serve(state, listener, secret, tls).await
@@ -125,6 +134,35 @@ async fn handle_agent(
     );
     #[cfg(not(feature = "forward-secrecy"))]
     let session = Arc::new(CryptoSession::from_shared_secret(secret.as_bytes()));
+
+    // mTLS: after the TLS handshake, extract and log the client certificate CN.
+    // When mtls_enabled is true the WebPkiClientVerifier has already verified
+    // the certificate chain at the TLS layer; this block provides audit
+    // logging and defense-in-depth rejection for the case where a cert was
+    // somehow omitted.
+    if state.config.mtls_enabled {
+        let (_, server_conn) = tls_stream.get_ref();
+        match server_conn.peer_certificates().and_then(|c| c.first()) {
+            Some(cert_der) => {
+                let cn = crate::tls::extract_cn(cert_der)
+                    .unwrap_or_else(|| "<unparseable>".to_string());
+                tracing::info!(
+                    connection_id = %connection_id,
+                    %peer,
+                    client_cert_cn = %cn,
+                    "mTLS: client certificate accepted"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    connection_id = %connection_id,
+                    %peer,
+                    "mTLS: no client certificate presented; closing connection"
+                );
+                return Ok(());
+            }
+        }
+    }
 
     let (mut r, mut w) = tokio::io::split(tls_stream);
 

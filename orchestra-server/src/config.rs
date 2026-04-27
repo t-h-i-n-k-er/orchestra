@@ -48,6 +48,23 @@ pub struct ServerConfig {
     /// Benign-looking IP returned for beacon A queries when no tasking exists.
     #[serde(default = "default_doh_idle_ip")]
     pub doh_idle_ip: String,
+    // ── Mutual TLS (agent channel) ─────────────────────────────────────────
+    /// When `true`, the agent-facing TCP listener requires client certificates.
+    /// Defaults to `false` for backward compatibility.
+    #[serde(default)]
+    pub mtls_enabled: bool,
+    /// Path to a PEM-encoded CA certificate used to verify agent client certs.
+    /// Required when `mtls_enabled = true`.
+    #[serde(default)]
+    pub mtls_ca_cert_path: Option<PathBuf>,
+    /// Allowed Common Names in agent client certificates.  When non-empty,
+    /// only agents whose cert CN appears in this list are accepted.
+    #[serde(default)]
+    pub mtls_allowed_cns: Vec<String>,
+    /// Allowed Organizational Units in agent client certificates.  When
+    /// non-empty, the client cert's OU must appear in this list.
+    #[serde(default)]
+    pub mtls_allowed_ous: Vec<String>,
 }
 
 fn default_builds_dir() -> PathBuf {
@@ -95,6 +112,10 @@ impl Default for ServerConfig {
             doh_domain: default_doh_domain(),
             doh_beacon_sentinel: default_doh_beacon_sentinel(),
             doh_idle_ip: default_doh_idle_ip(),
+            mtls_enabled: false,
+            mtls_ca_cert_path: None,
+            mtls_allowed_cns: Vec::new(),
+            mtls_allowed_ous: Vec::new(),
         }
     }
 }

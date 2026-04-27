@@ -52,6 +52,10 @@ use uuid::Uuid;
 const BAKED_ADDR: Option<&str> = option_env!("ORCHESTRA_C_ADDR");
 const BAKED_SECRET: Option<&str> = option_env!("ORCHESTRA_C_SECRET");
 const BAKED_CERT_FP: Option<&str> = option_env!("ORCHESTRA_C_CERT_FP");
+/// Path to the PEM client certificate presented to the server during mTLS.
+const BAKED_MTLS_CERT: Option<&str> = option_env!("ORCHESTRA_C_MTLS_CERT");
+/// Path to the PEM private key for the mTLS client certificate.
+const BAKED_MTLS_KEY: Option<&str> = option_env!("ORCHESTRA_C_MTLS_KEY");
 
 const MAX_BACKOFF_SECS: u64 = 64;
 
@@ -93,31 +97,65 @@ pub fn resolve_cert_fp() -> Option<String> {
 /// When `cert_fp` is provided the server certificate is verified by its
 /// SHA-256 fingerprint (strict pinning).  Otherwise the system's native root
 /// CA store is used.
-fn build_tls_client_config(cert_fp: Option<&str>) -> Result<ClientConfig> {
-    if let Some(fp) = cert_fp {
+///
+/// When `mtls_cert_path` and `mtls_key_path` are both provided the client
+/// presents its own certificate during the TLS handshake, enabling mTLS.
+/// This is backward compatible: if neither path is set the client connects
+/// without a client certificate (standard TLS).
+fn build_tls_client_config(
+    cert_fp: Option<&str>,
+    mtls_cert_path: Option<&str>,
+    mtls_key_path: Option<&str>,
+) -> Result<ClientConfig> {
+    // ── Server certificate verification ──────────────────────────────────
+    let builder = if let Some(fp) = cert_fp {
         let verifier = PinnedCertVerifier::from_hex(fp)?;
-        let cfg = ClientConfig::builder()
+        ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
-            .with_no_client_auth();
-        return Ok(cfg);
+    } else {
+        // No fingerprint — fall back to native root store.
+        let mut roots = rustls::RootCertStore::empty();
+        let native = rustls_native_certs::load_native_certs();
+        if !native.errors.is_empty() {
+            warn!(
+                "outbound-c: {} errors loading native root certs (continuing)",
+                native.errors.len()
+            );
+        }
+        for cert in native.certs {
+            roots.add(cert).ok();
+        }
+        ClientConfig::builder().with_root_certificates(roots)
+    };
+
+    // ── Client certificate (mTLS) ─────────────────────────────────────────
+    if let (Some(cert_path), Some(key_path)) = (mtls_cert_path, mtls_key_path) {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let cert_bytes = std::fs::read(cert_path)
+            .map_err(|e| anyhow!("reading mTLS client cert {cert_path}: {e}"))?;
+        let key_bytes = std::fs::read(key_path)
+            .map_err(|e| anyhow!("reading mTLS client key {key_path}: {e}"))?;
+
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut cert_bytes.as_slice())
+                .collect::<std::result::Result<Vec<_>, _>>
+                ()
+                .map_err(|e| anyhow!("parsing mTLS client cert {cert_path}: {e}"))?;
+
+        let key: PrivateKeyDer<'static> =
+            rustls_pemfile::private_key(&mut key_bytes.as_slice())
+                .map_err(|e| anyhow!("parsing mTLS client key {key_path}: {e}"))?
+                .ok_or_else(|| anyhow!("no private key found in {key_path}"))?;
+
+        info!("outbound-c: mTLS client certificate configured ({})", cert_path);
+        return builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| anyhow!("configuring mTLS client cert: {e}"));
     }
 
-    // No fingerprint — fall back to native root store.
-    let mut roots = rustls::RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    if !native.errors.is_empty() {
-        warn!(
-            "outbound-c: {} errors loading native root certs (continuing)",
-            native.errors.len()
-        );
-    }
-    for cert in native.certs {
-        roots.add(cert).ok();
-    }
-    Ok(ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth())
+    Ok(builder.with_no_client_auth())
 }
 
 /// Build the appropriate outbound transport based on compiled features and the
@@ -224,7 +262,7 @@ pub async fn build_outbound_transport(
     let tcp = TcpStream::connect(addr).await?;
     tcp.set_nodelay(true)?;
 
-    let tls_cfg = build_tls_client_config(cert_fp)?;
+    let tls_cfg = build_tls_client_config(cert_fp, BAKED_MTLS_CERT, BAKED_MTLS_KEY)?;
     let connector = TlsConnector::from(Arc::new(tls_cfg));
 
     let host = addr.split(':').next().unwrap_or(addr);
