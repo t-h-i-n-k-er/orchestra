@@ -745,10 +745,47 @@ mod runtime_rewrite {
     }
 
     #[cfg(unix)]
+    fn read_page_protection(addr: usize) -> u32 {
+        // Parse /proc/self/maps to find the protection for the page containing
+        // `addr`.  Returns PROT_READ | PROT_EXEC as a safe fallback when
+        // parsing fails (e.g. on non-Linux unix targets that lack /proc).
+        use std::fs;
+        if let Ok(maps) = fs::read_to_string("/proc/self/maps") {
+            for line in maps.lines() {
+                let parts: Vec<&str> = line.splitn(6, ' ').collect();
+                if parts.len() >= 2 {
+                    let range: Vec<&str> = parts[0].splitn(2, '-').collect();
+                    if range.len() == 2 {
+                        if let (Ok(start), Ok(end)) = (
+                            usize::from_str_radix(range[0], 16),
+                            usize::from_str_radix(range[1], 16),
+                        ) {
+                            if addr >= start && addr < end {
+                                let mut prot: u32 = 0;
+                                for c in parts[1].chars() {
+                                    match c {
+                                        'r' => prot |= libc::PROT_READ as u32,
+                                        'w' => prot |= libc::PROT_WRITE as u32,
+                                        'x' => prot |= libc::PROT_EXEC as u32,
+                                        _ => {}
+                                    }
+                                }
+                                return prot;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (libc::PROT_READ | libc::PROT_EXEC) as u32
+    }
+
+    #[cfg(unix)]
     unsafe fn make_writable(addr: usize, len: usize) -> Result<ProtSnapshot, String> {
         let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
         let aligned = addr & !(page - 1);
         let aligned_len = ((addr + len) - aligned + page - 1) & !(page - 1);
+        let orig_prot = read_page_protection(aligned);
         if libc::mprotect(
             aligned as *mut libc::c_void,
             aligned_len,
@@ -760,25 +797,21 @@ mod runtime_rewrite {
                 std::io::Error::last_os_error()
             ));
         }
-        // We don't read original protection on unix; assume PROT_READ|PROT_EXEC for restore.
-        Ok(ProtSnapshot(0))
+        // Save the page's *original* protection so restore can put it back
+        // exactly (e.g. PROT_READ-only .rodata stays read-only) — H-6.
+        Ok(ProtSnapshot(orig_prot))
     }
 
     #[cfg(unix)]
     unsafe fn restore_protection(
         addr: usize,
         len: usize,
-        _old: &mut ProtSnapshot,
+        old: &mut ProtSnapshot,
     ) -> Result<(), String> {
         let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
         let aligned = addr & !(page - 1);
         let aligned_len = ((addr + len) - aligned + page - 1) & !(page - 1);
-        if libc::mprotect(
-            aligned as *mut libc::c_void,
-            aligned_len,
-            libc::PROT_READ | libc::PROT_EXEC,
-        ) != 0
-        {
+        if libc::mprotect(aligned as *mut libc::c_void, aligned_len, old.0 as i32) != 0 {
             return Err(format!(
                 "mprotect(restore) failed: {}",
                 std::io::Error::last_os_error()
@@ -788,9 +821,33 @@ mod runtime_rewrite {
     }
 
     #[cfg(unix)]
-    unsafe fn flush_icache(_addr: usize, _len: usize) {
-        // x86_64/aarch64 Linux uses coherent I-cache; mprotect already
-        // serializes.  For other arches we'd call __builtin___clear_cache.
+    unsafe fn flush_icache(addr: usize, len: usize) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            // aarch64 I-cache is NOT coherent with D-cache.
+            // Sequence: DC CVAU on each cache line, DSB ISH, IC IVAU on each
+            // line, DSB ISH, ISB.  Without this the CPU may execute stale
+            // instructions from I-cache after we rewrite code in D-cache (H-6).
+            const CACHE_LINE: usize = 64; // typical aarch64 line size
+            let end = addr + len;
+            let mut p = addr & !(CACHE_LINE - 1);
+            while p < end {
+                std::arch::asm!("dc cvau, {x}", x = in(reg) p);
+                p += CACHE_LINE;
+            }
+            std::arch::asm!("dsb ish");
+            let mut p = addr & !(CACHE_LINE - 1);
+            while p < end {
+                std::arch::asm!("ic ivau, {x}", x = in(reg) p);
+                p += CACHE_LINE;
+            }
+            std::arch::asm!("dsb ish", "isb");
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            // x86_64: coherent I-cache; mprotect serialises.  No-op is correct.
+            let _ = (addr, len);
+        }
     }
 
     #[cfg(not(any(windows, unix)))]
