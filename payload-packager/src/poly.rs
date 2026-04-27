@@ -147,22 +147,37 @@ pub fn poly_emit_stub(blob: &PolyBlob) -> String {
     let v_klen = format!("kl_{suf_klen}");
     let v_dead = format!("_dead_{suf_dead}");
 
-    let key_literal = byte_array_literal(&blob.key);
+    // M-38: Avoid embedding the raw key bytes directly in source.  Mask the
+    // key with a SplitMix64 stream and reconstruct it at runtime in the stub.
+    let key_seed: u64 = rng.gen();
+    let key_seed_lo = key_seed as u32;
+    let key_seed_hi = (key_seed >> 32) as u32;
+    let seed_mask_lo: u32 = rng.gen();
+    let seed_mask_hi: u32 = rng.gen();
+    let masked_seed_lo = key_seed_lo ^ seed_mask_lo;
+    let masked_seed_hi = key_seed_hi ^ seed_mask_hi;
+
+    let mut sm_state = key_seed;
+    let masked_key: Vec<u8> = blob
+        .key
+        .iter()
+        .map(|&b| b ^ (splitmix64_next(&mut sm_state) as u8))
+        .collect();
+    let masked_key_literal = byte_array_literal(&masked_key);
+
+    let reconstruct_key_fn = emit_reconstruct_key_fn(
+        &masked_key_literal,
+        masked_seed_lo,
+        masked_seed_hi,
+        seed_mask_lo,
+        seed_mask_hi,
+        &mut rng,
+    );
 
     let body = match blob.scheme {
-        PolyScheme::XorStream => emit_xor_body(
-            &v_ct,
-            &v_key,
-            &v_out,
-            &v_idx,
-            &v_klen,
-            &key_literal,
-            &mut rng,
-        ),
-        PolyScheme::Rc4 => emit_rc4_body(&v_ct, &v_key, &v_out, &key_literal, &mut rng),
-        PolyScheme::ChaCha20Stream => emit_chacha20_body(
-            &v_ct, &v_key, &v_out, &key_literal, &mut rng,
-        ),
+        PolyScheme::XorStream => emit_xor_body(&v_ct, &v_key, &v_out, &v_idx, &v_klen, &mut rng),
+        PolyScheme::Rc4 => emit_rc4_body(&v_ct, &v_key, &v_out, &mut rng),
+        PolyScheme::ChaCha20Stream => emit_chacha20_body(&v_ct, &v_key, &v_out, &mut rng),
     };
 
     // Vary whether dead code appears before or after the key assignment.
@@ -184,11 +199,13 @@ pub fn poly_emit_stub(blob: &PolyBlob) -> String {
          #[allow(unused_variables, unused_mut, clippy::all, non_snake_case)]\n\
          pub fn poly_decrypt({v_ct}: &[u8]) -> ::std::vec::Vec<u8> {{\n\
          {before_dead}\
+         {reconstruct_key_fn}\
          {body}\
          {after_dead}\
          }}\n",
         build_token = build_token,
         scheme = blob.scheme,
+        reconstruct_key_fn = reconstruct_key_fn,
     )
 }
 
@@ -317,6 +334,73 @@ fn chacha20_stream(data: &[u8], key: &[u8]) -> Vec<u8> {
     output
 }
 
+#[inline]
+fn splitmix64_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn emit_reconstruct_key_fn(
+    masked_key_lit: &str,
+    masked_seed_lo: u32,
+    masked_seed_hi: u32,
+    seed_mask_lo: u32,
+    seed_mask_hi: u32,
+    rng: &mut impl Rng,
+) -> String {
+    let mut suf = || format!("{:04x}", rng.gen::<u16>());
+    let v_masked = format!("mk_{}", suf());
+    let v_out = format!("rk_{}", suf());
+    let v_state = format!("sm_{}", suf());
+    let v_x = format!("x_{}", suf());
+    let v_lo = format!("lo_{}", suf());
+    let v_hi = format!("hi_{}", suf());
+    let v_i = format!("i_{}", suf());
+
+    let body = if rng.gen_bool(0.5) {
+        format!(
+            "    fn reconstruct_key() -> ::std::vec::Vec<u8> {{\n        \
+             let {v_masked}: &[u8] = &[{masked_key_lit}];\n        \
+             let {v_lo}: u32 = 0x{masked_seed_lo:08x}u32 ^ 0x{seed_mask_lo:08x}u32;\n        \
+             let {v_hi}: u32 = 0x{masked_seed_hi:08x}u32 ^ 0x{seed_mask_hi:08x}u32;\n        \
+             let mut {v_state}: u64 = ({v_lo} as u64) | (({v_hi} as u64) << 32);\n        \
+             let mut {v_out}: ::std::vec::Vec<u8> = ::std::vec::Vec::with_capacity({v_masked}.len());\n        \
+             for &{v_i} in {v_masked} {{\n            \
+             {v_state} = {v_state}.wrapping_add(0x9E3779B97F4A7C15u64);\n            \
+             let mut {v_x} = {v_state};\n            \
+             {v_x} = ({v_x} ^ ({v_x} >> 30)).wrapping_mul(0xBF58476D1CE4E5B9u64);\n            \
+             {v_x} = ({v_x} ^ ({v_x} >> 27)).wrapping_mul(0x94D049BB133111EBu64);\n            \
+             {v_x} ^= {v_x} >> 31;\n            \
+             {v_out}.push({v_i} ^ ({v_x} as u8));\n        \
+             }}\n        \
+             {v_out}\n    \
+             }}\n"
+        )
+    } else {
+        format!(
+            "    fn reconstruct_key() -> ::std::vec::Vec<u8> {{\n        \
+             let {v_masked}: &[u8] = &[{masked_key_lit}];\n        \
+             let {v_lo}: u32 = 0x{masked_seed_lo:08x}u32 ^ 0x{seed_mask_lo:08x}u32;\n        \
+             let {v_hi}: u32 = 0x{masked_seed_hi:08x}u32 ^ 0x{seed_mask_hi:08x}u32;\n        \
+             let mut {v_state}: u64 = ({v_lo} as u64) | (({v_hi} as u64) << 32);\n        \
+             {v_masked}.iter().map(|&b| {{\n            \
+             {v_state} = {v_state}.wrapping_add(0x9E3779B97F4A7C15u64);\n            \
+             let mut {v_x} = {v_state};\n            \
+             {v_x} = ({v_x} ^ ({v_x} >> 30)).wrapping_mul(0xBF58476D1CE4E5B9u64);\n            \
+             {v_x} = ({v_x} ^ ({v_x} >> 27)).wrapping_mul(0x94D049BB133111EBu64);\n            \
+             {v_x} ^= {v_x} >> 31;\n            \
+             b ^ ({v_x} as u8)\n        \
+             }}).collect()\n    \
+             }}\n"
+        )
+    };
+
+    body
+}
+
 // ── Stub body emitters ────────────────────────────────────────────────────────
 
 fn emit_xor_body(
@@ -325,13 +409,12 @@ fn emit_xor_body(
     v_out: &str,
     v_idx: &str,
     v_klen: &str,
-    key_lit: &str,
     rng: &mut impl Rng,
 ) -> String {
     if rng.gen_bool(0.5) {
         // Style A: indexed for-loop
         format!(
-            "    let {v_key}: &[u8] = &[{key_lit}];\n    \
+            "    let {v_key}: ::std::vec::Vec<u8> = reconstruct_key();\n    \
              let {v_klen} = {v_key}.len();\n    \
              let mut {v_out} = ::std::vec::Vec::with_capacity({v_ct}.len());\n    \
              for {v_idx} in 0..{v_ct}.len() {{\n        \
@@ -342,7 +425,7 @@ fn emit_xor_body(
     } else {
         // Style B: iterator chain (no explicit loop variable)
         format!(
-            "    let {v_key}: &[u8] = &[{key_lit}];\n    \
+            "    let {v_key}: ::std::vec::Vec<u8> = reconstruct_key();\n    \
              {v_ct}.iter().enumerate()\n        \
              .map(|({v_idx}, &b)| b ^ {v_key}[{v_idx} % {v_key}.len()])\n        \
              .collect()\n",
@@ -354,7 +437,6 @@ fn emit_rc4_body(
     v_ct: &str,
     v_key: &str,
     v_out: &str,
-    key_lit: &str,
     rng: &mut impl Rng,
 ) -> String {
     // Variable names for internal RC4 state
@@ -366,7 +448,7 @@ fn emit_rc4_body(
     let vb = format!("b_{}", suf());
 
     format!(
-        "    let {v_key}: &[u8] = &[{key_lit}];\n    \
+        "    let {v_key}: ::std::vec::Vec<u8> = reconstruct_key();\n    \
          let mut {vs}: [u8; 256] = ::std::array::from_fn(|i| i as u8);\n    \
          let mut {vj}: usize = 0;\n    \
          for {vi} in 0..256usize {{\n        \
@@ -390,7 +472,6 @@ fn emit_chacha20_body(
     v_ct: &str,
     v_key: &str,
     v_out: &str,
-    key_lit: &str,
     rng: &mut impl Rng,
 ) -> String {
     let mut suf = || format!("{:04x}", rng.gen::<u16>());
@@ -409,7 +490,7 @@ fn emit_chacha20_body(
     if rng.gen_bool(0.5) {
         // Style A: inline QR operations, no helper functions
         format!(
-"    let {v_key}: &[u8] = &[{key_lit}];
+    "    let {v_key}: ::std::vec::Vec<u8> = reconstruct_key();
     let {v_consts}: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
     let mut {v_kwords}: [u32; 8] = [0; 8];
     for i in 0..8usize {{ {v_kwords}[i] = u32::from_le_bytes({v_key}[i*4..i*4+4].try_into().unwrap()); }}
@@ -469,7 +550,7 @@ fn emit_chacha20_body(
         for i in 0..16 {{ let v = w[i].wrapping_add({v_state}[i]); out[i*4..i*4+4].copy_from_slice(&v.to_le_bytes()); }}
         out
     }}
-    let {v_key}: &[u8] = &[{key_lit}];
+    let {v_key}: ::std::vec::Vec<u8> = reconstruct_key();
     let {v_consts}: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
     let mut {v_kwords}: [u32; 8] = [0; 8];
     for i in 0..8 {{ {v_kwords}[i] = u32::from_le_bytes({v_key}[i*4..i*4+4].try_into().unwrap()); }}
@@ -555,17 +636,76 @@ mod tests {
     }
 
     #[test]
-    fn stub_contains_key_bytes() {
+    fn stub_reconstructs_key_and_hides_raw_literals() {
         let pt = b"stub key test";
         let blob = poly_wrap(pt);
         let stub = poly_emit_stub(&blob);
-        // Every key byte should appear as a hex literal somewhere in the stub.
-        for byte in &blob.key {
+
+        // The generated source must contain runtime reconstruction.
+        assert!(
+            stub.contains("fn reconstruct_key() -> ::std::vec::Vec<u8>"),
+            "stub missing reconstruct_key function"
+        );
+
+        // Raw key must not appear as a contiguous literal sequence.
+        let full_raw_key_lit = byte_array_literal(&blob.key);
+        assert!(
+            !stub.contains(&full_raw_key_lit),
+            "stub leaked full raw key literal"
+        );
+
+        // Allow accidental single-byte collisions, but reject any 8-byte
+        // contiguous raw-key window appearing in source.
+        for i in 0..=blob.key.len().saturating_sub(8) {
+            let window_lit = byte_array_literal(&blob.key[i..i + 8]);
             assert!(
-                stub.contains(&format!("0x{:02x}u8", byte)),
-                "stub missing key byte 0x{:02x}",
-                byte
+                !stub.contains(&window_lit),
+                "stub leaked contiguous raw-key literal window starting at byte {i}"
             );
         }
+    }
+
+    #[test]
+    fn masked_key_not_equal_to_real_key() {
+        fn extract_literal_bytes(stub: &str) -> Vec<u8> {
+            let marker = ": &[u8] = &[";
+            let start = stub
+                .find(marker)
+                .expect("masked key literal start marker not found")
+                + marker.len();
+            let after_bracket = &stub[start..];
+            let bracket_end = after_bracket
+                .find("];")
+                .expect("masked key literal end not found");
+            let raw = &after_bracket[..bracket_end];
+            raw.split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|tok| {
+                    let hex = tok
+                        .strip_prefix("0x")
+                        .and_then(|v| v.strip_suffix("u8"))
+                        .expect("unexpected key byte token format");
+                    u8::from_str_radix(hex, 16).expect("invalid hex key byte")
+                })
+                .collect()
+        }
+
+        let blob = poly_wrap(b"mask coverage test payload");
+        let stub = poly_emit_stub(&blob);
+        let masked = extract_literal_bytes(&stub);
+
+        assert_eq!(masked.len(), blob.key.len(), "masked key length mismatch");
+
+        let diff = masked
+            .iter()
+            .zip(blob.key.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            diff * 2 >= blob.key.len(),
+            "expected >=50% bytes to differ, got {diff}/{}",
+            blob.key.len()
+        );
     }
 }
