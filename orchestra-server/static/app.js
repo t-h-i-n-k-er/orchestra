@@ -66,6 +66,13 @@
     ).join("");
     sel.innerHTML = agents.map(a => `<option value="${escapeAttr(a.agent_id)}">${escapeHtml(a.agent_id)}</option>`).join("");
     if (agents.find(a => a.agent_id === prevSel)) sel.value = prevSel;
+    // Keep the shell tab agent selector in sync.
+    const shellSel = document.getElementById("shell-agent-select");
+    if (shellSel) {
+      const prevShell = shellSel.value;
+      shellSel.innerHTML = sel.innerHTML;
+      if (agents.find(a => a.agent_id === prevShell)) shellSel.value = prevShell;
+    }
   }
 
   function escapeHtml(s) {
@@ -90,6 +97,8 @@
       case "Ping": return "Ping";
       case "GetSystemInfo": return "GetSystemInfo";
       case "ListProcesses": return "ListProcesses";
+      case "CaptureScreen": return "CaptureScreen";
+      case "DiscoverNetwork": return "DiscoverNetwork";
       case "ListDirectory": return { ListDirectory: { path: arg } };
       case "ReadFile": return { ReadFile: { path: arg } };
       case "RunApprovedScript": return { RunApprovedScript: { script: arg } };
@@ -156,14 +165,9 @@
   const btnDash = $("tab-btn-dash");
   const btnBuilder = $("tab-btn-builder");
 
-  btnDash.addEventListener("click", () => {
-    tabDash.hidden = false;
-    tabBuilder.hidden = true;
-    btnDash.style.fontWeight = "bold";
-    btnDash.className = "tab-btn active";
-    btnBuilder.style.fontWeight = "normal";
-    btnBuilder.className = "tab-btn";
-  });
+  // Tab switching is handled below by activateTab helper (see shell tab section)
+  // Placeholder listeners replaced by activateTab-based ones below.
+  void 0;
 
   btnBuilder.addEventListener("click", () => {
     tabDash.hidden = true;
@@ -173,6 +177,158 @@
     btnBuilder.style.fontWeight = "bold";
     btnBuilder.className = "tab-btn active";
   });
+
+  // ── Shell tab ────────────────────────────────────────────────────
+  const tabShell = $("tab-shell");
+  const btnShell = $("tab-btn-shell");
+
+  function activateTab(active, inactive1, inactive2, tabActive, tabInactive1, tabInactive2) {
+    tabActive.hidden = false;
+    tabInactive1.hidden = true;
+    tabInactive2.hidden = true;
+    active.className = "tab-btn active";
+    inactive1.className = "tab-btn";
+    inactive2.className = "tab-btn";
+  }
+
+  btnDash.addEventListener("click", () => activateTab(btnDash, btnShell, btnBuilder, tabDash, tabShell, tabBuilder));
+  btnShell.addEventListener("click", () => {
+    activateTab(btnShell, btnDash, btnBuilder, tabShell, tabDash, tabBuilder);
+    syncShellAgentSelect();
+  });
+  btnBuilder.addEventListener("click", () => activateTab(btnBuilder, btnDash, btnShell, tabBuilder, tabDash, tabShell));
+
+  function syncShellAgentSelect() {
+    const src = $("agent-select");
+    const dst = $("shell-agent-select");
+    const prev = dst.value;
+    dst.innerHTML = src.innerHTML;
+    if (dst.querySelector(`option[value="${escapeAttr(prev)}"]`)) dst.value = prev;
+  }
+
+  // ── xterm.js shell session ───────────────────────────────────────
+  let term = null;
+  let shellAgentId = null;
+  let shellSessionId = null;
+  let shellPollTimer = null;
+
+  function initTerm() {
+    if (term) { term.dispose(); }
+    term = new Terminal({
+      theme: {
+        background: "#0d1117",
+        foreground: "#e6edf3",
+        cursor: "#58a6ff",
+        selectionBackground: "#264f78",
+        black: "#0d1117", red: "#f85149", green: "#3fb950", yellow: "#d29922",
+        blue: "#58a6ff", magenta: "#bc8cff", cyan: "#39c5cf", white: "#e6edf3",
+        brightBlack: "#8b949e", brightRed: "#ff7b72", brightGreen: "#56d364",
+        brightYellow: "#e3b341", brightBlue: "#79c0ff", brightMagenta: "#d2a8ff",
+        brightCyan: "#56d4dd", brightWhite: "#f0f6fc",
+      },
+      fontFamily: '"Cascadia Code", "Fira Code", "SF Mono", Consolas, "Courier New", monospace',
+      fontSize: 14,
+      cursorBlink: true,
+      scrollback: 2000,
+    });
+    const container = $("terminal-container");
+    container.innerHTML = "";
+    term.open(container);
+    term.onData((data) => sendShellInput(data));
+  }
+
+  async function openShell() {
+    syncShellAgentSelect();
+    const agentId = $("shell-agent-select").value;
+    if (!agentId) { alert("Select an agent first."); return; }
+
+    $("btn-shell-open").disabled = true;
+    $("shell-status").textContent = "Connecting…";
+    $("shell-status").className = "muted";
+
+    try {
+      const res = await api("/agents/" + encodeURIComponent(agentId) + "/shell", {
+        method: "POST",
+        body: "{}",
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(txt || res.statusText);
+      }
+      const { session_id } = await res.json();
+      shellAgentId = agentId;
+      shellSessionId = session_id;
+
+      initTerm();
+      $("shell-status").textContent = "Connected";
+      $("shell-status").className = "muted connected";
+      $("btn-shell-close").disabled = false;
+      $("btn-shell-open").disabled = false;
+
+      shellPollTimer = setInterval(pollShellOutput, 250);
+    } catch (e) {
+      $("shell-status").textContent = "Failed: " + e.message;
+      $("shell-status").className = "err";
+      $("btn-shell-open").disabled = false;
+    }
+  }
+
+  async function sendShellInput(data) {
+    if (!shellSessionId) return;
+    const encoded = btoa(data.split("").map(c => String.fromCharCode(c.charCodeAt(0) & 0xff)).join(""));
+    try {
+      await api(
+        "/agents/" + encodeURIComponent(shellAgentId) +
+        "/shell/" + encodeURIComponent(shellSessionId) + "/input",
+        { method: "POST", body: JSON.stringify({ data: encoded }) }
+      );
+    } catch (e) {
+      console.warn("shell input error", e);
+    }
+  }
+
+  async function pollShellOutput() {
+    if (!shellSessionId) return;
+    try {
+      const res = await api(
+        "/agents/" + encodeURIComponent(shellAgentId) +
+        "/shell/" + encodeURIComponent(shellSessionId) + "/output"
+      );
+      if (!res.ok) return;
+      const { data } = await res.json();
+      if (data && term) {
+        try {
+          // data is base64-encoded bytes from the agent
+          const decoded = atob(data);
+          term.write(decoded);
+        } catch (_) {}
+      }
+    } catch (e) {
+      console.warn("shell output poll error", e);
+    }
+  }
+
+  async function closeShell() {
+    if (shellPollTimer) { clearInterval(shellPollTimer); shellPollTimer = null; }
+    if (shellAgentId && shellSessionId) {
+      try {
+        await api("/agents/" + encodeURIComponent(shellAgentId) + "/command", {
+          method: "POST",
+          body: JSON.stringify({ command: { CloseShell: { session_id: shellSessionId } } }),
+        });
+      } catch (_) {}
+    }
+    shellAgentId = null;
+    shellSessionId = null;
+    if (term) { term.write("\r\n\x1b[31m[session closed]\x1b[0m\r\n"); }
+    $("btn-shell-close").disabled = true;
+    $("shell-status").textContent = "Not connected";
+    $("shell-status").className = "muted";
+  }
+
+  $("btn-shell-open").addEventListener("click", openShell);
+  $("btn-shell-close").addEventListener("click", closeShell);
+
 
   $("btn-gen-key").addEventListener("click", () => {
     const bytes = new Uint8Array(32);

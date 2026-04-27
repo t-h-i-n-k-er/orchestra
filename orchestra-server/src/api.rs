@@ -13,6 +13,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use common::{Command, Message, Outcome};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -31,6 +32,23 @@ pub struct CommandReply {
     pub outcome: &'static str,
     pub output: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct OpenShellReply {
+    pub session_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct ShellInputRequest {
+    /// Base64-encoded bytes to write to the shell's stdin.
+    pub data: String,
+}
+
+#[derive(Serialize)]
+pub struct ShellOutputReply {
+    /// Base64-encoded bytes read from the shell's stdout/stderr since last poll.
+    pub data: String,
 }
 
 pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
@@ -54,6 +72,9 @@ pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
             "/build/:id/download",
             get(crate::build_handler::handle_download),
         )
+        .route("/agents/:id/shell", post(open_shell))
+        .route("/agents/:id/shell/:sid/input", post(shell_input))
+        .route("/agents/:id/shell/:sid/output", get(shell_output))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
@@ -76,6 +97,57 @@ async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentView>>
 
 async fn recent_audit(State(state): State<Arc<AppState>>) -> Json<Vec<common::AuditEvent>> {
     Json(state.audit.recent(200))
+}
+
+async fn open_shell(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<OpenShellReply>, (StatusCode, String)> {
+    let entry = state
+        .find_by_agent_id(&agent_id)
+        .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
+    let req = CommandRequest {
+        command: Command::StartShell,
+    };
+    let reply = dispatch_command(state, user, entry, req).await?;
+    let session_id = reply.0.output.unwrap_or_default();
+    Ok(Json(OpenShellReply { session_id }))
+}
+
+async fn shell_input(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((agent_id, session_id)): Path<(String, String)>,
+    Json(req): Json<ShellInputRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let entry = state
+        .find_by_agent_id(&agent_id)
+        .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
+    let data = B64
+        .decode(&req.data)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid base64 in data field".into()))?;
+    let cmd_req = CommandRequest {
+        command: Command::ShellInput { session_id, data },
+    };
+    let _ = dispatch_command(state, user, entry, cmd_req).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn shell_output(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((agent_id, session_id)): Path<(String, String)>,
+) -> Result<Json<ShellOutputReply>, (StatusCode, String)> {
+    let entry = state
+        .find_by_agent_id(&agent_id)
+        .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
+    let cmd_req = CommandRequest {
+        command: Command::ShellOutput { session_id },
+    };
+    let reply = dispatch_command(state, user, entry, cmd_req).await?;
+    let data = reply.0.output.unwrap_or_default();
+    Ok(Json(ShellOutputReply { data }))
 }
 
 async fn send_command_by_agent_id(
