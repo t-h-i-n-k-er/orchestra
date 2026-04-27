@@ -59,6 +59,12 @@ unsafe extern "system" fn veh_handler(
                 }
                 ptr = ptr.add(1);
             }
+            // Fallback: if no ret gadget found in the search window, do NOT
+            // redirect RIP to an arbitrary address (which would crash).
+            // Let the exception propagate to the next handler in the VEH chain (C-4).
+            if *ptr != 0xC3 && *ptr != 0xC2 {
+                return winapi::vc::excpt::EXCEPTION_CONTINUE_SEARCH;
+            }
             (*context).Rip = ptr as u64;
 
             return winapi::vc::excpt::EXCEPTION_CONTINUE_EXECUTION;
