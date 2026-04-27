@@ -137,14 +137,30 @@ pub mod crypto {
 
     #[cfg(windows)]
     unsafe fn get_code_sections() -> Vec<(*mut u8, usize)> {
-        use winapi::um::libloaderapi::GetModuleHandleA;
         use winapi::um::winnt::{
             IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_HEADERS64, IMAGE_NT_SIGNATURE,
             IMAGE_SECTION_HEADER,
         };
 
         let mut sections = Vec::new();
-        let base = GetModuleHandleA(std::ptr::null_mut());
+        // M-26 Part G: read PEB.ImageBaseAddress directly instead of going
+        // through the hookable GetModuleHandleA IAT entry.
+        #[cfg(target_arch = "x86_64")]
+        let base: *mut winapi::shared::minwindef::HINSTANCE__ = {
+            let teb: usize;
+            core::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, nomem, preserves_flags));
+            let peb = *((teb + 0x60) as *const usize) as *const u8;
+            *(peb.add(0x10) as *const usize) as *mut _
+        };
+        #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+        let base: *mut winapi::shared::minwindef::HINSTANCE__ = {
+            let teb: usize;
+            core::arch::asm!("mrs {}, tpidr_el0", out(reg) teb, options(nostack, nomem));
+            let peb = *((teb + 0x60) as *const usize) as *const u8;
+            *(peb.add(0x10) as *const usize) as *mut _
+        };
+        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_os = "windows"))))]
+        let base: *mut winapi::shared::minwindef::HINSTANCE__ = std::ptr::null_mut();
         if base.is_null() {
             return sections;
         }

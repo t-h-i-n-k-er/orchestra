@@ -2768,6 +2768,7 @@ dependencies = [
  "goblin 0.7.1",
  "libc",
  "libloading",
+ "pe_resolve",
  "reqwest 0.11.27",
  "sha2",
  "tempfile",

