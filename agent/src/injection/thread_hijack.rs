@@ -1,10 +1,10 @@
 use crate::injection::Injector;
 use anyhow::{anyhow, Result};
 
-pub struct ThreadHijackInjector;
+pub struct NtCreateThreadInjector;
 
 #[cfg(windows)]
-impl Injector for ThreadHijackInjector {
+impl Injector for NtCreateThreadInjector {
     /// Inject shellcode into a target process.
     ///
     /// The original implementation suspended an existing thread, redirected its
@@ -148,8 +148,8 @@ impl Injector for ThreadHijackInjector {
 }
 
 #[cfg(not(windows))]
-impl Injector for ThreadHijackInjector {
+impl Injector for NtCreateThreadInjector {
     fn inject(&self, _pid: u32, _payload: &[u8]) -> Result<()> {
-        Err(anyhow!("Thread Hijacking only supported on Windows"))
+        Err(anyhow!("NtCreateThread injection only supported on Windows"))
     }
 }

@@ -240,7 +240,6 @@ impl Pass for NopInsertionPass {
 /// Returns true if the instruction is a branch, call, or return that ends a
 /// basic block, determined by re-encoding the instruction and inspecting
 /// the leading opcode byte(s).
-#[cfg_attr(not(feature = "diversification"), allow(dead_code))]
 fn is_block_terminator(ins: &Instruction) -> bool {
     let mut enc = Encoder::new(64);
     if enc.encode(ins, 0).is_err() {

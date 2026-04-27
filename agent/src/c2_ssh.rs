@@ -1,3 +1,4 @@
+// Requires russh >= 0.46
 //! SSH covert transport for the Orchestra agent.
 //!
 //! # Status: EXPERIMENTAL — enabled via `--features ssh-transport`
@@ -33,7 +34,8 @@
 //!
 //! * `Key`      — loads a PEM/OpenSSH private key from a filesystem path.
 //! * `Password` — plain password authentication (use only when necessary).
-//! * `Agent`    — not implemented; returns an error at runtime.
+//! * `Agent`    — uses identities loaded in the local ssh-agent via
+//!                `SSH_AUTH_SOCK`.
 //!
 //! ## Reconnection
 //!
@@ -187,10 +189,60 @@ impl SshTransport {
             }
 
             SshAuthConfig::Agent => {
-                return Err(anyhow!(
-                    "ssh-transport: ssh-agent auth is not supported; \
-                     configure Key or Password auth in malleable profile"
-                ));
+                let mut agent_client = russh_keys::agent::client::AgentClient::connect_env()
+                    .await
+                    .map_err(|e| match e {
+                        russh_keys::Error::EnvVar("SSH_AUTH_SOCK") => anyhow!(
+                            "ssh-transport: ssh-agent auth requires SSH_AUTH_SOCK to be set and a running ssh-agent; start ssh-agent and load a key with ssh-add"
+                        ),
+                        russh_keys::Error::BadAuthSock => anyhow!(
+                            "ssh-transport: ssh-agent auth requires a reachable socket at SSH_AUTH_SOCK; start ssh-agent and ensure SSH_AUTH_SOCK points to the agent socket"
+                        ),
+                        other => anyhow!("ssh-transport: failed to connect to ssh-agent: {other}"),
+                    })?;
+
+                let identities = agent_client
+                    .request_identities()
+                    .await
+                    .map_err(|e| anyhow!("ssh-transport: failed to enumerate ssh-agent identities: {e}"))?;
+
+                if identities.is_empty() {
+                    return Err(anyhow!(
+                        "ssh-transport: ssh-agent is reachable but has no identities loaded; add a key with ssh-add"
+                    ));
+                }
+
+                let mut authenticated_via_agent = false;
+
+                for key in identities {
+                    let fingerprint = key.fingerprint();
+                    let (next_client, auth_result) = handle
+                        .authenticate_future(username, key, agent_client)
+                        .await;
+                    agent_client = next_client;
+
+                    match auth_result {
+                        Ok(true) => {
+                            info!(
+                                "ssh-transport: ssh-agent authentication succeeded with identity {fingerprint}"
+                            );
+                            authenticated_via_agent = true;
+                            break;
+                        }
+                        Ok(false) => {
+                            log::debug!(
+                                "ssh-transport: ssh-agent identity {fingerprint} was rejected by server"
+                            );
+                        }
+                        Err(e) => {
+                            log::debug!(
+                                "ssh-transport: ssh-agent identity {fingerprint} failed during authentication: {e}"
+                            );
+                        }
+                    }
+                }
+
+                authenticated_via_agent
             }
         };
 

@@ -30,86 +30,40 @@ pub struct SyscallTarget {
     pub gadget_addr: usize,
 }
 
-#[cfg(windows)]
-fn rva_to_offset(
-    rva: u32,
-    nt_headers: *const winapi::um::winnt::IMAGE_NT_HEADERS64,
-    base: *const u8,
-) -> u32 {
-    unsafe {
-        let num_sections = (*nt_headers).FileHeader.NumberOfSections;
-        let mut section = (nt_headers as usize
-            + std::mem::size_of::<winapi::um::winnt::IMAGE_NT_HEADERS64>())
-            as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
-        for _ in 0..num_sections {
-            let start = (*section).VirtualAddress;
-            let end = start + (*section).Misc.VirtualSize();
-            if rva >= start && rva < end {
-                return rva - start + (*section).PointerToRawData;
-            }
-            section = section.add(1);
-        }
-        rva
-    }
+// ── Linux syscall infrastructure ─────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
+
+/// Per-call cache: syscall name → resolved SSN.  Built lazily on first use.
+#[cfg(target_os = "linux")]
+static LINUX_SYSCALL_CACHE: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+
+/// Minimal syscall descriptor for Linux: just the syscall number.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+pub struct SyscallTarget {
+    pub ssn: u32,
 }
 
 #[cfg(windows)]
-fn get_bootstrap_ssn(raw_bytes: &[u8], func_name: &str) -> Option<SyscallTarget> {
+fn parse_syscall_stub(func_addr: usize) -> Option<SyscallTarget> {
     unsafe {
-        let base = raw_bytes.as_ptr();
-        let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
-        if (*dos_header).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
-            return None;
-        }
-
-        let nt_headers = (base as usize + (*dos_header).e_lfanew as usize)
-            as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
-        let export_dir_rva = (*nt_headers).OptionalHeader.DataDirectory
-            [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
-            .VirtualAddress;
-        if export_dir_rva == 0 {
-            return None;
-        }
-
-        let export_dir_offset = rva_to_offset(export_dir_rva, nt_headers, base);
-        let export_dir = (base as usize + export_dir_offset as usize)
-            as *const winapi::um::winnt::IMAGE_EXPORT_DIRECTORY;
-        let num_names = (*export_dir).NumberOfNames as usize;
-
-        let names_offset = rva_to_offset((*export_dir).AddressOfNames, nt_headers, base);
-        let funcs_offset = rva_to_offset((*export_dir).AddressOfFunctions, nt_headers, base);
-        let ords_offset = rva_to_offset((*export_dir).AddressOfNameOrdinals, nt_headers, base);
-
-        let names = (base as usize + names_offset as usize) as *const u32;
-        let funcs = (base as usize + funcs_offset as usize) as *const u32;
-        let ords = (base as usize + ords_offset as usize) as *const u16;
-
-        for i in 0..num_names {
-            let name_rva = *names.add(i);
-            let name_offset = rva_to_offset(name_rva, nt_headers, base);
-            let name_ptr = (base as usize + name_offset as usize) as *const i8;
-            let name = std::ffi::CStr::from_ptr(name_ptr).to_str().unwrap_or("");
-            if name == func_name {
-                let ord = *ords.add(i);
-                let func_rva = *funcs.add(ord as usize);
-                let func_offset = rva_to_offset(func_rva, nt_headers, base);
-                let func_addr = base as usize + func_offset as usize;
-
-                let bytes = std::slice::from_raw_parts(func_addr as *const u8, 32);
-                for j in 0..bytes.len().saturating_sub(1) {
-                    if bytes[j] == 0x0f && bytes[j + 1] == 0x05 {
-                        // syscall gadget
-                        for k in (0..j).rev() {
-                            if bytes[k] == 0xb8 && k + 5 <= bytes.len() {
-                                // mov eax, ssn
-                                let ssn =
-                                    u32::from_le_bytes(bytes[k + 1..k + 5].try_into().unwrap());
-                                return Some(SyscallTarget {
-                                    ssn,
-                                    gadget_addr: 0, // gadget_addr is not valid since it's unmapped memory, but we will find one mapped later
-                                });
-                            }
-                        }
+        let bytes = std::slice::from_raw_parts(func_addr as *const u8, 32);
+        for j in 0..bytes.len().saturating_sub(1) {
+            if bytes[j] == 0x0f && bytes[j + 1] == 0x05 {
+                // syscall gadget
+                for k in (0..j).rev() {
+                    if bytes[k] == 0xb8 && k + 5 <= bytes.len() {
+                        // mov eax, ssn
+                        let ssn = u32::from_le_bytes(bytes[k + 1..k + 5].try_into().unwrap());
+                        return Some(SyscallTarget {
+                            ssn,
+                            gadget_addr: func_addr + j,
+                        });
                     }
                 }
             }
@@ -119,21 +73,29 @@ fn get_bootstrap_ssn(raw_bytes: &[u8], func_name: &str) -> Option<SyscallTarget>
 }
 
 #[cfg(windows)]
+fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
+    unsafe {
+        // Bootstrap resolution delegates export lookup to pe_resolve so this
+        // module does not maintain a second PE export walker.
+        let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
+        let mut name = func_name.as_bytes().to_vec();
+        name.push(0);
+        let target_hash = pe_resolve::hash_str(&name);
+        let func_addr = pe_resolve::get_proc_address_by_hash(ntdll_base, target_hash)?;
+        parse_syscall_stub(func_addr)
+    }
+}
+
+#[cfg(windows)]
 fn map_clean_ntdll() -> Result<usize> {
     use std::os::windows::ffi::OsStrExt;
 
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    let ntdll_disk_path = format!(r"{}\System32\ntdll.dll", sysroot);
-
-    // Read raw unmapped bytes to parse SSNs for NtOpenFile, NtCreateSection, NtMapViewOfSection
-    let raw_bytes = std::fs::read(&ntdll_disk_path)
-        .map_err(|e| anyhow!("Failed to read ntdll from disk: {e}"))?;
-
     let sys_ntopenfile =
-        get_bootstrap_ssn(&raw_bytes, "NtOpenFile").ok_or_else(|| anyhow!("No NtOpenFile SSN"))?;
-    let sys_ntcreatesection = get_bootstrap_ssn(&raw_bytes, "NtCreateSection")
+        get_bootstrap_ssn("NtOpenFile").ok_or_else(|| anyhow!("No NtOpenFile SSN"))?;
+    let sys_ntcreatesection = get_bootstrap_ssn("NtCreateSection")
         .ok_or_else(|| anyhow!("No NtCreateSection SSN"))?;
-    let sys_ntmapview = get_bootstrap_ssn(&raw_bytes, "NtMapViewOfSection")
+    let sys_ntmapview = get_bootstrap_ssn("NtMapViewOfSection")
         .ok_or_else(|| anyhow!("No NtMapView SSN"))?;
 
     let mut ntdll_nt_path = format!(r"\??\{}\System32\ntdll.dll", sysroot)
@@ -269,61 +231,18 @@ fn map_clean_ntdll() -> Result<usize> {
 #[cfg(windows)]
 fn read_export_dir(base: usize, func_name: &str) -> Result<SyscallTarget> {
     unsafe {
-        let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
-        if (*dos_header).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
-            anyhow::bail!("Invalid DOS signature");
-        }
+        let mut name = func_name.as_bytes().to_vec();
+        name.push(0);
+        let target_hash = pe_resolve::hash_str(&name);
+        let func_addr = pe_resolve::get_proc_address_by_hash(base, target_hash)
+            .ok_or_else(|| anyhow!("Function {} not found in clean ntdll", func_name))?;
 
-        let nt_headers = (base + (*dos_header).e_lfanew as usize)
-            as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
-        if (*nt_headers).Signature != winapi::um::winnt::IMAGE_NT_SIGNATURE {
-            anyhow::bail!("Invalid NT signature");
-        }
-
-        let export_dir_rva = (*nt_headers).OptionalHeader.DataDirectory
-            [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
-            .VirtualAddress;
-        if export_dir_rva == 0 {
-            anyhow::bail!("No export directory");
-        }
-
-        let export_dir =
-            (base + export_dir_rva as usize) as *const winapi::um::winnt::IMAGE_EXPORT_DIRECTORY;
-        let num_names = (*export_dir).NumberOfNames as usize;
-        let names = (base + (*export_dir).AddressOfNames as usize) as *const u32;
-        let funcs = (base + (*export_dir).AddressOfFunctions as usize) as *const u32;
-        let ords = (base + (*export_dir).AddressOfNameOrdinals as usize) as *const u16;
-
-        for i in 0..num_names {
-            let name_rva = *names.add(i);
-            let name_ptr = (base + name_rva as usize) as *const i8;
-            let name = std::ffi::CStr::from_ptr(name_ptr).to_str().unwrap_or("");
-            if name == func_name {
-                let ord = *ords.add(i);
-                let func_rva = *funcs.add(ord as usize);
-                let func_addr = base + func_rva as usize;
-
-                let bytes = std::slice::from_raw_parts(func_addr as *const u8, 32);
-                for j in 0..bytes.len().saturating_sub(1) {
-                    if bytes[j] == 0x0f && bytes[j + 1] == 0x05 {
-                        for k in (0..j).rev() {
-                            if bytes[k] == 0xb8 && k + 5 <= bytes.len() {
-                                let ssn =
-                                    u32::from_le_bytes(bytes[k + 1..k + 5].try_into().unwrap());
-                                return Ok(SyscallTarget {
-                                    ssn,
-                                    gadget_addr: func_addr + j,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        anyhow::bail!(
-            "Function {} not found in clean ntdll or could not parse SSN",
-            func_name
-        )
+        parse_syscall_stub(func_addr).ok_or_else(|| {
+            anyhow!(
+                "Function {} found in clean ntdll but could not parse SSN",
+                func_name
+            )
+        })
     }
 }
 
@@ -1059,10 +978,10 @@ macro_rules! clean_call {
 /// ```
 macro_rules! syscall {
     ($func_name:expr $(, $args:expr)* $(,)?) => {{
-        let ssn = $crate::syscalls::get_syscall_id($func_name).expect("unknown linux syscall");
+        let target = $crate::syscalls::get_syscall_id($func_name).expect("unknown linux syscall");
         let args: &[u64] = &[$($args as u64),*];
         unsafe {
-            $crate::syscalls::do_syscall(ssn as u32, args)
+            $crate::syscalls::do_syscall(target.ssn, args)
                 .map_err(|errno| anyhow::anyhow!(
                     "syscall `{}` failed: errno {} ({})",
                     $func_name,
@@ -1155,7 +1074,7 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
 }
 
 #[cfg(all(unix, feature = "direct-syscalls"))]
-pub fn get_syscall_id(name: &str) -> anyhow::Result<u32> {
+fn syscall_number_raw(name: &str) -> anyhow::Result<u32> {
     #[cfg(target_arch = "x86_64")]
     match name {
         "read" => Ok(0),
@@ -1860,6 +1779,24 @@ pub fn get_syscall_id(name: &str) -> anyhow::Result<u32> {
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     compile_error!("Unsupported architecture for direct syscalls");
+}
+
+/// Look up a Linux syscall by name and return a [`SyscallTarget`].
+///
+/// Results are memoised in [`LINUX_SYSCALL_CACHE`] so repeated lookups for the
+/// same name avoid re-running the match.
+#[cfg(all(unix, feature = "direct-syscalls"))]
+pub fn get_syscall_id(name: &str) -> anyhow::Result<SyscallTarget> {
+    let cache = LINUX_SYSCALL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = cache.lock().unwrap();
+        if let Some(&ssn) = guard.get(name) {
+            return Ok(SyscallTarget { ssn });
+        }
+    }
+    let ssn = syscall_number_raw(name)?;
+    cache.lock().unwrap().insert(name.to_owned(), ssn);
+    Ok(SyscallTarget { ssn })
 }
 
 #[cfg(all(unix, feature = "direct-syscalls"))]

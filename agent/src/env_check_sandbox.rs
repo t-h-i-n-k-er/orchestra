@@ -428,27 +428,34 @@ pub fn check_system_uptime_artifacts() -> u8 {
 fn is_cloud_instance_sandbox() -> bool {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(v) = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor") {
-            let v = v.trim().to_lowercase();
-            if v.contains("amazon")
-                || v.contains("microsoft")
-                || v.contains("google")
-                || v.contains("digitalocean")
-                || v.contains("vmware")
-                || v.contains("xen")
-                || v.contains("ovm")
-            {
-                return true;
-            }
+        let sys_vendor = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+            .ok()
+            .map(|v| v.trim().to_lowercase())
+            .unwrap_or_default();
+        let vendor_is_known_cloud = sys_vendor.contains("amazon")
+            || sys_vendor.contains("microsoft")
+            || sys_vendor.contains("google")
+            || sys_vendor.contains("digitalocean")
+            || sys_vendor.contains("vmware")
+            || sys_vendor.contains("xen");
+
+        if vendor_is_known_cloud {
+            return true;
         }
+
         if let Ok(p) = std::fs::read_to_string("/sys/class/dmi/id/product_name") {
             let p = p.trim().to_lowercase();
-            if p.contains("kvm")
-                || p.contains("cloud")
-                || p.contains("compute")
-                || p.contains("virtual")
-                || p.contains("vmware")
-            {
+            if p.contains("virtual") {
+                if !vendor_is_known_cloud {
+                    log::debug!(
+                        "sandbox: product_name contains 'virtual' but sys_vendor '{}' is not a known cloud provider; treating as non-cloud",
+                        sys_vendor
+                    );
+                    return false;
+                }
+                return true;
+            }
+            if p.contains("kvm") || p.contains("cloud") || p.contains("compute") || p.contains("vmware") {
                 return true;
             }
         }
@@ -463,7 +470,28 @@ fn is_cloud_instance_sandbox() -> bool {
 
         let subkey: Vec<u16> =
             "HARDWARE\\DESCRIPTION\\System\\BIOS\0".encode_utf16().collect();
-        let value_name: Vec<u16> = "SystemManufacturer\0".encode_utf16().collect();
+        let manufacturer_value_name: Vec<u16> = "SystemManufacturer\0".encode_utf16().collect();
+        let product_value_name: Vec<u16> = "SystemProductName\0".encode_utf16().collect();
+
+        unsafe fn query_reg_sz(hkey: winapi::shared::minwindef::HKEY, name: &[u16]) -> Option<String> {
+            let mut buf = vec![0u16; 256];
+            let mut buf_len = (buf.len() * 2) as u32;
+            let mut val_type: u32 = 0;
+            if RegQueryValueExW(
+                hkey,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut val_type,
+                buf.as_mut_ptr() as _,
+                &mut buf_len,
+            ) != 0
+                || val_type != REG_SZ
+            {
+                return None;
+            }
+            let nul = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            Some(String::from_utf16_lossy(&buf[..nul]))
+        }
 
         unsafe {
             let mut hkey = std::ptr::null_mut();
@@ -475,31 +503,37 @@ fn is_cloud_instance_sandbox() -> bool {
                 &mut hkey,
             ) == 0
             {
-                let mut buf = vec![0u16; 256];
-                let mut buf_len = (buf.len() * 2) as u32;
-                let mut val_type: u32 = 0;
-                if RegQueryValueExW(
-                    hkey,
-                    value_name.as_ptr(),
-                    std::ptr::null_mut(),
-                    &mut val_type,
-                    buf.as_mut_ptr() as _,
-                    &mut buf_len,
-                ) == 0
-                    && val_type == REG_SZ
-                {
-                    RegCloseKey(hkey);
-                    let nul = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-                    let vendor = String::from_utf16_lossy(&buf[..nul]).to_lowercase();
-                    if vendor.contains("amazon")
-                        || vendor.contains("microsoft")
-                        || vendor.contains("google")
-                        || vendor.contains("digitalocean")
-                    {
+                let vendor = query_reg_sz(hkey, &manufacturer_value_name)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let product = query_reg_sz(hkey, &product_value_name)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                RegCloseKey(hkey);
+
+                let vendor_lc = vendor.to_lowercase();
+                let product_lc = product.to_lowercase();
+
+                let microsoft_cloud = vendor_lc == "microsoft corporation"
+                    && !product_lc.contains("surface");
+                let vendor_is_known_cloud = vendor_lc.contains("amazon")
+                    || microsoft_cloud
+                    || vendor_lc.contains("google")
+                    || vendor_lc.contains("digitalocean")
+                    || vendor_lc.contains("vmware")
+                    || vendor_lc.contains("xen");
+
+                if product_lc.contains("virtual machine") {
+                    if vendor_is_known_cloud {
                         return true;
                     }
-                } else {
-                    RegCloseKey(hkey);
+                    return false;
+                }
+
+                if vendor_is_known_cloud {
+                    return true;
                 }
             }
         }
@@ -562,25 +596,29 @@ pub fn check_hardware_plausibility() -> u8 {
     let ram_gb = mem_status.ullTotalPhys / (1024 * 1024 * 1024);
     let cpus = sys_info.dwNumberOfProcessors;
     
-    let mut below_threshold_count = 0;
-    // Thresholds tuned to avoid false positives on small cloud VMs (DO/Linode
-    // 1 GB instances, AWS t3.micro, etc.).  Sandboxes typically use far less
-    // than these values.
+    let cloud_instance = is_cloud_instance_sandbox();
+    let mut below_threshold_count: u8 = 0;
+    // Thresholds are scored differently for cloud hosts to reduce false
+    // positives on small but legitimate instances. For cloud VMs, each
+    // threshold contributes 5 points (instead of halving the final score),
+    // and RAM is only scored when `ram_gb == 0` (sub-1 GiB after integer
+    // GiB conversion, i.e., extremely small allocations).
     if disk_gb <= 10 { below_threshold_count += 1; }
-    if ram_gb <= 1 { below_threshold_count += 1; }
+    if cloud_instance {
+        if ram_gb == 0 { below_threshold_count += 1; }
+    } else if ram_gb <= 1 {
+        below_threshold_count += 1;
+    }
     if cpus <= 1 { below_threshold_count += 1; }
-    
-    let raw_score = match below_threshold_count {
-        0 => 0,
-        1 => 10,
-        _ => 20,
-    };
 
-    // Cloud VMs often have minimal hardware; don't penalize them heavily.
-    if is_cloud_instance_sandbox() {
-        raw_score / 2
+    if cloud_instance {
+        below_threshold_count * 5
     } else {
-        raw_score
+        match below_threshold_count {
+            0 => 0,
+            1 => 10,
+            _ => 20,
+        }
     }
 }
 
@@ -588,7 +626,8 @@ pub fn check_hardware_plausibility() -> u8 {
 /// `/proc/meminfo`, and CPU count from `sysconf(_SC_NPROCESSORS_ONLN)`.
 #[cfg(target_os = "linux")]
 pub fn check_hardware_plausibility() -> u8 {
-    let mut below_threshold_count = 0;
+    let cloud_instance = is_cloud_instance_sandbox();
+    let mut below_threshold_count: u8 = 0;
     
     let mut disk_gb = 0;
     unsafe {
@@ -609,22 +648,27 @@ pub fn check_hardware_plausibility() -> u8 {
             }
         }
     }
-    if ram_gb <= 1 { below_threshold_count += 1; }
+    if cloud_instance {
+        if ram_gb == 0 { below_threshold_count += 1; }
+    } else if ram_gb <= 1 {
+        below_threshold_count += 1;
+    }
     
     let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
     if cpus <= 1 { below_threshold_count += 1; }
     
-    let raw_score = match below_threshold_count {
-        0 => 0,
-        1 => 10,
-        _ => 20,
-    };
-
-    // Cloud VMs often have minimal hardware; don't penalize them heavily.
-    if is_cloud_instance_sandbox() {
-        raw_score / 2
+    // Thresholds are scored differently for cloud hosts to reduce false
+    // positives on small but legitimate instances. For cloud VMs, each
+    // tripped threshold contributes 5 points and RAM is only scored when
+    // `ram_gb == 0` (sub-1 GiB after integer GiB conversion).
+    if cloud_instance {
+        below_threshold_count * 5
     } else {
-        raw_score
+        match below_threshold_count {
+            0 => 0,
+            1 => 10,
+            _ => 20,
+        }
     }
 }
 
@@ -632,7 +676,8 @@ pub fn check_hardware_plausibility() -> u8 {
 /// `sysctl hw.memsize`, and CPU count from `sysconf(_SC_NPROCESSORS_ONLN)`.
 #[cfg(target_os = "macos")]
 pub fn check_hardware_plausibility() -> u8 {
-    let mut below_threshold_count = 0;
+    let cloud_instance = is_cloud_instance_sandbox();
+    let mut below_threshold_count: u8 = 0;
 
     // Disk size via statvfs (works on macOS, same as Linux).
     let disk_gb: u64 = unsafe {
@@ -653,22 +698,27 @@ pub fn check_hardware_plausibility() -> u8 {
         .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().ok())
         .map(|bytes| bytes / (1024 * 1024 * 1024))
         .unwrap_or(0);
-    if ram_gb <= 1 { below_threshold_count += 1; }
+    if cloud_instance {
+        if ram_gb == 0 { below_threshold_count += 1; }
+    } else if ram_gb <= 1 {
+        below_threshold_count += 1;
+    }
 
     let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
     if cpus <= 1 { below_threshold_count += 1; }
 
-    let raw_score = match below_threshold_count {
-        0 => 0,
-        1 => 10,
-        _ => 20,
-    };
-
-    // Cloud VMs often have minimal hardware; don't penalize them heavily.
-    if is_cloud_instance_sandbox() {
-        raw_score / 2
+    // Thresholds are scored differently for cloud hosts to reduce false
+    // positives on small but legitimate instances. For cloud VMs, each
+    // tripped threshold contributes 5 points and RAM is only scored when
+    // `ram_gb == 0` (sub-1 GiB after integer GiB conversion).
+    if cloud_instance {
+        below_threshold_count * 5
     } else {
-        raw_score
+        match below_threshold_count {
+            0 => 0,
+            1 => 10,
+            _ => 20,
+        }
     }
 }
 

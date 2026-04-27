@@ -391,66 +391,262 @@ fn is_cloud_instance() -> bool {
         use std::time::Duration;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 80);
-        let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
-            Ok(s) => s,
-            Err(_) => return false,
+        let open_stream = || -> Option<TcpStream> {
+            let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(50)).ok()?;
+            // Keep IMDS operations tight to avoid startup stalls.
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+            Some(stream)
         };
 
-        // Tighter read timeout: genuine IMDS responds in <5ms; 100ms is generous.
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+        let validate_metadata_response =
+            |buf: &[u8], n: usize, allow_auth_only: bool| -> bool {
+                if !buf.starts_with(b"HTTP/1.") || n < 12 {
+                    return false;
+                }
 
-        // Send a minimal IMDSv1-style request.  Intentionally use HTTP/1.0 (no
-        // keep-alive) so the server closes the connection after responding.
-        let req = b"GET /latest/meta-data/ HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n";
-        if stream.write_all(req).is_err() {
+                let status = &buf[9..12];
+                if allow_auth_only {
+                    if !matches!(status, b"200" | b"400" | b"401") {
+                        return false;
+                    }
+                } else if status != b"200" {
+                    return false;
+                }
+
+                // For HTTP 200 responses, reject HTML/captive-portal bodies and
+                // require at least one known IMDS key when a body is present.
+                if status == b"200" && n > 16 {
+                    let header_end = buf[..n]
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|p| p + 4);
+                    if let Some(body_start) = header_end {
+                        let body = &buf[body_start..n];
+                        if body.starts_with(b"<") || body.starts_with(b"<!") {
+                            return false;
+                        }
+                        let body_str = String::from_utf8_lossy(body);
+                        let known_keys = ["ami-id", "instance-id", "hostname", "local-ipv4"];
+                        if !known_keys.iter().any(|k| body_str.contains(k)) {
+                            return false;
+                        }
+                    }
+                }
+
+                true
+            };
+
+        // IMDSv1 attempt first.
+        let imds_v1_success = {
+            if let Some(mut stream) = open_stream() {
+                let req = b"GET /latest/meta-data/ HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n";
+                if stream.write_all(req).is_err() {
+                    false
+                } else {
+                    let mut buf = [0u8; 256];
+                    let n = match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => 0,
+                        Ok(n) => n,
+                    };
+                    n > 0 && validate_metadata_response(&buf, n, true)
+                }
+            } else {
+                false
+            }
+        };
+
+        if imds_v1_success {
+            log::debug!("env_check: cloud instance detected via IMDSv1");
+            return true;
+        }
+
+        // IMDSv2 fallback: fetch token then query metadata with token header.
+        let token = {
+            let mut stream = match open_stream() {
+                Some(s) => s,
+                None => return false,
+            };
+
+            let token_req = b"PUT /latest/api/token HTTP/1.0\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\n\r\n";
+            if stream.write_all(token_req).is_err() {
+                return false;
+            }
+
+            let mut buf = [0u8; 512];
+            let n = match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => n,
+            };
+
+            if !buf.starts_with(b"HTTP/1.") || n < 12 || &buf[9..12] != b"200" {
+                return false;
+            }
+
+            let header_end = match buf[..n].windows(4).position(|w| w == b"\r\n\r\n") {
+                Some(p) => p + 4,
+                None => return false,
+            };
+
+            let t = String::from_utf8_lossy(&buf[header_end..n]).trim().to_string();
+            if t.is_empty() {
+                return false;
+            }
+            t
+        };
+
+        let mut stream = match open_stream() {
+            Some(s) => s,
+            None => return false,
+        };
+        let metadata_req = format!(
+            "GET /latest/meta-data/ HTTP/1.0\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token: {}\r\n\r\n",
+            token
+        );
+        if stream.write_all(metadata_req.as_bytes()).is_err() {
             return false;
         }
 
-        // Read enough bytes to validate both status line AND partial body.
         let mut buf = [0u8; 256];
         let n = match stream.read(&mut buf) {
             Ok(0) | Err(_) => return false,
             Ok(n) => n,
         };
-
-        if !buf.starts_with(b"HTTP/1.") {
-            return false;
+        if validate_metadata_response(&buf, n, false) {
+            log::debug!("env_check: cloud instance detected via IMDSv2");
+            return true;
         }
 
-        if n < 12 {
-            return false;
-        }
-        let status = &buf[9..12];
-        if !matches!(status, b"200" | b"400" | b"401") {
-            return false;
-        }
+        false
+    }
+}
 
-        // M-29 enhancement: for HTTP 200 responses, verify the body contains
-        // known IMDS content.  AWS IMDS returns directory-style listings like
-        // "ami-id\ninstance-id\n...".  If the body looks like HTML (a captive
-        // portal page), reject it.
-        if status == b"200" && n > 16 {
-            let header_end = buf[..n]
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map(|p| p + 4);
-            if let Some(body_start) = header_end {
-                let body = &buf[body_start..n];
-                // If body starts with "<" it's HTML — not IMDS
-                if body.starts_with(b"<") || body.starts_with(b"<!") {
-                    return false;
-                }
-                // IMDS body typically contains lowercase directory names
-                // separated by newlines.  Check for at least one known key.
-                let body_str = String::from_utf8_lossy(body);
-                let known_keys = ["ami-id", "instance-id", "hostname", "local-ipv4"];
-                if !known_keys.iter().any(|k| body_str.contains(k)) {
-                    return false;
+/// Fetch cloud instance-id from IMDS, supporting IMDSv1 and IMDSv2.
+/// Returns `None` when IMDS is unavailable or the response is invalid.
+#[cfg(target_os = "macos")]
+fn fetch_cloud_instance_id() -> Option<String> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fetch_cloud_instance_id() -> Option<String> {
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 80);
+    let open_stream = || -> Option<TcpStream> {
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(50)).ok()?;
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+        Some(stream)
+    };
+
+    let parse_http_200_body = |buf: &[u8], n: usize| -> Option<String> {
+        if !buf.starts_with(b"HTTP/1.") || n < 12 || &buf[9..12] != b"200" {
+            return None;
+        }
+        let header_end = buf[..n].windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        let body = &buf[header_end..n];
+        if body.starts_with(b"<") || body.starts_with(b"<!") {
+            return None;
+        }
+        let id = String::from_utf8_lossy(body).trim().to_string();
+        if id.is_empty() {
+            None
+        } else {
+            Some(id)
+        }
+    };
+
+    // IMDSv1 instance-id request.
+    if let Some(mut stream) = open_stream() {
+        let req =
+            b"GET /latest/meta-data/instance-id HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n";
+        if stream.write_all(req).is_ok() {
+            let mut buf = [0u8; 256];
+            if let Ok(n) = stream.read(&mut buf) {
+                if n > 0 {
+                    if let Some(id) = parse_http_200_body(&buf, n) {
+                        return Some(id);
+                    }
                 }
             }
         }
+    }
 
+    // IMDSv2 fallback: token request then token-authenticated instance-id GET.
+    let token = {
+        let mut stream = open_stream()?;
+        let req = b"PUT /latest/api/token HTTP/1.0\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\n\r\n";
+        if stream.write_all(req).is_err() {
+            return None;
+        }
+        let mut buf = [0u8; 512];
+        let n = stream.read(&mut buf).ok()?;
+        if n == 0 || !buf.starts_with(b"HTTP/1.") || n < 12 || &buf[9..12] != b"200" {
+            return None;
+        }
+        let header_end = buf[..n].windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        let t = String::from_utf8_lossy(&buf[header_end..n]).trim().to_string();
+        if t.is_empty() {
+            return None;
+        }
+        t
+    };
+
+    let mut stream = open_stream()?;
+    let req = format!(
+        "GET /latest/meta-data/instance-id HTTP/1.0\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token: {}\r\n\r\n",
+        token
+    );
+    if stream.write_all(req.as_bytes()).is_err() {
+        return None;
+    }
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf).ok()?;
+    if n == 0 {
+        return None;
+    }
+    parse_http_200_body(&buf, n)
+}
+
+fn cloud_instance_vm_refusal_bypassed() -> bool {
+    if !is_cloud_instance() {
+        return false;
+    }
+
+    let cfg = match crate::config::load_config() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let expected = cfg
+        .malleable_profile
+        .cloud_instance_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let expected = match expected {
+        Some(id) => id,
+        None => return false,
+    };
+
+    let actual = match fetch_cloud_instance_id() {
+        Some(id) => id,
+        None => return false,
+    };
+
+    if actual == expected {
+        log::info!(
+            "env_check: running on whitelisted cloud instance {}, VM refusal bypassed",
+            actual
+        );
         true
+    } else {
+        false
     }
 }
 
@@ -637,67 +833,125 @@ fn macos_system_profiler_indicates_vm() -> bool {
         }
     }
 
-    // ioreg -l can output 100–500 KB and stall for several seconds on a busy
-    // system.  Bound execution to 5 s to avoid blocking agent startup.
-    if let Some(stdout) = {
+    // Stream ioreg output line-by-line and bound execution to 2 s so startup
+    // is not blocked on loaded systems.  Return as soon as we see a
+    // definitive hypervisor marker (e.g., AppleVirtIO).
+    {
+        use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
+        use std::sync::mpsc::{self, RecvTimeoutError};
         use std::time::{Duration, Instant};
-        let mut child = Command::new("ioreg")
+
+        let virtualbox_needle = String::from_utf8_lossy(&string_crypt::enc_str!("virtualbox"))
+            .trim_end_matches('\0')
+            .to_string();
+        let vmware_needle = String::from_utf8_lossy(&string_crypt::enc_str!("vmware"))
+            .trim_end_matches('\0')
+            .to_string();
+        let qemu_needle = String::from_utf8_lossy(&string_crypt::enc_str!("qemu"))
+            .trim_end_matches('\0')
+            .to_string();
+
+        if let Ok(mut child) = Command::new("ioreg")
             .arg("-l")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .ok();
-        if let Some(ref mut c) = child {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                match c.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() >= deadline => {
-                        let _ = c.kill();
+        {
+            if let Some(stdout) = child.stdout.take() {
+                let (tx, rx) = mpsc::channel::<String>();
+                let reader = std::thread::spawn(move || {
+                    let mut buf = BufReader::new(stdout);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match buf.read_line(&mut line) {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let _ = tx.send(line.to_ascii_lowercase());
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+
+                let mut saw_docker_desktop = false;
+                let mut saw_qemu = false;
+                let mut timed_out = false;
+                let deadline = Instant::now() + Duration::from_secs(2);
+
+                let mut process_line = |line: &str| -> bool {
+                    if line.contains("docker")
+                        || line.contains("com.docker")
+                        || line.contains("docker.desktop")
+                    {
+                        saw_docker_desktop = true;
+                    }
+
+                    if line.contains("applevirtio")
+                        || line.contains("parallels")
+                        || line.contains(virtualbox_needle.as_str())
+                        || line.contains(vmware_needle.as_str())
+                    {
+                        return true;
+                    }
+
+                    if line.contains(qemu_needle.as_str()) {
+                        saw_qemu = true;
+                    }
+
+                    false
+                };
+
+                loop {
+                    if Instant::now() >= deadline {
+                        timed_out = true;
+                        let _ = child.kill();
                         break;
                     }
-                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                    Err(_) => break,
+
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let wait_for = std::cmp::min(remaining, Duration::from_millis(100));
+
+                    match rx.recv_timeout(wait_for) {
+                        Ok(line) => {
+                            if process_line(&line) {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                let _ = reader.join();
+                                return true;
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) => match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) => {}
+                            Err(_) => break,
+                        },
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+
+                // Process any buffered lines emitted right before process exit.
+                while let Ok(line) = rx.try_recv() {
+                    if process_line(&line) {
+                        is_vm = true;
+                        break;
+                    }
+                }
+
+                let _ = child.wait();
+                let _ = reader.join();
+
+                if timed_out {
+                    log::debug!(
+                        "env_check: macOS ioreg -l timed out after 2s; returning no ioreg VM indicator"
+                    );
+                } else if saw_qemu && !saw_docker_desktop {
+                    // Only flag qemu when Docker Desktop markers are absent,
+                    // since Docker may surface QEMU-backed virtual devices.
+                    is_vm = true;
                 }
             }
-            c.wait_with_output().ok().map(|o| o.stdout)
-        } else {
-            None
-        }
-    } {
-        let ioreg = String::from_utf8_lossy(&stdout).to_lowercase();
-        // Docker Desktop on macOS injects "qemu" virtual NICs into ioreg.
-        // Check for Docker-specific identifiers and discount them to avoid
-        // false positives on developer machines.
-        let is_docker_desktop = ioreg.contains("docker")
-            || ioreg.contains("com.docker")
-            || ioreg.contains("docker.desktop");
-        if ioreg.contains(
-            String::from_utf8_lossy(&string_crypt::enc_str!("virtualbox"))
-                .trim_end_matches('\0')
-                .to_string(),
-        ) {
-            is_vm = true;
-        }
-        if ioreg.contains(
-            String::from_utf8_lossy(&string_crypt::enc_str!("vmware"))
-                .trim_end_matches('\0')
-                .to_string(),
-        ) {
-            is_vm = true;
-        }
-        if ioreg.contains("parallels") {
-            is_vm = true;
-        }
-        // Only flag qemu if Docker Desktop is NOT present — Docker uses QEMU NICs.
-        if ioreg.contains(
-            String::from_utf8_lossy(&string_crypt::enc_str!("qemu"))
-                .trim_end_matches('\0')
-                .to_string(),
-        ) && !is_docker_desktop
-        {
-            is_vm = true;
         }
     }
 
@@ -903,6 +1157,37 @@ fn is_ld_preload_set() -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_has_cap_sys_ptrace() -> bool {
+    // CAP_SYS_PTRACE is capability bit 19.
+    const CAP_SYS_PTRACE_BIT: u32 = 19;
+
+    let status = match std::fs::read_to_string("/proc/self/status") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let cap_eff_hex = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .map(str::trim);
+
+    match cap_eff_hex.and_then(|hex| u128::from_str_radix(hex, 16).ok()) {
+        Some(mask) => (mask & (1u128 << CAP_SYS_PTRACE_BIT)) != 0,
+        None => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_real_uid(proc_path: &Path) -> Option<u32> {
+    let status = std::fs::read_to_string(proc_path.join("status")).ok()?;
+    let uid_line = status.lines().find(|line| line.starts_with("Uid:"))?;
+    uid_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u32>().ok())
+}
+
+#[cfg(target_os = "linux")]
 fn is_tracer_process_running() -> bool {
     // Primary check: Check for a ptrace attachment on our own process
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
@@ -921,18 +1206,39 @@ fn is_tracer_process_running() -> bool {
     // avoiding false positives from other users' debuggers on shared systems (4.5)
     let tracers = ["strace", "gdb", "ltrace", "gdbserver"];
     let my_uid = unsafe { libc::getuid() };
+    let can_ptrace_cross_uid = unsafe { libc::geteuid() == 0 } || linux_has_cap_sys_ptrace();
+    let mut scanned = 0usize;
+
     if let Ok(procs) = std::fs::read_dir("/proc") {
         for proc in procs.flatten() {
-            // Only consider processes owned by the current UID
             let proc_path = proc.path();
-            if let Ok(meta) = std::fs::metadata(&proc_path) {
-                use std::os::unix::fs::MetadataExt;
-                if meta.uid() != my_uid {
-                    continue;
-                }
-            } else {
+
+            // /proc contains non-PID entries (net, fs, sys, ...). Skip them.
+            let is_pid_dir = proc_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.as_bytes().iter().all(u8::is_ascii_digit))
+                .unwrap_or(false);
+            if !is_pid_dir {
                 continue;
             }
+
+            scanned += 1;
+            if scanned > 200 {
+                log::debug!(
+                    "env_check: /proc tracer scan reached 200 processes without a GUI marker; stopping early"
+                );
+                break;
+            }
+
+            // Read /proc/<pid>/status first to get the process UID and avoid
+            // predictable EACCES errors on /proc/<pid>/environ for other users.
+            let proc_uid = match linux_proc_real_uid(&proc_path) {
+                Some(uid) => uid,
+                None => continue,
+            };
+            let same_uid = proc_uid == my_uid;
+
             if let Ok(cmdline) = std::fs::read_to_string(proc_path.join("cmdline")) {
                 let parts: Vec<&str> = cmdline.split('\0').collect();
                 if let Some(prog) = parts.first() {
@@ -943,6 +1249,21 @@ fn is_tracer_process_running() -> bool {
                     if tracers.contains(&prog_name) {
                         return true;
                     }
+                }
+            }
+
+            if !same_uid && !can_ptrace_cross_uid {
+                continue;
+            }
+
+            // Early-exit optimization: if we observe a GUI session marker in
+            // a process environment (`DISPLAY=`), stop scanning immediately.
+            if let Ok(environ) = std::fs::read(proc_path.join("environ")) {
+                if environ
+                    .split(|&b| b == 0)
+                    .any(|entry| entry.starts_with(b"DISPLAY="))
+                {
+                    return false;
                 }
             }
         }
@@ -1204,7 +1525,16 @@ pub fn enforce(
     sandbox_score_threshold: Option<u32>,
 ) -> EnvDecision {
     let report = EnvReport::collect(required_domain);
-    let refuse = report.should_refuse(refuse_when_debugged, refuse_in_vm, sandbox_score_threshold);
+    let effective_refuse_in_vm = if refuse_in_vm && report.vm_detected {
+        !cloud_instance_vm_refusal_bypassed()
+    } else {
+        refuse_in_vm
+    };
+    let refuse = report.should_refuse(
+        refuse_when_debugged,
+        effective_refuse_in_vm,
+        sandbox_score_threshold,
+    );
     EnvDecision { report, refuse }
 }
 

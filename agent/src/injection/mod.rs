@@ -1,3 +1,6 @@
+#[cfg(target_os = "linux")]
+pub mod linux_inject;
+
 #[cfg(windows)]
 pub mod dll_sideload;
 #[cfg(windows)]
@@ -15,13 +18,19 @@ pub enum InjectionMethod {
     Hollowing,
     ManualMap,
     RemoteThread,
-    ThreadHijack,
+    NtCreateThread,
     ModuleStomp,
     DllSideLoad,
     EarlyBird,
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum InjectionMethod {
+    LinuxPtrace,
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 pub trait Injector {
     fn inject(&self, pid: u32, payload: &[u8]) -> anyhow::Result<()>;
 }
@@ -30,7 +39,7 @@ pub trait Injector {
 #[cfg(windows)]
 pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> anyhow::Result<()> {
     match method {
-        InjectionMethod::ThreadHijack => thread_hijack::ThreadHijackInjector.inject(pid, payload),
+        InjectionMethod::NtCreateThread => thread_hijack::NtCreateThreadInjector.inject(pid, payload),
         InjectionMethod::ModuleStomp => module_stomp::ModuleStompInjector.inject(pid, payload),
         InjectionMethod::RemoteThread => remote_thread::RemoteThreadInjector.inject(pid, payload),
         InjectionMethod::EarlyBird => early_bird::EarlyBirdInjector.inject(pid, payload),
@@ -48,6 +57,14 @@ pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> 
         }
         InjectionMethod::ManualMap => manual_map_inject(pid, payload),
         InjectionMethod::DllSideLoad => dll_sideload::DllSideLoadInjector.inject(pid, payload),
+    }
+}
+
+/// Dispatch helper — Linux injection methods.
+#[cfg(target_os = "linux")]
+pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> anyhow::Result<()> {
+    match method {
+        InjectionMethod::LinuxPtrace => linux_inject::LinuxPtraceInjector.inject(pid, payload),
     }
 }
 

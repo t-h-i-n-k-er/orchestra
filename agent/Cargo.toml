@@ -47,8 +47,8 @@ aes = "0.9.0"
 ctr = "0.10.0"
 async-trait = "0.1.89"
 winapi = { version = "0.3", features = ["ntdef", "psapi", "threadpoolapiset", "threadpoollegacyapiset"] }
-russh = { version = "0.45", optional = true }
-russh-keys = { version = "0.45", optional = true }
+russh = { version = "0.46", optional = true }
+russh-keys = { version = "0.46", optional = true }
 notify = { version = "6.1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

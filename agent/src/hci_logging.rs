@@ -107,10 +107,14 @@ lazy_static! {
 }
 
 #[cfg(target_os = "macos")]
+const MACOS_TAP_PERMISSION_WARNING: &str = "hci_logging: CGEventTap creation failed — the application likely lacks Accessibility permissions. Enable it in System Preferences > Security & Privacy > Privacy > Accessibility.";
+
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MacOsTapHealth {
-    /// Event tap could not be created (commonly missing Accessibility perms).
-    Unavailable,
+    /// CGEventTapCreate returned NULL and the tap is therefore not enabled.
+    /// This is typically a permissions-denied condition.
+    CreationFailedDisabled,
     /// Event tap object exists but is disabled.
     Disabled,
     /// Event tap exists and is enabled.
@@ -168,11 +172,18 @@ fn probe_macos_event_tap_health() -> MacOsTapHealth {
         )
     };
 
-    if tap.is_null() {
-        return MacOsTapHealth::Unavailable;
+    let enabled = if tap.is_null() {
+        false
+    } else {
+        unsafe { CGEventTapIsEnabled(tap) != 0 }
+    };
+
+    // Permission-denial path requested by Prompt 7-6: creation failed and
+    // the tap is not enabled.
+    if tap.is_null() && !enabled {
+        return MacOsTapHealth::CreationFailedDisabled;
     }
 
-    let enabled = unsafe { CGEventTapIsEnabled(tap) != 0 };
     unsafe {
         CFMachPortInvalidate(tap);
         CFRelease(tap as *const c_void);
@@ -265,12 +276,13 @@ pub fn start_logging() -> Result<(), String> {
             // Probe event-tap state up front to give operators actionable
             // feedback when key capture is unavailable due to permissions.
             match probe_macos_event_tap_health() {
-                MacOsTapHealth::Unavailable => {
-                    log::warn!(
-                        "hci_logging: macOS CGEventTap could not be created. \
-                         Grant Accessibility permissions to this process in \
-                         System Preferences -> Privacy & Security -> Accessibility \
-                         to enable keylogging."
+                MacOsTapHealth::CreationFailedDisabled => {
+                    log::warn!("{}", MACOS_TAP_PERMISSION_WARNING);
+                    IS_LOGGING.store(false, Ordering::SeqCst);
+                    LISTENER_STARTED.store(false, Ordering::SeqCst);
+                    return Err(
+                        "hci_logging: CGEventTap initialization failed due to missing macOS Accessibility permissions"
+                            .to_string(),
                     );
                 }
                 MacOsTapHealth::Disabled => {
@@ -320,7 +332,7 @@ pub fn start_logging() -> Result<(), String> {
                                 MacOsTapHealth::Enabled => {
                                     warned_disabled = false;
                                 }
-                                MacOsTapHealth::Unavailable | MacOsTapHealth::Disabled => {
+                                MacOsTapHealth::CreationFailedDisabled | MacOsTapHealth::Disabled => {
                                     if !warned_disabled {
                                         log::warn!(
                                             "hci_logging: macOS CGEventTap was disabled at runtime - \

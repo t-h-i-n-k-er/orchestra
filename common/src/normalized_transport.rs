@@ -1,3 +1,7 @@
+//! **IMPORTANT:** NormalizedTransport is currently client-side only. The server must handle raw TLS streams or implement its own NormalizedTransport::accept() path. See outbound.rs for the client usage pattern.
+// TODO: Add server-side NormalizedTransport support to
+// orchestra-server/src/agent_link.rs for full end-to-end traffic normalization.
+//
 //! # Network Compatibility Layer
 //!
 //! `NormalizedTransport` wraps the orchestra wire protocol so that, on the

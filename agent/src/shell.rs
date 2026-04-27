@@ -45,21 +45,43 @@ impl ShellSession {
         let cmd = if cfg!(windows) {
             CommandBuilder::new("cmd.exe")
         } else {
-            CommandBuilder::new("/bin/sh")
+            let shell_path = std::env::var("SHELL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "/bin/sh".to_string());
+            log::info!("Shell session started with: {}", shell_path);
+            CommandBuilder::new(shell_path)
         };
 
         let child = pair.slave.spawn_command(cmd)?;
+        // SAFETY: The child has been spawned with the slave end attached; this
+        // constructor no longer needs its local slave handle.
+        // Dropping it immediately narrows the lifetime and prevents accidental
+        // future use of `pair.slave` in refactors.
+        drop(pair.slave);
+
         let child_killer = Some(child.clone_killer());
 
+        // SAFETY / ORDERING INVARIANT (DO NOT REORDER):
+        // `take_writer()` and `try_clone_reader()` MUST run before
+        // `drop(pair.master)`. Dropping the master closes that PTY endpoint,
+        // and any subsequent attempt to take/clone streams from `pair.master`
+        // can panic or fail unexpectedly.
+        //
+        // Required order:
+        //   1) `take_writer()`
+        //   2) `try_clone_reader()`
+        //   3) `drop(pair.master)`
         let writer = pair.master.take_writer()?;
         let mut reader = pair.master.try_clone_reader()?;
-        // Drop the master and slave handles so the PTY is closed when
-        // the child exits, allowing the reader thread to observe EOF
-        // and terminate cleanly.
+
+        // Drop the remaining setup handle so the PTY closes cleanly when
+        // the child exits, allowing the reader thread to observe EOF.
         let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
+        // SAFETY: Writer/reader were extracted above in the required order,
+        // so dropping this leftover setup handle is now correct.
         drop(pair.master);
-        drop(pair.slave);
 
         let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let buf_clone = buffer.clone();
