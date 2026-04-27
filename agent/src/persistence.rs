@@ -245,15 +245,13 @@ pub mod windows {
         fn remove(&self) -> Result<()> {
             let escaped_subscription_name = escape_ps_string(&self.subscription_name);
             let ps_cmd = format!(
-                r#"powershell -NonInteractive -WindowStyle Hidden -Command "
-                Get-WmiObject __EventFilter -Namespace root\subscription | Where-Object {{$_.Name -eq '{0}'}} | Remove-WmiObject;
+                r#"Get-WmiObject __EventFilter -Namespace root\subscription | Where-Object {{$_.Name -eq '{0}'}} | Remove-WmiObject;
                 Get-WmiObject CommandLineEventConsumer -Namespace root\subscription | Where-Object {{$_.Name -eq '{0}'}} | Remove-WmiObject;
-                Get-WmiObject __FilterToConsumerBinding -Namespace root\subscription | Where-Object {{$_.Filter -like '*{0}*'}} | Remove-WmiObject"
-            "#,
+                Get-WmiObject __FilterToConsumerBinding -Namespace root\subscription | Where-Object {{$_.Filter -like '*{0}*'}} | Remove-WmiObject"#,
                 escaped_subscription_name
             );
-            let _ = std::process::Command::new("cmd")
-                .args(["/C", &ps_cmd])
+            let _ = std::process::Command::new("powershell")
+                .args(["-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
                 .status();
             log::info!(
                 "WmiSubscription::remove: removed '{}'",
@@ -265,10 +263,11 @@ pub mod windows {
         fn verify(&self) -> Result<bool> {
             let escaped_subscription_name = escape_ps_string(&self.subscription_name);
             let ps_cmd = format!(
-                "powershell -NonInteractive -Command \"(Get-WmiObject __EventFilter -Namespace root\\subscription | Where-Object {{$_.Name -eq '{}'}}) -ne $null\""
-            , escaped_subscription_name);
-            let out = std::process::Command::new("cmd")
-                .args(["/C", &ps_cmd])
+                "(Get-WmiObject __EventFilter -Namespace root\\subscription | Where-Object {{$_.Name -eq '{}'}}) -ne $null",
+                escaped_subscription_name
+            );
+            let out = std::process::Command::new("powershell")
+                .args(["-NonInteractive", "-Command", &ps_cmd])
                 .output()
                 .map_err(|e| anyhow!("WmiSubscription::verify: {}", e))?;
             let stdout = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
