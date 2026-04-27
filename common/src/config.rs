@@ -127,6 +127,11 @@ pub struct MalleableProfile {
     /// SSH authentication configuration.
     #[serde(default)]
     pub ssh_auth: Option<SshAuthConfig>,
+    /// Expected SHA-256 fingerprint of the SSH server host key (hex, optional).
+    /// When set the agent rejects servers whose key does not match.  When
+    /// absent the agent accepts any key but logs a warning.
+    #[serde(default)]
+    pub ssh_host_key_fingerprint: Option<String>,
 }
 
 /// Authentication method for the SSH covert transport.
@@ -173,6 +178,7 @@ impl Default for MalleableProfile {
             ssh_port: None,
             ssh_username: None,
             ssh_auth: None,
+            ssh_host_key_fingerprint: None,
         }
     }
 }

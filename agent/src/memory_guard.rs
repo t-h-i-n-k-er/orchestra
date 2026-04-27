@@ -500,9 +500,22 @@ impl Drop for LockedKeyPage {
     fn drop(&mut self) {
         if self.page_size == 0 {
             unsafe {
-                std::ptr::write_bytes(self.ptr, 0, 32);
+                // Use write_volatile so the compiler cannot elide these as dead
+                // stores (the memory is freed immediately after, which would
+                // otherwise make the zeroing look like unreachable code).
+                for i in 0..32usize {
+                    std::ptr::write_volatile(self.ptr.add(i), 0u8);
+                }
                 libc::munlock(self.ptr as *const _, 32);
-                let _ = Box::from_raw(self.ptr as *mut [u8; 32]);
+                // Reconstruct the Box and std::mem::forget it so no destructor
+                // runs a second pass; we've already zeroed above.  The raw
+                // memory is returned to the allocator via dealloc directly.
+                let boxed = Box::from_raw(self.ptr as *mut [u8; 32]);
+                std::mem::forget(boxed);
+                std::alloc::dealloc(
+                    self.ptr,
+                    std::alloc::Layout::new::<[u8; 32]>(),
+                );
             }
         } else {
             unsafe {

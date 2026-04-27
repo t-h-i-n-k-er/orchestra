@@ -156,13 +156,13 @@ pub fn init_build_queue(workers: usize, build_dir: PathBuf, retention_days: u32)
                 if v.status == "Queued" || v.status == "Running" {
                     return true;
                 }
-                // Remove completed/failed jobs older than 24 hours (M-35 fix).
+                // Remove completed/failed jobs older than build_retention_days (M-35 fix).
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
                 let elapsed = now_secs.saturating_sub(v.started_at);
-                elapsed < 86400
+                elapsed < retention_days as u64 * 86400
             });
             // Cleanup FS
             if let Ok(entries) = std::fs::read_dir(&build_dir) {

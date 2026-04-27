@@ -25,6 +25,7 @@
 //! No OS handles are opened: ntdll is located by walking the PEB loader list
 //! and `VirtualProtect` operates on the current process address space directly.
 
+#[cfg(windows)]
 use std::sync::atomic::AtomicU8;
 
 /// Saved original first byte of `EtwEventWrite` (0 = never patched).

@@ -261,7 +261,7 @@ pub fn start_logging() -> Result<(), String> {
         });
     }
 
-    println!("HCI logging started.");
+    log::debug!("HCI logging started.");
     Ok(())
 }
 
@@ -274,7 +274,7 @@ pub fn stop_logging() -> Result<(), String> {
     {
         return Err("Logging is not in progress.".to_string());
     }
-    println!("HCI logging stopped.");
+    log::debug!("HCI logging stopped.");
     Ok(())
 }
 

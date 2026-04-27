@@ -456,8 +456,10 @@ fn is_cloud_instance() -> bool {
 
 pub fn detect_vm() -> bool {
     // The hypervisor bit is now just one of several indicators.
+    // Call is_expected_hypervisor() once and reuse the result below.
+    let cloud_hypervisor = is_expected_hypervisor();
     let mut indicators = 0i32;
-    if cpuid_hypervisor_bit() && !is_expected_hypervisor() {
+    if cpuid_hypervisor_bit() && !cloud_hypervisor {
         indicators += 1;
     }
     #[cfg(target_os = "linux")]
@@ -503,7 +505,6 @@ pub fn detect_vm() -> bool {
     //     whose DMI strings aren't in our list), we raise the threshold to 3,
     //     so a standard 3-indicator cloud VM (CPUID + DMI + MAC) is not flagged
     //     while a heavily-instrumented analysis VM with 4+ indicators still is.
-    let cloud_hypervisor = is_expected_hypervisor();
     let cloud_imds = is_cloud_instance();
     let threshold = if cloud_hypervisor && cloud_imds {
         4 // Strong confirmation: both local DMI *and* IMDS agree → cloud

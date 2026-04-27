@@ -19,7 +19,7 @@ pub unsafe fn decrypt_payload() {
 
         // gs:[0x60] is the PEB pointer on x86_64 Windows
         let peb: usize;
-        asm!("mov {}, gs:[0x60]", out(reg) peb, options(pure, nomem, nostack));
+        asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
         if peb == 0 {
             return;
         }

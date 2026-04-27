@@ -47,6 +47,7 @@ async-trait = "0.1.89"
 winapi = { version = "0.3", features = ["ntdef", "psapi", "threadpoolapiset", "threadpoollegacyapiset"] }
 russh = { version = "0.45", optional = true }
 russh-keys = { version = "0.45", optional = true }
+notify = { version = "6.1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11cap = { version = "0.1", optional = true }
@@ -67,6 +68,7 @@ hollowing = { path = "../hollowing" }
 ppid-spoofing = []
 stealth = ["direct-syscalls", "unsafe-runtime-rewrite", "memory-guard", "ppid-spoofing"]
 dev = []
+hot-reload = ["notify"]
 env-validation = []
 persistence = []
 network-discovery = []

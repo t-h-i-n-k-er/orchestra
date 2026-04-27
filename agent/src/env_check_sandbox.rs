@@ -161,7 +161,7 @@ where
     }
     if unique.len() < 2 || total_distance < 5.0 {
         20
-    } else if unique.len() < 4 || total_distance < 50.0 {
+    } else if unique.len() < 4 && total_distance < 50.0 {
         10
     } else {
         0

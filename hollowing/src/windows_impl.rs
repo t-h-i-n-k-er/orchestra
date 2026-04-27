@@ -115,15 +115,19 @@ unsafe fn ldr_load_local(dll_name: &str) -> usize {
 /// crate doesn't need to depend on agent or call hooked GetProcAddress.
 #[cfg(windows)]
 unsafe fn local_get_export_addr_by_ordinal(base: usize, ordinal: u32) -> *mut std::ffi::c_void {
+    use std::ffi::{CStr, CString};
+    use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
+
     let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
     if (*dos_header).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
         return std::ptr::null_mut();
     }
     let nt_headers = (base + (*dos_header).e_lfanew as usize)
         as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
-    let export_dir_rva = (*nt_headers).OptionalHeader.DataDirectory
-        [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
-        .VirtualAddress;
+    let export_data_dir = (*nt_headers).OptionalHeader.DataDirectory
+        [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize];
+    let export_dir_rva = export_data_dir.VirtualAddress;
+    let export_dir_size = export_data_dir.Size as usize;
     if export_dir_rva == 0 {
         return std::ptr::null_mut();
     }
@@ -143,6 +147,54 @@ unsafe fn local_get_export_addr_by_ordinal(base: usize, ordinal: u32) -> *mut st
     if func_rva == 0 {
         return std::ptr::null_mut();
     }
+
+    // Forwarder: RVA points inside export directory, so it is an ASCII
+    // "DLL.Func" string rather than executable code.
+    let export_start = export_dir_rva as usize;
+    let export_end = export_start.saturating_add(export_dir_size);
+    if func_rva >= export_start && func_rva < export_end {
+        let forward_ptr = (base + func_rva) as *const i8;
+        let forward = match CStr::from_ptr(forward_ptr).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let (dll_part, symbol_part) = match forward.find('.') {
+            Some(i) => (&forward[..i], &forward[i + 1..]),
+            None => return std::ptr::null_mut(),
+        };
+
+        let dll_name = if dll_part.to_ascii_lowercase().ends_with(".dll") {
+            dll_part.to_string()
+        } else {
+            format!("{}.dll", dll_part)
+        };
+
+        let dll_c = match CString::new(dll_name) {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        let hmod = LoadLibraryA(dll_c.as_ptr());
+        if hmod.is_null() {
+            return std::ptr::null_mut();
+        }
+
+        if let Some(ord_str) = symbol_part.strip_prefix('#') {
+            let ord = match ord_str.parse::<u16>() {
+                Ok(v) => v,
+                Err(_) => return std::ptr::null_mut(),
+            };
+            return GetProcAddress(hmod, ord as usize as *const i8) as *mut std::ffi::c_void;
+        }
+
+        let symbol_c = match CString::new(symbol_part) {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        return GetProcAddress(hmod, symbol_c.as_ptr()) as *mut std::ffi::c_void;
+    }
+
     (base + func_rva) as *mut std::ffi::c_void
 }
 

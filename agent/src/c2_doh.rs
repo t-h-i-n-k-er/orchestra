@@ -40,10 +40,11 @@ pub struct DohTransport {
     session: CryptoSession,
     session_id: u32,
     seq: u32,
+    agent_id: String,
 }
 
 impl DohTransport {
-    pub async fn new(profile: &MalleableProfile, session: CryptoSession) -> Result<Self> {
+    pub async fn new(profile: &MalleableProfile, session: CryptoSession, agent_id: String) -> Result<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::USER_AGENT,
@@ -65,6 +66,7 @@ impl DohTransport {
             session,
             session_id: rand::random(),
             seq: 0,
+            agent_id,
         })
     }
 
@@ -154,7 +156,7 @@ impl Transport for DohTransport {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
-                agent_id: String::new(),
+                agent_id: self.agent_id.clone(),
                 status: "idle".to_string(),
             });
         }

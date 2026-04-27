@@ -925,7 +925,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
             // Make IAT writable
             let mut num_thunks = 0;
             let mut temp_thunk = first_thunk;
-            while (*temp_thunk).u1.AddressOfData() != &0 {
+            while *(*temp_thunk).u1.AddressOfData() != 0 {
                 num_thunks += 1;
                 temp_thunk = temp_thunk.add(1);
             }
@@ -955,7 +955,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                 }
             }
 
-            while (*original_thunk).u1.AddressOfData() != &0 {
+            while *(*original_thunk).u1.AddressOfData() != 0 {
                 let addr_of_data = *(*original_thunk).u1.AddressOfData() as u64;
                 let proc_addr = if (addr_of_data & winapi::um::winnt::IMAGE_ORDINAL_FLAG64) != 0 {
                     let ordinal = (addr_of_data & 0xffff) as u16;
@@ -1110,6 +1110,62 @@ unsafe fn get_export_addr(base: usize, func_name_ptr: *const i8) -> usize {
     0
 }
 
+#[cfg(windows)]
+fn is_forwarded_export_rva(func_rva: usize, export_dir_rva: u32, export_dir_size: u32) -> bool {
+    let start = export_dir_rva as usize;
+    let end = start.saturating_add(export_dir_size as usize);
+    func_rva >= start && func_rva < end
+}
+
+#[cfg(windows)]
+unsafe fn resolve_forwarded_export(base: usize, func_rva: usize) -> *mut std::ffi::c_void {
+    let forward_str_ptr = (base + func_rva) as *const i8;
+    let forward_cstr = std::ffi::CStr::from_ptr(forward_str_ptr);
+    let forward_str = match forward_cstr.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+
+    let (dll_part, func_part) = match forward_str.find('.') {
+        Some(dot_pos) => (&forward_str[..dot_pos], &forward_str[dot_pos + 1..]),
+        None => return std::ptr::null_mut(),
+    };
+
+    let dll_name_with_ext = if dll_part.to_ascii_lowercase().ends_with(".dll") {
+        dll_part.to_string()
+    } else {
+        format!("{}.dll", dll_part)
+    };
+    let dll_lower = dll_name_with_ext.to_lowercase();
+
+    let target_base = match map_clean_dll(&dll_lower) {
+        Ok(b) => b,
+        Err(_) => CLEAN_MODULES
+            .get()
+            .and_then(|m| m.lock().unwrap().get(&dll_lower).copied())
+            .unwrap_or(0),
+    };
+    if target_base == 0 {
+        return std::ptr::null_mut();
+    }
+
+    if let Some(stripped) = func_part.strip_prefix('#') {
+        if let Ok(target_ordinal) = stripped.parse::<u32>() {
+            return get_export_addr_by_ordinal(target_base, target_ordinal);
+        }
+        return std::ptr::null_mut();
+    }
+
+    let mut func_name_null = func_part.as_bytes().to_vec();
+    func_name_null.push(0);
+    let addr = get_export_addr(target_base, func_name_null.as_ptr() as *const i8);
+    if addr == 0 {
+        return std::ptr::null_mut();
+    }
+
+    addr as *mut std::ffi::c_void
+}
+
 /// Resolve an export by ordinal from a clean-mapped DLL.
 /// This avoids calling the hookable GetProcAddress for ordinal imports (M-24).
 #[cfg(windows)]
@@ -1120,9 +1176,10 @@ unsafe fn get_export_addr_by_ordinal(base: usize, ordinal: u32) -> *mut std::ffi
     }
     let nt_headers = (base + (*dos_header).e_lfanew as usize)
         as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
-    let export_dir_rva = (*nt_headers).OptionalHeader.DataDirectory
-        [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
-        .VirtualAddress;
+    let export_dir_data_dir = (*nt_headers).OptionalHeader.DataDirectory
+        [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize];
+    let export_dir_rva = export_dir_data_dir.VirtualAddress;
+    let export_dir_size = export_dir_data_dir.Size;
     if export_dir_rva == 0 {
         return std::ptr::null_mut();
     }
@@ -1142,6 +1199,11 @@ unsafe fn get_export_addr_by_ordinal(base: usize, ordinal: u32) -> *mut std::ffi
     if func_rva == 0 {
         return std::ptr::null_mut();
     }
+
+    if is_forwarded_export_rva(func_rva, export_dir_rva, export_dir_size) {
+        return resolve_forwarded_export(base, func_rva);
+    }
+
     (base + func_rva) as *mut std::ffi::c_void
 }
 

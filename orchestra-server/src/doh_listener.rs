@@ -10,6 +10,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use axum_server::accept::Accept;
 use common::{CryptoSession, Message, PROTOCOL_VERSION};
 use dashmap::{
     mapref::entry::Entry,
@@ -18,13 +19,21 @@ use dashmap::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, VecDeque},
+    future::Future,
+    io,
     net::{Ipv4Addr, SocketAddr},
+    pin::Pin,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio_rustls::{server::TlsStream, TlsAcceptor};
 
 const TYPE_A: u16 = 1;
 const TYPE_TXT: u16 = 16;
+const DOH_SESSION_SWEEP_INTERVAL_SECS: u64 = 60;
+const DOH_SESSION_TIMEOUT_DEFAULT_SECS: u64 = 300;
 
 #[derive(Clone)]
 struct DohRuntime {
@@ -43,6 +52,7 @@ struct DohSession {
     next_seq: Option<u32>,
     outbound_rx: mpsc::Receiver<Message>,
     outbound_queue: VecDeque<Message>,
+    last_activity: Instant,
 }
 
 impl DohRuntime {
@@ -101,6 +111,7 @@ impl DohRuntime {
                     next_seq: None,
                     outbound_rx: rx,
                     outbound_queue: VecDeque::new(),
+                    last_activity: Instant::now(),
                 }));
                 v.insert(session.clone());
                 session
@@ -259,6 +270,7 @@ impl DohRuntime {
                 Err(poisoned) => poisoned.into_inner(),
             };
             guard.fragments.insert(seq, chunk.to_string());
+            guard.last_activity = Instant::now();
             if guard.next_seq.is_none() {
                 guard.next_seq = Some(seq);
             }
@@ -341,6 +353,92 @@ impl DohRuntime {
         if let Some(mut entry) = self.app.registry.get_mut(&guard.connection_id) {
             entry.last_seen = now_secs();
         }
+    }
+
+    fn cleanup_stale_sessions(&self, stale_after: Duration) -> usize {
+        let now = Instant::now();
+        let stale = self
+            .sessions
+            .iter()
+            .filter_map(|entry| {
+                let session_id = entry.key().clone();
+                let session = entry.value().clone();
+                let guard = match session.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+
+                if now.saturating_duration_since(guard.last_activity) > stale_after {
+                    Some((session_id, guard.connection_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for (session_id, connection_id) in &stale {
+            self.sessions.remove(session_id);
+            self.app.registry.remove(connection_id);
+        }
+
+        stale.len()
+    }
+}
+
+#[derive(Clone)]
+struct DohTlsAcceptor {
+    inner: TlsAcceptor,
+}
+
+type DohTlsAcceptFuture<S> = Pin<Box<dyn Future<Output = io::Result<(TlsStream<TcpStream>, S)>> + Send>>;
+
+impl<S> Accept<TcpStream, S> for DohTlsAcceptor
+where
+    S: Send + 'static,
+{
+    type Stream = TlsStream<TcpStream>;
+    type Service = S;
+    type Future = DohTlsAcceptFuture<S>;
+
+    fn accept(&self, stream: TcpStream, service: S) -> Self::Future {
+        let acceptor = self.inner.clone();
+        Box::pin(async move {
+            let tls = acceptor.accept(stream).await.map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("DoH TLS handshake failed: {e}"),
+                )
+            })?;
+            Ok((tls, service))
+        })
+    }
+}
+
+fn parse_bool_env(name: &str) -> Option<bool> {
+    let raw = std::env::var(name).ok()?;
+    let lowered = raw.trim().to_ascii_lowercase();
+    match lowered.as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => {
+            tracing::warn!(env = %name, value = %raw, "invalid boolean environment override; ignoring");
+            None
+        }
+    }
+}
+
+fn doh_use_tls_enabled(state: &AppState) -> bool {
+    // Matches requested default behavior: enable DoH TLS when a TLS cert path
+    // is configured, unless explicitly overridden.
+    let default_enabled = state.config.tls_cert_path.is_some();
+    parse_bool_env("ORCHESTRA_DOH_USE_TLS").unwrap_or(default_enabled)
+}
+
+fn doh_session_timeout() -> Duration {
+    let raw = std::env::var("ORCHESTRA_DOH_SESSION_TIMEOUT_SECS").ok();
+    match raw.and_then(|s| s.parse::<u64>().ok()) {
+        Some(0) | None => Duration::from_secs(DOH_SESSION_TIMEOUT_DEFAULT_SECS),
+        Some(secs) => Duration::from_secs(secs),
     }
 }
 
@@ -501,14 +599,46 @@ pub async fn run(
         doh_idle_ip,
     )?);
 
+    let use_tls = doh_use_tls_enabled(&state.app);
+    let stale_after = doh_session_timeout();
+    let sweep_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(DOH_SESSION_SWEEP_INTERVAL_SECS));
+        loop {
+            interval.tick().await;
+            let removed = sweep_state.cleanup_stale_sessions(stale_after);
+            tracing::debug!("DoH: cleaned up {} stale sessions", removed);
+        }
+    });
+
     tracing::info!(
         addr = %listen_addr,
         domain = %state.domain,
+        tls = use_tls,
+        session_timeout_secs = stale_after.as_secs(),
         "DoH listener bound"
     );
 
-    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-    axum::serve(listener, router(state).into_make_service()).await?;
+    if use_tls {
+        let tls_cfg = crate::tls::build(
+            state.app.config.tls_cert_path.as_deref(),
+            state.app.config.tls_key_path.as_deref(),
+        )
+        .await?
+        .get_inner();
+
+        let acceptor = DohTlsAcceptor {
+            inner: TlsAcceptor::from(tls_cfg),
+        };
+
+        axum_server::bind(listen_addr)
+            .acceptor(acceptor)
+            .serve(router(state).into_make_service())
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+        axum::serve(listener, router(state).into_make_service()).await?;
+    }
     Ok(())
 }
 

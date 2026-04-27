@@ -58,14 +58,17 @@ const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 // ── SSH client handler ────────────────────────────────────────────────────────
 
-/// Minimal [`client::Handler`] that unconditionally accepts the server's host
-/// key.  The Orchestra shared secret and the application-layer AEAD already
-/// provide mutual authentication; host-key pinning would require distributing
-/// an additional secret.
+/// [`client::Handler`] that optionally pins the server host key by its
+/// SHA-256 fingerprint stored in `MalleableProfile.ssh_host_key_fingerprint`.
 ///
-/// Deployments that prefer strict host-key verification should store the
-/// expected key fingerprint in `MalleableProfile` and compare it here.
-struct ClientHandler;
+/// * When `allowed_host_key` is `Some(fp)` the connection is rejected if the
+///   server's public key fingerprint does not match `fp` (MITM protection).
+/// * When `allowed_host_key` is `None` the key is accepted but a warning is
+///   logged so operators know pinning is not active.
+struct ClientHandler {
+    /// Expected hex SHA-256 fingerprint, or `None` to accept any key.
+    allowed_host_key: Option<String>,
+}
 
 #[async_trait]
 impl client::Handler for ClientHandler {
@@ -73,13 +76,29 @@ impl client::Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &PublicKey,
+        server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        // Accept all server host keys.  The application-layer CryptoSession
-        // (AES-256-GCM) provides authenticated encryption; an attacker that
-        // can MITM the SSH connection does not learn the PSK and cannot forge
-        // valid ciphertext.
-        Ok(true)
+        let fingerprint = server_public_key.fingerprint();
+        match &self.allowed_host_key {
+            Some(expected) => {
+                if fingerprint == *expected {
+                    Ok(true)
+                } else {
+                    log::error!(
+                        "ssh-transport: host key fingerprint mismatch \
+                         (expected {expected}, got {fingerprint}) — rejecting connection"
+                    );
+                    Ok(false)
+                }
+            }
+            None => {
+                log::warn!(
+                    "ssh-transport: no host key fingerprint configured; \
+                     accepting server key {fingerprint} without verification"
+                );
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -146,7 +165,10 @@ impl SshTransport {
 
         let addr = format!("{host}:{port}");
         info!("ssh-transport: connecting to {addr}");
-        let mut handle = client::connect(ssh_config, addr.as_str(), ClientHandler).await?;
+        let handler = ClientHandler {
+            allowed_host_key: profile.ssh_host_key_fingerprint.clone(),
+        };
+        let mut handle = client::connect(ssh_config, addr.as_str(), handler).await?;
 
         // Authenticate according to the configured method.
         let authenticated = match auth_cfg {

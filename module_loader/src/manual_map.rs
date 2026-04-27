@@ -16,10 +16,8 @@ use winapi::um::winnt::{
     IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
     IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
     PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
-    PROCESS_ALL_ACCESS,
 };
 use winapi::um::processthreadsapi::OpenProcess;
-use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
 use pe_resolve;
 
 
