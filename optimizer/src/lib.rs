@@ -5,6 +5,26 @@ use iced_x86::{OpKind, Register};
 use rand::seq::SliceRandom;
 use rand::{thread_rng, Rng};
 
+include!(concat!(env!("OUT_DIR"), "/stub_seed.rs"));
+
+/// Derive an 8-byte dead-code value from the build-time STUB_SEED and a
+/// per-stub index using HKDF-SHA256.  This ensures every build produces
+/// different dead-code constants (because STUB_SEED changes each build) while
+/// also ensuring each stub site within a build gets a distinct value (because
+/// `index` differs per site).
+#[cfg(feature = "diversification")]
+fn derive_dead_val(index: u64) -> u64 {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    let hk = Hkdf::<Sha256>::new(None, &STUB_SEED);
+    let mut okm = [0u8; 8];
+    let info = index.to_le_bytes();
+    hk.expand(&info, &mut okm)
+        .expect("HKDF expand with 8-byte OKM should never fail");
+    u64::from_le_bytes(okm)
+}
+
 pub trait Pass {
     fn run(&self, instrs: &mut Vec<Instruction>);
 }
@@ -455,11 +475,17 @@ impl Pass for OpaqueDeadCodePass {
         let mut rng = thread_rng();
         let mut result = Vec::with_capacity(instrs.len() + instrs.len() / 4);
         let mut at_block_start = true;
+        let mut stub_index: u64 = 0;
 
         for &ins in instrs.iter() {
             if at_block_start && rng.gen_bool(0.35) {
                 let reg = *SCRATCH.choose(&mut rng).unwrap();
-                let dead_val: u64 = rng.gen();
+                // Derive dead_val from the build-time STUB_SEED and the per-site
+                // stub index using HKDF-SHA256.  This makes every build produce
+                // different constants (STUB_SEED changes each build) while each
+                // stub site within a build also gets a distinct value.
+                let dead_val = derive_dead_val(stub_index);
+                stub_index += 1;
                 // PUSH / MOV / POP — EFLAGS unchanged, RSP net change = 0.
                 if let (Ok(push), Ok(mov), Ok(pop)) = (
                     Instruction::with1(Code::Push_r64, reg),

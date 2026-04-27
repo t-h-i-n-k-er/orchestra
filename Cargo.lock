@@ -3067,11 +3067,13 @@ dependencies = [
  "anyhow",
  "criterion 0.5.1",
  "goblin 0.7.1",
+ "hkdf",
  "iced-x86",
  "libc",
  "memmap2 0.9.10",
  "rand 0.8.6",
  "region",
+ "sha2",
  "tracing",
  "winapi",
 ]

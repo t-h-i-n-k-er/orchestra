@@ -266,7 +266,6 @@ on per profile only when you need them.
 | `manual-map` | Experimental Windows manual-map compile flag that exposes `module_loader/manual-map`; unsupported runtime paths return explicit errors when the flag is absent. |
 | `unsafe-runtime-rewrite` | Experimental runtime-rewrite compatibility flag. Leave disabled unless a specific test plan requires it. |
 | `memory-guard` | Enables guarded sleep and memory-protection helpers used around reconnect/dormant waits. |
-| `linux-ptrace-migrate` | Experimental Linux x86_64 process-migration path. Disabled by default and not part of normal deployment profiles. |
 | `doh-transport` | Activates the DNS-over-HTTPS covert transport (`c2_doh::DohTransport`). When `dns_over_https = true` is set in `agent.toml`, the agent tunnels C2 traffic through DNS TXT queries sent to a DoH resolver. Requires a compatible server-side DNS-to-C2 bridge. |
 | `http-transport` | Activates the HTTP malleable-profile transport (`c2_http::HttpTransport`). When `cdn_relay = true` is set in `agent.toml`, the agent tunnels C2 traffic over HTTP/S using configurable header and URI profiles for traffic blending. |
 | `env-validation` | Runs startup environment checks when explicitly enabled. Refusal is controlled by runtime policy fields such as `required_domain`, `refuse_in_vm`, `refuse_when_debugged`, and `sandbox_score_threshold`; otherwise signals are informational. See [docs/USER_GUIDE.md §10](docs/USER_GUIDE.md) for full details. |

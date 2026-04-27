@@ -644,6 +644,16 @@ pub mod macos {
                 log::warn!("CronJob install failed (non-fatal): {}", e);
             }
         }
+        if cfg.launch_daemon {
+            if let Err(e) = LaunchDaemon::default().install(&exe) {
+                log::warn!("LaunchDaemon install failed (non-fatal): {}", e);
+            }
+        }
+        if cfg.login_item {
+            if let Err(e) = LoginItem::default().install(&exe) {
+                log::warn!("LoginItem install failed (non-fatal): {}", e);
+            }
+        }
 
         Ok(exe)
     }
@@ -652,6 +662,8 @@ pub mod macos {
         let exe = std::env::current_exe()?;
         let _ = LaunchAgent::default().remove();
         let _ = CronJob.remove();
+        let _ = LaunchDaemon::default().remove();
+        let _ = LoginItem::default().remove();
         Ok(exe)
     }
 

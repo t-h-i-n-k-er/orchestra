@@ -4,10 +4,9 @@
 //! migrating the agent into a long-running system process.
 //!
 //! Implementation status by platform:
-//! * **Linux (no feature flag):** returns an explicit "not implemented" error;
-//!   no filesystem side effects.
-//! * **Linux (`linux-ptrace-migrate` feature):** experimental and x86_64-only;
-//!   returns explicit errors when ptrace prerequisites are missing.
+//! * **Linux:** experimental and x86_64-only; uses ptrace+clone to inject a
+//!   staged execve stub.  Returns explicit errors when ptrace prerequisites
+//!   are missing (CAP_SYS_PTRACE or same-uid access).
 //! * **macOS:** experimental; requires root or the
 //!   `com.apple.security.cs.debugger` entitlement and returns explicit errors
 //!   when platform prerequisites are not met.
@@ -63,16 +62,6 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
         anyhow::bail!("invalid migration target (self or pid 0)");
     }
 
-    #[cfg(not(feature = "linux-ptrace-migrate"))]
-    {
-        anyhow::bail!(
-            "linux process migration is not implemented without the \
-             `linux-ptrace-migrate` feature; rebuild the agent with \
-             `--features linux-ptrace-migrate` to enable ptrace-based migration"
-        )
-    }
-
-    #[cfg(feature = "linux-ptrace-migrate")]
     {
         // Verify we have ptrace capability or same-uid access.
         let target_uid_path = format!("/proc/{target_pid}/status");
@@ -353,7 +342,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                     0usize,
                     0usize,
                 );
-                anyhow::bail!("linux-ptrace-migrate is only implemented for x86_64");
+                anyhow::bail!("Linux process migration via ptrace+clone is only implemented for x86_64");
             }
 
             Ok(())
@@ -367,7 +356,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
 /// stub is entirely self-contained and can be injected as a single flat blob.
 ///
 /// The stub is generated at runtime so the path length can vary.
-#[cfg(all(target_os = "linux", feature = "linux-ptrace-migrate"))]
+#[cfg(target_os = "linux")]
 fn build_execve_stub(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
     let path_bytes = path.as_os_str().as_bytes();
@@ -886,31 +875,12 @@ mod tests {
         );
     }
 
-    /// Without the `linux-ptrace-migrate` feature, migration on Linux must return
-    /// the documented "not implemented without … feature" error (not a panic or
-    /// an OS-level failure).
+    /// The ptrace migration path must reject obviously invalid PIDs (0 and the
+    /// agent's own PID) without attempting a ptrace attach.  This tests the
+    /// guard logic only — no real system process is touched.
     #[test]
-    #[cfg(all(target_os = "linux", not(feature = "linux-ptrace-migrate")))]
-    fn migrate_without_feature_returns_unsupported_error() {
-        let err = migrate_to_process(1).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("linux-ptrace-migrate"),
-            "error should mention the feature name; got: {msg}"
-        );
-        assert!(
-            msg.contains("not implemented") || msg.contains("not enabled"),
-            "error should say the feature is not enabled; got: {msg}"
-        );
-    }
-
-    /// With the `linux-ptrace-migrate` feature enabled, the validation path must
-    /// reject obviously invalid PIDs (0 and the agent's own PID) without
-    /// attempting a ptrace attach.  This tests the guard logic only — no real
-    /// system process is touched.
-    #[test]
-    #[cfg(all(target_os = "linux", feature = "linux-ptrace-migrate"))]
-    fn migrate_with_feature_rejects_invalid_pids() {
+    #[cfg(target_os = "linux")]
+    fn migrate_rejects_invalid_pids() {
         // pid=0 is always invalid.
         let err_zero = migrate_to_process(0).unwrap_err();
         assert!(

