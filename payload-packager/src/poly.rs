@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! [4 bytes: magic "POLY"]
-//! [1 byte:  scheme (0 = XorStream, 1 = Rc4, 2 = LfsrStream)]
+//! [1 byte:  scheme (0 = XorStream, 1 = Rc4, 2 = ChaCha20Stream)]
 //! [4 bytes BE: key_len]
 //! [key_len bytes: key]
 //! [4 bytes BE: ciphertext_len]
@@ -24,7 +24,7 @@
 //! |----|-------------|-------------|----------------------------------|
 //! | 0  | XorStream   | 16–64 bytes | Repeating XOR                    |
 //! | 1  | Rc4         | 16–256 bytes| Classic RC4 stream cipher        |
-//! | 2  | LfsrStream  | 8 bytes     | 64-bit Galois LFSR keystream     |
+//! | 2  | ChaCha20Stream | 44 bytes   | ChaCha20 stream cipher (RFC 8439) |
 
 use rand::Rng;
 
@@ -34,7 +34,7 @@ use rand::Rng;
 pub enum PolyScheme {
     XorStream = 0,
     Rc4 = 1,
-    LfsrStream = 2,
+    ChaCha20Stream = 2,  // Was LfsrStream — replaced due to M-37 8-bit leak
 }
 
 impl PolyScheme {
@@ -42,7 +42,7 @@ impl PolyScheme {
         match rng.gen_range(0u8..3) {
             0 => Self::XorStream,
             1 => Self::Rc4,
-            _ => Self::LfsrStream,
+            _ => Self::ChaCha20Stream,
         }
     }
 
@@ -88,10 +88,10 @@ pub fn poly_wrap(plaintext: &[u8]) -> PolyBlob {
                 ciphertext: ct,
             }
         }
-        PolyScheme::LfsrStream => {
-            // 8-byte seed — fed into a 64-bit Galois LFSR.
-            let key: Vec<u8> = (0..8).map(|_| rng.gen()).collect();
-            let ct = lfsr_stream(plaintext, &key);
+        PolyScheme::ChaCha20Stream => {
+            // 44 bytes: 32-byte ChaCha20 key + 12-byte nonce
+            let key: Vec<u8> = (0..44).map(|_| rng.gen()).collect();
+            let ct = chacha20_stream(plaintext, &key);
             PolyBlob {
                 scheme,
                 key,
@@ -160,9 +160,9 @@ pub fn poly_emit_stub(blob: &PolyBlob) -> String {
             &mut rng,
         ),
         PolyScheme::Rc4 => emit_rc4_body(&v_ct, &v_key, &v_out, &key_literal, &mut rng),
-        PolyScheme::LfsrStream => {
-            emit_lfsr_body(&v_ct, &v_key, &v_out, &v_idx, &key_literal, &mut rng)
-        }
+        PolyScheme::ChaCha20Stream => emit_chacha20_body(
+            &v_ct, &v_key, &v_out, &key_literal, &mut rng,
+        ),
     };
 
     // Vary whether dead code appears before or after the key assignment.
@@ -225,26 +225,96 @@ fn rc4(data: &[u8], key: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// 64-bit Galois LFSR stream cipher.
-/// The 8-byte key initialises the LFSR state; the tap polynomial is
-/// `x^64 + x^4 + x^3 + x + 1` (a standard maximal-length primitive).
-fn lfsr_stream(data: &[u8], key: &[u8]) -> Vec<u8> {
-    assert!(key.len() >= 8);
-    let mut state = u64::from_le_bytes(key[..8].try_into().unwrap());
-    if state == 0 {
-        state = 0xace1_ace1_ace1_ace1;
-    } // avoid all-zero state
-    const POLY: u64 = 0x8000_0000_0000_000b; // taps at 64,4,3,1 (Galois form)
-    data.iter()
-        .map(|&b| {
-            let bit = state & 1;
-            state >>= 1;
-            if bit != 0 {
-                state ^= POLY;
-            }
-            b ^ (state as u8)
-        })
-        .collect()
+/// ChaCha20 stream cipher (RFC 8439).
+///
+/// Replaces the previous LFSR stream cipher (M-37), which leaked 8 bits of
+/// state per output byte.  ChaCha20 is a proper stream cipher with no known
+/// practical attacks.
+///
+/// Key: 32 bytes.  Nonce: 12 bytes (bytes 32–43 of `key`, zero-padded if shorter).
+fn chacha20_stream(data: &[u8], key: &[u8]) -> Vec<u8> {
+    assert!(key.len() >= 32, "ChaCha20 requires at least 32 bytes of key material");
+
+    fn qr(mut a: u32, mut b: u32, mut c: u32, mut d: u32) -> (u32, u32, u32, u32) {
+        a = a.wrapping_add(b); d ^= a; d = d.rotate_left(16);
+        c = c.wrapping_add(d); b ^= c; b = b.rotate_left(12);
+        a = a.wrapping_add(b); d ^= a; d = d.rotate_left(8);
+        c = c.wrapping_add(d); b ^= c; b = b.rotate_left(7);
+        (a, b, c, d)
+    }
+
+    fn chacha20_block(state: &[u32; 16]) -> [u8; 64] {
+        let mut w = *state;
+        for _ in 0..10 {
+            let (w0,w4,w8,w12) = qr(w[0],w[4],w[8],w[12]);
+            w[0]=w0; w[4]=w4; w[8]=w8; w[12]=w12;
+            let (w1,w5,w9,w13) = qr(w[1],w[5],w[9],w[13]);
+            w[1]=w1; w[5]=w5; w[9]=w9; w[13]=w13;
+            let (w2,w6,w10,w14) = qr(w[2],w[6],w[10],w[14]);
+            w[2]=w2; w[6]=w6; w[10]=w10; w[14]=w14;
+            let (w3,w7,w11,w15) = qr(w[3],w[7],w[11],w[15]);
+            w[3]=w3; w[7]=w7; w[11]=w11; w[15]=w15;
+            let (w0,w5,w10,w15) = qr(w[0],w[5],w[10],w[15]);
+            w[0]=w0; w[5]=w5; w[10]=w10; w[15]=w15;
+            let (w1,w6,w11,w12) = qr(w[1],w[6],w[11],w[12]);
+            w[1]=w1; w[6]=w6; w[11]=w11; w[12]=w12;
+            let (w2,w7,w8,w13) = qr(w[2],w[7],w[8],w[13]);
+            w[2]=w2; w[7]=w7; w[8]=w8; w[13]=w13;
+            let (w3,w4,w9,w14) = qr(w[3],w[4],w[9],w[14]);
+            w[3]=w3; w[4]=w4; w[9]=w9; w[14]=w14;
+        }
+        let mut output = [0u8; 64];
+        for i in 0..16 {
+            let added = w[i].wrapping_add(state[i]);
+            output[i * 4..i * 4 + 4].copy_from_slice(&added.to_le_bytes());
+        }
+        output
+    }
+
+    let cipher_key = &key[..32];
+    let nonce: [u8; 12] = if key.len() >= 44 {
+        key[32..44].try_into().unwrap()
+    } else {
+        let mut n = [0u8; 12];
+        let avail = key.len().saturating_sub(32).min(12);
+        if avail > 0 {
+            n[..avail].copy_from_slice(&key[32..32 + avail]);
+        }
+        n
+    };
+
+    let mut key_words = [0u32; 8];
+    for i in 0..8 {
+        key_words[i] = u32::from_le_bytes(cipher_key[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    let mut nonce_words = [0u32; 3];
+    for i in 0..3 {
+        nonce_words[i] = u32::from_le_bytes(nonce[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    let constants: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
+
+    let mut output = Vec::with_capacity(data.len());
+    let mut counter: u32 = 1; // RFC 8439: counter starts at 1
+    let mut keystream_pos = 64usize; // force new block on first byte
+    let mut keystream = [0u8; 64];
+
+    for &byte in data {
+        if keystream_pos >= 64 {
+            let state: [u32; 16] = [
+                constants[0], constants[1], constants[2], constants[3],
+                key_words[0], key_words[1], key_words[2], key_words[3],
+                key_words[4], key_words[5], key_words[6], key_words[7],
+                counter, nonce_words[0], nonce_words[1], nonce_words[2],
+            ];
+            keystream = chacha20_block(&state);
+            keystream_pos = 0;
+            counter = counter.wrapping_add(1);
+        }
+        output.push(byte ^ keystream[keystream_pos]);
+        keystream_pos += 1;
+    }
+
+    output
 }
 
 // ── Stub body emitters ────────────────────────────────────────────────────────
@@ -316,54 +386,110 @@ fn emit_rc4_body(
     )
 }
 
-fn emit_lfsr_body(
+fn emit_chacha20_body(
     v_ct: &str,
     v_key: &str,
     v_out: &str,
-    v_idx: &str,
     key_lit: &str,
     rng: &mut impl Rng,
 ) -> String {
     let mut suf = || format!("{:04x}", rng.gen::<u16>());
-    let vst = format!("st_{}", suf());
-    let vbt = format!("bt_{}", suf());
+    let v_qr     = format!("qr_{}",   suf());
+    let v_block  = format!("blk_{}",  suf());
+    let v_state  = format!("st_{}",   suf());
+    let v_work   = format!("w_{}",    suf());
+    let v_ctr    = format!("ctr_{}",  suf());
+    let v_npos   = format!("npos_{}", suf());
+    let v_ks     = format!("ks_{}",   suf());
+    let v_b      = format!("b_{}",    suf());
+    let v_kwords = format!("kw_{}",   suf());
+    let v_nwords = format!("nw_{}",   suf());
+    let v_consts = format!("cst_{}",  suf());
 
-    // Hardcode the polynomial constant differently each build: the value is
-    // always the same but the literal is written differently.
-    let poly_val: u64 = 0x8000_0000_0000_000b;
-    let poly_lit = if rng.gen_bool(0.5) {
-        format!("0x{:016x}u64", poly_val)
-    } else {
-        format!("{}u64", poly_val)
-    };
-
-    // Style A: loop with explicit index
     if rng.gen_bool(0.5) {
+        // Style A: inline QR operations, no helper functions
         format!(
-            "    let {v_key}: &[u8] = &[{key_lit}];\n    \
-             let mut {vst} = u64::from_le_bytes({v_key}[..8].try_into().unwrap_or([0xacu8, 0xe1, 0xac, 0xe1, 0xac, 0xe1, 0xac, 0xe1]));\n    \
-             if {vst} == 0 {{ {vst} = 0xace1_ace1_ace1_ace1u64; }}\n    \
-             let mut {v_out} = ::std::vec::Vec::with_capacity({v_ct}.len());\n    \
-             for {v_idx} in 0..{v_ct}.len() {{\n        \
-             let {vbt} = {vst} & 1;\n        \
-             {vst} >>= 1;\n        \
-             if {vbt} != 0 {{ {vst} ^= {poly_lit}; }}\n        \
-             {v_out}.push({v_ct}[{v_idx}] ^ {vst} as u8);\n    \
-             }}\n    \
-             {v_out}\n",
+"    let {v_key}: &[u8] = &[{key_lit}];
+    let {v_consts}: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
+    let mut {v_kwords}: [u32; 8] = [0; 8];
+    for i in 0..8usize {{ {v_kwords}[i] = u32::from_le_bytes({v_key}[i*4..i*4+4].try_into().unwrap()); }}
+    let mut {v_nwords}: [u32; 3] = [0; 3];
+    for i in 0..3usize {{ {v_nwords}[i] = u32::from_le_bytes({v_key}[32+i*4..32+i*4+4].try_into().unwrap()); }}
+    let mut {v_ctr}: u32 = 1;
+    let mut {v_ks}: [u8; 64] = [0; 64];
+    let mut {v_npos}: usize = 64;
+    let mut {v_out}: ::std::vec::Vec<u8> = ::std::vec::Vec::with_capacity({v_ct}.len());
+    for &{v_b} in {v_ct} {{
+        if {v_npos} >= 64 {{
+            let mut {v_work}: [u32; 16] = [{v_consts}[0],{v_consts}[1],{v_consts}[2],{v_consts}[3],{v_kwords}[0],{v_kwords}[1],{v_kwords}[2],{v_kwords}[3],{v_kwords}[4],{v_kwords}[5],{v_kwords}[6],{v_kwords}[7],{v_ctr},{v_nwords}[0],{v_nwords}[1],{v_nwords}[2]];
+            let {v_state} = {v_work};
+            for _ in 0..10 {{
+                let (mut a,mut b,mut c,mut d)=({v_work}[0],{v_work}[4],{v_work}[8],{v_work}[12]); a=a.wrapping_add(b);d^=a;d=d.rotate_left(16);c=c.wrapping_add(d);b^=c;b=b.rotate_left(12);a=a.wrapping_add(b);d^=a;d=d.rotate_left(8);c=c.wrapping_add(d);b^=c;b=b.rotate_left(7); {v_work}[0]=a;{v_work}[4]=b;{v_work}[8]=c;{v_work}[12]=d;
+                let (mut a,mut b,mut c,mut d)=({v_work}[1],{v_work}[5],{v_work}[9],{v_work}[13]); a=a.wrapping_add(b);d^=a;d=d.rotate_left(16);c=c.wrapping_add(d);b^=c;b=b.rotate_left(12);a=a.wrapping_add(b);d^=a;d=d.rotate_left(8);c=c.wrapping_add(d);b^=c;b=b.rotate_left(7); {v_work}[1]=a;{v_work}[5]=b;{v_work}[9]=c;{v_work}[13]=d;
+                let (mut a,mut b,mut c,mut d)=({v_work}[2],{v_work}[6],{v_work}[10],{v_work}[14]); a=a.wrapping_add(b);d^=a;d=d.rotate_left(16);c=c.wrapping_add(d);b^=c;b=b.rotate_left(12);a=a.wrapping_add(b);d^=a;d=d.rotate_left(8);c=c.wrapping_add(d);b^=c;b=b.rotate_left(7); {v_work}[2]=a;{v_work}[6]=b;{v_work}[10]=c;{v_work}[14]=d;
+                let (mut a,mut b,mut c,mut d)=({v_work}[3],{v_work}[7],{v_work}[11],{v_work}[15]); a=a.wrapping_add(b);d^=a;d=d.rotate_left(16);c=c.wrapping_add(d);b^=c;b=b.rotate_left(12);a=a.wrapping_add(b);d^=a;d=d.rotate_left(8);c=c.wrapping_add(d);b^=c;b=b.rotate_left(7); {v_work}[3]=a;{v_work}[7]=b;{v_work}[11]=c;{v_work}[15]=d;
+                let (mut a,mut b,mut c,mut d)=({v_work}[0],{v_work}[5],{v_work}[10],{v_work}[15]); a=a.wrapping_add(b);d^=a;d=d.rotate_left(16);c=c.wrapping_add(d);b^=c;b=b.rotate_left(12);a=a.wrapping_add(b);d^=a;d=d.rotate_left(8);c=c.wrapping_add(d);b^=c;b=b.rotate_left(7); {v_work}[0]=a;{v_work}[5]=b;{v_work}[10]=c;{v_work}[15]=d;
+                let (mut a,mut b,mut c,mut d)=({v_work}[1],{v_work}[6],{v_work}[11],{v_work}[12]); a=a.wrapping_add(b);d^=a;d=d.rotate_left(16);c=c.wrapping_add(d);b^=c;b=b.rotate_left(12);a=a.wrapping_add(b);d^=a;d=d.rotate_left(8);c=c.wrapping_add(d);b^=c;b=b.rotate_left(7); {v_work}[1]=a;{v_work}[6]=b;{v_work}[11]=c;{v_work}[12]=d;
+                let (mut a,mut b,mut c,mut d)=({v_work}[2],{v_work}[7],{v_work}[8],{v_work}[13]); a=a.wrapping_add(b);d^=a;d=d.rotate_left(16);c=c.wrapping_add(d);b^=c;b=b.rotate_left(12);a=a.wrapping_add(b);d^=a;d=d.rotate_left(8);c=c.wrapping_add(d);b^=c;b=b.rotate_left(7); {v_work}[2]=a;{v_work}[7]=b;{v_work}[8]=c;{v_work}[13]=d;
+                let (mut a,mut b,mut c,mut d)=({v_work}[3],{v_work}[4],{v_work}[9],{v_work}[14]); a=a.wrapping_add(b);d^=a;d=d.rotate_left(16);c=c.wrapping_add(d);b^=c;b=b.rotate_left(12);a=a.wrapping_add(b);d^=a;d=d.rotate_left(8);c=c.wrapping_add(d);b^=c;b=b.rotate_left(7); {v_work}[3]=a;{v_work}[4]=b;{v_work}[9]=c;{v_work}[14]=d;
+            }}
+            for i in 0..16usize {{ let v = {v_work}[i].wrapping_add({v_state}[i]); {v_ks}[i*4..i*4+4].copy_from_slice(&v.to_le_bytes()); }}
+            {v_ctr} = {v_ctr}.wrapping_add(1);
+            {v_npos} = 0;
+        }}
+        {v_out}.push({v_b} ^ {v_ks}[{v_npos}]);
+        {v_npos} += 1;
+    }}
+    {v_out}
+",
         )
     } else {
-        // Style B: fold/scan
+        // Style B: with extracted helper functions
         format!(
-            "    let {v_key}: &[u8] = &[{key_lit}];\n    \
-             let seed = u64::from_le_bytes({v_key}[..8].try_into().unwrap_or([0xacu8, 0xe1, 0xac, 0xe1, 0xac, 0xe1, 0xac, 0xe1]));\n    \
-             let mut {vst}: u64 = if seed == 0 {{ 0xace1_ace1_ace1_ace1u64 }} else {{ seed }};\n    \
-             {v_ct}.iter().map(|&{vbt}| {{\n        \
-             let bit = {vst} & 1;\n        \
-             {vst} >>= 1;\n        \
-             if bit != 0 {{ {vst} ^= {poly_lit}; }}\n        \
-             {vbt} ^ {vst} as u8\n    \
-             }}).collect()\n",
+"    fn {v_qr}(mut a: u32, mut b: u32, mut c: u32, mut d: u32) -> (u32, u32, u32, u32) {{
+        a = a.wrapping_add(b); d ^= a; d = d.rotate_left(16);
+        c = c.wrapping_add(d); b ^= c; b = b.rotate_left(12);
+        a = a.wrapping_add(b); d ^= a; d = d.rotate_left(8);
+        c = c.wrapping_add(d); b ^= c; b = b.rotate_left(7);
+        (a, b, c, d)
+    }}
+    fn {v_block}({v_state}: &[u32; 16]) -> [u8; 64] {{
+        let mut w = *{v_state};
+        for _ in 0..10 {{
+            let (a,b,c,d)={v_qr}(w[0],w[4],w[8],w[12]); w[0]=a;w[4]=b;w[8]=c;w[12]=d;
+            let (a,b,c,d)={v_qr}(w[1],w[5],w[9],w[13]); w[1]=a;w[5]=b;w[9]=c;w[13]=d;
+            let (a,b,c,d)={v_qr}(w[2],w[6],w[10],w[14]); w[2]=a;w[6]=b;w[10]=c;w[14]=d;
+            let (a,b,c,d)={v_qr}(w[3],w[7],w[11],w[15]); w[3]=a;w[7]=b;w[11]=c;w[15]=d;
+            let (a,b,c,d)={v_qr}(w[0],w[5],w[10],w[15]); w[0]=a;w[5]=b;w[10]=c;w[15]=d;
+            let (a,b,c,d)={v_qr}(w[1],w[6],w[11],w[12]); w[1]=a;w[6]=b;w[11]=c;w[12]=d;
+            let (a,b,c,d)={v_qr}(w[2],w[7],w[8],w[13]); w[2]=a;w[7]=b;w[8]=c;w[13]=d;
+            let (a,b,c,d)={v_qr}(w[3],w[4],w[9],w[14]); w[3]=a;w[4]=b;w[9]=c;w[14]=d;
+        }}
+        let mut out = [0u8; 64];
+        for i in 0..16 {{ let v = w[i].wrapping_add({v_state}[i]); out[i*4..i*4+4].copy_from_slice(&v.to_le_bytes()); }}
+        out
+    }}
+    let {v_key}: &[u8] = &[{key_lit}];
+    let {v_consts}: [u32; 4] = [0x61707865, 0x3320646e, 0x79622d32, 0x6b206574];
+    let mut {v_kwords}: [u32; 8] = [0; 8];
+    for i in 0..8 {{ {v_kwords}[i] = u32::from_le_bytes({v_key}[i*4..i*4+4].try_into().unwrap()); }}
+    let mut {v_nwords}: [u32; 3] = [0; 3];
+    for i in 0..3 {{ {v_nwords}[i] = u32::from_le_bytes({v_key}[32+i*4..32+i*4+4].try_into().unwrap()); }}
+    let mut {v_ctr}: u32 = 1;
+    let mut {v_npos}: usize = 64;
+    let mut {v_ks}: [u8; 64] = [0; 64];
+    {v_ct}.iter().map(|&{v_b}| {{
+        if {v_npos} >= 64 {{
+            let s: [u32; 16] = [{v_consts}[0],{v_consts}[1],{v_consts}[2],{v_consts}[3],{v_kwords}[0],{v_kwords}[1],{v_kwords}[2],{v_kwords}[3],{v_kwords}[4],{v_kwords}[5],{v_kwords}[6],{v_kwords}[7],{v_ctr},{v_nwords}[0],{v_nwords}[1],{v_nwords}[2]];
+            {v_ks} = {v_block}(&s);
+            {v_ctr} = {v_ctr}.wrapping_add(1);
+            {v_npos} = 0;
+        }}
+        let r = {v_b} ^ {v_ks}[{v_npos}];
+        {v_npos} += 1;
+        r
+    }}).collect()
+",
         )
     }
 }
@@ -403,12 +529,12 @@ mod tests {
     }
 
     #[test]
-    fn lfsr_stream_roundtrip() {
-        let pt = b"lfsr stream cipher test payload!";
-        let key = vec![0x01u8, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let ct = lfsr_stream(pt, &key);
+    fn chacha20_stream_roundtrip() {
+        let pt = b"chacha20 stream cipher test payload!";
+        let key: Vec<u8> = (0..44).map(|i| i as u8).collect();
+        let ct = chacha20_stream(pt, &key);
         assert_ne!(&ct[..], &pt[..]);
-        assert_eq!(&lfsr_stream(&ct, &key), pt);
+        assert_eq!(&chacha20_stream(&ct, &key), pt);
     }
 
     #[test]
