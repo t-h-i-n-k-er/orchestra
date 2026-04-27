@@ -1183,6 +1183,7 @@ fn syscall_number_raw(name: &str) -> anyhow::Result<u32> {
     match name {
         "read" => Ok(0),
         "write" => Ok(1),
+        #[doc = "Deprecated on Linux 5.x+ and often blocked by seccomp in containerized/sandboxed environments; prefer openat (257) with AT_FDCWD for compatibility."]
         "open" => Ok(2),
         "close" => Ok(3),
         "stat" => Ok(4),
