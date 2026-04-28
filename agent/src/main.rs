@@ -10,6 +10,7 @@
 //! connection.
 
 #[tokio::main]
+#[junk_macro::junk_barrier]
 async fn main() -> anyhow::Result<()> {
     junk_macro::insert_junk!();
     run().await
