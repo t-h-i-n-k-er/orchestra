@@ -42,6 +42,23 @@ and similar IT estates.
 | `optimizer` | lib | Runtime tuning of hot paths based on detected CPU microarchitecture. |
 | `module_loader` | lib | Securely fetches, verifies, and loads signed capability plugins. |
 
+## CI matrix
+
+GitHub Actions currently verifies cross-platform compile coverage with the
+matrix below:
+
+| Job | Runner | Target | Command | Purpose |
+|-----|--------|--------|---------|---------|
+| Linux default check | `ubuntu-latest` | host | `cargo check` | Baseline workspace compile health. |
+| Linux feature check | `ubuntu-latest` | host | `cargo check -p agent --features outbound-c,env-validation,persistence,network-discovery,memory-guard,forward-secrecy` | Verifies common agent feature combinations used in deployment profiles. |
+| Windows cross check (non-blocking) | `ubuntu-latest` | `x86_64-pc-windows-msvc` (fallback `x86_64-pc-windows-gnu`) | `cargo check -p agent --target <target> --features direct-syscalls,manual-map,stealth,env-validation` | Compiles Windows-only code paths (syscalls/manual-map/hollowing/injection/evasion-related modules). |
+| macOS cross check (non-blocking) | `macos-latest` | `x86_64-apple-darwin` | `cargo check -p agent --target x86_64-apple-darwin --features persistence,env-validation,remote-assist` | Compiles macOS-specific persistence and environment-check paths. |
+
+The Windows and macOS jobs are intentionally configured as non-blocking
+(`continue-on-error: true`) while platform coverage is stabilized. Once these
+jobs are consistently green, remove `continue-on-error` to promote them to
+required checks.
+
 ## Quick start
 
 ### One-command quickbuild (recommended)
