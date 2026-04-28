@@ -16,6 +16,7 @@
 
 use crate::state::{now_secs, AgentEntry, AppState};
 use anyhow::{Context as _, Result};
+use common::normalized_transport::NormalizedTransport;
 use common::{CryptoSession, Message};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -164,7 +165,19 @@ async fn handle_agent(
         }
     }
 
-    let (mut r, mut w) = tokio::io::split(tls_stream);
+    let stream: common::normalized_transport::CleartextStream =
+        if let Some(profile) = state.config.agent_traffic_profile {
+            tracing::debug!(
+                connection_id = %connection_id,
+                profile = ?profile,
+                "agent listener: enabling server-side normalized transport acceptance"
+            );
+            NormalizedTransport::accept(tls_stream, profile).await?
+        } else {
+            Box::new(tls_stream)
+        };
+
+    let (mut r, mut w) = tokio::io::split(stream);
 
     // Bounded channel for the API layer to push commands to this connection.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(32);

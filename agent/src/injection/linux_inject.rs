@@ -5,6 +5,16 @@ pub struct LinuxPtraceInjector;
 
 #[cfg(target_os = "linux")]
 impl Injector for LinuxPtraceInjector {
+    /// Fire-and-forget Linux ptrace injection.
+    ///
+    /// This injector redirects the target thread RIP to injected shellcode and
+    /// then detaches without restoring the original RIP or execution context.
+    /// The target process should therefore be treated as non-surviving once
+    /// shellcode returns unless the payload explicitly transfers control to a
+    /// stable endpoint.
+    ///
+    /// Payloads must either call `execve()`, call `exit()`, or be
+    /// position-independent and implement an explicit return-to-host mechanism.
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
         if payload.is_empty() {
             return Err(anyhow!("LinuxPtraceInjector: payload is empty"));
@@ -27,9 +37,10 @@ impl Injector for LinuxPtraceInjector {
         #[cfg(target_arch = "x86_64")]
         {
             let original_regs = ptrace_getregs(target_pid)?;
-            let remote_addr = remote_mmap_rwx(target_pid, payload.len(), &original_regs)?;
+            let remote_addr = remote_mmap_rw(target_pid, payload.len(), &original_regs)?;
 
             write_payload(target_pid, remote_addr, payload)?;
+            remote_mprotect_rx(target_pid, remote_addr, payload.len(), &original_regs)?;
 
             let mut exec_regs = original_regs;
             exec_regs.rip = remote_addr as u64;
@@ -270,7 +281,7 @@ impl Drop for RipPatchGuard {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn remote_mmap_rwx(
+fn remote_mmap_rw(
     pid: libc::pid_t,
     requested_len: usize,
     original_regs: &libc::user_regs_struct,
@@ -294,7 +305,7 @@ fn remote_mmap_rwx(
     mmap_regs.rax = libc::SYS_mmap as u64;
     mmap_regs.rdi = 0;
     mmap_regs.rsi = alloc_len as u64;
-    mmap_regs.rdx = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
+    mmap_regs.rdx = (libc::PROT_READ | libc::PROT_WRITE) as u64;
     mmap_regs.r10 = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64;
     mmap_regs.r8 = u64::MAX;
     mmap_regs.r9 = 0;
@@ -314,6 +325,58 @@ fn remote_mmap_rwx(
     }
 
     Ok(post_regs.rax as usize)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn remote_mprotect_rx(
+    pid: libc::pid_t,
+    remote_addr: usize,
+    requested_len: usize,
+    original_regs: &libc::user_regs_struct,
+) -> Result<()> {
+    let page_size = {
+        // SAFETY: sysconf is called with a valid constant.
+        let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if ps > 0 {
+            ps as usize
+        } else {
+            4096
+        }
+    };
+    let min_len = requested_len.max(1);
+    let aligned_start = remote_addr & !(page_size - 1);
+    let end_addr = remote_addr
+        .checked_add(min_len)
+        .ok_or_else(|| anyhow!("LinuxPtraceInjector: mprotect range overflow"))?;
+    let aligned_end = ((end_addr + page_size - 1) / page_size) * page_size;
+    let prot_len = aligned_end
+        .checked_sub(aligned_start)
+        .ok_or_else(|| anyhow!("LinuxPtraceInjector: invalid mprotect range"))?;
+
+    let rip = original_regs.rip as usize;
+    let _patch = RipPatchGuard::install(pid, rip)?;
+
+    let mut mprotect_regs = *original_regs;
+    mprotect_regs.rax = libc::SYS_mprotect as u64;
+    mprotect_regs.rdi = aligned_start as u64;
+    mprotect_regs.rsi = prot_len as u64;
+    mprotect_regs.rdx = (libc::PROT_READ | libc::PROT_EXEC) as u64;
+
+    ptrace_setregs(pid, &mprotect_regs)?;
+    ptrace_continue_and_wait(pid)?;
+
+    let post_regs = ptrace_getregs(pid)?;
+    ptrace_setregs(pid, original_regs)?;
+
+    let mprotect_result = post_regs.rax as i64;
+    if mprotect_result < 0 {
+        return Err(anyhow!(
+            "LinuxPtraceInjector: remote mprotect syscall failed with {}",
+            mprotect_result
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

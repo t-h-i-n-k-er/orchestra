@@ -1,5 +1,6 @@
 //! Server configuration loaded from a TOML file or built with defaults.
 
+use common::normalized_transport::TrafficProfile;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -13,6 +14,12 @@ pub struct ServerConfig {
     /// Pre-shared secret used to derive the AES-256 key for the agent channel.
     /// In production this should be replaced by mTLS; see roadmap.
     pub agent_shared_secret: String,
+    /// Optional server-side traffic shaping profile for the agent channel.
+    ///
+    /// `None` (default) disables shaping and keeps the listener in raw framed
+    /// mode. Set to `"tls"` to accept fake TLS-shaped framing from agents.
+    #[serde(default)]
+    pub agent_traffic_profile: Option<TrafficProfile>,
     /// Bearer token operators must present in `Authorization: Bearer ...`.
     pub admin_token: String,
     /// Path to a JSON-Lines audit log (created if missing, append-only).
@@ -98,6 +105,7 @@ impl Default for ServerConfig {
             http_addr: "127.0.0.1:8443".parse().unwrap(),
             agent_addr: "127.0.0.1:8444".parse().unwrap(),
             agent_shared_secret: "change-me-pre-shared-secret".into(),
+            agent_traffic_profile: None,
             admin_token: "change-me-admin-token".into(),
             audit_log_path: PathBuf::from("orchestra-audit.jsonl"),
             tls_cert_path: None,

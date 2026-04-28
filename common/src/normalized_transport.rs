@@ -1,6 +1,5 @@
-//! **IMPORTANT:** NormalizedTransport is currently client-side only. The server must handle raw TLS streams or implement its own NormalizedTransport::accept() path. See outbound.rs for the client usage pattern.
-// TODO: Add server-side NormalizedTransport support to
-// orchestra-server/src/agent_link.rs for full end-to-end traffic normalization.
+//! NormalizedTransport supports both client-side dialing (`connect`) and
+//! server-side acceptance (`accept`) for TLS-shaped traffic profiles.
 //
 //! # Network Compatibility Layer
 //!
@@ -106,6 +105,15 @@ pub enum TrafficProfile {
     Tls,
 }
 
+/// Object-safe stream trait used by [`NormalizedTransport::accept`] to return
+/// a cleartext stream regardless of whether shaping is enabled.
+pub trait CleartextIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> CleartextIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+/// Stream returned by [`NormalizedTransport::accept`].
+pub type CleartextStream = Box<dyn CleartextIo>;
+
 /// Transport that frames AES‑GCM ciphertexts as TLS 1.2 application‑data
 /// records over an arbitrary byte stream.
 pub struct NormalizedTransport<S> {
@@ -117,6 +125,28 @@ impl<S> NormalizedTransport<S>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    /// Accept a server-side stream and adapt it for the message framing layer.
+    ///
+    /// - `TrafficProfile::Raw`: passthrough (no additional shaping).
+    /// - `TrafficProfile::Tls`: consume fake handshake records and convert
+    ///   TLS-shaped records to/from the cleartext framed stream expected by the
+    ///   server (`u32_le length || ciphertext`).
+    pub async fn accept(stream: S, profile: TrafficProfile) -> Result<CleartextStream>
+    where
+        S: 'static,
+    {
+        match profile {
+            TrafficProfile::Raw => Ok(Box::new(stream)),
+            TrafficProfile::Tls => {
+                let (clear_server, clear_bridge) = tokio::io::duplex(128 * 1024);
+                tokio::spawn(async move {
+                    let _ = bridge_tls_shaping(stream, clear_bridge).await;
+                });
+                Ok(Box::new(clear_server))
+            }
+        }
+    }
+
     /// Construct a normalized transport and perform the fake TLS handshake.
     pub async fn connect(mut stream: S, session: CryptoSession, role: Role) -> Result<Self> {
         match role {
@@ -478,10 +508,214 @@ where
     Ok(())
 }
 
+async fn bridge_tls_shaping<S>(mut stream: S, clear: tokio::io::DuplexStream) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    read_fake_hello(&mut stream, HANDSHAKE_CLIENT_HELLO).await?;
+    write_fake_hello(&mut stream, HANDSHAKE_SERVER_HELLO).await?;
+
+    let (mut net_r, mut net_w) = tokio::io::split(stream);
+    let (mut clear_r, mut clear_w) = tokio::io::split(clear);
+
+    let inbound = async {
+        loop {
+            let ciphertext = match recv_shaped_ciphertext(&mut net_r).await? {
+                Some(ct) => ct,
+                None => break,
+            };
+            if ciphertext.len() > u32::MAX as usize {
+                return Err(anyhow!(
+                    "normalized transport inbound frame too large: {} bytes",
+                    ciphertext.len()
+                ));
+            }
+            clear_w.write_u32_le(ciphertext.len() as u32).await?;
+            clear_w.write_all(&ciphertext).await?;
+            clear_w.flush().await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let outbound = async {
+        loop {
+            let len = match read_u32_le_or_eof(&mut clear_r).await? {
+                Some(v) => v,
+                None => break,
+            };
+            if len > MAX_ASSEMBLED_BYTES as u32 {
+                return Err(anyhow!(
+                    "normalized transport outbound frame too large: {} bytes",
+                    len
+                ));
+            }
+            let mut ciphertext = vec![0u8; len as usize];
+            clear_r.read_exact(&mut ciphertext).await?;
+            send_shaped_ciphertext(&mut net_w, &ciphertext).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    tokio::select! {
+        res = inbound => res?,
+        res = outbound => res?,
+    }
+
+    Ok(())
+}
+
+async fn read_u32_le_or_eof<R>(reader: &mut R) -> Result<Option<u32>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = [0u8; 4];
+    if !read_exact_or_eof(reader, &mut buf).await? {
+        return Ok(None);
+    }
+    Ok(Some(u32::from_le_bytes(buf)))
+}
+
+async fn read_exact_or_eof<R>(reader: &mut R, buf: &mut [u8]) -> Result<bool>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut read = 0usize;
+    while read < buf.len() {
+        let n = reader.read(&mut buf[read..]).await?;
+        if n == 0 {
+            if read == 0 {
+                return Ok(false);
+            }
+            return Err(anyhow!("unexpected EOF while reading shaped stream"));
+        }
+        read += n;
+    }
+    Ok(true)
+}
+
+async fn recv_shaped_ciphertext<R>(reader: &mut R) -> Result<Option<Vec<u8>>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut assembled: Vec<u8> = Vec::new();
+
+    loop {
+        let mut header = [0u8; 5];
+        if !read_exact_or_eof(reader, &mut header).await? {
+            if assembled.is_empty() {
+                return Ok(None);
+            }
+            return Err(anyhow!(
+                "unexpected EOF while reading fragmented shaped record"
+            ));
+        }
+        if header[0] != TLS_CONTENT_TYPE_APPLICATION_DATA {
+            return Err(anyhow!(
+                "unexpected TLS content type: 0x{:02x}",
+                header[0]
+            ));
+        }
+        if header[1] != TLS_VERSION_HI || header[2] != TLS_VERSION_LO {
+            return Err(anyhow!(
+                "unexpected TLS version: 0x{:02x}{:02x}",
+                header[1],
+                header[2]
+            ));
+        }
+
+        let body_len = ((header[3] as usize) << 8) | header[4] as usize;
+        if body_len < 2 {
+            return Err(anyhow!("record body too small"));
+        }
+
+        let mut body = vec![0u8; body_len];
+        reader.read_exact(&mut body).await?;
+
+        let pad_len_field = ((body[0] as u16) << 8) | body[1] as u16;
+        let has_more = (pad_len_field & FRAG_MORE) != 0;
+        let actual_pad_len = (pad_len_field & !FRAG_MORE) as usize;
+
+        let payload_start = 2 + actual_pad_len;
+        if payload_start > body.len() {
+            return Err(anyhow!("declared pad length overflows record body"));
+        }
+
+        assembled.extend_from_slice(&body[payload_start..]);
+        if assembled.len() > MAX_ASSEMBLED_BYTES {
+            return Err(anyhow!(
+                "reassembled message exceeds limit of {} bytes",
+                MAX_ASSEMBLED_BYTES
+            ));
+        }
+
+        if !has_more {
+            break;
+        }
+    }
+
+    Ok(Some(assembled))
+}
+
+async fn send_shaped_ciphertext<W>(writer: &mut W, ciphertext: &[u8]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if ciphertext.len() <= MAX_FRAG_PAYLOAD {
+        send_shaped_record(writer, ciphertext, false).await
+    } else {
+        let mut offset = 0usize;
+        while offset < ciphertext.len() {
+            let end = (offset + MAX_FRAG_PAYLOAD).min(ciphertext.len());
+            let has_more = end < ciphertext.len();
+            send_shaped_record(writer, &ciphertext[offset..end], has_more).await?;
+            offset = end;
+        }
+        Ok(())
+    }
+}
+
+async fn send_shaped_record<W>(writer: &mut W, chunk: &[u8], has_more: bool) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let (actual_pad_len, pad) = {
+        let mut rng = rand::thread_rng();
+        let actual_pad: u16 = rng.gen_range(0..=MAX_PAD as u16);
+        let mut pad = vec![0u8; actual_pad as usize];
+        rng.fill_bytes(&mut pad);
+        (actual_pad, pad)
+    };
+    let pad_len_field: u16 = if has_more {
+        actual_pad_len | FRAG_MORE
+    } else {
+        actual_pad_len
+    };
+
+    let body_len = 2 + pad.len() + chunk.len();
+    if body_len > u16::MAX as usize {
+        return Err(anyhow!("record body exceeds u16 max"));
+    }
+
+    let mut header = [0u8; 5];
+    header[0] = TLS_CONTENT_TYPE_APPLICATION_DATA;
+    header[1] = TLS_VERSION_HI;
+    header[2] = TLS_VERSION_LO;
+    header[3] = ((body_len >> 8) & 0xff) as u8;
+    header[4] = (body_len & 0xff) as u8;
+
+    writer.write_all(&header).await?;
+    writer.write_all(&pad_len_field.to_be_bytes()).await?;
+    writer.write_all(&pad).await?;
+    writer.write_all(chunk).await?;
+    writer.flush().await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{duplex, AsyncReadExt};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn handshake_and_roundtrip_messages() {
@@ -571,6 +805,62 @@ mod tests {
         // Drop sniff so any further writes from the spawned task error
         // cleanly rather than hang the test.
         drop(sniff);
+    }
+
+    #[tokio::test]
+    async fn accept_tls_profile_bridges_to_cleartext_framing() {
+        let (client_side, server_side) = duplex(64 * 1024);
+        let session_client = CryptoSession::from_shared_secret(b"shared");
+        let session_server = CryptoSession::from_shared_secret(b"shared");
+
+        let client_task = tokio::spawn(async move {
+            let mut client =
+                NormalizedTransport::connect(client_side, session_client, Role::Client)
+                    .await
+                    .unwrap();
+
+            client
+                .send(Message::Heartbeat {
+                    timestamp: 7,
+                    agent_id: "agent-a".into(),
+                    status: "ok".into(),
+                })
+                .await
+                .unwrap();
+
+            let msg = client.recv().await.unwrap();
+            match msg {
+                Message::Shutdown => {}
+                other => panic!("unexpected response message: {other:?}"),
+            }
+        });
+
+        let mut clear = NormalizedTransport::accept(server_side, TrafficProfile::Tls)
+            .await
+            .unwrap();
+
+        // Read one cleartext frame (u32_le length || ciphertext), decrypt, and
+        // verify it maps back to the original message.
+        let len = clear.read_u32_le().await.unwrap();
+        let mut ciphertext = vec![0u8; len as usize];
+        clear.read_exact(&mut ciphertext).await.unwrap();
+
+        let plaintext = session_server.decrypt(&ciphertext).unwrap();
+        let msg: Message = bincode::deserialize(&plaintext).unwrap();
+        match msg {
+            Message::Heartbeat { timestamp, .. } => assert_eq!(timestamp, 7),
+            other => panic!("unexpected inbound message: {other:?}"),
+        }
+
+        // Send a framed encrypted response back through the clear stream;
+        // client-side NormalizedTransport should decode it as a normal message.
+        let response = Message::Shutdown;
+        let response_plain = bincode::serialize(&response).unwrap();
+        let response_ct = session_server.encrypt(&response_plain);
+        clear.write_u32_le(response_ct.len() as u32).await.unwrap();
+        clear.write_all(&response_ct).await.unwrap();
+
+        client_task.await.unwrap();
     }
 
     #[test]
