@@ -481,7 +481,7 @@ pub use macos::*;
 pub mod macos {
     use super::{Persist, shell_quote_single};
     use anyhow::{anyhow, Result};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// LaunchAgent persistence.  The default label uses a value that blends
     /// with legitimate Apple software update agents; callers may override it.
@@ -916,11 +916,49 @@ pub mod macos {
 
     // ── 5.1: LoginItems ───────────────────────────────────────────────────────
 
-    /// LoginItems persistence via a GUI-session LaunchAgent bootstrap.
+    type CFStringRef = *const std::ffi::c_void;
+    const K_CFSTRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+    #[link(name = "ServiceManagement", kind = "framework")]
+    extern "C" {
+        fn SMLoginItemSetEnabled(identifier: CFStringRef, enabled: u8) -> u8;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringCreateWithCString(
+            alloc: *const std::ffi::c_void,
+            c_str: *const std::os::raw::c_char,
+            encoding: u32,
+        ) -> CFStringRef;
+        fn CFRelease(cf: *const std::ffi::c_void);
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LoginItemStrategy {
+        ServiceManagement,
+        LaunchAgentFallback,
+    }
+
+    struct SmHelperContext {
+        helper_bundle_path: PathBuf,
+        helper_bundle_id: String,
+    }
+
+    /// LoginItems persistence with automatic strategy selection.
     ///
-    /// Thin wrapper around [`LaunchAgent`] with `asuser_bootstrap: true`.
-    /// The `app_name` drives the plist label; all persistence logic is
-    /// delegated to `LaunchAgent`.
+    /// Strategy selection:
+    /// 1) If the executable is running from inside an `.app` bundle, use
+    ///    ServiceManagement (`SMLoginItemSetEnabled`) and require a helper app
+    ///    at:
+    ///    `<MainApp>.app/Contents/Library/LoginItems/<app_name>.app`
+    /// 2) Otherwise, fall back to the existing GUI LaunchAgent strategy
+    ///    (`asuser_bootstrap: true`).
+    ///
+    /// ServiceManagement requirement:
+    /// The helper login item app **must** be embedded in
+    /// `Contents/Library/LoginItems`. If it is missing, installation returns an
+    /// error describing the expected location.
     pub struct LoginItem {
         pub app_name: String,
     }
@@ -934,6 +972,174 @@ pub mod macos {
     }
 
     impl LoginItem {
+        fn strategy_for_executable(executable_path: &Path) -> LoginItemStrategy {
+            if Self::app_bundle_root(executable_path).is_some() {
+                LoginItemStrategy::ServiceManagement
+            } else {
+                LoginItemStrategy::LaunchAgentFallback
+            }
+        }
+
+        fn app_bundle_root(executable_path: &Path) -> Option<PathBuf> {
+            let mut cur = executable_path.parent();
+            while let Some(p) = cur {
+                let is_app = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("app"))
+                    .unwrap_or(false);
+                if is_app {
+                    return Some(p.to_path_buf());
+                }
+                cur = p.parent();
+            }
+            None
+        }
+
+        fn helper_bundle_path_for_executable(&self, executable_path: &Path) -> Option<PathBuf> {
+            let app_root = Self::app_bundle_root(executable_path)?;
+            Some(
+                app_root
+                    .join("Contents")
+                    .join("Library")
+                    .join("LoginItems")
+                    .join(format!("{}.app", self.app_name)),
+            )
+        }
+
+        fn read_helper_bundle_id(helper_bundle_path: &Path) -> Result<String> {
+            let info_plist = helper_bundle_path.join("Contents").join("Info.plist");
+            if !info_plist.exists() {
+                return Err(anyhow!(
+                    "LoginItem: missing helper Info.plist at '{}'",
+                    info_plist.display()
+                ));
+            }
+
+            let out = std::process::Command::new("defaults")
+                .arg("read")
+                .arg(&info_plist)
+                .arg("CFBundleIdentifier")
+                .output()
+                .map_err(|e| anyhow!("LoginItem: defaults read CFBundleIdentifier: {}", e))?;
+
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let detail = if stderr.is_empty() {
+                    "no stderr output".to_string()
+                } else {
+                    stderr
+                };
+                return Err(anyhow!(
+                    "LoginItem: failed to read helper bundle identifier from '{}': {}",
+                    info_plist.display(),
+                    detail
+                ));
+            }
+
+            let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if id.is_empty() {
+                return Err(anyhow!(
+                    "LoginItem: helper CFBundleIdentifier is empty in '{}'",
+                    info_plist.display()
+                ));
+            }
+            Ok(id)
+        }
+
+        fn resolve_sm_helper_context(&self, executable_path: &Path) -> Result<SmHelperContext> {
+            let helper_bundle_path = self
+                .helper_bundle_path_for_executable(executable_path)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "LoginItem::install: executable is not running from an application bundle"
+                    )
+                })?;
+
+            if !helper_bundle_path.exists() {
+                return Err(anyhow!(
+                    "LoginItem::install: ServiceManagement requires helper app at '{}'. \
+                     Place the helper in '<MainApp>.app/Contents/Library/LoginItems/' and retry.",
+                    helper_bundle_path.display()
+                ));
+            }
+
+            let helper_bundle_id = Self::read_helper_bundle_id(&helper_bundle_path)?;
+            Ok(SmHelperContext {
+                helper_bundle_path,
+                helper_bundle_id,
+            })
+        }
+
+        fn sm_set_enabled(helper_bundle_id: &str, enabled: bool) -> Result<()> {
+            use std::ffi::CString;
+
+            let c_id = CString::new(helper_bundle_id)
+                .map_err(|_| anyhow!("LoginItem: helper bundle id contains NUL byte"))?;
+
+            unsafe {
+                let cf_id = CFStringCreateWithCString(
+                    std::ptr::null(),
+                    c_id.as_ptr(),
+                    K_CFSTRING_ENCODING_UTF8,
+                );
+                if cf_id.is_null() {
+                    return Err(anyhow!(
+                        "LoginItem: CFStringCreateWithCString failed for '{}'",
+                        helper_bundle_id
+                    ));
+                }
+
+                let ok = SMLoginItemSetEnabled(cf_id, if enabled { 1 } else { 0 }) != 0;
+                CFRelease(cf_id);
+
+                if !ok {
+                    return Err(anyhow!(
+                        "LoginItem: SMLoginItemSetEnabled({}, enabled={}) failed. \
+                         Ensure helper app '{}' is signed and embedded correctly.",
+                        helper_bundle_id,
+                        enabled,
+                        helper_bundle_id
+                    ));
+                }
+            }
+
+            Ok(())
+        }
+
+        fn install_via_service_management(&self, ctx: &SmHelperContext) -> Result<()> {
+            Self::sm_set_enabled(&ctx.helper_bundle_id, true)?;
+            log::info!(
+                "LoginItem::install: enabled ServiceManagement helper '{}' from '{}'",
+                ctx.helper_bundle_id,
+                ctx.helper_bundle_path.display()
+            );
+            Ok(())
+        }
+
+        fn remove_via_service_management(&self, ctx: &SmHelperContext) -> Result<()> {
+            Self::sm_set_enabled(&ctx.helper_bundle_id, false)?;
+            log::info!(
+                "LoginItem::remove: disabled ServiceManagement helper '{}'",
+                ctx.helper_bundle_id
+            );
+            Ok(())
+        }
+
+        fn verify_via_service_management(&self, ctx: &SmHelperContext) -> Result<bool> {
+            let uid = unsafe { libc::getuid() };
+            let service = format!("gui/{}/{}", uid, ctx.helper_bundle_id);
+            let status = std::process::Command::new("launchctl")
+                .arg("asuser")
+                .arg(uid.to_string())
+                .arg("launchctl")
+                .arg("print")
+                .arg(&service)
+                .status()
+                .map_err(|e| anyhow!("LoginItem::verify: launchctl asuser print: {}", e))?;
+            Ok(status.success())
+        }
+
         fn as_launch_agent(&self) -> LaunchAgent {
             LaunchAgent {
                 label: format!(
@@ -947,15 +1153,52 @@ pub mod macos {
 
     impl Persist for LoginItem {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            self.as_launch_agent().install(executable_path)
+            match Self::strategy_for_executable(executable_path) {
+                LoginItemStrategy::ServiceManagement => {
+                    let ctx = self.resolve_sm_helper_context(executable_path)?;
+                    self.install_via_service_management(&ctx)
+                }
+                LoginItemStrategy::LaunchAgentFallback => {
+                    log::info!(
+                        "LoginItem::install: executable is not in an app bundle; using LaunchAgent fallback"
+                    );
+                    self.as_launch_agent().install(executable_path)
+                }
+            }
         }
 
         fn remove(&self) -> Result<()> {
-            self.as_launch_agent().remove()
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(_) => return self.as_launch_agent().remove(),
+            };
+
+            match Self::strategy_for_executable(&exe) {
+                LoginItemStrategy::ServiceManagement => {
+                    let ctx = self.resolve_sm_helper_context(&exe)?;
+                    self.remove_via_service_management(&ctx)
+                }
+                LoginItemStrategy::LaunchAgentFallback => self.as_launch_agent().remove(),
+            }
         }
 
         fn verify(&self) -> Result<bool> {
-            self.as_launch_agent().verify()
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(_) => return self.as_launch_agent().verify(),
+            };
+
+            match Self::strategy_for_executable(&exe) {
+                LoginItemStrategy::ServiceManagement => {
+                    let launch_agent_ok = self.as_launch_agent().verify().unwrap_or(false);
+                    let sm_ok = match self.resolve_sm_helper_context(&exe) {
+                        Ok(ctx) => self.verify_via_service_management(&ctx)?,
+                        Err(_) => false,
+                    };
+                    Ok(sm_ok || launch_agent_ok)
+                }
+                LoginItemStrategy::LaunchAgentFallback => self.as_launch_agent().verify(),
+            }
         }
     }
 }
