@@ -269,6 +269,8 @@ pub fn check_desktop_windows() -> u8 {
 /// process counting if wmctrl is unavailable).  Headless / no-DISPLAY → 0.
 #[cfg(target_os = "linux")]
 pub fn check_desktop_windows() -> u8 {
+    const DESKTOP_COUNT_UNRELIABLE_SENTINEL: u8 = u8::MAX;
+
     if std::env::var_os("DISPLAY").is_none() {
         return 0;
     }
@@ -285,41 +287,77 @@ pub fn check_desktop_windows() -> u8 {
                 .output()
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
-        })
-        .or_else(|| {
-            // Last resort: count processes that hold an open connection to X11
-            // by looking for "DISPLAY=" in their /proc/*/environ.
-            // Cap at 256 entries to bound execution time on systems with many
-            // processes; we only need to distinguish "0 or a few" vs "many".
-            let mut cnt = 0usize;
-            const MAX_ENTRIES: usize = 256;
-            if let Ok(entries) = std::fs::read_dir("/proc") {
-                for entry in entries.flatten().take(MAX_ENTRIES) {
-                    // Only numeric entries are processes.
-                    if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
-                        continue;
-                    }
-                    let env_path = entry.path().join("environ");
-                    // environ files on Linux are small (<16 KiB) but reading
-                    // them for every process is still O(n).  Early-exit once
-                    // we have a result that will push count above threshold (8).
-                    if let Ok(env) = std::fs::read(&env_path) {
-                        if env.windows(8).any(|w| w == b"DISPLAY=") {
-                            cnt += 1;
-                            if cnt >= 8 {
-                                break; // Already past the highest threshold
-                            }
+        });
+
+    if let Some(count) = count {
+        if count < 3 {
+            return 20;
+        } else if count < 8 {
+            return 10;
+        }
+        return 0;
+    }
+
+    // Last resort: count processes that hold an open connection to X11
+    // by looking for "DISPLAY=" in their /proc/*/environ.
+    // Cap at 256 entries to bound execution time on systems with many
+    // processes; we only need to distinguish "0 or a few" vs "many".
+    let mut cnt = 0usize;
+    let mut restricted_access = false;
+    const MAX_ENTRIES: usize = 256;
+
+    // Heuristic capability probe: on hardened systems /proc/<pid>/environ for
+    // other users may require CAP_SYS_PTRACE/root. If /proc/1/environ is
+    // permission denied, scan results are potentially incomplete.
+    if let Err(e) = std::fs::read("/proc/1/environ") {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            restricted_access = true;
+            warn!(
+                "env_check_sandbox: /proc environ access restricted (EACCES on /proc/1/environ); desktop process scan limited to same-UID processes"
+            );
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten().take(MAX_ENTRIES) {
+            // Only numeric entries are processes.
+            if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+                continue;
+            }
+            let env_path = entry.path().join("environ");
+            // environ files on Linux are small (<16 KiB) but reading
+            // them for every process is still O(n).  Early-exit once
+            // we have a result that will push count above threshold (8).
+            match std::fs::read(&env_path) {
+                Ok(env) => {
+                    if env.windows(8).any(|w| w == b"DISPLAY=") {
+                        cnt += 1;
+                        if cnt >= 8 {
+                            break; // Already past the highest threshold
                         }
                     }
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    log::trace!(
+                        "env_check_sandbox: skipping '{}' due to EACCES",
+                        env_path.display()
+                    );
+                }
+                Err(_) => {}
             }
-            Some(cnt)
-        })
-        .unwrap_or(0);
+        }
+    }
 
-    if count < 3 {
+    if cnt == 0 && restricted_access {
+        // No observable desktop processes under restricted /proc visibility.
+        // Return an explicit sentinel so scoring can treat this as unreliable,
+        // not as evidence of a sandbox.
+        return DESKTOP_COUNT_UNRELIABLE_SENTINEL;
+    }
+
+    if cnt < 3 {
         20
-    } else if count < 8 {
+    } else if cnt < 8 {
         10
     } else {
         0
@@ -788,9 +826,26 @@ pub fn sandbox_probability_score(metrics: &SandboxMetrics) -> u32 {
 /// Higher scores indicate a greater likelihood of a sandbox environment.
 /// The caller decides what to do with the score — see `EnvReport::sandbox_score`.
 pub fn evaluate_sandbox() -> Result<u32> {
+    #[cfg(target_os = "linux")]
+    let desktop_richness_score = {
+        const DESKTOP_COUNT_UNRELIABLE_SENTINEL: u8 = u8::MAX;
+        let score = check_desktop_windows();
+        if score == DESKTOP_COUNT_UNRELIABLE_SENTINEL {
+            warn!(
+                "env_check_sandbox: desktop window score unavailable due to restricted /proc permissions; using neutral contribution"
+            );
+            0
+        } else {
+            score
+        }
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let desktop_richness_score = check_desktop_windows();
+
     let metrics = SandboxMetrics {
         mouse_movement_score: check_mouse_movement(),
-        desktop_richness_score: check_desktop_windows(),
+        desktop_richness_score,
         uptime_score: check_system_uptime_artifacts(),
         hardware_plausibility_score: check_hardware_plausibility(),
     };
