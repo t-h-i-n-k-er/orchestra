@@ -927,25 +927,42 @@ fn cloud_instance_vm_refusal_bypassed() -> bool {
         Err(_) => return false,
     };
 
-    let expected = cfg
-        .malleable_profile
+    let profile = &cfg.malleable_profile;
+    let expected = profile
         .cloud_instance_id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    let expected = match expected {
-        Some(id) => id,
-        None => return false,
-    };
-
     let actual = match fetch_cloud_instance_id() {
         Some(id) => id,
-        None => return false,
+        None => {
+            if profile.cloud_instance_allow_without_imds {
+                log::warn!(
+                    "env_check: IMDS reachable but instance-id unavailable; VM refusal bypassed via cloud_instance_allow_without_imds"
+                );
+                return true;
+            }
+
+            let fallback_count = profile
+                .cloud_instance_fallback_ids
+                .iter()
+                .filter(|p| !p.trim().is_empty())
+                .count();
+
+            if fallback_count > 0 && is_expected_hypervisor() {
+                log::warn!(
+                    "env_check: IMDS instance-id unavailable; VM refusal bypassed via cloud_instance_fallback_ids ({fallback_count} configured) + expected cloud hypervisor"
+                );
+                return true;
+            }
+
+            return false;
+        }
     };
 
-    if actual == expected {
+    if expected.as_deref() == Some(actual.as_str()) {
         log::info!(
             "env_check: running on whitelisted cloud instance {}, VM refusal bypassed",
             actual
