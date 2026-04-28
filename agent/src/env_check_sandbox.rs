@@ -112,27 +112,57 @@ pub fn check_mouse_movement() -> u8 {
     })
 }
 
-/// macOS implementation: sample mouse position via a small Python3/Quartz one-liner.
-/// On headless macOS (CI runners without a WindowServer) this command will fail
-/// and we return 0 (neutral).
+/// macOS implementation: sample mouse position via native CoreGraphics APIs.
+///
+/// Uses `CGEventCreate` + `CGEventGetLocation` to avoid runtime dependencies
+/// on Python/pyobjc.  On headless macOS (no WindowServer), this can fail; in
+/// that case we log a warning once and return 0 (neutral).
 #[cfg(target_os = "macos")]
 pub fn check_mouse_movement() -> u8 {
-    _sample_mouse_positions(|_| {
-        std::process::Command::new("python3")
-            .args(["-c",
-                "import Quartz; e=Quartz.CGEventCreate(None); \
-                 p=Quartz.CGEventGetLocation(e); print(int(p.x), int(p.y))"
-            ])
-            .output()
-            .ok()
-            .and_then(|o| {
-                let out = String::from_utf8_lossy(&o.stdout);
-                let mut parts = out.split_whitespace();
-                let x = parts.next()?.parse::<i32>().ok()?;
-                let y = parts.next()?.parse::<i32>().ok()?;
-                Some((x, y))
-            })
-    })
+    #[repr(C)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+
+    type CGEventRef = *const std::ffi::c_void;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn CGEventCreate(source: *const std::ffi::c_void) -> CGEventRef;
+        fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(cf: *const std::ffi::c_void);
+    }
+
+    static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+    let mut successful_samples = 0usize;
+
+    let score = _sample_mouse_positions(|_| unsafe {
+        let event = CGEventCreate(std::ptr::null());
+        if event.is_null() {
+            return None;
+        }
+
+        let point = CGEventGetLocation(event);
+        CFRelease(event as *const std::ffi::c_void);
+
+        successful_samples += 1;
+        Some((point.x.round() as i32, point.y.round() as i32))
+    });
+
+    if successful_samples == 0 {
+        WARN_ONCE.call_once(|| {
+            warn!(
+                "env_check_sandbox: native macOS mouse probe unavailable (CoreGraphics returned no events); returning neutral score"
+            );
+        });
+    }
+
+    score
 }
 
 /// Shared sampling loop: calls `probe` 4 times with 250 ms intervals and
