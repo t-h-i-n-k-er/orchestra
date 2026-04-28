@@ -439,8 +439,8 @@ fn is_expected_hypervisor() -> bool {
 /// requests at the HTTP layer, yet the TCP connect succeeds.
 ///
 /// This function uses a two-step validation:
-///   1. TCP connect within 150 ms (conservative vs. the old 100 ms, to handle
-///      slightly slower hypervisor routing on some Azure SKUs).
+///   1. TCP connect within 200 ms with one 100 ms delayed retry on failure,
+///      bounded by a 1 second total IMDS probe budget.
 ///   2. Write a minimal HTTP/1.0 GET and read the response.  Accept only status
 ///      codes that an IMDS genuinely returns:
 ///      200 (OK — IMDSv1 enabled)
@@ -468,15 +468,76 @@ fn is_cloud_instance() -> bool {
     {
         use std::io::{Read, Write};
         use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 80);
-        let open_stream = || -> Option<TcpStream> {
-            let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(50)).ok()?;
-            // Keep IMDS operations tight to avoid startup stalls.
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-            Some(stream)
+        const IMDS_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+        const IMDS_RETRY_DELAY: Duration = Duration::from_millis(100);
+        const IMDS_IO_TIMEOUT: Duration = Duration::from_millis(100);
+        const IMDS_TOTAL_BUDGET: Duration = Duration::from_secs(1);
+
+        let probe_started = Instant::now();
+        let remaining_budget = || IMDS_TOTAL_BUDGET.saturating_sub(probe_started.elapsed());
+        let log_probe_failure = |stage: &str, err: &dyn std::fmt::Display| {
+            log::debug!(
+                "env_check: IMDS probe failed at {} after {:?}: {}",
+                stage,
+                probe_started.elapsed(),
+                err
+            );
+        };
+        let has_budget_for_io = |stage: &str| -> bool {
+            if remaining_budget() < IMDS_IO_TIMEOUT {
+                log_probe_failure(stage, &"probe deadline exhausted before read/write");
+                return false;
+            }
+            true
+        };
+
+        let open_stream = |stage: &str| -> Option<TcpStream> {
+            let first_timeout = std::cmp::min(IMDS_CONNECT_TIMEOUT, remaining_budget());
+            if first_timeout.is_zero() {
+                log_probe_failure(stage, &"probe deadline exhausted before connect");
+                return None;
+            }
+
+            let connect_with_timeouts = |timeout: Duration| -> std::io::Result<TcpStream> {
+                let stream = TcpStream::connect_timeout(&addr, timeout)?;
+                // Keep IMDS operations tight to avoid startup stalls.
+                let _ = stream.set_read_timeout(Some(IMDS_IO_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(IMDS_IO_TIMEOUT));
+                Ok(stream)
+            };
+
+            match connect_with_timeouts(first_timeout) {
+                Ok(stream) => Some(stream),
+                Err(first_err) => {
+                    if remaining_budget() <= IMDS_RETRY_DELAY {
+                        log_probe_failure(stage, &first_err);
+                        return None;
+                    }
+
+                    std::thread::sleep(IMDS_RETRY_DELAY);
+
+                    let second_timeout = std::cmp::min(IMDS_CONNECT_TIMEOUT, remaining_budget());
+                    if second_timeout.is_zero() {
+                        log_probe_failure(stage, &first_err);
+                        return None;
+                    }
+
+                    match connect_with_timeouts(second_timeout) {
+                        Ok(stream) => Some(stream),
+                        Err(second_err) => {
+                            let combined_err = format!(
+                                "first attempt: {}; retry attempt: {}",
+                                first_err, second_err
+                            );
+                            log_probe_failure(stage, &combined_err);
+                            None
+                        }
+                    }
+                }
+            }
         };
 
         let validate_metadata_response =
@@ -519,14 +580,27 @@ fn is_cloud_instance() -> bool {
 
         // IMDSv1 attempt first.
         let imds_v1_success = {
-            if let Some(mut stream) = open_stream() {
+            if let Some(mut stream) = open_stream("IMDSv1 connect") {
                 let req = b"GET /latest/meta-data/ HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n";
-                if stream.write_all(req).is_err() {
+                if !has_budget_for_io("IMDSv1 write") {
+                    false
+                } else if let Err(e) = stream.write_all(req) {
+                    log_probe_failure("IMDSv1 write", &e);
                     false
                 } else {
                     let mut buf = [0u8; 256];
+                    if !has_budget_for_io("IMDSv1 read") {
+                        return false;
+                    }
                     let n = match stream.read(&mut buf) {
-                        Ok(0) | Err(_) => 0,
+                        Ok(0) => {
+                            log_probe_failure("IMDSv1 read", &"empty response");
+                            0
+                        }
+                        Err(e) => {
+                            log_probe_failure("IMDSv1 read", &e);
+                            0
+                        }
                         Ok(n) => n,
                     };
                     n > 0 && validate_metadata_response(&buf, n, true)
@@ -543,59 +617,98 @@ fn is_cloud_instance() -> bool {
 
         // IMDSv2 fallback: fetch token then query metadata with token header.
         let token = {
-            let mut stream = match open_stream() {
+            let mut stream = match open_stream("IMDSv2 token connect") {
                 Some(s) => s,
-                None => return false,
+                None => {
+                    return false;
+                }
             };
 
             let token_req = b"PUT /latest/api/token HTTP/1.0\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\n\r\n";
-            if stream.write_all(token_req).is_err() {
+            if !has_budget_for_io("IMDSv2 token write") {
+                return false;
+            }
+            if let Err(e) = stream.write_all(token_req) {
+                log_probe_failure("IMDSv2 token write", &e);
                 return false;
             }
 
             let mut buf = [0u8; 512];
+            if !has_budget_for_io("IMDSv2 token read") {
+                return false;
+            }
             let n = match stream.read(&mut buf) {
-                Ok(0) | Err(_) => return false,
+                Ok(0) => {
+                    log_probe_failure("IMDSv2 token read", &"empty response");
+                    return false;
+                }
+                Err(e) => {
+                    log_probe_failure("IMDSv2 token read", &e);
+                    return false;
+                }
                 Ok(n) => n,
             };
 
             if !buf.starts_with(b"HTTP/1.") || n < 12 || &buf[9..12] != b"200" {
+                log_probe_failure("IMDSv2 token response", &"unexpected HTTP status");
                 return false;
             }
 
             let header_end = match buf[..n].windows(4).position(|w| w == b"\r\n\r\n") {
                 Some(p) => p + 4,
-                None => return false,
+                None => {
+                    log_probe_failure("IMDSv2 token response", &"missing HTTP header terminator");
+                    return false;
+                }
             };
 
             let t = String::from_utf8_lossy(&buf[header_end..n]).trim().to_string();
             if t.is_empty() {
+                log_probe_failure("IMDSv2 token response", &"empty token body");
                 return false;
             }
             t
         };
 
-        let mut stream = match open_stream() {
+        let mut stream = match open_stream("IMDSv2 metadata connect") {
             Some(s) => s,
-            None => return false,
+            None => {
+                return false;
+            }
         };
         let metadata_req = format!(
             "GET /latest/meta-data/ HTTP/1.0\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token: {}\r\n\r\n",
             token
         );
-        if stream.write_all(metadata_req.as_bytes()).is_err() {
+        if !has_budget_for_io("IMDSv2 metadata write") {
+            return false;
+        }
+        if let Err(e) = stream.write_all(metadata_req.as_bytes()) {
+            log_probe_failure("IMDSv2 metadata write", &e);
             return false;
         }
 
         let mut buf = [0u8; 256];
+        if !has_budget_for_io("IMDSv2 metadata read") {
+            return false;
+        }
         let n = match stream.read(&mut buf) {
-            Ok(0) | Err(_) => return false,
+            Ok(0) => {
+                log_probe_failure("IMDSv2 metadata read", &"empty response");
+                return false;
+            }
+            Err(e) => {
+                log_probe_failure("IMDSv2 metadata read", &e);
+                return false;
+            }
             Ok(n) => n,
         };
         if validate_metadata_response(&buf, n, false) {
             log::debug!("env_check: cloud instance detected via IMDSv2");
             return true;
         }
+
+        log_probe_failure("IMDSv2 metadata response", &"unexpected HTTP status/body");
 
         false
     }
