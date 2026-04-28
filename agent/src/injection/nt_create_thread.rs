@@ -109,15 +109,27 @@ impl Injector for NtCreateThreadInjector {
                 pe_resolve::close_handle(h_proc);
                 return Err(anyhow!("WriteProcessMemory failed"));
             }
+            if written != payload.len() {
+                pe_resolve::close_handle(h_proc);
+                return Err(anyhow!(
+                    "WriteProcessMemory wrote {} of {} bytes",
+                    written,
+                    payload.len()
+                ));
+            }
 
             let mut old_prot = 0u32;
-            VirtualProtectEx(
+            if VirtualProtectEx(
                 h_proc,
                 remote_mem,
                 payload.len(),
                 PAGE_EXECUTE_READ,
                 &mut old_prot,
-            );
+            ) == 0
+            {
+                pe_resolve::close_handle(h_proc);
+                return Err(anyhow!("VirtualProtectEx to RX failed"));
+            }
             // Flush I-cache before creating the new thread.
             FlushInstructionCache(h_proc, remote_mem, payload.len());
 

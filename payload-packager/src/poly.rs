@@ -1,6 +1,6 @@
 //! Polymorphic payload wrapper for Orchestra's payload-packager.
 //!
-//! Each call to [`poly_wrap`] randomly selects one of three stream-cipher
+//! Each call to [`poly_wrap`] randomly selects one of two stream-cipher
 //! schemes, generates a fresh key, and encrypts the payload.  The companion
 //! [`poly_emit_stub`] function outputs a *structurally unique* Rust source
 //! file for the decryption stub: variable names, loop forms, and dead-code
@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! [4 bytes: magic "POLY"]
-//! [1 byte:  scheme (0 = XorStream, 1 = Rc4, 2 = ChaCha20Stream)]
+//! [1 byte:  scheme (0 = AesCtrStream, 2 = ChaCha20Stream)]
 //! [4 bytes BE: key_len]
 //! [key_len bytes: key]
 //! [4 bytes BE: ciphertext_len]
@@ -20,11 +20,10 @@
 //!
 //! # Schemes
 //!
-//! | ID | Name        | Key size    | Notes                            |
-//! |----|-------------|-------------|----------------------------------|
-//! | 0  | XorStream   | 16–64 bytes | Repeating XOR                    |
-//! | 1  | Rc4         | 16–256 bytes| Classic RC4 stream cipher        |
-//! | 2  | ChaCha20Stream | 44 bytes   | ChaCha20 stream cipher (RFC 8439) |
+//! | ID | Name           | Key size | Notes                                |
+//! |----|----------------|----------|--------------------------------------|
+//! | 0  | AesCtrStream   | 48 bytes | AES-256-CTR (32-byte key + 16-byte counter seed) |
+//! | 2  | ChaCha20Stream | 44 bytes | ChaCha20 stream cipher (RFC 8439)   |
 
 use rand::Rng;
 
@@ -32,17 +31,16 @@ use rand::Rng;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolyScheme {
-    XorStream = 0,
-    Rc4 = 1,
+    AesCtrStream = 0,
     ChaCha20Stream = 2,  // Was LfsrStream — replaced due to M-37 8-bit leak
 }
 
 impl PolyScheme {
     fn random(rng: &mut impl Rng) -> Self {
-        match rng.gen_range(0u8..3) {
-            0 => Self::XorStream,
-            1 => Self::Rc4,
-            _ => Self::ChaCha20Stream,
+        if rng.gen_bool(0.7) {
+            Self::ChaCha20Stream
+        } else {
+            Self::AesCtrStream
         }
     }
 
@@ -68,20 +66,10 @@ pub fn poly_wrap(plaintext: &[u8]) -> PolyBlob {
     let scheme = PolyScheme::random(&mut rng);
 
     match scheme {
-        PolyScheme::XorStream => {
-            let key_len: usize = rng.gen_range(16..=64);
-            let key: Vec<u8> = (0..key_len).map(|_| rng.gen()).collect();
-            let ct = xor_stream(plaintext, &key);
-            PolyBlob {
-                scheme,
-                key,
-                ciphertext: ct,
-            }
-        }
-        PolyScheme::Rc4 => {
-            let key_len: usize = rng.gen_range(16..=256);
-            let key: Vec<u8> = (0..key_len).map(|_| rng.gen()).collect();
-            let ct = rc4(plaintext, &key);
+        PolyScheme::AesCtrStream => {
+            // 48 bytes: 32-byte AES-256 key + 16-byte initial counter block.
+            let key: Vec<u8> = (0..48).map(|_| rng.gen()).collect();
+            let ct = aes256_ctr_stream(plaintext, &key);
             PolyBlob {
                 scheme,
                 key,
@@ -135,16 +123,12 @@ pub fn poly_emit_stub(blob: &PolyBlob) -> String {
     let suf_ct = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
     let suf_out = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
     let suf_key = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
-    let suf_idx = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
-    let suf_klen = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
     let suf_dead = format!("{:04x}{:04x}", rng.gen::<u16>(), rng.gen::<u16>());
     let dead_val: u64 = rng.gen();
 
     let v_ct = format!("ct_{suf_ct}");
     let v_out = format!("out_{suf_out}");
     let v_key = format!("key_{suf_key}");
-    let v_idx = format!("i_{suf_idx}");
-    let v_klen = format!("kl_{suf_klen}");
     let v_dead = format!("_dead_{suf_dead}");
 
     // M-38: Avoid embedding the raw key bytes directly in source.  Mask the
@@ -175,8 +159,7 @@ pub fn poly_emit_stub(blob: &PolyBlob) -> String {
     );
 
     let body = match blob.scheme {
-        PolyScheme::XorStream => emit_xor_body(&v_ct, &v_key, &v_out, &v_idx, &v_klen, &mut rng),
-        PolyScheme::Rc4 => emit_rc4_body(&v_ct, &v_key, &v_out, &mut rng),
+        PolyScheme::AesCtrStream => emit_aes_ctr_body(&v_ct, &v_key, &v_out, &mut rng),
         PolyScheme::ChaCha20Stream => emit_chacha20_body(&v_ct, &v_key, &v_out, &mut rng),
     };
 
@@ -211,35 +194,199 @@ pub fn poly_emit_stub(blob: &PolyBlob) -> String {
 
 // ── Stream cipher implementations ─────────────────────────────────────────────
 
-/// XOR plaintext with a repeating key.
-fn xor_stream(data: &[u8], key: &[u8]) -> Vec<u8> {
-    assert!(!key.is_empty());
-    data.iter()
-        .enumerate()
-        .map(|(i, &b)| b ^ key[i % key.len()])
-        .collect()
+const AES_SBOX: [u8; 256] = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+];
+
+#[inline]
+fn aes_xtime(x: u8) -> u8 {
+    if (x & 0x80) != 0 {
+        (x << 1) ^ 0x1b
+    } else {
+        x << 1
+    }
 }
 
-/// Classic RC4 (ARCFOUR) stream cipher.
-fn rc4(data: &[u8], key: &[u8]) -> Vec<u8> {
-    assert!(!key.is_empty());
-    let mut s: [u8; 256] = std::array::from_fn(|i| i as u8);
-    let mut j: usize = 0;
-    for i in 0..256 {
-        j = (j + s[i] as usize + key[i % key.len()] as usize) & 0xff;
-        s.swap(i, j);
+#[inline]
+fn aes_sub_word(word: u32) -> u32 {
+    let [b0, b1, b2, b3] = word.to_be_bytes();
+    u32::from_be_bytes([
+        AES_SBOX[b0 as usize],
+        AES_SBOX[b1 as usize],
+        AES_SBOX[b2 as usize],
+        AES_SBOX[b3 as usize],
+    ])
+}
+
+#[inline]
+fn aes_rot_word(word: u32) -> u32 {
+    word.rotate_left(8)
+}
+
+fn aes256_expand_key(key: &[u8; 32]) -> [u32; 60] {
+    const RCON: [u8; 8] = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40];
+
+    let mut w = [0u32; 60];
+    for i in 0..8 {
+        w[i] = u32::from_be_bytes([
+            key[i * 4],
+            key[i * 4 + 1],
+            key[i * 4 + 2],
+            key[i * 4 + 3],
+        ]);
     }
-    let mut i = 0usize;
-    j = 0;
-    data.iter()
-        .map(|&b| {
-            i = (i + 1) & 0xff;
-            j = (j + s[i] as usize) & 0xff;
-            s.swap(i, j);
-            let k = s[(s[i] as usize + s[j] as usize) & 0xff];
-            b ^ k
-        })
-        .collect()
+
+    for i in 8..60 {
+        let mut temp = w[i - 1];
+        if i % 8 == 0 {
+            temp = aes_sub_word(aes_rot_word(temp)) ^ ((RCON[i / 8] as u32) << 24);
+        } else if i % 8 == 4 {
+            temp = aes_sub_word(temp);
+        }
+        w[i] = w[i - 8] ^ temp;
+    }
+
+    w
+}
+
+#[inline]
+fn aes_add_round_key(state: &mut [u8; 16], round_keys: &[u32; 60], round: usize) {
+    for col in 0..4 {
+        let rk = round_keys[round * 4 + col].to_be_bytes();
+        let base = col * 4;
+        state[base] ^= rk[0];
+        state[base + 1] ^= rk[1];
+        state[base + 2] ^= rk[2];
+        state[base + 3] ^= rk[3];
+    }
+}
+
+#[inline]
+fn aes_sub_bytes(state: &mut [u8; 16]) {
+    for b in state.iter_mut() {
+        *b = AES_SBOX[*b as usize];
+    }
+}
+
+#[inline]
+fn aes_shift_rows(state: &mut [u8; 16]) {
+    let t1 = state[1];
+    state[1] = state[5];
+    state[5] = state[9];
+    state[9] = state[13];
+    state[13] = t1;
+
+    let t2 = state[2];
+    let t6 = state[6];
+    state[2] = state[10];
+    state[6] = state[14];
+    state[10] = t2;
+    state[14] = t6;
+
+    let t3 = state[3];
+    state[3] = state[15];
+    state[15] = state[11];
+    state[11] = state[7];
+    state[7] = t3;
+}
+
+#[inline]
+fn aes_mix_columns(state: &mut [u8; 16]) {
+    for col in 0..4 {
+        let base = col * 4;
+        let a0 = state[base];
+        let a1 = state[base + 1];
+        let a2 = state[base + 2];
+        let a3 = state[base + 3];
+        let t = a0 ^ a1 ^ a2 ^ a3;
+        state[base] ^= t ^ aes_xtime(a0 ^ a1);
+        state[base + 1] ^= t ^ aes_xtime(a1 ^ a2);
+        state[base + 2] ^= t ^ aes_xtime(a2 ^ a3);
+        state[base + 3] ^= t ^ aes_xtime(a3 ^ a0);
+    }
+}
+
+fn aes256_encrypt_block(input: &[u8; 16], round_keys: &[u32; 60]) -> [u8; 16] {
+    let mut state = *input;
+
+    aes_add_round_key(&mut state, round_keys, 0);
+
+    for round in 1..14 {
+        aes_sub_bytes(&mut state);
+        aes_shift_rows(&mut state);
+        aes_mix_columns(&mut state);
+        aes_add_round_key(&mut state, round_keys, round);
+    }
+
+    aes_sub_bytes(&mut state);
+    aes_shift_rows(&mut state);
+    aes_add_round_key(&mut state, round_keys, 14);
+
+    state
+}
+
+#[inline]
+fn increment_be_counter(counter: &mut [u8; 16]) {
+    for byte in counter.iter_mut().rev() {
+        let (next, carry) = byte.overflowing_add(1);
+        *byte = next;
+        if !carry {
+            break;
+        }
+    }
+}
+
+/// AES-256 in CTR mode.
+///
+/// Key layout:
+/// - bytes 0..31  => AES-256 key
+/// - bytes 32..47 => initial 128-bit counter block (zero-padded if shorter)
+fn aes256_ctr_stream(data: &[u8], key_material: &[u8]) -> Vec<u8> {
+    assert!(
+        key_material.len() >= 32,
+        "AES-256-CTR requires at least 32 bytes of key material"
+    );
+
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&key_material[..32]);
+
+    let mut counter = [0u8; 16];
+    if key_material.len() >= 48 {
+        counter.copy_from_slice(&key_material[32..48]);
+    } else {
+        let avail = key_material.len().saturating_sub(32).min(16);
+        if avail > 0 {
+            counter[..avail].copy_from_slice(&key_material[32..32 + avail]);
+        }
+    }
+
+    let round_keys = aes256_expand_key(&key);
+    let mut out = Vec::with_capacity(data.len());
+
+    for chunk in data.chunks(16) {
+        let ks = aes256_encrypt_block(&counter, &round_keys);
+        for (i, &b) in chunk.iter().enumerate() {
+            out.push(b ^ ks[i]);
+        }
+        increment_be_counter(&mut counter);
+    }
+
+    out
 }
 
 /// ChaCha20 stream cipher (RFC 8439).
@@ -403,68 +550,144 @@ fn emit_reconstruct_key_fn(
 
 // ── Stub body emitters ────────────────────────────────────────────────────────
 
-fn emit_xor_body(
-    v_ct: &str,
-    v_key: &str,
-    v_out: &str,
-    v_idx: &str,
-    v_klen: &str,
-    rng: &mut impl Rng,
-) -> String {
-    if rng.gen_bool(0.5) {
-        // Style A: indexed for-loop
-        format!(
-            "    let {v_key}: ::std::vec::Vec<u8> = reconstruct_key();\n    \
-             let {v_klen} = {v_key}.len();\n    \
-             let mut {v_out} = ::std::vec::Vec::with_capacity({v_ct}.len());\n    \
-             for {v_idx} in 0..{v_ct}.len() {{\n        \
-             {v_out}.push({v_ct}[{v_idx}] ^ {v_key}[{v_idx} % {v_klen}]);\n    \
-             }}\n    \
-             {v_out}\n",
-        )
-    } else {
-        // Style B: iterator chain (no explicit loop variable)
-        format!(
-            "    let {v_key}: ::std::vec::Vec<u8> = reconstruct_key();\n    \
-             {v_ct}.iter().enumerate()\n        \
-             .map(|({v_idx}, &b)| b ^ {v_key}[{v_idx} % {v_key}.len()])\n        \
-             .collect()\n",
-        )
-    }
-}
-
-fn emit_rc4_body(
+fn emit_aes_ctr_body(
     v_ct: &str,
     v_key: &str,
     v_out: &str,
     rng: &mut impl Rng,
 ) -> String {
-    // Variable names for internal RC4 state
     let mut suf = || format!("{:04x}", rng.gen::<u16>());
-    let vs = format!("s_{}", suf());
-    let vj = format!("j_{}", suf());
-    let vi = format!("i_{}", suf());
-    let vk = format!("k_{}", suf());
-    let vb = format!("b_{}", suf());
+    let v_sbox = format!("sbox_{}", suf());
+    let v_xtime = format!("xt_{}", suf());
+    let v_sub_word = format!("sw_{}", suf());
+    let v_rot_word = format!("rw_{}", suf());
+    let v_expand = format!("ek_{}", suf());
+    let v_add_rk = format!("ark_{}", suf());
+    let v_sub_bytes = format!("sb_{}", suf());
+    let v_shift_rows = format!("sr_{}", suf());
+    let v_mix_columns = format!("mc_{}", suf());
+    let v_encrypt = format!("enc_{}", suf());
+    let v_inc_ctr = format!("inc_{}", suf());
+    let v_raw_key = format!("rk_{}", suf());
+    let v_ctr = format!("ctr_{}", suf());
+    let v_round_keys = format!("rks_{}", suf());
+    let v_chunk = format!("ch_{}", suf());
+    let v_ks = format!("ks_{}", suf());
+
+    let sbox_literal = byte_array_literal(&AES_SBOX);
 
     format!(
-        "    let {v_key}: ::std::vec::Vec<u8> = reconstruct_key();\n    \
-         let mut {vs}: [u8; 256] = ::std::array::from_fn(|i| i as u8);\n    \
-         let mut {vj}: usize = 0;\n    \
-         for {vi} in 0..256usize {{\n        \
-         {vj} = ({vj} + {vs}[{vi}] as usize + {v_key}[{vi} % {v_key}.len()] as usize) & 0xff;\n        \
-         {vs}.swap({vi}, {vj});\n    \
-         }}\n    \
-         let mut {vi}: usize = 0;\n    \
-         {vj} = 0;\n    \
-         let {v_out}: ::std::vec::Vec<u8> = {v_ct}.iter().map(|&{vb}| {{\n        \
-         {vi} = ({vi} + 1) & 0xff;\n        \
-         {vj} = ({vj} + {vs}[{vi}] as usize) & 0xff;\n        \
-         {vs}.swap({vi}, {vj});\n        \
-         let {vk} = {vs}[({vs}[{vi}] as usize + {vs}[{vj}] as usize) & 0xff];\n        \
-         {vb} ^ {vk}\n    \
-         }}).collect();\n    \
-         {v_out}\n",
+"    fn {v_xtime}(x: u8) -> u8 {{
+        if (x & 0x80) != 0 {{ (x << 1) ^ 0x1b }} else {{ x << 1 }}
+    }}
+    fn {v_sub_word}(word: u32, {v_sbox}: &[u8; 256]) -> u32 {{
+        let [b0, b1, b2, b3] = word.to_be_bytes();
+        u32::from_be_bytes([
+            {v_sbox}[b0 as usize],
+            {v_sbox}[b1 as usize],
+            {v_sbox}[b2 as usize],
+            {v_sbox}[b3 as usize],
+        ])
+    }}
+    fn {v_rot_word}(word: u32) -> u32 {{ word.rotate_left(8) }}
+    fn {v_expand}(key: &[u8; 32], {v_sbox}: &[u8; 256]) -> [u32; 60] {{
+        const RCON: [u8; 8] = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40];
+        let mut w = [0u32; 60];
+        for i in 0..8usize {{
+            w[i] = u32::from_be_bytes([key[i*4], key[i*4+1], key[i*4+2], key[i*4+3]]);
+        }}
+        for i in 8..60usize {{
+            let mut t = w[i - 1];
+            if i % 8 == 0 {{
+                t = {v_sub_word}({v_rot_word}(t), {v_sbox}) ^ ((RCON[i / 8] as u32) << 24);
+            }} else if i % 8 == 4 {{
+                t = {v_sub_word}(t, {v_sbox});
+            }}
+            w[i] = w[i - 8] ^ t;
+        }}
+        w
+    }}
+    fn {v_add_rk}(state: &mut [u8; 16], rks: &[u32; 60], round: usize) {{
+        for col in 0..4usize {{
+            let rk = rks[round * 4 + col].to_be_bytes();
+            let b = col * 4;
+            state[b] ^= rk[0];
+            state[b + 1] ^= rk[1];
+            state[b + 2] ^= rk[2];
+            state[b + 3] ^= rk[3];
+        }}
+    }}
+    fn {v_sub_bytes}(state: &mut [u8; 16], {v_sbox}: &[u8; 256]) {{
+        for b in state.iter_mut() {{ *b = {v_sbox}[*b as usize]; }}
+    }}
+    fn {v_shift_rows}(state: &mut [u8; 16]) {{
+        let t1 = state[1]; state[1] = state[5]; state[5] = state[9]; state[9] = state[13]; state[13] = t1;
+        let t2 = state[2]; let t6 = state[6]; state[2] = state[10]; state[6] = state[14]; state[10] = t2; state[14] = t6;
+        let t3 = state[3]; state[3] = state[15]; state[15] = state[11]; state[11] = state[7]; state[7] = t3;
+    }}
+    fn {v_mix_columns}(state: &mut [u8; 16]) {{
+        for col in 0..4usize {{
+            let b = col * 4;
+            let a0 = state[b];
+            let a1 = state[b + 1];
+            let a2 = state[b + 2];
+            let a3 = state[b + 3];
+            let t = a0 ^ a1 ^ a2 ^ a3;
+            state[b] ^= t ^ {v_xtime}(a0 ^ a1);
+            state[b + 1] ^= t ^ {v_xtime}(a1 ^ a2);
+            state[b + 2] ^= t ^ {v_xtime}(a2 ^ a3);
+            state[b + 3] ^= t ^ {v_xtime}(a3 ^ a0);
+        }}
+    }}
+    fn {v_encrypt}(input: &[u8; 16], rks: &[u32; 60], {v_sbox}: &[u8; 256]) -> [u8; 16] {{
+        let mut st = *input;
+        {v_add_rk}(&mut st, rks, 0);
+        for round in 1..14usize {{
+            {v_sub_bytes}(&mut st, {v_sbox});
+            {v_shift_rows}(&mut st);
+            {v_mix_columns}(&mut st);
+            {v_add_rk}(&mut st, rks, round);
+        }}
+        {v_sub_bytes}(&mut st, {v_sbox});
+        {v_shift_rows}(&mut st);
+        {v_add_rk}(&mut st, rks, 14);
+        st
+    }}
+    fn {v_inc_ctr}(ctr: &mut [u8; 16]) {{
+        for b in ctr.iter_mut().rev() {{
+            let (n, carry) = b.overflowing_add(1);
+            *b = n;
+            if !carry {{
+                break;
+            }}
+        }}
+    }}
+    let {v_key}: ::std::vec::Vec<u8> = reconstruct_key();
+    assert!({v_key}.len() >= 32, \"AES-256-CTR requires at least 32 bytes of key material\");
+    let {v_sbox}: [u8; 256] = [{sbox_literal}];
+    let mut {v_raw_key}: [u8; 32] = [0; 32];
+    {v_raw_key}.copy_from_slice(&{v_key}[..32]);
+    let mut {v_ctr}: [u8; 16] = [0; 16];
+    if {v_key}.len() >= 48 {{
+        {v_ctr}.copy_from_slice(&{v_key}[32..48]);
+    }} else {{
+        let avail = {v_key}.len().saturating_sub(32).min(16);
+        if avail > 0 {{
+            {v_ctr}[..avail].copy_from_slice(&{v_key}[32..32 + avail]);
+        }}
+    }}
+    let {v_round_keys}: [u32; 60] = {v_expand}(&{v_raw_key}, &{v_sbox});
+    let mut {v_out}: ::std::vec::Vec<u8> = ::std::vec::Vec::with_capacity({v_ct}.len());
+    for {v_chunk} in {v_ct}.chunks(16) {{
+        let {v_ks}: [u8; 16] = {v_encrypt}(&{v_ctr}, &{v_round_keys}, &{v_sbox});
+        for (i, &b) in {v_chunk}.iter().enumerate() {{
+            {v_out}.push(b ^ {v_ks}[i]);
+        }}
+        {v_inc_ctr}(&mut {v_ctr});
+    }}
+    {v_out}
+",
+        sbox_literal = sbox_literal,
     )
 }
 
@@ -592,21 +815,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn xor_stream_roundtrip() {
-        let pt = b"hello world, this is a test payload";
-        let key = vec![0x42u8, 0xde, 0xad, 0xbe, 0xef];
-        let ct = xor_stream(pt, &key);
+    fn aes256_ctr_stream_roundtrip() {
+        let pt = b"aes256-ctr stream cipher test payload";
+        let key: Vec<u8> = (0..48).map(|i| i as u8).collect();
+        let ct = aes256_ctr_stream(pt, &key);
         assert_ne!(&ct[..], &pt[..]);
-        assert_eq!(&xor_stream(&ct, &key), pt);
-    }
-
-    #[test]
-    fn rc4_roundtrip() {
-        let pt = b"orchestra polymorphic test";
-        let key = b"secret-key-bytes";
-        let ct = rc4(pt, key);
-        assert_ne!(&ct[..], &pt[..]);
-        assert_eq!(&rc4(&ct, key), pt);
+        assert_eq!(&aes256_ctr_stream(&ct, &key), pt);
     }
 
     #[test]
@@ -623,7 +837,29 @@ mod tests {
         let pt = b"full poly wrap test";
         let blob = poly_wrap(pt);
         let serialized = poly_serialize(&blob);
+
         assert_eq!(&serialized[..4], b"POLY");
+        assert_eq!(serialized[4], blob.scheme.byte());
+
+        assert!(matches!(
+            blob.scheme,
+            PolyScheme::AesCtrStream | PolyScheme::ChaCha20Stream
+        ));
+
+        let key_len = u32::from_be_bytes(serialized[5..9].try_into().unwrap()) as usize;
+        assert_eq!(key_len, blob.key.len());
+
+        match blob.scheme {
+            PolyScheme::AesCtrStream => assert_eq!(key_len, 48),
+            PolyScheme::ChaCha20Stream => assert_eq!(key_len, 44),
+        }
+
+        let ct_len_off = 9 + key_len;
+        let ct_len =
+            u32::from_be_bytes(serialized[ct_len_off..ct_len_off + 4].try_into().unwrap())
+                as usize;
+        assert_eq!(ct_len, blob.ciphertext.len());
+        assert_eq!(serialized.len(), ct_len_off + 4 + ct_len);
     }
 
     #[test]

