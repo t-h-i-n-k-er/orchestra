@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 mod poly;
+mod stub_emitter;
 
 #[derive(Parser, Debug)]
 #[command(

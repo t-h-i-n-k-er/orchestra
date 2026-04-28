@@ -3638,6 +3638,7 @@ dependencies = [
  "common",
  "ed25519-dalek",
  "hkdf",
+ "libc",
  "rand 0.8.6",
  "sha2",
  "tracing",
