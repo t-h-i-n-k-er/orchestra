@@ -37,11 +37,21 @@ impl AuditLog {
                 return;
             }
         };
-        if let Ok(mut f) = self.file.lock() {
-            if let Err(e) = writeln!(f, "{line}") {
-                tracing::error!("audit write error: {e}");
-            } else {
-                let _ = f.flush();
+        match self.file.lock() {
+            Ok(mut f) => {
+                if let Err(e) = writeln!(f, "{line}") {
+                    tracing::error!("audit write error: {e}");
+                } else {
+                    let _ = f.flush();
+                }
+            }
+            Err(poisoned) => {
+                let mut f = poisoned.into_inner();
+                if let Err(e) = writeln!(f, "{line}") {
+                    tracing::error!("audit write error: {e}");
+                } else {
+                    let _ = f.flush();
+                }
             }
         }
         let _ = self.tx.send(event);

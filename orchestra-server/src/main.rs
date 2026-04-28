@@ -50,6 +50,11 @@ async fn main() -> Result<()> {
             "admin_token is the default placeholder; set a strong value in your config or via --admin-token"
         );
     }
+    if cfg.agent_shared_secret == "change-me-pre-shared-secret" {
+        tracing::warn!(
+            "agent_shared_secret is the default placeholder; set a strong value in your config or via --agent-secret"
+        );
+    }
 
     let audit = Arc::new(AuditLog::open(cfg.audit_log_path.clone())?);
     let state = Arc::new(AppState::new(

@@ -92,6 +92,9 @@ impl EnvReport {
 ///   Windows sets in debugged processes).
 /// * Linux: parses `/proc/self/status` for a non‑zero `TracerPid:` entry,
 ///   which `ptrace(PTRACE_ATTACH, …)` and `gdb` both populate.
+/// * macOS: checks `kinfo_proc.kp_proc.p_flag & P_TRACED` via
+///   `sysctl(KERN_PROC, KERN_PROC_PID, getpid())` and calls
+///   `ptrace(PT_DENY_ATTACH, 0, 0, 0)` to deny future debugger attach.
 /// * Other Unixes: returns `false`.
 pub fn is_debugger_present() -> bool {
     #[cfg(windows)]
@@ -102,10 +105,89 @@ pub fn is_debugger_present() -> bool {
     {
         linux_is_debugger_present()
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_is_debugger_present()
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         false
     }
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MacExternProcPrefix {
+    p_un1: [usize; 2],
+    p_vmspace: *mut libc::c_void,
+    p_sigacts: *mut libc::c_void,
+    p_flag: libc::c_int,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MacKinfoProcPrefix {
+    kp_proc: MacExternProcPrefix,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_is_debugger_present() -> bool {
+    const P_TRACED: libc::c_int = 0x0000_0800;
+
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        unsafe { libc::getpid() },
+    ];
+
+    let mut needed_len: libc::size_t = 0;
+    let queried_len = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut needed_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == 0;
+
+    let traced = if queried_len {
+        let min_len = std::mem::size_of::<MacKinfoProcPrefix>();
+        let mut buf = vec![0u8; (needed_len as usize).max(min_len)];
+        let mut out_len = buf.len() as libc::size_t;
+        let got = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut out_len,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0;
+
+        if got && (out_len as usize) >= min_len {
+            let kp = unsafe { &*(buf.as_ptr() as *const MacKinfoProcPrefix) };
+            (kp.kp_proc.p_flag & P_TRACED) != 0
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let deny_attach_failed = unsafe {
+        libc::ptrace(
+            libc::PT_DENY_ATTACH,
+            0,
+            std::ptr::null_mut::<libc::c_char>(),
+            0,
+        )
+    } == -1;
+
+    traced || deny_attach_failed
 }
 
 #[cfg(target_os = "linux")]
