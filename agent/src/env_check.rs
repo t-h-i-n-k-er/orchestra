@@ -225,6 +225,27 @@ fn is_expected_hypervisor() -> bool {
             return true;
         }
 
+        // Operator-provided extension list for niche cloud providers not yet
+        // covered by the built-in expected-hypervisor needles.
+        if let Ok(cfg) = crate::config::load_config() {
+            let extra_needles: Vec<String> = cfg
+                .malleable_profile
+                .vm_detection_extra_hypervisor_names
+                .iter()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if extra_needles
+                .iter()
+                .any(|needle| product_name.contains(needle))
+            {
+                log::debug!(
+                    "env_check: expected hypervisor matched by vm_detection_extra_hypervisor_names"
+                );
+                return true;
+            }
+        }
+
         // Unambiguous cloud-only strings — these do not appear on consumer hardware.
         const UNAMBIGUOUS_CLOUD: &[&str] = &[
             "digitalocean",
@@ -973,6 +994,28 @@ fn cloud_instance_vm_refusal_bypassed() -> bool {
     }
 }
 
+/// Detect whether the current host should be classified as a VM using
+/// multi-signal indicator counting with adaptive cloud-aware thresholds.
+///
+/// Signals (CPUID, platform DMI/registry, MAC prefixes, etc.) are counted and
+/// compared against one of three thresholds:
+/// 1) `threshold = 2` when both cloud checks fail (`is_expected_hypervisor = false`
+///    and `is_cloud_instance = false`) - unknown virtualized environments.
+/// 2) `threshold = 3` when exactly one cloud check succeeds - likely cloud but
+///    with incomplete confirmation (for example IMDS blocked, or unknown DMI).
+/// 3) `threshold = 4` when both checks succeed - strongly confirmed cloud.
+///
+/// Edge case: if IMDS is unavailable and the provider hypervisor is not in the
+/// built-in (or operator-extended) expected list, the logic intentionally falls
+/// back to `threshold = 2`. In that case a legitimate cloud VM can still be
+/// classified as VM if enough generic indicators are present.
+///
+/// Recommended operator mitigation for niche cloud providers:
+/// - Configure `malleable_profile.cloud_instance_id` so known deployments can
+///   bypass VM refusal deterministically.
+/// - Add provider-specific names to
+///   `malleable_profile.vm_detection_extra_hypervisor_names` so
+///   `is_expected_hypervisor` recognizes the platform without code changes.
 pub fn detect_vm() -> bool {
     // The hypervisor bit is now just one of several indicators.
     // Call is_expected_hypervisor() once and reuse the result below.
@@ -1032,7 +1075,15 @@ pub fn detect_vm() -> bool {
     } else {
         2 // No cloud signal: standard analysis-VM threshold
     };
-    indicators >= threshold
+
+    let detected = indicators >= threshold;
+    if detected && threshold == 2 && !cloud_imds {
+        log::warn!(
+            "env_check: VM detected with threshold=2 while IMDS is unavailable; if this is a niche cloud deployment, verify IMDS connectivity and extend is_expected_hypervisor via vm_detection_extra_hypervisor_names"
+        );
+    }
+
+    detected
 }
 
 fn cpuid_hypervisor_bit() -> bool {

