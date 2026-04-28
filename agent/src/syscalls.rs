@@ -661,15 +661,24 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
         anyhow::bail!("Invalid DOS signature");
     }
 
-    let nt_headers =
-        (base + (*dos_header).e_lfanew as usize) as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
-    if (*nt_headers).Signature != winapi::um::winnt::IMAGE_NT_SIGNATURE {
-        anyhow::bail!("Invalid NT signature");
-    }
+    let (nt_base, opt_magic) = pe_nt_base_and_magic(base)
+        .ok_or_else(|| anyhow!("Invalid NT headers"))?;
 
-    let import_dir_rva = (*nt_headers).OptionalHeader.DataDirectory
-        [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_IMPORT as usize]
-        .VirtualAddress;
+    let import_dir_rva = match opt_magic {
+        winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR32_MAGIC => {
+            let nt_headers32 = nt_base as *const winapi::um::winnt::IMAGE_NT_HEADERS32;
+            (*nt_headers32).OptionalHeader.DataDirectory
+                [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_IMPORT as usize]
+                .VirtualAddress
+        }
+        winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR64_MAGIC => {
+            let nt_headers64 = nt_base as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
+            (*nt_headers64).OptionalHeader.DataDirectory
+                [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_IMPORT as usize]
+                .VirtualAddress
+        }
+        _ => anyhow::bail!("Unsupported PE optional-header magic: 0x{:x}", opt_magic),
+    };
     if import_dir_rva == 0 {
         return Ok(()); // No imports
     }
@@ -760,96 +769,196 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
             } else {
                 (*import_desc).FirstThunk
             };
-            let mut original_thunk = (base + original_thunk_rva as usize)
-                as *const winapi::um::winnt::IMAGE_THUNK_DATA64;
-            let mut first_thunk = (base + (*import_desc).FirstThunk as usize)
-                as *mut winapi::um::winnt::IMAGE_THUNK_DATA64;
 
-            // Make IAT writable
-            let mut num_thunks = 0;
-            let mut temp_thunk = first_thunk;
-            while *(*temp_thunk).u1.AddressOfData() != 0 {
-                num_thunks += 1;
-                temp_thunk = temp_thunk.add(1);
-            }
-            let iat_size =
-                (num_thunks + 1) * std::mem::size_of::<winapi::um::winnt::IMAGE_THUNK_DATA64>();
+            if opt_magic == winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR32_MAGIC {
+                let mut original_thunk = (base + original_thunk_rva as usize)
+                    as *const winapi::um::winnt::IMAGE_THUNK_DATA32;
+                let mut first_thunk = (base + (*import_desc).FirstThunk as usize)
+                    as *mut winapi::um::winnt::IMAGE_THUNK_DATA32;
 
-            let mut old_protect = 0u32;
-            // M-26 Part D: prefer NtProtectVirtualMemory; fall back to VirtualProtect.
-            {
-                let mut base_ptr = first_thunk as *mut winapi::ctypes::c_void;
-                let mut region_size = iat_size as winapi::shared::basetsd::SIZE_T;
-                if let Some(nt_p) = nt_protect {
-                    nt_p(
-                        -1isize as *mut winapi::ctypes::c_void,
-                        &mut base_ptr,
-                        &mut region_size,
-                        winapi::um::winnt::PAGE_READWRITE,
-                        &mut old_protect,
-                    );
-                } else {
-                    winapi::um::memoryapi::VirtualProtect(
-                        first_thunk as *mut _,
-                        iat_size,
-                        winapi::um::winnt::PAGE_READWRITE,
-                        &mut old_protect,
-                    );
+                // Make IAT writable
+                let mut num_thunks = 0;
+                let mut temp_thunk = first_thunk;
+                while *(*temp_thunk).u1.AddressOfData() != 0 {
+                    num_thunks += 1;
+                    temp_thunk = temp_thunk.add(1);
                 }
-            }
+                let iat_size =
+                    (num_thunks + 1) * std::mem::size_of::<winapi::um::winnt::IMAGE_THUNK_DATA32>();
 
-            while *(*original_thunk).u1.AddressOfData() != 0 {
-                let addr_of_data = *(*original_thunk).u1.AddressOfData() as u64;
-                let proc_addr = if (addr_of_data & winapi::um::winnt::IMAGE_ORDINAL_FLAG64) != 0 {
-                    let ordinal = (addr_of_data & 0xffff) as u16;
-                    // Resolve via clean export table instead of hookable GetProcAddress (M-24/M-26).
-                    let addr = get_export_addr_by_ordinal(dep_handle as usize, ordinal as u32);
-                    if !addr.is_null() {
-                        addr as usize
-                    } else {
-                        // M-26: do NOT fall back to GetProcAddress. Leave the slot at 0.
-                        tracing::warn!(
-                            "rebuild_iat: ordinal {} in {} could not be resolved cleanly, leaving IAT slot unfilled",
-                            ordinal, dll_name
+                let mut old_protect = 0u32;
+                {
+                    let mut base_ptr = first_thunk as *mut winapi::ctypes::c_void;
+                    let mut region_size = iat_size as winapi::shared::basetsd::SIZE_T;
+                    if let Some(nt_p) = nt_protect {
+                        nt_p(
+                            -1isize as *mut winapi::ctypes::c_void,
+                            &mut base_ptr,
+                            &mut region_size,
+                            winapi::um::winnt::PAGE_READWRITE,
+                            &mut old_protect,
                         );
-                        0
+                    } else {
+                        winapi::um::memoryapi::VirtualProtect(
+                            first_thunk as *mut _,
+                            iat_size,
+                            winapi::um::winnt::PAGE_READWRITE,
+                            &mut old_protect,
+                        );
                     }
-                } else {
-                    let import_by_name = (base + addr_of_data as usize)
-                        as *const winapi::um::winnt::IMAGE_IMPORT_BY_NAME;
-                    let name_ptr = (*import_by_name).Name.as_ptr();
-                    get_export_addr(dep_handle as usize, name_ptr)
-                };
-
-                if proc_addr != 0 {
-                    let mut_u1 = &mut (*first_thunk).u1 as *mut _ as *mut u64;
-                    *mut_u1 = proc_addr as u64;
                 }
 
-                original_thunk = original_thunk.add(1);
-                first_thunk = first_thunk.add(1);
-            }
+                while *(*original_thunk).u1.AddressOfData() != 0 {
+                    let addr_of_data = *(*original_thunk).u1.AddressOfData();
+                    let proc_addr = if (addr_of_data & winapi::um::winnt::IMAGE_ORDINAL_FLAG32) != 0 {
+                        let ordinal = (addr_of_data & 0xffff) as u16;
+                        let addr = get_export_addr_by_ordinal(dep_handle as usize, ordinal as u32);
+                        if !addr.is_null() {
+                            addr as usize
+                        } else {
+                            tracing::warn!(
+                                "rebuild_iat: ordinal {} in {} could not be resolved cleanly, leaving IAT slot unfilled",
+                                ordinal, dll_name
+                            );
+                            0
+                        }
+                    } else {
+                        let import_by_name = (base + addr_of_data as usize)
+                            as *const winapi::um::winnt::IMAGE_IMPORT_BY_NAME;
+                        let name_ptr = (*import_by_name).Name.as_ptr();
+                        get_export_addr(dep_handle as usize, name_ptr)
+                    };
 
-            {
-                let restore_addr = first_thunk.sub(num_thunks) as *mut winapi::ctypes::c_void;
-                let mut base_ptr = restore_addr;
-                let mut region_size = iat_size as winapi::shared::basetsd::SIZE_T;
-                let mut prev_protect = 0u32;
-                if let Some(nt_p) = nt_protect {
-                    nt_p(
-                        -1isize as *mut winapi::ctypes::c_void,
-                        &mut base_ptr,
-                        &mut region_size,
-                        old_protect,
-                        &mut prev_protect,
-                    );
-                } else {
-                    winapi::um::memoryapi::VirtualProtect(
-                        restore_addr as *mut _,
-                        iat_size,
-                        old_protect,
-                        &mut prev_protect,
-                    );
+                    if proc_addr != 0 {
+                        if let Ok(proc_addr32) = u32::try_from(proc_addr) {
+                            let mut_u1 = &mut (*first_thunk).u1 as *mut _ as *mut u32;
+                            *mut_u1 = proc_addr32;
+                        } else {
+                            tracing::warn!(
+                                "rebuild_iat: resolved address {:#x} for {} exceeds 32-bit range; leaving slot unfilled",
+                                proc_addr,
+                                dll_name
+                            );
+                        }
+                    }
+
+                    original_thunk = original_thunk.add(1);
+                    first_thunk = first_thunk.add(1);
+                }
+
+                {
+                    let restore_addr = first_thunk.sub(num_thunks) as *mut winapi::ctypes::c_void;
+                    let mut base_ptr = restore_addr;
+                    let mut region_size = iat_size as winapi::shared::basetsd::SIZE_T;
+                    let mut prev_protect = 0u32;
+                    if let Some(nt_p) = nt_protect {
+                        nt_p(
+                            -1isize as *mut winapi::ctypes::c_void,
+                            &mut base_ptr,
+                            &mut region_size,
+                            old_protect,
+                            &mut prev_protect,
+                        );
+                    } else {
+                        winapi::um::memoryapi::VirtualProtect(
+                            restore_addr as *mut _,
+                            iat_size,
+                            old_protect,
+                            &mut prev_protect,
+                        );
+                    }
+                }
+            } else {
+                let mut original_thunk = (base + original_thunk_rva as usize)
+                    as *const winapi::um::winnt::IMAGE_THUNK_DATA64;
+                let mut first_thunk = (base + (*import_desc).FirstThunk as usize)
+                    as *mut winapi::um::winnt::IMAGE_THUNK_DATA64;
+
+                // Make IAT writable
+                let mut num_thunks = 0;
+                let mut temp_thunk = first_thunk;
+                while *(*temp_thunk).u1.AddressOfData() != 0 {
+                    num_thunks += 1;
+                    temp_thunk = temp_thunk.add(1);
+                }
+                let iat_size =
+                    (num_thunks + 1) * std::mem::size_of::<winapi::um::winnt::IMAGE_THUNK_DATA64>();
+
+                let mut old_protect = 0u32;
+                {
+                    let mut base_ptr = first_thunk as *mut winapi::ctypes::c_void;
+                    let mut region_size = iat_size as winapi::shared::basetsd::SIZE_T;
+                    if let Some(nt_p) = nt_protect {
+                        nt_p(
+                            -1isize as *mut winapi::ctypes::c_void,
+                            &mut base_ptr,
+                            &mut region_size,
+                            winapi::um::winnt::PAGE_READWRITE,
+                            &mut old_protect,
+                        );
+                    } else {
+                        winapi::um::memoryapi::VirtualProtect(
+                            first_thunk as *mut _,
+                            iat_size,
+                            winapi::um::winnt::PAGE_READWRITE,
+                            &mut old_protect,
+                        );
+                    }
+                }
+
+                while *(*original_thunk).u1.AddressOfData() != 0 {
+                    let addr_of_data = *(*original_thunk).u1.AddressOfData() as u64;
+                    let proc_addr = if (addr_of_data & winapi::um::winnt::IMAGE_ORDINAL_FLAG64) != 0 {
+                        let ordinal = (addr_of_data & 0xffff) as u16;
+                        // Resolve via clean export table instead of hookable GetProcAddress (M-24/M-26).
+                        let addr = get_export_addr_by_ordinal(dep_handle as usize, ordinal as u32);
+                        if !addr.is_null() {
+                            addr as usize
+                        } else {
+                            // M-26: do NOT fall back to GetProcAddress. Leave the slot at 0.
+                            tracing::warn!(
+                                "rebuild_iat: ordinal {} in {} could not be resolved cleanly, leaving IAT slot unfilled",
+                                ordinal, dll_name
+                            );
+                            0
+                        }
+                    } else {
+                        let import_by_name = (base + addr_of_data as usize)
+                            as *const winapi::um::winnt::IMAGE_IMPORT_BY_NAME;
+                        let name_ptr = (*import_by_name).Name.as_ptr();
+                        get_export_addr(dep_handle as usize, name_ptr)
+                    };
+
+                    if proc_addr != 0 {
+                        let mut_u1 = &mut (*first_thunk).u1 as *mut _ as *mut u64;
+                        *mut_u1 = proc_addr as u64;
+                    }
+
+                    original_thunk = original_thunk.add(1);
+                    first_thunk = first_thunk.add(1);
+                }
+
+                {
+                    let restore_addr = first_thunk.sub(num_thunks) as *mut winapi::ctypes::c_void;
+                    let mut base_ptr = restore_addr;
+                    let mut region_size = iat_size as winapi::shared::basetsd::SIZE_T;
+                    let mut prev_protect = 0u32;
+                    if let Some(nt_p) = nt_protect {
+                        nt_p(
+                            -1isize as *mut winapi::ctypes::c_void,
+                            &mut base_ptr,
+                            &mut region_size,
+                            old_protect,
+                            &mut prev_protect,
+                        );
+                    } else {
+                        winapi::um::memoryapi::VirtualProtect(
+                            restore_addr as *mut _,
+                            iat_size,
+                            old_protect,
+                            &mut prev_protect,
+                        );
+                    }
                 }
             }
         }
@@ -869,6 +978,57 @@ unsafe fn get_export_addr(base: usize, func_name_ptr: *const i8) -> usize {
     let target_name = std::ffi::CStr::from_ptr(func_name_ptr).to_bytes_with_nul();
     let target_hash = pe_resolve::hash_str(target_name);
     pe_resolve::get_proc_address_by_hash(base, target_hash).unwrap_or(0)
+}
+
+#[cfg(windows)]
+unsafe fn pe_nt_base_and_magic(base: usize) -> Option<(usize, u16)> {
+    let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
+    if (*dos_header).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
+        return None;
+    }
+
+    let nt_base = base + (*dos_header).e_lfanew as usize;
+    if *(nt_base as *const u32) != winapi::um::winnt::IMAGE_NT_SIGNATURE {
+        return None;
+    }
+
+    let opt_magic = *((nt_base
+        + 4
+        + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()) as *const u16);
+    Some((nt_base, opt_magic))
+}
+
+#[cfg(windows)]
+unsafe fn get_export_dir_any_bitness(
+    base: usize,
+) -> Option<(u32, u32, *const winapi::um::winnt::IMAGE_EXPORT_DIRECTORY)> {
+    let (nt_base, opt_magic) = pe_nt_base_and_magic(base)?;
+
+    let export_data_dir = match opt_magic {
+        winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR32_MAGIC => {
+            let nt_headers32 = nt_base as *const winapi::um::winnt::IMAGE_NT_HEADERS32;
+            (*nt_headers32).OptionalHeader.DataDirectory
+                [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
+        }
+        winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR64_MAGIC => {
+            let nt_headers64 = nt_base as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
+            (*nt_headers64).OptionalHeader.DataDirectory
+                [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
+        }
+        _ => return None,
+    };
+
+    if export_data_dir.VirtualAddress == 0 {
+        return None;
+    }
+
+    let ed = (base + export_data_dir.VirtualAddress as usize)
+        as *const winapi::um::winnt::IMAGE_EXPORT_DIRECTORY;
+    Some((
+        export_data_dir.VirtualAddress,
+        export_data_dir.Size,
+        ed,
+    ))
 }
 
 #[cfg(windows)]
@@ -931,21 +1091,11 @@ unsafe fn resolve_forwarded_export(base: usize, func_rva: usize) -> *mut std::ff
 /// This avoids calling the hookable GetProcAddress for ordinal imports (M-24).
 #[cfg(windows)]
 unsafe fn get_export_addr_by_ordinal(base: usize, ordinal: u32) -> *mut std::ffi::c_void {
-    let dos_header = base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
-    if (*dos_header).e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
-        return std::ptr::null_mut();
-    }
-    let nt_headers = (base + (*dos_header).e_lfanew as usize)
-        as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
-    let export_dir_data_dir = (*nt_headers).OptionalHeader.DataDirectory
-        [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_EXPORT as usize];
-    let export_dir_rva = export_dir_data_dir.VirtualAddress;
-    let export_dir_size = export_dir_data_dir.Size;
-    if export_dir_rva == 0 {
-        return std::ptr::null_mut();
-    }
-    let ed =
-        (base + export_dir_rva as usize) as *const winapi::um::winnt::IMAGE_EXPORT_DIRECTORY;
+    let (export_dir_rva, export_dir_size, ed) = match get_export_dir_any_bitness(base) {
+        Some(v) => v,
+        None => return std::ptr::null_mut(),
+    };
+
     let base_ordinal = (*ed).Base;
     let num_funcs = (*ed).NumberOfFunctions;
     let funcs = (base + (*ed).AddressOfFunctions as usize) as *const u32;
