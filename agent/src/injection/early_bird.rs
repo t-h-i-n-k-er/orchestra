@@ -1,4 +1,4 @@
-use crate::injection::Injector;
+use crate::injection::{payload_has_valid_pe_headers, Injector};
 use anyhow::{anyhow, Result};
 
 /// Early-Bird APC injection:
@@ -13,7 +13,7 @@ impl Injector for EarlyBirdInjector {
     fn inject(&self, _pid: u32, payload: &[u8]) -> Result<()> {
         // Early-Bird APC injection queues shellcode into a newly created process.
         // It cannot load a PE image directly — pass raw shellcode, not an MZ binary.
-        let is_pe = payload.len() >= 2 && payload[0] == b'M' && payload[1] == b'Z';
+        let is_pe = payload_has_valid_pe_headers(payload);
         if is_pe {
             return Err(anyhow!(
                 "EarlyBird injection requires raw shellcode, not a PE image. \

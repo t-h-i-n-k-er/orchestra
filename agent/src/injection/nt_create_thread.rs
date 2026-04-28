@@ -1,4 +1,4 @@
-use crate::injection::Injector;
+use crate::injection::{payload_has_valid_pe_headers, Injector};
 use anyhow::{anyhow, Result};
 
 pub struct NtCreateThreadInjector;
@@ -26,7 +26,7 @@ impl Injector for NtCreateThreadInjector {
             PROCESS_VM_WRITE,
         };
 
-        let is_pe = payload.len() >= 2 && payload[0] == b'M' && payload[1] == b'Z';
+        let is_pe = payload_has_valid_pe_headers(payload);
         if is_pe {
             log::info!(
                 "PE payload detected, forwarding to process hollowing's inject_into_process"

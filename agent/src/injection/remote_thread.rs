@@ -1,4 +1,4 @@
-use crate::injection::Injector;
+use crate::injection::{payload_has_valid_pe_headers, Injector};
 use anyhow::{anyhow, Result};
 
 pub struct RemoteThreadInjector;
@@ -8,7 +8,7 @@ impl Injector for RemoteThreadInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
         // RemoteThread injects shellcode, not PE images.  PE payloads must use
         // Hollowing, ManualMap, or ModuleStomp (which forwards to hollowing).
-        let is_pe = payload.len() >= 2 && payload[0] == b'M' && payload[1] == b'Z';
+        let is_pe = payload_has_valid_pe_headers(payload);
         if is_pe {
             return Err(anyhow!(
                 "RemoteThread injection requires raw shellcode, not a PE image. \

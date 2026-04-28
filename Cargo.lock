@@ -3618,6 +3618,7 @@ dependencies = [
  "clap",
  "common",
  "ed25519-dalek",
+ "hkdf",
  "rand 0.8.6",
  "sha2",
  "tracing",

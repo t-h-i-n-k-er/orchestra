@@ -25,7 +25,9 @@
 //! | 0  | AesCtrStream   | 48 bytes | AES-256-CTR (32-byte key + 16-byte counter seed) |
 //! | 2  | ChaCha20Stream | 44 bytes | ChaCha20 stream cipher (RFC 8439)   |
 
+use hkdf::Hkdf;
 use rand::Rng;
+use sha2::Sha256;
 
 // ── Encryption scheme ─────────────────────────────────────────────────────────
 
@@ -131,30 +133,26 @@ pub fn poly_emit_stub(blob: &PolyBlob) -> String {
     let v_key = format!("key_{suf_key}");
     let v_dead = format!("_dead_{suf_dead}");
 
-    // M-38: Avoid embedding the raw key bytes directly in source.  Mask the
-    // key with a SplitMix64 stream and reconstruct it at runtime in the stub.
-    let key_seed: u64 = rng.gen();
-    let key_seed_lo = key_seed as u32;
-    let key_seed_hi = (key_seed >> 32) as u32;
-    let seed_mask_lo: u32 = rng.gen();
-    let seed_mask_hi: u32 = rng.gen();
-    let masked_seed_lo = key_seed_lo ^ seed_mask_lo;
-    let masked_seed_hi = key_seed_hi ^ seed_mask_hi;
+    // M-38: Avoid embedding the raw key bytes directly in source. Mask the
+    // key with an HKDF-SHA256-derived stream and reconstruct it at runtime.
+    let hkdf_psk: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
+    let hkdf_salt: Vec<u8> = (0..16).map(|_| rng.gen()).collect();
+    let hkdf_stream = hkdf_mask_stream(&hkdf_psk, &hkdf_salt, blob.key.len());
 
-    let mut sm_state = key_seed;
     let masked_key: Vec<u8> = blob
         .key
         .iter()
-        .map(|&b| b ^ (splitmix64_next(&mut sm_state) as u8))
+        .zip(hkdf_stream.iter())
+        .map(|(&b, &m)| b ^ m)
         .collect();
     let masked_key_literal = byte_array_literal(&masked_key);
+    let salt_literal = byte_array_literal(&hkdf_salt);
+    let psk_literal = byte_array_literal(&hkdf_psk);
 
     let reconstruct_key_fn = emit_reconstruct_key_fn(
         &masked_key_literal,
-        masked_seed_lo,
-        masked_seed_hi,
-        seed_mask_lo,
-        seed_mask_hi,
+        &salt_literal,
+        &psk_literal,
         &mut rng,
     );
 
@@ -481,47 +479,44 @@ fn chacha20_stream(data: &[u8], key: &[u8]) -> Vec<u8> {
     output
 }
 
-#[inline]
-fn splitmix64_next(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+fn hkdf_mask_stream(psk: &[u8], salt: &[u8], out_len: usize) -> Vec<u8> {
+    let hk = Hkdf::<Sha256>::new(Some(salt), psk);
+    let mut out = vec![0u8; out_len];
+    hk.expand(b"orchestra-poly-key", &mut out)
+        .expect("HKDF expand failed for key masking");
+    out
 }
 
 fn emit_reconstruct_key_fn(
     masked_key_lit: &str,
-    masked_seed_lo: u32,
-    masked_seed_hi: u32,
-    seed_mask_lo: u32,
-    seed_mask_hi: u32,
+    salt_lit: &str,
+    psk_lit: &str,
     rng: &mut impl Rng,
 ) -> String {
     let mut suf = || format!("{:04x}", rng.gen::<u16>());
     let v_masked = format!("mk_{}", suf());
+    let v_salt = format!("salt_{}", suf());
+    let v_psk = format!("psk_{}", suf());
+    let v_hk = format!("hk_{}", suf());
+    let v_okm = format!("okm_{}", suf());
     let v_out = format!("rk_{}", suf());
-    let v_state = format!("sm_{}", suf());
-    let v_x = format!("x_{}", suf());
-    let v_lo = format!("lo_{}", suf());
-    let v_hi = format!("hi_{}", suf());
     let v_i = format!("i_{}", suf());
 
-    let body = if rng.gen_bool(0.5) {
+    if rng.gen_bool(0.5) {
         format!(
             "    fn reconstruct_key() -> ::std::vec::Vec<u8> {{\n        \
              let {v_masked}: &[u8] = &[{masked_key_lit}];\n        \
-             let {v_lo}: u32 = 0x{masked_seed_lo:08x}u32 ^ 0x{seed_mask_lo:08x}u32;\n        \
-             let {v_hi}: u32 = 0x{masked_seed_hi:08x}u32 ^ 0x{seed_mask_hi:08x}u32;\n        \
-             let mut {v_state}: u64 = ({v_lo} as u64) | (({v_hi} as u64) << 32);\n        \
+             let {v_salt}: [u8; 16] = [{salt_lit}];\n        \
+             let {v_psk}: [u8; 32] = [{psk_lit}];\n        \
+             let {v_hk} = ::hkdf::Hkdf::<::sha2::Sha256>::new(Some(&{v_salt}), &{v_psk});\n        \
+             let mut {v_okm}: ::std::vec::Vec<u8> = ::std::vec::Vec::with_capacity({v_masked}.len());\n        \
+             {v_okm}.resize({v_masked}.len(), 0u8);\n        \
+             {v_hk}.expand(b\"orchestra-poly-key\", &mut {v_okm})\n            \
+                 .expect(\"HKDF expand failed in reconstruct_key\");\n        \
              let mut {v_out}: ::std::vec::Vec<u8> = ::std::vec::Vec::with_capacity({v_masked}.len());\n        \
              for &{v_i} in {v_masked} {{\n            \
-             {v_state} = {v_state}.wrapping_add(0x9E3779B97F4A7C15u64);\n            \
-             let mut {v_x} = {v_state};\n            \
-             {v_x} = ({v_x} ^ ({v_x} >> 30)).wrapping_mul(0xBF58476D1CE4E5B9u64);\n            \
-             {v_x} = ({v_x} ^ ({v_x} >> 27)).wrapping_mul(0x94D049BB133111EBu64);\n            \
-             {v_x} ^= {v_x} >> 31;\n            \
-             {v_out}.push({v_i} ^ ({v_x} as u8));\n        \
+             let idx = {v_out}.len();\n            \
+             {v_out}.push({v_i} ^ {v_okm}[idx]);\n        \
              }}\n        \
              {v_out}\n    \
              }}\n"
@@ -530,22 +525,19 @@ fn emit_reconstruct_key_fn(
         format!(
             "    fn reconstruct_key() -> ::std::vec::Vec<u8> {{\n        \
              let {v_masked}: &[u8] = &[{masked_key_lit}];\n        \
-             let {v_lo}: u32 = 0x{masked_seed_lo:08x}u32 ^ 0x{seed_mask_lo:08x}u32;\n        \
-             let {v_hi}: u32 = 0x{masked_seed_hi:08x}u32 ^ 0x{seed_mask_hi:08x}u32;\n        \
-             let mut {v_state}: u64 = ({v_lo} as u64) | (({v_hi} as u64) << 32);\n        \
-             {v_masked}.iter().map(|&b| {{\n            \
-             {v_state} = {v_state}.wrapping_add(0x9E3779B97F4A7C15u64);\n            \
-             let mut {v_x} = {v_state};\n            \
-             {v_x} = ({v_x} ^ ({v_x} >> 30)).wrapping_mul(0xBF58476D1CE4E5B9u64);\n            \
-             {v_x} = ({v_x} ^ ({v_x} >> 27)).wrapping_mul(0x94D049BB133111EBu64);\n            \
-             {v_x} ^= {v_x} >> 31;\n            \
-             b ^ ({v_x} as u8)\n        \
+             let {v_salt}: [u8; 16] = [{salt_lit}];\n        \
+             let {v_psk}: [u8; 32] = [{psk_lit}];\n        \
+             let {v_hk} = ::hkdf::Hkdf::<::sha2::Sha256>::new(Some(&{v_salt}), &{v_psk});\n        \
+             let mut {v_okm}: ::std::vec::Vec<u8> = ::std::vec::Vec::with_capacity({v_masked}.len());\n        \
+             {v_okm}.resize({v_masked}.len(), 0u8);\n        \
+             {v_hk}.expand(b\"orchestra-poly-key\", &mut {v_okm})\n            \
+                 .expect(\"HKDF expand failed in reconstruct_key\");\n        \
+             {v_masked}.iter().enumerate().map(|({v_i}, &b)| {{\n            \
+             b ^ {v_okm}[{v_i}]\n        \
              }}).collect()\n    \
              }}\n"
         )
-    };
-
-    body
+    }
 }
 
 // ── Stub body emitters ────────────────────────────────────────────────────────
@@ -881,6 +873,10 @@ mod tests {
         assert!(
             stub.contains("fn reconstruct_key() -> ::std::vec::Vec<u8>"),
             "stub missing reconstruct_key function"
+        );
+        assert!(
+            stub.contains("hkdf::Hkdf::<::sha2::Sha256>"),
+            "stub missing HKDF-SHA256 reconstruction path"
         );
 
         // Raw key must not appear as a contiguous literal sequence.

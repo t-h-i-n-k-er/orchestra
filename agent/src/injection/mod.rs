@@ -35,6 +35,34 @@ pub trait Injector {
     fn inject(&self, pid: u32, payload: &[u8]) -> anyhow::Result<()>;
 }
 
+#[cfg(windows)]
+pub(crate) fn payload_has_valid_pe_headers(payload: &[u8]) -> bool {
+    if payload.len() < 0x40 || payload[0] != b'M' || payload[1] != b'Z' {
+        return false;
+    }
+
+    let e_lfanew = u32::from_le_bytes([
+        payload[0x3c],
+        payload[0x3d],
+        payload[0x3e],
+        payload[0x3f],
+    ]) as usize;
+
+    if (e_lfanew & 0x3) != 0 {
+        return false;
+    }
+
+    let sig_end = match e_lfanew.checked_add(4) {
+        Some(v) => v,
+        None => return false,
+    };
+    if sig_end > payload.len() {
+        return false;
+    }
+
+    payload[e_lfanew..sig_end] == *b"PE\0\0"
+}
+
 /// Dispatch helper — select an injector and run it.
 #[cfg(windows)]
 pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> anyhow::Result<()> {
