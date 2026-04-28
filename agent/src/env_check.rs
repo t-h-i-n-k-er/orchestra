@@ -605,6 +605,119 @@ fn is_cloud_instance() -> bool {
 /// Returns `None` when IMDS is unavailable or the response is invalid.
 #[cfg(target_os = "macos")]
 fn fetch_cloud_instance_id() -> Option<String> {
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 80);
+    let open_stream = || -> Option<TcpStream> {
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(50)).ok()?;
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+        Some(stream)
+    };
+
+    let parse_http_200_body = |buf: &[u8], n: usize| -> Option<String> {
+        if !buf.starts_with(b"HTTP/1.") || n < 12 || &buf[9..12] != b"200" {
+            return None;
+        }
+        let header_end = buf[..n].windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        let body = &buf[header_end..n];
+        if body.starts_with(b"<") || body.starts_with(b"<!") {
+            return None;
+        }
+        let text = String::from_utf8_lossy(body).trim().to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    };
+
+    let parse_instance_id_from_identity_doc = |doc: &str| -> Option<String> {
+        let key = "\"instanceId\"";
+        let start = doc.find(key)? + key.len();
+        let after_key = &doc[start..];
+        let colon = after_key.find(':')?;
+        let after_colon = after_key[colon + 1..].trim_start();
+        if !after_colon.starts_with('"') {
+            return None;
+        }
+        let value = &after_colon[1..];
+        let end = value.find('"')?;
+        let id = value[..end].trim();
+        if id.is_empty() {
+            None
+        } else {
+            Some(id.to_string())
+        }
+    };
+
+    let fetch_path = |path: &str, token: Option<&str>| -> Option<String> {
+        let mut stream = open_stream()?;
+        let req = match token {
+            Some(t) => format!(
+                "GET {} HTTP/1.0\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token: {}\r\n\r\n",
+                path, t
+            ),
+            None => format!("GET {} HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n", path),
+        };
+        if stream.write_all(req.as_bytes()).is_err() {
+            return None;
+        }
+
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf).ok()?;
+        if n == 0 {
+            return None;
+        }
+        parse_http_200_body(&buf, n)
+    };
+
+    let fetch_imdsv2_token = || -> Option<String> {
+        let mut stream = open_stream()?;
+        let req = b"PUT /latest/api/token HTTP/1.0\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\n\r\n";
+        if stream.write_all(req).is_err() {
+            return None;
+        }
+
+        let mut buf = [0u8; 512];
+        let n = stream.read(&mut buf).ok()?;
+        if n == 0 || !buf.starts_with(b"HTTP/1.") || n < 12 || &buf[9..12] != b"200" {
+            return None;
+        }
+        let header_end = buf[..n].windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        let token = String::from_utf8_lossy(&buf[header_end..n]).trim().to_string();
+        if token.is_empty() {
+            None
+        } else {
+            Some(token)
+        }
+    };
+
+    // IMDSv2 preferred on EC2 Mac: token-authenticated metadata instance-id.
+    if let Some(token) = fetch_imdsv2_token() {
+        if let Some(id) = fetch_path("/latest/meta-data/instance-id", Some(&token)) {
+            return Some(id);
+        }
+        if let Some(doc) = fetch_path("/latest/dynamic/instance-identity/document", Some(&token))
+        {
+            if let Some(id) = parse_instance_id_from_identity_doc(&doc) {
+                return Some(id);
+            }
+        }
+    }
+
+    // IMDSv1 fallback when token service is unavailable.
+    if let Some(id) = fetch_path("/latest/meta-data/instance-id", None) {
+        return Some(id);
+    }
+    if let Some(doc) = fetch_path("/latest/dynamic/instance-identity/document", None) {
+        if let Some(id) = parse_instance_id_from_identity_doc(&doc) {
+            return Some(id);
+        }
+    }
+
     None
 }
 
