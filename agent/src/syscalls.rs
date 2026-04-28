@@ -31,6 +31,11 @@ pub struct SyscallTarget {
 }
 
 // ── Linux syscall infrastructure ─────────────────────────────────────────────
+// NOTE: Linux direct-syscall execution is implemented in this file below:
+//   - `syscall!` macro            (Linux): around line ~1216
+//   - `do_syscall(ssn, args)`     (Linux): around line ~1249
+//   - `get_syscall_id(name)`      (Linux): around line ~2044
+// These top-level declarations are shared state/types used by that path.
 
 #[cfg(target_os = "linux")]
 use std::sync::{Mutex, OnceLock};
@@ -39,6 +44,7 @@ use std::sync::{Mutex, OnceLock};
 use std::collections::HashMap;
 
 /// Per-call cache: syscall name → resolved SSN.  Built lazily on first use.
+/// Used by Linux `get_syscall_id` in the lower Linux implementation block.
 #[cfg(target_os = "linux")]
 static LINUX_SYSCALL_CACHE: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
 
@@ -2297,5 +2303,32 @@ pub unsafe fn syscall_NtProtectVirtualMemory(
             log::warn!("syscall_NtProtectVirtualMemory: could not get SSN: {}", e);
             -1
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux", feature = "direct-syscalls"))]
+mod linux_direct_syscall_tests {
+    use super::*;
+
+    #[test]
+    fn linux_get_syscall_id_resolves_getpid() {
+        let target = get_syscall_id("getpid").expect("getpid syscall id should resolve");
+        assert!(target.ssn > 0, "resolved syscall number should be non-zero");
+    }
+
+    #[test]
+    fn linux_do_syscall_getpid_matches_libc() {
+        let target = get_syscall_id("getpid").expect("getpid syscall id should resolve");
+        let direct = unsafe { do_syscall(target.ssn, &[]) }
+            .expect("direct syscall getpid should succeed") as libc::pid_t;
+        let libc_pid = unsafe { libc::getpid() };
+        assert_eq!(direct, libc_pid, "direct syscall pid must match libc getpid");
+    }
+
+    #[test]
+    fn linux_syscall_macro_getpid_matches_libc() {
+        let direct = syscall!("getpid").expect("syscall! getpid should succeed") as libc::pid_t;
+        let libc_pid = unsafe { libc::getpid() };
+        assert_eq!(direct, libc_pid, "syscall! pid must match libc getpid");
     }
 }

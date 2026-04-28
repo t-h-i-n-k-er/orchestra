@@ -500,8 +500,14 @@ fn is_cloud_instance_sandbox() -> bool {
             .ok()
             .map(|v| v.trim().to_lowercase())
             .unwrap_or_default();
+        let product_name = std::fs::read_to_string("/sys/class/dmi/id/product_name")
+            .ok()
+            .map(|v| v.trim().to_lowercase())
+            .unwrap_or_default();
+        let microsoft_cloud = sys_vendor.contains("microsoft corporation")
+            && product_name.contains("virtual machine");
         let vendor_is_known_cloud = sys_vendor.contains("amazon")
-            || sys_vendor.contains("microsoft")
+            || microsoft_cloud
             || sys_vendor.contains("google")
             || sys_vendor.contains("digitalocean")
             || sys_vendor.contains("vmware")
@@ -511,9 +517,8 @@ fn is_cloud_instance_sandbox() -> bool {
             return true;
         }
 
-        if let Ok(p) = std::fs::read_to_string("/sys/class/dmi/id/product_name") {
-            let p = p.trim().to_lowercase();
-            if p.contains("virtual") {
+        if !product_name.is_empty() {
+            if product_name.contains("virtual") {
                 if !vendor_is_known_cloud {
                     log::debug!(
                         "sandbox: product_name contains 'virtual' but sys_vendor '{}' is not a known cloud provider; treating as non-cloud",
@@ -523,7 +528,11 @@ fn is_cloud_instance_sandbox() -> bool {
                 }
                 return true;
             }
-            if p.contains("kvm") || p.contains("cloud") || p.contains("compute") || p.contains("vmware") {
+            if product_name.contains("kvm")
+                || product_name.contains("cloud")
+                || product_name.contains("compute")
+                || product_name.contains("vmware")
+            {
                 return true;
             }
         }
@@ -584,10 +593,9 @@ fn is_cloud_instance_sandbox() -> bool {
                 let vendor_lc = vendor.to_lowercase();
                 let product_lc = product.to_lowercase();
 
-                let microsoft_cloud = vendor_lc == "microsoft corporation"
-                    && !product_lc.contains("surface");
                 let vendor_is_known_cloud = vendor_lc.contains("amazon")
-                    || microsoft_cloud
+                    || (vendor_lc.contains("microsoft corporation")
+                        && product_lc.contains("virtual machine"))
                     || vendor_lc.contains("google")
                     || vendor_lc.contains("digitalocean")
                     || vendor_lc.contains("vmware")

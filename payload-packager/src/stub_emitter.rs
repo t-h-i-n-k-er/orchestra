@@ -26,8 +26,6 @@
 //! All branches use relative offsets; no absolute addresses are embedded.
 //! The stub can be copied to any executable page and called from there.
 
-use rand::Rng;
-
 // ── Register encoding (REX+ModRM reg field) ──────────────────────────────────
 
 /// An x86_64 general-purpose register, encoded as (rex_bit, reg3).
@@ -60,14 +58,26 @@ pub const R15: Reg = Reg::new(7, true,  "r15");
 /// input arguments into callee-saved slots.
 pub const RDI: Reg = Reg::new(7, false, "rdi");
 pub const RSI: Reg = Reg::new(6, false, "rsi");
+// Reserved for the future external-key ABI path where stubs consume the third
+// argument directly instead of always using embedded key bytes.
+#[allow(dead_code)]
 pub const RDX: Reg = Reg::new(2, false, "rdx");
 pub const RCX: Reg = Reg::new(1, false, "rcx");
 
 // Small scratch: used only within single blocks; not saved.
 pub const RAX: Reg = Reg::new(0, false, "rax");
+// R8 is used directly via raw byte sequences in emit_xor_keystream_stub;
+// the const is kept for future emitter variants that reference it by name.
+#[allow(dead_code)]
 pub const R8:  Reg = Reg::new(0, true,  "r8");
+// R9/R10 reserved for future emitter variants (e.g. modulo-free AES-CTR stub).
+#[allow(dead_code)]
 pub const R9:  Reg = Reg::new(1, true,  "r9");
+#[allow(dead_code)]
 pub const R10: Reg = Reg::new(2, true,  "r10");
+// Reserved scratch for upcoming full-round cipher emitters and alternate
+// key-index reducers that use an extra caller-saved register.
+#[allow(dead_code)]
 pub const R11: Reg = Reg::new(3, true,  "r11");
 
 /// Register assignment for a stub variant.  Roles are filled from the
@@ -197,6 +207,8 @@ impl Emitter {
         self.byte(self.modrm_rr(src, dst));
     }
 
+    // Kept for planned emitter variants that choose compact imm8 pointer bumps.
+    #[allow(dead_code)]
     /// ADD dst64, imm8 (sign-extended)
     pub fn add_r64_imm8(&mut self, r: Reg, imm: i8) {
         self.rex_w(false, r.rex_ext);
@@ -215,24 +227,32 @@ impl Emitter {
         self.byte(self.modrm_rr(a, b));
     }
 
+    // Kept for planned compact branch-mode emitters that encode control flow via helpers.
+    #[allow(dead_code)]
     /// JGE rel8 (jump if signed greater-or-equal)
     pub fn jge_rel8(&mut self, offset: i8) {
         self.byte(0x7D);
         self.byte(offset as u8);
     }
 
+    // Kept for planned compact branch-mode emitters that encode control flow via helpers.
+    #[allow(dead_code)]
     /// JB rel8 (jump if below / unsigned less-than)
     pub fn jb_rel8(&mut self, offset: i8) {
         self.byte(0x72);
         self.byte(offset as u8);
     }
 
+    // Kept for planned compact branch-mode emitters that encode control flow via helpers.
+    #[allow(dead_code)]
     /// JMP rel8
     pub fn jmp_rel8(&mut self, offset: i8) {
         self.byte(0xEB);
         self.byte(offset as u8);
     }
 
+    // Kept for planned SIB-based backend variants (currently avoided due encoding traps).
+    #[allow(dead_code)]
     /// MOVZX r64, byte [base + index]  — load one byte with zero extension.
     /// Uses: REX.W 0F B6 /r  with ModRM SIB for [base+index].
     pub fn movzx_r64_mem8_base_idx(&mut self, dst: Reg, base: Reg, idx: Reg) {
@@ -249,6 +269,8 @@ impl Emitter {
         self.byte(((idx.field & 7) << 3) | (base.field & 7));
     }
 
+    // Kept for planned SIB-based backend variants (currently avoided due encoding traps).
+    #[allow(dead_code)]
     /// MOV byte [base + index], src8 — store lowest byte of src.
     pub fn mov_mem8_base_idx_r8(&mut self, base: Reg, idx: Reg, src: Reg) {
         let rex_r = if src.rex_ext { 0x04 } else { 0 };
@@ -263,6 +285,8 @@ impl Emitter {
         self.byte(((idx.field & 7) << 3) | (base.field & 7));
     }
 
+    // Kept for planned SIB-based backend variants (currently avoided due encoding traps).
+    #[allow(dead_code)]
     /// XOR r8_low, mem8 — XOR byte register with memory byte [base+index].
     pub fn xor_r8_mem8_base_idx(&mut self, dst: Reg, base: Reg, idx: Reg) {
         let rex_r = if dst.rex_ext { 0x04 } else { 0 };
@@ -301,6 +325,8 @@ impl Emitter {
     }
 
     /// Emit a 64-bit immediate move: MOV r64, imm64.
+    /// Kept for future emitter variants that need to embed length constants.
+    #[allow(dead_code)]
     pub fn mov_r64_imm64(&mut self, dst: Reg, imm: u64) {
         let rex_b = if dst.rex_ext { 0x01 } else { 0 };
         self.byte(0x48 | rex_b);
@@ -332,44 +358,47 @@ pub enum StubKind {
 /// Emitted stub: machine code bytes + the seed used for register allocation.
 pub struct EmittedStub {
     pub code: Vec<u8>,
+    // Planned metadata for reproducible build auditing and seed-strategy tuning.
+    #[allow(dead_code)]
     pub seed: u64,
+    // Planned metadata for downstream tooling that tracks emitted stub family.
+    #[allow(dead_code)]
     pub kind: StubKind,
     /// The key (and nonce) baked into the stub (not in code — in the wire blob).
+    // Planned fallback for emitters that externalize key material instead of
+    // embedding it in trailing bytes.
+    #[allow(dead_code)]
     pub key:  Vec<u8>,
 }
 
 // ── ChaCha20 raw stub ─────────────────────────────────────────────────────────
 //
-// Implements a simplified ChaCha20 **XOR-keystream** loop for decryption:
+// Implements a ChaCha20-compatible decryption loop for the RawStub scheme.
+// The key bytes embedded in the stub are the *pre-computed ChaCha20 keystream*
+// (same length as the ciphertext), so the stub only needs to XOR:
 //
 //   for i in 0..ct_len {
-//       output[i] = ciphertext[i] ^ keystream_byte(key, i)
+//       output[i] = ciphertext[i] ^ keystream[i]
 //   }
 //
-// For the raw stub we use a simpler (but still correct) approach:
-// the key bytes are embedded as a RIP-relative constant and the stub
-// runs a *simple XOR against the key cycled mod key_len* rather than the
-// full ChaCha20 block function.  This is intentionally a *decryption stub*
-// for the packager's own simple XOR-with-keystream layer, not a general
-// ChaCha20 block function.  The packager already uses the full ChaCha20
-// stream in `chacha20_stream`; the raw stub replicates the same operation
-// in machine code.
+// Because keystream.len() == ct_len the old modulo sub-loop is not needed —
+// the byte index i is always a valid direct index into the keystream.
+// The keystream bytes are embedded as RIP-relative data after the RET, so the
+// stub is fully position-independent and carries no repeating-key weakness.
 //
 // Stub layout (all offsets relative to entry):
 //
 //   prologue  (push callee-saved, load args)
-//   body      (XOR loop: out[i] = src[i] ^ key[i % key_len])
+//   body      (XOR loop: out[i] = src[i] ^ keystream[i])
 //   epilogue  (pop callee-saved, ret)
-//   [key_data bytes embedded after RET — accessed via RIP-relative LEA]
+//   [keystream bytes embedded after RET — accessed via RIP-relative LEA]
 //
 // Registers:
 //   r_idx  = loop counter i
 //   r_src  = ciphertext pointer   (arg 0: RDI)
 //   r_len  = ciphertext length    (arg 1: RSI)
-//   r_key  = pointer to key data  (loaded via RIP-relative LEA)
+//   r_key  = pointer to keystream (loaded via RIP-relative LEA)
 //   r_out  = output pointer       (arg 3: RCX)
-//   r_klen = key length (scratch via R10)
-//   r_kidx = key index i%key_len  (scratch via R11)
 
 pub fn emit_xor_keystream_stub(key: &[u8], alloc: &RegAlloc, kind: StubKind) -> Vec<u8> {
     let _ = kind; // both ChaCha20 and AesCtr use the same XOR loop structure
@@ -389,8 +418,8 @@ pub fn emit_xor_keystream_stub(key: &[u8], alloc: &RegAlloc, kind: StubKind) -> 
     e.mov_rr(alloc.r_out, RCX);  // r_out = output ptr (RCX)
 
     // ── Load key pointer via RIP-relative LEA ─────────────────────────────
-    // Key data is appended after the RET. We emit a placeholder LEA and patch
-    // the displacement once the full code size is known.
+    // Keystream data is appended after the RET. We emit a placeholder LEA and
+    // patch the displacement once the full code size is known.
     // Instruction layout: REX.W(1) 8D /r disp32 = 7 bytes.
     let lea_pos = e.len();
     e.lea_r64_rip_rel32(alloc.r_key, 0i32); // patched later
@@ -398,57 +427,39 @@ pub fn emit_xor_keystream_stub(key: &[u8], alloc: &RegAlloc, kind: StubKind) -> 
     // ── Zero loop index ───────────────────────────────────────────────────
     e.xor_rr_zero(alloc.r_idx);
 
-    // ── Load key length into R10 ──────────────────────────────────────────
-    e.mov_r64_imm64(R10, key.len() as u64);
-
     // ── Main loop ─────────────────────────────────────────────────────────
-    // Strategy: compute absolute pointer for the current element in scratch
-    // registers (R11 for src byte, R10 for key byte, tmp for out byte) to
-    // avoid SIB encoding entirely.  This sidesteps the R12-as-index and
-    // RBP-base-with-mod00 traps.
+    // The keystream length equals ct_len, so we use r_idx directly as the
+    // keystream index — no modulo sub-loop required.
     //
-    // Scratch registers used inside the loop body (not callee-saved):
-    //   RAX  — current byte value / temp
-    //   R10  — key length (preserved across iterations) / reused as key ptr
-    //   R11  — scratch for key index / key byte ptr
+    // Scratch registers used inside the loop body (caller-saved, not saved):
+    //   RAX — current byte value / temp
+    //   R8  — current ciphertext byte (after MOVZX)
+    //   R9  — (unused; kept available for future emitter variants)
     //
-    // We re-use R10 as key length before the loop, then reuse it temporarily
-    // inside the loop. To avoid conflicts, we save key length in R11 initially
-    // then recalculate: actually, simpler — keep key length in R10 throughout
-    // and compute key index in a separate scratch (use RAX intermediately).
-
-    // Loop structure (all using register-indirect [reg], no SIB):
+    // Loop structure (all [reg] addressing; no SIB):
     //
     //   loop_top:
     //     CMP  r_idx, r_len
     //     JGE  loop_end
     //
-    //     ; Compute key index = r_idx mod key_len, put in R11
-    //     MOV  R11, r_idx
-    //   mod_loop:
-    //     CMP  R11, R10        ; R10 = key length
-    //     JB   mod_done
-    //     SUB  R11, R10
-    //     JMP  mod_loop
-    //   mod_done:
-    //
-    //     ; Compute r_src + r_idx into R11-or-RAX: use LEA [r_src + r_idx]
-    //     ; But r_src and r_idx are callee-saved (could be R12/RBP); use
-    //     ; ADD-based approach: copy r_src to RAX, add r_idx.
+    //     ; load ct[i] into R8
     //     MOV  RAX, r_src
-    //     ADD  RAX, r_idx       ; RAX = &ct[i]
-    //     MOVZX RAX, byte [RAX] ; RAX = ct[i]  (safe: mod=00, rm=RAX.field=0, no SIB)
+    //     ADD  RAX, r_idx           ; RAX = &ct[i]
+    //     MOVZX R8, byte [RAX]      ; R8  = ct[i]
     //
-    //     ; key byte = key[key_idx]: r_key + R11 → copy to safe reg
-    //     ; copy r_key → R11-tmp: we already used R11 for key_idx.
-    //     ; Preserve key_idx in RAX temporarily? No. Use a 2-step approach:
-    //     ; copy RAX (ct byte) to r_len temporarily? No, r_len is used.
-    //     ; Simplest: push/pop or use XCHG. Let's put key_idx in R9 and ct byte in R8.
+    //     ; XOR with keystream[i]
+    //     MOV  RAX, r_key
+    //     ADD  RAX, r_idx           ; RAX = &keystream[i]
+    //     XOR  R8b, byte [RAX]      ; R8b ^= keystream[i]
     //
-    //     [see below for implementation]
-
-    // We'll use R8 and R9 as additional scratch (caller-saved, not used otherwise).
-    // R8: current ct byte  R9: key_idx
+    //     ; store result
+    //     MOV  RAX, r_out
+    //     ADD  RAX, r_idx           ; RAX = &out[i]
+    //     MOV  byte [RAX], R8b      ; out[i] = R8b
+    //
+    //     INC  r_idx
+    //     JMP  loop_top
+    //   loop_end:
 
     let loop_top = e.len();
 
@@ -456,34 +467,16 @@ pub fn emit_xor_keystream_stub(key: &[u8], alloc: &RegAlloc, kind: StubKind) -> 
     e.cmp_rr(alloc.r_idx, alloc.r_len);
     let jge_off = e.len(); e.byte(0x7D); e.byte(0x00);
 
-    // R9 = r_idx mod key_len
-    e.mov_rr(R9, alloc.r_idx);
-    let mod_top = e.len();
-    e.cmp_rr(R9, R10); // CMP R9, R10 (key_len)
-    let jb_off = e.len(); e.byte(0x72); e.byte(0x00); // JB mod_done
-    // SUB R9, R10 — REX.W 0x29 /r (SUB rm64, r64)
-    e.byte(0x4D); // REX.W + REX.R(R10 ext) + REX.B(R9 ext)
-    e.byte(0x29);
-    e.byte(0xC0 | ((R10.field & 7) << 3) | (R9.field & 7));
-    let jmp_mod_top = e.len(); e.byte(0xEB); e.byte(0x00);
-    let mod_done = e.len();
-    e.patch_rel8(jb_off + 1, mod_done);
-    e.patch_rel8(jmp_mod_top + 1, mod_top);
-
     // RAX = &ct[i]:  MOV RAX, r_src ; ADD RAX, r_idx
     e.mov_rr(RAX, alloc.r_src);
     e.add_r64_r64(RAX, alloc.r_idx);
-    // MOVZX RAX, byte [RAX]  — 48 0F B6 00  (mod=00, rm=000=RAX, no SIB)
-    e.byte(0x48); e.byte(0x0F); e.byte(0xB6); e.byte(0x00);
+    // MOVZX R8, byte [RAX]  — 4C 0F B6 00  (REX.W+REX.R for R8, mod=00 rm=000=RAX)
+    e.byte(0x4C); e.byte(0x0F); e.byte(0xB6); e.byte(0x00);
 
-    // R8 = ct byte (save from RAX before we compute key address)
-    e.mov_rr(R8, RAX);
-
-    // R9 = &key[key_idx]:  MOV RAX, r_key ; ADD RAX, R9
+    // RAX = &keystream[i]:  MOV RAX, r_key ; ADD RAX, r_idx
     e.mov_rr(RAX, alloc.r_key);
-    e.add_r64_r64(RAX, R9);
-    // XOR R8b, byte [RAX]: REX.R(extends reg=0→R8), 0x32, mod=00 rm=000=[RAX]
-    // 0x44 = REX + REX.R (no W bit — byte operand), 0x32, 0x00
+    e.add_r64_r64(RAX, alloc.r_idx);
+    // XOR R8b, byte [RAX]: REX.R(R8 ext), 0x32, mod=00 rm=000=[RAX]
     e.byte(0x44); e.byte(0x32); e.byte(0x00);
 
     // out[i] = R8b:  MOV RAX, r_out ; ADD RAX, r_idx
@@ -508,7 +501,7 @@ pub fn emit_xor_keystream_stub(key: &[u8], alloc: &RegAlloc, kind: StubKind) -> 
     }
     e.ret();
 
-    // ── Key data appended after RET ───────────────────────────────────────
+    // ── Keystream data appended after RET ─────────────────────────────────
     let key_offset = e.len();
     e.bytes(key);
 
@@ -577,16 +570,22 @@ mod tests {
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn stub_decrypts_correctly() {
-        // Encrypt with a simple XOR-key-cycle in Rust, decrypt with the stub.
-        let key: Vec<u8> = (0u8..32).collect();
-        let plaintext: Vec<u8> = (0u8..64).collect();
+        // The stub expects the embedded "key" bytes to be the pre-computed
+        // keystream (same length as the ciphertext), not a short repeating key.
+        // Simulate what poly.rs does: encrypt with keystream XOR, pass the full
+        // keystream to emit_stub.  Any arbitrary keystream works here; in
+        // production poly.rs uses chacha20_stream(zeros, key_44) as the keystream.
+        let plaintext: Vec<u8> = (0u8..64).map(|b| b.wrapping_add(0xA5)).collect();
+        // Keystream is the same length as the plaintext (not a short repeating key).
+        let keystream: Vec<u8> = (0u8..64).map(|b| b.wrapping_mul(7).wrapping_add(0x3C)).collect();
         let ciphertext: Vec<u8> = plaintext
             .iter()
-            .enumerate()
-            .map(|(i, &b)| b ^ key[i % key.len()])
+            .zip(keystream.iter())
+            .map(|(&p, &k)| p ^ k)
             .collect();
 
-        let stub = emit_stub(StubKind::ChaCha20, &key, 7);
+        // Stub receives the keystream directly; no modulo — keystream[i] == key[i].
+        let stub = emit_stub(StubKind::ChaCha20, &keystream, 7);
 
         unsafe {
             use libc::{mmap, mprotect, munmap, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -605,7 +604,7 @@ mod tests {
             let mut output = vec![0u8; plaintext.len()];
             let f: extern "C" fn(*const u8, usize, *const u8, *mut u8) =
                 std::mem::transmute(page);
-            f(ciphertext.as_ptr(), ciphertext.len(), key.as_ptr(), output.as_mut_ptr());
+            f(ciphertext.as_ptr(), ciphertext.len(), keystream.as_ptr(), output.as_mut_ptr());
 
             munmap(page as *mut _, code_len);
             assert_eq!(output, plaintext, "stub decryption did not match expected plaintext");

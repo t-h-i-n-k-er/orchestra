@@ -100,15 +100,23 @@ pub fn poly_wrap(plaintext: &[u8]) -> PolyBlob {
             }
         }
         PolyScheme::RawStub => {
-            // 32-byte XOR key; use chacha20 stream for the actual encryption
-            // (same scheme as ChaCha20Stream so existing decrypt path works if
-            // the stub fails), but embed the key inside the machine-code stub.
-            let xor_key: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
-            let ct = xor_keystream(plaintext, &xor_key);
+            // 44-byte ChaCha20 key (32-byte key + 12-byte nonce).
+            // Encrypt the payload with the full ChaCha20 stream cipher so the
+            // wire format is not trivially reversible.  The machine-code stub
+            // decrypts by XOR-ing with the *pre-computed keystream* embedded in
+            // its trailing data — the stub never needs to implement the ChaCha20
+            // block function itself; it just XORs ct[i] ^ keystream[i].
+            let key_44: Vec<u8> = (0..44).map(|_| rng.gen()).collect();
+            let ct = chacha20_stream(plaintext, &key_44);
+            // Derive the keystream bytes that the stub will use:
+            //   chacha20_stream(zeros, key) == keystream  (XOR with 0 = identity)
+            let keystream = chacha20_stream(&vec![0u8; ct.len()], &key_44);
             let seed: u64 = rng.gen();
             // Choose randomly between ChaCha20 and AesCtr stub kind per build.
             let kind = if rng.gen_bool(0.5) { StubKind::ChaCha20 } else { StubKind::AesCtr };
-            let stub = emit_stub(kind, &xor_key, seed);
+            // Embed the full keystream in the stub; the XOR loop becomes
+            // out[i] = ct[i] ^ keystream[i] — correct ChaCha20 decryption.
+            let stub = emit_stub(kind, &keystream, seed);
             PolyBlob {
                 scheme,
                 key: stub.code, // wire format "key" field carries the stub bytes
@@ -388,8 +396,10 @@ fn increment_be_counter(counter: &mut [u8; 16]) {
     }
 }
 
-/// Simple XOR-with-cycled-key stream cipher used by the RawStub scheme.
-/// The raw machine-code stub replicates exactly this operation.
+/// Simple XOR-with-cycled-key stream cipher.
+/// Retained for internal tooling / test-vector generation; the RawStub wire
+/// format now uses `chacha20_stream` so this is no longer on the hot path.
+#[allow(dead_code)]
 fn xor_keystream(data: &[u8], key: &[u8]) -> Vec<u8> {
     assert!(!key.is_empty(), "xor_keystream: key must not be empty");
     data.iter()
