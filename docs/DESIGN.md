@@ -447,6 +447,15 @@ Windows compatibility compile path. CI verifies that the feature compiles; the
 strategy dispatcher routes through a shared bounded wrapper so stack arguments
 and unsupported ABIs fail consistently.
 
+Linux `aarch64` syscall path notes:
+
+- The low-level wrapper supports up to 6 syscall arguments (the architectural
+  calling convention limit for direct register-passed syscall args).
+- Requests with more than 6 arguments are rejected with `EINVAL` instead of
+  attempting stack-based argument marshalling.
+- This fail-closed behavior is intentional to keep unsupported ABI shapes
+  explicit and deterministic across platforms.
+
 ### In-Memory Plugin Deployment (Manual PE Mapping)
 
 On Windows, the `module_loader` can use a true in-memory DLL loader when the `manual-map` feature is enabled, avoiding the use of temporary files.
@@ -664,6 +673,48 @@ if let Err(report) = env_check::enforce() {
     std::process::exit(1);
 }
 ```
+
+### Adaptive VM Detection Thresholds
+
+`detect_vm()` uses indicator counting with an adaptive threshold so cloud
+deployments are less likely to be treated as analysis sandboxes.
+
+- Tier 1 (`threshold = 2`): used when no cloud confirmation signal is present.
+  This is the strict/default posture for unknown VMs.
+- Tier 2 (`threshold = 3`): used when one cloud signal is present (expected
+  cloud-hypervisor match and/or IMDS reachability). Expected hypervisor
+  families include provider-context VM stacks such as VMware, VirtualBox, KVM,
+  Hyper-V, and Xen.
+- Tier 3 (`threshold = 4`): used when cloud confirmation is strongest (both
+  expected-hypervisor and IMDS checks succeed). In practice this tier is
+  commonly paired with `cloud_instance_id` allowlisting; a configured
+  instance-id match can bypass VM refusal on known trusted instances.
+
+Edge case:
+
+- If IMDS is unavailable **and** the hypervisor name is not in the built-in or
+  operator-extended expected list, the logic falls back to Tier 1
+  (`threshold = 2`).
+- A legitimate niche cloud VM may therefore still be flagged as VM when enough
+  generic indicators accumulate.
+- Recommended mitigation: set `cloud_instance_id` in configuration and add
+  provider-specific strings via `vm_detection_extra_hypervisor_names` so
+  `is_expected_hypervisor()` can classify the platform correctly.
+
+### Cloud Whitelisting Fallback Controls
+
+The env-validation policy now includes additional cloud-allowlisting controls:
+
+- `cloud_instance_allow_without_imds`: permits VM-refusal bypass when IMDS is
+  reachable/validated but instance-id parsing is unavailable.
+- `cloud_instance_fallback_ids`: fallback instance-id pattern list used when
+  IMDS instance-id retrieval fails (for example due to metadata firewalls).
+- `vm_detection_extra_hypervisor_names`: operator-supplied hypervisor name
+  fragments added to expected-hypervisor matching (Linux DMI product-name
+  checks) without requiring code changes.
+
+These controls are intentionally opt-in because they trade strict identity
+binding for higher tolerance to provider/network metadata edge cases.
 
 ### Test coverage
 

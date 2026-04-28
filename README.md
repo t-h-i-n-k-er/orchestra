@@ -38,6 +38,7 @@ and similar IT estates.
 | `launcher` | bin | Tiny stub that fetches and decrypts an agent payload at runtime. |
 | `dev-server` | bin | Local HTTPS server for serving payloads to a launcher during testing. |
 | `payload-packager` | bin | Stand-alone AES-256-GCM payload encryptor. |
+| `hollowing` | lib | Windows process hollowing primitives for in-memory payload execution. |
 | `common` | lib | Protocol types, transport, audit, and crypto primitives shared by every binary. |
 | `optimizer` | lib | Runtime tuning of hot paths based on detected CPU microarchitecture. |
 | `module_loader` | lib | Securely fetches, verifies, and loads signed capability plugins. |
@@ -106,6 +107,36 @@ TLS cert covering the chosen address, writes both the agent profile and
 `cargo-zigbuild` when `mingw-w64` isn't installed for Windows builds),
 and optionally starts the Control Center.
 
+### Cross-compilation targets and toolchains
+
+For explicit cross-target workflows, install Rust targets with `rustup` and
+ensure the corresponding host toolchain is available:
+
+```sh
+# x86_64 targets
+rustup target add x86_64-unknown-linux-gnu
+rustup target add x86_64-pc-windows-msvc
+rustup target add x86_64-pc-windows-gnu
+rustup target add x86_64-apple-darwin
+
+# ARM64 targets
+rustup target add aarch64-unknown-linux-gnu
+rustup target add aarch64-pc-windows-msvc
+rustup target add aarch64-apple-darwin
+```
+
+Windows target notes:
+
+- `x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc` require Visual Studio
+  Build Tools (MSVC linker toolchain).
+- `x86_64-pc-windows-gnu` requires `mingw-w64`.
+
+macOS target notes:
+
+- `x86_64-apple-darwin` / `aarch64-apple-darwin` require Xcode Command Line
+  Tools on a macOS host for native builds.
+- From Linux, use `cargo-zigbuild` for practical Darwin cross-compilation.
+
 ### Build the Builder from source
 
 If you prefer to drive each step manually:
@@ -116,6 +147,10 @@ cd orchestra
 cargo build --release -p builder
 # Optional: put the binary on your PATH
 install -m 0755 target/release/orchestra-builder /usr/local/bin/
+
+# Linux host validating Windows-only compile paths:
+cargo check --target x86_64-pc-windows-gnu \
+  --features direct-syscalls,manual-map
 ```
 
 > **Note.** Orchestra is currently distributed as source. A `cargo install
@@ -273,6 +308,7 @@ on per profile only when you need them.
 | `network-discovery` | Enables bounded subnet enumeration so the agent can report neighbouring hosts back to the Control Center for inventory. CIDR sweeps reject overly broad ranges by default. |
 | `remote-assist` | Adds optional consent-gated screen-share/keyboard-forwarding capability for IT support sessions. Linux X11 and Wayland capture are supported; macOS uses `screencapture`; Windows capture uses the GDI `BitBlt` API. All platforms share a user-level consent file (`$HOME/.orchestra-consent`) or HKCU registry key on Windows so no elevated privileges are required to grant or revoke consent. |
 | `module-signatures` | Enables Ed25519 signature verification for dynamically loaded capability modules. |
+| `strict-module-key` | Requires a runtime `module_verify_key` when module signature checks are enabled; rejects compile-time fallback signing keys (`module_loader` feature). |
 | `hci-research` | Instruments human-computer-interaction telemetry (input latency, focus changes) for usability studies — disabled in normal IT deployments. On Linux the default build uses the X11/libinput backend (no extra system packages required). See `evdev` below for the kernel evdev alternative. |
 | `evdev` | **Linux only.** When combined with `hci-research`, switches rdev from the X11/libinput backend to the kernel evdev-rs backend. Useful on Wayland or headless systems that have no X11 server. **Requires libtool and a full autotools chain** (`autoconf`, `automake`, `libtool`) to be installed before building because evdev-rs runs `autoreconf` in its build script. Install on Debian/Ubuntu: `sudo apt install libtool autoconf automake`. |
 | `perf-optimize` | Experimental compatibility flag reserved for optimizer-backed tuning. It is accepted by profiles so builds fail early only on truly unknown features; production builds should leave it disabled until validated. |
@@ -285,6 +321,7 @@ on per profile only when you need them.
 | `memory-guard` | Enables guarded sleep and memory-protection helpers used around reconnect/dormant waits. |
 | `doh-transport` | Activates the DNS-over-HTTPS covert transport (`c2_doh::DohTransport`). When `dns_over_https = true` is set in `agent.toml`, the agent tunnels C2 traffic through DNS TXT queries sent to a DoH resolver. Requires a compatible server-side DNS-to-C2 bridge. |
 | `http-transport` | Activates the HTTP malleable-profile transport (`c2_http::HttpTransport`). When `cdn_relay = true` is set in `agent.toml`, the agent tunnels C2 traffic over HTTP/S using configurable header and URI profiles for traffic blending. |
+| `ssh-transport` | Activates the SSH-based C2 transport (`c2_ssh::SshTransport`). Experimental; intended for controlled deployments where SSH channeling is preferred. |
 | `env-validation` | Runs startup environment checks when explicitly enabled. Refusal is controlled by runtime policy fields such as `required_domain`, `refuse_in_vm`, `refuse_when_debugged`, and `sandbox_score_threshold`; otherwise signals are informational. See [docs/USER_GUIDE.md §10](docs/USER_GUIDE.md) for full details. |
 
 Run `orchestra-builder show-profile <name>` to inspect which features a
@@ -293,6 +330,32 @@ profile enables.
 Proc-macro build helpers are deterministic by default. Set
 `ORCHESTRA_STRING_CRYPT_SEED` only when you intentionally want a different,
 but still reproducible, string-obfuscation expansion.
+
+## Cross-platform compatibility
+
+### Windows-only feature paths
+
+- `direct-syscalls`, `manual-map`, and `unsafe-runtime-rewrite` are Windows-
+  specific compatibility paths and should be validated on Windows targets
+  before production rollout.
+
+### macOS-specific behavior
+
+- Persistence on macOS uses user-context `LaunchAgent` and `CronJob` paths.
+- `remote-assist` screen capture on macOS uses the system `screencapture`
+  utility.
+
+### System dependency requirements
+
+- `hci-research` with `evdev` on Linux requires `autoconf`, `automake`, and
+  `libtool` at build time.
+
+### IMDS requirement for cloud allowlisting
+
+- With `env-validation`, cloud instance allowlisting depends on IMDS
+  reachability at `169.254.169.254` during startup checks. Ensure local
+  firewall/proxy/seccomp policy allows metadata endpoint access when using
+  `cloud_instance_id`-based VM-refusal bypass controls.
 
 ## Security best practices
 

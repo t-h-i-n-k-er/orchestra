@@ -130,6 +130,19 @@ inventory for authorized troubleshooting and asset management.
 Compile both agent and server with `--features forward-secrecy` to add an
 ephemeral X25519 key exchange before application messages.
 
+### 6.6 Hollowing module (Windows, advanced)
+
+The `hollowing` crate provides Windows process hollowing for in-memory payload
+execution.
+
+- Current state: PE64 is the primary supported path; PE32/WOW64 support exists
+  but should be treated as an evolving compatibility path.
+- Workflow: create suspended target process, unmap image, map payload image,
+  apply relocations/import fixups, set thread context to payload entry, resume.
+- Limitation: remote manual-map/import repair may depend on ASLR layout
+  assumptions for shared system DLL mappings; this can break in hardened or
+  unusual session layouts where local and remote module bases diverge.
+
 ---
 ## 7. Key management
 
@@ -161,13 +174,16 @@ Forward the JSONL audit log to your SIEM.
 ---
 ## 9. Troubleshooting
 
-| Symptom | Likely cause |
-|---------|--------------|
-| `connection refused` | Control Center agent port unreachable, firewall, or wrong port. |
-| `AES-GCM authentication failed` | Pre-shared key mismatch. |
-| `tls handshake failure` | Server certificate pin mismatch or TLS material problem. |
-| `Path is not under any allowed root` | Add the directory to `allowed_paths` in `agent.toml`. |
-| Plugin load fails with `ELF magic` | Plugin built for the wrong target triple. |
+| Symptom | Likely cause | Suggested fix |
+|---------|--------------|---------------|
+| `connection refused` | Control Center agent port unreachable, firewall, or wrong port. | Verify `agent_addr`/port, routing, and host firewall policy. |
+| `AES-GCM authentication failed` | Pre-shared key mismatch. | Rotate and re-deploy matching shared secrets/profile values. |
+| `tls handshake failure` | Server certificate pin mismatch or TLS material problem. | Recalculate `server_cert_fingerprint` and verify cert/key pair paths. |
+| `Path is not under any allowed root` | Requested path is outside configured allow-list. | Add the required directory to `allowed_paths` in `agent.toml`. |
+| Plugin load fails with `ELF magic` | Plugin built for the wrong target triple. | Rebuild module for the agent target architecture/OS. |
+| Agent enters dormant state on cloud VM | IMDS unreachable, or `cloud_instance_id` not configured for VM-refusal bypass. | Ensure `169.254.169.254` is reachable, set `cloud_instance_id`, or enable `cloud_instance_allow_without_imds`. |
+| VM detected on legitimate cloud instance | Niche cloud provider hypervisor name is not in expected list. | Add provider-specific names to `vm_detection_extra_hypervisor_names` in `agent.toml`. |
+| Sandbox score unexpectedly high on Linux | Desktop-window fallback `/proc/*/environ` scan visibility is limited by process permissions. | Run with required capabilities/permissions, or treat the desktop-window indicator as non-enforcing telemetry. |
 
 For deeper diagnostics, run agent and server with
 `RUST_LOG=debug,orchestra=trace` and inspect the server audit log.
@@ -208,6 +224,48 @@ sandbox_score_threshold = 80
 
 If a configured refusal policy fails, the agent logs an error and enters a
 dormant sleep loop rather than continuing management actions.
+
+### Cloud instance whitelisting
+
+When `refuse_in_vm = true`, use cloud allowlisting to prevent known-good cloud
+instances from being treated as hostile VMs.
+
+Provider examples:
+
+```toml
+[malleable_profile]
+# Primary exact-match allowlist entry
+cloud_instance_id = "i-0123456789abcdef0"          # AWS EC2 example
+# cloud_instance_id = "2f1b4f3d-8d11-4c18-9d1f-..." # Azure VM id example
+# cloud_instance_id = "1234567890123456789"         # GCP numeric instance-id example
+
+# Optional fallback knobs when metadata identity is partially unavailable
+cloud_instance_allow_without_imds = false
+cloud_instance_fallback_ids = [
+   "i-012345*",          # AWS-style prefix pattern
+   "2f1b4f3d-*",         # Azure UUID-style prefix pattern
+   "1234567890*"         # GCP numeric prefix pattern
+]
+```
+
+IMDS reachability requirement:
+
+- The agent must be able to reach `169.254.169.254` during startup checks;
+   connectivity probes are tuned for a 200 ms connect timeout with bounded
+   retry behavior.
+
+Common causes of IMDS unreachability:
+
+- Host firewall rules blocking link-local metadata access.
+- Transparent HTTP proxy policy intercepting or denying metadata traffic.
+- Seccomp profiles that block `connect`/socket syscalls for the agent process.
+
+Fallback behavior summary:
+
+- `cloud_instance_allow_without_imds = true`: bypass can proceed when IMDS is
+  reachable but instance-id body parsing is unavailable.
+- `cloud_instance_fallback_ids`: allows operator-defined fallback identifiers
+  when metadata identity fetch is restricted in the deployment environment.
 
 ---
 ## 11. Transport compatibility
@@ -354,6 +412,19 @@ be explicitly started with `StartHciLogging` and is disabled on every
 restart.  Use only in compliance with applicable privacy regulations and
 with explicit written consent from the affected users.
 
+### 6.7 Hollowing module (Windows, advanced)
+
+The process-hollowing path is intended for advanced operator workflows and
+requires target/process compatibility validation.
+
+- PE64 is the primary supported payload format; PE32/WOW64 support is present
+  but should be treated as compatibility work-in-progress.
+- Workflow: spawn suspended target, unmap image, map payload sections, repair
+  relocations/imports, set thread context to payload entry, resume thread.
+- Remote manual-map import repair can be sensitive to ASLR layout mismatches;
+  in environments where local and remote module bases diverge, import
+  resolution may require fallback handling.
+
 ---
 
 ## 7. Encryption keys and the Builder
@@ -402,13 +473,16 @@ Pipe `audit.log` into your SIEM of choice (Splunk, Elastic, Loki, …).
 
 ## 9. Troubleshooting
 
-| Symptom                                        | Likely cause                                                       |
-|-----------------------------------------------|--------------------------------------------------------------------|
-| `connection refused`                          | Control Center agent port unreachable, firewall, or wrong port     |
-| `AES-GCM authentication failed`               | Pre-shared key mismatch                                            |
-| `tls handshake failure`                       | Server certificate pin mismatch or TLS material problem            |
-| `Path is not under any allowed root`          | Add the directory to `allowed_paths` in `agent.toml`               |
-| Plugin load fails with `ELF magic`            | Plugin built for the wrong target triple                           |
+| Symptom                                        | Likely cause                                                       | Suggested fix |
+|-----------------------------------------------|--------------------------------------------------------------------|---------------|
+| `connection refused`                          | Control Center agent port unreachable, firewall, or wrong port     | Verify listener bind, endpoint routing, and firewall policy. |
+| `AES-GCM authentication failed`               | Pre-shared key mismatch                                            | Regenerate/redeploy matching profile key material. |
+| `tls handshake failure`                       | Server certificate pin mismatch or TLS material problem            | Recompute fingerprint and verify certificate deployment chain. |
+| `Path is not under any allowed root`          | Requested file path falls outside policy allow-list                | Extend `allowed_paths` minimally for required workflows. |
+| Plugin load fails with `ELF magic`            | Plugin built for the wrong target triple                           | Rebuild plugin for the exact agent target triple. |
+| Agent enters dormant state on cloud VM        | IMDS is unreachable, or `cloud_instance_id` was not configured     | Confirm IMDS reachability, configure `cloud_instance_id`, or enable `cloud_instance_allow_without_imds`. |
+| VM detected on legitimate cloud instance      | Cloud provider hypervisor name is absent from expected list        | Add provider strings to `vm_detection_extra_hypervisor_names`. |
+| Sandbox score unexpectedly high on Linux      | `/proc/*/environ` desktop-process fallback is permission-limited   | Run with required capabilities/permissions or treat desktop-window signal as informational. |
 
 For deeper diagnostics, run the agent and server with
 `RUST_LOG=debug,orchestra=trace` and check the server audit log.
@@ -454,6 +528,31 @@ sandbox_score_threshold = 80
 | **Hypervisor / VM** | CPUID hypervisor bit (leaf 1, ECX bit 31); Linux: DMI strings (`vmware`, `virtualbox`, `kvm`, `qemu`, `xen`, `hyper-v`) from `/sys/class/dmi/id/`; Windows: registry entries under `HKLM\SYSTEM\CurrentControlSet\Services\{vmci,vboxguest,xen}`; MAC OUI prefixes associated with known VM vendors. |
 | **Domain match** | Case-insensitive string comparison against `USERDNSDOMAIN` (Windows), `HKLM\…\Tcpip\Parameters\Domain` (Windows registry), or `/proc/sys/kernel/domainname` (Linux). |
 | **Sandbox score** | Combined heuristic score from timing, resource, container, debugger, and VM indicators. Refusal requires `sandbox_score_threshold`. |
+
+### Cloud instance whitelisting
+
+Use cloud allowlisting when `refuse_in_vm = true` to keep trusted cloud
+instances from entering dormant mode.
+
+```toml
+[malleable_profile]
+cloud_instance_id = "i-0123456789abcdef0"   # AWS example
+# cloud_instance_id = "2f1b4f3d-8d11-..."   # Azure example
+# cloud_instance_id = "1234567890123456789" # GCP example
+
+cloud_instance_allow_without_imds = false
+cloud_instance_fallback_ids = ["i-012345*", "2f1b4f3d-*", "1234567890*"]
+```
+
+Operational notes:
+
+- Metadata endpoint `169.254.169.254` must be reachable during startup (200 ms
+  connect timeout profile).
+- Common blockers: local firewall policy, proxy interception, seccomp profile
+  restrictions on socket connect.
+- For niche providers, add names to
+  `vm_detection_extra_hypervisor_names` to improve expected-hypervisor
+  classification.
 
 ### Dormant state
 
