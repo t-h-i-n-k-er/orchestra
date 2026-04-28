@@ -667,51 +667,121 @@ pub mod macos {
     /// entry is removed, never any pre-existing @reboot entries (H-15 fix).
     const MAC_CRON_MARKER: &str = "# orchestra-persist";
 
+    /// Read current crontab as UTF-8 (lossy) text.
+    ///
+    /// Treat "no crontab for <user>" as an empty crontab so install/remove can
+    /// safely proceed without shell pipelines.
+    fn read_current_crontab() -> Result<String> {
+        let out = std::process::Command::new("crontab")
+            .arg("-l")
+            .output()
+            .map_err(|e| anyhow!("CronJob::read_current_crontab: {}", e))?;
+
+        if out.status.success() {
+            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+        }
+
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stderr_lower = stderr.to_ascii_lowercase();
+        if stderr_lower.contains("no crontab for") {
+            return Ok(String::new());
+        }
+
+        let detail = if stderr.is_empty() {
+            "no stderr output".to_string()
+        } else {
+            stderr
+        };
+        Err(anyhow!(
+            "CronJob::read_current_crontab: crontab -l failed: {}",
+            detail
+        ))
+    }
+
+    /// Write the full crontab contents via `crontab -` using stdin piping.
+    fn write_crontab(contents: &str) -> Result<()> {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let mut child = std::process::Command::new("crontab")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("CronJob::write_crontab: spawn failed: {}", e))?;
+
+        {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .ok_or_else(|| anyhow!("CronJob::write_crontab: missing stdin pipe"))?;
+            stdin
+                .write_all(contents.as_bytes())
+                .map_err(|e| anyhow!("CronJob::write_crontab: stdin write failed: {}", e))?;
+        }
+
+        let out = child
+            .wait_with_output()
+            .map_err(|e| anyhow!("CronJob::write_crontab: wait failed: {}", e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                "no stderr output".to_string()
+            } else {
+                stderr
+            };
+            return Err(anyhow!(
+                "CronJob::write_crontab: crontab - failed: {}",
+                detail
+            ));
+        }
+        Ok(())
+    }
+
+    fn filtered_crontab_without_marker(current: &str) -> String {
+        let filtered = current
+            .lines()
+            .filter(|line| !line.contains(MAC_CRON_MARKER))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if filtered.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", filtered)
+        }
+    }
+
     impl Persist for CronJob {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
             let exe = executable_path.to_string_lossy();
             let quoted_exe = shell_quote_single(exe.as_ref());
-            let quoted_marker = shell_quote_single(MAC_CRON_MARKER);
             let entry = format!(
                 "@reboot {} >/dev/null 2>&1 {}",
                 quoted_exe, MAC_CRON_MARKER
             );
-            let quoted_entry = shell_quote_single(&entry);
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!(
-                    "(crontab -l 2>/dev/null | grep -v {}; echo {}) | crontab -",
-                    quoted_marker, quoted_entry
-                ))
-                .status()
-                .map_err(|e| anyhow!("CronJob::install: {}", e))?;
-            if !out.success() {
-                return Err(anyhow!("CronJob::install: crontab command failed"));
-            }
+
+            let current = read_current_crontab()?;
+            let mut updated = filtered_crontab_without_marker(&current);
+            updated.push_str(&entry);
+            updated.push('\n');
+            write_crontab(&updated)?;
+
             log::info!("CronJob::install: added @reboot entry for '{}'", exe);
             Ok(())
         }
 
         fn remove(&self) -> Result<()> {
-            let quoted_marker = shell_quote_single(MAC_CRON_MARKER);
-            let _ = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!(
-                    "crontab -l 2>/dev/null | grep -v {} | crontab -",
-                    quoted_marker
-                ))
-                .status();
+            let current = read_current_crontab()?;
+            let updated = filtered_crontab_without_marker(&current);
+            write_crontab(&updated)?;
             log::info!("CronJob::remove: removed orchestra @reboot entry");
             Ok(())
         }
 
         fn verify(&self) -> Result<bool> {
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg("crontab -l 2>/dev/null")
-                .output()
-                .map_err(|e| anyhow!("CronJob::verify: {}", e))?;
-            Ok(String::from_utf8_lossy(&out.stdout).contains(MAC_CRON_MARKER))
+            let current = read_current_crontab()?;
+            Ok(current.contains(MAC_CRON_MARKER))
         }
     }
 
