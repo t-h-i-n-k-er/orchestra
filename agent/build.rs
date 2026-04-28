@@ -144,6 +144,19 @@ fn make_rng() -> Xoshiro256PlusPlus {
 fn main() {
     println!("cargo:rerun-if-env-changed=ORCHESTRA_KEY");
     println!("cargo:rerun-if-env-changed=ORCHESTRA_NONCE");
+    println!("cargo:rerun-if-env-changed=CODE_TRANSFORM_SEED");
+
+    // ── CODE_TRANSFORM_SEED ─────────────────────────────────────────────────
+    // Used by the `#[code_transform]` attribute macro to drive the
+    // instruction-substitution and basic-block reordering passes.
+    // If the operator sets CODE_TRANSFORM_SEED explicitly the same binary is
+    // produced on every build (reproducible); otherwise a fresh seed is
+    // derived from the same entropy pool used for ORCHESTRA_KEY.
+    if std::env::var("CODE_TRANSFORM_SEED").is_err() {
+        let mut rng = make_rng();
+        let seed = rng.next_u64();
+        println!("cargo:rustc-env=CODE_TRANSFORM_SEED={}", seed);
+    }
 
     // ── ORCHESTRA_KEY (32 bytes = 64 hex chars) ────────────────────────────
     if std::env::var("ORCHESTRA_KEY").is_err() {

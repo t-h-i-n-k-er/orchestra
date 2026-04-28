@@ -18,6 +18,8 @@ members = [
     "string_crypt",
     "pe_resolve",
     "junk_macro",
+    "code_transform",
+    "code_transform_macro",
 ]
 
 [workspace.package]
