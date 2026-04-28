@@ -1,7 +1,8 @@
 // Requires russh >= 0.46
 //! SSH covert transport for the Orchestra agent.
 //!
-//! # Status: EXPERIMENTAL — enabled via `--features ssh-transport`
+//! # Status: EXPERIMENTAL - not recommended for production use.
+//! Enabled only when built with `--features ssh-transport`.
 //!
 //! This module implements a [`Transport`] that tunnels agent messages through
 //! an SSH session channel.  The connection flow is:

@@ -1,6 +1,7 @@
 //! DNS-over-HTTPS (DoH) covert transport for the Orchestra agent.
 //!
-//! # Status: EXPERIMENTAL — not wired into the default startup path
+//! # Status: EXPERIMENTAL - not recommended for production use.
+//! Enabled only when built with `--features doh-transport`.
 //!
 //! This module implements a `Transport` that tunnels agent messages inside DNS
 //! TXT queries sent to a DoH resolver (Cloudflare, Google, etc.).  The C2

