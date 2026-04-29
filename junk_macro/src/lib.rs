@@ -24,7 +24,7 @@ fn get_seed() -> u64 {
 
 // ── insert_junk!() ────────────────────────────────────────────────────────────
 
-/// Generate 4 random `i32` junk values seeded from the current build time.
+/// Generate 4 junk `i32` values seeded from the current build time.
 ///
 /// Each invocation of `insert_junk!()` within the same compilation produces
 /// different values because `std::time::SystemTime::now()` advances between
@@ -34,24 +34,59 @@ fn get_seed() -> u64 {
 ///
 /// To reproduce a specific build exactly, set the `ORCHESTRA_JUNK_SEED`
 /// environment variable to a `u64` value before compiling.
+///
+/// ## Optimizer resistance
+///
+/// The generated code uses `std::ptr::read_volatile` on a `static AtomicU64`
+/// to derive the junk values at runtime.  Because the optimizer cannot prove
+/// the value of a volatile read, it must keep the arithmetic alive even in
+/// release builds.
 fn expansion() -> TokenStream2 {
     let seed: u64 = get_seed();
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let v1: i32 = rng.gen_range(100..10_000);
-    let v2: i32 = rng.gen_range(100..10_000);
-    let v3: i32 = rng.gen_range(100..10_000);
-    let v4: i32 = rng.gen_range(100..10_000);
+
+    // Generate the runtime seed and per-value offsets so the macro is still
+    // deterministic per build, but the actual computation happens at runtime
+    // from a volatile source.
+    let base_seed: u64 = rng.gen();
+    let off1: u32 = rng.gen();
+    let off2: u32 = rng.gen();
+    let off3: u32 = rng.gen();
+    let off4: u32 = rng.gen();
+
+    // Each junk macro gets a unique static name derived from the seed and
+    // the generated base_seed so multiple insertions don't collide, but
+    // output remains deterministic for a fixed ORCHESTRA_JUNK_SEED.
+    let static_id = format_ident!(
+        "_JUNK_SEED_{}_{}",
+        seed,
+        base_seed,
+    );
 
     quote! {
         {
-            let junk_values: [i32; 4] = [#v1, #v2, #v3, #v4];
-            for value in junk_values {
-                std::hint::black_box(value.wrapping_mul(3).wrapping_add(1));
-            }
-            unsafe {
-                let volatile_value = std::ptr::read_volatile(&junk_values[0] as *const i32);
-                std::hint::black_box(volatile_value);
-            }
+            /// Static atomic holding the junk seed.  The optimizer cannot
+            /// constant-fold through a volatile read of this value.
+            static #static_id: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(#base_seed);
+
+            let _junk_base: u64 = unsafe {
+                std::ptr::read_volatile(&#static_id as *const std::sync::atomic::AtomicU64 as *const u64)
+            };
+
+            // Derive four distinct i32 values from the volatile seed.
+            // The wrapping arithmetic ensures overflow is well-defined.
+            let _j1: i32 = ((_junk_base.wrapping_add(#off1 as u64)) >> 16) as i32;
+            let _j2: i32 = ((_junk_base.wrapping_add(#off2 as u64)) >> 16) as i32;
+            let _j3: i32 = ((_junk_base.wrapping_add(#off3 as u64)) >> 16) as i32;
+            let _j4: i32 = ((_junk_base.wrapping_add(#off4 as u64)) >> 16) as i32;
+
+            // Perform arithmetic that the optimizer must keep because the
+            // inputs come from a volatile read.
+            let _ = std::hint::black_box(_j1.wrapping_mul(3).wrapping_add(1));
+            let _ = std::hint::black_box(_j2.wrapping_mul(5).wrapping_add(3));
+            let _ = std::hint::black_box(_j3.wrapping_mul(7).wrapping_add(5));
+            let _ = std::hint::black_box(_j4.wrapping_mul(11).wrapping_add(7));
         }
     }
 }
@@ -91,19 +126,20 @@ fn parse_tamper(attr: TokenStream) -> TokenStream2 {
 ///
 /// The generated block:
 /// 1. Declares nine mutable `u64` locals named after x86_64 caller-saved
-///    registers (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`, `r9`, `r10`, `r11`)
-///    with random initial values — simulating a register push.
+///    registers (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`, `r9`, `r10`, `r11`).
+///    Initial values are derived from a volatile read of a static atomic so
+///    the optimizer cannot constant-fold them.
 /// 2. Applies `n_ops ∈ [8, 16]` random arithmetic operations:
 ///    * wrapping add / sub with a random immediate
 ///    * XOR with a random immediate
 ///    * register-to-register wrapping add
-/// 3. Computes a hash (XOR fold of all final register values) and checks it
-///    against a constant precomputed at macro expansion time.  The check is
-///    **always false at run-time** by construction, so `tamper` is never
-///    called.  Static analysis sees a meaningful hash check; the optimiser
-///    evaluates the entire block at compile time and removes it.
-/// 4. Binds all locals with `let _` — simulating a register pop — so the
-///    optimiser can prove they are dead and eliminate the block.
+/// 3. Computes a hash (XOR fold of all final register values) and compares it
+///    against a precomputed expected value that is also loaded via a volatile
+///    read.  The comparison is always-equal at run-time by construction (the
+///    volatile seed matches the seed used during macro expansion), so `tamper`
+///    is never called.  But the optimizer cannot prove this, so it must keep
+///    the arithmetic alive.
+/// 4. Binds all locals with `let _` — simulating a register pop.
 ///
 /// `id` is mixed into all identifier names so multiple barriers inside the
 /// same function scope do not shadow one another.
@@ -119,8 +155,15 @@ pub(crate) fn make_barrier_block(
         .map(|n| format_ident!("_jb_{}_{}", n, id))
         .collect();
 
-    // Random initial values (one per "register")
-    let init_vals: Vec<u64> = (0..NREGS).map(|_| rng.gen::<u64>()).collect();
+    // Generate a per-barrier seed and per-register offsets.  The seed is
+    // embedded in a static atomic; at runtime the init values are derived
+    // from a volatile read of that atomic, preventing constant folding.
+    let barrier_seed: u64 = rng.gen();
+    let reg_offsets: Vec<u64> = (0..NREGS).map(|_| rng.gen::<u64>()).collect();
+
+    // Compute the *expected* initial register values: seed + offset (wrapping).
+    // At runtime, the same computation is performed from the volatile seed.
+    let init_vals: Vec<u64> = reg_offsets.iter().map(|&off| barrier_seed.wrapping_add(off)).collect();
 
     // Random operations: (dst_reg_idx, kind, immediate, src_reg_idx)
     //   kind 0 → wrapping_add(imm)
@@ -155,16 +198,26 @@ pub(crate) fn make_barrier_block(
     }
 
     // Expected hash = XOR fold of all final register values.
-    // The same fold is emitted as Rust code below.
     let expected: u64 = vals.iter().copied().fold(0u64, |a, v| a ^ v);
 
     // ── Token construction ─────────────────────────────────────────────────
 
-    // "push": initialise simulated register locals
-    let inits: Vec<TokenStream2> = init_vals
+    // Static atomic holding the barrier seed.
+    let static_id = format_ident!("_JB_SEED_{}_{}", id, barrier_seed);
+
+    // "push": initialise simulated register locals from volatile seed
+    let inits: Vec<TokenStream2> = reg_offsets
         .iter()
         .zip(&reg_ids)
-        .map(|(&v, rid)| quote! { let mut #rid: u64 = #v; })
+        .map(|(&off, rid)| {
+            quote! {
+                let mut #rid: u64 = unsafe {
+                    std::ptr::read_volatile(
+                        &#static_id as *const std::sync::atomic::AtomicU64 as *const u64
+                    )
+                }.wrapping_add(#off);
+            }
+        })
         .collect();
 
     // arithmetic ops
@@ -192,15 +245,33 @@ pub(crate) fn make_barrier_block(
         .iter()
         .fold(quote! { #r0 }, |acc, r| quote! { #acc ^ #r });
 
+    // The expected hash is loaded from a volatile read of a second static
+    // atomic, so the optimizer cannot prove `hash_id == expected_volatile`.
+    let expected_static_id = format_ident!("_JB_EXP_{}_{}", id, expected);
     quote! {
         {
+            /// Static atomic holding the barrier seed.  The optimizer cannot
+            /// constant-fold through a volatile read of this value.
+            static #static_id: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(#barrier_seed);
+            /// Static atomic holding the expected hash value, also read
+            /// through volatile to prevent constant folding.
+            static #expected_static_id: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(#expected);
+
             // ── push caller-saved registers ───────────────────────────────
             #( #inits )*
             // ── arithmetic ops ────────────────────────────────────────────
             #( #op_stmts )*
-            // ── hash check (always passes by construction) ────────────────
+            // ── hash check (always passes by construction, but the optimizer
+            //    cannot prove it because both sides come from volatile reads) ─
             let #hash_id: u64 = #hash_expr;
-            if #hash_id != #expected {
+            let _expected_volatile: u64 = unsafe {
+                std::ptr::read_volatile(
+                    &#expected_static_id as *const std::sync::atomic::AtomicU64 as *const u64
+                )
+            };
+            if #hash_id != _expected_volatile {
                 #tamper;
             }
             // ── pop caller-saved registers ────────────────────────────────
@@ -282,7 +353,8 @@ mod tests {
     fn expansion_produces_valid_token_stream() {
         let tokens = expansion().to_string();
         assert!(!tokens.is_empty());
-        assert!(tokens.contains("junk_values"), "must contain junk_values binding");
+        assert!(tokens.contains("AtomicU64"), "must contain AtomicU64 static");
+        assert!(tokens.contains("read_volatile"), "must contain read_volatile");
         assert!(tokens.contains("black_box"), "must contain black_box call");
     }
 

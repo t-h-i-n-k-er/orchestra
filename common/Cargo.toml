@@ -19,6 +19,7 @@ rustls = { version = "0.23.38", default-features = false, features = ["ring", "s
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2.2.0"
 hkdf = { version = "0.12" }
+hmac = { version = "0.12", optional = true }
 zeroize = "1"
 
 # Optional: Ed25519 signatures for module verification.
@@ -32,7 +33,7 @@ bincode = "1.3.3"
 [features]
 module-signatures = ["dep:ed25519-dalek"]
 dangerous-tls = []
-forward-secrecy = ["dep:x25519-dalek"]
+forward-secrecy = ["dep:x25519-dalek", "dep:hmac"]
 
 [dev-dependencies]
 serde_json = "1.0"

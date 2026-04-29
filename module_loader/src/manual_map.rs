@@ -189,6 +189,8 @@ unsafe fn get_proc_address_by_ordinal_manual(module: *mut c_void, ordinal: u16) 
     let export_dir_rva = nt_headers.OptionalHeader.DataDirectory
         [IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
         .VirtualAddress;
+    let export_dir_size =
+        nt_headers.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT as usize].Size;
     if export_dir_rva == 0 {
         return std::ptr::null_mut();
     }
@@ -211,6 +213,42 @@ unsafe fn get_proc_address_by_ordinal_manual(module: *mut c_void, ordinal: u16) 
     if func_rva == 0 {
         return std::ptr::null_mut();
     }
+
+    // Forwarded export check: if func_rva falls within the export directory
+    // range, the bytes at func_rva are a null-terminated ASCII forwarder
+    // string of the form "ModuleName.FunctionName" (or "ModuleName.#Ordinal").
+    if func_rva >= export_dir_rva && func_rva < export_dir_rva + export_dir_size {
+        let fwd_ptr = base.add(func_rva as usize) as *const u8;
+        let mut fwd_len = 0;
+        while *fwd_ptr.add(fwd_len) != 0 {
+            fwd_len += 1;
+        }
+        let fwd_slice = std::slice::from_raw_parts(fwd_ptr, fwd_len);
+        if let Ok(fwd_str) = std::str::from_utf8(fwd_slice) {
+            if let Some(dot) = fwd_str.find('.') {
+                let target_mod = &fwd_str[..dot];
+                let target_fn = &fwd_str[dot + 1..];
+                // Try PEB walk first, then fall back to a ntdll-direct load.
+                let mut mod_handle = get_module_handle_peb(target_mod);
+                if mod_handle.is_null() {
+                    mod_handle = load_via_ldr(target_mod);
+                }
+                if !mod_handle.is_null() {
+                    // The forwarder target may be a name ("FuncName") or an
+                    // ordinal reference ("#123").  Handle both forms.
+                    if let Some(ordinal_str) = target_fn.strip_prefix('#') {
+                        if let Ok(target_ord) = ordinal_str.parse::<u16>() {
+                            return get_proc_address_by_ordinal_manual(mod_handle, target_ord);
+                        }
+                    } else {
+                        return get_proc_address_manual(mod_handle, target_fn);
+                    }
+                }
+            }
+        }
+        return std::ptr::null_mut();
+    }
+
     base.add(func_rva as usize) as *mut c_void
 }
 
@@ -548,9 +586,17 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                 // Walk the INT (use IAT as fallback if INT is zero) and write
                 // resolved addresses into the IAT slots.
                 //
-                // Each IMAGE_THUNK_DATA64 entry is an 8-byte value:
+                // PE32+ (64-bit): each IMAGE_THUNK_DATA64 entry is 8 bytes.
                 //   bit 63 set   → ordinal import (low 16 bits = ordinal)
                 //   bit 63 clear → RVA to IMAGE_IMPORT_BY_NAME (2-byte hint + name)
+                // PE32 (32-bit): each IMAGE_THUNK_DATA32 entry is 4 bytes.
+                //   bit 31 set   → ordinal import (low 16 bits = ordinal)
+                //   bit 31 clear → RVA to IMAGE_IMPORT_BY_NAME
+                let is_pe32_plus = optional_header.standard_fields.magic == 0x020B;
+                let thunk_entry_size: usize = if is_pe32_plus { 8 } else { 4 };
+                let ordinal_flag_mask: u64 = if is_pe32_plus { 1u64 << 63 } else { 1u64 << 31 };
+                let rva_mask: u64 = if is_pe32_plus { 0x7FFF_FFFF_FFFF_FFFF } else { 0x7FFF_FFFF };
+
                 let thunk_base_rva = if int_rva != 0 { int_rva } else { iat_rva };
                 if thunk_base_rva == 0 || iat_rva == 0 {
                     desc_va += DELAY_DESCR_SIZE;
@@ -559,24 +605,28 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
 
                 let mut slot_idx = 0usize;
                 loop {
-                    let thunk_rva = thunk_base_rva + slot_idx * 8;
-                    let iat_slot_rva = iat_rva + slot_idx * 8;
-                    if thunk_rva + 8 > image_size || iat_slot_rva + 8 > image_size {
+                    let thunk_rva = thunk_base_rva + slot_idx * thunk_entry_size;
+                    let iat_slot_rva = iat_rva + slot_idx * thunk_entry_size;
+                    if thunk_rva + thunk_entry_size > image_size || iat_slot_rva + thunk_entry_size > image_size {
                         break;
                     }
 
-                    let thunk_val = *(base_ptr.add(thunk_rva) as *const u64);
+                    let thunk_val: u64 = if is_pe32_plus {
+                        *(base_ptr.add(thunk_rva) as *const u64)
+                    } else {
+                        *(base_ptr.add(thunk_rva) as *const u32) as u64
+                    };
                     if thunk_val == 0 {
                         break;
                     }
 
-                    let proc_addr: *mut c_void = if thunk_val & (1u64 << 63) != 0 {
+                    let proc_addr: *mut c_void = if thunk_val & ordinal_flag_mask != 0 {
                         // Ordinal import — look up directly in the export ordinal table.
                         let ordinal = (thunk_val & 0xFFFF) as u16;
                         get_proc_address_by_ordinal_manual(dll_handle, ordinal)
                     } else {
                         // Named import: RVA to IMAGE_IMPORT_BY_NAME (+2 bytes hint, then name).
-                        let ibn_rva = (thunk_val & 0x7FFF_FFFF_FFFF_FFFF) as usize;
+                        let ibn_rva = (thunk_val & rva_mask) as usize;
                         if ibn_rva + 2 >= image_size {
                             slot_idx += 1;
                             continue;
@@ -598,7 +648,12 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                         );
                     } else {
                         // Write the resolved address into the IAT slot.
-                        *(image_base.add(iat_slot_rva) as *mut usize) = proc_addr as usize;
+                        // Use the correct slot width for the image's PE format.
+                        if is_pe32_plus {
+                            *(image_base.add(iat_slot_rva) as *mut u64) = proc_addr as u64;
+                        } else {
+                            *(image_base.add(iat_slot_rva) as *mut u32) = proc_addr as u32;
+                        }
                     }
 
                     slot_idx += 1;

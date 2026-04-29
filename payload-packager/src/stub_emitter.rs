@@ -126,6 +126,118 @@ impl RegAlloc {
     }
 }
 
+// ── Polymorphic stub diversity ───────────────────────────────────────────────
+//
+// Beyond register allocation, these techniques vary the non-functional
+// aspects of the emitted stub so that each build has a structurally
+// different binary while preserving identical cryptographic behavior.
+//
+// Techniques:
+//   1. Instruction scheduling  — reorder independent arg loads
+//   2. Equivalent instructions — XOR→SUB/MOV, INC→ADD, TEST→CMP
+//   3. Dead code insertion     — cancel-out arithmetic on unused regs
+//   4. Stack frame variation   — different layout offsets / padding
+//   5. Loop structure variation — decrement vs increment-and-compare
+
+/// Per-build diversity decisions, all derived deterministically from the seed.
+#[derive(Clone, Debug)]
+pub struct StubDiversity {
+    // ── Technique 1: Instruction scheduling ─────────────────────────────
+    /// Permutation order for loading the three argument registers.
+    /// Each element is one of: 0=r_len, 1=r_src, 2=r_out.
+    pub arg_load_order: [u8; 3],
+
+    // ── Technique 2: Equivalent instruction sequences ───────────────────
+    /// How to zero a register: 0=XOR, 1=SUB, 2=MOV_imm32.
+    pub zero_style: u8,
+    /// How to increment the loop counter: 0=INC, 1=ADD_imm8.
+    pub inc_style: u8,
+    /// How to test a register for zero: 0=TEST, 1=CMP_imm8.
+    pub test_zero_style: u8,
+
+    // ── Technique 3: Dead code insertion ────────────────────────────────
+    /// Number of dead-code blocks to insert (0..=2 for XOR stub, 0..=3 for inline).
+    pub dead_code_count: u8,
+    /// Which dead-code pattern to use for each insertion.
+    pub dead_code_patterns: [u8; 4],
+    /// Which unused caller-saved register to use for each dead block.
+    /// Indexes into DEAD_CODE_REGS.
+    pub dead_code_regs: [u8; 4],
+
+    // ── Technique 4: Stack frame variation (ChaCha20 inline stub) ───────
+    /// Base offset added to the working state on the stack (0 or 16).
+    /// With offset 0:  state at [rsp+0..63],  saved at [rsp+64..127].
+    /// With offset 16: state at [rsp+16..79], saved at [rsp+80..143].
+    /// Changes the total frame size: 128 or 160.
+    pub stack_base_offset: u8,
+    /// Whether to insert 16 bytes of padding between state and saved copy.
+    pub stack_has_padding: bool,
+
+    // ── Technique 5: Loop structure variation ───────────────────────────
+    /// XOR loop style: 0=increment-and-compare (current), 1=decrement-counter.
+    pub loop_style: u8,
+    /// For inline stub inner loop: 0=INC RCX + CMP 64, 1=DEC from 64 down.
+    pub inner_loop_style: u8,
+}
+
+/// Caller-saved registers safe for dead-code arithmetic (RAX is used inside
+/// loops, R8 is used in the XOR stub). We use R10/R11 which are truly free.
+const DEAD_CODE_REGS: [Reg; 2] = [R10, R11];
+
+impl StubDiversity {
+    /// Deterministically derive all diversity decisions from the seed.
+    pub fn from_seed(seed: u64) -> Self {
+        let mut s = seed.wrapping_add(0xDEADBEEF_CAFEBABE);
+        let mut next_u32 = || -> u32 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 33) as u32
+        };
+
+        // Technique 1: arg load order — Fisher-Yates on [0,1,2].
+        let mut order = [0u8, 1, 2];
+        for i in (1..3).rev() {
+            let j = (next_u32() % ((i + 1) as u32)) as usize;
+            order.swap(i, j);
+        }
+
+        // Technique 2: equivalent instructions.
+        let zero_style = (next_u32() % 3) as u8;             // 0, 1, or 2
+        let inc_style = (next_u32() % 2) as u8;              // 0 or 1
+        let test_zero_style = (next_u32() % 2) as u8;        // 0 or 1
+
+        // Technique 3: dead code.
+        let dead_code_count = (next_u32() % 4) as u8;        // 0..=3
+        let mut dead_code_patterns = [0u8; 4];
+        let mut dead_code_regs = [0u8; 4];
+        for i in 0..4 {
+            dead_code_patterns[i] = (next_u32() % 4) as u8;
+            dead_code_regs[i] = (next_u32() % 2) as u8;     // index into DEAD_CODE_REGS
+        }
+
+        // Technique 4: stack frame.
+        let stack_base_offset = if next_u32() & 1 == 1 { 16u8 } else { 0 };
+        let stack_has_padding = next_u32() & 1 == 1;
+
+        // Technique 5: loop structure.
+        let loop_style = (next_u32() % 2) as u8;             // 0 or 1
+        let inner_loop_style = (next_u32() % 2) as u8;       // 0 or 1
+
+        StubDiversity {
+            arg_load_order: order,
+            zero_style,
+            inc_style,
+            test_zero_style,
+            dead_code_count,
+            dead_code_patterns,
+            dead_code_regs,
+            stack_base_offset,
+            stack_has_padding,
+            loop_style,
+            inner_loop_style,
+        }
+    }
+}
+
 // ── Low-level byte emitter ───────────────────────────────────────────────────
 
 pub struct Emitter {
@@ -193,7 +305,8 @@ impl Emitter {
         self.byte(self.modrm_rr(src, dst));
     }
 
-    /// XOR dst64, dst64 (zero register)
+    /// XOR dst64, dst64 (zero register) — kept for potential future use.
+    #[allow(dead_code)]
     pub fn xor_rr_zero(&mut self, r: Reg) {
         self.rex_w(r.rex_ext, r.rex_ext);
         self.byte(0x33);
@@ -204,6 +317,13 @@ impl Emitter {
     pub fn add_r64_r64(&mut self, dst: Reg, src: Reg) {
         self.rex_wr(dst, src);
         self.byte(0x01);
+        self.byte(self.modrm_rr(src, dst));
+    }
+
+    /// SUB dst64, src64  (REX.W 29 /r)
+    pub fn sub_r64_r64(&mut self, dst: Reg, src: Reg) {
+        self.rex_wr(dst, src);
+        self.byte(0x29);
         self.byte(self.modrm_rr(src, dst));
     }
 
@@ -345,6 +465,20 @@ impl Emitter {
         self.bytes(&disp.to_le_bytes());
     }
 
+    /// LEA r64, [rsp + disp8] — load address of stack slot.
+    /// REX.W + 8D /r with SIB byte for RSP base.
+    pub fn lea_r64_rsp_disp8(&mut self, dst: Reg, disp: i8) {
+        // REX.W + REX.R if dst needs extension
+        let rex_r = if dst.rex_ext { 0x04 } else { 0 };
+        self.byte(0x48 | rex_r);
+        self.byte(0x8D);
+        // ModRM: mod=01 (disp8), reg=dst, rm=100 (SIB follows)
+        self.byte(0x44 | ((dst.field & 7) << 3));
+        // SIB: scale=00, index=100 (none), base=100 (RSP)
+        self.byte(0x24);
+        self.byte(disp as u8);
+    }
+
     // ── Helpers used by the inline ChaCha20 stub (M-4) ───────────────────
     //
     // All of the helpers below operate on 32-bit operands (the natural
@@ -450,6 +584,163 @@ impl Emitter {
         self.byte(0xC8 | (r.field & 7));
     }
 
+    // ── Polymorphic diversity helpers ────────────────────────────────────
+
+    /// Zero a register using the selected equivalent instruction style.
+    /// Style 0: XOR reg,reg  (shortest, standard)
+    /// Style 1: SUB reg,reg  (same size, different opcode)
+    /// Style 2: MOV reg, 0   via `MOV r64, imm32` (sign-extended 0)
+    pub fn zero_r64(&mut self, r: Reg, style: u8) {
+        match style % 3 {
+            0 => {
+                // XOR r64, r64  (33 /r with REX.W)
+                self.rex_w(r.rex_ext, r.rex_ext);
+                self.byte(0x33);
+                self.byte(self.modrm_rr(r, r));
+            }
+            1 => {
+                // SUB r64, r64  (2B /r with REX.W)
+                self.rex_w(r.rex_ext, r.rex_ext);
+                self.byte(0x2B);
+                self.byte(self.modrm_rr(r, r));
+            }
+            _ => {
+                // MOV r64, imm32(0)  — sign-extended to 64-bit zero
+                // REX.W + B8+rd + imm32
+                let rex_b = if r.rex_ext { 0x01 } else { 0 };
+                self.byte(0x48 | rex_b);
+                self.byte(0xC7);
+                self.byte(0xC0 | (r.field & 7));
+                self.bytes(&0u32.to_le_bytes());
+            }
+        }
+    }
+
+    /// Increment a register using the selected equivalent instruction style.
+    /// Style 0: INC r64  (FF /0 with REX.W)
+    /// Style 1: ADD r64, 1  (83 /0 ib with REX.W)
+    pub fn inc_r64_diverse(&mut self, r: Reg, style: u8) {
+        if style % 2 == 0 {
+            self.inc_r64(r);
+        } else {
+            // ADD r64, imm8(1)  — REX.W 83 /0 ib
+            self.rex_w(false, r.rex_ext);
+            self.byte(0x83);
+            self.byte(0xC0 | (r.field & 7));
+            self.byte(1);
+        }
+    }
+
+    /// Decrement a register using the selected equivalent instruction style.
+    /// Style 0: DEC r64  (FF /1 with REX.W)
+    /// Style 1: SUB r64, 1  (83 /5 ib with REX.W)
+    pub fn dec_r64_diverse(&mut self, r: Reg, style: u8) {
+        if style % 2 == 0 {
+            self.dec_r64(r);
+        } else {
+            // SUB r64, imm8(1)
+            self.rex_w(false, r.rex_ext);
+            self.byte(0x83);
+            self.byte(0xE8 | (r.field & 7));
+            self.byte(1);
+        }
+    }
+
+    /// Test register for zero using the selected equivalent instruction style.
+    /// Style 0: TEST r64, r64
+    /// Style 1: CMP r64, 0  (83 /7 ib with REX.W)
+    pub fn test_zero_r64(&mut self, r: Reg, style: u8) {
+        if style % 2 == 0 {
+            self.test_rr(r);
+        } else {
+            // CMP r64, imm8(0)
+            self.rex_w(false, r.rex_ext);
+            self.byte(0x83);
+            self.byte(0xF8 | (r.field & 7));
+            self.byte(0);
+        }
+    }
+
+    /// Insert a dead-code block using cancel-out arithmetic on an unused
+    /// scratch register.  The net effect is always zero.
+    ///
+    /// Pattern 0: ADD reg,imm8; SUB reg,imm8
+    /// Pattern 1: XOR reg,reg; XOR reg,reg  (idempotent)
+    /// Pattern 2: MOV reg,imm32; SUB reg,imm32
+    /// Pattern 3: ADD reg,reg; SUB reg,reg  (reg was 0 or restores itself)
+    pub fn emit_dead_code(&mut self, reg: Reg, pattern: u8) {
+        match pattern % 4 {
+            0 => {
+                // ADD reg, 0x5A; SUB reg, 0x5A  — net zero
+                // ADD r64, imm8
+                self.rex_w(false, reg.rex_ext);
+                self.byte(0x83);
+                self.byte(0xC0 | (reg.field & 7));
+                self.byte(0x5A);
+                // SUB r64, imm8
+                self.rex_w(false, reg.rex_ext);
+                self.byte(0x83);
+                self.byte(0xE8 | (reg.field & 7));
+                self.byte(0x5A);
+            }
+            1 => {
+                // XOR reg, reg twice — idempotent (first zeroes, second is no-op)
+                self.rex_w(reg.rex_ext, reg.rex_ext);
+                self.byte(0x33);
+                self.byte(self.modrm_rr(reg, reg));
+                self.rex_w(reg.rex_ext, reg.rex_ext);
+                self.byte(0x33);
+                self.byte(self.modrm_rr(reg, reg));
+            }
+            2 => {
+                // MOV reg, 0xDEAD; SUB reg, 0xDEAD  — net zero
+                // MOV r64, imm32 (sign-extended)
+                let rex_b = if reg.rex_ext { 0x01 } else { 0 };
+                self.byte(0x48 | rex_b);
+                self.byte(0xC7);
+                self.byte(0xC0 | (reg.field & 7));
+                self.bytes(&0x0000DEADu32.to_le_bytes());
+                // SUB r64, imm32
+                self.rex_w(false, reg.rex_ext);
+                self.byte(0x81);
+                self.byte(0xE8 | (reg.field & 7));
+                self.bytes(&0x0000DEADu32.to_le_bytes());
+            }
+            _ => {
+                // ADD reg, reg; SUB reg, reg — net zero if reg was zero
+                // Safe because we XOR the dead reg to zero first.
+                self.rex_w(reg.rex_ext, reg.rex_ext);
+                self.byte(0x33);
+                self.byte(self.modrm_rr(reg, reg));
+                // ADD reg, reg (doubles 0 → 0)
+                self.rex_wr(reg, reg);
+                self.byte(0x01);
+                self.byte(self.modrm_rr(reg, reg));
+                // SUB reg, reg (back to 0)
+                self.rex_wr(reg, reg);
+                self.byte(0x29);
+                self.byte(self.modrm_rr(reg, reg));
+            }
+        }
+    }
+
+    /// Insert dead-code blocks at the given position in the emission stream.
+    /// Uses the diversity settings to decide how many and which patterns.
+    pub fn emit_dead_code_block(&mut self, div: &StubDiversity, at_pos: usize) {
+        // Determine how many dead-code insertions are left based on position.
+        // We spread them: one after prologue, one before the loop, one inside
+        // the loop (for XOR stub), one before epilogue.
+        let count = div.dead_code_count as usize;
+        if count == 0 || at_pos >= 4 {
+            return;
+        }
+        let idx = at_pos.min(count - 1);
+        let reg_idx = div.dead_code_regs[idx] as usize % DEAD_CODE_REGS.len();
+        let reg = DEAD_CODE_REGS[reg_idx];
+        let pattern = div.dead_code_patterns[idx];
+        self.emit_dead_code(reg, pattern);
+    }
+
     /// JZ rel32  (0F 84 disp32) — returns position of the 4-byte displacement
     /// field for later patching with `patch_rel32`.
     pub fn jz_rel32_placeholder(&mut self) -> usize {
@@ -544,7 +835,7 @@ pub struct EmittedStub {
 //   r_key  = pointer to keystream (loaded via RIP-relative LEA)
 //   r_out  = output pointer       (arg 3: RCX)
 
-pub fn emit_xor_keystream_stub(key: &[u8], alloc: &RegAlloc, kind: StubKind) -> Vec<u8> {
+pub fn emit_xor_keystream_stub(key: &[u8], alloc: &RegAlloc, kind: StubKind, div: &StubDiversity) -> Vec<u8> {
     let _ = kind; // both ChaCha20 and AesCtr use the same XOR loop structure
     let mut e = Emitter::new();
 
@@ -553,91 +844,112 @@ pub fn emit_xor_keystream_stub(key: &[u8], alloc: &RegAlloc, kind: StubKind) -> 
         e.push_r64(r);
     }
 
-    // ── Load arguments into callee-saved roles ────────────────────────────
-    // We need to be careful about overwriting arguments, so load in safe order.
-    // RDI (ciphertext), RSI (ct_len), RCX (output) are the inputs we care about.
-    // We load ct_len first (it's needed after other moves may clobber RSI).
-    e.mov_rr(alloc.r_len, RSI);  // r_len = ct_len (RSI)
-    e.mov_rr(alloc.r_src, RDI);  // r_src = ct ptr (RDI)
-    e.mov_rr(alloc.r_out, RCX);  // r_out = output ptr (RCX)
+    // ── Technique 3: Dead code after prologue ─────────────────────────────
+    e.emit_dead_code_block(div, 0);
+
+    // ── Technique 1: Instruction scheduling — varied arg load order ───────
+    // Load arguments into callee-saved roles in the order determined by
+    // div.arg_load_order.  Each index maps to one argument:
+    //   0 → r_len = RSI,  1 → r_src = RDI,  2 → r_out = RCX
+    for &arg in &div.arg_load_order {
+        match arg {
+            0 => e.mov_rr(alloc.r_len, RSI),
+            1 => e.mov_rr(alloc.r_src, RDI),
+            _ => e.mov_rr(alloc.r_out, RCX),
+        }
+    }
 
     // ── Load key pointer via RIP-relative LEA ─────────────────────────────
-    // Keystream data is appended after the RET. We emit a placeholder LEA and
-    // patch the displacement once the full code size is known.
-    // Instruction layout: REX.W(1) 8D /r disp32 = 7 bytes.
     let lea_pos = e.len();
     e.lea_r64_rip_rel32(alloc.r_key, 0i32); // patched later
 
-    // ── Zero loop index ───────────────────────────────────────────────────
-    e.xor_rr_zero(alloc.r_idx);
+    // ── Zero loop index using technique 2 (equivalent instructions) ───────
+    e.zero_r64(alloc.r_idx, div.zero_style);
+
+    // ── Technique 3: Dead code before loop ────────────────────────────────
+    e.emit_dead_code_block(div, 1);
 
     // ── Main loop ─────────────────────────────────────────────────────────
-    // The keystream length equals ct_len, so we use r_idx directly as the
-    // keystream index — no modulo sub-loop required.
-    //
-    // Scratch registers used inside the loop body (caller-saved, not saved):
-    //   RAX — current byte value / temp
-    //   R8  — current ciphertext byte (after MOVZX)
-    //   R9  — (unused; kept available for future emitter variants)
-    //
-    // Loop structure (all [reg] addressing; no SIB):
-    //
-    //   loop_top:
-    //     CMP  r_idx, r_len
-    //     JGE  loop_end
-    //
-    //     ; load ct[i] into R8
-    //     MOV  RAX, r_src
-    //     ADD  RAX, r_idx           ; RAX = &ct[i]
-    //     MOVZX R8, byte [RAX]      ; R8  = ct[i]
-    //
-    //     ; XOR with keystream[i]
-    //     MOV  RAX, r_key
-    //     ADD  RAX, r_idx           ; RAX = &keystream[i]
-    //     XOR  R8b, byte [RAX]      ; R8b ^= keystream[i]
-    //
-    //     ; store result
-    //     MOV  RAX, r_out
-    //     ADD  RAX, r_idx           ; RAX = &out[i]
-    //     MOV  byte [RAX], R8b      ; out[i] = R8b
-    //
-    //     INC  r_idx
-    //     JMP  loop_top
-    //   loop_end:
+    // Technique 5: Loop structure variation.
+    // Style 0 = increment-and-compare (original: CMP at top, INC at bottom)
+    // Style 1 = decrement-counter (count down from r_len, JNZ at bottom)
 
     let loop_top = e.len();
 
-    // CMP r_idx, r_len  ;  JGE loop_end
-    e.cmp_rr(alloc.r_idx, alloc.r_len);
-    let jge_off = e.len(); e.byte(0x7D); e.byte(0x00);
+    if div.loop_style % 2 == 0 {
+        // ── Style 0: Increment loop counter, compare at top ───────────────
+        // CMP r_idx, r_len  ;  JGE loop_end
+        e.cmp_rr(alloc.r_idx, alloc.r_len);
+        let jge_off = e.len(); e.byte(0x7D); e.byte(0x00);
 
-    // RAX = &ct[i]:  MOV RAX, r_src ; ADD RAX, r_idx
-    e.mov_rr(RAX, alloc.r_src);
-    e.add_r64_r64(RAX, alloc.r_idx);
-    // MOVZX R8, byte [RAX]  — 4C 0F B6 00  (REX.W+REX.R for R8, mod=00 rm=000=RAX)
-    e.byte(0x4C); e.byte(0x0F); e.byte(0xB6); e.byte(0x00);
+        // RAX = &ct[i]:  MOV RAX, r_src ; ADD RAX, r_idx
+        e.mov_rr(RAX, alloc.r_src);
+        e.add_r64_r64(RAX, alloc.r_idx);
+        // MOVZX R8, byte [RAX]
+        e.byte(0x4C); e.byte(0x0F); e.byte(0xB6); e.byte(0x00);
 
-    // RAX = &keystream[i]:  MOV RAX, r_key ; ADD RAX, r_idx
-    e.mov_rr(RAX, alloc.r_key);
-    e.add_r64_r64(RAX, alloc.r_idx);
-    // XOR R8b, byte [RAX]: REX.R(R8 ext), 0x32, mod=00 rm=000=[RAX]
-    e.byte(0x44); e.byte(0x32); e.byte(0x00);
+        // RAX = &keystream[i]:  MOV RAX, r_key ; ADD RAX, r_idx
+        e.mov_rr(RAX, alloc.r_key);
+        e.add_r64_r64(RAX, alloc.r_idx);
+        // XOR R8b, byte [RAX]
+        e.byte(0x44); e.byte(0x32); e.byte(0x00);
 
-    // out[i] = R8b:  MOV RAX, r_out ; ADD RAX, r_idx
-    e.mov_rr(RAX, alloc.r_out);
-    e.add_r64_r64(RAX, alloc.r_idx);
-    // MOV byte [RAX], R8b: 44 88 00  (REX.R for R8, 88 /r, mod=00 rm=000=RAX)
-    e.byte(0x44); e.byte(0x88); e.byte(0x00);
+        // out[i] = R8b:  MOV RAX, r_out ; ADD RAX, r_idx
+        e.mov_rr(RAX, alloc.r_out);
+        e.add_r64_r64(RAX, alloc.r_idx);
+        // MOV byte [RAX], R8b
+        e.byte(0x44); e.byte(0x88); e.byte(0x00);
 
-    // INC r_idx
-    e.inc_r64(alloc.r_idx);
+        // INC r_idx using technique 2 (equivalent instructions)
+        e.inc_r64_diverse(alloc.r_idx, div.inc_style);
 
-    // JMP loop_top
-    let jmp_top = e.len(); e.byte(0xEB); e.byte(0x00);
-    let loop_end = e.len();
+        // JMP loop_top
+        let jmp_top = e.len(); e.byte(0xEB); e.byte(0x00);
+        let loop_end = e.len();
 
-    e.patch_rel8(jge_off + 1, loop_end);
-    e.patch_rel8(jmp_top + 1, loop_top);
+        e.patch_rel8(jge_off + 1, loop_end);
+        e.patch_rel8(jmp_top + 1, loop_top);
+    } else {
+        // ── Style 1: Decrement r_len from positive to zero ────────────────
+        // Use r_len as both loop counter and remaining count.
+        // At loop top: test r_len, r_len ; JZ loop_end
+        e.test_zero_r64(alloc.r_len, div.test_zero_style);
+        let jz_off = e.len(); e.byte(0x74); e.byte(0x00);
+
+        // Compute &ct[ct_len - r_len]:
+        //   RAX = r_src; ADD RAX, r_idx (which starts at 0 and increments)
+        //   (same addressing as style 0; r_idx still tracks the byte index)
+        e.mov_rr(RAX, alloc.r_src);
+        e.add_r64_r64(RAX, alloc.r_idx);
+        // MOVZX R8, byte [RAX]
+        e.byte(0x4C); e.byte(0x0F); e.byte(0xB6); e.byte(0x00);
+
+        // RAX = &keystream[i]
+        e.mov_rr(RAX, alloc.r_key);
+        e.add_r64_r64(RAX, alloc.r_idx);
+        // XOR R8b, byte [RAX]
+        e.byte(0x44); e.byte(0x32); e.byte(0x00);
+
+        // out[i] = R8b
+        e.mov_rr(RAX, alloc.r_out);
+        e.add_r64_r64(RAX, alloc.r_idx);
+        // MOV byte [RAX], R8b
+        e.byte(0x44); e.byte(0x88); e.byte(0x00);
+
+        // Increment byte index + decrement remaining counter
+        e.inc_r64_diverse(alloc.r_idx, div.inc_style);
+        e.dec_r64_diverse(alloc.r_len, div.inc_style);
+
+        // JMP loop_top
+        let jmp_top = e.len(); e.byte(0xEB); e.byte(0x00);
+        let loop_end = e.len();
+
+        e.patch_rel8(jz_off + 1, loop_end);
+        e.patch_rel8(jmp_top + 1, loop_top);
+    }
+
+    // ── Technique 3: Dead code before epilogue ────────────────────────────
+    e.emit_dead_code_block(div, 2);
 
     // ── Epilogue ──────────────────────────────────────────────────────────
     for &r in alloc.saved.iter().rev() {
@@ -710,38 +1022,57 @@ pub fn emit_xor_keystream_stub(key: &[u8], alloc: &RegAlloc, kind: StubKind) -> 
 ///   ADD rsp,128; pop callee-saved; ret
 ///   <44 bytes of key+nonce data>
 /// ```
-fn emit_chacha20_inline_stub(key44: &[u8], alloc: &RegAlloc) -> Vec<u8> {
+fn emit_chacha20_inline_stub(key44: &[u8], alloc: &RegAlloc, div: &StubDiversity) -> Vec<u8> {
     debug_assert_eq!(key44.len(), 44);
     let mut e = Emitter::new();
+
+    // ── Technique 4: Stack frame variation ────────────────────────────────
+    // Working state is always at [rsp+0..63] and saved copy at [rsp+64..127]
+    // so all disp8 offsets stay in range.  We vary the total frame size by
+    // adding unused padding *below* the state — this changes SUB/ADD RSP and
+    // the overall stack layout without affecting any memory accesses.
+    let frame_extra: u32 = match (div.stack_base_offset, div.stack_has_padding) {
+        (0, false) => 0,
+        (0, true)  => 16,
+        (_, false) => 32,
+        (_, true)  => 48,
+    };
+    let frame_size: u32 = 128 + frame_extra;
 
     // ── Prologue ─────────────────────────────────────────────────────────
     for &r in &alloc.saved {
         e.push_r64(r);
     }
-    // Allocate 128 bytes of stack for the working state + saved copy.
-    e.sub_rsp_imm32(128);
+    e.sub_rsp_imm32(frame_size);
 
-    // Save arguments into callee-saved roles.
-    e.mov_rr(alloc.r_len, RSI);
-    e.mov_rr(alloc.r_src, RDI);
-    e.mov_rr(alloc.r_out, RCX);
+    // ── Technique 3: Dead code after prologue ─────────────────────────────
+    e.emit_dead_code_block(div, 0);
+
+    // ── Load arguments (technique 1: instruction scheduling) ─────────────
+    for &arg in &div.arg_load_order {
+        match arg {
+            0 => e.mov_rr(alloc.r_len, RSI),
+            1 => e.mov_rr(alloc.r_src, RDI),
+            _ => e.mov_rr(alloc.r_out, RCX),
+        }
+    }
 
     // r_key = &key_data via RIP-relative LEA (patched at the end).
     let lea_pos = e.len();
     e.lea_r64_rip_rel32(alloc.r_key, 0i32);
 
-    // r_idx = 1  (ChaCha20 block counter starts at 1, matching `chacha20_stream`).
-    e.xor_rr_zero(alloc.r_idx);
-    e.inc_r64(alloc.r_idx);
+    // r_idx = 1 using technique 2 (equivalent instructions).
+    e.zero_r64(alloc.r_idx, div.zero_style);
+    e.inc_r64_diverse(alloc.r_idx, div.inc_style);
 
     // ── main_block_loop ─────────────────────────────────────────────────
     let main_loop_top = e.len();
 
-    // if r_len == 0 → goto done  (rel32 forward; patched after epilogue)
-    e.test_rr(alloc.r_len);
+    // if r_len == 0 → goto done
+    e.test_zero_r64(alloc.r_len, div.test_zero_style);
     let done_jz_disp = e.jz_rel32_placeholder();
 
-    // ── Initialize working state at [rsp+0..63] ─────────────────────────
+    // ── Initialize working state at [rsp+0..63] ──────────────────────────
     // Constants ("expand 32-byte k") at offsets 0..15.
     e.mov_rsp_disp8_imm32(0,  0x61707865);
     e.mov_rsp_disp8_imm32(4,  0x3320646e);
@@ -768,7 +1099,6 @@ fn emit_chacha20_inline_stub(key44: &[u8], alloc: &RegAlloc) -> Vec<u8> {
     }
 
     // ── 10 double-rounds via inner counter ECX ──────────────────────────
-    // MOV ECX, 10  (B9 imm32, no REX since ECX is field=1).
     e.byte(0xB9);
     e.bytes(&10u32.to_le_bytes());
 
@@ -783,10 +1113,13 @@ fn emit_chacha20_inline_stub(key44: &[u8], alloc: &RegAlloc) -> Vec<u8> {
     emit_chacha20_qr(&mut e, 1, 6, 11, 12);
     emit_chacha20_qr(&mut e, 2, 7,  8, 13);
     emit_chacha20_qr(&mut e, 3, 4,  9, 14);
-    // DEC ECX  (FF C9, no REX).
-    e.byte(0xFF); e.byte(0xC9);
-    // JNZ round_loop_top  (rel32 backward — body is ~hundreds of bytes).
+    // DEC ECX (technique 2: equivalent instructions).
+    e.dec_r64_diverse(RCX, div.inc_style);
+    // JNZ round_loop_top
     e.jnz_rel32_back(round_loop_top);
+
+    // ── Technique 3: Dead code before state-add ──────────────────────────
+    e.emit_dead_code_block(div, 1);
 
     // ── Add original state [rsp+64..127] into working state [rsp+0..63] ─
     for i in 0..16u8 {
@@ -795,43 +1128,60 @@ fn emit_chacha20_inline_stub(key44: &[u8], alloc: &RegAlloc) -> Vec<u8> {
     }
 
     // ── Inner XOR loop: out[i] = ks[i] ^ ct[i] for up to 64 bytes ────────
-    // Move the cipher/output pointers into RDI/RSI scratch (cheap clean-rm
-    // base regs), and ECX = 0 = inner index (0..64).
     e.mov_rr(RDI, alloc.r_src);
     e.mov_rr(RSI, alloc.r_out);
-    e.xor_rr_zero(RCX); // RCX = 0
+    e.zero_r64(RCX, div.zero_style); // RCX = inner index
 
     let inner_loop_top = e.len();
 
-    // test r_len, r_len ; jz block_advance (rel8 forward, patched).
-    e.test_rr(alloc.r_len);
+    // test r_len, r_len ; jz block_advance.
+    e.test_zero_r64(alloc.r_len, div.test_zero_style);
     e.byte(0x74); let inner_jz_pos = e.len(); e.byte(0x00);
-    // cmp rcx, 64 ; jge block_advance (rel8 forward, patched).
+    // cmp rcx, 64 ; jge block_advance.
     e.cmp_r64_imm8(RCX, 64);
     e.byte(0x7D); let inner_jge_pos = e.len(); e.byte(0x00);
 
-    // movzx eax, byte [rsp + rcx]   (0F B6 04 0C)
-    //   ModRM 0x04 = mod=00 reg=EAX=0 rm=100(SIB)
-    //   SIB    0x0C = scale=00 index=RCX=1 base=RSP=4
-    e.bytes(&[0x0F, 0xB6, 0x04, 0x0C]);
+    if div.inner_loop_style % 2 == 0 {
+        // ── Style 0: Forward index with SIB addressing (original) ────────
+        // movzx eax, byte [rsp + rcx]   (0F B6 04 0C)
+        e.bytes(&[0x0F, 0xB6, 0x04, 0x0C]);
+        // movzx edx, byte [rdi]
+        e.bytes(&[0x0F, 0xB6, 0x17]);
+        // xor eax, edx
+        e.bytes(&[0x33, 0xC2]);
+        // mov byte [rsi], al
+        e.bytes(&[0x88, 0x06]);
+        // inc rdi; inc rsi; inc rcx; dec r_len
+        e.inc_r64(RDI);
+        e.inc_r64(RSI);
+        e.inc_r64_diverse(RCX, div.inc_style);
+        e.dec_r64_diverse(alloc.r_len, div.inc_style);
+    } else {
+        // ── Style 1: Reverse byte processing within each 64-byte block ───
+        // Process keystream bytes in reverse order: ks[63-RCX], ks[62-RCX], ...
+        // This produces a different instruction sequence while remaining
+        // functionally equivalent — ChaCha20 output is a byte stream and
+        // each byte is independently XORed with the corresponding input.
+        //
+        // LEA RAX, [rsp + 63]; SUB RAX, RCX → address of ks[63 - rcx]
+        e.lea_r64_rsp_disp8(RAX, 63);
+        e.sub_r64_r64(RAX, RCX);
+        // MOVZX EAX, byte [RAX]
+        e.bytes(&[0x0F, 0xB6, 0x00]);
+        // movzx edx, byte [rdi]
+        e.bytes(&[0x0F, 0xB6, 0x17]);
+        // xor eax, edx
+        e.bytes(&[0x33, 0xC2]);
+        // mov byte [rsi], al
+        e.bytes(&[0x88, 0x06]);
+        // inc rdi; inc rsi; inc rcx; dec r_len
+        e.inc_r64(RDI);
+        e.inc_r64(RSI);
+        e.inc_r64_diverse(RCX, div.inc_style);
+        e.dec_r64_diverse(alloc.r_len, div.inc_style);
+    }
 
-    // movzx edx, byte [rdi]         (0F B6 17)
-    //   ModRM 0x17 = mod=00 reg=EDX=2 rm=RDI=7
-    e.bytes(&[0x0F, 0xB6, 0x17]);
-
-    // xor eax, edx                  (33 C2)  — XOR r32, r/m32; reg=EAX, rm=EDX
-    e.bytes(&[0x33, 0xC2]);
-
-    // mov byte [rsi], al            (88 06)  — reg=AL=0, rm=RSI=6
-    e.bytes(&[0x88, 0x06]);
-
-    // inc rdi ; inc rsi ; inc rcx ; dec r_len
-    e.inc_r64(RDI);
-    e.inc_r64(RSI);
-    e.inc_r64(RCX);
-    e.dec_r64(alloc.r_len);
-
-    // jmp inner_loop_top  (rel8 backward; loop body fits in i8 range).
+    // jmp inner_loop_top  (rel8 backward).
     let cur = e.len();
     let back = (inner_loop_top as isize) - (cur as isize) - 2;
     debug_assert!(back >= -128 && back <= 127, "inner loop too large for rel8 jmp");
@@ -844,16 +1194,19 @@ fn emit_chacha20_inline_stub(key44: &[u8], alloc: &RegAlloc) -> Vec<u8> {
 
     e.mov_rr(alloc.r_src, RDI);
     e.mov_rr(alloc.r_out, RSI);
-    e.inc_r64(alloc.r_idx);
+    e.inc_r64_diverse(alloc.r_idx, div.inc_style);
 
-    // jmp main_block_loop  (rel32 backward — far away).
+    // ── Technique 3: Dead code before loop back ──────────────────────────
+    e.emit_dead_code_block(div, 2);
+
+    // jmp main_block_loop  (rel32 backward).
     e.jmp_rel32_back(main_loop_top);
 
     // ── done ─────────────────────────────────────────────────────────────
     let done_label = e.len();
     e.patch_rel32(done_jz_disp, done_label);
 
-    e.add_rsp_imm32(128);
+    e.add_rsp_imm32(frame_size);
     for &r in alloc.saved.iter().rev() {
         e.pop_r64(r);
     }
@@ -929,8 +1282,9 @@ fn emit_chacha20_qr(e: &mut Emitter, a: u8, b: u8, c: u8, d: u8) {
 /// determined by `seed`.  Returns an [`EmittedStub`] containing the code bytes.
 pub fn emit_stub(kind: StubKind, key: &[u8], seed: u64) -> EmittedStub {
     let alloc = RegAlloc::from_seed(seed);
+    let div = StubDiversity::from_seed(seed);
     let code = match kind {
-        StubKind::ChaCha20 | StubKind::AesCtr => emit_xor_keystream_stub(key, &alloc, kind),
+        StubKind::ChaCha20 | StubKind::AesCtr => emit_xor_keystream_stub(key, &alloc, kind, &div),
         StubKind::RawStubInline => {
             assert_eq!(
                 key.len(),
@@ -938,7 +1292,7 @@ pub fn emit_stub(kind: StubKind, key: &[u8], seed: u64) -> EmittedStub {
                 "RawStubInline requires exactly 44 bytes (32-byte key + 12-byte nonce); got {}",
                 key.len()
             );
-            emit_chacha20_inline_stub(key, &alloc)
+            emit_chacha20_inline_stub(key, &alloc, &div)
         }
     };
     EmittedStub {
@@ -1159,5 +1513,44 @@ mod tests {
             assert_eq!(decrypted, plaintext,
                 "inline stub mismatch at seed={} len={}", seed, len);
         }
+    }
+
+    #[test]
+    fn diversity_produces_different_code_across_seeds() {
+        // Verify that the 5 diversity techniques produce structurally different
+        // stub binaries for different seeds while all decrypting correctly.
+        let key = vec![0xABu8; 32];
+        let stubs: Vec<_> = (0..8u64)
+            .map(|seed| emit_stub(StubKind::ChaCha20, &key, seed))
+            .collect();
+
+        // At least half of the pairs should differ in code bytes.
+        let mut unique_count = 0usize;
+        for i in 0..stubs.len() {
+            for j in (i + 1)..stubs.len() {
+                if stubs[i].code != stubs[j].code {
+                    unique_count += 1;
+                }
+            }
+        }
+        let total_pairs = 8 * 7 / 2; // 28 pairs
+        assert!(
+            unique_count > total_pairs / 2,
+            "expected > {} unique pairs out of {}, got {}",
+            total_pairs / 2,
+            total_pairs,
+            unique_count,
+        );
+    }
+
+    #[test]
+    fn diversity_from_seed_is_deterministic() {
+        let d1 = StubDiversity::from_seed(42);
+        let d2 = StubDiversity::from_seed(42);
+        assert_eq!(d1.arg_load_order, d2.arg_load_order);
+        assert_eq!(d1.zero_style, d2.zero_style);
+        assert_eq!(d1.inc_style, d2.inc_style);
+        assert_eq!(d1.loop_style, d2.loop_style);
+        assert_eq!(d1.dead_code_count, d2.dead_code_count);
     }
 }

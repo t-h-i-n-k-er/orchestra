@@ -26,7 +26,8 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
         ..ServerConfig::default()
     };
 
-    let audit = Arc::new(AuditLog::open(cfg.audit_log_path.clone()).unwrap());
+    let hmac_key = AuditLog::derive_hmac_key(&cfg.admin_token);
+    let audit = Arc::new(AuditLog::open(cfg.audit_log_path.clone(), &hmac_key).unwrap());
     let state = Arc::new(AppState::new(
         audit,
         cfg.admin_token.clone(),

@@ -247,6 +247,20 @@ unsafe fn peb_build_number() -> Option<u32> {
     #[cfg(target_arch = "x86_64")]
     std::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
 
+    // On aarch64 Windows the TEB is accessed via the system register
+    // TPIDR_EL0.  The PEB pointer is stored at TEB+0x60 (same offset as
+    // the x86_64 gs:[0x60] slot).  The kernel guarantees that TPIDR_EL0
+    // always points to the current thread's TEB.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let teb: *const u8;
+        std::arch::asm!("mrs {}, tpidr_el0", out(reg) teb, options(nostack, preserves_flags));
+        if teb.is_null() {
+            return None;
+        }
+        peb = *(teb.add(0x60) as *const *const u8);
+    }
+
     if peb.is_null() {
         return None;
     }

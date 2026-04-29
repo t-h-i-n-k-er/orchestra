@@ -11,11 +11,20 @@
 //!    kernel ABI, XLATB uses RBX as a table pointer.  Any permutable register
 //!    touched implicitly by any instruction is removed from the candidate pool.
 //!
-//! 3. **Liveness analysis** (forward scan).  A register is *live-in* if it is
-//!    read before it is first written in a left-to-right pass.  Live-in
-//!    registers may carry values from the caller and must not be renamed.
-//!    Calling-convention-pinned registers (RAX, RCX, RDX, R8, R9) are treated
-//!    as already-defined at function entry so they never appear in `live_in`.
+//! 3. **Liveness analysis** (iterative dataflow on CFG).  The instruction
+//!    stream is split into basic blocks at branch targets and post-terminator
+//!    boundaries, forming a control flow graph (CFG).  Per-block `use` and
+//!    `def` sets are computed, then the standard liveness equations are
+//!    iterated until convergence:
+//!
+//!    - `live_out[B] = ⋃ { live_in[S] | S ∈ successors(B) }`
+//!    - `live_in[B] = use[B] ∪ (live_out[B] \ def[B])`
+//!
+//!    The function's live-in set is `live_in[entry]`.  Live-in registers may
+//!    carry values from the caller or from other blocks and must not be
+//!    renamed.  Calling-convention-pinned registers (RAX, RCX, RDX, R8, R9)
+//!    are pre-loaded into each block's `def` set so they never appear in
+//!    `use` or `live_in`.
 //!
 //! 4. **Build permutation.**  The remaining candidates (permutable, not
 //!    implicitly pinned, not live-in) are shuffled with the provided CSPRNG.
@@ -208,38 +217,191 @@ fn implicit_permutable_pins(inst: &Instruction) -> &'static [Register] {
     }
 }
 
-// ─── Liveness analysis ────────────────────────────────────────────────────────
+// ─── Liveness analysis (iterative dataflow) ──────────────────────────────────
+//
+// The analysis builds a control flow graph (CFG) from the instruction list,
+// then iterates the standard liveness equations until convergence:
+//
+//   live_out[B] = ⋃ { live_in[S] | S ∈ successors(B) }
+//   live_in[B]  = use[B] ∪ (live_out[B] \ def[B])
+//
+// This correctly handles registers that are defined on one branch path but
+// read on another, which the old forward scan could not.
 
-/// Compute the set of 64-bit base registers that are *live-in* to the
-/// function: registers that are read before being first written in a
-/// left-to-right scan of the instruction stream.
+/// A basic block: a contiguous sequence of instructions with a single entry
+/// point (the first instruction) and a single exit point (the last
+/// instruction).
+#[derive(Clone)]
+struct BasicBlock {
+    /// Instructions belonging to this block.
+    instructions: Vec<Instruction>,
+}
+
+/// Build a CFG by splitting `instructions` into basic blocks at branch targets
+/// and post-terminator boundaries.
+fn build_cfg(instructions: &[Instruction]) -> Vec<BasicBlock> {
+    if instructions.is_empty() {
+        return Vec::new();
+    }
+
+    // ── Collect leader IPs ─────────────────────────────────────────────────
+    // A leader is the first instruction of a basic block.  Leaders are:
+    //   (a) The very first instruction of the function.
+    //   (b) The target of any branch (conditional or unconditional).
+    //   (c) The instruction immediately after a terminator (conditional branch,
+    //       unconditional jump, RET, INT3, UD2).
+    let mut leader_ips: HashSet<u64> = HashSet::new();
+    leader_ips.insert(instructions[0].ip());
+
+    for (idx, inst) in instructions.iter().enumerate() {
+        // Branch target is a leader.
+        if inst.is_jcc_short_or_near() || inst.is_jmp_short_or_near() {
+            leader_ips.insert(inst.near_branch64());
+        }
+        // Instruction after a terminator is a leader.
+        if is_block_terminator(inst) {
+            if let Some(next) = instructions.get(idx + 1) {
+                leader_ips.insert(next.ip());
+            }
+        }
+    }
+
+    // ── Split into blocks ──────────────────────────────────────────────────
+    let mut blocks: Vec<BasicBlock> = Vec::new();
+    let mut current: Vec<Instruction> = Vec::new();
+
+    for &inst in instructions {
+        if leader_ips.contains(&inst.ip()) && !current.is_empty() {
+            blocks.push(BasicBlock {
+                instructions: current,
+            });
+            current = Vec::new();
+        }
+        current.push(inst);
+    }
+
+    if !current.is_empty() {
+        blocks.push(BasicBlock {
+            instructions: current,
+        });
+    }
+
+    blocks
+}
+
+/// Is `inst` a block terminator?  Conditional branches, unconditional jumps,
+/// returns, and traps all terminate a basic block.
+fn is_block_terminator(inst: &Instruction) -> bool {
+    inst.is_jcc_short_or_near()
+        || inst.is_jmp_short_or_near()
+        || matches!(
+            inst.code(),
+            Code::Retnq
+                | Code::Retnd
+                | Code::Retnw
+                | Code::Retnq_imm16
+                | Code::Retnd_imm16
+                | Code::Retnw_imm16
+                | Code::Int3
+                | Code::Ud2
+                | Code::INVALID
+        )
+}
+
+/// Build a map from instruction IP → block index.
+fn ip_to_block_map(blocks: &[BasicBlock]) -> HashMap<u64, usize> {
+    let mut map = HashMap::new();
+    for (i, block) in blocks.iter().enumerate() {
+        if let Some(first) = block.instructions.first() {
+            map.insert(first.ip(), i);
+        }
+    }
+    map
+}
+
+/// Compute the set of successor block indices for block `bi`.
+fn block_successors(
+    block: &BasicBlock,
+    ip_to_block: &HashMap<u64, usize>,
+) -> Vec<usize> {
+    let Some(last) = block.instructions.last() else {
+        return Vec::new();
+    };
+
+    let mut succs = Vec::new();
+
+    if last.is_jcc_short_or_near() {
+        // Conditional branch: both taken and fall-through.
+        let target_ip = last.near_branch64();
+        if let Some(&si) = ip_to_block.get(&target_ip) {
+            succs.push(si);
+        }
+        let fallthrough_ip = last.ip().wrapping_add(last.len() as u64);
+        if let Some(&si) = ip_to_block.get(&fallthrough_ip) {
+            succs.push(si);
+        }
+    } else if last.is_jmp_short_or_near() {
+        // Unconditional jump: only taken target.
+        let target_ip = last.near_branch64();
+        if let Some(&si) = ip_to_block.get(&target_ip) {
+            succs.push(si);
+        }
+    } else if !is_unconditional_exit(last) {
+        // Fall-through (not a RET/TRAP/UD2).
+        let fallthrough_ip = last.ip().wrapping_add(last.len() as u64);
+        if let Some(&si) = ip_to_block.get(&fallthrough_ip) {
+            succs.push(si);
+        }
+    }
+
+    succs
+}
+
+/// Returns `true` if `inst` never transfers control to the next instruction
+/// (RET, INT3, UD2).
+fn is_unconditional_exit(inst: &Instruction) -> bool {
+    matches!(
+        inst.code(),
+        Code::Retnq
+            | Code::Retnd
+            | Code::Retnw
+            | Code::Retnq_imm16
+            | Code::Retnd_imm16
+            | Code::Retnw_imm16
+            | Code::Int3
+            | Code::Ud2
+    )
+}
+
+/// Compute the `use` and `def` sets for a single basic block.
 ///
-/// The calling-convention pinned set is pre-loaded into `defined` so that
-/// incidental reads of RAX, RCX, etc. do not pollute the `live_in` set with
-/// registers that are irrelevant to the permutable pool.
-fn compute_live_in(instructions: &[Instruction]) -> HashSet<Register> {
+/// * `use`: registers read before being defined within the block.
+/// * `def`: registers defined (written) within the block.
+///
+/// The calling-convention pinned set is pre-loaded into `def` so that
+/// incidental reads of RAX, RCX, etc. do not pollute the `use` set.
+fn block_use_def(block: &BasicBlock) -> (HashSet<Register>, HashSet<Register>) {
     let mut defined: HashSet<Register> = HashSet::new();
-    let mut live_in: HashSet<Register> = HashSet::new();
+    let mut used: HashSet<Register> = HashSet::new();
 
-    // Pre-populate with pinned registers so they are never added to live_in.
+    // Pre-populate with pinned registers so they never appear in `use`.
     for &r in &PINNED {
         defined.insert(r);
     }
 
-    for inst in instructions {
+    for inst in &block.instructions {
         let write_only_dest = is_dest_write_only(inst);
 
+        // Collect reads.
         for op_idx in 0..inst.op_count() {
             match inst.op_kind(op_idx) {
                 OpKind::Register => {
                     let r = inst.op_register(op_idx);
-                    // op0 of a write-only instruction is a pure destination —
-                    // it is not a read.
                     let is_pure_write = op_idx == 0 && write_only_dest;
                     if !is_pure_write {
                         if let Some(r64) = to_64bit(r) {
                             if !defined.contains(&r64) {
-                                live_in.insert(r64);
+                                used.insert(r64);
                             }
                         }
                     }
@@ -249,7 +411,7 @@ fn compute_live_in(instructions: &[Instruction]) -> HashSet<Register> {
                         if mr != Register::None {
                             if let Some(r64) = to_64bit(mr) {
                                 if !defined.contains(&r64) {
-                                    live_in.insert(r64);
+                                    used.insert(r64);
                                 }
                             }
                         }
@@ -259,10 +421,7 @@ fn compute_live_in(instructions: &[Instruction]) -> HashSet<Register> {
             }
         }
 
-        // Record the first write: op0 of any instruction that writes its
-        // destination register.  For read-modify-write instructions (ADD, etc.)
-        // the read is captured above; the write side still marks the register
-        // as defined so subsequent reads see it as locally defined.
+        // Collect writes (op0 of any instruction that writes its destination).
         if inst.op_count() > 0 && inst.op_kind(0) == OpKind::Register {
             if let Some(r64) = to_64bit(inst.op0_register()) {
                 defined.insert(r64);
@@ -270,7 +429,74 @@ fn compute_live_in(instructions: &[Instruction]) -> HashSet<Register> {
         }
     }
 
-    live_in
+    (used, defined)
+}
+
+/// Compute the set of 64-bit base registers that are *live-in* to the
+/// function using iterative dataflow analysis on the CFG.
+///
+/// The calling-convention pinned set is pre-loaded into each block's `def`
+/// set so that incidental reads of RAX, RCX, etc. do not pollute the result.
+fn compute_live_in(instructions: &[Instruction]) -> HashSet<Register> {
+    if instructions.is_empty() {
+        return HashSet::new();
+    }
+
+    let blocks = build_cfg(instructions);
+    if blocks.is_empty() {
+        return HashSet::new();
+    }
+
+    let ip_to_block = ip_to_block_map(&blocks);
+    let n = blocks.len();
+
+    // Pre-compute use/def and successor lists for every block.
+    let use_def: Vec<(HashSet<Register>, HashSet<Register>)> =
+        blocks.iter().map(|b| block_use_def(b)).collect();
+    let successors: Vec<Vec<usize>> = blocks
+        .iter()
+        .map(|b| block_successors(b, &ip_to_block))
+        .collect();
+
+    // live_in[i] and live_out[i] for each block i.
+    let mut live_in: Vec<HashSet<Register>> = vec![HashSet::new(); n];
+    let mut live_out: Vec<HashSet<Register>> = vec![HashSet::new(); n];
+
+    // Iterate until convergence (worklist is overkill for small functions;
+    // the simple fixed-point loop converges quickly).
+    let mut changed = true;
+    while changed {
+        changed = false;
+
+        // Reverse post-order would converge faster, but for the code sizes
+        // we handle, a simple reverse sweep is fine.
+        for bi in (0..n).rev() {
+            let (ref use_b, ref def_b) = use_def[bi];
+
+            // live_out[B] = ⋃ { live_in[S] | S ∈ successors(B) }
+            let mut new_out: HashSet<Register> = HashSet::new();
+            for &si in &successors[bi] {
+                new_out.extend(&live_in[si]);
+            }
+
+            // live_in[B] = use[B] ∪ (live_out[B] \ def[B])
+            let mut new_in: HashSet<Register> = use_b.clone();
+            for &r in &new_out {
+                if !def_b.contains(&r) {
+                    new_in.insert(r);
+                }
+            }
+
+            if new_in != live_in[bi] || new_out != live_out[bi] {
+                live_in[bi] = new_in;
+                live_out[bi] = new_out;
+                changed = true;
+            }
+        }
+    }
+
+    // The function's live-in set is the live-in of the entry block (block 0).
+    live_in.into_iter().next().unwrap_or_default()
 }
 
 // ─── Permutation application ──────────────────────────────────────────────────

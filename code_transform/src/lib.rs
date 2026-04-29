@@ -38,11 +38,21 @@ pub mod regalloc;
 pub mod reorder;
 #[cfg(target_arch = "x86_64")]
 pub mod substitute;
+#[cfg(target_arch = "x86_64")]
+pub mod virtualize;
+
+pub mod opaque_predicates;
 
 #[cfg(target_arch = "aarch64")]
 pub mod substitute_aarch64;
 #[cfg(target_arch = "aarch64")]
 pub mod reorder_aarch64;
+#[cfg(target_arch = "aarch64")]
+pub mod cfflatten_aarch64;
+#[cfg(target_arch = "aarch64")]
+pub mod opcode_diversity_aarch64;
+#[cfg(target_arch = "aarch64")]
+pub mod regalloc_aarch64;
 
 #[cfg(target_arch = "x86_64")]
 use rand::SeedableRng;
@@ -66,11 +76,44 @@ pub fn transform(code: &[u8], seed: u64) -> Vec<u8> {
     opcode_diversity::apply(&after_flatten, &mut rng)
 }
 
-/// AArch64 transform pipeline.  Runs the substitution pass followed by the
-/// basic-block reorder pass.  Both passes are length-aware and re-resolve
-/// PC-relative branch displacements; inputs containing PC-relative *data*
-/// references (`ADR`/`ADRP`/`LDR (literal)`) are returned unchanged from the
-/// reorder pass to stay safe.
+/// Apply the full transformation pipeline **with code virtualization** to a
+/// flat slice of x86-64 machine code.  This runs the same passes as
+/// [`transform`] followed by the VM transformation pass.
+///
+/// The virtualization pass translates basic blocks into custom stack-based VM
+/// bytecode interpreted by a generated interpreter function.  The VM opcode
+/// mapping is randomized per build using the seeded PRNG.
+///
+/// If the virtualization pass cannot be safely applied (e.g. the input
+/// contains instructions the VM cannot handle), the pipeline output from the
+/// preceding passes is returned unchanged.
+///
+/// `seed` must be the same value on every build for a reproducible output.
+#[cfg(target_arch = "x86_64")]
+pub fn transform_with_virtualization(code: &[u8], seed: u64) -> Vec<u8> {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let after_sub = substitute::apply_substitutions(code, &mut rng);
+    let after_reorder = reorder::reorder_blocks(&after_sub, &mut rng);
+    let after_flatten = cfflatten::flatten_control_flow(&after_reorder, &mut rng);
+    let after_diversity = opcode_diversity::apply(&after_flatten, &mut rng);
+    virtualize::virtualize(&after_diversity, &mut rng)
+}
+
+/// AArch64 transform pipeline.  Runs the following passes in order:
+///
+/// 1. **Instruction substitution** — replaces instructions with semantically
+///    equivalent alternatives (e.g. `MOVZ Xd, #0` → `EOR Xd, Xd, Xd`).
+/// 2. **Basic-block reordering** — shuffles block order with opaque predicates.
+///    ADRP+ADD pairs are tracked as atomic units.
+/// 3. **Control-flow flattening** — rewrites block edges into a dispatcher
+///    state machine with opaque predicates.
+/// 4. **Opcode diversity** — register renaming, ADD/SUB swap, NOP insertion,
+///    and conditional branch inversion.
+/// 5. **Register reallocation** — permutes volatile scratch registers (X9–X18)
+///    via liveness analysis.
+///
+/// Each pass returns the input unchanged when it cannot be safely applied
+/// (e.g. PC-relative data references that cannot be retargeted).
 ///
 /// `seed` produces deterministic output for reproducible builds.
 #[cfg(target_arch = "aarch64")]
@@ -78,7 +121,10 @@ pub fn transform(code: &[u8], seed: u64) -> Vec<u8> {
     use rand::SeedableRng;
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
     let after_sub = substitute_aarch64::apply_substitutions(code, &mut rng);
-    reorder_aarch64::reorder_blocks(&after_sub, &mut rng)
+    let after_reorder = reorder_aarch64::reorder_blocks(&after_sub, &mut rng);
+    let after_flatten = cfflatten_aarch64::flatten_control_flow(&after_reorder, &mut rng);
+    let after_diversity = opcode_diversity_aarch64::apply(&after_flatten, &mut rng);
+    regalloc_aarch64::reallocate_registers(&after_diversity, &mut rng)
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

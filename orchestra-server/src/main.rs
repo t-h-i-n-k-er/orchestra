@@ -56,7 +56,8 @@ async fn main() -> Result<()> {
         );
     }
 
-    let audit = Arc::new(AuditLog::open(cfg.audit_log_path.clone())?);
+    let hmac_key = AuditLog::derive_hmac_key(&cfg.admin_token);
+    let audit = Arc::new(AuditLog::open(cfg.audit_log_path.clone(), &hmac_key)?);
     let state = Arc::new(AppState::new(
         audit.clone(),
         cfg.admin_token.clone(),
