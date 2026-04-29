@@ -38,6 +38,30 @@ This document describes where the project is going next.
 - ✅ **`cargo test --workspace --all-features`** passes cleanly on Linux.
 - ✅ **`cargo clippy --workspace --all-features -- -D warnings`** zero warnings.
 - ✅ **`cargo fmt --all`** workspace fully formatted.
+- ✅ **HMAC-SHA256 signed audit events**: each JSONL entry is paired with
+  an HMAC tag; tampered records are flagged on read. Key derived from
+  admin token via HKDF.
+- ✅ **Protocol version 2**: per-message HKDF-SHA256 salt derivation with
+  wire format `salt(32) ‖ nonce(12) ‖ ciphertext_with_tag`. Includes
+  `VersionHandshake` message for version negotiation.
+- ✅ **Forward secrecy (X25519 + HKDF)**: the `forward-secrecy` feature
+  performs an ephemeral X25519 key exchange to derive a unique session
+  key, ensuring recorded sessions cannot be decrypted if the PSK is
+  later compromised.
+- ✅ **Interactive PTY shell sessions**: `StartShell`, `ShellInput`,
+  `ShellOutput`, `CloseShell` commands with non-blocking reader thread
+  architecture.
+- ✅ **Async build queue**: configurable worker pool for remote agent
+  builds via the Control Center REST API (`POST /api/build`, status
+  polling, artifact download).
+- ✅ **DNS-over-HTTPS bridge**: `doh_listener` module for agent sessions
+  tunneled over DNS queries with IP-based rate limiting.
+- ✅ **Mutual TLS for agent channel**: server-side mTLS enforcement with
+  configurable allowed CNs and OUs.
+- ✅ **Stack spoofing**: `stack-spoof` feature for spoofing user-mode
+  call stacks during indirect syscall dispatch on Windows x86-64.
+- ✅ **Hot-reload**: `hot-reload` feature enables runtime config
+  hot-reload via the `notify` crate.
 
 ### Known limitations
 
@@ -56,7 +80,6 @@ This document describes where the project is going next.
 
 - **Web GUI console.** A small Axum + React front-end that talks to the
   same `Transport` as the CLI. Shipped as a single static binary.
-- **HMAC-signed audit events** for tamper-evident compliance logs.
 - **`orchestra-agentd` reference daemon** so administrators don't have
   to write their own wrapper to embed the agent library.
 - **Windows MSI installer** built in CI from the release artifacts.
@@ -79,9 +102,6 @@ This document describes where the project is going next.
   every node, exposing pod-level diagnostics through dedicated commands.
 - **Sandboxed plugin execution.** seccomp-bpf on Linux and Job Objects on
   Windows to constrain what a loaded plugin can syscall.
-- **Authenticated key exchange.** Replace the development pre-shared-key
-  path with X25519 + HKDF, so even non-TLS deployments get forward
-  secrecy.
 - **Per-operator RBAC.** Bind the operator certificate's CN to a role
   and restrict commands accordingly (e.g., `read-only`, `operator`,
   `administrator`).
@@ -141,7 +161,8 @@ Orchestra today provides:
   and, where applicable, a consent file.
 - A signed-and-encrypted plugin loader that executes capability modules
   in process memory.
-- Structured per-command audit logging written as JSON-lines.
+- Structured per-command audit logging written as HMAC-SHA256-signed
+  JSON-lines for tamper-evidence.
 - Configurable policy enforcement via TOML, hot-reloadable at runtime.
 - Cross-platform CI for Linux, macOS, and Windows, plus a `cargo audit`
   job and a tag-driven release workflow that produces signed archives.

@@ -64,7 +64,8 @@ This launches an interactive wizard that asks for:
   (multi-select). Recognised
   flags include `persistence`, `network-discovery`, `hci-research`,
   `perf-optimize`, `direct-syscalls`, `manual-map`,
-  `traffic-normalization`, and `env-validation`. Unknown flags are rejected
+  `traffic-normalization`, `env-validation`, `forward-secrecy`,
+  `stack-spoof`, `hot-reload`, and others. Unknown flags are rejected
   before Cargo is invoked. `package = "launcher"` does not accept agent
   feature flags.
 - Optional output filename override

@@ -1,6 +1,6 @@
 # Orchestra Security Audit
 
-**Audit date:** 2026-04-21 (updated 2026-05-01)
+**Audit date:** 2026-04-21 (updated 2026-04-29)
 **Audit scope:** Entire workspace at the tagged release.
 **Auditor:** Project maintainer self-review (pre-public-release).
 
@@ -43,7 +43,7 @@ agent host.
 
 ## 3. Dependency audit (`cargo audit`)
 
-Run on 2026-05-01 against the latest RustSec advisory database. **No
+Run on 2026-04-29 against the latest RustSec advisory database. **No
 vulnerable dependencies** were detected. CI re-runs `cargo audit` on every
 push (see `.github/workflows/ci.yml` job `audit`).
 
@@ -189,23 +189,14 @@ Tests verifying this behaviour (both in `agent::handlers::tests`):
 
 ## 10. Outstanding follow-ups (tracked in `ROADMAP.md`)
 
-- HMAC-SHA256 signature on each `AuditEvent` (tamper-evidence).
-- Replace the pre-shared-key dev path with X25519 + HKDF authenticated
-  key exchange (the `forward-secrecy` feature is now compile-tested in CI;
-  it is not yet the default transport).
+- ~~HMAC-SHA256 signature on each `AuditEvent` (tamper-evidence).~~ **Completed** — `AuditLog::record()` computes HMAC-SHA256 over each JSON line; tampered entries are flagged on read.
+- ~~Replace the pre-shared-key dev path with X25519 + HKDF authenticated key exchange.~~ **Completed** — the `forward-secrecy` feature implements ephemeral X25519 key exchange with HKDF-SHA256 session key derivation. It is not yet the default transport (opt-in via feature flag).
 - Sandboxed plugin execution (seccomp on Linux, Job Objects on Windows).
-- `ManualMap` reflective injection (`agent/src/injection/`) is compiled
-  in with `--features manual-map` but is **not functional as remote
-  injection**: `module_loader::inject_into_process` is a placeholder that
-  returns `Err("not implemented")`.  No remote code injection is active.
-- [Medium] PE32 process-hollowing compatibility hardening and broader runtime
-  validation beyond current WOW64-focused coverage.
-- [High] Promote Windows/macOS compile checks from non-blocking CI jobs to
-  required quality gates once flake rate is reduced.
-- [Medium] Continue macOS native mouse-detection hardening/coverage after
-  removing Python dependency (headless and permission-edge validation).
-- [High] Expand regression coverage for remote manual-map import resolution
-  in mismatched-ASLR scenarios.
+- `ManualMap` reflective injection (`agent/src/injection/`) is compiled in with `--features manual-map` and contains substantial implementation code for PE header parsing, section mapping, import resolution, relocation, and `DllMain` invocation in the target process. The `inject_into_process` cross-process injection path is still a placeholder returning `Err("not implemented")`. In-process manual PE loading for the module loader is fully functional.
+- [Medium] PE32 process-hollowing compatibility hardening and broader runtime validation beyond current WOW64-focused coverage.
+- [High] Promote Windows/macOS compile checks from non-blocking CI jobs to required quality gates once flake rate is reduced.
+- [Medium] Continue macOS native mouse-detection hardening/coverage after removing Python dependency (headless and permission-edge validation).
+- [High] Expand regression coverage for remote manual-map import resolution in mismatched-ASLR scenarios.
 
 ---
 

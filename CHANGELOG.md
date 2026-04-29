@@ -8,6 +8,46 @@ All notable changes to Orchestra are documented here.
 
 ### Added
 
+#### `common` crate
+- **HMAC-SHA256 audit log signing** — `AuditLog::record()` now computes an
+  HMAC-SHA256 tag over each JSON line and writes it as a paired line in the
+  audit log. Tampered entries are flagged on read. The HMAC key is derived
+  from the admin token via `AuditLog::derive_hmac_key()`.
+- **Protocol version 2** — `PROTOCOL_VERSION` bumped to 2. Encrypted payloads
+  now use the format `salt(32) ‖ nonce(12) ‖ ciphertext_with_tag`, with
+  per-message HKDF key derivation from the PSK and embedded salt.
+  `CryptoSession::decrypt_with_psk()` handles full wire-format decryption.
+- **`VersionHandshake` message** — Agents send a `Message::VersionHandshake`
+  as the first message on every new connection; the server echoes back its
+  version. Mismatched versions log a warning.
+
+#### `orchestra-server` crate
+- **Async build queue** — New `build_handler` module with configurable
+  worker count (`max_concurrent_builds`), job tracking, output directory
+  sandboxing, and automatic retention cleanup. REST API endpoints:
+  `POST /api/build`, `GET /api/build/status/:id`, `GET /api/build/:id/download`.
+- **DNS-over-HTTPS bridge** — New `doh_listener` module. When `doh_enabled = true`
+  is set in the server config, the server accepts agent sessions over DNS TXT/A
+  queries with IP-based rate limiting and staged authentication.
+- **Mutual TLS (agent channel)** — New server config fields: `mtls_enabled`,
+  `mtls_ca_cert_path`, `mtls_allowed_cns`, `mtls_allowed_ous`. When enabled,
+  the agent-facing TCP listener requires valid client certificates.
+- **Interactive shell API** — New REST endpoints for managing PTY sessions
+  through the dashboard: `POST /agents/:id/shell`, `POST /agents/:id/shell/:sid/input`,
+  `GET /agents/:id/shell/:sid/output`.
+- **Server config expansions** — New fields: `builds_output_dir`,
+  `build_retention_days`, `max_concurrent_builds`, `doh_enabled`,
+  `doh_listen_addr`, `doh_domain`, `doh_beacon_sentinel`, `doh_idle_ip`,
+  `agent_traffic_profile`, `mtls_enabled`, `mtls_ca_cert_path`,
+  `mtls_allowed_cns`, `mtls_allowed_ous`.
+
+#### `agent` crate
+- **`stack-spoof` feature** — Spoofs the user-mode call stack visible to EDR
+  kernel callbacks during indirect syscall dispatch on Windows x86-64.
+  Implies `direct-syscalls`.
+- **`hot-reload` feature** — Enables runtime config hot-reload via the
+  `notify` crate.
+
 #### `agent` crate
 - **`env_check` module** — Trusted Execution Environment (TEE) enforcement:
   `is_debugger_present()`, `detect_vm()`, `validate_domain(required)`, and

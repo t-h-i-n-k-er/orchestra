@@ -11,16 +11,20 @@
 +----------------+   TLS + AES-GCM PSK  +----------------------+   HTTPS / WS    +-----------+
 |  agent (×N)    | <-----------------> |  orchestra-server    | <-------------> |  browser  |
 | (managed host) |   length-prefixed   |  (control center)    |  Bearer token   | dashboard |
-+----------------+   JSON frames       +----------+-----------+                 +-----------+
++----------------+   bincode frames    +----------+-----------+                 +-----------+
                                                   |
                                                   v
-                                       JSONL audit log (append-only)
+                                       JSONL audit log (append-only, HMAC-signed)
 ```
 
 - **Agent channel.** Stock agents use the outbound Control Center path:
    TLS to `agent_addr` (certificate-pinned when configured), followed by
-   `common::CryptoSession` (AES-256-GCM with random per-frame nonces) and
-   the shared `Message` protocol.
+   `common::CryptoSession` (AES-256-GCM with HKDF-SHA256 per-message salt
+   derivation, protocol v2 wire format: `salt(32) ‖ nonce(12) ‖ ciphertext_with_tag`)
+   and the shared `Message` protocol serialized with **bincode**.
+- **DoH bridge (optional).** When `doh_enabled = true`, agents can tunnel
+   sessions over DNS TXT/A queries through the `doh_listener` module with
+   IP-based rate limiting and staged authentication.
 - **Operator channel.** `axum` 0.7 + `axum-server` (`rustls`) serving
   REST under `/api/*`, a WebSocket under `/api/ws`, and the static
   dashboard from `static/`.
@@ -42,8 +46,10 @@
 | [src/agent_link.rs](../orchestra-server/src/agent_link.rs) | TLS + AES-GCM agent listener and per-connection driver |
 | [src/api.rs](../orchestra-server/src/api.rs) | REST + WebSocket router |
 | [src/auth.rs](../orchestra-server/src/auth.rs) | Bearer-token middleware |
-| [src/audit.rs](../orchestra-server/src/audit.rs) | Append-only JSONL audit log + broadcast |
+| [src/audit.rs](../orchestra-server/src/audit.rs) | Append-only JSONL audit log (HMAC-SHA256 signed) + broadcast |
 | [src/tls.rs](../orchestra-server/src/tls.rs) | `RustlsConfig` from PEM or self-signed |
+| [src/doh_listener.rs](../orchestra-server/src/doh_listener.rs) | DNS-over-HTTPS bridge for agent sessions (optional) |
+| [src/build_handler.rs](../orchestra-server/src/build_handler.rs) | Async build queue: job tracking, worker pool, output sandboxing |
 | [static/index.html](../orchestra-server/static/index.html) | Dashboard markup |
 | [static/app.js](../orchestra-server/static/app.js) | Dashboard client (vanilla JS) |
 | [tests/e2e.rs](../orchestra-server/tests/e2e.rs) | End-to-end test: agent + ping round-trip |
@@ -66,6 +72,27 @@ command_timeout_secs = 30
 # Optional: PEM TLS material (recommended for production).
 # tls_cert_path = "/etc/orchestra/server.crt"
 # tls_key_path  = "/etc/orchestra/server.key"
+
+# Optional: Async build queue.
+# builds_output_dir     = "/var/lib/orchestra/builds"
+# build_retention_days  = 7
+# max_concurrent_builds = 2
+
+# Optional: DNS-over-HTTPS bridge for agent sessions.
+# doh_enabled         = false
+# doh_listen_addr     = "0.0.0.0:8053"
+# doh_domain          = "doh.example.com"
+# doh_beacon_sentinel = "ORCHESTRA_BEACON"
+# doh_idle_ip         = "127.0.0.1"
+
+# Optional: Traffic-normalization profile for agent channel.
+# agent_traffic_profile = "none"   # "none" | "enterprise" | "stealth"
+
+# Optional: Mutual TLS for the agent channel.
+# mtls_enabled       = false
+# mtls_ca_cert_path  = "/etc/orchestra/ca.pem"
+# mtls_allowed_cns   = ["agent.example.com"]
+# mtls_allowed_ous   = ["OrchestraAgents"]
 ```
 
 If `tls_cert_path` / `tls_key_path` are omitted, the server logs a
@@ -97,6 +124,12 @@ All routes under `/api/*` require `Authorization: Bearer <admin_token>`.
 | `POST` | `/api/agents/{agent_id}/command` | `{ "command": <Command> }` | Route by agent's self-reported `agent_id` (most-recently-seen wins on duplicate). |
 | `POST` | `/api/connections/{connection_id}/command` | `{ "command": <Command> }` | Unambiguous routing by server-assigned `connection_id` — use this when multiple agents share an `agent_id`. |
 | `GET`  | `/api/audit` | — | Return up to 200 most recent audit events. |
+| `POST` | `/api/build` | `{ "target": "<triple>", "features": [...] }` | Submit an async build job to the build queue. Returns `{ "build_id": "..." }`. |
+| `GET`  | `/api/build/status/{id}` | — | Poll build job status (`pending` / `running` / `completed` / `failed`). |
+| `GET`  | `/api/build/{id}/download` | — | Download the completed build artifact (encrypted payload). |
+| `POST` | `/api/agents/{agent_id}/shell` | `{ "shell": "bash" }` | Open an interactive PTY session on the agent. Returns `{ "session_id": "..." }`. |
+| `POST` | `/api/agents/{agent_id}/shell/{sid}/input` | `{ "data": "<base64>" }` | Write bytes to the PTY session's stdin. |
+| `GET`  | `/api/agents/{agent_id}/shell/{sid}/output` | — | Poll the PTY session's stdout/stderr buffer. |
 | `GET`  | `/api/ws` | — | WebSocket — pushes `agents` snapshots every 2s and live `audit` events. Authenticated via the `Sec-WebSocket-Protocol` header — see below. |
 
 The `Command` JSON shape matches `serde_json::to_value(common::Command)`.
@@ -107,10 +140,15 @@ Examples:
 { "command": "GetSystemInfo" }
 { "command": { "ListDirectory": { "path": "/var/log" } } }
 { "command": { "RunApprovedScript": { "script": "rotate-logs" } } }
+{ "command": "StartShell" }
+{ "command": { "ShellInput": { "session_id": "...", "data": "ZWNobyBoZWxsbwo=" } } }
 ```
 
-The protocol intentionally has no "execute arbitrary shell" command; the
-server cannot relay one because the type system does not contain it.
+Interactive shell sessions are managed through `StartShell`, `ShellInput`,
+`ShellOutput`, and `CloseShell` commands. The agent opens a PTY and streams
+I/O through dedicated REST endpoints (see above). There is no arbitrary
+command execution endpoint — shells run through a sandboxed PTY managed by
+the agent.
 
 ## WebSocket authentication
 
@@ -349,9 +387,8 @@ See `common/src/crypto.rs` for the implementation and its unit tests.
 
 Aligned with [`ROADMAP.md`](../ROADMAP.md):
 
-- HMAC-signed audit events (tamper-evident).
+- ~~HMAC-signed audit events (tamper-evident).~~ **Completed** — each JSONL entry is HMAC-SHA256 signed.
 - OIDC / SSO for operator login.
 - Per-operator RBAC tied to the cert CN once mTLS is the default
   operator path.
-- WebSocket-streamed shell sessions backed by `Command::ShellInput` /
-  `ShellOutput`.
+- ~~WebSocket-streamed shell sessions backed by `Command::ShellInput` / `ShellOutput`.~~ **Completed** — REST shell API and PTY sessions are live.

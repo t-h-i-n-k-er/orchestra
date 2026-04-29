@@ -68,53 +68,89 @@ codec is JSON during development; a more compact codec such as `bincode` or
 
 | Variant | Direction | Purpose |
 |---------|-----------|---------|
-| `Heartbeat`     | agent → console | Reports liveness, identity, and a coarse status string. |
-| `TaskRequest`   | console → agent | Requests execution of a `Command` under a unique `task_id`. |
-| `TaskResponse`  | agent → console | Returns `Ok(stdout)` or `Err(message)` keyed by `task_id`. |
-| `ModulePush`    | console → agent | Delivers an encrypted, signed capability module for the `module_loader`. |
+| `VersionHandshake` | agent → server (init), server → agent (echo) | Protocol version negotiation. Agent sends its version on connect; server echoes back. Mismatches log a warning. Current version: `2`. |
+| `Heartbeat` | agent → console | Reports liveness, identity, and a coarse status string. |
+| `TaskRequest` | console → agent | Requests execution of a `Command` under a unique `task_id`. Includes optional `operator_id` populated by the Control Center. |
+| `TaskResponse` | agent → console | Returns `Ok(stdout)` or `Err(message)` keyed by `task_id`. |
+| `ModulePush` | console → agent | Delivers an encrypted, signed capability module for the `module_loader`. |
+| `AuditLog` | agent → console | Pushes an `AuditEvent` record for compliance logging. |
+| `Shutdown` | either | Graceful session termination. |
 
 ### Command vocabulary
 
-`Command` is a closed set. There is **no** "execute arbitrary shell" variant by
-design — administrators register named scripts on each endpoint out of band,
-and the wire protocol can only reference them by identifier
-(`Command::RunApprovedScript { script }`). This keeps the trust boundary at the
-endpoint where it can be audited rather than letting any compromised console
-turn an agent into a remote shell.
+`Command` is a closed set. There is **no** "execute arbitrary shell command"
+variant — the closest is `StartShell` which opens an interactive PTY session
+that the agent itself manages. All file operations are constrained by
+`allowed_paths`. The full command set:
+
+| Command | Purpose |
+|---------|---------|
+| `Ping` | Liveness check. |
+| `GetSystemInfo` | Host inventory (OS, arch, uptime, memory). |
+| `RunApprovedScript { script }` | Execute a pre-registered named maintenance script (not an arbitrary command line). |
+| `ListDirectory { path }` | List files within `allowed_paths`. |
+| `ReadFile { path }` | Read file contents within `allowed_paths`. |
+| `WriteFile { path, content }` | Write file within `allowed_paths`. |
+| `DeployModule { module_id }` | Stage a capability module by ID from the module cache. |
+| `ExecutePlugin { plugin_id, args }` | Execute a loaded plugin with arguments. |
+| `StartShell` | Open an interactive PTY session (returns a `session_id`). |
+| `ShellInput { session_id, data }` | Write bytes to a PTY session's stdin. |
+| `ShellOutput { session_id }` | Poll a PTY session's stdout/stderr. |
+| `CloseShell { session_id }` | Terminate a PTY session and free file descriptors. |
+| `Shutdown` | Gracefully stop the agent. |
+| `DiscoverNetwork` | Perform bounded subnet enumeration (requires `network-discovery` feature). |
+| `CaptureScreen` | Capture the primary display as PNG (requires `remote-assist` feature). |
+| `SimulateKey { key }` | Simulate a key press (requires `remote-assist` + consent). |
+| `SimulateMouse { x, y }` | Simulate mouse movement (requires `remote-assist` + consent). |
+| `StartHciLogging` | Begin HCI telemetry capture (requires `hci-research` feature). |
+| `StopHciLogging` | Stop HCI telemetry capture. |
+| `GetHciLogBuffer` | Drain buffered HCI events. |
+| `ReloadConfig` | Re-read `agent.toml` at runtime without restarting. |
+| `EnablePersistence` | Install the opt-in persistence service. |
+| `DisablePersistence` | Remove the persistence service. |
+| `MigrateAgent { target_pid }` | Migrate into another process (experimental, platform-gated). |
+| `ListProcesses` | Return a JSON snapshot of running processes. |
 
 ### Cryptography
 
 Confidentiality and integrity for every framed message are provided by
-**AES-256-GCM** (`aes-gcm` crate). The `CryptoSession` type wraps:
+**AES-256-GCM** (`aes-gcm` crate) with **HKDF-SHA256** key derivation.
+The `CryptoSession` type wraps:
 
-- A 32-byte key derived from a pre-shared secret via SHA-256 (development
-  bootstrap; will be replaced by an authenticated X25519 + HKDF handshake).
-- `encrypt(plaintext)` produces `nonce ‖ ciphertext_with_tag`, where the
-  12-byte nonce is freshly drawn from the OS CSPRNG (`rand::thread_rng`) for
-  every call. Reusing a (key, nonce) pair under GCM is catastrophic, so callers
-  MUST NOT supply nonces themselves.
-- `decrypt(buf)` validates the GCM tag and returns either the plaintext or a
-  `CryptoError` (truncated input or authentication failure). Authentication
-  failure is fatal — the receiver discards the message and SHOULD log the
-  event.
+- A 32-byte key derived from a pre-shared secret via **HKDF-SHA256** with a
+  per-session random 32-byte salt. Protocol version 2 wire format:
+  `salt(32) ‖ nonce(12) ‖ ciphertext_with_tag`. The nonce is freshly drawn
+  from the OS CSPRNG (`rand::thread_rng`) for every call.
+- `encrypt(plaintext)` produces `salt ‖ nonce ‖ ciphertext_with_tag`.
+- `decrypt_with_psk(psk, wire_data)` extracts the embedded salt, derives
+  the per-message key via HKDF, and decrypts. `decrypt()` handles both
+  the new salt-prefixed format and a legacy `nonce ‖ ciphertext` format
+  for backward compatibility.
+- Authentication failure is fatal — the receiver discards the message and
+  logs the event.
+
+When the `forward-secrecy` feature is enabled, an **X25519** ephemeral
+Diffie-Hellman exchange is performed after the TLS handshake to derive a
+unique session key via HKDF, ensuring forward secrecy even if the PSK is
+later compromised.
 
 ### Transport abstraction
 
 `Transport` is an `async_trait` with `send(Message)` and `recv() -> Message`.
 It deliberately leaves framing, congestion handling, and reconnection to
 concrete implementations so that the same protocol can ride over TCP+TLS,
-QUIC, or an in-memory loopback for tests.
+QUIC, or an in-memory loopback for tests. The on-wire codec is **bincode**
+(not JSON) for compact framing; each frame is `u32 length prefix ‖ bincode-serialised Message`.
 
 ### Test coverage
 
 `cargo test -p common` exercises:
-- AES-GCM round-trip on a real payload.
-- Per-call nonce uniqueness.
+- AES-GCM round-trip via `CryptoSession` with HKDF salt derivation.
+- Per-call salt/nonce uniqueness across encryptions.
 - Tamper detection (single-bit flip rejected with `AuthenticationFailed`).
 - Truncated ciphertext rejection.
 - `serde` round-trip of a `TaskRequest { RunApprovedScript }` message.
-
-All five tests pass on the initial implementation; no fixes were required.
+- `decrypt_with_psk` inter-operation between independently-created sessions.
 
 ## Secure Module Loading
 
@@ -230,7 +266,10 @@ Every command dispatched to the agent generates an `AuditEvent` record (defined 
 
 The agent sends the `AuditEvent` as a `Message::AuditLog` wire message *before* sending the `TaskResponse`, ensuring the console records the audit entry even if it discards the response. The console appends each event as a JSON line to `audit.log` in the working directory.
 
-**Tamper-evidence:** Future work will add an HMAC-SHA256 signature over each audit record, keyed with the agent's TLS private key, allowing the console to verify that entries have not been altered in transit.
+**Tamper-evidence:** Each audit record is signed with **HMAC-SHA256**, keyed with a
+key derived from the admin token via `AuditLog::derive_hmac_key()`. The HMAC tag
+is written as a paired line after each JSON entry. On read, `AuditLog::read_entries()`
+verifies the tag and flags any tampered records.
 
 ---
 
@@ -348,7 +387,7 @@ The hardened handler:
 
 ### Architecture
 
-The `common::tls_transport::TlsTransport<S>` generic struct wraps any `AsyncRead + AsyncWrite` stream and implements the `Transport` trait with the same 4-byte-length-prefix + JSON framing used by `TcpTransport`. TLS provides confidentiality, integrity, and mutual authentication, eliminating the need for an additional AES-GCM encryption layer on top.
+The `common::tls_transport::TlsTransport<S>` generic struct wraps any `AsyncRead + AsyncWrite` stream and implements the `Transport` trait with the same 4-byte-length-prefix + **bincode** framing used by `TcpTransport`. TLS provides confidentiality, integrity, and mutual authentication, eliminating the need for an additional AES-GCM encryption layer on top.
 
 ### Rustls 0.23
 
@@ -489,8 +528,8 @@ closed with a clear diagnostic when prerequisites are absent.
 
 `agent/benches/agent_benchmark.rs` is a Criterion harness measuring:
 
-1. JSON encode + AES-256-GCM encrypt of a `Ping` task request.
-2. AES-256-GCM decrypt + JSON decode of the same payload.
+1. Bincode encode + AES-256-GCM encrypt of a `Ping` task request.
+2. AES-256-GCM decrypt + Bincode decode of the same payload.
 3. AES-256-GCM encryption throughput on a 100 MiB payload.
 
 Run with `cargo bench -p agent --bench agent_benchmark`. On a Ryzen 7950X
@@ -498,11 +537,6 @@ the encrypt-only throughput on 100 MiB exceeds 3 GiB/s thanks to the
 `aes-gcm` crate's hardware-accelerated AES-NI implementation. Round-trip
 encode/encrypt for a `Ping` is ≈3 µs, allowing the agent to sustain
 hundreds of thousands of commands per second on the hot path.
-
-Because real deployments send only a handful of commands per second, no
-further serialization-format optimization (e.g., switching from JSON to
-`bincode`) is justified at this time. JSON keeps the wire format
-human-debuggable.
 
 ---
 

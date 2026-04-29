@@ -17,9 +17,10 @@ and similar IT estates.
 - **Cross-platform.** First-class targets: `x86_64-unknown-linux-gnu`,
   `x86_64-pc-windows-gnu`, and `x86_64-apple-darwin`. ARM64 variants build
   from the same sources.
-- **Authenticated end-to-end.** AES-256-GCM session encryption with random
-  per-frame nonces, optional mTLS, bearer-token operator auth, and
-  append-only JSONL audit logs.
+- **Authenticated end-to-end.** HKDF-SHA256–derived AES-256-GCM session
+  encryption with per-frame random salts and nonces (protocol version 2),
+  optional mTLS on the agent channel, bearer-token operator auth, and
+  HMAC-SHA256–signed JSONL audit logs.
 - **Opt-in capability model.** Every non-default capability (persistence,
   network discovery, remote assistance, etc.) is a Cargo feature flag
   baked into a profile — only what you opt in to ships in the binary.
@@ -33,15 +34,24 @@ and similar IT estates.
 |-------|------|---------|
 | `agent` | lib + bin | Agent service that runs on managed endpoints. Can be embedded by the launcher or built standalone via the `agent-standalone` binary. |
 | `console` | bin | Legacy protocol-test CLI for custom listeners; stock agents use the Control Center. |
-| `orchestra-server` | bin | **Orchestra Control Center** — self-hosted management plane fronting a fleet of agents over an HTTPS dashboard and REST/WebSocket API. See [docs/C_SERVER.md](docs/C_SERVER.md). |
+| `orchestra-server` | bin | **Orchestra Control Center** — self-hosted management plane fronting a fleet of agents over an HTTPS dashboard and REST/WebSocket API. Includes an async build queue and optional DNS-over-HTTPS bridge. See [docs/C_SERVER.md](docs/C_SERVER.md). |
 | `builder` | bin | One-stop CLI for dependency setup, profile management, cross-compilation, and AES-encrypting payloads. See [builder/README.md](builder/README.md). |
 | `launcher` | bin | Tiny stub that fetches and decrypts an agent payload at runtime. |
 | `dev-server` | bin | Local HTTPS server for serving payloads to a launcher during testing. |
-| `payload-packager` | bin | Stand-alone AES-256-GCM payload encryptor. |
-| `hollowing` | lib | Windows process hollowing primitives for in-memory payload execution. |
-| `common` | lib | Protocol types, transport, audit, and crypto primitives shared by every binary. |
-| `optimizer` | lib | Runtime tuning of hot paths based on detected CPU microarchitecture. |
-| `module_loader` | lib | Securely fetches, verifies, and loads signed capability plugins. |
+| `payload-packager` | bin | Stand-alone AES-256-GCM payload encryptor with polymorphic packaging. |
+| `hollowing` | lib | Windows process hollowing primitives for in-memory payload execution (PE64 and PE32). |
+| `common` | lib | Protocol types (wire `Message`/`Command` enums), `CryptoSession` (HKDF + AES-256-GCM), `Transport` trait, audit events, TLS transport, and optional forward-secrecy (X25519) primitives shared by every binary. |
+| `optimizer` | lib | Runtime tuning of hot paths based on detected CPU microarchitecture, plus build-time software diversification passes (instruction substitution, dead-code insertion). |
+| `module_loader` | lib | Securely fetches, verifies, and loads signed capability plugins in memory (`memfd_create` on Linux, manual PE mapping on Windows with the `manual-map` feature). |
+| `keygen` | bin | Utility for generating Ed25519 keypairs used for module signing. |
+| `string_crypt` | lib + proc-macro | Compile-time string obfuscation via XOR-based encryption. Deterministic by default; seedable via `ORCHESTRA_STRING_CRYPT_SEED`. |
+| `pe_resolve` | lib | PE format parsing and resolution utilities for Windows binary analysis. |
+| `nt_syscall` | lib | Windows NT direct and indirect syscall wrappers. |
+| `junk_macro` | proc-macro | Procedural macro for inserting junk code barriers at compile time. |
+| `code_transform` | lib | Control-flow flattening and code transformation passes (AArch64 and x86_64). |
+| `code_transform_macro` | proc-macro | Helper proc-macros for the `code_transform` crate. |
+| `orchestra-side-load-gen` | bin | Generator for DLL side-loading payloads (Windows). |
+| `orchestra-pe-hardener` | lib | PE binary hardening primitives. **Currently a stub** — no implementation yet. |
 
 ## CI matrix
 
@@ -323,6 +333,8 @@ on per profile only when you need them.
 | `http-transport` | Activates the HTTP malleable-profile transport (`c2_http::HttpTransport`). When `cdn_relay = true` is set in `agent.toml`, the agent tunnels C2 traffic over HTTP/S using configurable header and URI profiles for traffic blending. |
 | `ssh-transport` | Activates the SSH-based C2 transport (`c2_ssh::SshTransport`). Experimental; intended for controlled deployments where SSH channeling is preferred. |
 | `env-validation` | Runs startup environment checks when explicitly enabled. Refusal is controlled by runtime policy fields such as `required_domain`, `refuse_in_vm`, `refuse_when_debugged`, and `sandbox_score_threshold`; otherwise signals are informational. See [docs/USER_GUIDE.md §10](docs/USER_GUIDE.md) for full details. |
+| `hot-reload` | Enables runtime config hot-reload via the `notify` crate. When active, the agent watches `agent.toml` for changes and reloads without restarting. |
+| `stack-spoof` | **Windows x86-64 only.** Spoofs the user-mode call stack visible to EDR kernel callbacks during indirect syscall dispatch. Implies `direct-syscalls`. |
 
 Run `orchestra-builder show-profile <name>` to inspect which features a
 profile enables.

