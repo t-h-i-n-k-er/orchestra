@@ -17,7 +17,7 @@ use winapi::um::winnt::{
     IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
     PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
 };
-use winapi::um::processthreadsapi::OpenProcess;
+use winapi::um::processthreadsapi::{FlushInstructionCache, OpenProcess};
 use pe_resolve;
 
 
@@ -1441,6 +1441,19 @@ pub unsafe fn load_dll_in_remote_process(
         // Write the resolved function pointer into the remote IAT slot.
         let iat_addr_bytes = (proc_addr as usize).to_le_bytes();
         write_remote(import.rva, &iat_addr_bytes)?;
+    }
+
+    // ── Step 4c: flush instruction cache ─────────────────────────────────
+    // The CPU may have stale cached instruction bytes from before we wrote
+    // the PE image, applied relocations, and fixed the IAT.  Flush the
+    // entire mapped region in the target process so the remote thread always
+    // executes coherent code.  FlushInstructionCache is a no-op on x86/x64
+    // (coherency is guaranteed by hardware) but it is the documented pattern
+    // for portable correctness and satisfies AV/EDR expectations.
+    // SAFETY: target_process is a valid handle; remote_base and image_size
+    // describe the region we just wrote.
+    unsafe {
+        FlushInstructionCache(target_process, remote_base as *const c_void, image_size);
     }
 
     // ── Step 5: invoke DllMain via a shellcode stub ───────────────────────

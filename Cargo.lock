@@ -2865,6 +2865,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "warp",
+ "winapi",
 ]
 
 [[package]]

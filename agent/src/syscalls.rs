@@ -348,48 +348,6 @@ fn find_ntdll_spoof_frame() -> usize {
 /// - Primary call site: map_clean_ntdll gadget scan around line 140.
 /// - Secondary call site: find_jmp_rbx_gadget near the stack-spoofing helpers.
 /// - Related syscall dispatch entry: do_syscall immediately below.
-/// Scan the first 64 bytes of `ntdll!NtQuerySystemTime` for a `ret` (0xC3)
-/// instruction and return its address.  This address is used as the synthetic
-/// return site pushed onto the stack before the syscall gadget is entered when
-/// `stack-spoof` is active:
-///
-///   do_syscall  →(jmp)→  syscall_gadget (syscall; ret)
-///                       → *this ret* inside NtQuerySystemTime (ret)
-///                       → real continuation inside do_syscall
-///
-/// `NtQuerySystemTime` is chosen as the cover function because it is a short,
-/// high-frequency stub whose call pattern is innocuous and whose `ret` is
-/// reachable within the first 32 bytes on all recent Windows versions.
-///
-/// Returns 0 if the function cannot be resolved or contains no `ret` in the
-/// first 64 bytes.
-#[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
-fn find_ntdll_spoof_frame() -> usize {
-    unsafe {
-        let ntdll = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
-            Some(b) => b,
-            None => return 0,
-        };
-        let func_addr = match pe_resolve::get_proc_address_by_hash(
-            ntdll,
-            pe_resolve::hash_str(b"NtQuerySystemTime\0"),
-        ) {
-            Some(a) => a,
-            None => return 0,
-        };
-        // Scan for a `ret` (0xC3) within the first 64 bytes of the function.
-        // Most NT stubs reach their `ret` well within 32 bytes; 64 gives a
-        // generous margin for hooked or padded variants.
-        let probe = std::slice::from_raw_parts(func_addr as *const u8, 64);
-        for (i, &byte) in probe.iter().enumerate() {
-            if byte == 0xC3 {
-                return func_addr + i;
-            }
-        }
-        0
-    }
-}
-
 #[cfg(windows)]
 unsafe fn gadget_is_valid(addr: usize, len: usize) -> bool {
     use winapi::um::memoryapi::VirtualQuery;

