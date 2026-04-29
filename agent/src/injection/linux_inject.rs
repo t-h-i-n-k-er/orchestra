@@ -1,20 +1,49 @@
 use crate::injection::Injector;
 use anyhow::{anyhow, Result};
 
-pub struct LinuxPtraceInjector;
+pub struct LinuxPtraceInjector {
+    /// When false (default), keep the original fire-and-forget behaviour.
+    /// When true, execute payload via a trampoline and restore original
+    /// registers after payload return + INT3 breakpoint.
+    pub restore_after: bool,
+}
+
+impl Default for LinuxPtraceInjector {
+    fn default() -> Self {
+        Self {
+            restore_after: false,
+        }
+    }
+}
+
+impl LinuxPtraceInjector {
+    pub const fn new() -> Self {
+        Self {
+            restore_after: false,
+        }
+    }
+
+    pub const fn with_restore_after(restore_after: bool) -> Self {
+        Self { restore_after }
+    }
+}
 
 #[cfg(target_os = "linux")]
 impl Injector for LinuxPtraceInjector {
-    /// Fire-and-forget Linux ptrace injection.
+    /// Linux ptrace injection.
     ///
-    /// This injector redirects the target thread RIP to injected shellcode and
-    /// then detaches without restoring the original RIP or execution context.
-    /// The target process should therefore be treated as non-surviving once
-    /// shellcode returns unless the payload explicitly transfers control to a
-    /// stable endpoint.
+    /// Default behaviour is fire-and-forget (restore_after=false): redirect RIP
+    /// to the injected shellcode and detach without restoring execution context.
     ///
-    /// Payloads must either call `execve()`, call `exit()`, or be
-    /// position-independent and implement an explicit return-to-host mechanism.
+    /// Optional restore mode (restore_after=true): redirect RIP to a small
+    /// trampoline that calls shellcode and executes INT3; once the breakpoint
+    /// stop is observed, restore original registers, then detach.
+    ///
+    /// In fire-and-forget mode (`restore_after=false`), payloads must either
+    /// call `execve()`, call `exit()`, or implement their own transfer back to
+    /// a stable endpoint. In restore mode (`restore_after=true`), payloads are
+    /// expected to return normally so the trampoline can trigger INT3 and
+    /// restore the original register context.
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
         if payload.is_empty() {
             return Err(anyhow!("LinuxPtraceInjector: payload is empty"));
@@ -37,24 +66,82 @@ impl Injector for LinuxPtraceInjector {
         #[cfg(target_arch = "x86_64")]
         {
             let original_regs = ptrace_getregs(target_pid)?;
-            let remote_addr = remote_mmap_rw(target_pid, payload.len(), &original_regs)?;
+            let staged_len = if self.restore_after {
+                payload
+                    .len()
+                    .checked_add(RESTORE_TRAMPOLINE_LEN)
+                    .ok_or_else(|| anyhow!("LinuxPtraceInjector: payload length overflow"))?
+            } else {
+                payload.len()
+            };
+
+            let remote_addr = remote_mmap_rw(target_pid, staged_len, &original_regs)?;
 
             write_payload(target_pid, remote_addr, payload)?;
-            remote_mprotect_rx(target_pid, remote_addr, payload.len(), &original_regs)?;
+
+            let (entry_rip, expected_break_rip) = if self.restore_after {
+                let trampoline_addr = remote_addr
+                    .checked_add(payload.len())
+                    .ok_or_else(|| anyhow!("LinuxPtraceInjector: trampoline address overflow"))?;
+                let trampoline = build_restore_trampoline(remote_addr);
+                write_payload(target_pid, trampoline_addr, &trampoline)?;
+                (
+                    trampoline_addr as u64,
+                    Some((trampoline_addr + RESTORE_TRAMPOLINE_LEN) as u64),
+                )
+            } else {
+                (remote_addr as u64, None)
+            };
+
+            remote_mprotect_rx(target_pid, remote_addr, staged_len, &original_regs)?;
 
             let mut exec_regs = original_regs;
-            exec_regs.rip = remote_addr as u64;
+            exec_regs.rip = entry_rip;
             ptrace_setregs(target_pid, &exec_regs)?;
+
+            if let Some(expected_rip) = expected_break_rip {
+                ptrace_continue_and_wait(target_pid)?;
+
+                let stopped_regs = ptrace_getregs(target_pid)?;
+                if stopped_regs.rip != expected_rip {
+                    ptrace_setregs(target_pid, &original_regs)?;
+                    return Err(anyhow!(
+                        "LinuxPtraceInjector: restore breakpoint mismatch (expected RIP=0x{:x}, got RIP=0x{:x})",
+                        expected_rip,
+                        stopped_regs.rip
+                    ));
+                }
+
+                ptrace_setregs(target_pid, &original_regs)?;
+            }
 
             log::info!(
                 "LinuxPtraceInjector: staged {} bytes at 0x{:x} in pid {}",
-                payload.len(),
+                staged_len,
                 remote_addr,
                 pid
             );
             Ok(())
         }
     }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const RESTORE_TRAMPOLINE_LEN: usize = 13;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn build_restore_trampoline(shellcode_addr: usize) -> [u8; RESTORE_TRAMPOLINE_LEN] {
+    // movabs rax, <shellcode_addr>
+    // call   rax
+    // int3
+    let mut trampoline = [0u8; RESTORE_TRAMPOLINE_LEN];
+    trampoline[0] = 0x48;
+    trampoline[1] = 0xB8;
+    trampoline[2..10].copy_from_slice(&(shellcode_addr as u64).to_le_bytes());
+    trampoline[10] = 0xFF;
+    trampoline[11] = 0xD0;
+    trampoline[12] = 0xCC;
+    trampoline
 }
 
 #[cfg(target_os = "linux")]
@@ -464,4 +551,32 @@ fn write_with_ptrace_pokedata(pid: libc::pid_t, remote_addr: usize, payload: &[u
     }
 
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_injector_preserves_fire_and_forget_mode() {
+        assert!(!LinuxPtraceInjector::default().restore_after);
+        assert!(!LinuxPtraceInjector::new().restore_after);
+    }
+
+    #[test]
+    fn restore_trampoline_is_call_then_int3() {
+        let shellcode_addr = 0x1122_3344_5566_7788usize;
+        let tr = build_restore_trampoline(shellcode_addr);
+
+        assert_eq!(tr.len(), RESTORE_TRAMPOLINE_LEN);
+        assert_eq!(tr[0], 0x48); // movabs rax, imm64
+        assert_eq!(tr[1], 0xB8);
+        assert_eq!(
+            u64::from_le_bytes(tr[2..10].try_into().expect("imm64 slice")),
+            shellcode_addr as u64
+        );
+        assert_eq!(tr[10], 0xFF); // call rax
+        assert_eq!(tr[11], 0xD0);
+        assert_eq!(tr[12], 0xCC); // int3
+    }
 }

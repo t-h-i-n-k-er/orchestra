@@ -1,4 +1,5 @@
 //! M-1 – Instruction substitution pass.
+#![cfg(target_arch = "x86_64")]
 //!
 //! Three rules are applied in a single left-to-right scan:
 //!

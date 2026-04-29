@@ -11,6 +11,7 @@ iced-x86 = { version = "1", features = [
 ] }
 rand = { workspace = true }
 rand_chacha = "0.3"
+log = "0.4"
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 libc = "0.2"

@@ -1,4 +1,5 @@
 //! M-2 – Basic-block reordering with opaque predicates.
+#![cfg(target_arch = "x86_64")]
 //!
 //! # Algorithm
 //!

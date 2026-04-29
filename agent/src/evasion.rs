@@ -96,8 +96,16 @@ unsafe extern "system" fn veh_handler(
                 }
             }
 
+            let mut found_ret = false;
             for _ in 0..64 {
+                // Avoid dereferencing at the very end of a page from inside VEH.
+                // If ptr is the last byte (offset 0xFFF), stop scanning to avoid
+                // crossing into a potentially unmapped page.
+                if (ptr as usize) & 0xFFF > (0x1000 - 2) {
+                    break;
+                }
                 if *ptr == 0xC3 || *ptr == 0xC2 {
+                    found_ret = true;
                     break;
                 }
                 ptr = ptr.add(1);
@@ -105,7 +113,7 @@ unsafe extern "system" fn veh_handler(
             // Fallback: if no ret gadget found in the search window, do NOT
             // redirect RIP to an arbitrary address (which would crash).
             // Let the exception propagate to the next handler in the VEH chain (C-4).
-            if *ptr != 0xC3 && *ptr != 0xC2 {
+            if !found_ret {
                 return winapi::vc::excpt::EXCEPTION_CONTINUE_SEARCH;
             }
 

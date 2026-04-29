@@ -52,6 +52,14 @@ pub struct SleepConfig {
     pub working_hours_end: Option<u32>, // e.g. 17 for 17:00
     #[serde(default)]
     pub off_hours_multiplier: Option<f32>,
+    /// When `true`, the agent encrypts its `.text` and `.rdata` sections
+    /// in-place with a per-sleep ChaCha20 key before sleeping and decrypts
+    /// them on wake.  The 32-byte key is kept in a stack-local variable for
+    /// the duration of the sleep, preventing memory-scanning tools from
+    /// locating it via known global or thread-local offsets.  When `false`,
+    /// the current timing-based obfuscated sleep behaviour is preserved.
+    #[serde(default)]
+    pub sleep_mask_enabled: bool,
 }
 
 fn default_base_interval() -> u64 {
@@ -70,6 +78,7 @@ impl Default for SleepConfig {
             working_hours_start: None,
             working_hours_end: None,
             off_hours_multiplier: None,
+            sleep_mask_enabled: false,
         }
     }
 }

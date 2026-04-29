@@ -161,6 +161,398 @@ pub mod windows {
     }
 
     // ── FR-1B: WMI Event Subscriptions ───────────────────────────────────────
+
+    // ---- WMI COM interface definitions (wbemcli not in winapi crate) ---------
+    //
+    // We define only the vtable slots we need.  Layout must match the real
+    // COM vtables on every version of Windows; these match the MSDN/SDK
+    // definitions exactly.
+    use winapi::shared::guiddef::{GUID, REFIID};
+    use winapi::shared::wtypes::BSTR;
+    use winapi::um::unknwnbase::{IUnknown, IUnknownVtbl};
+    use winapi::um::winnt::LONG;
+
+    // IWbemClassObject (partial vtable – only Put and Release are used)
+    #[repr(C)]
+    struct IWbemClassObjectVtbl {
+        // IUnknown
+        pub query_interface: unsafe extern "system" fn(*mut IWbemClassObject, REFIID, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub add_ref:         unsafe extern "system" fn(*mut IWbemClassObject) -> u32,
+        pub release:         unsafe extern "system" fn(*mut IWbemClassObject) -> u32,
+        // IWbemClassObject – first 3 methods before Put
+        pub get_qualifier_set: unsafe extern "system" fn(*mut IWbemClassObject, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub get:             unsafe extern "system" fn(*mut IWbemClassObject, BSTR, LONG, *mut winapi::um::oaidl::VARIANT, *mut LONG, *mut LONG) -> winapi::shared::winerror::HRESULT,
+        pub put:             unsafe extern "system" fn(*mut IWbemClassObject, BSTR, LONG, *mut winapi::um::oaidl::VARIANT, LONG) -> winapi::shared::winerror::HRESULT,
+    }
+    #[repr(C)]
+    struct IWbemClassObject {
+        pub lpvtbl: *const IWbemClassObjectVtbl,
+    }
+
+    // IWbemServices (partial vtable – only GetObject and PutInstance are used)
+    // Full vtable slot offsets per MSDN (IWbemServices inherits from IUnknown):
+    //   0 QueryInterface, 1 AddRef, 2 Release,
+    //   3 OpenNamespace, 4 CancelAsyncCall, 5 QueryObjectSink,
+    //   6 GetObject, 7 GetObjectAsync,
+    //   8 PutClass, 9 PutClassAsync,
+    //   10 DeleteClass, 11 DeleteClassAsync,
+    //   12 CreateClassEnum, 13 CreateClassEnumAsync,
+    //   14 PutInstance, ...
+    #[repr(C)]
+    struct IWbemServicesVtbl {
+        pub query_interface:      unsafe extern "system" fn(*mut IWbemServices, REFIID, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub add_ref:              unsafe extern "system" fn(*mut IWbemServices) -> u32,
+        pub release:              unsafe extern "system" fn(*mut IWbemServices) -> u32,
+        pub open_namespace:       unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut IWbemServices, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub cancel_async_call:    unsafe extern "system" fn(*mut IWbemServices, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub query_object_sink:    unsafe extern "system" fn(*mut IWbemServices, LONG, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub get_object:           unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut IWbemClassObject, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub get_object_async:     unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub put_class:            unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub put_class_async:      unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub delete_class:         unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub delete_class_async:   unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub create_class_enum:    unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub create_class_enum_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub put_instance:         unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+    }
+    #[repr(C)]
+    struct IWbemServices {
+        pub lpvtbl: *const IWbemServicesVtbl,
+    }
+
+    // IWbemLocator (partial vtable – only ConnectServer)
+    #[repr(C)]
+    struct IWbemLocatorVtbl {
+        pub query_interface: unsafe extern "system" fn(*mut IWbemLocator, REFIID, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub add_ref:         unsafe extern "system" fn(*mut IWbemLocator) -> u32,
+        pub release:         unsafe extern "system" fn(*mut IWbemLocator) -> u32,
+        pub connect_server:  unsafe extern "system" fn(
+            *mut IWbemLocator,
+            BSTR,                        // strNetworkResource (namespace)
+            BSTR,                        // strUser
+            BSTR,                        // strPassword
+            BSTR,                        // strLocale
+            LONG,                        // lSecurityFlags
+            BSTR,                        // strAuthority
+            *mut std::ffi::c_void,       // pCtx
+            *mut *mut IWbemServices,     // ppNamespace (out)
+        ) -> winapi::shared::winerror::HRESULT,
+    }
+    #[repr(C)]
+    struct IWbemLocator {
+        pub lpvtbl: *const IWbemLocatorVtbl,
+    }
+
+    // GUIDs
+    const CLSID_WBEM_LOCATOR: GUID = GUID {
+        Data1: 0x4590_f811,
+        Data2: 0x1d3a,
+        Data3: 0x11d0,
+        Data4: [0x89, 0x1f, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24],
+    };
+    const IID_IWBEM_LOCATOR: GUID = GUID {
+        Data1: 0xdc12_a687,
+        Data2: 0x737f,
+        Data3: 0x11cf,
+        Data4: [0x88, 0x4d, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24],
+    };
+
+    // WBEM_FLAG_CREATE_OR_UPDATE = 0
+    const WBEM_FLAG_CREATE_OR_UPDATE: LONG = 0;
+    // VT_BSTR = 8
+    const VT_BSTR: u16 = 8;
+
+    // Helper: allocate a BSTR from a Rust &str
+    unsafe fn alloc_bstr(s: &str) -> BSTR {
+        use winapi::um::oleauto::SysAllocStringLen;
+        let wide: Vec<u16> = s.encode_utf16().collect();
+        SysAllocStringLen(wide.as_ptr(), wide.len() as u32)
+    }
+
+    // Helper: free a BSTR (null-safe)
+    unsafe fn free_bstr(b: BSTR) {
+        use winapi::um::oleauto::SysFreeString;
+        if !b.is_null() {
+            SysFreeString(b);
+        }
+    }
+
+    // Helper: set a BSTR property on an IWbemClassObject
+    unsafe fn put_bstr_prop(
+        obj: *mut IWbemClassObject,
+        name: &str,
+        value: &str,
+    ) -> winapi::shared::winerror::HRESULT {
+        use winapi::um::oaidl::VARIANT;
+        let name_bstr = alloc_bstr(name);
+        let val_bstr = alloc_bstr(value);
+        let mut var: VARIANT = std::mem::zeroed();
+        // Set variant type to VT_BSTR and assign the BSTR value
+        // VARIANT layout: n1 → n2 → (vt, n3 union containing bstrVal)
+        var.n1.n2_mut().vt = VT_BSTR;
+        *var.n1.n2_mut().n3.bstrVal_mut() = val_bstr;
+        let hr = ((*(*obj).lpvtbl).put)(obj, name_bstr, 0, &mut var, 0);
+        // Do NOT SysFreeString val_bstr — VariantClear would normally do it,
+        // but since we own the VARIANT and it's on the stack we free it here
+        // only after the Put call has copied/addref'd the value.
+        free_bstr(val_bstr);
+        free_bstr(name_bstr);
+        hr
+    }
+
+    // Core COM implementation: returns Ok(()) on success, Err with HR description on failure.
+    unsafe fn wmi_install_com(
+        subscription_name: &str,
+        exe_path: &str,
+    ) -> Result<()> {
+        use winapi::shared::winerror::SUCCEEDED;
+        use winapi::um::combaseapi::{CoCreateInstance, CoSetProxyBlanket};
+        use winapi::shared::rpcdce::{RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_IMP_LEVEL_IMPERSONATE, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
+
+        // Step 1: CoCreateInstance(CLSID_WbemLocator)
+        let mut locator_ptr: *mut IWbemLocator = ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_WBEM_LOCATOR,
+            ptr::null_mut(),
+            winapi::um::combaseapi::CLSCTX_INPROC_SERVER,
+            &IID_IWBEM_LOCATOR,
+            &mut locator_ptr as *mut _ as *mut *mut std::ffi::c_void,
+        );
+        if !SUCCEEDED(hr) {
+            return Err(anyhow!("CoCreateInstance(WbemLocator) failed: 0x{:08X}", hr));
+        }
+        let locator = &mut *locator_ptr;
+
+        // Step 2: ConnectServer("root\\subscription")
+        let ns_bstr = alloc_bstr("root\\subscription");
+        let mut services_ptr: *mut IWbemServices = ptr::null_mut();
+        let hr = ((*locator.lpvtbl).connect_server)(
+            locator_ptr,
+            ns_bstr,
+            ptr::null_mut(), // user (current)
+            ptr::null_mut(), // password (current)
+            ptr::null_mut(), // locale (default)
+            0,               // security flags
+            ptr::null_mut(), // authority
+            ptr::null_mut(), // context
+            &mut services_ptr,
+        );
+        free_bstr(ns_bstr);
+        if !SUCCEEDED(hr) {
+            ((*locator.lpvtbl).release)(locator_ptr);
+            return Err(anyhow!("IWbemLocator::ConnectServer failed: 0x{:08X}", hr));
+        }
+
+        // Step 3: Set proxy blanket on IWbemServices
+        let hr = CoSetProxyBlanket(
+            services_ptr as *mut IUnknown,
+            RPC_C_AUTHN_WINNT,
+            RPC_C_AUTHZ_NONE,
+            ptr::null_mut(),
+            RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            ptr::null_mut(),
+            0, // EOAC_NONE
+        );
+        if !SUCCEEDED(hr) {
+            ((*(*services_ptr).lpvtbl).release)(services_ptr);
+            ((*locator.lpvtbl).release)(locator_ptr);
+            return Err(anyhow!("CoSetProxyBlanket failed: 0x{:08X}", hr));
+        }
+
+        // Step 4a: Get the __EventFilter class definition and spawn an instance
+        let filter_class_bstr = alloc_bstr("__EventFilter");
+        let mut filter_class_obj: *mut IWbemClassObject = ptr::null_mut();
+        let hr = ((*(*services_ptr).lpvtbl).get_object)(
+            services_ptr,
+            filter_class_bstr,
+            0,
+            ptr::null_mut(),
+            &mut filter_class_obj,
+            ptr::null_mut(),
+        );
+        free_bstr(filter_class_bstr);
+        if !SUCCEEDED(hr) {
+            ((*(*services_ptr).lpvtbl).release)(services_ptr);
+            ((*locator.lpvtbl).release)(locator_ptr);
+            return Err(anyhow!("GetObject(__EventFilter) failed: 0x{:08X}", hr));
+        }
+
+        // Spawn a new instance from the class object by calling SpawnInstance via vtable.
+        // SpawnInstance is at vtable index 16 (0-based, after Put/Delete/etc.).
+        // Rather than define the full vtable, we PutInstance directly on the class object
+        // and let WMI create the instance for us via get_object + put.
+        // We create a fresh instance by calling SpawnInstance (vtable[16]).
+        // Define a minimal trampoline type to call it:
+        let spawn_instance_fn: unsafe extern "system" fn(
+            *mut IWbemClassObject, LONG, *mut *mut IWbemClassObject,
+        ) -> winapi::shared::winerror::HRESULT = std::mem::transmute(
+            (*(filter_class_obj as *const *const *const usize)
+                .read()
+            ).add(16)
+            .read() as *const ()
+        );
+
+        let mut filter_inst: *mut IWbemClassObject = ptr::null_mut();
+        let hr = spawn_instance_fn(filter_class_obj, 0, &mut filter_inst);
+        ((*(*filter_class_obj).lpvtbl).release)(filter_class_obj);
+        if !SUCCEEDED(hr) {
+            ((*(*services_ptr).lpvtbl).release)(services_ptr);
+            ((*locator.lpvtbl).release)(locator_ptr);
+            return Err(anyhow!("SpawnInstance(__EventFilter) failed: 0x{:08X}", hr));
+        }
+
+        let filter_query = "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'";
+        put_bstr_prop(filter_inst, "Name", subscription_name);
+        put_bstr_prop(filter_inst, "EventNamespace", "root/cimv2");
+        put_bstr_prop(filter_inst, "QueryLanguage", "WQL");
+        put_bstr_prop(filter_inst, "Query", filter_query);
+
+        let hr = ((*(*services_ptr).lpvtbl).put_instance)(
+            services_ptr, filter_inst, WBEM_FLAG_CREATE_OR_UPDATE,
+            ptr::null_mut(), ptr::null_mut(),
+        );
+        ((*(*filter_inst).lpvtbl).release)(filter_inst);
+        if !SUCCEEDED(hr) {
+            ((*(*services_ptr).lpvtbl).release)(services_ptr);
+            ((*locator.lpvtbl).release)(locator_ptr);
+            return Err(anyhow!("PutInstance(__EventFilter) failed: 0x{:08X}", hr));
+        }
+
+        // Step 4b: CommandLineEventConsumer
+        let consumer_class_bstr = alloc_bstr("CommandLineEventConsumer");
+        let mut consumer_class_obj: *mut IWbemClassObject = ptr::null_mut();
+        let hr = ((*(*services_ptr).lpvtbl).get_object)(
+            services_ptr,
+            consumer_class_bstr,
+            0,
+            ptr::null_mut(),
+            &mut consumer_class_obj,
+            ptr::null_mut(),
+        );
+        free_bstr(consumer_class_bstr);
+        if !SUCCEEDED(hr) {
+            ((*(*services_ptr).lpvtbl).release)(services_ptr);
+            ((*locator.lpvtbl).release)(locator_ptr);
+            return Err(anyhow!("GetObject(CommandLineEventConsumer) failed: 0x{:08X}", hr));
+        }
+
+        let spawn_instance_fn2: unsafe extern "system" fn(
+            *mut IWbemClassObject, LONG, *mut *mut IWbemClassObject,
+        ) -> winapi::shared::winerror::HRESULT = std::mem::transmute(
+            (*(consumer_class_obj as *const *const *const usize)
+                .read()
+            ).add(16)
+            .read() as *const ()
+        );
+        let mut consumer_inst: *mut IWbemClassObject = ptr::null_mut();
+        let hr = spawn_instance_fn2(consumer_class_obj, 0, &mut consumer_inst);
+        ((*(*consumer_class_obj).lpvtbl).release)(consumer_class_obj);
+        if !SUCCEEDED(hr) {
+            ((*(*services_ptr).lpvtbl).release)(services_ptr);
+            ((*locator.lpvtbl).release)(locator_ptr);
+            return Err(anyhow!("SpawnInstance(CommandLineEventConsumer) failed: 0x{:08X}", hr));
+        }
+
+        put_bstr_prop(consumer_inst, "Name", subscription_name);
+        put_bstr_prop(consumer_inst, "CommandLineTemplate", exe_path);
+
+        let hr = ((*(*services_ptr).lpvtbl).put_instance)(
+            services_ptr, consumer_inst, WBEM_FLAG_CREATE_OR_UPDATE,
+            ptr::null_mut(), ptr::null_mut(),
+        );
+        ((*(*consumer_inst).lpvtbl).release)(consumer_inst);
+        if !SUCCEEDED(hr) {
+            ((*(*services_ptr).lpvtbl).release)(services_ptr);
+            ((*locator.lpvtbl).release)(locator_ptr);
+            return Err(anyhow!("PutInstance(CommandLineEventConsumer) failed: 0x{:08X}", hr));
+        }
+
+        // Step 4c: __FilterToConsumerBinding
+        let binding_class_bstr = alloc_bstr("__FilterToConsumerBinding");
+        let mut binding_class_obj: *mut IWbemClassObject = ptr::null_mut();
+        let hr = ((*(*services_ptr).lpvtbl).get_object)(
+            services_ptr,
+            binding_class_bstr,
+            0,
+            ptr::null_mut(),
+            &mut binding_class_obj,
+            ptr::null_mut(),
+        );
+        free_bstr(binding_class_bstr);
+        if !SUCCEEDED(hr) {
+            ((*(*services_ptr).lpvtbl).release)(services_ptr);
+            ((*locator.lpvtbl).release)(locator_ptr);
+            return Err(anyhow!("GetObject(__FilterToConsumerBinding) failed: 0x{:08X}", hr));
+        }
+
+        let spawn_instance_fn3: unsafe extern "system" fn(
+            *mut IWbemClassObject, LONG, *mut *mut IWbemClassObject,
+        ) -> winapi::shared::winerror::HRESULT = std::mem::transmute(
+            (*(binding_class_obj as *const *const *const usize)
+                .read()
+            ).add(16)
+            .read() as *const ()
+        );
+        let mut binding_inst: *mut IWbemClassObject = ptr::null_mut();
+        let hr = spawn_instance_fn3(binding_class_obj, 0, &mut binding_inst);
+        ((*(*binding_class_obj).lpvtbl).release)(binding_class_obj);
+        if !SUCCEEDED(hr) {
+            ((*(*services_ptr).lpvtbl).release)(services_ptr);
+            ((*locator.lpvtbl).release)(locator_ptr);
+            return Err(anyhow!("SpawnInstance(__FilterToConsumerBinding) failed: 0x{:08X}", hr));
+        }
+
+        // Filter reference: "__EventFilter.Name=\"<name>\""
+        let filter_ref = format!("__EventFilter.Name=\"{}\"", subscription_name);
+        let consumer_ref = format!("CommandLineEventConsumer.Name=\"{}\"", subscription_name);
+        put_bstr_prop(binding_inst, "Filter", &filter_ref);
+        put_bstr_prop(binding_inst, "Consumer", &consumer_ref);
+
+        let hr = ((*(*services_ptr).lpvtbl).put_instance)(
+            services_ptr, binding_inst, WBEM_FLAG_CREATE_OR_UPDATE,
+            ptr::null_mut(), ptr::null_mut(),
+        );
+        ((*(*binding_inst).lpvtbl).release)(binding_inst);
+        ((*(*services_ptr).lpvtbl).release)(services_ptr);
+        ((*locator.lpvtbl).release)(locator_ptr);
+
+        if !SUCCEEDED(hr) {
+            return Err(anyhow!("PutInstance(__FilterToConsumerBinding) failed: 0x{:08X}", hr));
+        }
+        Ok(())
+    }
+
+    // Escape a value for embedding inside a single-quoted PowerShell string.
+    fn escape_ps_string(s: &str) -> String {
+        s.replace('\'', "''")
+    }
+
+    // PowerShell fallback for WMI registration
+    unsafe fn wmi_install_powershell(
+        subscription_name: &str,
+        exe_path: &str,
+    ) -> Result<()> {
+        let escaped_name = escape_ps_string(subscription_name);
+        let escaped_path = escape_ps_string(exe_path);
+        let filter_query = "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'";
+        let ps_cmd = format!(
+            "$filter = Set-WmiInstance -Class __EventFilter -Namespace root\\subscription -Arguments @{{Name='{}';EventNamespace='root/cimv2';QueryLanguage='WQL';Query='{}'}};
+            $consumer = Set-WmiInstance -Class CommandLineEventConsumer -Namespace root\\subscription -Arguments @{{Name='{}';CommandLineTemplate='{}'}};
+            Set-WmiInstance -Class __FilterToConsumerBinding -Namespace root\\subscription -Arguments @{{Filter=$filter;Consumer=$consumer}}",
+            escaped_name, filter_query, escaped_name, escaped_path
+        );
+        let status = std::process::Command::new("powershell")
+            .args(["-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
+            .status()
+            .map_err(|e| anyhow!("WmiSubscription: failed to spawn powershell: {}", e))?;
+        if !status.success() {
+            return Err(anyhow!("WmiSubscription: powershell returned non-zero exit code"));
+        }
+        Ok(())
+    }
+
     pub struct WmiSubscription {
         pub subscription_name: String,
     }
@@ -173,25 +565,13 @@ pub mod windows {
         }
     }
 
-    // Escape a value for embedding inside a single-quoted PowerShell string.
-    // In PowerShell single-quoted strings, only a single quote itself must be
-    // escaped, and it is escaped by doubling it.
-    fn escape_ps_string(s: &str) -> String {
-        s.replace('\'', "''")
-    }
-
     impl Persist for WmiSubscription {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            // WMI persistence via __EventFilter + CommandLineEventConsumer + __FilterToConsumerBinding
-            // Uses the WMI COM API (IWbemLocator → IWbemServices → ExecMethod)
-            // Requires COM to be initialised. We call CoInitializeEx here.
             use winapi::shared::winerror::SUCCEEDED;
-            use winapi::um::combaseapi::{CoCreateInstance, CoInitializeEx, CoUninitialize};
+            use winapi::um::combaseapi::{CoInitializeEx, CoUninitialize};
             use winapi::um::objbase::COINIT_MULTITHREADED;
 
             let exe_path = executable_path.to_string_lossy();
-            let escaped_subscription_name = escape_ps_string(&self.subscription_name);
-            let escaped_exe_path = escape_ps_string(exe_path.as_ref());
             log::info!(
                 "WmiSubscription::install: registering '{}' for '{}'",
                 self.subscription_name,
@@ -200,43 +580,26 @@ pub mod windows {
 
             unsafe {
                 let hr = CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED);
-                if !SUCCEEDED(hr) && hr != 0x00000001i32
-                /* S_FALSE - already init */
-                {
+                if !SUCCEEDED(hr) && hr != 0x00000001i32 /* S_FALSE */ {
                     return Err(anyhow!(
                         "WmiSubscription::install: CoInitializeEx failed: 0x{:08X}",
                         hr
                     ));
                 }
 
-                // Use PowerShell as a fallback WMI registration path when the
-                // full COM/IWbemServices path is not available (no wbemcli.h bindings).
-                let filter_query = format!(
-                    "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'"
-                );
-                let ps_cmd = format!(
-                    "$filter = Set-WmiInstance -Class __EventFilter -Namespace root\\subscription -Arguments @{{Name='{}';EventNamespace='root/cimv2';QueryLanguage='WQL';Query='{}'}};
-                    $consumer = Set-WmiInstance -Class CommandLineEventConsumer -Namespace root\\subscription -Arguments @{{Name='{}';CommandLineTemplate='{}'}};
-                    Set-WmiInstance -Class __FilterToConsumerBinding -Namespace root\\subscription -Arguments @{{Filter=$filter;Consumer=$consumer}}",
-                    escaped_subscription_name,
-                    filter_query,
-                    escaped_subscription_name,
-                    escaped_exe_path
-                );
-
-                let status = std::process::Command::new("powershell")
-                    .args(["-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
-                    .status()
-                    .map_err(|e| anyhow!("WmiSubscription: failed to spawn powershell: {}", e))?;
-
-                // One CoInitializeEx → one CoUninitialize.
-                CoUninitialize();
-
-                if !status.success() {
-                    return Err(anyhow!(
-                        "WmiSubscription::install: powershell returned non-zero exit code"
-                    ));
+                let result = wmi_install_com(&self.subscription_name, exe_path.as_ref());
+                if let Err(ref e) = result {
+                    log::warn!(
+                        "WmiSubscription::install: COM path failed ({}), falling back to PowerShell",
+                        e
+                    );
+                    let ps_result = wmi_install_powershell(&self.subscription_name, exe_path.as_ref());
+                    CoUninitialize();
+                    ps_result?;
+                } else {
+                    CoUninitialize();
                 }
+
                 log::info!("WmiSubscription::install: registered successfully");
             }
             Ok(())
@@ -924,6 +1287,16 @@ pub mod macos {
         fn SMLoginItemSetEnabled(identifier: CFStringRef, enabled: u8) -> u8;
     }
 
+    // SMAppService is an Objective-C API in ServiceManagement (macOS 13+).
+    // We invoke it through libobjc at runtime so older macOS versions can
+    // safely fall back to the legacy SMLoginItemSetEnabled path.
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
+        fn sel_registerName(name: *const std::os::raw::c_char) -> *const std::ffi::c_void;
+        fn objc_msgSend();
+    }
+
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
         fn CFStringCreateWithCString(
@@ -949,7 +1322,8 @@ pub mod macos {
     ///
     /// Strategy selection:
     /// 1) If the executable is running from inside an `.app` bundle, use
-    ///    ServiceManagement (`SMLoginItemSetEnabled`) and require a helper app
+    ///    ServiceManagement (SMAppService on macOS 13+, otherwise
+    ///    `SMLoginItemSetEnabled`) and require a helper app
     ///    at:
     ///    `<MainApp>.app/Contents/Library/LoginItems/<app_name>.app`
     /// 2) Otherwise, fall back to the existing GUI LaunchAgent strategy
@@ -1072,6 +1446,133 @@ pub mod macos {
         }
 
         fn sm_set_enabled(helper_bundle_id: &str, enabled: bool) -> Result<()> {
+            if Self::is_macos_13_or_later() {
+                match Self::sm_set_enabled_via_app_service(helper_bundle_id, enabled) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        log::warn!(
+                            "LoginItem: SMAppService path failed ({}); falling back to SMLoginItemSetEnabled",
+                            e
+                        );
+                    }
+                }
+            }
+
+            Self::sm_set_enabled_legacy(helper_bundle_id, enabled)
+        }
+
+        fn is_macos_13_or_later() -> bool {
+            let out = match std::process::Command::new("sw_vers")
+                .arg("-productVersion")
+                .output()
+            {
+                Ok(o) => o,
+                Err(_) => return false,
+            };
+            if !out.status.success() {
+                return false;
+            }
+            let version = String::from_utf8_lossy(&out.stdout);
+            let major = version
+                .trim()
+                .split('.')
+                .next()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            major >= 13
+        }
+
+        fn sm_set_enabled_via_app_service(helper_bundle_id: &str, enabled: bool) -> Result<()> {
+            use std::ffi::CString;
+
+            type MsgSendLoginItemService =
+                unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void, CFStringRef)
+                    -> *mut std::ffi::c_void;
+            type MsgSendRegister = unsafe extern "C" fn(
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+                *mut *mut std::ffi::c_void,
+            ) -> i8;
+
+            let cls_name = CString::new("SMAppService")
+                .map_err(|_| anyhow!("LoginItem: invalid SMAppService class name"))?;
+            let sel_login = CString::new("loginItemServiceWithIdentifier:")
+                .map_err(|_| anyhow!("LoginItem: invalid selector name"))?;
+            let sel_register = CString::new("registerAndReturnError:")
+                .map_err(|_| anyhow!("LoginItem: invalid selector name"))?;
+            let sel_unregister = CString::new("unregisterAndReturnError:")
+                .map_err(|_| anyhow!("LoginItem: invalid selector name"))?;
+
+            let c_id = CString::new(helper_bundle_id)
+                .map_err(|_| anyhow!("LoginItem: helper bundle id contains NUL byte"))?;
+
+            unsafe {
+                let cls = objc_getClass(cls_name.as_ptr());
+                if cls.is_null() {
+                    return Err(anyhow!(
+                        "LoginItem: SMAppService class is not available on this system"
+                    ));
+                }
+
+                let cf_id = CFStringCreateWithCString(
+                    std::ptr::null(),
+                    c_id.as_ptr(),
+                    K_CFSTRING_ENCODING_UTF8,
+                );
+                if cf_id.is_null() {
+                    return Err(anyhow!(
+                        "LoginItem: CFStringCreateWithCString failed for '{}'",
+                        helper_bundle_id
+                    ));
+                }
+
+                let login_sel = sel_registerName(sel_login.as_ptr());
+                if login_sel.is_null() {
+                    CFRelease(cf_id);
+                    return Err(anyhow!(
+                        "LoginItem: failed to resolve selector loginItemServiceWithIdentifier:"
+                    ));
+                }
+
+                let msg_send_login: MsgSendLoginItemService =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let service = msg_send_login(cls, login_sel, cf_id);
+                CFRelease(cf_id);
+                if service.is_null() {
+                    return Err(anyhow!(
+                        "LoginItem: SMAppService loginItemServiceWithIdentifier('{}') returned null",
+                        helper_bundle_id
+                    ));
+                }
+
+                let action_sel = if enabled {
+                    sel_registerName(sel_register.as_ptr())
+                } else {
+                    sel_registerName(sel_unregister.as_ptr())
+                };
+                if action_sel.is_null() {
+                    return Err(anyhow!(
+                        "LoginItem: failed to resolve SMAppService action selector"
+                    ));
+                }
+
+                let msg_send_register: MsgSendRegister =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let mut err_obj: *mut std::ffi::c_void = std::ptr::null_mut();
+                let ok = msg_send_register(service, action_sel, &mut err_obj) != 0;
+                if !ok {
+                    return Err(anyhow!(
+                        "LoginItem: SMAppService {} failed for helper '{}'",
+                        if enabled { "register" } else { "unregister" },
+                        helper_bundle_id
+                    ));
+                }
+            }
+
+            Ok(())
+        }
+
+        fn sm_set_enabled_legacy(helper_bundle_id: &str, enabled: bool) -> Result<()> {
             use std::ffi::CString;
 
             let c_id = CString::new(helper_bundle_id)

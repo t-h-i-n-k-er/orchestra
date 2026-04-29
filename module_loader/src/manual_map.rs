@@ -286,15 +286,58 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         .optional_header
         .ok_or_else(|| anyhow!("PE has no optional header"))?;
 
-    // 1. Allocate memory for the DLL
-    let image_base = VirtualAlloc(
-        std::ptr::null_mut(),
+    // 1. Allocate memory for the DLL.
+    // Try the preferred image base first to avoid relocations when that VA
+    // range is available, then fall back to an OS-chosen address.
+    let preferred_base = optional_header.windows_fields.image_base as *mut c_void;
+    let preferred_alloc = VirtualAlloc(
+        preferred_base,
         optional_header.windows_fields.size_of_image as usize,
         MEM_COMMIT | MEM_RESERVE,
         PAGE_READWRITE,
     );
-    if image_base.is_null() {
-        return Err(anyhow!("VirtualAlloc failed"));
+    let (image_base, used_fallback_alloc) = if preferred_alloc.is_null() {
+        let fallback = VirtualAlloc(
+            std::ptr::null_mut(),
+            optional_header.windows_fields.size_of_image as usize,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
+        if fallback.is_null() {
+            return Err(anyhow!("VirtualAlloc failed"));
+        }
+        (fallback, true)
+    } else {
+        (preferred_alloc, false)
+    };
+
+    let preferred_base = optional_header.windows_fields.image_base as isize;
+    let base_delta = image_base as isize - preferred_base;
+    if used_fallback_alloc && base_delta != 0 {
+        // When preferred-base allocation fails, rebasing is mandatory.
+        // Refuse to continue unless a sane relocation directory exists.
+        let reloc_dir = optional_header.data_directories.data_directories
+            [IMAGE_DIRECTORY_ENTRY_BASERELOC as usize]
+            .ok_or_else(|| anyhow!(
+                "VirtualAlloc at preferred base failed and PE has no relocation directory; cannot apply rebasing"
+            ))?;
+        if reloc_dir.virtual_address == 0 || reloc_dir.size == 0 {
+            return Err(anyhow!(
+                "VirtualAlloc at preferred base failed and relocation directory is empty; cannot apply rebasing"
+            ));
+        }
+
+        let image_size = optional_header.windows_fields.size_of_image as usize;
+        let reloc_start = reloc_dir.virtual_address as usize;
+        let reloc_size = reloc_dir.size as usize;
+        let reloc_end = reloc_start
+            .checked_add(reloc_size)
+            .ok_or_else(|| anyhow!("relocation directory range overflow"))?;
+        if reloc_start >= image_size || reloc_end > image_size {
+            return Err(anyhow!(
+                "VirtualAlloc at preferred base failed and relocation directory is out of image bounds"
+            ));
+        }
     }
 
     struct AllocGuard {
@@ -369,8 +412,6 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
     }
 
     // 4. Apply base relocations
-    let preferred_base = optional_header.windows_fields.image_base as isize;
-    let base_delta = image_base as isize - preferred_base;
     if base_delta != 0 {
         if let Some(reloc_entry) = optional_header.data_directories.data_directories
             [IMAGE_DIRECTORY_ENTRY_BASERELOC as usize]
@@ -495,7 +536,54 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         }
     }
 
-    // 4b. Invoke TLS callbacks (if any) before calling DllMain.
+    // 5. Set memory protections
+    for section in &pe.sections {
+        // PAGE_* constants are mutually exclusive — never OR them together.
+        // Map (exec, read, write) characteristic flags to the single PAGE_*
+        // value that best approximates the requested protection.
+        let exec = section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0;
+        let read = section.characteristics & IMAGE_SCN_MEM_READ != 0;
+        let write = section.characteristics & IMAGE_SCN_MEM_WRITE != 0;
+        let prot: u32 = match (exec, read, write) {
+            // Downgrade W+X to PAGE_EXECUTE_READ.  No legitimate section
+            // needs RWX at load time; RWX pages are a major EDR detection
+            // signal.  If a section's own code needs temporary write access
+            // after load it should call VirtualProtect itself.
+            (true, _, true) => PAGE_EXECUTE_READ,
+            (true, true, false) => PAGE_EXECUTE_READ,
+            (true, false, false) => PAGE_EXECUTE,
+            (false, _, true) => PAGE_READWRITE,
+            (false, true, false) => PAGE_READONLY,
+            (false, false, false) => PAGE_NOACCESS,
+        };
+        let mut old_prot = 0;
+        // Use the larger of virtual_size and size_of_raw_data: a linker may
+        // set VirtualSize to 0 (optimisation), which would make VirtualProtect
+        // a no-op and leave the section with the wrong permissions.
+        let prot_size = std::cmp::max(
+            section.virtual_size as usize,
+            section.size_of_raw_data as usize,
+        );
+        VirtualProtect(
+            image_base.add(section.virtual_address as usize),
+            prot_size,
+            prot,
+            &mut old_prot,
+        );
+    }
+
+    // 5a. Ensure newly written code bytes are visible to the CPU before any
+    //     mapped TLS callback or DLL entrypoint code executes.
+    #[cfg(windows)]
+    {
+        winapi::um::processthreadsapi::FlushInstructionCache(
+            winapi::um::processthreadsapi::GetCurrentProcess(),
+            image_base as *const c_void,
+            optional_header.windows_fields.size_of_image as usize,
+        );
+    }
+
+    // 5b. Invoke TLS callbacks (if any) before calling DllMain.
     //
     // Some DLLs compiled with MSVC __declspec(thread) register one or more
     // PIMAGE_TLS_CALLBACK functions in the TLS directory (data directory 9).
@@ -512,7 +600,7 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
             //   StartAddressOfRawData  : usize
             //   EndAddressOfRawData    : usize
             //   AddressOfIndex         : usize
-            //   AddressOfCallBacks     : usize  ← VA of null-terminated callback array
+            //   AddressOfCallBacks     : usize  <- VA of null-terminated callback array
             //   SizeOfZeroFill         : u32
             //   Characteristics        : u32
             #[repr(C)]
@@ -566,43 +654,7 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         }
     }
 
-    // 5. Set memory protections
-    for section in &pe.sections {
-        // PAGE_* constants are mutually exclusive — never OR them together.
-        // Map (exec, read, write) characteristic flags to the single PAGE_*
-        // value that best approximates the requested protection.
-        let exec = section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0;
-        let read = section.characteristics & IMAGE_SCN_MEM_READ != 0;
-        let write = section.characteristics & IMAGE_SCN_MEM_WRITE != 0;
-        let prot: u32 = match (exec, read, write) {
-            // Downgrade W+X to PAGE_EXECUTE_READ.  No legitimate section
-            // needs RWX at load time; RWX pages are a major EDR detection
-            // signal.  If a section's own code needs temporary write access
-            // after load it should call VirtualProtect itself.
-            (true, _, true) => PAGE_EXECUTE_READ,
-            (true, true, false) => PAGE_EXECUTE_READ,
-            (true, false, false) => PAGE_EXECUTE,
-            (false, _, true) => PAGE_READWRITE,
-            (false, true, false) => PAGE_READONLY,
-            (false, false, false) => PAGE_NOACCESS,
-        };
-        let mut old_prot = 0;
-        // Use the larger of virtual_size and size_of_raw_data: a linker may
-        // set VirtualSize to 0 (optimisation), which would make VirtualProtect
-        // a no-op and leave the section with the wrong permissions.
-        let prot_size = std::cmp::max(
-            section.virtual_size as usize,
-            section.size_of_raw_data as usize,
-        );
-        VirtualProtect(
-            image_base.add(section.virtual_address as usize),
-            prot_size,
-            prot,
-            &mut old_prot,
-        );
-    }
-
-    // 5b. Register the .pdata section (exception handling directory) so the OS
+    // 5c. Register the .pdata section (exception handling directory) so the OS
     //     can correctly unwind the stack for exceptions thrown inside the DLL.
     //     Without this, any C++ try/catch or SEH block in the DLL terminates
     //     the process instead of propagating to a handler.
@@ -971,11 +1023,13 @@ unsafe fn resolve_remote_export(
 /// 4. **Resolves the Import Address Table** from local or remote module data.
 ///    Before import resolution, the loader verifies the shared-ASLR assumption
 ///    by comparing local and remote `ntdll.dll` bases via
-///    `NtQueryInformationProcess` + `ReadProcessMemory`. If they differ, a
-///    warning is emitted and imports are resolved from the remote process's
-///    actual module addresses (via `CreateToolhelp32Snapshot` + per-DLL PE
-///    export-table reads).  If remote module enumeration fails, an error is
-///    returned rather than proceeding with incorrect local addresses.
+///    `NtQueryInformationProcess` + `ReadProcessMemory`, then validating
+///    critical DLL parity (`kernel32.dll`, `kernelbase.dll`) from a Toolhelp
+///    remote-module snapshot. If mismatches are detected, imports are resolved
+///    from the remote process's actual module addresses (via
+///    `CreateToolhelp32Snapshot` + per-DLL PE export-table reads). If remote
+///    module enumeration fails in the mismatch path, an error is returned
+///    rather than proceeding with incorrect local addresses.
 /// 5. **Starts the DLL entry point** via `NtCreateThreadEx` (resolved via PEB walk).
 ///    fire-and-forget: the returned thread handle is closed immediately after
 ///    creation.
@@ -1020,11 +1074,14 @@ pub unsafe fn load_dll_in_remote_process(
 
     // Verify the shared-ASLR assumption used by local import resolution.
     // When ntdll bases differ, all system-DLL addresses resolved in our
-    // process will be wrong in the remote process.  In that case we build
+    // process will be wrong in the remote process. In that case we build
     // a remote module map via Toolhelp and resolve each IAT entry from the
-    // actual remote module addresses.  Failing to enumerate the remote
+    // actual remote module addresses. Failing to enumerate the remote
     // modules is a hard error: proceeding with local addresses would cause
     // silent import corruption in the target process.
+    //
+    // Even when ntdll matches, also verify critical Win32 DLLs (kernel32,
+    // kernelbase). If either differs, switch to remote-module resolution.
     let local_ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"));
     let remote_ntdll = get_remote_ntdll_base(target_process);
     let remote_module_map: Option<HashMap<String, usize>> =
@@ -1041,7 +1098,45 @@ pub unsafe fn load_dll_in_remote_process(
                 // fails rather than proceeding with incorrect local addresses.
                 Some(build_remote_module_map(target_process)?)
             } else {
-                None
+                // ntdll matches: verify other critical DLL bases before taking
+                // the shared-ASLR fast path.
+                match build_remote_module_map(target_process) {
+                    Ok(rmod) => {
+                        let local_kernel32 = pe_resolve::get_module_handle_by_hash(
+                            pe_resolve::hash_str(b"kernel32.dll\0"),
+                        );
+                        let local_kernelbase = pe_resolve::get_module_handle_by_hash(
+                            pe_resolve::hash_str(b"kernelbase.dll\0"),
+                        );
+                        let remote_kernel32 = rmod.get("kernel32.dll").copied();
+                        let remote_kernelbase = rmod.get("kernelbase.dll").copied();
+
+                        let kernel32_mismatch =
+                            matches!((local_kernel32, remote_kernel32), (Some(l), Some(r)) if l != r);
+                        let kernelbase_mismatch =
+                            matches!((local_kernelbase, remote_kernelbase), (Some(l), Some(r)) if l != r);
+
+                        if kernel32_mismatch || kernelbase_mismatch {
+                            log::warn!(
+                                "remote_manual_map: shared-ASLR verification failed (kernel32 mismatch={}, kernelbase mismatch={}); resolving imports from remote process module list.",
+                                kernel32_mismatch,
+                                kernelbase_mismatch
+                            );
+                            Some(rmod)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(err) => {
+                        // Preserve the fast path when the extra verification step
+                        // cannot be performed and ntdll already matches.
+                        log::warn!(
+                            "remote_manual_map: unable to verify kernel32/kernelbase base parity ({}); keeping shared-ASLR fast path",
+                            err
+                        );
+                        None
+                    }
+                }
             }
         } else {
             None
@@ -1297,7 +1392,8 @@ pub unsafe fn load_dll_in_remote_process(
     //   Resolving via PEB walk in OUR process yields correct remote addresses.
     //
     // Safe path (remote_module_map is Some):
-    //   ntdll bases differ (e.g. different integrity levels / sessions).
+    //   Shared-ASLR verification failed (ntdll mismatch or critical DLL
+    //   mismatch, e.g. cross-session / WoW64 layout differences).
     //   Use the Toolhelp module map to obtain each DLL's actual remote base,
     //   then read its export table via ReadProcessMemory to find function RVAs.
     //   This ensures every IAT entry holds a valid remote-process address.

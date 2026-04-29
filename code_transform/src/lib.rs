@@ -22,11 +22,17 @@
 //! Functions that contain inline assembly must be excluded by the caller before
 //! passing their machine code to these routines.
 
-pub mod reorder;
 pub mod runtime;
+#[cfg(target_arch = "x86_64")]
+pub mod opcode_diversity;
+#[cfg(target_arch = "x86_64")]
+pub mod reorder;
+#[cfg(target_arch = "x86_64")]
 pub mod substitute;
 
+#[cfg(target_arch = "x86_64")]
 use rand::SeedableRng;
+#[cfg(target_arch = "x86_64")]
 use rand_chacha::ChaCha8Rng;
 
 /// Apply the full transformation pipeline to a flat slice of x86-64 machine
@@ -37,8 +43,19 @@ use rand_chacha::ChaCha8Rng;
 /// # Panics
 /// Will not panic on well-formed code; malformed or truncated encodings are
 /// silently passed through by `BlockEncoder`.
+#[cfg(target_arch = "x86_64")]
 pub fn transform(code: &[u8], seed: u64) -> Vec<u8> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let after_sub = substitute::apply_substitutions(code, &mut rng);
-    reorder::reorder_blocks(&after_sub, &mut rng)
+    let after_reorder = reorder::reorder_blocks(&after_sub, &mut rng);
+    opcode_diversity::apply(&after_reorder, &mut rng)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn transform(code: &[u8], _seed: u64) -> Vec<u8> {
+    log::warn!(
+        "code_transform: instruction transformation is not supported on architecture '{}'; returning input unchanged",
+        std::env::consts::ARCH
+    );
+    code.to_vec()
 }

@@ -47,22 +47,49 @@ mod imp {
     use winapi::um::memoryapi::VirtualProtect;
     use winapi::um::winnt::PAGE_EXECUTE_READWRITE;
 
+    /// Maximum number of hook chain levels to follow before giving up.
+    const MAX_HOOK_CHAIN_DEPTH: usize = 4;
+
     /// Resolve the real patchable address for a function, following any
-    /// 32-bit relative `jmp` (0xE9) that an EDR may have placed at the entry.
+    /// 32-bit relative `jmp` (0xE9) or RIP-relative indirect `jmp`
+    /// (0xFF 0x25) that an EDR may have placed at the entry.  Chains of
+    /// up to [`MAX_HOOK_CHAIN_DEPTH`] levels are followed; deeper chains
+    /// (or circular references from a malicious hook table) are rejected
+    /// and the last valid address is returned.
     unsafe fn resolve_target(func_addr: usize) -> usize {
         if func_addr == 0 {
             return 0;
         }
-        let first = *(func_addr as *const u8);
-        if first == 0xE9 {
-            // Near relative jmp: destination = func_addr + 5 + rel32
-            let rel = *(func_addr.wrapping_add(1) as *const i32) as isize;
-            let dest = (func_addr as isize).wrapping_add(5).wrapping_add(rel) as usize;
-            if dest != 0 {
-                return dest;
+        let mut addr = func_addr;
+        for _ in 0..MAX_HOOK_CHAIN_DEPTH {
+            let first = *(addr as *const u8);
+            if first == 0xE9 {
+                // Near relative jmp: destination = addr + 5 + rel32
+                let rel = *(addr.wrapping_add(1) as *const i32) as isize;
+                let dest = (addr as isize).wrapping_add(5).wrapping_add(rel) as usize;
+                if dest == 0 {
+                    break;
+                }
+                addr = dest;
+            } else if first == 0xFF && *(addr.wrapping_add(1) as *const u8) == 0x25 {
+                // RIP-relative indirect jmp: slot = addr + 6 + disp32
+                // absolute target = *slot (8-byte pointer)
+                let disp = *(addr.wrapping_add(2) as *const i32) as isize;
+                let slot = (addr as isize).wrapping_add(6).wrapping_add(disp) as usize;
+                if slot == 0 {
+                    break;
+                }
+                let dest = *(slot as *const usize);
+                if dest == 0 {
+                    break;
+                }
+                addr = dest;
+            } else {
+                // No further hook — addr is the real function body.
+                break;
             }
         }
-        func_addr
+        addr
     }
 
     /// Attempt to patch a single function entry point with `ret` (0xC3).
