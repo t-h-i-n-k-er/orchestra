@@ -55,6 +55,8 @@ notify = { version = "6.1", optional = true }
 x11cap = { version = "0.1", optional = true }
 enigo = { version = "0.2", optional = true, default-features = false, features = ["x11rb"] }
 image = { version = "0.25", optional = true }
+zbus = { version = "4", optional = true, default-features = false, features = ["tokio"] }
+futures-util = { version = "0.3", optional = true, default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 enigo = { version = "0.2", optional = true }
@@ -78,7 +80,7 @@ network-discovery = []
 # `[target.'cfg(target_os = "linux")'.dependencies]`); on Windows it is a
 # no-op feature activation because the optional dep is absent from the
 # target-specific dependency table.
-remote-assist = ["dep:enigo", "dep:image", "dep:x11cap"]
+remote-assist = ["dep:enigo", "dep:image", "dep:x11cap", "dep:zbus", "dep:futures-util"]
 module-signatures = ["common/module-signatures"]
 direct-syscalls = []
 # Spoof the user-mode call stack visible to EDR kernel callbacks during

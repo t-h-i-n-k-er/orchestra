@@ -20,6 +20,7 @@ members = [
     "junk_macro",
     "code_transform",
     "code_transform_macro",
+    "nt_syscall",
 ]
 
 [workspace.package]

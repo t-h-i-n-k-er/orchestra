@@ -25,6 +25,7 @@ use base64::Engine;
 use clap::Parser;
 use common::CryptoSession;
 use ed25519_dalek::{Signer, SigningKey};
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
@@ -92,7 +93,7 @@ fn main() -> Result<()> {
     if cli.poly {
         // ── Polymorphic mode ────────────────────────────────────────────────
         let blob = poly::poly_wrap(&plaintext);
-        let serialized = poly::poly_serialize(&blob);
+        let serialized = poly::poly_serialize(&blob, rand::thread_rng().gen::<u64>());
 
         std::fs::write(&cli.output, &serialized)
             .with_context(|| format!("Failed to write poly output {}", cli.output.display()))?;

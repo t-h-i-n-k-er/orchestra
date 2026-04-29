@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 pe_resolve = { path = "../pe_resolve" }
+nt_syscall = { path = "../nt_syscall" }
 string_crypt = { path = "../string_crypt" }
 anyhow = { workspace = true }
 rand.workspace = true

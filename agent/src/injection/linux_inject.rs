@@ -150,9 +150,125 @@ struct AttachGuard {
     attached: bool,
 }
 
+/// Read `/proc/sys/kernel/yama/ptrace_scope` and return the integer value.
+///
+/// Returns `None` when the file is absent (YAMA LSM not compiled in), which
+/// means there are no YAMA restrictions on ptrace.
+///
+/// Possible values:
+///   0 — no restriction (classic behaviour)
+///   1 — restricted: only parent/child processes or those that have been
+///       granted access via `prctl(PR_SET_PTRACER)` can attach
+///   2 — admin-only: requires `CAP_SYS_PTRACE`
+///   3 — no attachment: ptrace attach is disabled even for root/`CAP_SYS_PTRACE`
+#[cfg(target_os = "linux")]
+fn read_yama_ptrace_scope() -> Option<u8> {
+    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .ok()?
+        .trim()
+        .parse::<u8>()
+        .ok()
+}
+
+/// Return `true` if the current process has `CAP_SYS_PTRACE` (bit 19) in its
+/// effective capability set, by parsing `/proc/self/status`.
+///
+/// Falls back to `false` if the file cannot be read or parsed.
+#[cfg(target_os = "linux")]
+fn has_cap_sys_ptrace() -> bool {
+    const CAP_SYS_PTRACE_BIT: u64 = 1 << 19;
+    let status = match std::fs::read_to_string("/proc/self/status") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("CapEff:\t") {
+            if let Ok(caps) = u64::from_str_radix(rest.trim(), 16) {
+                return caps & CAP_SYS_PTRACE_BIT != 0;
+            }
+        }
+    }
+    false
+}
+
+/// Return `true` if `pid` is a direct child of the current process.
+///
+/// Reads `/proc/{pid}/status` and looks for a `PPid:` line whose value
+/// matches `std::process::id()`.  Falls back to `false` on any I/O error so
+/// the caller can still attempt the attach.
+#[cfg(target_os = "linux")]
+fn is_child_process(pid: libc::pid_t) -> bool {
+    let path = format!("/proc/{pid}/status");
+    let status = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let our_pid = std::process::id();
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("PPid:") {
+            return rest.trim().parse::<u32>().map(|ppid| ppid == our_pid).unwrap_or(false);
+        }
+    }
+    false
+}
+
 #[cfg(target_os = "linux")]
 impl AttachGuard {
     fn attach(pid: libc::pid_t) -> Result<Self> {
+        // ── YAMA ptrace scope pre-flight ────────────────────────────────────
+        // Check the YAMA LSM ptrace_scope setting before issuing PTRACE_ATTACH.
+        // Without this check, permission failures surface as a bare EPERM with
+        // no hint about the root cause or the remediation steps.
+        match read_yama_ptrace_scope() {
+            // scope=3: attachment is unconditionally disabled by policy.
+            // PTRACE_ATTACH will always fail; report immediately.
+            Some(3) => {
+                return Err(anyhow!(
+                    "LinuxPtraceInjector: PTRACE_ATTACH({pid}) is blocked by \
+                     kernel.yama.ptrace_scope=3 (no ptrace attachment allowed). \
+                     To enable injection, an administrator must set \
+                     /proc/sys/kernel/yama/ptrace_scope to 0 or 1."
+                ));
+            }
+            // scope=2: only processes with CAP_SYS_PTRACE may attach.
+            // Fail early if the effective capability set does not include it.
+            Some(2) => {
+                if !has_cap_sys_ptrace() {
+                    return Err(anyhow!(
+                        "LinuxPtraceInjector: PTRACE_ATTACH({pid}) requires CAP_SYS_PTRACE \
+                         (kernel.yama.ptrace_scope=2). Run as root or grant the capability \
+                         with: setcap cap_sys_ptrace+ep <binary>"
+                    ));
+                }
+            }
+            // scope=1: attachment is restricted to parent/child relationships
+            // or processes that called prctl(PR_SET_PTRACER).  Check whether
+            // the target is a direct child of this process so we can give a
+            // precise diagnostic if the attach subsequently fails.
+            Some(1) => {
+                let is_child = is_child_process(pid);
+                if is_child {
+                    log::debug!(
+                        "LinuxPtraceInjector: kernel.yama.ptrace_scope=1; \
+                         pid {pid} is a child of this process — attach should succeed"
+                    );
+                } else {
+                    log::warn!(
+                        "LinuxPtraceInjector: kernel.yama.ptrace_scope=1; \
+                         pid {pid} is NOT a child of this process (ppid mismatch). \
+                         PTRACE_ATTACH will fail with EPERM unless that process has \
+                         called prctl(PR_SET_PTRACER, {}) or a privileged peer has \
+                         granted access. Consider running as root or adjusting \
+                         /proc/sys/kernel/yama/ptrace_scope.",
+                        std::process::id()
+                    );
+                }
+            }
+            // scope=0 or YAMA not present: no additional restrictions.
+            _ => {}
+        }
+
+        // ── PTRACE_ATTACH ────────────────────────────────────────────────────
         // SAFETY: ptrace is called with PTRACE_ATTACH on a caller-supplied
         // pid. Return values are checked and no pointers are dereferenced.
         let rc = unsafe {
@@ -164,9 +280,22 @@ impl AttachGuard {
             )
         };
         if rc == -1 {
+            let os_err = std::io::Error::last_os_error();
+            // Enrich EPERM errors with ptrace_scope context so the operator
+            // knows whether a policy setting is the root cause.
+            let scope_note = if os_err.raw_os_error() == Some(libc::EPERM) {
+                match read_yama_ptrace_scope() {
+                    Some(s) => format!(
+                        " (kernel.yama.ptrace_scope={s}: \
+                          check /proc/sys/kernel/yama/ptrace_scope)"
+                    ),
+                    None => String::new(),
+                }
+            } else {
+                String::new()
+            };
             return Err(anyhow!(
-                "LinuxPtraceInjector: PTRACE_ATTACH({pid}) failed: {}",
-                std::io::Error::last_os_error()
+                "LinuxPtraceInjector: PTRACE_ATTACH({pid}) failed: {os_err}{scope_note}"
             ));
         }
 

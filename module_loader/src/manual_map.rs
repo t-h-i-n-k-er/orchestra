@@ -164,6 +164,56 @@ unsafe fn get_module_handle_peb(module_name: &str) -> *mut c_void {
     std::ptr::null_mut()
 }
 
+/// Resolve a function by ordinal from a module's export table without calling
+/// the hookable `GetProcAddress`.  Used for delay-import ordinal entries.
+unsafe fn get_proc_address_by_ordinal_manual(module: *mut c_void, ordinal: u16) -> *mut c_void {
+    if module.is_null() {
+        return std::ptr::null_mut();
+    }
+    let base = module as *const u8;
+    let dos_header = &*(base as *const IMAGE_DOS_HEADER);
+    if dos_header.e_magic != 0x5A4D {
+        return std::ptr::null_mut();
+    }
+    let e_lfanew = dos_header.e_lfanew as usize;
+
+    #[cfg(target_arch = "x86")]
+    use winapi::um::winnt::IMAGE_NT_HEADERS32 as IMAGE_NT_HEADERS;
+    #[cfg(target_arch = "x86_64")]
+    use winapi::um::winnt::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
+
+    let nt_headers = &*(base.add(e_lfanew) as *const IMAGE_NT_HEADERS);
+    if nt_headers.Signature != 0x4550 {
+        return std::ptr::null_mut();
+    }
+    let export_dir_rva = nt_headers.OptionalHeader.DataDirectory
+        [IMAGE_DIRECTORY_ENTRY_EXPORT as usize]
+        .VirtualAddress;
+    if export_dir_rva == 0 {
+        return std::ptr::null_mut();
+    }
+    let export_dir = &*(base.add(export_dir_rva as usize) as *const IMAGE_EXPORT_DIRECTORY);
+    // OrdinalBase: the lowest ordinal exported by this module.
+    // index into AddressOfFunctions = ordinal - OrdinalBase
+    let base_ord = export_dir.Base;
+    if (ordinal as u32) < base_ord {
+        return std::ptr::null_mut();
+    }
+    let index = (ordinal as u32 - base_ord) as usize;
+    if index >= export_dir.NumberOfFunctions as usize {
+        return std::ptr::null_mut();
+    }
+    let funcs = std::slice::from_raw_parts(
+        base.add(export_dir.AddressOfFunctions as usize) as *const u32,
+        export_dir.NumberOfFunctions as usize,
+    );
+    let func_rva = funcs[index];
+    if func_rva == 0 {
+        return std::ptr::null_mut();
+    }
+    base.add(func_rva as usize) as *mut c_void
+}
+
 unsafe fn get_proc_address_manual(module: *mut c_void, proc_name: &str) -> *mut c_void {
     // Bounded recursion guard: forwarded exports can chain across modules
     // (kernel32!HeapAlloc -> ntdll!RtlAllocateHeap -> ...).  A pathological
@@ -409,6 +459,160 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         }
         let thunk_ref = image_base.add(import.rva);
         *(thunk_ref as *mut usize) = proc_addr as usize;
+    }
+
+    // 3b. Process delay imports (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT = 13).
+    //
+    // ImgDelayDescr layout — all fields are RVAs when grAttrs bit 0 (dlattrRva) is set:
+    //   +0x00  grAttrs       u32  — bit 0 = 1 means all addresses are RVAs
+    //   +0x04  rvaDLLName    u32  — RVA of DLL name string
+    //   +0x08  rvaHmod       u32  — RVA of HMODULE slot
+    //   +0x0C  rvaIAT        u32  — RVA of IAT (thunks that will be resolved)
+    //   +0x10  rvaINT        u32  — RVA of INT (original unbound thunks)
+    //   +0x14  rvaBoundIAT   u32  — RVA of bound IAT (may be NULL)
+    //   +0x18  rvaUnloadIAT  u32  — RVA of unload IAT (may be NULL)
+    //   +0x1C  dwTimeStamp   u32  — time stamp (0 = not bound)
+    const IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT: usize = 13;
+    const DELAY_DESCR_SIZE: usize = 32; // 8 × u32
+
+    if let Some(delay_dir) = optional_header.data_directories.data_directories
+        [IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT]
+    {
+        if delay_dir.virtual_address != 0 && delay_dir.size > 0 {
+            let image_size = optional_header.size_of_image as usize;
+            let mut desc_va = delay_dir.virtual_address as usize;
+
+            loop {
+                // Bounds check for the descriptor itself.
+                if desc_va + DELAY_DESCR_SIZE > image_size {
+                    break;
+                }
+
+                // Read descriptor fields directly from the mapped image.
+                let base_ptr = image_base as *const u8;
+                let grattrs       = *(base_ptr.add(desc_va)        as *const u32);
+                let dll_name_rva  = *(base_ptr.add(desc_va + 0x04) as *const u32) as usize;
+                let hmod_rva      = *(base_ptr.add(desc_va + 0x08) as *const u32) as usize;
+                let iat_rva       = *(base_ptr.add(desc_va + 0x0C) as *const u32) as usize;
+                let int_rva       = *(base_ptr.add(desc_va + 0x10) as *const u32) as usize;
+
+                // Null-terminator descriptor: all-zero entry.
+                if dll_name_rva == 0 {
+                    break;
+                }
+
+                // Validate that addresses are RVAs (grAttrs bit 0 set).  Old-style
+                // VAs (grAttrs bit 0 clear) are not supported on modern x64 images.
+                if grattrs & 0x1 == 0 {
+                    tracing::warn!(
+                        "manual_map: delay-import descriptor at rva {:#x} uses legacy VA format; skipping",
+                        desc_va
+                    );
+                    desc_va += DELAY_DESCR_SIZE;
+                    continue;
+                }
+
+                // Resolve DLL name from the mapped image.
+                if dll_name_rva >= image_size {
+                    desc_va += DELAY_DESCR_SIZE;
+                    continue;
+                }
+                let dll_name_ptr = base_ptr.add(dll_name_rva) as *const i8;
+                let dll_name = std::ffi::CStr::from_ptr(dll_name_ptr)
+                    .to_str()
+                    .unwrap_or("");
+                if dll_name.is_empty() {
+                    break;
+                }
+
+                // Find or load the DLL.
+                let dll_handle = if !loaded_modules.contains_key(dll_name) {
+                    let mut handle = get_module_handle_peb(dll_name);
+                    if handle.is_null() {
+                        handle = load_via_ldr(dll_name);
+                        if handle.is_null() {
+                            tracing::warn!(
+                                "manual_map: delay-import: failed to load {}; skipping descriptor",
+                                dll_name
+                            );
+                            desc_va += DELAY_DESCR_SIZE;
+                            continue;
+                        }
+                    }
+                    loaded_modules.insert(dll_name, handle);
+                    handle
+                } else {
+                    *loaded_modules.get(dll_name).unwrap()
+                };
+
+                // Walk the INT (use IAT as fallback if INT is zero) and write
+                // resolved addresses into the IAT slots.
+                //
+                // Each IMAGE_THUNK_DATA64 entry is an 8-byte value:
+                //   bit 63 set   → ordinal import (low 16 bits = ordinal)
+                //   bit 63 clear → RVA to IMAGE_IMPORT_BY_NAME (2-byte hint + name)
+                let thunk_base_rva = if int_rva != 0 { int_rva } else { iat_rva };
+                if thunk_base_rva == 0 || iat_rva == 0 {
+                    desc_va += DELAY_DESCR_SIZE;
+                    continue;
+                }
+
+                let mut slot_idx = 0usize;
+                loop {
+                    let thunk_rva = thunk_base_rva + slot_idx * 8;
+                    let iat_slot_rva = iat_rva + slot_idx * 8;
+                    if thunk_rva + 8 > image_size || iat_slot_rva + 8 > image_size {
+                        break;
+                    }
+
+                    let thunk_val = *(base_ptr.add(thunk_rva) as *const u64);
+                    if thunk_val == 0 {
+                        break;
+                    }
+
+                    let proc_addr: *mut c_void = if thunk_val & (1u64 << 63) != 0 {
+                        // Ordinal import — look up directly in the export ordinal table.
+                        let ordinal = (thunk_val & 0xFFFF) as u16;
+                        get_proc_address_by_ordinal_manual(dll_handle, ordinal)
+                    } else {
+                        // Named import: RVA to IMAGE_IMPORT_BY_NAME (+2 bytes hint, then name).
+                        let ibn_rva = (thunk_val & 0x7FFF_FFFF_FFFF_FFFF) as usize;
+                        if ibn_rva + 2 >= image_size {
+                            slot_idx += 1;
+                            continue;
+                        }
+                        let name_ptr = base_ptr.add(ibn_rva + 2) as *const i8;
+                        let func_name = std::ffi::CStr::from_ptr(name_ptr)
+                            .to_str()
+                            .unwrap_or("");
+                        if func_name.is_empty() {
+                            slot_idx += 1;
+                            continue;
+                        }
+                        get_proc_address_manual(dll_handle, func_name)
+                    };
+                    if proc_addr.is_null() {
+                        tracing::warn!(
+                            "manual_map: delay-import: {}!slot-{} unresolved; leaving slot empty",
+                            dll_name, slot_idx
+                        );
+                    } else {
+                        // Write the resolved address into the IAT slot.
+                        *(image_base.add(iat_slot_rva) as *mut usize) = proc_addr as usize;
+                    }
+
+                    slot_idx += 1;
+                }
+
+                // Set the HMODULE field to the loaded module base so the
+                // delay-import helper knows the DLL has already been loaded.
+                if hmod_rva + std::mem::size_of::<usize>() <= image_size {
+                    *(image_base.add(hmod_rva) as *mut usize) = dll_handle as usize;
+                }
+
+                desc_va += DELAY_DESCR_SIZE;
+            }
+        }
     }
 
     // 4. Apply base relocations

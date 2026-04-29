@@ -1137,129 +1137,41 @@ pub mod macos {
         }
     }
 
-    /// Cron-based fallback: @reboot entry, output redirected to /dev/null to
-    /// prevent cron from mailing the user.
+    /// Cron-like persistence fallback for macOS.
+    ///
+    /// `crontab` is disabled by default on macOS 13+ (Ventura and later); the
+    /// crond daemon is no longer started automatically, so any `@reboot` entry
+    /// would silently never fire.  Instead, this implementation delegates to a
+    /// secondary `LaunchAgent` plist with a distinct label, which is managed by
+    /// launchd and works across all supported macOS versions.
     pub struct CronJob;
 
-    /// Marker appended to the cron entry so that only Orchestra's own @reboot
-    /// entry is removed, never any pre-existing @reboot entries (H-15 fix).
-    const MAC_CRON_MARKER: &str = "# orchestra-persist";
-
-    /// Read current crontab as UTF-8 (lossy) text.
-    ///
-    /// Treat "no crontab for <user>" as an empty crontab so install/remove can
-    /// safely proceed without shell pipelines.
-    fn read_current_crontab() -> Result<String> {
-        let out = std::process::Command::new("crontab")
-            .arg("-l")
-            .output()
-            .map_err(|e| anyhow!("CronJob::read_current_crontab: {}", e))?;
-
-        if out.status.success() {
-            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
-        }
-
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let stderr_lower = stderr.to_ascii_lowercase();
-        if stderr_lower.contains("no crontab for") {
-            return Ok(String::new());
-        }
-
-        let detail = if stderr.is_empty() {
-            "no stderr output".to_string()
-        } else {
-            stderr
-        };
-        Err(anyhow!(
-            "CronJob::read_current_crontab: crontab -l failed: {}",
-            detail
-        ))
-    }
-
-    /// Write the full crontab contents via `crontab -` using stdin piping.
-    fn write_crontab(contents: &str) -> Result<()> {
-        use std::io::Write;
-        use std::process::Stdio;
-
-        let mut child = std::process::Command::new("crontab")
-            .arg("-")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| anyhow!("CronJob::write_crontab: spawn failed: {}", e))?;
-
-        {
-            let stdin = child
-                .stdin
-                .as_mut()
-                .ok_or_else(|| anyhow!("CronJob::write_crontab: missing stdin pipe"))?;
-            stdin
-                .write_all(contents.as_bytes())
-                .map_err(|e| anyhow!("CronJob::write_crontab: stdin write failed: {}", e))?;
-        }
-
-        let out = child
-            .wait_with_output()
-            .map_err(|e| anyhow!("CronJob::write_crontab: wait failed: {}", e))?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let detail = if stderr.is_empty() {
-                "no stderr output".to_string()
-            } else {
-                stderr
-            };
-            return Err(anyhow!(
-                "CronJob::write_crontab: crontab - failed: {}",
-                detail
-            ));
-        }
-        Ok(())
-    }
-
-    fn filtered_crontab_without_marker(current: &str) -> String {
-        let filtered = current
-            .lines()
-            .filter(|line| !line.contains(MAC_CRON_MARKER))
-            .collect::<Vec<_>>()
-            .join("\n");
-        if filtered.is_empty() {
-            String::new()
-        } else {
-            format!("{}\n", filtered)
-        }
-    }
+    /// Label used by the secondary LaunchAgent installed on behalf of `CronJob`.
+    const CRON_FALLBACK_LABEL: &str = "com.apple.xpc.system-update-helper";
 
     impl Persist for CronJob {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            let exe = executable_path.to_string_lossy();
-            let quoted_exe = shell_quote_single(exe.as_ref());
-            let entry = format!(
-                "@reboot {} >/dev/null 2>&1 {}",
-                quoted_exe, MAC_CRON_MARKER
-            );
-
-            let current = read_current_crontab()?;
-            let mut updated = filtered_crontab_without_marker(&current);
-            updated.push_str(&entry);
-            updated.push('\n');
-            write_crontab(&updated)?;
-
-            log::info!("CronJob::install: added @reboot entry for '{}'", exe);
-            Ok(())
+            LaunchAgent {
+                label: CRON_FALLBACK_LABEL.to_string(),
+                asuser_bootstrap: false,
+            }
+            .install(executable_path)
         }
 
         fn remove(&self) -> Result<()> {
-            let current = read_current_crontab()?;
-            let updated = filtered_crontab_without_marker(&current);
-            write_crontab(&updated)?;
-            log::info!("CronJob::remove: removed orchestra @reboot entry");
-            Ok(())
+            LaunchAgent {
+                label: CRON_FALLBACK_LABEL.to_string(),
+                asuser_bootstrap: false,
+            }
+            .remove()
         }
 
         fn verify(&self) -> Result<bool> {
-            let current = read_current_crontab()?;
-            Ok(current.contains(MAC_CRON_MARKER))
+            LaunchAgent {
+                label: CRON_FALLBACK_LABEL.to_string(),
+                asuser_bootstrap: false,
+            }
+            .verify()
         }
     }
 
@@ -1400,16 +1312,6 @@ pub mod macos {
     #[link(name = "ServiceManagement", kind = "framework")]
     extern "C" {
         fn SMLoginItemSetEnabled(identifier: CFStringRef, enabled: u8) -> u8;
-    }
-
-    // SMAppService is an Objective-C API in ServiceManagement (macOS 13+).
-    // We invoke it through libobjc at runtime so older macOS versions can
-    // safely fall back to the legacy SMLoginItemSetEnabled path.
-    #[link(name = "objc")]
-    extern "C" {
-        fn objc_getClass(name: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
-        fn sel_registerName(name: *const std::os::raw::c_char) -> *const std::ffi::c_void;
-        fn objc_msgSend();
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -1598,92 +1500,33 @@ pub mod macos {
         }
 
         fn sm_set_enabled_via_app_service(helper_bundle_id: &str, enabled: bool) -> Result<()> {
-            use std::ffi::CString;
-
-            type MsgSendLoginItemService =
-                unsafe extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void, CFStringRef)
-                    -> *mut std::ffi::c_void;
-            type MsgSendRegister = unsafe extern "C" fn(
-                *mut std::ffi::c_void,
-                *const std::ffi::c_void,
-                *mut *mut std::ffi::c_void,
-            ) -> i8;
-
-            let cls_name = CString::new("SMAppService")
-                .map_err(|_| anyhow!("LoginItem: invalid SMAppService class name"))?;
-            let sel_login = CString::new("loginItemServiceWithIdentifier:")
-                .map_err(|_| anyhow!("LoginItem: invalid selector name"))?;
-            let sel_register = CString::new("registerAndReturnError:")
-                .map_err(|_| anyhow!("LoginItem: invalid selector name"))?;
-            let sel_unregister = CString::new("unregisterAndReturnError:")
-                .map_err(|_| anyhow!("LoginItem: invalid selector name"))?;
-
-            let c_id = CString::new(helper_bundle_id)
-                .map_err(|_| anyhow!("LoginItem: helper bundle id contains NUL byte"))?;
-
-            unsafe {
-                let cls = objc_getClass(cls_name.as_ptr());
-                if cls.is_null() {
-                    return Err(anyhow!(
-                        "LoginItem: SMAppService class is not available on this system"
-                    ));
-                }
-
-                let cf_id = CFStringCreateWithCString(
-                    std::ptr::null(),
-                    c_id.as_ptr(),
-                    K_CFSTRING_ENCODING_UTF8,
-                );
-                if cf_id.is_null() {
-                    return Err(anyhow!(
-                        "LoginItem: CFStringCreateWithCString failed for '{}'",
-                        helper_bundle_id
-                    ));
-                }
-
-                let login_sel = sel_registerName(sel_login.as_ptr());
-                if login_sel.is_null() {
-                    CFRelease(cf_id);
-                    return Err(anyhow!(
-                        "LoginItem: failed to resolve selector loginItemServiceWithIdentifier:"
-                    ));
-                }
-
-                let msg_send_login: MsgSendLoginItemService =
-                    std::mem::transmute(objc_msgSend as *const ());
-                let service = msg_send_login(cls, login_sel, cf_id);
-                CFRelease(cf_id);
-                if service.is_null() {
-                    return Err(anyhow!(
-                        "LoginItem: SMAppService loginItemServiceWithIdentifier('{}') returned null",
-                        helper_bundle_id
-                    ));
-                }
-
-                let action_sel = if enabled {
-                    sel_registerName(sel_register.as_ptr())
-                } else {
-                    sel_registerName(sel_unregister.as_ptr())
-                };
-                if action_sel.is_null() {
-                    return Err(anyhow!(
-                        "LoginItem: failed to resolve SMAppService action selector"
-                    ));
-                }
-
-                let msg_send_register: MsgSendRegister =
-                    std::mem::transmute(objc_msgSend as *const ());
-                let mut err_obj: *mut std::ffi::c_void = std::ptr::null_mut();
-                let ok = msg_send_register(service, action_sel, &mut err_obj) != 0;
-                if !ok {
-                    return Err(anyhow!(
-                        "LoginItem: SMAppService {} failed for helper '{}'",
-                        if enabled { "register" } else { "unregister" },
-                        helper_bundle_id
-                    ));
-                }
+            // Use the `servicectl` CLI (shipped since macOS 13 Ventura) to
+            // enable or disable an SMAppService-registered login item.  This
+            // replaces the previous hand-rolled ObjC runtime approach
+            // (objc_getClass / sel_registerName / objc_msgSend transmute) which
+            // depended on exact selector-string matching and could silently
+            // break across macOS updates.
+            let action = if enabled { "enable" } else { "disable" };
+            let status = std::process::Command::new("servicectl")
+                .arg(action)
+                .arg(helper_bundle_id)
+                .status()
+                .map_err(|e| {
+                    anyhow!(
+                        "LoginItem: servicectl {} '{}': {}",
+                        action, helper_bundle_id, e
+                    )
+                })?;
+            if !status.success() {
+                return Err(anyhow!(
+                    "LoginItem: servicectl {} '{}' returned non-zero exit status",
+                    action, helper_bundle_id
+                ));
             }
-
+            log::info!(
+                "LoginItem: servicectl {} '{}' succeeded",
+                action, helper_bundle_id
+            );
             Ok(())
         }
 

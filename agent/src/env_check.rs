@@ -34,6 +34,16 @@ pub struct EnvReport {
     /// This field is informational; use `should_refuse` to incorporate it into
     /// a policy decision by passing `sandbox_score_threshold`.
     pub sandbox_score: u32,
+    /// Value of `/proc/sys/kernel/yama/ptrace_scope` at collection time.
+    ///
+    /// * `None`  — YAMA LSM not compiled into the running kernel (no restriction).
+    /// * `Some(0)` — classic, unrestricted ptrace.
+    /// * `Some(1)` — restricted: only parent/child or PR_SET_PTRACER peers.
+    /// * `Some(2)` — admin-only: `CAP_SYS_PTRACE` required.
+    /// * `Some(3)` — disabled: no attachment even for root.
+    ///
+    /// Only populated on Linux; always `None` on other platforms.
+    pub yama_ptrace_scope: Option<u8>,
 }
 
 impl EnvReport {
@@ -47,6 +57,21 @@ impl EnvReport {
             tracer_process_found: is_tracer_process_running(),
             timing_anomaly_detected: detect_timing_anomaly(),
             sandbox_score: sandbox::evaluate_sandbox().unwrap_or(0),
+            yama_ptrace_scope: read_yama_ptrace_scope(),
+        }
+    }
+
+    /// Log the ptrace scope value so operators can diagnose injection permission
+    /// issues without having to read the `EnvReport` struct directly.
+    pub fn log_ptrace_scope(&self) {
+        #[cfg(target_os = "linux")]
+        match self.yama_ptrace_scope {
+            None => log::info!("env: kernel.yama.ptrace_scope not present (YAMA LSM absent — no ptrace restrictions)"),
+            Some(0) => log::info!("env: kernel.yama.ptrace_scope=0 (unrestricted ptrace)"),
+            Some(1) => log::info!("env: kernel.yama.ptrace_scope=1 (restricted to parent/child or PR_SET_PTRACER peers)"),
+            Some(2) => log::warn!("env: kernel.yama.ptrace_scope=2 (CAP_SYS_PTRACE required for ptrace injection)"),
+            Some(3) => log::warn!("env: kernel.yama.ptrace_scope=3 (ptrace injection disabled by policy)"),
+            Some(v) => log::warn!("env: kernel.yama.ptrace_scope={v} (unrecognised value)"),
         }
     }
 
@@ -81,6 +106,27 @@ impl EnvReport {
         }
         false
     }
+}
+
+// --------------------------------------------------------- yama ptrace scope
+
+/// Read `/proc/sys/kernel/yama/ptrace_scope` and return the integer value.
+///
+/// Returns `None` when the file is absent (YAMA LSM not compiled in), which
+/// means there are no YAMA-based ptrace restrictions.
+#[cfg(target_os = "linux")]
+fn read_yama_ptrace_scope() -> Option<u8> {
+    std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .ok()?
+        .trim()
+        .parse::<u8>()
+        .ok()
+}
+
+/// On non-Linux platforms YAMA does not exist; always returns `None`.
+#[cfg(not(target_os = "linux"))]
+fn read_yama_ptrace_scope() -> Option<u8> {
+    None
 }
 
 // ------------------------------------------------------------------ debugger
@@ -261,9 +307,85 @@ fn windows_is_debugger_present() -> bool {
 ///
 /// This is a collection of soft indicators. The CPUID hypervisor bit is no
 /// longer a hard failure, but contributes to the overall `vm_detected` score.
+/// Returns `true` when the process is running inside a container (Docker,
+/// LXC, Podman, Kubernetes CRI-O, or containerd).
+///
+/// Containers are managed runtime environments, not hostile analysis
+/// sandboxes.  Treating them as "expected hypervisors" in `detect_vm()`
+/// prevents false-positive VM classifications on containerised cloud
+/// workloads where:
+///
+/// * `/sys/class/dmi/id/*` files are absent or expose the *host* DMI,
+///   which may contain "KVM"/"Xen" strings from the underlying cloud
+///   hypervisor (adding a spurious `linux_dmi_indicates_vm()` indicator).
+/// * IMDS (169.254.169.254) is firewalled, so `is_cloud_instance()` and
+///   `cloud_instance_vm_refusal_bypassed()` cannot confirm the cloud host.
+///
+/// Checks (in order of cost):
+/// 1. `/.dockerenv`              — created by Docker at container start.
+/// 2. `/run/.containerenv`       — created by Podman.
+/// 3. `CONTAINER` env var        — set by some OCI runtimes.
+/// 4. `KUBERNETES_SERVICE_HOST`  — injected into every pod by Kubernetes.
+/// 5. `/proc/1/cgroup`           — cgroup path prefix contains a
+///    container-runtime token ("docker", "lxc", "kubepods", "containerd",
+///    "crio").  Reading `/proc/1/cgroup` is safe even without root.
+#[cfg(target_os = "linux")]
+fn is_container_environment() -> bool {
+    // Fast path: marker files written by Docker and Podman respectively.
+    if std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
+    {
+        return true;
+    }
+
+    // Env vars set by common container orchestrators.
+    if std::env::var_os("CONTAINER").is_some()
+        || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some()
+    {
+        return true;
+    }
+
+    // cgroup membership: all major container runtimes place processes under
+    // a cgroup hierarchy whose path contains a recognisable token.
+    const CONTAINER_CGROUP_TOKENS: &[&str] =
+        &["docker", "lxc", "kubepods", "containerd", "crio", "cri-containerd"];
+    if let Ok(content) = std::fs::read_to_string("/proc/1/cgroup") {
+        let lower = content.to_ascii_lowercase();
+        if CONTAINER_CGROUP_TOKENS.iter().any(|t| lower.contains(t)) {
+            return true;
+        }
+    }
+
+    // /proc/self/mountinfo: overlay or aufs filesystem type indicates an
+    // overlayfs/aufs-based container (Docker, containerd, Podman, …).
+    // Require the CPUID hypervisor bit to be set to avoid false positives from
+    // storage configurations that use overlayfs on bare-metal hosts.
+    if let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") {
+        let lower = content.to_ascii_lowercase();
+        if (lower.contains("overlay") || lower.contains("aufs")) && cpuid_hypervisor_bit() {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn is_expected_hypervisor() -> bool {
     #[cfg(target_os = "linux")]
     {
+        // Containers (Docker, LXC, Podman, Kubernetes) are managed runtime
+        // environments, not hostile analysis sandboxes.  On these hosts the
+        // usual DMI signals are absent or reflect the underlying hypervisor,
+        // not the container runtime itself.  Returning `true` here ensures
+        // that `detect_vm()` (a) does not count the CPUID hypervisor bit as an
+        // indicator and (b) uses at least threshold=3 even when IMDS is
+        // firewalled, preventing false-positive VM refusals on containerised
+        // cloud workloads.
+        if is_container_environment() {
+            log::debug!("env_check: is_expected_hypervisor: container environment detected");
+            return true;
+        }
+
         // Read relevant DMI fields once and check combinations rather than
         // scanning every field with a broad needle list.  This avoids false
         // positives on physical hardware that happens to share a manufacturer
@@ -976,16 +1098,82 @@ fn cloud_instance_vm_refusal_bypassed() -> bool {
 ///
 /// Signals (CPUID, platform DMI/registry, MAC prefixes, etc.) are counted and
 /// compared against one of three thresholds:
-/// 1) `threshold = 2` when both cloud checks fail (`is_expected_hypervisor = false`
-///    and `is_cloud_instance = false`) - unknown virtualized environments.
+/// 1) `threshold = 3` when both cloud checks fail (`is_expected_hypervisor = false`
+///    and `is_cloud_instance = false`) - unknown virtualized environments.  Three
+///    independent indicators are required so that the common pairing of CPUID
+///    hypervisor bit + cloud-vendor MAC prefix alone (two generic indicators that
+///    appear on any VM, including legitimate hardened-cloud hosts with IMDS
+///    firewalled) does not trigger a false positive.
+/// Returns total physical RAM in GiB (rounded down).  Used by `detect_vm` to
+/// identify likely production VMs where large RAM reduces sandbox probability.
+fn get_ram_gb() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+            for line in content.lines() {
+                if line.starts_with("MemTotal:") {
+                    let kb: u64 = line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    return kb / (1024 * 1024); // KiB → GiB
+                }
+            }
+        }
+        0
+    }
+    #[cfg(windows)]
+    unsafe {
+        use winapi::um::sysinfoapi::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut mem: MEMORYSTATUSEX = std::mem::zeroed();
+        mem.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if GlobalMemoryStatusEx(&mut mem) != 0 {
+            mem.ullTotalPhys / (1024 * 1024 * 1024)
+        } else {
+            0
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        0
+    }
+}
+
+/// Returns system uptime in seconds.  Used by `detect_vm` alongside RAM to
+/// identify production hosts that have been running for extended periods.
+fn get_uptime_secs() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/uptime") {
+            content
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|f| f as u64)
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    }
+    #[cfg(windows)]
+    {
+        unsafe { winapi::um::sysinfoapi::GetTickCount64() / 1000 }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        0
+    }
+}
+
 /// 2) `threshold = 3` when exactly one cloud check succeeds - likely cloud but
 ///    with incomplete confirmation (for example IMDS blocked, or unknown DMI).
 /// 3) `threshold = 4` when both checks succeed - strongly confirmed cloud.
 ///
 /// Edge case: if IMDS is unavailable and the provider hypervisor is not in the
-/// built-in (or operator-extended) expected list, the logic intentionally falls
-/// back to `threshold = 2`. In that case a legitimate cloud VM can still be
-/// classified as VM if enough generic indicators are present.
+/// built-in (or operator-extended) expected list, the logic falls back to
+/// `threshold = 3`.  Two generic indicators (CPUID bit + MAC prefix) no longer
+/// suffice; a third platform-level indicator (DMI/registry) is also required.
 ///
 /// Recommended operator mitigation for niche cloud providers:
 /// - Configure `malleable_profile.cloud_instance_id` so known deployments can
@@ -1045,18 +1233,46 @@ pub fn detect_vm() -> bool {
     //     so a standard 3-indicator cloud VM (CPUID + DMI + MAC) is not flagged
     //     while a heavily-instrumented analysis VM with 4+ indicators still is.
     let cloud_imds = is_cloud_instance();
+
+    // When the CPUID hypervisor bit is set on a host with ample RAM (>4 GiB)
+    // that has been running for over 24 hours, it is far more likely a
+    // production VM than a live-analysis sandbox.  Raise the threshold by 1 to
+    // reduce false-positive VM refusals on legitimate long-running deployments
+    // whose IMDS is firewalled or DMI strings are not in the built-in list.
+    let likely_legitimate_server = cpuid_hypervisor_bit()
+        && get_ram_gb() > 4
+        && get_uptime_secs() > 24 * 3600;
+
+    // Allow operators to force a minimum threshold of 3 regardless of cloud
+    // detection results.  Useful on restricted networks where IMDS is
+    // firewalled.  Default: false (backward-compatible).
+    let high_threshold_mode = crate::config::load_config()
+        .map(|c| c.malleable_profile.vm_detection_high_threshold_mode)
+        .unwrap_or(false);
+
     let threshold = if cloud_hypervisor && cloud_imds {
         4 // Strong confirmation: both local DMI *and* IMDS agree → cloud
     } else if cloud_hypervisor || cloud_imds {
         3 // Moderate confidence: one signal present → likely cloud
     } else {
-        2 // No cloud signal: standard analysis-VM threshold
+        // No cloud signal confirmed.
+        if likely_legitimate_server {
+            // CPUID set + >4 GiB RAM + >24 h uptime → likely production VM.
+            4
+        } else {
+            3
+        }
     };
 
+    // vm_detection_high_threshold_mode guarantees the threshold is at least 3.
+    let threshold = threshold.max(if high_threshold_mode { 3 } else { 0 });
+
     let detected = indicators >= threshold;
-    if detected && threshold == 2 && !cloud_imds {
+    if detected && !cloud_imds && !cloud_hypervisor {
         log::warn!(
-            "env_check: VM detected with threshold=2 while IMDS is unavailable; if this is a niche cloud deployment, verify IMDS connectivity and extend is_expected_hypervisor via vm_detection_extra_hypervisor_names"
+            "env_check: VM detected with threshold={threshold} and no cloud signal confirmed; \
+             if this is a niche cloud deployment, verify IMDS connectivity and \
+             extend is_expected_hypervisor via vm_detection_extra_hypervisor_names"
         );
     }
 

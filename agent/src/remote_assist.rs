@@ -112,6 +112,222 @@ where
     })
 }
 
+// ─────────────────────────── Linux screen-capture helpers ───────────────────
+
+/// Capture via the X11 root window using the vendored `x11cap` crate.
+#[cfg(target_os = "linux")]
+fn capture_x11() -> Result<Vec<u8>> {
+    use image::{ImageBuffer, Rgb};
+    let mut capturer =
+        Capturer::new(Screen::Default).map_err(|_| anyhow!("failed to open X11 display"))?;
+    let (pixels, (width, height)) = capturer
+        .capture_frame()
+        .map_err(|e| anyhow!("X11 capture_frame failed: {:?}", e))?;
+    let raw: Vec<u8> = pixels.iter().flat_map(|p| [p.r, p.g, p.b]).collect();
+    let img = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, raw)
+        .ok_or_else(|| anyhow!("failed to create image buffer from X11 pixels"))?;
+    let mut buffer = Vec::new();
+    img.write_to(
+        &mut std::io::Cursor::new(&mut buffer),
+        image::ImageFormat::Png,
+    )?;
+    Ok(buffer)
+}
+
+/// Capture the primary framebuffer via `/dev/fb0` (headless/VT fallback).
+///
+/// Reads display geometry from `/sys/class/graphics/fb0/virtual_size` and
+/// bits-per-pixel from `/sys/class/graphics/fb0/bits_per_pixel`.
+/// Only 32 bpp (BGRA) framebuffers are supported; other formats return an
+/// error rather than producing corrupt output.
+#[cfg(target_os = "linux")]
+fn capture_fb0() -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let virt_size = std::fs::read_to_string("/sys/class/graphics/fb0/virtual_size")
+        .map_err(|e| anyhow!("/dev/fb0 not available: /sys/class/graphics/fb0/virtual_size: {e}"))?;
+    let mut parts = virt_size.trim().split(',');
+    let width: u32 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow!("invalid fb0 virtual_size (width)"))?;
+    let height: u32 = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow!("invalid fb0 virtual_size (height)"))?;
+
+    let bpp: u32 = std::fs::read_to_string("/sys/class/graphics/fb0/bits_per_pixel")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(32);
+
+    if bpp != 32 {
+        return Err(anyhow!(
+            "/dev/fb0 bits_per_pixel={bpp}; only 32 bpp (BGRA) is supported"
+        ));
+    }
+
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| anyhow!("fb0 dimensions overflow"))?;
+
+    let mut fb_data = vec![0u8; expected];
+    let mut fb = std::fs::File::open("/dev/fb0")
+        .map_err(|e| anyhow!("/dev/fb0 open failed: {e}"))?;
+    fb.read_exact(&mut fb_data)
+        .map_err(|e| anyhow!("/dev/fb0 read failed: {e}"))?;
+
+    // Framebuffers typically store BGRA; swap B (index 0) and R (index 2) for RGBA.
+    for chunk in fb_data.chunks_exact_mut(4) {
+        chunk.swap(0, 2);
+    }
+
+    let img = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width, height, fb_data)
+        .ok_or_else(|| anyhow!("failed to construct RGBA image from fb0 data"))?;
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
+    Ok(out)
+}
+
+/// Capture via the XDG Desktop Portal Screenshot interface over D-Bus
+/// (Wayland sessions).
+///
+/// Spawns a dedicated OS thread with its own Tokio runtime to drive the
+/// async D-Bus exchange, avoiding nesting issues with the agent's main
+/// runtime.  Times out after 35 seconds.
+#[cfg(target_os = "linux")]
+fn capture_wayland_portal() -> Result<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(1);
+    std::thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| anyhow!("tokio runtime init failed: {e}"))
+            .and_then(|rt| rt.block_on(capture_wayland_portal_async()));
+        let _ = tx.send(result);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(35))
+        .map_err(|_| anyhow!("xdg-desktop-portal timed out (35 s)"))?
+}
+
+/// Async core of the XDG Portal screenshot request.
+///
+/// Flow:
+/// 1. Open the D-Bus session bus.
+/// 2. Subscribe to `org.freedesktop.portal.Request.Response` on the
+///    expected handle path *before* calling `Screenshot`, to avoid a
+///    TOCTOU race if the portal responds immediately.
+/// 3. Call `org.freedesktop.portal.Screenshot.Screenshot` with
+///    `interactive = false`.
+/// 4. Wait up to 30 s for the `Response` signal.
+/// 5. Extract the `file://` URI, read the PNG, and return the bytes.
+#[cfg(target_os = "linux")]
+async fn capture_wayland_portal_async() -> Result<Vec<u8>> {
+    use futures_util::StreamExt;
+    use std::collections::HashMap;
+    use zbus::zvariant::Value;
+
+    let conn = zbus::Connection::session()
+        .await
+        .map_err(|e| anyhow!("D-Bus session connection failed: {e}"))?;
+
+    // Build the expected request-handle path from the caller's unique bus name
+    // and the handle token.  The portal constructs the same path.
+    let token = format!("rs{}", std::process::id());
+    let unique_name = conn
+        .unique_name()
+        .ok_or_else(|| anyhow!("no D-Bus unique name assigned"))?
+        .to_string();
+    // ":1.23" → "1_23"
+    let sender_id = unique_name.trim_start_matches(':').replace('.', "_");
+    let handle_path = format!(
+        "/org/freedesktop/portal/desktop/request/{}/{}",
+        sender_id, token
+    );
+
+    // Subscribe to the Response signal *before* making the call to avoid
+    // missing an immediate response.
+    let match_rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.portal.Request")
+        .map_err(|e| anyhow!("invalid interface name: {e}"))?
+        .member("Response")
+        .map_err(|e| anyhow!("invalid member name: {e}"))?
+        .path(handle_path.as_str())
+        .map_err(|e| anyhow!("invalid path: {e}"))?
+        .build();
+
+    let mut signal_stream =
+        zbus::MessageStream::for_match_rule(match_rule, &conn, Some(1))
+            .await
+            .map_err(|e| anyhow!("failed to subscribe to portal response signal: {e}"))?;
+
+    // Build the options dictionary for the Screenshot portal call.
+    let mut opts: HashMap<&str, Value<'_>> = HashMap::new();
+    opts.insert("interactive", false.into());
+    opts.insert("handle_token", Value::Str(token.as_str().into()));
+
+    conn.call_method(
+        Some("org.freedesktop.portal.Desktop"),
+        "/org/freedesktop/portal/desktop",
+        Some("org.freedesktop.portal.Screenshot"),
+        "Screenshot",
+        &("", &opts),
+    )
+    .await
+    .map_err(|e| anyhow!("Screenshot portal call failed: {e}"))?;
+
+    // Wait for the response signal, with a 30-second timeout.
+    let msg = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        signal_stream.next(),
+    )
+    .await
+    .map_err(|_| anyhow!("xdg-desktop-portal did not respond within 30 seconds"))?
+    .ok_or_else(|| anyhow!("portal signal stream ended without a Response"))?
+    .map_err(|e| anyhow!("portal D-Bus message error: {e}"))?;
+
+    // Parse the body: (response_code: u32, results: a{sv})
+    let (response, results): (u32, HashMap<String, zbus::zvariant::OwnedValue>) =
+        msg.body()
+            .deserialize()
+            .map_err(|e| anyhow!("failed to deserialize portal Response body: {e}"))?;
+
+    if response != 0 {
+        return Err(anyhow!(
+            "xdg-desktop-portal screenshot request rejected (response code {}; \
+             0=success, 1=cancelled, 2=other error)",
+            response
+        ));
+    }
+
+    // Extract the file URI from the results dictionary.
+    let uri_value = results
+        .get("uri")
+        .ok_or_else(|| anyhow!("portal Response missing 'uri' field"))?;
+
+    let uri_str: String = uri_value
+        .clone()
+        .try_into()
+        .map_err(|_| anyhow!("portal 'uri' value is not a string"))?;
+
+    let file_path = uri_str
+        .strip_prefix("file://")
+        .ok_or_else(|| anyhow!("portal returned non-file URI: {uri_str}"))?;
+
+    // The portal saves a PNG; read it directly.
+    let png_bytes = std::fs::read(file_path)
+        .map_err(|e| anyhow!("failed to read portal screenshot file '{file_path}': {e}"))?;
+
+    // Clean up the temporary file (best-effort; ignore errors).
+    let _ = std::fs::remove_file(file_path);
+
+    Ok(png_bytes)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+
 /// Checks for the existence of a consent flag.
 ///
 /// Consent storage is intentionally user-level on all platforms so that no
@@ -178,29 +394,28 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
     #[cfg(target_os = "linux")]
     {
         check_consent()?;
-        // On Wayland without an X11 socket, x11cap will fail silently.
-        // Detect and report this explicitly so callers receive a useful error.
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_none() {
-            return Err(anyhow!(
-                "Screen capture is not supported on a pure Wayland session. \
-                 Enable XWayland (set DISPLAY) or use an XDG Desktop Portal-compatible tool."
-            ));
+        // Priority 1: Wayland session → xdg-desktop-portal Screenshot portal.
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            match capture_wayland_portal() {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => log::warn!(
+                    "xdg-desktop-portal screenshot failed ({}); falling back to X11/fb0",
+                    e
+                ),
+            }
         }
-        use image::{ImageBuffer, Rgb};
-        let mut capturer =
-            Capturer::new(Screen::Default).map_err(|_| anyhow!("failed to open X11 display"))?;
-        let (pixels, (width, height)) = capturer
-            .capture_frame()
-            .map_err(|e| anyhow!("capture failed: {:?}", e))?;
-        let raw: Vec<u8> = pixels.iter().flat_map(|p| [p.r, p.g, p.b]).collect();
-        let img = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, raw)
-            .ok_or_else(|| anyhow!("failed to create image buffer"))?;
-        let mut buffer = Vec::new();
-        img.write_to(
-            &mut std::io::Cursor::new(&mut buffer),
-            image::ImageFormat::Png,
-        )?;
-        Ok(buffer)
+        // Priority 2: X11 via x11cap.
+        if std::env::var_os("DISPLAY").is_some() {
+            match capture_x11() {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) => log::warn!(
+                    "X11 screen capture failed ({}); falling back to /dev/fb0",
+                    e
+                ),
+            }
+        }
+        // Priority 3: raw framebuffer (headless servers, VTs).
+        capture_fb0()
     }
     #[cfg(windows)]
     {
