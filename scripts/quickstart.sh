@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# scripts/quickstart.sh — One command to go from git clone to running system.
+#
+# What it does:
+#   1. Checks / installs Rust toolchain (with consent)
+#   2. Builds orchestra-builder (release)
+#   3. Runs orchestra-builder setup --auto-install
+#   4. Generates a default outbound profile with random credentials
+#   5. Generates a self-signed TLS certificate
+#   6. Builds the agent payload (outbound-c mode)
+#   7. Generates orchestra-server.toml with matching credentials
+#   8. Builds the Orchestra Control Center
+#   9. Prints dashboard URL, bearer token, and agent deployment command
+#
+# Environment variables:
+#   ORCHESTRA_PROFILE    — profile name (default: "default")
+#   ORCHESTRA_HTTP_PORT  — dashboard HTTPS port (default: 8443)
+#   ORCHESTRA_AGENT_PORT — agent listener port (default: 8444)
+#   ORCHESTRA_SKIP_SERVER — set to "1" to skip starting the server
+#
+# Required tools: bash, git, curl, openssl, a C compiler (gcc/clang).
+# Exit codes: 0 on success, 1 on failure.
+#
+# This script is intended for use on systems you own or manage.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+PROFILE_NAME="${ORCHESTRA_PROFILE:-default}"
+HTTP_PORT="${ORCHESTRA_HTTP_PORT:-8443}"
+AGENT_PORT="${ORCHESTRA_AGENT_PORT:-8444}"
+SKIP_SERVER="${ORCHESTRA_SKIP_SERVER:-0}"
+PROFILE_PATH="profiles/${PROFILE_NAME}.toml"
+SERVER_CFG="orchestra-server.toml"
+
+log()  { printf '\033[1;34m[quickstart]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[quickstart]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[quickstart]\033[0m %s\n' "$*" >&2; exit 1; }
+
+confirm() {
+    local prompt="$1" reply
+    if [[ ! -t 0 && ! -e /dev/tty ]]; then
+        warn "no TTY available; assuming 'no' for: $prompt"
+        return 1
+    fi
+    read -r -p "$prompt [y/N] " reply </dev/tty
+    [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# ── 1. Rust toolchain ────────────────────────────────────────────────────────
+
+if ! command -v cargo >/dev/null 2>&1; then
+    warn "Rust toolchain (cargo) was not found on PATH."
+    if confirm "Install Rust now via rustup?"; then
+        log "Downloading rustup-init..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+        # shellcheck disable=SC1090
+        source "$HOME/.cargo/env"
+    else
+        die "Rust is required. Install it from https://rustup.rs and re-run."
+    fi
+fi
+
+log "cargo: $(cargo --version)"
+
+# ── 2. Builder ───────────────────────────────────────────────────────────────
+
+BUILDER_BIN="$ROOT/target/release/orchestra-builder"
+if [[ ! -x "$BUILDER_BIN" ]]; then
+    log "Building orchestra-builder (release)..."
+    cargo build --release -p builder
+fi
+
+log "Running 'orchestra-builder setup --auto-install'..."
+"$BUILDER_BIN" setup --auto-install || warn "setup reported issues; review above"
+
+# ── 3. Platform detection ────────────────────────────────────────────────────
+
+detect_os() {
+    case "$(uname -s)" in
+        Linux*)  echo "linux"  ;;
+        Darwin*) echo "macos"  ;;
+        MINGW*|MSYS*|CYGWIN*) echo "windows" ;;
+        *)       echo "linux"  ;;
+    esac
+}
+
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "x86_64"  ;;
+        aarch64|arm64) echo "aarch64" ;;
+        *)             echo "x86_64" ;;
+    esac
+}
+
+OS=$(detect_os)
+ARCH=$(detect_arch)
+
+# Detect LAN IP for C2 address default
+DETECTED_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+[[ -z "$DETECTED_IP" ]] && DETECTED_IP="127.0.0.1"
+
+# ── 4. Credentials ───────────────────────────────────────────────────────────
+
+mkdir -p profiles dist secrets
+
+gen_b64() { head -c "$1" /dev/urandom | base64 | tr -d '\n'; }
+
+AES_KEY=$(gen_b64 32)
+AGENT_SECRET=$(gen_b64 32)
+ADMIN_TOKEN=$(gen_b64 24 | tr '+/' '-_' | tr -d '=')
+
+# ── 5. TLS certificate ──────────────────────────────────────────────────────
+
+CERT="secrets/server.crt"
+KEY="secrets/server.key"
+
+if [[ ! -f "$CERT" || ! -f "$KEY" ]]; then
+    log "Generating self-signed TLS cert (127.0.0.1, ${DETECTED_IP}, localhost)..."
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 365 \
+        -keyout "$KEY" -out "$CERT" \
+        -subj "/CN=orchestra-control-center" \
+        -addext "subjectAltName=IP:127.0.0.1,IP:${DETECTED_IP},DNS:localhost" \
+        >/dev/null 2>&1 || die "openssl failed (is openssl installed?)"
+    chmod 600 "$KEY"
+    log "TLS material: $CERT / $KEY"
+fi
+
+cert_fingerprint() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        openssl x509 -in "$1" -outform DER | sha256sum | awk '{print $1}'
+    else
+        openssl x509 -in "$1" -outform DER | shasum -a 256 | awk '{print $1}'
+    fi
+}
+CERT_FP=$(cert_fingerprint "$CERT")
+log "Server certificate SHA-256 fingerprint: $CERT_FP"
+
+# ── 6. Agent profile ────────────────────────────────────────────────────────
+
+if [[ ! -f "$PROFILE_PATH" ]]; then
+    log "Creating default outbound profile: $PROFILE_PATH"
+    cat > "$PROFILE_PATH" <<TOML
+# Auto-generated by scripts/quickstart.sh
+target_os               = "${OS}"
+target_arch             = "${ARCH}"
+c2_address              = "${DETECTED_IP}:${AGENT_PORT}"
+encryption_key          = "${AES_KEY}"
+c_server_secret         = "${AGENT_SECRET}"
+server_cert_fingerprint = "${CERT_FP}"
+features                = ["outbound-c"]
+package                 = "agent"
+bin_name                = "agent-standalone"
+TOML
+    log "Wrote $PROFILE_PATH"
+else
+    log "Re-using existing profile $PROFILE_PATH"
+    # Re-read key for display
+    AES_KEY=$(awk -F'"' '/^encryption_key/ { print $2; exit }' "$PROFILE_PATH")
+fi
+
+# ── 7. Build agent payload ──────────────────────────────────────────────────
+
+log "Building agent payload for profile '$PROFILE_NAME'..."
+"$BUILDER_BIN" build "$PROFILE_NAME"
+
+PAYLOAD="dist/${PROFILE_NAME}.enc"
+if [[ ! -f "$PAYLOAD" ]]; then
+    # Builder may produce a plain binary for native targets
+    PAYLOAD="dist/${PROFILE_NAME}"
+fi
+[[ -f "$PAYLOAD" ]] || die "expected payload in dist/ after build"
+log "Payload ready: $(ls -lh "$PAYLOAD" | awk '{print $5, $9}')"
+
+# ── 8. Server configuration ─────────────────────────────────────────────────
+
+if [[ ! -f "$SERVER_CFG" ]]; then
+    log "Writing $SERVER_CFG..."
+    cat > "$SERVER_CFG" <<EOF
+# Auto-generated by scripts/quickstart.sh
+http_addr           = "0.0.0.0:${HTTP_PORT}"
+agent_addr          = "0.0.0.0:${AGENT_PORT}"
+agent_shared_secret = "${AGENT_SECRET}"
+admin_token         = "${ADMIN_TOKEN}"
+audit_log_path      = "secrets/orchestra-audit.jsonl"
+static_dir          = "orchestra-server/static"
+tls_cert_path       = "${CERT}"
+tls_key_path        = "${KEY}"
+command_timeout_secs = 30
+EOF
+    log "Wrote $SERVER_CFG"
+else
+    log "Re-using existing $SERVER_CFG"
+    ADMIN_TOKEN=$(awk -F'"' '/^admin_token/ { print $2; exit }' "$SERVER_CFG")
+fi
+
+# ── 9. Build Control Center ─────────────────────────────────────────────────
+
+log "Building Orchestra Control Center..."
+cargo build --release -p orchestra-server
+log "Control Center built"
+
+# ── 10. Save credentials ────────────────────────────────────────────────────
+
+CRED_FILE="secrets/${PROFILE_NAME}.env"
+umask 077
+cat > "$CRED_FILE" <<EOF
+# Orchestra credentials for profile: ${PROFILE_NAME}
+# Generated: $(date -u +%FT%TZ)
+PROFILE_NAME=${PROFILE_NAME}
+TARGET_OS=${OS}
+TARGET_ARCH=${ARCH}
+AES_KEY=${AES_KEY}
+AGENT_SECRET=${AGENT_SECRET}
+ADMIN_TOKEN=${ADMIN_TOKEN}
+CERT_FINGERPRINT=${CERT_FP}
+EOF
+chmod 600 "$CRED_FILE"
+log "Credentials saved: $CRED_FILE (mode 600)"
+
+# ── 11. Print summary / optionally start server ─────────────────────────────
+
+cat <<EOF
+
+================================================================================
+  Orchestra Quickstart complete.
+
+  Dashboard URL     : https://${DETECTED_IP}:${HTTP_PORT}/
+  Admin bearer token: ${ADMIN_TOKEN}
+  Server config     : ${SERVER_CFG}
+  Agent profile     : ${PROFILE_PATH}
+  Agent payload     : ${PAYLOAD}
+  TLS fingerprint   : ${CERT_FP}
+
+  ── Next steps ──────────────────────────────────────────────────────────────
+
+  1. Start the Control Center:
+
+       $ ./target/release/orchestra-server --config ${SERVER_CFG}
+
+  2. Open the dashboard in a browser (accept the self-signed cert):
+
+       https://${DETECTED_IP}:${HTTP_PORT}/
+
+     Log in with the bearer token shown above.
+
+  3. Copy the agent payload to a target endpoint and run:
+
+       $ ./agent-standalone
+
+     The agent dials ${DETECTED_IP}:${AGENT_PORT} automatically.
+
+  4. The agent appears in the dashboard within a few seconds.
+     Send a Ping to verify connectivity.
+
+  ── Advanced ────────────────────────────────────────────────────────────────
+
+  Interactive wizard:    ./scripts/setup.sh
+  TLS cert generation:   ./scripts/generate-certs.sh
+  Verify prerequisites:  ./scripts/verify-setup.sh
+  Full documentation:    docs/QUICKSTART.md
+
+  Reminder: only deploy to systems you own or are authorised to manage.
+================================================================================
+EOF
+
+if [[ "$SKIP_SERVER" != "1" ]]; then
+    if confirm "Start the Orchestra Control Center now?"; then
+        log "Starting Control Center..."
+        exec "$ROOT/target/release/orchestra-server" --config "$SERVER_CFG"
+    else
+        log "Skipped server start. Run manually with the command above."
+    fi
+fi

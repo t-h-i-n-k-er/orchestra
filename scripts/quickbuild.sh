@@ -7,6 +7,8 @@
 #   3. Creating a default profile targeting the current OS if none exists.
 #   4. Building the payload.
 #   5. Starting the dev-server to serve the payload.
+#
+# Repository: https://github.com/t-h-i-n-k-er/orchestra.git
 #   6. Printing the exact launcher command to run on a target endpoint.
 #
 # This script is intended for use on systems you own or manage.
