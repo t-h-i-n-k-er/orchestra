@@ -559,7 +559,8 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
                 let height = CGImageGetHeight(image);
                 if width == 0 || height == 0 {
                     return Err(anyhow!(
-                        "CoreGraphics returned invalid screenshot size: {}x{}",
+                        "CoreGraphics returned invalid screenshot size: {}x{} — \
+                         Screen Recording permission may not be granted",
                         width,
                         height
                     ));
@@ -633,6 +634,40 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
                             rgba[dst_idx + 1] = row[src_idx + 1];
                             rgba[dst_idx + 2] = row[src_idx];
                             rgba[dst_idx + 3] = row[src_idx + 3];
+                        }
+                    }
+
+                    // ── Screen Recording permission check ─────────────────
+                    // On macOS 10.15+, CGWindowListCreateImage returns a valid
+                    // but *blank* image (typically all black or all zeros) when
+                    // the Screen Recording permission has not been granted to
+                    // the calling process.  Detect this by sampling pixels
+                    // across the image — if all sampled pixels are identical
+                    // (R==G==B==0, fully opaque), the capture is blank.
+                    {
+                        let pixel_count = width * height;
+                        // Sample up to 256 evenly-spaced pixels.
+                        let step = (pixel_count / 256).max(1);
+                        let mut all_blank = true;
+                        let first_r = rgba[0];
+                        let first_g = rgba[1];
+                        let first_b = rgba[2];
+                        for i in (0..pixel_count).step_by(step) {
+                            let idx = i * 4;
+                            if rgba[idx] != first_r
+                                || rgba[idx + 1] != first_g
+                                || rgba[idx + 2] != first_b
+                            {
+                                all_blank = false;
+                                break;
+                            }
+                        }
+                        if all_blank && first_r == 0 && first_g == 0 && first_b == 0 {
+                            return Err(anyhow!(
+                                "Screen capture produced a blank image — \
+                                 Screen Recording permission is required. \
+                                 Grant it in System Settings → Privacy & Security → Screen Recording"
+                            ));
                         }
                     }
 

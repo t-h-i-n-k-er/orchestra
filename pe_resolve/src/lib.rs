@@ -166,6 +166,11 @@ pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Opt
     let rva_names = *((export_dir + 0x20) as *const u32) as usize;
     let rva_ords = *((export_dir + 0x24) as *const u32) as usize;
 
+    // Read SizeOfImage from the PE optional header for post-resolution
+    // address-range validation (guards against ordinal-based misresolution
+    // after Windows updates that shift function RVAs).
+    let size_of_image = *((opt_header + 0x38) as *const u32) as usize;
+
     let names = (dll_base + rva_names) as *const u32;
     let funcs = (dll_base + rva_funcs) as *const u32;
     let ords = (dll_base + rva_ords) as *const u16;
@@ -183,6 +188,12 @@ pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Opt
             let func_rva = *funcs.add(ord) as usize;
             if is_forwarder(func_rva, export_dir_rva, export_dir_size) {
                 return resolve_forwarded_export(dll_base, func_rva);
+            }
+            // Validate resolved address falls within the module's VA range.
+            // After Windows updates, ordinal tables can shift and a stale
+            // hash match may resolve to the wrong RVA outside the image.
+            if func_rva >= size_of_image {
+                return None;
             }
             return Some(dll_base + func_rva);
         }
@@ -263,6 +274,11 @@ pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Opt
     let rva_names = *((export_dir + 0x20) as *const u32) as usize;
     let rva_ords = *((export_dir + 0x24) as *const u32) as usize;
 
+    // Read SizeOfImage from the PE optional header for post-resolution
+    // address-range validation (guards against ordinal-based misresolution
+    // after Windows updates that shift function RVAs).
+    let size_of_image = *((opt_header + 0x38) as *const u32) as usize;
+
     let names = (dll_base + rva_names) as *const u32;
     let funcs = (dll_base + rva_funcs) as *const u32;
     let ords = (dll_base + rva_ords) as *const u16;
@@ -280,6 +296,10 @@ pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Opt
             let func_rva = *funcs.add(ord) as usize;
             if is_forwarder(func_rva, export_dir_rva, export_dir_size) {
                 return resolve_forwarded_export(dll_base, func_rva);
+            }
+            // Validate resolved address falls within the module's VA range.
+            if func_rva >= size_of_image {
+                return None;
             }
             return Some(dll_base + func_rva);
         }

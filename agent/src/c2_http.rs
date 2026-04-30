@@ -35,35 +35,15 @@ fn check_kill_date(kill_date: &str) -> Result<()> {
     check_kill_date_pub(kill_date)
 }
 
-/// Public wrapper around kill-date enforcement used by `Agent::new()` (4-2).
+/// Public wrapper around kill-date enforcement.
+/// Delegates to the shared implementation in `config` to avoid duplication.
 pub fn check_kill_date_pub(kill_date: &str) -> Result<()> {
-    // Parse as YYYY-MM-DD; produce a comparable 8-digit integer YYYYMMDD.
-    let parts: Vec<&str> = kill_date.splitn(3, '-').collect();
-    if parts.len() != 3 {
-        anyhow::bail!("invalid kill_date format '{}'; expected YYYY-MM-DD", kill_date);
-    }
-    let y: u32 = parts[0].parse().map_err(|_| anyhow!("invalid kill_date year"))?;
-    let m: u32 = parts[1].parse().map_err(|_| anyhow!("invalid kill_date month"))?;
-    let d: u32 = parts[2].parse().map_err(|_| anyhow!("invalid kill_date day"))?;
-    let kd_val = y * 10_000 + m * 100 + d;
-
-    // Derive today's date from the Unix epoch (UTC, no external deps).
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let days_since_epoch = secs / 86400;
-    // Compute year/month/day from days_since_epoch (proleptic Gregorian, UTC).
-    let (ty, tm, td) = days_to_ymd(days_since_epoch);
-    let today_val = ty * 10_000 + tm * 100 + td;
-
-    if today_val >= kd_val {
-        anyhow::bail!("kill date {} has passed; agent refusing to connect", kill_date);
-    }
-    Ok(())
+    crate::config::check_kill_date(kill_date)
 }
 
 /// Convert days since the Unix epoch (1970-01-01) to (year, month, day).
+/// Kept for backward compat with any external callers; delegates to config.
+#[allow(dead_code)]
 fn days_to_ymd(days: u64) -> (u32, u32, u32) {
     // Algorithm: http://howardhinnant.github.io/date_algorithms.html#civil_from_days
     let z = days as i64 + 719468;

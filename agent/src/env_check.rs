@@ -1188,11 +1188,21 @@ fn get_uptime_secs() -> u64 {
 ///   `is_expected_hypervisor` recognizes the platform without code changes.
 pub fn detect_vm() -> bool {
     // The hypervisor bit is now just one of several indicators.
-    // Call is_expected_hypervisor() once and reuse the result below.
+    // Call both cloud-confirmation checks once and reuse below so that the
+    // hypervisor-bit indicator can be excluded when *either* signal is true
+    // (not just is_expected_hypervisor).
     let cloud_hypervisor = is_expected_hypervisor();
+    let cloud_imds = is_cloud_instance();
     let mut indicators = 0i32;
-    if cpuid_hypervisor_bit() && !cloud_hypervisor {
+    let mut hypervisor_bit_counted = false;
+    // Exclude the hypervisor-bit indicator when either local DMI/registry or
+    // IMDS confirms this is a cloud host.  This prevents false positives on
+    // legitimate cloud VMs running in containers where IMDS is unreachable
+    // and DMI strings are absent.
+    let cloud_confirmed = cloud_hypervisor || cloud_imds;
+    if cpuid_hypervisor_bit() && !cloud_confirmed {
         indicators += 1;
+        hypervisor_bit_counted = true;
     }
     #[cfg(target_os = "linux")]
     {
@@ -1221,8 +1231,7 @@ pub fn detect_vm() -> bool {
     // cloud-vendor strings in DMI tables.  These are genuine signs of
     // virtualisation but NOT of a hostile analysis environment.
     //
-    // Strategy: check both independent confirmation paths and adjust the
-    // threshold to ensure a legitimate cloud deployment is never refused.
+    // Strategy: both cloud-confirmation paths were checked above.
     //
     //   • is_expected_hypervisor(): inspects local DMI/registry for known
     //     cloud-vendor strings — works even when IMDS is firewalled.
@@ -1237,7 +1246,6 @@ pub fn detect_vm() -> bool {
     //     whose DMI strings aren't in our list), we raise the threshold to 3,
     //     so a standard 3-indicator cloud VM (CPUID + DMI + MAC) is not flagged
     //     while a heavily-instrumented analysis VM with 4+ indicators still is.
-    let cloud_imds = is_cloud_instance();
 
     // When the CPUID hypervisor bit is set on a host with ample RAM (>4 GiB)
     // that has been running for over 24 hours, it is far more likely a
@@ -1272,7 +1280,23 @@ pub fn detect_vm() -> bool {
     // vm_detection_high_threshold_mode guarantees the threshold is at least 3.
     let threshold = threshold.max(if high_threshold_mode { 3 } else { 0 });
 
-    let detected = indicators >= threshold;
+    let mut detected = indicators >= threshold;
+
+    // Defence-in-depth: never refuse based solely on the hypervisor bit.
+    // When the CPUID hypervisor bit is the only counted indicator (i.e.
+    // all other signals — DMI, MAC prefix, registry — are absent), it is
+    // far more likely a legitimate cloud/production VM than an analysis
+    // sandbox.  Require at least one additional non-hypervisor-bit indicator
+    // before flagging.  This prevents single-signal false positives on cloud
+    // instances where IMDS is unreachable and DMI strings are absent.
+    if detected && hypervisor_bit_counted && indicators == 1 {
+        log::info!(
+            "env_check: hypervisor bit is the sole VM indicator (indicators={indicators}, \
+             threshold={threshold}); suppressing VM detection to avoid false positive"
+        );
+        detected = false;
+    }
+
     if detected && !cloud_imds && !cloud_hypervisor {
         log::warn!(
             "env_check: VM detected with threshold={threshold} and no cloud signal confirmed; \

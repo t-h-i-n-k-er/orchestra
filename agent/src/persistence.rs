@@ -1172,39 +1172,169 @@ pub mod macos {
 
     /// Cron-like persistence fallback for macOS.
     ///
-    /// `crontab` is disabled by default on macOS 13+ (Ventura and later); the
-    /// crond daemon is no longer started automatically, so any `@reboot` entry
-    /// would silently never fire.  Instead, this implementation delegates to a
-    /// secondary `LaunchAgent` plist with a distinct label, which is managed by
-    /// launchd and works across all supported macOS versions.
+    /// Attempts to install a `@reboot` cron entry.  On macOS with System
+    /// Integrity Protection (SIP), `crontab` modifications may be silently
+    /// ignored — the write appears to succeed but `crontab -l` shows no
+    /// entry.  After each write, we verify with `crontab -l` that the
+    /// expected entry is present; if verification fails we return an error
+    /// suggesting the `LaunchAgent` path instead.
     pub struct CronJob;
 
-    /// Label used by the secondary LaunchAgent installed on behalf of `CronJob`.
-    const CRON_FALLBACK_LABEL: &str = "com.apple.xpc.system-update-helper";
+    /// Marker string embedded in the cron entry so we can locate it later.
+    const CRON_MARKER: &str = "# orchestra-persist";
+
+    impl CronJob {
+        /// Build the `@reboot` cron line for `executable_path`.
+        fn cron_entry(executable_path: &PathBuf) -> String {
+            format!(
+                "@reboot {} {}",
+                shell_quote_single(&executable_path.to_string_lossy()),
+                CRON_MARKER
+            )
+        }
+
+        /// Run `crontab -l` and return its stdout, or an empty string if the
+        /// user has no crontab (exit 1 from crontab is "no crontab for user").
+        fn read_crontab() -> String {
+            let output = std::process::Command::new("crontab")
+                .arg("-l")
+                .output();
+            match output {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+                Ok(_) => {
+                    // Non-zero exit (typically "no crontab for user") — treat
+                    // as empty rather than an error.
+                    String::new()
+                }
+                Err(e) => {
+                    log::debug!("CronJob: crontab -l failed to execute: {e}");
+                    String::new()
+                }
+            }
+        }
+
+        /// Verify that the expected cron entry is present in `crontab -l`.
+        fn verify_cron_entry_present(executable_path: &PathBuf) -> bool {
+            let expected = Self::cron_entry(executable_path);
+            let current = Self::read_crontab();
+            current.lines().any(|line| line == expected)
+        }
+    }
 
     impl Persist for CronJob {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            LaunchAgent {
-                label: CRON_FALLBACK_LABEL.to_string(),
-                asuser_bootstrap: false,
+            let entry = Self::cron_entry(executable_path);
+
+            // Read existing crontab (may be empty) and append our entry.
+            let mut new_crontab = Self::read_crontab();
+            // Strip any trailing newline so we don't accumulate blank lines.
+            let trimmed = new_crontab.trim_end_matches('\n').to_string();
+            new_crontab = if trimmed.is_empty() {
+                format!("{entry}\n")
+            } else {
+                format!("{trimmed}\n{entry}\n")
+            };
+
+            // Pipe the new crontab content into `crontab -`.
+            let mut child = std::process::Command::new("crontab")
+                .arg("-")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| anyhow!("CronJob::install: failed to spawn crontab: {e}"))?;
+
+            use std::io::Write;
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(new_crontab.as_bytes());
             }
-            .install(executable_path)
+            let status = child.wait().map_err(|e| {
+                anyhow!("CronJob::install: failed to wait for crontab: {e}")
+            })?;
+            if !status.success() {
+                return Err(anyhow!(
+                    "CronJob::install: crontab - exited with status {status}; \
+                     SIP may be blocking cron modifications — \
+                     use LaunchAgent persistence instead"
+                ));
+            }
+
+            // Verify that the entry actually landed.  On macOS with SIP,
+            // crontab writes may be silently discarded.
+            if !Self::verify_cron_entry_present(executable_path) {
+                log::warn!(
+                    "CronJob::install: crontab -l does not contain the expected \
+                     @reboot entry; SIP may be blocking cron modifications on this host"
+                );
+                return Err(anyhow!(
+                    "CronJob::install: crontab verification failed — \
+                     the @reboot entry was not found in crontab -l output.  \
+                     System Integrity Protection (SIP) may be blocking cron \
+                     modifications.  Use LaunchAgent persistence instead"
+                ));
+            }
+
+            log::info!("CronJob::install: crontab @reboot entry verified");
+            Ok(())
         }
 
         fn remove(&self) -> Result<()> {
-            LaunchAgent {
-                label: CRON_FALLBACK_LABEL.to_string(),
-                asuser_bootstrap: false,
+            // Read current crontab and remove lines containing our marker.
+            let current = Self::read_crontab();
+            let filtered: String = current
+                .lines()
+                .filter(|line| !line.contains(CRON_MARKER))
+                .collect::<Vec<&str>>()
+                .join("\n");
+
+            if filtered.is_empty() {
+                // No remaining entries — remove the crontab entirely.
+                let status = std::process::Command::new("crontab")
+                    .arg("-r")
+                    .status()
+                    .map_err(|e| anyhow!("CronJob::remove: failed to run crontab -r: {e}"))?;
+                if !status.success() {
+                    // crontab -r returns non-zero when there is no crontab;
+                    // that is not an error in the remove path.
+                    log::debug!("CronJob::remove: crontab -r exited non-zero (no crontab)");
+                }
+            } else {
+                // Write back without our entry.
+                let new_crontab = format!("{filtered}\n");
+                let mut child = std::process::Command::new("crontab")
+                    .arg("-")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .map_err(|e| {
+                        anyhow!("CronJob::remove: failed to spawn crontab: {e}")
+                    })?;
+                use std::io::Write;
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(new_crontab.as_bytes());
+                }
+                child.wait().map_err(|e| {
+                    anyhow!("CronJob::remove: failed to wait for crontab: {e}")
+                })?;
             }
-            .remove()
+
+            log::info!("CronJob::remove: cron entry removed");
+            Ok(())
         }
 
         fn verify(&self) -> Result<bool> {
-            LaunchAgent {
-                label: CRON_FALLBACK_LABEL.to_string(),
-                asuser_bootstrap: false,
+            // We need the executable path to build the expected entry.
+            // If we cannot determine it, fall back to a marker-only check.
+            let exe = std::env::current_exe().ok();
+            if let Some(ref exe_path) = exe {
+                if Self::verify_cron_entry_present(exe_path) {
+                    return Ok(true);
+                }
             }
-            .verify()
+            // Fallback: check if any line in crontab contains our marker.
+            let current = Self::read_crontab();
+            Ok(current.lines().any(|line| line.contains(CRON_MARKER)))
         }
     }
 
