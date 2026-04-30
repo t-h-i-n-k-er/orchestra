@@ -318,12 +318,12 @@ on per profile only when you need them.
 | `network-discovery` | Enables bounded subnet enumeration so the agent can report neighbouring hosts back to the Control Center for inventory. CIDR sweeps reject overly broad ranges by default. |
 | `remote-assist` | Adds optional consent-gated screen-share/keyboard-forwarding capability for IT support sessions. Linux X11 and Wayland capture are supported; macOS uses `screencapture`; Windows capture uses the GDI `BitBlt` API. All platforms share a user-level consent file (`$HOME/.orchestra-consent`) or HKCU registry key on Windows so no elevated privileges are required to grant or revoke consent. |
 | `module-signatures` | Enables Ed25519 signature verification for dynamically loaded capability modules. |
-| `strict-module-key` | Requires a runtime `module_verify_key` when module signature checks are enabled; rejects compile-time fallback signing keys (`module_loader` feature). |
 | `hci-research` | Instruments human-computer-interaction telemetry (input latency, focus changes) for usability studies — disabled in normal IT deployments. On Linux the default build uses the X11/libinput backend (no extra system packages required). See `evdev` below for the kernel evdev alternative. |
 | `evdev` | **Linux only.** When combined with `hci-research`, switches rdev from the X11/libinput backend to the kernel evdev-rs backend. Useful on Wayland or headless systems that have no X11 server. **Requires libtool and a full autotools chain** (`autoconf`, `automake`, `libtool`) to be installed before building because evdev-rs runs `autoreconf` in its build script. Install on Debian/Ubuntu: `sudo apt install libtool autoconf automake`. |
 | `perf-optimize` | Experimental compatibility flag reserved for optimizer-backed tuning. It is accepted by profiles so builds fail early only on truly unknown features; production builds should leave it disabled until validated. |
 | `outbound-c` | Switches the agent into outbound mode so it dials the Control Center automatically and reconnects with exponential backoff. See [docs/C_SERVER.md](docs/C_SERVER.md). |
 | `forward-secrecy` | Adds an X25519 session-key negotiation layer to outbound Control Center connections. |
+| `self-reencode` | Enables runtime self-re-encoding ("Metamorphic Lite"): periodically re-encode the agent's own `.text` section using the `code_transform` pipeline with a fresh seed derived from a C2-supplied nonce and the current timestamp, producing a unique binary layout per session. |
 | `traffic-normalization` | Experimental compatibility flag for the shared `NormalizedTransport` library. It is not a documented stock-agent deployment mode. |
 | `direct-syscalls` | Experimental Windows compatibility path for direct syscall wrappers. It is compiled only when explicitly enabled. |
 | `manual-map` | Experimental Windows manual-map compile flag that exposes `module_loader/manual-map`; unsupported runtime paths return explicit errors when the flag is absent. |
@@ -335,6 +335,7 @@ on per profile only when you need them.
 | `env-validation` | Runs startup environment checks when explicitly enabled. Refusal is controlled by runtime policy fields such as `required_domain`, `refuse_in_vm`, `refuse_when_debugged`, and `sandbox_score_threshold`; otherwise signals are informational. See [docs/USER_GUIDE.md §10](docs/USER_GUIDE.md) for full details. |
 | `hot-reload` | Enables runtime config hot-reload via the `notify` crate. When active, the agent watches `agent.toml` for changes and reloads without restarting. |
 | `stack-spoof` | **Windows x86-64 only.** Spoofs the user-mode call stack visible to EDR kernel callbacks during indirect syscall dispatch. Implies `direct-syscalls`. |
+| `smb-pipe-transport` | Activates the SMB/TCP named-pipe C2 transport (`c2_smb::SmbTransport`). On Windows, connects to a remote named pipe (`\\host\pipe\name`); on Linux, opens a TCP socket to the same port for protocol-compatible testing. Intended for environments where SMB traffic blends in with legitimate enterprise file-sharing. |
 
 Run `orchestra-builder show-profile <name>` to inspect which features a
 profile enables.

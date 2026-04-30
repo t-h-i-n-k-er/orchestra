@@ -207,6 +207,37 @@ async fn agent_registers_and_ping_round_trips() {
         .send();
 
     let agent_handle = tokio::spawn(async move {
+        // The server sends SetReencodeSeed as the first TaskRequest after
+        // Heartbeat registration (M-5 morph seed).  Drain it before waiting
+        // for the Ping command.
+        let req = agent.recv().await;
+        match req {
+            Message::TaskRequest { command, .. }
+                if matches!(command, Command::SetReencodeSeed { .. }) =>
+            {
+                // Acknowledge and wait for the real command.
+            }
+            Message::TaskRequest {
+                task_id, command, ..
+            } => {
+                // If the first message is already Ping, handle it directly.
+                assert!(
+                    matches!(command, Command::Ping),
+                    "expected Ping, got {command:?}"
+                );
+                agent
+                    .send(&Message::TaskResponse {
+                        task_id,
+                        result: Ok("pong".into()),
+                        result_data: None,
+                    })
+                    .await;
+                return;
+            }
+            other => panic!("unexpected message to agent: {other:?}"),
+        }
+
+        // Now receive the actual Ping command.
         let req = agent.recv().await;
         let task_id = match req {
             Message::TaskRequest {
@@ -224,6 +255,7 @@ async fn agent_registers_and_ping_round_trips() {
             .send(&Message::TaskResponse {
                 task_id,
                 result: Ok("pong".into()),
+                result_data: None,
             })
             .await;
     });

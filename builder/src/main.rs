@@ -3,6 +3,7 @@
 mod build;
 mod config;
 mod deps;
+mod pe_artifact_kit;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

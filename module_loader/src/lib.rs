@@ -34,6 +34,8 @@
 use anyhow::{anyhow, Result};
 use common::CryptoSession;
 use libloading::{Library, Symbol};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 #[cfg(not(windows))]
 use std::io::Write;
 #[cfg(target_os = "linux")]
@@ -74,6 +76,12 @@ const MODULE_TEST_SIGNING_SEED: [u8; 32] = [
 /// Function-pointer table that each plugin must populate.
 ///
 /// All fields use `extern "C"` so the layout and calling convention are stable.
+///
+/// # ABI Stability
+///
+/// These four entries are guaranteed to remain at these offsets.  Extended
+/// capabilities (metadata, binary execution) are exposed via a separate
+/// [`PluginVTableExt`] table that plugins can optionally export.
 #[repr(C)]
 pub struct PluginVTable {
     /// One-time initialisation.  Returns 0 on success, non-zero on failure.
@@ -96,6 +104,103 @@ pub struct PluginVTable {
 
     /// Destroy the plugin instance and release all associated resources.
     pub destroy: unsafe extern "C" fn(this: *mut PluginObject),
+}
+
+/// **Extended** vtable for plugins that support metadata and binary I/O.
+///
+/// Plugins that want to participate in the extended framework export a
+/// `_get_plugin_vtable_ext() -> *const PluginVTableExt` symbol in addition
+/// to the mandatory `_create_plugin()` entry point.  The loader queries
+/// this symbol after loading the library; if it is absent, all extended
+/// features fall back to sensible defaults and the plugin still works.
+#[repr(C)]
+pub struct PluginVTableExt {
+    /// Size-of-self for forward-compatible versioning.  Must be set to
+    /// `std::mem::size_of::<PluginVTableExt>()`.
+    pub size: usize,
+
+    /// Return a JSON-encoded [`PluginMetadata`] string.  The returned buffer
+    /// is owned by the plugin and must be freed with `free_metadata`.
+    /// On success returns 0 and writes a heap-allocated buffer.
+    /// On error returns non-zero.
+    pub get_metadata: Option<unsafe extern "C" fn(this: *mut PluginObject, out_ptr: *mut *mut u8, out_len: *mut usize) -> i32>,
+
+    /// Free a metadata string previously returned by `get_metadata`.
+    pub free_metadata: Option<unsafe extern "C" fn(ptr: *mut u8, len: usize)>,
+
+    /// Binary execution path.  Takes arbitrary bytes as input and returns
+    /// arbitrary bytes as output.  On success returns 0 and writes a
+    /// heap-allocated buffer into `*out_ptr` / `*out_len`.  The caller must
+    /// free it via `free_binary_result`.  On error returns non-zero.
+    pub execute_binary: Option<unsafe extern "C" fn(
+        this: *mut PluginObject,
+        in_ptr: *const u8,
+        in_len: usize,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> i32>,
+
+    /// Free a binary result buffer previously written by `execute_binary`.
+    pub free_binary_result: Option<unsafe extern "C" fn(ptr: *mut u8, len: usize)>,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Plugin metadata and registry types
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Metadata describing a loaded plugin's capabilities and requirements.
+///
+/// Populated via the `get_metadata` vtable entry when available, or
+/// constructed with default/unknown values for legacy plugins.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PluginMetadata {
+    /// Human-readable plugin name.
+    pub name: String,
+    /// Semantic version string (e.g. "1.0.0").
+    pub version: String,
+    /// One-line description of the plugin's purpose.
+    pub description: String,
+    /// Optional author attribution.
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Capability identifiers (e.g. "credential-harvesting",
+    /// "process-inspection", "network-discovery").
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Minimum agent version required, if applicable.
+    #[serde(default)]
+    pub min_agent_version: Option<String>,
+    /// Privilege level required: "user", "elevated", or "system".
+    #[serde(default)]
+    pub privilege_required: Option<String>,
+}
+
+impl PluginMetadata {
+    /// Construct a default metadata object for a legacy plugin that does not
+    /// implement `get_metadata`.
+    pub fn default_for(plugin_id: &str) -> Self {
+        Self {
+            name: plugin_id.to_string(),
+            version: "unknown".to_string(),
+            description: "(no metadata available)".to_string(),
+            author: None,
+            capabilities: Vec::new(),
+            min_agent_version: None,
+            privilege_required: None,
+        }
+    }
+}
+
+/// A loaded plugin together with its metadata and load timestamp.
+///
+/// This is the value type stored in the agent's `LOADED_PLUGINS` registry.
+pub struct LoadedPlugin {
+    /// The loaded plugin instance.
+    pub plugin: Arc<Box<dyn Plugin + Send + Sync>>,
+    /// Metadata extracted from the plugin (or default values).
+    pub metadata: PluginMetadata,
+    /// Unix epoch seconds when the plugin was loaded.
+    pub load_timestamp: u64,
 }
 
 /// Header that every plugin instance must start with (first field, `#[repr(C)]`).
@@ -122,12 +227,28 @@ pub trait Plugin: Send + Sync {
     fn init(&self) -> Result<()>;
     /// The main entry point for executing the plugin's logic.
     fn execute(&self, args: &str) -> Result<String>;
+    /// Optional binary execution path for plugins that accept/return raw bytes.
+    /// The default implementation returns `Err` so that existing plugins are
+    /// not required to implement it.  When the vtable's `execute_binary` entry
+    /// is available, [`FfiPlugin`] overrides this with a real implementation.
+    fn execute_binary(&self, _input: &[u8]) -> Result<Vec<u8>> {
+        Err(anyhow!("plugin does not support binary execution"))
+    }
+    /// Return plugin metadata, if the vtable provides `get_metadata`.
+    /// The default implementation returns `None`.
+    fn get_metadata(&self) -> Option<PluginMetadata> {
+        None
+    }
 }
 
 /// Adapter that wraps a raw [`PluginObject`] and exposes it as `dyn Plugin`.
 ///
 /// This is an implementation detail of the loader and is not part of the public API.
-struct FfiPlugin(*mut PluginObject);
+struct FfiPlugin {
+    obj: *mut PluginObject,
+    /// Optional extended vtable, resolved via `_get_plugin_vtable_ext`.
+    ext: Option<*const PluginVTableExt>,
+}
 
 // SAFETY: We are the sole owner after creation; the underlying plugin is
 // required to be Send+Sync by construction.
@@ -136,7 +257,7 @@ unsafe impl Sync for FfiPlugin {}
 
 impl Plugin for FfiPlugin {
     fn init(&self) -> Result<()> {
-        let rc = unsafe { ((*(*self.0).vtable).init)(self.0) };
+        let rc = unsafe { ((*(*self.obj).vtable).init)(self.obj) };
         if rc != 0 {
             Err(anyhow!("plugin init() returned error code {}", rc))
         } else {
@@ -148,8 +269,8 @@ impl Plugin for FfiPlugin {
         let mut out_ptr: *mut u8 = std::ptr::null_mut();
         let mut out_len: usize = 0;
         let rc = unsafe {
-            ((*(*self.0).vtable).execute)(
-                self.0,
+            ((*(*self.obj).vtable).execute)(
+                self.obj,
                 args.as_ptr(),
                 args.len(),
                 &mut out_ptr,
@@ -164,26 +285,91 @@ impl Plugin for FfiPlugin {
         }
         // Copy bytes out before we release the plugin-owned allocation.
         let bytes = unsafe { std::slice::from_raw_parts(out_ptr, out_len).to_vec() };
-        unsafe { ((*(*self.0).vtable).free_result)(out_ptr, out_len) };
+        unsafe { ((*(*self.obj).vtable).free_result)(out_ptr, out_len) };
         String::from_utf8(bytes)
             .map_err(|e| anyhow!("plugin execute() returned non-UTF-8 output: {}", e))
+    }
+
+    fn execute_binary(&self, input: &[u8]) -> Result<Vec<u8>> {
+        let ext = self
+            .ext
+            .ok_or_else(|| anyhow!("plugin does not support binary execution"))?;
+        let vtable = unsafe { &*ext };
+        let execute_fn = vtable
+            .execute_binary
+            .ok_or_else(|| anyhow!("plugin does not support binary execution"))?;
+        let mut out_ptr: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let rc = unsafe {
+            execute_fn(self.obj, input.as_ptr(), input.len(), &mut out_ptr, &mut out_len)
+        };
+        if rc != 0 {
+            return Err(anyhow!("plugin execute_binary() returned error code {}", rc));
+        }
+        if out_ptr.is_null() {
+            return Err(anyhow!("plugin execute_binary() returned a null output buffer"));
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(out_ptr, out_len).to_vec() };
+        if let Some(free_fn) = vtable.free_binary_result {
+            unsafe { free_fn(out_ptr, out_len) };
+        }
+        Ok(bytes)
+    }
+
+    fn get_metadata(&self) -> Option<PluginMetadata> {
+        let ext_ptr = self.ext?;
+        let vtable = unsafe { &*ext_ptr };
+        let get_fn = vtable.get_metadata?;
+        let mut out_ptr: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let rc = unsafe { get_fn(self.obj, &mut out_ptr, &mut out_len) };
+        if rc != 0 || out_ptr.is_null() {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(out_ptr, out_len).to_vec() };
+        if let Some(free_fn) = vtable.free_metadata {
+            unsafe { free_fn(out_ptr, out_len) };
+        }
+        serde_json::from_slice(&bytes).ok()
     }
 }
 
 impl Drop for FfiPlugin {
     fn drop(&mut self) {
         // SAFETY: We own the object; destroy() frees it using the plugin's allocator.
-        unsafe { ((*(*self.0).vtable).destroy)(self.0) };
+        unsafe { ((*(*self.obj).vtable).destroy)(self.obj) };
     }
 }
 
-fn initialized_plugin(plugin_ptr: *mut PluginObject) -> Result<Box<dyn Plugin>> {
+fn initialized_plugin(plugin_ptr: *mut PluginObject, ext: Option<*const PluginVTableExt>) -> Result<Box<dyn Plugin>> {
     if plugin_ptr.is_null() {
         return Err(anyhow!("_create_plugin() returned a null pointer"));
     }
-    let plugin = Box::new(FfiPlugin(plugin_ptr)) as Box<dyn Plugin>;
+    let plugin = Box::new(FfiPlugin { obj: plugin_ptr, ext }) as Box<dyn Plugin>;
     plugin.init()?;
     Ok(plugin)
+}
+
+/// Convenience wrapper: load a plugin and return it as a [`LoadedPlugin`] with
+/// metadata and timestamp.
+fn loaded_plugin_with_metadata(
+    plugin_ptr: *mut PluginObject,
+    ext: Option<*const PluginVTableExt>,
+    plugin_id: &str,
+) -> Result<LoadedPlugin> {
+    let plugin = initialized_plugin(plugin_ptr, ext)?;
+    let metadata = plugin
+        .get_metadata()
+        .unwrap_or_else(|| PluginMetadata::default_for(plugin_id));
+    let load_timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Ok(LoadedPlugin {
+        plugin: Arc::new(plugin),
+        metadata,
+        load_timestamp,
+    })
 }
 
 /// Loads a decrypted, signed plugin from a byte slice into a `Box<dyn Plugin>`.
@@ -313,15 +499,21 @@ pub fn load_plugin(
                         create_func()
                     };
                     // Library memory is leaked intentionally (plugin lifetime = process lifetime).
-                    return initialized_plugin(plugin_ptr);
+                    return initialized_plugin(plugin_ptr, None);
                 }
                 // Export not found — free the mapped image rather than falling
                 // through to the temp-file path with a partially-initialised DLL.
+                // Use NtFreeVirtualMemory via nt_syscall to avoid IAT-visible
+                // VirtualFree hooks.
                 unsafe {
-                    winapi::um::memoryapi::VirtualFree(
-                        image_base,
-                        0,
-                        winapi::um::winnt::MEM_RELEASE,
+                    let mut base = image_base;
+                    let mut size: usize = 0;
+                    let _ = nt_syscall::syscall!(
+                        "NtFreeVirtualMemory",
+                        (-1isize) as u64, // current process
+                        &mut base as *mut _ as u64,
+                        &mut size as *mut _ as u64,
+                        winapi::um::winnt::MEM_RELEASE as u64,
                     );
                 }
                 return Err(anyhow!(
@@ -388,12 +580,22 @@ pub fn load_plugin(
     let create_func: Symbol<unsafe extern "C" fn() -> *mut PluginObject> =
         unsafe { library.get(b"_create_plugin")? };
 
+    // 4. Try to resolve optional extended vtable symbol.
+    let ext: Option<*const PluginVTableExt> = unsafe {
+        library
+            .get::<unsafe extern "C" fn() -> *const PluginVTableExt>(
+                b"_get_plugin_vtable_ext\0",
+            )
+            .ok()
+            .map(|sym| sym())
+    };
+
     let plugin_ptr = unsafe { create_func() };
 
     // Leak the library so the plugin's code remains mapped for the process lifetime.
     std::mem::forget(library);
 
-    initialized_plugin(plugin_ptr)
+    initialized_plugin(plugin_ptr, ext)
 }
 
 #[cfg(test)]

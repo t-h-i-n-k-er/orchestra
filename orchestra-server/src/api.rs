@@ -190,6 +190,8 @@ async fn dispatch_command(
 
     let cmd_label = command_label(&req.command);
     let cmd_detail = serde_json::to_string(&req.command).unwrap_or_default();
+    let is_morph_now = matches!(req.command, Command::MorphNow { .. });
+    let connection_id = entry.connection_id.clone();
 
     let request = Message::TaskRequest {
         task_id: task_id.clone(),
@@ -210,6 +212,17 @@ async fn dispatch_command(
 
     match result {
         Ok(Ok(Ok(output))) => {
+            // If this was a MorphNow command, capture the .text hash from
+            // the response and store it in the agent's entry.
+            if is_morph_now {
+                state.update_text_hash(&connection_id, &output);
+                tracing::info!(
+                    agent_id = %agent_id,
+                    connection_id = %connection_id,
+                    text_hash = %output,
+                    "MorphNow completed — .text hash recorded"
+                );
+            }
             state
                 .audit
                 .record_simple(&agent_id, &user.0, cmd_label, &cmd_detail, Outcome::Success);
@@ -282,6 +295,14 @@ fn command_label(c: &Command) -> &'static str {
         Command::DisablePersistence => "DisablePersistence",
         Command::MigrateAgent { .. } => "MigrateAgent",
         Command::ListProcesses => "ListProcesses",
+        Command::SetReencodeSeed { .. } => "SetReencodeSeed",
+        Command::MorphNow { .. } => "MorphNow",
+        Command::ListPlugins => "ListPlugins",
+        Command::UnloadPlugin { .. } => "UnloadPlugin",
+        Command::GetPluginInfo { .. } => "GetPluginInfo",
+        Command::DownloadModule { .. } => "DownloadModule",
+        Command::ExecutePluginBinary { .. } => "ExecutePluginBinary",
+        Command::JobStatus { .. } => "JobStatus",
     }
 }
 

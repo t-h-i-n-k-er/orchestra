@@ -1,77 +1,114 @@
-use goblin::pe::PE;
-use rand::{thread_rng, Rng};
+//! Orchestra PE Hardener — standalone CLI front-end.
+//!
+//! Wraps the `pe_artifact_kit` library module from the `builder` crate.
+//! The core four hardening operations are always applied.  Additional
+//! operations can be requested with optional flags.
+//!
+//! Usage:
+//!   orchestra-pe-hardener <input> <output> [options]
+//!
+//! Options:
+//!   --strip-signature        Remove any existing digital signature
+//!   --strip-debug            Remove the debug directory (PDB path)
+//!   --manifest <preset>      Inject RT_MANIFEST; preset: asInvoker,
+//!                            requireAdministrator, highestAvailable
+//!   --icon <path>            Inject RT_ICON/RT_GROUP_ICON from a .ico file
+//!   --version-info <json>    Inject VS_VERSIONINFO from a JSON object
+//!                            (keys: file_version, product_version, company_name,
+//!                             file_description, product_name, original_filename,
+//!                             legal_copyright, comments, file_version_name,
+//!                             clone_from)
+
+use builder::pe_artifact_kit;
+use builder::config::VersionInfoConfig;
 use std::env;
 use std::fs;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        println!("Usage: {} <input_pe> <output_pe>", args[0]);
-        return Ok(());
+        eprintln!("Usage: {} <input_pe> <output_pe> [--strip-signature] [--strip-debug] \
+                  [--manifest <preset>] [--icon <path>] [--version-info <json>]",
+                  args[0]);
+        std::process::exit(1);
     }
 
-    let input_path = &args[1];
+    let input_path  = &args[1];
     let output_path = &args[2];
 
-    let mut buffer = fs::read(input_path)?;
-    let buffer_len = buffer.len();
+    // Parse optional flags.
+    let mut strip_signature = false;
+    let mut strip_debug = false;
+    let mut manifest: Option<String> = None;
+    let mut icon_path: Option<String> = None;
+    let mut version_info: Option<VersionInfoConfig> = None;
 
-    // Extract all the offsets we need from the PE *before* taking any mutable
-    // references to buffer, so we avoid conflicting borrows (E0502).
-    let (file_header_offset, pe_start, sections_offset, num_sections) = {
-        let pe = PE::parse(&buffer)?;
-        let fh_off = pe.header.dos_header.pe_pointer as usize + 4;
-        let pe_s = pe.header.dos_header.pe_pointer as usize;
-        let sec_off = fh_off + 20 + pe.header.coff_header.size_of_optional_header as usize;
-        let nsec = pe.header.coff_header.number_of_sections as usize;
-        (fh_off, pe_s, sec_off, nsec)
-        // `pe` is dropped here, releasing the immutable borrow of `buffer`
-    };
-
-    let mut rng = thread_rng();
-
-    // 1. TimeDateStamp zeroing
-    if file_header_offset + 20 <= buffer_len {
-        for i in 0..4 {
-            buffer[file_header_offset + 4 + i] = 0;
-        }
-    }
-
-    // 2. Rich Header Removal — scan backwards from PE header for 'DanS'
-    let mut rich_start = 0usize;
-    for i in (0..pe_start).rev() {
-        if i + 4 <= buffer_len && &buffer[i..i + 4] == b"DanS" {
-            for j in (0..i).rev() {
-                if j + 4 <= buffer_len && &buffer[j..j + 4] == b"Rich" {
-                    rich_start = j;
-                    break;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--strip-signature" => { strip_signature = true; }
+            "--strip-debug"     => { strip_debug = true; }
+            "--manifest" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("--manifest requires an argument");
+                    std::process::exit(1);
                 }
+                manifest = Some(args[i].clone());
             }
-            if rich_start > 0 {
-                let dos_stub_end = 0x40;
-                buffer[dos_stub_end..pe_start].fill(0);
+            "--icon" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("--icon requires a path argument");
+                    std::process::exit(1);
+                }
+                icon_path = Some(args[i].clone());
             }
-            break;
+            "--version-info" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("--version-info requires a JSON argument");
+                    std::process::exit(1);
+                }
+                version_info = Some(
+                    serde_json::from_str(&args[i])
+                        .map_err(|e| format!("Invalid --version-info JSON: {e}"))?
+                );
+            }
+            other => {
+                eprintln!("Unknown argument: {other}");
+                std::process::exit(1);
+            }
         }
+        i += 1;
     }
 
-    // 3. Section name randomization
-    let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    for i in 0..num_sections {
-        let section_offset = sections_offset + (i * 40);
-        if section_offset + 8 <= buffer_len {
-            for j in 0..8 {
-                buffer[section_offset + j] = chars[rng.gen_range(0..chars.len())];
-            }
-        }
+    let mut buffer = fs::read(input_path)?;
+
+    // Always apply the four core hardening operations.
+    pe_artifact_kit::apply_hardening_only(&mut buffer);
+
+    // Optional operations.
+    if strip_signature {
+        pe_artifact_kit::strip_signature(&mut buffer);
+    }
+    if strip_debug {
+        pe_artifact_kit::strip_debug_directory(&mut buffer);
+    }
+    if let Some(ref vi) = version_info {
+        pe_artifact_kit::inject_version_info(&mut buffer, vi)?;
+    }
+    if let Some(ref ico) = icon_path {
+        pe_artifact_kit::inject_icon(&mut buffer, ico)?;
+    }
+    if let Some(ref m) = manifest {
+        pe_artifact_kit::inject_manifest(&mut buffer, m)?;
     }
 
-    // 4. Entropy padding
-    let mut padding = vec![0u8; rng.gen_range(1024..4096)];
-    rng.fill(padding.as_mut_slice());
-    buffer.extend(padding);
+    // Always recalculate the PE checksum after any modifications.
+    pe_artifact_kit::recalculate_checksum(&mut buffer);
 
     fs::write(output_path, &buffer)?;
-    println!("PE Hardened successfully.");
+    println!("PE hardened successfully.");
     Ok(())
 }

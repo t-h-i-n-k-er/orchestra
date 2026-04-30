@@ -59,6 +59,7 @@ name = "agent"
 version = "0.1.0"
 dependencies = [
  "aes 0.9.0",
+ "aes-gcm",
  "anyhow",
  "async-trait",
  "base32",
@@ -67,6 +68,7 @@ dependencies = [
  "chacha20",
  "chacha20poly1305",
  "chrono",
+ "code_transform",
  "common",
  "criterion 0.8.2",
  "ctr 0.10.0",
@@ -74,6 +76,7 @@ dependencies = [
  "dirs",
  "enigo",
  "futures-util",
+ "goblin 0.7.1",
  "hex",
  "hmac",
  "hollowing",
@@ -1089,6 +1092,7 @@ dependencies = [
  "ed25519-dalek",
  "hkdf",
  "hmac",
+ "log",
  "rand 0.8.6",
  "rustls 0.23.38",
  "rustls-pemfile 2.2.0",
@@ -3316,8 +3320,11 @@ dependencies = [
  "goblin 0.7.1",
  "libc",
  "libloading",
+ "nt_syscall",
  "pe_resolve",
  "reqwest 0.11.27",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",
@@ -3734,6 +3741,7 @@ dependencies = [
  "hex",
  "hmac",
  "libc",
+ "rand 0.8.6",
  "rcgen 0.13.2",
  "reqwest 0.12.28",
  "rustls 0.23.38",
@@ -5305,6 +5313,19 @@ name = "shell-words"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
+
+[[package]]
+name = "shellcode_packager"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "code_transform",
+ "log",
+ "pe_resolve",
+ "rand 0.8.6",
+ "thiserror 1.0.69",
+ "tracing",
+]
 
 [[package]]
 name = "shlex"

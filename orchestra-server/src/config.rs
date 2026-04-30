@@ -72,6 +72,19 @@ pub struct ServerConfig {
     /// non-empty, the client cert's OU must appear in this list.
     #[serde(default)]
     pub mtls_allowed_ous: Vec<String>,
+    // ── SMB named-pipe relay ───────────────────────────────────────────────
+    /// Enable the server-side SMB named-pipe relay.  The relay creates a
+    /// Windows named pipe and bridges each connection to the agent TCP
+    /// listener.  On non-Windows platforms this compiles to a no-op stub.
+    #[serde(default)]
+    pub smb_relay_enabled: bool,
+    /// Name of the pipe to create (without the `\\.\pipe\` prefix).
+    /// Defaults to `"orchestra"`.
+    #[serde(default = "default_smb_relay_pipe_name")]
+    pub smb_relay_pipe_name: String,
+    /// Maximum number of concurrent pipe instances.  Defaults to 4.
+    #[serde(default = "default_smb_relay_max_instances")]
+    pub smb_relay_max_instances: u32,
 }
 
 fn default_builds_dir() -> PathBuf {
@@ -97,6 +110,12 @@ fn default_doh_beacon_sentinel() -> String {
 }
 fn default_doh_idle_ip() -> String {
     "104.18.5.22".to_string()
+}
+fn default_smb_relay_pipe_name() -> String {
+    "orchestra".to_string()
+}
+fn default_smb_relay_max_instances() -> u32 {
+    4
 }
 
 impl Default for ServerConfig {
@@ -124,6 +143,9 @@ impl Default for ServerConfig {
             mtls_ca_cert_path: None,
             mtls_allowed_cns: Vec::new(),
             mtls_allowed_ous: Vec::new(),
+            smb_relay_enabled: false,
+            smb_relay_pipe_name: default_smb_relay_pipe_name(),
+            smb_relay_max_instances: default_smb_relay_max_instances(),
         }
     }
 }

@@ -14,5 +14,6 @@ pub mod auth;
 pub mod build_handler;
 pub mod config;
 pub mod doh_listener;
+pub mod smb_relay;
 pub mod state;
 pub mod tls;

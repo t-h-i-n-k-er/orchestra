@@ -224,16 +224,21 @@ fn macos_is_debugger_present() -> bool {
         false
     };
 
-    let deny_attach_failed = unsafe {
+    // Call PT_DENY_ATTACH as a side-effect to deny future debugger attachment.
+    // Do NOT use the return value to determine whether a debugger is present:
+    // on macOS, ptrace(PT_DENY_ATTACH) fails with EPERM when no debugger is
+    // attached (this is normal — only a traced process can deny attachment),
+    // so treating the failure as "debugger present" causes a false positive.
+    let _ = unsafe {
         libc::ptrace(
             libc::PT_DENY_ATTACH,
             0,
             std::ptr::null_mut::<libc::c_char>(),
             0,
         )
-    } == -1;
+    };
 
-    traced || deny_attach_failed
+    traced
 }
 
 #[cfg(target_os = "linux")]

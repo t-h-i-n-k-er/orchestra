@@ -255,7 +255,7 @@ impl HttpTransport {
                         e,
                         current_delay
                     );
-                    crate::memory_guard::guarded_sleep(Duration::from_secs(current_delay), None)
+                    crate::memory_guard::guarded_sleep(Duration::from_secs(current_delay), None, 0)
                         .await?;
                     delay *= 2;
                     if delay > 64 {
@@ -340,7 +340,7 @@ impl Transport for HttpTransport {
             let sleep_dur = crate::obfuscated_sleep::calculate_jittered_sleep(
                 &common::config::SleepConfig::default(),
             );
-            crate::memory_guard::guarded_sleep(sleep_dur, None).await?;
+            crate::memory_guard::guarded_sleep(sleep_dur, None, 0).await?;
             return Ok(Message::Heartbeat {
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

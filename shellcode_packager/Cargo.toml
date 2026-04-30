@@ -1,0 +1,25 @@
+[package]
+name = "shellcode_packager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+log = "0.4"
+
+# PE parsing — we do it ourselves to keep dependencies minimal and to
+# generate matching x86_64 machine code for fixups.
+
+# Optional: apply code_transform pipeline to the emitted shellcode for
+# instruction substitution and block reordering.
+code_transform = { path = "../code_transform", optional = true }
+pe_resolve = { path = "../pe_resolve" }
+
+[features]
+default = []
+# Enable code_transform integration for shellcode obfuscation.
+obfuscate = ["code_transform"]

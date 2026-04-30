@@ -64,6 +64,68 @@ use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 static LINUX_SYSCALL_CACHE: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
 
+// ── SIGSYS handler for seccomp compatibility ───────────────────────────────
+//
+// When a Linux seccomp filter blocks a syscall with SECCOMP_RET_TRAP,
+// the kernel delivers SIGSYS to the offending thread.  Without a handler
+// the default disposition is `Core` (process termination + core dump).
+// By installing a lightweight handler that sets a thread-local flag, we can
+// detect seccomp-blocked syscalls and return a graceful error instead of
+// crashing.
+
+/// Thread-local flag set by the SIGSYS handler when seccomp blocks a syscall.
+#[cfg(all(target_os = "linux", feature = "direct-syscalls"))]
+thread_local! {
+    static SECCOMP_BLOCKED: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+/// SIGSYS signal handler.  Sets the per-thread `SECCOMP_BLOCKED` flag so that
+/// `do_syscall` can detect the blocked call and return an error.
+///
+/// # Safety
+///
+/// Called by the kernel in signal context.  Only writes to a thread-local
+/// `Cell<bool>`, which is async-signal-safe.
+#[cfg(all(target_os = "linux", feature = "direct-syscalls"))]
+extern "C" fn sigsys_handler(
+    _sig: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    _ucontext: *mut libc::c_void,
+) {
+    SECCOMP_BLOCKED.with(|f| f.set(true));
+}
+
+/// Install a SIGSYS handler so that seccomp-blocked syscalls are reported via
+/// an error return from `do_syscall` instead of terminating the process.
+///
+/// This is idempotent; calling it more than once is harmless.
+///
+/// Should be called once during agent initialisation, before any direct
+/// syscall is attempted.
+#[cfg(all(target_os = "linux", feature = "direct-syscalls"))]
+pub fn install_sigsys_handler() {
+    use std::mem;
+
+    let mut sa: libc::sigaction = unsafe { mem::zeroed() };
+    sa.sa_sigaction = sigsys_handler as usize;
+    // SA_SIGINFO: receive siginfo_t and ucontext in the handler.
+    // SA_RESTART: restart interrupted syscalls that aren't the blocked one.
+    sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+    unsafe {
+        libc::sigemptyset(&mut sa.sa_mask);
+    }
+
+    let ret = unsafe { libc::sigaction(libc::SIGSYS, &sa, std::ptr::null_mut()) };
+    if ret != 0 {
+        log::error!(
+            "sigsys: failed to install SIGSYS handler: {}",
+            std::io::Error::last_os_error()
+        );
+    } else {
+        log::debug!("sigsys: SIGSYS handler installed for seccomp compatibility");
+    }
+}
+
 /// Minimal syscall descriptor for Linux: just the syscall number.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
@@ -1879,6 +1941,10 @@ macro_rules! syscall {
 pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
     #[cfg(target_arch = "x86_64")]
     {
+        // Clear the seccomp flag before invoking the syscall so we only
+        // detect SIGSYS delivered by *this* call.
+        SECCOMP_BLOCKED.with(|f| f.set(false));
+
         let mut ret: i64;
         // NOTE: options(nostack) must NOT be used here.  The `syscall` instruction
         // implicitly clobbers rcx (saved RIP) and r11 (saved RFLAGS).  Declaring
@@ -1909,6 +1975,12 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
             }
             _ => panic!("too many syscall arguments"),
         }
+
+        // Check whether seccomp blocked this syscall (SIGSYS delivered).
+        if SECCOMP_BLOCKED.with(|f| f.replace(false)) {
+            return Err(libc::EPERM);
+        }
+
         if ret < 0 {
             Err(-ret as i32)
         } else {
@@ -1917,6 +1989,10 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
     }
     #[cfg(target_arch = "aarch64")]
     {
+        // Clear the seccomp flag before invoking the syscall so we only
+        // detect SIGSYS delivered by *this* call.
+        SECCOMP_BLOCKED.with(|f| f.set(false));
+
         // Linux syscalls accept at most 6 register arguments on aarch64.
         if args.len() > 6 {
             // Return EINVAL instead of panicking so callers can handle this
@@ -2050,6 +2126,11 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
                 _ => unreachable!(),
             }
         }
+        // Check whether seccomp blocked this syscall (SIGSYS delivered).
+        if SECCOMP_BLOCKED.with(|f| f.replace(false)) {
+            return Err(libc::EPERM);
+        }
+
         if ret < 0 {
             Err(-ret as i32)
         } else {
@@ -2066,7 +2147,7 @@ fn syscall_number_raw(name: &str) -> anyhow::Result<u32> {
     match name {
         "read" => Ok(0),
         "write" => Ok(1),
-        #[doc = "Deprecated on Linux 5.x+ and often blocked by seccomp in containerized/sandboxed environments; prefer openat (257) with AT_FDCWD for compatibility."]
+        // Deprecated on Linux 5.x+ and often blocked by seccomp in containerized/sandboxed environments; prefer openat (257) with AT_FDCWD for compatibility.
         "open" => Ok(2),
         "close" => Ok(3),
         "stat" => Ok(4),

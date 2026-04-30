@@ -495,6 +495,14 @@ fn build_profile_from_request(
         output_name: Some(job_id.to_string()),
         package: "agent".to_string(),
         bin_name: Some("agent-standalone".to_string()),
+        // Artifact kit fields default to off for server-initiated builds.
+        // Operators configure these in their local profiles if needed.
+        version_info: None,
+        icon_path: None,
+        manifest_preset: None,
+        custom_manifest: None,
+        strip_signature: true,
+        strip_debug: true,
     })
 }
 

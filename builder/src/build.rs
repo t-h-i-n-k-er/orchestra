@@ -1,4 +1,4 @@
-//! Payload build pipeline: cargo build → strip → encrypt → write to `dist/`.
+//! Payload build pipeline: cargo build → strip → artifact kit → encrypt → write to `dist/`.
 
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
@@ -6,6 +6,7 @@ use std::process::Command;
 use tracing::{info, warn};
 
 use crate::config::{partition_features, read_agent_features, PayloadConfig};
+use crate::pe_artifact_kit;
 
 /// Build the agent for the given profile and return the raw binary bytes.
 pub fn build_agent_for_profile(cfg: &PayloadConfig) -> Result<Vec<u8>> {
@@ -38,8 +39,14 @@ pub fn build_agent_for_profile(cfg: &PayloadConfig) -> Result<Vec<u8>> {
         warn!("strip step skipped: {e:#}");
     }
 
-    std::fs::read(&bin_path)
-        .with_context(|| format!("Failed to read built binary {}", bin_path.display()))
+    let mut binary = std::fs::read(&bin_path)
+        .with_context(|| format!("Failed to read built binary {}", bin_path.display()))?;
+
+    // Apply PE artifact kit post-processing (no-op for non-PE / non-Windows targets).
+    pe_artifact_kit::apply_all(&mut binary, cfg)
+        .context("PE artifact kit post-processing failed")?;
+
+    Ok(binary)
 }
 
 fn features_for_package(package: &str, requested: &[String]) -> Result<Vec<String>> {
