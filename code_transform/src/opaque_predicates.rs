@@ -773,13 +773,21 @@ fn enc_cbz_x(rt: u32, imm19: i32) -> u32 {
 }
 
 /// Encode `TBNZ Xt, #bit, #imm14*4`.
-/// Encoding: 1 011011 1 b14 imm14 Rt (b = bit[4] at bit[31])
+///
+/// ARM A64 encoding (DDI 0487A, C4.4.5):
+/// ```text
+///   bit[31]    = b5  (bit 5 of the test position; 0 for X reg bit 0–31)
+///   bits[30:24] = 0110111  (TBNZ; TBZ = 0110110)
+///   bits[23:19] = b40 (bits 4:0 of the test position)
+///   bits[18:5]  = imm14 (signed offset in words)
+///   bits[4:0]   = Rt
+/// ```
 fn enc_tbnz(rt: u32, bit: u32, imm14: i32) -> u32 {
     debug_assert!(rt < 31 && bit < 64);
     let b5 = (bit >> 5) & 1;
     let b40 = bit & 0x1F;
     let imm_bits = (imm14 as u32) & 0x3FFF;
-    (b5 << 31) | 0x3700_0000 | (imm_bits << 5) | b40 | (rt << 0)
+    (b5 << 31) | 0x3700_0000 | (b40 << 19) | (imm_bits << 5) | rt
 }
 
 /// Wait, the encoding is wrong. Let me fix: TBNZ encoding:

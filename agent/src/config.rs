@@ -238,21 +238,23 @@ pub fn load_config() -> Result<Config> {
             Ok(false) => {
                 tracing::error!(
                     path = %path.display(),
-                    "config integrity verification failed for ORCHESTRA_CONFIG_HMAC; using default config"
+                    "config integrity verification failed for ORCHESTRA_CONFIG_HMAC; aborting"
                 );
-                let fallback = Config::default();
-                update_cache(&fallback, mtime_token);
-                return Ok(fallback);
+                anyhow::bail!(
+                    "Config integrity check failed: ORCHESTRA_CONFIG_HMAC mismatch for {}",
+                    path.display()
+                );
             }
             Err(err) => {
                 tracing::error!(
                     path = %path.display(),
                     error = %err,
-                    "config integrity verification errored for ORCHESTRA_CONFIG_HMAC; using default config"
+                    "config integrity verification errored for ORCHESTRA_CONFIG_HMAC; aborting"
                 );
-                let fallback = Config::default();
-                update_cache(&fallback, mtime_token);
-                return Ok(fallback);
+                anyhow::bail!(
+                    "Config integrity check failed: ORCHESTRA_CONFIG_HMAC verification error for {}",
+                    path.display()
+                );
             }
         }
     }

@@ -75,18 +75,19 @@ pub fn package_with_config(pe_bytes: &[u8], config: &ShellcodeConfig) -> Result<
         seed: config.seed,
         ..Default::default()
     };
-    let blob = emit_loader(&pe, &emitter_config)?;
+    #[cfg_attr(feature = "obfuscate", allow(unused_mut))]
+    let mut blob = emit_loader(&pe, &emitter_config)?;
 
     // Optionally apply code_transform to the loader portion
     #[cfg(feature = "obfuscate")]
     if config.obfuscate {
         let loader_size = blob.len() - pe.image_size as usize;
-        let (loader, image) = blob.split_at_mut(loader_size);
-        let loader_owned = loader.to_vec();
+        let image_copy = blob[loader_size..].to_vec();
+        let loader_owned = blob[..loader_size].to_vec();
         let transformed = code_transform::transform(&loader_owned, config.seed);
         // Rebuild: transformed loader + original image
         blob = transformed;
-        blob.extend_from_slice(image);
+        blob.extend_from_slice(&image_copy);
     }
 
     tracing::info!(

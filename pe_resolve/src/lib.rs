@@ -37,7 +37,16 @@ fn is_forwarder(func_rva: usize, export_dir_rva: usize, export_dir_size: usize) 
     func_rva >= export_dir_rva && func_rva < export_dir_rva.saturating_add(export_dir_size)
 }
 
-unsafe fn resolve_forwarded_export(dll_base: usize, func_rva: usize) -> Option<usize> {
+/// Maximum recursion depth for forwarded-export resolution.
+/// Forwarder chains deeper than this are treated as circular/malicious and
+/// resolution returns `None` instead of overflowing the stack.
+const MAX_FORWARDER_DEPTH: u32 = 8;
+
+#[cfg(target_os = "windows")]
+unsafe fn resolve_forwarded_export(dll_base: usize, func_rva: usize, depth: u32) -> Option<usize> {
+    if depth >= MAX_FORWARDER_DEPTH {
+        return None;
+    }
     const MAX_FORWARDER_STR_LEN: usize = 512;
     const MAX_MODULE_WIDE_LEN: usize = 260;
 
@@ -90,7 +99,7 @@ unsafe fn resolve_forwarded_export(dll_base: usize, func_rva: usize) -> Option<u
         })?;
 
     let function_hash = hash_str(function_name);
-    get_proc_address_by_hash(module_base, function_hash)
+    _get_proc_address_by_hash_depth(module_base, function_hash, depth + 1)
 }
 
 /// Walk the Windows PEB loader list and return the base address of the module
@@ -141,6 +150,11 @@ pub unsafe fn get_module_handle_by_hash(target_hash: u32) -> Option<usize> {
 /// accessible and not mutated for the duration of the call.
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Option<usize> {
+    _get_proc_address_by_hash_depth(dll_base, target_hash, 0)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+unsafe fn _get_proc_address_by_hash_depth(dll_base: usize, target_hash: u32, depth: u32) -> Option<usize> {
     let dos_magic = *(dll_base as *const u16);
     if dos_magic != 0x5A4D {
         return None;
@@ -187,7 +201,7 @@ pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Opt
             let ord = *ords.add(i as usize) as usize;
             let func_rva = *funcs.add(ord) as usize;
             if is_forwarder(func_rva, export_dir_rva, export_dir_size) {
-                return resolve_forwarded_export(dll_base, func_rva);
+                return resolve_forwarded_export(dll_base, func_rva, depth);
             }
             // Validate resolved address falls within the module's VA range.
             // After Windows updates, ordinal tables can shift and a stale
@@ -248,6 +262,11 @@ pub unsafe fn get_module_handle_by_hash(target_hash: u32) -> Option<usize> {
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
 pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Option<usize> {
+    _get_proc_address_by_hash_depth(dll_base, target_hash, 0)
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+unsafe fn _get_proc_address_by_hash_depth(dll_base: usize, target_hash: u32, depth: u32) -> Option<usize> {
     // Export directory parsing is identical to x86_64: PE32+ format is the
     // same for both architectures; only the machine type in FileHeader differs.
     let dos_magic = *(dll_base as *const u16);
@@ -295,7 +314,7 @@ pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Opt
             let ord = *ords.add(i as usize) as usize;
             let func_rva = *funcs.add(ord) as usize;
             if is_forwarder(func_rva, export_dir_rva, export_dir_size) {
-                return resolve_forwarded_export(dll_base, func_rva);
+                return resolve_forwarded_export(dll_base, func_rva, depth);
             }
             // Validate resolved address falls within the module's VA range.
             if func_rva >= size_of_image {

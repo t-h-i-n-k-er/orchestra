@@ -643,24 +643,28 @@ pub fn enc_str(input: TokenStream) -> TokenStream {
                         let _xs2 = _xs1_2; let _xs3 = _xs1_3;
                         let _res = _xs0.wrapping_add(_xs3).rotate_left(23).wrapping_add(_xs0);
                         let _t = _xs1 << 17;
-                        _xs1_2 = _xs2 ^ _xs0;
-                        _xs1_3 = _xs3 ^ _xs1;
-                        _xs1_1 = _xs1_2 ^ _xs1;
-                        _xs1_0 = _xs1_3 ^ _xs0;
-                        _xs1_2 ^= _t;
-                        _xs1_3 = _xs1_3.rotate_left(45);
+                        let _xs2_new = _xs2 ^ _xs0;
+                        let _xs3_new = _xs3 ^ _xs1;
+                        let _xs1_new = _xs2 ^ _xs1;
+                        let _xs0_new = _xs3 ^ _xs0;
+                        let _xs2_new = _xs2_new ^ _t;
+                        let _xs3_new = _xs3_new.rotate_left(45);
+                        _xs1_0 = _xs0_new; _xs1_1 = _xs1_new;
+                        _xs1_2 = _xs2_new; _xs1_3 = _xs3_new;
                         _buf1 = _res.to_le_bytes();
                         _buf1_idx = 0;
                     }
                     if _buf_idx >= 8 {
                         let _res = _xs0.wrapping_add(_xs3).rotate_left(23).wrapping_add(_xs0);
                         let _t = _xs1 << 17;
-                        _xs2 ^= _xs0;
-                        _xs3 ^= _xs1;
-                        _xs1 ^= _xs2;
-                        _xs0 ^= _xs3;
-                        _xs2 ^= _t;
-                        _xs3 = _xs3.rotate_left(45);
+                        let _xs2_new = _xs2 ^ _xs0;
+                        let _xs3_new = _xs3 ^ _xs1;
+                        let _xs1_new = _xs2 ^ _xs1;
+                        let _xs0_new = _xs3 ^ _xs0;
+                        let _xs2_new = _xs2_new ^ _t;
+                        let _xs3_new = _xs3_new.rotate_left(45);
+                        _xs0 = _xs0_new; _xs1 = _xs1_new;
+                        _xs2 = _xs2_new; _xs3 = _xs3_new;
                         _buf = _res.to_le_bytes();
                         _buf_idx = 0;
                     }
@@ -1131,24 +1135,28 @@ pub fn enc_wstr(input: TokenStream) -> TokenStream {
                         let _xs2 = _xs1_2; let _xs3 = _xs1_3;
                         let _res = _xs0.wrapping_add(_xs3).rotate_left(23).wrapping_add(_xs0);
                         let _t = _xs1 << 17;
-                        _xs1_2 = _xs2 ^ _xs0;
-                        _xs1_3 = _xs3 ^ _xs1;
-                        _xs1_1 = _xs1_2 ^ _xs1;
-                        _xs1_0 = _xs1_3 ^ _xs0;
-                        _xs1_2 ^= _t;
-                        _xs1_3 = _xs1_3.rotate_left(45);
+                        let _xs2_new = _xs2 ^ _xs0;
+                        let _xs3_new = _xs3 ^ _xs1;
+                        let _xs1_new = _xs2 ^ _xs1;
+                        let _xs0_new = _xs3 ^ _xs0;
+                        let _xs2_new = _xs2_new ^ _t;
+                        let _xs3_new = _xs3_new.rotate_left(45);
+                        _xs1_0 = _xs0_new; _xs1_1 = _xs1_new;
+                        _xs1_2 = _xs2_new; _xs1_3 = _xs3_new;
                         _buf1 = _res.to_le_bytes();
                         _buf1_idx = 0;
                     }
                     if _buf_idx >= 8 {
                         let _res = _xs0.wrapping_add(_xs3).rotate_left(23).wrapping_add(_xs0);
                         let _t = _xs1 << 17;
-                        _xs2 ^= _xs0;
-                        _xs3 ^= _xs1;
-                        _xs1 ^= _xs2;
-                        _xs0 ^= _xs3;
-                        _xs2 ^= _t;
-                        _xs3 = _xs3.rotate_left(45);
+                        let _xs2_new = _xs2 ^ _xs0;
+                        let _xs3_new = _xs3 ^ _xs1;
+                        let _xs1_new = _xs2 ^ _xs1;
+                        let _xs0_new = _xs3 ^ _xs0;
+                        let _xs2_new = _xs2_new ^ _t;
+                        let _xs3_new = _xs3_new.rotate_left(45);
+                        _xs0 = _xs0_new; _xs1 = _xs1_new;
+                        _xs2 = _xs2_new; _xs3 = _xs3_new;
                         _buf = _res.to_le_bytes();
                         _buf_idx = 0;
                     }

@@ -394,10 +394,26 @@ impl Injector for ModuleStompInjector {
                         std::ptr::null_mut(),
                     );
                     if status >= 0 && !h_thread.is_null() {
-                        winapi::um::synchapi::WaitForSingleObject(
+                        // Use a bounded timeout instead of INFINITE to avoid
+                        // deadlocking if the remote thread hangs (e.g. loader
+                        // lock).  30 seconds is generous for a simple LdrLoadDll.
+                        const LDRLOADDLL_TIMEOUT_MS: u32 = 30_000;
+                        let wait = winapi::um::synchapi::WaitForSingleObject(
                             h_thread,
-                            winapi::um::winbase::INFINITE,
+                            LDRLOADDLL_TIMEOUT_MS,
                         );
+                        if wait == winapi::um::winbase::WAIT_TIMEOUT {
+                            log::warn!(
+                                "module_stomp: LdrLoadDll remote thread timed out after {}ms",
+                                LDRLOADDLL_TIMEOUT_MS
+                            );
+                            // Attempt to terminate the hung thread.
+                            nt_syscall::syscall!(
+                                "NtTerminateThread",
+                                h_thread as u64,
+                                1u64 // exit code
+                            ).ok();
+                        }
                         nt_syscall::syscall!("NtClose", h_thread as u64).ok();
                     }
                     nt_free!(stub_region);

@@ -22,7 +22,8 @@ pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
                     .unwrap_or_default()
                     .as_secs() as libc::time_t;
                 unsafe {
-                    let lt = libc::localtime(&secs);
+                    let mut tm: libc::tm = std::mem::zeroed();
+                    let lt = libc::localtime_r(&secs, &mut tm);
                     if lt.is_null() {
                         (secs / 3600 % 24) as u32
                     } else {

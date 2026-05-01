@@ -163,7 +163,29 @@ unsafe fn get_module_handle_peb(module_name: &str) -> *mut c_void {
 
 /// Resolve a function by ordinal from a module's export table without calling
 /// the hookable `GetProcAddress`.  Used for delay-import ordinal entries.
+///
+/// Includes a bounded recursion guard (thread-local depth counter) to prevent
+/// stack overflow from circular or deeply nested export forwarder chains.
 unsafe fn get_proc_address_by_ordinal_manual(module: *mut c_void, ordinal: u16) -> *mut c_void {
+    // Bounded recursion guard: forwarded exports can chain across modules.
+    // A pathological or malicious export table could form a cycle; cap the depth.
+    thread_local! {
+        static ORDINAL_FWD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    const MAX_ORDINAL_FWD_DEPTH: u32 = 8;
+    let depth = ORDINAL_FWD_DEPTH.with(|c| c.get());
+    if depth >= MAX_ORDINAL_FWD_DEPTH {
+        return std::ptr::null_mut();
+    }
+    ORDINAL_FWD_DEPTH.with(|c| c.set(depth + 1));
+    struct DepthGuard;
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            ORDINAL_FWD_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+        }
+    }
+    let _guard = DepthGuard;
+
     if module.is_null() {
         return std::ptr::null_mut();
     }

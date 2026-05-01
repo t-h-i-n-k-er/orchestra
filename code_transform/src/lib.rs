@@ -38,8 +38,20 @@ pub mod regalloc;
 pub mod reorder;
 #[cfg(target_arch = "x86_64")]
 pub mod substitute;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "virtualize"))]
 pub mod virtualize;
+
+#[cfg(all(not(feature = "virtualize"), target_arch = "x86_64"))]
+mod virtualize {
+    //! Stub module when the `virtualize` feature is disabled.
+    //! The VM interpreter is non-functional, so the module is gated off
+    //! to prevent accidental use of broken functionality.
+    #![allow(dead_code)]
+    use rand_chacha::ChaCha8Rng;
+    pub fn virtualize(_code: &[u8], _rng: &mut ChaCha8Rng) -> Vec<u8> {
+        unimplemented!("virtualize feature is not enabled")
+    }
+}
 
 pub mod opaque_predicates;
 
@@ -89,7 +101,7 @@ pub fn transform(code: &[u8], seed: u64) -> Vec<u8> {
 /// preceding passes is returned unchanged.
 ///
 /// `seed` must be the same value on every build for a reproducible output.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", feature = "virtualize"))]
 pub fn transform_with_virtualization(code: &[u8], seed: u64) -> Vec<u8> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let after_sub = substitute::apply_substitutions(code, &mut rng);

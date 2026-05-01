@@ -487,11 +487,18 @@ fn emit_ordinal_resolver(mut e: &mut Emitter, ret_label: usize) {
 // ── Primitive emitters ───────────────────────────────────────────────────────
 
 /// `mov r64, gs:[offset]`
+///
+/// Encoded as: GS prefix + REX.W + 0x8B (MOV r64, r/m64) + ModRM(mod=00, rm=SIB)
+/// + SIB(scale=0, index=none, base=disp32) + disp32.
+/// This produces `mov r64, gs:[abs32]` using SIB-based absolute addressing
+/// (mod=00, rm=100b, SIB base=101b) which is the only way to encode a flat
+/// 32-bit absolute offset with a segment override in 64-bit long mode.
 fn emit_gs_load(e: &mut Emitter, reg: u8, offset: u32) {
     e.emit_byte(0x65); // GS segment override
-    e.rex_w(0, reg);
-    e.emit_byte(0x8B);
-    e.emit_byte(Emitter::modrm(2, reg, 5)); // RIP-relative with GS override
+    e.rex_w(reg, 0);   // REX.W + R bit for target register (no B/M needed)
+    e.emit_byte(0x8B); // MOV r64, r/m64
+    e.emit_byte(Emitter::modrm(0, reg, 4)); // mod=00, rm=100 → SIB follows
+    e.emit_byte(Emitter::sib(0, 4, 5));     // scale=0, index=100(none), base=101(disp32)
     e.emit_u32_le(offset);
 }
 

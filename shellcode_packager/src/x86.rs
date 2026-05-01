@@ -80,7 +80,7 @@ impl Emitter {
     }
 
     /// SIB byte: scale(2) | index(3) | base(3)
-    fn sib(scale: u8, index: u8, base: u8) -> u8 {
+    pub fn sib(scale: u8, index: u8, base: u8) -> u8 {
         (scale << 6) | ((index & 7) << 3) | (base & 7)
     }
 

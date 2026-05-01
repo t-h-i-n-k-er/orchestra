@@ -417,23 +417,32 @@ fn try_substitute(ins: &Instruction, rng: &mut impl Rng) -> Option<Instruction> 
 ///   POP  <scratch_reg>
 /// ```
 /// This sequence preserves all flags and all registers (RSP nets to zero) but
-/// produces a different binary fingerprint every build.  The scratch register
-/// is chosen randomly from a callee-saved register set to avoid clobber risk
-/// across block boundaries.
+/// produces a different binary fingerprint every build.
+///
+/// The scratch register is chosen from **caller-saved** registers (RAX, RCX,
+/// RDX, R8–R11) because these are volatile by convention — the calling code
+/// already assumes they may be clobbered.  Callee-saved registers (RBX,
+/// R12–R15) were previously used but are unsafe to touch without liveness
+/// analysis: if the surrounding function has live values in those registers,
+/// the PUSH/MOV/POP sequence would silently corrupt them.
 #[cfg(feature = "diversification")]
 pub struct OpaqueDeadCodePass;
 
 #[cfg(feature = "diversification")]
 impl Pass for OpaqueDeadCodePass {
     fn run(&self, instrs: &mut Vec<Instruction>) {
-        // Callee-saved registers on both SysV AMD64 and Windows x64 ABI.
-        // RBP is intentionally excluded because frame-pointer code may rely on it.
+        // Caller-saved (volatile) registers on both SysV AMD64 and Windows x64
+        // ABI.  These are safe to use without liveness analysis because the
+        // calling convention assumes they may be clobbered at any call site or
+        // block boundary.  RSP and RBP are excluded.
         const SCRATCH: &[Register] = &[
-            Register::RBX,
-            Register::R12,
-            Register::R13,
-            Register::R14,
-            Register::R15,
+            Register::RAX,
+            Register::RCX,
+            Register::RDX,
+            Register::R8,
+            Register::R9,
+            Register::R10,
+            Register::R11,
         ];
         let mut rng = thread_rng();
         let mut result = Vec::with_capacity(instrs.len() + instrs.len() / 4);

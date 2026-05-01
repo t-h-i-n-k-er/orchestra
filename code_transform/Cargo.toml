@@ -3,6 +3,9 @@ name = "code_transform"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+virtualize = []
+
 [dependencies]
 iced-x86 = { version = "1", features = [
     "decoder",

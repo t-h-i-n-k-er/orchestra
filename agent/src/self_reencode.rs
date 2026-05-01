@@ -280,12 +280,23 @@ pub unsafe fn reencode_text(seed: u64) -> Result<()> {
 
     if transformed.len() > text.size {
         // The transform may produce larger output.  We cannot grow the
-        // section in-place, so we truncate — this is safe because the
-        // pipeline preserves semantic equivalence and the truncation
-        // only discards NOP-padding at the end.  If the transformed
-        // code is significantly larger, log a warning.
+        // section in-place, so we would need to truncate.  However, we
+        // must first verify that the bytes beyond the original size are
+        // all single-byte NOP instructions (0x90) — any non-NOP byte
+        // would mean real code is being silently discarded.
+        let tail = &transformed[text.size..];
+        let all_nops = tail.iter().all(|&b| b == 0x90);
+        if !all_nops {
+            log::error!(
+                "self_reencode: transformed .text is {} bytes, original is {} bytes, \
+                 and trailing bytes are not all NOPs — skipping re-encoding to avoid corruption",
+                transformed.len(),
+                text.size
+            );
+            return Ok(());
+        }
         log::warn!(
-            "self_reencode: transformed .text is {} bytes, original is {} bytes — truncating to fit",
+            "self_reencode: transformed .text is {} bytes, original is {} bytes — truncating NOP-padding to fit",
             transformed.len(),
             text.size
         );

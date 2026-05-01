@@ -114,48 +114,45 @@ impl Xoshiro256PlusPlus {
         self.s[3] = self.s[3].rotate_left(45);
         result
     }
-
-    fn fill_bytes(&mut self, out: &mut [u8]) {
-        for chunk in out.chunks_mut(8) {
-            let v = self.next_u64().to_le_bytes();
-            chunk.copy_from_slice(&v[..chunk.len()]);
-        }
-    }
 }
 
 fn main() {
-    // Generate a per-build 16-byte seed at compile time.  Every `cargo build`
-    // produces a different STUB_SEED so the opaque dead-code stubs inserted by
-    // the optimizer carry different values in each build — making the binary
-    // fingerprint unique without requiring runtime entropy.
-    //
-    // M-40: Harvest entropy from multiple OS/process/thread sources and feed
-    // a xoshiro256++ PRNG to avoid predictable build-time seeds.
-    let seed: [u8; 16] = {
+    // Only generate stub_seed.rs when the `diversification` feature is enabled.
+    // The feature flag is communicated via the cargo:rustc-cfg printed by the
+    // [features] section in Cargo.toml, but build scripts cannot inspect
+    // features directly — instead we always generate the file (it's tiny) and
+    // let the `#[cfg(feature = "diversification")]` gate on the `include!`
+    // side decide whether it is actually compiled.
+
+    // Support a reproducible-build override: if OPTIMIZER_STUB_SEED is set,
+    // use its value (a hex-encoded u64) instead of harvesting fresh entropy.
+    println!("cargo:rerun-if-env-changed=OPTIMIZER_STUB_SEED");
+    println!("cargo:rerun-if-changed=build.rs");
+
+    let seed_value: u64 = if let Ok(hex_str) = std::env::var("OPTIMIZER_STUB_SEED") {
+        u64::from_str_radix(hex_str.trim(), 16)
+            .expect("OPTIMIZER_STUB_SEED must be a valid hex-encoded u64")
+    } else {
         let harvested = harvest_entropy();
         assert!(
             harvested.iter().any(|&b| b != 0),
             "harvest_entropy returned an all-zero seed; aborting build"
         );
         let mut rng = Xoshiro256PlusPlus::from_seed(harvested);
-        let mut out = [0u8; 16];
-        rng.fill_bytes(&mut out);
-        out
+        rng.next_u64()
     };
+
+    let seed_bytes = seed_value.to_le_bytes();
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let dest = Path::new(&out_dir).join("stub_seed.rs");
     std::fs::write(
         &dest,
         format!(
-            "const STUB_SEED: [u8; 16] = [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}];\n",
-            seed[0], seed[1], seed[2], seed[3],
-            seed[4], seed[5], seed[6], seed[7],
-            seed[8], seed[9], seed[10], seed[11],
-            seed[12], seed[13], seed[14], seed[15],
+            "pub const STUB_SEED: [u8; 8] = [{}, {}, {}, {}, {}, {}, {}, {}];\n",
+            seed_bytes[0], seed_bytes[1], seed_bytes[2], seed_bytes[3],
+            seed_bytes[4], seed_bytes[5], seed_bytes[6], seed_bytes[7],
         ),
     )
     .unwrap();
-
-    println!("cargo:rerun-if-changed=build.rs");
 }

@@ -492,19 +492,6 @@ fn translate_instruction(inst: &Instruction) -> TranslateResult {
         return TranslateResult::Native;
     }
 
-    // XOR r, r (zeroing idiom) → translate as MOV_REG_IMM dst, 0
-    if matches!(code, Code::Xor_r32_rm32 | Code::Xor_r64_rm64) {
-        if inst.op_count() >= 2
-            && inst.op_kind(0) == OpKind::Register
-            && inst.op_kind(1) == OpKind::Register
-            && inst.op_register(0) == inst.op_register(1)
-        {
-            if let Some(dst) = normalize_gpr(inst.op_register(0)).and_then(gpr_index) {
-                return TranslateResult::Ok(vec![BytecodeInsn::MovRegImm { dst, imm: 0 }]);
-            }
-        }
-    }
-
     // LEA r64, [r64 + disp32] → MOV_REG_IMM + BinOp(ADD) with immediate
     // (Simplified: only handle LEA r64, [r64] — register copy)
     if matches!(code, Code::Lea_r64_m) {
