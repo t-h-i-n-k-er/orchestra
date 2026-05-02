@@ -307,10 +307,12 @@ async fn capture_wayland_portal_async() -> Result<Vec<u8>> {
         .get("uri")
         .ok_or_else(|| anyhow!("portal Response missing 'uri' field"))?;
 
-    let uri_str: String = uri_value
-        .clone()
-        .try_into()
-        .map_err(|_| anyhow!("portal 'uri' value is not a string"))?;
+    // OwnedValue derefs to Value; use downcast_ref::<String>() to extract
+    // the URI (the unsized `str` type is not accepted by downcast_ref).
+    let uri_str = uri_value
+        .downcast_ref::<String>()
+        .map_err(|_| anyhow!("portal 'uri' value is not a string"))?
+        .clone();
 
     let file_path = uri_str
         .strip_prefix("file://")

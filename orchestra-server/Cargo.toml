@@ -51,6 +51,9 @@ rustls-pemfile = "2"
 # Enable dangerous-tls so tests can use NoCertificateVerification.
 common = { path = "../common", features = ["dangerous-tls"] }
 
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winbase", "namedpipeapi", "fileapi", "handleapi"] }
+
 [features]
 default = []
 # Application-layer forward secrecy via X25519 ECDH. Must also be enabled on

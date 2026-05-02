@@ -280,3 +280,110 @@ pre {
   text-decoration: none;
 }
 #build-download a:hover { background: #4ad660; }
+
+/* ── Modal overlay ──────────────────────────────────────────────── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.5rem;
+  min-width: 360px;
+  max-width: 520px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+.modal-card h3 {
+  margin: 0 0 1rem;
+  color: var(--text);
+}
+
+.modal-field {
+  margin-bottom: 0.75rem;
+}
+
+.modal-field label {
+  display: block;
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+}
+
+.modal-field input,
+.modal-field textarea {
+  width: 100%;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.modal-btn {
+  padding: 0.4rem 1rem;
+  border-radius: 6px;
+  font-weight: 500;
+}
+
+.screenshot-modal {
+  max-width: 90vw;
+  max-height: 90vh;
+}
+
+.screenshot-modal img {
+  max-height: 70vh;
+}
+
+/* ── Command groups & grid ──────────────────────────────────────── */
+.cmd-group {
+  margin-bottom: 1rem;
+}
+
+.cmd-group h3 {
+  margin: 0.75rem 0 0.4rem;
+}
+
+.cmd-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.cmd-btn {
+  padding: 0.35rem 0.75rem;
+  font-size: 0.88rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg3);
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.cmd-btn:hover:not(:disabled) {
+  background: var(--bg2);
+  border-color: var(--accent);
+  color: var(--accent-h);
+}
+
+.cmd-btn-danger {
+  border-color: var(--err);
+  color: var(--err);
+}
+
+.cmd-btn-danger:hover:not(:disabled) {
+  background: var(--err);
+  color: #fff;
+  border-color: var(--err);
+}

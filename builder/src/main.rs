@@ -50,6 +50,12 @@ enum Cmd {
         /// Reserved for build-time code diversification; currently disabled.
         #[arg(long)]
         diversify: bool,
+        /// Optional 64-bit hex seed for reproducible builds.  When set, both
+        /// `OPTIMIZER_STUB_SEED` and `CODE_TRANSFORM_SEED` are pinned to this
+        /// value so the output binary is bit-for-bit identical across machines.
+        /// Without this flag every build produces a unique binary.
+        #[arg(long)]
+        seed: Option<String>,
     },
 }
 
@@ -71,12 +77,24 @@ fn main() -> Result<()> {
             println!("{}", toml::to_string_pretty(&profile)?);
             Ok(())
         }
-        Cmd::Build { name, diversify } => {
+        Cmd::Build {
+            name,
+            diversify,
+            seed,
+        } => {
             let profile = load_profile(&name)?;
             let enc_key = profile.encryption_key_bytes()?;
 
-            let agent_bytes =
-                build::build_agent_for_profile(&profile).context("Failed to build agent")?;
+            let parsed_seed: Option<u64> = match seed.as_deref() {
+                Some(hex) => Some(
+                    u64::from_str_radix(hex.trim_start_matches("0x"), 16)
+                        .context("seed must be a valid hex-encoded u64 (e.g. 0xa1b2c3d4e5f6a7b8)")?,
+                ),
+                None => None,
+            };
+
+            let agent_bytes = build::build_agent_for_profile(&profile, parsed_seed)
+                .context("Failed to build agent")?;
 
             let final_agent_bytes = if diversify {
                 info!("Applying code diversification passes...");

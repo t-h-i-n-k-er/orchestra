@@ -202,6 +202,59 @@ pub enum Command {
     JobStatus {
         job_id: String,
     },
+
+    // ── Token Manipulation (Windows only) ───────────────────────────────
+
+    /// Create a new logon session with the provided credentials.
+    /// Returns the new session's token handle information on success.
+    MakeToken {
+        username: String,
+        password: String,
+        domain: String,
+        logon_type: u32,
+    },
+    /// Duplicate an existing process token via `OpenProcessToken` +
+    /// `DuplicateTokenEx` and begin impersonating it.
+    StealToken {
+        target_pid: u32,
+    },
+    /// Revert to the original process token (undo `StealToken` / `MakeToken`).
+    Rev2Self,
+    /// Elevate to SYSTEM privileges via token impersonation (steal from a
+    /// SYSTEM-owned process such as `winlogon.exe` or `lsass.exe`).
+    GetSystem,
+
+    // ── Lateral Movement (Windows only) ─────────────────────────────────
+
+    /// Execute a command on a remote host via PsExec-style service creation.
+    PsExec {
+        target_host: String,
+        command: String,
+        username: Option<String>,
+        password: Option<String>,
+    },
+    /// Execute a command on a remote host via WMI `IWbemServices`.
+    WmiExec {
+        target_host: String,
+        command: String,
+        username: Option<String>,
+        password: Option<String>,
+    },
+    /// Execute a command on a remote host via DCOM (`ShellWindows` /
+    /// `ShellBrowserWindow` COM object).
+    DcomExec {
+        target_host: String,
+        command: String,
+        username: Option<String>,
+        password: Option<String>,
+    },
+    /// Execute a command on a remote host via WinRM SOAP requests.
+    WinRmExec {
+        target_host: String,
+        command: String,
+        username: Option<String>,
+        password: Option<String>,
+    },
 }
 
 /// Errors produced by [`CryptoSession`].

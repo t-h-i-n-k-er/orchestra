@@ -10,7 +10,7 @@ unsafe-runtime-rewrite = []
 
 [dependencies]
 goblin = { version = "0.7", default-features = false, features = ["elf64", "elf32", "pe64", "pe32", "mach64", "mach32", "endian_fd"] }
-iced-x86 = { version = "1.20", default-features = false, features = ["std", "decoder", "encoder", "block_encoder"] }
+iced-x86 = { version = "1.20", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info"] }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 libc = "0.2"

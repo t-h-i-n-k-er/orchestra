@@ -630,6 +630,53 @@ grep -A 50 '\[features\]' agent/Cargo.toml
 
 ---
 
+## Build Diversification & Reproducibility
+
+Every agent build automatically receives **unique random seeds** for code
+transformation and optimizer stub values, so even when the same source code
+and profile are used, the resulting binary will be different on every build.
+This ensures that two deployments never share identical binary signatures.
+
+Two seed environment variables are injected by the builder:
+
+| Variable | Consumer | Purpose |
+|---|---|---|
+| `OPTIMIZER_STUB_SEED` | `optimizer/build.rs` | Randomizes dead-code constants and stub values |
+| `CODE_TRANSFORM_SEED` | `code_transform_macro` | Seeds the ChaCha8 PRNG for instruction substitution, block reordering, and opaque predicates |
+
+### Per-build uniqueness (default)
+
+When no seed is specified, the builder reads 8 bytes from `/dev/urandom`
+(Linux/macOS) to generate a fresh seed each time.  This means **every build
+produces a unique binary** — even back-to-back builds with identical source
+code and the same profile.
+
+### Reproducible builds
+
+For incident response, audit, or testing scenarios where bit-for-bit
+reproducibility is required, pass an explicit seed:
+
+**Builder CLI:**
+```sh
+cargo run --release -p builder -- build my-profile --seed a1b2c3d4e5f6a7b8
+```
+
+**Orchestra Server API** (`POST /build`):
+```json
+{
+  "os": "windows",
+  "arch": "x86_64",
+  "seed": "a1b2c3d4e5f6a7b8",
+  ...
+}
+```
+
+When `seed` is provided, both `OPTIMIZER_STUB_SEED` and
+`CODE_TRANSFORM_SEED` are pinned to that value, making the output binary
+bit-for-bit identical across machines.
+
+---
+
 ## See also
 
 - [QUICKSTART.md](QUICKSTART.md) — Getting started guide

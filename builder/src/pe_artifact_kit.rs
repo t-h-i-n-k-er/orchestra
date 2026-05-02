@@ -5,16 +5,18 @@
 //! diagnostic message and return the input buffer unchanged.
 //!
 //! # Operation order (applied by [`apply_all`])
-//! 1. Timestamp zeroing
-//! 2. Rich header removal
-//! 3. Section name randomization
-//! 4. Entropy padding
-//! 5. Strip digital signature (optional)
-//! 6. Strip debug directory (optional)
-//! 7. Inject version info resource (optional)
-//! 8. Inject icon resource (optional)
-//! 9. Inject manifest resource (optional)
-//! 10. Recalculate PE checksum
+//! 1. Strip overlay/appended data
+//! 2. Replace DOS stub with random bytes
+//! 3. Randomize TimeDateStamp to a plausible date
+//! 4. Replace Rich header with synthetic MSVC header
+//! 5. Replace PDB path in debug directory with plausible path
+//! 6. Randomize section names
+//! 7. Strip digital signature (optional, default: on)
+//! 8. Strip debug directory (optional, default: on)
+//! 9. Inject version info resource (optional)
+//! 10. Inject icon resource (optional)
+//! 11. Inject manifest resource (optional)
+//! 12. Recalculate PE checksum
 
 use anyhow::{anyhow, Context, Result};
 use goblin::pe::PE;
@@ -64,40 +66,107 @@ fn parse_pe_offsets(
 
 // ── Existing four hardening operations ───────────────────────────────────────
 
-/// Zero the TimeDateStamp field in the COFF FileHeader.
-pub fn zero_timestamp(buf: &mut Vec<u8>) {
+/// Randomize the TimeDateStamp field in the COFF FileHeader to a plausible
+/// date (random timestamp between 2020-01-01 and 2025-12-31 UTC).
+pub fn randomize_timestamp(buf: &mut Vec<u8>) {
     let Ok((_, fh_off, _, _, _, _)) = parse_pe_offsets(buf) else {
-        warn!("zero_timestamp: not a PE file, skipping");
+        warn!("randomize_timestamp: not a PE file, skipping");
         return;
     };
     // TimeDateStamp is at bytes 4..8 of the COFF FileHeader.
+    if fh_off + 8 <= buf.len() {
+        // 2020-01-01 00:00:00 UTC = 1577836800
+        // 2025-12-31 23:59:59 UTC = 1767225599
+        let mut rng = thread_rng();
+        let ts: u32 = rng.gen_range(1577836800u32..1767225599u32);
+        write_u32_le(buf, fh_off + 4, ts);
+    }
+}
+
+/// Zero the TimeDateStamp field (legacy API preserved for compatibility).
+pub fn zero_timestamp(buf: &mut Vec<u8>) {
+    let Ok((_, fh_off, _, _, _, _)) = parse_pe_offsets(buf) else {
+        return;
+    };
     if fh_off + 8 <= buf.len() {
         write_u32_le(buf, fh_off + 4, 0);
     }
 }
 
-/// Zero the Rich header in the DOS stub area (bytes 0x40 to PE signature).
+/// Remove the Rich header by zeroing the region between the DOS stub and
+/// the PE signature, then inject a synthetic Rich header that mimics a
+/// legitimate Microsoft Visual Studio build.
+///
+/// A real Rich header sits between the DOS stub (ending at ~0x40 or later)
+/// and the PE signature (at `e_lfanew`).  Its structure is:
+///
+/// ```text
+/// "DanS" XOR-mask   (4 bytes)
+///   [comp_id (2) | prod_id (2) | count (4)]  × N  (each XOR-masked)
+/// "Rich"             (4 bytes, unmasked)
+///   XOR mask value   (4 bytes, unmasked)
+///   zero padding to PE signature
+/// ```
 pub fn remove_rich_header(buf: &mut Vec<u8>) {
     let Ok((pe_off, _, _, _, _, _)) = parse_pe_offsets(buf) else {
         warn!("remove_rich_header: not a PE file, skipping");
         return;
     };
-    // Scan backwards from the PE signature for the "DanS" marker.
-    let mut found = false;
-    for i in (0..pe_off).rev() {
-        if i + 4 <= buf.len() && &buf[i..i + 4] == b"DanS" {
-            for j in (0..i).rev() {
-                if j + 4 <= buf.len() && &buf[j..j + 4] == b"Rich" {
-                    found = true;
-                    break;
-                }
-            }
-            if found {
-                let dos_stub_end = 0x40usize.min(pe_off);
-                buf[dos_stub_end..pe_off].fill(0);
-            }
-            break;
-        }
+
+    // First, zero the entire region from the end of the DOS header (0x40)
+    // up to the PE signature.
+    let dos_stub_end = 0x40usize.min(pe_off);
+    if dos_stub_end < pe_off {
+        buf[dos_stub_end..pe_off].fill(0);
+    }
+
+    // If there's not enough room for a Rich header (need at least ~40 bytes
+    // between 0x40 and pe_off), skip injection.
+    let available = pe_off.saturating_sub(dos_stub_end);
+    if available < 40 {
+        return;
+    }
+
+    // Build a synthetic Rich header that looks like a VS 2019 build.
+    // XOR mask: a random non-zero u32.
+    let mut rng = thread_rng();
+    let xor_mask: u32 = rng.gen_range(1u32..0xFFFF_FFFF);
+
+    // Encode a Rich header entry: (comp_id, prod_id, count) each XOR-masked.
+    // We use common MSVC product/comp IDs that appear in real binaries.
+    // Each entry is 8 bytes: comp_id(u16) | prod_id(u16) | count(u32), all XOR'd.
+    let entries: &[(u16, u16, u32)] = &[
+        (0x0001, 0x0000, 3),   // Import0 (linker)
+        (0x0159, 0x0001, 38),  // CVTRES (res converter, VS 14.0+)
+        (0x8002, 0x0001, 1),   // LINK (linker)
+        (0x8009, 0x0001, 1),   // LINK (alt)
+        (0xF1AD, 0x0001, 2),   // Unknown object
+    ];
+
+    let mut rich = Vec::with_capacity(pe_off - dos_stub_end);
+
+    // "DanS" marker XOR-masked.
+    let dans = u32::from_le_bytes(*b"DanS") ^ xor_mask;
+    rich.extend_from_slice(&dans.to_le_bytes());
+
+    // Entries (each 8 bytes, XOR-masked).
+    for &(comp, prod, count) in entries {
+        let word0 = ((comp as u32) | ((prod as u32) << 16)) ^ xor_mask;
+        let word1 = count ^ xor_mask;
+        rich.extend_from_slice(&word0.to_le_bytes());
+        rich.extend_from_slice(&word1.to_le_bytes());
+    }
+
+    // "Rich" marker (unmasked).
+    rich.extend_from_slice(b"Rich");
+    // XOR mask value (unmasked).
+    rich.extend_from_slice(&xor_mask.to_le_bytes());
+
+    // Pad to fill the available space (zeros already there from the fill above).
+    if rich.len() <= available {
+        // Write the Rich header so it ends exactly at pe_off.
+        let write_start = pe_off - rich.len();
+        buf[write_start..pe_off].copy_from_slice(&rich);
     }
 }
 
@@ -130,6 +199,110 @@ pub fn add_entropy_padding(buf: &mut Vec<u8>) {
 
 // ── New operations ────────────────────────────────────────────────────────────
 
+/// Replace the DOS stub (the region between the DOS header at 0x40 and the
+/// Rich header / PE signature) with random bytes, eliminating the default
+/// "This program cannot be run in DOS mode" message.
+///
+/// The DOS header fields (e_magic, e_lfanew, etc.) are preserved; only the
+/// stub program and its embedded string are replaced.
+pub fn replace_dos_stub(buf: &mut Vec<u8>) {
+    let Ok((pe_off, _, _, _, _, _)) = parse_pe_offsets(buf) else {
+        warn!("replace_dos_stub: not a PE file, skipping");
+        return;
+    };
+    // The DOS stub starts at offset 0x40 (after the fixed DOS header fields)
+    // and extends to either the Rich header or the PE signature, whichever
+    // comes first.  We want to replace bytes [0x40, pe_off) but leave room
+    // for the synthetic Rich header that `remove_rich_header` writes at the
+    // end of this region.
+    //
+    // To avoid clobbering the Rich header, we only randomize [0x40, 0x80)
+    // which covers the default DOS stub message area.  The Rich header
+    // typically starts around 0x80 in MSVC-linked binaries.
+    let stub_start = 0x40usize;
+    // Don't overwrite past 0x80 to preserve room for Rich header, and don't
+    // go past the PE signature either.
+    let stub_end = 0x80usize.min(pe_off);
+    if stub_start >= stub_end {
+        return;
+    }
+    let mut rng = thread_rng();
+    rng.fill(&mut buf[stub_start..stub_end]);
+}
+
+/// Strip overlay/appended data that sits beyond the last section's raw data.
+///
+/// Legitimate PEs end at the last section's `PointerToRawData + SizeOfRawData`
+/// (or the certificate table, if present).  Data appended after that point is
+/// typically digital signatures, installers, or other identifiable artifacts.
+/// This function truncates the file to remove such overlay data, EXCEPT for
+/// data referenced by the security directory (certificates are handled
+/// separately by `strip_signature`).
+pub fn strip_overlay(buf: &mut Vec<u8>) {
+    let Ok((_, _, _, sec_off, n_sec, _)) = parse_pe_offsets(buf) else {
+        warn!("strip_overlay: not a PE file, skipping");
+        return;
+    };
+
+    // Find the end of the last section's raw data.
+    let mut pe_end: usize = 0;
+    for i in 0..n_sec {
+        let s = sec_off + i * 40;
+        if s + 40 > buf.len() {
+            break;
+        }
+        let raw_off = read_u32_le(buf, s + 20) as usize;
+        let raw_size = read_u32_le(buf, s + 16) as usize;
+        if raw_off > 0 && raw_size > 0 {
+            let section_end = raw_off + raw_size;
+            pe_end = pe_end.max(section_end);
+        }
+    }
+
+    if pe_end == 0 || pe_end >= buf.len() {
+        return; // No sections with raw data, or nothing to strip.
+    }
+
+    // Don't truncate if there's a certificate table that extends beyond pe_end —
+    // that's handled by strip_signature.  Check the security directory entry.
+    if let Ok((_, _, oh_off, _, _, is_plus)) = parse_pe_offsets(buf) {
+        let dd_base = oh_off + if is_plus { 112 } else { 96 };
+        let sec_dd_off = dd_base + 4 * 8; // IMAGE_DIRECTORY_ENTRY_SECURITY = index 4
+        if sec_dd_off + 8 <= buf.len() {
+            let cert_off = read_u32_le(buf, sec_dd_off) as usize;
+            let cert_size = read_u32_le(buf, sec_dd_off + 4) as usize;
+            if cert_off > 0 && cert_size > 0 {
+                let cert_end = cert_off + cert_size;
+                if cert_end > pe_end {
+                    // Certificate extends past sections; keep up to cert_end.
+                    pe_end = cert_end;
+                }
+            }
+        }
+    }
+
+    // Also account for any rsrc section we may have appended.
+    if let Ok((_, _, oh_off, _, _, is_plus)) = parse_pe_offsets(buf) {
+        let dd_base = oh_off + if is_plus { 112 } else { 96 };
+        let rsrc_dd_off = dd_base + 2 * 8; // IMAGE_DIRECTORY_ENTRY_RESOURCE = index 2
+        if rsrc_dd_off + 8 <= buf.len() {
+            let rsrc_rva = read_u32_le(buf, rsrc_dd_off) as usize;
+            let rsrc_size = read_u32_le(buf, rsrc_dd_off + 4) as usize;
+            if rsrc_rva > 0 && rsrc_size > 0 {
+                if let Some(rsrc_file_off) = rva_to_file_offset(buf, rsrc_rva as u32) {
+                    let rsrc_end = rsrc_file_off + rsrc_size;
+                    pe_end = pe_end.max(rsrc_end);
+                }
+            }
+        }
+    }
+
+    // Truncate overlay data beyond pe_end.
+    if pe_end < buf.len() {
+        buf.truncate(pe_end);
+    }
+}
+
 /// Zero the IMAGE_DIRECTORY_ENTRY_SECURITY (index 4) data directory entry
 /// and blank out the certificate table data it references.
 pub fn strip_signature(buf: &mut Vec<u8>) {
@@ -153,6 +326,90 @@ pub fn strip_signature(buf: &mut Vec<u8>) {
     // Zero the certificate table data (it is a file offset, not an RVA).
     if cert_rva > 0 && cert_rva + cert_size <= buf.len() {
         buf[cert_rva..cert_rva + cert_size].fill(0);
+    }
+}
+
+/// Replace the PDB path in the debug directory with a plausible path, or
+/// zero the entire debug directory if no entries exist.
+///
+/// Each IMAGE_DEBUG_DIRECTORY entry is 28 bytes.  For CODEVIEW entries
+/// (type 2), the data starts with "RSDS" (4 bytes) + GUID (16 bytes) + age
+/// (4 bytes) followed by a null-terminated UTF-8 PDB path.
+pub fn replace_pdb_path(buf: &mut Vec<u8>) {
+    let Ok((_, _, oh_off, _, _, is_plus)) = parse_pe_offsets(buf) else {
+        warn!("replace_pdb_path: not a PE file, skipping");
+        return;
+    };
+    let dd_base = oh_off + if is_plus { 112 } else { 96 };
+    // DEBUG entry is index 6.
+    let dbg_dd_off = dd_base + 6 * 8;
+    if dbg_dd_off + 8 > buf.len() {
+        return;
+    }
+    let dbg_rva = read_u32_le(buf, dbg_dd_off) as usize;
+    let dbg_size = read_u32_le(buf, dbg_dd_off + 4) as usize;
+
+    if dbg_rva == 0 || dbg_size == 0 {
+        return; // No debug directory present.
+    }
+
+    let Some(file_off) = rva_to_file_offset(buf, dbg_rva as u32) else {
+        return;
+    };
+
+    // Walk debug directory entries (each 28 bytes).
+    let mut rng = thread_rng();
+    let mut offset = file_off;
+    while offset + 28 <= file_off + dbg_size {
+        let debug_type = read_u32_le(buf, offset);
+        let data_rva = read_u32_le(buf, offset + 16);
+        let data_size = read_u32_le(buf, offset + 20);
+
+        if debug_type == 2 && data_rva != 0 && data_size > 24 {
+            // CODEVIEW entry — replace the PDB path.
+            if let Some(data_file_off) = rva_to_file_offset(buf, data_rva) {
+                if data_file_off + 24 <= buf.len() {
+                    // Check for RSDS signature.
+                    if &buf[data_file_off..data_file_off + 4] == b"RSDS" {
+                        // Randomize the GUID (16 bytes at offset 4).
+                        let mut guid = [0u8; 16];
+                        rng.fill(guid.as_mut_slice());
+                        // Set GUID version 4 variant.
+                        guid[6] = (guid[6] & 0x0F) | 0x40;
+                        guid[8] = (guid[8] & 0x3F) | 0x80;
+                        buf[data_file_off + 4..data_file_off + 20].copy_from_slice(&guid);
+                        // Randomize age (4 bytes at offset 20).
+                        let age: u32 = rng.gen_range(1..100);
+                        buf[data_file_off + 20..data_file_off + 24]
+                            .copy_from_slice(&age.to_le_bytes());
+                        // Replace PDB path with a plausible Windows system path.
+                        let plausible_pdbs: &[&[u8]] = &[
+                            b"c:\\windows\\symbols\\ntdll.pdb",
+                            b"c:\\windows\\symbols\\kernel32.pdb",
+                            b"c:\\windows\\symbols\\user32.pdb",
+                            b"c:\\windows\\symbols\\msvcrt.pdb",
+                            b"c:\\windows\\symbols\\crypt32.pdb",
+                            b"c:\\windows\\symbols\\advapi32.pdb",
+                            b"c:\\windows\\symbols\\ws2_32.pdb",
+                            b"c:\\windows\\symbols\\secur32.pdb",
+                            b"c:\\builds\\msvc\\vctools\\crt\\vcstartup\\src\\startup\\crt0.pdb",
+                        ];
+                        let pdb_path = plausible_pdbs[rng.gen_range(0..plausible_pdbs.len())];
+                        let path_start = data_file_off + 24;
+                        let path_end = data_file_off + data_size as usize;
+                        let buf_len = buf.len();
+                        if path_start + pdb_path.len() + 1 <= path_end.min(buf_len) {
+                            // Clear old path.
+                            buf[path_start..path_end.min(buf_len)].fill(0);
+                            // Write new path.
+                            buf[path_start..path_start + pdb_path.len()]
+                                .copy_from_slice(pdb_path);
+                        }
+                    }
+                }
+            }
+        }
+        offset += 28;
     }
 }
 
@@ -1039,6 +1296,21 @@ fn jitter_version_build(blob: &mut Vec<u8>) {
 /// On non-Windows targets (where the binary is ELF or Mach-O rather than PE)
 /// the function returns `Ok(())` immediately after logging a message — all
 /// operations are no-ops.
+///
+/// # Operation order
+///
+/// 1. Strip overlay/appended data (removes identifiable signatures beyond last section)
+/// 2. Replace DOS stub with random bytes
+/// 3. Randomize TimeDateStamp to a plausible date
+/// 4. Replace Rich header with synthetic MSVC-looking header
+/// 5. Replace PDB path in debug directory with plausible path
+/// 6. Randomize section names
+/// 7. Strip digital signature (optional, default: on)
+/// 8. Strip debug directory (optional, default: on — removes PDB reference entirely)
+/// 9. Inject version info resource (optional)
+/// 10. Inject icon resource (optional)
+/// 11. Inject manifest resource (optional)
+/// 12. Recalculate PE checksum
 pub fn apply_all(buf: &mut Vec<u8>, cfg: &PayloadConfig) -> Result<()> {
     // Detect PE vs non-PE by checking the MZ magic.
     if buf.len() < 2 || &buf[0..2] != b"MZ" {
@@ -1046,49 +1318,57 @@ pub fn apply_all(buf: &mut Vec<u8>, cfg: &PayloadConfig) -> Result<()> {
         return Ok(());
     }
 
-    info!("artifact kit: applying PE hardening operations");
+    info!("artifact kit: applying comprehensive PE hardening operations");
 
-    // 1. Timestamp zeroing.
-    zero_timestamp(buf);
-    info!("artifact kit: timestamp zeroed");
+    // 1. Strip overlay/appended data beyond the last section.
+    strip_overlay(buf);
+    info!("artifact kit: overlay data stripped");
 
-    // 2. Rich header removal.
+    // 2. Replace DOS stub with random bytes.
+    replace_dos_stub(buf);
+    info!("artifact kit: DOS stub replaced");
+
+    // 3. Randomize TimeDateStamp to a plausible date.
+    randomize_timestamp(buf);
+    info!("artifact kit: timestamp randomized");
+
+    // 4. Replace Rich header with synthetic MSVC header.
     remove_rich_header(buf);
-    info!("artifact kit: Rich header removed");
+    info!("artifact kit: Rich header replaced with synthetic header");
 
-    // 3. Section name randomization.
+    // 5. Replace PDB path with plausible path (before optional strip).
+    replace_pdb_path(buf);
+    info!("artifact kit: PDB path replaced");
+
+    // 6. Randomize section names.
     randomize_section_names(buf);
     info!("artifact kit: section names randomized");
 
-    // 4. Entropy padding.
-    add_entropy_padding(buf);
-    info!("artifact kit: entropy padding added");
-
-    // 5. Strip digital signature.
+    // 7. Strip digital signature.
     if cfg.strip_signature {
         strip_signature(buf);
         info!("artifact kit: digital signature stripped");
     }
 
-    // 6. Strip debug directory.
+    // 8. Strip debug directory (removes PDB reference entirely).
     if cfg.strip_debug {
         strip_debug_directory(buf);
         info!("artifact kit: debug directory stripped");
     }
 
-    // 7. Inject version info.
+    // 9. Inject version info.
     if let Some(ref vi) = cfg.version_info {
         inject_version_info(buf, vi).context("artifact kit: version info injection failed")?;
         info!("artifact kit: version info injected");
     }
 
-    // 8. Inject icon.
+    // 10. Inject icon.
     if let Some(ref icon) = cfg.icon_path {
         inject_icon(buf, icon).context("artifact kit: icon injection failed")?;
         info!("artifact kit: icon injected");
     }
 
-    // 9. Inject manifest.
+    // 11. Inject manifest.
     let manifest = cfg.custom_manifest.as_deref()
         .or(cfg.manifest_preset.as_deref());
     if let Some(m) = manifest {
@@ -1096,24 +1376,34 @@ pub fn apply_all(buf: &mut Vec<u8>, cfg: &PayloadConfig) -> Result<()> {
         info!("artifact kit: manifest injected");
     }
 
-    // 10. Recalculate PE checksum.
+    // 12. Recalculate PE checksum.
     recalculate_checksum(buf);
     info!("artifact kit: PE checksum recalculated");
 
     Ok(())
 }
 
-/// Apply only the original four hardening operations (for the standalone CLI).
+/// Apply the full suite of hardening operations (for the standalone CLI).
+///
+/// Applies all non-optional hardening operations.  Optional operations like
+/// signature stripping, version info injection, etc. require the full
+/// [`apply_all`] entry point with a [`PayloadConfig`].
 #[allow(dead_code)]
 pub fn apply_hardening_only(buf: &mut Vec<u8>) {
     if buf.len() < 2 || &buf[0..2] != b"MZ" {
         info!("pe-hardener: binary does not start with MZ — operations skipped");
         return;
     }
-    zero_timestamp(buf);
+    strip_overlay(buf);
+    replace_dos_stub(buf);
+    randomize_timestamp(buf);
     remove_rich_header(buf);
+    replace_pdb_path(buf);
+    strip_debug_directory(buf);
+    strip_signature(buf);
     randomize_section_names(buf);
     add_entropy_padding(buf);
+    recalculate_checksum(buf);
 }
 
 #[cfg(test)]

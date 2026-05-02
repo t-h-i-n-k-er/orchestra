@@ -1,7 +1,6 @@
 #[cfg(target_os = "linux")]
 pub mod linux_inject;
 
-#[cfg(windows)]
 pub mod dll_sideload;
 #[cfg(windows)]
 pub mod early_bird;

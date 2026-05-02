@@ -22,6 +22,13 @@ pub struct BuildRequest {
     pub pin: String,
     pub key: String,
     pub output_dir: Option<String>,
+    /// Optional hex-encoded 64-bit seed for reproducible builds.  When set,
+    /// both `OPTIMIZER_STUB_SEED` and `CODE_TRANSFORM_SEED` are pinned to
+    /// this value so the output binary is bit-for-bit identical across builds.
+    /// When absent, the builder generates fresh random seeds, producing a
+    /// unique binary every time.
+    #[serde(default)]
+    pub seed: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -209,6 +216,19 @@ pub async fn handle_build(
             }),
         ));
     }
+    if let Some(ref seed_hex) = req.seed {
+        if let Err(e) = validate_seed(seed_hex) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(BuildResponse {
+                    job_id: None,
+                    log: None,
+                    status: None,
+                    error: Some(e.to_string()),
+                }),
+            ));
+        }
+    }
 
     // Initialize lazily if not done
     if JOB_SENDER.get().is_none() {
@@ -336,6 +356,12 @@ fn execute_build_safely(
         .arg("--")
         .arg("build")
         .arg("temp_profile");
+
+    // Pass the reproducibility seed through to the builder CLI when the
+    // operator supplied one.
+    if let Some(ref seed_hex) = req.seed {
+        cmd.arg("--seed").arg(seed_hex);
+    }
 
     let profile_dir = tmp_path.join("profiles");
     std::fs::create_dir_all(&profile_dir)?;
@@ -510,6 +536,16 @@ fn validate_cert_pin(pin: &str) -> anyhow::Result<()> {
     let pin = pin.trim();
     if pin.len() != 64 || !pin.chars().all(|c| c.is_ascii_hexdigit()) {
         anyhow::bail!("pin must be a SHA-256 certificate fingerprint encoded as 64 hex characters");
+    }
+    Ok(())
+}
+
+fn validate_seed(seed_hex: &str) -> anyhow::Result<()> {
+    let s = seed_hex.trim().trim_start_matches("0x");
+    if s.len() > 16 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "seed must be a hex-encoded u64 (up to 16 hex characters, e.g. 'a1b2c3d4e5f6a7b8')"
+        );
     }
     Ok(())
 }

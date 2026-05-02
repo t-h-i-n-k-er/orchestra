@@ -185,53 +185,10 @@ mod imp {
         unsafe { winapi::um::handleapi::CloseHandle(handle) };
     }
 
-    /// Bridge a single pipe connection to the agent TCP listener.
-    ///
-    /// Spawns two blocking tasks:
-    /// - pipe → TCP
-    /// - TCP → pipe
-    pub async fn bridge_pipe_to_tcp(
-        pipe_handle: *mut std::ffi::c_void,
-        agent_addr: std::net::SocketAddr,
-    ) -> Result<()> {
-        let tcp = TcpStream::connect(agent_addr).await?;
-        tcp.set_nodelay(true)?;
-        let (mut tcp_r, mut tcp_w) = tcp.into_split();
-
-        // Pipe → TCP direction.
-        let pipe_to_tcp = tokio::task::spawn_blocking(move || {
-            let mut buf = Vec::with_capacity(4096);
-            loop {
-                if let Err(e) = read_frame_sync(pipe_handle, &mut buf) {
-                    tracing::debug!("smb_relay: pipe→TCP read ended: {e}");
-                    return;
-                }
-                // Send the frame (len prefix + payload) over TCP.
-                // We already have the raw bytes in `buf` from read_frame_sync,
-                // but read_frame_sync strips the length prefix and only puts
-                // the payload in buf. We need to re-add it.
-                // Actually, let's re-read the design: the relay is transparent,
-                // so it should forward the raw framed bytes. Let me adjust:
-                // read_frame_sync reads len + payload, but stores only payload.
-                // For transparent bridging we need to forward len + payload.
-                // So we write the length prefix first, then the payload.
-                let len_bytes = (buf.len() as u32).to_le_bytes();
-                // Use blocking write on TCP via a runtime handle...
-                // Actually we're in spawn_blocking, so we can't do async TCP.
-                // Let's use std::net::TcpStream instead.
-                break;
-            }
-        });
-
-        // TCP → Pipe direction.
-        let tcp_to_pipe = tokio::task::spawn_blocking(move || {
-            // Same issue — can't do async TCP from blocking context.
-        });
-
-        let _ = pipe_to_tcp.await;
-        let _ = tcp_to_pipe.await;
-        Ok(())
-    }
+    // NOTE: The original bridge_pipe_to_tcp was dead code — the blocking
+    // tasks could not perform async TCP I/O.  The working implementation
+    // lives in the top-level bridge_connection() function which uses mpsc
+    // channels to decouple blocking pipe I/O from async TCP.
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
