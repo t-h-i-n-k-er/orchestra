@@ -227,12 +227,12 @@ impl DohRuntime {
 
         let prefix = &labels[..labels.len() - self.domain_labels.len()];
         match prefix {
-            [kind, session_id] if kind == "beacon" && is_hex(session_id) => {
+            [kind, session_id] if kind == common::ioc::IOC_DNS_BEACON && is_hex(session_id) => {
                 Some(ParsedName::Beacon {
                     session_id: session_id.clone(),
                 })
             }
-            [kind, session_id] if kind == "task" && is_hex(session_id) => {
+            [kind, session_id] if kind == common::ioc::IOC_DNS_TASK && is_hex(session_id) => {
                 Some(ParsedName::Task {
                     session_id: session_id.clone(),
                 })

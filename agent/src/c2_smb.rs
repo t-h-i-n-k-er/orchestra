@@ -318,7 +318,7 @@ impl SmbPipeTransport {
     ///
     /// Reads configuration from `MalleableProfile`:
     /// - `smb_pipe_host` — target host (required)
-    /// - `smb_pipe_name` — pipe name (defaults to "orchestra")
+    /// - `smb_pipe_name` — pipe name (defaults to the compile-time randomised constant)
     /// - `smb_pipe_mode` — "smb" or "tcp_relay" (defaults to "smb")
     /// - `smb_tcp_relay_port` — TCP relay port (defaults to 4455)
     pub async fn new(
@@ -333,7 +333,7 @@ impl SmbPipeTransport {
         let pipe_name = profile
             .smb_pipe_name
             .as_deref()
-            .unwrap_or("orchestra");
+            .unwrap_or(common::ioc::IOC_PIPE_NAME);
 
         let mode = profile
             .smb_pipe_mode

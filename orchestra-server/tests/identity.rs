@@ -116,10 +116,6 @@ impl FakeAgent {
         let domain = rustls::pki_types::ServerName::try_from("localhost".to_owned()).unwrap();
         let mut tls_stream = connector.connect(domain, tcp).await.unwrap();
 
-        #[cfg(not(feature = "forward-secrecy"))]
-        let session = CryptoSession::from_shared_secret(SECRET.as_bytes());
-
-        #[cfg(feature = "forward-secrecy")]
         let session = common::forward_secrecy::negotiate_session_key(
             &mut tls_stream,
             SECRET.as_bytes(),

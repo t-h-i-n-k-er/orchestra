@@ -29,8 +29,8 @@ pub const PROTOCOL_VERSION: u32 = 2;
 
 pub mod audit;
 pub mod config;
-#[cfg(feature = "forward-secrecy")]
 pub mod forward_secrecy;
+pub mod ioc;
 pub mod normalized_transport;
 pub mod tls_transport;
 

@@ -53,8 +53,8 @@ pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
         }
     }
     let mut rng = thread_rng();
-    // Enforce a minimum of ±20% jitter to defeat timing-based sleep detection.
-    let jitter_frac = ((config.jitter_percent as f64) / 100.0).max(0.20);
+    // Enforce a minimum of ±40% jitter to defeat timing-based sleep detection.
+    let jitter_frac = ((config.jitter_percent as f64) / 100.0).max(0.40);
     let jitter_val = base * jitter_frac;
     let offset = rng.gen_range(-jitter_val..=jitter_val);
     std::time::Duration::from_secs_f64((base + offset).max(1.0))

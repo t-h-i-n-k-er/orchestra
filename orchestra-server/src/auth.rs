@@ -1,4 +1,5 @@
-//! Bearer-token authentication middleware. Constant-time comparison.
+//! Bearer-token authentication middleware. Supports multi-operator lookup
+//! with constant-time comparison, falling back to the legacy admin token.
 
 use axum::{
     extract::State,
@@ -11,6 +12,7 @@ use subtle::ConstantTimeEq;
 
 use crate::state::AppState;
 
+/// Identity of the authenticated operator, attached as a request extension.
 #[derive(Clone)]
 pub struct AuthenticatedUser(pub String);
 
@@ -26,15 +28,21 @@ pub async fn require_bearer(
         .unwrap_or("");
 
     let presented = header_val.strip_prefix("Bearer ").unwrap_or("");
-    let expected = state.admin_token.as_bytes();
 
-    let ok: bool = presented.as_bytes().ct_eq(expected).into();
-    if !ok {
-        return Err(StatusCode::UNAUTHORIZED);
+    // 1. Try the multi-operator store (constant-time SHA-256 hash comparison).
+    if let Some(operator_id) = state.authenticate_operator(presented) {
+        req.extensions_mut()
+            .insert(AuthenticatedUser(operator_id));
+        return Ok(next.run(req).await);
     }
 
-    // Tag the request with a synthetic user identity for audit logs.
-    req.extensions_mut()
-        .insert(AuthenticatedUser("admin".into()));
-    Ok(next.run(req).await)
+    // 2. Fallback: legacy single admin token (constant-time direct comparison).
+    let ok: bool = presented.as_bytes().ct_eq(state.admin_token.as_bytes()).into();
+    if ok {
+        req.extensions_mut()
+            .insert(AuthenticatedUser("admin".into()));
+        return Ok(next.run(req).await);
+    }
+
+    Err(StatusCode::UNAUTHORIZED)
 }

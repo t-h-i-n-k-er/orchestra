@@ -3737,6 +3737,7 @@ dependencies = [
  "clap",
  "common",
  "dashmap",
+ "ed25519-dalek",
  "futures-util",
  "hex",
  "hmac",

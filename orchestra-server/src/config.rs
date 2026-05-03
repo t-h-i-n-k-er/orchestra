@@ -2,8 +2,72 @@
 
 use common::normalized_transport::TrafficProfile;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+
+/// A single operator identity loaded from the `[operators]` TOML section.
+///
+/// Each operator has their own bearer token, which is stored as a SHA-256
+/// hash and compared in constant time during authentication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorConfig {
+    /// Human-readable name (shown in audit logs and the dashboard).
+    pub name: String,
+    /// Bearer token presented by this operator.  Stored as a SHA-256 hex
+    /// digest at load time — the plaintext is never retained.
+    pub token: String,
+    /// Comma-separated permission flags.  Currently informational; all
+    /// authenticated operators have full access.  Reserved for future RBAC.
+    #[serde(default)]
+    pub permissions: Vec<String>,
+}
+
+/// Resolved operator record used at runtime by the auth middleware.
+#[derive(Debug)]
+pub struct OperatorRecord {
+    pub id: String,
+    pub name: String,
+    /// SHA-256 hash of the bearer token (hex-encoded).
+    pub token_hash: String,
+    pub permissions: Vec<String>,
+    pub last_seen: std::sync::atomic::AtomicU64,
+}
+
+impl Clone for OperatorRecord {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            token_hash: self.token_hash.clone(),
+            permissions: self.permissions.clone(),
+            last_seen: std::sync::atomic::AtomicU64::new(
+                self.last_seen.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+}
+
+impl OperatorRecord {
+    /// Compute a SHA-256 hex digest of a bearer token.
+    pub fn hash_token(token: &str) -> String {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(token.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    /// Build an `OperatorRecord` from a config entry, assigning the given id.
+    pub fn from_config(id: &str, cfg: &OperatorConfig) -> Self {
+        Self {
+            id: id.to_string(),
+            name: cfg.name.clone(),
+            token_hash: Self::hash_token(&cfg.token),
+            permissions: cfg.permissions.clone(),
+            last_seen: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -72,6 +136,37 @@ pub struct ServerConfig {
     /// non-empty, the client cert's OU must appear in this list.
     #[serde(default)]
     pub mtls_allowed_ous: Vec<String>,
+    // ── Module signing ──────────────────────────────────────────────────
+    /// Ed25519 signing key for module binaries.  Base64-encoded 32-byte
+    /// seed (the same format produced by `keygen --module-signing-key`).
+    /// When set, any module pushed to an agent via `ModulePush` is signed
+    /// before encryption.  The agent verifies the signature against its
+    /// embedded (or configured) Ed25519 public key before loading.
+    #[serde(default)]
+    pub module_signing_key: Option<String>,
+    /// AES-256 key used to encrypt module blobs pushed to agents.
+    /// Base64-encoded 32 bytes — must match the `module_aes_key` configured
+    /// on every agent that will receive pushed modules.
+    #[serde(default)]
+    pub module_aes_key: Option<String>,
+    // ── Multi-operator support ─────────────────────────────────────────
+    /// Named operators loaded from the `[operators]` TOML map.
+    /// Each entry key becomes the operator ID; the sub-table contains
+    /// `name`, `token`, and optional `permissions`.
+    ///
+    /// Example TOML:
+    /// ```toml
+    /// [operators.alice]
+    /// name = "Alice (lead)"
+    /// token = "secret-bearer-token-for-alice"
+    ///
+    /// [operators.bob]
+    /// name = "Bob"
+    /// token = "secret-bearer-token-for-bob"
+    /// permissions = ["read"]
+    /// ```
+    #[serde(default)]
+    pub operators: HashMap<String, OperatorConfig>,
     // ── SMB named-pipe relay ───────────────────────────────────────────────
     /// Enable the server-side SMB named-pipe relay.  The relay creates a
     /// Windows named pipe and bridges each connection to the agent TCP
@@ -79,7 +174,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub smb_relay_enabled: bool,
     /// Name of the pipe to create (without the `\\.\pipe\` prefix).
-    /// Defaults to `"orchestra"`.
+    /// Defaults to the compile-time randomised constant from `common::ioc::IOC_PIPE_NAME`.
     #[serde(default = "default_smb_relay_pipe_name")]
     pub smb_relay_pipe_name: String,
     /// Maximum number of concurrent pipe instances.  Defaults to 4.
@@ -112,7 +207,7 @@ fn default_doh_idle_ip() -> String {
     "104.18.5.22".to_string()
 }
 fn default_smb_relay_pipe_name() -> String {
-    "orchestra".to_string()
+    common::ioc::IOC_PIPE_NAME.to_string()
 }
 fn default_smb_relay_max_instances() -> u32 {
     4
@@ -143,6 +238,9 @@ impl Default for ServerConfig {
             mtls_ca_cert_path: None,
             mtls_allowed_cns: Vec::new(),
             mtls_allowed_ous: Vec::new(),
+            operators: HashMap::new(),
+            module_signing_key: None,
+            module_aes_key: None,
             smb_relay_enabled: false,
             smb_relay_pipe_name: default_smb_relay_pipe_name(),
             smb_relay_max_instances: default_smb_relay_max_instances(),

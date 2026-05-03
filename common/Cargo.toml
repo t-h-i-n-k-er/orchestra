@@ -20,21 +20,23 @@ rustls = { version = "0.23.38", default-features = false, features = ["ring", "s
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2.2.0"
 hkdf = { version = "0.12" }
-hmac = { version = "0.12", optional = true }
+hmac = { version = "0.12" }
 zeroize = "1"
 
 # Optional: Ed25519 signatures for module verification.
 # Enabled by the `module-signatures` feature.
 ed25519-dalek = { version = "2", optional = true }
-# Optional: X25519 ephemeral DH for application-layer forward secrecy.
-# Enabled by the `forward-secrecy` feature.
-x25519-dalek = { version = "2", optional = true }
+# X25519 ephemeral DH for application-layer forward secrecy.
+# Always enabled — each session performs ECDH to derive a per-session key.
+x25519-dalek = { version = "2" }
 bincode = "1.3.3"
 
 [features]
 module-signatures = ["dep:ed25519-dalek"]
 dangerous-tls = []
-forward-secrecy = ["dep:x25519-dalek", "dep:hmac"]
+# Legacy no-op feature kept for backward compat with CI/build scripts.
+# Forward secrecy (X25519 ECDH) is now always enabled.
+forward-secrecy = []
 
 [dev-dependencies]
 serde_json = "1.0"

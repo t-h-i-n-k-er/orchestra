@@ -9,12 +9,14 @@
 //! the dashboard and clean up by closing the rogue connection.
 
 use crate::audit::AuditLog;
-use crate::config::ServerConfig;
+use crate::config::{OperatorRecord, ServerConfig};
 use common::Message;
 use dashmap::{DashMap, DashSet};
 use rand::RngCore;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
 
 /// One connected agent.  `connection_id` is assigned by the server on accept.
@@ -70,7 +72,13 @@ pub struct AppState {
     pub registry: DashMap<String, AgentEntry>,
     pub pending: DashMap<String, oneshot::Sender<Result<String, String>>>,
     pub audit: Arc<AuditLog>,
+    /// Legacy single-admin token kept for backward compat and as a fallback
+    /// when no `[operators]` section is defined in the config.
     pub admin_token: String,
+    /// Per-operator records keyed by operator ID.  Populated at startup from
+    /// the `[operators]` TOML section.  When empty, the legacy `admin_token`
+    /// is used instead.
+    pub operators: HashMap<String, OperatorRecord>,
     pub command_timeout_secs: u64,
     pub config: ServerConfig,
     /// Set of morph seeds currently assigned to active agents.  Ensures no
@@ -86,15 +94,52 @@ impl AppState {
         command_timeout_secs: u64,
         config: ServerConfig,
     ) -> Self {
+        // Build the operator store from config.
+        let operators: HashMap<String, OperatorRecord> = config
+            .operators
+            .iter()
+            .map(|(id, cfg)| (id.clone(), OperatorRecord::from_config(id, cfg)))
+            .collect();
+        if !operators.is_empty() {
+            tracing::info!(
+                count = operators.len(),
+                "loaded operator credentials from config"
+            );
+        }
         Self {
             registry: DashMap::new(),
             pending: DashMap::new(),
             audit,
             admin_token,
+            operators,
             command_timeout_secs,
             config,
             assigned_seeds: DashSet::new(),
         }
+    }
+
+    /// Look up a bearer token against the operator store.  Returns the
+    /// operator ID on match, or `None` if no operator matched.
+    ///
+    /// Comparison is constant-time: the presented token is hashed with
+    /// SHA-256, then compared against each stored hash with `subtle::ct_eq`.
+    pub fn authenticate_operator(&self, presented_token: &str) -> Option<String> {
+        let presented_hash = OperatorRecord::hash_token(presented_token);
+        for (_id, op) in &self.operators {
+            let ok: bool = presented_hash.as_bytes().ct_eq(op.token_hash.as_bytes()).into();
+            if ok {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                op.last_seen.store(
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                return Some(op.id.clone());
+            }
+        }
+        None
     }
 
     /// Generate a unique morph seed that is not currently assigned to any

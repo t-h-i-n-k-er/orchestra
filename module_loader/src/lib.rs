@@ -50,6 +50,9 @@ pub mod manual_map;
 use ed25519_dalek::{Signature, VerifyingKey};
 
 #[cfg(feature = "module-signatures")]
+use sha2::Digest as _;
+
+#[cfg(feature = "module-signatures")]
 #[allow(dead_code)]
 const MODULE_SIGNING_PUBKEY: [u8; 32] = [
     0xc4, 0x5a, 0x22, 0x2a, 0x6a, 0x94, 0x86, 0xa5, 0xef, 0x72, 0xa7, 0xee, 0x2e, 0xb2, 0x4d, 0xf3,
@@ -440,7 +443,14 @@ pub fn load_plugin(
             MODULE_SIGNING_PUBKEY
         };
         let public_key = VerifyingKey::from_bytes(&pub_key_bytes)?;
-        public_key.verify_strict(module_bytes, &signature)?;
+        // The signature covers SHA-256(module_bytes) || module_bytes, matching
+        // the server's `sign_module()` function.  This binds the hash to the
+        // payload and prevents existential-forgery edge cases on raw bytes.
+        let hash = sha2::Sha256::digest(module_bytes);
+        let mut msg = Vec::with_capacity(32 + module_bytes.len());
+        msg.extend_from_slice(&hash);
+        msg.extend_from_slice(module_bytes);
+        public_key.verify_strict(&msg, &signature)?;
         info!("Module signature verified successfully.");
         module_bytes
     };
@@ -663,8 +673,13 @@ mod tests {
         #[cfg(feature = "module-signatures")]
         let payload = {
             use ed25519_dalek::Signer;
+            use sha2::Digest;
             let signing_key = ed25519_dalek::SigningKey::from_bytes(&MODULE_TEST_SIGNING_SEED);
-            let sig = signing_key.sign(&plugin_bytes);
+            let hash = sha2::Sha256::digest(&plugin_bytes);
+            let mut msg = Vec::with_capacity(32 + plugin_bytes.len());
+            msg.extend_from_slice(&hash);
+            msg.extend_from_slice(&plugin_bytes);
+            let sig = signing_key.sign(&msg);
             let mut signed = Vec::with_capacity(64 + plugin_bytes.len());
             signed.extend_from_slice(sig.to_bytes().as_ref());
             signed.extend_from_slice(&plugin_bytes);
@@ -707,8 +722,13 @@ mod tests {
 
         // 2. Sign it
         use ed25519_dalek::Signer;
+        use sha2::Digest;
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&MODULE_TEST_SIGNING_SEED);
-        let signature = signing_key.sign(&plugin_bytes);
+        let hash = sha2::Sha256::digest(&plugin_bytes);
+        let mut msg = Vec::with_capacity(32 + plugin_bytes.len());
+        msg.extend_from_slice(&hash);
+        msg.extend_from_slice(&plugin_bytes);
+        let signature = signing_key.sign(&msg);
         let mut signed_payload = Vec::with_capacity(64 + plugin_bytes.len());
         signed_payload.extend_from_slice(signature.to_bytes().as_ref());
         signed_payload.append(&mut plugin_bytes);

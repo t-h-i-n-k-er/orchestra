@@ -112,19 +112,13 @@ async fn handle_agent(
     sock.set_nodelay(true).ok();
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-    // `mut` is only needed when the forward-secrecy feature is enabled
-    // (negotiate_session_key takes &mut tls_stream).  In the default build
-    // the warning fires because the non-forward-secrecy path never mutates
-    // the stream, so we gate the binding mutability on the feature.
-    #[cfg(feature = "forward-secrecy")]
+    // `mut` is needed because negotiate_session_key takes &mut tls_stream.
     let mut tls_stream = acceptor.accept(sock).await?;
-    #[cfg(not(feature = "forward-secrecy"))]
-    let tls_stream = acceptor.accept(sock).await?;
 
-    // When forward-secrecy is enabled, perform an X25519 ECDH exchange before
-    // the first application message.  The derived per-session key replaces the
+    // Forward secrecy: perform an X25519 ECDH exchange before the first
+    // application message.  The derived per-session key replaces the
     // static PSK-derived key, providing PFS at the application layer.
-    #[cfg(feature = "forward-secrecy")]
+    // This is mandatory — if the handshake fails, the connection is rejected.
     let session = Arc::new(
         common::forward_secrecy::negotiate_session_key(
             &mut tls_stream,
@@ -133,8 +127,6 @@ async fn handle_agent(
         )
         .await?,
     );
-    #[cfg(not(feature = "forward-secrecy"))]
-    let session = Arc::new(CryptoSession::from_shared_secret(secret.as_bytes()));
 
     // mTLS: after the TLS handshake, extract and log the client certificate CN.
     // When mtls_enabled is true the WebPkiClientVerifier has already verified

