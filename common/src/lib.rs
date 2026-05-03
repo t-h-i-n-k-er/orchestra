@@ -146,6 +146,18 @@ pub enum Message {
         agent_id: String,
         children: Vec<P2pChildInfo>,
     },
+    /// P2P mesh link failure report.  Sent by an agent to the server when
+    /// a P2P link transitions to `Dead` state.  Contains quality metrics
+    /// captured at the time of failure for server-side mesh monitoring.
+    P2pLinkFailureReport {
+        agent_id: String,
+        dead_peer_id: String,
+        link_type: u8,
+        uptime_secs: u64,
+        latency_ms: u32,
+        packet_loss: f32,
+        bandwidth_bps: u64,
+    },
 }
 
 /// A single child entry in a [`Message::P2pTopologyReport`].

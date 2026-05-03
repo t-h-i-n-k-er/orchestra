@@ -56,6 +56,12 @@ pub enum P2pFrameType {
     RouteProbeReply = 0x32,
     /// Server → Agent: peer discovery directive with connection details.
     PeerDiscovery = 0x33,
+    /// Bidirectional: bandwidth probe — payload is random bytes; receiver
+    /// echoes it back immediately so the sender can measure round-trip time.
+    BandwidthProbe = 0x34,
+    /// Agent → Server: report that a P2P link has died, including quality
+    /// metrics captured at the time of failure.
+    LinkFailureReport = 0x35,
 }
 
 impl P2pFrameType {
@@ -75,6 +81,8 @@ impl P2pFrameType {
             0x31 => Some(Self::RouteProbe),
             0x32 => Some(Self::RouteProbeReply),
             0x33 => Some(Self::PeerDiscovery),
+            0x34 => Some(Self::BandwidthProbe),
+            0x35 => Some(Self::LinkFailureReport),
             _ => None,
         }
     }
@@ -388,6 +396,127 @@ impl PeerTarget {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// BandwidthProbe serialization
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Bandwidth probe payload: just raw bytes (random padding).
+/// The receiver echoes the exact same payload back.
+///
+/// Wire format: `[payload_len: u32 LE] [padding: bytes]`
+///
+/// Note: the actual P2P frame already carries `payload_len`, so the
+/// serialization here is simply the raw padding bytes.  The 4-byte length
+/// prefix is **not** duplicated — it lives in the frame header.
+
+/// Default bandwidth probe payload size (4 KiB).
+pub const BANDWIDTH_PROBE_SIZE: usize = 4096;
+
+/// Serialize a `BandwidthProbe` payload — just random bytes.
+///
+/// The caller should fill `padding` with cryptographically random data.
+pub fn serialize_bandwidth_probe(padding: &[u8]) -> Vec<u8> {
+    padding.to_vec()
+}
+
+/// Deserialize a `BandwidthProbe` payload — returns the raw bytes.
+pub fn deserialize_bandwidth_probe(data: &[u8]) -> Vec<u8> {
+    data.to_vec()
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// LinkFailureReport serialization
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Data about a failed link, sent from the agent to the server.
+///
+/// Wire format:
+/// ```text
+/// [ dead_peer_id_len: u16 LE ] [ dead_peer_id: bytes ]
+/// [ link_type: u8 ]            (0 = Parent, 1 = Child, 2 = Peer)
+/// [ uptime_secs: u64 LE ]
+/// [ latency_ms: u32 LE ]
+/// [ packet_loss: f32 LE ]
+/// [ bandwidth_bps: u64 LE ]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkFailureReportData {
+    /// Agent ID of the peer on the dead link.
+    pub dead_peer_id: String,
+    /// Topology type of the dead link.
+    pub link_type: u8,
+    /// How long the link was alive before failure, in seconds.
+    pub uptime_secs: u64,
+    /// Last-known latency in milliseconds.
+    pub latency_ms: u32,
+    /// Last-known packet loss ratio (0.0–1.0).
+    pub packet_loss: f32,
+    /// Last-known estimated bandwidth in bits per second.
+    pub bandwidth_bps: u64,
+}
+
+impl LinkFailureReportData {
+    /// Serialize the report into bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let id_bytes = self.dead_peer_id.as_bytes();
+        buf.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(id_bytes);
+        buf.push(self.link_type);
+        buf.extend_from_slice(&self.uptime_secs.to_le_bytes());
+        buf.extend_from_slice(&self.latency_ms.to_le_bytes());
+        buf.extend_from_slice(&self.packet_loss.to_le_bytes());
+        buf.extend_from_slice(&self.bandwidth_bps.to_le_bytes());
+        buf
+    }
+
+    /// Deserialize a `LinkFailureReport` payload.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 2 {
+            return Err("LinkFailureReport: payload too short".to_string());
+        }
+        let id_len = u16::from_le_bytes([data[0], data[1]]) as usize;
+        if data.len() < 2 + id_len + 1 + 8 + 4 + 4 + 8 {
+            return Err(format!(
+                "LinkFailureReport: payload too short: {} < {}",
+                data.len(),
+                2 + id_len + 25
+            ));
+        }
+        let mut offset = 2;
+        let dead_peer_id = String::from_utf8(data[offset..offset + id_len].to_vec())
+            .map_err(|e| format!("LinkFailureReport: invalid peer_id UTF-8: {e}"))?;
+        offset += id_len;
+        let link_type = data[offset];
+        offset += 1;
+        let uptime_secs = u64::from_le_bytes([
+            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+        ]);
+        offset += 8;
+        let latency_ms = u32::from_le_bytes([
+            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+        ]);
+        offset += 4;
+        let packet_loss = f32::from_le_bytes([
+            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+        ]);
+        offset += 4;
+        let bandwidth_bps = u64::from_le_bytes([
+            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+        ]);
+        Ok(Self {
+            dead_peer_id,
+            link_type,
+            uptime_secs,
+            latency_ms,
+            packet_loss,
+            bandwidth_bps,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +570,8 @@ mod tests {
             P2pFrameType::RouteProbe,
             P2pFrameType::RouteProbeReply,
             P2pFrameType::PeerDiscovery,
+            P2pFrameType::BandwidthProbe,
+            P2pFrameType::LinkFailureReport,
         ] {
             assert_eq!(P2pFrameType::from_u8(v as u8), Some(v));
         }
@@ -518,5 +649,34 @@ mod tests {
         assert_eq!(parsed[0].address, "10.0.0.1:9050");
         assert_eq!(parsed[1].agent_id, "agent-2");
         assert_eq!(parsed[1].address, r"\\.\pipe\test-pipe");
+    }
+
+    #[test]
+    fn bandwidth_probe_roundtrip() {
+        let padding = vec![0xAB; BANDWIDTH_PROBE_SIZE];
+        let serialized = serialize_bandwidth_probe(&padding);
+        assert_eq!(serialized.len(), BANDWIDTH_PROBE_SIZE);
+        let deserialized = deserialize_bandwidth_probe(&serialized);
+        assert_eq!(deserialized, padding);
+    }
+
+    #[test]
+    fn link_failure_report_roundtrip() {
+        let report = LinkFailureReportData {
+            dead_peer_id: "agent-dead-42".to_string(),
+            link_type: 2, // Peer
+            uptime_secs: 3600,
+            latency_ms: 150,
+            packet_loss: 0.05,
+            bandwidth_bps: 1_000_000,
+        };
+        let bytes = report.to_bytes();
+        let parsed = LinkFailureReportData::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.dead_peer_id, "agent-dead-42");
+        assert_eq!(parsed.link_type, 2);
+        assert_eq!(parsed.uptime_secs, 3600);
+        assert_eq!(parsed.latency_ms, 150);
+        assert!((parsed.packet_loss - 0.05).abs() < f32::EPSILON);
+        assert_eq!(parsed.bandwidth_bps, 1_000_000);
     }
 }

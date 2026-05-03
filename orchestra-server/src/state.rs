@@ -18,6 +18,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
+use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot, RwLock};
 
 /// One connected agent.  `connection_id` is assigned by the server on accept.
@@ -92,7 +93,33 @@ pub struct TopologyMap {
     /// correct `P2pToChild` routing envelopes.
     #[serde(skip)]
     pub child_link_map: HashMap<(String, String), u32>,
+    /// Recent link failure reports (bounded, newest first).
+    pub link_failures: Vec<LinkFailureRecord>,
 }
+
+/// Record of a P2P link failure reported by an agent.
+#[derive(Clone, Debug, Serialize)]
+pub struct LinkFailureRecord {
+    /// Agent that reported the failure.
+    pub agent_id: String,
+    /// Agent ID of the dead peer.
+    pub dead_peer_id: String,
+    /// Link type: 0=parent, 1=child, 2=peer.
+    pub link_type: u8,
+    /// How long the link was alive (seconds).
+    pub uptime_secs: u64,
+    /// Last known RTT (ms).
+    pub latency_ms: u32,
+    /// Packet loss ratio (0.0–1.0).
+    pub packet_loss: f32,
+    /// Estimated bandwidth at time of failure (bps).
+    pub bandwidth_bps: u64,
+    /// When this report was received by the server.
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Maximum number of link failure records to keep.
+const MAX_LINK_FAILURE_RECORDS: usize = 1000;
 
 pub struct AppState {
     /// Registry keyed by connection_id.
@@ -363,6 +390,181 @@ impl AppState {
         // be cleaned up when their own heartbeats time out, or when the
         // parent reconnects and sends an updated topology report.
     }
+
+    /// Record a link failure report from an agent.
+    pub async fn record_link_failure(
+        &self,
+        agent_id: &str,
+        dead_peer_id: &str,
+        link_type: u8,
+        uptime_secs: u64,
+        latency_ms: u32,
+        packet_loss: f32,
+        bandwidth_bps: u64,
+    ) {
+        let mut topo = self.topology.write().await;
+
+        let record = LinkFailureRecord {
+            agent_id: agent_id.to_string(),
+            dead_peer_id: dead_peer_id.to_string(),
+            link_type,
+            uptime_secs,
+            latency_ms,
+            packet_loss,
+            bandwidth_bps,
+            timestamp: Utc::now(),
+        };
+
+        // Insert at front, trim to max capacity.
+        topo.link_failures.insert(0, record);
+        topo.link_failures.truncate(MAX_LINK_FAILURE_RECORDS);
+
+        // Clean up stale child_link_map entries for the dead link.
+        match link_type {
+            // child link: agent_id was the parent, dead_peer_id was the child
+            1 => {
+                topo.child_link_map
+                    .remove(&(agent_id.to_string(), dead_peer_id.to_string()));
+                // Remove dead child from parent's children list.
+                if let Some(parent_node) = topo.nodes.get_mut(agent_id) {
+                    parent_node.children.retain(|c| c != dead_peer_id);
+                }
+                // Clear parent pointer on the dead child.
+                if let Some(child_node) = topo.nodes.get_mut(dead_peer_id) {
+                    child_node.parent = None;
+                }
+            }
+            // parent link: agent_id was the child, dead_peer_id was the parent
+            0 => {
+                topo.child_link_map
+                    .remove(&(dead_peer_id.to_string(), agent_id.to_string()));
+                if let Some(child_node) = topo.nodes.get_mut(agent_id) {
+                    child_node.parent = None;
+                }
+            }
+            _ => {}
+        }
+
+        tracing::info!(
+            %agent_id,
+            %dead_peer_id,
+            link_type,
+            "recorded link failure, total failures recorded: {}",
+            topo.link_failures.len()
+        );
+    }
+
+    /// Generate a Graphviz DOT representation of the current mesh topology.
+    ///
+    /// Produces a directed graph where each node is an agent and edges
+    /// represent parent→child relationships.  Node shape reflects depth:
+    /// the server is a doubleoctagon, direct agents are boxes, and deeper
+    /// agents are ellipses.
+    pub async fn topology_to_dot(&self) -> String {
+        let topo = self.topology.read().await;
+        let mut dot = String::from("digraph p2p_mesh {\n");
+        dot.push_str("    rankdir=TB;\n");
+        dot.push_str("    node [fontname=\"monospace\"];\n");
+        dot.push_str("    SERVER [shape=doubleoctagon, label=\"Server\"];\n\n");
+
+        for (agent_id, node) in &topo.nodes {
+            let label_short = if agent_id.len() > 12 {
+                &agent_id[..12]
+            } else {
+                agent_id
+            };
+            let shape = if node.depth == 0 {
+                "box"
+            } else {
+                "ellipse"
+            };
+            dot.push_str(&format!(
+                "    \"{aid}\" [shape={shape}, label=\"{label_short}\\nd={d}\\nchildren={nc}\"];\n",
+                aid = agent_id,
+                shape = shape,
+                label_short = label_short,
+                d = node.depth,
+                nc = node.children.len(),
+            ));
+
+            // Draw edge from parent to child (or server to root agent).
+            match &node.parent {
+                Some(parent_id) => {
+                    dot.push_str(&format!(
+                        "    \"{pid}\" -> \"{aid}\";\n",
+                        pid = parent_id,
+                        aid = agent_id,
+                    ));
+                }
+                None => {
+                    // Directly connected to server.
+                    dot.push_str(&format!(
+                        "    SERVER -> \"{aid}\";\n",
+                        aid = agent_id,
+                    ));
+                }
+            }
+        }
+
+        dot.push_str("}\n");
+        dot
+    }
+
+    /// Return a summary of mesh topology statistics.
+    pub async fn mesh_stats(&self) -> MeshStats {
+        let topo = self.topology.read().await;
+        let total_nodes = topo.nodes.len();
+        let max_depth = topo.nodes.values().map(|n| n.depth).max().unwrap_or(0);
+        let direct_agents = topo
+            .nodes
+            .values()
+            .filter(|n| n.parent.is_none())
+            .count();
+        let total_edges: usize = topo.nodes.values().map(|n| n.children.len()).sum();
+        let total_peer_links = topo.child_link_map.len();
+        let recent_failures = topo.link_failures.len();
+
+        // Compute average fan-out (children per non-leaf node).
+        let non_leaf_count = topo
+            .nodes
+            .values()
+            .filter(|n| !n.children.is_empty())
+            .count();
+        let avg_fanout = if non_leaf_count > 0 {
+            total_edges as f64 / non_leaf_count as f64
+        } else {
+            0.0
+        };
+
+        MeshStats {
+            total_nodes,
+            max_depth,
+            direct_agents,
+            total_edges,
+            total_peer_links,
+            recent_failures,
+            avg_fanout,
+        }
+    }
+}
+
+/// Summary statistics for the P2P mesh topology.
+#[derive(Clone, Debug, Serialize)]
+pub struct MeshStats {
+    /// Total number of nodes in the topology.
+    pub total_nodes: usize,
+    /// Maximum depth from the server.
+    pub max_depth: u32,
+    /// Number of directly-connected agents (depth 0).
+    pub direct_agents: usize,
+    /// Total parent→child edges.
+    pub total_edges: usize,
+    /// Total entries in the peer link map.
+    pub total_peer_links: usize,
+    /// Number of recent link failure records.
+    pub recent_failures: usize,
+    /// Average number of children per non-leaf node.
+    pub avg_fanout: f64,
 }
 
 pub fn now_secs() -> u64 {

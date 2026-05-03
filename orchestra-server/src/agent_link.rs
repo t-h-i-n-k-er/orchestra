@@ -441,6 +441,44 @@ async fn handle_agent(
                     "P2P forward data recorded (end-to-end encrypted)"
                 );
             }
+            Message::P2pLinkFailureReport {
+                agent_id,
+                dead_peer_id,
+                link_type,
+                uptime_secs,
+                latency_ms,
+                packet_loss,
+                bandwidth_bps,
+            } => {
+                // ── P2P link failure report ─────────────────────
+                // An agent reports that a peer link has died.  Record
+                // the failure in the topology map and log quality metrics.
+                let link_kind = match link_type {
+                    0 => "parent",
+                    1 => "child",
+                    _ => "peer",
+                };
+                tracing::info!(
+                    connection_id = %conn_id,
+                    %agent_id,
+                    %dead_peer_id,
+                    link_kind,
+                    uptime_secs,
+                    latency_ms,
+                    packet_loss,
+                    bandwidth_bps,
+                    "received P2P link failure report"
+                );
+                state.record_link_failure(
+                    &agent_id,
+                    &dead_peer_id,
+                    link_type,
+                    uptime_secs,
+                    latency_ms,
+                    packet_loss,
+                    bandwidth_bps,
+                ).await;
+            }
             other => {
                 tracing::debug!("ignoring agent->server message: {:?}", other);
             }
