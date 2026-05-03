@@ -261,6 +261,8 @@ async fn handle_agent(
                     peer: peer.clone(),
                     morph_seed,
                     text_hash: None,
+                    mesh_certificate: None,
+                    compartment: None,
                 };
                 state.registry.insert(conn_id.clone(), entry);
                 registered = true;
@@ -291,6 +293,58 @@ async fn handle_agent(
                         connection_id = %conn_id,
                         "failed to send initial morph seed — writer task closed"
                     );
+                }
+
+                // ── Mesh certificate issuance ────────────────────────────
+                // If the server has a signing key configured, issue a mesh
+                // certificate to this agent so it can authenticate during
+                // P2P link handshakes.
+                if state.config.module_signing_key.is_some() {
+                    match crate::api::load_signing_key(&state) {
+                        Ok(signing_key) => {
+                            // Use a placeholder public key — the agent will
+                            // present its real X25519 key during the P2P
+                            // handshake, and the certificate only needs to
+                            // bind the agent identity.  The public_key field
+                            // in the cert carries the Ed25519 verification
+                            // key for the agent (future: per-agent keypair).
+                            let placeholder_pk = [0u8; 32];
+                            let cert = crate::api::sign_mesh_certificate(
+                                &signing_key,
+                                &agent_id,
+                                &placeholder_pk,
+                                None as Option<&str>,
+                            );
+                            tracing::info!(
+                                connection_id = %conn_id,
+                                agent_id = %agent_id,
+                                "issuing mesh certificate (expires_at={})",
+                                cert.expires_at
+                            );
+                            // Store cert in the agent entry.
+                            if let Some(mut entry) = state.registry.get_mut(&conn_id) {
+                                entry.mesh_certificate = Some(cert.clone());
+                            }
+                            // Send the certificate to the agent.
+                            if tx
+                                .send(Message::MeshCertificateIssuance { certificate: cert })
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    connection_id = %conn_id,
+                                    "failed to send mesh certificate — writer task closed"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                connection_id = %conn_id,
+                                "failed to load signing key for mesh certificate: {:?}",
+                                e
+                            );
+                        }
+                    }
                 }
             }
             Message::TaskResponse { task_id, result, .. } => {
@@ -512,6 +566,95 @@ async fn handle_agent(
                     hop_count,
                     "route too deep — mesh frame dropped"
                 );
+            }
+            Message::MeshCertificateRenewal => {
+                // Agent is requesting a certificate renewal.  Re-issue if
+                // the signing key is available.
+                if state.config.module_signing_key.is_some() {
+                    let agent_id = state
+                        .registry
+                        .get(&conn_id)
+                        .map(|e| e.agent_id.clone())
+                        .unwrap_or_default();
+                    match crate::api::load_signing_key(&state) {
+                        Ok(signing_key) => {
+                            let placeholder_pk = [0u8; 32];
+                            let compartment = state
+                                .registry
+                                .get(&conn_id)
+                                .and_then(|e| e.compartment.clone());
+                            let cert = crate::api::sign_mesh_certificate(
+                                &signing_key,
+                                &agent_id,
+                                &placeholder_pk,
+                                compartment.as_deref(),
+                            );
+                            tracing::info!(
+                                connection_id = %conn_id,
+                                agent_id = %agent_id,
+                                "renewed mesh certificate"
+                            );
+                            if let Some(mut entry) = state.registry.get_mut(&conn_id) {
+                                entry.mesh_certificate = Some(cert.clone());
+                            }
+                            if tx
+                                .send(Message::MeshCertificateIssuance { certificate: cert })
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    connection_id = %conn_id,
+                                    "failed to send renewed mesh certificate"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                connection_id = %conn_id,
+                                "failed to load signing key for cert renewal: {:?}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+            Message::MeshCertificateRevocation { revoked_agent_id_hash } => {
+                // An agent reports a certificate revocation from the mesh.
+                tracing::warn!(
+                    connection_id = %conn_id,
+                    "mesh certificate revocation reported: agent_hash={:?}",
+                    revoked_agent_id_hash
+                );
+                state.revoked_certificates.insert(revoked_agent_id_hash);
+            }
+            Message::MeshQuarantineReport {
+                quarantined_agent_id_hash,
+                reason,
+                evidence_hash,
+            } => {
+                // An agent reports a quarantine event in the mesh.
+                tracing::warn!(
+                    connection_id = %conn_id,
+                    "mesh quarantine report: agent_hash={:?} reason={} evidence={:?}",
+                    quarantined_agent_id_hash, reason, evidence_hash
+                );
+                // Store in audit log for operator awareness.
+                let reporting_agent = state
+                    .registry
+                    .get(&conn_id)
+                    .map(|e| e.agent_id.clone())
+                    .unwrap_or_else(|| conn_id.clone());
+                state.audit.record(common::AuditEvent {
+                    timestamp: now_secs(),
+                    agent_id: reporting_agent,
+                    user: "mesh".to_string(),
+                    action: format!(
+                        "MeshQuarantineReport(agent_hash={:?}, reason={})",
+                        quarantined_agent_id_hash, reason
+                    ),
+                    outcome: common::Outcome::Success,
+                    details: format!("evidence_hash={:?}", evidence_hash),
+                });
             }
             other => {
                 tracing::debug!("ignoring agent->server message: {:?}", other);

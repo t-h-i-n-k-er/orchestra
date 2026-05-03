@@ -175,6 +175,27 @@ pub enum Message {
         origin: String,
         hop_count: u8,
     },
+    /// Server delivers a mesh certificate to the agent during check-in or
+    /// renewal.  The agent stores this certificate and presents it during
+    /// every P2P link handshake.
+    MeshCertificateIssuance {
+        certificate: MeshCertificate,
+    },
+    /// Agent requests a mesh certificate renewal from the server (typically
+    /// 2 hours before expiry).
+    MeshCertificateRenewal,
+    /// Server broadcasts a certificate revocation to all agents.  Every agent
+    /// checks its active links and terminates any connection to the revoked peer.
+    MeshCertificateRevocation {
+        revoked_agent_id_hash: [u8; 32],
+    },
+    /// Agent reports to the server that a peer has been quarantined due to
+    /// suspicious behaviour (invalid cert, compromise indicators, etc.).
+    MeshQuarantineReport {
+        quarantined_agent_id_hash: [u8; 32],
+        reason: u8,
+        evidence_hash: [u8; 32],
+    },
 }
 
 /// A single child entry in a [`Message::P2pTopologyReport`].
@@ -202,6 +223,145 @@ pub struct P2pPeerInfo {
 pub struct P2pRouteInfo {
     pub destination: String,
     pub hop_count: u8,
+}
+
+/// A mesh certificate issued by the Orchestra server, used for P2P link
+/// authentication.  Each agent receives a certificate during check-in and
+/// presents it during the P2P handshake.  The Ed25519 signature is computed
+/// over the concatenation:
+///
+/// ```text
+/// agent_id_hash(32) || public_key(32) || issued_at_le(8) || expires_at_le(8)
+/// ```
+///
+/// Optional compartment tag restricts peer links to agents in the same
+/// compartment.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MeshCertificate {
+    /// SHA-256 hash of the agent's `agent_id` string (used for revocation
+    /// lookups without revealing the plaintext ID on the wire).
+    pub agent_id_hash: [u8; 32],
+    /// The agent's long-term Ed25519 public key for link authentication.
+    pub public_key: [u8; 32],
+    /// Unix timestamp (seconds) when the certificate was issued.
+    pub issued_at: u64,
+    /// Unix timestamp (seconds) when the certificate expires.
+    pub expires_at: u64,
+    /// Ed25519 signature over the certificate body, produced by the server's
+    /// `module_signing_key`.
+    #[serde(
+        serialize_with = "serialize_sig_64",
+        deserialize_with = "deserialize_sig_64"
+    )]
+    pub server_signature: [u8; 64],
+    /// Optional mesh compartment identifier.  When set, the agent may only
+    /// establish peer links with agents in the same compartment.
+    #[serde(default)]
+    pub compartment: Option<String>,
+}
+
+/// Serde helper: serialize a 64-byte Ed25519 signature as a byte array.
+fn serialize_sig_64<S: serde::Serializer>(sig: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_bytes(sig)
+}
+
+/// Serde helper: deserialize a 64-byte Ed25519 signature from a byte array.
+fn deserialize_sig_64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+    struct SigVisitor;
+    impl<'de> serde::de::Visitor<'de> for SigVisitor {
+        type Value = [u8; 64];
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a 64-byte signature")
+        }
+        fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+            v.try_into().map_err(|_| E::invalid_length(v.len(), &self))
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut buf = [0u8; 64];
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = seq.next_element()?.ok_or_else(|| {
+                    serde::de::Error::invalid_length(i, &self)
+                })?;
+            }
+            Ok(buf)
+        }
+    }
+    d.deserialize_bytes(SigVisitor)
+}
+
+impl MeshCertificate {
+    /// Return the canonical byte buffer that is signed / verified:
+    /// `agent_id_hash || public_key || issued_at_le || expires_at_le`.
+    pub fn signing_input(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + 32 + 8 + 8);
+        buf.extend_from_slice(&self.agent_id_hash);
+        buf.extend_from_slice(&self.public_key);
+        buf.extend_from_slice(&self.issued_at.to_le_bytes());
+        buf.extend_from_slice(&self.expires_at.to_le_bytes());
+        buf
+    }
+
+    /// Check whether the certificate has expired relative to `now` (Unix ts).
+    pub fn is_expired(&self, now: u64) -> bool {
+        now >= self.expires_at
+    }
+
+    /// Check whether the certificate is within the renewal window.
+    pub fn needs_renewal(&self, now: u64) -> bool {
+        let renewal_threshold = self
+            .expires_at
+            .saturating_sub(crate::p2p_proto::MESH_CERT_RENEWAL_SECS);
+        now >= renewal_threshold
+    }
+}
+
+/// Compute the SHA-256 hash of an agent_id string (used for revocation and
+/// certificate identity).
+pub fn hash_agent_id(agent_id: &str) -> [u8; 32] {
+    use sha2::Digest;
+    let mut hasher = Sha256::new();
+    hasher.update(agent_id.as_bytes());
+    hasher.finalize().into()
+}
+
+/// Verify a mesh certificate's Ed25519 signature and expiry.
+///
+/// Returns `Ok(())` if the signature is valid and the certificate has not
+/// expired relative to `now` (Unix timestamp in seconds).  Returns `Err`
+/// with a human-readable description otherwise.
+///
+/// This function is only available when the `module-signatures` feature is
+/// enabled (which pulls in `ed25519-dalek`).
+#[cfg(feature = "module-signatures")]
+pub fn verify_mesh_certificate(
+    cert: &MeshCertificate,
+    server_public_key: &[u8; 32],
+    now: u64,
+) -> Result<(), String> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    // Check expiry first.
+    if cert.is_expired(now) {
+        return Err("mesh certificate has expired".to_string());
+    }
+
+    // Verify the agent_id_hash matches — this is a sanity check ensuring
+    // the cert struct is internally consistent.
+    // (The caller typically already knows the agent_id and can verify separately.)
+
+    // Reconstruct the Ed25519 verifying key from bytes.
+    let verifying_key = VerifyingKey::from_bytes(server_public_key)
+        .map_err(|e| format!("invalid server public key: {e}"))?;
+
+    // Reconstruct the signature from bytes.
+    let signature = Signature::from_bytes(&cert.server_signature);
+
+    // Verify the signature over the canonical signing input.
+    verifying_key
+        .verify(&cert.signing_input(), &signature)
+        .map_err(|e| format!("mesh certificate signature verification failed: {e}"))?;
+
+    Ok(())
 }
 
 /// The set of administrator-approved actions the agent is willing to perform.
@@ -407,6 +567,27 @@ pub enum Command {
     /// Tell agent A to close its link with agent B.
     MeshDisconnect {
         target_agent_id: String,
+    },
+    /// Emergency kill switch: terminate ALL P2P links immediately, purge the
+    /// mesh routing table, and refuse new links until cleared.  Sent by the
+    /// server when a severe compromise is detected.
+    MeshKillSwitch,
+    /// Operator-initiated quarantine: the agent must immediately terminate
+    /// any link to the specified peer, mark it as quarantined, and refuse
+    /// future connections from it.
+    MeshQuarantine {
+        target_agent_id: String,
+        /// Reason code (see `common::p2p_proto::quarantine_reason`).
+        reason: u8,
+    },
+    /// Clear the quarantine flag for an agent, allowing it to reconnect.
+    MeshClearQuarantine {
+        target_agent_id: String,
+    },
+    /// Set or change the mesh compartment for this agent.  Affects which
+    /// peers are allowed for new link establishment.
+    MeshSetCompartment {
+        compartment: String,
     },
 }
 

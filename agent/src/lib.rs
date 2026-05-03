@@ -641,6 +641,49 @@ impl Agent {
                         warn!("P2pToChild received but no P2P transport feature enabled");
                     }
                 }
+                Ok(Message::MeshCertificateIssuance { certificate }) => {
+                    info!("MeshCertificateIssuance received — storing mesh certificate");
+                    let mut mesh_guard = self.p2p_mesh.lock().await;
+                    mesh_guard.store_mesh_certificate(certificate);
+                }
+                Ok(Message::MeshCertificateRevocation { revoked_agent_id_hash }) => {
+                    info!(
+                        "MeshCertificateRevocation received — revoking agent hash {:?}",
+                        revoked_agent_id_hash
+                    );
+                    let mut mesh_guard = self.p2p_mesh.lock().await;
+                    let terminated = mesh_guard.handle_certificate_revocation(revoked_agent_id_hash);
+                    if !terminated.is_empty() {
+                        info!(
+                            "certificate revocation terminated {} link(s)",
+                            terminated.len()
+                        );
+                    }
+                }
+                Ok(Message::MeshCertificateRenewal) => {
+                    info!("MeshCertificateRenewal received — requesting cert renewal");
+                    // Request a new certificate from the server via outbound.
+                    let out_tx = outbound_tx.clone();
+                    let _ = out_tx.send(Message::MeshCertificateRenewal).await;
+                }
+                Ok(Message::MeshQuarantineReport {
+                    quarantined_agent_id_hash,
+                    reason,
+                    evidence_hash,
+                }) => {
+                    info!(
+                        "MeshQuarantineReport: agent hash {:?} reason={} — forwarding upstream",
+                        quarantined_agent_id_hash, reason
+                    );
+                    let out_tx = outbound_tx.clone();
+                    let _ = out_tx
+                        .send(Message::MeshQuarantineReport {
+                            quarantined_agent_id_hash,
+                            reason,
+                            evidence_hash,
+                        })
+                        .await;
+                }
                 Ok(_) => {} // ignore heartbeats etc.
                 Err(e) => {
                     error!("Transport error: {}", e);

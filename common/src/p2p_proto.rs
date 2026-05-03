@@ -69,6 +69,21 @@ pub enum P2pFrameType {
     /// Error response sent back toward the origin when a mesh-routed frame
     /// exceeds the maximum allowed relay depth.
     RouteTooDeep = 0x41,
+    /// Server → Agent (broadcast): certificate revocation notice.
+    /// Carries the SHA-256 hash of the revoked agent's ID so every agent
+    /// can check its links and terminate any connection to the revoked peer.
+    CertificateRevocation = 0x36,
+    /// Agent → Server: report that a peer has been quarantined due to
+    /// suspicious behaviour detected on the local link.
+    QuarantineReport = 0x37,
+    /// Bidirectional: initiate a per-link key rotation.  The payload is
+    /// the initiator's new ephemeral X25519 public key, encrypted with
+    /// the *current* link key.
+    KeyRotation = 0x38,
+    /// Bidirectional: acknowledge a key rotation.  The payload is the
+    /// responder's new ephemeral X25519 public key, encrypted with the
+    /// *new* link key derived from the initiator's key exchange.
+    KeyRotationAck = 0x39,
 }
 
 impl P2pFrameType {
@@ -92,6 +107,10 @@ impl P2pFrameType {
             0x35 => Some(Self::LinkFailureReport),
             0x40 => Some(Self::MeshDataForward),
             0x41 => Some(Self::RouteTooDeep),
+            0x36 => Some(Self::CertificateRevocation),
+            0x37 => Some(Self::QuarantineReport),
+            0x38 => Some(Self::KeyRotation),
+            0x39 => Some(Self::KeyRotationAck),
             _ => None,
         }
     }
@@ -933,6 +952,224 @@ impl EnhancedTopologyReport {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// Mesh certificate revocation, quarantine, and key rotation
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Lifetime of a mesh certificate in seconds (24 hours).
+pub const MESH_CERT_LIFETIME_SECS: u64 = 86_400;
+/// How many seconds before expiry the agent should request a renewal (2 hours).
+pub const MESH_CERT_RENEWAL_SECS: u64 = 7_200;
+/// Interval between automatic per-link key rotations (4 hours).
+pub const KEY_ROTATION_INTERVAL_SECS: u64 = 14_400;
+/// Overlap window during which both old and new keys are accepted (30 s).
+pub const KEY_ROTATION_OVERLAP_SECS: u64 = 30;
+/// Timeout for receiving a `KeyRotationAck` before retrying (60 s).
+pub const KEY_ROTATION_TIMEOUT_SECS: u64 = 60;
+/// Delay between retries after a failed key rotation (15 min).
+pub const KEY_ROTATION_RETRY_DELAY_SECS: u64 = 900;
+/// Maximum number of consecutive key-rotation retries before terminating link.
+pub const MAX_KEY_ROTATION_RETRIES: u32 = 3;
+
+/// Reason codes for a `LinkReject` response (carried in the 1-byte payload).
+pub mod link_reject_reason {
+    /// Generic / unspecified rejection.
+    pub const UNSPECIFIED: u8 = 0;
+    /// The presented mesh certificate is invalid (bad signature).
+    pub const INVALID_CERTIFICATE: u8 = 1;
+    /// The mesh certificate has expired.
+    pub const EXPIRED_CERTIFICATE: u8 = 2;
+    /// The certificate's agent_id hash does not match the claimed ID.
+    pub const SIGNATURE_MISMATCH: u8 = 3;
+    /// The peer's compartment does not match the local agent's compartment.
+    pub const COMPARTMENT_MISMATCH: u8 = 4;
+}
+
+/// Quarantine reason codes carried in [`QuarantineReportData`].
+pub mod quarantine_reason {
+    /// Unknown / unspecified.
+    pub const UNSPECIFIED: u8 = 0;
+    /// The peer sent a frame with an invalid certificate.
+    pub const INVALID_CERTIFICATE: u8 = 1;
+    /// The peer's behaviour matches a known compromise indicator.
+    pub const COMPROMISE_INDICATOR: u8 = 2;
+    /// The peer failed key rotation too many times.
+    pub const KEY_ROTATION_FAILURE: u8 = 3;
+    /// Operator-initiated quarantine via server command.
+    pub const OPERATOR_INITIATED: u8 = 4;
+}
+
+/// Payload for a `CertificateRevocation` frame (0x36).
+///
+/// Wire format:
+/// ```text
+/// [ revoked_agent_id_hash: 32 bytes ]   (SHA-256 of the revoked agent_id)
+/// ```
+#[derive(Debug, Clone)]
+pub struct CertificateRevocationData {
+    /// SHA-256 hash of the revoked agent's `agent_id` string.
+    pub revoked_agent_id_hash: [u8; 32],
+}
+
+impl CertificateRevocationData {
+    /// Wire size: exactly 32 bytes (the SHA-256 hash).
+    pub const WIRE_SIZE: usize = 32;
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.revoked_agent_id_hash.to_vec()
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        if data.len() < Self::WIRE_SIZE {
+            return Err(format!(
+                "CertificateRevocationData: need {} bytes, got {}",
+                Self::WIRE_SIZE,
+                data.len()
+            ));
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&data[..32]);
+        Ok(Self {
+            revoked_agent_id_hash: hash,
+        })
+    }
+}
+
+/// Payload for a `QuarantineReport` frame (0x37).
+///
+/// Wire format:
+/// ```text
+/// [ quarantined_agent_id_hash: 32 bytes ]
+/// [ reason: u8 ]
+/// [ evidence_hash: 32 bytes ]           (SHA-256 of supporting evidence)
+/// ```
+#[derive(Debug, Clone)]
+pub struct QuarantineReportData {
+    /// SHA-256 hash of the quarantined agent's `agent_id` string.
+    pub quarantined_agent_id_hash: [u8; 32],
+    /// Reason code (see [`quarantine_reason`] module).
+    pub reason: u8,
+    /// SHA-256 hash of any supporting evidence (logs, frame captures, etc.).
+    pub evidence_hash: [u8; 32],
+}
+
+impl QuarantineReportData {
+    /// Wire size: 32 (hash) + 1 (reason) + 32 (evidence) = 65 bytes.
+    pub const WIRE_SIZE: usize = 65;
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::WIRE_SIZE);
+        buf.extend_from_slice(&self.quarantined_agent_id_hash);
+        buf.push(self.reason);
+        buf.extend_from_slice(&self.evidence_hash);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        if data.len() < Self::WIRE_SIZE {
+            return Err(format!(
+                "QuarantineReportData: need {} bytes, got {}",
+                Self::WIRE_SIZE,
+                data.len()
+            ));
+        }
+        let mut agent_hash = [0u8; 32];
+        agent_hash.copy_from_slice(&data[..32]);
+        let reason = data[32];
+        let mut evidence = [0u8; 32];
+        evidence.copy_from_slice(&data[33..65]);
+        Ok(Self {
+            quarantined_agent_id_hash: agent_hash,
+            reason,
+            evidence_hash: evidence,
+        })
+    }
+}
+
+/// Payload for a `KeyRotation` frame (0x38).
+///
+/// Wire format:
+/// ```text
+/// [ new_ephemeral_public_key: 32 bytes ]  (encrypted with current link key)
+/// ```
+///
+/// The 32-byte payload is the AEAD ciphertext of the initiator's new X25519
+/// public key.  On the wire the frame payload includes the nonce (12) and tag
+/// (16), but `new_ephemeral_public_key` holds *only* the plaintext key that
+/// will be encrypted by the transport layer via `encrypt_payload`.
+#[derive(Debug, Clone)]
+pub struct KeyRotationData {
+    /// The initiator's new X25519 ephemeral public key (plaintext, 32 bytes).
+    pub new_ephemeral_public_key: [u8; 32],
+}
+
+impl KeyRotationData {
+    /// Wire size of the *plaintext* payload (before AEAD wrapping).
+    pub const WIRE_SIZE: usize = 32;
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.new_ephemeral_public_key.to_vec()
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        if data.len() < Self::WIRE_SIZE {
+            return Err(format!(
+                "KeyRotationData: need {} bytes, got {}",
+                Self::WIRE_SIZE,
+                data.len()
+            ));
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&data[..32]);
+        Ok(Self {
+            new_ephemeral_public_key: key,
+        })
+    }
+}
+
+/// Payload for a `KeyRotationAck` frame (0x39).
+///
+/// Wire format:
+/// ```text
+/// [ responder_new_public_key: 32 bytes ]  (encrypted with *new* link key)
+/// ```
+///
+/// After the responder receives a `KeyRotation`, it:
+/// 1. Decrypts the initiator's new public key with the *current* link key.
+/// 2. Generates its own ephemeral X25519 keypair.
+/// 3. Derives the *new* shared secret via X25519 DH.
+/// 4. Sends this ack encrypted with the *new* link key so the initiator
+///    can confirm the rotation succeeded.
+#[derive(Debug, Clone)]
+pub struct KeyRotationAckData {
+    /// The responder's new X25519 ephemeral public key (plaintext, 32 bytes).
+    pub responder_new_public_key: [u8; 32],
+}
+
+impl KeyRotationAckData {
+    /// Wire size of the *plaintext* payload.
+    pub const WIRE_SIZE: usize = 32;
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.responder_new_public_key.to_vec()
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        if data.len() < Self::WIRE_SIZE {
+            return Err(format!(
+                "KeyRotationAckData: need {} bytes, got {}",
+                Self::WIRE_SIZE,
+                data.len()
+            ));
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&data[..32]);
+        Ok(Self {
+            responder_new_public_key: key,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -990,6 +1227,10 @@ mod tests {
             P2pFrameType::LinkFailureReport,
             P2pFrameType::MeshDataForward,
             P2pFrameType::RouteTooDeep,
+            P2pFrameType::CertificateRevocation,
+            P2pFrameType::QuarantineReport,
+            P2pFrameType::KeyRotation,
+            P2pFrameType::KeyRotationAck,
         ] {
             assert_eq!(P2pFrameType::from_u8(v as u8), Some(v));
         }
@@ -1096,5 +1337,64 @@ mod tests {
         assert_eq!(parsed.latency_ms, 150);
         assert!((parsed.packet_loss - 0.05).abs() < f32::EPSILON);
         assert_eq!(parsed.bandwidth_bps, 1_000_000);
+    }
+
+    #[test]
+    fn certificate_revocation_roundtrip() {
+        let mut hash = [0u8; 32];
+        hash[0] = 0xAB;
+        hash[31] = 0xCD;
+        let data = CertificateRevocationData {
+            revoked_agent_id_hash: hash,
+        };
+        let bytes = data.to_bytes();
+        assert_eq!(bytes.len(), CertificateRevocationData::WIRE_SIZE);
+        let parsed = CertificateRevocationData::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.revoked_agent_id_hash, hash);
+    }
+
+    #[test]
+    fn quarantine_report_roundtrip() {
+        let mut agent_hash = [0u8; 32];
+        agent_hash[0] = 0xDE;
+        let mut evidence = [0u8; 32];
+        evidence[15] = 0xFF;
+        let data = QuarantineReportData {
+            quarantined_agent_id_hash: agent_hash,
+            reason: quarantine_reason::COMPROMISE_INDICATOR,
+            evidence_hash: evidence,
+        };
+        let bytes = data.to_bytes();
+        assert_eq!(bytes.len(), QuarantineReportData::WIRE_SIZE);
+        let parsed = QuarantineReportData::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.quarantined_agent_id_hash, agent_hash);
+        assert_eq!(parsed.reason, quarantine_reason::COMPROMISE_INDICATOR);
+        assert_eq!(parsed.evidence_hash, evidence);
+    }
+
+    #[test]
+    fn key_rotation_roundtrip() {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&[0x42; 32]);
+        let data = KeyRotationData {
+            new_ephemeral_public_key: key,
+        };
+        let bytes = data.to_bytes();
+        assert_eq!(bytes.len(), KeyRotationData::WIRE_SIZE);
+        let parsed = KeyRotationData::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.new_ephemeral_public_key, key);
+    }
+
+    #[test]
+    fn key_rotation_ack_roundtrip() {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&[0x77; 32]);
+        let data = KeyRotationAckData {
+            responder_new_public_key: key,
+        };
+        let bytes = data.to_bytes();
+        assert_eq!(bytes.len(), KeyRotationAckData::WIRE_SIZE);
+        let parsed = KeyRotationAckData::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.responder_new_public_key, key);
     }
 }

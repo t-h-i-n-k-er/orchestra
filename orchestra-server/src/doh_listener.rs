@@ -163,6 +163,8 @@ impl DohRuntime {
                 peer: format!("doh/{session_id}"),
                 morph_seed,
                 text_hash: None,
+                mesh_certificate: None,
+                compartment: None,
             },
         );
 

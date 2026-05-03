@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 #[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
 use common::p2p_proto::{P2pFrame, P2pFrameType, HEADER_SIZE, MAX_PAYLOAD_BYTES};
@@ -356,6 +356,28 @@ pub struct P2pLink {
     pub quality: LinkQuality,
     /// Instant when this link was established (Connected state).
     pub connected_at: Instant,
+    // ── Key rotation state ──────────────────────────────────────────────
+    /// Instant when the last key rotation was completed (or link creation).
+    pub last_key_rotation: Instant,
+    /// Whether a key rotation handshake is in progress.
+    pub key_rotation_in_progress: bool,
+    /// Previous link key retained during the overlap window after rotation.
+    pub previous_key: Option<[u8; 32]>,
+    /// Deadline after which the previous key is discarded.
+    pub rotation_overlap_deadline: Option<Instant>,
+    /// Number of consecutive key-rotation retries.
+    pub key_rotation_retries: u32,
+    /// Instant when the current key-rotation attempt was started.
+    pub key_rotation_started: Option<Instant>,
+    /// Our new X25519 secret for an in-progress key rotation (initiator only).
+    /// Stored as raw bytes so we can reconstruct a StaticSecret for the
+    /// final DH computation when the KeyRotationAck arrives.
+    pub pending_rotation_secret: Option<[u8; 32]>,
+    // ── Certificate / quarantine ────────────────────────────────────────
+    /// The peer's mesh certificate (verified during handshake).
+    pub peer_certificate: Option<common::MeshCertificate>,
+    /// Whether this peer has been locally quarantined.
+    pub quarantined: bool,
 }
 
 /// Summary of a single P2P link, returned by [`P2pMesh::list_links`].
@@ -411,6 +433,15 @@ impl P2pLink {
             pending_forwards: VecDeque::new(),
             quality: LinkQuality::default(),
             connected_at: Instant::now(),
+            last_key_rotation: Instant::now(),
+            key_rotation_in_progress: false,
+            previous_key: None,
+            rotation_overlap_deadline: None,
+            key_rotation_retries: 0,
+            key_rotation_started: None,
+            pending_rotation_secret: None,
+            peer_certificate: None,
+            quarantined: false,
         }
     }
 
@@ -435,6 +466,15 @@ impl P2pLink {
             pending_forwards: VecDeque::new(),
             quality: LinkQuality::default(),
             connected_at: Instant::now(),
+            last_key_rotation: Instant::now(),
+            key_rotation_in_progress: false,
+            previous_key: None,
+            rotation_overlap_deadline: None,
+            key_rotation_retries: 0,
+            key_rotation_started: None,
+            pending_rotation_secret: None,
+            peer_certificate: None,
+            quarantined: false,
         }
     }
 
@@ -511,6 +551,22 @@ pub struct P2pMesh {
     pub relay_bytes_current_window: u64,
     /// Bandwidth budget for relayed traffic in the current window (bytes).
     pub relay_bandwidth_budget: u64,
+    // ── Mesh certificate + security state ───────────────────────────────
+    /// This agent's mesh certificate (issued by server during check-in).
+    pub mesh_certificate: Option<common::MeshCertificate>,
+    /// Server's Ed25519 public key for verifying peer certificates.
+    /// Extracted from the build-time config (same key as `module_signing_key`).
+    pub server_ed25519_public_key: Option<[u8; 32]>,
+    /// Set of agent_id hashes that have been quarantined (refuse links).
+    pub quarantined_agents: std::collections::HashSet<[u8; 32]>,
+    /// Set of agent_id hashes whose certificates have been revoked.
+    pub revoked_agents: std::collections::HashSet<[u8; 32]>,
+    /// Optional mesh compartment identifier.  When set, peer links are only
+    /// allowed with agents in the same compartment.
+    pub compartment: Option<String>,
+    /// Kill switch: when true, all P2P links are terminated and no new links
+    /// are accepted until cleared by the server.
+    pub kill_switch_active: bool,
 }
 
 impl P2pMesh {
@@ -533,6 +589,12 @@ impl P2pMesh {
             relay_active_agents: std::collections::HashSet::new(),
             relay_bytes_current_window: 0,
             relay_bandwidth_budget: u64::MAX,
+            mesh_certificate: None,
+            server_ed25519_public_key: None,
+            quarantined_agents: std::collections::HashSet::new(),
+            revoked_agents: std::collections::HashSet::new(),
+            compartment: None,
+            kill_switch_active: false,
         }
     }
 
@@ -557,6 +619,12 @@ impl P2pMesh {
             relay_active_agents: std::collections::HashSet::new(),
             relay_bytes_current_window: 0,
             relay_bandwidth_budget: u64::MAX,
+            mesh_certificate: None,
+            server_ed25519_public_key: None,
+            quarantined_agents: std::collections::HashSet::new(),
+            revoked_agents: std::collections::HashSet::new(),
+            compartment: None,
+            kill_switch_active: false,
         }
     }
 
@@ -1998,6 +2066,509 @@ impl P2pMesh {
             encrypted_blob: encrypted,
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Mesh Security: Certificate verification, containment, key rotation
+    // ══════════════════════════════════════════════════════════════════
+
+    /// Verify a peer's mesh certificate.
+    ///
+    /// Checks:
+    /// 1. Certificate is not expired.
+    /// 2. Signature is valid (if we have the server's Ed25519 public key).
+    /// 3. The certificate's `agent_id_hash` matches the expected hash.
+    /// 4. The certificate is not in the local revocation list.
+    /// 5. The compartment matches (if compartment enforcement is active).
+    pub fn verify_peer_certificate(
+        &self,
+        cert: &common::MeshCertificate,
+        peer_agent_id: &str,
+        now: u64,
+    ) -> Result<(), String> {
+        // Check expiry.
+        if cert.is_expired(now) {
+            return Err(format!(
+                "mesh certificate expired (expires_at={})",
+                cert.expires_at
+            ));
+        }
+
+        // Check revocation list.
+        if self.revoked_agents.contains(&cert.agent_id_hash) {
+            return Err("mesh certificate has been revoked".to_string());
+        }
+
+        // Verify the agent_id_hash matches the claimed peer identity.
+        let expected_hash = common::hash_agent_id(peer_agent_id);
+        if cert.agent_id_hash != expected_hash {
+            return Err("mesh certificate agent_id_hash mismatch".to_string());
+        }
+
+        // Verify Ed25519 signature (if we have the server's public key).
+        if let Some(ref server_pk) = self.server_ed25519_public_key {
+            #[cfg(feature = "module-signatures")]
+            {
+                if let Err(e) = common::verify_mesh_certificate(cert, server_pk, now) {
+                    return Err(format!("mesh certificate signature invalid: {e}"));
+                }
+            }
+            #[cfg(not(feature = "module-signatures"))]
+            {
+                let _ = (server_pk, now);
+                log::warn!(
+                    "mesh certificate signature verification skipped: \
+                     module-signatures feature not enabled"
+                );
+            }
+        } else {
+            log::warn!(
+                "mesh certificate signature verification skipped: \
+                 no server Ed25519 public key configured"
+            );
+        }
+
+        // Check compartment match.
+        if let Some(ref our_compartment) = self.compartment {
+            match &cert.compartment {
+                Some(their_compartment) if their_compartment == our_compartment => {}
+                Some(their_compartment) => {
+                    return Err(format!(
+                        "compartment mismatch: ours={our_compartment}, theirs={their_compartment}"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "peer has no compartment but we require compartment '{our_compartment}'"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Store the server-issued mesh certificate for this agent.
+    pub fn store_mesh_certificate(&mut self, cert: common::MeshCertificate) {
+        log::info!(
+            "mesh certificate stored: expires_at={}, compartment={:?}",
+            cert.expires_at,
+            cert.compartment,
+        );
+        self.mesh_certificate = Some(cert);
+    }
+
+    /// Process a certificate revocation notice.
+    ///
+    /// Adds the revoked agent hash to the local set and terminates any
+    /// active links to the revoked agent.
+    ///
+    /// Returns a list of link IDs that were terminated.
+    pub fn handle_certificate_revocation(
+        &mut self,
+        revoked_hash: [u8; 32],
+    ) -> Vec<u32> {
+        log::warn!(
+            "mesh certificate revocation received for agent hash {:02x?}…",
+            &revoked_hash[..8]
+        );
+        self.revoked_agents.insert(revoked_hash);
+
+        // Find and terminate links to the revoked agent.
+        let mut terminated = Vec::new();
+        let dead_ids: Vec<u32> = self
+            .links
+            .iter()
+            .filter(|(_, link)| {
+                link.peer_certificate
+                    .as_ref()
+                    .map_or(false, |c| c.agent_id_hash == revoked_hash)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+
+        for id in dead_ids {
+            if let Some(link) = self.links.get_mut(&id) {
+                log::warn!(
+                    "terminating link {:#010X} to revoked agent '{}'",
+                    id, link.peer_agent_id
+                );
+                let _ = link.transition(LinkState::Dead);
+                terminated.push(id);
+            }
+            self.remove_routes_via(id);
+        }
+
+        terminated
+    }
+
+    /// Quarantine a peer agent.
+    ///
+    /// Marks the peer as quarantined, stops relaying data through it,
+    /// and optionally sends a QuarantineReport to the server.
+    pub fn quarantine_peer(
+        &mut self,
+        target_agent_id: &str,
+        reason: u8,
+    ) -> Result<(), String> {
+        let target_hash = common::hash_agent_id(target_agent_id);
+        log::warn!(
+            "quarantining agent '{}' (reason={})",
+            target_agent_id, reason
+        );
+
+        self.quarantined_agents.insert(target_hash);
+
+        // Mark matching links as quarantined.
+        let link_ids: Vec<u32> = self
+            .links
+            .iter()
+            .filter(|(_, link)| link.peer_agent_id == target_agent_id)
+            .map(|(&id, _)| id)
+            .collect();
+
+        for id in link_ids {
+            if let Some(link) = self.links.get_mut(&id) {
+                link.quarantined = true;
+                log::info!(
+                    "link {:#010X} to '{}' marked as quarantined",
+                    id, target_agent_id
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clear quarantine for a peer agent.
+    pub fn clear_quarantine(&mut self, target_agent_id: &str) -> Result<(), String> {
+        let target_hash = common::hash_agent_id(target_agent_id);
+        log::info!("clearing quarantine for agent '{}'", target_agent_id);
+
+        self.quarantined_agents.remove(&target_hash);
+
+        let link_ids: Vec<u32> = self
+            .links
+            .iter()
+            .filter(|(_, link)| link.peer_agent_id == target_agent_id)
+            .map(|(&id, _)| id)
+            .collect();
+
+        for id in link_ids {
+            if let Some(link) = self.links.get_mut(&id) {
+                link.quarantined = false;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Activate the mesh kill switch.
+    ///
+    /// Terminates ALL peer links immediately and refuses new connections.
+    pub fn activate_kill_switch(&mut self) {
+        log::warn!("MESH KILL SWITCH ACTIVATED — terminating all links");
+        self.kill_switch_active = true;
+
+        let all_ids: Vec<u32> = self.links.keys().copied().collect();
+        for id in all_ids {
+            if let Some(link) = self.links.get_mut(&id) {
+                let _ = link.transition(LinkState::Dead);
+            }
+        }
+        self.routing_table.clear();
+    }
+
+    /// Deactivate the mesh kill switch.
+    ///
+    /// Allows new connections to be established again.
+    pub fn deactivate_kill_switch(&mut self) {
+        log::info!("mesh kill switch deactivated — new connections allowed");
+        self.kill_switch_active = false;
+    }
+
+    /// Check whether new links should be accepted.
+    ///
+    /// Returns `Err(reason)` if the kill switch is active or the agent
+    /// is quarantined.
+    pub fn check_link_allowed(&self) -> Result<(), String> {
+        if self.kill_switch_active {
+            return Err("mesh kill switch is active — refusing new links".to_string());
+        }
+        Ok(())
+    }
+
+    /// Check whether a specific link should relay data.
+    ///
+    /// Quarantined links should not relay data.
+    pub fn should_relay_link(&self, link_id: u32) -> bool {
+        if self.kill_switch_active {
+            return false;
+        }
+        match self.links.get(&link_id) {
+            Some(link) => !link.quarantined && link.state.is_usable(),
+            None => false,
+        }
+    }
+
+    /// Set the mesh compartment for this agent.
+    pub fn set_compartment(&mut self, compartment: String) {
+        log::info!("mesh compartment set to '{}'", compartment);
+        self.compartment = Some(compartment);
+    }
+
+    /// Initiate a key rotation on a specific link.
+    ///
+    /// Generates a new X25519 ephemeral keypair, derives a preliminary
+    /// shared secret (with the peer's public key from the existing DH),
+    /// and sends a `KeyRotation` frame to the peer.
+    ///
+    /// Returns `Ok(())` if the KeyRotation frame was prepared (the caller
+    /// must send it), or an error if the link doesn't exist or rotation
+    /// is already in progress.
+    pub fn initiate_key_rotation(&mut self, link_id: u32) -> Result<[u8; 32], String> {
+        let link = self.links.get_mut(&link_id).ok_or_else(|| {
+            format!("initiate_key_rotation: link {:#010X} not found", link_id)
+        })?;
+
+        if link.key_rotation_in_progress {
+            return Err(format!(
+                "key rotation already in progress on link {:#010X}",
+                link_id
+            ));
+        }
+
+        // Generate new ephemeral X25519 keypair.
+        // We generate the raw secret bytes first so we can store them for the
+        // final DH in handle_key_rotation_ack (EphemeralSecret is not Clone
+        // and is consumed by diffie_hellman).
+        let new_secret_bytes: [u8; 32] = rand::random();
+        let new_secret = x25519_dalek::StaticSecret::from(new_secret_bytes);
+        let new_public = x25519_dalek::PublicKey::from(&new_secret);
+
+        // Save the current key as previous_key for overlap decryption.
+        link.previous_key = Some(link.ecdh_shared_secret);
+
+        // Set rotation state.
+        link.key_rotation_in_progress = true;
+        link.key_rotation_started = Some(Instant::now());
+        link.rotation_overlap_deadline =
+            Some(Instant::now() + Duration::from_secs(
+                common::p2p_proto::KEY_ROTATION_OVERLAP_SECS,
+            ));
+
+        // Store the new secret for the final DH when KeyRotationAck arrives.
+        link.pending_rotation_secret = Some(new_secret_bytes);
+
+        let new_public_bytes = *new_public.as_bytes();
+
+        log::info!(
+            "key rotation initiated on link {:#010X} (peer={})",
+            link_id, link.peer_agent_id
+        );
+
+        Ok(new_public_bytes)
+    }
+
+    /// Handle an incoming KeyRotation frame from a peer.
+    ///
+    /// The peer has sent us their new ephemeral public key.  We generate
+    /// our own new ephemeral, derive the new shared secret, and send back
+    /// a KeyRotationAck.
+    ///
+    /// Returns the KeyRotationAckData to be sent back, or an error.
+    pub fn handle_key_rotation(
+        &mut self,
+        link_id: u32,
+        payload: &[u8],
+    ) -> Result<[u8; 32], String> {
+        use common::p2p_proto::KeyRotationData;
+
+        let data = KeyRotationData::from_bytes(payload)
+            .map_err(|e| format!("KeyRotation parse error: {e}"))?;
+
+        let link = self.links.get_mut(&link_id).ok_or_else(|| {
+            format!("handle_key_rotation: link {:#010X} not found", link_id)
+        })?;
+
+        // Generate our own new ephemeral.
+        let our_new_secret = x25519_dalek::EphemeralSecret::random_from_rng(rand::thread_rng());
+        let our_new_public = x25519_dalek::PublicKey::from(&our_new_secret);
+
+        // Derive new shared secret: DH(our_new_secret, peer_new_public).
+        let peer_new_public = x25519_dalek::PublicKey::from(data.new_ephemeral_public_key);
+        let new_shared = our_new_secret.diffie_hellman(&peer_new_public);
+        let new_key = derive_link_key(new_shared.as_bytes());
+
+        // Save old key for overlap period.
+        link.previous_key = Some(link.ecdh_shared_secret);
+
+        // Apply the new key.
+        link.ecdh_shared_secret = new_key;
+        link.key_rotation_in_progress = true;
+        link.rotation_overlap_deadline =
+            Some(Instant::now() + Duration::from_secs(
+                common::p2p_proto::KEY_ROTATION_OVERLAP_SECS,
+            ));
+        link.last_key_rotation = Instant::now();
+        link.key_rotation_retries = 0;
+        link.key_rotation_started = None;
+
+        let our_new_public_bytes = *our_new_public.as_bytes();
+
+        log::info!(
+            "key rotation completed (responder side) on link {:#010X} (peer={})",
+            link_id, link.peer_agent_id
+        );
+
+        Ok(our_new_public_bytes)
+    }
+
+    /// Handle an incoming KeyRotationAck frame.
+    ///
+    /// The responder has acknowledged our key rotation and provided their
+    /// new public key.  We derive the final shared secret and apply it.
+    ///
+    /// Returns `Ok(())` on success.
+    pub fn handle_key_rotation_ack(
+        &mut self,
+        link_id: u32,
+        payload: &[u8],
+    ) -> Result<(), String> {
+        use common::p2p_proto::KeyRotationAckData;
+
+        let data = KeyRotationAckData::from_bytes(payload)
+            .map_err(|e| format!("KeyRotationAck parse error: {e}"))?;
+
+        let link = self.links.get_mut(&link_id).ok_or_else(|| {
+            format!("handle_key_rotation_ack: link {:#010X} not found", link_id)
+        })?;
+
+        // Retrieve the secret we stored during initiate_key_rotation.
+        let secret_bytes = link.pending_rotation_secret.take().ok_or_else(|| {
+            "handle_key_rotation_ack: no pending rotation secret (was initiate_key_rotation called?)"
+                .to_string()
+        })?;
+
+        // Derive new shared secret: DH(our_new_secret, peer_new_public).
+        let our_secret = x25519_dalek::StaticSecret::from(secret_bytes);
+        let peer_new_public = x25519_dalek::PublicKey::from(data.responder_new_public_key);
+        let new_shared = our_secret.diffie_hellman(&peer_new_public);
+        let new_key = derive_link_key(new_shared.as_bytes());
+
+        // Apply the new key.
+        link.ecdh_shared_secret = new_key;
+        link.key_rotation_in_progress = false;
+        link.last_key_rotation = Instant::now();
+        link.key_rotation_retries = 0;
+        link.key_rotation_started = None;
+        link.pending_rotation_secret = None;
+        // Keep previous_key until overlap deadline passes.
+
+        log::info!(
+            "key rotation completed (initiator side) on link {:#010X} (peer={})",
+            link_id, link.peer_agent_id
+        );
+
+        Ok(())
+    }
+
+    /// Check all links for key rotation eligibility and overlap expiry.
+    ///
+    /// Returns a list of link IDs that need key rotation initiated.
+    pub fn links_needing_key_rotation(&self, now: Instant) -> Vec<u32> {
+        use common::p2p_proto::KEY_ROTATION_INTERVAL_SECS;
+
+        let mut needs_rotation = Vec::new();
+        for (&id, link) in &self.links {
+            if !link.state.is_usable() || link.quarantined {
+                continue;
+            }
+            if link.key_rotation_in_progress {
+                // Check for timeout.
+                if let Some(started) = link.key_rotation_started {
+                    let elapsed = now.duration_since(started).as_secs();
+                    if elapsed > common::p2p_proto::KEY_ROTATION_TIMEOUT_SECS {
+                        // Rotation timed out — needs retry or termination.
+                        needs_rotation.push(id);
+                    }
+                }
+                continue;
+            }
+            let elapsed = now.duration_since(link.last_key_rotation).as_secs();
+            if elapsed >= KEY_ROTATION_INTERVAL_SECS {
+                needs_rotation.push(id);
+            }
+        }
+        needs_rotation
+    }
+
+    /// Check for key rotation timeouts and return links that exceeded
+    /// the maximum retry count (should be terminated).
+    pub fn check_key_rotation_timeouts(&mut self, now: Instant) -> Vec<u32> {
+        let mut to_terminate = Vec::new();
+        let link_ids: Vec<u32> = self.links.keys().copied().collect();
+
+        for id in link_ids {
+            let should_terminate = {
+                let link = match self.links.get_mut(&id) {
+                    Some(l) => l,
+                    None => continue,
+                };
+                if !link.key_rotation_in_progress {
+                    continue;
+                }
+                if let Some(started) = link.key_rotation_started {
+                    let elapsed = now.duration_since(started).as_secs();
+                    if elapsed > common::p2p_proto::KEY_ROTATION_TIMEOUT_SECS {
+                        link.key_rotation_retries += 1;
+                        if link.key_rotation_retries
+                            >= common::p2p_proto::MAX_KEY_ROTATION_RETRIES as u32
+                        {
+                            log::warn!(
+                                "key rotation on link {:#010X} exceeded max retries ({}), terminating",
+                                id, link.key_rotation_retries
+                            );
+                            true
+                        } else {
+                            log::warn!(
+                                "key rotation on link {:#010X} timed out (attempt {}), will retry",
+                                id, link.key_rotation_retries
+                            );
+                            // Reset rotation state for retry.
+                            link.key_rotation_in_progress = false;
+                            link.key_rotation_started = None;
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if should_terminate {
+                if let Some(link) = self.links.get_mut(&id) {
+                    let _ = link.transition(LinkState::Dead);
+                }
+                to_terminate.push(id);
+            }
+        }
+
+        to_terminate
+    }
+
+    /// Clean up expired overlap keys on all links.
+    pub fn cleanup_overlap_keys(&mut self, now: Instant) {
+        for (_, link) in self.links.iter_mut() {
+            if let Some(deadline) = link.rotation_overlap_deadline {
+                if now >= deadline {
+                    link.previous_key = None;
+                    link.rotation_overlap_deadline = None;
+                }
+            }
+        }
+    }
 }
 
 /// Result of processing a `MeshDataForward` frame.
@@ -2258,6 +2829,10 @@ pub fn spawn_child_relay(
                         None => continue,
                     };
 
+                    // All encrypted control frames.  KeyRotation,
+                    // KeyRotationAck, CertificateRevocation and
+                    // QuarantineReport are also encrypted with the
+                    // per-link key.
                     let decrypted_frame = if matches!(
                         frame.frame_type,
                         P2pFrameType::LinkHeartbeat
@@ -2266,6 +2841,10 @@ pub fn spawn_child_relay(
                             | P2pFrameType::RouteProbeReply
                             | P2pFrameType::BandwidthProbe
                             | P2pFrameType::PeerDiscovery
+                            | P2pFrameType::KeyRotation
+                            | P2pFrameType::KeyRotationAck
+                            | P2pFrameType::CertificateRevocation
+                            | P2pFrameType::QuarantineReport
                     ) {
                         let payload = decrypt_payload(&key, &frame.payload)
                             .unwrap_or_default();
@@ -2279,11 +2858,158 @@ pub fn spawn_child_relay(
                         frame
                     };
 
-                    handle_control_frame_inner(
-                        &mut mesh_guard,
-                        &decrypted_frame,
-                        &outbound_tx,
-                    ).await;
+                    // Dispatch security-related control frames directly.
+                    // These need access to the mesh lock and/or transport
+                    // for writing response frames, so they cannot go
+                    // through handle_control_frame_inner (which takes
+                    // &mut P2pMesh but cannot write frames).
+                    match decrypted_frame.frame_type {
+                        P2pFrameType::KeyRotation => {
+                            match mesh_guard.handle_key_rotation(
+                                link_id,
+                                &decrypted_frame.payload,
+                            ) {
+                                Ok(responder_new_pubkey) => {
+                                    // Build KeyRotationAck, encrypt with
+                                    // the OLD key (captured before handle_key_rotation
+                                    // applied the new one).
+                                    use common::p2p_proto::KeyRotationAckData;
+                                    let ack_data = KeyRotationAckData {
+                                        responder_new_public_key: responder_new_pubkey,
+                                    };
+                                    let ack_payload = ack_data.to_bytes();
+                                    let ack_frame = P2pFrame {
+                                        frame_type: P2pFrameType::KeyRotationAck,
+                                        link_id,
+                                        payload_len: 0,
+                                        payload: ack_payload.to_vec(),
+                                    };
+                                    let link = match mesh_guard.links.get_mut(&link_id) {
+                                        Some(l) => l,
+                                        None => continue,
+                                    };
+                                    let write_res = match &mut link.transport {
+                                        #[cfg(feature = "p2p-tcp")]
+                                        P2pTransport::TcpStream(handle_arc) => {
+                                            let mut h = handle_arc.lock().await;
+                                            h.encrypt_write_frame(&ack_frame, &key).await
+                                        }
+                                        #[cfg(all(windows, feature = "smb-pipe-transport"))]
+                                        P2pTransport::SmbPipe(ref pipe) => {
+                                            let encrypted =
+                                                encrypt_payload(&key, &ack_frame.payload)?;
+                                            let enc_frame = P2pFrame {
+                                                frame_type: P2pFrameType::KeyRotationAck,
+                                                link_id,
+                                                payload_len: encrypted.len() as u32,
+                                                payload: encrypted,
+                                            };
+                                            nt_pipe_server::NtPipeHandle::write_frame(
+                                                pipe, &enc_frame,
+                                            )
+                                        }
+                                        _ => Err(anyhow::anyhow!("unsupported transport")),
+                                    };
+                                    if let Err(e) = write_res {
+                                        log::warn!(
+                                            "child relay: KeyRotationAck write failed on {:#010X}: {}",
+                                            link_id, e
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "child relay: KeyRotation error on {:#010X}: {}",
+                                        link_id, e
+                                    );
+                                }
+                            }
+                        }
+                        P2pFrameType::KeyRotationAck => {
+                            match mesh_guard.handle_key_rotation_ack(
+                                link_id,
+                                &decrypted_frame.payload,
+                            ) {
+                                Ok(()) => {
+                                    log::info!(
+                                        "child relay: key rotation completed on {:#010X}",
+                                        link_id
+                                    );
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "child relay: KeyRotationAck error on {:#010X}: {}",
+                                        link_id, e
+                                    );
+                                }
+                            }
+                        }
+                        P2pFrameType::CertificateRevocation => {
+                            use common::p2p_proto::CertificateRevocationData;
+                            match CertificateRevocationData::from_bytes(
+                                &decrypted_frame.payload,
+                            ) {
+                                Ok(data) => {
+                                    let terminated =
+                                        mesh_guard.handle_certificate_revocation(
+                                            data.revoked_agent_id_hash,
+                                        );
+                                    if !terminated.is_empty() {
+                                        log::info!(
+                                            "child relay: cert revocation terminated {} links on {:#010X}",
+                                            terminated.len(), link_id
+                                        );
+                                    }
+                                    // Propagate upstream.
+                                    let msg = common::Message::MeshCertificateRevocation {
+                                        revoked_agent_id_hash: data.revoked_agent_id_hash,
+                                    };
+                                    drop(mesh_guard);
+                                    let _ = outbound_tx.send(msg).await;
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "child relay: CertificateRevocation parse error on {:#010X}: {}",
+                                        link_id, e
+                                    );
+                                }
+                            }
+                        }
+                        P2pFrameType::QuarantineReport => {
+                            use common::p2p_proto::QuarantineReportData;
+                            match QuarantineReportData::from_bytes(
+                                &decrypted_frame.payload,
+                            ) {
+                                Ok(data) => {
+                                    log::info!(
+                                        "child relay: quarantine report from {:#010X}",
+                                        link_id
+                                    );
+                                    let msg = common::Message::MeshQuarantineReport {
+                                        quarantined_agent_id_hash: data.quarantined_agent_id_hash,
+                                        reason: data.reason,
+                                        evidence_hash: data.evidence_hash,
+                                    };
+                                    drop(mesh_guard);
+                                    let _ = outbound_tx.send(msg).await;
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "child relay: QuarantineReport parse error on {:#010X}: {}",
+                                        link_id, e
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            // Standard control frame — delegate to inner handler.
+                            handle_control_frame_inner(
+                                &mut mesh_guard,
+                                &decrypted_frame,
+                                &outbound_tx,
+                            ).await;
+                        }
+                    }
                 }
             }
         }
@@ -2620,6 +3346,7 @@ pub fn spawn_parent_reader(
                         None => continue,
                     };
 
+                    // All encrypted control frames including new security types.
                     let decrypted_frame = if matches!(
                         frame.frame_type,
                         P2pFrameType::LinkHeartbeat
@@ -2628,6 +3355,10 @@ pub fn spawn_parent_reader(
                             | P2pFrameType::RouteProbeReply
                             | P2pFrameType::BandwidthProbe
                             | P2pFrameType::PeerDiscovery
+                            | P2pFrameType::KeyRotation
+                            | P2pFrameType::KeyRotationAck
+                            | P2pFrameType::CertificateRevocation
+                            | P2pFrameType::QuarantineReport
                     ) {
                         let payload = decrypt_payload(&key, &frame.payload)
                             .unwrap_or_default();
@@ -2641,25 +3372,163 @@ pub fn spawn_parent_reader(
                         frame
                     };
 
-                    // Handle PeerDiscovery specially — it needs mesh_arc.
-                    if decrypted_frame.frame_type == P2pFrameType::PeerDiscovery {
-                        if let Err(e) = handle_peer_discovery(
-                            &mut mesh_guard,
-                            &decrypted_frame.payload,
-                            mesh.clone(),
-                            dummy_tx.clone(),
-                        ).await {
-                            log::debug!(
-                                "PeerDiscovery error on parent {:#010X}: {}",
-                                parent_link_id, e
-                            );
+                    // Dispatch security-related control frames directly.
+                    match decrypted_frame.frame_type {
+                        P2pFrameType::KeyRotation => {
+                            match mesh_guard.handle_key_rotation(
+                                parent_link_id,
+                                &decrypted_frame.payload,
+                            ) {
+                                Ok(responder_new_pubkey) => {
+                                    use common::p2p_proto::KeyRotationAckData;
+                                    let ack_data = KeyRotationAckData {
+                                        responder_new_public_key: responder_new_pubkey,
+                                    };
+                                    let ack_payload = ack_data.to_bytes();
+                                    let ack_frame = P2pFrame {
+                                        frame_type: P2pFrameType::KeyRotationAck,
+                                        link_id: parent_link_id,
+                                        payload_len: 0,
+                                        payload: ack_payload.to_vec(),
+                                    };
+                                    let link = match mesh_guard.links.get_mut(&parent_link_id) {
+                                        Some(l) => l,
+                                        None => continue,
+                                    };
+                                    let write_res = match &mut link.transport {
+                                        #[cfg(feature = "p2p-tcp")]
+                                        P2pTransport::TcpStream(handle_arc) => {
+                                            let mut h = handle_arc.lock().await;
+                                            h.encrypt_write_frame(&ack_frame, &key).await
+                                        }
+                                        #[cfg(all(windows, feature = "smb-pipe-transport"))]
+                                        P2pTransport::SmbPipe(ref pipe) => {
+                                            let encrypted =
+                                                encrypt_payload(&key, &ack_frame.payload)?;
+                                            let enc_frame = P2pFrame {
+                                                frame_type: P2pFrameType::KeyRotationAck,
+                                                link_id: parent_link_id,
+                                                payload_len: encrypted.len() as u32,
+                                                payload: encrypted,
+                                            };
+                                            nt_pipe_server::NtPipeHandle::write_frame(
+                                                pipe, &enc_frame,
+                                            )
+                                        }
+                                        _ => Err(anyhow::anyhow!("unsupported transport")),
+                                    };
+                                    if let Err(e) = write_res {
+                                        log::warn!(
+                                            "parent reader: KeyRotationAck write failed on {:#010X}: {}",
+                                            parent_link_id, e
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "parent reader: KeyRotation error on {:#010X}: {}",
+                                        parent_link_id, e
+                                    );
+                                }
+                            }
                         }
-                    } else {
-                        handle_control_frame_inner(
-                            &mut mesh_guard,
-                            &decrypted_frame,
-                            &dummy_tx,
-                        ).await;
+                        P2pFrameType::KeyRotationAck => {
+                            match mesh_guard.handle_key_rotation_ack(
+                                parent_link_id,
+                                &decrypted_frame.payload,
+                            ) {
+                                Ok(()) => {
+                                    log::info!(
+                                        "parent reader: key rotation completed on {:#010X}",
+                                        parent_link_id
+                                    );
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "parent reader: KeyRotationAck error on {:#010X}: {}",
+                                        parent_link_id, e
+                                    );
+                                }
+                            }
+                        }
+                        P2pFrameType::CertificateRevocation => {
+                            use common::p2p_proto::CertificateRevocationData;
+                            match CertificateRevocationData::from_bytes(
+                                &decrypted_frame.payload,
+                            ) {
+                                Ok(data) => {
+                                    let terminated =
+                                        mesh_guard.handle_certificate_revocation(
+                                            data.revoked_agent_id_hash,
+                                        );
+                                    if !terminated.is_empty() {
+                                        log::info!(
+                                            "parent reader: cert revocation terminated {} links",
+                                            terminated.len()
+                                        );
+                                    }
+                                    // Inject as a command into the local agent.
+                                    drop(mesh_guard);
+                                    let msg = common::Message::MeshCertificateRevocation {
+                                        revoked_agent_id_hash: data.revoked_agent_id_hash,
+                                    };
+                                    let _ = inbound_tx.send(msg).await;
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "parent reader: CertificateRevocation parse error: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        P2pFrameType::QuarantineReport => {
+                            use common::p2p_proto::QuarantineReportData;
+                            match QuarantineReportData::from_bytes(
+                                &decrypted_frame.payload,
+                            ) {
+                                Ok(data) => {
+                                    log::info!(
+                                        "parent reader: quarantine report from parent {:#010X}",
+                                        parent_link_id
+                                    );
+                                    let msg = common::Message::MeshQuarantineReport {
+                                        quarantined_agent_id_hash: data.quarantined_agent_id_hash,
+                                        reason: data.reason,
+                                        evidence_hash: data.evidence_hash,
+                                    };
+                                    drop(mesh_guard);
+                                    let _ = inbound_tx.send(msg).await;
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "parent reader: QuarantineReport parse error: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        // Handle PeerDiscovery specially — it needs mesh_arc.
+                        P2pFrameType::PeerDiscovery => {
+                            if let Err(e) = handle_peer_discovery(
+                                &mut mesh_guard,
+                                &decrypted_frame.payload,
+                                mesh.clone(),
+                                dummy_tx.clone(),
+                            ).await {
+                                log::debug!(
+                                    "PeerDiscovery error on parent {:#010X}: {}",
+                                    parent_link_id, e
+                                );
+                            }
+                        }
+                        _ => {
+                            handle_control_frame_inner(
+                                &mut mesh_guard,
+                                &decrypted_frame,
+                                &dummy_tx,
+                            ).await;
+                        }
                     }
                 }
             }

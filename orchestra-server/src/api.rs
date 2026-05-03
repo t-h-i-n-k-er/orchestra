@@ -130,6 +130,11 @@ pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
         .route("/mesh/disconnect", post(mesh_disconnect))
         .route("/mesh/topology", get(mesh_topology))
         .route("/mesh/stats", get(mesh_stats))
+        // Mesh security endpoints (kill switch, quarantine, compartment).
+        .route("/mesh/kill-switch", post(mesh_kill_switch))
+        .route("/mesh/quarantine", post(mesh_quarantine))
+        .route("/mesh/clear-quarantine", post(mesh_clear_quarantine))
+        .route("/mesh/set-compartment", post(mesh_set_compartment))
         // Redirector management endpoints (authed for operator use).
         .route("/redirector/list", get(crate::redirector::handle_list))
         .route("/redirector/remove", post(crate::redirector::handle_remove))
@@ -349,6 +354,36 @@ pub fn load_module_crypto(state: &AppState) -> Result<CryptoSession, (StatusCode
         .try_into()
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "module_aes_key must be exactly 32 bytes".into()))?;
     Ok(CryptoSession::from_key(key))
+}
+
+/// Build and sign a mesh certificate for an agent.
+///
+/// The certificate binds the agent's identity (via SHA-256 of `agent_id`)
+/// to a 32-byte public key.  The Ed25519 signature covers the
+/// `signing_input()` portion of the certificate.
+pub fn sign_mesh_certificate(
+    signing_key: &ed25519_dalek::SigningKey,
+    agent_id: &str,
+    public_key: &[u8; 32],
+    compartment: Option<&str>,
+) -> common::MeshCertificate {
+    use common::p2p_proto::MESH_CERT_LIFETIME_SECS;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time went backwards")
+        .as_secs();
+    let mut cert = common::MeshCertificate {
+        agent_id_hash: common::hash_agent_id(agent_id),
+        public_key: *public_key,
+        issued_at: now,
+        expires_at: now + MESH_CERT_LIFETIME_SECS,
+        server_signature: [0u8; 64],
+        compartment: compartment.map(|s| s.to_string()),
+    };
+    let signing_input = cert.signing_input();
+    let signature = signing_key.sign(&signing_input);
+    cert.server_signature = signature.to_bytes();
+    cert
 }
 
 /// `POST /api/agents/:id/push-module`
@@ -748,6 +783,222 @@ async fn mesh_stats(
     Json(mesh.stats())
 }
 
+// ── Mesh security endpoints ──────────────────────────────────────────────
+
+/// `POST /mesh/kill-switch`
+///
+/// Activate the mesh kill switch.  Sends `MeshKillSwitch` to ALL connected
+/// agents, causing them to terminate every P2P link immediately.
+#[derive(Deserialize)]
+struct KillSwitchRequest {
+    /// Optional: restrict to a specific agent_id.  If omitted, broadcasts
+    /// to all connected agents.
+    agent_id: Option<String>,
+}
+
+async fn mesh_kill_switch(
+    State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthenticatedUser>,
+    Json(req): Json<KillSwitchRequest>,
+) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    let cmd = Command::MeshKillSwitch;
+    let mut sent = 0;
+    let mut errors = 0;
+
+    let targets: Vec<_> = if let Some(ref agent_id) = req.agent_id {
+        state.find_by_agent_id(agent_id)
+            .map(|e| (e.agent_id.clone(), e.tx.clone()))
+            .into_iter()
+            .collect()
+    } else {
+        state.registry
+            .iter()
+            .map(|e| (e.agent_id.clone(), e.tx.clone()))
+            .collect()
+    };
+
+    for (agent_id, tx) in targets {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        match tx.send(Message::TaskRequest {
+            task_id,
+            command: cmd.clone(),
+            operator_id: None,
+        }).await {
+            Ok(()) => {
+                tracing::info!(agent_id = %agent_id, "mesh kill switch sent");
+                sent += 1;
+            }
+            Err(e) => {
+                tracing::warn!(agent_id = %agent_id, "mesh kill switch send failed: {}", e);
+                errors += 1;
+            }
+        }
+    }
+
+    Ok(Json(CommandReply {
+        task_id: "kill-switch-broadcast".to_string(),
+        outcome: "ok",
+        output: Some(format!(
+            "mesh kill switch: sent={}, errors={}",
+            sent, errors
+        )),
+        error: None,
+    }))
+}
+
+/// `POST /mesh/quarantine`
+///
+/// Quarantine a specific agent in the mesh.  Sends `MeshQuarantine` command
+/// to the target agent, which will mark it as quarantined and stop relaying.
+#[derive(Deserialize)]
+struct QuarantineRequest {
+    agent_id: String,
+    /// Quarantine reason code (0=unspecified, 1=invalid_cert, 2=compromise, etc.)
+    #[serde(default)]
+    reason: u8,
+}
+
+async fn mesh_quarantine(
+    State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthenticatedUser>,
+    Json(req): Json<QuarantineRequest>,
+) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    let entry = state
+        .find_by_agent_id(&req.agent_id)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("no agent with agent_id '{}'", req.agent_id),
+        ))?;
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    entry
+        .tx
+        .send(Message::TaskRequest {
+            task_id: task_id.clone(),
+            command: Command::MeshQuarantine {
+                target_agent_id: req.agent_id.clone(),
+                reason: req.reason,
+            },
+            operator_id: None,
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("send failed: {e}")))?;
+
+    tracing::info!(
+        agent_id = %req.agent_id,
+        reason = req.reason,
+        "mesh quarantine command sent"
+    );
+
+    Ok(Json(CommandReply {
+        task_id,
+        outcome: "ok",
+        output: Some(format!("quarantine command sent to {}", req.agent_id)),
+        error: None,
+    }))
+}
+
+/// `POST /mesh/clear-quarantine`
+///
+/// Clear the quarantine status of a specific agent.
+#[derive(Deserialize)]
+struct ClearQuarantineRequest {
+    agent_id: String,
+}
+
+async fn mesh_clear_quarantine(
+    State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthenticatedUser>,
+    Json(req): Json<ClearQuarantineRequest>,
+) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    let entry = state
+        .find_by_agent_id(&req.agent_id)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("no agent with agent_id '{}'", req.agent_id),
+        ))?;
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    entry
+        .tx
+        .send(Message::TaskRequest {
+            task_id: task_id.clone(),
+            command: Command::MeshClearQuarantine {
+                target_agent_id: req.agent_id.clone(),
+            },
+            operator_id: None,
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("send failed: {e}")))?;
+
+    tracing::info!(agent_id = %req.agent_id, "mesh clear-quarantine command sent");
+
+    Ok(Json(CommandReply {
+        task_id,
+        outcome: "ok",
+        output: Some(format!("clear-quarantine command sent to {}", req.agent_id)),
+        error: None,
+    }))
+}
+
+/// `POST /mesh/set-compartment`
+///
+/// Assign a compartment to a specific agent.  The agent will only form P2P
+/// links with agents in the same compartment.
+#[derive(Deserialize)]
+struct SetCompartmentRequest {
+    agent_id: String,
+    compartment: String,
+}
+
+async fn mesh_set_compartment(
+    State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthenticatedUser>,
+    Json(req): Json<SetCompartmentRequest>,
+) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    let entry = state
+        .find_by_agent_id(&req.agent_id)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("no agent with agent_id '{}'", req.agent_id),
+        ))?;
+
+    // Update the server-side entry too.
+    let conn_id = entry.connection_id.clone();
+    if let Some(mut e) = state.registry.get_mut(&conn_id) {
+        e.compartment = Some(req.compartment.clone());
+    }
+
+    let task_id = uuid::Uuid::new_v4().to_string();
+    entry
+        .tx
+        .send(Message::TaskRequest {
+            task_id: task_id.clone(),
+            command: Command::MeshSetCompartment {
+                compartment: req.compartment.clone(),
+            },
+            operator_id: None,
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("send failed: {e}")))?;
+
+    tracing::info!(
+        agent_id = %req.agent_id,
+        compartment = %req.compartment,
+        "mesh set-compartment command sent"
+    );
+
+    Ok(Json(CommandReply {
+        task_id,
+        outcome: "ok",
+        output: Some(format!(
+            "compartment '{}' set for agent {}",
+            req.compartment, req.agent_id
+        )),
+        error: None,
+    }))
+}
+
 // ── Command dispatch ──────────────────────────────────────────────────────
 
 async fn send_command_by_agent_id(
@@ -1025,6 +1276,10 @@ fn command_label(c: &Command) -> &'static str {
         Command::ListLinks => "ListLinks",
         Command::MeshConnect { .. } => "MeshConnect",
         Command::MeshDisconnect { .. } => "MeshDisconnect",
+        Command::MeshKillSwitch => "MeshKillSwitch",
+        Command::MeshQuarantine { .. } => "MeshQuarantine",
+        Command::MeshClearQuarantine { .. } => "MeshClearQuarantine",
+        Command::MeshSetCompartment { .. } => "MeshSetCompartment",
     }
 }
 

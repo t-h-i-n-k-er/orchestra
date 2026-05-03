@@ -749,6 +749,26 @@ pub async fn handle_command(
                 None => Err(format!("no link to agent '{}'", target_agent_id)),
             }
         }
+        Command::MeshKillSwitch => {
+            let mut mesh_guard = p2p_mesh.lock().await;
+            mesh_guard.activate_kill_switch();
+            Ok("mesh kill switch activated: all links terminated".to_string())
+        }
+        Command::MeshQuarantine { ref target_agent_id, reason } => {
+            let mut mesh_guard = p2p_mesh.lock().await;
+            mesh_guard.quarantine_peer(target_agent_id, reason);
+            Ok(format!("agent '{}' quarantined (reason={})", target_agent_id, reason))
+        }
+        Command::MeshClearQuarantine { ref target_agent_id } => {
+            let mut mesh_guard = p2p_mesh.lock().await;
+            mesh_guard.clear_quarantine(target_agent_id);
+            Ok(format!("quarantine cleared for agent '{}'", target_agent_id))
+        }
+        Command::MeshSetCompartment { ref compartment } => {
+            let mut mesh_guard = p2p_mesh.lock().await;
+            mesh_guard.set_compartment(compartment.clone());
+            Ok(format!("mesh compartment set to '{}'", compartment))
+        }
     };
 
     let (outcome, details) = match &result {

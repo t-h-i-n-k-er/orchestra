@@ -41,6 +41,10 @@ pub struct AgentEntry {
     /// SHA-256 hash of the agent's `.text` section after the most recent
     /// morph operation.  Updated when the agent reports a `MorphResult`.
     pub text_hash: Option<String>,
+    /// Server-issued mesh certificate for this agent (set on check-in).
+    pub mesh_certificate: Option<common::MeshCertificate>,
+    /// Compartment assigned to this agent (operator-configured).
+    pub compartment: Option<String>,
 }
 
 /// JSON-friendly snapshot of an agent for the dashboard.
@@ -53,6 +57,7 @@ pub struct AgentView {
     pub peer: String,
     pub morph_seed: u64,
     pub text_hash: Option<String>,
+    pub compartment: Option<String>,
 }
 
 impl From<&AgentEntry> for AgentView {
@@ -65,6 +70,7 @@ impl From<&AgentEntry> for AgentView {
             peer: e.peer.clone(),
             morph_seed: e.morph_seed,
             text_hash: e.text_hash.clone(),
+            compartment: e.compartment.clone(),
         }
     }
 }
@@ -148,6 +154,10 @@ pub struct AppState {
     pub redirector_state: RedirectorState,
     /// Mesh controller with Dijkstra pathfinding for mesh-aware routing.
     pub mesh_controller: RwLock<crate::mesh_controller::MeshController>,
+    /// Revoked mesh certificate hashes (SHA-256 of agent_id).  Any agent
+    /// whose `agent_id_hash` appears in this set will be rejected during
+    /// P2P link handshake and have existing links terminated.
+    pub revoked_certificates: DashSet<[u8; 32]>,
 }
 
 impl AppState {
@@ -181,6 +191,7 @@ impl AppState {
             topology: RwLock::new(TopologyMap::default()),
             redirector_state: RedirectorState::new(),
             mesh_controller: RwLock::new(crate::mesh_controller::MeshController::new()),
+            revoked_certificates: DashSet::new(),
         }
     }
 

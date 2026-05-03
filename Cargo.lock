@@ -74,6 +74,7 @@ dependencies = [
  "ctr 0.10.0",
  "directories",
  "dirs",
+ "ed25519-dalek",
  "enigo",
  "futures-util",
  "goblin 0.7.1",
