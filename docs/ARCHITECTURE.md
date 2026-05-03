@@ -460,44 +460,92 @@ pub struct MultiProfileManager {
 
 ### Frame Types
 
-| Type | Purpose |
-|------|---------|
-| `LinkRequest` | Initiate a new P2P link |
-| `Accept` | Accept link request |
-| `Reject` | Reject link request |
-| `Heartbeat` | Keep link alive |
-| `Disconnect` | Graceful link teardown |
-| `DataForward` | Forward data toward C2 |
-| `DataAck` | Acknowledge data receipt |
-| `TopologyReport` | Report mesh topology to server |
+| Type | Code | Purpose |
+|------|------|---------|
+| `LinkRequest` | `0x30` | Initiate a new P2P link |
+| `LinkAccept` | `0x31` | Accept link request |
+| `LinkReject` | `0x32` | Reject link request (includes reason) |
+| `Heartbeat` | `0x33` | Keep-alive + latency measurement |
+| `Disconnect` | `0x34` | Graceful link teardown |
+| `DataForward` | `0x35` | Relay data toward C2 |
+| `CertificateRevocation` | `0x36` | Revoke a mesh certificate |
+| `QuarantineReport` | `0x37` | Report quarantined agent |
+| `KeyRotation` | `0x38` | Start per-link key rotation |
+| `KeyRotationAck` | `0x39` | Acknowledge key rotation |
+| `RouteUpdate` | `0x3A` | Distance-vector route advertisement |
+| `RouteProbe` | `0x3B` | Measure link latency/hops |
+| `RouteProbeReply` | `0x3C` | Reply to route probe |
+| `DataAck` | `0x3D` | Acknowledge data receipt |
+| `TopologyReport` | `0x3E` | Report mesh topology to server |
+| `BandwidthProbe` | `0x3F` | Measure available bandwidth |
 
-### Topology
+### Topology Modes
 
 ```
-                    ┌──────────┐
-                    │  Server  │
-                    └────┬─────┘
-                         │
-                    ┌────▼─────┐
-                    │ Parent   │
-                    │ Agent    │
-                    └─┬──┬──┬─┘
-                      │  │  │
-               ┌──────┘  │  └──────┐
-               │         │         │
-          ┌────▼───┐ ┌───▼───┐ ┌──▼────┐
-          │Child A │ │Child B│ │Child C│
-          └────┬───┘ └───────┘ └───────┘
-               │
-          ┌────▼───┐
-          │Child D │  (nested)
-          └────────┘
+Tree Mode:                  Mesh Mode:                  Hybrid Mode:
+                            (all agents peers)          (tree + peer shortcuts)
+
+     Server                      Server                      Server
+       │                           │                           │
+    Parent                      Agent A                    Parent
+    ┌──┼──┐                   ◄──► B ◄──► C               ┌──┼──┐
+    A  B  C                   ◄──► D ◄──► E               A  B  C
+    (no lateral)               (full mesh)                     ◄──►
+                                                             (peer link)
 ```
 
-- Parent agents relay messages between children and the server
-- Each link has a unique `link_id` for routing
-- `P2pForward` messages travel up the tree toward the server
-- `P2pToChild` messages travel down toward a specific child
+- **Tree**: Strict hierarchy — all traffic through parents. Maximum OPSEC.
+- **Mesh**: Full peer-to-peer with route discovery. Maximum resilience.
+- **Hybrid** (default): Tree backbone with optional peer links.
+
+### Certificate Lifecycle
+
+```
+┌───────────┐      ┌──────────────┐      ┌───────────────┐
+│  Server   │─────►│   Agent A    │      │   Agent B     │
+│  issues   │      │  (presented  │─────►│   (verifies   │
+│  MeshCert │      │   to peers)  │      │   signature)  │
+└───────────┘      └──────┬───────┘      └───────────────┘
+                          │                       │
+                   ┌──────▼───────┐        ┌──────▼──────┐
+                   │  Renewal     │        │ Revocation  │
+                   │  (2h before  │        │ (propagates │
+                   │   expiry)    │        │  via mesh)  │
+                   └──────────────┘        └─────────────┘
+```
+
+- Certificates are signed with the server's Ed25519 `module_signing_key`.
+- Lifetime: 24 hours. Renewal window: 2 hours before expiry.
+- Revocation propagates through `CertificateRevocation` frames.
+- All agents terminate links to revoked peers immediately.
+
+### Key Rotation Timeline
+
+```
+Time: 0h          4h          4h+δ         4h+δ+30s
+      │            │            │             │
+      ├─ normal ──►│ rotation   │ new key     │ old key
+      │  traffic   │ starts     │ active      │ discarded
+      │            │            │             │
+      │            │◄─ overlap ─►│             │
+      │            │  (30s)     │             │
+      │            │            │             │
+      │  OLD key   │ OLD key    │ NEW key     │ NEW key
+      │  only      │ + NEW key  │ + OLD key   │ only
+```
+
+- Rotation interval: 4 hours per link.
+- Overlap period: 30 seconds (both keys accepted).
+- Timeout: 60 seconds for `KeyRotationAck`, then retry.
+- Max retries: 3 before giving up on rotation.
+
+### Routing
+
+- **Protocol**: Distributed distance-vector (Bellman-Ford).
+- **Update interval**: 60 seconds (`RouteUpdate` frames).
+- **Quality metric**: Composite of latency (40%), packet loss (40%), jitter (20%).
+- **Relay selection**: 70% route quality + 30% inverse hop count.
+- **Stale timeout**: Routes expire after 300 seconds without update.
 
 ---
 
@@ -506,12 +554,13 @@ pub struct MultiProfileManager {
 | Primitive | Usage | Key Size |
 |-----------|-------|----------|
 | AES-256-GCM | Wire encryption (all transports) | 256-bit |
-| HKDF-SHA256 | Per-message key derivation | 256-bit |
-| X25519 | Forward secrecy ECDH | 256-bit |
-| Ed25519 | Module signing/verification | 256-bit |
+| ChaCha20-Poly1305 | P2P per-link encryption | 256-bit |
+| HKDF-SHA256 | Per-message key derivation, P2P link key derivation | 256-bit |
+| X25519 | Forward secrecy ECDH, P2P link handshake & key rotation | 256-bit |
+| Ed25519 | Module signing/verification, mesh certificate signing | 256-bit |
 | XChaCha20-Poly1305 | Sleep obfuscation memory encryption | 256-bit |
 | HMAC-SHA256 | Audit log integrity, config HMAC | 256-bit |
-| SHA-256 | Certificate fingerprinting, integrity checks | 256-bit |
+| SHA-256 | Certificate fingerprinting, agent identity hashing, integrity checks | 256-bit |
 
 ---
 

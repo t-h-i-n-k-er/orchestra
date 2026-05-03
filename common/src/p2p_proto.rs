@@ -728,12 +728,16 @@ impl MeshRoutingBlob {
 /// ```
 #[derive(Debug, Clone)]
 pub struct RouteTooDeepData {
+    /// Target agent that could not be reached.
     pub destination: String,
+    /// Agent that originated the frame.
     pub origin: String,
+    /// Number of hops the frame has traversed.
     pub hop_count: u8,
 }
 
 impl RouteTooDeepData {
+    /// Serialize to the wire format.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         let dest_bytes = self.destination.as_bytes();
@@ -746,6 +750,7 @@ impl RouteTooDeepData {
         buf
     }
 
+    /// Deserialize from the wire format.
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
         let mut offset = 0;
         if data.len() < offset + 2 {
@@ -794,9 +799,13 @@ impl RouteTooDeepData {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopologyPeerEntry {
+    /// Identifier of the connected peer agent.
     pub peer_id: String,
+    /// Link type: 0=parent, 1=child, 2=peer.
     pub link_type: u8,
+    /// Composite quality score (0.0–1.0, higher is better).
     pub quality: f32,
+    /// Smoothed average round-trip latency in milliseconds.
     pub latency_ms: u32,
 }
 
@@ -809,7 +818,9 @@ pub struct TopologyPeerEntry {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopologyRouteEntry {
+    /// Destination agent identifier reachable via this route.
     pub destination: String,
+    /// Number of hops to reach the destination.
     pub hop_count: u8,
 }
 
@@ -827,12 +838,16 @@ pub struct TopologyRouteEntry {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnhancedTopologyReport {
+    /// Identifier of the reporting agent.
     pub agent_id: String,
+    /// Connected peers and their link quality metrics.
     pub peers: Vec<TopologyPeerEntry>,
+    /// Known routes to other agents in the mesh.
     pub routes: Vec<TopologyRouteEntry>,
 }
 
 impl EnhancedTopologyReport {
+    /// Serialize to the wire format.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
 
@@ -864,6 +879,7 @@ impl EnhancedTopologyReport {
         buf
     }
 
+    /// Deserialize from the wire format.
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
         let mut offset = 0;
 
@@ -1015,10 +1031,12 @@ impl CertificateRevocationData {
     /// Wire size: exactly 32 bytes (the SHA-256 hash).
     pub const WIRE_SIZE: usize = 32;
 
+    /// Serialize to the wire format (raw 32-byte hash).
     pub fn to_bytes(&self) -> Vec<u8> {
         self.revoked_agent_id_hash.to_vec()
     }
 
+    /// Deserialize from the wire format.
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
         if data.len() < Self::WIRE_SIZE {
             return Err(format!(
@@ -1057,6 +1075,7 @@ impl QuarantineReportData {
     /// Wire size: 32 (hash) + 1 (reason) + 32 (evidence) = 65 bytes.
     pub const WIRE_SIZE: usize = 65;
 
+    /// Serialize to the wire format.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(Self::WIRE_SIZE);
         buf.extend_from_slice(&self.quarantined_agent_id_hash);
@@ -1065,6 +1084,7 @@ impl QuarantineReportData {
         buf
     }
 
+    /// Deserialize from the wire format.
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
         if data.len() < Self::WIRE_SIZE {
             return Err(format!(
@@ -1107,10 +1127,12 @@ impl KeyRotationData {
     /// Wire size of the *plaintext* payload (before AEAD wrapping).
     pub const WIRE_SIZE: usize = 32;
 
+    /// Serialize the new ephemeral public key to bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.new_ephemeral_public_key.to_vec()
     }
 
+    /// Deserialize the new ephemeral public key from bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
         if data.len() < Self::WIRE_SIZE {
             return Err(format!(
@@ -1150,10 +1172,12 @@ impl KeyRotationAckData {
     /// Wire size of the *plaintext* payload.
     pub const WIRE_SIZE: usize = 32;
 
+    /// Serialize the responder's new public key to bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.responder_new_public_key.to_vec()
     }
 
+    /// Deserialize the responder's new public key from bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
         if data.len() < Self::WIRE_SIZE {
             return Err(format!(

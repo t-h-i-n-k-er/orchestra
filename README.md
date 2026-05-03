@@ -767,6 +767,85 @@ orchestra-server redirector remove --identifier redirector-id-here
 
 ---
 
+## P2P Mesh Networking
+
+Agents can form a peer-to-peer mesh for lateral communication, C2 relay
+through nested networks, and resilient routing that survives individual link
+failures.
+
+### Mesh Topology
+
+```
+                    ┌──────────┐
+                    │  Server  │
+                    └────┬─────┘
+                         │
+                    ┌────▼─────┐
+                    │ Agent A  │ (parent, internet-facing)
+                    └─┬──┬──┬─┘
+                      │  │  │
+               ┌──────┘  │  └──────┐
+               │         │         │
+          ┌────▼───┐ ┌───▼───┐ ┌──▼────┐
+          │Agent B │ │Agent D│ │Agent E│
+          │  ◄──►  │ └───────┘ └───────┘
+          └─┬──┬───┘
+       peer│  │child
+          ┌─┘  └──┐
+     ┌────▼──┐ ┌──▼───┐
+     │Agent C│ │Agent │
+     │       │ │  F   │
+     └───────┘ └──────┘
+```
+
+- **Parent/Child**: Hierarchical C2 relay (tree backbone).
+- **Peer**: Lateral links for direct agent-to-agent communication.
+
+### MeshMode Comparison
+
+| Mode | Peer Links | Route Discovery | Best For |
+|------|:----------:|:---------------:|----------|
+| **Tree** | ✗ | ✗ | Maximum OPSEC — all traffic funnels through parents |
+| **Mesh** | ✓ | ✓ | Maximum resilience — any agent reaches any other |
+| **Hybrid** | ✓ | ✓ | Balanced (default) — tree backbone + peer shortcuts |
+
+### Quick Mesh Setup
+
+```bash
+# 1. Link two agents (server command → parent agent)
+curl -X POST https://c2.example.com/api/mesh/connect \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"parent_agent_id":"DESKTOP-WIN10","child_address":"10.0.0.20:4443"}'
+
+# 2. View mesh topology
+curl https://c2.example.com/api/mesh/topology \
+  -H "Authorization: Bearer $TOKEN"
+
+# 3. View mesh statistics
+curl https://c2.example.com/api/mesh/stats \
+  -H "Authorization: Bearer $TOKEN"
+
+# 4. Broadcast command to all mesh agents
+curl -X POST https://c2.example.com/api/mesh/broadcast \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"command":"GetSystemInfo"}'
+```
+
+### Security Model
+
+| Feature | Description |
+|---------|-------------|
+| **Server-signed certificates** | Each agent receives an Ed25519-signed mesh certificate (24h lifetime) |
+| **Per-link encryption** | X25519 ECDH → ChaCha20-Poly1305 on every link |
+| **Key rotation** | Automatic 4-hour key rotation per link with overlap period |
+| **Compartment isolation** | Agents only peer with agents in the same compartment |
+| **Kill switch** | Instantly terminate all P2P links mesh-wide |
+| **Quarantine** | Isolate a compromised agent while keeping server connection |
+
+> See [docs/P2P_MESH.md](docs/P2P_MESH.md) for the full mesh reference.
+
+---
+
 ## Configuration Reference
 
 ### Server CLI Arguments

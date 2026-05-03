@@ -20,6 +20,15 @@ All notable changes to Orchestra are documented here.
 - **`VersionHandshake` message** — Agents send a `Message::VersionHandshake`
   as the first message on every new connection; the server echoes back its
   version. Mismatched versions log a warning.
+- **P2P mesh wire protocol** — Full set of 16+ frame types in `p2p_proto`:
+  `LinkRequest`, `LinkAccept`, `LinkReject`, `Heartbeat`, `Disconnect`,
+  `DataForward`, `CertificateRevocation`, `QuarantineReport`, `KeyRotation`,
+  `KeyRotationAck`, `RouteUpdate`, `RouteProbe`, `RouteProbeReply`,
+  `DataAck`, `TopologyReport`, `BandwidthProbe`. All frames use a 10-byte
+  header with per-link ChaCha20-Poly1305 encryption.
+- **Distance-vector routing protocol** — `RouteEntry` struct with quality
+  scoring (latency 40%, packet loss 40%, jitter 20%). Routes advertised via
+  `RouteUpdate` frames every 60 seconds with automatic stale/expiry cleanup.
 
 #### `orchestra-server` crate
 - **Async build queue** — New `build_handler` module with configurable
@@ -40,6 +49,15 @@ All notable changes to Orchestra are documented here.
   `doh_listen_addr`, `doh_domain`, `doh_beacon_sentinel`, `doh_idle_ip`,
   `agent_traffic_profile`, `mtls_enabled`, `mtls_ca_cert_path`,
   `mtls_allowed_cns`, `mtls_allowed_ous`.
+- **Mesh controller** — New mesh controller module for server-side topology
+  management. REST endpoints: `GET /mesh/topology`, `GET /mesh/stats`,
+  `POST /mesh/connect`, `POST /mesh/disconnect`, `POST /mesh/kill-switch`,
+  `POST /mesh/quarantine`, `POST /mesh/clear-quarantine`,
+  `POST /mesh/set-compartment`, `POST /mesh/route`, `POST /mesh/broadcast`.
+- **Server mesh commands** — Commands to manage mesh: `MeshConnect`,
+  `MeshDisconnect`, `MeshKillSwitch`, `MeshQuarantine`,
+  `MeshClearQuarantine`, `MeshSetCompartment`, `MeshListTopology`,
+  `MeshListLinks`, `MeshBroadcast`.
 
 #### `agent` crate
 - **`stack-spoof` feature** — Spoofs the user-mode call stack visible to EDR
@@ -47,6 +65,33 @@ All notable changes to Orchestra are documented here.
   Implies `direct-syscalls`.
 - **`hot-reload` feature** — Enables runtime config hot-reload via the
   `notify` crate.
+- **Full P2P mesh topology** — `MeshMode` enum with Tree/Mesh/Hybrid modes.
+  Tree for strict hierarchy, Mesh for full peer-to-peer, Hybrid for balanced
+  tree backbone with peer shortcuts (default).
+- **Dynamic route discovery** — Distance-vector routing with `RouteUpdate`
+  frames. Automatic route quality scoring, stale/expiry cleanup, and
+  fallback to server relay when no mesh route exists.
+- **Link quality monitoring** — Per-link latency (heartbeat RTT), jitter
+  (stddev), packet loss (missed heartbeat ratio), and bandwidth (periodic
+  probes). Quality = 40% latency + 40% loss + 20% jitter.
+- **Link healing** — Dead link detection (heartbeat timeout, read errors).
+  Automatic reconnection with exponential backoff. Route table cleanup and
+  re-discovery after reconnection.
+- **Adaptive relay selection** — Relay hop chosen by 70% route quality +
+  30% inverse hop count. Weighted round-robin for ties within 10%. Congestion
+  detection penalizes links with >64 KiB pending data.
+- **Server-signed mesh certificates** — Ed25519-signed certificates binding
+  agent_id_hash to public key. 24h lifetime, 2h renewal window, automatic
+  revocation propagation through `CertificateRevocation` frames.
+- **Per-link encryption** — X25519 ECDH handshake → HKDF-derived
+  ChaCha20-Poly1305 keys. Every frame payload encrypted independently.
+- **Compromise containment** — Kill switch (terminate all P2P links),
+  quarantine (isolate agent while keeping server connection), compartment
+  isolation (agents only peer within same compartment).
+- **Periodic link key rotation** — Automatic 4-hour key rotation per link
+  with 30-second overlap period. 3 retries with 60s timeout on failure.
+- **Bandwidth-aware relay throttling** — Per-link relay throttle based on
+  measured bandwidth. Congestion detection with high/low thresholds.
 
 #### `agent` crate
 - **`env_check` module** — Trusted Execution Environment (TEE) enforcement:

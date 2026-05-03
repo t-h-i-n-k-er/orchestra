@@ -2590,6 +2590,11 @@ pub enum MeshRelayAction {
     /// Frame is invalid or cannot be routed — silently drop.
     Drop,
 }
+
+/// Exponential backoff state for P2P link reconnection attempts.
+///
+/// Tracks the number of consecutive failed reconnection attempts and computes
+/// the delay before the next retry. Backoff is reset on successful reconnection.
 #[derive(Debug, Clone, Default)]
 pub struct ReconnectBackoff {
     /// Number of consecutive failed attempts.
