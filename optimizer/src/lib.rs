@@ -1,3 +1,26 @@
+//! x86-64 binary diversification engine.
+//!
+//! This crate applies post-compilation transformations to x86-64 instruction
+//! streams to produce semantically equivalent but structurally unique binaries.
+//! Each build produces a different output even from identical source code.
+//!
+//! # Transformation Passes
+//!
+//! - **NOP insertion**: Inserts random NOP instructions (single-byte `0x90` or
+//!   multi-byte forms like `0F 1F /0`) at configurable density.
+//! - **Instruction scheduling**: Reorders independent instructions within a
+//!   basic block using a dependency-aware scheduler.
+//! - **Instruction substitution**: Replaces instructions with equivalent but
+//!   different encodings (e.g., `MOV reg, 0` → `XOR reg, reg`).
+//! - **Dead-code insertion**: Inserts provably-dead code paths (always-false
+//!   conditions) filled with realistic-looking but unreachable instructions.
+//!
+//! # Usage
+//!
+//! Implement the [`Pass`] trait for custom transformation passes, or use the
+//! built-in passes: [`NopInsertion`], [`InstructionScheduling`],
+//! [`SubstitutionPass`], and [`DeadCodePass`].
+
 // Optimizer
 use iced_x86::{Code, Decoder, DecoderOptions, Encoder, FlowControl, Instruction, OpKind, Register};
 use rand::seq::SliceRandom;
@@ -24,10 +47,21 @@ fn derive_dead_val(index: u64) -> u64 {
     u64::from_le_bytes(okm)
 }
 
+/// A single transformation pass over an instruction stream.
+///
+/// Implementations receive a mutable vector of decoded instructions and
+/// may reorder, insert, replace, or remove them, provided the final
+/// instruction stream is semantically equivalent to the input.
 pub trait Pass {
+    /// Apply this transformation pass to the instruction stream.
     fn run(&self, instrs: &mut Vec<Instruction>);
 }
 
+/// Apply diversification passes to raw code bytes.
+///
+/// Convenience wrapper around [`apply_passes_at`] with a default base address
+/// of `0x1000`. Use [`apply_passes_at`] directly when the actual section VA
+/// is known.
 pub fn apply_passes(code: &[u8]) -> Vec<u8> {
     apply_passes_at(0x1000, code)
 }
@@ -218,6 +252,11 @@ pub fn apply_passes_to_binary(binary: &[u8]) -> Result<Vec<u8>, String> {
 
 
 
+/// NOP insertion pass: randomly inserts multi-byte NOPs (`0F 1F /0`)
+/// between instructions at ~10% density.
+///
+/// Each build produces a different NOP pattern, changing the binary's
+/// fingerprint without affecting semantics.
 pub struct NopInsertionPass;
 impl Pass for NopInsertionPass {
     fn run(&self, instrs: &mut Vec<Instruction>) {
@@ -288,6 +327,12 @@ fn is_block_terminator(ins: &Instruction) -> bool {
 
 // ── SSA-based instruction scheduling pass ────────────────────────────────────
 
+/// Instruction scheduling pass: reorders independent (non-dependent)
+/// instructions within basic blocks.
+///
+/// Instructions are grouped into dependency chains and the chains are
+/// interleaved to produce a different execution order while preserving
+/// data-flow correctness.
 pub struct InstructionSchedulingPass;
 impl Pass for InstructionSchedulingPass {
     fn run(&self, instrs: &mut Vec<Instruction>) {
@@ -738,6 +783,16 @@ fn schedule_block(block: &mut [Instruction]) {
 /// which covers the vast majority of loop-counter and pointer-increment
 /// patterns.  Enable only when you accept this caveat.
 #[cfg(feature = "diversification")]
+/// Instruction substitution pass: replaces instructions with semantically
+/// equivalent alternatives.
+///
+/// Substitutions include:
+/// - `ADD reg, 1` ↔ `INC reg`
+/// - `SUB reg, 1` ↔ `DEC reg`
+/// - `MOV reg, 0` → `XOR reg, reg`
+/// - `TEST reg, reg` ↔ `CMP reg, 0`
+///
+/// Each substitution is applied with 50% probability per instruction.
 pub struct InstructionSubstitutionPass;
 
 #[cfg(feature = "diversification")]
@@ -887,6 +942,16 @@ impl Pass for OpaqueDeadCodePass {
     }
 }
 
+/// Apply runtime diversification to a named function.
+///
+/// When the `unsafe-runtime-rewrite` feature is enabled, this locates the
+/// function by name in the current process's memory, applies diversification
+/// passes, and patches the function in-place. Otherwise, this is a no-op.
+///
+/// # Safety
+///
+/// This function modifies executable memory at runtime. It should only be
+/// called when no other thread is executing the target function.
 pub fn optimize_hot_function(name: &str) -> Result<(), String> {
     tracing::debug!("optimize_hot_function: requested for '{}'", name);
 

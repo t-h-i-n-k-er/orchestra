@@ -280,7 +280,7 @@ pub mod windows {
         pub lpvtbl: *const IWbemClassObjectVtbl,
     }
 
-    // IWbemServices (partial vtable – only GetObject and PutInstance are used)
+    // IWbemServices (partial vtable)
     // Full vtable slot offsets per MSDN (IWbemServices inherits from IUnknown):
     //   0 QueryInterface, 1 AddRef, 2 Release,
     //   3 OpenNamespace, 4 CancelAsyncCall, 5 QueryObjectSink,
@@ -288,7 +288,10 @@ pub mod windows {
     //   8 PutClass, 9 PutClassAsync,
     //   10 DeleteClass, 11 DeleteClassAsync,
     //   12 CreateClassEnum, 13 CreateClassEnumAsync,
-    //   14 PutInstance, ...
+    //   14 PutInstance, 15 PutInstanceAsync,
+    //   16 DeleteInstance, 17 DeleteInstanceAsync,
+    //   18 CreateInstanceEnum, 19 CreateInstanceEnumAsync,
+    //   20 ExecQuery, ...
     #[repr(C)]
     struct IWbemServicesVtbl {
         pub query_interface:      unsafe extern "system" fn(*mut IWbemServices, REFIID, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
@@ -306,6 +309,12 @@ pub mod windows {
         pub create_class_enum:    unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
         pub create_class_enum_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
         pub put_instance:         unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub put_instance_async:   unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub delete_instance:      unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub delete_instance_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub create_instance_enum: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub create_instance_enum_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub exec_query:           unsafe extern "system" fn(*mut IWbemServices, BSTR, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
     }
     #[repr(C)]
     struct IWbemServices {
@@ -351,8 +360,34 @@ pub mod windows {
 
     // WBEM_FLAG_CREATE_OR_UPDATE = 0
     const WBEM_FLAG_CREATE_OR_UPDATE: LONG = 0;
+    // WBEM_FLAG_FORWARD_ONLY = 0x20 (for ExecQuery — forward-only enumerator)
+    const WBEM_FLAG_FORWARD_ONLY: LONG = 0x20;
+    // WBEM_INFINITE = 0xFFFFFFFF (timeout for IEnumWbemClassObject::Next)
+    const WBEM_INFINITE: LONG = -1;
     // VT_BSTR = 8
     const VT_BSTR: u16 = 8;
+
+    // IEnumWbemClassObject (partial vtable – Next and Release)
+    // Full vtable: 0 QI, 1 AddRef, 2 Release, 3 Reset, 4 Next, 5 NextAsync,
+    //              6 Skip, 7 Clone
+    #[repr(C)]
+    struct IEnumWbemClassObjectVtbl {
+        pub query_interface: unsafe extern "system" fn(*mut IEnumWbemClassObject, REFIID, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub add_ref:         unsafe extern "system" fn(*mut IEnumWbemClassObject) -> u32,
+        pub release:         unsafe extern "system" fn(*mut IEnumWbemClassObject) -> u32,
+        pub reset:           unsafe extern "system" fn(*mut IEnumWbemClassObject) -> winapi::shared::winerror::HRESULT,
+        pub next:            unsafe extern "system" fn(
+            *mut IEnumWbemClassObject,
+            LONG,                          // lTimeout
+            u32,                           // uCount
+            *mut *mut IWbemClassObject,    // apObjects
+            *mut u32,                      // puReturned
+        ) -> winapi::shared::winerror::HRESULT,
+    }
+    #[repr(C)]
+    struct IEnumWbemClassObject {
+        pub lpvtbl: *const IEnumWbemClassObjectVtbl,
+    }
 
     // Helper: allocate a BSTR from a Rust &str
     unsafe fn alloc_bstr(s: &str) -> BSTR {
@@ -390,6 +425,33 @@ pub mod windows {
         free_bstr(val_bstr);
         free_bstr(name_bstr);
         hr
+    }
+
+    // Helper: read a BSTR property from an IWbemClassObject.
+    // Returns Ok(String) on success, or Err if the property is missing /
+    // not a BSTR.
+    unsafe fn get_bstr_prop(obj: *mut IWbemClassObject, name: &str) -> Result<String> {
+        use winapi::um::oaidl::VARIANT;
+        let name_bstr = alloc_bstr(name);
+        let mut var: VARIANT = std::mem::zeroed();
+        let hr = ((*(*obj).lpvtbl).get)(obj, name_bstr, 0, &mut var, ptr::null_mut(), ptr::null_mut());
+        free_bstr(name_bstr);
+        if !winapi::shared::winerror::SUCCEEDED(hr) {
+            return Err(anyhow!("IWbemClassObject::Get('{}') failed: 0x{:08X}", name, hr));
+        }
+        let vt = var.n1.n2().vt;
+        if vt != VT_BSTR {
+            return Err(anyhow!("Property '{}' is not VT_BSTR (got {})", name, vt));
+        }
+        let bstr = *var.n1.n2().n3.bstrVal();
+        let s = if bstr.is_null() {
+            String::new()
+        } else {
+            let len = (0..).take_while(|&i| *bstr.add(i) != 0).count();
+            String::from_utf16_lossy(std::slice::from_raw_parts(bstr, len))
+        };
+        winapi::um::oleauto::VariantClear(&mut var);
+        Ok(s)
     }
 
     /// Resolve the `SpawnInstance` virtual function pointer from an
@@ -733,6 +795,226 @@ pub mod windows {
         Ok(())
     }
 
+    // ── Shared WMI connection helper (used by remove & verify) ───────────
+    //
+    // Connects to root\subscription via COM and returns the IWbemServices
+    // pointer.  The caller must Release both the services and locator pointers
+    // when done.
+    unsafe fn wmi_connect() -> Result<(*mut IWbemLocator, *mut IWbemServices)> {
+        use winapi::shared::winerror::SUCCEEDED;
+        use winapi::um::combaseapi::{CoCreateInstance, CoSetProxyBlanket};
+        use winapi::shared::rpcdce::{
+            RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_IMP_LEVEL_IMPERSONATE,
+            RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE,
+        };
+        use winapi::um::combaseapi::CLSCTX_INPROC_SERVER;
+
+        let mut locator_ptr: *mut IWbemLocator = ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_WBEM_LOCATOR,
+            ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IID_IWBEM_LOCATOR,
+            &mut locator_ptr as *mut _ as *mut *mut std::ffi::c_void,
+        );
+        if !SUCCEEDED(hr) {
+            return Err(anyhow!("CoCreateInstance(WbemLocator) failed: 0x{:08X}", hr));
+        }
+
+        let ns_bstr = alloc_bstr("root\\subscription");
+        let mut services_ptr: *mut IWbemServices = ptr::null_mut();
+        let hr = ((*(*locator_ptr).lpvtbl).connect_server)(
+            locator_ptr,
+            ns_bstr,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut services_ptr,
+        );
+        free_bstr(ns_bstr);
+        if !SUCCEEDED(hr) {
+            ((*(*locator_ptr).lpvtbl).release)(locator_ptr);
+            return Err(anyhow!("IWbemLocator::ConnectServer failed: 0x{:08X}", hr));
+        }
+
+        let hr = CoSetProxyBlanket(
+            services_ptr as *mut IUnknown,
+            RPC_C_AUTHN_WINNT,
+            RPC_C_AUTHZ_NONE,
+            ptr::null_mut(),
+            RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            ptr::null_mut(),
+            0,
+        );
+        if !SUCCEEDED(hr) {
+            ((*(*services_ptr).lpvtbl).release)(services_ptr);
+            ((*(*locator_ptr).lpvtbl).release)(locator_ptr);
+            return Err(anyhow!("CoSetProxyBlanket failed: 0x{:08X}", hr));
+        }
+
+        Ok((locator_ptr, services_ptr))
+    }
+
+    // ── COM-based WMI removal ───────────────────────────────────────────
+    //
+    // Connects to root\subscription, queries for the three WMI objects
+    // associated with the subscription name (__FilterToConsumerBinding,
+    // CommandLineEventConsumer, __EventFilter), and deletes each one via
+    // IWbemServices::DeleteInstance.
+    unsafe fn wmi_remove_com(subscription_name: &str) -> Result<()> {
+        use winapi::shared::winerror::SUCCEEDED;
+
+        let (locator, services) = wmi_connect()?;
+
+        // We must delete in dependency order:
+        //   1. __FilterToConsumerBinding (references Filter + Consumer)
+        //   2. CommandLineEventConsumer
+        //   3. __EventFilter
+        let classes_and_keys: &[(&str, &str)] = &[
+            ("__FilterToConsumerBinding",
+             &format!("__FilterToConsumerBinding.Filter=\"__EventFilter.Name=\\\"{}\\\"\"", subscription_name)),
+            ("CommandLineEventConsumer",
+             &format!("CommandLineEventConsumer.Name=\"{}\"", subscription_name)),
+            ("__EventFilter",
+             &format!("__EventFilter.Name=\"{}\"", subscription_name)),
+        ];
+
+        let wql_bstr = alloc_bstr("WQL");
+
+        for &(class, _key_path) in classes_and_keys {
+            // Query for instances of this class matching the subscription name.
+            let query = format!("SELECT * FROM {} WHERE Name = '{}'", class, subscription_name);
+            let query_bstr = alloc_bstr(&query);
+
+            let mut enum_ptr: *mut IEnumWbemClassObject = ptr::null_mut();
+            let hr = ((*(*services).lpvtbl).exec_query)(
+                services,
+                wql_bstr,
+                query_bstr,
+                WBEM_FLAG_FORWARD_ONLY,
+                ptr::null_mut(),
+                &mut enum_ptr as *mut _ as *mut *mut std::ffi::c_void,
+            );
+            free_bstr(query_bstr);
+
+            if !SUCCEEDED(hr) || enum_ptr.is_null() {
+                // Query failure for one class is non-fatal — continue trying
+                // the others.  The subscription may be partially torn down.
+                continue;
+            }
+
+            // Iterate results and delete each instance.
+            loop {
+                let mut obj: *mut IWbemClassObject = ptr::null_mut();
+                let mut returned: u32 = 0;
+                let next_hr = ((*(*enum_ptr).lpvtbl).next)(
+                    enum_ptr,
+                    WBEM_INFINITE,
+                    1,
+                    &mut obj,
+                    &mut returned,
+                );
+                if next_hr != winapi::shared::winerror::S_OK || returned == 0 {
+                    break;
+                }
+
+                // Read the __PATH property to get the full object path for
+                // DeleteInstance.
+                let path_str = match get_bstr_prop(obj, "__PATH") {
+                    Ok(p) => p,
+                    Err(_) => {
+                        ((*(*obj).lpvtbl).release)(obj);
+                        continue;
+                    }
+                };
+                ((*(*obj).lpvtbl).release)(obj);
+
+                let path_bstr = alloc_bstr(&path_str);
+                let del_hr = ((*(*services).lpvtbl).delete_instance)(
+                    services,
+                    path_bstr,
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                );
+                free_bstr(path_bstr);
+
+                if !SUCCEEDED(del_hr) {
+                    log::warn!(
+                        "WmiSubscription::remove: DeleteInstance('{}') failed: 0x{:08X}",
+                        path_str, del_hr
+                    );
+                }
+            }
+            ((*(*enum_ptr).lpvtbl).release)(enum_ptr);
+        }
+
+        free_bstr(wql_bstr);
+        ((*(*services).lpvtbl).release)(services);
+        ((*(*locator).lpvtbl).release)(locator);
+        Ok(())
+    }
+
+    // ── COM-based WMI verification ──────────────────────────────────────
+    //
+    // Queries root\subscription for an __EventFilter with the given name.
+    // Returns Ok(true) if found, Ok(false) if not.
+    unsafe fn wmi_verify_com(subscription_name: &str) -> Result<bool> {
+        use winapi::shared::winerror::S_OK;
+
+        let (locator, services) = wmi_connect()?;
+
+        let wql_bstr = alloc_bstr("WQL");
+        let query = format!(
+            "SELECT * FROM __EventFilter WHERE Name = '{}'",
+            subscription_name
+        );
+        let query_bstr = alloc_bstr(&query);
+
+        let mut enum_ptr: *mut IEnumWbemClassObject = ptr::null_mut();
+        let hr = ((*(*services).lpvtbl).exec_query)(
+            services,
+            wql_bstr,
+            query_bstr,
+            WBEM_FLAG_FORWARD_ONLY,
+            ptr::null_mut(),
+            &mut enum_ptr as *mut _ as *mut *mut std::ffi::c_void,
+        );
+        free_bstr(query_bstr);
+        free_bstr(wql_bstr);
+
+        let found = if SUCCEEDED(hr) && !enum_ptr.is_null() {
+            let mut obj: *mut IWbemClassObject = ptr::null_mut();
+            let mut returned: u32 = 0;
+            let next_hr = ((*(*enum_ptr).lpvtbl).next)(
+                enum_ptr,
+                WBEM_INFINITE,
+                1,
+                &mut obj,
+                &mut returned,
+            );
+            if next_hr == S_OK && returned > 0 {
+                ((*(*obj).lpvtbl).release)(obj);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !enum_ptr.is_null() {
+            ((*(*enum_ptr).lpvtbl).release)(enum_ptr);
+        }
+        ((*(*services).lpvtbl).release)(services);
+        ((*(*locator).lpvtbl).release)(locator);
+        Ok(found)
+    }
+
     pub struct WmiSubscription {
         pub subscription_name: String,
     }
@@ -806,16 +1088,30 @@ pub mod windows {
         }
 
         fn remove(&self) -> Result<()> {
-            let escaped_subscription_name = escape_ps_string(&self.subscription_name);
-            let ps_cmd = format!(
-                r#"Get-WmiObject __EventFilter -Namespace root\subscription | Where-Object {{$_.Name -eq '{0}'}} | Remove-WmiObject;
-                Get-WmiObject CommandLineEventConsumer -Namespace root\subscription | Where-Object {{$_.Name -eq '{0}'}} | Remove-WmiObject;
-                Get-WmiObject __FilterToConsumerBinding -Namespace root\subscription | Where-Object {{$_.Filter -like '*{0}*'}} | Remove-WmiObject"#,
-                escaped_subscription_name
-            );
-            let _ = std::process::Command::new("powershell")
-                .args(["-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
-                .status();
+            use winapi::shared::winerror::SUCCEEDED;
+            use winapi::um::combaseapi::{CoInitializeEx, CoUninitialize};
+            use winapi::um::objbase::COINIT_MULTITHREADED;
+
+            unsafe {
+                const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
+                let hr = CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED);
+                let should_uninitialize = SUCCEEDED(hr);
+                if !should_uninitialize && hr != RPC_E_CHANGED_MODE {
+                    return Err(anyhow!(
+                        "WmiSubscription::remove: CoInitializeEx failed: 0x{:08X}",
+                        hr
+                    ));
+                }
+
+                let result = wmi_remove_com(&self.subscription_name);
+                if let Err(ref e) = result {
+                    log::warn!("WmiSubscription::remove: COM path failed ({})", e);
+                }
+                if should_uninitialize {
+                    CoUninitialize();
+                }
+                result?;
+            }
             log::info!(
                 "WmiSubscription::remove: removed '{}'",
                 self.subscription_name
@@ -824,17 +1120,27 @@ pub mod windows {
         }
 
         fn verify(&self) -> Result<bool> {
-            let escaped_subscription_name = escape_ps_string(&self.subscription_name);
-            let ps_cmd = format!(
-                "(Get-WmiObject __EventFilter -Namespace root\\subscription | Where-Object {{$_.Name -eq '{}'}}) -ne $null",
-                escaped_subscription_name
-            );
-            let out = std::process::Command::new("powershell")
-                .args(["-NonInteractive", "-Command", &ps_cmd])
-                .output()
-                .map_err(|e| anyhow!("WmiSubscription::verify: {}", e))?;
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
-            Ok(stdout == "true")
+            use winapi::shared::winerror::SUCCEEDED;
+            use winapi::um::combaseapi::{CoInitializeEx, CoUninitialize};
+            use winapi::um::objbase::COINIT_MULTITHREADED;
+
+            unsafe {
+                const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
+                let hr = CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED);
+                let should_uninitialize = SUCCEEDED(hr);
+                if !should_uninitialize && hr != RPC_E_CHANGED_MODE {
+                    return Err(anyhow!(
+                        "WmiSubscription::verify: CoInitializeEx failed: 0x{:08X}",
+                        hr
+                    ));
+                }
+
+                let result = wmi_verify_com(&self.subscription_name);
+                if should_uninitialize {
+                    CoUninitialize();
+                }
+                result
+            }
         }
     }
 

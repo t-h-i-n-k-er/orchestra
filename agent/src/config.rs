@@ -1,3 +1,20 @@
+//! Agent configuration loading, HMAC integrity verification, and hot-reload.
+//!
+//! This module handles loading the agent's TOML configuration file from
+//! `~/.config/orchestra/agent.toml`. Key features:
+//!
+//! - **HMAC integrity verification**: If the config file includes a
+//!   `# hmac = <hex>` comment, the HMAC-SHA256 is verified using the shared
+//!   secret before loading.
+//! - **SHA-256 companion check**: An optional `.sha256` sidecar file can be
+//!   used for additional integrity verification.
+//! - **Hot-reload**: When the `hot-reload` feature is enabled, a filesystem
+//!   watcher automatically reloads the config on changes with 500ms debounce.
+//! - **Kill-date enforcement**: The agent will refuse to start if the current
+//!   date is at or past the configured kill date.
+//! - **Caching**: Loaded configs are cached with mtime tokens to avoid
+//!   redundant file reads and deserialization.
+
 #![allow(unexpected_cfgs)]
 
 use anyhow::{Context as _, Result};
@@ -23,6 +40,10 @@ static LAST_MTIME: AtomicU64 = AtomicU64::new(0);
 static LAST_CONFIG: once_cell::sync::Lazy<StdRwLock<Option<Config>>> =
     once_cell::sync::Lazy::new(|| StdRwLock::new(None));
 
+/// Thread-safe handle to the agent configuration.
+///
+/// Wrapped in `Arc<RwLock<Config>>` to allow shared ownership and concurrent
+/// read access with exclusive write access during hot-reloads.
 pub type ConfigHandle = Arc<RwLock<Config>>;
 
 fn resolve_shared_secret() -> Option<String> {
@@ -97,6 +118,10 @@ fn update_cache(config: &Config, token: u64) {
     }
 }
 
+/// Return the default configuration file path.
+///
+/// Resolves to `~/.config/orchestra/agent.toml`. Falls back to
+/// `./.config/orchestra/agent.toml` if the home directory cannot be found.
 pub fn config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -130,6 +155,11 @@ fn verify_config_hmac(config_bytes: &[u8], expected_hmac: &str) -> Result<bool> 
     Ok(mac.verify_slice(&expected_bytes).is_ok())
 }
 
+/// Compute and append an HMAC-SHA256 tag to the configuration file.
+///
+/// Reads the file at `config_path`, strips any existing `# hmac = ...` line,
+/// computes HMAC-SHA256 over the remaining content, and rewrites the file
+/// with the tag appended as a comment.
 pub fn append_config_hmac(config_path: &std::path::Path) -> anyhow::Result<()> {
     // NOTE: this function requires the `hex` crate in the `agent` crate deps.
     let raw = std::fs::read_to_string(config_path)?;
@@ -263,11 +293,20 @@ pub fn load_config() -> Result<Config> {
     Ok(config)
 }
 
+/// Load the agent configuration and wrap it in a [`ConfigHandle`].
+///
+/// Equivalent to [`load_config`] but returns the config wrapped in
+/// `Arc<RwLock<Config>>` for shared ownership across tasks.
 pub fn load_config_handle() -> Result<ConfigHandle> {
     let config = load_config()?;
     Ok(Arc::new(RwLock::new(config)))
 }
 
+/// Reload the configuration from disk into an existing [`ConfigHandle`].
+///
+/// Acquires a write lock on the handle and replaces the config with a
+/// freshly loaded one. Used by the hot-reload watcher and manual
+/// `ReloadConfig` commands.
 pub async fn reload_config(handle: &ConfigHandle) -> Result<()> {
     let new_config = load_config()?;
     let mut guard = handle.write().await;

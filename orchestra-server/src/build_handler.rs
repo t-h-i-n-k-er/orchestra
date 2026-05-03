@@ -653,6 +653,7 @@ mod tests {
             pin: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=".into(),
             output_dir: None,
+            seed: None,
         }
     }
 

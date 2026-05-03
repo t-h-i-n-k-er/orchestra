@@ -1,5 +1,6 @@
 [package]
 name = "builder"
+description = "Profile-driven agent build pipeline with cross-compilation and PE artifact diversification"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

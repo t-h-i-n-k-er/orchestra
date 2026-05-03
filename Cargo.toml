@@ -15,6 +15,7 @@ members = [
     "keygen",
     "hollowing",
     "orchestra-side-load-gen",
+    "redirector",
     "string_crypt",
     "pe_resolve",
     "junk_macro",

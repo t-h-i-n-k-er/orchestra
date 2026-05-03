@@ -10,6 +10,7 @@
 
 use crate::audit::AuditLog;
 use crate::config::{OperatorRecord, ServerConfig};
+use crate::redirector::RedirectorState;
 use common::Message;
 use dashmap::{DashMap, DashSet};
 use rand::RngCore;
@@ -17,7 +18,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, RwLock};
 
 /// One connected agent.  `connection_id` is assigned by the server on accept.
 /// `agent_id` and `hostname` are whatever the agent reported in its Heartbeat.
@@ -67,6 +68,32 @@ impl From<&AgentEntry> for AgentView {
     }
 }
 
+// ── P2P topology map ───────────────────────────────────────────────────
+
+/// One node in the P2P mesh topology.
+#[derive(Clone, Debug, Serialize)]
+pub struct TopologyNode {
+    /// `agent_id` of this node's parent in the mesh (if any).
+    pub parent: Option<String>,
+    /// `agent_id`s of this node's direct children.
+    pub children: Vec<String>,
+    /// Depth in the mesh tree (0 for directly-connected agents).
+    pub depth: u32,
+}
+
+/// Tracks the P2P mesh hierarchy so the server can route commands through
+/// the relay chain to reach deeply-nested child agents.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TopologyMap {
+    /// Keyed by `agent_id`.
+    pub nodes: HashMap<String, TopologyNode>,
+    /// Maps `(parent_agent_id, child_agent_id)` → `link_id` on the parent.
+    /// Populated from `P2pTopologyReport` data so the server can construct
+    /// correct `P2pToChild` routing envelopes.
+    #[serde(skip)]
+    pub child_link_map: HashMap<(String, String), u32>,
+}
+
 pub struct AppState {
     /// Registry keyed by connection_id.
     pub registry: DashMap<String, AgentEntry>,
@@ -85,6 +112,13 @@ pub struct AppState {
     /// two concurrent sessions share the same seed, guaranteeing that each
     /// agent produces a unique `.text` section layout after morphing.
     pub assigned_seeds: DashSet<u64>,
+    /// P2P mesh topology map, keyed by `agent_id`.  Updated when the server
+    /// receives `P2pTopologyReport` messages from agents.  Protected by an
+    /// async `RwLock` so topology reads don't block agent writes.
+    pub topology: RwLock<TopologyMap>,
+    /// Redirector chain registry.  Tracks registered redirectors, their
+    /// health via heartbeat, and provides agent config generation.
+    pub redirector_state: RedirectorState,
 }
 
 impl AppState {
@@ -115,6 +149,8 @@ impl AppState {
             command_timeout_secs,
             config,
             assigned_seeds: DashSet::new(),
+            topology: RwLock::new(TopologyMap::default()),
+            redirector_state: RedirectorState::new(),
         }
     }
 
@@ -192,6 +228,140 @@ impl AppState {
         if let Some(mut entry) = self.registry.get_mut(connection_id) {
             entry.value_mut().text_hash = Some(hash.to_string());
         }
+    }
+
+    /// Process an incoming `P2pTopologyReport` and update the topology map.
+    ///
+    /// The report is sent by an agent and lists its direct children.
+    /// We rebuild the parent-child relationships based on the report:
+    ///   - The reporting agent is each listed child's parent.
+    ///   - The reporting agent's depth is computed from its own parent
+    ///     (or 0 if it is directly connected to the server).
+    pub async fn update_topology(
+        &self,
+        reporter_agent_id: &str,
+        children: &[common::P2pChildInfo],
+    ) {
+        let mut topo = self.topology.write().await;
+
+        // Determine the reporter's depth.  If the reporter is directly
+        // connected (no parent in the topology), depth is 0.
+        let reporter_depth = topo
+            .nodes
+            .get(reporter_agent_id)
+            .and_then(|n| n.parent.as_ref())
+            .and_then(|parent_id| topo.nodes.get(parent_id))
+            .map(|n| n.depth + 1)
+            .unwrap_or(0);
+
+        // Collect child agent_ids.
+        let child_ids: Vec<String> = children.iter().map(|c| c.agent_id.clone()).collect();
+
+        // Populate the child_link_map with link_ids from the report.
+        for child in children {
+            topo.child_link_map.insert(
+                (reporter_agent_id.to_string(), child.agent_id.clone()),
+                child.link_id,
+            );
+        }
+
+        // Ensure the reporter has a node entry.
+        topo.nodes
+            .entry(reporter_agent_id.to_string())
+            .and_modify(|node| {
+                node.children = child_ids.clone();
+            })
+            .or_insert(TopologyNode {
+                parent: None,
+                children: child_ids.clone(),
+                depth: reporter_depth,
+            });
+
+        // Update each child's parent pointer and depth.
+        for child_id in &child_ids {
+            topo.nodes
+                .entry(child_id.clone())
+                .and_modify(|node| {
+                    node.parent = Some(reporter_agent_id.to_string());
+                    node.depth = reporter_depth + 1;
+                })
+                .or_insert(TopologyNode {
+                    parent: Some(reporter_agent_id.to_string()),
+                    children: Vec::new(),
+                    depth: reporter_depth + 1,
+                });
+        }
+
+        tracing::debug!(
+            reporter = %reporter_agent_id,
+            child_count = children.len(),
+            total_nodes = topo.nodes.len(),
+            "topology map updated"
+        );
+    }
+
+    /// Walk the topology from a target `agent_id` up to a directly-connected
+    /// ancestor, returning the ordered list of `(parent_agent_id, link_id)`
+    /// pairs that form the relay chain from the server to the target.
+    ///
+    /// The first element is the directly-connected agent; subsequent elements
+    /// are the link_id each parent must use to forward to the next hop.
+    ///
+    /// Returns `None` if the target is unknown or not reachable through any
+    /// directly-connected agent.
+    pub async fn route_to_agent(&self, target_agent_id: &str) -> Option<Vec<(String, u32)>> {
+        let topo = self.topology.read().await;
+
+        // Walk from the target up to the root, collecting (parent, link_id).
+        let mut path = Vec::new();
+        let mut current = target_agent_id.to_string();
+
+        loop {
+            let node = topo.nodes.get(&current)?;
+            match &node.parent {
+                Some(parent_id) => {
+                    // Look up the link_id for this parent→child edge.
+                    let link_id = topo
+                        .child_link_map
+                        .get(&(parent_id.clone(), current.clone()))
+                        .copied()
+                        .unwrap_or(0);
+                    path.push((parent_id.clone(), link_id));
+                    current = parent_id.clone();
+                }
+                None => {
+                    // This node has no parent — it should be directly
+                    // connected to the server.
+                    break;
+                }
+            }
+        }
+
+        if path.is_empty() {
+            return None;
+        }
+
+        // Reverse so it goes: [directly-connected agent, ..., target's parent].
+        path.reverse();
+        Some(path)
+    }
+
+    /// Remove an agent and all its descendants from the topology map.
+    pub async fn remove_from_topology(&self, agent_id: &str) {
+        let mut topo = self.topology.write().await;
+        // Remove this agent from its parent's children list and link map.
+        if let Some(node) = topo.nodes.remove(agent_id) {
+            if let Some(parent_id) = &node.parent {
+                if let Some(parent_node) = topo.nodes.get_mut(parent_id) {
+                    parent_node.children.retain(|c| c != agent_id);
+                }
+                topo.child_link_map
+                    .remove(&(parent_id.clone(), agent_id.to_string()));
+            }
+        }
+        // Note: we don't recursively remove descendants because they'll
+        // be cleaned up when their own heartbeats time out, or when the
+        // parent reconnects and sends an updated topology report.
     }
 }
 

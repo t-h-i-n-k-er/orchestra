@@ -1,5 +1,6 @@
 [package]
 name = "module_loader"
+description = "Dynamic module loading via memfd_create and manual mapping with reflective loading support"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

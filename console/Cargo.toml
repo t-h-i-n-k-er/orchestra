@@ -1,5 +1,6 @@
 [package]
 name = "console"
+description = "Operator console CLI for agent management, tasking, and monitoring"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

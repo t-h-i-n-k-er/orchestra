@@ -1,5 +1,6 @@
 [package]
 name = "shellcode_packager"
+description = "PE-to-shellcode converter producing position-independent blobs with built-in relocation and import resolution"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

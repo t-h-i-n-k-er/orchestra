@@ -1,5 +1,6 @@
 [package]
 name = "optimizer"
+description = "x86-64 binary diversification engine: NOP insertion, instruction scheduling, substitution, and dead-code insertion"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

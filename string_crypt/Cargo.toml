@@ -1,5 +1,6 @@
 [package]
 name = "string_crypt"
+description = "Compile-time string encryption proc-macros using Xoshiro256PlusPlus with split-seed key derivation"
 version = "0.1.0"
 edition = "2021"
 

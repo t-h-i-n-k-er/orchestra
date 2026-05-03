@@ -1,5 +1,6 @@
 [package]
 name = "hello_plugin"
+description = "Example plugin demonstrating the Orchestra agent plugin interface"
 version = "0.1.0"
 edition = "2021"
 

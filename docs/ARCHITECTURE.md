@@ -1,113 +1,357 @@
 # Architecture
 
-This document describes Orchestra's internal design: the workspace structure,
-wire protocol, cryptographic primitives, transport abstraction, module loading,
-and configuration system.
+Deep-dive into Orchestra's internal design: agent module initialization, syscall infrastructure, memory guard lifecycle, evasion subsystem, C2 state machine, injection engine, sleep obfuscation pipeline, and server internals.
 
 ---
 
-## Workspace structure
+## Agent Internals
 
-Orchestra is a Cargo workspace with 24 crates grouped by role:
+### Module Initialization Order
 
-| Crate | Role | Description |
-|-------|------|-------------|
-| `common` | **Protocol** | Wire protocol (`Message` enum), `Command` vocabulary, crypto primitives (`CryptoSession`), TLS transport, error types, audit types, configuration structs |
-| `agent` | **Endpoint** | Resident service on managed endpoints — receives authenticated commands, executes them within policy constraints, reports results |
-| `console` | **Operator CLI** | Signs/encrypts requests, dispatches to agents, renders results (legacy protocol-test CLI) |
-| `orchestra-server` | **Control Center** | HTTPS dashboard + agent listener — `axum` REST/WebSocket frontend, TLS + AES-GCM agent channel, JSONL audit log |
-| `builder` | **Build tool** | Profile-driven CLI builder — generates outbound profiles, compiles agent payloads, encrypts output |
-| `launcher` | **Bootstrap stub** | Downloads encrypted payload over HTTPS, decrypts in memory, executes without touching disk |
-| `optimizer` | **Performance** | Detects host CPU microarchitecture and applies optimized implementations via runtime dispatch |
-| `module_loader` | **Plugins** | Fetches signed capability plugins, verifies SHA-256 + signature chain, loads in memory |
-| `hollowing` | **Process ops** | Cross-platform process hollowing primitive (Windows primary, stub elsewhere) |
-| `payload-packager` | **Packaging** | AES-256-GCM encrypted bundle producer for launcher consumption |
-| `dev-server` | **Development** | Static-file HTTP server for local QA (no auth, localhost only) |
-| `string_crypt` | **Obfuscation** | Compile-time string encryption proc-macro |
-| `code_transform` | **Obfuscation** | Compile-time code transformation proc-macro |
-| `code_transform_macro` | **Obfuscation** | Helper proc-macro for `code_transform` |
-| `nt_syscall` | **Low-level** | Windows NT direct-syscall wrappers |
-| `keygen` | **Utility** | Ed25519 keypair generation for module signing |
-| `pe_resolve` | **PE ops** | PE header parsing and export resolution |
-
-### Security boundaries
-
-- The agent only executes **named, pre-registered scripts** — never arbitrary command strings. Enforced at the protocol layer via `Command::RunApprovedScript`.
-- All console↔agent traffic is encrypted with AES-256-GCM. Development builds use a pre-shared key; production can use X25519 ephemeral key exchange for forward secrecy.
-- Modules are signed and content-addressed; `module_loader` rejects unverified blobs.
-
----
-
-## Communication protocol
-
-All operator↔agent traffic is modelled as a single `Message` enum defined in `common/src/lib.rs`. The enum is `Serialize`/`Deserialize` via `bincode` (not JSON) for compact framing.
-
-### Frame format
-
-Each frame on the wire is:
+When the agent binary starts, modules initialize in a specific sequence to ensure dependencies are satisfied before use:
 
 ```
-┌──────────────┬─────────────────────────────────┐
-│ u32 LE (4 B) │ bincode-serialised Message       │
-│ length       │                                  │
-└──────────────┴─────────────────────────────────┘
+1. config.rs          — Load or embed configuration
+2. env_check.rs       — Sandbox/debugger/VM detection
+3. env_check_sandbox.rs — Extended sandbox scoring
+4. nt_syscall         — Map clean ntdll, resolve SSNs (Windows)
+5. evasion.rs         — AMSI bypass, ETW patching
+6. amsi_defense.rs    — HWBP AMSI or memory-patch AMSI
+7. etw_patch.rs       — ETW function hooking
+8. c2_*.rs            — Transport initialization
+9. sleep_obfuscation  — Memory region tracking
+10. memory_guard.rs   — Heap encryption registration
+11. injection_engine  — Pre-injection recon cache
+12. handlers.rs       — Command dispatch table
 ```
 
-The length prefix does **not** include itself — it is the byte count of the payload that follows.
+Each step runs to completion before the next begins. If any security check fails (sandbox detected, debugger present, domain mismatch), the agent exits silently.
 
-### Message variants
+### Agent State Machine
 
-| Variant | Direction | Purpose |
-|---------|-----------|---------|
-| `VersionHandshake` | agent → server (init), server → agent (echo) | Protocol version negotiation. Current version: `2`. |
-| `Heartbeat` | agent → server | Reports liveness, identity, and coarse status. |
-| `TaskRequest` | server → agent | Requests execution of a `Command` under a unique `task_id`. Includes optional `operator_id`. |
-| `TaskResponse` | agent → server | Returns `Ok(stdout)` or `Err(message)` keyed by `task_id`. |
-| `ModulePush` | server → agent | Delivers an encrypted, signed capability module. |
-| `AuditLog` | agent → server | Pushes an `AuditEvent` record for compliance logging. |
-| `Shutdown` | either | Graceful session termination. |
+```
+                    ┌──────────────┐
+                    │   Start      │
+                    └──────┬───────┘
+                           │
+                    ┌──────▼───────┐
+                    │ Env Check    │──── Fail ──► Silent Exit
+                    │ (sandbox/    │
+                    │  debugger)   │
+                    └──────┬───────┘
+                           │ Pass
+                    ┌──────▼───────┐
+                    │ Evasion Init │
+                    │ AMSI + ETW   │
+                    └──────┬───────┘
+                           │
+                    ┌──────▼───────┐
+                    │ C2 Connect   │──── Fail ──► Backoff + Retry
+                    │ (malleable)  │
+                    └──────┬───────┘
+                           │ Connected
+                    ┌──────▼───────┐
+               ┌──►│  Main Loop   │
+               │   └──────┬───────┘
+               │          │
+               │   ┌──────▼───────┐
+               │   │ Sleep Cycle  │
+               │   │ (encrypt     │
+               │   │  memory)     │
+               │   └──────┬───────┘
+               │          │ Wake
+               │   ┌──────▼───────┐
+               │   │ Check Tasks  │──── Task ──► Execute ──┐
+               │   │ (beacon)     │                         │
+               │   └──────┬───────┘                         │
+               │          │ No task                         │
+               └──────────┘◄────────────────────────────────┘
+```
 
-### Command vocabulary
+### Command Dispatch (`handlers.rs`)
 
-`Command` is a closed set — there is **no** arbitrary shell command variant. The closest is `StartShell` which opens an interactive PTY managed by the agent. All file operations are constrained by `allowed_paths`.
+The `handle_command()` function receives a `Command` variant and dispatches to the appropriate handler. It takes 6 parameters:
 
-| Command | Purpose |
-|---------|---------|
-| `Ping` | Liveness check. |
-| `GetSystemInfo` | Host inventory (OS, arch, uptime, memory). |
-| `RunApprovedScript { script }` | Execute a pre-registered named maintenance script. |
-| `ListDirectory { path }` | List files within `allowed_paths`. |
-| `ReadFile { path }` | Read file contents within `allowed_paths`. |
-| `WriteFile { path, content }` | Write file within `allowed_paths`. |
-| `DeployModule { module_id }` | Stage a capability module from the cache. |
-| `ExecutePlugin { plugin_id, args }` | Execute a loaded plugin with arguments. |
-| `StartShell` | Open an interactive PTY session (returns `session_id`). |
-| `ShellInput { session_id, data }` | Write bytes to a PTY session's stdin. |
-| `ShellOutput { session_id }` | Poll a PTY session's stdout/stderr. |
-| `CloseShell { session_id }` | Terminate a PTY session and free file descriptors. |
-| `Shutdown` | Gracefully stop the agent. |
-| `DiscoverNetwork` | Bounded subnet enumeration (`network-discovery` feature). |
-| `CaptureScreen` | Capture primary display as PNG (`remote-assist` feature). |
-| `SimulateKey { key }` | Simulate key press (`remote-assist` + consent). |
-| `SimulateMouse { x, y }` | Simulate mouse movement (`remote-assist` + consent). |
-| `StartHciLogging` | Begin HCI telemetry capture (`hci-research` feature). |
-| `StopHciLogging` | Stop HCI telemetry capture. |
-| `GetHciLogBuffer` | Drain buffered HCI events. |
-| `ReloadConfig` | Re-read `agent.toml` at runtime. |
-| `EnablePersistence` | Install opt-in persistence service. |
-| `DisablePersistence` | Remove persistence service. |
-| `MigrateAgent { target_pid }` | Migrate into another process (experimental, platform-gated). |
-| `ListProcesses` | Return JSON snapshot of running processes. |
+```rust
+pub fn handle_command(
+    cmd: Command,
+    config: &mut Config,
+    session: &CryptoSession,
+    agent_id: &str,
+    extra_args: Option<&str>,
+    plugin_manager: &mut PluginManager,
+) -> Result<String, String>
+```
+
+Each command handler is a separate function in `handlers.rs` or a dedicated module. The 40+ commands include:
+
+| Category | Commands |
+|----------|----------|
+| **Core** | `Ping`, `GetSystemInfo`, `Shutdown`, `ReloadConfig` |
+| **Filesystem** | `ListDirectory`, `ReadFile`, `WriteFile` |
+| **Shell** | `StartShell`, `ShellInput`, `ShellOutput`, `CloseShell` |
+| **Modules** | `DeployModule`, `ExecutePlugin`, `ListPlugins`, `UnloadPlugin`, `GetPluginInfo`, `DownloadModule`, `ExecutePluginBinary` |
+| **Discovery** | `DiscoverNetwork`, `ListProcesses`, `JobStatus` |
+| **Remote Assist** | `CaptureScreen`, `SimulateKey`, `SimulateMouse` |
+| **HCI Research** | `StartHciLogging`, `StopHciLogging`, `GetHciLogBuffer` |
+| **Persistence** | `EnablePersistence`, `DisablePersistence` |
+| **Injection** | `MigrateAgent` |
+| **Evasion** | `SetReencodeSeed`, `MorphNow` |
+| **Token** | `MakeToken`, `StealToken`, `Rev2Self`, `GetSystem` |
+| **Lateral** | `PsExec`, `WmiExec`, `DcomExec`, `WinRmExec` |
+| **P2P** | `LinkAgents`, `UnlinkAgent`, `ListTopology`, `LinkTo`, `Unlink`, `ListLinks` |
 
 ---
 
-## Cryptography
+## Syscall Infrastructure
 
-### AES-256-GCM with HKDF-SHA256
+### Direct Syscalls (`nt_syscall`)
 
-Every framed message is encrypted with AES-256-GCM. Key derivation uses HKDF-SHA256 with a per-message random salt.
+On Windows, the agent avoids calling ntdll exports directly. Instead, it:
 
-**Wire format (protocol v2):**
+1. **Maps a clean copy of ntdll.dll** from disk (`\KnownDlls\ntdll.dll` or `\SystemRoot\System32\ntdll.dll`)
+2. **Resolves syscall stubs** by walking the clean ntdll's export table
+3. **Extracts the SSN** (System Service Number) from each stub's `mov eax, IMM32` instruction
+4. **Finds a syscall gadget** (`syscall; ret` or `jmp r11`) in the clean ntdll
+5. **Caches results** in a static `DashMap<String, SyscallTarget>`
+
+```rust
+pub struct SyscallTarget {
+    pub ssn: u32,           // System Service Number
+    pub gadget_addr: usize, // Address of syscall;ret gadget
+}
+```
+
+### Halo's Gate Fallback
+
+If a syscall stub has been hooked (e.g., replaced with `jmp <hook>` by an EDR), the agent falls back to Halo's Gate:
+
+1. Examine neighboring syscall stubs (up/down by 32 bytes)
+2. Find an unhooked stub and calculate the SSN offset
+3. Use the unhooked stub's syscall gadget
+
+This handles the case where EDR products inline-hook specific NT API functions.
+
+### Indirect Syscall Dispatch
+
+For maximum evasion, the agent uses indirect syscalls that dispatch through `NtContinue`:
+
+1. Set up a fake call stack on the heap
+2. Push `NtContinue` context with the target syscall's SSN in RAX
+3. `NtContinue` transfers execution to the syscall gadget
+4. The kernel-mode call stack appears to originate from `ntdll.dll`, not the agent
+
+### SSN Resolution Functions
+
+The agent resolves these NT functions at runtime:
+
+| Function | Purpose |
+|----------|---------|
+| `NtAllocateVirtualMemory` | Memory allocation (RW/RX) |
+| `NtProtectVirtualMemory` | Memory protection changes |
+| `NtWriteVirtualMemory` | Cross-process memory writes |
+| `NtCreateThreadEx` | Remote thread creation |
+| `NtOpenProcess` | Process handle acquisition |
+| `NtClose` | Handle closure |
+| `NtDelayExecution` | Sleep (used by sleep obfuscation) |
+| `NtContinue` | Thread context restoration (stack spoofing) |
+| `NtFreeVirtualMemory` | Memory deallocation |
+| `NtQueryVirtualMemory` | Memory region enumeration |
+| `NtReadVirtualMemory` | Cross-process memory reads |
+
+---
+
+## Memory Guard Lifecycle
+
+The `memory_guard` module provides encrypted heap storage that integrates with the sleep obfuscation cycle.
+
+### Registration
+
+```rust
+// Register a heap allocation for automatic encryption during sleep
+let guarded = MemoryGuard::new(1024);  // Allocates 1024 bytes
+// Data is automatically tracked and will be encrypted during sleep
+```
+
+### Lifecycle States
+
+```
+  ┌──────────┐
+  │Allocated │◄── Initial state after MemoryGuard::new()
+  └────┬─────┘
+       │ Sleep cycle begins
+  ┌────▼─────┐
+  │Encrypted │◄── MemoryGuard registers region with sleep subsystem
+  └────┬─────┘    Contents encrypted with XChaCha20-Poly1305
+       │ Wake
+  ┌────▼─────┐
+  │Decrypted │◄── Contents restored, integrity verified
+  └────┬─────┘
+       │ Drop
+  ┌────▼─────┐
+  │  Freed   │◄── Zeroed before deallocation
+  └──────────┘
+```
+
+### XMM Register Key Stash (Windows)
+
+On Windows x86_64, the sleep encryption key is stashed in XMM14/XMM15 registers:
+
+- **XMM14**: First 16 bytes of the 32-byte XChaCha20 key
+- **XMM15**: Last 16 bytes of the 32-byte XChaCha20 key
+
+These registers are not routinely inspected by EDR memory scanners and survive `NtDelayExecution` calls. The key never exists in process memory as plaintext during the sleep period.
+
+---
+
+## Evasion Subsystem
+
+### AMSI Bypass
+
+The agent implements two AMSI bypass strategies, selectable at build time:
+
+#### HWBP AMSI (`amsi_defense.rs` — HWBP mode)
+
+Uses hardware breakpoints (DR0/DR1) with a Vectored Exception Handler:
+
+1. `AddVectoredExceptionHandler(1, amsi_veh_handler)` — Register VEH as first handler
+2. `SetThreadContext` — Set DR0 to address of `AmsiScanBuffer`, DR1 to `AmsiScanString`
+3. Set DR7 to enable DR0/DR1 as execute breakpoints
+4. When AMSI is called, the CPU triggers a breakpoint exception
+5. The VEH handler intercepts the exception, sets `RAX = S_OK` (0) and `Result = AmsiResult::AMSI_RESULT_CLEAN`
+6. Execution continues as if the scan returned clean
+
+This approach does not modify any code pages, making it invisible to memory integrity checks.
+
+#### Memory Patch AMSI (`amsi_defense.rs` — Memory mode)
+
+Directly patches `amsiInitFailed` in the `amsi.dll` `.data` section:
+
+1. Resolve `amsi.dll` base via PEB walking
+2. Find the `AmsiInitialize` function export
+3. Locate the `amsiInitFailed` flag variable in `.data`
+4. Use `NtProtectVirtualMemory` (via syscall) to make the page writable
+5. Patch the flag to non-zero (forcing initialization failure)
+6. All subsequent AMSI scans return `AMSI_RESULT_CLEAN`
+
+Fallback: If patching fails, the agent falls back to returning `E_INVALIDARG` from `AmsiScanBuffer` by patching the function's prologue.
+
+### ETW Patching (`etw_patch.rs`)
+
+Patches ETW functions to suppress event telemetry:
+
+1. Resolve `ntdll.dll` base via PEB walking
+2. Find `EtwEventWrite`, `EtwEventWriteEx`, and `NtTraceEvent` exports
+3. Use `NtProtectVirtualMemory` syscall to make the code page writable
+4. Patch the first bytes of each function to:
+   ```asm
+   mov eax, 0x00000000  ; STATUS_SUCCESS
+   ret
+   ```
+5. `NtProtectVirtualMemory` to restore original protection
+
+Three patch modes:
+- **Safe** — Patch only if no EDR hooks detected on the target functions
+- **Always** — Unconditionally patch
+- **Never** — Skip ETW patching entirely
+
+---
+
+## C2 State Machine
+
+### HTTP Transport (`c2_http.rs`)
+
+The HTTP transport implements a full malleable C2 state machine:
+
+```
+┌──────────────────────────────────────────────────┐
+│                 HttpTransport                     │
+│                                                  │
+│  Fields:                                         │
+│  - client: reqwest::Client                       │
+│  - session: CryptoSession                        │
+│  - agent_id: String                              │
+│  - profile: AgentMalleableProfile                │
+│  - redirectors: Vec<RedirectorConfig>            │
+│  - failover: FailoverState                       │
+│  - front_domain: Option<String>                  │
+│  - current_sticky: usize (sticky counter)        │
+│  - backoff_secs: f64                             │
+│  - endpoint_index: usize                         │
+└──────────────────────────────────────────────────┘
+```
+
+### Request Lifecycle
+
+1. **Select URI** — Randomly pick from `profile.http_get.uri` (beacon) or `profile.http_post.uri` (task result)
+2. **Apply transforms** — Prepend, encode (Base64/Mask/NetBIOS), append to data
+3. **Set headers** — User-Agent from profile, custom headers
+4. **Deliver payload** — Cookie, URI-append, header, or body delivery based on profile
+5. **Domain fronting** (if configured) — Connect to front domain IP, send actual Host header
+6. **Redirector failover** — On failure, advance to next redirector with exponential backoff
+
+### FailoverState Management
+
+```rust
+pub struct FailoverState {
+    pub current_index: usize,
+    pub sticky_count: usize,
+    pub max_sticky: usize,       // Default: 10
+    pub backoff_secs: f64,
+    pub max_backoff: f64,        // Default: 60.0
+    pub full_cycle: bool,
+}
+```
+
+- **Sticky session**: After a successful request, keep using the same endpoint for `max_sticky` requests
+- **Exponential backoff**: On failure, `backoff_secs *= 2.0` up to `max_backoff`
+- **Full cycle**: After exhausting all redirectors, fall back to direct C2
+- **Recovery**: After direct C2 succeeds, reset and try redirectors again
+
+### DNS-over-HTTPS Transport (`c2_doh.rs`)
+
+The DoH transport encodes C2 data in DNS queries:
+
+1. **Beacon** — Agent sends periodic A-record queries to `beacon_pattern.data.dns_suffix`
+2. **Task retrieval** — Server responds with encoded task data in A or TXT records
+3. **Data exfiltration** — Agent sends TXT queries with encoded result data
+4. **Encoding** — hex, base32, or base64url depending on profile setting
+5. **Resolver** — All queries go through `https://dns.google/dns-query` (configurable)
+
+### SSH Transport (`c2_ssh.rs`)
+
+Tunnels C2 traffic through SSH subsystem connections:
+
+1. Connect to SSH server using key, password, or agent authentication
+2. Request a subsystem (`IOC_SSH_SUBSYSTEM` — randomized per build)
+3. Use the subsystem channel as a `Transport` (bincode frames)
+4. Session keepalive via SSH keepalive messages
+
+### SMB Transport (`c2_smb.rs`)
+
+Uses Windows named pipes or TCP relay:
+
+1. Connect to `\\.\pipe\IOC_PIPE_NAME` (randomized per build)
+2. Or connect to a TCP relay on the configured port
+3. Use the pipe/socket as a `Transport` (bincode frames)
+4. Supports both inbound (server creates pipe) and outbound (agent connects) modes
+
+---
+
+## Wire Protocol
+
+### Frame Format
+
+Every frame on the wire follows this format:
+
+```
+┌──────────────┬──────────────────────────────────────────┐
+│ u32 LE (4 B) │ Encrypted payload                        │
+│ length       │                                          │
+└──────────────┴──────────────────────────────────────────┘
+```
+
+Inside the encrypted payload (protocol v2):
 
 ```
 ┌────────────┬──────────────┬─────────────────────────────┐
@@ -115,214 +359,274 @@ Every framed message is encrypted with AES-256-GCM. Key derivation uses HKDF-SHA
 └────────────┴──────────────┴─────────────────────────────┘
 ```
 
-- **Salt**: 32 random bytes, freshly drawn from the OS CSPRNG (`rand::thread_rng`) per message.
-- **Nonce**: 12 random bytes per message.
-- **Key derivation**: `HKDF-SHA256(salt, psk, info=b"orchestra-v2")` → 32-byte per-message key.
-- **Authentication failure is fatal**: the receiver discards the message and logs the event.
+- **Salt**: 32 random bytes per message, used for HKDF key derivation
+- **Nonce**: 12 random bytes per message
+- **Key derivation**: `HKDF-SHA256(salt, psk, info=b"orchestra-v2")` → 32-byte per-message key
+- **Ciphertext**: bincode-serialized `Message`, encrypted with AES-256-GCM
 
-The `CryptoSession` type wraps these operations:
+### Message Variants
 
-| Method | Behaviour |
-|--------|-----------|
-| `encrypt(plaintext)` | Generates salt + nonce, derives per-message key, encrypts. Returns `salt ‖ nonce ‖ ciphertext_with_tag`. |
-| `decrypt_with_psk(psk, wire_data)` | Extracts salt, derives key via HKDF, decrypts. Handles both v2 (salt-prefixed) and legacy v1 (`nonce ‖ ciphertext`) formats. |
+| Variant | Direction | Purpose |
+|---------|-----------|---------|
+| `VersionHandshake` | bidirectional | Protocol version negotiation (current: v2) |
+| `Heartbeat` | agent → server | Liveness + status report |
+| `TaskRequest` | server → agent | Execute a `Command` under a `task_id` |
+| `TaskResponse` | agent → server | Return result keyed by `task_id` |
+| `ModulePush` | server → agent | Deliver encrypted, signed plugin |
+| `ModuleRequest` | agent → server | Request a specific module by name |
+| `ModuleResponse` | server → agent | Module data response |
+| `AuditLog` | agent → server | Audit event for compliance logging |
+| `MorphResult` | agent → server | Self-reencode completion notification |
+| `P2pForward` | agent → agent | P2P mesh data forwarding |
+| `P2pToChild` | parent → child | P2P mesh child-directed message |
+| `P2pTopologyReport` | agent → server | P2P mesh topology update |
+| `Shutdown` | bidirectional | Graceful session termination |
 
-### Forward secrecy (optional)
-
-When the `forward-secrecy` feature is enabled, an X25519 ephemeral Diffie-Hellman exchange is performed after the TLS handshake:
-
-1. Both sides generate a fresh `EphemeralSecret` (X25519).
-2. Public keys are exchanged over the encrypted channel.
-3. Both compute `X25519(priv, peer_pub)` shared secret.
-4. HKDF-SHA256 mixes the shared secret with `SHA-256(PSK)` and the domain string `"orchestra-fs-v1"` to derive a 32-byte `session_key`.
-5. All subsequent frames use a `CryptoSession` constructed from `session_key`.
-
-**Guarantee**: a passive observer who later learns the PSK cannot decrypt recorded sessions because the ephemeral key material is never persisted.
-
----
-
-## Transport abstraction
-
-`Transport` is an `async_trait` with `send(Message)` and `recv() -> Message`:
+### CryptoSession API
 
 ```rust
-#[async_trait]
-pub trait Transport: Send + Sync {
-    async fn send(&mut self, msg: Message) -> Result<()>;
-    async fn recv(&mut self) -> Result<Message>;
+impl CryptoSession {
+    pub fn from_shared_secret(key: &[u8]) -> Self;
+    pub fn from_shared_secret_with_salt(key: &[u8], salt: &[u8]) -> Self;
+    pub fn from_key(key: [u8; 32], salt: [u8; 32]) -> Self;
+    pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8>;
+    pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError>;
+    pub fn decrypt_with_psk(psk: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError>;
 }
 ```
 
-It leaves framing, congestion handling, and reconnection to concrete implementations. Available transports:
+### Forward Secrecy
 
-| Transport | Description |
-|-----------|-------------|
-| `TlsTransport<S>` | Wraps any `AsyncRead + AsyncWrite` stream with TLS + 4-byte length-prefix bincode framing |
-| `TcpTransport` | Plaintext TCP with length-prefix bincode (development only) |
-| Loopback | In-memory channel pair for integration tests |
+When the `forward-secrecy` feature is enabled:
 
-The on-wire codec is **bincode** (not JSON). Each frame: `u32 LE length prefix ‖ bincode-serialised Message`.
+1. Both sides generate X25519 ephemeral keypairs
+2. Exchange public keys over the encrypted channel
+3. Compute shared secret: `X25519(my_secret, peer_public)`
+4. Derive session key: `HKDF-SHA256(shared_secret, SHA256(PSK), "orchestra-fs-v1")`
+5. All subsequent frames use the derived session key
 
-### Outbound agent connection flow
-
-```
-agent                              orchestra-server
-  │                                       │
-  │──── TCP connect to agent_addr ───────►│
-  │              TLS handshake            │
-  │◄─────────────────────────────────────►│
-  │     [optional X25519 key exchange]    │
-  │◄─────────────────────────────────────►│
-  │        VersionHandshake (v=2)         │
-  │◄─────────────────────────────────────►│
-  │           Heartbeat (register)        │
-  │                                       │
-  │◄─────── TaskRequest ─────────────────│  (server pushes command)
-  │──────── TaskResponse ────────────────►│
-  │          ... command loop ...          │
-```
+Key ordering uses canonical comparison to ensure both sides derive the same key regardless of role.
 
 ---
 
-## Module loading
+## Server Internals
 
-The `module_loader` crate provides secure dynamic extension of the agent.
+### Orchestra Server (`orchestra-server`)
 
-### Encryption and verification
+Built on `axum` 0.7 with `tokio` async runtime:
 
-- **Encryption**: Plugins are encrypted with AES-256-GCM via `CryptoSession`.
-- **Ed25519 signatures** (`module-signatures` feature, on by default): The packager signs the plaintext module with an Ed25519 private key. The 64-byte signature is prepended: `[signature][module_data]`. The loader verifies against a public key before decryption.
-- **GCM tag**: Provides integrity and authenticity of the encrypted payload.
+| Module | Responsibility |
+|--------|---------------|
+| `api.rs` | REST API routes (dashboard, build queue, agent management) |
+| `state.rs` | `AppState` with `DashMap` for agents, modules, redirectors |
+| `config.rs` | Server configuration parsing |
+| `malleable.rs` | `MultiProfileManager` — loads, validates, hot-reloads profiles |
+| `http_c2.rs` | HTTP C2 listener with malleable profile handling |
+| `doh_listener.rs` | DNS-over-HTTPS C2 listener |
+| `redirector.rs` | Redirector registration and health monitoring |
+| `build_handler.rs` | On-demand agent compilation |
+| `agent_link.rs` | Agent session management |
+| `audit.rs` | JSONL audit log with HMAC-SHA256 tamper evidence |
+| `auth.rs` | Bearer token operator authentication |
+| `tls.rs` | TLS configuration and certificate management |
+| `smb_relay.rs` | SMB named pipe relay for P2P agent chains |
 
-### In-memory loading
-
-| Platform | Loading method |
-|----------|---------------|
-| **Linux** | `memfd_create` → write to anonymous fd → `libloading` loads from `/proc/self/fd/<fd>` — plugin never touches disk |
-| **Windows** (with `manual-map`) | PE loader parses headers, copies sections, resolves imports, applies relocations, calls entry point — all in memory |
-| **Other** | Temp-file fallback (less secure, compatibility mode) |
-
-### Plugin interface
-
-Plugins implement the `Plugin` trait:
+### Multi-Profile Manager
 
 ```rust
-pub trait Plugin {
+pub struct MultiProfileManager {
+    profiles: DashMap<String, MalleableProfile>,
+    watch_dir: PathBuf,
+}
+```
+
+- Watches the `profiles/` directory for changes
+- Validates profiles before loading
+- Supports simultaneous serving of multiple profiles on different ports or via SNI routing
+- Hot-reloads without server restart
+
+---
+
+## P2P Mesh Protocol
+
+### Frame Format
+
+```
+┌──────────────┬─────────────┬───────────────┬─────────────────┐
+│ type (1B)    │ link_id (4B)│ payload_len   │ payload         │
+│ P2pFrameType │             │ (4B)          │ (payload_len B) │
+└──────────────┴─────────────┴───────────────┴─────────────────┘
+```
+
+### Frame Types
+
+| Type | Purpose |
+|------|---------|
+| `LinkRequest` | Initiate a new P2P link |
+| `Accept` | Accept link request |
+| `Reject` | Reject link request |
+| `Heartbeat` | Keep link alive |
+| `Disconnect` | Graceful link teardown |
+| `DataForward` | Forward data toward C2 |
+| `DataAck` | Acknowledge data receipt |
+| `TopologyReport` | Report mesh topology to server |
+
+### Topology
+
+```
+                    ┌──────────┐
+                    │  Server  │
+                    └────┬─────┘
+                         │
+                    ┌────▼─────┐
+                    │ Parent   │
+                    │ Agent    │
+                    └─┬──┬──┬─┘
+                      │  │  │
+               ┌──────┘  │  └──────┐
+               │         │         │
+          ┌────▼───┐ ┌───▼───┐ ┌──▼────┐
+          │Child A │ │Child B│ │Child C│
+          └────┬───┘ └───────┘ └───────┘
+               │
+          ┌────▼───┐
+          │Child D │  (nested)
+          └────────┘
+```
+
+- Parent agents relay messages between children and the server
+- Each link has a unique `link_id` for routing
+- `P2pForward` messages travel up the tree toward the server
+- `P2pToChild` messages travel down toward a specific child
+
+---
+
+## Cryptographic Summary
+
+| Primitive | Usage | Key Size |
+|-----------|-------|----------|
+| AES-256-GCM | Wire encryption (all transports) | 256-bit |
+| HKDF-SHA256 | Per-message key derivation | 256-bit |
+| X25519 | Forward secrecy ECDH | 256-bit |
+| Ed25519 | Module signing/verification | 256-bit |
+| XChaCha20-Poly1305 | Sleep obfuscation memory encryption | 256-bit |
+| HMAC-SHA256 | Audit log integrity, config HMAC | 256-bit |
+| SHA-256 | Certificate fingerprinting, integrity checks | 256-bit |
+
+---
+
+## Module Loading Pipeline
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ Encrypted    │────►│ Decrypt      │────►│ Verify       │────►│ Load         │
+│ Module Blob  │     │ AES-256-GCM  │     │ Ed25519      │     │ Platform-    │
+└──────────────┘     └──────────────┘     └──────────────┘     │ specific     │
+                                                                └──────┬───────┘
+                                                                       │
+                                                          ┌────────────▼───────────┐
+                                                          │ Linux: memfd_create +  │
+                                                          │   libloading           │
+                                                          ├────────────────────────┤
+                                                          │ Windows: manual_map or │
+                                                          │   temp file            │
+                                                          └────────────────────────┘
+```
+
+### Plugin Interface
+
+```rust
+#[repr(C)]
+pub struct PluginObject {
+    pub vtable: *const PluginVTable,
+}
+
+pub struct PluginVTable {
+    pub init: extern "C" fn(*mut PluginObject),
+    pub execute: extern "C" fn(*mut PluginObject, *const c_char) -> *const c_char,
+    pub free_result: extern "C" fn(*const c_char),
+    pub destroy: extern "C" fn(*mut PluginObject),
+}
+
+pub trait Plugin: Send + Sync {
     fn init(&self);
-    fn execute(&self);
+    fn execute(&self, args: &str) -> String;
+    fn execute_binary(&self, input: &[u8]) -> Vec<u8>;
+    fn get_metadata(&self) -> PluginMetadata;
 }
 ```
 
-Exported via `_create_plugin()` extern function.
+---
 
-### Module-signing key policy
+## Persistence Subsystem
 
-| Mode | Behaviour |
-|------|-----------|
-| `module_verify_key = Some(b64)` | Verifies against the supplied Ed25519 public key |
-| `module_verify_key = None` | Falls back to compile-time constant `MODULE_SIGNING_PUBKEY` |
-| `strict-module-key` feature | Converts `None` fallback into hard `Err` — use for production |
+The `persistence` module implements platform-specific persistence mechanisms:
+
+| Platform | Method | Details |
+|----------|--------|---------|
+| Windows | Registry Run | Writes to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` with configurable key name |
+| Windows | COM Hijack | Replaces InProcServer32 for a GUID with agent path |
+| Windows | WMI Subscription | Creates `__EventFilter` + `CommandLineEventConsumer` binding via COM |
+| Linux | LaunchAgent (macOS) | Writes `.plist` to `~/Library/LaunchAgents/` |
+| Linux | cron | Adds `@reboot` entry to user crontab |
+| Linux | systemd | Creates user service unit in `~/.config/systemd/user/` |
+| Linux | shell profile | Appends execution to `.bashrc` / `.zshrc` |
+
+All persistence methods are gated behind the `persistence` feature flag and require an explicit `EnablePersistence` command.
 
 ---
 
-## Configuration
+## Binary Diversification Stack
 
-### Agent configuration (`agent.toml`)
+Multiple layers ensure no two builds produce identical binaries:
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `allowed_paths` | `/var/log`, `/home`, `/tmp` | File-system subtrees the agent can read/write |
-| `heartbeat_interval_secs` | `30` | Interval between liveness heartbeats |
-| `persistence_enabled` | `false` | Opt-in: install systemd/scheduled-task entry |
-| `module_repo_url` | — | Base URL for fetching capability modules |
-| `module_signing_key` | `None` | Base64 AES-256 key for module decryption |
-| `module_cache_dir` | Platform-specific | Directory for pre-staged module blobs |
-
-The agent reads `~/.config/orchestra/agent.toml` at startup (or creates a safe default). `ReloadConfig` re-reads at runtime.
-
-### Build profiles (`profiles/<name>.toml`)
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `target_os` | yes | `linux`, `windows`, or `macos` |
-| `target_arch` | yes | `x86_64`, `aarch64`, etc. |
-| `c2_address` | yes | `host:port` the agent dials |
-| `encryption_key` | yes | AES-256 key for payload encryption |
-| `c_server_secret` | yes | PSK matching server's `agent_shared_secret` |
-| `server_cert_fingerprint` | no | SHA-256 DER fingerprint for cert pinning |
-| `features` | no | Cargo features to compile into the agent |
-| `package` | yes | Must be `"agent"` |
-| `bin_name` | no | Binary name (default: `agent-standalone`) |
-
-### Path validation
-
-All filesystem I/O routes through `fsops::validate_path`:
-
-1. **Fast-path `..` rejection** — any `..` component is rejected before filesystem I/O.
-2. **Canonicalization** — resolves symlinks and produces absolute path.
-3. **Allow-list check** — canonical path must be under one of `config.allowed_paths`.
-4. **TOCTOU protection** — `write_file` opens with `O_NOFOLLOW` on Unix to prevent final-component symlink swap.
+| Layer | Crate | Mechanism |
+|-------|-------|-----------|
+| **Junk Code** | `junk_macro` | Attribute proc-macro inserts dead stores and calculations at function boundaries |
+| **Instruction Scheduling** | `optimizer` | Reorders independent instructions for different execution orderings |
+| **NOP Insertion** | `optimizer` | Inserts random NOP sleds (1–5 bytes) between instructions |
+| **Instruction Substitution** | `optimizer` | Replaces instructions with equivalent forms (e.g., `xor rax, rax` → `mov rax, 0`) |
+| **Opaque Predicates** | `code_transform` | Inserts always-true/false conditional branches that confuse disassemblers |
+| **Block Reordering** | `code_transform` | Randomizes basic block order within functions |
+| **Register Reallocation** | `code_transform` | Remaps registers to different physical registers |
+| **String Encryption** | `string_crypt` | Compile-time XOR encryption of all string literals |
+| **Self-Reencode** | `agent` (runtime) | Periodically re-encodes `.text` section with a fresh seed |
+| **Per-Build IoCs** | `agent/build.rs` | Randomizes pipe names, DNS prefixes, service names, and other strings |
+| **PE Hardening** | `builder` | Randomizes timestamps, section names, DOS stubs, Rich header removal |
 
 ---
 
-## Audit logging
+## Cross-Platform Notes
 
-Every command generates an `AuditEvent`:
+Platform-specific code is gated with `#[cfg(target_os = "...")]` and feature flags:
 
-| Field | Description |
-|-------|-------------|
-| `timestamp` | Unix seconds |
-| `agent_id` | Endpoint hostname |
-| `user` | Operator identity (from `operator_id` in `TaskRequest`) |
-| `action` | Human-readable command description (sensitive fields redacted) |
-| `details` | Success message or error string |
-| `outcome` | `Success` or `Failure` |
+```rust
+#[cfg(target_os = "windows")]
+mod injection;      // Full injection engine
 
-**Tamper-evidence**: Each audit record is signed with HMAC-SHA256. The HMAC key is derived from the admin token. Tampered entries are flagged on read.
+#[cfg(target_os = "linux")]
+mod injection;      // memfd_create-based injection only
 
-**Sensitive data hygiene**: `sanitize_result` strips file contents, shell I/O, and screenshot data from audit records — replaced with size summaries.
+#[cfg(target_os = "windows")]
+mod evasion;        // AMSI, ETW patching
 
----
-
-## Performance
-
-Benchmarks from `agent/benches/agent_benchmark.rs` (Criterion):
-
-| Metric | Result |
-|--------|--------|
-| Ping encode + encrypt | ~3 µs |
-| AES-256-GCM throughput (100 MiB) | >3 GiB/s (AES-NI accelerated) |
-| Soak test RSS growth | <1 MiB over 1M iterations |
-
-Run benchmarks:
-
-```sh
-cargo bench -p agent --bench agent_benchmark
+#[cfg(feature = "direct-syscalls")]
+mod nt_syscall;     // SSN resolution, Halo's Gate
 ```
 
-Long-running stability:
-
-```sh
-ORCHESTRA_SOAK_HOURS=1 cargo test --release --test soak_test
-```
-
----
-
-## Cross-platform support
-
-| OS | Default tests | Optional checks |
-|----|---------------|-----------------|
-| Linux (ubuntu-latest) | Full | Feature-module compile, doc/feature drift, deterministic proc-macro |
-| Windows (windows-latest) | Compile | Windows-facing agent features, `module_loader/manual-map` |
-| macOS (macos-latest) | Compile | macOS agent features when Darwin toolchain present |
-
-Platform-specific code is gated with `#[cfg(target_os = "...")]` attributes so `cargo check --workspace` succeeds on all platforms without warnings.
+The workspace compiles cleanly on all three platforms via `cargo check --workspace`:
+- **Linux**: Full agent features, all tests pass
+- **Windows**: Full agent features, injection, evasion, syscalls
+- **macOS**: Core features, persistence, remote-assist
 
 ---
 
-## See also
+## See Also
 
-- [QUICKSTART.md](QUICKSTART.md) — Clone to first command in 8 steps
-- [CONTROL_CENTER.md](CONTROL_CENTER.md) — Server configuration and REST API
-- [FEATURES.md](FEATURES.md) — Complete feature flag reference
-- [SECURITY.md](SECURITY.md) — Threat model and hardening guide
+- [MALLEABLE_PROFILES.md](MALLEABLE_PROFILES.md) — Exhaustive TOML profile reference
+- [INJECTION_ENGINE.md](INJECTION_ENGINE.md) — Injection techniques deep-dive
+- [SLEEP_OBFUSCATION.md](SLEEP_OBFUSCATION.md) — Sleep obfuscation pipeline
+- [REDIRECTOR_GUIDE.md](REDIRECTOR_GUIDE.md) — Redirector deployment guide
+- [OPERATOR_MANUAL.md](OPERATOR_MANUAL.md) — Operator manual
+- [FEATURES.md](FEATURES.md) — Feature flag reference
+- [SECURITY.md](SECURITY.md) — Threat model and hardening

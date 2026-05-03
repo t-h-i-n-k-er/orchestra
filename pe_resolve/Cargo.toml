@@ -1,5 +1,6 @@
 [package]
 name = "pe_resolve"
+description = "PE export resolution via API hashing — PEB walking and export table parsing without GetProcAddress"
 version = "0.1.0"
 edition = "2021"
 

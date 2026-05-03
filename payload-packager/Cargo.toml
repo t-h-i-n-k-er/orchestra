@@ -1,5 +1,6 @@
 [package]
 name = "payload-packager"
+description = "Payload packaging tool that bundles agent binaries with profiles and configuration for deployment"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

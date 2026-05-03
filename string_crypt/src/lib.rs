@@ -1,3 +1,22 @@
+//! Compile-time string encryption proc-macros.
+//!
+//! This crate provides procedural macros that encrypt string literals at
+//! compile time and generate decryption code that runs at program startup.
+//! This prevents static analysis tools from finding sensitive strings in
+//! the binary.
+//!
+//! # Key Derivation
+//!
+//! Keys are derived from (seed + label) only — NOT from the plaintext.
+//! The master seed is split into two halves stored at different locations
+//! in the binary and recombined at runtime (Xoshiro256PlusPlus PRNG).
+//!
+//! # Available Macros
+//!
+//! - [`encrypt_string!`]: Encrypt a string literal, returns decrypted `String` at runtime.
+//! - [`encrypt_bytes!`]: Encrypt a byte literal, returns decrypted `Vec<u8>` at runtime.
+//! - [`encrypted_const!`]: Create an encrypted const array that decrypts at first access.
+
 extern crate proc_macro;
 use proc_macro::TokenStream;
 use quote::quote;

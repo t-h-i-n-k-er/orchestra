@@ -1,5 +1,6 @@
 [package]
 name = "dev-server"
+description = "Local development server for testing agent builds without a full Orchestra deployment"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

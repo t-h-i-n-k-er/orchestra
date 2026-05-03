@@ -1,5 +1,6 @@
 [package]
 name = "code_transform"
+description = "x86-64 instruction-level code transformation: opaque predicates, block reordering, register allocation, and control-flow flattening"
 version = "0.1.0"
 edition = "2021"
 

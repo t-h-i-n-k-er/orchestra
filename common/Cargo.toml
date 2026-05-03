@@ -1,5 +1,6 @@
 [package]
 name = "common"
+description = "Shared protocol types, AES-256-GCM crypto session, transport traits, and wire message definitions"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

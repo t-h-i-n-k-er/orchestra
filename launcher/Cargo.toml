@@ -1,5 +1,6 @@
 [package]
 name = "launcher"
+description = "Payload launcher and stager for executing packaged agents on target systems"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

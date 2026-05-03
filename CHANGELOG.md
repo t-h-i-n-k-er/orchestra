@@ -117,6 +117,19 @@ All notable changes to Orchestra are documented here.
 - `ed25519-dalek 2.1` — Added `use ed25519_dalek::Signer;` where `.sign()` is
   called.
 
+### Documentation
+
+- **Comprehensive documentation overhaul** — Rewrote and expanded all project documentation:
+  - `README.md` — Full rewrite with 11 sections: Architecture Overview, Workspace Crates, Feature Matrix, Quick Start, Malleable Profiles, Injection Engine, Sleep Obfuscation, Redirector Deployment, Configuration Reference, OPSEC Notes, and Building & Development.
+  - `docs/ARCHITECTURE.md` — Deep-dive covering agent internals, syscall infrastructure, memory guard lifecycle, evasion subsystem, C2 state machine, wire protocol, server internals, P2P mesh protocol, cryptographic summary, module loading pipeline, persistence subsystem, and binary diversification stack.
+  - `docs/MALLEABLE_PROFILES.md` — Exhaustive TOML reference with all sections, transform type deep-dive (None, Base64, Base64Url, Mask, Netbios, NetbiosU), data flow examples, and multi-profile server configuration.
+  - `docs/INJECTION_ENGINE.md` — Full reference for all 6 injection techniques with memory layouts, pre-injection reconnaissance, decision flowchart, sleep enrollment, and cleanup procedures.
+  - `docs/SLEEP_OBFUSCATION.md` — Memory region tracking, XChaCha20-Poly1305 encryption flow, stack encryption, integrity verification, XMM14/XMM15 key management, and performance benchmarks.
+  - `docs/REDIRECTOR_GUIDE.md` — VPS setup, TLS provisioning, CLI reference, failover behavior, CDN integration, systemd service template, and deployment checklist.
+  - `docs/OPERATOR_MANUAL.md` — Server management, agent building, profile management, injection technique selection, multi-operator workflows, audit log review, P2P mesh operations, and emergency procedures.
+- **Inline rustdoc** — Added `///` and `//!` doc comments to all public API items across 13 source files: `common/src/lib.rs`, `agent/src/config.rs`, `agent/src/handlers.rs`, `agent/src/amsi_defense.rs`, `agent/src/fsops.rs`, `pe_resolve/src/lib.rs`, `hollowing/src/lib.rs`, `builder/src/lib.rs`, `optimizer/src/lib.rs`, `code_transform/src/lib.rs`, `string_crypt/src/lib.rs`, and `shellcode_packager/src/lib.rs`.
+- **Cargo.toml descriptions** — Added accurate `description` fields to all 22 workspace crates.
+
 ### Build
 
 - `cargo test --workspace --all-features` — **all tests pass** on Linux.

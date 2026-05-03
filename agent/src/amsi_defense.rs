@@ -1,3 +1,18 @@
+//! AMSI (Anti-Malware Scan Interface) bypass strategies.
+//!
+//! This module provides multiple techniques for bypassing AMSI scanning on
+//! Windows. Three bypass strategies are available:
+//!
+//! 1. **HWBP (Hardware Breakpoint)**: Sets a hardware breakpoint on
+//!    `AmsiScanBuffer` to intercept and neutralize scan results. Most
+//!    OPSEC-safe as it does not modify AMSI DLL memory.
+//! 2. **Memory Patch**: Directly patches `AmsiScanBuffer` in-memory to
+//!    return `AMSI_RESULT_CLEAN`. Higher risk of detection but simpler.
+//! 3. **ETW Patching**: Patches `EtwEventWrite` to suppress event
+//!    forwarding to AMSI consumers.
+//!
+//! All strategies are Windows-only and compile to no-ops on other platforms.
+
 // AMSI Defense
 #[cfg(windows)]
 use std::ptr;

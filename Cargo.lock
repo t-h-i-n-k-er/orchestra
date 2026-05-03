@@ -78,6 +78,7 @@ dependencies = [
  "futures-util",
  "goblin 0.7.1",
  "hex",
+ "hkdf",
  "hmac",
  "hollowing",
  "image",
@@ -108,16 +109,19 @@ dependencies = [
  "string_crypt",
  "sysinfo",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tokio-rustls 0.26.4",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "twox-hash",
+ "url",
  "uuid",
  "winapi",
  "winreg 0.52.0",
  "x11cap",
+ "x25519-dalek",
  "zbus",
  "zeroize",
 ]
@@ -4506,6 +4510,24 @@ dependencies = [
  "libc",
  "winapi",
  "x11",
+]
+
+[[package]]
+name = "redirector"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "axum-server",
+ "clap",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 0.8.23",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 [package]
 name = "keygen"
+description = "Cryptographic key and certificate generation utility for Orchestra deployments"
 version = "0.1.0"
 edition = "2021"
 

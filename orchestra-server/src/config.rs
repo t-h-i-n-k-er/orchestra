@@ -149,6 +149,12 @@ pub struct ServerConfig {
     /// on every agent that will receive pushed modules.
     #[serde(default)]
     pub module_aes_key: Option<String>,
+    /// Directory where module binaries (`.so` / `.dll`) are stored for
+    /// C2-tunneled downloads.  When an agent sends a [`ModuleRequest`],
+    /// the server looks up `<modules_dir>/<module_id>.<ext>` here.
+    /// Defaults to a `modules` subdirectory of `builds_output_dir`.
+    #[serde(default = "default_modules_dir")]
+    pub modules_dir: PathBuf,
     // ── Multi-operator support ─────────────────────────────────────────
     /// Named operators loaded from the `[operators]` TOML map.
     /// Each entry key becomes the operator ID; the sub-table contains
@@ -180,10 +186,30 @@ pub struct ServerConfig {
     /// Maximum number of concurrent pipe instances.  Defaults to 4.
     #[serde(default = "default_smb_relay_max_instances")]
     pub smb_relay_max_instances: u32,
+    // ── Malleable C2 HTTP listener ─────────────────────────────────────────
+    /// Address for the malleable-profile-aware HTTP C2 listener.
+    ///
+    /// This is a separate listener from the operator HTTPS dashboard.
+    /// Agents connect here using their profile-configured URIs.
+    #[serde(default = "default_http_c2_addr")]
+    pub http_c2_addr: SocketAddr,
+    /// Path to a directory of malleable C2 profile TOML files.
+    ///
+    /// When set, the server loads all `.toml` files in this directory
+    /// at startup and watches for changes every 30 seconds.
+    #[serde(default)]
+    pub profile_dir: Option<PathBuf>,
+    /// Path to a single malleable C2 profile file (backward compat).
+    #[serde(default)]
+    pub profile_path: Option<PathBuf>,
 }
 
 fn default_builds_dir() -> PathBuf {
     PathBuf::from("/var/lib/orchestra/builds")
+}
+
+fn default_modules_dir() -> PathBuf {
+    default_builds_dir().join("modules")
 }
 fn default_build_retention_days() -> u32 {
     7
@@ -211,6 +237,9 @@ fn default_smb_relay_pipe_name() -> String {
 }
 fn default_smb_relay_max_instances() -> u32 {
     4
+}
+fn default_http_c2_addr() -> SocketAddr {
+    "127.0.0.1:8446".parse().unwrap()
 }
 
 impl Default for ServerConfig {
@@ -241,9 +270,13 @@ impl Default for ServerConfig {
             operators: HashMap::new(),
             module_signing_key: None,
             module_aes_key: None,
+            modules_dir: default_modules_dir(),
             smb_relay_enabled: false,
             smb_relay_pipe_name: default_smb_relay_pipe_name(),
             smb_relay_max_instances: default_smb_relay_max_instances(),
+            http_c2_addr: default_http_c2_addr(),
+            profile_dir: None,
+            profile_path: None,
         }
     }
 }

@@ -1,5 +1,6 @@
 [package]
 name = "hollowing"
+description = "Process hollowing, module stomping, and shellcode injection primitives for Windows"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

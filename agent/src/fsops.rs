@@ -31,10 +31,14 @@ use tokio::fs as afs;
 #[cfg(unix)]
 use libc;
 
+/// A single directory entry returned by [`list_directory`].
 #[derive(serde::Serialize)]
 pub struct FileEntry {
+    /// File or directory name (final path component only).
     pub name: String,
+    /// `true` if this entry is a directory.
     pub is_dir: bool,
+    /// File size in bytes (0 for directories).
     pub size: u64,
 }
 
@@ -153,6 +157,11 @@ fn is_reparse_point(_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// List directory contents within the agent's allowed paths.
+///
+/// Returns a vector of [`FileEntry`] structs describing each file and
+/// subdirectory. The path is validated against `config.allowed_paths`
+/// before listing.
 pub async fn list_directory(path: &str, config: &Config) -> Result<Vec<FileEntry>> {
     let path = validate_path(path, config).await?;
     let mut entries = Vec::new();
@@ -169,11 +178,20 @@ pub async fn list_directory(path: &str, config: &Config) -> Result<Vec<FileEntry
     Ok(entries)
 }
 
+/// Read a file's contents within the agent's allowed paths.
+///
+/// Returns the raw bytes of the file. The path is validated against
+/// `config.allowed_paths` before reading.
 pub async fn read_file(path: &str, config: &Config) -> Result<Vec<u8>> {
     let path = validate_path(path, config).await?;
     Ok(afs::read(path).await?)
 }
 
+/// Write data to a file within the agent's allowed paths.
+///
+/// Creates the file if it does not exist, truncates if it does. On Unix,
+/// the file is opened with `O_NOFOLLOW` to prevent symlink-based TOCTOU
+/// attacks on the final path component.
 pub async fn write_file(path: &str, data: &[u8], config: &Config) -> Result<()> {
     let path = validate_path(path, config).await?;
     // Use O_NOFOLLOW on Unix so that if the final path component is a symlink

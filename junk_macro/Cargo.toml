@@ -1,5 +1,6 @@
 [package]
 name = "junk_macro"
+description = "Proc-macro for generating junk code sequences at compile time for binary diversification"
 version = "0.1.0"
 edition = "2021"
 

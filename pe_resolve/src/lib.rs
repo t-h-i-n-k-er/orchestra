@@ -1,8 +1,38 @@
+//! PE export resolution via API hashing.
+//!
+//! This crate provides functions to resolve DLL module bases and exported
+//! function addresses by hash rather than by name string. This avoids
+//! calling `LoadLibrary` / `GetProcAddress` directly, which are commonly
+//! hooked by EDR/AV products.
+//!
+//! # Hashing Algorithm
+//!
+//! The hash function rotates a 32-bit seed right by 13 bits and XORs in
+//! each byte of the name (case-folded to lowercase). The seed value is
+//! generated at build time by `build.rs` and stored in `api_hashes.rs`.
+//!
+//! # Platform Support
+//!
+//! - **Windows x86_64**: Full PEB walking + PE export table parsing
+//! - **Windows aarch64**: Full PEB walking + PE export table parsing
+//! - **Non-Windows**: Stub implementations that return `None`
+
 #![allow(dead_code)]
 #![no_std]
 
 include!(concat!(env!("OUT_DIR"), "/api_hashes.rs"));
 
+/// Compute a case-insensitive rotational hash of a UTF-8 byte string.
+///
+/// Used for hashing DLL export names. The hash is computed by rotating
+/// the accumulator right by 13 bits and XORing in each byte (lowercased).
+/// A null terminator (`0x00`) ends the hash.
+///
+/// # Example
+///
+/// ```ignore
+/// let hash = hash_str(b"NtCreateThreadEx");
+/// ```
 #[inline(always)]
 pub fn hash_str(bytes: &[u8]) -> u32 {
     let mut hash: u32 = SEED;
@@ -15,6 +45,17 @@ pub fn hash_str(bytes: &[u8]) -> u32 {
     hash
 }
 
+/// Compute a case-insensitive rotational hash of a UTF-16 wide string.
+///
+/// Used for hashing DLL module names from the PEB loader data. Both the
+/// low and high bytes of each UTF-16 code unit are folded into the hash
+/// to correctly handle non-ASCII module names.
+///
+/// # Example
+///
+/// ```ignore
+/// let hash = hash_wstr(&[b'N' as u16, b'T' as u16, b'D' as u16, b'L' as u16, b'L' as u16]);
+/// ```
 #[inline(always)]
 pub fn hash_wstr(bytes: &[u16]) -> u32 {
     let mut hash: u32 = SEED;

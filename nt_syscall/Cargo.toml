@@ -1,5 +1,6 @@
 [package]
 name = "nt_syscall"
+description = "Direct NT syscall wrappers with SSN resolution for bypassing usermode API hooks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
