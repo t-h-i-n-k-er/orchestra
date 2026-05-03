@@ -98,6 +98,10 @@ network-discovery = []
 remote-assist = ["dep:enigo", "dep:image", "dep:x11cap", "dep:zbus", "dep:futures-util"]
 module-signatures = ["common/module-signatures"]
 direct-syscalls = []
+# Pre-injection ETW auto-logger enumeration via registry (NtOpenKey /
+# NtEnumerateKey / NtQueryValueKey).  When disabled, check_etw_trace()
+# returns EtwStatus::Unknown immediately with no registry access.
+etw-check = []
 # Spoof the user-mode call stack visible to EDR kernel callbacks during
 # indirect syscall dispatch.  Before jumping to the ntdll syscall gadget
 # a two-entry fake frame chain is pushed onto the stack so that stack walkers

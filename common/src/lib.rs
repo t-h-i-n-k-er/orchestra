@@ -41,6 +41,8 @@ pub mod normalized_transport;
 pub mod p2p_proto;
 /// TLS transport configuration and certificate handling.
 pub mod tls_transport;
+/// Malleable C2 profile types shared between agent and server.
+pub mod malleable_types;
 
 pub use audit::{AuditEvent, Outcome};
 

@@ -68,6 +68,12 @@ pub struct RedirectorEntry {
     /// IP address or domain the redirector sees itself as.
     #[serde(default)]
     pub external_addr: String,
+    /// Domain fronting domain for this redirector. When set, the agent's TLS
+    /// SNI uses this domain while the HTTP Host header carries the redirector
+    /// URL domain. This enables multi-CDN scenarios where different redirectors
+    /// sit behind different CDNs.
+    #[serde(default)]
+    pub front_domain: Option<String>,
 }
 
 /// Shared state for redirector management.
@@ -98,6 +104,7 @@ impl RedirectorState {
         url: String,
         profile_name: String,
         external_addr: String,
+        front_domain: Option<String>,
     ) -> RedirectorEntry {
         let now = now_secs();
         let id = self.generate_id();
@@ -109,6 +116,7 @@ impl RedirectorState {
             last_heartbeat: now,
             registered_at: now,
             external_addr,
+            front_domain,
         };
         self.redirectors.insert(entry.id.clone(), entry.clone());
         tracing::info!(
@@ -213,6 +221,9 @@ pub struct RegisterRequest {
     /// External address the redirector sees itself as.
     #[serde(default)]
     pub external_addr: String,
+    /// Domain fronting domain for this redirector.
+    #[serde(default)]
+    pub front_domain: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -254,6 +265,9 @@ pub struct RedirectorConfigEntry {
     pub url: String,
     pub headers: std::collections::HashMap<String, String>,
     pub profile_name: String,
+    /// Domain fronting domain for this redirector (overrides the global front_domain).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub front_domain: Option<String>,
 }
 
 // ── API handlers ─────────────────────────────────────────────────────────────
@@ -282,7 +296,7 @@ pub async fn handle_register(
 
     let entry = state
         .redirector_state
-        .register(req.url, req.profile_name, req.external_addr);
+        .register(req.url, req.profile_name, req.external_addr, req.front_domain);
 
     Ok((
         StatusCode::OK,
@@ -343,6 +357,7 @@ pub async fn handle_agent_config(
             url: e.url,
             headers: std::collections::HashMap::new(),
             profile_name: e.profile_name,
+            front_domain: e.front_domain,
         })
         .collect();
     Json(AgentConfigResponse {

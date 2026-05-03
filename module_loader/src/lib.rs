@@ -766,7 +766,7 @@ mod tests {
             result.is_err(),
             "strict-module-key must reject verify_key = None"
         );
-        let msg = result.unwrap_err().to_string();
+        let msg = result.err().expect("expected error").to_string();
         assert!(
             msg.contains("module_verify_key must be supplied"),
             "error message should explain the strict-module-key requirement, got: {msg}"

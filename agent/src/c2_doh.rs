@@ -819,9 +819,9 @@ mod tests {
     fn test_encode_decode_base32() {
         let data = b"hello dns world";
         let encoded = encode_subdomain(data, "base32");
-        // Base32 should be lowercase and contain only DNS-safe chars.
-        assert!(encoded.chars().all(|c| c.is_ascii_lowercase() || c == '='));
-        // But we don't pad, so no '='.
+        // Base32 should be lowercase letters or digits 2-7 (DNS-safe).
+        assert!(encoded.chars().all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c)));
+        // No padding.
         assert!(!encoded.contains('='));
         let decoded = decode_subdomain(&encoded, "base32").unwrap();
         assert_eq!(decoded, data);

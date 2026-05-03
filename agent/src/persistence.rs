@@ -469,8 +469,7 @@ pub mod windows {
     ///    WMI implementation DLL as the known-good IUnknown methods and that no
     ///    out-of-module hook has redirected entry 16.
     ///
-    /// Returns the validated function pointer, or `None` to signal that the
-    /// caller should fall back to the PowerShell path.
+    /// Returns the validated function pointer, or `None` if validation fails.
     unsafe fn resolve_spawn_instance(
         class_obj: *mut IWbemClassObject,
     ) -> Option<
@@ -505,7 +504,7 @@ pub mod windows {
 
         // Both entries must belong to the same module (the WMI implementation
         // DLL, typically fastprox.dll).  A mismatch indicates an inline hook or
-        // an unexpected vtable layout change and we fall back to PowerShell.
+        // an unexpected vtable layout change.
         let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
             | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
         let mut hmod_0: winapi::shared::minwindef::HMODULE = std::ptr::null_mut();
@@ -535,7 +534,122 @@ pub mod windows {
         Some(std::mem::transmute(entry_16))
     }
 
+    /// Attempt to spawn a new instance of a WMI class with vtable validation
+    /// and retries.  Each retry re-fetches the class definition via
+    /// GetObject, validates the vtable, and calls SpawnInstance.
+    /// Returns the spawned instance on success.
+    unsafe fn spawn_instance_with_retry(
+        services_ptr: *mut IWbemServices,
+        class_name: &str,
+    ) -> Result<*mut IWbemClassObject> {
+        use winapi::shared::winerror::SUCCEEDED;
+
+        let max_retries = 3u32;
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                // 100 ms delay between retries
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            // Re-fetch the class definition each attempt
+            let class_bstr = alloc_bstr(class_name);
+            let mut class_obj: *mut IWbemClassObject = ptr::null_mut();
+            let hr = ((*(*services_ptr).lpvtbl).get_object)(
+                services_ptr,
+                class_bstr,
+                0,
+                ptr::null_mut(),
+                &mut class_obj,
+                ptr::null_mut(),
+            );
+            free_bstr(class_bstr);
+
+            if !SUCCEEDED(hr) {
+                log::warn!(
+                    "WmiSubscription: GetObject({}) attempt {} failed: 0x{:08X}",
+                    class_name, attempt + 1, hr
+                );
+                continue;
+            }
+
+            // Validate vtable and resolve SpawnInstance
+            match resolve_spawn_instance(class_obj) {
+                Some(spawn_fn) => {
+                    let mut inst: *mut IWbemClassObject = ptr::null_mut();
+                    let hr = spawn_fn(class_obj, 0, &mut inst);
+                    ((*(*class_obj).lpvtbl).release)(class_obj);
+
+                    if SUCCEEDED(hr) && !inst.is_null() {
+                        log::debug!(
+                            "WmiSubscription: SpawnInstance({}) succeeded on attempt {}",
+                            class_name, attempt + 1
+                        );
+                        return Ok(inst);
+                    }
+                    log::warn!(
+                        "WmiSubscription: SpawnInstance({}) attempt {} failed: 0x{:08X}",
+                        class_name, attempt + 1, hr
+                    );
+                    if !inst.is_null() {
+                        ((*(*inst).lpvtbl).release)(inst);
+                    }
+                }
+                None => {
+                    ((*(*class_obj).lpvtbl).release)(class_obj);
+                    log::warn!(
+                        "WmiSubscription: vtable validation failed for {} on attempt {}",
+                        class_name, attempt + 1
+                    );
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "SpawnInstance({}) failed after {} retries",
+            class_name, max_retries
+        ))
+    }
+
+    /// Fallback approach when SpawnInstance fails: fetch an existing instance
+    /// (or template) via GetObject using the object path, then modify its
+    /// properties and use PutInstance with WBEM_FLAG_CREATE_OR_UPDATE.
+    /// Returns the modified instance ready for PutInstance, or an error.
+    unsafe fn get_instance_by_path(
+        services_ptr: *mut IWbemServices,
+        object_path: &str,
+    ) -> Result<*mut IWbemClassObject> {
+        use winapi::shared::winerror::SUCCEEDED;
+
+        let path_bstr = alloc_bstr(object_path);
+        let mut obj: *mut IWbemClassObject = ptr::null_mut();
+        let hr = ((*(*services_ptr).lpvtbl).get_object)(
+            services_ptr,
+            path_bstr,
+            0,
+            ptr::null_mut(),
+            &mut obj,
+            ptr::null_mut(),
+        );
+        free_bstr(path_bstr);
+
+        if !SUCCEEDED(hr) {
+            return Err(anyhow!(
+                "GetObject(path={}) fallback failed: 0x{:08X}",
+                object_path, hr
+            ));
+        }
+        if obj.is_null() {
+            return Err(anyhow!(
+                "GetObject(path={}) returned null",
+                object_path
+            ));
+        }
+        Ok(obj)
+    }
+
     // Core COM implementation: returns Ok(()) on success, Err with HR description on failure.
+    // Uses robust retry logic for SpawnInstance and falls back to GetObject-by-path + PutInstance
+    // if SpawnInstance fails after all retries.
     unsafe fn wmi_install_com(
         subscription_name: &str,
         exe_path: &str,
@@ -595,51 +709,43 @@ pub mod windows {
             return Err(anyhow!("CoSetProxyBlanket failed: 0x{:08X}", hr));
         }
 
-        // Step 4a: Get the __EventFilter class definition and spawn an instance
-        let filter_class_bstr = alloc_bstr("__EventFilter");
-        let mut filter_class_obj: *mut IWbemClassObject = ptr::null_mut();
-        let hr = ((*(*services_ptr).lpvtbl).get_object)(
-            services_ptr,
-            filter_class_bstr,
-            0,
-            ptr::null_mut(),
-            &mut filter_class_obj,
-            ptr::null_mut(),
-        );
-        free_bstr(filter_class_bstr);
-        if !SUCCEEDED(hr) {
-            ((*(*services_ptr).lpvtbl).release)(services_ptr);
-            ((*locator.lpvtbl).release)(locator_ptr);
-            return Err(anyhow!("GetObject(__EventFilter) failed: 0x{:08X}", hr));
+        // Helper: release services + locator on fatal error
+        macro_rules! cleanup_and_err {
+            ($services:expr, $locator:expr, $msg:expr) => {{
+                ((*(*$services).lpvtbl).release)($services);
+                ((*(*$locator).lpvtbl).release)($locator);
+                return Err(anyhow!($msg));
+            }};
+            ($services:expr, $locator:expr, $fmt:expr, $($arg:tt)*) => {{
+                ((*(*$services).lpvtbl).release)($services);
+                ((*(*$locator).lpvtbl).release)($locator);
+                return Err(anyhow!($fmt, $($arg)*));
+            }};
         }
 
-        // Spawn a new instance from the class object by calling SpawnInstance.
-        // The vtable layout is validated at runtime via resolve_spawn_instance
-        // (checks module provenance of vtable[0] and vtable[16]) so that a
-        // layout change or out-of-module hook causes fallback to PowerShell
-        // rather than a crash or bad indirect call.
-        let spawn_instance_fn = match resolve_spawn_instance(filter_class_obj) {
-            Some(f) => f,
-            None => {
-                ((*(*filter_class_obj).lpvtbl).release)(filter_class_obj);
-                ((*(*services_ptr).lpvtbl).release)(services_ptr);
-                ((*locator.lpvtbl).release)(locator_ptr);
-                return Err(anyhow!(
-                    "SpawnInstance vtable validation failed for __EventFilter; vtable layout mismatch or hook detected"
-                ));
+        // ── Step 4a: __EventFilter ──────────────────────────────────────────
+        let filter_query = "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'";
+
+        let filter_inst = match spawn_instance_with_retry(services_ptr, "__EventFilter") {
+            Ok(inst) => inst,
+            Err(e) => {
+                log::warn!(
+                    "WmiSubscription: SpawnInstance(__EventFilter) failed ({}), \
+                     trying GetObject-by-path fallback", e
+                );
+                // Fallback: get instance by object path
+                let filter_path = format!("__EventFilter.Name=\"{}\"", subscription_name);
+                match get_instance_by_path(services_ptr, &filter_path) {
+                    Ok(inst) => inst,
+                    Err(e2) => cleanup_and_err!(
+                        services_ptr, locator_ptr,
+                        "WmiSubscription: all COM approaches failed for __EventFilter: {} (spawn), {} (path fallback)",
+                        e, e2
+                    ),
+                }
             }
         };
 
-        let mut filter_inst: *mut IWbemClassObject = ptr::null_mut();
-        let hr = spawn_instance_fn(filter_class_obj, 0, &mut filter_inst);
-        ((*(*filter_class_obj).lpvtbl).release)(filter_class_obj);
-        if !SUCCEEDED(hr) {
-            ((*(*services_ptr).lpvtbl).release)(services_ptr);
-            ((*locator.lpvtbl).release)(locator_ptr);
-            return Err(anyhow!("SpawnInstance(__EventFilter) failed: 0x{:08X}", hr));
-        }
-
-        let filter_query = "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'";
         put_bstr_prop(filter_inst, "Name", subscription_name);
         put_bstr_prop(filter_inst, "EventNamespace", "root/cimv2");
         put_bstr_prop(filter_inst, "QueryLanguage", "WQL");
@@ -651,48 +757,28 @@ pub mod windows {
         );
         ((*(*filter_inst).lpvtbl).release)(filter_inst);
         if !SUCCEEDED(hr) {
-            ((*(*services_ptr).lpvtbl).release)(services_ptr);
-            ((*locator.lpvtbl).release)(locator_ptr);
-            return Err(anyhow!("PutInstance(__EventFilter) failed: 0x{:08X}", hr));
+            cleanup_and_err!(services_ptr, locator_ptr, "PutInstance(__EventFilter) failed: 0x{:08X}", hr);
         }
 
-        // Step 4b: CommandLineEventConsumer
-        let consumer_class_bstr = alloc_bstr("CommandLineEventConsumer");
-        let mut consumer_class_obj: *mut IWbemClassObject = ptr::null_mut();
-        let hr = ((*(*services_ptr).lpvtbl).get_object)(
-            services_ptr,
-            consumer_class_bstr,
-            0,
-            ptr::null_mut(),
-            &mut consumer_class_obj,
-            ptr::null_mut(),
-        );
-        free_bstr(consumer_class_bstr);
-        if !SUCCEEDED(hr) {
-            ((*(*services_ptr).lpvtbl).release)(services_ptr);
-            ((*locator.lpvtbl).release)(locator_ptr);
-            return Err(anyhow!("GetObject(CommandLineEventConsumer) failed: 0x{:08X}", hr));
-        }
-
-        let spawn_instance_fn2 = match resolve_spawn_instance(consumer_class_obj) {
-            Some(f) => f,
-            None => {
-                ((*(*consumer_class_obj).lpvtbl).release)(consumer_class_obj);
-                ((*(*services_ptr).lpvtbl).release)(services_ptr);
-                ((*locator.lpvtbl).release)(locator_ptr);
-                return Err(anyhow!(
-                    "SpawnInstance vtable validation failed for CommandLineEventConsumer; vtable layout mismatch or hook detected"
-                ));
+        // ── Step 4b: CommandLineEventConsumer ───────────────────────────────
+        let consumer_inst = match spawn_instance_with_retry(services_ptr, "CommandLineEventConsumer") {
+            Ok(inst) => inst,
+            Err(e) => {
+                log::warn!(
+                    "WmiSubscription: SpawnInstance(CommandLineEventConsumer) failed ({}), \
+                     trying GetObject-by-path fallback", e
+                );
+                let consumer_path = format!("CommandLineEventConsumer.Name=\"{}\"", subscription_name);
+                match get_instance_by_path(services_ptr, &consumer_path) {
+                    Ok(inst) => inst,
+                    Err(e2) => cleanup_and_err!(
+                        services_ptr, locator_ptr,
+                        "WmiSubscription: all COM approaches failed for CommandLineEventConsumer: {} (spawn), {} (path fallback)",
+                        e, e2
+                    ),
+                }
             }
         };
-        let mut consumer_inst: *mut IWbemClassObject = ptr::null_mut();
-        let hr = spawn_instance_fn2(consumer_class_obj, 0, &mut consumer_inst);
-        ((*(*consumer_class_obj).lpvtbl).release)(consumer_class_obj);
-        if !SUCCEEDED(hr) {
-            ((*(*services_ptr).lpvtbl).release)(services_ptr);
-            ((*locator.lpvtbl).release)(locator_ptr);
-            return Err(anyhow!("SpawnInstance(CommandLineEventConsumer) failed: 0x{:08X}", hr));
-        }
 
         put_bstr_prop(consumer_inst, "Name", subscription_name);
         put_bstr_prop(consumer_inst, "CommandLineTemplate", exe_path);
@@ -703,48 +789,31 @@ pub mod windows {
         );
         ((*(*consumer_inst).lpvtbl).release)(consumer_inst);
         if !SUCCEEDED(hr) {
-            ((*(*services_ptr).lpvtbl).release)(services_ptr);
-            ((*locator.lpvtbl).release)(locator_ptr);
-            return Err(anyhow!("PutInstance(CommandLineEventConsumer) failed: 0x{:08X}", hr));
+            cleanup_and_err!(services_ptr, locator_ptr, "PutInstance(CommandLineEventConsumer) failed: 0x{:08X}", hr);
         }
 
-        // Step 4c: __FilterToConsumerBinding
-        let binding_class_bstr = alloc_bstr("__FilterToConsumerBinding");
-        let mut binding_class_obj: *mut IWbemClassObject = ptr::null_mut();
-        let hr = ((*(*services_ptr).lpvtbl).get_object)(
-            services_ptr,
-            binding_class_bstr,
-            0,
-            ptr::null_mut(),
-            &mut binding_class_obj,
-            ptr::null_mut(),
-        );
-        free_bstr(binding_class_bstr);
-        if !SUCCEEDED(hr) {
-            ((*(*services_ptr).lpvtbl).release)(services_ptr);
-            ((*locator.lpvtbl).release)(locator_ptr);
-            return Err(anyhow!("GetObject(__FilterToConsumerBinding) failed: 0x{:08X}", hr));
-        }
-
-        let spawn_instance_fn3 = match resolve_spawn_instance(binding_class_obj) {
-            Some(f) => f,
-            None => {
-                ((*(*binding_class_obj).lpvtbl).release)(binding_class_obj);
-                ((*(*services_ptr).lpvtbl).release)(services_ptr);
-                ((*locator.lpvtbl).release)(locator_ptr);
-                return Err(anyhow!(
-                    "SpawnInstance vtable validation failed for __FilterToConsumerBinding; vtable layout mismatch or hook detected"
-                ));
+        // ── Step 4c: __FilterToConsumerBinding ──────────────────────────────
+        let binding_inst = match spawn_instance_with_retry(services_ptr, "__FilterToConsumerBinding") {
+            Ok(inst) => inst,
+            Err(e) => {
+                log::warn!(
+                    "WmiSubscription: SpawnInstance(__FilterToConsumerBinding) failed ({}), \
+                     trying GetObject-by-path fallback", e
+                );
+                let binding_path = format!(
+                    "__FilterToConsumerBinding.Filter=\"__EventFilter.Name=\\\"{}\\\"\",Consumer=\"CommandLineEventConsumer.Name=\\\"{}\\\"\"",
+                    subscription_name, subscription_name
+                );
+                match get_instance_by_path(services_ptr, &binding_path) {
+                    Ok(inst) => inst,
+                    Err(e2) => cleanup_and_err!(
+                        services_ptr, locator_ptr,
+                        "WmiSubscription: all COM approaches failed for __FilterToConsumerBinding: {} (spawn), {} (path fallback)",
+                        e, e2
+                    ),
+                }
             }
         };
-        let mut binding_inst: *mut IWbemClassObject = ptr::null_mut();
-        let hr = spawn_instance_fn3(binding_class_obj, 0, &mut binding_inst);
-        ((*(*binding_class_obj).lpvtbl).release)(binding_class_obj);
-        if !SUCCEEDED(hr) {
-            ((*(*services_ptr).lpvtbl).release)(services_ptr);
-            ((*locator.lpvtbl).release)(locator_ptr);
-            return Err(anyhow!("SpawnInstance(__FilterToConsumerBinding) failed: 0x{:08X}", hr));
-        }
 
         // Filter reference: "__EventFilter.Name=\"<name>\""
         let filter_ref = format!("__EventFilter.Name=\"{}\"", subscription_name);
@@ -762,35 +831,6 @@ pub mod windows {
 
         if !SUCCEEDED(hr) {
             return Err(anyhow!("PutInstance(__FilterToConsumerBinding) failed: 0x{:08X}", hr));
-        }
-        Ok(())
-    }
-
-    // Escape a value for embedding inside a single-quoted PowerShell string.
-    fn escape_ps_string(s: &str) -> String {
-        s.replace('\'', "''")
-    }
-
-    // PowerShell fallback for WMI registration
-    unsafe fn wmi_install_powershell(
-        subscription_name: &str,
-        exe_path: &str,
-    ) -> Result<()> {
-        let escaped_name = escape_ps_string(subscription_name);
-        let escaped_path = escape_ps_string(exe_path);
-        let filter_query = "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'";
-        let ps_cmd = format!(
-            "$filter = Set-WmiInstance -Class __EventFilter -Namespace root\\subscription -Arguments @{{Name='{}';EventNamespace='root/cimv2';QueryLanguage='WQL';Query='{}'}};
-            $consumer = Set-WmiInstance -Class CommandLineEventConsumer -Namespace root\\subscription -Arguments @{{Name='{}';CommandLineTemplate='{}'}};
-            Set-WmiInstance -Class __FilterToConsumerBinding -Namespace root\\subscription -Arguments @{{Filter=$filter;Consumer=$consumer}}",
-            escaped_name, filter_query, escaped_name, escaped_path
-        );
-        let status = std::process::Command::new("powershell")
-            .args(["-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
-            .status()
-            .map_err(|e| anyhow!("WmiSubscription: failed to spawn powershell: {}", e))?;
-        if !status.success() {
-            return Err(anyhow!("WmiSubscription: powershell returned non-zero exit code"));
         }
         Ok(())
     }
@@ -1067,20 +1107,15 @@ pub mod windows {
 
                 let result = wmi_install_com(&self.subscription_name, exe_path.as_ref());
                 if let Err(ref e) = result {
-                    log::warn!(
-                        "WmiSubscription::install: COM path failed ({}), falling back to PowerShell",
+                    log::error!(
+                        "WmiSubscription::install: all COM approaches failed ({})",
                         e
                     );
-                    let ps_result = wmi_install_powershell(&self.subscription_name, exe_path.as_ref());
-                    if should_uninitialize {
-                        CoUninitialize();
-                    }
-                    ps_result?;
-                } else {
-                    if should_uninitialize {
-                        CoUninitialize();
-                    }
                 }
+                if should_uninitialize {
+                    CoUninitialize();
+                }
+                result?;
 
                 log::info!("WmiSubscription::install: registered successfully");
             }

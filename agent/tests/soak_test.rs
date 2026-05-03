@@ -52,6 +52,8 @@ async fn soak_handler_dispatch() {
 
     let crypto = Arc::new(CryptoSession::from_shared_secret(b"soak-test"));
     let config = Arc::new(Mutex::new(Config::default()));
+    let (out_tx, _out_rx) = tokio::sync::mpsc::channel(16);
+    let p2p_mesh = Arc::new(tokio::sync::Mutex::new(agent::p2p::P2pMesh::default()));
 
     let baseline = rss_kib();
     let started = Instant::now();
@@ -67,7 +69,7 @@ async fn soak_handler_dispatch() {
                 },
             ] {
                 let _ =
-                    agent::handlers::handle_command(crypto.clone(), config.clone(), cmd, "admin")
+                    agent::handlers::handle_command(crypto.clone(), config.clone(), cmd, "admin", out_tx.clone(), p2p_mesh.clone())
                         .await;
                 iterations += 1;
             }

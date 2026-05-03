@@ -399,3 +399,25 @@ pub unsafe fn unpatch_etw() {
 
 #[cfg(not(windows))]
 pub unsafe fn unpatch_etw() {}
+
+/// Check whether the agent has already patched any ETW function locally.
+///
+/// Returns `true` if at least one of `EtwEventWrite`, `EtwEventWriteEx`,
+/// or `NtTraceEvent` has been patched (their original first byte was saved).
+/// On non-Windows targets always returns `false`.
+///
+/// This is used by the injection engine's ETW check to determine if a
+/// local ETW probe is viable: if the agent has already silenced ETW, the
+/// result of any further ETW enumeration would be unreliable.
+#[cfg(windows)]
+pub fn is_etw_patched() -> bool {
+    use std::sync::atomic::Ordering;
+    ORIG_ETW_WRITE.load(Ordering::Acquire) != 0
+        || ORIG_ETW_WRITE_EX.load(Ordering::Acquire) != 0
+        || ORIG_NT_TRACE.load(Ordering::Acquire) != 0
+}
+
+#[cfg(not(windows))]
+pub fn is_etw_patched() -> bool {
+    false
+}

@@ -82,6 +82,12 @@ struct Cli {
     /// Bearer token for authenticating with the Orchestra server.
     #[arg(long)]
     server_token: Option<String>,
+
+    /// Domain fronting domain for this redirector. When set, the agent's TLS
+    /// SNI will use this domain while the HTTP Host header carries the
+    /// redirector's actual domain.
+    #[arg(long)]
+    front_domain: Option<String>,
 }
 
 // ── Profile loader ───────────────────────────────────────────────────────────
@@ -353,15 +359,24 @@ impl ServerConnection {
     }
 
     /// Register this redirector with the Orchestra server.
-    async fn register(&mut self, listen_url: &str, profile_name: &str) -> Result<()> {
+    async fn register(
+        &mut self,
+        listen_url: &str,
+        profile_name: &str,
+        front_domain: Option<&str>,
+    ) -> Result<()> {
+        let mut payload = serde_json::json!({
+            "url": listen_url,
+            "profile_name": profile_name,
+        });
+        if let Some(fd) = front_domain {
+            payload["front_domain"] = serde_json::Value::String(fd.to_string());
+        }
         let resp = self
             .client
             .post(format!("{}/api/redirector/register", self.api_url))
             .header("Authorization", format!("Bearer {}", self.token))
-            .json(&serde_json::json!({
-                "url": listen_url,
-                "profile_name": profile_name,
-            }))
+            .json(&payload)
             .send()
             .await?;
 
@@ -418,7 +433,10 @@ async fn main() -> Result<()> {
     {
         let mut conn = ServerConnection::new(api_url, token);
         let listen_url = format!("https://{}", cli.listen_addr);
-        if let Err(e) = conn.register(&listen_url, &profile_name).await {
+        if let Err(e) = conn
+            .register(&listen_url, &profile_name, cli.front_domain.as_deref())
+            .await
+        {
             tracing::warn!("initial registration failed: {} (will retry in heartbeat loop)", e);
         }
         Some(conn)
