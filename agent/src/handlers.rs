@@ -714,6 +714,41 @@ pub async fn handle_command(
             let links = mesh_guard.list_links();
             Ok(serde_json::to_string(&links).unwrap_or_else(|_| "[]".to_string()))
         }
+
+        // ── Mesh routing commands ──────────────────────────────────────
+        Command::MeshConnect { ref target_agent_id, ref transport, ref target_addr } => {
+            let mesh_arc = p2p_mesh.clone();
+            let mut mesh_guard = mesh_arc.lock().await;
+            match mesh_guard.connect_to_parent(
+                target_addr,
+                transport,
+                out_tx.clone(),
+                p2p_mesh.clone(),
+            ).await {
+                Ok(link_id) => {
+                    // Record the peer agent_id on the new link.
+                    if let Some(link) = mesh_guard.links.get_mut(&link_id) {
+                        link.peer_agent_id = target_agent_id.clone();
+                    }
+                    Ok(format!(
+                        "mesh connect to {} at {} via {}, link_id={:#010X}",
+                        target_agent_id, target_addr, transport, link_id
+                    ))
+                }
+                Err(e) => Err(format!("MeshConnect failed: {e}")),
+            }
+        }
+        Command::MeshDisconnect { ref target_agent_id } => {
+            let mut mesh_guard = p2p_mesh.lock().await;
+            let link_id = mesh_guard.link_id_by_peer(target_agent_id);
+            match link_id {
+                Some(id) => match mesh_guard.disconnect(Some(id)).await {
+                    0 => Err("no links to disconnect".to_string()),
+                    n => Ok(format!("mesh disconnected {} ({n} link(s))", target_agent_id)),
+                },
+                None => Err(format!("no link to agent '{}'", target_agent_id)),
+            }
+        }
     };
 
     let (outcome, details) = match &result {

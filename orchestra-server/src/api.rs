@@ -97,6 +97,7 @@ pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
     // Routes that require the standard `Authorization: Bearer <token>` header.
     let api_authed = Router::new()
         .route("/agents", get(list_agents))
+        .route("/agents/mesh", get(list_agents_mesh))
         // Route by reported agent_id (most-recently-seen wins when duplicates exist).
         .route("/agents/:id/command", post(send_command_by_agent_id))
         // Unambiguous routing by server-assigned connection_id.
@@ -122,6 +123,13 @@ pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
         .route("/p2p/link", post(link_agents))
         .route("/p2p/unlink", post(unlink_agent))
         .route("/p2p/topology", get(list_topology))
+        // Mesh routing endpoints (Dijkstra pathfinding).
+        .route("/mesh/route", get(mesh_route))
+        .route("/mesh/broadcast", get(mesh_broadcast))
+        .route("/mesh/connect", post(mesh_connect))
+        .route("/mesh/disconnect", post(mesh_disconnect))
+        .route("/mesh/topology", get(mesh_topology))
+        .route("/mesh/stats", get(mesh_stats))
         // Redirector management endpoints (authed for operator use).
         .route("/redirector/list", get(crate::redirector::handle_list))
         .route("/redirector/remove", post(crate::redirector::handle_remove))
@@ -159,6 +167,73 @@ pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
 
 async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentView>> {
     Json(state.list_agents())
+}
+
+/// Mesh-aware agent listing that includes routing information.
+#[derive(serde::Serialize)]
+struct MeshAgentView {
+    connection_id: String,
+    agent_id: String,
+    hostname: String,
+    last_seen: u64,
+    peer: String,
+    /// Whether the agent is directly connected or relayed.
+    connection_type: String,
+    /// Number of hops from the server (0 = direct).
+    hop_count: u32,
+    /// Number of P2P links the agent has.
+    link_count: u32,
+    /// Best link quality (0.0–1.0).
+    best_quality: f32,
+    /// Transports used.
+    transports: Vec<String>,
+}
+
+/// `GET /api/agents/mesh`
+///
+/// List all agents with mesh-aware information including hop count,
+/// link quality, and connection type (direct/relayed).
+async fn list_agents_mesh(State(state): State<Arc<AppState>>) -> Json<Vec<MeshAgentView>> {
+    let agents = state.list_agents();
+    let mesh = state.mesh_controller.read().await;
+
+    let views: Vec<MeshAgentView> = agents
+        .iter()
+        .map(|a| {
+            let node = mesh.get_node(&a.agent_id);
+            let directly_connected = node
+                .as_ref()
+                .map(|n| n.directly_connected)
+                .unwrap_or(true); // If not in mesh graph, assume direct
+
+            let hop_count = node.as_ref().map(|n| n.hop_count).unwrap_or(0);
+            let link_count = node.as_ref().map(|n| n.link_count).unwrap_or(0);
+            let best_quality = node.as_ref().map(|n| n.best_quality).unwrap_or(0.0);
+            let transports: Vec<String> = node
+                .as_ref()
+                .map(|n| n.transports.iter().cloned().collect())
+                .unwrap_or_default();
+
+            MeshAgentView {
+                connection_id: a.connection_id.clone(),
+                agent_id: a.agent_id.clone(),
+                hostname: a.hostname.clone(),
+                last_seen: a.last_seen,
+                peer: a.peer.clone(),
+                connection_type: if directly_connected {
+                    "direct".to_string()
+                } else {
+                    "relayed".to_string()
+                },
+                hop_count,
+                link_count,
+                best_quality,
+                transports,
+            }
+        })
+        .collect();
+
+    Json(views)
 }
 
 async fn recent_audit(State(state): State<Arc<AppState>>) -> Json<Vec<common::AuditEvent>> {
@@ -452,6 +527,227 @@ async fn list_topology(State(state): State<Arc<AppState>>) -> Json<TopologyReply
     Json(TopologyReply { nodes })
 }
 
+// ── Mesh routing endpoints ──────────────────────────────────────────────
+
+/// Query parameters for `GET /api/mesh/route`.
+#[derive(serde::Deserialize)]
+struct MeshRouteQuery {
+    /// Destination agent_id.
+    destination: String,
+    /// Optional source agent_id (defaults to best directly-connected agent).
+    source: Option<String>,
+}
+
+/// `GET /api/mesh/route?destination=X&source=Y`
+///
+/// Compute the shortest mesh path from source to destination.
+async fn mesh_route(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<MeshRouteQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mesh = state.mesh_controller.read().await;
+
+    let route = if let Some(src) = &params.source {
+        mesh.shortest_path(src, &params.destination)
+    } else {
+        mesh.route_from_server(&params.destination)
+    };
+
+    match route {
+        Some(r) => Ok(Json(serde_json::json!({
+            "path": r.path,
+            "cost": r.cost,
+            "hop_count": r.hop_count,
+        }))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!("no route to agent '{}'", params.destination),
+        )),
+    }
+}
+
+/// `GET /api/mesh/broadcast`
+///
+/// Compute broadcast routes from the server to all reachable agents.
+async fn mesh_broadcast(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let mesh = state.mesh_controller.read().await;
+    let routes = mesh.broadcast_routes();
+
+    let route_map: Vec<serde_json::Value> = routes
+        .iter()
+        .map(|(dest, r)| {
+            serde_json::json!({
+                "destination": dest,
+                "path": r.path,
+                "cost": r.cost,
+                "hop_count": r.hop_count,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "routes": route_map,
+        "total": route_map.len(),
+    }))
+}
+
+/// Request body for `POST /api/mesh/connect`.
+#[derive(serde::Deserialize)]
+struct MeshConnectRequest {
+    /// Agent ID to instruct.
+    agent_id: String,
+    /// Target agent to connect to.
+    target_agent_id: String,
+    /// Transport to use ("tcp" or "smb").
+    #[serde(default = "default_transport")]
+    transport: String,
+    /// Target address (host:port).
+    target_addr: String,
+}
+
+fn default_transport() -> String {
+    "tcp".to_string()
+}
+
+/// `POST /api/mesh/connect`
+///
+/// Instruct an agent to establish a mesh link to a target agent.
+async fn mesh_connect(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(req): Json<MeshConnectRequest>,
+) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    let entry = state
+        .find_by_agent_id(&req.agent_id)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("agent '{}' not found", req.agent_id),
+        ))?;
+
+    let cmd = common::Command::MeshConnect {
+        target_agent_id: req.target_agent_id.clone(),
+        transport: req.transport.clone(),
+        target_addr: req.target_addr.clone(),
+    };
+
+    let cmd_req = CommandRequest {
+        command: cmd,
+    };
+
+    state.audit.record_simple(
+        &req.agent_id,
+        &user.0,
+        &format!("mesh connect to {}", req.target_agent_id),
+        "mesh connect command dispatched",
+        Outcome::Success,
+    );
+
+    dispatch_command(state, user, entry, cmd_req).await
+}
+
+/// Request body for `POST /api/mesh/disconnect`.
+#[derive(serde::Deserialize)]
+struct MeshDisconnectRequest {
+    /// Agent ID to instruct.
+    agent_id: String,
+    /// Target agent to disconnect from.
+    target_agent_id: String,
+}
+
+/// `POST /api/mesh/disconnect`
+///
+/// Instruct an agent to disconnect from a mesh peer.
+async fn mesh_disconnect(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(req): Json<MeshDisconnectRequest>,
+) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    let entry = state
+        .find_by_agent_id(&req.agent_id)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("agent '{}' not found", req.agent_id),
+        ))?;
+
+    let cmd = common::Command::MeshDisconnect {
+        target_agent_id: req.target_agent_id.clone(),
+    };
+
+    let cmd_req = CommandRequest {
+        command: cmd,
+    };
+
+    state.audit.record_simple(
+        &req.agent_id,
+        &user.0,
+        &format!("mesh disconnect from {}", req.target_agent_id),
+        "mesh disconnect command dispatched",
+        Outcome::Success,
+    );
+
+    dispatch_command(state, user, entry, cmd_req).await
+}
+
+/// `GET /api/mesh/topology`
+///
+/// Return the full mesh topology with nodes and edges.
+async fn mesh_topology(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let mesh = state.mesh_controller.read().await;
+    let topo = mesh.topology();
+
+    let nodes: Vec<serde_json::Value> = topo
+        .nodes
+        .values()
+        .map(|n| {
+            serde_json::json!({
+                "agent_id": n.agent_id,
+                "directly_connected": n.directly_connected,
+                "link_count": n.link_count,
+                "best_quality": n.best_quality,
+                "hop_count": n.hop_count,
+                "transports": n.transports,
+            })
+        })
+        .collect();
+
+    let edges: Vec<serde_json::Value> = topo
+        .edges
+        .values()
+        .flat_map(|v| v.iter())
+        .map(|e| {
+            serde_json::json!({
+                "from": e.from,
+                "to": e.to,
+                "quality": e.quality,
+                "latency_ms": e.latency_ms,
+                "link_type": e.link_type,
+                "transport": e.transport,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "nodes": nodes,
+        "edges": edges,
+        "edge_count": topo.edge_count,
+        "built_at": topo.built_at,
+    }))
+}
+
+/// `GET /api/mesh/stats`
+///
+/// Return mesh statistics.
+async fn mesh_stats(
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::mesh_controller::MeshStats> {
+    let mesh = state.mesh_controller.read().await;
+    Json(mesh.stats())
+}
+
 // ── Command dispatch ──────────────────────────────────────────────────────
 
 async fn send_command_by_agent_id(
@@ -727,6 +1023,8 @@ fn command_label(c: &Command) -> &'static str {
         Command::LinkTo { .. } => "LinkTo",
         Command::Unlink { .. } => "Unlink",
         Command::ListLinks => "ListLinks",
+        Command::MeshConnect { .. } => "MeshConnect",
+        Command::MeshDisconnect { .. } => "MeshDisconnect",
     }
 }
 

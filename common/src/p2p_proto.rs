@@ -62,6 +62,13 @@ pub enum P2pFrameType {
     /// Agent → Server: report that a P2P link has died, including quality
     /// metrics captured at the time of failure.
     LinkFailureReport = 0x35,
+    /// Mesh-routed data frame with per-hop routing blob.  Each relay agent
+    /// decrypts the outer layer, checks the destination, and either processes
+    /// locally or re-encrypts and forwards to the next hop.
+    MeshDataForward = 0x40,
+    /// Error response sent back toward the origin when a mesh-routed frame
+    /// exceeds the maximum allowed relay depth.
+    RouteTooDeep = 0x41,
 }
 
 impl P2pFrameType {
@@ -83,6 +90,8 @@ impl P2pFrameType {
             0x33 => Some(Self::PeerDiscovery),
             0x34 => Some(Self::BandwidthProbe),
             0x35 => Some(Self::LinkFailureReport),
+            0x40 => Some(Self::MeshDataForward),
+            0x41 => Some(Self::RouteTooDeep),
             _ => None,
         }
     }
@@ -517,6 +526,413 @@ impl LinkFailureReportData {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// Mesh routing blob — per-hop onion-style routing envelope
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Maximum relay depth before a frame is dropped.
+pub const MAX_MESH_HOP_COUNT: u8 = 8;
+
+/// Maximum number of agents simultaneously relayed before throttle kicks in.
+pub const RELAY_THROTTLE_THRESHOLD: usize = 3;
+
+/// Bandwidth fraction reserved for relay traffic when throttled (0.0–1.0).
+pub const RELAY_THROTTLE_FRACTION: f64 = 0.5;
+
+/// Mesh routing blob carried inside `MeshDataForward` frames.
+///
+/// Wire format:
+/// ```text
+/// [ destination_len: u16 LE ] [ destination: bytes ]
+/// [ origin_len: u16 LE ]     [ origin: bytes ]
+/// [ hop_count: u8 ]
+/// [ current_hop: u8 ]        (index into path, 0-based)
+/// [ path_count: u16 LE ]
+///   for each path entry:
+///     [ agent_id_len: u16 LE ] [ agent_id: bytes ]
+/// [ payload_len: u32 LE ]    [ payload: bytes ]
+/// ```
+///
+/// Each relay agent:
+/// 1. Decrypts the outer layer with its incoming link key.
+/// 2. Checks `destination` — if it matches this agent, process locally.
+/// 3. Otherwise, increments `current_hop`, re-encrypts with the outgoing
+///    link key for `path[current_hop]`, and forwards as a new
+///    `MeshDataForward` frame.
+/// 4. If `hop_count > MAX_MESH_HOP_COUNT`, drops the frame and sends
+///    `RouteTooDeep` back toward the origin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshRoutingBlob {
+    /// Final target agent_id.
+    pub destination: String,
+    /// Origin agent_id (or "server" for server-originated messages).
+    pub origin: String,
+    /// Total hops this frame may traverse (for depth limiting).
+    pub hop_count: u8,
+    /// Current position in the path (incremented by each relay).
+    pub current_hop: u8,
+    /// Ordered list of agent_ids forming the relay path.
+    pub path: Vec<String>,
+    /// Inner payload (end-to-end encrypted between origin and destination).
+    pub payload: Vec<u8>,
+}
+
+impl MeshRoutingBlob {
+    /// Serialize the mesh routing blob to bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // destination
+        let dest_bytes = self.destination.as_bytes();
+        buf.extend_from_slice(&(dest_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(dest_bytes);
+
+        // origin
+        let orig_bytes = self.origin.as_bytes();
+        buf.extend_from_slice(&(orig_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(orig_bytes);
+
+        // hop_count + current_hop
+        buf.push(self.hop_count);
+        buf.push(self.current_hop);
+
+        // path
+        buf.extend_from_slice(&(self.path.len() as u16).to_le_bytes());
+        for agent_id in &self.path {
+            let id_bytes = agent_id.as_bytes();
+            buf.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(id_bytes);
+        }
+
+        // payload
+        buf.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.payload);
+
+        buf
+    }
+
+    /// Deserialize a mesh routing blob from bytes.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+
+        // destination
+        if data.len() < offset + 2 {
+            return Err("MeshRoutingBlob: truncated destination_len".to_string());
+        }
+        let dest_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        if data.len() < offset + dest_len {
+            return Err("MeshRoutingBlob: truncated destination".to_string());
+        }
+        let destination = String::from_utf8(data[offset..offset + dest_len].to_vec())
+            .map_err(|e| format!("MeshRoutingBlob: invalid destination UTF-8: {e}"))?;
+        offset += dest_len;
+
+        // origin
+        if data.len() < offset + 2 {
+            return Err("MeshRoutingBlob: truncated origin_len".to_string());
+        }
+        let orig_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        if data.len() < offset + orig_len {
+            return Err("MeshRoutingBlob: truncated origin".to_string());
+        }
+        let origin = String::from_utf8(data[offset..offset + orig_len].to_vec())
+            .map_err(|e| format!("MeshRoutingBlob: invalid origin UTF-8: {e}"))?;
+        offset += orig_len;
+
+        // hop_count + current_hop
+        if data.len() < offset + 2 {
+            return Err("MeshRoutingBlob: truncated hop fields".to_string());
+        }
+        let hop_count = data[offset];
+        let current_hop = data[offset + 1];
+        offset += 2;
+
+        // path
+        if data.len() < offset + 2 {
+            return Err("MeshRoutingBlob: truncated path_count".to_string());
+        }
+        let path_count = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        let mut path = Vec::with_capacity(path_count);
+        for _ in 0..path_count {
+            if data.len() < offset + 2 {
+                return Err("MeshRoutingBlob: truncated path entry len".to_string());
+            }
+            let id_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+            offset += 2;
+            if data.len() < offset + id_len {
+                return Err("MeshRoutingBlob: truncated path entry".to_string());
+            }
+            let agent_id = String::from_utf8(data[offset..offset + id_len].to_vec())
+                .map_err(|e| format!("MeshRoutingBlob: invalid path entry UTF-8: {e}"))?;
+            offset += id_len;
+            path.push(agent_id);
+        }
+
+        // payload
+        if data.len() < offset + 4 {
+            return Err("MeshRoutingBlob: truncated payload_len".to_string());
+        }
+        let payload_len = u32::from_le_bytes([
+            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+        ]) as usize;
+        offset += 4;
+        if data.len() < offset + payload_len {
+            return Err(format!(
+                "MeshRoutingBlob: truncated payload: have {}, need {}",
+                data.len() - offset,
+                payload_len
+            ));
+        }
+        let payload = data[offset..offset + payload_len].to_vec();
+
+        Ok(Self {
+            destination,
+            origin,
+            hop_count,
+            current_hop,
+            path,
+            payload,
+        })
+    }
+}
+
+/// Payload for a `RouteTooDeep` error frame.
+///
+/// Wire format:
+/// ```text
+/// [ destination_len: u16 LE ] [ destination: bytes ]
+/// [ origin_len: u16 LE ]     [ origin: bytes ]
+/// [ hop_count: u8 ]
+/// ```
+#[derive(Debug, Clone)]
+pub struct RouteTooDeepData {
+    pub destination: String,
+    pub origin: String,
+    pub hop_count: u8,
+}
+
+impl RouteTooDeepData {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let dest_bytes = self.destination.as_bytes();
+        buf.extend_from_slice(&(dest_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(dest_bytes);
+        let orig_bytes = self.origin.as_bytes();
+        buf.extend_from_slice(&(orig_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(orig_bytes);
+        buf.push(self.hop_count);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+        if data.len() < offset + 2 {
+            return Err("RouteTooDeep: truncated destination_len".to_string());
+        }
+        let dest_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        if data.len() < offset + dest_len {
+            return Err("RouteTooDeep: truncated destination".to_string());
+        }
+        let destination = String::from_utf8(data[offset..offset + dest_len].to_vec())
+            .map_err(|e| format!("RouteTooDeep: invalid destination UTF-8: {e}"))?;
+        offset += dest_len;
+        if data.len() < offset + 2 {
+            return Err("RouteTooDeep: truncated origin_len".to_string());
+        }
+        let orig_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        if data.len() < offset + orig_len + 1 {
+            return Err("RouteTooDeep: truncated origin or hop_count".to_string());
+        }
+        let origin = String::from_utf8(data[offset..offset + orig_len].to_vec())
+            .map_err(|e| format!("RouteTooDeep: invalid origin UTF-8: {e}"))?;
+        offset += orig_len;
+        let hop_count = data[offset];
+        Ok(Self {
+            destination,
+            origin,
+            hop_count,
+        })
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Enhanced TopologyReport serialization
+// ══════════════════════════════════════════════════════════════════════════
+
+/// A single peer entry in an enhanced topology report.
+///
+/// Wire format:
+/// ```text
+/// [ peer_id_len: u16 LE ] [ peer_id: bytes ]
+/// [ link_type: u8 ]       (0=parent, 1=child, 2=peer)
+/// [ quality: f32 LE ]
+/// [ latency_ms: u32 LE ]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyPeerEntry {
+    pub peer_id: String,
+    pub link_type: u8,
+    pub quality: f32,
+    pub latency_ms: u32,
+}
+
+/// A routing summary entry — destination reachable and how many hops.
+///
+/// Wire format:
+/// ```text
+/// [ dest_len: u16 LE ] [ dest: bytes ]
+/// [ hop_count: u8 ]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyRouteEntry {
+    pub destination: String,
+    pub hop_count: u8,
+}
+
+/// Enhanced topology report payload sent every 120 seconds.
+///
+/// Wire format:
+/// ```text
+/// [ agent_id_len: u16 LE ] [ agent_id: bytes ]
+/// [ peer_count: u16 LE ]
+///   for each peer:
+///     TopologyPeerEntry...
+/// [ route_count: u16 LE ]
+///   for each route:
+///     TopologyRouteEntry...
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnhancedTopologyReport {
+    pub agent_id: String,
+    pub peers: Vec<TopologyPeerEntry>,
+    pub routes: Vec<TopologyRouteEntry>,
+}
+
+impl EnhancedTopologyReport {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // agent_id
+        let id_bytes = self.agent_id.as_bytes();
+        buf.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(id_bytes);
+
+        // peers
+        buf.extend_from_slice(&(self.peers.len() as u16).to_le_bytes());
+        for peer in &self.peers {
+            let pid_bytes = peer.peer_id.as_bytes();
+            buf.extend_from_slice(&(pid_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(pid_bytes);
+            buf.push(peer.link_type);
+            buf.extend_from_slice(&peer.quality.to_le_bytes());
+            buf.extend_from_slice(&peer.latency_ms.to_le_bytes());
+        }
+
+        // routes
+        buf.extend_from_slice(&(self.routes.len() as u16).to_le_bytes());
+        for route in &self.routes {
+            let dest_bytes = route.destination.as_bytes();
+            buf.extend_from_slice(&(dest_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(dest_bytes);
+            buf.push(route.hop_count);
+        }
+
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        let mut offset = 0;
+
+        // agent_id
+        if data.len() < offset + 2 {
+            return Err("EnhancedTopologyReport: truncated agent_id_len".to_string());
+        }
+        let id_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        if data.len() < offset + id_len {
+            return Err("EnhancedTopologyReport: truncated agent_id".to_string());
+        }
+        let agent_id = String::from_utf8(data[offset..offset + id_len].to_vec())
+            .map_err(|e| format!("EnhancedTopologyReport: invalid agent_id UTF-8: {e}"))?;
+        offset += id_len;
+
+        // peers
+        if data.len() < offset + 2 {
+            return Err("EnhancedTopologyReport: truncated peer_count".to_string());
+        }
+        let peer_count = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        let mut peers = Vec::with_capacity(peer_count);
+        for _ in 0..peer_count {
+            if data.len() < offset + 2 {
+                return Err("EnhancedTopologyReport: truncated peer_id_len".to_string());
+            }
+            let pid_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+            offset += 2;
+            if data.len() < offset + pid_len + 1 + 4 + 4 {
+                return Err("EnhancedTopologyReport: truncated peer entry".to_string());
+            }
+            let peer_id = String::from_utf8(data[offset..offset + pid_len].to_vec())
+                .map_err(|e| format!("EnhancedTopologyReport: invalid peer_id UTF-8: {e}"))?;
+            offset += pid_len;
+            let link_type = data[offset];
+            offset += 1;
+            let quality = f32::from_le_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            ]);
+            offset += 4;
+            let latency_ms = u32::from_le_bytes([
+                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            ]);
+            offset += 4;
+            peers.push(TopologyPeerEntry {
+                peer_id,
+                link_type,
+                quality,
+                latency_ms,
+            });
+        }
+
+        // routes
+        if data.len() < offset + 2 {
+            return Err("EnhancedTopologyReport: truncated route_count".to_string());
+        }
+        let route_count = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        let mut routes = Vec::with_capacity(route_count);
+        for _ in 0..route_count {
+            if data.len() < offset + 2 {
+                return Err("EnhancedTopologyReport: truncated route dest_len".to_string());
+            }
+            let dest_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
+            offset += 2;
+            if data.len() < offset + dest_len + 1 {
+                return Err("EnhancedTopologyReport: truncated route entry".to_string());
+            }
+            let destination = String::from_utf8(data[offset..offset + dest_len].to_vec())
+                .map_err(|e| format!("EnhancedTopologyReport: invalid route dest UTF-8: {e}"))?;
+            offset += dest_len;
+            let hop_count = data[offset];
+            offset += 1;
+            routes.push(TopologyRouteEntry {
+                destination,
+                hop_count,
+            });
+        }
+
+        Ok(Self {
+            agent_id,
+            peers,
+            routes,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,6 +988,8 @@ mod tests {
             P2pFrameType::PeerDiscovery,
             P2pFrameType::BandwidthProbe,
             P2pFrameType::LinkFailureReport,
+            P2pFrameType::MeshDataForward,
+            P2pFrameType::RouteTooDeep,
         ] {
             assert_eq!(P2pFrameType::from_u8(v as u8), Some(v));
         }

@@ -16,6 +16,7 @@ pub mod config;
 pub mod doh_listener;
 pub mod http_c2;
 pub mod malleable;
+pub mod mesh_controller;
 pub mod redirector;
 pub mod smb_relay;
 pub mod state;

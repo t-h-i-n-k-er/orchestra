@@ -158,6 +158,23 @@ pub enum Message {
         packet_loss: f32,
         bandwidth_bps: u64,
     },
+    /// Enhanced P2P mesh topology report.  Sent every 120 seconds by each
+    /// agent, includes all connected peers (parent/child/lateral) with
+    /// link quality metrics and a routing table summary.
+    P2pEnhancedTopologyReport {
+        agent_id: String,
+        /// All connected peers with link type and quality.
+        peers: Vec<P2pPeerInfo>,
+        /// Reachable destinations with hop counts.
+        routes: Vec<P2pRouteInfo>,
+    },
+    /// A mesh-routed frame exceeded the maximum relay depth.  Sent by
+    /// the detecting agent back toward the origin (or server).
+    P2pRouteTooDeep {
+        destination: String,
+        origin: String,
+        hop_count: u8,
+    },
 }
 
 /// A single child entry in a [`Message::P2pTopologyReport`].
@@ -165,6 +182,26 @@ pub enum Message {
 pub struct P2pChildInfo {
     pub link_id: u32,
     pub agent_id: String,
+}
+
+/// A single peer entry in a [`Message::P2pEnhancedTopologyReport`].
+/// Contains the peer's agent_id, link type, quality score, and latency.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct P2pPeerInfo {
+    pub peer_id: String,
+    /// 0=parent, 1=child, 2=peer (lateral).
+    pub link_type: u8,
+    /// Composite quality score (0.0–1.0).
+    pub quality: f32,
+    /// Last measured latency in milliseconds.
+    pub latency_ms: u32,
+}
+
+/// A routing summary entry in a [`Message::P2pEnhancedTopologyReport`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct P2pRouteInfo {
+    pub destination: String,
+    pub hop_count: u8,
 }
 
 /// The set of administrator-approved actions the agent is willing to perform.
@@ -360,6 +397,17 @@ pub enum Command {
     },
     /// Report the current P2P links on this agent.
     ListLinks,
+    // ── Mesh controller commands ───────────────────────────────────────────
+    /// Tell agent A to establish a peer link with agent B.
+    MeshConnect {
+        target_agent_id: String,
+        transport: String,
+        target_addr: String,
+    },
+    /// Tell agent A to close its link with agent B.
+    MeshDisconnect {
+        target_agent_id: String,
+    },
 }
 
 /// Errors produced by [`CryptoSession`].

@@ -479,6 +479,40 @@ async fn handle_agent(
                     bandwidth_bps,
                 ).await;
             }
+            Message::P2pEnhancedTopologyReport {
+                agent_id,
+                peers,
+                routes,
+            } => {
+                // ── Enhanced mesh topology ──────────────────────────
+                // An agent reports its peer links and known routes with
+                // quality/latency data.  Merge into the mesh controller.
+                tracing::info!(
+                    connection_id = %conn_id,
+                    %agent_id,
+                    peer_count = peers.len(),
+                    route_count = routes.len(),
+                    "received enhanced mesh topology report"
+                );
+                let mut mesh = state.mesh_controller.write().await;
+                mesh.merge_enhanced_topology(&agent_id, &peers, &routes);
+            }
+            Message::P2pRouteTooDeep {
+                destination,
+                origin,
+                hop_count,
+            } => {
+                // ── Route too deep notification ─────────────────────
+                // A mesh relay agent dropped a frame because the hop
+                // count exceeded the maximum.  Log for operator awareness.
+                tracing::warn!(
+                    connection_id = %conn_id,
+                    %destination,
+                    %origin,
+                    hop_count,
+                    "route too deep — mesh frame dropped"
+                );
+            }
             other => {
                 tracing::debug!("ignoring agent->server message: {:?}", other);
             }

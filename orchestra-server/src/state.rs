@@ -146,6 +146,8 @@ pub struct AppState {
     /// Redirector chain registry.  Tracks registered redirectors, their
     /// health via heartbeat, and provides agent config generation.
     pub redirector_state: RedirectorState,
+    /// Mesh controller with Dijkstra pathfinding for mesh-aware routing.
+    pub mesh_controller: RwLock<crate::mesh_controller::MeshController>,
 }
 
 impl AppState {
@@ -178,6 +180,7 @@ impl AppState {
             assigned_seeds: DashSet::new(),
             topology: RwLock::new(TopologyMap::default()),
             redirector_state: RedirectorState::new(),
+            mesh_controller: RwLock::new(crate::mesh_controller::MeshController::new()),
         }
     }
 

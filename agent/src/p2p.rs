@@ -503,6 +503,14 @@ pub struct P2pMesh {
     /// Set once during initialization; `None` means the parent reader has
     /// not been wired up yet.
     pub inbound_tx: Option<tokio::sync::mpsc::Sender<common::Message>>,
+    /// Set of agent_ids for which this agent is currently relaying traffic.
+    /// Used for relay throttling: when more than RELAY_THROTTLE_THRESHOLD
+    /// agents are being relayed, bandwidth for relayed frames is capped.
+    pub relay_active_agents: std::collections::HashSet<String>,
+    /// Bytes relayed in the current throttle window (reset every second).
+    pub relay_bytes_current_window: u64,
+    /// Bandwidth budget for relayed traffic in the current window (bytes).
+    pub relay_bandwidth_budget: u64,
 }
 
 impl P2pMesh {
@@ -522,6 +530,9 @@ impl P2pMesh {
             mesh_mode: MeshMode::default(),
             routing_table: HashMap::new(),
             inbound_tx: None,
+            relay_active_agents: std::collections::HashSet::new(),
+            relay_bytes_current_window: 0,
+            relay_bandwidth_budget: u64::MAX,
         }
     }
 
@@ -543,6 +554,9 @@ impl P2pMesh {
             mesh_mode,
             routing_table: HashMap::new(),
             inbound_tx: None,
+            relay_active_agents: std::collections::HashSet::new(),
+            relay_bytes_current_window: 0,
+            relay_bandwidth_budget: u64::MAX,
         }
     }
 
@@ -1832,9 +1846,179 @@ impl P2pMesh {
 
         paths
     }
+
+    /// Check whether relay traffic should be throttled based on the number
+    /// of agents being actively relayed.
+    ///
+    /// Returns `true` if more than [`RELAY_THROTTLE_THRESHOLD`] agents are
+    /// being relayed and the relay bandwidth budget has been exceeded.
+    pub fn should_throttle_relay(&self, additional_bytes: u64) -> bool {
+        use common::p2p_proto::{RELAY_THROTTLE_FRACTION, RELAY_THROTTLE_THRESHOLD};
+
+        if self.relay_active_agents.len() <= RELAY_THROTTLE_THRESHOLD {
+            return false;
+        }
+        self.relay_bytes_current_window + additional_bytes > self.relay_bandwidth_budget
+    }
+
+    /// Record bytes spent on relay traffic for throttle accounting.
+    pub fn record_relay_bytes(&mut self, bytes: u64) {
+        self.relay_bytes_current_window += bytes;
+    }
+
+    /// Reset the relay throttle window.  Called periodically (every second)
+    /// to refresh the bandwidth budget.
+    pub fn reset_relay_window(&mut self, estimated_bps: u64) {
+        use common::p2p_proto::RELAY_THROTTLE_FRACTION;
+        self.relay_bytes_current_window = 0;
+        self.relay_bandwidth_budget =
+            ((estimated_bps as f64) * RELAY_THROTTLE_FRACTION / 8.0) as u64;
+    }
+
+    /// Look up a link_id by the peer's agent_id.  Returns the link_id
+    /// of the first link whose `peer_agent_id` matches.
+    pub fn link_id_by_peer(&self, peer_agent_id: &str) -> Option<u32> {
+        self.links
+            .iter()
+            .find(|(_, link)| link.peer_agent_id == peer_agent_id && link.state.is_usable())
+            .map(|(&id, _)| id)
+    }
+
+    /// Process a `MeshDataForward` frame that was received on `link_id`.
+    ///
+    /// Returns a `MeshRelayAction` indicating what to do next:
+    /// - `DeliverLocally(payload)` — this agent is the destination
+    /// - `ForwardToNextHop { next_link_id, encrypted_blob }` — relay to next
+    /// - `DropTooDeep { destination, origin, hop_count }` — exceeded max hops
+    pub fn handle_mesh_data_forward(
+        &mut self,
+        incoming_link_id: u32,
+        decrypted_payload: &[u8],
+    ) -> MeshRelayAction {
+        use common::p2p_proto::{MeshRoutingBlob, MAX_MESH_HOP_COUNT};
+
+        let blob = match MeshRoutingBlob::from_bytes(decrypted_payload) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("handle_mesh_data_forward: failed to parse blob: {e}");
+                return MeshRelayAction::Drop;
+            }
+        };
+
+        // Check hop depth limit.
+        if blob.hop_count > MAX_MESH_HOP_COUNT {
+            log::warn!(
+                "mesh relay: dropping frame to {} — hop_count={} > max={}",
+                blob.destination,
+                blob.hop_count,
+                MAX_MESH_HOP_COUNT
+            );
+            return MeshRelayAction::DropTooDeep {
+                destination: blob.destination,
+                origin: blob.origin,
+                hop_count: blob.hop_count,
+            };
+        }
+
+        // Check if this agent is the destination.
+        if blob.destination == self.agent_id {
+            log::debug!(
+                "mesh relay: delivering {}-byte payload locally",
+                blob.payload.len()
+            );
+            return MeshRelayAction::DeliverLocally(blob.payload);
+        }
+
+        // Need to relay.  Find the next hop.
+        let next_agent_id = match blob.path.get(blob.current_hop as usize) {
+            Some(id) => id.clone(),
+            None => {
+                log::warn!(
+                    "mesh relay: path index {} out of bounds (path len={})",
+                    blob.current_hop,
+                    blob.path.len()
+                );
+                return MeshRelayAction::Drop;
+            }
+        };
+
+        // Look up the link to the next hop.
+        let next_link_id = match self.link_id_by_peer(&next_agent_id) {
+            Some(id) => id,
+            None => {
+                log::warn!(
+                    "mesh relay: no link to next hop '{}' — dropping",
+                    next_agent_id
+                );
+                return MeshRelayAction::Drop;
+            }
+        };
+
+        // Record this agent in the active relay set.
+        self.relay_active_agents.insert(blob.destination.clone());
+
+        // Increment hop counter in the blob.
+        let mut new_blob = blob;
+        new_blob.current_hop += 1;
+
+        // Serialize the updated blob.
+        let blob_bytes = new_blob.to_bytes();
+
+        // Throttle check.
+        if self.should_throttle_relay(blob_bytes.len() as u64) {
+            log::debug!(
+                "mesh relay: throttling {} bytes to {} ({} active relays)",
+                blob_bytes.len(),
+                next_agent_id,
+                self.relay_active_agents.len()
+            );
+            // Don't drop, but the caller should delay.
+        }
+
+        // Get the next-hop link key.
+        let next_key = match self.links.get(&next_link_id) {
+            Some(link) => link.ecdh_shared_secret,
+            None => return MeshRelayAction::Drop,
+        };
+
+        // Encrypt for the next hop.
+        let encrypted = match encrypt_payload(&next_key, &blob_bytes) {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!("mesh relay: encrypt failed for next hop: {e}");
+                return MeshRelayAction::Drop;
+            }
+        };
+
+        // Record relay bytes.
+        self.record_relay_bytes(encrypted.len() as u64);
+
+        MeshRelayAction::ForwardToNextHop {
+            next_link_id,
+            encrypted_blob: encrypted,
+        }
+    }
 }
 
-/// Exponential backoff state for reconnection attempts.
+/// Result of processing a `MeshDataForward` frame.
+#[derive(Debug)]
+pub enum MeshRelayAction {
+    /// The payload is addressed to this agent — deliver it.
+    DeliverLocally(Vec<u8>),
+    /// Forward the encrypted blob to the specified next-hop link.
+    ForwardToNextHop {
+        next_link_id: u32,
+        encrypted_blob: Vec<u8>,
+    },
+    /// Frame exceeded the maximum relay depth — send RouteTooDeep back.
+    DropTooDeep {
+        destination: String,
+        origin: String,
+        hop_count: u8,
+    },
+    /// Frame is invalid or cannot be routed — silently drop.
+    Drop,
+}
 #[derive(Debug, Clone, Default)]
 pub struct ReconnectBackoff {
     /// Number of consecutive failed attempts.
@@ -1951,6 +2135,119 @@ pub fn spawn_child_relay(
                             link_id
                         );
                         return;
+                    }
+                }
+                P2pFrameType::MeshDataForward => {
+                    // Decrypt the mesh routing blob.
+                    let mesh_guard = mesh.lock().await;
+                    let key = match mesh_guard.links.get(&link_id) {
+                        Some(l) => l.ecdh_shared_secret,
+                        None => return,
+                    };
+                    let plaintext = match decrypt_payload(&key, &frame.payload) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::warn!(
+                                "child relay: mesh decrypt error on {:#010X}: {}",
+                                link_id, e
+                            );
+                            continue;
+                        }
+                    };
+                    drop(mesh_guard);
+
+                    // Process the mesh routing blob.
+                    let mut mesh_guard = mesh.lock().await;
+                    match mesh_guard.handle_mesh_data_forward(link_id, &plaintext) {
+                        MeshRelayAction::DeliverLocally(payload) => {
+                            drop(mesh_guard);
+                            // Forward locally-delivered mesh payload upstream
+                            // via the normal DataForward path.  The agent's
+                            // main loop will see it as a P2pForward message.
+                            let msg = common::Message::P2pForward {
+                                child_link_id: link_id,
+                                data: payload,
+                            };
+                            if outbound_tx.send(msg).await.is_err() {
+                                log::warn!(
+                                    "child relay: outbound channel closed for {:#010X}, exiting",
+                                    link_id
+                                );
+                                return;
+                            }
+                        }
+                        MeshRelayAction::ForwardToNextHop {
+                            next_link_id,
+                            encrypted_blob,
+                        } => {
+                            // Write the MeshDataForward frame directly to the
+                            // next-hop transport (same pattern as forward_to_child).
+                            let link = mesh_guard.links.get_mut(&next_link_id);
+                            match link {
+                                Some(l) if l.state.is_usable() => {
+                                    let key = l.ecdh_shared_secret;
+                                    let fwd_frame = P2pFrame {
+                                        frame_type: P2pFrameType::MeshDataForward,
+                                        link_id: next_link_id,
+                                        payload_len: 0,
+                                        payload: encrypted_blob,
+                                    };
+                                    let res = match &mut l.transport {
+                                        #[cfg(feature = "p2p-tcp")]
+                                        P2pTransport::TcpStream(handle_arc) => {
+                                            let mut h = handle_arc.lock().await;
+                                            h.encrypt_write_frame(&fwd_frame, &key).await
+                                        }
+                                        #[cfg(all(windows, feature = "smb-pipe-transport"))]
+                                        P2pTransport::SmbPipe(ref pipe) => {
+                                            let encrypted = encrypt_payload(&key, &fwd_frame.payload)?;
+                                            let enc_frame = P2pFrame {
+                                                frame_type: P2pFrameType::MeshDataForward,
+                                                link_id: next_link_id,
+                                                payload_len: encrypted.len() as u32,
+                                                payload: encrypted,
+                                            };
+                                            nt_pipe_server::NtPipeHandle::write_frame(pipe, &enc_frame)
+                                        }
+                                        _ => Err(anyhow::anyhow!("unsupported transport")),
+                                    };
+                                    drop(mesh_guard);
+                                    if let Err(e) = res {
+                                        log::warn!(
+                                            "child relay: mesh forward to {:#010X} failed: {}",
+                                            next_link_id, e
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    drop(mesh_guard);
+                                    log::warn!(
+                                        "child relay: next hop {:#010X} not usable",
+                                        next_link_id
+                                    );
+                                }
+                            }
+                        }
+                        MeshRelayAction::DropTooDeep {
+                            destination,
+                            origin,
+                            hop_count,
+                        } => {
+                            drop(mesh_guard);
+                            log::warn!(
+                                "child relay: route too deep {} -> {} ({} hops)",
+                                origin, destination, hop_count
+                            );
+                            let msg = common::Message::P2pRouteTooDeep {
+                                destination,
+                                origin,
+                                hop_count,
+                            };
+                            let _ = outbound_tx.send(msg).await;
+                        }
+                        MeshRelayAction::Drop => {
+                            // Silently drop.
+                        }
                     }
                 }
                 _ => {
@@ -2198,6 +2495,120 @@ pub fn spawn_parent_reader(
                                     e
                                 );
                             }
+                        }
+                    }
+                }
+                P2pFrameType::MeshDataForward => {
+                    // Decrypt the mesh routing blob.
+                    let key = {
+                        let mesh_guard = mesh.lock().await;
+                        match mesh_guard.links.get(&parent_link_id) {
+                            Some(l) => l.ecdh_shared_secret,
+                            None => return,
+                        }
+                    };
+                    let plaintext = match decrypt_payload(&key, &frame.payload) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log::warn!(
+                                "parent reader: mesh decrypt error on {:#010X}: {}",
+                                parent_link_id, e
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Process the mesh routing blob.
+                    let mut mesh_guard = mesh.lock().await;
+                    match mesh_guard.handle_mesh_data_forward(parent_link_id, &plaintext) {
+                        MeshRelayAction::DeliverLocally(payload) => {
+                            drop(mesh_guard);
+                            // The parent reader has inbound_tx — deliver
+                            // the decoded message to the main agent loop.
+                            match bincode::deserialize::<common::Message>(&payload) {
+                                Ok(msg) => {
+                                    if inbound_tx.send(msg).await.is_err() {
+                                        log::warn!(
+                                            "parent reader: inbound channel closed, exiting"
+                                        );
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "parent reader: failed to decode mesh payload: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        MeshRelayAction::ForwardToNextHop {
+                            next_link_id,
+                            encrypted_blob,
+                        } => {
+                            // Write the MeshDataForward frame directly to the
+                            // next-hop transport (same pattern as forward_to_child).
+                            let link = mesh_guard.links.get_mut(&next_link_id);
+                            match link {
+                                Some(l) if l.state.is_usable() => {
+                                    let key = l.ecdh_shared_secret;
+                                    let fwd_frame = P2pFrame {
+                                        frame_type: P2pFrameType::MeshDataForward,
+                                        link_id: next_link_id,
+                                        payload_len: 0,
+                                        payload: encrypted_blob,
+                                    };
+                                    let res = match &mut l.transport {
+                                        #[cfg(feature = "p2p-tcp")]
+                                        P2pTransport::TcpStream(handle_arc) => {
+                                            let mut h = handle_arc.lock().await;
+                                            h.encrypt_write_frame(&fwd_frame, &key).await
+                                        }
+                                        #[cfg(all(windows, feature = "smb-pipe-transport"))]
+                                        P2pTransport::SmbPipe(ref pipe) => {
+                                            let encrypted = encrypt_payload(&key, &fwd_frame.payload)?;
+                                            let enc_frame = P2pFrame {
+                                                frame_type: P2pFrameType::MeshDataForward,
+                                                link_id: next_link_id,
+                                                payload_len: encrypted.len() as u32,
+                                                payload: encrypted,
+                                            };
+                                            nt_pipe_server::NtPipeHandle::write_frame(pipe, &enc_frame)
+                                        }
+                                        _ => Err(anyhow::anyhow!("unsupported transport")),
+                                    };
+                                    drop(mesh_guard);
+                                    if let Err(e) = res {
+                                        log::warn!(
+                                            "parent reader: mesh forward to {:#010X} failed: {}",
+                                            next_link_id, e
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    drop(mesh_guard);
+                                    log::warn!(
+                                        "parent reader: next hop {:#010X} not usable",
+                                        next_link_id
+                                    );
+                                }
+                            }
+                        }
+                        MeshRelayAction::DropTooDeep {
+                            destination,
+                            origin,
+                            hop_count,
+                        } => {
+                            drop(mesh_guard);
+                            log::warn!(
+                                "parent reader: route too deep {} -> {} ({} hops)",
+                                origin, destination, hop_count
+                            );
+                            // Cannot easily send RouteTooDeep back to origin
+                            // from the parent reader — just log for now.
+                        }
+                        MeshRelayAction::Drop => {
+                            // Silently drop.
                         }
                     }
                 }
@@ -2697,6 +3108,47 @@ pub fn spawn_heartbeat_task(
                             e
                         );
                         return; // channel closed, agent is shutting down
+                    }
+
+                    // ── Generate Enhanced Topology Report ──────────────
+                    let enhanced = {
+                        let mesh_guard = mesh.lock().await;
+                        let peers: Vec<common::P2pPeerInfo> = mesh_guard
+                            .links
+                            .values()
+                            .filter(|l| l.state.is_usable())
+                            .map(|l| common::P2pPeerInfo {
+                                peer_id: l.peer_agent_id.clone(),
+                                link_type: match l.link_type {
+                                    LinkType::Parent => 0,
+                                    LinkType::Child => 1,
+                                    LinkType::Peer => 2,
+                                },
+                                quality: l.quality.quality_score(),
+                                latency_ms: l.quality.latency_ms,
+                            })
+                            .collect();
+                        let routes: Vec<common::P2pRouteInfo> = mesh_guard
+                            .routing_table
+                            .values()
+                            .map(|r| common::P2pRouteInfo {
+                                destination: format!("{:#010X}", r.destination),
+                                hop_count: r.hop_count,
+                            })
+                            .collect();
+                        common::Message::P2pEnhancedTopologyReport {
+                            agent_id: mesh_guard.agent_id.clone(),
+                            peers,
+                            routes,
+                        }
+                    };
+
+                    if let Err(e) = outbound_tx.send(enhanced).await {
+                        log::warn!(
+                            "P2P enhanced topology report: outbound channel closed: {}",
+                            e
+                        );
+                        return;
                     }
                 }
 
