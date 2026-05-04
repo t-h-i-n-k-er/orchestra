@@ -374,6 +374,102 @@ The following issues were identified and resolved during the security audit:
 
 ---
 
+## New Feature Security Considerations
+
+The following sections cover security considerations for features added since
+the initial security audit.
+
+### LSASS Credential Harvesting (`HarvestLSASS`)
+
+**Risk level: HIGH**
+
+| Concern | Mitigation |
+|---------|------------|
+| LSASS requires `SE_DEBUG_NAME` privilege | Agent validates privilege before attempting access |
+| EDR heavily monitors LSASS process handles | Uses `NtOpenProcess` with `PROCESS_VM_READ` only (not `PROCESS_ALL_ACCESS`) |
+| Credential material in memory | Credentials are encrypted in transit (AES-256-GCM CryptoSession) and never written to disk |
+| Audit trail | Operation is always logged with operator identity and timestamp |
+| Post-harvest cleanup | LSASS handle is closed immediately; credential buffers are zeroed with `SecureZeroMemory` |
+
+**Operator guidance:**
+- Use `StealToken` from a SYSTEM process to obtain `SE_DEBUG_NAME` before running `HarvestLSASS`
+- Rotate harvested credentials immediately — do not store in the audit log
+- Consider OPSEC implications: LSASS access is one of the most heavily monitored operations
+
+### Browser Data Extraction (`BrowserData`)
+
+**Risk level: MEDIUM**
+
+| Concern | Mitigation |
+|---------|------------|
+| Chrome v127+ App-Bound Encryption | Agent implements the IElevator COM interface to decrypt cookies |
+| Database file locking | Uses shadow copies (`CopyFileEx`) rather than opening live DB files |
+| Credential material in memory | All extracted data is encrypted via CryptoSession before transmission |
+| Anti-tamper detection by browsers | Agent operates on copies, never modifies original DB files |
+
+**Supported browsers:** Chrome, Edge, Firefox, Brave (cookie and credential extraction)
+
+### Surveillance Module (`surveillance` feature)
+
+**Risk level: MEDIUM**
+
+| Concern | Mitigation |
+|---------|------------|
+| Keystroke data sensitivity | Encrypted ring buffer with XChaCha20-Poly1305; keys held in guarded memory |
+| Screenshot data volume | Compressed via `image` crate (PNG); configurable resolution and interval |
+| Clipboard content exposure | Clipboard snapshots are encrypted in transit; redacted in audit log |
+| Detection by monitoring tools | Uses `GetAsyncKeyState` polling (not hooks); screenshots via native Win32 API |
+
+**Feature flags:**
+- `surveillance` enables: `Screenshot`, `KeyloggerStart`, `KeyloggerStop`, `KeyloggerDump`, `ClipboardGet`, `ClipboardSet`
+- Requires `dep:image` for screenshot encoding
+
+### NTDLL Unhooking (`UnhookNtdll`)
+
+**Risk level: LOW (defensive)**
+
+| Concern | Mitigation |
+|---------|------------|
+| `\KnownDlls` access monitored by EDR | Fallback to on-disk `C:\Windows\System32\ntdll.dll` |
+| Hook detection false positives | Only checks first 5 bytes of syscall stubs for well-known hook patterns |
+| `.text` section re-fetch overhead | Lazy — only performed when hooks are actually detected |
+| Post-sleep re-hooking | Step 12 of sleep cycle performs automatic `maybe_unhook()` after each wake |
+
+### Interactive Shell Sessions
+
+**Risk level: MEDIUM**
+
+| Concern | Mitigation |
+|---------|------------|
+| PTY allocation detection | Uses standard `CreatePseudoConsole` (Windows) / `forkpty` (Unix) |
+| Shell history persistence | Agent sets `HISTFILE=/dev/null` and `history -c` on session start |
+| Multiple concurrent sessions | Bounded by `MAX_SHELL_SESSIONS` (default: 5); excess requests return error |
+| Session cleanup | All PTY handles and child processes are cleaned up on session close or agent shutdown |
+
+### Token Manipulation
+
+**Risk level: HIGH**
+
+| Concern | Mitigation |
+|---------|------------|
+| Privilege escalation audit trail | All token operations (`MakeToken`, `StealToken`, `Rev2Self`, `GetSystem`) are logged |
+| Token handle leaks | RAII `HandleGuard` ensures all token handles are closed |
+| `Rev2Self` without prior `MakeToken` | Agent tracks original token; `Rev2Self` is a no-op if no token was stored |
+| `GetSystem` via named pipe impersonation | Creates a temporary service binary; cleans up service and binary after use |
+
+### .NET Assembly and BOF Execution
+
+**Risk level: MEDIUM**
+
+| Concern | Mitigation |
+|---------|------------|
+| CLR loading detection | Uses `ICLRMetaHost` → `ICLRRuntimeHost` (legitimate hosting API) |
+| BOF memory leaks | COFF loader tracks all allocations; frees on completion or timeout |
+| Assembly timeout | Configurable wall-clock timeout (default: 30s); CLR thread is terminated on expiry |
+| AMSI bypass | Optional `hwbp-amsi` feature uses hardware breakpoints (DR0/DR1) via VEH |
+
+---
+
 ## Outstanding Follow-ups
 
 Tracked in `ROADMAP.md`:

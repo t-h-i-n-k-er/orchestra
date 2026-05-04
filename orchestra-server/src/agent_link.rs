@@ -656,6 +656,42 @@ async fn handle_agent(
                     details: format!("evidence_hash={:?}", evidence_hash),
                 });
             }
+            Message::ShellOutput {
+                session_id,
+                data,
+                stream,
+            } => {
+                // ── Interactive shell output stream ────────────────────
+                // Asynchronous output from a persistent shell process.
+                // Log for operator awareness; in a full implementation
+                // this would be forwarded to connected operator consoles
+                // via a WebSocket / SSE stream.
+                let stream_name = match stream {
+                    common::ShellStream::Stdout => "stdout",
+                    common::ShellStream::Stderr => "stderr",
+                };
+                tracing::info!(
+                    connection_id = %conn_id,
+                    session_id,
+                    stream = stream_name,
+                    data_len = data.len(),
+                    "shell output: {}",
+                    data.chars().take(200).collect::<String>()
+                );
+                let reporting_agent = state
+                    .registry
+                    .get(&conn_id)
+                    .map(|e| e.agent_id.clone())
+                    .unwrap_or_else(|| conn_id.clone());
+                state.audit.record(common::AuditEvent {
+                    timestamp: now_secs(),
+                    agent_id: reporting_agent,
+                    user: "shell".to_string(),
+                    action: format!("ShellOutput(session={session_id}, stream={stream_name})"),
+                    outcome: common::Outcome::Success,
+                    details: format!("{} bytes", data.len()),
+                });
+            }
             other => {
                 tracing::debug!("ignoring agent->server message: {:?}", other);
             }

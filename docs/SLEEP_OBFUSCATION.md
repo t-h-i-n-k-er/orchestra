@@ -543,6 +543,70 @@ This overhead is negligible compared to typical sleep durations (30–300 second
 
 ---
 
+## Post-Wake NTDLL Hook Re-Check (Step 12)
+
+After the sleep decryption pipeline completes and integrity verification passes,
+the agent performs an additional step to detect NTDLL hooks that EDR products may
+have placed while the agent was dormant:
+
+```
+                    ┌─────────▼─────────┐
+                    │  Integrity        │
+                    │  Verification     │
+                    └─────────┬─────────┘
+                              │
+                    ┌─────────▼─────────┐
+                    │  Step 12: Post-   │
+                    │  wake NTDLL hook  │
+                    │  re-check         │
+                    │  (maybe_unhook)   │
+                    └─────────┬─────────┘
+                              │
+                    ┌─────────▼─────────┐
+                    │ Hooks detected?   │
+                    └────┬─────────┬────┘
+                         │ Yes     │ No
+                ┌────────▼───┐    │
+                │ Full .text │    │
+                │ re-fetch   │    │
+                │ from       │    │
+                │ \KnownDlls │    │
+                └────────┬───┘    │
+                         │        │
+                ┌────────▼────────▼───┐
+                │  Continue Loop      │
+                │  (beacon)           │
+                └─────────────────────┘
+```
+
+### Why this is needed
+
+EDR products monitor for sleep obfuscation and may take advantage of the agent's
+dormant period to inline-hook NTDLL syscall stubs. Without this check:
+
+1. Agent wakes from sleep
+2. Agent immediately calls `NtDelayExecution` (via a now-hooked stub) to schedule the next sleep
+3. EDR intercepts the hooked syscall and gains visibility into agent behavior
+
+The post-wake check ensures the agent detects and removes any hooks before resuming
+normal operation.
+
+### Implementation
+
+```rust
+// In sleep_obfuscation.rs, after decryption and integrity verification:
+if cfg!(target_os = "windows") {
+    crate::ntdll_unhook::maybe_unhook();
+}
+```
+
+`maybe_unhook()` calls `are_syscall_stubs_hooked()` to inspect the first bytes of
+23 critical syscall stubs. If any hooks are detected, a full `.text` section
+re-fetch is performed from `\KnownDlls\ntdll.dll` (or disk fallback). After the
+re-fetch, all SSNs are re-resolved and the syscall cache is invalidated.
+
+---
+
 ## Feature Flags
 
 | Flag | Effect |

@@ -441,35 +441,45 @@ async fn handle_shell(transport: &mut dyn Transport) -> Result<()> {
     transport
         .send(Message::TaskRequest {
             task_id,
-            command: Command::StartShell,
+            command: Command::CreateShell { shell_path: None },
             operator_id: None,
         })
         .await?;
 
-    let session_id = loop {
+    // Wait for the shell to be created and get the session info.
+    let session_id: u32 = loop {
         match transport.recv().await? {
             Message::TaskResponse { result, .. } => {
-                break result.map_err(|e| anyhow::anyhow!(e))?;
+                let info_str = result.map_err(|e| anyhow::anyhow!(e))?;
+                let info: serde_json::Value = serde_json::from_str(&info_str)
+                    .context("failed to parse shell info")?;
+                break info["session_id"]
+                    .as_u64()
+                    .context("missing session_id in shell info")? as u32;
             }
             Message::AuditLog(ev) => write_audit_log(&ev)?,
             _ => {}
         }
     };
 
+    println!("Shell session {} started. Type commands (Ctrl-D to close).", session_id);
+
     let mut stdin = io::stdin();
     let mut stdout = io::stdout();
     let mut buf = [0u8; 1024];
 
     loop {
+        // Read from local stdin.
         match stdin.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                let text = String::from_utf8_lossy(&buf[..n]).into_owned();
                 transport
                     .send(Message::TaskRequest {
                         task_id: uuid::Uuid::new_v4().to_string(),
                         command: Command::ShellInput {
-                            session_id: session_id.clone(),
-                            data: buf[..n].to_vec(),
+                            session_id,
+                            data: text,
                         },
                         operator_id: None,
                     })
@@ -478,37 +488,45 @@ async fn handle_shell(transport: &mut dyn Transport) -> Result<()> {
             Err(_) => break,
         }
 
-        transport
-            .send(Message::TaskRequest {
-                task_id: uuid::Uuid::new_v4().to_string(),
-                command: Command::ShellOutput {
-                    session_id: session_id.clone(),
-                },
-                operator_id: None,
-            })
-            .await?;
-
+        // Drain any pending output (ShellOutput events arrive asynchronously
+        // but in this simple REPL we collect them between input cycles).
         loop {
-            match transport.recv().await? {
-                Message::TaskResponse { result, .. } => {
-                    if let Ok(encoded) = result {
-                        let bytes = base64::engine::general_purpose::STANDARD
-                            .decode(&encoded)
-                            .unwrap_or_default();
-                        if !bytes.is_empty() {
-                            stdout.write_all(&bytes)?;
-                            stdout.flush()?;
-                        }
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                transport.recv(),
+            )
+            .await
+            {
+                Ok(Ok(Message::ShellOutput { data, stream, .. })) => {
+                    let prefix = match stream {
+                        common::ShellStream::Stdout => "",
+                        common::ShellStream::Stderr => "[stderr] ",
+                    };
+                    if !data.is_empty() {
+                        print!("{prefix}{data}");
+                        stdout.flush()?;
                     }
-                    break;
                 }
-                Message::AuditLog(ev) => write_audit_log(&ev)?,
-                _ => {}
+                Ok(Ok(Message::AuditLog(ev))) => write_audit_log(&ev)?,
+                Ok(Ok(Message::TaskResponse { .. })) => {
+                    // Command acknowledgement — continue draining.
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_) => break, // timeout — no more pending output
             }
         }
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+
+    // Close the shell session on exit.
+    transport
+        .send(Message::TaskRequest {
+            task_id: uuid::Uuid::new_v4().to_string(),
+            command: Command::ShellClose { session_id },
+            operator_id: None,
+        })
+        .await?;
+    println!("Shell session {session_id} closed.");
     Ok(())
 }
 

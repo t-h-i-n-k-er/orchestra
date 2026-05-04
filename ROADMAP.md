@@ -76,6 +76,42 @@ This document describes where the project is going next.
 
 ---
 
+## Completed (continued — 2025)
+
+- ✅ **NTDLL unhooking pipeline** — Full `.text` re-fetch from `\KnownDlls\ntdll.dll`
+  with disk fallback, chunked overwrite, hook detection for 23 critical syscalls,
+  post-sleep automatic hook re-check.
+- ✅ **In-process .NET assembly execution** (`assembly_loader.rs`) — CLR hosting
+  via `mscoree.dll`, lazy init, fresh AppDomain per execution, AMSI bypass,
+  configurable timeout, 5-min idle auto-teardown.
+- ✅ **BOF / COFF loader** (`coff_loader.rs`) — Beacon-compatible API (18 exports),
+  COFF relocation, x86_64 only, compatible with public BOF ecosystem.
+- ✅ **Browser data extraction** (`browser_data.rs`) — Chrome v127+ App-Bound
+  Encryption (3 bypass strategies), Edge, Firefox. Custom SQLite parser, NSS
+  runtime loading. Gated by `browser-data` feature.
+- ✅ **Interactive shell sessions** (`interactive_shell.rs`) — PTY sessions with
+  background reader threads, async output via `ShellOutput`, sleep obfuscation
+  integration, multi-session support.
+- ✅ **LSASS credential harvesting** (`lsass_harvest.rs`) — Incremental memory
+  reading via indirect syscalls, no MiniDumpWriteDump, build-specific offset
+  tables for Windows 19041–26100, MSV/WDigest/Kerberos/DPAPI/DCC2 extraction.
+- ✅ **Surveillance module** (`surveillance.rs`) — Screenshot capture,
+  keylogger (WH_KEYBOARD_LL), clipboard monitoring, all stored in ChaCha20-Poly1305
+  encrypted ring buffers. Gated by `surveillance` feature.
+- ✅ **Injection engine expansion** — ThreadPool (8 sub-variants), Fiber,
+  Context-Only, Section Mapping, Callback (12 APIs) injection techniques.
+  Total: 12 techniques in the unified injection engine.
+- ✅ **Token manipulation commands** — `MakeToken`, `StealToken`, `Rev2Self`,
+  `GetSystem` with thread-safe impersonation.
+- ✅ **Lateral movement commands** — `PsExec`, `WmiExec`, `DcomExec`, `WinRmExec`.
+  No PowerShell used — all native COM/WinRM/NT API.
+- ✅ **Halo's Gate unhook callback** — `nt_syscall::set_halo_gate_fallback()`
+  registers agent's unhook function; automatic unhook on Halo's Gate failure.
+- ✅ **Feature flags for new capabilities** — `surveillance` (Windows, dep:image),
+  `browser-data` (Windows), `hwbp-amsi` (Windows, DR0/DR1 VEH).
+
+---
+
 ## Short term (next 0–3 months)
 
 - **Web GUI console.** A small Axum + React front-end that talks to the
@@ -107,12 +143,18 @@ This document describes where the project is going next.
   `administrator`).
 - **Sleep obfuscation hardening.** Encrypt sensitive agent memory regions
   during dormant/sleep intervals with audited key-lifecycle handling.
+  → ✅ Completed. Full XChaCha20-Poly1305 encryption of heap + stack, XMM14/XMM15
+  key stash, post-wake NTDLL hook re-check.
 - **Malleable C2 profile system.** Expand traffic-shaping controls for
   header/URI cadence, jitter, and profile rotation.
+  → ✅ Completed. Full TOML malleable profile system with multi-profile support,
+  hot-reload, and per-transaction transforms.
 - **BOF-equivalent in-process COFF execution.** Provide a constrained,
   signed object-loader capability for operator task extensions.
+  → ✅ Completed. See `coff_loader.rs` in the agent crate.
 - **P2P pivoting capability.** Add SMB/TCP relay paths between agents for
   segmented-network operations.
+  → ✅ Completed. See P2P Mesh Protocol in `ARCHITECTURE.md` and `P2P_MESH.md`.
 
 ## Long term (9+ months)
 
@@ -136,7 +178,7 @@ This document describes where the project is going next.
 2. Open a draft PR early; we discuss design before merging code.
 3. Run `cargo fmt --all`, `cargo clippy --workspace -- -D warnings`,
    `cargo test --workspace`, and `cargo audit` locally before pushing.
-4. Add or update entries in `docs/DESIGN.md` for any user-visible
+4. Add or update entries in `docs/ARCHITECTURE.md` for any user-visible
    behaviour change.
 5. Sign your commits (`git commit -s`) under the
    [Developer Certificate of Origin](https://developercertificate.org/).

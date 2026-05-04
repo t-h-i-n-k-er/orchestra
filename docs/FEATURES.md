@@ -469,6 +469,95 @@ Enables evdev-based input event capture on Linux for HCI research.
 
 ---
 
+### `surveillance`
+
+**Default: no** | **Windows only** | **Opt-in**
+
+Enables screenshot capture, keylogger, and clipboard monitoring capabilities.
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows only |
+| Dependencies | `dep:image` (for screenshot PNG encoding) |
+| Commands | `Screenshot`, `KeyloggerStart`, `KeyloggerDump`, `KeyloggerStop`, `ClipboardMonitorStart`, `ClipboardMonitorDump`, `ClipboardMonitorStop`, `ClipboardGet` |
+| Storage | Encrypted ring buffers (ChaCha20-Poly1305) |
+
+**Capabilities:**
+
+| Capability | Method | Output |
+|------------|--------|--------|
+| Screenshot | Multi-monitor Win32 API capture | PNG bytes |
+| Keylogger | `SetWindowsHookExW(WH_KEYBOARD_LL)` | Encrypted keystroke buffer |
+| Clipboard | `OpenClipboard` + `GetClipboardData` | Encrypted clipboard buffer |
+
+All captured data is stored in encrypted ring buffers that are automatically
+encrypted/decrypted during sleep obfuscation cycles.
+
+**Example profile:**
+```toml
+features = ["outbound-c", "surveillance"]
+```
+
+---
+
+### `browser-data`
+
+**Default: no** | **Windows only** | **Opt-in**
+
+Enables credential and cookie extraction from Chrome, Edge, and Firefox browsers.
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows only |
+| Dependencies | None (custom SQLite parser, NSS runtime loading) |
+| Command | `BrowserData` with `BrowserType` and `BrowserDataType` enums |
+| Chrome support | v127+ App-Bound Encryption with 3 bypass strategies |
+
+**Supported browsers and data types:**
+
+| Browser | Credentials | Cookies | Encryption Handling |
+|---------|:-----------:|:-------:|---------------------|
+| Chrome | ✅ | ✅ | App-Bound Encryption v127+ (3 bypass strategies) |
+| Edge | ✅ | ✅ | Same Chromium engine as Chrome |
+| Firefox | ✅ | ✅ | NSS `logins.json` + `key4.db` |
+
+**Chrome App-Bound Encryption bypass strategies:**
+
+| Strategy | Method | Requirement |
+|----------|--------|-------------|
+| Local COM | `IElevator` COM activation in-process | Elevated agent |
+| SYSTEM token + DPAPI | Impersonate SYSTEM, call `CryptUnprotectData` | `SeDebugPrivilege` |
+| Named-pipe IPC | Communicate with `elevation_service.exe` | Service running |
+
+**Example profile:**
+```toml
+features = ["outbound-c", "browser-data"]
+```
+
+---
+
+### `hwbp-amsi`
+
+**Default: no** | **Windows only**
+
+Uses hardware breakpoints (DR0/DR1) via a Vectored Exception Handler to bypass
+AMSI without modifying any code pages. When this feature is **not** enabled,
+the agent falls back to the memory-patch AMSI bypass.
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows only |
+| Method | DR0/DR1 execute breakpoints on `AmsiScanBuffer` / `AmsiScanString` |
+| VEH handler | Returns `S_OK` + `AMSI_RESULT_CLEAN` |
+| Stealth | No code page modifications — invisible to memory integrity checks |
+
+**Example profile:**
+```toml
+features = ["outbound-c", "hwbp-amsi"]
+```
+
+---
+
 ## Build Features
 
 ### `dev`
@@ -583,6 +672,9 @@ microarchitecture-specific dispatch.
 | `remote-assist` | ✅ | ✅ | ⚠️ |
 | `hci-research` | ✅ | ✅ | ✅ |
 | `evdev` | ✅ | — | — |
+| `surveillance` | — | ✅ | — |
+| `browser-data` | — | ✅ | — |
+| `hwbp-amsi` | — | ✅ | — |
 
 ### Common feature combinations
 
@@ -603,7 +695,12 @@ features = ["outbound-c", "stealth", "manual-map"]
 
 **Full capability agent:**
 ```toml
-features = ["outbound-c", "forward-secrecy", "persistence", "network-discovery", "remote-assist"]
+features = ["outbound-c", "forward-secrecy", "persistence", "network-discovery", "remote-assist", "surveillance", "browser-data"]
+```
+
+**Windows full-stealth with post-exploitation:**
+```toml
+features = ["outbound-c", "stealth", "manual-map", "hwbp-amsi", "surveillance", "browser-data"]
 ```
 
 **Development/testing:**

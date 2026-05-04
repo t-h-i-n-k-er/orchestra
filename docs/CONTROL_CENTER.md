@@ -205,6 +205,45 @@ The `Command` JSON shape matches `serde_json::to_value(common::Command)`:
 | `POST` | `/api/agents/{agent_id}/shell` | Open PTY session. Body: `{ "shell": "bash" }`. Returns `{ "session_id": "..." }`. |
 | `POST` | `/api/agents/{agent_id}/shell/{sid}/input` | Write to PTY stdin. Body: `{ "data": "<base64>" }`. |
 | `GET` | `/api/agents/{agent_id}/shell/{sid}/output` | Poll PTY stdout/stderr buffer. |
+| `POST` | `/api/agents/{agent_id}/shell/{sid}/close` | Close PTY session and kill child process. |
+| `POST` | `/api/agents/{agent_id}/shell/{sid}/resize` | Resize PTY. Body: `{ "rows": 40, "cols": 120 }`. |
+| `GET` | `/api/agents/{agent_id}/shells` | List active shell sessions for an agent. |
+
+### Mesh / P2P topology
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/agents/{agent_id}/command` with `MeshConnect` | Tell agent to establish a peer link. Body: `{ "command": { "MeshConnect": { "target_agent_id": "...", "transport": "tcp", "target_addr": "10.0.0.5:8445" } } }` |
+| `POST` | `/api/agents/{agent_id}/command` with `MeshDisconnect` | Close a specific peer link. Body: `{ "command": { "MeshDisconnect": { "target_agent_id": "..." } } }` |
+| `POST` | `/api/agents/{agent_id}/command` with `MeshKillSwitch` | Emergency: terminate ALL P2P links, purge routing table, refuse new links. |
+| `POST` | `/api/agents/{agent_id}/command` with `MeshQuarantine` | Quarantine a peer. Body: `{ "command": { "MeshQuarantine": { "target_agent_id": "...", "reason": 1 } } }` |
+| `POST` | `/api/agents/{agent_id}/command` with `MeshClearQuarantine` | Clear quarantine flag for a peer, allowing reconnection. |
+| `POST` | `/api/agents/{agent_id}/command` with `MeshSetCompartment` | Set mesh compartment. Body: `{ "command": { "MeshSetCompartment": { "compartment": "red-team-1" } } }` |
+
+**Mesh command examples:**
+
+```sh
+# Connect agent to a peer
+curl -sk -X POST \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"command":{"MeshConnect":{"target_agent_id":"agent-b","transport":"tcp","target_addr":"10.0.0.5:8445"}}}' \
+    "$BASE_URL/api/agents/agent-a/command"
+
+# Emergency kill switch — sever all P2P links
+curl -sk -X POST \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"command":"MeshKillSwitch"}' \
+    "$BASE_URL/api/agents/agent-a/command"
+
+# Quarantine a compromised peer
+curl -sk -X POST \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"command":{"MeshQuarantine":{"target_agent_id":"agent-c","reason":1}}}' \
+    "$BASE_URL/api/agents/agent-a/command"
+```
 
 ### Audit
 

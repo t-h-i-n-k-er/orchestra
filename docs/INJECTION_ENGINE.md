@@ -16,8 +16,11 @@ The injection engine (`agent/src/injection/` — Windows, gated by `#[cfg(target
 | **Module Stomping** | Very High | High | High | Blending with loaded modules |
 | **Early Bird APC** | Medium | High | Low | Suspended/new processes |
 | **Thread Hijacking** | Very High | Medium | High | Avoiding new thread creation |
-| **ThreadPool Injection** | Very High | Medium | High | Avoiding thread creation entirely |
+| **ThreadPool Injection** (8 variants) | Very High | Medium | High | Avoiding thread creation entirely |
 | **Fiber Injection** | Very High | Medium | High | Legitimate execution context |
+| **Context-Only Injection** | Very High | Medium | Low | Quick RIP redirect, no shellcode |
+| **Section Mapping Injection** | Very High | High | Medium | Dual-mapped shared sections |
+| **Callback Injection** (12 APIs) | Very High | Medium | Medium | Legitimate API callback dispatch |
 
 ---
 
@@ -418,6 +421,145 @@ Converts a thread to a fiber, creates a new fiber with the payload, and switches
 
 ---
 
+### 7. ThreadPool Injection — Extended Variants
+
+The ThreadPool injection technique has been expanded to **8 sub-variants**, each
+using a different thread pool work-dispatch mechanism. This variety allows the
+operator to select the variant least likely to be monitored by a given EDR product.
+
+| Variant | Dispatch API | Callback Signature | Notes |
+|---------|-------------|-------------------|-------|
+| `TpAllocWork` | `TppAllocWork` | `PTP_WORK_CALLBACK` | Classic work item |
+| `TpAllocWorkEx` | Extended alloc | `PTP_WORK_CALLBACK` | Extended parameters |
+| `TpPostWork` | `TppPostWork` | — | Post existing work |
+| `TpAllocJob` | `TppAllocJob` | `PTP_JOB_CALLBACK` | Job-based execution |
+| `TpAllocAlpcCompletion` | `TppAllocAlpcCompletion` | ALPC handler | ALPC port-based |
+| `TpAllocIoCompletion` | `TppAllocIoCompletion` | IO completion | I/O completion port |
+| `TpAllocTimer` | `TppAllocTimer` | `PTP_TIMER_CALLBACK` | Timer-triggered |
+| `TpAllocWait` | `TppAllocWait` | `PTP_WAIT_CALLBACK` | Wait-triggered |
+
+#### Selection Logic
+
+The engine automatically selects the variant based on target process reconnaissance:
+
+1. If the target already has an I/O completion port → use `TpAllocIoCompletion`
+2. If the target has ALPC ports → use `TpAllocAlpcCompletion`
+3. If the target has timer objects → use `TpAllocTimer`
+4. Default: `TpAllocWork` (most common, least suspicious)
+
+---
+
+### 8. Context-Only Injection
+
+Performs a minimal thread-context hijack without injecting any shellcode.
+The attacker-supplied function address is written directly into the RIP
+register of a suspended thread. No memory allocation, no write, no protection
+change — only a `CONTEXT` structure modification.
+
+#### Syscall Sequence
+
+```
+1. OpenProcess(PROCESS_ALL_ACCESS, FALSE, target_pid)
+   → process_handle
+
+2. NtGetContextThread(thread_handle, &context)
+   → Save original context
+
+3. context.Rip = payload_address  (already in process memory)
+   → Redirect execution
+
+4. NtSetContextThread(thread_handle, &context)
+   → Apply modified context
+
+5. NtResumeThread(thread_handle, NULL)
+   → Thread resumes at payload_address
+```
+
+#### Advantages
+
+- Zero memory allocation — nothing suspicious in virtual memory
+- Zero memory writes — no `NtWriteVirtualMemory` calls
+- Only a single `NtSetContextThread` syscall (plus `NtGetContextThread`)
+- Best OPSEC when payload already exists in target (e.g., module stomping already done)
+
+---
+
+### 9. Section Mapping Injection
+
+Creates a shared section object (via `NtCreateSection`), maps it into both the
+agent and the target process, and writes the payload via the local mapping.
+The target process accesses it via the remote mapping. This avoids
+`NtWriteVirtualMemory` entirely.
+
+#### Syscall Sequence
+
+```
+1. NtCreateSection(&section_handle, SECTION_ALL_ACCESS, NULL,
+      &size, PAGE_EXECUTE_READWRITE, SEC_COMMIT, NULL)
+   → Create shared section
+
+2. NtMapViewOfSection(section_handle, NtCurrentProcess(), &local_base, ...)
+   → Map into agent (RW)
+
+3. memcpy(local_base, shellcode, shellcode_len)
+   → Write payload locally
+
+4. NtMapViewOfSection(section_handle, target_process, &remote_base, ...)
+   → Map into target (RX)
+
+5. NtClose(section_handle)
+   → Clean up section handle
+
+6. CreateRemoteThread(target_process, remote_base, NULL)
+   → Execute in target
+```
+
+#### Advantages
+
+- No `NtWriteVirtualMemory` — EDR commonly hooks this
+- Section objects are used legitimately for shared memory IPC
+- The section can be mapped with different permissions in each process
+- `NtMapViewOfSection` from `\KnownDlls` is a common legitimate pattern
+
+---
+
+### 10. Callback Injection (12 APIs)
+
+Abuses legitimate Windows API functions that accept function-pointer callbacks.
+The payload address is supplied as the callback; when the API invokes it, the
+payload executes in the context of the calling thread.
+
+| # | API | Trigger | Callback Param |
+|---|-----|---------|---------------|
+| 1 | `EnumChildWindows` | Window enumeration | `WNDENUMPROC` |
+| 2 | `EnumSystemLocalesA` | Locale enumeration | `LOCALE_ENUMPROC` |
+| 3 | `EnumSystemLocalesW` | Locale enumeration (wide) | `LOCALE_ENUMPROC` |
+| 4 | `EnumDesktopWindows` | Desktop window enumeration | `WNDENUMPROC` |
+| 5 | `EnumFontsA` | Font enumeration | `FONTENUMPROCA` |
+| 6 | `EnumFontsW` | Font enumeration (wide) | `FONTENUMPROCW` |
+| 7 | `EnumDisplayMonitors` | Display enumeration | `MONITORENUMPROC` |
+| 8 | `EnumResourceTypesA` | Resource type enumeration | `ENUMRESTYPEPROC` |
+| 9 | `EnumResourceTypesW` | Resource type enumeration (wide) | `ENUMRESTYPEPROC` |
+| 10 | `CreateTimerQueueTimer` | Timer expiry | `WAITORTIMERCALLBACK` |
+| 11 | `EnumClipboardFormats` | Clipboard format enumeration | `CLIPBOARDENUMPROC` |
+| 12 | `EnumThreadWindows` | Thread window enumeration | `WNDENUMPROC` |
+
+#### Selection Logic
+
+1. If a desktop/window exists in the target → prefer window-based callbacks (1, 4, 12)
+2. If GUI resources are available → prefer `EnumDisplayMonitors`, `EnumFonts`
+3. If no GUI → use `EnumSystemLocales`, `EnumResourceTypes`, `EnumClipboardFormats`
+4. For delayed execution → use `CreateTimerQueueTimer`
+
+#### Advantages
+
+- All 12 APIs are legitimate Windows functions with callback parameters
+- EDR must hook all 12 APIs to detect this technique (computationally expensive)
+- Callbacks execute in the caller's thread — no remote thread creation
+- Extremely difficult to distinguish from legitimate enumeration calls
+
+---
+
 ## InjectionViability Assessment
 
 The engine classifies each target process with a viability rating:
@@ -541,8 +683,11 @@ Each error includes a human-readable description and the failing NTSTATUS code w
 | `default` | Process Hollowing + Early Bird APC |
 | `module-stomp` | Enables Module Stomping technique |
 | `thread-hijack` | Enables Thread Hijacking technique |
-| `threadpool-inject` | Enables ThreadPool injection technique |
+| `threadpool-inject` | Enables ThreadPool injection technique (8 variants) |
 | `fiber-inject` | Enables Fiber injection technique |
+| `context-only` | Enables Context-Only injection technique |
+| `section-map` | Enables Section Mapping injection technique |
+| `callback-inject` | Enables Callback injection technique (12 APIs) |
 | `direct-syscalls` | All techniques use direct syscalls via `nt_syscall` crate |
 
 ---

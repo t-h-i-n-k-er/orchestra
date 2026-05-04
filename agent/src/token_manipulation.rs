@@ -452,6 +452,16 @@ pub fn get_system() -> Result<String> {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
+/// Return the current impersonation token handle if one is active.
+///
+/// Used by `interactive_shell` to create child processes with the correct
+/// security context (e.g. `CreateProcessWithTokenW`).  Returns a null
+/// `HANDLE` when no impersonation token is set.
+pub fn get_current_token() -> HANDLE {
+    let saved = SAVED_TOKEN.lock().unwrap();
+    saved.unwrap_or(std::ptr::null_mut())
+}
+
 /// Save the current thread's impersonation token (if any) for later restoration.
 fn save_current_token() {
     let mut token: HANDLE = std::ptr::null_mut();

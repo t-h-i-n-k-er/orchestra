@@ -1,6 +1,6 @@
 # Orchestra
 
-A cross-platform, operationally secure command-and-control framework built in Rust. Orchestra provides a malleable C2 pipeline, a unified injection engine with six techniques, advanced sleep obfuscation, and a standalone redirector binary — all designed for red-team operations requiring granular control over network signatures, memory forensics resistance, and payload delivery.
+A cross-platform, operationally secure command-and-control framework built in Rust. Orchestra provides a malleable C2 pipeline, a unified injection engine with twelve techniques, advanced sleep obfuscation with post-wake NTDLL hook re-check, in-process .NET assembly and BOF execution, browser credential extraction, LSASS harvesting, interactive shell sessions, P2P mesh networking, and a standalone redirector binary — all designed for red-team operations requiring granular control over network signatures, memory forensics resistance, and payload delivery.
 
 | | |
 |---|---|
@@ -56,7 +56,7 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 
 | Crate | Type | Purpose |
 |-------|------|---------|
-| `agent` | lib + bin | Implant: C2 transports, evasion, injection, sleep obfuscation, persistence |
+| `agent` | lib + bin | Implant: C2 transports, evasion, injection, sleep obfuscation, persistence, .NET/BOF exec, browser data, LSASS harvest, surveillance, shells, lateral movement |
 | `orchestra-server` | bin | Control center: agent management, module signing, build queue, profile hot-reload |
 | `redirector` | bin | Standalone HTTP reverse proxy with cover traffic and registration |
 | `common` | lib | Wire protocol (`Message`, `Command`), `Transport` trait, crypto, config types |
@@ -73,7 +73,7 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 | `code_transform_macro` | proc-macro | Attribute macro for per-function code transformation |
 | `optimizer` | lib | x86_64 instruction-level optimization passes (NOP insertion, scheduling, substitution) |
 | `junk_macro` | proc-macro | Junk code insertion at function boundaries |
-| `nt_syscall` | lib | Direct/indirect syscall infrastructure (SSN resolution, Halo's Gate, clean ntdll mapping) |
+| `nt_syscall` | lib | Direct/indirect syscall infrastructure (SSN resolution, Halo's Gate, clean ntdll mapping, unhook callback) |
 | `pe_resolve` | lib | PEB walking, ROR-13 export hashing |
 | `dev-server` | bin | Lightweight static file server for local testing |
 | `orchestra-pe-hardener` | lib | PE header hardening transformations |
@@ -95,10 +95,21 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 | **Module Stomping** (NtWaitForSingleObject) | ✅ | — | — | Overwrites `.text` of legitimate signed DLL in target |
 | **EarlyBird APC Injection** | ✅ | — | — | QueueUserAPC before thread resumes |
 | **Thread Hijacking** | ✅ | — | — | Suspend → rewrite RIP → resume |
-| **Thread Pool Injection** | ✅ | — | — | `TpAllocWork` / `TpPostWork` callback execution |
-| **Fiber Injection** | ✅ | — | — | `CreateFiber` → `SwitchToFiber` |
-| **Unified Injection Engine** | ✅ | ✅ | — | Auto-selects technique based on EDR recon; 6-technique fallback chain |
+| **Unified Injection Engine** | ✅ | ✅ | — | Auto-selects technique based on EDR recon; 12-technique fallback chain |
 | **Pre-Injection EDR Reconnaissance** | ✅ | — | — | Module enumeration, integrity check, architecture verification |
+| **ThreadPool Injection** (8 variants) | ✅ | — | — | `TpAllocWork`, `TpPostWork`, `CreateTimerQueueTimer`, etc. |
+| **Fiber Injection** | ✅ | — | — | `CreateFiber` → `SwitchToFiber` |
+| **Context-Only Injection** | ✅ | — | — | `SetThreadContext` RIP rewrite (no shellcode) |
+| **Section Mapping Injection** | ✅ | — | — | `NtCreateSection` + `NtMapViewOfSection` dual-mapping |
+| **Callback Injection** (12 APIs) | ✅ | — | — | `EnumChildWindows`, `CreateTimerQueueTimer`, etc. |
+| **.NET Assembly Execution** | ✅ | — | — | In-process CLR hosting, fresh AppDomain per exec |
+| **BOF / COFF Execution** | ✅ | — | — | Beacon-compatible API, public BOF ecosystem |
+| **Interactive Shell Sessions** | ✅ | ✅ | ✅ | cmd.exe / sh / zsh with background reader threads |
+| **Browser Data Extraction** | ✅ | — | — | Chrome v127+ App-Bound Encryption, Edge, Firefox |
+| **LSASS Credential Harvesting** | ✅ | — | — | Indirect syscalls, no MiniDumpWriteDump |
+| **NTDLL Unhooking** | ✅ | — | — | `\KnownDlls` re-fetch + disk fallback, post-sleep auto-check |
+| **Surveillance** (screenshot/keylogger/clipboard) | ✅ | — | — | `surveillance` feature; encrypted ring buffers |
+| **Token Manipulation** | ✅ | — | — | MakeToken, StealToken, Rev2Self, GetSystem; thread-safe |
 | **Sleep Obfuscation** (full memory encryption) | ✅ | ✅ | ✅ | XChaCha20-Poly1305 region encryption; stack encryption on Windows |
 | **Stack Encryption during Sleep** | ✅ | — | — | Full stack frame encryption with safety guarantees |
 | **PEB Unlinking & Memory Hygiene** | ✅ | — | — | Module unlink, thread start scrub, handle table scrub |

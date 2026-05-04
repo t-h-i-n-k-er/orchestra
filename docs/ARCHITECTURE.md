@@ -100,6 +100,13 @@ Each command handler is a separate function in `handlers.rs` or a dedicated modu
 | **Token** | `MakeToken`, `StealToken`, `Rev2Self`, `GetSystem` |
 | **Lateral** | `PsExec`, `WmiExec`, `DcomExec`, `WinRmExec` |
 | **P2P** | `LinkAgents`, `UnlinkAgent`, `ListTopology`, `LinkTo`, `Unlink`, `ListLinks` |
+| **Mesh** | `MeshConnect`, `MeshDisconnect`, `MeshKillSwitch`, `MeshQuarantine`, `MeshClearQuarantine`, `MeshSetCompartment` |
+| **.NET/BOF** | `ExecuteAssembly`, `ExecuteBOF` |
+| **Interactive Shell** | `CreateShell`, `ShellInput`, `ShellOutput`, `ShellClose`, `ShellList`, `ShellResize` |
+| **Surveillance** | `Screenshot`, `KeyloggerStart`, `KeyloggerDump`, `KeyloggerStop`, `ClipboardMonitorStart`, `ClipboardMonitorDump`, `ClipboardMonitorStop`, `ClipboardGet` |
+| **Browser Data** | `BrowserData` (Chrome, Edge, Firefox — credentials + cookies) |
+| **Credential Access** | `HarvestLSASS` (no dump file — incremental memory reading) |
+| **Evasion** | `UnhookNtdll` (KnownDlls re-fetch + disk fallback) |
 
 ---
 
@@ -132,6 +139,73 @@ If a syscall stub has been hooked (e.g., replaced with `jmp <hook>` by an EDR), 
 
 This handles the case where EDR products inline-hook specific NT API functions.
 
+### NTDLL Unhooking Pipeline (`ntdll_unhook.rs`)
+
+When Halo's Gate fails — i.e., **all** adjacent syscall stubs are hooked — the agent performs a full `.text` section re-fetch of ntdll.dll:
+
+```
+┌─────────────────────┐
+│ syscall!() called    │
+└──────┬──────────────┘
+       │
+┌──────▼──────────────┐     ┌────────────────────┐
+│ SSN Cache hit?      │──No►│ Resolve from clean  │
+│                     │     │ ntdll mapping        │
+└──────┬──────────────┘     └──────┬──────────────┘
+       │ Yes                       │ Hooked?
+       │                    ┌──────▼──────────────┐
+       │                    │ Halo's Gate: scan    │
+       │                    │ adjacent stubs       │
+       │                    └──────┬──────────────┘
+       │                           │ All hooked?
+       │                    ┌──────▼──────────────┐
+       │                    │ NTDLL Unhook:        │
+       │                    │ Re-fetch .text from  │
+       │                    │ \KnownDlls            │
+       │                    └──────┬──────────────┘
+       │                           │ Success?
+       │                    ┌──────▼──────────────┐
+       │                    │ Invalidate cache +   │
+       │                    │ Re-resolve SSN       │
+       │                    └──────┬──────────────┘
+       └───────────────────────────┘
+```
+
+**Primary path** (`\KnownDlls\ntdll.dll`):
+1. `NtOpenSection("\KnownDlls\ntdll.dll")` — open the kernel-maintained read-only section
+2. `NtMapViewOfSection(PAGE_READONLY)` — map a clean copy
+3. Parse PE headers to locate `.text` section in both copies
+4. `NtProtectVirtualMemory(PAGE_READWRITE)` on the hooked `.text`
+5. Chunked overwrite (4 KiB chunks with 50 µs delays between each)
+6. `NtProtectVirtualMemory(restore original protection)`
+7. `NtFlushInstructionCache` to invalidate CPU instruction cache
+8. `NtUnmapViewOfSection` + `NtClose` cleanup
+
+**Fallback path** (disk re-read):
+If `\KnownDlls` is blocked by EDR, the agent reads `C:\Windows\System32\ntdll.dll` from disk via `NtCreateFile` + `NtReadFile`. Less stealthy (creates file I/O events), but works when KnownDlls is unavailable.
+
+**Post-unhook operations**:
+- **Cache invalidation**: All 23 critical syscall stubs are re-resolved from the now-clean ntdll via `get_syscall_id()`
+- **SSN cache purge**: `invalidate_ssn_cache()` clears the `SYSCALL_CACHE` HashMap
+- **Execution normalization**: `NtQueryPerformanceCounter` is called immediately after unhooking to normalize the execution flow and avoid detectable call-pattern anomalies
+
+**Automatic trigger points**:
+1. **Halo's Gate failure**: When `infer_ssn_halo_gate()` returns `None` (all adjacent stubs hooked), the registered callback `halo_gate_fallback()` is invoked
+2. **Post-sleep wake**: Sleep obfuscation step 12 calls `maybe_unhook()` to detect and remove hooks EDR placed while the agent was dormant
+3. **On-demand**: Operator sends `UnhookNtdll` command
+
+**Hook detection**: `are_syscall_stubs_hooked()` inspects the first bytes of 23 critical syscall stubs for hook indicators:
+- `E9` — `jmp rel32` (inline hook, 5-byte detour)
+- `EB` — `jmp rel8` (short jump detour)
+- `FF 25` — `jmp [rip+offset]` (absolute indirect jump)
+- `0F 0B` — `ud2` (stub neutered)
+- `C3` — `ret` (stub neutered)
+
+**Anti-EDR mitigations**:
+- Chunked writes (4 KiB) with 50 µs delays to avoid bulk-write signatures
+- Post-unhook normalization call to `NtQueryPerformanceCounter`
+- `\KnownDlls` preferred to avoid file I/O monitoring
+
 ### Indirect Syscall Dispatch
 
 For maximum evasion, the agent uses indirect syscalls that dispatch through `NtContinue`:
@@ -150,6 +224,7 @@ The agent resolves these NT functions at runtime:
 | `NtAllocateVirtualMemory` | Memory allocation (RW/RX) |
 | `NtProtectVirtualMemory` | Memory protection changes |
 | `NtWriteVirtualMemory` | Cross-process memory writes |
+| `NtReadVirtualMemory` | Cross-process memory reads |
 | `NtCreateThreadEx` | Remote thread creation |
 | `NtOpenProcess` | Process handle acquisition |
 | `NtClose` | Handle closure |
@@ -157,7 +232,25 @@ The agent resolves these NT functions at runtime:
 | `NtContinue` | Thread context restoration (stack spoofing) |
 | `NtFreeVirtualMemory` | Memory deallocation |
 | `NtQueryVirtualMemory` | Memory region enumeration |
-| `NtReadVirtualMemory` | Cross-process memory reads |
+
+### Unhook Callback Registration
+
+When the `ntdll_unhook` module is available, it registers a fallback callback with `nt_syscall`:
+
+```rust
+// In agent initialization:
+nt_syscall::set_halo_gate_fallback(crate::ntdll_unhook::halo_gate_fallback);
+
+// In nt_syscall, when Halo's Gate fails:
+if let Some(cb) = HALO_GATE_FALLBACK.load(Ordering::Relaxed) {
+    let func: fn(&str) -> Option<SyscallTarget> = unsafe { std::mem::transmute(cb) };
+    if let Some(target) = func(syscall_name) {
+        return Some(target);
+    }
+}
+```
+
+This avoids a circular dependency: `nt_syscall` cannot depend on `agent`, so the agent registers its unhook callback at startup.
 
 ---
 
@@ -670,6 +763,346 @@ The workspace compiles cleanly on all three platforms via `cargo check --workspa
 
 ---
 
+## .NET Assembly Loader (`assembly_loader.rs`)
+
+In-process .NET assembly execution via CLR hosting, compatible with any .NET Framework 4.x assembly:
+
+### Architecture
+
+```
+┌──────────────────────┐
+│ ExecuteAssembly cmd  │
+└──────┬───────────────┘
+       │
+┌──────▼───────────────┐     ┌─────────────────────────┐
+│ Lazy CLR init         │────►│ LoadLibrary(mscoree.dll) │
+│ (once per process)    │     │ CLRCreateInstance()      │
+└──────┬───────────────┘     │ ICLRMetaHost → ICLRRInfo  │
+       │                      │ ICLRRuntimeHost::Start()  │
+┌──────▼───────────────┐     └──────────────────────────┘
+│ AMSI bypass           │
+│ (pre-execution)       │
+└──────┬───────────────┘
+       │
+┌──────▼───────────────┐
+│ Create fresh          │
+│ AppDomain per exec    │
+└──────┬───────────────┘
+       │
+┌──────▼───────────────┐
+│ ICLRRuntimeHost::     │
+│ ExecuteInDefaultApp   │
+│ Domain()              │
+└──────┬───────────────┘
+       │
+┌──────▼───────────────┐
+│ Collect output +      │
+│ auto-teardown after   │
+│ 5-min idle            │
+└──────────────────────┘
+```
+
+### Key Properties
+
+| Property | Value |
+|----------|-------|
+| Assembly source | Byte array received via `ExecuteAssembly` command |
+| Arguments | Passed as space-delimited string |
+| Timeout | Configurable; default 60 seconds |
+| AppDomain | Fresh `AppDomain` per execution; unloaded on completion |
+| AMSI bypass | Applied before assembly load via HWBP or memory patch |
+| CLR version | .NET Framework 4.x (mscoree.dll CLRCreateInstance) |
+| Auto-teardown | CLR resources released after 5 minutes idle |
+| Max output | 4 MiB per execution |
+
+---
+
+## COFF / BOF Loader (`coff_loader.rs`)
+
+Beacon Object File (BOF) execution compatible with the public BOF ecosystem:
+
+### Execution Flow
+
+1. Parse COFF headers, sections, symbols, relocations
+2. Allocate RW memory, copy sections
+3. Resolve external symbols (Beacon-compatible API)
+4. Apply COFF relocations (x86_64: `IMAGE_REL_AMD64_ADDR64`, `ADDR32NB`, `REL32`)
+5. `mprotect` to RX
+6. Call `void go(char *args, int len)` entry point
+7. Collect output from Beacon-compatible output functions
+
+### Beacon-Compatible API
+
+| Export | Purpose |
+|--------|---------|
+| `BeaconPrintf` | Formatted output (printf-style) |
+| `BeaconOutput` | Raw output with type flag |
+| `BeaconDataParse` | Parse packed BOF arguments |
+| `BeaconDataInt` | Extract integer argument |
+| `BeaconDataShort` | Extract short argument |
+| `BeaconDataLength` | Get remaining argument length |
+| `BeaconDataExtract` | Extract byte buffer argument |
+| `BeaconFormatAlloc` | Allocate format buffer |
+| `BeaconFormatPrintf` | Printf into format buffer |
+| `BeaconFormatToString` | Convert format buffer to string |
+| `BeaconFormatFree` | Free format buffer |
+| `BeaconFormatInt` | Append integer to format buffer |
+| `BeaconUseToken` | Apply stolen token (no-op in Orchestra) |
+| `BeaconRevertToken` | Revert to original token (no-op) |
+| `BeaconIsAdmin` | Check if running elevated |
+| `toNative` | Convert char* to wide string |
+
+| Constraint | Value |
+|------------|-------|
+| Max BOF size | 1 MiB |
+| Max output | 1 MiB |
+| Architecture | x86_64 only |
+| Execution | Synchronous; blocks until `go()` returns |
+
+---
+
+## Browser Data Extraction (`browser_data.rs`)
+
+Extracts credentials and cookies from Chrome, Edge, and Firefox. Gated behind `#[cfg(all(windows, feature = "browser-data"))]`.
+
+### Supported Browsers and Data Types
+
+| Browser | Credentials | Cookies | Notes |
+|---------|:-----------:|:-------:|-------|
+| Chrome | ✅ | ✅ | App-Bound Encryption v127+ with 3 bypass strategies |
+| Edge | ✅ | ✅ | Same Chromium engine as Chrome |
+| Firefox | ✅ | ✅ | NSS library (logins.json + key4.db) |
+
+### Chrome App-Bound Encryption (v127+)
+
+Chrome 127+ uses App-Bound Encryption which ties decryption to an elevated service (`elevation_service.exe`). Three bypass strategies:
+
+| Strategy | Method | Requirements |
+|----------|--------|--------------|
+| **Local COM** | Activate `IElevator` COM object in-process | Agent running elevated |
+| **SYSTEM token + DPAPI** | Impersonate SYSTEM token, call `CryptUnprotectData` | Agent running as SYSTEM or with `SeDebugPrivilege` |
+| **Named-pipe IPC** | Communicate with `elevation_service.exe` via named pipe | Elevation service must be running |
+
+### Credential Extraction Pipeline
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ Locate       │────►│ Decrypt      │────►│ Parse        │
+│ Login Data   │     │ v10/v20 key  │     │ SQLite rows  │
+│ SQLite DB    │     │ via DPAPI    │     │ (custom parser)│
+└──────────────┘     └──────────────┘     └──────┬───────┘
+                                                  │
+                                           ┌──────▼───────┐
+                                           │ Return       │
+                                           │ BrowserData  │
+                                           │ Result       │
+                                           └──────────────┘
+```
+
+- Uses a **custom minimal SQLite parser** (no external dependency) for reading Login Data and Cookies databases
+- Chrome `v10` / `v20` encrypted values are decrypted using AES-256-GCM with a DPAPI-unwrapped key
+- Firefox uses NSS `logins.json` + `key4.db` with runtime DLL loading
+
+---
+
+## LSASS Memory Harvesting (`lsass_harvest.rs`)
+
+Incremental LSASS memory reading via indirect syscalls — **no MiniDumpWriteDump** or disk writes:
+
+### Architecture
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ Open LSASS   │────►│ Enumerate    │────►│ Read memory  │
+│ via NtOpen   │     │ memory       │     │ regions via  │
+│ Process      │     │ regions      │     │ NtReadVirtual│
+└──────────────┘     └──────────────┘     │ Memory       │
+                                          └──────┬───────┘
+                                                  │
+┌─────────────────────────────────────────────────┘
+│
+┌──────▼───────────────────────────────────────────┐
+│ Parse credential structures in-process:           │
+│                                                   │
+│ • MSV1.0 (NT hashes)                              │
+│ • WDigest (plaintext passwords)                   │
+│ • Kerberos (TGT/TGS tickets)                      │
+│ • DPAPI master keys                               │
+│ • DCC2 (domain cached credentials)                │
+└──────┬───────────────────────────────────────────┘
+       │
+┌──────▼───────────────────────────────────────────┐
+│ Return JSON with all extracted credentials         │
+└──────────────────────────────────────────────────┘
+```
+
+### Build-Specific Offset Tables
+
+| Windows Build | LSASS Version | MSV Offset | WDigest Offset | Tested |
+|:-------------|:-------------|:-----------|:---------------|:------:|
+| 19041 (2004) | 10.0.19041 | ✅ | ✅ | ✅ |
+| 19042 (20H2) | 10.0.19042 | ✅ | ✅ | ✅ |
+| 19043 (21H1) | 10.0.19043 | ✅ | ✅ | ✅ |
+| 19044 (21H2) | 10.0.19044 | ✅ | ✅ | ✅ |
+| 19045 (22H2) | 10.0.19045 | ✅ | ✅ | ✅ |
+| 22621 (Win11 22H2) | 10.0.22621 | ✅ | ✅ | ✅ |
+| 22631 (Win11 23H2) | 10.0.22631 | ✅ | ✅ | ✅ |
+| 26100 (Win11 24H2) | 10.0.26100 | ✅ | ✅ | ✅ |
+
+### OPSEC Properties
+
+- **No file I/O**: All reading done via `NtReadVirtualMemory` syscall
+- **No MiniDumpWriteDump**: Avoids the most common LSASS access indicator
+- **Indirect syscalls**: LSASS handle opened via syscall gadget, not `OpenProcess`
+- **Incremental**: Reads only memory regions containing credential structures
+
+---
+
+## Surveillance Module (`surveillance.rs`)
+
+Screenshot capture, keylogger, and clipboard monitoring. Gated by `#[cfg(feature = "surveillance")]`.
+
+### Capabilities
+
+| Capability | API | Storage |
+|------------|-----|---------|
+| **Screenshot** | Multi-monitor via Win32 API | PNG bytes, returned inline |
+| **Keylogger** | `SetWindowsHookEx(WH_KEYBOARD_LL)` | Encrypted ring buffer (ChaCha20-Poly1305) |
+| **Clipboard** | `OpenClipboard` + `GetClipboardData` | Encrypted ring buffer |
+
+### Encrypted Ring Buffer
+
+All captured data is stored in encrypted ring buffers:
+
+```
+┌─────────────────────────────────────────────────┐
+│ RingBuffer<T>                                    │
+│                                                  │
+│ ┌─────────┐  head ──►  ┌─────────┐              │
+│ │ Entry 0 │            │ Entry N │  ◄── tail    │
+│ └────┬────┘            └────┬────┘              │
+│      │                      │                    │
+│  ┌───▼──────────────────────▼───┐                │
+│  │ Encrypted with ChaCha20-     │                │
+│  │ Poly1305 (per-buffer key)    │                │
+│  └──────────────────────────────┘                │
+│                                                  │
+│ Max: configurable entries, auto-wrap             │
+└─────────────────────────────────────────────────┘
+```
+
+### Keylogger Lifecycle
+
+1. `KeyloggerStart` — Install `WH_KEYBOARD_LL` hook via `SetWindowsHookExW`
+2. Hook callback records keystrokes to encrypted ring buffer
+3. `KeyloggerDump` — Return buffered keystrokes (cleared after dump)
+4. `KeyloggerStop` — `UnhookWindowsHookEx`, zero and free buffer
+
+### Command Matrix
+
+| Command | Action |
+|---------|--------|
+| `Screenshot` | Capture all monitors, return PNG bytes |
+| `KeyloggerStart` | Install keyboard hook |
+| `KeyloggerDump` | Return captured keystrokes |
+| `KeyloggerStop` | Remove hook, free buffer |
+| `ClipboardMonitorStart` | Begin periodic clipboard monitoring |
+| `ClipboardMonitorDump` | Return captured clipboard data |
+| `ClipboardMonitorStop` | Stop monitoring, free buffer |
+| `ClipboardGet` | One-shot clipboard read |
+
+---
+
+## Interactive Shell Sessions (`interactive_shell.rs`)
+
+Full interactive PTY/shell sessions with background reader threads:
+
+### Session Lifecycle
+
+```
+┌──────────┐     ┌──────────────┐     ┌──────────────┐
+│ Create   │────►│ Reader       │────►│ ShellOutput  │
+│ Shell    │     │ Thread       │     │ (async msg)  │
+│ (cmd/    │     │ (background) │     │              │
+│  sh/zsh) │     └──────┬───────┘     └──────────────┘
+└──────────┘            │
+                  ┌─────▼──────┐
+                  │ ShellInput │
+                  │ (operator) │
+                  └────────────┘
+```
+
+### Supported Shells
+
+| Platform | Default Shell | Custom Shell |
+|----------|--------------|--------------|
+| Windows | `cmd.exe` | Configurable path |
+| Linux | `/bin/sh` | `/bin/zsh`, `/bin/bash`, custom |
+| macOS | `/bin/sh` | `/bin/zsh`, `/bin/bash`, custom |
+
+### Commands
+
+| Command | Direction | Purpose |
+|---------|-----------|---------|
+| `CreateShell` | Server → Agent | Spawn new shell session |
+| `ShellInput` | Server → Agent | Send text to shell stdin |
+| `ShellClose` | Server → Agent | Terminate shell session |
+| `ShellList` | Server → Agent | List all active sessions |
+| `ShellResize` | Server → Agent | Change PTY dimensions |
+
+### Async Output
+
+Shell output is delivered asynchronously via `Message::ShellOutput`:
+
+```rust
+pub struct ShellOutput {
+    pub session_id: String,
+    pub stream: ShellStream,   // Stdout or Stderr
+    pub data: Vec<u8>,
+}
+```
+
+### Sleep Obfuscation Integration
+
+Shell reader threads are **paused** during sleep obfuscation via:
+- `pause_all_readers()` — Called before sleep encryption begins
+- `resume_all_readers()` — Called after wake decryption completes
+
+This prevents data corruption when the agent's memory is encrypted during sleep.
+
+---
+
+## Sleep Obfuscation — NTDLL Hook Re-check
+
+After waking from sleep obfuscation, the agent performs a post-wake hook detection:
+
+**Step 12** (added to the sleep obfuscation pipeline):
+
+```
+... Step 11 (restore thread contexts) ...
+       │
+┌──────▼──────────────┐
+│ Post-wake ntdll     │
+│ hook re-check       │
+│ maybe_unhook()      │
+└──────┬──────────────┘
+       │ Hooks detected?
+┌──────▼──────────────┐
+│ Yes → Full .text    │
+│ re-fetch from       │
+│ \KnownDlls          │
+└──────┬──────────────┘
+       │
+┌──────▼──────────────┐
+│ Continue normal     │
+│ operation           │
+└─────────────────────┘
+```
+
+This is critical because EDR products may hook ntdll syscall stubs **while the agent is dormant** during sleep obfuscation. Without this check, the agent would wake up and immediately use hooked stubs.
+
+---
+
 ## See Also
 
 - [MALLEABLE_PROFILES.md](MALLEABLE_PROFILES.md) — Exhaustive TOML profile reference
@@ -679,3 +1112,5 @@ The workspace compiles cleanly on all three platforms via `cargo check --workspa
 - [OPERATOR_MANUAL.md](OPERATOR_MANUAL.md) — Operator manual
 - [FEATURES.md](FEATURES.md) — Feature flag reference
 - [SECURITY.md](SECURITY.md) — Threat model and hardening
+- [P2P_MESH.md](P2P_MESH.md) — P2P mesh protocol and topology
+- [USER_GUIDE.md](USER_GUIDE.md) — End-user getting started guide

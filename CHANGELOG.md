@@ -8,6 +8,96 @@ All notable changes to Orchestra are documented here.
 
 ### Added
 
+#### NTDLL Unhooking (`agent/ntdll_unhook.rs`)
+- **Full NTDLL .text re-fetch pipeline** — Replaces the hooked ntdll `.text` section
+  with a clean copy from `\KnownDlls\ntdll.dll`, falling back to disk read via
+  `NtCreateFile` + `NtReadFile` when KnownDlls is unavailable.
+- **Hook detection** — `are_syscall_stubs_hooked()` inspects 23 critical syscall
+  stubs for inline hooks (`E9 jmp`, `FF 25 jmp`, `ud2`, `ret`, `EB jmp`).
+- **Chunked overwrite with anti-EDR delays** — 4 KiB chunks with 50 µs inter-chunk
+  delay to avoid bulk-write signatures. Post-unhook `NtQueryPerformanceCounter`
+  normalization call.
+- **Halo's Gate unhook callback** — `nt_syscall::set_halo_gate_fallback()` registers
+  the unhook callback; `nt_syscall::invalidate_ssn_cache()` purges stale SSNs.
+  When Halo's Gate fails (all adjacent stubs hooked), the callback triggers a full
+  unhook automatically.
+- **Post-sleep wake hook re-check** — Sleep obfuscation step 12 calls
+  `ntdll_unhook::maybe_unhook()` to detect hooks EDR placed while the agent was
+  dormant.
+- **On-demand `UnhookNtdll` command** — Operator-initiated unhook with
+  `UnhookResult { method, bytes_overwritten, hooks_detected, stubs_re_resolved, error }`.
+
+#### .NET Assembly Loader (`agent/assembly_loader.rs`)
+- **In-process .NET Framework 4.x assembly execution** via CLR hosting (`mscoree.dll`
+  → `CLRCreateInstance` → `ICLRRuntimeHost::ExecuteInDefaultAppDomain`).
+- **Lazy CLR initialization** — First call loads CLR; stays loaded for subsequent calls.
+- **Fresh AppDomain per execution** — Isolated execution, auto-unloaded on completion.
+- **AMSI bypass applied pre-execution** — HWBP or memory-patch bypass active during
+  assembly load.
+- **5-minute idle auto-teardown** — CLR resources released after 5 minutes idle.
+- **Configurable timeout** — Default 60 seconds, max 4 MiB output.
+
+#### BOF / COFF Loader (`agent/coff_loader.rs`)
+- **Beacon Object File execution** compatible with the public Cobalt Strike BOF ecosystem.
+- **Beacon-compatible API** — 18 exports: `BeaconPrintf`, `BeaconOutput`, `BeaconDataParse`,
+  `BeaconDataInt`, `BeaconDataShort`, `BeaconDataLength`, `BeaconDataExtract`,
+  `BeaconFormatAlloc`, `BeaconFormatPrintf`, `BeaconFormatToString`, `BeaconFormatFree`,
+  `BeaconFormatInt`, `BeaconUseToken`, `BeaconRevertToken`, `BeaconIsAdmin`, `toNative`.
+- **COFF relocation support** — `IMAGE_REL_AMD64_ADDR64`, `ADDR32NB`, `REL32`.
+- **Max BOF 1 MiB**, max output 1 MiB, synchronous execution.
+
+#### Browser Data Extraction (`agent/browser_data.rs`)
+- **Chrome credential and cookie extraction** — Handles App-Bound Encryption (v127+)
+  with three bypass strategies: Local COM (`IElevator`), SYSTEM token + DPAPI,
+  Named-pipe IPC.
+- **Edge credential and cookie extraction** — Same Chromium engine as Chrome.
+- **Firefox credential and cookie extraction** — NSS runtime DLL loading, `logins.json`
+  + `key4.db` parsing.
+- **Custom minimal SQLite parser** — No external dependency for reading Login Data
+  and Cookies databases.
+- **Gated by `browser-data` feature flag** — `#[cfg(all(windows, feature = "browser-data"))]`.
+
+#### Interactive Shell Sessions (`agent/interactive_shell.rs`)
+- **Full interactive PTY/shell sessions** — `cmd.exe` (Windows), `/bin/sh` or custom
+  (Linux/macOS).
+- **Background reader threads** — Non-blocking stdout/stderr capture.
+- **Async output delivery** — `Message::ShellOutput` with session_id, stream type, data.
+- **Sleep obfuscation integration** — `pause_all_readers()` / `resume_all_readers()`
+  to prevent data corruption during sleep encryption.
+- **Session management** — `CreateShell`, `ShellInput`, `ShellClose`, `ShellList`,
+  `ShellResize`.
+
+#### LSASS Credential Harvesting (`agent/lsass_harvest.rs`)
+- **Incremental LSASS memory reading** via indirect syscalls (`NtReadVirtualMemory`).
+- **No MiniDumpWriteDump** — All credential parsing in-process, no disk writes.
+- **Build-specific offset tables** — Windows builds 19041 through 26100 (Win10 2004
+  through Win11 24H2).
+- **Credential type extraction** — MSV1.0 (NT hashes), WDigest (plaintext), Kerberos
+  (TGT/TGS), DPAPI master keys, DCC2 (domain cached credentials).
+
+#### Surveillance Module (`agent/surveillance.rs`)
+- **Screenshot capture** — Multi-monitor via Win32 API, PNG output.
+- **Keylogger** — `SetWindowsHookExW(WH_KEYBOARD_LL)` with encrypted ring buffer.
+- **Clipboard monitoring** — `OpenClipboard` + `GetClipboardData` with encrypted ring buffer.
+- **Encrypted storage** — ChaCha20-Poly1305 ring buffers for all captured data.
+- **Gated by `surveillance` feature flag** — `#[cfg(feature = "surveillance")]`,
+  requires `dep:image`.
+
+#### Injection Engine Expansion (`agent/injection_engine.rs`)
+- **ThreadPool injection** — 8 sub-variants: `TpAllocWork`, `TpPostWork`,
+  `CreateTimerQueueTimer`, `RegisterWaitForSingleObject`, and more.
+- **Fiber injection** — `CreateFiber` → `SwitchToFiber`.
+- **Context-only injection** — `SetThreadContext` RIP rewrite without shellcode.
+- **Section mapping injection** — `NtCreateSection` + `NtMapViewOfSection` dual-mapping.
+- **Callback injection** — 12 Windows API callbacks (EnumChildWindows,
+  CreateTimerQueueTimer, EnumSystemLocales, etc.).
+- **`InjectionHandle`** with `enroll_sleep()` and `eject()` methods.
+
+#### New Feature Flags
+- **`surveillance`** — Screenshot, keylogger, clipboard monitoring (Windows, `dep:image`).
+- **`browser-data`** — Browser credential/cookie extraction (Windows only).
+- **`hwbp-amsi`** — Hardware breakpoint AMSI bypass (Windows only).
+
 #### `common` crate
 - **HMAC-SHA256 audit log signing** — `AuditLog::record()` now computes an
   HMAC-SHA256 tag over each JSON line and writes it as a paired line in the
