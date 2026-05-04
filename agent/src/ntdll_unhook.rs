@@ -346,15 +346,11 @@ unsafe fn find_text_section_from_file(
 /// patched by EDR to redirect to hooks. After unhooking, we re-read the
 /// syscall numbers from the now-clean stubs.
 fn invalidate_syscall_cache() {
-    // The nt_syscall crate doesn't expose a public cache invalidation API.
-    // We call `init_syscall_infrastructure()` which will re-map a clean ntdll
-    // from disk. This effectively invalidates the cache because:
-    //   1. The CLEAN_NTDLL static gets updated via the clean-mapped path
-    //   2. The SYSCALL_CACHE HashMap entries will be stale but get overwritten
-    //      on next resolution since we clear them.
-    //
-    // However, the clean ntdll we just got from KnownDlls IS the clean copy.
-    // The simplest approach: iterate each critical syscall and force re-resolve.
+    // Use the new nt_syscall API to clear the SSN cache and mark the
+    // clean ntdll mapping as stale, forcing a re-map on next access.
+    nt_syscall::invalidate_syscall_cache();
+
+    // Force re-resolve all critical syscalls so the cache is warm.
     log::debug!("[ntdll_unhook] invalidating syscall cache — re-resolving all stubs");
 
     for func_name in CRITICAL_SYSCALLS {
@@ -1013,8 +1009,9 @@ pub fn halo_gate_fallback() -> bool {
                     "[ntdll_unhook] Halo's Gate fallback unhook succeeded via {}",
                     result.method,
                 );
-                // Invalidate the nt_syscall SSN cache so the retry reads clean stubs.
-                nt_syscall::invalidate_ssn_cache();
+                // Invalidate the nt_syscall SSN cache and reset the clean ntdll
+                // mapping so the retry reads fresh stubs from the unhooked ntdll.
+                nt_syscall::invalidate_syscall_cache();
                 true
             } else {
                 log::error!(

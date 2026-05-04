@@ -53,9 +53,17 @@ Sleep obfuscation encrypts the agent's memory while it sleeps between C2 beacons
               └───────────────┼───────────────┘
                               │
                     ┌─────────▼─────────┐
-                    │  NtDelayExecution │
-                    │  (sleep for       │
-                    │   duration)       │
+                    │  Sleep Variant    │
+                    │  ┌───────────────┐│
+                    │  │ Cronus:       ││
+                    │  │ NtSetTimer +  ││
+                    │  │ NtWaitFor     ││
+                    │  │ SingleObject  ││
+                    │  ├───────────────┤│
+                    │  │ Ekko:         ││
+                    │  │ NtDelay       ││
+                    │  │ Execution     ││
+                    │  └───────────────┘│
                     └─────────┬─────────┘
                               │ Wake
                     ┌─────────▼─────────┐

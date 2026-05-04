@@ -15,14 +15,15 @@ When the agent binary starts, modules initialize in a specific sequence to ensur
 2. env_check.rs       — Sandbox/debugger/VM detection
 3. env_check_sandbox.rs — Extended sandbox scoring
 4. nt_syscall         — Map clean ntdll, resolve SSNs (Windows)
-5. evasion.rs         — AMSI bypass, ETW patching
-6. amsi_defense.rs    — HWBP AMSI or memory-patch AMSI
-7. etw_patch.rs       — ETW function hooking
-8. c2_*.rs            — Transport initialization
-9. sleep_obfuscation  — Memory region tracking
-10. memory_guard.rs   — Heap encryption registration
-11. injection_engine  — Pre-injection recon cache
-12. handlers.rs       — Command dispatch table
+5. evanesco           — Continuous page tracker init (BEFORE evasion)
+6. evasion.rs         — AMSI bypass, ETW patching
+7. amsi_defense.rs    — Write-Raid / HWBP / memory-patch AMSI bypass
+8. etw_patch.rs       — ETW function hooking
+9. c2_*.rs            — Transport initialization
+10. sleep_obfuscation  — Memory region tracking
+11. memory_guard.rs   — Heap encryption registration
+12. injection_engine  — Pre-injection recon cache
+13. handlers.rs       — Command dispatch table
 ```
 
 Each step runs to completion before the next begins. If any security check fails (sandbox detected, debugger present, domain mismatch), the agent exits silently.
@@ -120,7 +121,8 @@ On Windows, the agent avoids calling ntdll exports directly. Instead, it:
 2. **Resolves syscall stubs** by walking the clean ntdll's export table
 3. **Extracts the SSN** (System Service Number) from each stub's `mov eax, IMM32` instruction
 4. **Finds a syscall gadget** (`syscall; ret` or `jmp r11`) in the clean ntdll
-5. **Caches results** in a static `DashMap<String, SyscallTarget>`
+5. **Caches results** in a static `HashMap<String, (u32, usize, u32)>` — SSN, gadget address, and PE timestamp
+6. **Validates cached SSNs** periodically via cross-reference and probe methods
 
 ```rust
 pub struct SyscallTarget {
@@ -128,6 +130,36 @@ pub struct SyscallTarget {
     pub gadget_addr: usize, // Address of syscall;ret gadget
 }
 ```
+
+### Dynamic SSN Validation
+
+Cached SSNs are validated through two complementary methods:
+
+**Cross-reference method**: The PE `TimeDateStamp` of the loaded ntdll is compared
+with the timestamp captured when each cache entry was created. If they differ
+(e.g., after a Windows Update replaced ntdll), the entire cache is invalidated.
+
+**Probe method**: For 4 critical syscalls, a test call with a NULL handle is made:
+- `STATUS_INVALID_HANDLE` → SSN is correct
+- `STATUS_INVALID_SYSTEM_SERVICE` → SSN is stale (wrong number)
+
+**Build-aware caching**: The Windows build number is cached from `KUSER_SHARED_DATA`
+(`0x7FFE0000 + 0x0260`). Build number changes also trigger cache invalidation.
+
+**Versioned SSN ranges**: A hardcoded table covers 20 critical syscalls across
+Windows 10 1903–22H2 and Windows 11 21H2–24H2. Resolved SSNs are checked against
+the expected range for the current build.
+
+### SSDT Nuclear Fallback
+
+When both clean-mapping and Halo's Gate fail (all adjacent stubs hooked), the
+agent can resolve SSNs from the kernel's `KeServiceDescriptorTable`:
+
+1. `NtQuerySystemInformation(SystemModuleInformation)` → kernel base address
+2. Build-number-based SSN range table → midpoint guess for the target syscall
+3. Probe to confirm the guessed SSN
+
+This requires `SeDebugPrivilege` and is intentionally conservative.
 
 ### Halo's Gate Fallback
 
@@ -150,7 +182,7 @@ When Halo's Gate fails — i.e., **all** adjacent syscall stubs are hooked — t
        │
 ┌──────▼──────────────┐     ┌────────────────────┐
 │ SSN Cache hit?      │──No►│ Resolve from clean  │
-│                     │     │ ntdll mapping        │
+│ (+timestamp check)  │     │ ntdll mapping        │
 └──────┬──────────────┘     └──────┬──────────────┘
        │ Yes                       │ Hooked?
        │                    ┌──────▼──────────────┐
@@ -165,7 +197,7 @@ When Halo's Gate fails — i.e., **all** adjacent syscall stubs are hooked — t
        │                    └──────┬──────────────┘
        │                           │ Success?
        │                    ┌──────▼──────────────┐
-       │                    │ Invalidate cache +   │
+       │                    │ invalidate_cache() + │
        │                    │ Re-resolve SSN       │
        │                    └──────┬──────────────┘
        └───────────────────────────┘
@@ -210,10 +242,34 @@ If `\KnownDlls` is blocked by EDR, the agent reads `C:\Windows\System32\ntdll.dl
 
 For maximum evasion, the agent uses indirect syscalls that dispatch through `NtContinue`:
 
-1. Set up a fake call stack on the heap
+1. Build a multi-frame fake call chain from the `stack_db` module
 2. Push `NtContinue` context with the target syscall's SSN in RAX
 3. `NtContinue` transfers execution to the syscall gadget
-4. The kernel-mode call stack appears to originate from `ntdll.dll`, not the agent
+4. The kernel-mode call stack appears to originate from a plausible chain of Win32 API calls (e.g. `kernelbase!CreateProcessW` → `kernel32!CreateProcessA` → `ntdll!NtCreateUserProcess`)
+
+#### Unwind-Aware Call Stack Spoofing (`stack_db`)
+
+The `stack_db` module (gated behind `stack-spoof` + x86_64) builds and maintains a database of valid return addresses from loaded-module export tables. It counters Elastic Security's call-stack consistency checks by:
+
+- **Address database**: Scans export tables of common DLLs (ntdll, kernel32, kernelbase, user32, msvcrt, ucrtbase) and collects function entry points per module
+- **Ret gadget scanning**: For each exported function, scans the first 128 bytes for a `ret` (0xC3) instruction that has valid `RUNTIME_FUNCTION` unwind metadata (verified via `RtlLookupFunctionEntry`)
+- **Chain templates**: 10 pre-built plausible call graph templates that terminate at NT syscalls (CreateProcessW, VirtualAlloc, WriteFile, ReadFile, CreateFile, OpenProcess, WaitForSingleObject, DeviceIoControl, OpenThread, MapViewOfFile paths)
+- **Dynamic selection**: Each `do_syscall` invocation randomly selects a resolved chain from the cache, preventing EDR fingerprinting of consistent call stacks
+- **Post-sleep revalidation**: After sleep obfuscation decrypts memory, cached chain addresses are spot-checked and rebuilt if any are stale (modules can be rebased by EDR during sleep)
+
+**Multi-frame chain layout** (NtContinue path):
+```
+  RSP →  [chain_frame_0]      ← ret gadget in ntdll function (popped by gadget ret)
+         [chain_frame_1]      ← ret gadget in kernel32 function
+         [chain_frame_2]      ← ret gadget in kernelbase function
+         [continuation]       ← real return to do_syscall
+         [shadow home 1..3]   ← zeroed (not read by kernel for syscalls)
+         [arg 5, arg 6, ...]  ← stack-passed arguments
+```
+
+**Shadow-stack/CET compatibility**: Spoofed frames are placed between the NtContinue return and the target syscall gadget — they never cross the `syscall; ret` boundary, so CET shadow-stack verification is not affected.
+
+**Fallback**: When no multi-frame chain resolves, falls back to a single-frame `NtQuerySystemTime` spoof (legacy behavior). When NtContinue's SSN is unavailable, uses a jmp-based single-frame path.
 
 ### SSN Resolution Functions
 
@@ -228,10 +284,13 @@ The agent resolves these NT functions at runtime:
 | `NtCreateThreadEx` | Remote thread creation |
 | `NtOpenProcess` | Process handle acquisition |
 | `NtClose` | Handle closure |
-| `NtDelayExecution` | Sleep (used by sleep obfuscation) |
-| `NtContinue` | Thread context restoration (stack spoofing) |
+| `NtDelayExecution` | Sleep (used by Ekko sleep variant) |
+| `NtContinue` | Thread context restoration (unwind-aware multi-frame stack spoofing) |
 | `NtFreeVirtualMemory` | Memory deallocation |
 | `NtQueryVirtualMemory` | Memory region enumeration |
+| `NtCreateTimer` | Waitable timer creation (Cronus sleep variant) |
+| `NtSetTimer` | Timer configuration (Cronus sleep variant) |
+| `NtWaitForSingleObject` | Timer wait (Cronus sleep variant) |
 
 ### Unhook Callback Registration
 
@@ -295,13 +354,177 @@ On Windows x86_64, the sleep encryption key is stashed in XMM14/XMM15 registers:
 
 These registers are not routinely inspected by EDR memory scanners and survive `NtDelayExecution` calls. The key never exists in process memory as plaintext during the sleep period.
 
+### Sleep Variants
+
+The agent supports two sleep mechanisms, selectable via configuration or runtime command:
+
+#### Ekko (NtDelayExecution)
+
+The classic approach: calls `NtDelayExecution` with a negative relative timeout.
+Well-tested but heavily monitored by EDR hooks on `ntdll!NtDelayExecution`.
+
+#### Cronus (Waitable Timer) — Default
+
+Uses an unnamed waitable timer created via `NtCreateTimer` and configured with
+`NtSetTimer`.  The agent waits on the timer handle with `NtWaitForSingleObject`
+(alertable wait).  This approach is less commonly hooked by EDR because
+waitable timers are a legitimate synchronization mechanism used by many
+applications.
+
+**Auto-select**: When Cronus is configured, the agent verifies that `NtSetTimer`
+resolves successfully.  If the syscall cannot be located, it automatically falls
+back to Ekko with a log warning.
+
+**RC4 encryption stub**: Cronus includes a position-independent RC4 encryption
+stub (generated at runtime) that can be used for remote process sleep encryption.
+The stub is allocated as a single RWX page with the pre-initialized S-box and
+key embedded at fixed offsets, using RIP-relative addressing.
+
+**Configuration**:
+```toml
+[sleep]
+method = "cronus"   # or "ekko"
+```
+
+**Runtime switching**:
+```
+SetSleepVariant { variant: "cronus" }   # or "ekko"
+```
+
+---
+
+## Evanesco — Continuous Memory Hiding
+
+Evanesco is an additional memory-protection layer that keeps all enrolled pages
+encrypted and `PAGE_NOACCESS` at all times — not just during sleep.  It sits
+alongside (and integrates with) the existing sleep-obfuscation subsystem but
+operates independently on a per-page basis.
+
+### Architecture Overview
+
+```
+  ┌──────────────────────────────────────────────────────────────┐
+  │                     PageTrackerInner                         │
+  │  ┌────────────────────────────────────────────────────────┐  │
+  │  │ pages: RwLock<HashMap<usize, PageInfo>>                │  │
+  │  │   key = page-aligned base address                      │  │
+  │  │   value = { base, size, state, rc4_key,               │  │
+  │  │            last_access, orig_protect, label }          │  │
+  │  └────────────────────────────────────────────────────────┘  │
+  │  idle_threshold_ms  scan_interval_ms  shutdown flag          │
+  │  encrypt_count      decrypt_count                           │
+  └──────────┬──────────────────────┬───────────────────────────┘
+             │                      │
+    ┌────────▼────────┐   ┌────────▼────────┐
+    │ Background      │   │ VEH Handler     │
+    │ Re-encrypt      │   │ (auto-decrypt)  │
+    │ Thread          │   │                 │
+    └─────────────────┘   └─────────────────┘
+```
+
+### Page States
+
+| State           | Protection        | Description                                    |
+|-----------------|-------------------|------------------------------------------------|
+| `Encrypted`     | `PAGE_NOACCESS`   | XOR'd with per-page RC4 key; unreadable        |
+| `DecryptedRW`   | `PAGE_READWRITE`  | Decrypted, accessible for reading/writing      |
+| `DecodedRX`     | `PAGE_EXECUTE_READ` | Decrypted, executable for code execution     |
+
+### Key Flows
+
+**JIT Decryption** (`acquire_pages` → `PageGuard`):
+1. Caller requests page range with `AccessType::ReadWrite` or `Execute`.
+2. `PageTrackerInner` RC4-decrypts the page in place.
+3. `NtProtectVirtualMemory` sets `PAGE_READWRITE` or `PAGE_EXECUTE_READ`.
+4. `PageGuard` is returned — holds references, updates `last_access`.
+5. On `Drop`, `PageGuard` re-encrypts and restores `PAGE_NOACCESS`.
+
+**VEH Auto-decryption** (transparent):
+1. Code executes on a tracked page that is `PAGE_NOACCESS`.
+2. CPU raises `STATUS_ACCESS_VIOLATION` (0xC0000005).
+3. VEH handler aligns fault address to page boundary.
+4. Looks up the page in the tracker.  If found, decrypts with `Execute` access.
+5. Returns `EXCEPTION_CONTINUE_EXECUTION` — the faulting instruction retries.
+
+**Background Re-encryption**:
+1. Thread wakes every `scan_interval_ms` (default 50 ms).
+2. Iterates all tracked pages; collects those with `last_access` older than
+   `idle_threshold_ms` (default 100 ms).
+3. Re-encrypts each idle page and restores `PAGE_NOACCESS`.
+
+### Integration Points
+
+| Component            | Integration                                           |
+|----------------------|-------------------------------------------------------|
+| `sleep_obfuscation`  | `encrypt_all()` on sleep, `decrypt_minimum()` on wake |
+| `injection_engine`   | `enroll()` to register payload pages                  |
+| `memory_guard`       | Additional layer; MemoryGuard heap + Evanesco pages   |
+| `handlers.rs`        | `EvanescoStatus`, `EvanescoSetThreshold` commands     |
+
+### Configuration
+
+```toml
+[evanesco]
+idle-threshold-ms = 100   # re-encrypt after 100 ms idle
+scan-interval-ms = 50     # background thread check interval
+```
+
+### Cryptography
+
+| Operation           | Algorithm              | Rationale                                   |
+|---------------------|------------------------|---------------------------------------------|
+| Per-page encrypt    | RC4 (per-page key)     | Fast, low overhead for frequent ops         |
+| Full sleep sweep    | XChaCha20-Poly1305     | Stronger AEAD for the longer sleep window   |
+
+### Feature Flag
+
+```toml
+# agent/Cargo.toml
+[features]
+evanesco = []
+```
+
+All code lives in `agent/src/page_tracker.rs` and is gated behind
+`#[cfg(all(windows, feature = "evanesco"))]`.
+
 ---
 
 ## Evasion Subsystem
 
 ### AMSI Bypass
 
-The agent implements two AMSI bypass strategies, selectable at build time:
+The agent implements three AMSI bypass strategies, selectable at build time
+and switchable at runtime via the `AmsiBypassMode` command:
+
+#### Write-Raid AMSI (`amsi_defense.rs` — `write-raid-amsi` feature) — *Preferred*
+
+A data-only race condition that avoids all code patching, hardware breakpoints,
+and `VirtualProtect` calls:
+
+1. Resolve `amsi.dll` base via PEB walking (`pe_resolve`)
+2. Locate the `AmsiInitialize` export and scan its prologue for
+   `mov dword ptr [rip+disp], 1` — the instruction that sets
+   `AmsiInitFailed` during initialization failure
+3. Extract the RIP-relative target address (the `AmsiInitFailed` flag in
+   `.data`)
+4. Spawn a dedicated race thread via `NtCreateThreadEx` (indirect syscall)
+5. The race thread continuously writes `1` to the `AmsiInitFailed` flag using
+   `NtWriteVirtualMemory` on `NtCurrentProcess()`, causing all subsequent
+   `AmsiScanBuffer` calls to short-circuit and return `AMSI_RESULT_CLEAN`
+6. Between iterations, the thread yields via `NtDelayExecution(0)` or
+   `SwitchToThread()`
+
+**OPSEC advantages:**
+
+- Zero `.text` modifications — code integrity checks pass
+- Zero `NtProtectVirtualMemory` calls — no page-protection changes
+- Zero hardware breakpoint registers — DR0–DR7 remain clean
+- The `.data` write blends with normal AMSI internal state updates
+- Thread is registered with sleep obfuscation (pauses during memory encryption)
+
+The bypass can be enabled/disabled at runtime and is compatible with the
+sleep obfuscation subsystem (the race thread pauses during memory encryption
+cycles to avoid corrupting ciphertext).
 
 #### HWBP AMSI (`amsi_defense.rs` — HWBP mode)
 
@@ -810,7 +1033,7 @@ In-process .NET assembly execution via CLR hosting, compatible with any .NET Fra
 | Arguments | Passed as space-delimited string |
 | Timeout | Configurable; default 60 seconds |
 | AppDomain | Fresh `AppDomain` per execution; unloaded on completion |
-| AMSI bypass | Applied before assembly load via HWBP or memory patch |
+| AMSI bypass | Applied before assembly load via write-raid (preferred), HWBP, or memory patch |
 | CLR version | .NET Framework 4.x (mscoree.dll CLRCreateInstance) |
 | Auto-teardown | CLR resources released after 5 minutes idle |
 | Max output | 4 MiB per execution |
@@ -869,19 +1092,44 @@ Extracts credentials and cookies from Chrome, Edge, and Firefox. Gated behind `#
 
 | Browser | Credentials | Cookies | Notes |
 |---------|:-----------:|:-------:|-------|
-| Chrome | ✅ | ✅ | App-Bound Encryption v127+ with 3 bypass strategies |
+| Chrome | ✅ | ✅ | App-Bound Encryption v127+ with 4 bypass strategies (C4 padding oracle first) |
 | Edge | ✅ | ✅ | Same Chromium engine as Chrome |
 | Firefox | ✅ | ✅ | NSS library (logins.json + key4.db) |
 
 ### Chrome App-Bound Encryption (v127+)
 
-Chrome 127+ uses App-Bound Encryption which ties decryption to an elevated service (`elevation_service.exe`). Three bypass strategies:
+Chrome 127+ uses App-Bound Encryption which ties decryption to an elevated service (`elevation_service.exe`). Four bypass strategies, attempted in order:
 
-| Strategy | Method | Requirements |
-|----------|--------|--------------|
-| **Local COM** | Activate `IElevator` COM object in-process | Agent running elevated |
-| **SYSTEM token + DPAPI** | Impersonate SYSTEM token, call `CryptUnprotectData` | Agent running as SYSTEM or with `SeDebugPrivilege` |
-| **Named-pipe IPC** | Communicate with `elevation_service.exe` via named pipe | Elevation service must be running |
+| Priority | Strategy | Method | Requirements |
+|----------|----------|--------|--------------|
+| **1st** | **C4 Bomb** (padding oracle) | CBC padding oracle against `CryptUnprotectData` — no elevation needed | `browser_c4_timeout_secs > 0` (default 60 s) |
+| **2nd** | **Local COM** | Activate `IElevator` COM object in-process | Agent running elevated |
+| **3rd** | **SYSTEM token + DPAPI** | Impersonate SYSTEM token, call `CryptUnprotectData` | Agent running as SYSTEM or with `SeDebugPrivilege` |
+| **4th** | **Named-pipe IPC** | Communicate with `elevation_service.exe` via named pipe | Elevation service must be running |
+
+### C4 Bomb — DPAPI Padding Oracle
+
+```
+┌───────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│ Parse DPAPI   │────►│ CBC Padding      │────►│ Extract AES-256  │
+│ blob headers  │     │ Oracle Attack    │     │ key (last 32B)   │
+│ (offset/len)  │     │ (CryptUnprotect  │     │                  │
+└───────────────┘     │  Data as oracle) │     └──────────────────┘
+                      └───────┬──────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              │               │               │
+      ┌───────▼──────┐ ┌─────▼──────┐ ┌──────▼──────┐
+      │ Random delay │ │ Shuffled   │ │ Cancel-safe │
+      │ 1-10 ms      │ │ candidates │ │ AtomicBool  │
+      │ (LCG-based)  │ │ (LCG-based)│ │ + timeout   │
+      └──────────────┘ └────────────┘ └─────────────┘
+```
+
+- **Oracle**: `CryptUnprotectData` returns success (valid PKCS#7 padding) or failure (`ERROR_BAD_DATA`). Each call reveals one byte of plaintext.
+- **OPSEC**: Random inter-oracle delays (1–10 ms) and shuffled candidate bytes via LCG PRNG — avoids deterministic timing patterns.
+- **Cancellation**: `C4_LOCK` serializes attacks; new requests cancel in-progress attacks. Configurable timeout via `browser_c4_timeout_secs`.
+- **Dynamic resolution**: `CryptUnprotectData` resolved at runtime via `pe_resolve` hash-based API lookup (no import table entries for `crypt32.dll`).
 
 ### Credential Extraction Pipeline
 
@@ -955,6 +1203,570 @@ Incremental LSASS memory reading via indirect syscalls — **no MiniDumpWriteDum
 - **No MiniDumpWriteDump**: Avoids the most common LSASS access indicator
 - **Indirect syscalls**: LSASS handle opened via syscall gadget, not `OpenProcess`
 - **Incremental**: Reads only memory regions containing credential structures
+
+---
+
+## LSA Whisperer — SSP Interface Credential Extraction (`lsa_whisperer.rs`)
+
+Credential extraction via LSA SSP interfaces — **no LSASS memory reads at all**:
+
+### Why It Bypasses Credential Guard & RunAsPPL
+
+| Protection | What It Blocks | Why LSA Whisperer Bypasses |
+|:-----------|:--------------|:--------------------------|
+| Credential Guard | LSASS *process memory* reads via VBS/isolated LSA | LSA Whisperer uses the **SSP interface**, not memory reads |
+| RunAsPPL | Process-level access to LSASS (`NtOpenProcess`) | No `NtReadVirtualMemory` on LSASS; responses are authorized outputs |
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    LSA Whisperer                              │
+│                                                              │
+│  Method 1: Untrusted          Method 2: SSP Inject           │
+│  ┌──────────────────┐         ┌──────────────────┐           │
+│  │LsaConnectUntrusted│         │LsaRegisterLogon  │           │
+│  │(no admin needed) │         │Process (admin)   │           │
+│  └────────┬─────────┘         └────────┬─────────┘           │
+│           │                            │                     │
+│  ┌────────▼────────────────────────────▼─────────┐           │
+│  │    LsaCallAuthenticationPackage                │           │
+│  │    (resolved from secur32.dll via pe_resolve)  │           │
+│  └────────┬──────────────────────────────────────┘           │
+│           │                                                   │
+│  ┌────────▼──────────────────────────────────────┐           │
+│  │  Authentication Package Queries               │           │
+│  │                                                │           │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐      │           │
+│  │  │ MSV1_0   │ │ Kerberos │ │ WDigest  │      │           │
+│  │  │ EnumUsers│ │ TktCache │ │ SubAuth  │      │           │
+│  │  │ SubAuth  │ │ Retrieve │ │ Query    │      │           │
+│  │  └────┬─────┘ └────┬─────┘ └────┬─────┘      │           │
+│  └───────┼─────────────┼────────────┼────────────┘           │
+│          │             │            │                         │
+│  ┌───────▼─────────────▼────────────▼────────────┐           │
+│  │  Response Parsers                              │           │
+│  │  • parse_msv_enum_response()                   │           │
+│  │  • parse_msv_subauth_response()                │           │
+│  │  • parse_kerb_tkt_cache()                      │           │
+│  │  • parse_wdigest_response()                    │           │
+│  │  • extract_unicode_credentials()               │           │
+│  └────────┬──────────────────────────────────────┘           │
+│           │                                                   │
+│  ┌────────▼──────────────────────────────────────┐           │
+│  │  WhisperedCredential → JSON (same format as   │           │
+│  │  lsass_harvest::HarvestedCredential)          │           │
+│  └────────────────────────────────────────────────┘           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Dynamic API Resolution
+
+All LSA functions resolved at runtime via `pe_resolve` (no import table entries):
+
+| API Function | DLL | Hash Constant |
+|:------------|:----|:-------------|
+| `LsaConnectUntrusted` | `secur32.dll` | `HASH_LSACONNECTUNTRUSTED` |
+| `LsaCallAuthenticationPackage` | `secur32.dll` | `HASH_LSACALLAUTHENTICATIONPACKAGE` |
+| `LsaLookupAuthenticationPackage` | `secur32.dll` | `HASH_LSALOOKUPAUTHENTICATIONPACKAGE` |
+| `LsaRegisterLogonProcess` | `secur32.dll` | `HASH_LSAREGISTERLOGONPROCESS` |
+| `LsaDeregisterLogonProcess` | `secur32.dll` | `HASH_LSADEREGISTERLOGONPROCESS` |
+| `LsaFreeReturnBuffer` | `secur32.dll` | `HASH_LSAFREERETURNBUFFER` |
+
+### Commands
+
+| Command | Description |
+|:--------|:-----------|
+| `HarvestLSA { method: LsaMethod }` | Harvest credentials using specified method (`Untrusted`, `SspInject`, `Auto`) |
+| `LSAWhispererStatus` | Return current status (method, credential count, SSP state) |
+| `LSAWhispererStop` | Cancel in-progress operation, securely zero credential buffer |
+
+### OPSEC Properties
+
+- **No LSASS memory reads** — entirely API-based
+- **No import table entries** — all functions resolved via `pe_resolve` hash lookup
+- **All strings encrypted** — via `string_crypt::enc_str!`
+- **Anti-forensic cleanup** — `whisperer_stop()` uses `write_volatile` + compiler fence
+- **Untrusted method requires zero elevation**
+
+### Configuration
+
+```toml
+[lsa-whisperer]
+timeout-secs = 30        # Max harvest duration
+buffer-size = 1024       # Credential ring buffer capacity
+auto-inject = true       # Auto-attempt SSP injection if elevated
+```
+
+---
+
+## Kernel Callback Overwrite — BYOVD (`kernel_callback.rs`)
+
+Gated by `#[cfg(all(windows, feature = "kernel-callback"))]`.  Requires and
+implies `direct-syscalls`.
+
+### Purpose
+
+Surgically overwrites EDR kernel callback function pointers to point to a `ret`
+instruction instead of NULLing them.  This defeats EDR self-integrity checks
+(CrowdStrike, Microsoft Defender for Endpoint) that verify their callbacks are
+still registered by checking if the pointer is non-NULL.  A `ret` pointer
+passes these checks (non-NULL, valid executable memory) but causes the callback
+to immediately return without executing any monitoring logic.
+
+### Why "ret, not NULL"?
+
+| Strategy | Pointer Value | EDR Integrity Check | Result |
+|----------|--------------|---------------------|--------|
+| NULL overwrite | `0x0000000000000000` | `if (ptr == NULL) alert()` | **Detected** — EDR re-registers |
+| **Ret overwrite** | `0xFFFFF80012345678` (ret gadget) | `if (ptr == NULL) alert()` | **Bypassed** — non-NULL, valid |
+| Ret overwrite | (same) | Callback invoked | Returns immediately (`ret`) |
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│             kernel_callback.rs (public API)       │
+│  scan() · nuke() · restore() · status()          │
+├─────────────────────────────────────────────────┤
+│                                                   │
+│  ┌──────────────┐  ┌──────────────┐              │
+│  │  driver_db   │  │   deploy     │              │
+│  │              │  │              │              │
+│  │ 8 drivers    │  │ scan+load    │              │
+│  │ top 3 embed  │  │ IOCTL r/w    │              │
+│  └──────────────┘  │ cleanup      │              │
+│                    └──────────────┘              │
+│                                                   │
+│  ┌──────────────┐  ┌──────────────┐              │
+│  │  discover    │  │  overwrite   │              │
+│  │              │  │              │              │
+│  │ PE exports   │  │ find ret     │              │
+│  │ callback walk│  │ overwrite    │              │
+│  │ module ID    │  │ backup       │              │
+│  └──────────────┘  │ unlink driver│              │
+│                    └──────────────┘              │
+│                                                   │
+│  ┌──────────────────────────────────────┐        │
+│  │     nt_syscall::syscall! (all NT)    │        │
+│  │     string_crypt (all strings)       │        │
+│  └──────────────────────────────────────┘        │
+└─────────────────────────────────────────────────┘
+```
+
+### Vulnerable Driver Database
+
+| # | Driver | Vendor | Memory Access | Status |
+|---|--------|--------|--------------|--------|
+| 0 | DBUtil_2_3.sys | Dell | PhysicalMemory | **Embedded** |
+| 1 | rtcore64.sys | MSI Afterburner | PhysicalMemory | **Embedded** |
+| 2 | gdrv.sys | Gigabyte | PhysicalMemory | **Embedded** |
+| 3 | AsIO.sys | ASUS | PortIo | Scan only |
+| 4 | AsIO2.sys | ASUS | PortIo | Scan only |
+| 5 | BdKit.sys | Baidu | PhysicalMemory | Scan only |
+| 6 | ene.sys | ENE Technology | PhysicalMemory | Scan only |
+| 7 | procexp152.sys | Process Explorer | PhysicalMemory | Scan only |
+
+Top 3 drivers are XOR-obfuscated and embedded in the agent binary.  Decryption
+key is derived from the HKDF session key with info `"orchestra-driver-key"`.
+
+### Callback Types
+
+| Kernel Symbol | Type | Walk Method | Safe to Overwrite |
+|---------------|------|-------------|-------------------|
+| `PspCreateProcessNotifyRoutine` | Process | Array (64 entries) | ✅ Yes |
+| `PspCreateThreadNotifyRoutine` | Thread | Array (64 entries) | ✅ Yes |
+| `PspLoadImageNotifyRoutine` | Image | Array (64 entries) | ✅ Yes |
+| `CallbackListHead` | Object Manager | Linked list | ✅ Yes |
+| `KeBugCheckCallbackListHead` | BugCheck | Linked list | ❌ **NEVER** |
+
+### Safety Mechanisms
+
+1. **BugCheck exclusion** — `KeBugCheckCallbackListHead` entries are never
+   overwritten.  Overwriting these causes BSOD.
+2. **Read-before-write** — Original pointer value is read and saved before
+   overwrite.  If the read fails, the entry is skipped.
+3. **Write verification** — If physical memory write fails, the entry is
+   skipped (no garbage writes).
+4. **Backup/restore** — All original pointers are saved in a process-local
+   backup vector.  `KernelCallbackRestore` writes them back.
+5. **Driver unlink** — After overwrite, the vulnerable driver is unlinked from
+   `PsLoadedModuleList` (Flink/Blink manipulation) for anti-forensic cleanup.
+6. **No driver unload** — The driver is not unloaded (that would zero its
+   device object).  It stays loaded but unlinked.
+
+### Runtime Commands
+
+| Command | Description |
+|---------|-------------|
+| `KernelCallbackScan` | Discover and report all registered EDR callbacks |
+| `KernelCallbackNuke { drivers }` | Deploy driver, overwrite callbacks with ret, save backups |
+| `KernelCallbackRestore` | Restore original callback pointers from backup |
+
+### Feature Flag
+
+```toml
+[features]
+kernel-callback = ["direct-syscalls"]
+```
+
+All code is cfg-gated behind `#[cfg(all(windows, feature = "kernel-callback"))]`.
+
+---
+
+## Automated EDR Bypass Transformation Engine (`edr_bypass_transform.rs`)
+
+Gated by `#[cfg(feature = "evasion-transform")]`.  Requires and implies
+`self-reencode`.
+
+### Purpose
+
+Scans the agent's own compiled `.text` section for byte signatures known to
+be detected by EDR products (YARA rules, entropy heuristics, known gadget
+chains).  When a detected pattern is found, applies semantic-preserving
+transformations at runtime to break the signature without changing program
+behavior.
+
+This module **supplements** the existing `self_reencode` pipeline — it handles
+**pattern avoidance** before and after morphing.  Self-reencoding handles
+runtime `.text` morphing; this module handles **signature evasion**.
+
+### Relationship to Self-Reencoding
+
+```
+┌─────────────────────────────────────────────────────┐
+│                 Agent Main Loop                      │
+│                                                      │
+│  ┌──────────────────┐   ┌──────────────────────┐    │
+│  │  self_reencode   │   │ edr_bypass_transform  │    │
+│  │                  │   │                       │    │
+│  │ Runtime morphing │   │ Signature avoidance   │    │
+│  │ of .text section │   │ of .text section      │    │
+│  │                  │   │                       │    │
+│  │ Changes bytes    │   │ Changes specific      │    │
+│  │ to evade entropy │   │ patterns to break     │    │
+│  │ scanners         │   │ YARA/sig rules        │    │
+│  └──────────────────┘   └──────────────────────┘    │
+│           ↑                         ↑                 │
+│           │    find_text_section()   │                 │
+│           └─────────┬───────────────┘                 │
+│                     │                                 │
+│              .text section                            │
+│              (shared target)                          │
+└─────────────────────────────────────────────────────┘
+```
+
+### Signature Database
+
+9 byte patterns known to be detected by EDR:
+
+| # | Name | Pattern | Severity |
+|---|------|---------|----------|
+| 0 | `direct_syscall_stub_prologue` | `4C 8B D1 B8` | high |
+| 1 | `syscall_instruction` | `0F 05` | high |
+| 2 | `ret_after_syscall` | `0F 05 C3` | high |
+| 3 | `indirect_syscall_via_r10` | `41 FF E2` | medium |
+| 4 | `xor_eax_eax_ret` | `31 C0 C3` | medium |
+| 5 | `mov_r10_rcx_mov_eax` | `4C 8B D1 B8` | high |
+| 6 | `ntcreatefile_pattern` | `B8 55 00 00 00` | low |
+| 7 | `push_pop_shellcode_init` | `50 48 31 C0` | medium |
+| 8 | `virtual_alloc_stub` | `48 89 C8 48 C1` | low |
+
+### Transformation Passes
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    Transformation Pipeline                │
+│                                                          │
+│  1. Instruction Substitution                             │
+│     xor rax,rax → sub rax,rax                            │
+│     call [rip+disp32] → lea r15,[rip+disp32]; call r15    │
+│                                                          │
+│  2. Register Reassignment                                │
+│     mov r10,rcx → mov r11,rcx (outside exclusion zone)   │
+│                                                          │
+│  3. NOP Sled Insertion                                   │
+│     Insert semantic NOPs after RET instructions           │
+│     (xchg rax,rax · mov rdi,rdi · lea rsp,[rsp+0])       │
+│                                                          │
+│  4. Constant Splitting                                   │
+│     mov rax,imm64 → mov rcx,imm64 + xchg rax,rcx         │
+│                                                          │
+│  5. Jump Obfuscation                                     │
+│     Short jmp (EB XX) → Long jmp (E9 XXXXXXXX) + NOPs    │
+│                                                          │
+│  ┌─────────────────────────────────────────────┐         │
+│  │         Syscall Exclusion Zone              │         │
+│  │  ±32 bytes around every `syscall` (0F 05)  │         │
+│  │  No transformations applied in this zone    │         │
+│  └─────────────────────────────────────────────┘         │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Safety Mechanisms
+
+1. **Syscall stub exclusion zone** — ±32 bytes around every `syscall` (0F 05)
+   instruction.  No transformations applied within this zone.
+2. **Shannon entropy filtering** — Regions above the configurable entropy
+   threshold (default 6.8) are skipped (already appear random).
+3. **SHA-256 hash verification** — Hash computed before/after each cycle to
+   confirm transformations were applied.
+4. **Page protection management** — `NtProtectVirtualMemory` (direct syscall)
+   makes `.text` writable, restores original protection after.  Instruction
+   cache flushed via `NtFlushInstructionCache`.
+5. **No `self_reencode` modification** — Uses `self_reencode::find_text_section()`
+   for safe `.text` discovery but does not modify `self_reencode` logic.
+6. **XChaCha20 memory guard intact** — Transformations happen on decrypted
+   `.text` only; the existing memory encryption guard is not touched.
+7. **Same-size transformations preferred** — Most transformations are same-size
+   replacements to avoid shifting subsequent code.
+
+### Semantic NOP Table
+
+7 semantic-equivalent NOP instructions used for sled insertion:
+
+| Bytes | Instruction | Length |
+|-------|-------------|--------|
+| `48 90` | `xchg rax, rax` | 2 |
+| `48 89 FF` | `mov rdi, rdi` | 3 |
+| `48 8D 24 24` | `lea rsp, [rsp+0]` | 4 |
+| `48 87 DB` | `xchg rbx, rbx` | 3 |
+| `0F 1F 44 00 00` | `nop dword [rax+rax]` | 5 |
+| `48 8D 65 00` | `lea rbp, [rbp+0]` | 4 |
+| `48 89 ED` | `mov rbp, rbp` | 3 |
+
+### Config
+
+```toml
+[evasion.auto_transform]
+enabled = true
+scan_interval_secs = 300
+max_transforms_per_cycle = 12
+entropy_threshold = 6.8
+```
+
+### Runtime Commands
+
+| Command | Description |
+|---------|-------------|
+| `EvasionTransformScan` | Scan `.text` for EDR signatures, return JSON array of `SignatureHit` |
+| `EvasionTransformRun` | Run one scan-and-transform cycle, return JSON summary |
+
+### Public API
+
+```rust
+// Run one full scan-and-transform cycle
+pub fn run_edr_bypass_transform(
+    max_transforms: u32,
+    entropy_threshold: f64,
+) -> Result<TransformCycleResult>
+
+// Scan for signatures without transforming
+pub fn scan_for_signatures() -> Result<Vec<SignatureHit>>
+
+// Status query
+pub fn status() -> String
+```
+
+### Feature Flag
+
+```toml
+[features]
+evasion-transform = ["self-reencode"]
+```
+
+---
+
+## NTFS Transaction-Based Process Hollowing (`injection_transacted.rs`)
+
+Gated by `#[cfg(all(windows, feature = "transacted-hollowing"))]`.  Requires and
+implies `direct-syscalls`.
+
+### Purpose
+
+Performs process hollowing without leaving any file artifacts on disk by using
+NTFS transactions.  Creates a section backed by an NTFS transaction, maps it
+into the target process, then rolls back the transaction.  The section mapping
+persists in the target process even though the file never existed on disk.
+Additionally blinds ETW in the target process by patching `EtwEventWrite` with
+a `RET` instruction and emitting fake events with spoofed provider GUIDs.
+
+### Attack Flow
+
+```
+  create_transaction()
+       │
+  create_transacted_section(SEC_COMMIT)
+       │
+  write_payload_to_section(local RW map + memcpy)
+       │
+  create_suspended_process(CREATE_SUSPENDED)
+       │
+  patch_remote_etw(target EtwEventWrite → 0xC3)
+       │
+  emit_fake_etw_events(Defender/AMSI/Sysmon GUIDs)
+       │
+  map_section_to_target(remote RX)
+       │
+  redirect_thread(SetThreadContext → new RIP)
+       │
+  rollback_transaction()   ← File gone from disk
+       │
+  restore_remote_etw(original byte)
+       │
+  resume_thread()
+```
+
+### NTFS Transaction Details
+
+The NTFS transaction mechanism is the core innovation:
+
+1. **`NtCreateTransaction`** — Creates a kernel transaction manager object.
+   SSN not in bootstrap table, so resolved at runtime with fallback to
+   `RtlCreateTransaction` via kernel32 ordinal.
+2. **`NtCreateSection(SEC_COMMIT)`** — Section is backed by the transaction's
+   pagefile. No permanent file mapping is created.
+3. **`NtRollbackTransaction`** — Rolls back the transaction. All file
+   operations within the transaction are undone. But the section mapping
+   in the target process survives because the memory manager holds a
+   reference to the section object independently of the transaction.
+
+### Remote ETW Blinding
+
+The agent patches `EtwEventWrite` in the **target** process (not the agent's
+own process), which is different from the local ETW patching in `etw_patch.rs`:
+
+1. **Find remote ntdll** — Uses shared ASLR base (ntdll loads at the same
+   virtual address in all processes).
+2. **Walk remote PE exports** — `NtReadVirtualMemory` reads the target's
+   ntdll DOS/PE/Export headers to resolve `EtwEventWrite` address.
+3. **Patch** — `NtWriteVirtualMemory` writes `0xC3` (RET) to the first byte.
+4. **Fake events** — Emits 5 spoofed ETW events with Windows Defender, AMSI,
+   and Sysmon provider GUIDs.
+5. **Restore** — Original byte restored after thread resume.
+
+### Configuration
+
+```toml
+[injection.transacted_hollowing]
+enabled = true
+prefer_over_hollowing = true    # Rank above standard ProcessHollow
+etw_blinding = true             # Patch EtwEventWrite in target
+rollback_timeout_ms = 5000      # Timeout for NtRollbackTransaction
+```
+
+### Runtime Command
+
+```
+Command::TransactedHollow { target_process, payload, etw_blinding }
+```
+
+Returns JSON: `{ pid, base_addr, technique, payload_size }`.
+
+### Feature Flag
+
+```toml
+[features]
+transacted-hollowing = ["direct-syscalls"]
+```
+
+---
+
+## Delayed Module-Stomp Injection (`injection_delayed_stomp.rs`)
+
+Two-phase module stomping that defeats EDR timing heuristics by waiting
+for the initial-scan window to pass before overwriting the sacrificial
+DLL's `.text` section.
+
+### Why Delayed?
+
+Many EDR products record DLL load times and flag modules whose code changes
+within a short window after `LoadLibrary` returns.  The delayed stomp waits
+8–15 seconds (configurable) — well beyond the typical 1–3 second scan
+window — so the `.text` modification blends into normal background memory
+activity.
+
+### Two-Phase Design
+
+```
+Phase 1 (immediate)          Phase 2 (after delay)
+┌─────────────────┐          ┌─────────────────────┐
+│ 1. OpenProcess   │          │ 4. Find .text VA    │
+│ 2. EnumModules   │          │ 5. Stomp .text      │
+│ 3. LoadLibraryA  │   ──►    │    (NtWriteVM)      │
+│    (remote thread)│  delay   │ 6. Fix relocations  │
+│    into target    │  8-15s   │    (if PE payload)  │
+│                  │          │ 7. Execute payload   │
+│ Returns JSON     │          │    (NtCreateThreadEx)│
+│ immediately      │          └─────────────────────┘
+└─────────────────┘
+```
+
+Phase 1 returns immediately. Phase 2 runs in a background thread
+(`delayed-stomp-phase2`), leaving the agent's main task loop unblocked.
+
+### Sacrificial DLL Selection
+
+1. Walks the target PEB via `NtQueryInformationProcess` to enumerate
+   loaded modules.
+2. Iterates a curated list of ~30 candidate DLLs (version.dll, dwmapi.dll,
+   msctf.dll, uxtheme.dll, netprofm.dll, etc.).
+3. Skips any DLL already loaded in the target or on the built-in exclusion
+   list (ntdll, kernel32, amsi, ws2_32, wininet, etc.).
+4. Loads the selected DLL via `LoadLibraryA` called in a remote thread.
+
+### PE Relocation Fixups
+
+If the payload is a PE (detected by `MZ` signature):
+- Parses the base relocation directory from the original payload buffer.
+- Calculates delta: `actual_base - preferred_image_base`.
+- Applies `IMAGE_REL_BASED_DIR64` (8-byte) and `IMAGE_REL_BASED_HIGHLOW`
+  (4-byte) fixups via `NtReadVirtualMemory` + `NtWriteVirtualMemory`.
+- Entry point is set to `dll_base + payload_entry_rva`.
+
+For raw shellcode, entry point is the start of the `.text` section.
+
+### Payload State Encryption
+
+The `PendingStomp` struct (target PID, DLL base, payload ciphertext, delay)
+is zeroed on drop via `write_volatile` + compiler fence.  Integration with
+`memory_guard` encrypts the payload buffer when the agent sleeps.
+
+### Auto-Selection Ranking
+
+`DelayedModuleStomp` is ranked **above** standard `ModuleStomp` in all four
+`auto_select_techniques()` branches when the feature is enabled:
+
+```
+WTH > ContextOnly > SectionMapping > NtSetInfoProcess > CallbackInjection >
+  [TransactedHollowing] > ProcessHollow > DelayedModuleStomp > ModuleStomp > ...
+```
+
+### Configuration
+
+```toml
+[injection.delayed_stomp]
+enabled = true
+min-delay-secs = 8
+max-delay-secs = 15
+prefer-over-stomp = true
+# sacrificial-dlls = ["version.dll", "dwmapi.dll", ...]
+```
+
+### Runtime Command
+
+```
+Command::DelayedStomp { target_pid, payload, delay_secs }
+```
+
+Returns JSON: `{ status, target_pid, dll_name, dll_base, delay_secs, message }`.
+
+### Feature Flag
+
+```toml
+[features]
+delayed-stomp = ["direct-syscalls"]
+```
 
 ---
 

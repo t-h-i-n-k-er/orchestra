@@ -8,6 +8,334 @@ All notable changes to Orchestra are documented here.
 
 ### Added
 
+#### Continuous Memory Hiding — Evanesco (`evanesco` feature)
+- **Per-page RC4 encryption at rest** — All enrolled memory pages are kept in
+  an encrypted + `PAGE_NOACCESS` state whenever they are not actively being
+  executed or read.  Unlike sleep-only encryption (Ekko/Cronus), Evanesco
+  operates continuously, not just during `secure_sleep` cycles.
+- **JIT decryption via `acquire_pages()`** — Returns a `PageGuard` RAII handle
+  that decrypts the requested ranges with the requested access type
+  (`ReadWrite` or `Execute`), sets appropriate page protection, and
+  automatically re-encrypts on drop.
+- **VEH-based auto-decryption** — A Vectored Exception Handler catches
+  `STATUS_ACCESS_VIOLATION` on tracked `PAGE_NOACCESS` pages and transparently
+  decrypts them for execution.  This allows, e.g., callback-based injection
+  methods to fire without explicit `acquire_pages()` calls.
+- **Background re-encryption thread** — Scans all tracked pages every
+  `scan_interval_ms` (default 50 ms) and re-encrypts any page that has been
+  idle longer than `idle_threshold_ms` (default 100 ms).
+- **Sleep-obfuscation integration** — `encrypt_all()` is called during
+  `secure_sleep` to sweep all pages; `decrypt_minimum()` restores the bare
+  minimum on wake.  XChaCha20-Poly1305 is still used for the full sleep sweep,
+  RC4 for per-page continuous encryption.
+- **`EvanescoConfig`** — New config struct in `common/src/config.rs` with
+  `idle_threshold_ms` and `scan_interval_ms` fields.  New `evanesco` section
+  in agent TOML config.
+- **Runtime commands** — `EvanescoStatus` returns live statistics (page count,
+  encrypt/decrypt counters); `EvanescoSetThreshold { idle_ms }` adjusts the
+  idle threshold at runtime.
+- **Feature flag** — `evanesco = []` in `agent/Cargo.toml`.  All code is
+  cfg-gated behind `#[cfg(all(windows, feature = "evanesco"))]`.
+- **New module: `agent/src/page_tracker.rs`** — ~550 lines implementing
+  `PageTrackerInner`, `PageGuard`, `PageInfo`, `PageState`, `AccessType`,
+  RC4 primitives, VEH handler, background thread, and public API.
+
+#### C4 Bomb — DPAPI Padding Oracle (`browser-data` feature)
+- **4th App-Bound Encryption bypass strategy** — Implements a full CBC
+  padding-oracle attack against Windows DPAPI's `CryptUnprotectData` to
+  recover the Chrome v20+ App-Bound encryption key without elevation.
+- **Attempted first** — C4 runs before the existing elevated strategies (COM
+  IElevator, SYSTEM token impersonation, named-pipe relay), maximizing the
+  chance of silent key recovery.
+- **Configurable timeout** — `browser_c4_timeout_secs` in agent TOML (default
+  60 s). Set to `0` to disable C4 entirely.
+- **Cancellation-safe** — `C4_LOCK` serializes attacks; a new request cancels
+  any in-progress attack via `AtomicBool`.
+- **OPSEC hardening** — Random inter-oracle delays (1–10 ms, LCG-based),
+  shuffled candidate bytes (LCG), no heap allocations in the hot loop.
+- **pe_resolve integration** — Dynamically resolves `CryptUnprotectData` from
+  `crypt32.dll` at runtime via hash-based API resolution (no import table
+  entries).
+- **Robust blob parsing** — `parse_dpapi_blob()` walks DPAPI blob headers,
+  credential/mask keys, and falls back to heuristic offset detection for
+  non-standard blob layouts.
+
+#### LSA Whisperer — SSP Interface Credential Extraction (`lsa-whisperer` feature)
+- **LSA SSP interface credential extraction** — Harvests credentials from LSA
+  authentication packages (MSV1_0, Kerberos, WDigest) through their documented
+  interfaces, operating entirely within the LSA process's own security context
+  without reading LSASS process memory.
+- **Credential Guard bypass** — Credential Guard protects LSASS *process memory*,
+  not the SSP interface.  SSP responses are authorized outputs from the LSA
+  process itself.
+- **RunAsPPL bypass** — No LSASS memory reads means no `NtReadVirtualMemory`
+  on the protected process.
+- **Two extraction methods**:
+  - **Untrusted** — `LsaConnectUntrusted` (any process, no admin required).
+    Queries MSV1_0 (EnumUsers, SubAuth), Kerberos (ticket cache), and WDigest.
+  - **SSP Inject** — Registers as a logon process via `LsaRegisterLogonProcess`
+    (requires SeTcbPrivilege / admin) for richer credential data. Falls back
+    to untrusted if not elevated.
+- **Auto mode** — Tries SSP injection first, falls back to untrusted.
+- **pe_resolve integration** — All 6 LSA API functions dynamically resolved
+  from `secur32.dll` via hash-based API resolution (no import table entries).
+- **Configurable** — `LsaWhispererConfig` with `timeout_secs` (default 30),
+  `buffer_size` (default 1024), `auto_inject` (default true).
+- **Runtime commands** — `HarvestLSA { method: LsaMethod }`,
+  `LSAWhispererStatus`, `LSAWhispererStop`.
+- **Anti-forensic cleanup** — `whisperer_stop()` securely zeroes the
+  credential buffer with `write_volatile` + compiler fence.
+- **Feature flag** — `lsa-whisperer = []` in `agent/Cargo.toml`.
+- **New module: `agent/src/lsa_whisperer.rs`** — ~580 lines implementing
+  dynamic API resolution, RAII LSA handle, MSV1_0/Kerberos/WDigest response
+  parsers, credential ring buffer, and public API.
+
+#### Indirect Dynamic Syscall Resolution (`direct-syscalls` feature upgrade)
+- **Runtime SSN validation** — Two complementary methods detect stale SSN
+  caches without re-resolving:
+  - **Cross-reference**: Compares the PE `TimeDateStamp` of the loaded ntdll
+    with the cached timestamp.  Mismatches (e.g. after Windows Update)
+    trigger full cache invalidation.
+  - **Probe**: Calls 4 critical syscalls (`NtAllocateVirtualMemory`,
+    `NtProtectVirtualMemory`, `NtWriteVirtualMemory`, `NtCreateThreadEx`)
+    with a NULL handle.  `STATUS_INVALID_HANDLE` confirms the SSN is valid;
+    `STATUS_INVALID_SYSTEM_SERVICE` means it's stale.
+- **SSDT-based nuclear fallback** — When both clean-mapping and Halo's Gate
+  fail, resolves SSNs from the kernel's `KeServiceDescriptorTable` via
+  `NtQuerySystemInformation(SystemModuleInformation)`.  Uses build-number-
+  based SSN range table as the final authoritative source.  Requires
+  `SeDebugPrivilege`.
+- **Build-aware SSN cache** — Windows build number cached from
+  `KUSER_SHARED_DATA` (always mapped at `0x7FFE0000`).  Cache entries
+  include the PE timestamp of the ntdll they were resolved from.  Build
+  number changes invalidate all entries.
+- **Versioned syscall stubs** — Hardcoded SSN range table for the 20 most
+  critical syscalls across Windows 10 1903–22H2 and Windows 11 21H2–24H2.
+  Resolved SSNs are validated against the expected range and logged if
+  out of bounds.
+- **Cache invalidation on NtDll unhook** — `ntdll_unhook.rs` calls the new
+  `invalidate_syscall_cache()` API which clears the SSN cache and marks the
+  clean ntdll mapping as stale, forcing re-resolution from the unhooked ntdll.
+- **Periodic validation** — Agent main loop calls `validate_cache()` every N
+  iterations (configurable via `syscall.validate_interval`, default 100).
+  Failed validation triggers automatic cache invalidation and re-mapping.
+- **New public API**:
+  - `nt_syscall::invalidate_syscall_cache()` — full cache + mapping reset
+  - `nt_syscall::validate_cache() -> Result<usize>` — cross-ref + probe
+  - `nt_syscall::get_build_number() -> u32` — cached KUSER_SHARED_DATA read
+  - `agent::syscalls::invalidate_syscall_cache()` — same for agent crate
+  - `agent::syscalls::validate_cache() -> Result<usize>` — same for agent
+  - `agent::syscalls::get_build_number() -> u32` — same for agent
+- **New config struct** — `SyscallConfig` in `common/src/config.rs` with
+  `validate_interval: u32` (default 100).
+- **Upgraded modules**: `nt_syscall/src/lib.rs`, `agent/src/syscalls.rs`,
+  `agent/src/ntdll_unhook.rs`, `agent/src/lib.rs`, `common/src/config.rs`.
+- **No new feature flag** — upgrade to the existing `direct-syscalls` feature.
+
+#### Kernel Callback Overwrite — BYOVD (`kernel-callback` feature)
+- **Surgical EDR callback overwrite via BYOVD** — Overwrites EDR kernel
+  callback function pointers to point to a `ret` instruction instead of
+  NULLing them.  Defeats EDR self-integrity checks (CrowdStrike, Microsoft
+  Defender for Endpoint) that verify their callbacks are still registered by
+  checking if the pointer is non-NULL.  A `ret` pointer passes these checks
+  (non-NULL, valid executable memory) but causes the callback to immediately
+  return without executing any monitoring logic.
+- **Vulnerable driver database** — 8 known vulnerable signed drivers (Dell
+  DBUtil_2_3.sys, MSI Afterburner rtcore64.sys, Gigabyte gdrv.sys, ASUS
+  AsIO/AsIO2, Baidu BdKit, ENE Technology ene.sys, Process Explorer
+  procexp152.sys).  Top 3 are embedded (XOR-obfuscated, HKDF-derived key)
+  in the agent binary.
+- **Driver deployment pipeline** — Scans for pre-loaded drivers via
+  `NtQuerySystemInformation(SystemModuleInformation)`, falls back to
+  decrypting and dropping an embedded driver, loading via `NtLoadDriver`
+  with registry service entry, and cleaning the file from disk.
+- **Callback discovery** — Reads kernel memory to locate and enumerate EDR
+  callbacks in `PspCreateProcessNotifyRoutine`,
+  `PspCreateThreadNotifyRoutine`, `PspLoadImageNotifyRoutine`,
+  `KeBugCheckCallbackListHead`, and `CallbackListHead`.  Resolves kernel
+  symbols by walking ntoskrnl.exe PE export directory via binary search.
+- **Ret pointer finding** — Two methods: (1) resolves
+  `IoInvalidDeviceRequest` export (it's just `ret`), (2) scans ntoskrnl
+  `.text` section for `0xC3` bytes (prefers 16-byte aligned addresses).
+- **Anti-forensic cleanup** — Unlinks the vulnerable driver from
+  `PsLoadedModuleList` after overwrite (LIST_ENTRY Flink/Blink manipulation).
+- **Safety mechanisms** — KeBugCheck callbacks are **never** overwritten
+  (BSOD risk).  Original pointers are saved for `KernelCallbackRestore`.
+  Failed physical memory writes are skipped.
+- **Three new runtime commands**:
+  - `KernelCallbackScan` — discover and report all registered EDR callbacks.
+  - `KernelCallbackNuke { drivers: Vec<String> }` — deploy driver, overwrite
+    callbacks with ret pointer, save backups, unlink driver.
+  - `KernelCallbackRestore` — restore original callback pointers from backup.
+- **Feature flag** — `kernel-callback = ["direct-syscalls"]` in
+  `agent/Cargo.toml` (implies `direct-syscalls`).
+- **New modules**: `agent/src/kernel_callback.rs`,
+  `agent/src/kernel_callback/driver_db.rs`,
+  `agent/src/kernel_callback/deploy.rs`,
+  `agent/src/kernel_callback/discover.rs`,
+  `agent/src/kernel_callback/overwrite.rs`.
+- **All NT API calls** through `nt_syscall::syscall!`, all strings through
+  `string_crypt`.  Driver decryption keys derived from agent's HKDF session
+  key with info string `"orchestra-driver-key"`.
+
+#### Automated EDR Bypass Transformation Engine (`evasion-transform` feature)
+- **Runtime `.text` signature scanning** — Scans the agent's own compiled
+  `.text` section for 9 byte signatures known to be detected by EDR products
+  (YARA rules, entropy heuristics, known gadget chains).  Signatures include
+  direct syscall stub prologues, `syscall; ret` trampolines, indirect syscall
+  via `jmp r10`, common patch patterns, and VirtualAlloc stubs.
+- **5 semantic-preserving transformations**:
+  1. **Instruction substitution** — `xor rax,rax` → `sub rax,rax`; indirect
+     `call [rip+disp32]` → `lea r15,[rip+disp32]; call r15`.
+  2. **Register reassignment** — `mov r10,rcx` → `mov r11,rcx` outside
+     syscall exclusion zones, breaking EDR's syscall stub pattern matching.
+  3. **NOP sled insertion** — Inserts random semantic-equivalent NOPs
+     (e.g., `xchg rax,rax`, `lea rsp,[rsp+0]`, `mov rdi,rdi`) at safe
+     locations after RET instructions.
+  4. **Constant splitting** — `mov rax,imm64` → `mov rcx,imm64` + register
+     swap, changing the register encoding pattern without altering the value.
+  5. **Jump obfuscation** — Short `EB XX` jumps → long `E9 XXXXXXXX` jumps
+     with NOP padding, changing the byte signature of direct jumps.
+- **Syscall stub exclusion zone** — 32-byte buffer around every `syscall`
+  instruction where no transformations are applied, preventing corruption of
+  the agent's syscall trampolines.
+- **Shannon entropy filtering** — Regions above the configurable entropy
+  threshold (default 6.8) are skipped because they already appear random.
+- **SHA-256 hash verification** — Before/after hash comparison of `.text`
+  section confirms transformations were applied correctly.
+- **Page protection management** — `NtProtectVirtualMemory` (direct syscall)
+  makes `.text` writable for transformation and restores original protection
+  after.  Instruction cache flushed via `NtFlushInstructionCache`.
+- **Integration with `self_reencode`** — Supplements the existing morphing
+  pipeline (handles pattern avoidance before/after morphing).  Does not
+  modify `self_reencode` logic.  Uses `self_reencode::find_text_section()`
+  for safe `.text` section discovery.
+- **Configurable** — `EvasionTransformConfig` with `enabled` (default true),
+  `scan_interval_secs` (default 300), `max_transforms_per_cycle` (default 12),
+  `entropy_threshold` (default 6.8).  Configured in TOML under
+  `[evasion.auto_transform]`.
+- **Two runtime commands**:
+  - `EvasionTransformScan` — scan `.text` for EDR signatures, return JSON
+    array of `SignatureHit` objects.
+  - `EvasionTransformRun` — run one scan-and-transform cycle, return JSON
+    summary with hashes, hits, transforms, and timing.
+- **Public API**: `run_edr_bypass_transform(max_transforms, entropy_threshold)`
+  and `scan_for_signatures() -> Vec<SignatureHit>`, callable from agent main
+  loop for periodic automated scanning.
+- **Feature flag** — `evasion-transform = ["self-reencode"]` in
+  `agent/Cargo.toml` (implies `self-reencode`).
+- **New module: `agent/src/edr_bypass_transform.rs`** — ~650 lines implementing
+  the full scan engine, 5 transformation passes, exclusion zones, page
+  protection, SHA-256 verification, and public API.
+
+#### NTFS Transaction-Based Process Hollowing with ETW Blinding (`transacted-hollowing` feature)
+- **Fileless process hollowing via NTFS transactions** — Creates an NTFS
+  transaction with `NtCreateTransaction`, writes the payload into a
+  transaction-backed section via `NtCreateSection(SEC_COMMIT)` +
+  `NtMapViewOfSection`, maps it into the suspended target process, then
+  rolls back the transaction with `NtRollbackTransaction`. The file on disk
+  never existed but the section mapping remains valid in the target process.
+- **Kernel32 ordinal fallback** — When `NtCreateTransaction` SSN is not in
+  the bootstrap syscall table, resolves `RtlCreateTransaction` from kernel32
+  by ordinal, falling back to ntdll export. Same fallback chain for
+  `NtRollbackTransaction`.
+- **Remote ETW blinding** — Resolves `EtwEventWrite` in the target process's
+  ntdll by walking the remote PE export table via `NtReadVirtualMemory`, then
+  patches the first byte with `0xC3` via `NtWriteVirtualMemory`. This blinds
+  EDR's ETW-based process creation monitoring without touching the local
+  process.
+- **Spoofed ETW provider GUIDs** — Emits 5 fake ETW event artifacts with
+  Windows Defender (`{11cd958a-c507-4ef3-b3f2-5fd9dfbd2c78}`), AMSI
+  (`{79f7af20-2b5e-4cb1-8b6e-396376e8f8e8}`), and Sysmon
+  (`{5770385f-c22a-43e0-bf4c-06f5698ffbd9}`) provider GUIDs to flood EDR
+  telemetry with benign-looking events.
+- **ETW restore policy** — Original `EtwEventWrite` byte is restored after
+  `NtResumeThread`, minimizing the window of blinded ETW.
+- **Auto-selection ranking** — `TransactedHollowing` inserted above standard
+  `ProcessHollow` in all 4 auto-selection branches (svchost, explorer,
+  service, default). Configurable `prefer_over_hollowing` flag.
+- **All syscalls through existing indirect syscall infrastructure** —
+  `get_syscall_id` + `do_syscall` for NtCreateSection, NtMapViewOfSection,
+  NtUnmapViewOfSection, NtWriteVirtualMemory, NtReadVirtualMemory,
+  NtResumeThread, NtQueryInformationProcess.
+- **Configurable** — `TransactedHollowingConfig` with `enabled` (default true),
+  `prefer_over_hollowing` (default true), `etw_blinding` (default true),
+  `rollback_timeout_ms` (default 5000). Configured in TOML under
+  `[injection.transacted_hollowing]`.
+- **Runtime command** — `TransactedHollow { target_process, payload,
+  etw_blinding }` returns JSON with pid, base_addr, technique, payload_size.
+- **Feature flag** — `transacted-hollowing = ["direct-syscalls"]` in
+  `agent/Cargo.toml` (implies `direct-syscalls`).
+- **New module: `agent/src/injection_transacted.rs`** — ~750 lines implementing
+  transaction creation/fallback, section management, remote ETW patching,
+  fake event emission, suspended process creation, thread redirection, and
+  the full injection pipeline.
+- **Modified files**: `common/src/config.rs` (TransactedHollowingConfig),
+  `common/src/lib.rs` (Command::TransactedHollow), `agent/Cargo.toml`
+  (feature flag), `agent/src/injection_engine.rs` (technique variant,
+  dispatch, auto-selection ranking), `agent/src/lib.rs` (module declaration),
+  `agent/src/handlers.rs` (command handler).
+
+#### Delayed Module-Stomp Injection (`delayed-stomp` feature)
+- **EDR timing-heuristic bypass** — Loads a sacrificial DLL into the target
+  process via `LoadLibraryA`, waits for a configurable randomized delay
+  (default 8–15 seconds) to let EDR initial-scan heuristics pass, then
+  overwrites the DLL's `.text` section with the payload using
+  `NtWriteVirtualMemory` (indirect syscall).  Defeats timing-based EDR
+  heuristics that flag modules whose code changes shortly after loading.
+- **Two-phase injection** — Phase 1 (load DLL) returns immediately; Phase 2
+  (stomp + execute) fires after the delay in a background thread so the
+  agent's main task loop is not blocked.
+- **Sacrificial DLL selection** — Enumerates target modules via PEB walk,
+  selects a DLL NOT already loaded from ~30 curated candidates (version.dll,
+  dwmapi.dll, msctf.dll, etc.).  Built-in exclusion list prevents loading
+  critical DLLs (ntdll, kernel32, amsi, etc.).
+- **PE relocation fixups** — If the payload is a PE (vs raw shellcode),
+  base relocations are fixed up relative to the loaded DLL base using the
+  relocation directory from the original payload buffer.
+- **Non-blocking** — Phase 2 runs in a dedicated background thread
+  (`delayed-stomp-phase2`); the operator receives a Phase 1 JSON
+  acknowledgement immediately and can query injection status for Phase 2
+  completion.
+- **Auto-selection ranking** — `DelayedModuleStomp` inserted above standard
+  `ModuleStomp` in all four `auto_select_techniques()` branches when the
+  feature is enabled.  Configurable `prefer_over_stomp` (default true).
+- **Configurable** — `DelayedStompConfig` with `enabled` (default true),
+  `min_delay_secs` (default 8), `max_delay_secs` (default 15),
+  `sacrificial_dlls` (30 candidates), `prefer_over_stomp` (default true).
+  New `[injection.delayed_stomp]` section in agent TOML config.
+- **Runtime command** — `DelayedStomp { target_pid, payload, delay_secs }`
+  returns JSON with status, target_pid, dll_name, dll_base, delay_secs.
+- **Feature flag** — `delayed-stomp = ["direct-syscalls"]` in
+  `agent/Cargo.toml` (implies `direct-syscalls`).
+- **New module: `agent/src/injection_delayed_stomp.rs`** — ~600 lines
+  implementing sacrificial DLL selection, remote module enumeration via PEB
+  walk, DLL loading via `LoadLibraryA` remote thread, `.text` section
+  parsing, payload stomping, relocation fixups, entry point calculation,
+  payload execution, async Phase 2 dispatch, and unit tests.
+- **Modified files**: `common/src/config.rs` (DelayedStompConfig),
+  `common/src/lib.rs` (Command::DelayedStomp), `agent/Cargo.toml`
+  (feature flag), `agent/src/injection_engine.rs` (technique variant,
+  dispatch, auto-selection ranking), `agent/src/lib.rs` (module declaration),
+  `agent/src/handlers.rs` (command handler).
+
+#### AMSI Write-Raid Bypass (`write-raid-amsi` feature)
+- **Data-only race condition** — Spawns a background thread that continuously
+  overwrites the `AmsiInitFailed` flag in `amsi.dll`'s `.data` section via
+  `NtWriteVirtualMemory` (indirect syscall), causing all subsequent
+  `AmsiScanBuffer` calls to return `AMSI_RESULT_CLEAN`.
+- **Zero code/permission/breakpoint modifications** — No `.text` patches, no
+  `NtProtectVirtualMemory` calls, no DR0–DR7 changes. Blends with normal
+  AMSI internal state updates. Most stealthy AMSI bypass available.
+- **Runtime-switchable** — New `AmsiBypassMode` command allows switching
+  between Write-Raid, HWBP, and Memory-Patch strategies without rebuilding.
+  `Auto` mode selects the best available (write-raid > hwbp > memory-patch).
+- **Sleep-obfuscation integration** — Race thread automatically pauses during
+  `secure_sleep` memory encryption cycles to prevent ciphertext corruption.
+- **Feature flag** — `write-raid-amsi = []` in `agent/Cargo.toml`.
+- **Shared types** — `AmsiBypassMode` enum added to `common/src/lib.rs`.
+
+
 #### NTDLL Unhooking (`agent/ntdll_unhook.rs`)
 - **Full NTDLL .text re-fetch pipeline** — Replaces the hooked ntdll `.text` section
   with a clean copy from `\KnownDlls\ntdll.dll`, falling back to disk read via
@@ -21,6 +349,44 @@ All notable changes to Orchestra are documented here.
   the unhook callback; `nt_syscall::invalidate_ssn_cache()` purges stale SSNs.
   When Halo's Gate fails (all adjacent stubs hooked), the callback triggers a full
   unhook automatically.
+
+#### Cronus Sleep Obfuscation (waitable-timer variant)
+- **New `SleepVariant` enum** in `sleep_obfuscation.rs` — `Cronus` (default) uses
+  `NtCreateTimer` + `NtSetTimer` + `NtWaitForSingleObject` instead of
+  `NtDelayExecution`.  Less commonly hooked by EDR.
+- **Auto-select with fallback** — When Cronus is selected, verifies that
+  `NtSetTimer` resolves.  Falls back to Ekko (NtDelayExecution) with a log
+  warning if resolution fails.
+- **Position-independent RC4 stub** — Runtime-generated x86-64 code page with
+  pre-initialized S-box and key at fixed offsets, RIP-relative addressing.
+  Used for remote process sleep encryption.
+- **New `SleepMethod::Cronus` variant** in `common/src/config.rs` — Selectable
+  via `method = "cronus"` in TOML config.
+- **Runtime switching** — New `Command::SetSleepVariant { variant }` enables
+  operator-initiated variant change without rebuild.
+- **Remote process registry integration** — Timer handle and RC4 stub tracked
+  in `RemoteProcess` struct, properly cleaned up on unregister.
+- **New syscall wrappers** — `syscall_NtCreateTimer`, `syscall_NtSetTimer`,
+  `syscall_NtWaitForSingleObject`, `syscall_NtClose` in `syscalls.rs`.
+
+#### Unwind-Aware Call Stack Spoofing (upgrade to `stack-spoof` feature)
+- **New module: `agent/src/stack_db.rs`** — Address database builder, chain template
+  generator, and unwind metadata validation functions.
+- **Multi-frame plausible call graph chains** — Builds N-frame chains (e.g.
+  `kernelbase!CreateProcessW` → `kernel32!CreateProcessA` → `ntdll!NtCreateUserProcess`)
+  from 10 pre-built templates. Each `do_syscall` randomly selects a template,
+  preventing EDR fingerprinting of consistent call stacks.
+- **Unwind metadata consistency** — Every `ret` gadget address is verified against
+  `RUNTIME_FUNCTION` entries via `RtlLookupFunctionEntry`. Only addresses with
+  valid unwind data are used, ensuring EDR stack walkers can traverse synthetic
+  frames without errors.
+- **Shadow-stack/CET compatibility** — Spoofed frames never cross the `syscall; ret`
+  boundary; they sit between the NtContinue context restore and the target gadget.
+- **Post-sleep revalidation** — After sleep obfuscation decrypts memory, cached chain
+  addresses are spot-checked via `VirtualQuery` and the database is rebuilt if any
+  are stale (handles EDR module rebasing during sleep).
+- **Feature flag stays as `stack-spoof`** — This is an upgrade, not a new feature.
+  No changes to `Cargo.toml` required.
 - **Post-sleep wake hook re-check** — Sleep obfuscation step 12 calls
   `ntdll_unhook::maybe_unhook()` to detect hooks EDR placed while the agent was
   dormant.

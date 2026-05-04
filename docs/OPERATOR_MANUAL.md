@@ -808,7 +808,7 @@ orchestra-console send --agent DESKTOP-WIN10 --command ExecuteAssembly \
 **How it works:**
 1. The agent lazily initializes the CLR (via `mscoree.dll` → `CLRCreateInstance`) on first use
 2. A fresh `AppDomain` is created for each execution (isolated, auto-unloaded)
-3. AMSI bypass is applied before loading the assembly
+3. AMSI bypass is applied before loading the assembly (prefers write-raid, then HWBP, then memory-patch)
 4. The assembly's entry point is called via `ExecuteInDefaultAppDomain`
 5. Output (stdout/stderr) is captured and returned
 6. CLR resources are auto-teardown after 5 minutes idle
@@ -1073,7 +1073,50 @@ orchestra-console send --agent DESKTOP-WIN10 --command UnhookNtdll
 
 ---
 
-## 21. Token Manipulation
+## 21. AMSI Bypass Mode
+
+### Switching AMSI Bypass Strategy at Runtime
+
+The agent supports switching AMSI bypass strategies at runtime without
+rebuilding.  Use the `AmsiBypassMode` command to select a strategy:
+
+```bash
+# Enable the write-raid AMSI bypass (most stealthy, recommended)
+orchestra-console send --agent DESKTOP-WIN10 --command AmsiBypassMode \
+  --args '{"mode":"write_raid"}'
+
+# Switch to hardware breakpoint bypass
+orchestra-console send --agent DESKTOP-WIN10 --command AmsiBypassMode \
+  --args '{"mode":"hwbp"}'
+
+# Switch to memory-patch bypass
+orchestra-console send --agent DESKTOP-WIN10 --command AmsiBypassMode \
+  --args '{"mode":"memory_patch"}'
+
+# Let the agent select the best available strategy
+# (write-raid > hwbp > memory-patch)
+orchestra-console send --agent DESKTOP-WIN10 --command AmsiBypassMode \
+  --args '{"mode":"auto"}'
+```
+
+**Available modes:**
+
+| Mode | Feature Flag | Description |
+|------|-------------|-------------|
+| `write_raid` | `write-raid-amsi` | Data-only race condition on `AmsiInitFailed` flag. Zero code/permission/breakpoint modifications. **Most stealthy.** |
+| `hwbp` | `hwbp-amsi` | Hardware breakpoints (DR0/DR1) + VEH handler. No code patches, but breakpoint registers are monitorable. |
+| `memory_patch` | *(always available)* | Direct code patching of `AmsiScanBuffer`. Detectable via integrity checks. |
+| `auto` | *(any)* | Automatically selects the best available: write-raid → hwbp → memory-patch. |
+
+**Operational notes:**
+- Switching modes disables the current bypass before enabling the new one
+- Write-raid spawns a background thread that is automatically paused during sleep obfuscation cycles
+- If the requested mode's feature flag is not compiled, the agent returns an error
+- `auto` mode always succeeds (falls back to whatever is available)
+
+---
+
+## 22. Token Manipulation
 
 ### Token Operations
 

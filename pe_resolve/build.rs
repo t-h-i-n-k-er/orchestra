@@ -40,8 +40,17 @@ fn main() {
         "EtwEventWrite",
         "EtwEventWriteEx",
         "NtTraceEvent",
+        "CryptUnprotectData",
+        "NCryptUnprotectSecret",
+        // LSA Whisperer — SSP interface exploitation (secur32.dll)
+        "LsaConnectUntrusted",
+        "LsaCallAuthenticationPackage",
+        "LsaLookupAuthenticationPackage",
+        "LsaRegisterLogonProcess",
+        "LsaDeregisterLogonProcess",
+        "LsaFreeReturnBuffer",
     ];
-    let dlls = ["ntdll.dll", "amsi.dll", "kernel32.dll"];
+    let dlls = ["ntdll.dll", "amsi.dll", "kernel32.dll", "crypt32.dll", "ncrypt.dll", "secur32.dll"];
 
     let mut rs = format!("pub const SEED: u32 = {:#x};\n", seed);
     for api in apis {

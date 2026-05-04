@@ -246,6 +246,8 @@ Every `unsafe` block carries an inline `// SAFETY:` comment.
 | `agent/src/memory_guard.rs` | Raw pointer extraction for `KeyBufPtr` | Pointer from valid `&'static mut [u8; 32]` before borrow consumed; only accessed while holding `Mutex` guard. |
 | `agent/src/syscalls.rs` | `do_syscall` inline asm (x86_64 + aarch64) | Register bindings explicitly constrained; aarch64 >6-arg calls fail with `EINVAL`. |
 | `agent/src/syscalls.rs` | `spoof_call` register pivot | Preserves call ABI; validates prerequisites before transfer. |
+| `agent/src/stack_db.rs` | PE export table walking, `RtlLookupFunctionEntry` | Null-terminated byte hashes; VirtualQuery validation before address reuse; Mutex-guarded database rebuilds. |
+| `agent/src/stack_db.rs` | Raw pointer reads for `ret` gadget scanning | Bounded scan (128 bytes) within committed executable memory; unwind metadata verified before use. |
 | `agent/src/evasion.rs` | VEH handler ret-gadget / jump-chain | Bounded search with page-boundary checks; capped depth; validated encodings only. |
 
 ### Path-traversal review
@@ -466,7 +468,7 @@ the initial security audit.
 | CLR loading detection | Uses `ICLRMetaHost` → `ICLRRuntimeHost` (legitimate hosting API) |
 | BOF memory leaks | COFF loader tracks all allocations; frees on completion or timeout |
 | Assembly timeout | Configurable wall-clock timeout (default: 30s); CLR thread is terminated on expiry |
-| AMSI bypass | Optional `hwbp-amsi` feature uses hardware breakpoints (DR0/DR1) via VEH |
+| AMSI bypass | `write-raid-amsi` (data-only race, preferred) or `hwbp-amsi` (DR0/DR1 VEH) or memory-patch (fallback) |
 
 ---
 

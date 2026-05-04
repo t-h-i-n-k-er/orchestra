@@ -108,7 +108,8 @@ This document describes where the project is going next.
 - ✅ **Halo's Gate unhook callback** — `nt_syscall::set_halo_gate_fallback()`
   registers agent's unhook function; automatic unhook on Halo's Gate failure.
 - ✅ **Feature flags for new capabilities** — `surveillance` (Windows, dep:image),
-  `browser-data` (Windows), `hwbp-amsi` (Windows, DR0/DR1 VEH).
+  `browser-data` (Windows), `hwbp-amsi` (Windows, DR0/DR1 VEH),
+  `write-raid-amsi` (Windows, data-only race condition, preferred AMSI bypass).
 
 ---
 

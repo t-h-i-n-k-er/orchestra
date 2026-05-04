@@ -206,15 +206,26 @@ Avoids API hooks set by security products.
 
 ### `stack-spoof`
 
-**Default: no** | **Windows only**
+**Default: no** | **Windows only (x86_64)**
 
 Spoofs the call stack to make agent threads appear as legitimate system
-threads when inspected by security tools.
+threads when inspected by security tools (EDR/Elastic).
 
 | Attribute | Value |
 |-----------|-------|
-| Platform | Windows only |
+| Platform | Windows x86_64 only |
 | Dependencies | None |
+| New module | `stack_db` — address database + chain generator |
+| Technique | NtContinue-based multi-frame chain with unwind metadata validation |
+
+**Anti-detection capabilities:**
+- Builds an address database from loaded-module export tables (ntdll, kernel32, kernelbase, user32, msvcrt, ucrtbase)
+- Scans for `ret` gadgets (0xC3) inside real functions with valid `RUNTIME_FUNCTION` unwind entries (verified via `RtlLookupFunctionEntry`)
+- Generates multi-frame plausible call graph chains (10 templates: CreateProcessW, VirtualAlloc, WriteFile, ReadFile, CreateFile, OpenProcess, WaitForSingleObject, DeviceIoControl, OpenThread, MapViewOfFile paths)
+- Each `do_syscall` invocation randomly selects a chain template, preventing EDR fingerprinting
+- Post-sleep revalidation checks cached chains for stale addresses after memory decryption
+- Shadow-stack/CET compatible (frames never cross the `syscall; ret` boundary)
+- Falls back to single-frame NtQuerySystemTime spoof if multi-frame chains unavailable
 
 ---
 
@@ -536,6 +547,38 @@ features = ["outbound-c", "browser-data"]
 
 ---
 
+### `write-raid-amsi`
+
+**Default: no** | **Windows only** | **Preferred AMSI bypass**
+
+Spawns a dedicated race thread that continuously overwrites the `AmsiInitFailed`
+flag in `amsi.dll`'s `.data` section, causing all `AmsiScanBuffer` calls to
+return `AMSI_RESULT_CLEAN`. This is the most stealthy AMSI bypass available:
+
+- **Zero code patches** — no `.text` modifications, integrity checks pass
+- **Zero `VirtualProtect` calls** — no page-protection changes on EDR radar
+- **Zero hardware breakpoints** — DR0–DR7 remain clean
+- **Data-only** — writes blend with normal AMSI internal state updates
+- **Sleep-obfuscation aware** — race thread pauses during memory encryption
+
+The bypass can be enabled/disabled at runtime via the `AmsiBypassMode` command.
+In `Auto` mode, Write-Raid is preferred over HWBP and memory-patch strategies.
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows only |
+| Method | Data-only race condition on `AmsiInitFailed` flag |
+| Syscalls | `NtCreateThreadEx`, `NtWriteVirtualMemory`, `NtDelayExecution` |
+| Stealth | No code/permission/breakpoint modifications |
+| Sleep compat | Thread pauses during `secure_sleep` encryption cycles |
+
+**Example profile:**
+```toml
+features = ["outbound-c", "write-raid-amsi"]
+```
+
+---
+
 ### `hwbp-amsi`
 
 **Default: no** | **Windows only**
@@ -675,6 +718,7 @@ microarchitecture-specific dispatch.
 | `surveillance` | — | ✅ | — |
 | `browser-data` | — | ✅ | — |
 | `hwbp-amsi` | — | ✅ | — |
+| `write-raid-amsi` | — | ✅ | — |
 
 ### Common feature combinations
 
@@ -700,7 +744,7 @@ features = ["outbound-c", "forward-secrecy", "persistence", "network-discovery",
 
 **Windows full-stealth with post-exploitation:**
 ```toml
-features = ["outbound-c", "stealth", "manual-map", "hwbp-amsi", "surveillance", "browser-data"]
+features = ["outbound-c", "stealth", "manual-map", "write-raid-amsi", "surveillance", "browser-data"]
 ```
 
 **Development/testing:**

