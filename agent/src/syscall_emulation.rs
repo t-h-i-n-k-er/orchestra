@@ -7,7 +7,7 @@
 //!
 //! # Architecture
 //!
-//! The emulation layer sits ABOVE `nt_syscall` — it wraps the existing indirect
+//! The emulation layer sits ABOVE `crate::syscalls` — it wraps the existing indirect
 //! syscall infrastructure.  When emulation is enabled and a configured function
 //! is dispatched:
 //!
@@ -45,7 +45,7 @@
 //!
 //! # Constraints
 //!
-//! - Does NOT replace `nt_syscall` — this is a LAYER on top.
+//! - Does NOT replace `crate::syscalls` — this is a LAYER on top.
 //! - The indirect syscall path remains the fallback.
 //! - Does NOT remove Halo's Gate SSN resolution.
 //! - Does NOT change existing function signatures — wraps them.
@@ -230,19 +230,12 @@ pub fn emulate_nt_write_virtual_memory(
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
-        debug!("syscall_emulation: falling back to indirect syscall");
+        // Let the caller (dispatch/macro) handle the indirect syscall fallback.
+        return Err(anyhow::anyhow!("NtWriteVirtualMemory: kernel32 path failed with Win32 error {err}"));
     }
 
-    // Fallback: indirect syscall.
-    let target = nt_syscall::get_syscall_id("NtWriteVirtualMemory")?;
-    let args: &[u64] = &[
-        process_handle,
-        base_address,
-        buffer,
-        number_of_bytes_to_write,
-        number_of_bytes_written,
-    ];
-    Ok(unsafe { nt_syscall::do_syscall(target.ssn, target.gadget_addr, args) })
+    // Emulation not active for this function — caller should use direct syscall.
+    Err(anyhow::anyhow!("NtWriteVirtualMemory: emulation not active"))
 }
 
 /// Emulate `NtReadVirtualMemory` via `ReadProcessMemory`.
@@ -298,18 +291,12 @@ pub fn emulate_nt_read_virtual_memory(
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
-        debug!("syscall_emulation: falling back to indirect syscall");
+        // Let the caller (dispatch/macro) handle the indirect syscall fallback.
+        return Err(anyhow::anyhow!("NtReadVirtualMemory: kernel32 path failed with Win32 error {err}"));
     }
 
-    let target = nt_syscall::get_syscall_id("NtReadVirtualMemory")?;
-    let args: &[u64] = &[
-        process_handle,
-        base_address,
-        buffer,
-        number_of_bytes_to_read,
-        number_of_bytes_read,
-    ];
-    Ok(unsafe { nt_syscall::do_syscall(target.ssn, target.gadget_addr, args) })
+    // Emulation not active for this function — caller should use direct syscall.
+    Err(anyhow::anyhow!("NtReadVirtualMemory: emulation not active"))
 }
 
 /// Emulate `NtAllocateVirtualMemory` via `VirtualAllocEx`.
@@ -386,19 +373,12 @@ pub fn emulate_nt_allocate_virtual_memory(
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
-        debug!("syscall_emulation: falling back to indirect syscall");
+        // Let the caller (dispatch/macro) handle the indirect syscall fallback.
+        return Err(anyhow::anyhow!("NtAllocateVirtualMemory: kernel32 path failed with Win32 error {err}"));
     }
 
-    let target = nt_syscall::get_syscall_id("NtAllocateVirtualMemory")?;
-    let args: &[u64] = &[
-        process_handle,
-        base_address,
-        zero_bits,
-        region_size,
-        allocation_type,
-        protect,
-    ];
-    Ok(unsafe { nt_syscall::do_syscall(target.ssn, target.gadget_addr, args) })
+    // Emulation not active for this function — caller should use direct syscall.
+    Err(anyhow::anyhow!("NtAllocateVirtualMemory: emulation not active"))
 }
 
 /// Emulate `NtFreeVirtualMemory` via `VirtualFreeEx`.
@@ -457,17 +437,12 @@ pub fn emulate_nt_free_virtual_memory(
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
-        debug!("syscall_emulation: falling back to indirect syscall");
+        // Let the caller (dispatch/macro) handle the indirect syscall fallback.
+        return Err(anyhow::anyhow!("NtFreeVirtualMemory: kernel32 path failed with Win32 error {err}"));
     }
 
-    let target = nt_syscall::get_syscall_id("NtFreeVirtualMemory")?;
-    let args: &[u64] = &[
-        process_handle,
-        base_address,
-        region_size,
-        free_type,
-    ];
-    Ok(unsafe { nt_syscall::do_syscall(target.ssn, target.gadget_addr, args) })
+    // Emulation not active for this function — caller should use direct syscall.
+    Err(anyhow::anyhow!("NtFreeVirtualMemory: emulation not active"))
 }
 
 /// Emulate `NtProtectVirtualMemory` via `VirtualProtectEx`.
@@ -544,18 +519,12 @@ pub fn emulate_nt_protect_virtual_memory(
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
-        debug!("syscall_emulation: falling back to indirect syscall");
+        // Let the caller (dispatch/macro) handle the indirect syscall fallback.
+        return Err(anyhow::anyhow!("NtProtectVirtualMemory: kernel32 path failed with Win32 error {err}"));
     }
 
-    let target = nt_syscall::get_syscall_id("NtProtectVirtualMemory")?;
-    let args: &[u64] = &[
-        process_handle,
-        base_address,
-        region_size,
-        new_protect,
-        old_protect,
-    ];
-    Ok(unsafe { nt_syscall::do_syscall(target.ssn, target.gadget_addr, args) })
+    // Emulation not active for this function — caller should use direct syscall.
+    Err(anyhow::anyhow!("NtProtectVirtualMemory: emulation not active"))
 }
 
 /// Emulate `NtCreateThreadEx` via `CreateRemoteThread`.
@@ -603,7 +572,7 @@ pub fn emulate_nt_create_thread_ex(
         debug!(
             "syscall_emulation: NtCreateThreadEx — CREATE_SUSPENDED requested, using indirect syscall"
         );
-        let target = nt_syscall::get_syscall_id("NtCreateThreadEx")?;
+        let target = crate::syscalls::get_syscall_id("NtCreateThreadEx")?;
         let args: &[u64] = &[
             thread_handle,
             desired_access,
@@ -617,7 +586,7 @@ pub fn emulate_nt_create_thread_ex(
             maximum_stack_size,
             attribute_list,
         ];
-        return Ok(unsafe { nt_syscall::do_syscall(target.ssn, target.gadget_addr, args) });
+        return Ok(unsafe { crate::syscalls::do_syscall(target.ssn, target.gadget_addr, args) });
     }
 
     if is_emulation_enabled() && should_emulate("NtCreateThreadEx") && config.prefer_kernel32 {
@@ -654,24 +623,12 @@ pub fn emulate_nt_create_thread_ex(
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
-        debug!("syscall_emulation: falling back to indirect syscall");
+        // Let the caller (dispatch/macro) handle the indirect syscall fallback.
+        return Err(anyhow::anyhow!("NtCreateThreadEx: kernel32 path failed with Win32 error {err}"));
     }
 
-    let target = nt_syscall::get_syscall_id("NtCreateThreadEx")?;
-    let args: &[u64] = &[
-        thread_handle,
-        desired_access,
-        object_attributes,
-        process_handle,
-        start_routine,
-        argument,
-        create_flags,
-        zero_bits,
-        stack_size,
-        maximum_stack_size,
-        attribute_list,
-    ];
-    Ok(unsafe { nt_syscall::do_syscall(target.ssn, target.gadget_addr, args) })
+    // Emulation not active for this function — caller should use direct syscall.
+    Err(anyhow::anyhow!("NtCreateThreadEx: emulation not active"))
 }
 
 /// Emulate `NtOpenProcess` via `OpenProcess`.
@@ -732,17 +689,12 @@ pub fn emulate_nt_open_process(
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
-        debug!("syscall_emulation: falling back to indirect syscall");
+        // Let the caller (dispatch/macro) handle the indirect syscall fallback.
+        return Err(anyhow::anyhow!("NtOpenProcess: kernel32 path failed with Win32 error {err}"));
     }
 
-    let target = nt_syscall::get_syscall_id("NtOpenProcess")?;
-    let args: &[u64] = &[
-        process_handle,
-        desired_access,
-        object_attributes,
-        client_id,
-    ];
-    Ok(unsafe { nt_syscall::do_syscall(target.ssn, target.gadget_addr, args) })
+    // Emulation not active for this function — caller should use direct syscall.
+    Err(anyhow::anyhow!("NtOpenProcess: emulation not active"))
 }
 
 /// Emulate `NtClose` via `CloseHandle`.
@@ -774,12 +726,12 @@ pub fn emulate_nt_close(handle: u64) -> anyhow::Result<i32> {
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
-        debug!("syscall_emulation: falling back to indirect syscall");
+        // Let the caller (dispatch/macro) handle the indirect syscall fallback.
+        return Err(anyhow::anyhow!("NtClose: kernel32 path failed with Win32 error {err}"));
     }
 
-    let target = nt_syscall::get_syscall_id("NtClose")?;
-    let args: &[u64] = &[handle];
-    Ok(unsafe { nt_syscall::do_syscall(target.ssn, target.gadget_addr, args) })
+    // Emulation not active for this function — caller should use direct syscall.
+    Err(anyhow::anyhow!("NtClose: emulation not active"))
 }
 
 /// Emulate `NtQueryVirtualMemory` via `VirtualQueryEx`.
@@ -814,7 +766,7 @@ pub fn emulate_nt_query_virtual_memory(
         debug!(
             "syscall_emulation: NtQueryVirtualMemory — class {memory_information_class} not supported via VirtualQueryEx, using indirect syscall"
         );
-        let target = nt_syscall::get_syscall_id("NtQueryVirtualMemory")?;
+        let target = crate::syscalls::get_syscall_id("NtQueryVirtualMemory")?;
         let args: &[u64] = &[
             process_handle,
             base_address,
@@ -823,7 +775,7 @@ pub fn emulate_nt_query_virtual_memory(
             memory_information_length,
             return_length,
         ];
-        return Ok(unsafe { nt_syscall::do_syscall(target.ssn, target.gadget_addr, args) });
+        return Ok(unsafe { crate::syscalls::do_syscall(target.ssn, target.gadget_addr, args) });
     }
 
     if is_emulation_enabled() && should_emulate("NtQueryVirtualMemory") && config.prefer_kernel32 {
@@ -866,32 +818,25 @@ pub fn emulate_nt_query_virtual_memory(
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
-        debug!("syscall_emulation: falling back to indirect syscall");
+        // Let the caller (dispatch/macro) handle the indirect syscall fallback.
+        return Err(anyhow::anyhow!("NtQueryVirtualMemory: kernel32 path failed with Win32 error {err}"));
     }
 
-    let target = nt_syscall::get_syscall_id("NtQueryVirtualMemory")?;
-    let args: &[u64] = &[
-        process_handle,
-        base_address,
-        memory_information_class,
-        memory_information,
-        memory_information_length,
-        return_length,
-    ];
-    Ok(unsafe { nt_syscall::do_syscall(target.ssn, target.gadget_addr, args) })
+    // Emulation not active for this function — caller should use direct syscall.
+    Err(anyhow::anyhow!("NtQueryVirtualMemory: emulation not active"))
 }
 
 // ── Convenience re-exports for indirect-syscall fallback ─────────────────────
 //
 // When emulation is disabled or not compiled in, consumers can call these
-// directly as a pass-through to the underlying nt_syscall infrastructure.
+// directly as a pass-through to the underlying crate::syscalls indirect syscall
+// infrastructure.
 
-/// Direct access to `nt_syscall::syscall!` macro for callers that need the
-/// raw indirect syscall path.  This is the SAME macro as `nt_syscall::syscall!`
-/// but re-exported here for ergonomic use from modules that import the
-/// emulation layer.
-pub use nt_syscall::get_syscall_id;
-pub use nt_syscall::do_syscall;
+/// Direct access to `crate::syscalls` for callers that need the raw indirect
+/// syscall path.  These use the shared SSN cache and clean ntdll mapping for
+/// consistency across the agent.
+pub use crate::syscalls::get_syscall_id;
+pub use crate::syscalls::do_syscall;
 
 // ── Integration helpers ──────────────────────────────────────────────────────
 
@@ -934,7 +879,7 @@ pub fn status_json() -> String {
 
 // ── Dispatch + macro for ergonomic integration ───────────────────────────────
 //
-// The `emulated_syscall!` macro mirrors `nt_syscall::syscall!` so that
+// The `emulated_syscall!` macro mirrors the indirect syscall path so that
 // consuming modules can swap the import without changing call sites.
 //
 // When emulation is compiled in and enabled, the macro first tries the
@@ -942,7 +887,7 @@ pub fn status_json() -> String {
 // emulated set), it falls back to the existing indirect-syscall path.
 //
 // When the `syscall-emulation` feature is NOT compiled in, the macro
-// expands to a plain `nt_syscall::syscall!` call (zero overhead).
+// expands to a plain indirect syscall via crate::syscalls (zero overhead).
 
 /// Internal: dispatch an emulated syscall by name.
 ///
@@ -1029,7 +974,7 @@ pub fn dispatch(name: &str, args: &[u64]) -> anyhow::Result<i32> {
 /// emulation layer is compiled in AND enabled, it first tries the
 /// kernel32/advapi32 path for any function listed in `emulated_functions`.
 /// On failure (or if the function is not emulated), it falls back to the
-/// existing indirect-syscall path via `nt_syscall::syscall!`.
+/// existing indirect-syscall path via `crate::syscalls`.
 ///
 /// # Example
 ///
@@ -1064,18 +1009,24 @@ macro_rules! emulated_syscall {
                         "emulated_syscall: {} → emulation returned failure status {:#x}, trying indirect fallback",
                         __name, status
                     );
-                    nt_syscall::syscall!($func_name $(, $args)*)
+                    $crate::syscalls::get_syscall_id($func_name).map(|t| {
+                        unsafe { $crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[$($args as u64),*]) }
+                    })
                 }
                 Err(e) => {
                     log::debug!(
                         "emulated_syscall: {} → emulation error: {}, trying indirect fallback",
                         __name, e
                     );
-                    nt_syscall::syscall!($func_name $(, $args)*)
+                    $crate::syscalls::get_syscall_id($func_name).map(|t| {
+                        unsafe { $crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[$($args as u64),*]) }
+                    })
                 }
             }
         } else {
-            nt_syscall::syscall!($func_name $(, $args)*)
+            $crate::syscalls::get_syscall_id($func_name).map(|t| {
+                unsafe { $crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[$($args as u64),*]) }
+            })
         }
     }};
 }

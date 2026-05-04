@@ -890,6 +890,10 @@ impl C4CancelToken {
     }
 }
 
+thread_local! {
+    static C4_TIMEOUT: std::cell::Cell<u64> = std::cell::Cell::new(60);
+}
+
 /// Read the C4 timeout from the global agent config (if available).
 /// Returns `None` if the config has not been initialised yet or if
 /// `browser_c4_timeout_secs` is 0 (disabled).
@@ -897,9 +901,6 @@ fn c4_oracle_timeout() -> Option<u64> {
     // The config is inside an Arc<RwLock<Config>> on the agent side.
     // Rather than coupling browser_data.rs to the full agent state, we
     // expose the timeout through a thread-local set by the caller.
-    thread_local! {
-        static C4_TIMEOUT: std::cell::Cell<u64> = std::cell::Cell::new(60);
-    }
     let timeout = C4_TIMEOUT.with(|t| t.get());
     if timeout == 0 {
         None
@@ -911,9 +912,6 @@ fn c4_oracle_timeout() -> Option<u64> {
 /// Set the thread-local C4 timeout (called from the agent's handler before
 /// invoking browser_data).
 pub fn set_c4_timeout(secs: u64) {
-    thread_local! {
-        static C4_TIMEOUT: std::cell::Cell<u64> = std::cell::Cell::new(60);
-    }
     C4_TIMEOUT.with(|t| t.set(secs));
 }
 

