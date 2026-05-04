@@ -16,6 +16,10 @@ When the agent binary starts, modules initialize in a specific sequence to ensur
 3. env_check_sandbox.rs — Extended sandbox scoring
 4. nt_syscall         — Map clean ntdll, resolve SSNs (Windows)
 5. evanesco           — Continuous page tracker init (BEFORE evasion)
+5b. syscall_emulation — Emulation layer init (BEFORE any injection/syscalls)
+5c. cet_bypass        — CET/shadow-stack detection and mitigation (BEFORE any spoofed calls)
+5d. token_impersonation — Token-only impersonation init (pipe token cache, auto-revert config)
+5e. forensic_cleanup  — Prefetch evidence removal init (cleanup method, auto-clean config)
 6. evasion.rs         — AMSI bypass, ETW patching
 7. amsi_defense.rs    — Write-Raid / HWBP / memory-patch AMSI bypass
 8. etw_patch.rs       — ETW function hooking
@@ -27,6 +31,108 @@ When the agent binary starts, modules initialize in a specific sequence to ensur
 ```
 
 Each step runs to completion before the next begins. If any security check fails (sandbox detected, debugger present, domain mismatch), the agent exits silently.
+
+### Module Dependency Graph
+
+```
+                    ┌──────────┐
+                    │  config  │
+                    └────┬─────┘
+                         │
+                    ┌────▼──────┐
+                    │ env_check │──────────────────────────────┐
+                    └────┬──────┘                              │
+                         │ (exit if sandbox/debugger)          │
+                    ┌────▼──────┐                              │
+                    │ nt_syscall│ (Windows only)               │
+                    └────┬──────┘                              │
+              ┌──────────┼──────────┐                          │
+              │          │          │                          │
+     ┌────────▼───┐ ┌───▼────┐ ┌──▼──────────┐               │
+     │  evanesco   │ │syscall │ │ cet_bypass  │               │
+     │             │ │emul.   │ │             │               │
+     └────────┬───┘ └───┬────┘ └──┬──────────┘               │
+              │         │         │                            │
+              └────┬────┘─────────┘                            │
+                   │                                          │
+         ┌─────────▼──────────┐                               │
+         │  evasion subsystem │                               │
+         │  (AMSI + ETW)      │                               │
+         └─────────┬──────────┘                               │
+                   │                                          │
+         ┌─────────▼──────────┐                               │
+         │ token_impersonation│                               │
+         └─────────┬──────────┘                               │
+                   │                                          │
+         ┌─────────▼──────────┐                               │
+         │ forensic_cleanup   │                               │
+         └─────────┬──────────┘                               │
+                   │                                          │
+         ┌─────────▼──────────┐                               │
+         │  C2 transport      │◄──────────────────────────────┘
+         │  (HTTP/SMB/DNS)    │                    (on fail → exit)
+         └─────────┬──────────┘
+                   │
+       ┌───────────┼───────────┐
+       │           │           │
+  ┌────▼──┐  ┌────▼────┐  ┌──▼──────────┐
+  │sleep  │  │memory   │  │injection    │
+  │obfusc.│  │guard    │  │engine       │
+  └────┬──┘  └────┬────┘  └──┬──────────┘
+       │          │          │
+       └──────────┼──────────┘
+                  │
+          ┌───────▼───────┐
+          │   handlers    │
+          │  (dispatch)   │
+          └───────────────┘
+                  │
+    ┌─────────────┼──────────────┐
+    │             │              │
+┌───▼───┐  ┌─────▼─────┐  ┌────▼──────┐
+│browser │  │LSASS/LSA  │  │ post-ex   │
+│data    │  │harvest    │  │ modules   │
+└────────┘  └───────────┘  └───────────┘
+```
+
+### Evasion Pipeline Flow
+
+The evasion pipeline applies defenses in order, with each stage building on the previous:
+
+```
+┌───────────┐    ┌───────────┐    ┌──────────────┐    ┌───────────┐
+│ ETW Patch │───▶│ AMSI      │───▶│ NTDLL        │───▶│ Syscall   │
+│ (disable  │    │ Bypass    │    │ Unhook       │    │ Strategy  │
+│  provider │    │ (write-   │    │ (KnownDlls   │    │ Selection │
+│  logging) │    │  raid/    │    │  re-fetch)   │    │ (emulate/ │
+│           │    │  HWBP)    │    │              │    │  direct)  │
+└───────────┘    └───────────┘    └──────────────┘    └─────┬─────┘
+                                                              │
+                    ┌─────────────────────────────────────────┘
+                    │
+         ┌──────────▼──────────┐
+         │ CET Bypass          │
+         │ (policy / compat /  │
+         │  VEH fix)           │
+         └──────────┬──────────┘
+                    │
+         ┌──────────▼──────────┐
+         │ Stack Spoofing      │
+         │ (NtContinue or      │
+         │  unwind-aware)      │
+         └──────────┬──────────┘
+                    │
+         ┌──────────▼──────────┐
+         │ EDR Transform       │
+         │ (if enabled: scan   │
+         │  + transform .text) │
+         └──────────┬──────────┘
+                    │
+         ┌──────────▼──────────┐
+         │ Self-Reencode       │
+         │ (per-build unique)  │
+         └─────────────────────┘
+```
 
 ### Agent State Machine
 
@@ -97,8 +203,9 @@ Each command handler is a separate function in `handlers.rs` or a dedicated modu
 | **HCI Research** | `StartHciLogging`, `StopHciLogging`, `GetHciLogBuffer` |
 | **Persistence** | `EnablePersistence`, `DisablePersistence` |
 | **Injection** | `MigrateAgent` |
-| **Evasion** | `SetReencodeSeed`, `MorphNow` |
+| **Evasion** | `SetReencodeSeed`, `MorphNow`, `SyscallEmulationToggle`, `CetStatus` |
 | **Token** | `MakeToken`, `StealToken`, `Rev2Self`, `GetSystem` |
+| **Forensic Cleanup** | `CleanPrefetch`, `DisablePrefetch`, `RestorePrefetch` |
 | **Lateral** | `PsExec`, `WmiExec`, `DcomExec`, `WinRmExec` |
 | **P2P** | `LinkAgents`, `UnlinkAgent`, `ListTopology`, `LinkTo`, `Unlink`, `ListLinks` |
 | **Mesh** | `MeshConnect`, `MeshDisconnect`, `MeshKillSwitch`, `MeshQuarantine`, `MeshClearQuarantine`, `MeshSetCompartment` |
@@ -112,6 +219,60 @@ Each command handler is a separate function in `handlers.rs` or a dedicated modu
 ---
 
 ## Syscall Infrastructure
+
+### User-Mode NT Kernel Interface Emulation (`syscall-emulation` feature)
+
+On top of the direct-syscall infrastructure, the agent can route configured NT
+syscalls ENTIRELY through user-mode kernel32/advapi32 equivalents, bypassing
+ntdll.dll syscall stubs completely.
+
+```
+┌─────────────────────────────┐
+│   Caller (injection_engine, │
+│   lsass_harvest, etc.)      │
+└──────┬──────────────────────┘
+       │ emulated_syscall!("NtWriteVirtualMemory", ...)
+       │
+┌──────▼──────────────────────┐
+│   Emulation dispatch        │
+│   (syscall_emulation.rs)    │
+│                             │
+│   ┌─ Is emulation ON? ────┐│
+│   │  AND function in set? ││
+│   │                       ││
+│   │  YES → kernel32 path  ││
+│   │  NO  → indirect path  ││
+│   └───────────────────────┘│
+└──────┬──────────┬───────────┘
+       │          │
+  ┌────▼─────┐   ┌▼──────────────┐
+  │ kernel32 │   │ Indirect      │
+  │ fallback │   │ syscall path  │
+  │ (Write-  │   │ (nt_syscall)  │
+  │ Process- │   │               │
+  │ Memory)  │   │ SSN + gadget  │
+  └──────────┘   └───────────────┘
+```
+
+**9 emulated syscalls**: `NtWriteVirtualMemory` → `WriteProcessMemory`,
+`NtReadVirtualMemory` → `ReadProcessMemory`,
+`NtAllocateVirtualMemory` → `VirtualAllocEx`,
+`NtFreeVirtualMemory` → `VirtualFreeEx`,
+`NtProtectVirtualMemory` → `VirtualProtectEx`,
+`NtCreateThreadEx` → `CreateRemoteThread` (limited: no `CREATE_SUSPENDED`),
+`NtOpenProcess` → `OpenProcess`,
+`NtClose` → `CloseHandle`,
+`NtQueryVirtualMemory` → `VirtualQueryEx` (class 0 only).
+
+**Configuration**: `[evasion.syscall_emulation]` in agent TOML:
+- `enabled = true` — Global toggle (can be toggled at runtime via C2)
+- `prefer_kernel32 = true` — Try kernel32/advapi32 first
+- `fallback_to_indirect = true` — Fall back to indirect syscall on failure
+- `emulated_functions = [...]` — List of function names to emulate
+
+**Call stack OPSEC**: When kernel32 equivalents are used, the call stack shows
+`kernel32!WriteProcessMemory` instead of ntdll syscall stubs — this looks like
+legitimate API usage to EDR products that hook ntdll.
 
 ### Direct Syscalls (`nt_syscall`)
 
@@ -291,6 +452,143 @@ The agent resolves these NT functions at runtime:
 | `NtCreateTimer` | Waitable timer creation (Cronus sleep variant) |
 | `NtSetTimer` | Timer configuration (Cronus sleep variant) |
 | `NtWaitForSingleObject` | Timer wait (Cronus sleep variant) |
+
+### CET / Shadow Stack Bypass (`cet-bypass` feature)
+
+Windows 11 24H2 (build ≥ 26100) enables **Intel CET hardware-enforced shadow stacks** by default. CET maintains a separate CPU-managed stack that records return addresses — if a `ret` instruction's target doesn't match the shadow stack entry, a `#CP` (Control Protection) exception fires. This defeats ROP, stack pivoting, and return-address spoofing techniques.
+
+The `cet_bypass` module (gated behind `#[cfg(all(windows, feature = "cet-bypass"))]`) provides three complementary bypass strategies:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              clean_call! macro invocation                │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                  ┌──────▼──────────┐
+                  │ prepare_spoofing│
+                  │ (CET check)     │
+                  └──────┬──────────┘
+                         │
+           ┌─────────────┼─────────────────┐
+           │             │                 │
+    ┌──────▼──────┐ ┌────▼─────┐  ┌───────▼───────┐
+    │ Proceed /   │ │UseCall-  │  │ Abort         │
+    │ Disabled    │ │Chain     │  │ (cannot       │
+    │             │ │          │  │  bypass)      │
+    │ spoof_call  │ │ kernel32 │  └───────────────┘
+    │ (existing)  │ │ direct   │
+    └─────────────┘ └──────────┘
+```
+
+**Strategy 1 — Policy disable** (preferred):
+- Self-process: `SetProcessMitigationPolicy(ProcessControlFlowGuardPolicy, ...)`
+- Remote process: `NtSetInformationProcess` with info class 52 (ProcessMitigationPolicy)
+- Queries `GetProcessMitigationPolicy` to verify CFG/CET state first
+
+**Strategy 2 — CET-compatible call chains**:
+- Routes NT API calls through kernel32 equivalents (e.g., `NtWriteVirtualMemory` → `kernel32!WriteProcessMemory`)
+- Each `call` instruction pushes a legitimate shadow-stack entry
+- 8 NT API names mapped to kernel32 equivalents in a `Lazy<HashMap>` registry
+
+**Strategy 3 — VEH shadow-stack fix** (requires `kernel-callback` feature):
+- Installs a Vectored Exception Handler for `#CP` exceptions
+- On exception, patches the shadow-stack entry to match the expected return address
+- Requires kernel-level access (BYOVD) for shadow-stack memory manipulation
+
+**Detection**: Build number read from `KUSER_SHARED_DATA` (`0x7FFE0000 + 0x260`). CET assumed present on builds ≥ 26100. CFG policy queried via `GetProcessMitigationPolicy` for confirmation.
+
+**Integration with syscalls.rs**: The `clean_call!` macro is the primary integration point — it checks CET state before calling `spoof_call` and routes through CET-compatible paths when shadow stacks are active. A secondary warning in `spoof_call` itself alerts if CET is active and the function is called directly.
+
+### Token-Only Impersonation (`token_impersonation`)
+
+The `token_impersonation` module (gated behind `#[cfg(all(windows, feature = "token-impersonation"))]`) bypasses EDR detection of `ImpersonateNamedPipeClient` by never calling it on the main agent thread:
+
+**Strategy 1 — SetThreadToken (preferred)**:
+1. Create a named pipe and wait for client connection
+2. Briefly call `ImpersonateNamedPipeClient`, extract token via `NtOpenThreadToken`
+3. Immediately revert via `RevertToSelf`
+4. Duplicate token via `NtDuplicateToken`, apply via `SetThreadToken(NULL, dup)`
+5. EDR monitoring post-revert sees no impersonation context
+
+**Strategy 2 — Impersonation Thread (fallback)**:
+1. Spawn helper thread that calls `ConnectNamedPipe` + `ImpersonateNamedPipeClient`
+2. Main thread extracts token via `NtOpenThreadToken` on helper thread
+3. Apply via `NtSetInformationThread(ThreadImpersonationToken)`
+4. Main thread call stack never contains impersonation APIs
+
+**Token Cache**: Extracted tokens are stored in `HashMap<TokenSource, CachedToken>` with user/domain/SID metadata. Active tracking enables auto-revert after task completion.
+
+**Integration Points**:
+- `lsass_harvest.rs`: `prepare_privileges()` checks cached tokens first before SeDebugPrivilege/SYSTEM theft
+- `p2p.rs`: Pipe server extracts tokens from connecting peers via `import_token()`
+- `handlers.rs`: Auto-revert after each task if configured
+
+### Forensic Cleanup — Prefetch Evidence Removal (`forensic_cleanup`)
+
+The `forensic_cleanup::prefetch` module (gated behind `#[cfg(all(windows, feature = "forensic-cleanup"))]`) removes Windows Prefetch (.pf) evidence that records process execution data:
+
+**Why**: Windows stores .pf files in `C:\Windows\Prefetch\` recording executable name, run count, timestamps, loaded DLLs, and accessed directories. EDR and forensic tools parse these to build execution timelines.
+
+**Three Cleanup Strategies**:
+
+1. **Patch** (preferred) — Maps the .pf file via `NtCreateSection` + `NtMapViewOfSection`, patches the header in-place (zeros run count, timestamps, executable name/paths), then unmaps. File remains on disk but contains no useful forensic data.
+
+2. **Delete** — Removes the .pf file via `NtDeleteFile`. More obvious to EDR but simpler.
+
+3. **Disable service** — Sets `EnablePrefetcher` registry value to 0 before the operation, restores after. Prevents new .pf files from being created during the operation window.
+
+**PF Format Support**: Parses MAM-format .pf headers for Windows 8 (v17), 8.1 (v23), 10 (v26), and 11 (v30). Extracts executable name from `EXECUTABLE-HASH.pf` naming convention for targeted cleanup.
+
+**USN Journal Consistency**: Reads USN journal entries referencing the .pf file and writes USN close records to cleanly mark them, preventing forensic timeline analysis from recovering modification events.
+
+**All NT API calls** use indirect syscalls via `nt_syscall` to bypass user-mode hooks:
+- `NtCreateFile`, `NtQueryDirectoryFile` — Directory and file enumeration
+- `NtDeleteFile` — File deletion
+- `NtCreateSection`, `NtMapViewOfSection`, `NtUnmapViewOfSection` — Memory mapping for patching
+- `NtOpenKey`, `NtSetValueKey`, `NtQueryValueKey`, `NtClose` — Registry manipulation
+- `NtFsControlFile` — USN journal operations
+
+**Post-Injection Hook**: Automatically cleans .pf evidence for the injected process after `TransactedHollow` or `DelayedStomp` completes. The hook is in `handlers.rs`, not `injection_engine.rs` — injection logic is unmodified.
+
+**Collision Note**: This handles DISK evidence only. It does NOT overlap with any memory-hygiene subsystem (which handles MEMORY evidence).
+
+### Forensic Cleanup Pipeline — Full Flow
+
+Beyond prefetch, the forensic cleanup pipeline includes additional stages for comprehensive evidence removal:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Forensic Cleanup Pipeline                   │
+│                                                              │
+│  Stage 1: Prefetch                                          │
+│  ├── Scan C:\Windows\Prefetch\ for matching .pf files       │
+│  ├── Patch headers (preferred) or delete files               │
+│  ├── Optionally disable Prefetch service                     │
+│  └── Clean USN journal entries for modified .pf files        │
+│                                                              │
+│  Stage 2: MFT Timestamps                                     │
+│  ├── Record baseline timestamps before file operations       │
+│  ├── Restore original timestamps via NtSetInformationFile    │
+│  └── Zero MFT entries for deleted files                      │
+│                                                              │
+│  Stage 3: USN Journal                                        │
+│  ├── Enumerate USN entries referencing agent files           │
+│  ├── Selective deletion of matching entries                  │
+│  └── Nuclear: delete entire USN journal if needed            │
+│                                                              │
+│  Stage 4: $LogFile                                           │
+│  ├── Scan NTFS $LogFile pages for agent references           │
+│  ├── Overwrite matching records with zeros                   │
+│  └── Recalculate page checksums                              │
+│                                                              │
+│  Stage 5: Memory Hygiene                                     │
+│  ├── SecureZeroMemory all temporary buffers                  │
+│  ├── Free all cleanup allocations                            │
+│  └── NtFlushBuffersFile to commit changes to disk            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+See `docs/FORENSICS.md` for detailed documentation of each stage, detection risk assessment, and operational security recommendations.
 
 ### Unhook Callback Registration
 
@@ -877,6 +1175,65 @@ Time: 0h          4h          4h+δ         4h+δ+30s
 | XChaCha20-Poly1305 | Sleep obfuscation memory encryption | 256-bit |
 | HMAC-SHA256 | Audit log integrity, config HMAC | 256-bit |
 | SHA-256 | Certificate fingerprinting, agent identity hashing, integrity checks | 256-bit |
+
+---
+
+## Injection Selection Logic
+
+The unified injection engine (`injection_engine.rs`) automatically selects the optimal injection technique based on the target environment. When `default_technique` is set to `"auto"`, the engine follows this priority ranking:
+
+### Technique Priority (Highest → Lowest)
+
+| Priority | Technique | Selection Criteria |
+|----------|-----------|-------------------|
+| 1 | **Transacted Hollowing** | Preferred for stealth; fileless on NTFS; no disk artifacts |
+| 2 | **Delayed Module Stomp** | EDR timing-heuristic bypass; randomized delay before stomp |
+| 3 | **Module Stomping** | Legitimate signed DLL .text overwriting; good against basic EDR |
+| 4 | **Process Hollowing** | Classic technique; well-understood; good compatibility |
+| 5 | **EarlyBird APC** | Best for process creation context; before main thread starts |
+| 6 | **ThreadPool Injection** | No new threads created; leverages existing thread pool |
+| 7 | **Callback Injection** | 12 API options; no explicit thread creation; callback-based |
+| 8 | **Section Mapping** | No WriteProcessMemory; dual-mapped section |
+| 9 | **Fiber Injection** | No thread creation; fiber context switch |
+| 10 | **Thread Hijacking** | Suspends existing thread; rewrites RIP |
+| 11 | **Context-Only** | No shellcode; pure context manipulation |
+
+### Auto-Selection Decision Tree
+
+```
+┌─────────────────────────────────────────┐
+│ Is target process already running?      │
+└────────────┬────────────────────────────┘
+             │
+     ┌─── Yes ───┴─── No ───┐
+     │                       │
+┌────▼─────────┐    ┌───────▼────────────┐
+│ Is EDR       │    │ Create sacrificial  │
+│ aggressive?  │    │ process (spawnto)   │
+└────┬─────────┘    └───────┬────────────┘
+     │                      │
+ ┌───┴───┐          ┌───────▼────────────┐
+ Yes     No         │ EarlyBird APC      │
+ │       │          │ (before thread     │
+ │       │          │  resumes)          │
+┌▼───────▼───────┐  └────────────────────┘
+│ Transacted     │
+│ Hollowing OR   │
+│ Delayed Stomp  │
+│ (highest stealth│
+│  + timing ev.) │
+└────────────────┘
+```
+
+### Technique Selection Overrides
+
+| Condition | Override |
+|-----------|----------|
+| `default_technique != "auto"` | Use specified technique directly |
+| Target process is `svchost.exe` | Prefer ThreadPool or Callback (service context) |
+| Target process is `explorer.exe` | Prefer Module Stomping (user context) |
+| CET detected and enabled | Avoid Thread Hijacking and Context-Only |
+| Specified technique fails | Fall through to next priority |
 
 ---
 

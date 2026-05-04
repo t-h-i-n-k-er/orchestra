@@ -6,7 +6,85 @@ All notable changes to Orchestra are documented here.
 
 ## [Unreleased]
 
+### Feature Categories
+
+| Category | Features |
+|----------|----------|
+| **Evasion & Stealth** | Evanesco, CET Bypass, Token Impersonation, Syscall Emulation, Kernel Callback (BYOVD), EDR Bypass Transform, AMSI Write-Raid, NTDLL Unhooking, Stack Spoofing |
+| **Injection** | Transacted Hollowing, Delayed Module Stomp, Injection Engine Expansion, .NET Assembly Loader, BOF/COFF Loader |
+| **Post-Exploitation** | C4 Bomb (DPAPI), LSA Whisperer, Browser Data, LSASS Harvest, Surveillance, Interactive Shells |
+| **Forensics** | Prefetch Evidence Removal, Dynamic SSN Validation, Sleep Obfuscation (Ekko + Cronus) |
+| **Infrastructure** | P2P Mesh, Server (Build Queue, DoH, mTLS, Mesh Controller), Builder, Protocol v2, Audit HMAC |
+
 ### Added
+
+#### Windows Prefetch Evidence Removal (`forensic-cleanup` feature)
+- **Prefetch (.pf) evidence removal** — Cleans Windows Prefetch files that
+  record process execution evidence (executable name, run count, timestamps,
+  loaded DLLs, directories accessed).  EDR and forensic tools parse these to
+  build execution timelines.  All NT API calls use indirect syscalls via
+  `nt_syscall` to bypass user-mode API hooks.
+- **Three cleanup strategies**:
+  1. **Patch** (preferred) — Maps the .pf file via `NtCreateSection` +
+     `NtMapViewOfSection`, patches the header in-place (zeros run count,
+     timestamps, executable name/paths), then unmaps.
+  2. **Delete** — Removes the .pf file via `NtDeleteFile`.
+  3. **Disable service** — Sets `EnablePrefetcher` registry value to 0 before
+     the operation, restores after.
+- **USN journal consistency** — Reads USN journal entries referencing the .pf
+  file and writes USN close records to cleanly mark them.
+- **Post-injection auto-cleanup** — Hooks into `TransactedHollow` and
+  `DelayedStomp` injection handlers to automatically clean .pf evidence.
+- **PF format support** — Parses MAM-format .pf headers for Windows 8 (v17),
+  8.1 (v23), 10 (v26), and 11 (v30).
+- **Feature flag** — `forensic-cleanup = ["direct-syscalls"]` in
+  `agent/Cargo.toml`.
+
+#### User-Mode NT Kernel Interface Emulation (`syscall-emulation` feature)
+- **kernel32/advapi32 syscall emulation** — Frequently-used NT syscalls are
+  implemented entirely in user-mode via kernel32/advapi32 fallbacks, eliminating
+  all references to ntdll.dll syscall stubs. Makes the agent invisible to EDR
+  hooks on ntdll AND to ntdll unhooking detection.
+- **9 emulated syscalls**: `NtWriteVirtualMemory`, `NtReadVirtualMemory`,
+  `NtAllocateVirtualMemory`, `NtFreeVirtualMemory`, `NtProtectVirtualMemory`,
+  `NtCreateThreadEx`, `NtOpenProcess`, `NtClose`, `NtQueryVirtualMemory`.
+- **`emulated_syscall!` macro** — Drop-in replacement for `nt_syscall::syscall!`.
+  Routes through kernel32/advapi32 when enabled, falls back to indirect syscalls.
+- **Call stack legitimacy** — When kernel32 equivalents are used, the call
+  stack shows `kernel32!WriteProcessMemory` etc. instead of ntdll syscall stubs.
+- **Feature flag** — `syscall-emulation = ["direct-syscalls"]` in
+  `agent/Cargo.toml`.
+
+#### CET / Shadow Stack Bypass (`cet-bypass` feature)
+- **Windows 11 24H2+ shadow-stack bypass** — Detects and bypasses Intel CET
+  hardware-enforced shadow stacks that break traditional stack-spoofing.
+- **Three bypass strategies**:
+  1. **Policy disable** — `SetProcessMitigationPolicy` or
+     `NtSetInformationProcess` (info class 52) to disable CET.
+  2. **CET-compatible call chains** — Routes NT API calls through kernel32
+     equivalents for valid shadow-stack entries.
+  3. **VEH shadow-stack fix** — Vectored Exception Handler for `#CP` exceptions
+     to patch shadow-stack entries.
+- **Build detection** — Reads Windows build from `KUSER_SHARED_DATA` at
+  `0x7FFE0000+0x260`; CET assumed on builds ≥ 26100.
+- **Feature flag** — `cet-bypass = ["direct-syscalls"]` in `agent/Cargo.toml`.
+
+#### Token-Only Impersonation (`token-impersonation` feature)
+- **EDR-evading token impersonation** — Extracts and applies impersonation
+  tokens without calling `ImpersonateNamedPipeClient` on the main thread.
+- **Two bypass strategies**:
+  1. **SetThreadToken** (preferred) — Briefly impersonates, extracts token,
+     reverts immediately, then applies via `SetThreadToken`.
+  2. **Impersonation thread** (fallback) — Spawns helper thread for
+     `ConnectNamedPipe` + `ImpersonateNamedPipeClient`; main thread extracts
+     token via `NtOpenThreadToken` on the helper.
+- **Encrypted token cache** — Duplicated tokens stored in `HashMap` with
+  user/domain/SID metadata for reuse across operations.
+- **Auto-revert** — Optionally reverts impersonation after each C2 task.
+- **Integration** — `lsass_harvest` checks cached token first; P2P SMB pipe
+  server extracts tokens from connecting peers.
+- **Feature flag** — `token-impersonation = ["direct-syscalls"]` in
+  `agent/Cargo.toml`.
 
 #### Continuous Memory Hiding — Evanesco (`evanesco` feature)
 - **Per-page RC4 encryption at rest** — All enrolled memory pages are kept in

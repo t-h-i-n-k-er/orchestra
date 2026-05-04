@@ -37,6 +37,16 @@ they own or are explicitly authorized to manage. The threat model focuses on:
 | PSK compromise leading to session decryption | Optional X25519 forward secrecy (`forward-secrecy` feature) |
 | Audit log tampering | HMAC-SHA256 signed entries; tampered records flagged on read |
 | Rogue agent impersonating another | Server-assigned `connection_id` as primary registry key |
+| CET/shadow-stack enforcement (Win11 24H2+) | `cet-bypass` feature: policy disable + CET-compatible call chains + VEH |
+| EDR hooking `ImpersonateNamedPipeClient` | `token-impersonation` feature: SetThreadToken or NtSetInformationThread via indirect syscalls |
+| Forensic timeline analysis via Prefetch .pf files | `forensic-cleanup` feature: patch/delete .pf files, disable Prefetch service, clean USN journal entries |
+| EDR kernel callbacks blocking agent operations | `kernel-callback` feature: BYOVD driver load → overwrite callback function pointers (8 vulnerable drivers supported) |
+| EDR signature detection on agent .text section | `evade-edr-transform` feature: runtime scan + 5 semantic-preserving code transforms |
+| NTFS forensic artifacts from injection | `transacted-hollowing` feature: NTFS transaction-backed sections, never committed to disk |
+| EDR timing heuristic detecting module stomping | `delayed-stomp` feature: randomized delay between DLL load and .text overwrite |
+| Credential Guard preventing credential harvesting | `lsa-whisperer` feature: SSP installation receives plaintext before hashing, bypasses Credential Guard |
+| Evanesco memory scanning while agent active | `evanesco` feature: continuous per-page RC4 encryption + PAGE_NOACCESS |
+| EDR user-mode syscall instruction scanning | `syscall-emulation` feature: routes Nt* through kernel32/advapi32, no syscall instructions in user code |
 
 **Out of scope**: defending against a fully privileged local attacker on the
 agent host.
@@ -83,6 +93,8 @@ Use this checklist when deploying Orchestra to production.
 - [ ] Enable `env-validation` on sensitive deployments
 - [ ] Set `persistence_enabled = false` unless explicitly needed
 - [ ] Minimize enabled features to reduce attack surface
+- [ ] Enable `syscall-emulation` feature to avoid ntdll hook detection
+- [ ] Configure `emulated_functions` to include injection-related syscalls
 
 ### Build queue
 
@@ -373,6 +385,16 @@ The following issues were identified and resolved during the security audit:
 | 24 | VM-refusal bypass required exact IMDS match | Added fallback controls | Medium |
 | 25 | VM threshold lacked operator extension | Added `vm_detection_extra_hypervisor_names` | Medium |
 | 26 | Optimizer helper dead-code lint noise | Matched cfg to diversification pass | Low |
+| 27 | CET shadow stacks break stack-spoofing on Win11 24H2+ | `cet-bypass` feature: policy disable, CET-compatible call chains, VEH fix | High |
+| 28 | EDR hooks on `ImpersonateNamedPipeClient` detect pipe impersonation | `token-impersonation` feature: SetThreadToken/NtSetInformationThread via indirect syscalls, token cache with auto-revert | High |
+| 29 | Forensic timeline analysis via Prefetch .pf files reveals execution history | `forensic-cleanup` feature: patch .pf headers (preferred), delete .pf files, disable Prefetch service, clean USN journal entries; all NT API calls via indirect syscalls | High |
+| 30 | EDR kernel callbacks block agent operations (handle protection, image load monitoring) | `kernel-callback` feature: BYOVD with 8 vulnerable drivers; overwrites callback return pointers to null/stub | High |
+| 31 | EDR signature-based detection of agent .text section | `evade-edr-transform` feature: runtime .text scan + 5 semantic-preserving transforms (register rename, instruction swap, block reorder, NOP sled, constant fold) | Medium |
+| 32 | NTFS disk artifacts from process hollowing | `transacted-hollowing` feature: NTFS transaction-backed sections never committed to disk; fake provider GUIDs for ETW blinding | High |
+| 33 | EDR timing heuristic detects module stomping via load→modify timing | `delayed-stomp` feature: randomized 5–30s delay between DLL load and .text overwrite | Medium |
+| 34 | Credential Guard prevents LSASS-based credential harvesting | `lsa-whisperer` feature: custom SSP installation intercepts plaintext credentials before hashing; bypasses Credential Guard and RunAsPPL | High |
+| 35 | EDR periodic memory scanning while agent is active | `evanesco` feature: continuous per-page RC4 encryption + PAGE_NOACCESS; pages only decrypted for microseconds during execution | High |
+| 36 | EDR detects direct syscall instructions in user-mode memory | `syscall-emulation` feature: routes Nt* calls through kernel32/advapi32; no syscall instructions in user code | Medium |
 
 ---
 
@@ -436,6 +458,22 @@ the initial security audit.
 | Hook detection false positives | Only checks first 5 bytes of syscall stubs for well-known hook patterns |
 | `.text` section re-fetch overhead | Lazy — only performed when hooks are actually detected |
 | Post-sleep re-hooking | Step 12 of sleep cycle performs automatic `maybe_unhook()` after each wake |
+
+### Syscall Emulation (`SyscallEmulationToggle`)
+
+**Risk level: LOW (defensive)**
+
+Routes configured NT syscalls through kernel32/advapi32 equivalents, bypassing
+ntdll.dll syscall stubs entirely.  When enabled, EDR hooks on ntdll see no
+syscall traffic from the agent.
+
+| Concern | Mitigation |
+|---------|------------|
+| kernel32 API monitoring by EDR | Call stacks show legitimate API usage (WriteProcessMemory etc.) |
+| Emulation failure | Configurable fallback to existing indirect-syscall path |
+| `NtCreateThreadEx` cannot CREATE_SUSPENDED | Automatically falls back to indirect syscall for suspended threads |
+| `NtQueryVirtualMemory` class > 0 unsupported | Falls back to indirect syscall for unsupported info classes |
+| Runtime toggling detected by EDR | Toggle is silent; no additional IPC or registry writes |
 
 ### Interactive Shell Sessions
 

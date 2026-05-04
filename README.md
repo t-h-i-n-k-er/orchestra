@@ -1,6 +1,6 @@
 # Orchestra
 
-A cross-platform, operationally secure command-and-control framework built in Rust. Orchestra provides a malleable C2 pipeline, a unified injection engine with twelve techniques, advanced sleep obfuscation with post-wake NTDLL hook re-check, in-process .NET assembly and BOF execution, browser credential extraction, LSASS harvesting, interactive shell sessions, P2P mesh networking, and a standalone redirector binary — all designed for red-team operations requiring granular control over network signatures, memory forensics resistance, and payload delivery.
+A cross-platform, operationally secure command-and-control framework built in Rust. Orchestra provides a malleable C2 pipeline, a unified injection engine with twelve techniques, advanced sleep obfuscation with post-wake NTDLL hook re-check, in-process .NET assembly and BOF execution, browser credential extraction (including Chrome v20 DPAPI padding-oracle bypass), LSASS harvesting, LSA SSP credential extraction (Credential Guard bypass), token-only impersonation, kernel callback overwrite (BYOVD), CET/shadow-stack bypass, syscall emulation, EDR bypass transformation, forensic cleanup (Prefetch/MFT/USN), interactive shell sessions, P2P mesh networking, and a standalone redirector binary — all designed for red-team operations requiring granular control over network signatures, memory forensics resistance, and payload delivery.
 
 | | |
 |---|---|
@@ -36,11 +36,33 @@ A cross-platform, operationally secure command-and-control framework built in Ru
                     └────────────┼────────────┘
                                  │ HTTP/S (malleable)
                                  ▼
-                          ┌──────────────┐
-                          │    Agent     │
-                          │ (in-memory)  │  ◄── Sleep obfuscation
-                          │              │  ◄── Memory hygiene
-                          └──────┬───────┘  ◄── Self-reencode
+                    ┌──────────────────────────┐
+                    │         Agent            │
+                    │       (in-memory)        │
+                    │                          │
+                    │ ┌─ evasion/ ───────────┐ │
+                    │ │ AMSI · ETW · Unhook  │ │
+                    │ │ SyscallEmu · CET     │ │
+                    │ │ EDR Transform        │ │
+                    │ │ StackSpoof · Evanesco│ │
+                    │ └──────────────────────┘ │
+                    │ ┌─ injection/ ─────────┐ │  ◄── Sleep obfuscation
+                    │ │ Hollow · Transacted  │ │  ◄── Memory hygiene
+                    │ │ ModuleStomp · Delayed│ │  ◄── Self-reencode
+                    │ │ EarlyBird · Thread   │ │  ◄── Kernel callback
+                    │ │ ThreadPool · Fiber   │ │
+                    │ │ Callback · Section   │ │
+                    │ └──────────────────────┘ │
+                    │ ┌─ forensic_cleanup/ ──┐ │
+                    │ │ Prefetch · Timestamps│ │
+                    │ │ USN · $LogFile       │ │
+                    │ └──────────────────────┘ │
+                    │ ┌─ post-exploitation ──┐ │
+                    │ │ Browser · LSASS      │ │
+                    │ │ LSA Whisperer · Token│ │
+                    │ │ .NET · BOF · Shells  │ │
+                    │ └──────────────────────┘ │
+                    └────────────┬─────────────┘
                                  │
                     ┌────────────┼────────────┐
                     │            │            │
@@ -56,7 +78,7 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 
 | Crate | Type | Purpose |
 |-------|------|---------|
-| `agent` | lib + bin | Implant: C2 transports, evasion, injection, sleep obfuscation, persistence, .NET/BOF exec, browser data, LSASS harvest, surveillance, shells, lateral movement |
+| `agent` | lib + bin | Implant: C2 transports, evasion (AMSI/ETW/syscall emulation/CET/EDR transform), injection (12 techniques), sleep obfuscation, forensic cleanup, persistence, .NET/BOF exec, browser data, LSASS/LSA harvest, token impersonation, kernel callback, surveillance, shells, lateral movement |
 | `orchestra-server` | bin | Control center: agent management, module signing, build queue, profile hot-reload |
 | `redirector` | bin | Standalone HTTP reverse proxy with cover traffic and registration |
 | `common` | lib | Wire protocol (`Message`, `Command`), `Transport` trait, crypto, config types |
@@ -93,6 +115,8 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 | **NtContinue Call Stack Spoofing** | ✅ | — | — | Stack-spoofed syscall dispatch via `NtContinue` |
 | **Process Hollowing** | ✅ | — | — | Create suspended → unmap → write → fix relocations/IAT → resume |
 | **Module Stomping** (NtWaitForSingleObject) | ✅ | — | — | Overwrites `.text` of legitimate signed DLL in target |
+| **Transacted Hollowing** (NTFS fileless) | ✅ | — | — | NTFS transaction-backed section, ETW blinding, fake provider GUIDs |
+| **Delayed Module Stomp** | ✅ | — | — | EDR timing-heuristic bypass: load DLL → randomized delay → stomp |
 | **EarlyBird APC Injection** | ✅ | — | — | QueueUserAPC before thread resumes |
 | **Thread Hijacking** | ✅ | — | — | Suspend → rewrite RIP → resume |
 | **Unified Injection Engine** | ✅ | ✅ | — | Auto-selects technique based on EDR recon; 12-technique fallback chain |
@@ -102,15 +126,25 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 | **Context-Only Injection** | ✅ | — | — | `SetThreadContext` RIP rewrite (no shellcode) |
 | **Section Mapping Injection** | ✅ | — | — | `NtCreateSection` + `NtMapViewOfSection` dual-mapping |
 | **Callback Injection** (12 APIs) | ✅ | — | — | `EnumChildWindows`, `CreateTimerQueueTimer`, etc. |
+| **User-Mode Syscall Emulation** | ✅ | — | — | Routes Nt* calls through kernel32/advapi32; invisible to ntdll hooks |
+| **CET / Shadow Stack Bypass** | ✅ | — | — | Policy disable, CET-compatible call chains, VEH shadow-stack fix |
+| **AMSI Write-Raid Bypass** | ✅ | — | — | Data-only race on `AmsiInitFailed`; zero code/permission/breakpoint mods |
+| **Kernel Callback Overwrite** (BYOVD) | ✅ | — | — | 8 vulnerable drivers; ret-pointer overwrite; defeats EDR integrity checks |
+| **EDR Bypass Transformation Engine** | ✅ | — | — | Runtime .text signature scanning + 5 semantic-preserving transforms |
+| **Token-Only Impersonation** | ✅ | — | — | SetThreadToken / impersonation thread; encrypted token cache; auto-revert |
+| **Continuous Memory Hiding** (Evanesco) | ✅ | — | — | Per-page RC4 encryption + PAGE_NOACCESS at all times, not just sleep |
 | **.NET Assembly Execution** | ✅ | — | — | In-process CLR hosting, fresh AppDomain per exec |
 | **BOF / COFF Execution** | ✅ | — | — | Beacon-compatible API, public BOF ecosystem |
 | **Interactive Shell Sessions** | ✅ | ✅ | ✅ | cmd.exe / sh / zsh with background reader threads |
-| **Browser Data Extraction** | ✅ | — | — | Chrome v127+ App-Bound Encryption, Edge, Firefox |
+| **Browser Data Extraction** | ✅ | — | — | Chrome v20+ DPAPI padding-oracle (C4 Bomb), App-Bound Encryption, Edge, Firefox |
 | **LSASS Credential Harvesting** | ✅ | — | — | Indirect syscalls, no MiniDumpWriteDump |
+| **LSA Whisperer** (SSP Credential Extraction) | ✅ | — | — | Bypasses Credential Guard + RunAsPPL; no LSASS memory reads |
+| **Prefetch Evidence Removal** | ✅ | — | — | Patch/delete .pf files; disable service; USN journal cleanup |
 | **NTDLL Unhooking** | ✅ | — | — | `\KnownDlls` re-fetch + disk fallback, post-sleep auto-check |
+| **Dynamic SSN Validation** | ✅ | — | — | Cross-reference + probe + SSDT nuclear fallback |
 | **Surveillance** (screenshot/keylogger/clipboard) | ✅ | — | — | `surveillance` feature; encrypted ring buffers |
 | **Token Manipulation** | ✅ | — | — | MakeToken, StealToken, Rev2Self, GetSystem; thread-safe |
-| **Sleep Obfuscation** (full memory encryption) | ✅ | ✅ | ✅ | XChaCha20-Poly1305 region encryption; stack encryption on Windows |
+| **Sleep Obfuscation** (full memory encryption) | ✅ | ✅ | ✅ | XChaCha20-Poly1305 region encryption; Cronus (waitable timer) + Ekko variants |
 | **Stack Encryption during Sleep** | ✅ | — | — | Full stack frame encryption with safety guarantees |
 | **PEB Unlinking & Memory Hygiene** | ✅ | — | — | Module unlink, thread start scrub, handle table scrub |
 | **Thread Start Address Scrubbing** | ✅ | — | — | Replaces thread start address to hide anomalous entry points |
@@ -131,7 +165,6 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 | **Lateral Movement** | ✅ | — | — | PsExec, WMI, DCOM, WinRM — no PowerShell |
 | **Linux In-Memory Execution** | — | ✅ | — | `memfd_create` + `fexecve` |
 | **Linux RW→RX Transition** | — | ✅ | — | `mmap` RW → write → `mprotect` RX |
-| **Token Manipulation** | ✅ | — | — | MakeToken, StealToken, Rev2Self, GetSystem; thread-safe |
 | **HKDF-SHA256 Key Derivation** | ✅ | ✅ | ✅ | All session keys derived via HKDF |
 | **Per-Build Randomized IoCs** | ✅ | ✅ | ✅ | `build.rs` generates random pipe names, DNS prefixes, service names |
 | **Server Credential Enforcement** | ✅ | ✅ | ✅ | No default credentials; startup fails without explicit tokens |
@@ -184,10 +217,10 @@ permissions = ["all"]
 ### Build an Agent
 
 ```bash
-# Cross-compile for Windows with HTTP transport
+# Cross-compile for Windows with HTTP transport and full evasion
 cargo build --release --package agent \
     --target x86_64-pc-windows-gnu \
-    --features "http-transport,outbound-c"
+    --features "http-transport,outbound-c,direct-syscalls,memory-guard,stack-spoof,cet-bypass,token-impersonation,forensic-cleanup,write-raid-amsi,syscall-emulation"
 
 # Cross-compile for Linux with DoH transport
 cargo build --release --package agent \
@@ -1006,10 +1039,10 @@ cargo check --workspace
 # Build server (release)
 cargo build --release --package orchestra-server
 
-# Build agent for Windows (with HTTP transport)
+# Build agent for Windows (with HTTP transport + full evasion suite)
 cargo build --release --package agent \
     --target x86_64-pc-windows-gnu \
-    --features "http-transport,outbound-c,direct-syscalls,memory-guard"
+    --features "http-transport,outbound-c,direct-syscalls,memory-guard,stack-spoof,cet-bypass,token-impersonation,forensic-cleanup,write-raid-amsi,syscall-emulation,evanesco,evade-edr-transform"
 
 # Build agent for Linux
 cargo build --release --package agent \

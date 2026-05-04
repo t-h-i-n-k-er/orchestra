@@ -229,6 +229,127 @@ threads when inspected by security tools (EDR/Elastic).
 
 ---
 
+### `cet-bypass`
+
+**Default: no** | **Windows only (x86_64)** | **Requires: `direct-syscalls`**
+
+Bypasses Intel CET (Control-flow Enforcement Technology) hardware-enforced
+shadow stacks introduced in Windows 11 24H2 (build ≥ 26100). Without this
+feature, stack-spoofing return-address manipulation triggers `#CP` exceptions
+that crash the agent or alert EDR.
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows x86_64 only |
+| Dependencies | `direct-syscalls` |
+| New module | `cet_bypass` — detection, policy manipulation, call chains, VEH |
+| Default config | `enabled = true`, `prefer_policy_disable = true`, `fallback_to_call_chain = true` |
+
+**Three bypass strategies (attempted in order):**
+
+1. **Policy disable** — Disables CET shadow stacks for the target process via
+   `SetProcessMitigationPolicy` (self) or `NtSetInformationProcess` info class
+   52 (remote).  Preferred because it requires no runtime overhead after the
+   one-time disable.
+
+2. **CET-compatible call chains** — Routes NT API calls through kernel32
+   equivalents (e.g., `NtWriteVirtualMemory` → `WriteProcessMemory`).  Each
+   `call` instruction pushes a legitimate shadow-stack entry, maintaining
+   shadow-stack integrity.  8 NT API names mapped to kernel32 equivalents.
+
+3. **VEH shadow-stack fix** — Installs a Vectored Exception Handler for `#CP`
+   exceptions that patches the shadow-stack entry to match the expected return
+   address.  Requires the `kernel-callback` feature for kernel-level memory
+   access.
+
+**Integration with `clean_call!` macro:** When CET is active, the macro
+automatically routes calls through CET-compatible paths.  Existing `spoof_call`
+behavior is preserved when CET is off or has been disabled.
+
+**Runtime command:** `CetStatus` returns JSON describing CET presence, state,
+and active bypass strategy.
+
+---
+
+### `token-impersonation`
+
+**Default: no** | **Windows only** | **Implies: `direct-syscalls`**
+
+Bypasses EDR detection of `ImpersonateNamedPipeClient` by extracting and
+applying impersonation tokens without calling the API on the main agent
+thread.  Two strategies: SetThreadToken (preferred, brief impersonation +
+immediate revert + duplicate apply) and Impersonation Thread (fallback,
+helper thread does impersonation, main thread uses NtSetInformationThread).
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows only |
+| Applies to | Agent core, lsass_harvest, P2P SMB |
+| Depends on | `direct-syscalls` |
+| New module | `token_impersonation` — pipe listener, token cache, auto-revert |
+
+**Runtime commands:**
+- `ImpersonatePipe { pipe_name }` — create pipe, extract connecting client token
+- `RevertToken` — clear thread impersonation via NtSetInformationThread(NULL)
+- `ListTokens` — return all cached tokens as JSON
+
+**Integration:**
+- `lsass_harvest.rs`: checks cached tokens before SeDebugPrivilege/SYSTEM theft
+- `p2p.rs`: pipe server auto-extracts tokens from connecting peers
+- `handlers.rs`: auto-revert after each task if configured
+
+---
+
+### `forensic-cleanup`
+
+**Default: no** | **Windows only** | **Implies: `direct-syscalls`**
+
+Removes Windows Prefetch (.pf) evidence that records process execution data
+(executable name, run count, timestamps, loaded DLLs, accessed directories).
+EDR and forensic tools parse these files to build execution timelines.
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows only |
+| Applies to | Post-injection cleanup, on-demand evidence removal |
+| Depends on | `direct-syscalls` |
+| New module | `forensic_cleanup::prefetch` — PF enumeration, header patching, USN cleanup |
+
+**Three cleanup strategies** (configurable via `[prefetch]` config):
+1. **Patch** (preferred) — Maps .pf file, patches header in-place (zeros run
+   count, timestamps, executable name/paths). File remains on disk but
+   contains no useful forensic data.
+2. **Delete** — Removes .pf file via `NtDeleteFile`.
+3. **Disable service** — Sets `EnablePrefetcher` registry value to 0 before
+   operation, restores after.
+
+**All NT API calls** use indirect syscalls via `nt_syscall`:
+`NtCreateFile`, `NtQueryDirectoryFile`, `NtDeleteFile`, `NtCreateSection`,
+`NtMapViewOfSection`, `NtUnmapViewOfSection`, `NtOpenKey`, `NtSetValueKey`,
+`NtQueryValueKey`, `NtClose`, `NtFsControlFile`.
+
+**Runtime commands:**
+- `CleanPrefetch { exe_name }` — clean .pf evidence for executable (or all)
+- `DisablePrefetch` — disable Prefetch service (EnablePrefetcher = 0)
+- `RestorePrefetch` — restore Prefetch service to previous state
+
+**Automatic cleanup:**
+- Hooks into `TransactedHollow` and `DelayedStomp` injection handlers
+- Cleans .pf evidence for injected process after injection completes
+- Configurable via `auto_clean_after_injection = true`
+
+**Config section:**
+```toml
+[prefetch]
+enabled = true
+auto_clean_after_injection = true
+method = "patch"        # "delete", "patch", "disable-service"
+restore_service_after = true
+clean_usn_journal = true
+```
+
+---
+
 ### `manual-map`
 
 **Default: no** | **Windows only**
@@ -354,6 +475,196 @@ helping evade file-based detection.
 |-----------|-------|
 | Platform | All |
 | Overhead | One-time cost at startup |
+
+---
+
+### `syscall-emulation`
+
+**Default: no** | **Windows only**
+
+Routes `Nt*` API calls through their kernel32/advapi32 equivalents instead of
+calling ntdll directly. Because EDR hooks ntdll's `.text` section, routing
+through kernel32 makes agent syscalls invisible to user-mode hook-based
+detection.
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows only |
+| Alternative to | `direct-syscalls` (different bypass strategy) |
+| Mapped APIs | 8 NT API → kernel32 equivalents |
+| Stealth | Appears as normal Win32 API usage |
+
+**When to use:** When `direct-syscalls` is detected (EDR scans for syscall
+instructions in user memory) or when you want NT API calls to have normal
+kernel32 call stacks.
+
+**Example profile:**
+```toml
+features = ["outbound-c", "syscall-emulation"]
+```
+
+---
+
+### `evanesco`
+
+**Default: no** | **Windows only**
+
+Continuous memory hiding that keeps executable pages encrypted and set to
+`PAGE_NOACCESS` at all times, not just during sleep. Pages are only decrypted
+for microseconds when code needs to execute, making memory scanning extremely
+difficult.
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows only |
+| Encryption | Per-page RC4 |
+| Page state | `PAGE_NOACCESS` when dormant |
+| Performance | Medium impact (page faults on execution) |
+
+**How it differs from sleep obfuscation:** Sleep obfuscation only hides memory
+during sleep periods. Evanesco hides memory continuously, with pages only
+briefly decrypted for execution. This defeats memory scanning that occurs
+while the agent is active (e.g., periodic EDR memory scans).
+
+**Example profile:**
+```toml
+features = ["outbound-c", "evanesco"]
+```
+
+---
+
+### `evade-edr-transform`
+
+**Default: no** | **Windows only**
+
+Automated runtime transformation engine that scans the agent's own `.text`
+section for known signatures and applies semantic-preserving code
+transformations to evade EDR signature-based detection.
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows only |
+| Transforms | Register rename, instruction swap, block reorder, NOP sled, constant fold |
+| Trigger | Init + post-sleep + on-demand |
+| Safety | Semantic preservation verified per transform |
+
+**Transform types:**
+1. **Register Rename** — Renames general-purpose registers (`rax` ↔ `rcx`)
+2. **Instruction Swap** — Swaps independent adjacent instructions
+3. **Block Reorder** — Reorders basic blocks with adjusted branches
+4. **NOP Sled Insertion** — Inserts multi-byte NOPs between instructions
+5. **Constant Folding** — Replaces constants with equivalent expressions
+
+**Example profile:**
+```toml
+features = ["outbound-c", "evade-edr-transform"]
+```
+
+---
+
+### `kernel-callback`
+
+**Default: no** | **Windows only** | **Requires: Administrator**
+
+Disables EDR kernel callbacks by overwriting function pointers in kernel memory
+using Bring Your Own Vulnerable Driver (BYOVD). Supports 8 known vulnerable
+drivers for physical memory read/write.
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows only |
+| Requirement | Administrator privileges |
+| Drivers | 8 vulnerable drivers supported (MSI, Dell, ASUS, Gigabyte, etc.) |
+| Callbacks | ObRegisterCallbacks, PsSetCreateProcess/Thread/LoadImage, CmRegisterCallback |
+| Risk | High — driver load is heavily monitored |
+
+**When to use:** When EDR products are using kernel callbacks that prevent
+agent operations (e.g., handle protection preventing token theft, or image
+load callbacks preventing injection).
+
+**Example profile:**
+```toml
+features = ["outbound-c", "kernel-callback"]
+```
+
+---
+
+### `transacted-hollowing`
+
+**Default: no** | **Windows only**
+
+NTFS transaction-based process hollowing variant that creates a fileless
+section backed by an NTFS transaction. The transaction is never committed,
+leaving no disk artifacts.
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows only |
+| Technique | NTFS transaction + section mapping |
+| Stealth | Fileless — no disk artifacts |
+| ETW blinding | Fake provider GUIDs used for transaction operations |
+
+**Advantages over standard hollowing:** No temporary file on disk. The NTFS
+transaction is created, a section is mapped from it, and the transaction is
+rolled back. The section remains valid in memory but has no disk presence.
+
+**Example profile:**
+```toml
+features = ["outbound-c", "transacted-hollowing"]
+```
+
+---
+
+### `delayed-stomp`
+
+**Default: no** | **Windows only**
+
+Delayed module-stomp injection variant that introduces a randomized delay
+between loading the legitimate DLL and stomping its `.text` section. This
+defeats EDR timing heuristics that detect stomping by monitoring for
+immediate `.text` modification after DLL load.
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows only |
+| Technique | Module stomping with randomized delay |
+| Delay range | Configurable (default: 5–30 seconds) |
+| Detection | Defeats timing-heuristic based EDR |
+
+**When to use:** When standard module stomping is detected by EDR products
+that monitor DLL load → `.text` modification timing.
+
+**Example profile:**
+```toml
+features = ["outbound-c", "delayed-stomp"]
+```
+
+---
+
+### `lsa-whisperer`
+
+**Default: no** | **Windows only** | **Requires: Administrator**
+
+Installs a custom Security Support Provider (SSP) to intercept plaintext
+credentials during authentication. Bypasses Credential Guard and RunAsPPL
+because the SSP receives credentials before they are hashed.
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows only |
+| Requirement | Administrator (for SSP installation) |
+| Credential Guard | Bypassed — SSP receives plaintext before hashing |
+| RunAsPPL | Bypassed — no LSASS memory reads required |
+| Storage | Encrypted in-memory buffer (AES-256-GCM) |
+
+**How it works:** Installs a custom SSP via `AddSecurityPackage` or registry
+modification. The SSP's `SpAcceptCredentials` callback receives plaintext
+username/password for every authentication event.
+
+**Example profile:**
+```toml
+features = ["outbound-c", "lsa-whisperer"]
+```
 
 ---
 
