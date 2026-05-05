@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use winapi::shared::guiddef::GUID;
 use winapi::um::combaseapi::{CoCreateInstance, CoInitializeEx, CoUninitialize};
-use winapi::um::handleapi::CloseHandle;
+// CloseHandle removed — using NtClose indirect syscall instead
 use winapi::um::libloaderapi::{FreeLibrary, GetProcAddress, LoadLibraryA};
 use winapi::um::oleauto::{SysAllocStringByteLen, SysFreeString};
 use winapi::um::winbase::LocalFree;
@@ -754,7 +754,7 @@ fn decrypt_master_key_via_pipe(encrypted_key: &[u8]) -> Result<Vec<u8>> {
     impl Drop for PipeGuard {
         fn drop(&mut self) {
             if !self.0.is_null() {
-                unsafe { CloseHandle(self.0) };
+                let _ = syscall!("NtClose", self.0 as u64);
             }
         }
     }

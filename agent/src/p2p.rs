@@ -4896,7 +4896,7 @@ pub mod nt_pipe_server {
         //   PipeHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
         //   ReadMode, CompletionMode, MaximumInstances,
         //   InboundQuota, OutboundQuota, DefaultTimeout, Timeout
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtCreateNamedPipeFile",
             &mut handle as *mut _ as u64,
             (GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE) as u64,
@@ -4924,7 +4924,7 @@ pub mod nt_pipe_server {
     /// `NtFsControlFile` with `FSCTL_PIPE_LISTEN`.
     unsafe fn pipe_listen(handle: *mut std::ffi::c_void) -> Result<()> {
         let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtFsControlFile",
             handle as u64,                              // FileHandle
             0u64,                                        // Event
@@ -4951,7 +4951,7 @@ pub mod nt_pipe_server {
     /// Read bytes from a file handle via `NtReadFile` (NT direct syscall).
     unsafe fn read_file(handle: *mut std::ffi::c_void, buf: &mut [u8]) -> Result<usize> {
         let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtReadFile",
             handle as u64,
             0u64,
@@ -4977,7 +4977,7 @@ pub mod nt_pipe_server {
     /// Write bytes to a file handle via `NtWriteFile` (NT direct syscall).
     unsafe fn write_file(handle: *mut std::ffi::c_void, buf: &[u8]) -> Result<usize> {
         let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtWriteFile",
             handle as u64,
             0u64,
@@ -5002,7 +5002,7 @@ pub mod nt_pipe_server {
 
     /// Close a handle via `NtClose` (NT direct syscall).
     unsafe fn close_handle(handle: *mut std::ffi::c_void) -> Result<()> {
-        let status = nt_syscall::syscall!("NtClose", handle as u64)
+        let status = syscall!("NtClose", handle as u64)
             .map_err(|e| anyhow!("nt_syscall resolution for NtClose: {e}"))?;
         if status < 0 {
             return Err(anyhow!("NtClose failed: NTSTATUS {:#010X}", status as u32));
@@ -5061,7 +5061,7 @@ pub mod nt_pipe_server {
         let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
         let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
 
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtOpenFile",
             &mut handle as *mut _ as u64,                 // FileHandle
             (GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE) as u64, // DesiredAccess

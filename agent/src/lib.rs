@@ -159,6 +159,17 @@ pub mod edr_bypass_transform;
 #[cfg(all(windows, feature = "transacted-hollowing"))]
 pub mod injection_transacted;
 
+// Process Doppelganging injection: creates a file within an NTFS transaction,
+// writes the payload, creates a section backed by the transacted file, then
+// rolls back the transaction (deleting the file from disk).  The section
+// mapping persists in memory and is mapped into the target process.  Unlike
+// transacted hollowing, doppelganging does not replace a sacrificial process
+// image — it maps the section directly into an existing or newly-created
+// target.  All NT API calls use indirect syscalls.  Windows-only, gated by
+// `transacted-hollowing` feature flag.
+#[cfg(all(windows, feature = "transacted-hollowing"))]
+pub mod injection_doppelganging;
+
 // Delayed module-stomp injection: loads a sacrificial DLL into the target
 // process via LoadLibraryA, waits for a configurable randomized delay
 // (default 8–15 seconds) to let EDR initial-scan heuristics pass, then

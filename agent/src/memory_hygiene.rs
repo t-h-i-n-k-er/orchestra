@@ -286,7 +286,7 @@ unsafe fn nt_query_system_information(
 
 /// Call NtClose via pe_resolve (or nt_syscall).
 unsafe fn nt_close(handle: usize) -> Option<i32> {
-    let result = nt_syscall::syscall!("NtClose", handle);
+    let result = syscall!("NtClose", handle);
     result.ok()
 }
 

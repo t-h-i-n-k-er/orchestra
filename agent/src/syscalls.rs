@@ -950,11 +950,12 @@ fn expected_ssn_range(func_name: &str, _build: u32) -> Option<(u32, u32)> {
 #[cfg(windows)]
 #[macro_export]
 macro_rules! syscall {
-    ($func_name:expr $(, $args:expr)* $(,)?) => {{
-        let target = $crate::syscalls::get_syscall_id($func_name)?;
-        let args: &[u64] = &[$($args as u64),*];
-        $crate::syscalls::do_syscall(target.ssn, target.gadget_addr, args)
-    }};
+    ($func_name:expr $(, $args:expr)* $(,)?) => {
+        $crate::syscalls::get_syscall_id($func_name).map(|__target| {
+            let __args: &[u64] = &[$($args as u64),*];
+            unsafe { $crate::syscalls::do_syscall(__target.ssn, __target.gadget_addr, __args) }
+        })
+    };
 }
 
 /// Scan the first 64 bytes of `ntdll!NtQuerySystemTime` for a `ret` (0xC3)

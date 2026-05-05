@@ -497,11 +497,7 @@ pub fn build_legacy_chain() -> Option<ResolvedChain> {
                         frames: vec![ChainFrame { return_addr: addr }],
                     });
                 }
-                // Unwind check failed — still return it as a last resort;
-                // the old code didn't check unwind info at all.
-                return Some(ResolvedChain {
-                    frames: vec![ChainFrame { return_addr: addr }],
-                });
+                // Unwind check failed — continue scanning for a valid ret gadget.
             }
         }
         None
@@ -606,17 +602,21 @@ pub fn populate_frame_buffer(
 
 /// Check whether `addr` points into committed executable memory.
 fn is_executable_address(addr: usize) -> bool {
-    use winapi::um::memoryapi::VirtualQuery;
     use winapi::um::winnt::{MEMORY_BASIC_INFORMATION, MEM_COMMIT};
 
     unsafe {
         let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        let result = VirtualQuery(
-            addr as *const _,
-            &mut mbi,
-            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        let mut return_len: usize = 0;
+        let status = syscall!(
+            "NtQueryVirtualMemory",
+            -1i64 as u64,                                      // NtCurrentProcess()
+            addr as u64,                                       // BaseAddress
+            0u64,                                              // MemoryBasicInformation
+            &mut mbi as *mut _ as u64,                         // Buffer
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>() as u64, // Length
+            &mut return_len as *mut _ as u64,                  // ReturnLength
         );
-        if result == 0 {
+        if status.is_err() || status.unwrap() < 0 {
             return false;
         }
         if mbi.State != MEM_COMMIT {

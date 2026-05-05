@@ -110,7 +110,7 @@ mod nt_pipe {
         let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
         let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
 
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtCreateFile",
             &mut handle as *mut _ as u64,
             (GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE) as u64,
@@ -141,7 +141,7 @@ mod nt_pipe {
         buf: &mut [u8],
     ) -> Result<usize> {
         let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtReadFile",
             handle as u64,
             0u64,
@@ -170,7 +170,7 @@ mod nt_pipe {
         buf: &[u8],
     ) -> Result<usize> {
         let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtWriteFile",
             handle as u64,
             0u64,
@@ -195,7 +195,7 @@ mod nt_pipe {
 
     /// Close a handle via `NtClose` (NT direct syscall).
     pub unsafe fn close_handle(handle: *mut std::ffi::c_void) -> Result<()> {
-        let status = nt_syscall::syscall!("NtClose", handle as u64)
+        let status = syscall!("NtClose", handle as u64)
             .map_err(|e| anyhow!("nt_syscall resolution for NtClose: {e}"))?;
         if status < 0 {
             return Err(anyhow!("NtClose failed: NTSTATUS {:#010X}", status as u32));

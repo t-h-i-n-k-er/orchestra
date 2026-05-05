@@ -58,13 +58,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use log::{debug, warn};
-use winapi::um::memoryapi::*;
-use winapi::um::handleapi::*;
-use winapi::um::processthreadsapi::*;
-use winapi::um::winnt::*;
-use winapi::um::psapi::*;
-use winapi::shared::minwindef::*;
-use winapi::shared::ntdef::*;
+// Type-only imports — no function imports to avoid IAT entries.
+// All win32 API calls are resolved dynamically via pe_resolve.
+use winapi::um::winnt::HANDLE;
+use winapi::um::psapi::MEMORY_BASIC_INFORMATION;
+use winapi::shared::minwindef::{DWORD, SIZE_T, BOOL, LPVOID};
+use winapi::shared::ntdef::ULONG;
 
 // ── NTSTATUS helpers ─────────────────────────────────────────────────────────
 
@@ -88,6 +87,202 @@ fn win32_to_ntstatus(error_code: DWORD) -> i32 {
             );
             STATUS_NOT_SUPPORTED
         }
+    }
+}
+
+// ── Dynamic kernel32 resolution ──────────────────────────────────────────────
+// Resolve win32 API functions by hash at runtime to avoid IAT entries.
+// These are the "emulated" wrappers that intentionally call kernel32
+// to disguise the call stack.
+
+/// Dynamically resolve a kernel32 export by name.
+///
+/// Returns `None` if the module or function cannot be found.
+fn resolve_kernel32_fn(name: &[u8]) -> Option<usize> {
+    let base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+    let hash = pe_resolve::hash_str(name);
+    pe_resolve::get_proc_address_by_hash(base, hash)
+}
+
+/// Dynamically resolved `GetLastError`.
+unsafe fn dynamic_get_last_error() -> DWORD {
+    type FnGetLastError = unsafe extern "system" fn() -> DWORD;
+    match resolve_kernel32_fn(b"GetLastError\0") {
+        Some(addr) => {
+            let f: FnGetLastError = std::mem::transmute(addr as *mut _);
+            f()
+        }
+        None => 0,
+    }
+}
+
+/// Dynamically resolved `WriteProcessMemory`.
+unsafe fn dynamic_write_process_memory(
+    h_process: HANDLE,
+    lp_base_address: *mut std::ffi::c_void,
+    lp_buffer: *const std::ffi::c_void,
+    n_size: SIZE_T,
+    lp_number_of_bytes_written: *mut SIZE_T,
+) -> BOOL {
+    type FnWriteProcessMemory = unsafe extern "system" fn(
+        HANDLE, *mut std::ffi::c_void, *const std::ffi::c_void, SIZE_T, *mut SIZE_T,
+    ) -> BOOL;
+    match resolve_kernel32_fn(b"WriteProcessMemory\0") {
+        Some(addr) => {
+            let f: FnWriteProcessMemory = std::mem::transmute(addr as *mut _);
+            f(h_process, lp_base_address, lp_buffer, n_size, lp_number_of_bytes_written)
+        }
+        None => 0,
+    }
+}
+
+/// Dynamically resolved `ReadProcessMemory`.
+unsafe fn dynamic_read_process_memory(
+    h_process: HANDLE,
+    lp_base_address: *const std::ffi::c_void,
+    lp_buffer: *mut std::ffi::c_void,
+    n_size: SIZE_T,
+    lp_number_of_bytes_read: *mut SIZE_T,
+) -> BOOL {
+    type FnReadProcessMemory = unsafe extern "system" fn(
+        HANDLE, *const std::ffi::c_void, *mut std::ffi::c_void, SIZE_T, *mut SIZE_T,
+    ) -> BOOL;
+    match resolve_kernel32_fn(b"ReadProcessMemory\0") {
+        Some(addr) => {
+            let f: FnReadProcessMemory = std::mem::transmute(addr as *mut _);
+            f(h_process, lp_base_address, lp_buffer, n_size, lp_number_of_bytes_read)
+        }
+        None => 0,
+    }
+}
+
+/// Dynamically resolved `VirtualAllocEx`.
+unsafe fn dynamic_virtual_alloc_ex(
+    h_process: HANDLE,
+    lp_address: LPVOID,
+    dw_size: SIZE_T,
+    fl_allocation_type: DWORD,
+    fl_protect: DWORD,
+) -> LPVOID {
+    type FnVirtualAllocEx = unsafe extern "system" fn(
+        HANDLE, LPVOID, SIZE_T, DWORD, DWORD,
+    ) -> LPVOID;
+    match resolve_kernel32_fn(b"VirtualAllocEx\0") {
+        Some(addr) => {
+            let f: FnVirtualAllocEx = std::mem::transmute(addr as *mut _);
+            f(h_process, lp_address, dw_size, fl_allocation_type, fl_protect)
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Dynamically resolved `VirtualFreeEx`.
+unsafe fn dynamic_virtual_free_ex(
+    h_process: HANDLE,
+    lp_address: LPVOID,
+    dw_size: SIZE_T,
+    dw_free_type: DWORD,
+) -> BOOL {
+    type FnVirtualFreeEx = unsafe extern "system" fn(
+        HANDLE, LPVOID, SIZE_T, DWORD,
+    ) -> BOOL;
+    match resolve_kernel32_fn(b"VirtualFreeEx\0") {
+        Some(addr) => {
+            let f: FnVirtualFreeEx = std::mem::transmute(addr as *mut _);
+            f(h_process, lp_address, dw_size, dw_free_type)
+        }
+        None => 0,
+    }
+}
+
+/// Dynamically resolved `VirtualProtectEx`.
+unsafe fn dynamic_virtual_protect_ex(
+    h_process: HANDLE,
+    lp_address: LPVOID,
+    dw_size: SIZE_T,
+    fl_new_protect: DWORD,
+    lpfl_old_protect: *mut DWORD,
+) -> BOOL {
+    type FnVirtualProtectEx = unsafe extern "system" fn(
+        HANDLE, LPVOID, SIZE_T, DWORD, *mut DWORD,
+    ) -> BOOL;
+    match resolve_kernel32_fn(b"VirtualProtectEx\0") {
+        Some(addr) => {
+            let f: FnVirtualProtectEx = std::mem::transmute(addr as *mut _);
+            f(h_process, lp_address, dw_size, fl_new_protect, lpfl_old_protect)
+        }
+        None => 0,
+    }
+}
+
+/// Dynamically resolved `CreateRemoteThread`.
+unsafe fn dynamic_create_remote_thread(
+    h_process: HANDLE,
+    lp_thread_attributes: LPVOID,
+    dw_stack_size: SIZE_T,
+    lp_start_address: Option<unsafe extern "system" fn(*mut std::ffi::c_void) -> DWORD>,
+    lp_parameter: *mut std::ffi::c_void,
+    dw_creation_flags: DWORD,
+    lp_thread_id: *mut DWORD,
+) -> HANDLE {
+    type FnCreateRemoteThread = unsafe extern "system" fn(
+        HANDLE, LPVOID, SIZE_T,
+        Option<unsafe extern "system" fn(*mut std::ffi::c_void) -> DWORD>,
+        *mut std::ffi::c_void, DWORD, *mut DWORD,
+    ) -> HANDLE;
+    match resolve_kernel32_fn(b"CreateRemoteThread\0") {
+        Some(addr) => {
+            let f: FnCreateRemoteThread = std::mem::transmute(addr as *mut _);
+            f(h_process, lp_thread_attributes, dw_stack_size, lp_start_address, lp_parameter, dw_creation_flags, lp_thread_id)
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Dynamically resolved `OpenProcess`.
+unsafe fn dynamic_open_process(
+    dw_desired_access: DWORD,
+    b_inherit_handle: BOOL,
+    dw_process_id: DWORD,
+) -> HANDLE {
+    type FnOpenProcess = unsafe extern "system" fn(DWORD, BOOL, DWORD) -> HANDLE;
+    match resolve_kernel32_fn(b"OpenProcess\0") {
+        Some(addr) => {
+            let f: FnOpenProcess = std::mem::transmute(addr as *mut _);
+            f(dw_desired_access, b_inherit_handle, dw_process_id)
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Dynamically resolved `CloseHandle`.
+unsafe fn dynamic_close_handle(h_object: HANDLE) -> BOOL {
+    type FnCloseHandle = unsafe extern "system" fn(HANDLE) -> BOOL;
+    match resolve_kernel32_fn(b"CloseHandle\0") {
+        Some(addr) => {
+            let f: FnCloseHandle = std::mem::transmute(addr as *mut _);
+            f(h_object)
+        }
+        None => 0,
+    }
+}
+
+/// Dynamically resolved `VirtualQueryEx`.
+unsafe fn dynamic_virtual_query_ex(
+    h_process: HANDLE,
+    lp_address: *const std::ffi::c_void,
+    lp_buffer: *mut MEMORY_BASIC_INFORMATION,
+    dw_length: SIZE_T,
+) -> SIZE_T {
+    type FnVirtualQueryEx = unsafe extern "system" fn(
+        HANDLE, *const std::ffi::c_void, *mut MEMORY_BASIC_INFORMATION, SIZE_T,
+    ) -> SIZE_T;
+    match resolve_kernel32_fn(b"VirtualQueryEx\0") {
+        Some(addr) => {
+            let f: FnVirtualQueryEx = std::mem::transmute(addr as *mut _);
+            f(h_process, lp_address, lp_buffer, dw_length)
+        }
+        None => 0,
     }
 }
 
@@ -202,7 +397,7 @@ pub fn emulate_nt_write_virtual_memory(
         debug!("syscall_emulation: NtWriteVirtualMemory → WriteProcessMemory");
         let mut bytes_written: SIZE_T = 0;
         let result = unsafe {
-            WriteProcessMemory(
+            dynamic_write_process_memory(
                 process_handle as HANDLE,
                 base_address as *mut c_void,
                 buffer as *const c_void,
@@ -222,7 +417,7 @@ pub fn emulate_nt_write_virtual_memory(
             return Ok(STATUS_SUCCESS);
         }
 
-        let err = unsafe { GetLastError() };
+        let err = unsafe { dynamic_get_last_error() };
         debug!(
             "syscall_emulation: WriteProcessMemory failed with Win32 error {err}"
         );
@@ -264,7 +459,7 @@ pub fn emulate_nt_read_virtual_memory(
         debug!("syscall_emulation: NtReadVirtualMemory → ReadProcessMemory");
         let mut bytes_read: SIZE_T = 0;
         let result = unsafe {
-            ReadProcessMemory(
+            dynamic_read_process_memory(
                 process_handle as HANDLE,
                 base_address as *const c_void,
                 buffer as *mut c_void,
@@ -283,7 +478,7 @@ pub fn emulate_nt_read_virtual_memory(
             return Ok(STATUS_SUCCESS);
         }
 
-        let err = unsafe { GetLastError() };
+        let err = unsafe { dynamic_get_last_error() };
         debug!(
             "syscall_emulation: ReadProcessMemory failed with Win32 error {err}"
         );
@@ -335,7 +530,7 @@ pub fn emulate_nt_allocate_virtual_memory(
         };
 
         let allocated = unsafe {
-            VirtualAllocEx(
+            dynamic_virtual_alloc_ex(
                 process_handle as HANDLE,
                 if base_address != 0 {
                     *(base_address as *const *mut c_void)
@@ -365,7 +560,7 @@ pub fn emulate_nt_allocate_virtual_memory(
             return Ok(STATUS_SUCCESS);
         }
 
-        let err = unsafe { GetLastError() };
+        let err = unsafe { dynamic_get_last_error() };
         debug!(
             "syscall_emulation: VirtualAllocEx failed with Win32 error {err}"
         );
@@ -417,7 +612,7 @@ pub fn emulate_nt_free_virtual_memory(
         };
 
         let result = unsafe {
-            VirtualFreeEx(
+            dynamic_virtual_free_ex(
                 process_handle as HANDLE,
                 addr,
                 size,
@@ -429,7 +624,7 @@ pub fn emulate_nt_free_virtual_memory(
             return Ok(STATUS_SUCCESS);
         }
 
-        let err = unsafe { GetLastError() };
+        let err = unsafe { dynamic_get_last_error() };
         debug!(
             "syscall_emulation: VirtualFreeEx failed with Win32 error {err}"
         );
@@ -484,7 +679,7 @@ pub fn emulate_nt_protect_virtual_memory(
         let mut old: DWORD = 0;
 
         let result = unsafe {
-            VirtualProtectEx(
+            dynamic_virtual_protect_ex(
                 process_handle as HANDLE,
                 addr,
                 size,
@@ -511,7 +706,7 @@ pub fn emulate_nt_protect_virtual_memory(
             return Ok(STATUS_SUCCESS);
         }
 
-        let err = unsafe { GetLastError() };
+        let err = unsafe { dynamic_get_last_error() };
         debug!(
             "syscall_emulation: VirtualProtectEx failed with Win32 error {err}"
         );
@@ -594,7 +789,7 @@ pub fn emulate_nt_create_thread_ex(
 
         let mut tid: DWORD = 0;
         let handle = unsafe {
-            CreateRemoteThread(
+            dynamic_create_remote_thread(
                 process_handle as HANDLE,
                 std::ptr::null_mut(),
                 stack_size as SIZE_T,
@@ -615,7 +810,7 @@ pub fn emulate_nt_create_thread_ex(
             return Ok(STATUS_SUCCESS);
         }
 
-        let err = unsafe { GetLastError() };
+        let err = unsafe { dynamic_get_last_error() };
         debug!(
             "syscall_emulation: CreateRemoteThread failed with Win32 error {err}"
         );
@@ -664,7 +859,7 @@ pub fn emulate_nt_open_process(
         };
 
         let handle = unsafe {
-            OpenProcess(
+            dynamic_open_process(
                 desired_access as DWORD,
                 0, // bInheritHandle = FALSE
                 pid,
@@ -681,7 +876,7 @@ pub fn emulate_nt_open_process(
             return Ok(STATUS_SUCCESS);
         }
 
-        let err = unsafe { GetLastError() };
+        let err = unsafe { dynamic_get_last_error() };
         debug!(
             "syscall_emulation: OpenProcess failed with Win32 error {err}"
         );
@@ -712,13 +907,13 @@ pub fn emulate_nt_close(handle: u64) -> anyhow::Result<i32> {
     if is_emulation_enabled() && should_emulate("NtClose") && config.prefer_kernel32 {
         debug!("syscall_emulation: NtClose → CloseHandle");
 
-        let result = unsafe { CloseHandle(handle as HANDLE) };
+        let result = unsafe { dynamic_close_handle(handle as HANDLE) };
 
         if result != 0 {
             return Ok(STATUS_SUCCESS);
         }
 
-        let err = unsafe { GetLastError() };
+        let err = unsafe { dynamic_get_last_error() };
         debug!(
             "syscall_emulation: CloseHandle failed with Win32 error {err}"
         );
@@ -783,7 +978,7 @@ pub fn emulate_nt_query_virtual_memory(
 
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let result = unsafe {
-            VirtualQueryEx(
+            dynamic_virtual_query_ex(
                 process_handle as HANDLE,
                 base_address as *const c_void,
                 &mut mbi,
@@ -810,7 +1005,7 @@ pub fn emulate_nt_query_virtual_memory(
             return Ok(STATUS_SUCCESS);
         }
 
-        let err = unsafe { GetLastError() };
+        let err = unsafe { dynamic_get_last_error() };
         debug!(
             "syscall_emulation: VirtualQueryEx failed with Win32 error {err}"
         );
@@ -970,7 +1165,7 @@ pub fn dispatch(name: &str, args: &[u64]) -> anyhow::Result<i32> {
 
 /// Emulation-aware syscall macro.
 ///
-/// Drop-in replacement for `nt_syscall::syscall!`.  When the syscall
+/// Drop-in replacement for `syscall!`.  When the syscall
 /// emulation layer is compiled in AND enabled, it first tries the
 /// kernel32/advapi32 path for any function listed in `emulated_functions`.
 /// On failure (or if the function is not emulated), it falls back to the
@@ -980,14 +1175,14 @@ pub fn dispatch(name: &str, args: &[u64]) -> anyhow::Result<i32> {
 ///
 /// ```ignore
 /// // Instead of:
-/// let status = nt_syscall::syscall!("NtClose", handle as u64);
+/// let status = syscall!("NtClose", handle as u64);
 ///
 /// // Use:
 /// let status = emulated_syscall!("NtClose", handle as u64);
 /// ```
 ///
 /// The return type is `anyhow::Result<i32>` (NTSTATUS), identical to
-/// `nt_syscall::syscall!`.
+/// `syscall!`.
 #[macro_export]
 macro_rules! emulated_syscall {
     ($func_name:expr $(, $args:expr)* $(,)?) => {{

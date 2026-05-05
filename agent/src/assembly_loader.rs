@@ -52,15 +52,15 @@ use winapi::shared::minwindef::{DWORD, LPVOID, ULONG};
 use winapi::shared::ntdef::{HRESULT, LPCWSTR, LPWSTR};
 use winapi::shared::winerror::S_OK;
 use winapi::um::combaseapi::{CoInitializeEx, CoTaskMemFree};
-use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 use winapi::um::libloaderapi::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
 use winapi::um::namedpipeapi::{CreatePipe, PeekNamedPipe};
 use winapi::um::processthreadsapi::{
-    CreateThread, GetCurrentProcessId, ResumeThread, SuspendThread, WaitForSingleObject,
+    ResumeThread, SuspendThread,
 };
 use winapi::um::synchapi::{CreateEventW, SetEvent};
-use winapi::um::winbase::{INFINITE, WAIT_OBJECT_0};
+use winapi::um::winbase::WAIT_OBJECT_0;
 use winapi::um::winnt::{HANDLE, PAGE_READWRITE, PROCESS_ALL_ACCESS, SECURITY_DESCRIPTOR};
 use winapi::um::fileapi::{ReadFile, WriteFile};
 use winapi::um::processsnapshot::HeapAlloc;
@@ -694,8 +694,8 @@ pub unsafe fn execute(
         return Err("CreatePipe(stdout) failed".to_string());
     }
     if CreatePipe(&mut stderr_read, &mut stderr_write, &mut sa, 0) == 0 {
-        CloseHandle(stdout_read);
-        CloseHandle(stdout_write);
+        let _ = syscall!("NtClose", stdout_read as u64);
+        let _ = syscall!("NtClose", stdout_write as u64);
         let _ = std::fs::remove_file(&temp_file);
         return Err("CreatePipe(stderr) failed".to_string());
     }
@@ -775,7 +775,21 @@ pub unsafe fn execute(
 
     // Wait with timeout.
     let exec_handle = exec_thread.as_raw_handle();
-    let wait_result = WaitForSingleObject(exec_handle, (timeout * 1000) as DWORD);
+    let wait_result = unsafe {
+        // NtWaitForSingleObject with timeout in 100ns units (negative = relative).
+        let timeout_100ns: i64 = -((timeout * 1000) as i64 * 10_000_000i64);
+        let status = syscall!(
+            "NtWaitForSingleObject",
+            exec_handle as u64,
+            0u64, // Alertable = FALSE
+            &timeout_100ns as *const _ as u64,
+        );
+        if status.is_err() || status.unwrap() < 0 {
+            0xFFFFFFFFu32 // WAIT_FAILED equivalent
+        } else {
+            status.unwrap() as u32
+        }
+    };
 
     let mut captured_output = Vec::new();
 
@@ -803,12 +817,12 @@ pub unsafe fn execute(
     };
 
     // ── Cleanup ─────────────────────────────────────────────────────────
-    CloseHandle(stdout_read);
-    CloseHandle(stdout_write);
-    CloseHandle(stderr_read);
-    CloseHandle(stderr_write);
+    let _ = syscall!("NtClose", stdout_read as u64);
+    let _ = syscall!("NtClose", stdout_write as u64);
+    let _ = syscall!("NtClose", stderr_read as u64);
+    let _ = syscall!("NtClose", stderr_write as u64);
     if !timeout_event.is_null() {
-        CloseHandle(timeout_event);
+        let _ = syscall!("NtClose", timeout_event as u64);
     }
 
     // Drop the exec thread join handle (detaches it if still running).

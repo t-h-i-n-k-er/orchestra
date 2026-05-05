@@ -695,6 +695,74 @@ All notable changes to Orchestra are documented here.
   `image::ImageFormat::Png`.
 - `ed25519-dalek 2.1` — Added `use ed25519_dalek::Signer;` where `.sign()` is
   called.
+- **Comprehensive IAT elimination** — Replaced all Win32 API imports with NT
+  syscall equivalents via the `syscall!` macro across 15+ files, removing
+  detectable IAT entries for `VirtualProtect`, `OpenProcess`,
+  `WriteProcessMemory`, `VirtualAllocEx`, `VirtualQuery`, `CloseHandle`,
+  `WaitForSingleObject`, `GetExitCodeProcess`, `SetHandleInformation`,
+  `GetCurrentProcessId`, and `ImpersonateNamedPipeClient`.  Affected modules:
+  `process_manager`, `process_spoof`, `token_manipulation`,
+  `token_impersonation`, `stub`, `stack_db`, `memory_hygiene`, `p2p`,
+  `lsass_harvest`, `sleep_obfuscation`, and `kernel_callback/discover`.
+- `agent/syscalls` — Fixed `syscall!` macro to return `Result<i32>` instead of
+  raw `i32`, enabling proper error propagation.  All callers updated to handle
+  the `Result` type.
+- `agent/ntdll_unhook` — Fixed `bytes_overwritten` to report actual bytes
+  written instead of hardcoded `0`.  Fixed `NtCreateFile` parameter ordering
+  (`CreateDisposition`/`CreateOptions` were swapped).  Migrated from
+  `nt_syscall::` to `crate::syscalls::`.
+- `agent/token_impersonation` — Rewrote `impersonate_pipe_via_set_thread_token`
+  to spawn a helper thread via `NtCreateThreadEx` instead of calling
+  `ImpersonateNamedPipeClient` on the main thread.  Added `CachedToken::Drop`
+  impl that closes handles via `NtClose`.  Changed `ImpersonationThreadCtx`
+  success flag from `bool` to `AtomicBool` with `Release`/`Acquire` ordering.
+  Replaced `CreateThread`/`WaitForSingleObject` with
+  `NtCreateThreadEx`/`NtWaitForSingleObject`.
+- `agent/obfuscated_sleep` — Fixed fiber resource leak via `FiberGuard` RAII
+  pattern with `thread_local!`.  Changed post-encryption page protection from
+  restoring original protection to `PAGE_NOACCESS`, preventing memory scanners
+  from reading encrypted sections.
+- `agent/syscall_emulation` — Replaced wildcard imports with specific type-only
+  imports.  Added ~200 lines of dynamic `kernel32` resolution functions
+  (`resolve_kernel32_fn`, `dynamic_virtual_alloc_ex`,
+  `dynamic_write_process_memory`, etc.) to eliminate all IAT entries from the
+  emulation layer.
+- `agent/process_manager` — Replaced `OpenProcess`, `VirtualAllocEx`,
+  `WriteProcessMemory`, `VirtualProtectEx` with `NtOpenProcess`,
+  `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`,
+  `NtProtectVirtualMemory`.  Handle cleanup via `syscall!("NtClose", ...)`.
+- `agent/process_spoof` — Replaced `OpenProcess`, `WaitForSingleObject`,
+  `GetExitCodeProcess`, `SetHandleInformation` with NT syscall equivalents
+  (`NtOpenProcess`, `NtWaitForSingleObject`, `NtQueryInformationProcess`,
+  `NtSetInformationObject`).  Added inline `ObjHandleFlagInfo` and
+  `ProcessBasicInformation` structs.
+- `agent/token_manipulation` — `CloseHandle` → `syscall!("NtClose", ...)`.
+  `GetCurrentProcessId()` → `NtQueryInformationProcess(ProcessBasicInformation)`
+  with inline PBI struct.  Migrated from `nt_syscall::` to `crate::syscalls::`.
+- `agent/stack_db` — Replaced `VirtualQuery` with `NtQueryVirtualMemory` via
+  `syscall!`.  Removed fallback that returned addresses failing unwind
+  validation.
+- `agent/stub` — Replaced all `VirtualProtect` calls with
+  `NtProtectVirtualMemory` via `syscall!`.
+- `agent/kernel_callback/discover` — Migrated from `nt_syscall::syscall!` to
+  `syscall!`.  Added `translate_va_to_pa` for drivers requiring physical
+  addresses (PTE walk via `MmPteBase`).  Added proper
+  `walk_bugcheck_callback_list` for `KeBugCheckCallbackListHead` (linked list,
+  not flat array).  Fixed `DBUtil_2_3.sys` driver record:
+  `needs_physical_addr` corrected to `false` (driver does VA→PA internally).
+- `agent/lsa_whisperer` — `LsaCallAuthenticationPackage` return buffer now
+  correctly freed via `LsaFreeReturnBuffer` instead of `LocalFree`, preventing
+  handle leaks on repeated calls.
+- `agent/injection_doppelganging` — **New module**: Process Doppelganging
+  injection technique using NTFS transactions
+  (`NtCreateTransaction` → `NtCreateFile` → `NtWriteFile` →
+  `NtCreateSection` → `NtRollbackTransaction` → `NtMapViewOfSection` →
+  `NtCreateThreadEx`).  Zero IAT entries for injection operations.  Gated by
+  `transacted-hollowing` feature flag.
+- `agent/kernel_callback/driver_db` — Replaced placeholder SHA-256 hashes with
+  verified hashes for `rtcore64.sys`, `AsIO.sys`, `AsIO2.sys`, `ene.sys`, and
+  `procexp152.sys`.  Updated `BdKit.sys` comments noting hash is still
+  unverified.
 
 ### Documentation
 

@@ -39,7 +39,7 @@
 //!
 //! # NT API Usage
 //!
-//! All NT API calls go through `nt_syscall::syscall!`.
+//! All NT API calls go through `syscall!`.
 //! All strings through `string_crypt`.
 
 pub mod driver_db;

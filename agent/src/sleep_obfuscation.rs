@@ -1094,9 +1094,9 @@ fn cronus_probe() -> bool {
     #[cfg(feature = "direct-syscalls")]
     {
         // Try resolving NtSetTimer and NtCreateTimer.
-        nt_syscall::get_syscall_id("NtSetTimer").is_ok()
-            && nt_syscall::get_syscall_id("NtCreateTimer").is_ok()
-            && nt_syscall::get_syscall_id("NtWaitForSingleObject").is_ok()
+        crate::syscalls::get_syscall_id("NtSetTimer").is_ok()
+            && crate::syscalls::get_syscall_id("NtCreateTimer").is_ok()
+            && crate::syscalls::get_syscall_id("NtWaitForSingleObject").is_ok()
     }
     #[cfg(not(feature = "direct-syscalls"))]
     {

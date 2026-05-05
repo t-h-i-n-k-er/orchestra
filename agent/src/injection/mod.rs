@@ -112,7 +112,7 @@ fn manual_map_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
             | winapi::um::winnt::PROCESS_VM_WRITE
             | winapi::um::winnt::PROCESS_VM_READ
             | winapi::um::winnt::PROCESS_CREATE_THREAD) as u64;
-        let open_status = nt_syscall::syscall!(
+        let open_status = syscall!(
             "NtOpenProcess",
             &mut h_proc as *mut _ as u64,
             access_mask,
@@ -127,7 +127,7 @@ fn manual_map_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         struct HandleGuard(*mut winapi::ctypes::c_void);
         impl Drop for HandleGuard {
             fn drop(&mut self) {
-                nt_syscall::syscall!("NtClose", self.0 as u64).ok();
+                syscall!("NtClose", self.0 as u64).ok();
             }
         }
         let _guard = HandleGuard(process);
