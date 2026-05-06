@@ -736,10 +736,10 @@ pub unsafe fn execute(
 
     let timeout_event = CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null_mut());
     if timeout_event.is_null() {
-        CloseHandle(stdout_read);
-        CloseHandle(stdout_write);
-        CloseHandle(stderr_read);
-        CloseHandle(stderr_write);
+        let _ = syscall!("NtClose", stdout_read as u64);
+        let _ = syscall!("NtClose", stdout_write as u64);
+        let _ = syscall!("NtClose", stderr_read as u64);
+        let _ = syscall!("NtClose", stderr_write as u64);
         let _ = std::fs::remove_file(&temp_file);
         return Err("CreateEvent for timeout failed".to_string());
     }

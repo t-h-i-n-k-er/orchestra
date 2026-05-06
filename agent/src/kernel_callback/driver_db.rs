@@ -145,22 +145,10 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
         needs_physical_addr: false,
     },
 
-    // BdKit.sys — Baidu anti-rootkit driver.
-    // NOTE: Exhaustive public search (LOLDrivers, VirusTotal, KDU, Elastic,
-    // KeServiceDescriptorTable/vulnerable-drivers, 10+ BYOVD repos, Chinese-language
-    // searches) yielded no SHA-256 for this driver. Replace when a verified hash
+    // BdKit.sys was removed: no verified SHA-256 hash was found after exhaustive
+    // public search (LOLDrivers, VirusTotal, KDU, Elastic, KeServiceDescriptorTable,
+    // 10+ BYOVD repos, Chinese-language searches).  Re-add when a verified hash
     // becomes available.
-    VulnerableDriver {
-        name: "BdKit.sys",
-        device_name: "BdKit",
-        sha256: "TODO_BDKIT_SHA256_VERIFY_AND_REPLACE_0000000000000000000000000000",
-        read_phys_fn: "DeviceIoControl",
-        write_phys_fn: "DeviceIoControl",
-        mapping_type: DriverMapping::PhysicalMemory,
-        read_ioctl: 0x22E024,
-        write_ioctl: 0x22E028,
-        needs_physical_addr: false,
-    },
 
     // ene.sys — ENE Technology driver.
     VulnerableDriver {

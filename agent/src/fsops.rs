@@ -109,47 +109,96 @@ fn canonicalize_existing(path: &Path) -> Result<PathBuf> {
 #[cfg(windows)]
 fn is_reparse_point(path: &Path) -> Result<bool> {
     use std::os::windows::ffi::OsStrExt;
-    use winapi::um::fileapi::{CreateFileW, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING};
-    use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-    use winapi::um::winbase::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT};
-    use winapi::um::winnt::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        GENERIC_READ,
+
+    // ── NT constants (no winapi function imports → no IAT entries) ───────
+    const OBJ_CASE_INSENSITIVE: u32 = 0x00000040;
+    const SYNCHRONIZE: u32 = 0x00100000;
+    const GENERIC_READ: u32 = 0x80000000;
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+    const FILE_SHARE_DELETE: u32 = 0x00000004;
+    const FILE_OPEN: u32 = 1;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x00000020;
+    const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x00004000;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+
+    /// FILE_BASIC_INFORMATION — returned by NtQueryAttributesFile.
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileBasicInformation {
+        creation_time: i64,
+        last_access_time: i64,
+        last_write_time: i64,
+        change_time: i64,
+        file_attributes: u32,
+    }
+
+    // Build the NT-path from the Win32 path (prefix with \??\).
+    let win32_str = path.to_string_lossy();
+    let nt_path_str = if win32_str.starts_with(r"\\?\") {
+        format!(r"\??\{}", &win32_str[4..])
+    } else if win32_str.starts_with(r"\\") {
+        format!(r"\??\UNC\{}", &win32_str[2..])
+    } else {
+        format!(r"\??\{}", win32_str)
     };
+    let mut wide: Vec<u16> = nt_path_str.encode_utf16().chain(std::iter::once(0)).collect();
 
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0u16))
-        .collect();
-
-    // Open without following the reparse point.
-    // FILE_FLAG_BACKUP_SEMANTICS is required when the path is a directory.
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null_mut(),
-            OPEN_EXISTING,
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-            std::ptr::null_mut(),
-        )
+    // ── Step 1: Open the file (NtCreateFile, no IAT) ────────────────────
+    // Opening with FILE_OPEN_REPARSE_POINT prevents following the reparse
+    // point, and FILE_OPEN_FOR_BACKUP_INTENT covers the directory case.
+    let mut obj_name = winapi::shared::ntdef::UNICODE_STRING {
+        Length: ((wide.len() - 1) * 2) as u16,
+        MaximumLength: (wide.len() * 2) as u16,
+        Buffer: wide.as_mut_ptr(),
     };
+    let mut obj_attr = winapi::shared::ntdef::OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: std::ptr::null_mut(),
+        ObjectName: &mut obj_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: std::ptr::null_mut(),
+        SecurityQualityOfService: std::ptr::null_mut(),
+    };
+    let mut io_status = [0u64; 2];
+    let mut h_file: usize = 0;
 
-    if handle == INVALID_HANDLE_VALUE {
+    let open_status = syscall!(
+        "NtCreateFile",
+        &mut h_file as *mut _ as u64,
+        (SYNCHRONIZE | GENERIC_READ) as u64,   // DesiredAccess
+        &mut obj_attr as *mut _ as u64,         // ObjectAttributes
+        io_status.as_mut_ptr() as u64,          // IoStatusBlock
+        0u64,                                   // AllocationSize
+        0u64,                                   // FileAttributes
+        (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE) as u64, // ShareAccess
+        FILE_OPEN as u64,                       // CreateDisposition
+        (FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT) as u64, // CreateOptions
+        0u64,                                   // EaBuffer
+        0u64,                                   // EaLength
+    );
+
+    if open_status.is_err() || open_status.unwrap() < 0 || h_file == 0 {
         // Path does not exist yet — cannot be a reparse point.
         return Ok(false);
     }
-    unsafe { CloseHandle(handle) };
+    let _ = syscall!("NtClose", h_file as u64);
 
-    // GetFileAttributesW does not follow reparse points; it reports the
-    // attributes of the reparse point entry itself.
-    let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
-    if attrs == INVALID_FILE_ATTRIBUTES {
+    // ── Step 2: Query attributes (NtQueryAttributesFile, no IAT) ────────
+    // NtQueryAttributesFile reports the attributes of the reparse point
+    // entry itself (does not follow the reparse point).
+    let mut basic_info: FileBasicInformation = FileBasicInformation::default();
+    let query_status = syscall!(
+        "NtQueryAttributesFile",
+        &mut obj_attr as *mut _ as u64,
+        &mut basic_info as *mut _ as u64,
+    );
+
+    if query_status.is_err() || query_status.unwrap() < 0 {
         return Ok(false);
     }
-    Ok((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+    Ok((basic_info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
 }
 
 #[cfg(all(not(windows), not(unix)))]

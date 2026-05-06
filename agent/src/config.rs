@@ -104,7 +104,11 @@ fn combined_mtime_token(path: &Path) -> Result<u64> {
     Ok(config_mtime ^ sha_mtime.rotate_left(1))
 }
 
-fn cached_config() -> Option<Config> {
+/// Return a clone of the cached config, if one has been loaded.
+///
+/// Used by modules that need config values but don't have a `ConfigHandle`
+/// threaded through their call chain (e.g. injection-engine dispatch helpers).
+pub fn cached_config() -> Option<Config> {
     LAST_CONFIG
         .read()
         .ok()

