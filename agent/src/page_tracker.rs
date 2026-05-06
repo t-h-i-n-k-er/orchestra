@@ -153,6 +153,17 @@ pub struct PageInfo {
     pub label: String,
 }
 
+impl Drop for PageInfo {
+    fn drop(&mut self) {
+        // Securely zero the AEAD key to prevent key material from lingering
+        // in freed heap memory after the PageInfo is deallocated.
+        for b in self.aead_key.iter_mut() {
+            unsafe { std::ptr::write_volatile(b, 0) }
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 // ── PageGuard (RAII) ────────────────────────────────────────────────────────
 
 /// RAII guard that decrypts pages on creation and re-encrypts them on drop.
@@ -565,6 +576,15 @@ pub fn shutdown() {
                 }
             }
         }
+        // Explicitly zeroize all AEAD keys before clearing the map.
+        // Although PageInfo::Drop also zeroizes, this ensures keys are
+        // wiped before the HashMap's internal storage is deallocated.
+        for info in pages.values_mut() {
+            for b in info.aead_key.iter_mut() {
+                unsafe { std::ptr::write_volatile(b, 0) }
+            }
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         pages.clear();
         crypto_sidecar.clear();
     }
@@ -585,8 +605,6 @@ pub fn shutdown() {
 
 /// Register the Vectored Exception Handler for auto-decryption.
 fn register_veh(inner: &Arc<PageTrackerInner>) -> Result<()> {
-    use winapi::um::errhandlingapi::AddVectoredExceptionHandler;
-
     // Store a raw pointer to the inner tracker in a module-level static.
     // The Arc is never dropped while the VEH is registered (shutdown
     // removes the VEH before releasing the Arc).
@@ -594,12 +612,21 @@ fn register_veh(inner: &Arc<PageTrackerInner>) -> Result<()> {
         .set(Arc::as_ptr(inner))
         .map_err(|_| anyhow!("evanesco: VEH tracker pointer already set"))?;
 
-    let handle = unsafe {
-        AddVectoredExceptionHandler(
-            1, // first handler
-            Some(veh_handler),
-        )
-    };
+    // Dynamic resolution — no IAT entry for AddVectoredExceptionHandler.
+    type FnAddVEH = unsafe extern "system" fn(
+        u32,
+        Option<unsafe extern "system" fn(*mut winapi::um::winnt::EXCEPTION_POINTERS) -> i32>,
+    ) -> *mut std::ffi::c_void;
+
+    let add_veh: FnAddVEH = (|| unsafe {
+        let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+        let hash = pe_resolve::hash_str(b"AddVectoredExceptionHandler\0");
+        let addr = pe_resolve::get_proc_address_by_hash(k32, hash)?;
+        Some(std::mem::transmute::<usize, FnAddVEH>(addr))
+    })()
+    .ok_or_else(|| anyhow!("evanesco: cannot resolve AddVectoredExceptionHandler"))?;
+
+    let handle = unsafe { add_veh(1, Some(veh_handler)) };
     if handle.is_null() {
         return Err(anyhow!("evanesco: AddVectoredExceptionHandler failed"));
     }
@@ -612,8 +639,25 @@ fn register_veh(inner: &Arc<PageTrackerInner>) -> Result<()> {
 
 /// Remove a previously registered VEH handler.
 unsafe fn remove_veh(handle: usize) {
-    use winapi::um::errhandlingapi::RemoveVectoredExceptionHandler;
-    RemoveVectoredExceptionHandler(handle as *mut _);
+    type FnRemoveVEH = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+
+    let k32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+        Some(base) => base,
+        None => {
+            log::error!("evanesco: cannot resolve kernel32 for RemoveVectoredExceptionHandler");
+            return;
+        }
+    };
+    let remove_veh: Option<FnRemoveVEH> = (|| unsafe {
+        let hash = pe_resolve::hash_str(b"RemoveVectoredExceptionHandler\0");
+        let addr = pe_resolve::get_proc_address_by_hash(k32, hash)?;
+        Some(std::mem::transmute::<usize, FnRemoveVEH>(addr))
+    })();
+    if let Some(fn_ptr) = remove_veh {
+        fn_ptr(handle as *mut std::ffi::c_void);
+    } else {
+        log::error!("evanesco: cannot resolve RemoveVectoredExceptionHandler");
+    }
 }
 
 /// Module-level static holding the raw pointer to the tracker inner,
@@ -874,6 +918,20 @@ pub fn encrypt_all() {
         None => return,
     };
 
+    // Collect current page info first — we cannot iterate the HashMap while
+    // mutating keys.  NtProtectVirtualMemory may adjust the base address
+    // (kernel rounds to page boundary), which changes the HashMap key.
+    let page_info: Vec<(usize, usize)> = {
+        let pages = match inner.pages.read() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        pages.iter()
+            .filter(|(_, info)| info.state != PageState::Encrypted)
+            .map(|(&base, info)| (base, info.size))
+            .collect()
+    };
+
     let mut pages = match inner.pages.write() {
         Ok(g) => g,
         Err(_) => return,
@@ -883,11 +941,29 @@ pub fn encrypt_all() {
         Err(_) => return,
     };
 
-    for (&base, info) in pages.iter_mut() {
-        if info.state != PageState::Encrypted {
-            encrypt_page_unlocked(&mut pages, &mut crypto_sidecar, base, info.size);
-            inner.encrypt_count.fetch_add(1, Ordering::Relaxed);
+    for (base, size) in page_info {
+        encrypt_page_unlocked(&mut pages, &mut crypto_sidecar, base, size);
+
+        // Re-key: if the kernel adjusted the base address via
+        // NtProtectVirtualMemory, the old HashMap key is stale.
+        // Check the stored info.base against the original key.
+        let new_base = pages.get(&base).map(|info| info.base).unwrap_or(base);
+        if new_base != base {
+            if let Some(mut entry) = pages.remove(&base) {
+                log::debug!(
+                    "evanesco: re-keying page {:#x} → {:#x} after kernel adjustment",
+                    base, entry.base
+                );
+                let re_key = entry.base;
+                let crypto = crypto_sidecar.remove(&base);
+                pages.insert(re_key, entry);
+                if let Some(c) = crypto {
+                    crypto_sidecar.insert(re_key, c);
+                }
+            }
         }
+
+        inner.encrypt_count.fetch_add(1, Ordering::Relaxed);
     }
 }
 

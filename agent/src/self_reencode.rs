@@ -136,11 +136,15 @@ fn find_text_section_windows() -> Result<TextSection> {
     use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64};
 
     // Resolve the agent's own module base.  The agent can be either the main
-    // EXE or a DLL loaded into another process.  GetModuleHandleW(NULL)
-    // returns the main EXE base.
+    // EXE or a DLL loaded into another process.  Read PEB.ImageBaseAddress
+    // directly to avoid a GetModuleHandleW(NULL) IAT entry.
     let base = unsafe {
-        let ret = winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null_mut());
-        ret as usize
+        // PEB is at GS:[0x60] on x86_64 Windows.
+        // PEB.ImageBaseAddress is at offset 0x10 (PVOID).
+        let peb: *mut u8;
+        std::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+        let base_ptr = (peb as *const usize).add(0x10 / std::mem::size_of::<usize>());
+        base_ptr.read() as usize
     };
     if base == 0 {
         anyhow::bail!("self_reencode: could not resolve own module base");

