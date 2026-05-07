@@ -304,6 +304,13 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
                     rustls_0_21::CertificateError::UnknownIssuer,
                 ));
             }
+            // P2-14: Validate SAN/hostname in addition to fingerprint checking.
+            if !verify_cert_hostname_rustls021(&end_entity.0, server_name) {
+                log::error!("cert pinning: fingerprint matched but hostname validation failed");
+                return Err(rustls_0_21::Error::InvalidCertificate(
+                    rustls_0_21::CertificateError::NotValidForName,
+                ));
+            }
             // Fingerprint matches — accept the certificate without CA chain
             // validation since we are pinning the exact cert.
             log::debug!("cert pinning: fingerprint verified OK");
@@ -332,6 +339,184 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
     ) -> Result<rustls_0_21::client::HandshakeSignatureValid, rustls_0_21::Error> {
         self.webpki.verify_tls13_signature(message, cert, dss)
     }
+}
+
+/// P2-14: Verify that the certificate's SAN or CN matches the expected server name.
+fn verify_cert_hostname_rustls021(der: &[u8], server_name: &rustls_0_21::ServerName) -> bool {
+    let expected = match server_name {
+        rustls_0_21::ServerName::DnsName(dns) => dns.as_ref().to_ascii_lowercase(),
+        _ => return true, // IP address or other — skip hostname check
+    };
+
+    // Minimal DER parsing for SAN and CN extraction.
+    if let Some(sans) = extract_san_dns_names_minimal(der) {
+        for san in &sans {
+            if san == &expected || match_wildcard_rustls021(san, &expected) {
+                return true;
+            }
+        }
+        log::warn!("c2_http: hostname {} not found in SANs: {:?}", expected, sans);
+        return false;
+    }
+    if let Some(cn) = extract_cn_minimal(der) {
+        if cn == expected || match_wildcard_rustls021(&cn, &expected) {
+            return true;
+        }
+        log::warn!("c2_http: hostname {} does not match CN {}", expected, cn);
+        return false;
+    }
+    log::warn!("c2_http: no SAN or CN found for hostname validation");
+    false
+}
+
+/// Match wildcard `*.example.com` against `sub.example.com`.
+fn match_wildcard_rustls021(pattern: &str, name: &str) -> bool {
+    if !pattern.starts_with("*.") {
+        return false;
+    }
+    let suffix = &pattern[1..];
+    if let Some(dot_pos) = name.find('.') {
+        name[dot_pos..] == *suffix
+    } else {
+        false
+    }
+}
+
+/// Extract dNSName entries from SAN extension using minimal DER parsing.
+fn extract_san_dns_names_minimal(der: &[u8]) -> Option<Vec<String>> {
+    let san_oid: &[u8] = &[0x55, 0x1d, 0x11];
+    let ext = find_extension_minimal(der, san_oid)?;
+
+    let mut pos = 0usize;
+    // OCTET STRING wrapper.
+    if ext.get(pos)? != &0x04 { return None; }
+    pos = skip_len(ext, pos)?;
+
+    // SEQUENCE of GeneralNames.
+    if ext.get(pos)? != &0x30 { return None; }
+    let seq_end = {
+        let (vs, vl) = read_len(ext, pos + 1)?;
+        vs + vl
+    };
+    pos = read_len(ext, pos + 1)?.0;
+
+    let mut names = Vec::new();
+    while pos < seq_end.min(ext.len()) {
+        let tag = *ext.get(pos)?;
+        pos += 1;
+        let (vs, vl) = read_len(ext, pos)?;
+        pos = vs + vl;
+        if tag == 0x82 { // dNSName [2]
+            if let Ok(s) = std::str::from_utf8(&ext[vs..vs + vl]) {
+                names.push(s.to_ascii_lowercase());
+            }
+        }
+    }
+    if names.is_empty() { None } else { Some(names) }
+}
+
+/// Extract Common Name from Subject field.
+fn extract_cn_minimal(der: &[u8]) -> Option<String> {
+    let cn_oid: &[u8] = &[0x55, 0x04, 0x03];
+    let mut p = enter_seq_min(der, 0)?;
+    p = enter_seq_min(der, p)?;
+    if der.get(p) == Some(&0xa0) { p = skip_tlv_min(der, p)?; }
+    p = skip_tlv_min(der, p)?; // serial
+    p = skip_tlv_min(der, p)?; // sig algo
+    p = skip_tlv_min(der, p)?; // issuer
+    let subject_end = {
+        let (vs, vl) = read_len(der, p + 1)?;
+        vs + vl
+    };
+    let mut pos = enter_seq_min(der, p)?;
+    while pos < subject_end.min(der.len()) {
+        if der.get(pos) != Some(&0x31) { pos = skip_tlv_min(der, pos)?; continue; }
+        let mut inner = enter_seq_min(der, pos)?;
+        let set_end = { let (vs, vl) = read_len(der, pos + 1)?; vs + vl };
+        while inner < set_end.min(der.len()) {
+            if der.get(inner) != Some(&0x30) { inner = skip_tlv_min(der, inner)?; continue; }
+            let attr_end = { let (vs, vl) = read_len(der, inner + 1)?; vs + vl };
+            let mut ap = read_len(der, inner + 1)?.0;
+            if der.get(ap) != Some(&0x06) { inner = attr_end; continue; }
+            let (os, ol) = read_len(der, ap + 1)?;
+            if &der[os..os + ol] == cn_oid {
+                let vp = os + ol;
+                let vt = *der.get(vp)?;
+                let (vs, vl) = read_len(der, vp + 1)?;
+                if vt == 0x0c || vt == 0x13 {
+                    return std::str::from_utf8(&der[vs..vs + vl]).ok().map(|s| s.to_ascii_lowercase());
+                }
+            }
+            inner = attr_end;
+        }
+        pos = set_end;
+    }
+    None
+}
+
+/// Find an extension by OID in the certificate.
+fn find_extension_minimal(der: &[u8], oid: &[u8]) -> Option<&[u8]> {
+    let mut p = enter_seq_min(der, 0)?;
+    p = enter_seq_min(der, p)?;
+    if der.get(p) == Some(&0xa0) { p = skip_tlv_min(der, p)?; }
+    p = skip_tlv_min(der, p)?; // serial
+    p = skip_tlv_min(der, p)?; // sig algo
+    p = skip_tlv_min(der, p)?; // issuer
+    p = skip_tlv_min(der, p)?; // validity
+    p = skip_tlv_min(der, p)?; // subject
+    p = skip_tlv_min(der, p)?; // spki
+    if der.get(p) != Some(&0xa3) { return None; } // extensions [3]
+    let (ext_start, ext_len) = read_len(der, p + 1)?;
+    let ext_end = ext_start + ext_len;
+    let mut pos = ext_start;
+    if der.get(pos) != Some(&0x30) { return None; }
+    let (ss, sl) = read_len(der, pos + 1)?;
+    let seq_end = ss + sl;
+    pos = ss;
+    while pos < seq_end.min(ext_end).min(der.len()) {
+        if der.get(pos) != Some(&0x30) { pos = skip_tlv_min(der, pos)?; continue; }
+        let ext_seq_end = { let (vs, vl) = read_len(der, pos + 1)?; vs + vl };
+        let mut ep = read_len(der, pos + 1)?.0;
+        if der.get(ep) != Some(&0x06) { pos = ext_seq_end; continue; }
+        let (os, ol) = read_len(der, ep + 1)?;
+        if &der[os..os + ol] == oid {
+            ep = os + ol;
+            if der.get(ep) == Some(&0x01) { ep = skip_tlv_min(der, ep)?; }
+            if der.get(ep) == Some(&0x04) {
+                let (vs, vl) = read_len(der, ep + 1)?;
+                return Some(&der[vs..vs + vl]);
+            }
+        }
+        pos = ext_seq_end;
+    }
+    None
+}
+
+fn read_len(buf: &[u8], pos: usize) -> Option<(usize, usize)> {
+    let first = *buf.get(pos)?;
+    if first & 0x80 == 0 { Some((pos + 1, first as usize)) }
+    else {
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 4 || pos + 1 + n > buf.len() { return None; }
+        let mut l = 0usize;
+        for i in 0..n { l = (l << 8) | buf[pos + 1 + i] as usize; }
+        Some((pos + 1 + n, l))
+    }
+}
+
+fn skip_len(buf: &[u8], pos: usize) -> Option<usize> {
+    let (vs, vl) = read_len(buf, pos + 1)?;
+    Some(vs + vl)
+}
+
+fn skip_tlv_min(buf: &[u8], pos: usize) -> Option<usize> {
+    let (vs, vl) = read_len(buf, pos + 1)?;
+    Some(vs + vl)
+}
+
+fn enter_seq_min(buf: &[u8], pos: usize) -> Option<usize> {
+    if buf.get(pos)? != &0x30 { return None; }
+    read_len(buf, pos + 1).map(|(vs, _)| vs)
 }
 
 // ── HTTP Transport ───────────────────────────────────────────────────────────

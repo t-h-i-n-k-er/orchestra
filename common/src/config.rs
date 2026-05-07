@@ -856,7 +856,7 @@ impl Default for SleepConfig {
             working_hours_end: None,
             off_hours_multiplier: None,
             sleep_mask_enabled: false,
-            mask_rotation_interval_secs: 0,
+            mask_rotation_interval_secs: 300,
             mask_rotation_schemes: Vec::new(),
         }
     }

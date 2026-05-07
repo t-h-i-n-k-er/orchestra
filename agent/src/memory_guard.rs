@@ -357,7 +357,7 @@ pub fn register_session_key(session: &common::CryptoSession) {
     // Update the buffer with the current key bytes.
     if let Ok(mut kp) = guard.lock() {
         // SAFETY: raw pointer is valid (Box::leak) and we hold the Mutex.
-        unsafe { (*kp.0).copy_from_slice(session.key_bytes()) };
+        unsafe { (*kp.0).copy_from_slice(&session.key_bytes()) };
         if !registered {
             tracing::debug!("[memory-guard] session key registered for protection");
         } else {

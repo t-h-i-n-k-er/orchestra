@@ -548,22 +548,77 @@ fn get_active_window_title() -> Result<String, String> {
 fn get_active_window_title() -> Result<String, String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
-    use winapi::um::winuser::{GetForegroundWindow, GetWindowTextW};
 
-    let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.is_null() {
-        return Err("No foreground window found".to_string());
+    // ── pe_resolve helpers ────────────────────────────────────────────────
+    const fn hash_str_const(s: &[u8]) -> u32 {
+        let mut h: u32 = pe_resolve::SEED;
+        let mut i = 0;
+        while i < s.len() {
+            h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
+            i += 1;
+        }
+        h
+    }
+    const fn hash_wstr_const(w: &[u16]) -> u32 {
+        let mut h: u32 = pe_resolve::SEED;
+        let mut i = 0;
+        while i < w.len() {
+            h = h.wrapping_mul(31).wrapping_add(w[i] as u32);
+            i += 1;
+        }
+        h
+    }
+    unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) -> Option<T> {
+        let module = match pe_resolve::get_module_handle_by_hash(dll_hash) {
+            Some(m) => m,
+            None => {
+                let load_fn: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
+                    resolve_api(pe_resolve::HASH_KERNEL32_DLL, hash_str_const(b"LoadLibraryW\0"))?;
+                let m = load_fn(dll_wide.as_ptr());
+                if m.is_null() { return None; }
+                m
+            }
+        };
+        let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)?;
+        Some(std::mem::transmute_copy(&addr))
+    }
+    unsafe fn resolve_api<T>(dll_hash: u32, fn_hash: u32) -> Option<T> {
+        let module = pe_resolve::get_module_handle_by_hash(dll_hash)?;
+        let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)?;
+        Some(std::mem::transmute_copy(&addr))
     }
 
-    let mut buffer: [u16; 256] = [0; 256];
-    let len = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    const USER32_DLL_W: &[u16] = &['u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+    const HASH_USER32_DLL: u32 = hash_wstr_const(USER32_DLL_W);
+    const HASH_GETFOREGROUNDWINDOW: u32 = hash_str_const(b"GetForegroundWindow\0");
+    const HASH_GETWINDOWTEXTW: u32 = hash_str_const(b"GetWindowTextW\0");
 
-    if len > 0 {
-        Ok(OsString::from_wide(&buffer[..len as usize])
-            .to_string_lossy()
-            .into_owned())
-    } else {
-        Err("Could not get window title".to_string())
+    type FnGetForegroundWindow = unsafe extern "system" fn() -> *mut std::ffi::c_void;
+    type FnGetWindowTextW = unsafe extern "system" fn(*mut std::ffi::c_void, *mut u16, i32) -> i32;
+
+    unsafe {
+        let get_fg: FnGetForegroundWindow = resolve_api_or_load(
+            USER32_DLL_W, HASH_USER32_DLL, HASH_GETFOREGROUNDWINDOW,
+        ).ok_or("GetForegroundWindow not found")?;
+        let get_wtext: FnGetWindowTextW = resolve_api(
+            HASH_USER32_DLL, HASH_GETWINDOWTEXTW,
+        ).ok_or("GetWindowTextW not found")?;
+
+        let hwnd = get_fg();
+        if hwnd.is_null() {
+            return Err("No foreground window found".to_string());
+        }
+
+        let mut buffer: [u16; 256] = [0; 256];
+        let len = get_wtext(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+
+        if len > 0 {
+            Ok(OsString::from_wide(&buffer[..len as usize])
+                .to_string_lossy()
+                .into_owned())
+        } else {
+            Err("Could not get window title".to_string())
+        }
     }
 }
 

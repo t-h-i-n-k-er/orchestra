@@ -17,6 +17,8 @@ use winapi::um::winnt::{
 };
 use pe_resolve;
 
+/// Minimal thread access for injection: THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION.
+const THREAD_INJECT_ACCESS: u64 = 0x1A02;
 
 // RUNTIME_FUNCTION (IMAGE_RUNTIME_FUNCTION_ENTRY) – 12 bytes, x64 only.
 #[cfg(target_arch = "x86_64")]
@@ -2028,7 +2030,7 @@ pub unsafe fn load_dll_in_remote_process(
         let status = nt_syscall::syscall!(
             "NtCreateThreadEx",
             &mut h_thread as *mut _ as u64,       // ThreadHandle
-            0x1FFFFFu64,                          // THREAD_ALL_ACCESS
+            THREAD_INJECT_ACCESS,                          // minimal thread access
             std::ptr::null_mut::<c_void>() as u64, // ObjectAttributes
             target_process as u64,                 // ProcessHandle
             stub_mem as u64,                       // StartRoutine

@@ -52,10 +52,10 @@
 
 #![cfg(all(windows, feature = "syscall-emulation"))]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use log::{debug, warn};
 // Type-only imports — no function imports to avoid IAT entries.
@@ -95,13 +95,76 @@ fn win32_to_ntstatus(error_code: DWORD) -> i32 {
 // These are the "emulated" wrappers that intentionally call kernel32
 // to disguise the call stack.
 
+/// Cache of resolved kernel32 function addresses (name → address).
+/// Populated lazily on first resolution and never evicted.
+static KERNEL32_CACHE: OnceLock<Mutex<HashMap<Vec<u8>, usize>>> = OnceLock::new();
+
+/// Read `SizeOfImage` from the PE optional header at `base`.
+///
+/// Returns `None` if the PE headers are invalid.
+///
+/// # Safety
+///
+/// `base` must point to a valid, fully-mapped PE image.
+unsafe fn get_module_size(base: usize) -> Option<usize> {
+    let dos_magic = *(base as *const u16);
+    if dos_magic != 0x5A4D {
+        return None;
+    }
+    let e_lfanew = *((base + 0x3C) as *const u32) as usize;
+    let nt_headers = base + e_lfanew;
+    let signature = *(nt_headers as *const u32);
+    if signature != 0x4550 {
+        return None;
+    }
+    let opt_header = nt_headers + 0x18;
+    Some(*((opt_header + 0x38) as *const u32) as usize)
+}
+
 /// Dynamically resolve a kernel32 export by name.
 ///
-/// Returns `None` if the module or function cannot be found.
+/// Returns `None` if the module or function cannot be found, or if the
+/// resolved address falls outside kernel32's VA range (possible PEB
+/// tampering / hook).  Results are cached in a process-wide `OnceLock`
+/// map so that subsequent calls for the same function name return
+/// immediately without re-resolving.
 fn resolve_kernel32_fn(name: &[u8]) -> Option<usize> {
+    // Fast-path: check the cache first.
+    let cache = KERNEL32_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(&addr) = guard.get(name) {
+            return Some(addr);
+        }
+    }
+
+    // Slow-path: resolve via PEB walking + export table hash.
     let base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
     let hash = pe_resolve::hash_str(name);
-    pe_resolve::get_proc_address_by_hash(base, hash)
+    let addr = pe_resolve::get_proc_address_by_hash(base, hash)?;
+
+    // Validate that the resolved address falls within kernel32's address range.
+    // This guards against PEB tampering, IAT hooks, or stale ordinal tables.
+    unsafe {
+        if let Some(module_size) = get_module_size(base) {
+            if addr < base || addr >= base + module_size {
+                warn!(
+                    "syscall_emulation: resolved {:?} at {:#x} is outside kernel32 range ({:#x}..{:#x}) — possible PEB tampering",
+                    std::str::from_utf8(name).unwrap_or("<invalid>"),
+                    addr,
+                    base,
+                    base + module_size
+                );
+                return None;
+            }
+        }
+    }
+
+    // Store in cache for future calls.
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(name.to_vec(), addr);
+    }
+
+    Some(addr)
 }
 
 /// Dynamically resolved `GetLastError`.

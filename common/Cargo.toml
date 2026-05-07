@@ -33,6 +33,10 @@ ed25519-dalek = { version = "2", optional = true }
 x25519-dalek = { version = "2" }
 bincode = "1.3.3"
 
+# Memory locking for PSK protection (mlock on Unix, VirtualLock on Windows).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 module-signatures = ["dep:ed25519-dalek"]
 dangerous-tls = []

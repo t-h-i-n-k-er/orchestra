@@ -81,6 +81,10 @@ pub async fn negotiate_session_key<S: AsyncRead + AsyncWrite + Unpin>(
     psk: &[u8],
     is_client: bool,
 ) -> Result<CryptoSession> {
+    // Copy the PSK into a zeroizable buffer so we can wipe it after key
+    // derivation.  The caller's `String` or `Vec` is *not* modified.
+    let mut psk_buf = psk.to_vec();
+
     let our_secret = EphemeralSecret::random_from_rng(rand::thread_rng());
     let our_public = PublicKey::from(&our_secret);
     let our_pub_bytes: [u8; 32] = *our_public.as_bytes();
@@ -113,13 +117,13 @@ pub async fn negotiate_session_key<S: AsyncRead + AsyncWrite + Unpin>(
         let srv_tag: &[u8] = &srv_msg[32..MSG_LEN];
 
         // Verify server's tag.
-        let expected_tag = compute_auth_tag(psk, &our_pub_bytes, &srv_pub);
+        let expected_tag = compute_auth_tag(&psk_buf, &our_pub_bytes, &srv_pub);
         if !hmac_verify(&expected_tag, srv_tag) {
             anyhow::bail!("forward secrecy: server HMAC verification failed — PSK mismatch or MITM");
         }
 
         // Step 3: Send our tag (client's tag).
-        let our_tag = compute_auth_tag(psk, &our_pub_bytes, &srv_pub);
+        let our_tag = compute_auth_tag(&psk_buf, &our_pub_bytes, &srv_pub);
         stream.write_all(&our_tag).await?;
 
         srv_pub
@@ -129,7 +133,7 @@ pub async fn negotiate_session_key<S: AsyncRead + AsyncWrite + Unpin>(
         stream.read_exact(&mut cli_pub).await?;
 
         // Step 2: Server sends its full message (pubkey + tag).
-        let our_tag = compute_auth_tag(psk, &cli_pub, &our_pub_bytes);
+        let our_tag = compute_auth_tag(&psk_buf, &cli_pub, &our_pub_bytes);
         let mut srv_msg = [0u8; MSG_LEN];
         srv_msg[..32].copy_from_slice(&our_pub_bytes);
         srv_msg[32..MSG_LEN].copy_from_slice(&our_tag);
@@ -138,7 +142,7 @@ pub async fn negotiate_session_key<S: AsyncRead + AsyncWrite + Unpin>(
         // Step 3: Read client's tag and verify it.
         let mut cli_tag = [0u8; HMAC_TAG_LEN];
         stream.read_exact(&mut cli_tag).await?;
-        let expected_tag = compute_auth_tag(psk, &cli_pub, &our_pub_bytes);
+        let expected_tag = compute_auth_tag(&psk_buf, &cli_pub, &our_pub_bytes);
         if !hmac_verify(&expected_tag, &cli_tag) {
             anyhow::bail!("forward secrecy: client HMAC verification failed — PSK mismatch or MITM");
         }
@@ -151,7 +155,11 @@ pub async fn negotiate_session_key<S: AsyncRead + AsyncWrite + Unpin>(
     let shared = our_secret.diffie_hellman(&peer_public);
 
     // HKDF: salt = PSK, IKM = ECDH shared secret.
-    let h = Hkdf::<Sha256>::new(Some(psk), shared.as_bytes());
+    let h = Hkdf::<Sha256>::new(Some(&psk_buf), shared.as_bytes());
+
+    // Zeroize the local PSK copy now that key derivation is complete.
+    use zeroize::Zeroize;
+    psk_buf.zeroize();
     let mut session_key = [0u8; KEY_LEN];
     h.expand(b"orchestra-forward-secret-v1", &mut session_key)
         .map_err(|_| anyhow::anyhow!("HKDF expand failed (output too long)") )?;

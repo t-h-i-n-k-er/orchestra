@@ -68,13 +68,6 @@ const CET_ENABLED_CANNOT_DISABLE: u8 = 2;
 const STATUS_SUCCESS: i32 = 0;
 /// NTSTATUS for STATUS_ACCESS_DENIED.
 const STATUS_ACCESS_DENIED: i32 = 0xC0000022_u32 as i32;
-/// NTSTATUS for STATUS_NOT_SUPPORTED.
-const STATUS_NOT_SUPPORTED: i32 = 0xC00000BB_u32 as i32;
-/// NTSTATUS for STATUS_INVALID_INFO_CLASS.
-const STATUS_INVALID_INFO_CLASS: i32 = 0xC0000003_u32 as i32;
-/// NTSTATUS for STATUS_INVALID_PARAMETER.
-const STATUS_INVALID_PARAMETER: i32 = 0xC000000D_u32 as i32;
-
 /// Exception code for Control Protection violation (#CP).
 const STATUS_CONTROL_STACK_VIOLATION: DWORD = 0xC00001A7;
 
@@ -931,14 +924,16 @@ pub fn has_call_chain(func_name: &str) -> bool {
 ///
 /// When CET is active and a shadow-stack violation occurs, the kernel sends
 /// a STATUS_CONTROL_STACK_VIOLATION exception to the VEH chain.  This handler
-/// intercepts it and attempts to fix the shadow stack by:
-/// 1. Reading the current shadow-stack pointer from KTHREAD
-/// 2. Adjusting the shadow-stack entry to match the target return address
-/// 3. Returning EXCEPTION_CONTINUE_EXECUTION
+/// intercepts it and:
 ///
-/// **Requires kernel access** (BYOVD) to read/write KTHREAD structure.
-/// Without kernel access, this handler simply logs the exception and returns
-/// EXCEPTION_CONTINUE_SEARCH.
+/// 1. Checks if the exception is a `STATUS_CONTROL_STACK_VIOLATION`.
+/// 2. Reads the faulting IP from the context record.
+/// 3. If kernel access (BYOVD) is available, attempts to adjust the shadow
+///    stack pointer to skip the mismatched return address.
+/// 4. Without kernel access, logs the error and returns
+///    `EXCEPTION_CONTINUE_SEARCH` — deliberately NOT returning
+///    `EXCEPTION_CONTINUE_EXECUTION`, which would cause an infinite loop of
+///    #CP exceptions.
 unsafe extern "system" fn veh_shadow_stack_handler(
     exception_info: *mut winapi::um::minwinbase::EXCEPTION_POINTERS,
 ) -> LONG {
@@ -946,12 +941,14 @@ unsafe extern "system" fn veh_shadow_stack_handler(
     let record = &*(info.ExceptionRecord);
 
     if record.ExceptionCode != STATUS_CONTROL_STACK_VIOLATION {
-        return EXCEPTION_CONTINUE_SEARCH;
+        return EXCEPTION_CONTINUE_SEARCH; // Not our exception
     }
 
-    log::debug!(
-        "cet_bypass: intercepted #CP exception at address {:p}",
-        record.ExceptionAddress,
+    let ctx = &*(info.ContextRecord);
+
+    log::error!(
+        "[cet_bypass] CET shadow stack violation at IP={:#x} — cannot fix automatically",
+        ctx.Rip
     );
 
     // Check if we have kernel access (kernel-callback feature).
@@ -967,14 +964,12 @@ unsafe extern "system" fn veh_shadow_stack_handler(
         //
         // This is highly complex and version-dependent.  For now, log
         // and fall through to the non-kernel path.
-        log::warn!("cet_bypass: kernel-based shadow stack fix not yet implemented");
+        log::warn!("[cet_bypass] kernel-based shadow stack fix not yet implemented");
     }
 
     // Without kernel access, we cannot fix the shadow stack.
-    // Log the exception and continue searching for other handlers.
-    log::warn!(
-        "cet_bypass: cannot fix shadow stack (no kernel access), passing exception to next handler"
-    );
+    // Deliberately do NOT return EXCEPTION_CONTINUE_EXECUTION — that would
+    // cause an infinite loop of #CP exceptions.
     EXCEPTION_CONTINUE_SEARCH
 }
 
@@ -1053,9 +1048,50 @@ fn get_windows_build() -> u32 {
         return masked;
     }
 
-    // Fallback: use RtlGetVersion via sysinfo crate.
-    // The sysinfo crate provides OS version info without ntdll calls.
-    log::debug!("cet_bypass: KUSER_SHARED_DATA build {} looks invalid, using fallback", masked);
+    // P2-16: Fallback using RtlGetVersion via pe_resolve if KUSER_SHARED_DATA
+    // value looks invalid.  RtlGetVersion is guaranteed to return accurate
+    // version info even when compatibility manifests lie to GetVersionEx.
+    log::debug!("cet_bypass: KUSER_SHARED_DATA build {} looks invalid, trying RtlGetVersion fallback", masked);
+
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        struct OsVersionInfoExW {
+            dw_os_version_info_size: u32,
+            dw_major_version: u32,
+            dw_minor_version: u32,
+            dw_build_number: u32,
+            dw_platform_id: u32,
+            sz_csd_version: [u16; 128],
+        }
+
+        let ntdll_hash = pe_resolve::hash_wstr(&"ntdll.dll\0".encode_utf16().collect::<Vec<u16>>());
+        if let Some(ntdll_base) = pe_resolve::get_module_handle_by_hash(ntdll_hash) {
+            let fn_hash = pe_resolve::hash_str(b"RtlGetVersion\0");
+            if let Some(fn_addr) = pe_resolve::get_proc_address_by_hash(ntdll_base, fn_hash) {
+                type FnRtlGetVersion = unsafe extern "system" fn(*mut OsVersionInfoExW) -> i32;
+                let rtl_get_version: FnRtlGetVersion = unsafe { std::mem::transmute(fn_addr as *mut _) };
+                let mut version_info = OsVersionInfoExW {
+                    dw_os_version_info_size: std::mem::size_of::<OsVersionInfoExW>() as u32,
+                    dw_major_version: 0,
+                    dw_minor_version: 0,
+                    dw_build_number: 0,
+                    dw_platform_id: 0,
+                    sz_csd_version: [0u16; 128],
+                };
+                let status = unsafe { rtl_get_version(&mut version_info) };
+                if status >= 0 && version_info.dw_build_number >= 10000 {
+                    log::debug!(
+                        "cet_bypass: RtlGetVersion fallback returned build {}",
+                        version_info.dw_build_number
+                    );
+                    return version_info.dw_build_number;
+                }
+            }
+        }
+        log::warn!("cet_bypass: RtlGetVersion fallback failed, returning 0");
+    }
+
     0
 }
 

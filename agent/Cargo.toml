@@ -60,6 +60,17 @@ aes-gcm = "0.10"
 aes = "0.9.0"
 ctr = "0.10.0"
 async-trait = "0.1.89"
+# winapi type-only dependency: provides HANDLE, DWORD, IMAGE_*_HEADER etc.
+# All `use winapi::` imports in cross-platform modules (syscalls, env_check,
+# process_manager) are inside `#[cfg(windows)]` function bodies, so this dep
+# compiles but is never linked on non-Windows targets.  The Windows-specific
+# API features (OpenProcess, VirtualAlloc, etc.) live in the target-gated
+# `[target.'cfg(windows)'.dependencies]` entry below.
+#
+# Future optimisation: move this to `cfg(windows)` once every module-level
+# `use winapi::` import is behind a cfg gate (currently cet_bypass.rs has
+# ungated module-level imports, but that module itself is cfg-gated, so it
+# is safe).  Risk is low, benefit is marginal (type-only, no linking).
 winapi = { version = "0.3", features = ["ntdef", "psapi", "threadpoolapiset", "threadpoollegacyapiset", "memoryapi", "winnt", "ntsecapi", "sspi"] }
 russh = { version = "0.46", optional = true }
 russh-keys = { version = "0.46", optional = true }

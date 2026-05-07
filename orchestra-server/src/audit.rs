@@ -38,14 +38,14 @@ impl AuditLog {
         })
     }
 
-    /// Convenience: derive the HMAC key from a shared secret string using
-    /// a simple SHA-256 hash of the secret bytes.  This is deterministic
-    /// so the same secret always yields the same key.
+    /// Derive the HMAC key from the admin token using HKDF-style HMAC-based
+    /// key derivation. Uses HMAC-SHA256 with a fixed info string so the key
+    /// is deterministic but derived through a proper KDF instead of plain hashing.
     pub fn derive_hmac_key(secret: &str) -> Vec<u8> {
-        use sha2::Digest;
-        let mut hasher = Sha256::new();
-        hasher.update(secret.as_bytes());
-        hasher.finalize().to_vec()
+        let mut mac = HmacSha256::new_from_slice(b"orchestra-audit-hmac-key-derivation")
+            .expect("HMAC key length is valid");
+        mac.update(secret.as_bytes());
+        mac.finalize().into_bytes().to_vec()
     }
 
     pub fn record(&self, event: AuditEvent) {
@@ -124,7 +124,7 @@ impl AuditLog {
             let stored_hmac = lines[i + 1];
             i += 2;
 
-            let mut event: AuditEvent = match serde_json::from_str(json_line) {
+            let event: AuditEvent = match serde_json::from_str(json_line) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
@@ -136,8 +136,10 @@ impl AuditLog {
             match mac.verify_slice(&hex::decode(stored_hmac).unwrap_or_default()) {
                 Ok(()) => {}
                 Err(_) => {
-                    // Flag tampered entry.
-                    event.details = format!("[TAMPERED] {}", event.details);
+                    tracing::error!("[audit] TAMPERED ENTRY DETECTED: agent_id={}, user={}, details={}",
+                                event.agent_id, event.user, event.details);
+                    // Skip the tampered entry entirely — do not return it
+                    continue;
                 }
             }
 
@@ -149,5 +151,12 @@ impl AuditLog {
             out.drain(0..drop);
         }
         out
+    }
+}
+
+impl Drop for AuditLog {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.hmac_key.zeroize();
     }
 }

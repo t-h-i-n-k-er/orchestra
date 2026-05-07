@@ -40,7 +40,7 @@ use chacha20poly1305::{
 use rand::RngCore;
 use std::collections::HashMap;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -515,6 +515,10 @@ pub fn shutdown() {
     // Signal the background thread to stop.
     inner.shutdown.store(true, Ordering::SeqCst);
 
+    // Null out the VEH tracker pointer *before* any Arc is dropped so that
+    // a racing VEH callback never dereferences a dangling pointer.
+    VEH_TRACKER_PTR.store(std::ptr::null_mut(), Ordering::Release);
+
     // Join the background thread.
     if let Ok(mut guard) = inner.thread_handle.lock() {
         if let Some(handle) = guard.take() {
@@ -608,9 +612,7 @@ fn register_veh(inner: &Arc<PageTrackerInner>) -> Result<()> {
     // Store a raw pointer to the inner tracker in a module-level static.
     // The Arc is never dropped while the VEH is registered (shutdown
     // removes the VEH before releasing the Arc).
-    VEH_TRACKER_PTR
-        .set(Arc::as_ptr(inner))
-        .map_err(|_| anyhow!("evanesco: VEH tracker pointer already set"))?;
+    VEH_TRACKER_PTR.store(Arc::as_ptr(inner) as *mut _, Ordering::Release);
 
     // Dynamic resolution — no IAT entry for AddVectoredExceptionHandler.
     type FnAddVEH = unsafe extern "system" fn(
@@ -662,7 +664,11 @@ unsafe fn remove_veh(handle: usize) {
 
 /// Module-level static holding the raw pointer to the tracker inner,
 /// accessible from the bare VEH function pointer.
-static VEH_TRACKER_PTR: OnceLock<*const PageTrackerInner> = OnceLock::new();
+/// Module-level static holding the raw pointer to the tracker inner,
+/// accessible from the bare VEH function pointer.
+/// Nulled out during shutdown *before* the inner tracker is dropped
+/// to prevent a use-after-free in the VEH handler.
+static VEH_TRACKER_PTR: AtomicPtr<PageTrackerInner> = AtomicPtr::new(std::ptr::null_mut());
 
 /// VEH handler for STATUS_ACCESS_VIOLATION on tracked PAGE_NOACCESS pages.
 ///
@@ -705,11 +711,18 @@ unsafe extern "system" fn veh_handler(
     };
 
     // Retrieve the tracker pointer from the module-level static.
-    let inner_ptr = match VEH_TRACKER_PTR.get() {
-        Some(&p) => p,
-        None => return EXCEPTION_CONTINUE_SEARCH,
-    };
+    // A null pointer means shutdown is in progress or already complete.
+    let inner_ptr = VEH_TRACKER_PTR.load(Ordering::Acquire);
+    if inner_ptr.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     let inner = &*inner_ptr;
+
+    // If the tracker is shutting down, do not attempt to decrypt — the
+    // shutdown path is already decrypting all pages.
+    if inner.shutdown.load(Ordering::Acquire) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
 
     // Quick check: page-align the fault address and see if it's tracked.
     let page_base = fault_addr & !0xFFF;
@@ -832,7 +845,11 @@ pub fn enroll(base: *mut u8, size: usize, orig_protect: u32, label: &str) -> Res
 
     // Page-align base.
     let aligned_base = (base as usize) & !0xFFF;
-    let end = ((base as usize + size + 0xFFF) & !0xFFF);
+    // P2-06: Overflow check for base + size calculation.
+    let end_raw = (base as usize).checked_add(size).ok_or_else(|| {
+        anyhow!("evanesco: base + size overflow: base={:#x}, size={:#x}", base as usize, size)
+    })?;
+    let end = ((end_raw + 0xFFF) & !0xFFF);
     let aligned_size = end - aligned_base;
 
     let info = PageInfo {
@@ -942,6 +959,18 @@ pub fn encrypt_all() {
     };
 
     for (base, size) in page_info {
+        // TOCTOU mitigation: re-validate that the page is still not encrypted
+        // under the write lock before calling encrypt_page_unlocked.  Between
+        // the read-lock collection above and this write lock, the VEH handler
+        // or another thread may have already changed the page state.
+        if let Some(info) = pages.get(&base) {
+            if info.state == PageState::Encrypted {
+                continue;
+            }
+        } else {
+            continue; // page was removed between locks
+        }
+
         encrypt_page_unlocked(&mut pages, &mut crypto_sidecar, base, size);
 
         // Re-key: if the kernel adjusted the base address via

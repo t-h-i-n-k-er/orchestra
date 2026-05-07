@@ -1099,6 +1099,7 @@ dependencies = [
  "ed25519-dalek",
  "hkdf",
  "hmac",
+ "libc",
  "log",
  "rand 0.8.6",
  "rustls 0.23.38",
@@ -3770,6 +3771,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "winapi",
+ "zeroize",
 ]
 
 [[package]]

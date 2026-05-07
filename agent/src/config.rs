@@ -134,13 +134,17 @@ pub fn config_path() -> PathBuf {
         .join("agent.toml")
 }
 
-fn compute_config_hmac(raw_toml: &[u8]) -> [u8; 32] {
-    let key_material = resolve_shared_secret()
-        .unwrap_or_else(|| "orchestra-config-integrity-v1".to_string());
+fn compute_config_hmac(raw_toml: &[u8]) -> Result<[u8; 32]> {
+    let key_material = resolve_shared_secret().ok_or_else(|| {
+        anyhow::anyhow!(
+            "ORCHESTRA_SECRET environment variable not set — config HMAC cannot be computed. \
+             Set ORCHESTRA_SECRET before running the agent."
+        )
+    })?;
     let mut mac = HmacSha256::new_from_slice(key_material.as_bytes())
         .expect("HMAC key length is valid");
     mac.update(raw_toml);
-    mac.finalize().into_bytes().into()
+    Ok(mac.finalize().into_bytes().into())
 }
 
 fn verify_config_hmac(config_bytes: &[u8], expected_hmac: &str) -> Result<bool> {
@@ -172,7 +176,7 @@ pub fn append_config_hmac(config_path: &std::path::Path) -> anyhow::Result<()> {
         .filter(|l| !l.starts_with("# hmac = "))
         .collect::<Vec<_>>()
         .join("\n");
-    let hmac_bytes = compute_config_hmac(content.as_bytes());
+    let hmac_bytes = compute_config_hmac(content.as_bytes())?;
     let hmac_hex = hex::encode(hmac_bytes);
     let signed = format!("{}\n# hmac = {}\n", content, hmac_hex);
     std::fs::write(config_path, signed)?;

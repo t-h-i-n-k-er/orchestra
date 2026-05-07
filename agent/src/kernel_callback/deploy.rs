@@ -498,7 +498,7 @@ fn load_driver_via_registry(
         syscall!(
             "NtCreateKey",
             &mut key_handle as *mut usize as u64,
-            0x000F003Fu64, // KEY_ALL_ACCESS
+            0x00020006u64, // KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY
             &mut oa as *mut _ as u64,
             0u64, // TitleIndex
             std::ptr::null::<u64>() as u64, // Class (NULL)

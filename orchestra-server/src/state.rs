@@ -158,6 +158,8 @@ pub struct AppState {
     /// whose `agent_id_hash` appears in this set will be rejected during
     /// P2P link handshake and have existing links terminated.
     pub revoked_certificates: DashSet<[u8; 32]>,
+    /// Rate limiter for authentication endpoints (brute-force protection).
+    pub auth_rate_limiter: crate::auth::RateLimiter,
 }
 
 impl AppState {
@@ -192,6 +194,10 @@ impl AppState {
             redirector_state: RedirectorState::new(),
             mesh_controller: RwLock::new(crate::mesh_controller::MeshController::new()),
             revoked_certificates: DashSet::new(),
+            auth_rate_limiter: crate::auth::RateLimiter::new(
+                100,                                     // max attempts
+                std::time::Duration::from_secs(60 * 5),  // per 5-minute window
+            ),
         }
     }
 

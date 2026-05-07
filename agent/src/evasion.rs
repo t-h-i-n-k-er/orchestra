@@ -69,7 +69,10 @@ unsafe extern "system" fn veh_handler(
 #[cfg(windows)]
 pub unsafe fn setup_hardware_breakpoints() {
     use winapi::um::handleapi::INVALID_HANDLE_VALUE;
-    use winapi::um::winnt::{CONTEXT, CONTEXT_DEBUG_REGISTERS, THREAD_ALL_ACCESS};
+    use winapi::um::winnt::{CONTEXT, CONTEXT_DEBUG_REGISTERS};
+
+    /// Minimal thread access for hardware breakpoints: THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION.
+    const THREAD_BP_ACCESS: u64 = 0x1A02;
 
     // ── Dynamic resolution helpers (no IAT entries) ──────────────────────
     // VEH registration / removal and thread enumeration are resolved at
@@ -319,7 +322,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                     let open_ok = syscall!(
                         "NtOpenThread",
                         &mut h_thread as *mut _ as u64,
-                        THREAD_ALL_ACCESS as u64,
+                        THREAD_BP_ACCESS as u64,
                         &mut oa as *mut _ as u64,
                         cid.as_mut_ptr() as u64,
                     );

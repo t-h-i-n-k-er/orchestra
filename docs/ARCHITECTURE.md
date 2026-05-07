@@ -254,7 +254,7 @@ ntdll.dll syscall stubs completely.
   └──────────┘   └───────────────┘
 ```
 
-**9 emulated syscalls**: `NtWriteVirtualMemory` → `WriteProcessMemory`,
+**10 emulated syscalls**: `NtWriteVirtualMemory` → `WriteProcessMemory`,
 `NtReadVirtualMemory` → `ReadProcessMemory`,
 `NtAllocateVirtualMemory` → `VirtualAllocEx`,
 `NtFreeVirtualMemory` → `VirtualFreeEx`,
@@ -262,7 +262,8 @@ ntdll.dll syscall stubs completely.
 `NtCreateThreadEx` → `CreateRemoteThread` (limited: no `CREATE_SUSPENDED`),
 `NtOpenProcess` → `OpenProcess`,
 `NtClose` → `CloseHandle`,
-`NtQueryVirtualMemory` → `VirtualQueryEx` (class 0 only).
+`NtQueryVirtualMemory` → `VirtualQueryEx` (class 0 only),
+`NtDuplicateToken` → `DuplicateTokenEx`.
 
 **Configuration**: `[evasion.syscall_emulation]` in agent TOML:
 - `enabled = true` — Global toggle (can be toggled at runtime via C2)
@@ -706,7 +707,7 @@ operates independently on a per-page basis.
   │  ┌────────────────────────────────────────────────────────┐  │
   │  │ pages: RwLock<HashMap<usize, PageInfo>>                │  │
   │  │   key = page-aligned base address                      │  │
-  │  │   value = { base, size, state, rc4_key,               │  │
+  │  │   value = { base, size, state, aead_key: [u8; 32],       │  │
   │  │            last_access, orig_protect, label }          │  │
   │  └────────────────────────────────────────────────────────┘  │
   │  idle_threshold_ms  scan_interval_ms  shutdown flag          │
@@ -724,7 +725,7 @@ operates independently on a per-page basis.
 
 | State           | Protection        | Description                                    |
 |-----------------|-------------------|------------------------------------------------|
-| `Encrypted`     | `PAGE_NOACCESS`   | XOR'd with per-page RC4 key; unreadable        |
+| `Encrypted`     | `PAGE_NOACCESS`   | Encrypted with per-page XChaCha20-Poly1305; unreadable |
 | `DecryptedRW`   | `PAGE_READWRITE`  | Decrypted, accessible for reading/writing      |
 | `DecodedRX`     | `PAGE_EXECUTE_READ` | Decrypted, executable for code execution     |
 
@@ -732,7 +733,7 @@ operates independently on a per-page basis.
 
 **JIT Decryption** (`acquire_pages` → `PageGuard`):
 1. Caller requests page range with `AccessType::ReadWrite` or `Execute`.
-2. `PageTrackerInner` RC4-decrypts the page in place.
+2. `PageTrackerInner` XChaCha20-Poly1305 decrypts the page in place.
 3. `NtProtectVirtualMemory` sets `PAGE_READWRITE` or `PAGE_EXECUTE_READ`.
 4. `PageGuard` is returned — holds references, updates `last_access`.
 5. On `Drop`, `PageGuard` re-encrypts and restores `PAGE_NOACCESS`.
@@ -771,7 +772,7 @@ scan-interval-ms = 50     # background thread check interval
 
 | Operation           | Algorithm              | Rationale                                   |
 |---------------------|------------------------|---------------------------------------------|
-| Per-page encrypt    | RC4 (per-page key)     | Fast, low overhead for frequent ops         |
+| Per-page encrypt    | XChaCha20-Poly1305 (per-page key) | AEAD with integrity, low overhead for frequent ops |
 | Full sleep sweep    | XChaCha20-Poly1305     | Stronger AEAD for the longer sleep window   |
 
 ### Feature Flag

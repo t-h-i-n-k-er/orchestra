@@ -88,6 +88,12 @@ struct Cli {
     /// redirector's actual domain.
     #[arg(long)]
     front_domain: Option<String>,
+
+    /// Path to PEM-encoded C2 server certificate for TLS pinning.
+    /// When set, only this certificate is trusted for C2 forwarding.
+    /// When omitted, system root CAs are used (less secure).
+    #[arg(long)]
+    c2_cert: Option<PathBuf>,
 }
 
 // ── Profile loader ───────────────────────────────────────────────────────────
@@ -145,6 +151,31 @@ impl Profile {
     }
 }
 
+// ── TLS-pinned HTTP client builder ───────────────────────────────────────────
+
+/// Build a `reqwest::Client` with certificate pinning.
+///
+/// If `c2_cert` is `Some(path)`, only that PEM certificate is trusted
+/// (built-in root CAs are disabled).  If `None`, system root CAs are
+/// used and a warning is logged.
+fn build_pinned_client(c2_cert: Option<&PathBuf>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(cert_path) = c2_cert {
+        let cert_pem = std::fs::read(cert_path)
+            .map_err(|e| anyhow::anyhow!("failed to read C2 cert from {}: {}", cert_path.display(), e))?;
+        builder = builder
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(reqwest::Certificate::from_pem(&cert_pem)?);
+        tracing::info!(path = %cert_path.display(), "C2 certificate pinning enabled");
+    } else {
+        tracing::warn!(
+            "[redirector] No C2 certificate configured — using system root CAs. \
+             Configure --c2-cert for certificate pinning."
+        );
+    }
+    Ok(builder.build()?)
+}
+
 // ── Shared state ─────────────────────────────────────────────────────────────
 
 struct RedirectorState {
@@ -171,11 +202,8 @@ struct LogEntry {
 }
 
 impl RedirectorState {
-    fn new(profile: &Profile, c2_addr: String, cover_dir: Option<PathBuf>) -> Self {
-        let c2_client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .expect("failed to build HTTP client");
+    fn new(profile: &Profile, c2_addr: String, cover_dir: Option<PathBuf>, c2_cert: Option<&PathBuf>) -> Self {
+        let c2_client = build_pinned_client(c2_cert).expect("failed to build HTTP client");
 
         Self {
             c2_uris: profile.c2_uris(),
@@ -345,11 +373,8 @@ struct ServerConnection {
 }
 
 impl ServerConnection {
-    fn new(api_url: String, token: String) -> Self {
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .expect("failed to build HTTP client");
+    fn new(api_url: String, token: String, c2_cert: Option<&PathBuf>) -> Self {
+        let client = build_pinned_client(c2_cert).expect("failed to build HTTP client");
         Self {
             api_url,
             token,
@@ -419,6 +444,7 @@ async fn main() -> Result<()> {
         &profile,
         cli.c2_addr.clone(),
         cli.cover_content.clone(),
+        cli.c2_cert.as_ref(),
     ));
 
     // Build the router.
@@ -431,7 +457,7 @@ async fn main() -> Result<()> {
     let server_conn = if let (Some(api_url), Some(token)) =
         (cli.server_api.clone(), cli.server_token.clone())
     {
-        let mut conn = ServerConnection::new(api_url, token);
+        let mut conn = ServerConnection::new(api_url, token, cli.c2_cert.as_ref());
         let listen_url = format!("https://{}", cli.listen_addr);
         if let Err(e) = conn
             .register(&listen_url, &profile_name, cli.front_domain.as_deref())
@@ -456,12 +482,10 @@ async fn main() -> Result<()> {
             (api_url, token, redirector_id)
         };
         let (api_url, _token, redirector_id) = conn_clone;
+        let heartbeat_cert = cli.c2_cert.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build()
-                .unwrap();
+            let client = build_pinned_client(heartbeat_cert.as_ref()).unwrap();
             loop {
                 interval.tick().await;
                 if let Some(ref id) = redirector_id {

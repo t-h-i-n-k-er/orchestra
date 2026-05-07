@@ -786,7 +786,7 @@ fn enable_debug_privilege() -> Result<bool> {
             )
         };
         if nt_success(status) {
-            let tp = unsafe { &*(buf.as_ptr() as *const TOKEN_PRIVILEGES) };
+            let tp = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const TOKEN_PRIVILEGES) };
             let count = tp.PrivilegeCount;
             let entries = unsafe {
                 std::slice::from_raw_parts(
@@ -978,7 +978,7 @@ fn find_lsass_pid() -> Result<u32> {
         }
 
         let entry = unsafe {
-            &*(buffer.as_ptr().add(offset) as *const SystemProcessInformation)
+            std::ptr::read_unaligned(buffer.as_ptr().add(offset) as *const SystemProcessInformation)
         };
 
         // Compute FNV-1a hash of the image name (UTF-16).

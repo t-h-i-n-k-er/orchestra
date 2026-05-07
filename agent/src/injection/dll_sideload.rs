@@ -130,7 +130,7 @@ fn derive_payload_key() -> [u8; 32] {
 }
 
 /// Derive a 16-byte RC4 key (used for re-encryption in the stub data block).
-#[allow(dead_code)]
+#[cfg(test)]
 fn derive_stub_rc4_key() -> [u8; 16] {
     let ikm = string_crypt::enc_str!("ORCHESTRA_PAYLOAD_KEY_SEED");
     let okm = hkdf_sha256_derive(
@@ -210,7 +210,7 @@ impl Rc4State {
 }
 
 /// RC4 encrypt/decrypt (symmetric operation).
-#[allow(dead_code)]
+#[cfg(test)]
 fn rc4_encrypt(plaintext: &[u8], key: &[u8]) -> Vec<u8> {
     let mut ct = plaintext.to_vec();
     Rc4State::new(key).process_in_place(&mut ct);

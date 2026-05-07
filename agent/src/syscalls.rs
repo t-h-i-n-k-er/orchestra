@@ -1761,6 +1761,33 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
         }
     };
 
+    /// IAT-free fallback: resolves VirtualProtect from kernel32 via pe_resolve
+    /// and invokes NtProtectVirtualMemory-style calling convention.
+    /// Used when the ntdll-based nt_protect resolution above fails.
+    #[inline(always)]
+    unsafe fn nt_protect_fallback(
+        addr: *mut winapi::ctypes::c_void,
+        size: usize,
+        new_prot: u32,
+        old_prot: &mut u32,
+    ) {
+        // Try kernel32!VirtualProtect via pe_resolve as last resort.
+        if let Some(k32) = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+            if let Some(vp_addr) = pe_resolve::get_proc_address_by_hash(
+                k32,
+                pe_resolve::hash_str(b"VirtualProtect\0"),
+            ) {
+                let vp: unsafe extern "system" fn(
+                    *mut winapi::ctypes::c_void,
+                    usize,
+                    u32,
+                    *mut u32,
+                ) -> i32 = std::mem::transmute(vp_addr);
+                vp(addr, size, new_prot, old_prot);
+            }
+        }
+    }
+
     while (*import_desc).Name != 0 {
         let dll_name_ptr = (base + (*import_desc).Name as usize) as *const i8;
         let dll_name = std::ffi::CStr::from_ptr(dll_name_ptr)
@@ -1854,7 +1881,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                             &mut old_protect,
                         );
                     } else {
-                        winapi::um::memoryapi::VirtualProtect(
+                        nt_protect_fallback(
                             first_thunk as *mut _,
                             iat_size,
                             winapi::um::winnt::PAGE_READWRITE,
@@ -1915,7 +1942,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                             &mut prev_protect,
                         );
                     } else {
-                        winapi::um::memoryapi::VirtualProtect(
+                        nt_protect_fallback(
                             restore_addr as *mut _,
                             iat_size,
                             old_protect,
@@ -1952,7 +1979,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                             &mut old_protect,
                         );
                     } else {
-                        winapi::um::memoryapi::VirtualProtect(
+                        nt_protect_fallback(
                             first_thunk as *mut _,
                             iat_size,
                             winapi::um::winnt::PAGE_READWRITE,
@@ -2007,7 +2034,7 @@ unsafe fn rebuild_iat(base: usize) -> Result<()> {
                             &mut prev_protect,
                         );
                     } else {
-                        winapi::um::memoryapi::VirtualProtect(
+                        nt_protect_fallback(
                             restore_addr as *mut _,
                             iat_size,
                             old_protect,

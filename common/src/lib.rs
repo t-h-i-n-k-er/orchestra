@@ -1090,22 +1090,183 @@ pub enum CryptoError {
 ///      warning and require a specific `--allow-legacy-crypto` flag.
 ///    - **Phase 3 (Removal):** Static PSK code paths are entirely dropped, and the PSK
 ///      is used exclusively for authenticating the ephemeral DH exchange.
+/// Number of encrypt/decrypt operations after which the session key is
+/// automatically re-derived from the PSK to limit the amount of ciphertext
+/// an attacker can collect under a single key.
+const REKEY_INTERVAL: u64 = 10_000;
+
+// ── LockedSecret: mlock-protected, zeroizing secret wrapper ──────────────────
+
+/// Wrapper that keeps a secret byte buffer locked in RAM (`mlock` / `VirtualLock`)
+/// and zeroizes it on drop so it never ends up in swap or core dumps.
+///
+/// On Unix the buffer is pinned with `mlock(2)`.  On Windows we fall back to
+/// `VirtualLock` when available; otherwise the zeroization still takes effect.
+pub struct LockedSecret {
+    data: Vec<u8>,
+}
+
+impl LockedSecret {
+    /// Create a new `LockedSecret` from a byte slice, immediately locking it
+    /// in physical RAM.
+    pub fn new(data: &[u8]) -> Self {
+        let s = Self { data: data.to_vec() };
+        s.lock_memory();
+        s
+    }
+
+    /// Return a reference to the raw secret bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Lock the backing memory so the OS will not page it to swap.
+    fn lock_memory(&self) {
+        let ptr = self.data.as_ptr() as *const u8;
+        let len = self.data.len();
+        // Best-effort — failure to lock is logged but not fatal.
+        #[cfg(unix)]
+        unsafe {
+            if libc::mlock(ptr as *const _, len) != 0 {
+                log::warn!("LockedSecret: mlock({} bytes) failed", len);
+            }
+        }
+        #[cfg(windows)]
+        unsafe {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn VirtualLock(lpAddress: *const u8, dwSize: usize) -> i32;
+            }
+            if VirtualLock(ptr, len) == 0 {
+                log::warn!("LockedSecret: VirtualLock({} bytes) failed", len);
+            }
+        }
+    }
+
+    /// Unlock the backing memory (called from Drop).
+    fn unlock_memory(&self) {
+        let ptr = self.data.as_ptr() as *const u8;
+        let len = self.data.len();
+        #[cfg(unix)]
+        unsafe {
+            libc::munlock(ptr as *const _, len);
+        }
+        #[cfg(windows)]
+        unsafe {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn VirtualUnlock(lpAddress: *const u8, dwSize: usize) -> i32;
+            }
+            VirtualUnlock(ptr, len);
+        }
+    }
+}
+
+impl Drop for LockedSecret {
+    fn drop(&mut self) {
+        // Zeroize before unlocking.
+        self.data.zeroize();
+        self.unlock_memory();
+    }
+}
+
 pub struct CryptoSession {
-    cipher: Aes256Gcm,
-    /// Copy of the raw key bytes, zeroed on drop.
-    key: [u8; KEY_LEN],
+    /// Cipher and key protected by a write-lock for periodic re-keying.
+    inner: std::sync::RwLock<CryptoInner>,
     /// HKDF salt associated with this session.
-    salt: [u8; SALT_LEN],
+    salt: std::sync::RwLock<[u8; SALT_LEN]>,
     /// Optional pre-shared secret used to derive per-message keys from wire salts.
-    pre_shared_secret: Option<Vec<u8>>,
+    /// Wrapped in `LockedSecret` for mlock + zeroize-on-drop protection.
+    pre_shared_secret: Option<LockedSecret>,
+    /// Monotonic counter of encrypt + decrypt operations; triggers re-keying
+    /// every [`REKEY_INTERVAL`] operations.
+    op_counter: std::sync::atomic::AtomicU64,
+}
+
+/// Mutable inner state of a [`CryptoSession`], protected by an `RwLock`.
+struct CryptoInner {
+    cipher: Aes256Gcm,
+    /// Copy of the raw key bytes, zeroed on drop / re-key.
+    key: [u8; KEY_LEN],
+    /// P2-12: Counter-based nonce — 4-byte random prefix, 8-byte monotonic counter.
+    /// Guarantees nonce uniqueness without relying on per-message randomness.
+    nonce_prefix: [u8; 4],
+    nonce_counter: u64,
+    /// P2-09: Whether the key memory has been locked via mlock/VirtualLock.
+    key_locked: bool,
+}
+
+impl CryptoInner {
+    /// Lock the key bytes in physical RAM (best-effort, non-fatal on failure).
+    fn lock_key_memory(&mut self) {
+        let ptr = self.key.as_ptr() as *const u8;
+        let len = self.key.len();
+        #[cfg(unix)]
+        unsafe {
+            if libc::mlock(ptr as *const _, len) != 0 {
+                log::warn!("CryptoInner: mlock(key, {} bytes) failed", len);
+            } else {
+                self.key_locked = true;
+            }
+        }
+        #[cfg(windows)]
+        unsafe {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn VirtualLock(lpAddress: *const u8, dwSize: usize) -> i32;
+            }
+            if VirtualLock(ptr, len) != 0 {
+                self.key_locked = true;
+            } else {
+                log::warn!("CryptoInner: VirtualLock(key, {} bytes) failed", len);
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (ptr, len);
+        }
+    }
+
+    /// Unlock the key bytes (called during zeroize/re-key).
+    fn unlock_key_memory(&mut self) {
+        if !self.key_locked {
+            return;
+        }
+        let ptr = self.key.as_ptr() as *const u8;
+        let len = self.key.len();
+        #[cfg(unix)]
+        unsafe {
+            libc::munlock(ptr as *const _, len);
+        }
+        #[cfg(windows)]
+        unsafe {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn VirtualUnlock(lpAddress: *const u8, dwSize: usize) -> i32;
+            }
+            VirtualUnlock(ptr, len);
+        }
+        self.key_locked = false;
+    }
+
+    /// P2-12: Generate the next nonce as `prefix || counter.to_be_bytes()`.
+    fn next_nonce(&mut self) -> [u8; NONCE_LEN] {
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce[..4].copy_from_slice(&self.nonce_prefix);
+        nonce[4..].copy_from_slice(&self.nonce_counter.to_be_bytes());
+        self.nonce_counter = self.nonce_counter.wrapping_add(1);
+        nonce
+    }
 }
 
 impl Drop for CryptoSession {
     fn drop(&mut self) {
-        self.key.zeroize();
-        if let Some(psk) = self.pre_shared_secret.as_mut() {
-            psk.zeroize();
+        // Zeroize the key inside the RwLock and unlock it.
+        if let Ok(inner) = self.inner.get_mut() {
+            inner.unlock_key_memory();
+            inner.key.zeroize();
         }
+        // `pre_shared_secret` (LockedSecret) zeroizes itself via its own Drop.
     }
 }
 
@@ -1146,11 +1307,25 @@ impl CryptoSession {
         let copy_len = salt.len().min(SALT_LEN);
         salt_bytes[..copy_len].copy_from_slice(&salt[..copy_len]);
 
-        Self {
+        // P2-12: Generate a random 4-byte nonce prefix for counter-based nonces.
+        let mut nonce_prefix = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut nonce_prefix);
+
+        let mut inner = CryptoInner {
             cipher: Aes256Gcm::new(key),
             key: key_bytes,
-            salt: salt_bytes,
-            pre_shared_secret: Some(pre_shared_secret.to_vec()),
+            nonce_prefix,
+            nonce_counter: 0,
+            key_locked: false,
+        };
+        // P2-09: Lock the key memory.
+        inner.lock_key_memory();
+
+        Self {
+            inner: std::sync::RwLock::new(inner),
+            salt: std::sync::RwLock::new(salt_bytes),
+            pre_shared_secret: Some(LockedSecret::new(pre_shared_secret)),
+            op_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1159,36 +1334,104 @@ impl CryptoSession {
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
         let mut salt = [0u8; SALT_LEN];
         rand::thread_rng().fill_bytes(&mut salt);
-        Self {
+        // P2-12: Generate a random 4-byte nonce prefix.
+        let mut nonce_prefix = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut nonce_prefix);
+
+        let mut inner = CryptoInner {
             cipher: Aes256Gcm::new(key),
             key: key_bytes,
-            salt,
+            nonce_prefix,
+            nonce_counter: 0,
+            key_locked: false,
+        };
+        // P2-09: Lock the key memory.
+        inner.lock_key_memory();
+
+        Self {
+            inner: std::sync::RwLock::new(inner),
+            salt: std::sync::RwLock::new(salt),
             pre_shared_secret: None,
+            op_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Return a reference to the raw 32-byte AES-256-GCM key.
+    /// Check the operation counter and re-derive the session key if the
+    /// [`REKEY_INTERVAL`] has been reached.  This limits the amount of
+    /// ciphertext produced under a single key.
+    ///
+    /// Uses a compare-exchange to ensure only one thread performs the re-key;
+    /// others continue with the current key until the next interval.
+    fn maybe_rekey(&self) {
+        use std::sync::atomic::Ordering;
+        let prev = self.op_counter.fetch_add(1, Ordering::Relaxed);
+        // Re-key every REKEY_INTERVAL operations, but not on the very first
+        // call (prev == 0) because the session was just created.
+        if prev == 0 || prev % REKEY_INTERVAL != 0 {
+            return;
+        }
+
+        // Re-derive key from PSK + fresh random salt.
+        let psk = match self.pre_shared_secret.as_ref() {
+            Some(p) => p,
+            None => return, // from_key sessions have no PSK to re-derive from
+        };
+
+        let mut new_salt = [0u8; SALT_LEN];
+        rand::thread_rng().fill_bytes(&mut new_salt);
+        let new_key_bytes = Self::derive_key_bytes(psk.as_bytes(), &new_salt);
+        let new_key = Key::<Aes256Gcm>::from_slice(&new_key_bytes);
+
+        // Update under write lock — unlock + zeroize old key first.
+        {
+            let mut inner = self.inner.write().unwrap();
+            inner.unlock_key_memory();
+            inner.key.zeroize();
+            inner.key = new_key_bytes;
+            inner.cipher = Aes256Gcm::new(new_key);
+            // P2-12: Reset nonce counter on re-key to avoid wrapping.
+            let mut new_prefix = [0u8; 4];
+            rand::thread_rng().fill_bytes(&mut new_prefix);
+            inner.nonce_prefix = new_prefix;
+            inner.nonce_counter = 0;
+            // P2-09: Lock the new key.
+            inner.lock_key_memory();
+        }
+        {
+            let mut salt = self.salt.write().unwrap();
+            *salt = new_salt;
+        }
+    }
+
+    /// Return a copy of the raw 32-byte AES-256-GCM key.
     ///
     /// Intended for registering the key with the memory-guard subsystem so it
     /// is encrypted while the agent is idle.  Prefer calling
     /// `memory_guard::register_session_key` rather than reading these bytes
     /// directly.
-    pub fn key_bytes(&self) -> &[u8; KEY_LEN] {
-        &self.key
+    pub fn key_bytes(&self) -> [u8; KEY_LEN] {
+        self.inner.read().unwrap().key
     }
 
     /// Encrypt `plaintext` and return `salt || nonce || ciphertext_with_tag`.
+    ///
+    /// P2-12: Uses counter-based nonces (4-byte random prefix + 8-byte counter)
+    /// instead of random nonces, providing stronger uniqueness guarantees.
     pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
-        let mut nonce_bytes = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        self.maybe_rekey();
+        // Write lock needed to increment the nonce counter.
+        let mut inner = self.inner.write().unwrap();
+        let salt = self.salt.read().unwrap();
+
+        let nonce_bytes = inner.next_nonce();
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = self
+        let ciphertext = inner
             .cipher
             .encrypt(nonce, plaintext)
             .expect("AES-GCM encryption is infallible for valid inputs");
 
         let mut out = Vec::with_capacity(SALT_LEN + NONCE_LEN + ciphertext.len());
-        out.extend_from_slice(&self.salt);
+        out.extend_from_slice(&*salt);
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);
         out
@@ -1200,6 +1443,8 @@ impl CryptoSession {
     /// context. Callers receiving full wire-format payloads prefixed with salt
     /// SHOULD use [`Self::decrypt_with_psk`].
     pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        self.maybe_rekey();
+
         // New format: salt || nonce || ciphertext_with_tag.
         // Try this path first for backward compatibility with existing callers
         // that pass encrypt() output directly to decrypt().
@@ -1210,21 +1455,25 @@ impl CryptoSession {
             // key from the embedded salt so independently-created sessions
             // sharing the same PSK can still interoperate.
             if let Some(psk) = self.pre_shared_secret.as_ref() {
-                let key_bytes = Self::derive_key_bytes(psk, salt);
+                let key_bytes = Self::derive_key_bytes(psk.as_bytes(), salt);
                 let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
                 let cipher = Aes256Gcm::new(key);
                 if let Ok(plain) = Self::decrypt_nonce_prefixed(&cipher, rest) {
                     return Ok(plain);
                 }
-            } else if let Ok(plain) = Self::decrypt_nonce_prefixed(&self.cipher, rest) {
-                // from_key sessions don't have a PSK; fall back to decrypting
-                // the salt-stripped payload with the session key.
-                return Ok(plain);
+            } else {
+                let inner = self.inner.read().unwrap();
+                if let Ok(plain) = Self::decrypt_nonce_prefixed(&inner.cipher, rest) {
+                    // from_key sessions don't have a PSK; fall back to decrypting
+                    // the salt-stripped payload with the session key.
+                    return Ok(plain);
+                }
             }
         }
 
         // Legacy format: nonce || ciphertext_with_tag.
-        Self::decrypt_nonce_prefixed(&self.cipher, ciphertext)
+        let inner = self.inner.read().unwrap();
+        Self::decrypt_nonce_prefixed(&inner.cipher, ciphertext)
     }
 
     /// Decrypt a full wire-format message produced by [`Self::encrypt`]:

@@ -1,6 +1,7 @@
 use crate::{Message, Transport};
 use anyhow::Result;
 use async_trait::async_trait;
+use log;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -54,7 +55,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         &self,
         end_entity: &rustls::pki_types::CertificateDer<'_>,
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
+        server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
@@ -62,6 +63,13 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         if fingerprint != self.expected {
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
+        // P2-15: Validate SAN/hostname in addition to fingerprint pinning.
+        if !verify_cert_hostname(end_entity.as_ref(), server_name) {
+            log::warn!("tls_transport: certificate fingerprint matched but hostname validation failed");
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName,
             ));
         }
         // Reject certificates outside their validity window.
@@ -114,6 +122,256 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+/// P2-15: Verify that the certificate's Subject Alternative Names (or Common Name)
+/// match the expected server name.
+///
+/// Performs a minimal DER parse to extract SAN dNSName entries and compares
+/// them against `server_name`.  Falls back to CN matching if no SAN extension
+/// is present.  Returns `true` if the name matches, `false` otherwise.
+fn verify_cert_hostname(der: &[u8], server_name: &rustls::pki_types::ServerName<'_>) -> bool {
+    let expected = match server_name {
+        rustls::pki_types::ServerName::DnsName(dns) => dns.as_ref().to_ascii_lowercase(),
+        _ => return true, // IP address or other types — skip hostname check
+    };
+
+    // Try to extract SANs from the certificate.
+    if let Some(sans) = extract_san_dns_names(der) {
+        for san in &sans {
+            if san == &expected || match_wildcard(san, &expected) {
+                return true;
+            }
+        }
+        log::warn!("tls_transport: hostname {} not found in SANs: {:?}", expected, sans);
+        return false;
+    }
+
+    // No SAN extension — fall back to CN matching.
+    if let Some(cn) = extract_common_name(der) {
+        if cn == expected || match_wildcard(&cn, &expected) {
+            return true;
+        }
+        log::warn!("tls_transport: hostname {} does not match CN {}", expected, cn);
+        return false;
+    }
+
+    log::warn!("tls_transport: no SAN or CN found in certificate for hostname validation");
+    false
+}
+
+/// Match a wildcard pattern like `*.example.com` against `sub.example.com`.
+fn match_wildcard(pattern: &str, name: &str) -> bool {
+    if !pattern.starts_with("*.") {
+        return false;
+    }
+    let suffix = &pattern[1..]; // e.g., ".example.com"
+    // The name must have exactly one label before the suffix.
+    if let Some(dot_pos) = name.find('.') {
+        name[dot_pos..] == *suffix
+    } else {
+        false
+    }
+}
+
+/// Extract dNSName entries from the Subject Alternative Names extension.
+fn extract_san_dns_names(der: &[u8]) -> Option<Vec<String>> {
+    // OID for SAN: 2.5.29.17 → 55 1d 11
+    let san_oid: &[u8] = &[0x55, 0x1d, 0x11];
+    let ext_value = find_extension(der, san_oid)?;
+
+    // The extension value is an OCTET STRING wrapping a GeneralNames SEQUENCE.
+    let mut pos = 0usize;
+    // Skip OCTET STRING tag + length.
+    if ext_value.get(pos)? != &0x04 {
+        return None;
+    }
+    pos += 1;
+    let (_, _) = read_der_len(ext_value, pos)?;
+    pos = read_der_len(ext_value, pos)?.0;
+
+    // SEQUENCE of GeneralNames.
+    if ext_value.get(pos)? != &0x30 {
+        return None;
+    }
+    pos += 1;
+    let (_, seq_len) = read_der_len(ext_value, pos)?;
+    let seq_end = read_der_len(ext_value, pos)?.0 + seq_len;
+    pos = read_der_len(ext_value, pos)?.0;
+
+    let mut names = Vec::new();
+    while pos < seq_end.min(ext_value.len()) {
+        let tag = *ext_value.get(pos)?;
+        pos += 1;
+        let (val_start, val_len) = read_der_len(ext_value, pos)?;
+        pos = val_start + val_len;
+        // dNSName = context tag [2] → 0x82
+        if tag == 0x82 {
+            if let Ok(s) = std::str::from_utf8(&ext_value[val_start..val_start + val_len]) {
+                names.push(s.to_ascii_lowercase());
+            }
+        }
+    }
+    if names.is_empty() { None } else { Some(names) }
+}
+
+/// Extract the Common Name from the certificate's Subject field.
+fn extract_common_name(der: &[u8]) -> Option<String> {
+    // OID for CN: 2.5.4.3 → 55 04 03
+    let cn_oid: &[u8] = &[0x55, 0x04, 0x03];
+    // Navigate: Certificate → TBSCertificate → Subject → RDN Sequence.
+    let p = enter_seq(der, 0)?; // Certificate
+    let mut p = enter_seq(der, p)?; // TBSCertificate
+    // Skip optional [0] version.
+    if der.get(p)? == &0xa0 {
+        p = skip_tlv(der, p)?;
+    }
+    p = skip_tlv(der, p)?; // serialNumber
+    p = skip_tlv(der, p)?; // signature algorithm
+    p = skip_tlv(der, p)?; // issuer
+    // Subject SEQUENCE.
+    let subject_end = {
+        let (vs, vl) = read_der_len(der, p + 1)?;
+        vs + vl
+    };
+    // Scan for CN OID within the Subject.
+    let mut pos = enter_seq(der, p)?;
+    while pos < subject_end {
+        // Each RDN is a SET.
+        if der.get(pos)? != &0x31 {
+            pos = skip_tlv(der, pos)?;
+            continue;
+        }
+        let mut inner = enter_seq(der, pos)?;
+        let set_end = {
+            let (vs, vl) = read_der_len(der, pos + 1)?;
+            vs + vl
+        };
+        while inner < set_end.min(der.len()) {
+            // AttributeTypeAndValue SEQUENCE.
+            if der.get(inner)? != &0x30 {
+                inner = skip_tlv(der, inner)?;
+                continue;
+            }
+            inner += 1;
+            let (vs, vl) = read_der_len(der, inner)?;
+            let attr_end = vs + vl;
+            inner = vs;
+            // OID.
+            if der.get(inner)? != &0x06 {
+                inner = attr_end;
+                continue;
+            }
+            let (oid_start, oid_len) = read_der_len(der, inner + 1)?;
+            if &der[oid_start..oid_start + oid_len] == cn_oid {
+                inner = oid_start + oid_len;
+                // UTF8String or PrintableString value.
+                let val_tag = *der.get(inner)?;
+                inner += 1;
+                let (vs, vl) = read_der_len(der, inner)?;
+                if val_tag == 0x0c || val_tag == 0x13 {
+                    return std::str::from_utf8(&der[vs..vs + vl])
+                        .ok()
+                        .map(|s| s.to_ascii_lowercase());
+                }
+            }
+            inner = attr_end;
+        }
+        pos = set_end;
+    }
+    None
+}
+
+/// Find an extension by OID in the certificate's extensions block.
+fn find_extension<'a>(der: &'a [u8], oid: &[u8]) -> Option<&'a [u8]> {
+    let p = enter_seq(der, 0)?; // Certificate
+    let mut p = enter_seq(der, p)?; // TBSCertificate
+    // Skip optional [0] version.
+    if der.get(p)? == &0xa0 {
+        p = skip_tlv(der, p)?;
+    }
+    p = skip_tlv(der, p)?; // serialNumber
+    p = skip_tlv(der, p)?; // signature algorithm
+    p = skip_tlv(der, p)?; // issuer
+    p = skip_tlv(der, p)?; // validity
+    p = skip_tlv(der, p)?; // subject
+    p = skip_tlv(der, p)?; // subjectPublicKeyInfo
+    // Optional [3] extensions.
+    if der.get(p)? != &0xa3 {
+        return None;
+    }
+    let (ext_start, ext_len) = read_der_len(der, p + 1)?;
+    let ext_end = ext_start + ext_len;
+    let mut pos = ext_start;
+    // Extensions SEQUENCE.
+    if der.get(pos)? != &0x30 {
+        return None;
+    }
+    pos += 1;
+    let (seq_start, seq_len) = read_der_len(der, pos)?;
+    let seq_end = seq_start + seq_len;
+    pos = seq_start;
+    while pos < seq_end.min(ext_end).min(der.len()) {
+        // Each extension is a SEQUENCE.
+        if der.get(pos)? != &0x30 {
+            pos = skip_tlv(der, pos)?;
+            continue;
+        }
+        pos += 1;
+        let (vs, vl) = read_der_len(der, pos)?;
+        let ext_seq_end = vs + vl;
+        pos = vs;
+        // OID.
+        if der.get(pos)? != &0x06 {
+            pos = ext_seq_end;
+            continue;
+        }
+        let (oid_start, oid_len) = read_der_len(der, pos + 1)?;
+        if &der[oid_start..oid_start + oid_len] == oid {
+            pos = oid_start + oid_len;
+            // Skip optional BOOLEAN (critical).
+            if der.get(pos)? == &0x01 {
+                pos = skip_tlv(der, pos)?;
+            }
+            // OCTET STRING value.
+            if der.get(pos)? == &0x04 {
+                let (val_start, val_len) = read_der_len(der, pos + 1)?;
+                return Some(&der[val_start..val_start + val_len]);
+            }
+        }
+        pos = ext_seq_end;
+    }
+    None
+}
+
+fn read_der_len(buf: &[u8], pos: usize) -> Option<(usize, usize)> {
+    let first = *buf.get(pos)?;
+    if first & 0x80 == 0 {
+        Some((pos + 1, first as usize))
+    } else {
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 4 || pos + 1 + n > buf.len() {
+            return None;
+        }
+        let mut l = 0usize;
+        for i in 0..n {
+            l = (l << 8) | buf[pos + 1 + i] as usize;
+        }
+        Some((pos + 1 + n, l))
+    }
+}
+
+fn skip_tlv(buf: &[u8], pos: usize) -> Option<usize> {
+    let (val, len) = read_der_len(buf, pos + 1)?;
+    Some(val + len)
+}
+
+fn enter_seq(buf: &[u8], pos: usize) -> Option<usize> {
+    if buf.get(pos)? != &0x30 {
+        return None;
+    }
+    let (val, _) = read_der_len(buf, pos + 1)?;
+    Some(val)
 }
 
 /// Parse the X.509 `Validity` interval from a DER-encoded certificate.

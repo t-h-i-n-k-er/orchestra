@@ -1,5 +1,6 @@
 use crate::injection::Injector;
 use anyhow::{anyhow, Result};
+use rand::Rng;
 
 pub struct ModuleStompInjector;
 
@@ -368,7 +369,7 @@ impl Injector for ModuleStompInjector {
 
             // Randomly select a candidate from the collected pool.
             let selected = if !candidates.is_empty() {
-                let idx = rand::random::<usize>() % candidates.len();
+                let idx = rand::thread_rng().gen_range(0..candidates.len());
                 Some(candidates.into_iter().nth(idx).unwrap())
             } else {
                 None
