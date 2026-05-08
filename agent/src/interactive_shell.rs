@@ -121,9 +121,9 @@ struct PlatformPipes {
 
 #[cfg(unix)]
 struct PlatformPipes {
-    stdin_write: i32,
-    stdout_read: i32,
-    stderr_read: i32,
+    /// PTY master file descriptor — used for both reading output and writing input.
+    /// The slave side is attached to the child's stdin/stdout/stderr via `login_tty`.
+    master_fd: i32,
 }
 
 #[cfg(not(any(windows, unix)))]
@@ -187,12 +187,23 @@ pub fn create_shell(
             .as_secs();
 
         // Spawn background reader threads.
+        // Create a copy of process info for the reader thread so it can detect
+        // child exit.  On Windows the handle is a kernel object reference (not
+        // duplicated); we only use it for non-blocking NtWaitForSingleObject.
+        #[cfg(windows)]
+        let child_for_reader = PlatformProcess { handle: process.handle, pid: process.pid };
+        #[cfg(unix)]
+        let child_for_reader = PlatformProcess { pid: process.pid };
+        #[cfg(not(any(windows, unix)))]
+        let child_for_reader = PlatformProcess;
+
         reader_handle = spawn_readers(
             session_id,
             &pipes,
             out_tx,
             pause_flag.clone(),
             stop_flag.clone(),
+            child_for_reader,
         );
 
         let pid = process.pid();
@@ -771,7 +782,7 @@ fn is_process_alive(process: &PlatformProcess) -> bool {
     unsafe {
         // NtWaitForSingleObject with timeout=0 (non-blocking).
         // Timeout of 0 means return immediately.
-        let mut timeout: i64 = -1; // use relative timeout of -100ns (effectively 0)
+        let timeout: i64 = 0; // Non-blocking: return immediately with current state
         let status = syscall!(
             "NtWaitForSingleObject",
             process.handle as u64,  // Handle
@@ -793,39 +804,78 @@ fn is_process_alive(process: &PlatformProcess) -> bool {
 fn spawn_shell_process(
     shell_path: &str,
 ) -> Result<(PlatformProcess, PlatformPipes), String> {
-    use std::os::unix::io::AsRawFd;
+    // ── PTY-based shell spawn ─────────────────────────────────────────
+    // Allocate a PTY pair so the child gets a proper controlling terminal
+    // with full terminal emulation (colour, line editing, resize, etc.).
 
-    // Create pipes for stdin/stdout/stderr.
-    let stdin_pipe = create_pipe()?;
-    let stdout_pipe = create_pipe()?;
-    let stderr_pipe = create_pipe()?;
+    // Open the PTY master.
+    let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+    if master_fd < 0 {
+        return Err(format!("posix_openpt() failed: {}", std::io::Error::last_os_error()));
+    }
+
+    // Grant access to the slave (chown to the current user).
+    if unsafe { libc::grantpt(master_fd) } != 0 {
+        let err = std::io::Error::last_os_error();
+        close_fd(master_fd);
+        return Err(format!("grantpt() failed: {err}"));
+    }
+
+    // Unlock the slave side so the child can open it.
+    if unsafe { libc::unlockpt(master_fd) } != 0 {
+        let err = std::io::Error::last_os_error();
+        close_fd(master_fd);
+        return Err(format!("unlockpt() failed: {err}"));
+    }
+
+    // Get the slave device path.
+    let slave_name = unsafe {
+        let ptr = libc::ptsname(master_fd);
+        if ptr.is_null() {
+            close_fd(master_fd);
+            return Err(format!("ptsname() failed: {}", std::io::Error::last_os_error()));
+        }
+        std::ffi::CStr::from_ptr(ptr).to_owned()
+    };
 
     match unsafe { libc::fork() } {
         -1 => {
             let err = std::io::Error::last_os_error();
-            close_fd(stdin_pipe.0);
-            close_fd(stdin_pipe.1);
-            close_fd(stdout_pipe.0);
-            close_fd(stdout_pipe.1);
-            close_fd(stderr_pipe.0);
-            close_fd(stderr_pipe.1);
+            close_fd(master_fd);
             Err(format!("fork() failed: {err}"))
         }
         0 => {
             // Child process.
             unsafe {
-                // Redirect stdin/stdout/stderr.
-                libc::dup2(stdin_pipe.0, 0);
-                libc::dup2(stdout_pipe.1, 1);
-                libc::dup2(stderr_pipe.1, 2);
+                // Close the master side — child only needs the slave.
+                libc::close(master_fd);
 
-                // Close all pipe fds (they're duped now).
-                libc::close(stdin_pipe.0);
-                libc::close(stdin_pipe.1);
-                libc::close(stdout_pipe.0);
-                libc::close(stdout_pipe.1);
-                libc::close(stderr_pipe.0);
-                libc::close(stderr_pipe.1);
+                // Open the slave PTY and make it the controlling terminal
+                // via login_tty (setsid + open + dup2 for fd 0/1/2).
+                let slave_fd = libc::open(
+                    slave_name.as_ptr(),
+                    libc::O_RDWR | libc::O_NOCTTY,
+                );
+                if slave_fd < 0 {
+                    libc::_exit(1);
+                }
+
+                // Create a new session and set the slave as controlling terminal.
+                libc::setsid();
+
+                // login_tty: dup2 slave to stdin/stdout/stderr, close original.
+                libc::dup2(slave_fd, 0);
+                libc::dup2(slave_fd, 1);
+                libc::dup2(slave_fd, 2);
+                if slave_fd > 2 {
+                    libc::close(slave_fd);
+                }
+
+                // Set a reasonable initial terminal size.
+                let mut winsize: libc::winsize = std::mem::zeroed();
+                winsize.ws_col = 80;
+                winsize.ws_row = 24;
+                libc::ioctl(0, libc::TIOCSWINSZ, &winsize);
 
                 // Exec the shell.
                 let shell_c = std::ffi::CString::new(shell_path).unwrap_or_default();
@@ -836,31 +886,12 @@ fn spawn_shell_process(
             }
         }
         child_pid => {
-            // Parent process.
-            // Close child-side fds.
-            close_fd(stdin_pipe.0);
-            close_fd(stdout_pipe.1);
-            close_fd(stderr_pipe.1);
-
+            // Parent process — master_fd is the read/write endpoint.
             Ok((
                 PlatformProcess { pid: child_pid },
-                PlatformPipes {
-                    stdin_write: stdin_pipe.1,
-                    stdout_read: stdout_pipe.0,
-                    stderr_read: stderr_pipe.0,
-                },
+                PlatformPipes { master_fd },
             ))
         }
-    }
-}
-
-#[cfg(unix)]
-fn create_pipe() -> Result<(i32, i32), String> {
-    let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
-        Err(format!("pipe() failed: {}", std::io::Error::last_os_error()))
-    } else {
-        Ok((fds[0], fds[1]))
     }
 }
 
@@ -874,11 +905,11 @@ fn close_fd(fd: i32) {
 #[cfg(unix)]
 fn write_to_pipe(pipes: &PlatformPipes, data: &[u8]) -> Result<(), String> {
     let result = unsafe {
-        libc::write(pipes.stdin_write, data.as_ptr() as *const c_void, data.len())
+        libc::write(pipes.master_fd, data.as_ptr() as *const c_void, data.len())
     };
     if result < 0 {
         Err(format!(
-            "write to stdin pipe failed: {}",
+            "write to PTY master failed: {}",
             std::io::Error::last_os_error()
         ))
     } else {
@@ -888,7 +919,6 @@ fn write_to_pipe(pipes: &PlatformPipes, data: &[u8]) -> Result<(), String> {
 
 #[cfg(unix)]
 fn read_from_pipe(fd: i32) -> Option<Vec<u8>> {
-    use std::os::unix::io::AsRawFd;
 
     // Use poll() to check for available data.
     let mut pfd = libc::pollfd {
@@ -920,9 +950,7 @@ fn terminate_process(process: &PlatformProcess) {
 
 #[cfg(unix)]
 fn close_pipes(pipes: &PlatformPipes) {
-    close_fd(pipes.stdin_write);
-    close_fd(pipes.stdout_read);
-    close_fd(pipes.stderr_read);
+    close_fd(pipes.master_fd);
 }
 
 #[cfg(unix)]
@@ -934,10 +962,21 @@ fn is_process_alive(process: &PlatformProcess) -> bool {
 
 #[cfg(unix)]
 fn resize_pty(session: &ShellSession, cols: u16, rows: u16) -> Result<(), String> {
-    // For plain pipes this is a no-op.  When PTY support is added, this
-    // would use ioctl(TIOCSWINSZ).
+    let mut winsize: libc::winsize = unsafe { std::mem::zeroed() };
+    winsize.ws_col = cols;
+    winsize.ws_row = rows;
+    let result = unsafe {
+        libc::ioctl(session.pipes.master_fd, libc::TIOCSWINSZ, &winsize)
+    };
+    if result < 0 {
+        return Err(format!(
+            "ioctl(TIOCSWINSZ) failed for session {}: {}",
+            session.session_id,
+            std::io::Error::last_os_error()
+        ));
+    }
     log::debug!(
-        "[interactive_shell] resize_pty called for session {} ({}x{}) — no-op for pipe mode",
+        "[interactive_shell] PTY resized for session {} to {}x{}",
         session.session_id,
         cols,
         rows
@@ -1001,6 +1040,7 @@ fn spawn_readers(
     out_tx: Sender<Message>,
     pause_flag: std::sync::Arc<AtomicBool>,
     stop_flag: std::sync::Arc<AtomicBool>,
+    child_process: PlatformProcess,
 ) -> std::thread::JoinHandle<()> {
     #[cfg(windows)]
     let stdout_handle = pipes.stdout_read;
@@ -1008,13 +1048,11 @@ fn spawn_readers(
     let stderr_handle = pipes.stderr_read;
 
     #[cfg(unix)]
-    let stdout_fd = pipes.stdout_read;
-    #[cfg(unix)]
-    let stderr_fd = pipes.stderr_read;
+    let master_fd = pipes.master_fd;
 
     #[cfg(not(any(windows, unix)))]
     {
-        let _ = (session_id, pipes, out_tx, pause_flag, stop_flag);
+        let _ = (session_id, pipes, out_tx, pause_flag, stop_flag, child_process);
     }
 
     // We'll use a single thread that polls both stdout and stderr.
@@ -1047,7 +1085,7 @@ fn spawn_readers(
                         }
                         #[cfg(unix)]
                         {
-                            read_from_pipe(stdout_fd)
+                            read_from_pipe(master_fd)
                         }
                     };
 
@@ -1062,26 +1100,28 @@ fn spawn_readers(
                         let _ = out_tx.try_send(msg);
                     }
 
-                    // Read from stderr.
-                    let stderr_data = {
-                        #[cfg(windows)]
-                        {
-                            read_from_pipe(stderr_handle)
-                        }
-                        #[cfg(unix)]
-                        {
-                            read_from_pipe(stderr_fd)
-                        }
-                    };
+                    // Read from stderr (Windows only — PTY merges into master_fd on Unix).
+                    #[cfg(windows)]
+                    {
+                        let stderr_data = read_from_pipe(stderr_handle);
 
-                    if let Some(data) = stderr_data {
-                        let text = String::from_utf8_lossy(&data).to_string();
-                        let msg = Message::ShellOutput {
-                            session_id,
-                            data: text,
-                            stream: ShellStream::Stderr,
-                        };
-                        let _ = out_tx.try_send(msg);
+                        if let Some(data) = stderr_data {
+                            let text = String::from_utf8_lossy(&data).to_string();
+                            let msg = Message::ShellOutput {
+                                session_id,
+                                data: text,
+                                stream: ShellStream::Stderr,
+                            };
+                            let _ = out_tx.try_send(msg);
+                        }
+                    }
+
+                    // Check if the child process has exited.  When the shell
+                    // dies (exit, crash, killed) there's no more data coming,
+                    // so stop the reader to avoid leaking a thread.
+                    if !is_process_alive(&child_process) {
+                        log::info!("interactive_shell: child process exited, stopping reader");
+                        break;
                     }
                 }
 

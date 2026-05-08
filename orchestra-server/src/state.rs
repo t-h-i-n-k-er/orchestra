@@ -11,7 +11,7 @@
 use crate::audit::AuditLog;
 use crate::config::{OperatorRecord, ServerConfig};
 use crate::redirector::RedirectorState;
-use common::Message;
+use common::{LockedSecret, Message};
 use dashmap::{DashMap, DashSet};
 use rand::RngCore;
 use serde::Serialize;
@@ -149,6 +149,10 @@ pub struct AppState {
     pub operators: HashMap<String, OperatorRecord>,
     pub command_timeout_secs: u64,
     pub config: ServerConfig,
+    /// Agent PSK wrapped in LockedSecret (mlocked + zeroize-on-drop) so the
+    /// plaintext never lingers in heap memory.  Use `.as_bytes()` for
+    /// constant-time comparisons; never extract into a String.
+    pub agent_shared_secret: LockedSecret,
     /// Set of morph seeds currently assigned to active agents.  Ensures no
     /// two concurrent sessions share the same seed, guaranteeing that each
     /// agent produces a unique `.text` section layout after morphing.
@@ -205,6 +209,10 @@ impl AppState {
         let admin_token_hash = crate::config::OperatorRecord::hash_token(&admin_token);
         drop(admin_token); // ensure the plaintext is dropped
 
+        // N1-02: Wrap the agent PSK in LockedSecret so it is mlocked and
+        // zeroized on drop, preventing plaintext exposure in memory dumps.
+        let agent_shared_secret = LockedSecret::new(config.agent_shared_secret.as_bytes());
+
         Self {
             registry: DashMap::new(),
             pending: DashMap::new(),
@@ -213,6 +221,7 @@ impl AppState {
             operators,
             command_timeout_secs,
             config,
+            agent_shared_secret,
             assigned_seeds: DashSet::new(),
             topology: RwLock::new(TopologyMap::default()),
             redirector_state: RedirectorState::new(),

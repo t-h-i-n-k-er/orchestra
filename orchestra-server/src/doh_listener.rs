@@ -364,6 +364,15 @@ impl DohRuntime {
             return;
         }
 
+        // Per-fragment decoded size limit.
+        const MAX_FRAGMENT_SIZE: usize = 256; // bytes, after base32 decode
+        if let Some(decoded) = b32_decode(chunk) {
+            if decoded.len() > MAX_FRAGMENT_SIZE {
+                tracing::warn!("fragment too large: {} bytes", decoded.len());
+                return;
+            }
+        }
+
         // Check if already authenticated — if so, use the authenticated session.
         // Otherwise, use the staging area.
         let session = self
@@ -375,6 +384,22 @@ impl DohRuntime {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
+
+            // Per-session fragment count limit.
+            const MAX_FRAGMENTS_PER_SESSION: usize = 1024;
+            if guard.fragments.len() >= MAX_FRAGMENTS_PER_SESSION {
+                tracing::warn!("too many fragments for session");
+                return;
+            }
+
+            // Total reassembled size limit per session.
+            const MAX_REASSEMBLED_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+            let total_size: usize = guard.fragments.values().map(|f| f.len()).sum();
+            if total_size + chunk.len() > MAX_REASSEMBLED_SIZE {
+                tracing::warn!("reassembled payload too large");
+                return;
+            }
+
             guard.fragments.insert(seq, chunk.to_string());
             guard.last_activity = Instant::now();
             if guard.next_seq.is_none() {

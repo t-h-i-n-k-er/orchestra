@@ -1291,18 +1291,12 @@ mod virtual_lock {
 
     fn resolve_fn<T>(name: &[u8]) -> Option<T> {
         unsafe {
-            let module = winapi::um::libloaderapi::GetModuleHandleA(
-                b"kernel32.dll\0".as_ptr() as *const i8,
-            );
-            if module.is_null() {
-                return None;
-            }
-            let proc = winapi::um::libloaderapi::GetProcAddress(module, name.as_ptr() as *const i8);
-            if proc.is_null() {
-                None
-            } else {
-                Some(std::mem::transmute_copy(&proc))
-            }
+            let module = pe_resolve::get_module_handle_by_hash(
+                pe_resolve::HASH_KERNEL32_DLL,
+            )?;
+            let name_hash = pe_resolve::hash_str(name);
+            let proc = pe_resolve::get_proc_address_by_hash(module, name_hash)?;
+            Some(std::mem::transmute_copy(&proc))
         }
     }
 

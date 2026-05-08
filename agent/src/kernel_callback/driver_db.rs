@@ -117,33 +117,11 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
 
     // ── Tier 2: Reference only (not embedded) ─────────────────────────
 
-    // AsIO.sys — ASUS Low Latency Audio Port I/O driver.
-    // Port I/O based — does not use physical memory addressing.
-    VulnerableDriver {
-        name: "AsIO.sys",
-        device_name: "AsIO",
-        sha256: "0ee5067ce48883701824c5b1ad91695998916a3702cf8086962fbe58af74b2d6",
-        read_phys_fn: "READ_PORT",
-        write_phys_fn: "WRITE_PORT",
-        mapping_type: DriverMapping::PortIo,
-        read_ioctl: 0x222004,
-        write_ioctl: 0x222008,
-        needs_physical_addr: false,
-    },
-
-    // AsIO2.sys — ASUS Low Latency Audio Port I/O driver (v2).
-    // Port I/O based — does not use physical memory addressing.
-    VulnerableDriver {
-        name: "AsIO2.sys",
-        device_name: "AsIO2",
-        sha256: "5ae23f1fcf3fb735fcf1fa27f27e610d9945d668a149c7b7b0c84ffd6409d99a",
-        read_phys_fn: "READ_PORT",
-        write_phys_fn: "WRITE_PORT",
-        mapping_type: DriverMapping::PortIo,
-        read_ioctl: 0x222004,
-        write_ioctl: 0x222008,
-        needs_physical_addr: false,
-    },
+    // NOTE: Only `PhysicalMemory`-type drivers are currently supported by
+    // deploy.rs.  `PortIo` and `MmioMapping` drivers will fail at runtime.
+    // AsIO.sys and AsIO2.sys were removed because they use `PortIo` mapping
+    // which has no handler.  Re-add with a handler when PortIo support is
+    // implemented.
 
     // BdKit.sys was removed: no verified SHA-256 hash was found after exhaustive
     // public search (LOLDrivers, VirusTotal, KDU, Elastic, KeServiceDescriptorTable,

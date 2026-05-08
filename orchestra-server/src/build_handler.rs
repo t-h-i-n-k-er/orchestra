@@ -679,10 +679,7 @@ fn validate_host_not_private(host: &str) -> anyhow::Result<()> {
         .unwrap_or_default();
 
     if addrs.is_empty() {
-        // Can't resolve — let it through and let the build fail naturally,
-        // or reject if you prefer strict validation.
-        tracing::warn!(host = %host, "could not resolve build host; allowing with warning");
-        return Ok(());
+        anyhow::bail!("could not resolve build host '{}'; unresolvable hosts are rejected to prevent DNS rebinding attacks", host);
     }
 
     for ip in &addrs {

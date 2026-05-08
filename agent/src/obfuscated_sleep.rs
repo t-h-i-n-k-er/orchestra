@@ -25,11 +25,8 @@ mod win_resolve {
 
     use crate::pe_resolve_macros::hash_str_const;
 
-    // P2-04: Replaced kernel32 VirtualAlloc/VirtualFree/VirtualProtect with
-    // ntdll Nt* equivalents to avoid EDR-monitored kernel32 API calls.
-    pub const HASH_VIRTUALALLOC: u32   = hash_str_const(b"VirtualAlloc\0");
-    pub const HASH_VIRTUALFREE: u32    = hash_str_const(b"VirtualFree\0");
-    pub const HASH_VIRTUALPROTECT: u32 = hash_str_const(b"VirtualProtect\0");
+    // P2-04: Removed HASH_VIRTUALALLOC/HASH_VIRTUALFREE/HASH_VIRTUALPROTECT
+    // and their type aliases — all memory operations now use Nt* syscalls.
     pub const HASH_NTALLOCATEVIRTUALMEMORY: u32  = hash_str_const(b"NtAllocateVirtualMemory\0");
     pub const HASH_NTFREEVIRTUALMEMORY: u32      = hash_str_const(b"NtFreeVirtualMemory\0");
     pub const HASH_NTPROTECTVIRTUALMEMORY: u32   = hash_str_const(b"NtProtectVirtualMemory\0");
@@ -42,10 +39,8 @@ mod win_resolve {
     // Sleep is now performed via NtDelayExecution resolved from ntdll.
     pub const HASH_GETLOCALTIME: u32          = hash_str_const(b"GetLocalTime\0");
 
-    // Legacy kernel32 types (still used for fiber/key-page ops)
-    pub type FnVirtualAlloc   = unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32, u32) -> *mut std::ffi::c_void;
-    pub type FnVirtualFree    = unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32) -> i32;
-    pub type FnVirtualProtect = unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32, *mut u32) -> i32;
+    // P2-04: Removed legacy kernel32 FnVirtualAlloc/FnVirtualFree/FnVirtualProtect
+    // type aliases — all memory operations now use Nt* syscalls.
 
     // P2-04: Nt* types for ntdll memory operations.
     // NtAllocateVirtualMemory(ProcessHandle, BaseAddress*, RegionSize*,

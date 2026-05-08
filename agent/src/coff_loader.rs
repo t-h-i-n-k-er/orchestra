@@ -964,7 +964,7 @@ pub unsafe fn execute_bof(
             if roff + reloc_size > coff_bytes.len() {
                 continue;
             }
-            let reloc = *(coff_bytes.as_ptr().add(roff) as *const CoffRelocation);
+            let reloc = std::ptr::read_unaligned(coff_bytes.as_ptr().add(roff) as *const CoffRelocation);
             let sym_idx = reloc.symbol_table_index as usize;
             if sym_idx >= symbols.len() {
                 log::warn!(

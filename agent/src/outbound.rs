@@ -434,6 +434,11 @@ async fn run_with_heartbeat(
 
 /// Connect once, run the agent command loop until transport error or
 /// clean shutdown. Returns `Ok(())` on a clean `Shutdown` command.
+///
+/// Note: `run_forever` now inlines this logic to separately track connection
+/// vs session failures for correct backoff reset behaviour.  Kept as a
+/// convenience wrapper for tests or alternative entry points.
+#[allow(dead_code)]
 async fn connect_once(
     addr: &str,
     secret: &str,
@@ -485,7 +490,37 @@ pub async fn run_forever() -> Result<()> {
 
     let mut backoff = Duration::from_secs(1);
     loop {
-        match connect_once(&addr, &secret, &agent_id, cert_fp.as_deref()).await {
+        // Try to establish a transport.  Connection failures grow backoff.
+        let transport = match build_outbound_transport(
+            &addr,
+            &secret,
+            cert_fp.as_deref(),
+            &agent_id,
+        )
+        .await
+        {
+            Ok(t) => {
+                // Connection succeeded — reset backoff.  If the session later
+                // drops, the next reconnect starts from 1 s, not from whatever
+                // stale value carried over from a prior outage.
+                backoff = Duration::from_secs(1);
+                t
+            }
+            Err(e) => {
+                error!("outbound-c: connection failed: {e:#}");
+                warn!("outbound-c: reconnecting in {backoff:?}");
+                if let Err(ge) = crate::memory_guard::guarded_sleep(backoff, None, 0).await {
+                    error!("[memory-guard] error during reconnect backoff: {ge}");
+                    sleep(backoff).await;
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(MAX_BACKOFF_SECS));
+                continue;
+            }
+        };
+
+        // Transport established — run the session.  When the session ends
+        // (clean shutdown or disconnect), reconnect with a fresh 1 s backoff.
+        match run_with_heartbeat(transport, &agent_id).await {
             Ok(()) => {
                 // Clean shutdown — respect it, do not reconnect.
                 info!("outbound-c: received Shutdown from Control Center, exiting.");
@@ -493,13 +528,7 @@ pub async fn run_forever() -> Result<()> {
             }
             Err(e) => {
                 error!("outbound-c: session ended: {e:#}");
-                warn!("outbound-c: reconnecting in {backoff:?}");
-                // Protect sensitive memory while waiting to reconnect.
-                if let Err(ge) = crate::memory_guard::guarded_sleep(backoff, None, 0).await {
-                    error!("[memory-guard] error during reconnect backoff: {ge}");
-                    sleep(backoff).await;
-                }
-                backoff = (backoff * 2).min(Duration::from_secs(MAX_BACKOFF_SECS));
+                // backoff was already reset to 1 s when transport connected.
             }
         }
     }

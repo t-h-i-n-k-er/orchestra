@@ -38,7 +38,8 @@ bincode = "1.3.3"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["libloaderapi", "winnt"] }
+winapi = { version = "0.3", features = ["winnt"] }
+pe_resolve = { path = "../pe_resolve" }
 
 [features]
 module-signatures = ["dep:ed25519-dalek"]

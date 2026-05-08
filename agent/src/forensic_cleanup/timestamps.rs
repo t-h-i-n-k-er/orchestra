@@ -110,13 +110,310 @@ const USN_REASON_CLOSE: u32 = 0x80000000;
 /// MFT attribute type constants.
 const ATTR_TYPE_STANDARD_INFORMATION: u32 = 0x10;
 const ATTR_TYPE_FILE_NAME: u32 = 0x30;
+const ATTR_TYPE_DATA: u32 = 0x80;
 const ATTR_TYPE_END: u32 = 0xFFFFFFFF;
 
 /// MFT record signature "FILE".
 const MFT_RECORD_SIGNATURE: [u8; 4] = [b'F', b'I', b'L', b'E'];
 
-/// MFT record size (standard 1024 bytes).
-const MFT_RECORD_SIZE: usize = 1024;
+/// Default MFT record size (standard 1024 bytes).
+/// Used as fallback if dynamic detection fails, and in unit tests.
+const DEFAULT_MFT_RECORD_SIZE: usize = 1024;
+
+// ── MFT layout (VCN → LCN mapping) ──────────────────────────────────────────
+
+/// A single contiguous MFT data run mapping VCNs to LCNs.
+struct MftDataRun {
+    /// First VCN covered by this run (inclusive).
+    start_vcn: i64,
+    /// Ending VCN (exclusive) — start of the next run.
+    next_vcn: i64,
+    /// Logical cluster number at the start of this run.
+    lcn: i64,
+}
+
+/// Cached MFT layout for resolving record numbers to disk byte offsets.
+struct MftLayout {
+    /// Data runs parsed from $MFT non-resident $DATA attribute.
+    runs: Vec<MftDataRun>,
+    /// Bytes per cluster (bytes_per_sector * sectors_per_cluster).
+    bytes_per_cluster: u64,
+    /// MFT record size in bytes.
+    record_size: usize,
+}
+
+/// Cached MFT layout. `None` means not yet probed.
+static CACHED_MFT_LAYOUT: std::sync::OnceLock<MftLayout> = std::sync::OnceLock::new();
+
+/// Return the MFT record size from the cached layout.
+/// Falls back to `DEFAULT_MFT_RECORD_SIZE` if layout hasn't been built yet.
+fn get_mft_record_size() -> usize {
+    CACHED_MFT_LAYOUT.get().map(|l| l.record_size).unwrap_or(DEFAULT_MFT_RECORD_SIZE)
+}
+
+/// Return the cached MFT layout, building it on first call.
+///
+/// Reads the NTFS boot sector to find the MFT start LCN and cluster size,
+/// then reads MFT record 0 to parse its non-resident $DATA attribute and
+/// extract the VCN→LCN data runs.  Falls back to a contiguous layout using
+/// the MFT start LCN from the boot sector if data run parsing fails.
+unsafe fn get_mft_layout(
+    volume_handle: *mut std::ffi::c_void,
+) -> &'static MftLayout {
+    CACHED_MFT_LAYOUT.get_or_init(|| build_mft_layout(volume_handle))
+}
+
+/// Build the MFT layout by reading the boot sector and parsing data runs.
+unsafe fn build_mft_layout(
+    volume_handle: *mut std::ffi::c_void,
+) -> MftLayout {
+    // ── Step 1: Read NTFS boot sector (first 512 bytes) ────────────
+    let mut boot = [0u8; 512];
+    let bytes_per_cluster = match nt_read_file(volume_handle, &mut boot, Some(0)) {
+        Ok(n) if n >= 0x48 => {
+            let bytes_per_sector = u16::from_le_bytes([boot[0x0B], boot[0x0C]]) as u64;
+            let sectors_per_cluster = boot[0x0D] as u64;
+            if bytes_per_sector == 0 || sectors_per_cluster == 0 {
+                log::warn!("timestamps: invalid boot sector geometry, using defaults");
+                4096 // common default
+            } else {
+                bytes_per_sector * sectors_per_cluster
+            }
+        }
+        _ => {
+            log::warn!("timestamps: failed to read boot sector, using defaults");
+            4096
+        }
+    };
+
+    // MFT start LCN is at offset +0x30 in the boot sector (8 bytes, signed).
+    let mft_start_lcn = if boot.len() >= 0x38 {
+        i64::from_le_bytes([
+            boot[0x30], boot[0x31], boot[0x32], boot[0x33],
+            boot[0x34], boot[0x35], boot[0x36], boot[0x37],
+        ])
+    } else {
+        0
+    };
+
+    // ── Step 2: Read MFT record 0 from the correct offset ──────────
+    let mft_record_0_offset = mft_start_lcn * (bytes_per_cluster as i64);
+    let mut record_buf = vec![0u8; 4096]; // max possible MFT record size
+    let record_size = match nt_read_file(volume_handle, &mut record_buf, Some(mft_record_0_offset)) {
+        Ok(n) if n >= 0x20 && record_buf[0..4] == MFT_RECORD_SIGNATURE => {
+            let allocated = u32::from_le_bytes([
+                record_buf[0x1C], record_buf[0x1D], record_buf[0x1E], record_buf[0x1F],
+            ]) as usize;
+            if allocated >= 512 && allocated <= 4096 && (allocated & 0x1FF) == 0 {
+                log::debug!("timestamps: detected MFT record size = {}", allocated);
+                allocated
+            } else {
+                log::warn!("timestamps: implausible MFT record size ({})", allocated);
+                DEFAULT_MFT_RECORD_SIZE
+            }
+        }
+        Ok(n) => {
+            log::warn!("timestamps: short/invalid MFT record 0 read ({} bytes)", n);
+            DEFAULT_MFT_RECORD_SIZE
+        }
+        Err(e) => {
+            log::warn!("timestamps: failed to read MFT record 0: {}", e);
+            DEFAULT_MFT_RECORD_SIZE
+        }
+    };
+
+    // ── Step 3: Parse non-resident $DATA data runs from record 0 ───
+    // We need to remove fixup values first to get the raw content.
+    let mut record0 = record_buf[..record_size].to_vec();
+    let runs = if remove_mft_fixup(&mut record0).is_ok() {
+        match parse_mft_data_runs(&record0, bytes_per_cluster) {
+            Some(r) if !r.is_empty() => {
+                log::debug!("timestamps: parsed {} MFT data runs", r.len());
+                r
+            }
+            _ => {
+                log::warn!("timestamps: failed to parse $DATA data runs, using contiguous fallback");
+                contiguous_fallback(mft_start_lcn)
+            }
+        }
+    } else {
+        log::warn!("timestamps: failed to remove fixup from MFT record 0, using contiguous fallback");
+        contiguous_fallback(mft_start_lcn)
+    };
+
+    MftLayout {
+        runs,
+        bytes_per_cluster,
+        record_size,
+    }
+}
+
+/// Build a single contiguous data run as fallback.
+fn contiguous_fallback(mft_start_lcn: i64) -> Vec<MftDataRun> {
+    // Assume a single contiguous run covering up to 2^24 records (~16 GB).
+    vec![MftDataRun {
+        start_vcn: 0,
+        next_vcn: 0x1000000, // 16M VCNs — effectively unbounded
+        lcn: mft_start_lcn,
+    }]
+}
+
+/// Parse the non-resident $DATA attribute data runs from an MFT record.
+///
+/// NTFS data run encoding:
+///   - Header byte: low nibble = # bytes for length, high nibble = # bytes for offset
+///   - Length bytes (unsigned, little-endian)
+///   - Offset bytes (signed, little-endian, cumulative with previous LCN)
+///   - Terminated by 0x00
+fn parse_mft_data_runs(record: &[u8], _bytes_per_cluster: u64) -> Option<Vec<MftDataRun>> {
+    // Find the non-resident $DATA attribute.
+    let first_attr_offset = u16::from_le_bytes([record[0x14], record[0x15]]) as usize;
+    if first_attr_offset < 48 || first_attr_offset >= record.len() {
+        return None;
+    }
+
+    let mut offset = first_attr_offset;
+    loop {
+        if offset + 24 > record.len() {
+            break;
+        }
+        let attr_type = u32::from_le_bytes([
+            record[offset], record[offset + 1],
+            record[offset + 2], record[offset + 3],
+        ]);
+        if attr_type == ATTR_TYPE_END || attr_type == 0 {
+            break;
+        }
+        let total_length = u32::from_le_bytes([
+            record[offset + 4], record[offset + 5],
+            record[offset + 6], record[offset + 7],
+        ]) as usize;
+        if total_length == 0 {
+            break;
+        }
+
+        if attr_type == ATTR_TYPE_DATA {
+            let non_resident = record[offset + 8];
+            if non_resident == 0 {
+                // Resident $DATA on $MFT is unusual but possible for tiny volumes.
+                // No data runs to parse — fall back to contiguous.
+                return None;
+            }
+
+            // Non-resident attribute layout:
+            //   +0x08: NonResident (u8) = 1
+            //   +0x0C: StartingVcn (i64)
+            //   +0x10: ... (HighestVcn, unused here)
+            //   +0x18: DataRunsOffset (u16) — offset from attribute start
+            //   +0x20: ... (CompressionUnit, etc.)
+            if offset + 0x1A > record.len() {
+                return None;
+            }
+            let data_runs_offset = u16::from_le_bytes([
+                record[offset + 0x18], record[offset + 0x19],
+            ]) as usize;
+
+            let runs_start = offset + data_runs_offset;
+            if runs_start >= record.len() {
+                return None;
+            }
+
+            return parse_data_run_encoding(&record[runs_start..]);
+        }
+
+        offset += total_length;
+        offset = (offset + 7) & !7; // align to 8 bytes
+    }
+    None
+}
+
+/// Decode NTFS data run byte stream into a list of MftDataRun entries.
+fn parse_data_run_encoding(data: &[u8]) -> Option<Vec<MftDataRun>> {
+    let mut runs = Vec::new();
+    let mut pos = 0usize;
+    let mut current_vcn: i64 = 0;
+    let mut current_lcn: i64 = 0;
+
+    loop {
+        if pos >= data.len() {
+            break;
+        }
+        let header = data[pos];
+        if header == 0 {
+            break; // end of data runs
+        }
+        pos += 1;
+
+        let len_bytes = (header & 0x0F) as usize;
+        let off_bytes = ((header >> 4) & 0x0F) as usize;
+
+        if len_bytes == 0 || pos + len_bytes + off_bytes > data.len() {
+            log::warn!("timestamps: invalid data run encoding at pos {}", pos);
+            return None;
+        }
+
+        // Read run length (unsigned, little-endian).
+        let mut run_length: i64 = 0;
+        for i in (0..len_bytes).rev() {
+            run_length = (run_length << 8) | (data[pos + i] as i64);
+        }
+        pos += len_bytes;
+
+        // Read run offset (signed, little-endian, cumulative).
+        let mut run_offset: i64 = 0;
+        for i in (0..off_bytes).rev() {
+            run_offset = (run_offset << 8) | (data[pos + i] as i64);
+        }
+        // Sign-extend if the high bit of the last byte is set.
+        if off_bytes < 8 && (data[pos + off_bytes - 1] & 0x80) != 0 {
+            run_offset -= 1i64 << (off_bytes * 8);
+        }
+        pos += off_bytes;
+
+        // A zero offset means a sparse run (LCN = -1 for hole).
+        let lcn = if run_offset == 0 && !runs.is_empty() {
+            -1 // sparse/hole
+        } else {
+            current_lcn += run_offset;
+            current_lcn
+        };
+
+        runs.push(MftDataRun {
+            start_vcn: current_vcn,
+            next_vcn: current_vcn + run_length,
+            lcn,
+        });
+        current_vcn += run_length;
+    }
+
+    Some(runs)
+}
+
+/// Resolve an MFT record number to the actual byte offset on disk.
+///
+/// Uses the cached MFT layout (data runs) to handle fragmented MFT.
+/// Falls back to a simple multiplication if the layout isn't available.
+fn resolve_mft_byte_offset(record_number: i64) -> Option<i64> {
+    let layout = CACHED_MFT_LAYOUT.get()?;
+    let byte_within_mft = record_number * (layout.record_size as i64);
+
+    // Convert byte offset within MFT to VCN.
+    let vcn = byte_within_mft / (layout.bytes_per_cluster as i64);
+
+    // Find the data run containing this VCN.
+    for run in &layout.runs {
+        if vcn >= run.start_vcn && vcn < run.next_vcn {
+            if run.lcn < 0 {
+                return None; // sparse run — record shouldn't be here
+            }
+            let byte_within_cluster = byte_within_mft % (layout.bytes_per_cluster as i64);
+            return Some(run.lcn * (layout.bytes_per_cluster as i64)
+                + (vcn - run.start_vcn) * (layout.bytes_per_cluster as i64)
+                + byte_within_cluster);
+        }
+    }
+    None // VCN not found in any data run
+}
 
 /// Maximum USN journal buffer size for reading.
 const USN_JOURNAL_BUF_SIZE: usize = 65536;
@@ -937,22 +1234,26 @@ fn patch_fn_timestamps(
 }
 
 /// Read an MFT record from raw volume access.
-/// Uses NtReadFile on the volume handle at the byte offset corresponding
-/// to the MFT record number.
+/// Uses the cached MFT layout (data runs) to resolve the actual byte offset,
+/// handling fragmented MFT correctly.
 unsafe fn read_mft_record(
     volume_handle: *mut std::ffi::c_void,
     mft_record_number: i64,
 ) -> Result<Vec<u8>, String> {
-    // MFT record number maps to byte offset: record_number * MFT_RECORD_SIZE.
-    // For standard 1024-byte MFT records:
-    let byte_offset = mft_record_number * (MFT_RECORD_SIZE as i64);
-    let mut record = vec![0u8; MFT_RECORD_SIZE];
+    // Ensure the MFT layout is cached.
+    let layout = get_mft_layout(volume_handle);
+    let mft_record_size = layout.record_size;
 
+    // Resolve the actual disk byte offset via data runs.
+    let byte_offset = resolve_mft_byte_offset(mft_record_number)
+        .unwrap_or_else(|| mft_record_number * (mft_record_size as i64));
+
+    let mut record = vec![0u8; mft_record_size];
     let bytes_read = nt_read_file(volume_handle, &mut record, Some(byte_offset))?;
-    if bytes_read < MFT_RECORD_SIZE {
+    if bytes_read < mft_record_size {
         return Err(format!(
             "Short read on MFT record {}: got {} bytes, expected {}",
-            mft_record_number, bytes_read, MFT_RECORD_SIZE
+            mft_record_number, bytes_read, mft_record_size
         ));
     }
 
@@ -969,12 +1270,15 @@ unsafe fn read_mft_record(
 }
 
 /// Write an MFT record back to raw volume access.
+/// Uses the cached MFT layout to resolve the actual byte offset.
 unsafe fn write_mft_record(
     volume_handle: *mut std::ffi::c_void,
     mft_record_number: i64,
     record: &[u8],
 ) -> Result<(), String> {
-    let byte_offset = mft_record_number * (MFT_RECORD_SIZE as i64);
+    let layout = get_mft_layout(volume_handle);
+    let byte_offset = resolve_mft_byte_offset(mft_record_number)
+        .unwrap_or_else(|| mft_record_number * (layout.record_size as i64));
 
     let bytes_written = nt_write_file(volume_handle, record, Some(byte_offset))?;
     if bytes_written < record.len() {
@@ -1551,14 +1855,14 @@ mod tests {
 
     #[test]
     fn test_find_mft_attribute_bad_signature() {
-        let mut record = vec![0u8; MFT_RECORD_SIZE];
+        let mut record = vec![0u8; DEFAULT_MFT_RECORD_SIZE];
         record[0..4].copy_from_slice(b"BAAD");
         assert!(find_mft_attribute(&record, ATTR_TYPE_FILE_NAME).is_none());
     }
 
     #[test]
     fn test_find_mft_attribute_valid_empty() {
-        let mut record = vec![0u8; MFT_RECORD_SIZE];
+        let mut record = vec![0u8; DEFAULT_MFT_RECORD_SIZE];
         record[0..4].copy_from_slice(&MFT_RECORD_SIGNATURE);
         // Set first attribute offset.
         let attr_offset = 56u16;
@@ -1574,7 +1878,7 @@ mod tests {
 
     #[test]
     fn test_find_mft_attribute_with_filename() {
-        let mut record = vec![0u8; MFT_RECORD_SIZE];
+        let mut record = vec![0u8; DEFAULT_MFT_RECORD_SIZE];
         record[0..4].copy_from_slice(&MFT_RECORD_SIGNATURE);
 
         let attr_offset = 56u16;
@@ -1603,7 +1907,7 @@ mod tests {
 
     #[test]
     fn test_patch_fn_timestamps() {
-        let mut record = vec![0u8; MFT_RECORD_SIZE];
+        let mut record = vec![0u8; DEFAULT_MFT_RECORD_SIZE];
         record[0..4].copy_from_slice(&MFT_RECORD_SIGNATURE);
 
         let attr_offset = 56u16;
@@ -1646,7 +1950,7 @@ mod tests {
 
     #[test]
     fn test_remove_apply_fixup_roundtrip() {
-        let mut record = vec![0u8; MFT_RECORD_SIZE];
+        let mut record = vec![0u8; DEFAULT_MFT_RECORD_SIZE];
         record[0..4].copy_from_slice(&MFT_RECORD_SIGNATURE);
 
         // Set fixup offset and count.

@@ -339,6 +339,11 @@ async fn main() -> Result<()> {
         });
     }
 
+    // N1-02: Zeroize the PSK from the config — it is now only held inside
+    // LockedSecret in agent_link / AppState.  No component after this point
+    // reads cfg.agent_shared_secret.
+    common::secure_zero_string(&mut cfg.agent_shared_secret);
+
     // SMB named-pipe relay (optional, Windows-only; no-op stub on other OSes).
     // Accepts named-pipe connections and bridges them to the agent TCP listener.
     if cfg.smb_relay_enabled {

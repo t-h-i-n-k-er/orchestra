@@ -21,7 +21,7 @@ use once_cell::sync::Lazy;
 const DRIVER_XOR_KEY_LEN: usize = 32;
 
 /// State of a currently-loaded vulnerable driver.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DeployedDriver {
     /// The driver database entry that was loaded.
     pub driver: &'static VulnerableDriver,
@@ -314,24 +314,21 @@ pub fn deploy_embedded_driver(
         was_preloaded: false,
     };
 
-    // Store in global state.
+    // Store in global state (single construction, no redundant re-build).
     {
         let mut guard = DEPLOYED.lock().unwrap();
-        *guard = Some(DeployedDriver {
-            driver: deployed.driver,
-            device_handle: deployed.device_handle,
-            service_name: deployed.service_name.clone(),
-            was_preloaded: false,
-        });
+        *guard = Some(deployed);
     }
 
     log::info!(
         "Deployed vulnerable driver {} (device handle: {:?})",
         driver.name,
-        deployed.device_handle
+        Some(device_handle)
     );
 
-    Ok(deployed)
+    // Read back from global state for the return value.
+    let guard = DEPLOYED.lock().unwrap();
+    Ok(guard.as_ref().unwrap().clone())
 }
 
 /// XOR-encrypted placeholder driver embedded at compile time.
@@ -845,12 +842,7 @@ pub unsafe fn cleanup_driver() -> Result<()> {
 /// Get a reference to the currently deployed driver state, if any.
 pub fn get_deployed_driver() -> Option<DeployedDriver> {
     let guard = DEPLOYED.lock().unwrap();
-    guard.as_ref().map(|d| DeployedDriver {
-        driver: d.driver,
-        device_handle: d.device_handle,
-        service_name: d.service_name.clone(),
-        was_preloaded: d.was_preloaded,
-    })
+    guard.as_ref().map(|d| d.clone())
 }
 
 /// Main deployment orchestrator: try pre-loaded drivers, then embedded.
@@ -872,14 +864,10 @@ pub fn deploy(preferred: &[String], session_key: &[u8]) -> Result<DeployedDriver
             was_preloaded: true,
         };
 
+        // Store in global state (single construction, no redundant re-build).
         {
             let mut guard = DEPLOYED.lock().unwrap();
-            *guard = Some(DeployedDriver {
-                driver: deployed.driver,
-                device_handle: deployed.device_handle,
-                service_name: deployed.service_name.clone(),
-                was_preloaded: true,
-            });
+            *guard = Some(deployed);
         }
 
         log::info!(
@@ -887,7 +875,9 @@ pub fn deploy(preferred: &[String], session_key: &[u8]) -> Result<DeployedDriver
             driver.name
         );
 
-        return Ok(deployed);
+        // Read back from global state for the return value.
+        let guard = DEPLOYED.lock().unwrap();
+        return Ok(guard.as_ref().unwrap().clone());
     }
 
     // Step 2: Try embedded drivers.

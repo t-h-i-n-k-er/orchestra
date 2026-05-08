@@ -111,6 +111,7 @@ const PREFETCH_REG_KEY_NT: &[u16] = encode_wide!(
 const ENABLE_PREFETCHER_NAME: &[u16] = encode_wide!("EnablePrefetcher");
 
 /// FSCTL codes for USN journal operations.
+const FSCTL_QUERY_USN_JOURNAL: u32 = 0x000900F4;
 const FSCTL_READ_USN_JOURNAL: u32 = 0x000900BB;
 const FSCTL_WRITE_USN_CLOSE: u32 = 0x000900EF;
 
@@ -914,6 +915,38 @@ fn patch_pf_header(data: &mut [u8], version: u32) -> Result<(), String> {
 
 // ── USN Journal cleanup ──────────────────────────────────────────────────
 
+/// Query the USN journal ID for a volume using FSCTL_QUERY_USN_JOURNAL.
+///
+/// Returns the `UsnJournalID` field from `USN_JOURNAL_DATA`.  If the volume
+/// has no USN journal (e.g. FAT32), the underlying call fails and we return
+/// an error so the caller can skip USN cleanup gracefully.
+unsafe fn query_usn_journal_id(
+    volume_handle: *mut std::ffi::c_void,
+) -> Result<u64, String> {
+    let mut output = [0u8; 64]; // USN_JOURNAL_DATA is 56 bytes
+    nt_fs_control_file(
+        volume_handle,
+        FSCTL_QUERY_USN_JOURNAL,
+        std::ptr::null_mut(),
+        0,
+        output.as_mut_ptr() as *mut std::ffi::c_void,
+        output.len() as u32,
+    )?;
+
+    // USN_JOURNAL_DATA layout:
+    //   +0x00: UsnJournalID (u64)
+    //   +0x08: FirstUsn (i64)
+    //   +0x10: NextUsn (i64)
+    //   +0x18: LowestValidUsn (i64)
+    //   +0x20: MaxUsn (i64)
+    //   +0x28: MaximumSize (u64)
+    //   +0x30: AllocationDelta (u64)
+    Ok(u64::from_le_bytes([
+        output[0], output[1], output[2], output[3],
+        output[4], output[5], output[6], output[7],
+    ]))
+}
+
 /// Clean USN journal entries referencing a specific .pf file.
 ///
 /// This reads the USN journal, finds entries for the target file, and
@@ -954,6 +987,20 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
         return Ok(());
     }
 
+    // Query the USN journal ID for this volume.  Using 0 ("default journal")
+    // does not work reliably on all systems; we must query the actual ID.
+    let journal_id = match query_usn_journal_id(handle) {
+        Ok(id) => id,
+        Err(e) => {
+            log::debug!(
+                "prefetch: could not query USN journal ID on {}: {}",
+                volume_letter, e
+            );
+            let _ = nt_close(handle);
+            return Ok(()); // Non-fatal: no USN journal on this volume.
+        }
+    };
+
     // Read USN journal entries.  We allocate a large buffer and iterate.
     let journal_buf_size: usize = 65536;
     let mut journal_buf = vec![0u8; journal_buf_size];
@@ -965,7 +1012,7 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
         return_only_on_close: 0,
         timeout: 0,
         bytes_to_wait_for: 0,
-        usn_journal_id: 0,    // 0 = default journal
+        usn_journal_id: journal_id,
         min_major_version: 2,
         max_major_version: 4,
     };

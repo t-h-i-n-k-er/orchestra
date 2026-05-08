@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::state::AppState;
+use subtle::ConstantTimeEq;
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -319,7 +320,7 @@ pub async fn handle_heartbeat(
     // Validate the redirector shared secret when configured.
     if let Some(ref expected) = state.config.redirector_secret {
         let presented = req.secret.as_deref().unwrap_or("");
-        if presented != expected {
+        if !bool::from(presented.as_bytes().ct_eq(expected.as_bytes())) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 "invalid or missing redirector secret".to_string(),
@@ -374,7 +375,7 @@ pub async fn handle_agent_config(
         .get("x-agent-secret")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if presented != state.config.agent_shared_secret {
+    if !bool::from(presented.as_bytes().ct_eq(state.agent_shared_secret.as_bytes())) {
         return Err((
             StatusCode::UNAUTHORIZED,
             "invalid or missing agent secret".to_string(),

