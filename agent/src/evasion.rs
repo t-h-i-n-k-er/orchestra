@@ -689,8 +689,8 @@ pub unsafe fn apply_hwbp_to_current_thread() {
         );
     }
 
-    // GetCurrentThread() pseudo-handle = (-1)
-    let h: winapi::um::winnt::HANDLE = (-1isize) as *mut _;
+    // GetCurrentThread() pseudo-handle = (-2)
+    let h: winapi::um::winnt::HANDLE = (-2isize) as *mut _;
 
     let mut ctx: CONTEXT = std::mem::zeroed();
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;

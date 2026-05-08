@@ -788,6 +788,36 @@ fn is_expected_hypervisor() -> bool {
                     return true;
                 }
             }
+
+            // Legitimate Hyper-V on physical Windows: SystemManufacturer is
+            // "Microsoft Corporation" but product is NOT "Virtual Machine".
+            // This covers WSL2, Credential Guard, Device Guard, and Windows
+            // Sandbox — all of which set the CPUID hypervisor bit on an
+            // otherwise bare-metal Windows host.
+            if mfr.contains("microsoft corporation") && !prod.contains("virtual machine") {
+                log::debug!("env_check: Microsoft manufacturer without VM product name — likely physical Windows with Hyper-V features");
+                return true;
+            }
+        }
+
+        // WSL2 guest: the WSL_DISTRO_NAME environment variable is set inside
+        // Windows Subsystem for Linux containers.  This is a legitimate
+        // execution environment, not a hostile sandbox.
+        if std::env::var("WSL_DISTRO_NAME").is_ok() {
+            log::debug!("env_check: WSL_DISTRO_NAME set — WSL2 environment, treating as expected hypervisor");
+            return true;
+        }
+
+        // Windows Sandbox runs as WindowsSandbox.exe.  If the current process
+        // or its parent is WindowsSandbox.exe, this is a legitimate Windows
+        // feature, not a hostile analysis sandbox.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
+                if name.to_ascii_lowercase().contains("windowssandbox") {
+                    log::debug!("env_check: running inside Windows Sandbox — treating as expected hypervisor");
+                    return true;
+                }
+            }
         }
     }
 
