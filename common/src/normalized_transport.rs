@@ -3,7 +3,7 @@
 //
 //! # Network Compatibility Layer
 //!
-//! `NormalizedTransport` wraps the orchestra wire protocol so that, on the
+//! `NormalizedTransport` wraps the wire protocol so that, on the
 //! wire, the byte stream resembles a sequence of TLS 1.2 application‑data
 //! records prefaced by a fake `ClientHello`/`ServerHello` exchange.  The goal
 //! is to interoperate cleanly with deep‑packet‑inspection middleboxes that
@@ -733,6 +733,7 @@ mod tests {
             timestamp: 42,
             agent_id: "test".into(),
             status: "ok".into(),
+            mesh_public_key: None,
         };
         client.send(msg.clone()).await.unwrap();
         let received = server.recv().await.unwrap();
@@ -765,6 +766,7 @@ mod tests {
                 timestamp: 1,
                 agent_id: "x".into(),
                 status: "ok".into(),
+                mesh_public_key: None,
             })
             .await
             .unwrap();
@@ -824,6 +826,7 @@ mod tests {
                     timestamp: 7,
                     agent_id: "agent-a".into(),
                     status: "ok".into(),
+                    mesh_public_key: None,
                 })
                 .await
                 .unwrap();
@@ -888,9 +891,9 @@ mod tests {
 /// the agent dials out (root required for raw packet capture):
 ///
 /// ```bash
-/// sudo tcpdump -i any -w /tmp/orchestra.pcap 'host <controller-ip> and port 8443'
+/// sudo tcpdump -i any -w /tmp/capture.pcap 'host <controller-ip> and port 8443'
 /// # ...exercise the agent...
-/// tshark -r /tmp/orchestra.pcap -Y tls -T fields -e _ws.col.Protocol \
+/// tshark -r /tmp/capture.pcap -Y tls -T fields -e _ws.col.Protocol \
 ///        -e tls.record.content_type -e tls.handshake.type \
 ///   | head
 /// ```

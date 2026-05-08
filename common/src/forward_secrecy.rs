@@ -10,11 +10,11 @@
 //! **Security properties**
 //!
 //! * The PSK is used to derive a domain-separated HMAC key (via HKDF with
-//!   info `"orchestra-hmac-auth-key"`) that authenticates the exchanged
+//!   info [`hkdf_info::FS_HMAC`]) that authenticates the exchanged
 //!   public keys, binding the key exchange to the pre-shared secret.  Only
 //!   parties holding the PSK can produce or verify valid MACs, preventing
 //!   MITM even if the TLS channel is somehow intercepted.
-//! * A second sub-key derived from the PSK (info `"orchestra-fs-hkdf-salt"`)
+//! * A second sub-key derived from the PSK (info [`hkdf_info::FS_SALT`])
 //!   is used as the HKDF salt, meaning a future PSK compromise does
 //!   **not** expose past session ciphertexts (those require the ephemeral
 //!   private keys which are securely erased after the exchange).
@@ -25,7 +25,7 @@
 //! by a 32-byte HMAC-SHA256 tag.  The HMAC is computed as:
 //!
 //! ```text
-//! hmac_key = HKDF-Expand(ikm=psk, info="orchestra-hmac-auth-key")
+//! hmac_key = HKDF-Expand(ikm=psk, info=hkdf_info::FS_HMAC)
 //! tag = HMAC-SHA256(key=hmac_key, msg=local_pubkey || remote_pubkey)
 //! ```
 //!
@@ -40,8 +40,8 @@
 //! proceeds:
 //!
 //! ```text
-//! fs_salt  = HKDF-Expand(ikm=psk, info="orchestra-fs-hkdf-salt")
-//! session_key = HKDF-SHA256(ikm=ECDH_shared, salt=fs_salt, info="orchestra-forward-secret-v1")[..32]
+//! fs_salt  = HKDF-Expand(ikm=psk, info=hkdf_info::FS_SALT)
+//! session_key = HKDF-SHA256(ikm=ECDH_shared, salt=fs_salt, info=hkdf_info::FS_SESSION)[..32]
 //! ```
 
 use crate::{CryptoSession, LockedSecret, KEY_LEN};
@@ -79,7 +79,7 @@ const MSG_LEN: usize = 32 + HMAC_TAG_LEN;
 fn derive_hmac_key(psk: &[u8]) -> [u8; 32] {
     let hkdf = Hkdf::<Sha256>::new(None, psk);
     let mut key = [0u8; 32];
-    hkdf.expand(b"orchestra-hmac-auth-key", &mut key)
+    hkdf.expand(crate::hkdf_info::FS_HMAC, &mut key)
         .expect("HKDF expand for HMAC key must succeed");
     key
 }
@@ -89,7 +89,7 @@ fn derive_hmac_key(psk: &[u8]) -> [u8; 32] {
 fn derive_fs_salt(psk: &[u8]) -> [u8; 32] {
     let hkdf = Hkdf::<Sha256>::new(None, psk);
     let mut salt = [0u8; 32];
-    hkdf.expand(b"orchestra-fs-hkdf-salt", &mut salt)
+    hkdf.expand(crate::hkdf_info::FS_SALT, &mut salt)
         .expect("HKDF expand for FS salt must succeed");
     salt
 }
@@ -209,7 +209,88 @@ pub async fn negotiate_session_key<S: AsyncRead + AsyncWrite + Unpin>(
     use zeroize::Zeroize;
     psk_buf.zeroize();
     let mut session_key = [0u8; KEY_LEN];
-    h.expand(b"orchestra-forward-secret-v1", &mut session_key)
+    h.expand(crate::hkdf_info::FS_SESSION, &mut session_key)
+        .map_err(|_| anyhow::anyhow!("HKDF expand failed (output too long)") )?;
+
+    Ok(CryptoSession::from_key(session_key))
+}
+
+/// Synchronous variant of [`negotiate_session_key`] for transports that
+/// perform blocking I/O (e.g. Windows named pipes opened via NT syscalls).
+///
+/// The protocol is identical — only the I/O is synchronous.  The caller
+/// must wrap the invocation in [`tokio::task::spawn_blocking`] when called
+/// from an async context.
+pub fn negotiate_session_key_blocking<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    psk: &[u8],
+    is_client: bool,
+) -> Result<CryptoSession> {
+    let mut psk_buf = psk.to_vec();
+
+    let our_secret = EphemeralSecret::random_from_rng(rand::thread_rng());
+    let our_public = PublicKey::from(&our_secret);
+    let our_pub_bytes: [u8; 32] = *our_public.as_bytes();
+
+    let peer_pub_bytes: [u8; 32] = if is_client {
+        // Step 1: Client sends its public key first.
+        stream.write_all(&our_pub_bytes)?;
+        stream.flush()?;
+
+        // Step 2: Read server's full message (pubkey + tag).
+        let mut srv_msg = [0u8; MSG_LEN];
+        stream.read_exact(&mut srv_msg)?;
+        let mut srv_pub = [0u8; 32];
+        srv_pub.copy_from_slice(&srv_msg[..32]);
+        let srv_tag: &[u8] = &srv_msg[32..MSG_LEN];
+
+        // Verify server's tag.
+        let expected_tag = compute_auth_tag(&psk_buf, &our_pub_bytes, &srv_pub);
+        if !hmac_verify(&expected_tag, srv_tag) {
+            anyhow::bail!("forward secrecy: server HMAC verification failed — PSK mismatch or MITM");
+        }
+
+        // Step 3: Send our tag.
+        let our_tag = compute_auth_tag(&psk_buf, &our_pub_bytes, &srv_pub);
+        stream.write_all(&our_tag)?;
+        stream.flush()?;
+
+        srv_pub
+    } else {
+        // Step 1: Read client's public key.
+        let mut cli_pub = [0u8; 32];
+        stream.read_exact(&mut cli_pub)?;
+
+        // Step 2: Server sends its full message (pubkey + tag).
+        let our_tag = compute_auth_tag(&psk_buf, &cli_pub, &our_pub_bytes);
+        let mut srv_msg = [0u8; MSG_LEN];
+        srv_msg[..32].copy_from_slice(&our_pub_bytes);
+        srv_msg[32..MSG_LEN].copy_from_slice(&our_tag);
+        stream.write_all(&srv_msg)?;
+        stream.flush()?;
+
+        // Step 3: Read client's tag and verify it.
+        let mut cli_tag = [0u8; HMAC_TAG_LEN];
+        stream.read_exact(&mut cli_tag)?;
+        let expected_tag = compute_auth_tag(&psk_buf, &cli_pub, &our_pub_bytes);
+        if !hmac_verify(&expected_tag, &cli_tag) {
+            anyhow::bail!("forward secrecy: client HMAC verification failed — PSK mismatch or MITM");
+        }
+
+        cli_pub
+    };
+
+    // Key derivation (identical to async version).
+    let peer_public = PublicKey::from(peer_pub_bytes);
+    let shared = our_secret.diffie_hellman(&peer_public);
+    let fs_salt = derive_fs_salt(&psk_buf);
+    let h = Hkdf::<Sha256>::new(Some(&fs_salt), shared.as_bytes());
+
+    use zeroize::Zeroize;
+    psk_buf.zeroize();
+
+    let mut session_key = [0u8; KEY_LEN];
+    h.expand(crate::hkdf_info::FS_SESSION, &mut session_key)
         .map_err(|_| anyhow::anyhow!("HKDF expand failed (output too long)") )?;
 
     Ok(CryptoSession::from_key(session_key))
@@ -241,7 +322,7 @@ fn hmac_verify(expected: &[u8; HMAC_TAG_LEN], actual: &[u8]) -> bool {
 // ## Protocol
 //
 // 1. After N sessions or M hours (configurable), the server derives a new
-//    PSK: `new_psk = HKDF(ikm=old_psk, info="orchestra-psk-rotation-v1::<counter>")`.
+//    PSK: `new_psk = HKDF(ikm=old_psk, info=hkdf_info::PSK_ROTATION::<counter>)`.
 // 2. The new PSK is distributed to connected agents via the existing
 //    encrypted channel (inside a `Command::RotatePsk` message).
 // 3. Both sides update their stored PSK atomically.
@@ -263,13 +344,13 @@ pub const PSK_ROTATION_INTERVAL_SECS: u64 = 3600 * 24; // 24 hours
 /// knowing `new_psk` does not allow recovering `old_psk`.
 ///
 /// ```text
-/// new_psk = HKDF-Expand(ikm=old_psk, salt=rotation_counter_be, info="orchestra-psk-rotation-v1")[:32]
+/// new_psk = HKDF-Expand(ikm=old_psk, salt=rotation_counter_be, info=hkdf_info::PSK_ROTATION)[:32]
 /// ```
 pub fn derive_rotated_psk(old_psk: &[u8], rotation_counter: u64) -> [u8; 32] {
     let salt = rotation_counter.to_be_bytes();
     let hkdf = Hkdf::<Sha256>::new(Some(&salt), old_psk);
     let mut new_psk = [0u8; 32];
-    hkdf.expand(b"orchestra-psk-rotation-v1", &mut new_psk)
+    hkdf.expand(crate::hkdf_info::PSK_ROTATION, &mut new_psk)
         .expect("HKDF expand for PSK rotation must succeed");
     new_psk
 }

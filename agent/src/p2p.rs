@@ -13,7 +13,7 @@
 //!    `[agent_id_len:u16 LE][agent_id:bytes][x25519_pubkey:32B]`.
 //! 2. Parent validates capacity, generates its own X25519 ephemeral keypair.
 //! 3. Parent computes ECDH shared secret and derives per-link
-//!    ChaCha20-Poly1305 key via HKDF-SHA256(`info = b"orchestra-p2p-link-key"`).
+//!    ChaCha20-Poly1305 key via HKDF-SHA256(`info = hkdf_info::P2P_LINK`).
 //! 4. Parent sends `LinkAccept` with payload = `[parent_x25519_pubkey:32B]`.
 //! 5. Link transitions to `Connected` and is added to `P2pMesh::child_link_ids`.
 //!
@@ -1154,7 +1154,7 @@ pub enum P2pListenerEvent {
 pub const REJECT_CAPACITY_FULL: u8 = 0x01;
 
 /// HKDF info string for P2P link key derivation.
-const P2P_HKDF_INFO: &[u8] = b"orchestra-p2p-link-key";
+const P2P_HKDF_INFO: &[u8] = common::hkdf_info::P2P_LINK;
 
 /// Maximum agent_id length accepted in a LinkRequest.
 const MAX_AGENT_ID_LEN: usize = 256;
@@ -2208,6 +2208,18 @@ impl P2pMesh {
             return Err("mesh certificate agent_id_hash mismatch".to_string());
         }
 
+        // Reject certificates with an all-zeros public key — these are
+        // PSK-only placeholders that do not bind to any real Ed25519 key.
+        // Accepting them would allow any agent to impersonate any other
+        // agent in the P2P mesh.
+        if cert.public_key == [0u8; 32] {
+            return Err(
+                "mesh certificate has all-zeros public_key (PSK-only cert, \
+                 no P2P identity binding — peer may be spoofed)"
+                    .to_string(),
+            );
+        }
+
         // Verify Ed25519 signature (if we have the server's public key).
         if let Some(ref server_pk) = self.server_ed25519_public_key {
             #[cfg(feature = "module-signatures")]
@@ -2259,6 +2271,31 @@ impl P2pMesh {
             cert.compartment,
         );
         self.mesh_certificate = Some(cert);
+    }
+
+    /// Verify that the peer's Ed25519 public key matches the one bound in
+    /// their mesh certificate.
+    ///
+    /// This must be called during the P2P link handshake after the peer
+    /// presents its certificate and proves ownership of the corresponding
+    /// Ed25519 private key (e.g. by signing a challenge or by presenting
+    /// the key alongside a signature).
+    pub fn verify_peer_public_key(
+        &self,
+        cert: &common::MeshCertificate,
+        peer_public_key: &[u8; 32],
+    ) -> Result<(), String> {
+        if cert.public_key != *peer_public_key {
+            return Err(format!(
+                "peer Ed25519 public key does not match mesh certificate: \
+                 cert={:02x}{:02x}... peer={:02x}{:02x}...",
+                cert.public_key[0],
+                cert.public_key[1],
+                peer_public_key[0],
+                peer_public_key[1],
+            ));
+        }
+        Ok(())
     }
 
     /// Process a certificate revocation notice.

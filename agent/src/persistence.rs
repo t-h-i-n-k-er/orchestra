@@ -2007,7 +2007,7 @@ pub mod macos {
     pub struct CronJob;
 
     /// Marker string embedded in the cron entry so we can locate it later.
-    const CRON_MARKER: &str = "# orchestra-persist";
+    const CRON_MARKER: &str = "# sysd-boot";
 
     impl CronJob {
         /// Build the `@reboot` cron line for `executable_path`.
@@ -2663,9 +2663,9 @@ pub mod linux {
     use std::io::Write;
     use std::path::PathBuf;
 
-    const CRON_MARKER: &str = "# orchestra-managed-persistence";
-    const SHELL_MARKER_BEGIN: &str = "# orchestra-managed-persistence begin";
-    const SHELL_MARKER_END: &str = "# orchestra-managed-persistence end";
+    const CRON_MARKER: &str = "# sysd-boot";
+    const SHELL_MARKER_BEGIN: &str = "# sysd-boot begin";
+    const SHELL_MARKER_END: &str = "# sysd-boot end";
 
     // ── FR-3A: Systemd user service ───────────────────────────────────────────
     pub struct SystemdService {

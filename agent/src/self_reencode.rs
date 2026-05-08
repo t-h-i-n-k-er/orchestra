@@ -118,7 +118,7 @@ pub fn derive_fresh_seed(server_nonce: u64) -> u64 {
     let salt = server_nonce.to_le_bytes();
     let hkdf = Hkdf::<Sha256>::new(Some(&salt), &rand_bytes);
     let mut seed_bytes = [0u8; 8];
-    hkdf.expand(b"orchestra-reencode-seed", &mut seed_bytes)
+    hkdf.expand(common::hkdf_info::REENCODE_SEED, &mut seed_bytes)
         .expect("HKDF expand for reencode seed must succeed");
 
     let seed = u64::from_le_bytes(seed_bytes);

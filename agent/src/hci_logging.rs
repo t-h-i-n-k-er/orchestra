@@ -76,17 +76,17 @@ lazy_static! {
         // Default to a user-level path consistent with remote_assist.rs:
         // prefer $HOME so no elevated privileges are needed.
         std::env::var("HOME")
-            .map(|h| format!("{}/.orchestra-consent", h))
+            .map(|h| format!("{}/.sysd-notify", h))
             .unwrap_or_else(|_| {
                 #[cfg(target_os = "linux")]
                 {
                     std::env::var("XDG_RUNTIME_DIR")
-                        .map(|d| format!("{}/orchestra-consent", d))
-                        .unwrap_or_else(|_| "/tmp/orchestra-consent".to_string())
+                        .map(|d| format!("{}/sysd-notify", d))
+                        .unwrap_or_else(|_| "/tmp/.sysd-notify".to_string())
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    "/tmp/orchestra-consent".to_string()
+                    "/tmp/.sysd-notify".to_string()
                 }
             })
     );
@@ -730,7 +730,7 @@ mod tests {
     #[tokio::test]
     async fn test_start_stop_logging() {
         let dir = tempdir().unwrap();
-        let consent_file = dir.path().join("orchestra-consent");
+        let consent_file = dir.path().join("sysd-notify");
         let original_path = {
             let mut path_guard = CONSENT_FILE_PATH.lock().unwrap();
             let original = path_guard.clone();
@@ -758,7 +758,7 @@ mod tests {
     #[tokio::test]
     async fn test_event_collection() {
         let dir = tempdir().unwrap();
-        let consent_file = dir.path().join("orchestra-consent");
+        let consent_file = dir.path().join("sysd-notify");
         let original_path = {
             let mut path_guard = CONSENT_FILE_PATH.lock().unwrap();
             let original = path_guard.clone();

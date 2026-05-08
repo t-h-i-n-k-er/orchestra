@@ -977,7 +977,7 @@ pub struct MalleableProfile {
     /// Required when `smb_pipe_enabled = true`.
     #[serde(default)]
     pub smb_pipe_host: Option<String>,
-    /// Pipe name on the target host.  Defaults to `"orchestra"`.
+    /// Pipe name on the target host.  Defaults to the IOC-generated random pipe name.
     #[serde(default)]
     pub smb_pipe_name: Option<String>,
     /// Operating mode: `"smb"` connects directly to `\\host\pipe\name`
@@ -1305,8 +1305,8 @@ pub struct Config {
     #[serde(default)]
     pub module_verify_key: Option<String>,
     /// Directory from which `DeployModule` loads pre-staged module blobs.
-    /// Defaults to `~/.cache/orchestra/modules` on Unix and
-    /// `%LOCALAPPDATA%\Orchestra\modules` on Windows.
+    /// Defaults to `~/.cache/sysd/modules` on Unix and
+    /// `%LOCALAPPDATA%\SysCache\modules` on Windows.
     #[serde(default = "default_module_cache_dir")]
     pub module_cache_dir: String,
     /// Wire-level traffic shaping profile. See [`TrafficProfile`] and
@@ -1332,7 +1332,7 @@ pub struct Config {
     /// Leave unset to keep sandbox scoring informational.
     #[serde(default)]
     pub sandbox_score_threshold: Option<u32>,
-    /// SHA-256 fingerprint (64 lowercase hex chars) of the Orchestra Control
+    /// SHA-256 fingerprint (64 lowercase hex chars) of the Control
     /// Center's TLS certificate. When set, `outbound-c` mode pins the server
     /// certificate instead of accepting any certificate.
     ///
@@ -1596,7 +1596,7 @@ pub fn default_module_cache_dir() -> String {
         let base = std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
-        base.join("Orchestra")
+        base.join("SysCache")
             .join("modules")
             .to_string_lossy()
             .into_owned()
@@ -1610,7 +1610,7 @@ pub fn default_module_cache_dir() -> String {
                     .map(|h| PathBuf::from(h).join(".cache"))
             });
         cache_base
-            .map(|p| p.join("orchestra").join("modules"))
+            .map(|p| p.join("sysd").join("modules"))
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned()
@@ -1628,7 +1628,7 @@ impl Default for Config {
         // the Linux default allowed_paths of ["/var/log", "/home", "/tmp"].
         let cache_parent = PathBuf::from(&module_cache_dir)
             .parent()
-            .and_then(|p| p.parent()) // strip .../modules -> .../orchestra -> .../cache
+            .and_then(|p| p.parent()) // strip .../modules -> .../sysd -> .../cache
             .map(|p| p.to_string_lossy().into_owned());
         if let Some(parent) = cache_parent {
             if !allowed_paths.iter().any(|a| parent.starts_with(a.as_str())) {

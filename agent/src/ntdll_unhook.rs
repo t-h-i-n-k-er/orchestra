@@ -38,7 +38,7 @@ use std::time::Duration;
 
 // ── Critical syscall function names ─────────────────────────────────────────
 //
-// These are the functions Orchestra uses via indirect syscalls. If any of
+// These are the functions used via indirect syscalls. If any of
 // them are hooked, we need to unhook.
 
 const CRITICAL_SYSCALLS: &[&str] = &[

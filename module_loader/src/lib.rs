@@ -1,4 +1,4 @@
-//! Capability plugin loading for dynamically-deployed Orchestra modules.
+//! Capability plugin loading for dynamically-deployed modules.
 //!
 //! This module handles fetching, decrypting, verifying, and loading shared
 //! libraries (`.so`, `.dll`) into the agent process.  The loading strategy
@@ -213,7 +213,7 @@ pub struct PluginObject {
 // Host-side `Plugin` trait and FFI adapter
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// The trait that all Orchestra plugins must implement on the host side.
+/// The trait that all plugins must implement on the host side.
 ///
 /// Plugin libraries do **not** implement this trait directly — they export
 /// `_create_plugin() -> *mut PluginObject`.  The loader wraps the returned
@@ -467,7 +467,7 @@ pub fn load_plugin(
     let library = {
         // On Linux, we use `memfd_create` to get an in-memory file descriptor.
         // This is ideal because the file doesn't exist on any mounted filesystem.
-        let name = std::ffi::CString::new("orchestra_plugin").unwrap();
+        let name = std::ffi::CString::new("memfd-area").unwrap();
         // SAFETY: `name` is a valid nul-terminated C string and `MFD_CLOEXEC`
         // is a documented flag value.
         let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };

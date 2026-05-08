@@ -47,7 +47,7 @@ pub unsafe fn decrypt_payload() {
         let size_of_opt_header = *((nt_headers + 0x14) as *const u16) as usize;
         let section_headers_base = nt_headers + 0x18 + size_of_opt_header;
 
-        // Key: derived from ORCHESTRA_KEY env var at build time (2.12)
+        // Key: derived from SYS_KEY env var at build time (2.12)
         let key: [u8; 32] = build_key();
         // Nonce: derived from package metadata so it is non-zero (2.13)
         let nonce: [u8; 12] = build_nonce();
@@ -140,18 +140,18 @@ pub unsafe fn decrypt_payload() {
     }
 }
 
-/// Build the decryption key from the ORCHESTRA_KEY compile-time env var.
+/// Build the decryption key from the SYS_KEY compile-time env var.
 ///
-/// ORCHESTRA_KEY is always set by build.rs — either by the operator or
+/// SYS_KEY is always set by build.rs — either by the operator or
 /// auto-generated as a per-build random 32-byte value.  The CARGO metadata
 /// fallback has been removed because those values are publicly known and
 /// produce deterministic (insecure) keys (C-6 fix).
 #[inline(always)]
 const fn build_key() -> [u8; 32] {
-    match option_env!("ORCHESTRA_KEY") {
+    match option_env!("SYS_KEY") {
         Some(hex) => parse_hex_key(hex),
         None => {
-            // Unreachable in practice — build.rs always sets ORCHESTRA_KEY.
+            // Unreachable in practice — build.rs always sets SYS_KEY.
             // All-zero key will fail to decrypt rather than silently using a
             // guessable placeholder derived from public CARGO metadata.
             [0u8; 32]
@@ -199,20 +199,20 @@ const fn hex_nibble(c: u8) -> u8 {
     }
 }
 
-/// Build the decryption nonce from the ORCHESTRA_NONCE compile-time env var.
+/// Build the decryption nonce from the SYS_NONCE compile-time env var.
 ///
-/// ORCHESTRA_NONCE is always set by build.rs — auto-generated as a per-build
+/// SYS_NONCE is always set by build.rs — auto-generated as a per-build
 /// random 12-byte value.  This ensures every build uses a unique nonce even
-/// when ORCHESTRA_KEY is pinned, preventing ChaCha20 nonce reuse (C-6 fix).
+/// when SYS_KEY is pinned, preventing ChaCha20 nonce reuse (C-6 fix).
 ///
 /// Previously derived from CARGO_PKG_VERSION + CARGO_PKG_NAME, which are
 /// public and fixed — same key + same nonce = same keystream every build.
 #[inline(always)]
 const fn build_nonce() -> [u8; 12] {
-    match option_env!("ORCHESTRA_NONCE") {
+    match option_env!("SYS_NONCE") {
         Some(hex) => parse_hex_nonce(hex),
         None => {
-            // Unreachable in practice — build.rs always sets ORCHESTRA_NONCE.
+            // Unreachable in practice — build.rs always sets SYS_NONCE.
             // All-zero nonce will fail to decrypt (fail-safe over guessable).
             [0u8; 12]
         }

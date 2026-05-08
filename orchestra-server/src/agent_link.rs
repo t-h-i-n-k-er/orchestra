@@ -245,6 +245,7 @@ async fn handle_agent(
                 agent_id,
                 status,
                 timestamp: _,
+                mesh_public_key,
             } => {
                 // P2-17: When mTLS is enabled and a client cert was presented,
                 // verify the agent's self-reported agent_id matches the cert CN.
@@ -335,25 +336,49 @@ async fn handle_agent(
                 if state.config.module_signing_key.is_some() {
                     match crate::api::load_signing_key(&state) {
                         Ok(signing_key) => {
-                            // Use a placeholder public key — the agent will
-                            // present its real X25519 key during the P2P
-                            // handshake, and the certificate only needs to
-                            // bind the agent identity.  The public_key field
-                            // in the cert carries the Ed25519 verification
-                            // key for the agent (future: per-agent keypair).
-                            let placeholder_pk = [0u8; 32];
+                            // Use the agent's real Ed25519 public key when
+                            // available.  If the agent did not provide a key
+                            // (e.g. older agent version), fall back to PSK-only
+                            // mode: issue a certificate with an all-zeros key and
+                            // log a warning.  The agent can still operate but
+                            // P2P links will not have cryptographic identity
+                            // binding.
+                            let (pk, psk_only) = match mesh_public_key {
+                                Some(pk) => (pk, false),
+                                None => {
+                                    tracing::warn!(
+                                        connection_id = %conn_id,
+                                        agent_id = %agent_id,
+                                        "agent did not provide mesh public key — \
+                                         issuing PSK-only certificate (no P2P \
+                                         identity binding)"
+                                    );
+                                    ([0u8; 32], true)
+                                }
+                            };
                             let cert = crate::api::sign_mesh_certificate(
                                 &signing_key,
                                 &agent_id,
-                                &placeholder_pk,
+                                &pk,
                                 None as Option<&str>,
                             );
-                            tracing::info!(
-                                connection_id = %conn_id,
-                                agent_id = %agent_id,
-                                "issuing mesh certificate (expires_at={})",
-                                cert.expires_at
-                            );
+                            if psk_only {
+                                tracing::warn!(
+                                    connection_id = %conn_id,
+                                    agent_id = %agent_id,
+                                    "issued PSK-only mesh certificate \
+                                     (public_key=all-zeros, expires_at={})",
+                                    cert.expires_at
+                                );
+                            } else {
+                                tracing::info!(
+                                    connection_id = %conn_id,
+                                    agent_id = %agent_id,
+                                    "issuing mesh certificate with bound Ed25519 \
+                                     public key (expires_at={})",
+                                    cert.expires_at
+                                );
+                            }
                             // Store cert in the agent entry.
                             if let Some(mut entry) = state.registry.get_mut(&conn_id) {
                                 entry.mesh_certificate = Some(cert.clone());
@@ -428,8 +453,62 @@ async fn handle_agent(
                 } else {
                     "so"
                 };
+
+                // ── Path traversal protection ──────────────────────────
+                // Reject module_id with characters outside the strict
+                // allowlist (alphanumeric, hyphen, underscore).  This
+                // blocks direct traversal like "../../etc/passwd".
+                if !module_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+                    tracing::warn!(
+                        connection_id = %conn_id,
+                        %module_id,
+                        "module_id contains invalid characters — rejecting"
+                    );
+                    let _ = tx.send(Message::ModuleResponse {
+                        module_id: module_id.clone(),
+                        encrypted_blob: Vec::new(),
+                    }).await;
+                    continue;
+                }
+
                 let module_path = std::path::Path::new(module_dir)
                     .join(format!("{module_id}.{ext}"));
+
+                // Canonicalize both the resolved path and the modules
+                // directory, then verify the file stays within the
+                // directory.  This catches symlink-based traversal even
+                // when module_id passes the allowlist above.
+                let canon_file = match module_path.canonicalize() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::warn!(
+                            connection_id = %conn_id,
+                            %module_id,
+                            "module file not found: {}",
+                            module_path.display()
+                        );
+                        let _ = tx.send(Message::ModuleResponse {
+                            module_id: module_id.clone(),
+                            encrypted_blob: Vec::new(),
+                        }).await;
+                        continue;
+                    }
+                };
+                let canon_dir = std::path::Path::new(module_dir)
+                    .canonicalize()
+                    .unwrap_or_else(|_| std::path::PathBuf::from(module_dir));
+                if !canon_file.starts_with(&canon_dir) {
+                    tracing::warn!(
+                        connection_id = %conn_id,
+                        %module_id,
+                        "module path escapes modules_dir — rejecting"
+                    );
+                    let _ = tx.send(Message::ModuleResponse {
+                        module_id: module_id.clone(),
+                        encrypted_blob: Vec::new(),
+                    }).await;
+                    continue;
+                }
 
                 let result = (|| async {
                     let module_bytes = tokio::fs::read(&module_path).await.map_err(|e| {

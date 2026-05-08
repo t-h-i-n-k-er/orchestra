@@ -65,7 +65,10 @@ pub struct KeyHandle;
 /// concurrent mutation while the guard is active causes undefined behaviour.
 #[inline]
 pub unsafe fn register(buf: &'static mut [u8], label: &'static str) {
-    ensure_key();
+    if let Err(e) = ensure_key() {
+        log::error!("memory_guard_stub::register: key initialization failed: {e} — region will NOT be protected");
+        return;
+    }
     REGISTERED_REGIONS
         .lock()
         .unwrap()
@@ -82,9 +85,17 @@ pub unsafe fn register(buf: &'static mut [u8], label: &'static str) {
 /// Iterates over every region and XORs each byte with the corresponding
 /// byte of the 32-byte key (cycling).  Returns a [`KeyHandle`] that must
 /// be passed to [`unlock`] to restore the data.
+///
+/// # Errors
+///
+/// Returns an error if [`ensure_key`] has not been called yet (the key
+/// is uninitialised).  XOR with a zero key is a no-op, so we refuse to
+/// proceed silently.
 #[inline]
 pub fn lock() -> Result<KeyHandle> {
-    let key = GUARD_KEY.get().copied().unwrap_or([0u8; 32]);
+    let key = GUARD_KEY.get().copied().ok_or_else(|| {
+        anyhow::anyhow!("GUARD_KEY not initialized — call ensure_key() before lock()")
+    })?;
     let regions = REGISTERED_REGIONS.lock().unwrap();
     xor_regions(&regions, &key);
     Ok(KeyHandle)
@@ -94,9 +105,16 @@ pub fn lock() -> Result<KeyHandle> {
 ///
 /// XOR is symmetric — applying the same operation with the same key
 /// restores the original plaintext.
+///
+/// # Errors
+///
+/// Returns an error if [`ensure_key`] has not been called yet (the key
+/// is uninitialised).
 #[inline]
 pub fn unlock(_handle: KeyHandle) -> Result<()> {
-    let key = GUARD_KEY.get().copied().unwrap_or([0u8; 32]);
+    let key = GUARD_KEY.get().copied().ok_or_else(|| {
+        anyhow::anyhow!("GUARD_KEY not initialized — call ensure_key() before unlock()")
+    })?;
     let regions = REGISTERED_REGIONS.lock().unwrap();
     xor_regions(&regions, &key);
     Ok(())
@@ -195,7 +213,10 @@ pub fn init_schemes(
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 /// Generate the XOR key on first use and emit the protection-level warning.
-fn ensure_key() {
+///
+/// Returns an error if key generation fails or produces an all-zeros key
+/// (which would be a silent no-op during encryption).
+fn ensure_key() -> Result<()> {
     GUARD_KEY.get_or_init(|| {
         log::warn!(
             "memory-guard: feature disabled; using XOR-based stub encryption \
@@ -208,6 +229,13 @@ fn ensure_key() {
         rand::rngs::OsRng.fill_bytes(&mut k);
         k
     });
+    // Verify the key is not all-zeros (sanity check against silent no-op).
+    let key = GUARD_KEY.get().unwrap();
+    if key.iter().all(|&b| b == 0) {
+        anyhow::bail!("GUARD_KEY generation produced all-zeros key");
+    }
+    log::info!("memory_guard_stub: XOR key initialized successfully");
+    Ok(())
 }
 
 /// Apply the XOR cipher to every registered region.

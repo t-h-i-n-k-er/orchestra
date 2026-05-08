@@ -1061,7 +1061,7 @@ fn spawn_readers(
     let stop = stop_flag;
 
     std::thread::Builder::new()
-        .name(format!("shell-reader-{session_id}"))
+        .name(format!("bg-{session_id}"))
         .spawn(move || {
             log::debug!("[interactive_shell] reader thread started for session {session_id}");
 

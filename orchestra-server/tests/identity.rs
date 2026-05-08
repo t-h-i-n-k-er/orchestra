@@ -198,6 +198,7 @@ async fn duplicate_agent_id_gets_distinct_connection_ids() {
         timestamp: 0,
         agent_id: "dup-agent".into(),
         status: "host".into(),
+        mesh_public_key: None,
     };
     agent_a.send(&hb).await;
     agent_b.send(&hb).await;
@@ -228,6 +229,7 @@ async fn command_routed_by_connection_id_reaches_correct_agent() {
             timestamp: 0,
             agent_id: "dup-agent".into(),
             status: "host-a".into(),
+            mesh_public_key: None,
         })
         .await;
     agent_b
@@ -235,6 +237,7 @@ async fn command_routed_by_connection_id_reaches_correct_agent() {
             timestamp: 0,
             agent_id: "dup-agent".into(),
             status: "host-b".into(),
+            mesh_public_key: None,
         })
         .await;
 
@@ -306,6 +309,7 @@ async fn operator_id_appears_in_agent_audit_log() {
             timestamp: 0,
             agent_id: "audit-agent".into(),
             status: "host".into(),
+            mesh_public_key: None,
         })
         .await;
 

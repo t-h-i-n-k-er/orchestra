@@ -7,10 +7,10 @@
 //! reference the same strings.
 //!
 //! The seed source (first wins):
-//!   1. `ORCHESTRA_IOC_SEED` environment variable
+//!   1. `SYS_IOC_SEED` environment variable
 //!   2. Auto-generated from system time + default constant
 //!
-//! For reproducible / synchronised builds, set `ORCHESTRA_IOC_SEED` to the
+//! For reproducible / synchronised builds, set `SYS_IOC_SEED` to the
 //! same value when building both the agent and the server.
 
 pub mod generated {

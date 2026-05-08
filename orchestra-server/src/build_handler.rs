@@ -197,7 +197,7 @@ pub fn init_build_queue(workers: usize, build_dir: PathBuf, retention_days: u32)
 pub async fn handle_build(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(user): axum::extract::Extension<AuthenticatedUser>,
-    Json(req): Json<BuildRequest>,
+    Json(mut req): Json<BuildRequest>,
 ) -> Result<Json<BuildResponse>, (StatusCode, Json<BuildResponse>)> {
     if req.host.is_empty() || req.port == 0 || req.key.is_empty() || req.pin.is_empty() {
         return Err((
@@ -236,24 +236,32 @@ pub async fn handle_build(
     }
 
     // P1-14: Reject build targets that point to private/internal IPs (SSRF).
-    if let Err(e) = validate_host_not_private(&req.host) {
-        state.audit.record_simple(
-            "BUILDER",
-            &user.id,
-            "BuildRejected",
-            &format!("host={} reason={}", req.host, e),
-            common::Outcome::Failure,
-        );
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(BuildResponse {
-                job_id: None,
-                log: None,
-                status: None,
-                error: Some(e.to_string()),
-            }),
-        ));
-    }
+    // Pin the resolved IP to prevent DNS rebinding attacks (V3 fix).
+    let pinned_ip = match resolve_and_validate_host(&req.host).await {
+        Ok(ip) => ip,
+        Err(e) => {
+            state.audit.record_simple(
+                "BUILDER",
+                &user.id,
+                "BuildRejected",
+                &format!("host={} reason={}", req.host, e),
+                common::Outcome::Failure,
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(BuildResponse {
+                    job_id: None,
+                    log: None,
+                    status: None,
+                    error: Some(e.to_string()),
+                }),
+            ));
+        }
+    };
+
+    // Replace the hostname with the pinned IP so the agent connects directly
+    // to the validated address, not the operator-supplied hostname.
+    req.host = pinned_ip.to_string();
 
     // P1-15: Reject unsupported OS/arch values (TOML injection prevention).
     if let Err(e) = validate_target_os_arch(&req.os, &req.arch) {
@@ -585,7 +593,7 @@ fn build_profile_from_request(
         c_server_secret: Some({
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
-            hasher.update(b"orchestra-c2-psk-derivation");
+            hasher.update(common::hkdf_info::C2_PSK_DERIVATION);
             hasher.update(req.key.as_bytes());
             format!("{:x}", hasher.finalize())
         }),
@@ -654,29 +662,44 @@ fn validate_seed(seed_hex: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Validate that the build target host does not resolve to a private or
-/// internal IP address.  Prevents SSRF attacks that could reach cloud
-/// instance metadata endpoints (e.g. 169.254.169.254) or internal services.
-fn validate_host_not_private(host: &str) -> anyhow::Result<()> {
+/// Resolve a build target hostname and validate that it does not resolve
+/// to a private or internal IP address.  Prevents SSRF attacks that could
+/// reach cloud instance metadata endpoints (e.g. 169.254.169.254) or
+/// internal services.
+///
+/// Returns the pinned IP address to use in the agent's C2 configuration.
+/// IP pinning prevents DNS rebinding attacks where an operator configures
+/// a hostname that resolves to a public IP at validation time but is later
+/// re-pointed to a private IP (e.g. 169.254.169.254) before the agent
+/// connects.
+///
+/// **Tradeoff:** IP pinning means DNS-based load balancing will not work
+/// for the agent's C2 address.  Operators who need DNS-based failover
+/// should use a dedicated C2 protocol that supports multiple endpoints
+/// rather than relying on DNS round-robin.
+async fn resolve_and_validate_host(host: &str) -> anyhow::Result<IpAddr> {
     // Try to parse as an IP address first.
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_private_or_reserved(&ip) {
             anyhow::bail!(
-                "host '{}' resolves to a private/reserved IP address; \
+                "host '{}' is a private/reserved IP address; \
                  build targets must use public infrastructure addresses",
                 host
             );
         }
-        return Ok(());
+        return Ok(ip);
     }
 
-    // If it's a hostname, perform a DNS lookup and check all results.
-    // Use tokio's blocking spawn since we're in an async context but
-    // std::net::ToSocketAddrs is blocking.
+    // If it's a hostname, perform a DNS lookup via spawn_blocking to avoid
+    // blocking the Tokio runtime (std::net::ToSocketAddrs is synchronous).
     let host_owned = host.to_string();
-    let addrs: Vec<IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&format!("{host_owned}:0"))
-        .map(|addrs| addrs.map(|a| a.ip()).collect())
-        .unwrap_or_default();
+    let addrs: Vec<IpAddr> = tokio::task::spawn_blocking(move || {
+        std::net::ToSocketAddrs::to_socket_addrs(&format!("{}:0", host_owned))
+            .map(|addrs| addrs.map(|a| a.ip()).collect())
+            .unwrap_or_default()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("DNS resolution task failed: {e}"))?;
 
     if addrs.is_empty() {
         anyhow::bail!("could not resolve build host '{}'; unresolvable hosts are rejected to prevent DNS rebinding attacks", host);
@@ -692,40 +715,59 @@ fn validate_host_not_private(host: &str) -> anyhow::Result<()> {
             );
         }
     }
-    Ok(())
+
+    // Pin the first resolved IP address so the agent connects directly to
+    // the validated address, defeating DNS rebinding.
+    Ok(addrs[0])
 }
 
 /// Check whether an IP address falls into a private, loopback, link-local,
 /// or other reserved range that should not be used as a build target.
+///
+/// Handles IPv6-mapped IPv4 addresses (e.g. `::ffff:127.0.0.1`) by
+/// extracting the embedded IPv4 and checking it against the IPv4 private
+/// ranges.
 fn is_private_or_reserved(ip: &IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            // Loopback: 127.0.0.0/8
-            v4.is_loopback()
-            // Link-local: 169.254.0.0/16  (includes AWS IMDS 169.254.169.254)
-            || v4.is_link_local()
-            // RFC 1918 private: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-            || v4.is_private()
-            // Broadcast / unspecified
-            || v4.is_broadcast() || v4.is_unspecified()
-            // IETF protocol assignments: 192.0.0.0/24
-            || matches!(v4.octets(), [192, 0, 0, ..])
-            // TEST-NET-1/2/3: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
-            || matches!(v4.octets(), [192, 0, 2, ..])
-            || matches!(v4.octets(), [198, 51, 100, ..])
-            || matches!(v4.octets(), [203, 0, 113, ..])
-            // Carrier-grade NAT: 100.64.0.0/10
-            || matches!(v4.octets(), [100, 64..=127, ..])
-        }
+        IpAddr::V4(v4) => is_private_ipv4(v4),
         IpAddr::V6(v6) => {
+            // Check for IPv6-mapped IPv4 addresses (e.g. ::ffff:127.0.0.1).
+            // These can bypass the IPv4 checks if not explicitly handled.
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_private_ipv4(&mapped);
+            }
             v6.is_loopback()
             || v6.is_unspecified()
             // IPv6 link-local: fe80::/10
             || is_ipv6_link_local(v6)
-            // IPv6 unique local: fc00::/7
+            // IPv6 unique local: fc00::/7 (RFC 4193)
             || matches!(v6.segments()[0] & 0xfe00, 0xfc00)
+            // IPv4-mapped range ::ffff:0:0/96 is already handled above, but
+            // also check IPv6 documentation addresses: 2001:db8::/32
+            || matches!(v6.segments(), [0x2001, 0x0db8, ..])
         }
     }
+}
+
+/// Check whether an IPv4 address falls into a private, loopback, link-local,
+/// or other reserved range.
+fn is_private_ipv4(v4: &Ipv4Addr) -> bool {
+    // Loopback: 127.0.0.0/8
+    v4.is_loopback()
+    // Link-local: 169.254.0.0/16  (includes AWS IMDS 169.254.169.254)
+    || v4.is_link_local()
+    // RFC 1918 private: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+    || v4.is_private()
+    // Broadcast / unspecified
+    || v4.is_broadcast() || v4.is_unspecified()
+    // IETF protocol assignments: 192.0.0.0/24
+    || matches!(v4.octets(), [192, 0, 0, ..])
+    // TEST-NET-1/2/3: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+    || matches!(v4.octets(), [192, 0, 2, ..])
+    || matches!(v4.octets(), [198, 51, 100, ..])
+    || matches!(v4.octets(), [203, 0, 113, ..])
+    // Carrier-grade NAT: 100.64.0.0/10
+    || matches!(v4.octets(), [100, 64..=127, ..])
 }
 
 /// Check if an IPv6 address is in the link-local range fe80::/10.

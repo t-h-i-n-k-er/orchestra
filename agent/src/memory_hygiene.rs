@@ -1,4 +1,4 @@
-//! Continuous memory hygiene for the Orchestra agent.
+//! Continuous memory hygiene for the agent.
 //!
 //! This module runs alongside the sleep obfuscation system and provides
 //! ongoing forensic scrubbing that reduces the agent's in-memory visibility.

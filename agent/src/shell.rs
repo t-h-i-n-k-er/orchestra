@@ -93,7 +93,7 @@ impl ShellSession {
         let buf_clone = buffer.clone();
         let running_clone = is_running.clone();
         let reader_thread = std::thread::Builder::new()
-            .name("orchestra-pty-reader".into())
+            .name("bg-reader".into())
             .spawn(move || {
                 let mut chunk = [0u8; READ_CHUNK];
                 loop {

@@ -108,6 +108,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "string_crypt",
+ "subtle",
  "sysinfo",
  "tempfile",
  "thiserror 1.0.69",

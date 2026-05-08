@@ -8,7 +8,7 @@
 //! This module is the **single source of truth** for all malleable profile data
 //! types shared between the agent and the server crates.  Server-only types
 //! (e.g. `TransactionTransformer`, `SessionState`, `ProfileManager`) live in
-//! `orchestra-server/src/malleable.rs`.
+//! `server/src/malleable.rs`.
 //!
 //! # Profile Structure
 //!
@@ -806,7 +806,7 @@ impl Default for MalleableProfile {
         Self {
             profile: ProfileInfo {
                 name: "generic_cdn".to_string(),
-                author: "orchestra".to_string(),
+                author: "operator".to_string(),
                 description: "Safe default profile mimicking generic HTTPS CDN traffic".to_string(),
             },
             global: GlobalConfig {

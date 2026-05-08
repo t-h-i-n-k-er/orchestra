@@ -1,8 +1,8 @@
 //! Standalone agent binary.
 //!
-//! When built with the `outbound-c` feature the agent dials the Orchestra
-//! Control Center automatically (address baked in at build time or read from
-//! the `ORCHESTRA_C` environment variable) and reconnects on disconnection.
+//! When built with the `outbound-c` feature the agent dials the Control
+//! Center automatically (address baked in at build time or read from
+//! the `SYS_C` environment variable) and reconnects on disconnection.
 //!
 //! Without `outbound-c` the binary exits with a clear diagnostic; the normal
 //! deployment path in that case is the [`launcher`] crate, which downloads and

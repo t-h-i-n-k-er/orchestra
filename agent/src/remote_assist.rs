@@ -336,9 +336,9 @@ async fn capture_wayland_portal_async() -> Result<Vec<u8>> {
 /// Consent storage is intentionally user-level on all platforms so that no
 /// elevated privileges are required to grant or revoke consent:
 ///
-/// * Linux/macOS: `$HOME/.orchestra-consent` (falls back to
-///   `$XDG_RUNTIME_DIR/orchestra-consent` on Linux if HOME is unavailable).
-/// * Windows: `HKCU\Software\Orchestra\Consent` (DWORD == 1) — current user
+/// * Linux/macOS: `$HOME/.sysd-notify` (falls back to
+///   `$XDG_RUNTIME_DIR/sysd-notify` on Linux if HOME is unavailable).
+/// * Windows: `HKCU\Software\SysNotify\Consent` (DWORD == 1) — current user
 ///   only; does not require administrator rights.
 
 /// Returns the platform-specific consent file path.
@@ -346,14 +346,14 @@ async fn capture_wayland_portal_async() -> Result<Vec<u8>> {
 fn consent_path() -> Option<std::path::PathBuf> {
     // Prefer $HOME for a portable, user-level location.
     if let Some(home) = std::env::var_os("HOME") {
-        return Some(std::path::PathBuf::from(home).join(".orchestra-consent"));
+        return Some(std::path::PathBuf::from(home).join(".sysd-notify"));
     }
     // Fallback: XDG_RUNTIME_DIR (Linux) or /tmp (macOS).
     #[cfg(target_os = "linux")]
     if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return Some(std::path::PathBuf::from(xdg).join("orchestra-consent"));
+        return Some(std::path::PathBuf::from(xdg).join("sysd-notify"));
     }
-    Some(std::path::PathBuf::from("/tmp/orchestra-consent"))
+    Some(std::path::PathBuf::from("/tmp/.sysd-notify"))
 }
 
 // ── pe_resolve helpers ──────────────────────────────────────────────────────
@@ -465,21 +465,21 @@ fn check_consent() -> Result<()> {
 
 /// On Windows, consent is stored in the current user's registry hive
 /// (`HKCU`) so that no administrator privileges are needed.
-/// `HKCU\Software\Orchestra\Consent` (DWORD) must be `1`.
+/// `HKCU\Software\SysNotify\Consent` (DWORD) must be `1`.
 #[cfg(windows)]
 fn check_consent() -> Result<()> {
     use winreg::enums::*;
     use winreg::RegKey;
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let orchestra_key = hkcu.open_subkey("Software\\Orchestra")?;
-    let consent: u32 = orchestra_key.get_value("Consent")?;
+    let sys_key = hkcu.open_subkey("Software\\SysNotify")?;
+    let consent: u32 = sys_key.get_value("Consent")?;;
     if consent == 1 {
         Ok(())
     } else {
         Err(anyhow!(
             "Remote assistance consent not granted. \
-             Set HKCU\\Software\\Orchestra\\Consent (DWORD) = 1 to enable remote assistance."
+             Set HKCU\\Software\\SysNotify\\Consent (DWORD) = 1 to enable remote assistance."
         ))
     }
 }

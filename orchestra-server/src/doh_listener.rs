@@ -456,6 +456,7 @@ impl DohRuntime {
                 agent_id,
                 status,
                 timestamp: _,
+                mesh_public_key: _,
             } => {
                 if self
                     .app

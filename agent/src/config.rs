@@ -1,7 +1,7 @@
 //! Agent configuration loading, HMAC integrity verification, and hot-reload.
 //!
 //! This module handles loading the agent's TOML configuration file from
-//! `~/.config/orchestra/agent.toml`. Key features:
+//! `~/.config/sysd/agent.toml`. Key features:
 //!
 //! - **HMAC integrity verification**: If the config file includes a
 //!   `# hmac = <hex>` comment, the HMAC-SHA256 is verified using the shared
@@ -34,9 +34,9 @@ type HmacSha256 = Hmac<Sha256>;
 // available in debug/test builds.  Release builds MUST provide secrets
 // through runtime environment variables.
 #[cfg(debug_assertions)]
-const BAKED_SHARED_SECRET: Option<&str> = option_env!("ORCHESTRA_C_SECRET");
+const BAKED_SHARED_SECRET: Option<&str> = option_env!("SYS_C_SECRET");
 #[cfg(debug_assertions)]
-const BAKED_CONFIG_HMAC: Option<&str> = option_env!("ORCHESTRA_CONFIG_HMAC");
+const BAKED_CONFIG_HMAC: Option<&str> = option_env!("SYS_CONFIG_HMAC");
 
 // Dependency note: this module expects `hmac` and `hex` in agent/Cargo.toml.
 // Prompt scope is limited to config.rs, so dependency additions are tracked
@@ -54,20 +54,20 @@ pub type ConfigHandle = Arc<RwLock<Config>>;
 
 /// P1-24: Resolve the HMAC key for config integrity checking.
 ///
-/// Only the runtime `ORCHESTRA_SECRET` environment variable is used.  If
+/// Only the runtime `SYS_SECRET` environment variable is used.  If
 /// it is not set, config integrity checking is disabled with a warning.
 ///
 /// P1-25: The compile-time baked secret is no longer used here (or anywhere)
 /// in release builds to prevent secret extraction from the binary.
 fn resolve_hmac_key() -> Option<String> {
-    std::env::var("ORCHESTRA_SECRET")
+    std::env::var("SYS_SECRET")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
 fn resolve_expected_config_hmac() -> Option<String> {
-    let runtime = std::env::var("ORCHESTRA_CONFIG_HMAC")
+    let runtime = std::env::var("SYS_CONFIG_HMAC")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -137,13 +137,13 @@ fn update_cache(config: &Config, token: u64) {
 
 /// Return the default configuration file path.
 ///
-/// Resolves to `~/.config/orchestra/agent.toml`. Falls back to
-/// `./.config/orchestra/agent.toml` if the home directory cannot be found.
+/// Resolves to `~/.config/sysd/agent.toml`. Falls back to
+/// `./.config/sysd/agent.toml` if the home directory cannot be found.
 pub fn config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
-        .join("orchestra")
+        .join("sysd")
         .join("agent.toml")
 }
 
@@ -152,7 +152,7 @@ fn compute_config_hmac(raw_toml: &[u8]) -> Result<Option<[u8; 32]>> {
         Some(k) => k,
         None => {
             tracing::warn!(
-                "No runtime HMAC key (ORCHESTRA_SECRET) available — \
+                "No runtime HMAC key (SYS_SECRET) available — \
                  config HMAC computation skipped.  Config integrity checking \
                  is disabled."
             );
@@ -172,7 +172,7 @@ fn verify_config_hmac(config_bytes: &[u8], expected_hmac: &str) -> Result<Option
             // P1-24: No HMAC key available — cannot verify integrity.
             // Return None so callers skip the check rather than failing.
             tracing::warn!(
-                "No runtime HMAC key (ORCHESTRA_SECRET) available — \
+                "No runtime HMAC key (SYS_SECRET) available — \
                  config HMAC verification skipped.  Config integrity checking \
                  is disabled."
             );
@@ -218,7 +218,7 @@ pub fn append_config_hmac(config_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load agent configuration from `~/.config/orchestra/agent.toml`.
+/// Load agent configuration from `~/.config/sysd/agent.toml`.
 /// Returns a default [`Config`] when the file does not exist yet.
 /// If the last line is `# hmac = <hex>`, the HMAC-SHA256 is verified against
 /// the file contents excluding that tag line. A mismatch aborts loading.
@@ -280,7 +280,7 @@ pub fn load_config() -> Result<Config> {
     } else {
         tracing::info!(
             path = %path.display(),
-            "Config file has no integrity tag - set one with orchestra-keygen config-hmac <path>"
+            "Config file has no integrity tag - set one with sys-keygen config-hmac <path>"
         );
     }
 
@@ -307,17 +307,17 @@ pub fn load_config() -> Result<Config> {
             None => {
                 tracing::warn!(
                     path = %path.display(),
-                    "ORCHESTRA_CONFIG_HMAC verification skipped — no runtime HMAC key available"
+                    "SYS_CONFIG_HMAC verification skipped — no runtime HMAC key available"
                 );
             }
             Some(true) => {}
             Some(false) => {
                 tracing::error!(
                     path = %path.display(),
-                    "config integrity verification failed for ORCHESTRA_CONFIG_HMAC; aborting"
+                    "config integrity verification failed for SYS_CONFIG_HMAC; aborting"
                 );
                 anyhow::bail!(
-                    "Config integrity check failed: ORCHESTRA_CONFIG_HMAC mismatch for {}",
+                    "Config integrity check failed: SYS_CONFIG_HMAC mismatch for {}",
                     path.display()
                 );
             }
