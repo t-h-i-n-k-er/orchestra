@@ -730,6 +730,13 @@ pub unsafe fn reencode_text(seed: u64) -> Result<()> {
     // 2. Apply the transformation pipeline.
     let transformed = code_transform::transform(&original, seed);
 
+    if transformed.is_empty() {
+        log::error!(
+            "self_reencode: transform returned empty output — skipping re-encode (would NOP-pad entire .text)"
+        );
+        return Err("transform produced empty output".into());
+    }
+
     if transformed.len() > text.size {
         // The transform may produce larger output.  We cannot grow the
         // section in-place, so we would need to truncate.  However, we

@@ -371,6 +371,7 @@ async fn shell_close(
     Extension(user): Extension<AuthenticatedUser>,
     Path((agent_id, session_id)): Path<(String, u32)>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    user.require_any_permission(&["admin"])?;
     let entry = state
         .find_by_agent_id(&agent_id)
         .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
@@ -387,6 +388,7 @@ async fn shell_resize(
     Path((agent_id, session_id)): Path<(String, u32)>,
     Json(req): Json<ShellResizeRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    user.require_any_permission(&["admin"])?;
     let entry = state
         .find_by_agent_id(&agent_id)
         .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
@@ -727,12 +729,7 @@ async fn revoke_agent_cert(
     axum::Json(body): axum::Json<RevokeAgentRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Only authenticated operators with "admin" permission may revoke certs.
-    if !user.permissions.contains(&"admin".to_string()) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "insufficient permissions: 'admin' required".into(),
-        ));
-    }
+    user.require_any_permission(&["admin"])?;
     let hash = {
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
@@ -763,12 +760,7 @@ async fn reload_crl(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if !user.permissions.contains(&"admin".to_string()) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "insufficient permissions: 'admin' required".into(),
-        ));
-    }
+    user.require_any_permission(&["admin"])?;
     let crl_path = state
         .config
         .mtls_crl_path

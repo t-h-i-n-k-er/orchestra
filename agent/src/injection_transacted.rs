@@ -1038,8 +1038,24 @@ unsafe fn create_suspended_process(
 
     // Read the image base from the suspended process.
     // We'll use NtQueryInformationProcess to get the PEB address, then read ImageBaseAddress.
-    let image_base = read_process_image_base(process_handle)?;
-    let entry_point = read_process_entry_point(process_handle, image_base)?;
+    let image_base = match read_process_image_base(process_handle) {
+        Ok(ib) => ib,
+        Err(e) => {
+            let _ = syscall!("NtTerminateProcess", process_handle as u64, 1u64);
+            let _ = syscall!("NtClose", process_handle as u64);
+            let _ = syscall!("NtClose", thread_handle as u64);
+            return Err(e);
+        }
+    };
+    let entry_point = match read_process_entry_point(process_handle, image_base) {
+        Ok(ep) => ep,
+        Err(e) => {
+            let _ = syscall!("NtTerminateProcess", process_handle as u64, 1u64);
+            let _ = syscall!("NtClose", process_handle as u64);
+            let _ = syscall!("NtClose", thread_handle as u64);
+            return Err(e);
+        }
+    };
 
     log::debug!(
         "injection_transacted: created suspended process pid={}, image_base={:#x}, entry={:#x}",

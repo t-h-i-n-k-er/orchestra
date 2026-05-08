@@ -276,6 +276,11 @@ struct ClrHostState {
     last_used: Instant,
     /// Whether the host has been initialized.
     initialized: bool,
+    /// Set to `true` after a CLR exec thread is forcefully terminated via
+    /// `NtTerminateThread`.  The next `execute()` call will tear down the
+    /// CLR host and re-create it from scratch to avoid running on a
+    /// potentially corrupted CLR runtime.
+    needs_reinit: bool,
 }
 
 unsafe impl Send for ClrHostState {}
@@ -609,6 +614,336 @@ fn ensure_idle_watcher() {
     });
 }
 
+// ── .NET CLI Metadata Parsing ─────────────────────────────────────────────────
+//
+// Minimal parser for extracting the entry-point type name from a .NET assembly's
+// CLI metadata.  This is needed because ExecuteInDefaultAppDomain requires the
+// exact type name (e.g., "Namespace.Program"), which cannot be derived from the
+// file name or any heuristic — it must be read from the TypeDef table.
+//
+// The parser follows ECMA-335:
+//   PE → OptionalHeader.DataDirectory[14] → CLI Header → Metadata Root → #~ stream → TypeDef table → #Strings heap
+
+/// Common entry point type names tried as fallback when metadata parsing fails.
+const COMMON_ENTRY_TYPE_NAMES: &[&str] = &["Program", "App", "Startup", "EntryPoint"];
+
+/// Read a u16 from a byte slice at the given offset (bounds-checked).
+#[inline]
+fn read_u16_at(data: &[u8], off: usize) -> Option<u16> {
+    data.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+}
+
+/// Read a u32 from a byte slice at the given offset (bounds-checked).
+#[inline]
+fn read_u32_at(data: &[u8], off: usize) -> Option<u32> {
+    data.get(off..off + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Read a null-terminated string from the #Strings heap at the given byte index.
+fn read_heap_string(data: &[u8], heap_off: usize, heap_len: usize, idx: usize) -> Option<String> {
+    if idx >= heap_len {
+        return None;
+    }
+    let start = heap_off + idx;
+    let mut end = start;
+    while end < data.len() && data[end] != 0 {
+        end += 1;
+    }
+    Some(String::from_utf8_lossy(&data[start..end]).into_owned())
+}
+
+/// Convert a Relative Virtual Address to a file offset using the PE section table.
+fn rva_to_file_offset(data: &[u8], rva: u32) -> Option<usize> {
+    if data.len() < 64 {
+        return None;
+    }
+    let e_lfanew = read_u32_at(data, 0x3C)? as usize;
+    if e_lfanew + 24 > data.len() {
+        return None;
+    }
+    let coff = e_lfanew + 4;
+    let num_sections = read_u16_at(data, coff + 2)? as usize;
+    let size_opt_hdr = read_u16_at(data, coff + 16)? as usize;
+    let sec_table = coff + 20 + size_opt_hdr;
+
+    for i in 0..num_sections {
+        let s = sec_table + i * 40;
+        if s + 40 > data.len() {
+            return None;
+        }
+        let vs = read_u32_at(data, s + 8)?;
+        let va = read_u32_at(data, s + 12)?;
+        let rs = read_u32_at(data, s + 16)?;
+        let ro = read_u32_at(data, s + 20)?;
+
+        // Use the larger of VirtualSize and SizeOfRawData for the range check
+        let section_end = va + std::cmp::max(vs, rs);
+        if rva >= va && rva < section_end {
+            return Some((rva - va + ro) as usize);
+        }
+    }
+    None
+}
+
+/// Read a string index (2 or 4 bytes depending on heap size bit) from the #~ stream.
+fn read_string_idx(data: &[u8], off: usize, wide: bool) -> Option<usize> {
+    if wide {
+        read_u32_at(data, off).map(|v| v as usize)
+    } else {
+        read_u16_at(data, off).map(|v| v as usize)
+    }
+}
+
+/// Extract the entry-point type name from a .NET assembly's CLI metadata.
+///
+/// Strategy:
+/// 1. Parse the entry-point token from the CLI header → resolve to a TypeDef
+///    via the MethodList ranges.
+/// 2. If the token is absent or unresolvable, scan the TypeDef table for
+///    types matching common entry-point names.
+/// 3. Ultimate fallback: return "Program".
+fn extract_entry_point_type_name(data: &[u8]) -> String {
+    match extract_entry_point_type_name_inner(data) {
+        Some(name) => name,
+        None => {
+            log::warn!(
+                "[assembly_loader] failed to parse .NET metadata for entry point, \
+                 using fallback type name 'Program'"
+            );
+            "Program".to_string()
+        }
+    }
+}
+
+fn extract_entry_point_type_name_inner(data: &[u8]) -> Option<String> {
+    // ── PE Header ──────────────────────────────────────────────────────
+    if data.len() < 64 || data[0] != b'M' || data[1] != b'Z' {
+        return None;
+    }
+    let e_lfanew = read_u32_at(data, 0x3C)? as usize;
+    if e_lfanew + 26 > data.len() || &data[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
+        return None;
+    }
+    let coff = e_lfanew + 4;
+    let opt = coff + 20;
+    if opt + 2 > data.len() {
+        return None;
+    }
+    let magic = read_u16_at(data, opt)?;
+    // DataDirectory offset in the optional header
+    let dd_off = match magic {
+        0x10B => opt + 96,  // PE32: 16 entries starting at offset 96
+        0x20B => opt + 112, // PE32+: 16 entries starting at offset 112
+        _ => return None,
+    };
+
+    // IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR = 14
+    let com_dd = dd_off + 14 * 8;
+    let cli_rva = read_u32_at(data, com_dd)?;
+    if cli_rva == 0 {
+        return None;
+    }
+    let cli_off = rva_to_file_offset(data, cli_rva)?;
+
+    // ── CLI Header (IMAGE_COR20_HEADER) ────────────────────────────────
+    // +0x08: MetaData RVA (4)     +0x0C: MetaData Size (4)
+    // +0x14: EntryPointToken (4)
+    let md_rva = read_u32_at(data, cli_off + 8)?;
+    let ep_token = read_u32_at(data, cli_off + 0x14)?;
+    if md_rva == 0 {
+        return None;
+    }
+    let md_off = rva_to_file_offset(data, md_rva)?;
+
+    // ── Metadata Root (BSJB) ───────────────────────────────────────────
+    let sig = read_u32_at(data, md_off)?;
+    if sig != 0x424A5342 {
+        return None; // "BSJB" in LE
+    }
+    let ver_len = read_u32_at(data, md_off + 12)? as usize;
+    let ver_end_aligned = (md_off + 16 + ver_len + 3) & !3;
+    let num_streams = read_u16_at(data, ver_end_aligned + 2)? as usize;
+
+    // ── Parse stream headers ───────────────────────────────────────────
+    let mut soff = ver_end_aligned + 4;
+    let mut tilde_off: usize = 0;
+    let mut strings_off: usize = 0;
+    let mut strings_len: usize = 0;
+
+    for _ in 0..num_streams {
+        let s_offset = read_u32_at(data, soff)? as usize;
+        let s_size = read_u32_at(data, soff + 4)? as usize;
+        let name_start = soff + 8;
+        let mut name_end = name_start;
+        while name_end < data.len() && data[name_end] != 0 {
+            name_end += 1;
+        }
+        let name = std::str::from_utf8(data.get(name_start..name_end)?).unwrap_or("");
+
+        match name {
+            "#~" | "#" => tilde_off = md_off + s_offset,
+            "#Strings" => {
+                strings_off = md_off + s_offset;
+                strings_len = s_size;
+            }
+            _ => {}
+        }
+
+        // Advance past name + null + align to 4 bytes
+        soff = (name_end + 1 + 3) & !3;
+    }
+
+    if tilde_off == 0 || strings_off == 0 {
+        return None;
+    }
+
+    // ── Parse #~ stream header ─────────────────────────────────────────
+    // +6: HeapSizes byte
+    let heap_sizes = *data.get(tilde_off + 6)?;
+    let str_wide = heap_sizes & 1 != 0; // #Strings uses 4-byte indices
+    let guid_wide = heap_sizes & 2 != 0;
+    let blob_wide = heap_sizes & 4 != 0;
+    let str_sz = if str_wide { 4usize } else { 2 };
+    let guid_sz = if guid_wide { 4usize } else { 2 };
+    let blob_sz = if blob_wide { 4usize } else { 2 };
+
+    let valid = u64::from_le_bytes(data.get(tilde_off + 8..tilde_off + 16)?.try_into().ok()?);
+
+    // Read row counts
+    let mut rows: [u32; 64] = [0; 64];
+    let mut roff = tilde_off + 24;
+    for i in 0..64 {
+        if valid & (1u64 << i) != 0 {
+            rows[i] = read_u32_at(data, roff)?;
+            roff += 4;
+        }
+    }
+
+    // ── Compute coded/index sizes ──────────────────────────────────────
+    // ResolutionScope: Module(0), ModuleRef(0x1A), AssemblyRef(0x23), File(0x26) — 2-bit tag
+    let max_rs = rows[0x00].max(rows[0x1A]).max(rows[0x23]).max(rows[0x26]);
+    let rs_sz = if max_rs < (1 << 14) { 2usize } else { 4 };
+    // TypeDefOrRef: TypeDef(0x02), TypeRef(0x01), TypeSpec(0x1B) — 2-bit tag
+    let max_tdor = rows[0x02].max(rows[0x01]).max(rows[0x1B]);
+    let tdor_sz = if max_tdor < (1 << 14) { 2usize } else { 4 };
+    // Simple table indexes
+    let field_idx_sz = if rows[0x04] < (1 << 16) { 2usize } else { 4 };
+    let meth_idx_sz = if rows[0x06] < (1 << 16) { 2usize } else { 4 };
+    let param_idx_sz = if rows[0x08] < (1 << 16) { 2usize } else { 4 };
+
+    // ── Row sizes for tables 0x00–0x06 ─────────────────────────────────
+    // Module(0x00): Generation(2) + Name(str) + Mvid(guid) + EncId(guid) + EncBaseId(guid)
+    let mod_row = 2 + str_sz + guid_sz * 3;
+    // TypeRef(0x01): ResolutionScope(rs) + TypeName(str) + TypeNamespace(str)
+    let tref_row = rs_sz + str_sz * 2;
+    // TypeDef(0x02): Flags(4) + TypeName(str) + TypeNamespace(str) + Extends(tdor) + FieldList(field_idx) + MethodList(meth_idx)
+    let tdef_row = 4 + str_sz * 2 + tdor_sz + field_idx_sz + meth_idx_sz;
+    // FieldPtr(0x03): Field(field_idx)
+    let fptr_row = field_idx_sz;
+    // Field(0x04): Flags(2) + Name(str) + Signature(blob)
+    let fld_row = 2 + str_sz + blob_sz;
+    // MethodPtr(0x05): Method(meth_idx)
+    let mptr_row = meth_idx_sz;
+    // MethodDef(0x06): RVA(4) + ImplFlags(2) + Flags(2) + Name(str) + Signature(blob) + ParamList(param_idx)
+    let mdef_row = 4 + 2 + 2 + str_sz + blob_sz + param_idx_sz;
+
+    // ── Compute table offsets ──────────────────────────────────────────
+    let table_row_sizes: [usize; 7] = [mod_row, tref_row, tdef_row, fptr_row, fld_row, mptr_row, mdef_row];
+    let mut tdef_off: usize = 0;
+    let mut mdef_off: usize = 0;
+
+    for i in 0..7usize {
+        if valid & (1u64 << i) != 0 {
+            match i {
+                0x02 => tdef_off = roff,
+                0x06 => mdef_off = roff,
+                _ => {}
+            }
+            roff += table_row_sizes[i] * rows[i] as usize;
+        }
+    }
+
+    if tdef_off == 0 || rows[0x02] == 0 {
+        return None;
+    }
+    let num_tdefs = rows[0x02] as usize;
+
+    // ── Helper: extract fully-qualified type name from a TypeDef row ───
+    let get_typedef_name = |row_idx: usize| -> Option<String> {
+        let row_off = tdef_off + row_idx * tdef_row;
+        if row_off + tdef_row > data.len() {
+            return None;
+        }
+        let name_idx = read_string_idx(data, row_off + 4, str_wide)?;
+        let ns_idx = read_string_idx(data, row_off + 4 + str_sz, str_wide)?;
+        let name = read_heap_string(data, strings_off, strings_len, name_idx)?;
+        let ns = read_heap_string(data, strings_off, strings_len, ns_idx).unwrap_or_default();
+        if ns.is_empty() {
+            Some(name)
+        } else {
+            Some(format!("{}.{}", ns, name))
+        }
+    };
+
+    // ── Strategy 1: follow entry point token ───────────────────────────
+    let ep_table = (ep_token >> 24) as usize;
+    let ep_row = (ep_token & 0x00FF_FFFF) as usize;
+
+    if ep_table == 0x06 && ep_row > 0 && mdef_off > 0 {
+        // Entry point is a MethodDef — find the TypeDef that owns it.
+        // TypeDef.MethodList is 1-based; method ep_row belongs to the type
+        // where MethodList[i] <= ep_row < MethodList[i+1].
+        let ml_off_in_row = 4 + str_sz * 2 + tdor_sz + field_idx_sz;
+
+        for i in 0..num_tdefs {
+            let row_off = tdef_off + i * tdef_row;
+            let m_start = read_string_idx(data, row_off + ml_off_in_row, meth_idx_sz == 4)?;
+
+            let m_end = if i + 1 < num_tdefs {
+                let next_off = tdef_off + (i + 1) * tdef_row;
+                read_string_idx(data, next_off + ml_off_in_row, meth_idx_sz == 4)?
+            } else {
+                rows[0x06] as usize + 1
+            };
+
+            if ep_row >= m_start && ep_row < m_end {
+                return get_typedef_name(i);
+            }
+        }
+    }
+
+    // ── Strategy 2: scan TypeDef for common entry-point names ──────────
+    for i in 0..num_tdefs {
+        if let Some(name) = get_typedef_name(i) {
+            // Skip the pseudo-type <Module>
+            if name == "<Module>" {
+                continue;
+            }
+            // Check short name (after last '.') against common names
+            let short = name.rsplit('.').next().unwrap_or(&name);
+            if COMMON_ENTRY_TYPE_NAMES.contains(&short) {
+                return Some(name);
+            }
+        }
+    }
+
+    // ── Strategy 3: return first non-<Module> type ─────────────────────
+    for i in 0..num_tdefs {
+        if let Some(name) = get_typedef_name(i) {
+            if name != "<Module>" {
+                log::warn!(
+                    "[assembly_loader] no common entry point type found, \
+                     using first type: '{}'",
+                    name
+                );
+                return Some(name);
+            }
+        }
+    }
+
+    None
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /// Result of an assembly execution.
@@ -709,9 +1044,33 @@ pub unsafe fn execute(
     let runtime_host = {
         let mut guard = CLR_HOST.lock().map_err(|e| format!("CLR_HOST lock poisoned: {e}"))?;
         match *guard {
-            Some(ref mut state) if state.initialized && !state.runtime_host.is_null() => {
+            Some(ref mut state)
+                if state.initialized && !state.runtime_host.is_null() && !state.needs_reinit =>
+            {
                 state.last_used = Instant::now();
                 state.runtime_host
+            }
+            Some(ref mut state) if state.initialized && state.needs_reinit => {
+                // CLR was left in a potentially inconsistent state after a
+                // forced thread termination.  Tear it down and re-create.
+                log::warn!(
+                    "[assembly_loader] CLR host flagged for reinit — tearing down and re-creating"
+                );
+                unsafe {
+                    teardown_clr_host(state);
+                }
+                state.initialized = false;
+                state.needs_reinit = false;
+                let host = init_clr_host()?;
+                *state = ClrHostState {
+                    mscoree: std::ptr::null_mut(),
+                    runtime_host: host,
+                    create_instance_fn: None,
+                    last_used: Instant::now(),
+                    initialized: true,
+                    needs_reinit: false,
+                };
+                host
             }
             _ => {
                 let host = init_clr_host()?;
@@ -721,6 +1080,7 @@ pub unsafe fn execute(
                     create_instance_fn: None,
                     last_used: Instant::now(),
                     initialized: true,
+                    needs_reinit: false,
                 });
                 host
             }
@@ -880,19 +1240,11 @@ pub unsafe fn execute(
     // path and args, loads the assembly via Assembly.Load, and invokes its
     // entry point.  But that requires a bootstrap DLL.
     //
-    // The simplest approach: call ExecuteInDefaultAppDomain with the assembly
-    // path, the entry-point type name (guessed from the assembly), and
-    // "Main" as the method name.  If the assembly has a standard Program.Main
-    // signature, this works.
-    //
-    // For maximum compatibility, we pass:
-    //   type = "<assembly_name>.Program" (or the assembly name itself)
-    //   method = "Main" (static int Main(string))
-    //
-    // The single string argument is the joined args.
-    let assembly_name = format!("{file_uuid}");
-    let assembly_name_str = assembly_name.as_str();
-    let type_name = to_wide(assembly_name_str);
+    // Resolve the entry-point type name from .NET CLI metadata rather than
+    // guessing based on the assembly filename (which is a random UUID and
+    // therefore never matches any managed type).
+    let type_name_str = extract_entry_point_type_name(assembly_bytes);
+    let type_name = to_wide(&type_name_str);
     let method_name = to_wide("Main");
 
     // ── Execute with timeout ────────────────────────────────────────────
@@ -974,15 +1326,49 @@ pub unsafe fn execute(
             Err(_) => (E_EXECUTION_FAILED, 0),
         }
     } else {
-        // Timeout — the thread is still running.
+        // Timeout — the thread is still running.  Forcefully terminate it via
+        // NtTerminateThread to prevent a rogue assembly from continuing to
+        // execute (network traffic, file modifications, resource consumption).
+        //
+        // OPSEC WARNING: NtTerminateThread does not cleanly unwind the
+        // thread's stack or release any locks the CLR may hold.  The CLR
+        // runtime is now in a potentially inconsistent state.  We flag it
+        // for reinitialization so the next execute() call tears it down and
+        // rebuilds it from scratch.
         log::warn!(
-            "[assembly_loader] assembly timed out after {}s, terminating CLR thread",
+            "[assembly_loader] assembly timed out after {}s — forcefully terminating CLR thread",
             timeout
         );
-        // Suspend the CLR thread (it will be cleaned up when the CLR host is
-        // torn down or the thread handle is dropped).  We can't safely kill it
-        // without risking CLR state corruption, so we suspend it.
-        // In practice, the operator should be aware of this risk.
+
+        // NtTerminateThread(HANDLE ThreadHandle, NTSTATUS ExitStatus)
+        let term_status = syscall!("NtTerminateThread", exec_handle as u64, 0u64);
+        match term_status {
+            Ok(s) if s >= 0 => {
+                log::info!("[assembly_loader] CLR exec thread terminated (status 0x{s:08X})");
+            }
+            Ok(s) => {
+                log::warn!(
+                    "[assembly_loader] NtTerminateThread returned failure 0x{s:08X} — CLR thread may still be running"
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "[assembly_loader] NtTerminateThread syscall failed: {e} — CLR thread may still be running"
+                );
+            }
+        }
+
+        // Close the thread handle now that we've terminated it.
+        let _ = syscall!("NtClose", exec_handle as u64);
+
+        // Flag CLR host for reinit on next execution.
+        if let Ok(mut guard) = CLR_HOST.lock() {
+            if let Some(ref mut state) = *guard {
+                state.needs_reinit = true;
+                log::info!("[assembly_loader] CLR host flagged for reinit due to forced thread termination");
+            }
+        }
+
         (E_TIMEOUT, 0)
     };
 
@@ -995,7 +1381,10 @@ pub unsafe fn execute(
         let _ = syscall!("NtClose", timeout_event as u64);
     }
 
-    // Drop the exec thread join handle (detaches it if still running).
+    // Drop the exec thread join handle.  On the success path the thread has
+    // already exited, so this just releases the join handle.  On the timeout
+    // path we already called NtTerminateThread + NtClose on the raw handle
+    // above, so dropping the JoinHandle is a no-op (the OS thread is gone).
     drop(exec_thread);
 
     // Close the NT file handle.  FILE_DELETE_ON_CLOSE auto-deletes the file

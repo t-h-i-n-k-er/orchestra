@@ -51,7 +51,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
@@ -289,6 +289,15 @@ pub struct PskRotationState {
     last_rotation: Mutex<Instant>,
     /// The current PSK, wrapped in LockedSecret for mlock + zeroize-on-drop.
     current_psk: Mutex<LockedSecret>,
+    /// The previous PSK, kept during the transition window so that
+    /// in-flight session negotiations can still complete.
+    previous_psk: Mutex<Option<LockedSecret>>,
+    /// Instant when the current PSK was installed.  Used to expire
+    /// `previous_psk` after the transition window.
+    rotation_time: Mutex<Instant>,
+    /// How long `previous_psk` is retained after a rotation before
+    /// being zeroized and dropped.
+    transition_window: Duration,
     /// Threshold: rotate after this many sessions.
     session_threshold: u64,
     /// Threshold: rotate after this many seconds have elapsed.
@@ -297,6 +306,10 @@ pub struct PskRotationState {
 
 impl PskRotationState {
     /// Create a new rotation state with the given initial PSK and thresholds.
+    /// Default transition window: the previous PSK is retained for 5 minutes
+    /// after a rotation so that in-flight negotiations can complete.
+    pub const DEFAULT_TRANSITION_WINDOW_SECS: u64 = 300; // 5 minutes
+
     pub fn new(
         initial_psk: &[u8],
         session_threshold: u64,
@@ -307,6 +320,9 @@ impl PskRotationState {
             sessions_since_rotation: AtomicU64::new(0),
             last_rotation: Mutex::new(Instant::now()),
             current_psk: Mutex::new(LockedSecret::new(initial_psk)),
+            previous_psk: Mutex::new(None),
+            rotation_time: Mutex::new(Instant::now()),
+            transition_window: Duration::from_secs(Self::DEFAULT_TRANSITION_WINDOW_SECS),
             session_threshold,
             interval_secs,
         }
@@ -340,6 +356,9 @@ impl PskRotationState {
     /// Perform PSK rotation: derive a new PSK from the current one using
     /// HKDF with the rotation counter.  Returns the new rotation counter.
     ///
+    /// The current PSK is moved to `previous_psk` for the transition window
+    /// so that in-flight negotiations can still complete.
+    ///
     /// The caller is responsible for distributing the new PSK to connected
     /// agents via the encrypted channel.
     pub fn rotate(&self) -> u64 {
@@ -350,10 +369,20 @@ impl PskRotationState {
             derive_rotated_psk(psk.as_bytes(), new_counter)
         };
 
-        // Replace the PSK (LockedSecret zeroizes the old one on drop).
+        // Move current PSK to previous (for transition window), then install
+        // the new PSK.  LockedSecret zeroizes the old previous_psk on drop.
         {
-            let mut psk = self.current_psk.lock().unwrap();
-            *psk = LockedSecret::new(&new_psk_bytes);
+            let mut prev = self.previous_psk.lock().unwrap();
+            let cur = self.current_psk.lock().unwrap();
+            *prev = Some(LockedSecret::new(cur.as_bytes()));
+            drop(cur);
+            let mut cur = self.current_psk.lock().unwrap();
+            *cur = LockedSecret::new(&new_psk_bytes);
+        }
+
+        // Record the rotation timestamp for transition-window expiry.
+        if let Ok(mut rt) = self.rotation_time.lock() {
+            *rt = Instant::now();
         }
 
         // Reset session counter and timestamp.
@@ -390,7 +419,8 @@ impl PskRotationState {
     }
 
     /// Apply an externally-received PSK rotation (e.g. from the server).
-    /// Increments the rotation counter and replaces the PSK.
+    /// Increments the rotation counter, moves the current PSK to
+    /// `previous_psk` for the transition window, and installs the new PSK.
     pub fn apply_rotation(&self, new_psk: &[u8], expected_counter: u64) -> bool {
         let current = self.rotation_counter.load(AtomicOrdering::SeqCst);
         if expected_counter <= current {
@@ -402,10 +432,21 @@ impl PskRotationState {
             return false;
         }
 
+        // Move current PSK to previous for transition window.
         {
-            let mut psk = self.current_psk.lock().unwrap();
-            *psk = LockedSecret::new(new_psk);
+            let mut prev = self.previous_psk.lock().unwrap();
+            let cur = self.current_psk.lock().unwrap();
+            *prev = Some(LockedSecret::new(cur.as_bytes()));
+            drop(cur);
+            let mut cur = self.current_psk.lock().unwrap();
+            *cur = LockedSecret::new(new_psk);
         }
+
+        // Record rotation timestamp.
+        if let Ok(mut rt) = self.rotation_time.lock() {
+            *rt = Instant::now();
+        }
+
         self.rotation_counter.store(expected_counter, AtomicOrdering::SeqCst);
         self.sessions_since_rotation.store(0, AtomicOrdering::Relaxed);
         if let Ok(mut last) = self.last_rotation.lock() {
@@ -414,5 +455,61 @@ impl PskRotationState {
 
         log::info!("PSK rotation applied: counter={}", expected_counter);
         true
+    }
+
+    /// Verify an authentication tag against both the current and (if still
+    /// within the transition window) previous PSK.
+    ///
+    /// Returns `Ok(())` if verification succeeds with either PSK, or an
+    /// error if neither PSK verifies.  A successful verification with the
+    /// previous PSK logs a warning that a stale PSK was used.
+    ///
+    /// If the transition window has expired, `previous_psk` is cleared to
+    /// `None` (zeroized on drop).
+    pub fn verify_auth_tag(
+        &self,
+        client_pub: &[u8; 32],
+        server_pub: &[u8; 32],
+        received_tag: &[u8],
+    ) -> Result<()> {
+        // Expire previous_psk if the transition window has elapsed.
+        {
+            let rt = self.rotation_time.lock().unwrap();
+            if rt.elapsed() > self.transition_window {
+                drop(rt);
+                let mut prev = self.previous_psk.lock().unwrap();
+                if prev.is_some() {
+                    log::info!("PSK transition window expired — clearing previous PSK");
+                    *prev = None;
+                }
+            }
+        }
+
+        // Try current PSK first.
+        {
+            let psk = self.current_psk.lock().unwrap();
+            let expected = compute_auth_tag(psk.as_bytes(), client_pub, server_pub);
+            if hmac_verify(&expected, received_tag) {
+                return Ok(());
+            }
+        }
+
+        // Try previous PSK if available.
+        {
+            let prev = self.previous_psk.lock().unwrap();
+            if let Some(ref prev_psk) = *prev {
+                let expected = compute_auth_tag(prev_psk.as_bytes(), client_pub, server_pub);
+                if hmac_verify(&expected, received_tag) {
+                    log::warn!(
+                        "HMAC verified with previous (stale) PSK — peer may not have rotated yet"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        anyhow::bail!(
+            "HMAC verification failed against both current and previous PSK — PSK mismatch or MITM"
+        )
     }
 }

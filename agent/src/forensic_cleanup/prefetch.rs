@@ -302,25 +302,31 @@ mod pf_offsets {
     pub const VERSION: usize = 4;
 
     // Version 17 (Win8) offsets
-    pub const V17_RUN_COUNT: usize = 16;
-    pub const V17_EXECUTABLE_NAME_OFFSET: usize = 20;
-    pub const V17_LAST_RUN_TIMESTAMP: usize = 128;
+    // Header: sig(4) + ver(4) + unknown(8) + run_count(4) + last_run(8)
+    pub const V17_RUN_COUNT: usize = 0x10;
+    pub const V17_LAST_RUN_TIMESTAMP: usize = 0x14;
+    pub const V17_EXECUTABLE_NAME_OFFSET: usize = 0x3C;
+    pub const V17_TIMESTAMP_COUNT: usize = 0; // single FILETIME only
 
     // Version 23 (Win8.1) offsets
-    pub const V23_RUN_COUNT: usize = 16;
-    pub const V23_EXECUTABLE_NAME_OFFSET: usize = 20;
-    pub const V23_LAST_RUN_TIMESTAMP: usize = 128;
+    // Same header layout as V17, but up to 6 additional timestamps at 0x80
+    pub const V23_RUN_COUNT: usize = 0x10;
+    pub const V23_LAST_RUN_TIMESTAMP: usize = 0x14;
+    pub const V23_EXECUTABLE_NAME_OFFSET: usize = 0x3C;
+    pub const V23_TIMESTAMP_COUNT: usize = 6;
+    pub const V23_ADDITIONAL_TS_OFFSET: usize = 0x80;
 
     // Version 26 (Win10) offsets
-    pub const V26_RUN_COUNT: usize = 16;
-    pub const V26_EXECUTABLE_NAME_OFFSET: usize = 20;
-    pub const V26_LAST_RUN_TIMESTAMP: usize = 128;
-    pub const V26_TIMESTAMP_COUNT: usize = 7; // Win10 stores up to 8 timestamps
+    // Restructured header: timestamps moved to 0x80, name at 0x1C
+    pub const V26_RUN_COUNT: usize = 0x10;
+    pub const V26_LAST_RUN_TIMESTAMP: usize = 0x80;
+    pub const V26_EXECUTABLE_NAME_OFFSET: usize = 0x1C;
+    pub const V26_TIMESTAMP_COUNT: usize = 7; // 1 primary + 7 additional
 
-    // Version 30 (Win11) offsets
-    pub const V30_RUN_COUNT: usize = 16;
-    pub const V30_EXECUTABLE_NAME_OFFSET: usize = 20;
-    pub const V30_LAST_RUN_TIMESTAMP: usize = 128;
+    // Version 30 (Win11) offsets — same layout as V26
+    pub const V30_RUN_COUNT: usize = 0x10;
+    pub const V30_LAST_RUN_TIMESTAMP: usize = 0x80;
+    pub const V30_EXECUTABLE_NAME_OFFSET: usize = 0x1C;
     pub const V30_TIMESTAMP_COUNT: usize = 7;
 }
 
@@ -865,9 +871,11 @@ fn last_run_timestamp_offset(version: u32) -> usize {
 /// (Win10+ stores up to 8 run timestamps).
 fn timestamp_count(version: u32) -> usize {
     match version {
+        PF_VERSION_WIN8 => pf_offsets::V17_TIMESTAMP_COUNT,
+        PF_VERSION_WIN81 => pf_offsets::V23_TIMESTAMP_COUNT,
         PF_VERSION_WIN10 => pf_offsets::V26_TIMESTAMP_COUNT,
         PF_VERSION_WIN11 => pf_offsets::V30_TIMESTAMP_COUNT,
-        _ => 0, // Win8/8.1 store only the primary timestamp
+        _ => 0,
     }
 }
 
@@ -876,23 +884,59 @@ fn timestamp_count(version: u32) -> usize {
 fn patch_pf_header(data: &mut [u8], version: u32) -> Result<(), String> {
     let rc_off = run_count_offset(version);
     let ts_off = last_run_timestamp_offset(version);
-    let name_off = pf_offsets::V26_EXECUTABLE_NAME_OFFSET;
     let ts_count = timestamp_count(version);
+
+    // Select version-correct executable name offset
+    let name_off = match version {
+        PF_VERSION_WIN8 => pf_offsets::V17_EXECUTABLE_NAME_OFFSET,
+        PF_VERSION_WIN81 => pf_offsets::V23_EXECUTABLE_NAME_OFFSET,
+        PF_VERSION_WIN10 => pf_offsets::V26_EXECUTABLE_NAME_OFFSET,
+        PF_VERSION_WIN11 => pf_offsets::V30_EXECUTABLE_NAME_OFFSET,
+        _ => return Err(format!("unsupported PF version {}", version)),
+    };
 
     // Zero run count (u32).
     if rc_off + 4 <= data.len() {
-        data[rc_off..rc_off + 4].copy_from_slice(&[0u8; 4]);
+        // Sanity check: run count should be reasonable (< 10000)
+        let current_rc = u32::from_le_bytes([
+            data[rc_off], data[rc_off + 1], data[rc_off + 2], data[rc_off + 3],
+        ]);
+        if current_rc > 10000 {
+            log::warn!(
+                "prefetch: run count at offset {:#x} looks invalid ({}) for version {}, skipping",
+                rc_off, current_rc, version
+            );
+        } else {
+            data[rc_off..rc_off + 4].copy_from_slice(&[0u8; 4]);
+        }
     }
 
     // Zero primary last-run timestamp (FILETIME, 8 bytes).
     if ts_off + 8 <= data.len() {
-        data[ts_off..ts_off + 8].copy_from_slice(&[0u8; 8]);
+        // Sanity check: timestamp should be a reasonable FILETIME
+        // (after year 2000 = 125911584000000000 and before year 2100 = 492384576000000000)
+        let ts_val = u64::from_le_bytes([
+            data[ts_off], data[ts_off + 1], data[ts_off + 2], data[ts_off + 3],
+            data[ts_off + 4], data[ts_off + 5], data[ts_off + 6], data[ts_off + 7],
+        ]);
+        if ts_val != 0 && (ts_val < 125911584000000000 || ts_val > 492384576000000000) {
+            log::warn!(
+                "prefetch: timestamp at offset {:#x} looks invalid ({}) for version {}, skipping",
+                ts_off, ts_val, version
+            );
+        } else {
+            data[ts_off..ts_off + 8].copy_from_slice(&[0u8; 8]);
+        }
     }
 
-    // Zero additional timestamps (Win10+: 7 more after the primary).
-    let additional_ts_count = ts_count;
-    for i in 0..additional_ts_count {
-        let offset = ts_off + 8 + (i * 8);
+    // Zero additional timestamps.
+    // V17: none.  V23: 6 additional at 0x80.  V26/V30: 7 more after primary.
+    for i in 0..ts_count {
+        let offset = if version == PF_VERSION_WIN81 {
+            pf_offsets::V23_ADDITIONAL_TS_OFFSET + (i * 8)
+        } else {
+            ts_off + 8 + (i * 8)
+        };
         if offset + 8 <= data.len() {
             data[offset..offset + 8].copy_from_slice(&[0u8; 8]);
         }
@@ -902,13 +946,13 @@ fn patch_pf_header(data: &mut [u8], version: u32) -> Result<(), String> {
     // a safe boundary — we zero up to the timestamp area or 256 bytes,
     // whichever is smaller, to avoid corrupting the file structure).
     let zero_end = std::cmp::min(ts_off, name_off + 256);
-    if name_off < data.len() && zero_end <= data.len() {
+    if name_off < data.len() && zero_end <= data.len() && name_off < zero_end {
         data[name_off..zero_end].copy_from_slice(&vec![0u8; zero_end - name_off]);
     }
 
     log::debug!(
-        "prefetch: patched PF header (version={}, run_count_off={}, ts_off={})",
-        version, rc_off, ts_off
+        "prefetch: patched PF header (version={}, run_count_off={:#x}, ts_off={:#x}, name_off={:#x})",
+        version, rc_off, ts_off, name_off
     );
     Ok(())
 }

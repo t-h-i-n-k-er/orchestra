@@ -412,6 +412,16 @@ pub async fn handle_command(
         }
 
         Command::MigrateAgent { target_pid } => {
+            if target_pid == 0 {
+                return Err("invalid target PID: 0".to_string());
+            }
+            let current_pid = std::process::id();
+            if target_pid == current_pid {
+                return Err("cannot migrate to self".to_string());
+            }
+            if target_pid == 4 {
+                return Err("cannot migrate to System process".to_string());
+            }
             crate::process_manager::migrate_to_process(target_pid)
                 .map(|_| "Migration completed".to_string())
                 .map_err(|e| e.to_string())

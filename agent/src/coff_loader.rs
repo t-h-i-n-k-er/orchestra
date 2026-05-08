@@ -1006,6 +1006,35 @@ pub unsafe fn execute_bof(
 
             // Apply relocation at the target offset within the section.
             let target_ptr = (section_base + reloc.virtual_address as usize) as *mut u8;
+            let reloc_type = reloc.r#type;
+
+            // Validate relocation target is within the section's allocated memory
+            let write_size = match reloc_type {
+                IMAGE_REL_AMD64_ADDR64 => 8usize,
+                IMAGE_REL_AMD64_ADDR32NB => 4usize,
+                IMAGE_REL_AMD64_REL32 => 4usize,
+                IMAGE_REL_AMD64_REL32_1 => 4usize,
+                IMAGE_REL_AMD64_REL32_2 => 4usize,
+                IMAGE_REL_AMD64_REL32_3 => 4usize,
+                IMAGE_REL_AMD64_REL32_4 => 4usize,
+                IMAGE_REL_AMD64_REL32_5 => 4usize,
+                IMAGE_REL_I386_DIR32 => 4usize,
+                IMAGE_REL_I386_REL32 => 4usize,
+                _ => 0,
+            };
+            if write_size == 0 {
+                log::warn!(
+                    "[coff_loader] unsupported relocation type {} for symbol '{}' at offset {:#x}",
+                    reloc_type, sym_name, roff
+                );
+                continue;
+            }
+            if reloc.virtual_address as usize + write_size > section.virtual_size as usize {
+                return Err(format!(
+                    "relocation at offset {:#x} targets address {:#x} which is outside section (size {:#x})",
+                    roff, reloc.virtual_address, section.virtual_size
+                ));
+            }
 
             match reloc.r#type {
                 // AMD64 relocations
@@ -1013,6 +1042,12 @@ pub unsafe fn execute_bof(
                     *(target_ptr as *mut u64) = sym_addr as u64;
                 }
                 IMAGE_REL_AMD64_ADDR32NB => {
+                    if sym_addr > 0xFFFFFFFF {
+                        log::warn!(
+                            "[coff_loader] ADDR32NB relocation truncates 64-bit address {:#x}",
+                            sym_addr
+                        );
+                    }
                     *(target_ptr as *mut u32) = sym_addr as u32;
                 }
                 IMAGE_REL_AMD64_REL32 => {
@@ -1054,13 +1089,7 @@ pub unsafe fn execute_bof(
                     let rel = (sym_addr as i32 - target_va as i32 - 4);
                     *(target_ptr as *mut i32) = rel;
                 }
-                _ => {
-                    log::warn!(
-                        "[coff_loader] unsupported relocation type {} for symbol '{}'",
-                        reloc.r#type,
-                        sym_name
-                    );
-                }
+                _ => unreachable!(),
             }
         }
     }

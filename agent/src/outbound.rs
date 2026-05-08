@@ -38,6 +38,7 @@ use rustls::ClientConfig;
 use std::sync::Arc;
 use sysinfo::System;
 use tokio::net::TcpStream;
+use std::time::Instant;
 use tokio::time::{sleep, Duration};
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
@@ -489,6 +490,10 @@ pub async fn run_forever() -> Result<()> {
     );
 
     let mut backoff = Duration::from_secs(1);
+    let mut session_backoff = Duration::from_secs(2);
+    const MAX_SESSION_BACKOFF: Duration = Duration::from_secs(30);
+    const MIN_SESSION_DURATION: Duration = Duration::from_secs(30);
+
     loop {
         // Try to establish a transport.  Connection failures grow backoff.
         let transport = match build_outbound_transport(
@@ -520,6 +525,7 @@ pub async fn run_forever() -> Result<()> {
 
         // Transport established — run the session.  When the session ends
         // (clean shutdown or disconnect), reconnect with a fresh 1 s backoff.
+        let session_start = Instant::now();
         match run_with_heartbeat(transport, &agent_id).await {
             Ok(()) => {
                 // Clean shutdown — respect it, do not reconnect.
@@ -528,8 +534,30 @@ pub async fn run_forever() -> Result<()> {
             }
             Err(e) => {
                 error!("outbound-c: session ended: {e:#}");
-                // backoff was already reset to 1 s when transport connected.
             }
+        }
+
+        // ── Session-level backoff ─────────────────────────────────────────
+        // Distinguish between "connection failure" (never established) and
+        // "session failure" (connected but session dropped quickly).  A
+        // short-lived session likely indicates auth failure, protocol
+        // mismatch, or server-side rejection — apply exponential session
+        // backoff to avoid a tight reconnection loop.
+        let session_duration = session_start.elapsed();
+        if session_duration < MIN_SESSION_DURATION {
+            log::warn!(
+                "outbound: session lasted only {:?}, applying session backoff {:?}",
+                session_duration,
+                session_backoff
+            );
+            if let Err(ge) = crate::memory_guard::guarded_sleep(session_backoff, None, 0).await {
+                error!("[memory-guard] error during session backoff: {ge}");
+                sleep(session_backoff).await;
+            }
+            session_backoff = (session_backoff * 2).min(MAX_SESSION_BACKOFF);
+        } else {
+            // Long-lived session — normal disconnect, reset session backoff.
+            session_backoff = Duration::from_secs(2);
         }
     }
 }
