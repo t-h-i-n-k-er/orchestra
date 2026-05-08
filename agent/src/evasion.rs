@@ -599,7 +599,11 @@ pub unsafe fn setup_etw_patch(
     use common::config::EtwPatchMethod;
     let mode = mode.cloned().unwrap_or_default();
     match method.unwrap_or(&EtwPatchMethod::Direct) {
-        EtwPatchMethod::Direct => crate::etw_patch::patch_etw_with_mode(mode),
+        EtwPatchMethod::Direct => {
+            if let Err(e) = crate::etw_patch::patch_etw_with_mode(mode) {
+                log::warn!("etw_patch: direct patch failed: {}", e);
+            }
+        }
         EtwPatchMethod::Hwbp => {
             #[cfg(windows)]
             setup_hardware_breakpoints();

