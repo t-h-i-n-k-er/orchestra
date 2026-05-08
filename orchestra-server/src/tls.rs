@@ -206,12 +206,18 @@ fn parse_pem_key(pem_bytes: &[u8]) -> anyhow::Result<rustls::pki_types::PrivateK
 
 // ── CN/OU-restricting client certificate verifier ────────────────────────────
 
-/// Wraps a `WebPkiClientVerifier` and additionally enforces CN/OU allow-lists.
+/// Wraps a `WebPkiClientVerifier` and additionally enforces CN/OU allow-lists
+/// and optional CRL-based revocation checking (P2-16).
 #[derive(Debug)]
-struct CnOuVerifier {
+pub struct CnOuVerifier {
     inner: std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>,
     allowed_cns: Vec<String>,
     allowed_ous: Vec<String>,
+    /// Revoked certificate serial numbers (hex-encoded, lowercase).  Loaded
+    /// from the CRL PEM at startup and can be refreshed at runtime via
+    /// `POST /api/p2p/reload-crl`.  Protected by an RwLock so the TLS
+    /// handshake path (read) is not blocked by a concurrent reload (write).
+    revoked_serials: std::sync::RwLock<Vec<String>>,
 }
 
 impl rustls::server::danger::ClientCertVerifier for CnOuVerifier {
@@ -264,6 +270,17 @@ impl rustls::server::danger::ClientCertVerifier for CnOuVerifier {
             }
         }
 
+        // P2-16: CRL-based revocation check.  If a CRL is loaded, reject
+        // any client certificate whose serial number appears in the list.
+        if let Ok(serial) = extract_cert_serial(end_entity) {
+            let revoked = self.revoked_serials.read().unwrap_or_else(|p| p.into_inner());
+            if revoked.iter().any(|r| *r == serial) {
+                return Err(rustls::Error::General(
+                    format!("client cert serial {serial} is revoked (CRL)").into(),
+                ));
+            }
+        }
+
         Ok(rustls::server::danger::ClientCertVerified::assertion())
     }
 
@@ -290,6 +307,146 @@ impl rustls::server::danger::ClientCertVerifier for CnOuVerifier {
     }
 }
 
+/// Replace the in-memory CRL serial list on a concrete CnOuVerifier.
+/// Called from the reload endpoint.
+pub fn reload_crl_on_verifier(verifier: &CnOuVerifier, pem_path: &Path) -> anyhow::Result<usize> {
+    let serials = load_crl_serials(pem_path)?;
+    let count = serials.len();
+    let mut guard = verifier.revoked_serials.write().unwrap_or_else(|p| p.into_inner());
+    *guard = serials;
+    Ok(count)
+}
+
+/// Parse a PEM-encoded X.509 CRL and extract all revoked certificate serial
+/// numbers as lowercase hex strings.
+fn load_crl_serials(pem_path: &Path) -> anyhow::Result<Vec<String>> {
+    let pem_bytes = std::fs::read(pem_path)
+        .with_context(|| format!("reading CRL from {}", pem_path.display()))?;
+    let text = std::str::from_utf8(&pem_bytes).context("CRL PEM is not valid UTF-8")?;
+    let mut serials = Vec::new();
+    let mut rest = text;
+    while let Some(s) = rest.find("-----BEGIN X509 CRL-----") {
+        let body = &rest[s + "-----BEGIN X509 CRL-----".len()..];
+        let e = body.find("-----END X509 CRL-----")
+            .context("malformed CRL PEM: missing END marker")?;
+        let b64: String = body[..e].chars().filter(|c| !c.is_whitespace()).collect();
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .context("decoding CRL PEM base64")?;
+        serials.extend(parse_crl_der_serials(&der));
+        rest = &body[e + "-----END X509 CRL-----".len()..];
+    }
+    tracing::info!(path = %pem_path.display(), count = serials.len(), "CRL loaded");
+    Ok(serials)
+}
+
+/// Extract revoked serial numbers from a DER-encoded X.509 v2 CRL.
+///
+/// Minimal ASN.1 parsing: walks the TBSCertList looking for SEQUENCE { serial,
+/// revocationDate } entries.  The CRL structure is:
+///
+/// ```text
+/// SEQUENCE {                          -- CertificateList
+///   SEQUENCE {                        -- TBSCertList
+///     ...
+///     SEQUENCE { serial INTEGER, ... }  -- revokedCertificates entries
+///   }
+///   ...
+/// }
+/// ```
+fn parse_crl_der_serials(der: &[u8]) -> Vec<String> {
+    let mut serials = Vec::new();
+    // We scan for INTEGER tags (0x02) preceded by SEQUENCE tags (0x30) that
+    // appear to be inside the revokedCertificates portion.  A simple heuristic
+    // is sufficient: we look for patterns where a SEQUENCE header is followed
+    // by an INTEGER (the serial number).
+    let mut i = 0;
+    while i + 2 < der.len() {
+        // Look for SEQUENCE tag
+        if der[i] == 0x30 {
+            let (seq_len, header_len) = read_asn1_length(&der[i + 1..]);
+            let seq_content_start = i + 1 + header_len;
+            if seq_content_start < der.len() && der[seq_content_start] == 0x02 {
+                // This SEQUENCE starts with an INTEGER — likely a revoked cert entry
+                let int_start = seq_content_start + 1;
+                let (int_len, int_header_len) = read_asn1_length(&der[int_start..]);
+                let value_start = int_start + int_header_len;
+                if value_start + int_len <= der.len() {
+                    let serial_bytes = &der[value_start..value_start + int_len];
+                    let hex: String = serial_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                    // Skip trivially small serials (likely structural, not real serials)
+                    if int_len >= 1 && !hex.chars().all(|c| c == '0') {
+                        serials.push(hex);
+                    }
+                }
+                i = seq_content_start + seq_len;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    serials
+}
+
+/// Read an ASN.1 DER length field starting at offset 0.  Returns (length, header_bytes).
+fn read_asn1_length(buf: &[u8]) -> (usize, usize) {
+    if buf.is_empty() {
+        return (0, 0);
+    }
+    let first = buf[0] as usize;
+    if first < 0x80 {
+        (first, 1)
+    } else {
+        let num_bytes = first & 0x7f;
+        if num_bytes == 0 || num_bytes > 4 || num_bytes + 1 > buf.len() {
+            return (0, 1);
+        }
+        let mut len = 0usize;
+        for j in 0..num_bytes {
+            len = (len << 8) | (buf[1 + j] as usize);
+        }
+        (len, 1 + num_bytes)
+    }
+}
+
+/// Extract the serial number from a DER-encoded X.509 certificate as a
+/// lowercase hex string.  Used for CRL revocation comparison.
+fn extract_cert_serial(cert: &rustls::pki_types::CertificateDer<'_>) -> anyhow::Result<String> {
+    let der = cert.as_ref();
+    // X.509 certificate DER structure:
+    // SEQUENCE {                     -- Certificate
+    //   SEQUENCE {                   -- TBSCertificate
+    //     [0] EXPLICIT INTEGER       -- version (optional, context tag 0xa0)
+    //     INTEGER                    -- serialNumber
+    //     ...
+    //   }
+    // }
+    let mut i = 0;
+    // Outer SEQUENCE
+    if der.len() < 4 || der[0] != 0x30 { anyhow::bail!("not a valid certificate DER"); }
+    let (outer_len, outer_hl) = read_asn1_length(&der[1..]);
+    let _ = outer_len;
+    i = 1 + outer_hl;
+    // Inner SEQUENCE (TBSCertificate)
+    if i >= der.len() || der[i] != 0x30 { anyhow::bail!("no TBSCertificate SEQUENCE"); }
+    let (tbs_len, tbs_hl) = read_asn1_length(&der[i + 1..]);
+    let _ = tbs_len;
+    let tbs_start = i + 1 + tbs_hl;
+    i = tbs_start;
+    // Version: may be [0] EXPLICIT (0xa0) wrapping an INTEGER, or absent (v1).
+    if i < der.len() && der[i] == 0xa0 {
+        let (ver_len, ver_hl) = read_asn1_length(&der[i + 1..]);
+        i += 1 + ver_hl + ver_len;
+    }
+    // Serial number INTEGER
+    if i >= der.len() || der[i] != 0x02 { anyhow::bail!("serial number not found"); }
+    let (sn_len, sn_hl) = read_asn1_length(&der[i + 1..]);
+    let sn_start = i + 1 + sn_hl;
+    if sn_start + sn_len > der.len() { anyhow::bail!("serial number truncated"); }
+    let serial_bytes = &der[sn_start..sn_start + sn_len];
+    Ok(serial_bytes.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
 // ── mTLS agent-listener config ────────────────────────────────────────────────
 
 /// Build an `Arc<rustls::ServerConfig>` for the **agent-facing** TCP listener
@@ -304,9 +461,14 @@ impl rustls::server::danger::ClientCertVerifier for CnOuVerifier {
 /// Returns an error if `mtls_ca_cert_path`, `tls_cert_path`, or `tls_key_path`
 /// are absent in `server_cfg`.  Self-signed certs are not supported with mTLS
 /// because agents must pin a stable certificate fingerprint.
+/// Build an `Arc<rustls::ServerConfig>` for the **agent-facing** TCP listener
+/// with mutual TLS enabled.
+///
+/// Returns `(ServerConfig, Option<Arc<CnOuVerifier>>)` so the caller can
+/// retain a reference to the verifier for runtime CRL reload (P2-16).
 pub fn build_agent_tls_config(
     server_cfg: &crate::config::ServerConfig,
-) -> anyhow::Result<std::sync::Arc<rustls::ServerConfig>> {
+) -> anyhow::Result<(std::sync::Arc<rustls::ServerConfig>, Option<std::sync::Arc<CnOuVerifier>>)> {
     use anyhow::Context as _;
 
     // ── 1. Load CA certificate(s) ─────────────────────────────────────────
@@ -329,16 +491,34 @@ pub fn build_agent_tls_config(
         .build()
         .map_err(|e| anyhow::anyhow!("WebPkiClientVerifier build: {e:?}"))?;
 
-    let verifier: std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier> =
-        if !server_cfg.mtls_allowed_cns.is_empty() || !server_cfg.mtls_allowed_ous.is_empty() {
-            std::sync::Arc::new(CnOuVerifier {
-                inner: wv,
+    let cnou_verifier: Option<std::sync::Arc<CnOuVerifier>> =
+        if !server_cfg.mtls_allowed_cns.is_empty()
+            || !server_cfg.mtls_allowed_ous.is_empty()
+            || server_cfg.mtls_crl_path.is_some()
+        {
+            // P2-16: Load CRL serials if a CRL path is configured.
+            let revoked_serials = match &server_cfg.mtls_crl_path {
+                Some(crl_path) => load_crl_serials(crl_path)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(path = %crl_path.display(), error = %e, "CRL load failed; proceeding with empty revocation list");
+                        Vec::new()
+                    }),
+                None => Vec::new(),
+            };
+            Some(std::sync::Arc::new(CnOuVerifier {
+                inner: wv.clone(),
                 allowed_cns: server_cfg.mtls_allowed_cns.clone(),
                 allowed_ous: server_cfg.mtls_allowed_ous.clone(),
-            })
+                revoked_serials: std::sync::RwLock::new(revoked_serials),
+            }))
         } else {
-            wv
+            None
         };
+
+    let verifier: std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier> = match &cnou_verifier {
+        Some(v) => v.clone() as std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>,
+        None => wv,
+    };
 
     // ── 3. Load server certificate and key ────────────────────────────────
     let cert_path = server_cfg.tls_cert_path.as_ref().ok_or_else(|| {
@@ -373,9 +553,10 @@ pub fn build_agent_tls_config(
         ca = %ca_path.display(),
         allowed_cns = ?server_cfg.mtls_allowed_cns,
         allowed_ous = ?server_cfg.mtls_allowed_ous,
+        crl = ?server_cfg.mtls_crl_path.as_ref().map(|p| p.display()),
         "mTLS enabled on agent listener"
     );
 
-    Ok(std::sync::Arc::new(cfg))
+    Ok((std::sync::Arc::new(cfg), cnou_verifier))
 }
 

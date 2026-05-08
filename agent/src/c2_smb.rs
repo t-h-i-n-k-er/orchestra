@@ -204,11 +204,16 @@ mod nt_pipe {
     }
 
     /// Use Win32 `WaitNamedPipeW` to wait for a pipe to become available.
+    /// Resolved at runtime via pe_resolve to avoid IAT entry.
     pub fn wait_named_pipe(pipe_path: &str, timeout_ms: u32) -> Result<()> {
         let wide: Vec<u16> = pipe_path.encode_utf16().chain(std::iter::once(0)).collect();
-        let ok = unsafe {
-            winapi::um::namedpipeapi::WaitNamedPipeW(wide.as_ptr() as *const _, timeout_ms)
-        };
+        let wait_fn: Option<unsafe extern "system" fn(*const u16, u32) -> i32> = (|| unsafe {
+            let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+            let addr = pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"WaitNamedPipeW\0"))?;
+            Some(std::mem::transmute(addr))
+        })();
+        let wait_fn = wait_fn.ok_or_else(|| anyhow!("WaitNamedPipeW resolution failed"))?;
+        let ok = unsafe { wait_fn(wide.as_ptr() as *const _, timeout_ms) };
         if ok == 0 {
             let err = io::Error::last_os_error();
             Err(anyhow!("WaitNamedPipe failed for '{pipe_path}': {err}"))

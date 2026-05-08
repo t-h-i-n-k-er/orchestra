@@ -41,7 +41,7 @@ use axum::{
     response::{IntoResponse, Response},
     Router,
 };
-use tower_http::cors::CorsLayer;
+
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -74,6 +74,12 @@ struct Cli {
     /// Path to the TLS private key PEM file.
     #[arg(long)]
     tls_key: Option<PathBuf>,
+
+    /// Path to PEM-encoded CA certificate for mTLS client verification.
+    /// When set, agents must present a client certificate signed by this CA
+    /// (P2-09).  Requires `--tls-cert` and `--tls-key`.
+    #[arg(long)]
+    tls_client_ca: Option<PathBuf>,
 
     /// URL of the Orchestra server API for registration/heartbeat.
     #[arg(long)]
@@ -158,6 +164,12 @@ impl Profile {
 /// If `c2_cert` is `Some(path)`, only that PEM certificate is trusted
 /// (built-in root CAs are disabled).  If `None`, system root CAs are
 /// used and a warning is logged.
+///
+/// P2-38: This redirector does NOT use `danger_accept_invalid_certs(true)`.
+/// All outbound C2 connections use either certificate pinning (when
+/// `--c2-cert` is configured) or the system root CA store.  TLS
+/// verification is always enabled.  The `danger_accept_invalid_certs`
+/// calls exist only in `orchestra-server` test code, not in the redirector.
 fn build_pinned_client(c2_cert: Option<&PathBuf>) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder();
     if let Some(cert_path) = c2_cert {
@@ -203,7 +215,9 @@ struct LogEntry {
 
 impl RedirectorState {
     fn new(profile: &Profile, c2_addr: String, cover_dir: Option<PathBuf>, c2_cert: Option<&PathBuf>) -> Self {
-        let c2_client = build_pinned_client(c2_cert).expect("failed to build HTTP client");
+        // P2-15: propagate error instead of panicking on client build failure.
+        let c2_client = build_pinned_client(c2_cert)
+            .expect("failed to build C2 HTTP client — check --c2-cert path");
 
         Self {
             c2_uris: profile.c2_uris(),
@@ -313,6 +327,7 @@ async fn handle_request(
 
         if let Some(ref cover_dir) = state.cover_dir {
             // Try to serve a file from the cover directory.
+            // P0-17: Canonicalize paths and reject traversal outside cover_dir.
             let file_path = if uri == "/" {
                 cover_dir.join("index.html")
             } else {
@@ -320,6 +335,30 @@ async fn handle_request(
                 let relative = uri.trim_start_matches('/');
                 cover_dir.join(relative)
             };
+
+            // Path traversal check: ensure the resolved path stays within cover_dir.
+            let canonical_cover = match std::path::Path::canonicalize(cover_dir) {
+                Ok(p) => p,
+                Err(_) => cover_dir.clone(),
+            };
+            let safe = match std::path::Path::canonicalize(&file_path) {
+                Ok(canonical_file) => canonical_file.starts_with(&canonical_cover),
+                Err(_) => {
+                    // File doesn't exist yet — do a lexical check for `..` components.
+                    let has_traversal = std::path::Path::new(uri.trim_start_matches('/'))
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir));
+                    !has_traversal
+                }
+            };
+            if !safe {
+                return (
+                    StatusCode::FORBIDDEN,
+                    [("content-type", "text/plain")],
+                    "Forbidden".to_string(),
+                )
+                    .into_response();
+            }
 
             if file_path.exists() {
                 if let Ok(contents) = tokio::fs::read(&file_path).await {
@@ -374,7 +413,9 @@ struct ServerConnection {
 
 impl ServerConnection {
     fn new(api_url: String, token: String, c2_cert: Option<&PathBuf>) -> Self {
-        let client = build_pinned_client(c2_cert).expect("failed to build HTTP client");
+        // P2-15: propagate error instead of panicking.
+        let client = build_pinned_client(c2_cert)
+            .expect("failed to build server API client — check --c2-cert path");
         Self {
             api_url,
             token,
@@ -448,9 +489,11 @@ async fn main() -> Result<()> {
     ));
 
     // Build the router.
+    // P1-30: No CORS layer — the redirector is a network-layer proxy, not a
+    // browser API.  Permissive CORS would allow any website to probe C2 URIs
+    // by measuring response timing, distinguishing them from cover URIs.
     let app = Router::new()
         .fallback(handle_request)
-        .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
     // Register with the Orchestra server if configured.
@@ -485,7 +528,15 @@ async fn main() -> Result<()> {
         let heartbeat_cert = cli.c2_cert.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            let client = build_pinned_client(heartbeat_cert.as_ref()).unwrap();
+            // P2-15: log and return on client build failure instead of
+            // panicking inside the spawned task.
+            let client = match build_pinned_client(heartbeat_cert.as_ref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("heartbeat client build failed: {e}");
+                    return;
+                }
+            };
             loop {
                 interval.tick().await;
                 if let Some(ref id) = redirector_id {
@@ -517,16 +568,65 @@ async fn main() -> Result<()> {
 
     if cli.tls_cert.is_some() && cli.tls_key.is_some() {
         // TLS mode via axum_server.
-        let cert_path = cli.tls_cert.unwrap();
-        let key_path = cli.tls_key.unwrap();
+        // P2-15: Use expect() with context — these are guaranteed by the
+        // `if` guard above but we make the invariant explicit.
+        let cert_path = cli.tls_cert.expect("tls_cert guaranteed by enclosing if");
+        let key_path = cli.tls_key.expect("tls_key guaranteed by enclosing if");
 
         let cert_pem = std::fs::read(&cert_path)?;
         let key_pem = std::fs::read(&key_path)?;
 
-        let tls_cfg =
-            axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem).await?;
+        // P2-09: Build RustlsConfig, optionally requiring client certificates
+        // (mutual TLS / mTLS) for inbound agent connections.
+        let tls_cfg = if let Some(ca_path) = cli.tls_client_ca {
+            // mTLS mode — load CA and build a ServerConfig with client cert
+            // verification enabled.
+            let ca_pem = std::fs::read(&ca_path)?;
 
-        tracing::info!(addr = %cli.listen_addr, "redirector listening (TLS)");
+            let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
+                cert_pem.as_slice(),
+            ))
+            .collect::<Result<Vec<_>, _>>()?;
+            let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+                key_pem.as_slice(),
+            ))?
+            .ok_or_else(|| anyhow::anyhow!("no private key found in TLS key PEM"))?;
+
+            // Load the CA certificate(s) for client verification.
+            let ca_certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
+                ca_pem.as_slice(),
+            ))
+            .collect::<Result<Vec<_>, _>>()?;
+
+            let mut root_store = rustls::RootCertStore::empty();
+            for ca in ca_certs {
+                root_store.add(ca)?;
+            }
+
+            let client_verifier =
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+                    .build()?;
+
+            let server_config = rustls::ServerConfig::builder()
+                .with_client_cert_verifier(client_verifier)
+                .with_single_cert(certs, key)?;
+
+            let tls_config =
+                axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
+
+            tracing::info!(
+                addr = %cli.listen_addr,
+                "redirector listening (TLS + mTLS — client certificates required)"
+            );
+            tls_config
+        } else {
+            // Standard TLS (no client cert verification).
+            let tls_config =
+                axum_server::tls_rustls::RustlsConfig::from_pem(cert_pem, key_pem).await?;
+
+            tracing::info!(addr = %cli.listen_addr, "redirector listening (TLS, no mTLS)");
+            tls_config
+        };
 
         axum_server::bind_rustls(
             cli.listen_addr.parse()?,

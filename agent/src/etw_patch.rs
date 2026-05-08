@@ -77,15 +77,7 @@ mod imp {
         #[cfg(not(feature = "direct-syscalls"))]
         {
             // Resolve VirtualProtect from kernel32 at runtime to avoid IAT entry.
-            const fn hash_str_const(s: &[u8]) -> u32 {
-                let mut h: u32 = pe_resolve::SEED;
-                let mut i = 0;
-                while i < s.len() {
-                    h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
-                    i += 1;
-                }
-                h
-            }
+            use crate::pe_resolve_macros::hash_str_const;
             const HASH_VIRTUALPROTECT: u32 = hash_str_const(b"VirtualProtect\0");
             type FnVirtualProtect = unsafe extern "system" fn(
                 *mut std::ffi::c_void, usize, u32, *mut u32,

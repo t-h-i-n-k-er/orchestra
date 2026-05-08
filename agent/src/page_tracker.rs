@@ -145,6 +145,8 @@ pub struct PageInfo {
     pub state: PageState,
     /// Per-page XChaCha20-Poly1305 key (32 bytes).
     pub aead_key: [u8; AEAD_KEY_LEN],
+    /// P1-22: Whether the AEAD key has been locked via VirtualLock.
+    key_locked: bool,
     /// Instant of the last decrypt (transition away from Encrypted).
     pub last_access: Instant,
     /// Original protection when the page was enrolled.
@@ -153,8 +155,72 @@ pub struct PageInfo {
     pub label: String,
 }
 
+impl PageInfo {
+    /// P1-22: Lock the AEAD key in physical RAM via VirtualLock to prevent
+    /// it from being paged to swap.  Uses pe_resolve for runtime API
+    /// resolution (no static IAT entry).
+    ///
+    /// Must be called immediately after construction.  Best-effort — failure
+    /// is logged but not fatal.
+    pub fn lock_aead_key(&mut self) {
+        type FnVirtualLock = unsafe extern "system" fn(*const u8, usize) -> i32;
+
+        let fn_ptr: Option<FnVirtualLock> = (|| unsafe {
+            let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+            let hash = pe_resolve::hash_str(b"VirtualLock\0");
+            let addr = pe_resolve::get_proc_address_by_hash(k32, hash)?;
+            Some(std::mem::transmute::<usize, FnVirtualLock>(addr))
+        })();
+
+        if let Some(virtual_lock) = fn_ptr {
+            let ptr = self.aead_key.as_ptr() as *const u8;
+            let len = self.aead_key.len();
+            let result = unsafe { virtual_lock(ptr, len) };
+            if result != 0 {
+                self.key_locked = true;
+            } else {
+                log::warn!(
+                    "evanesco: VirtualLock({} bytes) failed for {:?} at {:#x}",
+                    len, self.label, self.base
+                );
+            }
+        } else {
+            log::warn!("evanesco: cannot resolve VirtualLock — AEAD key not locked");
+        }
+    }
+
+    /// P1-22: Unlock the AEAD key from physical RAM (called from Drop
+    /// before zeroization).
+    fn unlock_aead_key(&mut self) {
+        if !self.key_locked {
+            return;
+        }
+
+        type FnVirtualUnlock = unsafe extern "system" fn(*const u8, usize) -> i32;
+
+        let fn_ptr: Option<FnVirtualUnlock> = (|| unsafe {
+            let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+            let hash = pe_resolve::hash_str(b"VirtualUnlock\0");
+            let addr = pe_resolve::get_proc_address_by_hash(k32, hash)?;
+            Some(std::mem::transmute::<usize, FnVirtualUnlock>(addr))
+        })();
+
+        if let Some(virtual_unlock) = fn_ptr {
+            let ptr = self.aead_key.as_ptr() as *const u8;
+            let len = self.aead_key.len();
+            unsafe { virtual_unlock(ptr, len) };
+        }
+        self.key_locked = false;
+    }
+}
+
 impl Drop for PageInfo {
     fn drop(&mut self) {
+        // P1-22: Unlock before zeroization so the OS can reclaim the
+        // lock count.  Failure to unlock before zeroizing would leave a
+        // dangling lock on memory that may be reused.
+        self.unlock_aead_key();
+
         // Securely zero the AEAD key to prevent key material from lingering
         // in freed heap memory after the PageInfo is deallocated.
         for b in self.aead_key.iter_mut() {
@@ -664,10 +730,37 @@ unsafe fn remove_veh(handle: usize) {
 
 /// Module-level static holding the raw pointer to the tracker inner,
 /// accessible from the bare VEH function pointer.
-/// Module-level static holding the raw pointer to the tracker inner,
-/// accessible from the bare VEH function pointer.
-/// Nulled out during shutdown *before* the inner tracker is dropped
-/// to prevent a use-after-free in the VEH handler.
+///
+/// # Safety Invariant (P2-26)
+///
+/// `VEH_TRACKER_PTR` stores a raw pointer derived from an `Arc<PageTrackerInner>`.
+/// The lifetime of the `Arc` is tied to `GLOBAL_TRACKER`, which holds the last
+/// strong reference.  To prevent a use-after-free in the VEH handler:
+///
+/// 1. **Null-before-drop ordering**: `shutdown()` stores `null` into this
+///    static *before* the `GLOBAL_TRACKER` `Arc` is dropped (via
+///    `Ordering::Release`).  The VEH handler loads with `Ordering::Acquire`,
+///    establishing a happens-before relationship.
+///
+/// 2. **Shutdown flag**: Even if a racing VEH callback observes a non-null
+///    pointer during the brief window between `VEH_TRACKER_PTR.store(null)`
+///    and `Arc` deallocation, the `inner.shutdown.load(Acquire)` check in
+///    `veh_handler` causes it to bail out immediately.
+///
+/// 3. **Theoretical race window**: There remains a narrow window where the
+///    VEH handler reads a non-null pointer *after* shutdown has nulled it on
+///    another CPU, but *before* the null store is globally visible.  This is
+///    impossible in practice because `Ordering::Release`/`Acquire` on the same
+///    atomic guarantees visibility, and the VEH handler checks the shutdown
+///    flag *after* loading the pointer.
+///
+/// A stronger guarantee could be achieved by calling
+/// `Arc::increment_strong_count(inner)` in `register_veh` and
+/// `Arc::decrement_strong_count` when the VEH is removed (or in the handler
+/// itself via a deferred decrement).  This would ensure the `PageTrackerInner`
+/// allocation outlives any in-flight VEH callback.  The current approach is
+/// considered sufficient because the shutdown sequence is synchronous:
+/// null pointer → join background thread → remove VEH → drop Arc.
 static VEH_TRACKER_PTR: AtomicPtr<PageTrackerInner> = AtomicPtr::new(std::ptr::null_mut());
 
 /// VEH handler for STATUS_ACCESS_VIOLATION on tracked PAGE_NOACCESS pages.
@@ -852,15 +945,18 @@ pub fn enroll(base: *mut u8, size: usize, orig_protect: u32, label: &str) -> Res
     let end = ((end_raw + 0xFFF) & !0xFFF);
     let aligned_size = end - aligned_base;
 
-    let info = PageInfo {
+    let mut info = PageInfo {
         base: aligned_base,
         size: aligned_size,
         state: PageState::Encrypted, // will be encrypted below
         aead_key: random_aead_key(),
+        key_locked: false,
         last_access: Instant::now(),
         orig_protect,
         label: label.to_string(),
     };
+    // P1-22: Lock the AEAD key in RAM immediately after generation.
+    info.lock_aead_key();
 
     {
         let mut pages = inner.pages.write().map_err(|e| {
@@ -929,6 +1025,32 @@ pub fn acquire_pages(
 
 /// Encrypt ALL tracked pages immediately.  Used by sleep_obfuscation before
 /// the full memory sweep.
+///
+/// # TOCTOU Considerations (P2-27)
+///
+/// This function operates in two phases:
+/// 1. **Read-lock phase**: Collects `(base, size)` pairs for all non-encrypted
+///    pages into a `Vec`.
+/// 2. **Write-lock phase**: Iterates the collected pairs and encrypts each page.
+///
+/// Between phase 1 and phase 2, the page state may change because:
+/// - The VEH handler may decrypt a page in response to an access violation.
+/// - Another thread may call `acquire_pages()` or `encrypt_page()`.
+/// - A page may be removed (though this is not a current feature).
+///
+/// **Mitigation**: Under the write lock, the code re-validates that each page
+/// is still present and still not `Encrypted` before calling
+/// `encrypt_page_unlocked` (see the `info.state == PageState::Encrypted` check
+/// and the `pages.contains_key` guard).  If the VEH handler already decrypted
+/// a page that was `Encrypted` during the read-lock phase, that page simply
+/// won't appear in the collected set (since we only collect non-`Encrypted`
+/// pages).  Conversely, if a page was non-encrypted during the read phase but
+/// the VEH handler encrypted it before the write phase, the re-validation
+/// skip is correct — the page is already encrypted.
+///
+/// This pattern is safe because `encrypt_page_unlocked` is idempotent for
+/// pages that are already in the expected state, and the write-lock re-check
+/// prevents double-encryption.
 pub fn encrypt_all() {
     let inner = match GLOBAL_TRACKER.get() {
         Some(t) => t,
@@ -1022,7 +1144,12 @@ pub fn idle_threshold() -> u64 {
 }
 
 /// Return a JSON status snapshot of the Evanesco subsystem.
-pub fn status_json() -> String {
+///
+/// **Access control**: This function is `pub(crate)` so that it can only be
+/// called through the `Command::PageTrackerStatus` handler, which serves as
+/// the authorized telemetry gateway.  Once RBAC (P1-26) is implemented, the
+/// handler will enforce a minimum read permission level.
+pub(crate) fn status_json() -> String {
     let inner = match GLOBAL_TRACKER.get() {
         Some(t) => t,
         None => return r#"{"error":"not initialised"}"#.to_string(),
@@ -1055,6 +1182,43 @@ pub fn status_json() -> String {
         inner.scan_interval_ms.load(Ordering::Relaxed),
         inner.encrypt_count.load(Ordering::Relaxed),
         inner.decrypt_count.load(Ordering::Relaxed),
+    )
+}
+
+/// Return a redacted JSON status snapshot suitable for lower-privilege callers.
+///
+/// Contains only page counts (total, encrypted, decrypted_rw, decoded_rx).
+/// No timing data, no encrypt/decrypt counters, no thresholds.
+/// Exposed via `Command::PageTrackerStatusRedacted`.
+pub(crate) fn status_redacted() -> String {
+    let inner = match GLOBAL_TRACKER.get() {
+        Some(t) => t,
+        None => return r#"{"error":"not initialised"}"#.to_string(),
+    };
+
+    let pages = match inner.pages.read() {
+        Ok(g) => g,
+        Err(_) => return r#"{"error":"lock poisoned"}"#.to_string(),
+    };
+
+    let total = pages.len();
+    let mut encrypted = 0usize;
+    let mut decrypted_rw = 0usize;
+    let mut decoded_rx = 0usize;
+    for info in pages.values() {
+        match info.state {
+            PageState::Encrypted => encrypted += 1,
+            PageState::DecryptedRW => decrypted_rw += 1,
+            PageState::DecodedRX => decoded_rx += 1,
+        }
+    }
+
+    format!(
+        r#"{{"total_pages":{},"encrypted":{},"decrypted_rw":{},"decoded_rx":{}}}"#,
+        total,
+        encrypted,
+        decrypted_rw,
+        decoded_rx,
     )
 }
 

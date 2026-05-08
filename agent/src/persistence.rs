@@ -122,10 +122,7 @@ pub mod windows {
     // at runtime via pe_resolve hashing.  Only type definitions remain from
     // winapi — no function imports.
 
-    use winapi::shared::guiddef::GUID;
-    use winapi::shared::minwindef::{DWORD, HMODULE};
-    use winapi::shared::winerror::HRESULT;
-    use winapi::um::winnt::{HANDLE, LONG};
+    use crate::win_types::{GUID, DWORD, HMODULE, HRESULT, HANDLE, LONG};
 
     /// Resolve a function pointer from a DLL that is already loaded (in PEB).
     #[inline(always)]
@@ -167,35 +164,7 @@ pub mod windows {
     // ── DLL hash constants (not in pe_resolve build.rs) ──────────────────
     //
     // Computed at compile-time via const fn mirroring pe_resolve::hash_wstr.
-
-    const fn hash_str_const(bytes: &[u8]) -> u32 {
-        let seed: u32 = pe_resolve::SEED;
-        let mut hash: u32 = seed;
-        let mut i: usize = 0;
-        while i < bytes.len() {
-            let b = bytes[i];
-            if b == 0 { break; }
-            hash = hash.rotate_right(13) ^ (b.to_ascii_lowercase() as u32);
-            i += 1;
-        }
-        hash
-    }
-
-    const fn hash_wstr_const(units: &[u16]) -> u32 {
-        let seed: u32 = pe_resolve::SEED;
-        let mut hash: u32 = seed;
-        let mut i: usize = 0;
-        while i < units.len() {
-            let c = units[i];
-            if c == 0 { break; }
-            let lo = (c as u8).to_ascii_lowercase();
-            let hi = ((c >> 8) as u8).to_ascii_lowercase();
-            hash = hash.rotate_right(13) ^ (lo as u32);
-            hash = hash.rotate_right(13) ^ (hi as u32);
-            i += 1;
-        }
-        hash
-    }
+    use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
     /// "advapi32.dll" wide (no null)
     const ADVAPI32_W: &[u16] = &[
@@ -485,22 +454,19 @@ pub mod windows {
     // We define only the vtable slots we need.  Layout must match the real
     // COM vtables on every version of Windows; these match the MSDN/SDK
     // definitions exactly.
-    use winapi::shared::guiddef::{GUID, REFIID};
-    use winapi::shared::wtypes::BSTR;
-    use winapi::um::unknwnbase::{IUnknown, IUnknownVtbl};
-    use winapi::um::winnt::LONG;
+    use crate::win_types::{GUID, REFIID, BSTR, IUnknown, IUnknownVtbl, LONG, HRESULT, VARIANT};
 
     // IWbemClassObject (partial vtable – only Put and Release are used)
     #[repr(C)]
     struct IWbemClassObjectVtbl {
         // IUnknown
-        pub query_interface: unsafe extern "system" fn(*mut IWbemClassObject, REFIID, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub query_interface: unsafe extern "system" fn(*mut IWbemClassObject, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
         pub add_ref:         unsafe extern "system" fn(*mut IWbemClassObject) -> u32,
         pub release:         unsafe extern "system" fn(*mut IWbemClassObject) -> u32,
         // IWbemClassObject – first 3 methods before Put
-        pub get_qualifier_set: unsafe extern "system" fn(*mut IWbemClassObject, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub get:             unsafe extern "system" fn(*mut IWbemClassObject, BSTR, LONG, *mut winapi::um::oaidl::VARIANT, *mut LONG, *mut LONG) -> winapi::shared::winerror::HRESULT,
-        pub put:             unsafe extern "system" fn(*mut IWbemClassObject, BSTR, LONG, *mut winapi::um::oaidl::VARIANT, LONG) -> winapi::shared::winerror::HRESULT,
+        pub get_qualifier_set: unsafe extern "system" fn(*mut IWbemClassObject, *mut *mut std::ffi::c_void) -> HRESULT,
+        pub get:             unsafe extern "system" fn(*mut IWbemClassObject, BSTR, LONG, *mut VARIANT, *mut LONG, *mut LONG) -> HRESULT,
+        pub put:             unsafe extern "system" fn(*mut IWbemClassObject, BSTR, LONG, *mut VARIANT, LONG) -> HRESULT,
     }
     #[repr(C)]
     struct IWbemClassObject {
@@ -521,27 +487,27 @@ pub mod windows {
     //   20 ExecQuery, ...
     #[repr(C)]
     struct IWbemServicesVtbl {
-        pub query_interface:      unsafe extern "system" fn(*mut IWbemServices, REFIID, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub query_interface:      unsafe extern "system" fn(*mut IWbemServices, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
         pub add_ref:              unsafe extern "system" fn(*mut IWbemServices) -> u32,
         pub release:              unsafe extern "system" fn(*mut IWbemServices) -> u32,
-        pub open_namespace:       unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut IWbemServices, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub cancel_async_call:    unsafe extern "system" fn(*mut IWbemServices, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub query_object_sink:    unsafe extern "system" fn(*mut IWbemServices, LONG, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub get_object:           unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut IWbemClassObject, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub get_object_async:     unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub put_class:            unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub put_class_async:      unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub delete_class:         unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub delete_class_async:   unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub create_class_enum:    unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub create_class_enum_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub put_instance:         unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub put_instance_async:   unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub delete_instance:      unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub delete_instance_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub create_instance_enum: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub create_instance_enum_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
-        pub exec_query:           unsafe extern "system" fn(*mut IWbemServices, BSTR, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub open_namespace:       unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut IWbemServices, *mut *mut std::ffi::c_void) -> HRESULT,
+        pub cancel_async_call:    unsafe extern "system" fn(*mut IWbemServices, *mut std::ffi::c_void) -> HRESULT,
+        pub query_object_sink:    unsafe extern "system" fn(*mut IWbemServices, LONG, *mut *mut std::ffi::c_void) -> HRESULT,
+        pub get_object:           unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut IWbemClassObject, *mut *mut std::ffi::c_void) -> HRESULT,
+        pub get_object_async:     unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
+        pub put_class:            unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
+        pub put_class_async:      unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
+        pub delete_class:         unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
+        pub delete_class_async:   unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
+        pub create_class_enum:    unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
+        pub create_class_enum_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
+        pub put_instance:         unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
+        pub put_instance_async:   unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
+        pub delete_instance:      unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
+        pub delete_instance_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
+        pub create_instance_enum: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
+        pub create_instance_enum_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
+        pub exec_query:           unsafe extern "system" fn(*mut IWbemServices, BSTR, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
     }
     #[repr(C)]
     struct IWbemServices {
@@ -551,7 +517,7 @@ pub mod windows {
     // IWbemLocator (partial vtable – only ConnectServer)
     #[repr(C)]
     struct IWbemLocatorVtbl {
-        pub query_interface: unsafe extern "system" fn(*mut IWbemLocator, REFIID, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub query_interface: unsafe extern "system" fn(*mut IWbemLocator, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
         pub add_ref:         unsafe extern "system" fn(*mut IWbemLocator) -> u32,
         pub release:         unsafe extern "system" fn(*mut IWbemLocator) -> u32,
         pub connect_server:  unsafe extern "system" fn(
@@ -564,7 +530,7 @@ pub mod windows {
             BSTR,                        // strAuthority
             *mut std::ffi::c_void,       // pCtx
             *mut *mut IWbemServices,     // ppNamespace (out)
-        ) -> winapi::shared::winerror::HRESULT,
+        ) -> HRESULT,
     }
     #[repr(C)]
     struct IWbemLocator {
@@ -573,16 +539,16 @@ pub mod windows {
 
     // GUIDs
     const CLSID_WBEM_LOCATOR: GUID = GUID {
-        Data1: 0x4590_f811,
-        Data2: 0x1d3a,
-        Data3: 0x11d0,
-        Data4: [0x89, 0x1f, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24],
+        data1: 0x4590_f811,
+        data2: 0x1d3a,
+        data3: 0x11d0,
+        data4: [0x89, 0x1f, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24],
     };
     const IID_IWBEM_LOCATOR: GUID = GUID {
-        Data1: 0xdc12_a687,
-        Data2: 0x737f,
-        Data3: 0x11cf,
-        Data4: [0x88, 0x4d, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24],
+        data1: 0xdc12_a687,
+        data2: 0x737f,
+        data3: 0x11cf,
+        data4: [0x88, 0x4d, 0x00, 0xaa, 0x00, 0x4b, 0x2e, 0x24],
     };
 
     // WBEM_FLAG_CREATE_OR_UPDATE = 0
@@ -599,39 +565,129 @@ pub mod windows {
     //              6 Skip, 7 Clone
     #[repr(C)]
     struct IEnumWbemClassObjectVtbl {
-        pub query_interface: unsafe extern "system" fn(*mut IEnumWbemClassObject, REFIID, *mut *mut std::ffi::c_void) -> winapi::shared::winerror::HRESULT,
+        pub query_interface: unsafe extern "system" fn(*mut IEnumWbemClassObject, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
         pub add_ref:         unsafe extern "system" fn(*mut IEnumWbemClassObject) -> u32,
         pub release:         unsafe extern "system" fn(*mut IEnumWbemClassObject) -> u32,
-        pub reset:           unsafe extern "system" fn(*mut IEnumWbemClassObject) -> winapi::shared::winerror::HRESULT,
+        pub reset:           unsafe extern "system" fn(*mut IEnumWbemClassObject) -> HRESULT,
         pub next:            unsafe extern "system" fn(
             *mut IEnumWbemClassObject,
             LONG,                          // lTimeout
             u32,                           // uCount
             *mut *mut IWbemClassObject,    // apObjects
             *mut u32,                      // puReturned
-        ) -> winapi::shared::winerror::HRESULT,
+        ) -> HRESULT,
     }
     #[repr(C)]
     struct IEnumWbemClassObject {
         pub lpvtbl: *const IEnumWbemClassObjectVtbl,
     }
 
-    // Helper: allocate a BSTR from a Rust &str
-    unsafe fn alloc_bstr(s: &str) -> BSTR {
-        let sys_alloc: FnSysAllocStringLen = resolve_api_or_load(
-            OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_SYSALLOCSTRINGLEN,
-        ).expect("alloc_bstr: failed to resolve SysAllocStringLen");
-        let wide: Vec<u16> = s.encode_utf16().collect();
-        sys_alloc(wide.as_ptr(), wide.len() as u32)
+    // ── RAII wrappers ───────────────────────────────────────────────────
+
+    /// RAII wrapper for a COM BSTR allocated via `SysAllocStringLen`.
+    ///
+    /// Calls `SysFreeString` on drop, guaranteeing cleanup even when the
+    /// calling scope exits early via `?`, `return`, or panic.
+    struct ComBstr {
+        ptr: *mut u16,
     }
 
-    // Helper: free a BSTR (null-safe)
-    unsafe fn free_bstr(b: BSTR) {
-        let sys_free: FnSysFreeString = resolve_api_or_load(
-            OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_SYSFREESTRING,
-        ).expect("free_bstr: failed to resolve SysFreeString");
-        if !b.is_null() {
-            sys_free(b);
+    impl ComBstr {
+        /// Allocate a new BSTR from a Rust `&str`.
+        ///
+        /// Returns `None` if `SysAllocStringLen` could not be resolved or
+        /// returns a null pointer (out-of-memory).
+        unsafe fn new(s: &str) -> Option<Self> {
+            let sys_alloc: FnSysAllocStringLen = resolve_api_or_load(
+                OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_SYSALLOCSTRINGLEN,
+            )?;
+            let wide: Vec<u16> = s.encode_utf16().collect();
+            let ptr = sys_alloc(wide.as_ptr(), wide.len() as u32);
+            if ptr.is_null() {
+                None
+            } else {
+                Some(Self { ptr })
+            }
+        }
+
+        /// Returns the raw BSTR pointer for passing to COM methods.
+        fn as_ptr(&self) -> *mut u16 {
+            self.ptr
+        }
+    }
+
+    impl Drop for ComBstr {
+        fn drop(&mut self) {
+            if !self.ptr.is_null() {
+                unsafe {
+                    let sys_free: FnSysFreeString = resolve_api_or_load(
+                        OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_SYSFREESTRING,
+                    ).expect("ComBstr::drop: failed to resolve SysFreeString");
+                    sys_free(self.ptr);
+                }
+            }
+        }
+    }
+
+    /// RAII wrapper for a VARIANT that calls `VariantClear` on drop.
+    ///
+    /// Use this for VARIANTs received from COM methods (e.g.
+    /// `IWbemClassObject::Get`) where the caller owns the variant and
+    /// must clear it.
+    struct ComVariant {
+        var: VARIANT,
+        cleared: bool,
+    }
+
+    impl ComVariant {
+        /// Create a new zeroed ComVariant.
+        fn new() -> Self {
+            Self {
+                var: VARIANT { _data: [0; 3] },
+                cleared: false,
+            }
+        }
+
+        /// Returns a mutable pointer to the inner VARIANT for passing to
+        /// COM methods that write into it.
+        fn as_mut_ptr(&mut self) -> *mut VARIANT {
+            &mut self.var
+        }
+
+        /// Read the `vt` field (VARTYPE at offset 0).
+        unsafe fn vt(&self) -> u16 {
+            let p = &self.var as *const VARIANT as *const u16;
+            *p
+        }
+
+        /// Read the `bstrVal` field (BSTR at offset 8).
+        unsafe fn bstr_val(&self) -> BSTR {
+            let p = &self.var as *const VARIANT as *const u8;
+            *(p.add(8) as *const BSTR)
+        }
+
+        /// Manually clear the variant without waiting for drop.
+        /// Useful when you need the HRESULT from VariantClear.
+        unsafe fn clear(&mut self) -> HRESULT {
+            self.cleared = true;
+            let variant_clear: FnVariantClear = resolve_api_or_load(
+                OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_VARIANTCLEAR,
+            ).expect("ComVariant::clear: failed to resolve VariantClear");
+            variant_clear(&mut self.var as *mut _ as *mut std::ffi::c_void)
+        }
+    }
+
+    impl Drop for ComVariant {
+        fn drop(&mut self) {
+            if !self.cleared {
+                // Only clear if the variant type is non-zero (was actually used).
+                // A zeroed VARIANT (VT_EMPTY) does not need clearing.
+                unsafe {
+                    if self.vt() != 0 {
+                        let _ = self.clear();
+                    }
+                }
+            }
         }
     }
 
@@ -640,21 +696,27 @@ pub mod windows {
         obj: *mut IWbemClassObject,
         name: &str,
         value: &str,
-    ) -> winapi::shared::winerror::HRESULT {
-        use winapi::um::oaidl::VARIANT;
-        let name_bstr = alloc_bstr(name);
-        let val_bstr = alloc_bstr(value);
+    ) -> HRESULT {
+        let name_bstr = match ComBstr::new(name) {
+            Some(b) => b,
+            None => return -1 as HRESULT, // E_POINTER / allocation failure
+        };
+        let val_bstr = match ComBstr::new(value) {
+            Some(b) => b,
+            None => return -1 as HRESULT,
+        };
         let mut var: VARIANT = std::mem::zeroed();
         // Set variant type to VT_BSTR and assign the BSTR value
-        // VARIANT layout: n1 → n2 → (vt, n3 union containing bstrVal)
-        var.n1.n2_mut().vt = VT_BSTR;
-        *var.n1.n2_mut().n3.bstrVal_mut() = val_bstr;
-        let hr = ((*(*obj).lpvtbl).put)(obj, name_bstr, 0, &mut var, 0);
-        // Do NOT SysFreeString val_bstr — VariantClear would normally do it,
-        // but since we own the VARIANT and it's on the stack we free it here
-        // only after the Put call has copied/addref'd the value.
-        free_bstr(val_bstr);
-        free_bstr(name_bstr);
+        // VARIANT layout: vt (VARTYPE = u16) at offset 0, bstrVal at offset 8
+        {
+            let p = &mut var as *mut VARIANT as *mut u16;
+            *p = VT_BSTR;
+            let bstr_ptr = &mut var as *mut VARIANT as *mut u8;
+            *(bstr_ptr.add(8) as *mut BSTR) = val_bstr.as_ptr();
+        }
+        let hr = ((*(*obj).lpvtbl).put)(obj, name_bstr.as_ptr(), 0, &mut var, 0);
+        // ComBstr drops here, freeing both BSTRs.  After Put() has
+        // copied/add-ref'd the value the temporary BSTRs are no longer needed.
         hr
     }
 
@@ -662,29 +724,30 @@ pub mod windows {
     // Returns Ok(String) on success, or Err if the property is missing /
     // not a BSTR.
     unsafe fn get_bstr_prop(obj: *mut IWbemClassObject, name: &str) -> Result<String> {
-        use winapi::um::oaidl::VARIANT;
-        let name_bstr = alloc_bstr(name);
-        let mut var: VARIANT = std::mem::zeroed();
-        let hr = ((*(*obj).lpvtbl).get)(obj, name_bstr, 0, &mut var, ptr::null_mut(), ptr::null_mut());
-        free_bstr(name_bstr);
-        if !winapi::shared::winerror::SUCCEEDED(hr) {
+        let name_bstr = ComBstr::new(name)
+            .ok_or_else(|| anyhow!("get_bstr_prop: failed to allocate BSTR for '{}'", name))?;
+        let mut cv = ComVariant::new();
+        let hr = ((*(*obj).lpvtbl).get)(
+            obj, name_bstr.as_ptr(), 0,
+            cv.as_mut_ptr(), ptr::null_mut(), ptr::null_mut(),
+        );
+        // name_bstr drops here
+        if !crate::win_types::succeeded(hr) {
             return Err(anyhow!("IWbemClassObject::Get('{}') failed: 0x{:08X}", name, hr));
         }
-        let vt = var.n1.n2().vt;
+        let vt = cv.vt();
         if vt != VT_BSTR {
             return Err(anyhow!("Property '{}' is not VT_BSTR (got {})", name, vt));
+            // cv drops here — VariantClear called automatically
         }
-        let bstr = *var.n1.n2().n3.bstrVal();
+        let bstr = cv.bstr_val();
         let s = if bstr.is_null() {
             String::new()
         } else {
             let len = (0..).take_while(|&i| *bstr.add(i) != 0).count();
             String::from_utf16_lossy(std::slice::from_raw_parts(bstr, len))
         };
-        let variant_clear: FnVariantClear = resolve_api_or_load(
-            OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_VARIANTCLEAR,
-        ).expect("get_bstr_prop: failed to resolve VariantClear");
-        variant_clear(&mut var as *mut _ as *mut std::ffi::c_void);
+        // cv drops here — VariantClear called, which frees the BSTR inside
         Ok(s)
     }
 
@@ -711,7 +774,7 @@ pub mod windows {
             *mut IWbemClassObject,
             LONG,
             *mut *mut IWbemClassObject,
-        ) -> winapi::shared::winerror::HRESULT,
+        ) -> HRESULT,
     > {
         const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x00000004;
         const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x00000002;
@@ -736,16 +799,16 @@ pub mod windows {
             }
         }
 
-        let entry_0 = vtbl.add(0).read() as *const winapi::ctypes::c_void;
-        let entry_16 = vtbl.add(16).read() as *const winapi::ctypes::c_void;
+        let entry_0 = vtbl.add(0).read() as *const std::ffi::c_void;
+        let entry_16 = vtbl.add(16).read() as *const std::ffi::c_void;
 
         // Both entries must belong to the same module (the WMI implementation
         // DLL, typically fastprox.dll).  A mismatch indicates an inline hook or
         // an unexpected vtable layout change.
         let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
             | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
-        let mut hmod_0: winapi::shared::minwindef::HMODULE = std::ptr::null_mut();
-        let mut hmod_16: winapi::shared::minwindef::HMODULE = std::ptr::null_mut();
+        let mut hmod_0: HMODULE = std::ptr::null_mut();
+        let mut hmod_16: HMODULE = std::ptr::null_mut();
 
         let ok0 = get_module_handle_ex(flags, entry_0 as *const _, &mut hmod_0);
         let ok16 = get_module_handle_ex(flags, entry_16 as *const _, &mut hmod_16);
@@ -779,7 +842,7 @@ pub mod windows {
         services_ptr: *mut IWbemServices,
         class_name: &str,
     ) -> Result<*mut IWbemClassObject> {
-        use winapi::shared::winerror::SUCCEEDED;
+        use crate::win_types::succeeded;
 
         let max_retries = 3u32;
         for attempt in 0..max_retries {
@@ -789,19 +852,22 @@ pub mod windows {
             }
 
             // Re-fetch the class definition each attempt
-            let class_bstr = alloc_bstr(class_name);
+            let class_bstr = match ComBstr::new(class_name) {
+                Some(b) => b,
+                None => continue,
+            };
             let mut class_obj: *mut IWbemClassObject = ptr::null_mut();
             let hr = ((*(*services_ptr).lpvtbl).get_object)(
                 services_ptr,
-                class_bstr,
+                class_bstr.as_ptr(),
                 0,
                 ptr::null_mut(),
                 &mut class_obj,
                 ptr::null_mut(),
             );
-            free_bstr(class_bstr);
+            // class_bstr drops here
 
-            if !SUCCEEDED(hr) {
+            if !succeeded(hr) {
                 log::warn!(
                     "WmiSubscription: GetObject({}) attempt {} failed: 0x{:08X}",
                     class_name, attempt + 1, hr
@@ -816,7 +882,7 @@ pub mod windows {
                     let hr = spawn_fn(class_obj, 0, &mut inst);
                     ((*(*class_obj).lpvtbl).release)(class_obj);
 
-                    if SUCCEEDED(hr) && !inst.is_null() {
+                    if succeeded(hr) && !inst.is_null() {
                         log::debug!(
                             "WmiSubscription: SpawnInstance({}) succeeded on attempt {}",
                             class_name, attempt + 1
@@ -855,21 +921,22 @@ pub mod windows {
         services_ptr: *mut IWbemServices,
         object_path: &str,
     ) -> Result<*mut IWbemClassObject> {
-        use winapi::shared::winerror::SUCCEEDED;
+        use crate::win_types::succeeded;
 
-        let path_bstr = alloc_bstr(object_path);
+        let path_bstr = ComBstr::new(object_path)
+            .ok_or_else(|| anyhow!("get_instance_by_path: failed to allocate BSTR"))?;
         let mut obj: *mut IWbemClassObject = ptr::null_mut();
         let hr = ((*(*services_ptr).lpvtbl).get_object)(
             services_ptr,
-            path_bstr,
+            path_bstr.as_ptr(),
             0,
             ptr::null_mut(),
             &mut obj,
             ptr::null_mut(),
         );
-        free_bstr(path_bstr);
+        // path_bstr drops here
 
-        if !SUCCEEDED(hr) {
+        if !succeeded(hr) {
             return Err(anyhow!(
                 "GetObject(path={}) fallback failed: 0x{:08X}",
                 object_path, hr
@@ -891,7 +958,7 @@ pub mod windows {
         subscription_name: &str,
         exe_path: &str,
     ) -> Result<()> {
-        use winapi::shared::winerror::SUCCEEDED;
+        use crate::win_types::succeeded;
         // COM security constants
         const RPC_C_AUTHN_LEVEL_PKT_PRIVACY: u32 = 6;
         const RPC_C_IMP_LEVEL_IMPERSONATE: u32 = 3;
@@ -916,17 +983,18 @@ pub mod windows {
             &IID_IWBEM_LOCATOR,
             &mut locator_ptr as *mut _ as *mut *mut std::ffi::c_void,
         );
-        if !SUCCEEDED(hr) {
+        if !succeeded(hr) {
             return Err(anyhow!("CoCreateInstance(WbemLocator) failed: 0x{:08X}", hr));
         }
         let locator = &mut *locator_ptr;
 
         // Step 2: ConnectServer("root\\subscription")
-        let ns_bstr = alloc_bstr("root\\subscription");
+        let ns_bstr = ComBstr::new("root\\subscription")
+            .ok_or_else(|| anyhow!("wmi_install_com: failed to allocate namespace BSTR"))?;
         let mut services_ptr: *mut IWbemServices = ptr::null_mut();
         let hr = ((*locator.lpvtbl).connect_server)(
             locator_ptr,
-            ns_bstr,
+            ns_bstr.as_ptr(),
             ptr::null_mut(), // user (current)
             ptr::null_mut(), // password (current)
             ptr::null_mut(), // locale (default)
@@ -935,8 +1003,8 @@ pub mod windows {
             ptr::null_mut(), // context
             &mut services_ptr,
         );
-        free_bstr(ns_bstr);
-        if !SUCCEEDED(hr) {
+        // ns_bstr drops here
+        if !succeeded(hr) {
             ((*locator.lpvtbl).release)(locator_ptr);
             return Err(anyhow!("IWbemLocator::ConnectServer failed: 0x{:08X}", hr));
         }
@@ -952,7 +1020,7 @@ pub mod windows {
             ptr::null_mut(),
             0, // EOAC_NONE
         );
-        if !SUCCEEDED(hr) {
+        if !succeeded(hr) {
             ((*(*services_ptr).lpvtbl).release)(services_ptr);
             ((*locator.lpvtbl).release)(locator_ptr);
             return Err(anyhow!("CoSetProxyBlanket failed: 0x{:08X}", hr));
@@ -1005,7 +1073,7 @@ pub mod windows {
             ptr::null_mut(), ptr::null_mut(),
         );
         ((*(*filter_inst).lpvtbl).release)(filter_inst);
-        if !SUCCEEDED(hr) {
+        if !succeeded(hr) {
             cleanup_and_err!(services_ptr, locator_ptr, "PutInstance(__EventFilter) failed: 0x{:08X}", hr);
         }
 
@@ -1037,7 +1105,7 @@ pub mod windows {
             ptr::null_mut(), ptr::null_mut(),
         );
         ((*(*consumer_inst).lpvtbl).release)(consumer_inst);
-        if !SUCCEEDED(hr) {
+        if !succeeded(hr) {
             cleanup_and_err!(services_ptr, locator_ptr, "PutInstance(CommandLineEventConsumer) failed: 0x{:08X}", hr);
         }
 
@@ -1078,7 +1146,7 @@ pub mod windows {
         ((*(*services_ptr).lpvtbl).release)(services_ptr);
         ((*locator.lpvtbl).release)(locator_ptr);
 
-        if !SUCCEEDED(hr) {
+        if !succeeded(hr) {
             return Err(anyhow!("PutInstance(__FilterToConsumerBinding) failed: 0x{:08X}", hr));
         }
         Ok(())
@@ -1090,7 +1158,7 @@ pub mod windows {
     // pointer.  The caller must Release both the services and locator pointers
     // when done.
     unsafe fn wmi_connect() -> Result<(*mut IWbemLocator, *mut IWbemServices)> {
-        use winapi::shared::winerror::SUCCEEDED;
+        use crate::win_types::succeeded;
         // COM security constants
         const RPC_C_AUTHN_LEVEL_PKT_PRIVACY: u32 = 6;
         const RPC_C_IMP_LEVEL_IMPERSONATE: u32 = 3;
@@ -1114,15 +1182,16 @@ pub mod windows {
             &IID_IWBEM_LOCATOR,
             &mut locator_ptr as *mut _ as *mut *mut std::ffi::c_void,
         );
-        if !SUCCEEDED(hr) {
+        if !succeeded(hr) {
             return Err(anyhow!("CoCreateInstance(WbemLocator) failed: 0x{:08X}", hr));
         }
 
-        let ns_bstr = alloc_bstr("root\\subscription");
+        let ns_bstr = ComBstr::new("root\\subscription")
+            .ok_or_else(|| anyhow!("wmi_connect: failed to allocate namespace BSTR"))?;
         let mut services_ptr: *mut IWbemServices = ptr::null_mut();
         let hr = ((*(*locator_ptr).lpvtbl).connect_server)(
             locator_ptr,
-            ns_bstr,
+            ns_bstr.as_ptr(),
             ptr::null_mut(),
             ptr::null_mut(),
             ptr::null_mut(),
@@ -1131,8 +1200,8 @@ pub mod windows {
             ptr::null_mut(),
             &mut services_ptr,
         );
-        free_bstr(ns_bstr);
-        if !SUCCEEDED(hr) {
+        // ns_bstr drops here
+        if !succeeded(hr) {
             ((*(*locator_ptr).lpvtbl).release)(locator_ptr);
             return Err(anyhow!("IWbemLocator::ConnectServer failed: 0x{:08X}", hr));
         }
@@ -1147,7 +1216,7 @@ pub mod windows {
             ptr::null_mut(),
             0,
         );
-        if !SUCCEEDED(hr) {
+        if !succeeded(hr) {
             ((*(*services_ptr).lpvtbl).release)(services_ptr);
             ((*(*locator_ptr).lpvtbl).release)(locator_ptr);
             return Err(anyhow!("CoSetProxyBlanket failed: 0x{:08X}", hr));
@@ -1163,7 +1232,7 @@ pub mod windows {
     // CommandLineEventConsumer, __EventFilter), and deletes each one via
     // IWbemServices::DeleteInstance.
     unsafe fn wmi_remove_com(subscription_name: &str) -> Result<()> {
-        use winapi::shared::winerror::SUCCEEDED;
+        use crate::win_types::succeeded;
 
         let (locator, services) = wmi_connect()?;
 
@@ -1180,25 +1249,35 @@ pub mod windows {
              &format!("__EventFilter.Name=\"{}\"", subscription_name)),
         ];
 
-        let wql_bstr = alloc_bstr("WQL");
+        let wql_bstr = match ComBstr::new("WQL") {
+            Some(b) => b,
+            None => {
+                ((*(*services).lpvtbl).release)(services);
+                ((*(*locator).lpvtbl).release)(locator);
+                return Err(anyhow!("wmi_remove_com: failed to allocate WQL BSTR"));
+            }
+        };
 
         for &(class, _key_path) in classes_and_keys {
             // Query for instances of this class matching the subscription name.
             let query = format!("SELECT * FROM {} WHERE Name = '{}'", class, subscription_name);
-            let query_bstr = alloc_bstr(&query);
+            let query_bstr = match ComBstr::new(&query) {
+                Some(b) => b,
+                None => continue,
+            };
 
             let mut enum_ptr: *mut IEnumWbemClassObject = ptr::null_mut();
             let hr = ((*(*services).lpvtbl).exec_query)(
                 services,
-                wql_bstr,
-                query_bstr,
+                wql_bstr.as_ptr(),
+                query_bstr.as_ptr(),
                 WBEM_FLAG_FORWARD_ONLY,
                 ptr::null_mut(),
                 &mut enum_ptr as *mut _ as *mut *mut std::ffi::c_void,
             );
-            free_bstr(query_bstr);
+            // query_bstr drops here
 
-            if !SUCCEEDED(hr) || enum_ptr.is_null() {
+            if !succeeded(hr) || enum_ptr.is_null() {
                 // Query failure for one class is non-fatal — continue trying
                 // the others.  The subscription may be partially torn down.
                 continue;
@@ -1215,7 +1294,7 @@ pub mod windows {
                     &mut obj,
                     &mut returned,
                 );
-                if next_hr != winapi::shared::winerror::S_OK || returned == 0 {
+                if next_hr != crate::win_types::S_OK || returned == 0 {
                     break;
                 }
 
@@ -1230,17 +1309,20 @@ pub mod windows {
                 };
                 ((*(*obj).lpvtbl).release)(obj);
 
-                let path_bstr = alloc_bstr(&path_str);
+                let path_bstr = match ComBstr::new(&path_str) {
+                    Some(b) => b,
+                    None => continue,
+                };
                 let del_hr = ((*(*services).lpvtbl).delete_instance)(
                     services,
-                    path_bstr,
+                    path_bstr.as_ptr(),
                     0,
                     ptr::null_mut(),
                     ptr::null_mut(),
                 );
-                free_bstr(path_bstr);
+                // path_bstr drops here
 
-                if !SUCCEEDED(del_hr) {
+                if !succeeded(del_hr) {
                     log::warn!(
                         "WmiSubscription::remove: DeleteInstance('{}') failed: 0x{:08X}",
                         path_str, del_hr
@@ -1250,7 +1332,7 @@ pub mod windows {
             ((*(*enum_ptr).lpvtbl).release)(enum_ptr);
         }
 
-        free_bstr(wql_bstr);
+        // wql_bstr drops here
         ((*(*services).lpvtbl).release)(services);
         ((*(*locator).lpvtbl).release)(locator);
         Ok(())
@@ -1261,30 +1343,44 @@ pub mod windows {
     // Queries root\subscription for an __EventFilter with the given name.
     // Returns Ok(true) if found, Ok(false) if not.
     unsafe fn wmi_verify_com(subscription_name: &str) -> Result<bool> {
-        use winapi::shared::winerror::S_OK;
+        use crate::win_types::S_OK;
 
         let (locator, services) = wmi_connect()?;
 
-        let wql_bstr = alloc_bstr("WQL");
+        let wql_bstr = match ComBstr::new("WQL") {
+            Some(b) => b,
+            None => {
+                ((*(*services).lpvtbl).release)(services);
+                ((*(*locator).lpvtbl).release)(locator);
+                return Err(anyhow!("wmi_verify_com: failed to allocate WQL BSTR"));
+            }
+        };
         let query = format!(
             "SELECT * FROM __EventFilter WHERE Name = '{}'",
             subscription_name
         );
-        let query_bstr = alloc_bstr(&query);
+        let query_bstr = match ComBstr::new(&query) {
+            Some(b) => b,
+            None => {
+                // wql_bstr drops here
+                ((*(*services).lpvtbl).release)(services);
+                ((*(*locator).lpvtbl).release)(locator);
+                return Err(anyhow!("wmi_verify_com: failed to allocate query BSTR"));
+            }
+        };
 
         let mut enum_ptr: *mut IEnumWbemClassObject = ptr::null_mut();
         let hr = ((*(*services).lpvtbl).exec_query)(
             services,
-            wql_bstr,
-            query_bstr,
+            wql_bstr.as_ptr(),
+            query_bstr.as_ptr(),
             WBEM_FLAG_FORWARD_ONLY,
             ptr::null_mut(),
             &mut enum_ptr as *mut _ as *mut *mut std::ffi::c_void,
         );
-        free_bstr(query_bstr);
-        free_bstr(wql_bstr);
+        // query_bstr and wql_bstr drop here
 
-        let found = if SUCCEEDED(hr) && !enum_ptr.is_null() {
+        let found = if succeeded(hr) && !enum_ptr.is_null() {
             let mut obj: *mut IWbemClassObject = ptr::null_mut();
             let mut returned: u32 = 0;
             let next_hr = ((*(*enum_ptr).lpvtbl).next)(
@@ -1327,7 +1423,7 @@ pub mod windows {
 
     impl Persist for WmiSubscription {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            use winapi::shared::winerror::SUCCEEDED;
+            use crate::win_types::succeeded;
             const COINIT_MULTITHREADED: u32 = 0x0;
 
             let exe_path = executable_path.to_string_lossy();
@@ -1354,7 +1450,7 @@ pub mod windows {
                 // RPC_E_CHANGED_MODE — COM already initialised in a *different* apartment
                 //              model.  We do NOT own the initialisation and must NOT call
                 //              CoUninitialize, or we'll tear down the caller's COM setup.
-                let should_uninitialize = SUCCEEDED(hr);
+                let should_uninitialize = succeeded(hr);
                 if !should_uninitialize && hr != RPC_E_CHANGED_MODE {
                     return Err(anyhow!(
                         "WmiSubscription::install: CoInitializeEx failed: 0x{:08X}",
@@ -1386,7 +1482,7 @@ pub mod windows {
         }
 
         fn remove(&self) -> Result<()> {
-            use winapi::shared::winerror::SUCCEEDED;
+            use crate::win_types::succeeded;
             const COINIT_MULTITHREADED: u32 = 0x0;
 
             unsafe {
@@ -1399,7 +1495,7 @@ pub mod windows {
                 ).ok_or_else(|| anyhow!("WmiSubscription::remove: failed to resolve CoUninitialize"))?;
 
                 let hr = co_init(ptr::null_mut(), COINIT_MULTITHREADED);
-                let should_uninitialize = SUCCEEDED(hr);
+                let should_uninitialize = succeeded(hr);
                 if !should_uninitialize && hr != RPC_E_CHANGED_MODE {
                     return Err(anyhow!(
                         "WmiSubscription::remove: CoInitializeEx failed: 0x{:08X}",
@@ -1424,7 +1520,7 @@ pub mod windows {
         }
 
         fn verify(&self) -> Result<bool> {
-            use winapi::shared::winerror::SUCCEEDED;
+            use crate::win_types::succeeded;
             const COINIT_MULTITHREADED: u32 = 0x0;
 
             unsafe {
@@ -1437,7 +1533,7 @@ pub mod windows {
                 ).ok_or_else(|| anyhow!("WmiSubscription::verify: failed to resolve CoUninitialize"))?;
 
                 let hr = co_init(ptr::null_mut(), COINIT_MULTITHREADED);
-                let should_uninitialize = SUCCEEDED(hr);
+                let should_uninitialize = succeeded(hr);
                 if !should_uninitialize && hr != RPC_E_CHANGED_MODE {
                     return Err(anyhow!(
                         "WmiSubscription::verify: CoInitializeEx failed: 0x{:08X}",

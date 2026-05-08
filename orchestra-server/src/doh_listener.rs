@@ -165,6 +165,7 @@ impl DohRuntime {
                 text_hash: None,
                 mesh_certificate: None,
                 compartment: None,
+                cert_identity: None,
             },
         );
 

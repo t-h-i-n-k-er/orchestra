@@ -37,6 +37,9 @@ bincode = "1.3.3"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["libloaderapi", "winnt"] }
+
 [features]
 module-signatures = ["dep:ed25519-dalek"]
 dangerous-tls = []

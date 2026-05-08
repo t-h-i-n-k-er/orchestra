@@ -56,12 +56,21 @@ pub async fn run(
     secret: String,
     tls: Arc<rustls::ServerConfig>,
 ) -> Result<()> {
+    // P1-20: Immediately wrap the PSK in LockedSecret so it is mlocked
+    // and will be zeroized on drop.  The plaintext String goes out of
+    // scope at the end of this function.
+    let secret = Arc::new(common::LockedSecret::new(secret.as_bytes()));
     // If mTLS is enabled, rebuild the ServerConfig with a client certificate
     // verifier.  The HTTPS dashboard keeps the original config (no client
     // cert required so browsers can reach the operator GUI).
     let tls = if state.config.mtls_enabled {
-        crate::tls::build_agent_tls_config(&state.config)
-            .context("building mTLS ServerConfig for agent listener")?
+        let (cfg, verifier) = crate::tls::build_agent_tls_config(&state.config)
+            .context("building mTLS ServerConfig for agent listener")?;
+        // P2-16: Store the CnOuVerifier reference for runtime CRL reload.
+        if let Some(v) = verifier {
+            *state.mtls_verifier.write().unwrap_or_else(|p| p.into_inner()) = Some(v);
+        }
+        cfg
     } else {
         tls
     };
@@ -74,7 +83,7 @@ pub async fn run(
 pub async fn serve(
     state: Arc<AppState>,
     listener: TcpListener,
-    secret: String,
+    secret: Arc<common::LockedSecret>,
     tls: Arc<rustls::ServerConfig>,
 ) -> Result<()> {
     loop {
@@ -106,7 +115,7 @@ async fn handle_agent(
     peer: String,
     connection_id: String,
     state: Arc<AppState>,
-    secret: String,
+    secret: Arc<common::LockedSecret>,
     tls_config: Arc<rustls::ServerConfig>,
 ) -> Result<()> {
     sock.set_nodelay(true).ok();
@@ -119,6 +128,9 @@ async fn handle_agent(
     // application message.  The derived per-session key replaces the
     // static PSK-derived key, providing PFS at the application layer.
     // This is mandatory — if the handshake fails, the connection is rejected.
+    //
+    // P1-20: The PSK is read from a LockedSecret (mlocked + zeroize-on-drop)
+    // rather than a bare String, preventing it from being swapped to disk.
     let session = Arc::new(
         common::forward_secrecy::negotiate_session_key(
             &mut tls_stream,
@@ -128,11 +140,10 @@ async fn handle_agent(
         .await?,
     );
 
-    // mTLS: after the TLS handshake, extract and log the client certificate CN.
-    // When mtls_enabled is true the WebPkiClientVerifier has already verified
-    // the certificate chain at the TLS layer; this block provides audit
-    // logging and defense-in-depth rejection for the case where a cert was
-    // somehow omitted.
+    // P2-17: Extract the client certificate CN (if mTLS) and retain it
+    // for identity binding.  The CN is stored in `cert_identity` and later
+    // validated against the agent's self-reported `agent_id` at check-in.
+    let mut cert_identity: Option<String> = None;
     if state.config.mtls_enabled {
         let (_, server_conn) = tls_stream.get_ref();
         match server_conn.peer_certificates().and_then(|c| c.first()) {
@@ -145,6 +156,7 @@ async fn handle_agent(
                     client_cert_cn = %cn,
                     "mTLS: client certificate accepted"
                 );
+                cert_identity = Some(cn);
             }
             None => {
                 tracing::warn!(
@@ -188,6 +200,9 @@ async fn handle_agent(
     // Reader loop runs in the connection task.
     let conn_id = connection_id.clone();
     let mut registered = false;
+    // P2-17: Move cert_identity into the reader loop so it's available
+    // when the Heartbeat message is processed.
+    let cert_identity = cert_identity;
 
     loop {
         let msg = match read_frame(&mut r, &session).await {
@@ -231,6 +246,23 @@ async fn handle_agent(
                 status,
                 timestamp: _,
             } => {
+                // P2-17: When mTLS is enabled and a client cert was presented,
+                // verify the agent's self-reported agent_id matches the cert CN.
+                // This binds the logical agent identity to its cryptographic
+                // credential, preventing identity spoofing.
+                if let Some(ref cn) = cert_identity {
+                    if *cn != agent_id {
+                        tracing::warn!(
+                            connection_id = %conn_id,
+                            reported_agent_id = %agent_id,
+                            cert_cn = %cn,
+                            "P2-17: agent_id does not match mTLS certificate CN; \
+                             rejecting registration"
+                        );
+                        break;
+                    }
+                }
+
                 // Warn about duplicate agent_id but do not reject — it may be
                 // a legitimate reconnect racing with cleanup of the old socket.
                 if state
@@ -263,6 +295,7 @@ async fn handle_agent(
                     text_hash: None,
                     mesh_certificate: None,
                     compartment: None,
+                    cert_identity: cert_identity.clone(),
                 };
                 state.registry.insert(conn_id.clone(), entry);
                 registered = true;
@@ -654,6 +687,7 @@ async fn handle_agent(
                     ),
                     outcome: common::Outcome::Success,
                     details: format!("evidence_hash={:?}", evidence_hash),
+                    tampered: false,
                 });
             }
             Message::ShellOutput {
@@ -690,6 +724,7 @@ async fn handle_agent(
                     action: format!("ShellOutput(session={session_id}, stream={stream_name})"),
                     outcome: common::Outcome::Success,
                     details: format!("{} bytes", data.len()),
+                    tampered: false,
                 });
             }
             other => {

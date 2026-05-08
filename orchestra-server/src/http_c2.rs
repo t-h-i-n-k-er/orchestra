@@ -23,6 +23,7 @@
 //! 5. Process the task output
 //! 6. Send a transformed acknowledgment response
 
+use crate::auth;
 use crate::malleable::{MultiProfileManager, TransactionTransformer};
 use crate::state::AppState;
 use axum::body::Bytes;
@@ -31,6 +32,7 @@ use axum::http::{HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::Router;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 /// Shared state for the HTTP C2 handler.
@@ -38,6 +40,9 @@ use std::sync::Arc;
 pub struct HttpC2State {
     pub profile_manager: Arc<MultiProfileManager>,
     pub app_state: Arc<AppState>,
+    /// Per-IP rate limiter for C2 requests.  More permissive than the auth
+    /// limiter since legitimate agents poll frequently.
+    pub c2_rate_limiter: Arc<auth::PerIpRateLimiter>,
 }
 
 /// Build an axum Router for the HTTP C2 handler.
@@ -51,10 +56,23 @@ pub fn build_router(state: HttpC2State) -> Router {
 }
 
 /// Top-level dispatcher that extracts request components and delegates.
+///
+/// Enforces per-IP rate limiting before processing any C2 request.
 async fn dispatch_c2_request(
     State(state): State<HttpC2State>,
     req: axum::extract::Request,
 ) -> axum::response::Response {
+    // P1-16: Per-IP rate limiting — extract client IP and check quota.
+    let client_ip = extract_client_ip_from_request(&req);
+    if state.c2_rate_limiter.check(&client_ip).is_err() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+            "Too Many Requests",
+        )
+            .into_response();
+    }
+
     let method = req.method().clone();
     let uri = req.uri().to_string();
     let path = req.uri().path().to_string();
@@ -255,6 +273,14 @@ fn extract_headers(headers: &HeaderMap) -> HashMap<String, String> {
         }
     }
     map
+}
+
+/// Extract client IP from the incoming C2 request.
+///
+/// Delegates to `auth::extract_client_ip` which checks `ConnectInfo`,
+/// then `X-Forwarded-For`, then falls back to `127.0.0.1`.
+fn extract_client_ip_from_request(req: &axum::extract::Request) -> IpAddr {
+    auth::extract_client_ip(req)
 }
 
 /// Find a matching GET transformer for the given URI path.

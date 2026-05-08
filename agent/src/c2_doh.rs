@@ -59,16 +59,23 @@ use crate::malleable::MalleableProfile as AgentMalleableProfile;
 /// end-entity certificate's DER encoding does not hash to the expected
 /// fingerprint, the TLS handshake is rejected.
 ///
+/// P1-06: After the fingerprint check passes, the server name (hostname) is
+/// validated against the certificate's SAN/CN entries, matching the behaviour
+/// in `c2_http::FingerprintVerifier`.  This prevents a valid-pinned cert from
+/// being presented for the wrong hostname.
+///
 /// When `expected_fingerprint` is `None`, the verifier delegates to rustls's
 /// built-in `WebPkiVerifier` with platform root certificates — i.e. standard
 /// CA-based verification.
 struct FingerprintVerifier {
     expected_fingerprint: Option<String>,
+    /// P1-06: The expected server hostname for certificate name validation.
+    hostname: String,
     webpki: rustls_0_21::client::WebPkiVerifier,
 }
 
 impl FingerprintVerifier {
-    fn new(expected_fingerprint: Option<String>) -> Self {
+    fn new(expected_fingerprint: Option<String>, hostname: String) -> Self {
         let mut root_store = rustls_0_21::RootCertStore::empty();
         for cert in rustls_native_certs::load_native_certs()
             .certs
@@ -80,6 +87,7 @@ impl FingerprintVerifier {
         let webpki = rustls_0_21::client::WebPkiVerifier::new(root_store, None);
         Self {
             expected_fingerprint,
+            hostname,
             webpki,
         }
     }
@@ -110,6 +118,21 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
                 ));
             }
             log::debug!("cert pinning: fingerprint verified OK");
+
+            // P1-06: Validate that the certificate's SAN/CN matches the
+            // expected hostname.  Without this check, a valid pinned cert
+            // could be served for the wrong hostname (e.g. after SNI
+            // rewriting or a compromised relay).
+            if !crate::c2_http::verify_cert_hostname_rustls021(&end_entity.0, server_name) {
+                log::error!(
+                    "cert pinning: fingerprint matched but hostname validation failed for {:?}",
+                    server_name
+                );
+                return Err(rustls_0_21::Error::InvalidCertificate(
+                    rustls_0_21::CertificateError::NotValidForName,
+                ));
+            }
+
             Ok(rustls_0_21::client::ServerCertVerified::assertion())
         } else {
             self.webpki
@@ -249,7 +272,7 @@ impl DohTransport {
         };
 
         let client = if cert_fingerprint.is_some() {
-            let verifier = FingerprintVerifier::new(cert_fingerprint);
+            let verifier = FingerprintVerifier::new(cert_fingerprint, host_header.clone());
             let config = rustls_0_21::ClientConfig::builder()
                 .with_safe_defaults()
                 .with_custom_certificate_verifier(Arc::new(verifier))

@@ -1111,6 +1111,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "toml 1.1.2+spec-1.1.0",
+ "winapi",
  "x25519-dalek",
  "zeroize",
 ]
@@ -3064,6 +3065,7 @@ dependencies = [
  "junk_macro",
  "libc",
  "nix 0.28.0",
+ "pe_resolve",
  "predicates",
  "rand 0.8.6",
  "reqwest 0.11.27",
@@ -3072,7 +3074,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "warp",
- "winapi",
 ]
 
 [[package]]
@@ -3717,6 +3718,7 @@ dependencies = [
  "iced-x86",
  "libc",
  "memmap2 0.9.10",
+ "pe_resolve",
  "rand 0.8.6",
  "region",
  "sha2",
@@ -4526,6 +4528,8 @@ dependencies = [
  "axum-server",
  "clap",
  "reqwest 0.12.28",
+ "rustls 0.23.38",
+ "rustls-pemfile 2.2.0",
  "serde",
  "serde_json",
  "tokio",

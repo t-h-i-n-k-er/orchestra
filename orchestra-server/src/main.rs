@@ -8,6 +8,7 @@ use orchestra_server::{
     redirector, smb_relay,
     state::AppState, tls,
 };
+use orchestra_server::auth::PerIpRateLimiter;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -71,6 +72,9 @@ struct Cli {
     ///
     /// WARNING: This makes the server vulnerable to MITM attacks on
     /// redirector connections. Use only in development or air-gapped labs.
+    ///
+    /// Only available in debug builds — never in release.
+    #[cfg(debug_assertions)]
     #[arg(long, default_value_t = false)]
     allow_insecure_redirector: bool,
     /// SHA-256 fingerprint of the expected redirector TLS certificate.
@@ -150,7 +154,7 @@ async fn main() -> Result<()> {
             let base_url = format!("https://{}", cfg.http_addr);
             let client = {
                 let builder = reqwest::Client::builder();
-                if cli.allow_insecure_redirector {
+                if cfg!(debug_assertions) && cli.allow_insecure_redirector {
                     tracing::warn!(
                         "WARNING: Redirector TLS certificate verification is DISABLED. \
                          This makes the server vulnerable to MITM attacks. \
@@ -278,7 +282,10 @@ async fn main() -> Result<()> {
         "loaded malleable profiles"
     );
 
-    let hmac_key = AuditLog::derive_hmac_key(&cfg.admin_token);
+    let hmac_key = AuditLog::load_or_generate_hmac_key(
+        cfg.audit_hmac_key.as_deref(),
+        &cfg.audit_log_path.with_extension("jsonl.key"),
+    )?;
     let audit = Arc::new(AuditLog::open(cfg.audit_log_path.clone(), &hmac_key)?);
     let state = Arc::new(AppState::new(
         audit.clone(),
@@ -364,6 +371,13 @@ async fn main() -> Result<()> {
         let http_c2_state = HttpC2State {
             profile_manager: profile_manager.clone(),
             app_state: state.clone(),
+            // P1-16: C2 rate limiter — 200 requests per 60 seconds per IP.
+            // Much more permissive than the auth limiter since legitimate
+            // agents poll the C2 channel at their configured sleep interval.
+            c2_rate_limiter: Arc::new(PerIpRateLimiter::new(
+                200,
+                std::time::Duration::from_secs(60),
+            )),
         };
         let http_c2_addr = cfg.http_c2_addr;
         let router = orchestra_server::http_c2::build_router(http_c2_state);
@@ -386,7 +400,7 @@ async fn main() -> Result<()> {
     let app = api::router(state.clone(), cfg.static_dir.clone());
     tracing::info!(addr = %cfg.http_addr, "operator HTTPS listening");
     axum_server::bind_rustls(cfg.http_addr, tls_cfg)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await?;
     Ok(())
 }

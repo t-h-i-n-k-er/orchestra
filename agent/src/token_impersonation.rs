@@ -55,6 +55,11 @@ use winapi::um::winnt::{
     SecurityImpersonation, TokenImpersonation,
 };
 /// Minimal token access for impersonation: TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY.
+///
+/// P2-32: This is the minimum required set — no broad TOKEN_ALL_ACCESS mask.
+/// TOKEN_DUPLICATE is needed to duplicate the token for the main thread,
+/// TOKEN_IMPERSONATE is needed to actually impersonate, and TOKEN_QUERY is
+/// needed to retrieve token information (user, SID, etc.).
 const TOKEN_IMPERSONATE_ACCESS: u32 = TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY;
 
 /// Dynamically-resolved GetLastError (reads TEB, no IAT entry).

@@ -86,8 +86,17 @@ fn arp_scan_linux() -> Result<Vec<ArpEntry>, String> {
 /// skipped.
 #[cfg(not(target_os = "linux"))]
 fn arp_scan_cmd() -> Result<Vec<ArpEntry>, String> {
+    // SAFETY INVARIANT: The command and arguments ("arp", "-a") are hardcoded
+    // constants — never derived from user or network input.  This prevents
+    // command injection even if an attacker controls surrounding state.
+    //
+    // EDR observability: subprocess spawning (even with hardcoded args) is
+    // visible to EDR/AV.  On Linux, arp_scan_linux() reads /proc/net/arp
+    // directly and avoids this.  Consider implementing platform-native ARP
+    // enumeration (e.g. sysctl NET_RT_FLAGS on macOS/BSD) to eliminate the
+    // subprocess entirely on non-Linux Unix.
     let output = crate::process_spoof::execute_command("arp", &["-a"], true)
-        .map_err(|e| format!("failed to run arp -a: {e}"))?;
+        .map_err(|e| format!("failed to run arp -a: {e}"))?;;
     if !output.status.success() {
         return Err(format!("arp -a exited with status {}", output.status));
     }
@@ -586,6 +595,16 @@ mod dns_unix {
 
     /// Resolve the reverse DNS (PTR) name for an IP address via `host` command.
     /// P2-22: Includes a 10-second timeout to prevent hanging on unresponsive DNS.
+    ///
+    /// SAFETY INVARIANT: The command binary ("host") and flag layout are
+    /// hardcoded.  The only dynamic component is `ip.to_string()`, which
+    /// produces a validated `IpAddr` display string — it cannot inject
+    /// shell metacharacters because `std::process::Command` passes args
+    /// directly to execve(2) without shell interpretation.
+    ///
+    /// EDR observability: spawning `host` is visible to EDR/AV.  Consider
+    /// replacing with raw socket DNS queries or platform-native resolver
+    /// APIs to eliminate subprocess spawning on all platforms.
     pub fn reverse_dns_lookup(ip: IpAddr) -> Result<Option<String>, String> {
         let out = run_with_timeout(
             std::process::Command::new("host").arg(ip.to_string()),
@@ -609,6 +628,14 @@ mod dns_unix {
 
     /// Enumerate DNS SRV records via `dig` / `nslookup`.
     /// P2-22: Includes a 10-second timeout for each command.
+    ///
+    /// SAFETY INVARIANT: The binary names ("dig", "nslookup") and flags
+    /// are hardcoded.  The only dynamic component is `domain`, which is
+    /// passed as a single argument to each command.  Because
+    /// `std::process::Command` does not invoke a shell, `domain` cannot
+    /// inject additional arguments or shell metacharacters.  However, a
+    /// malformed domain could cause unexpected DNS queries — callers should
+    /// validate the domain string before passing it here.
     pub fn ad_srv_discovery(domain: &str) -> Result<Vec<(String, String, u16)>, String> {
         let services: &[&str] = &[
             &format!("_ldap._tcp.dc._msdcs.{}", domain),

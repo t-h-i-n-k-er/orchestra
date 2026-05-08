@@ -57,10 +57,45 @@ pub struct ShellResizeRequest {
     pub rows: u16,
 }
 
+/// Known-safe shell binaries that may be specified by an operator.
+/// Any value not in this list is rejected to prevent arbitrary command
+/// execution through shell path manipulation.
+const ALLOWED_SHELLS: &[&str] = &[
+    "/bin/sh",
+    "/bin/bash",
+    "/bin/zsh",
+    "/bin/dash",
+    "/usr/bin/bash",
+    "/usr/bin/zsh",
+    "/usr/bin/dash",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+];
+
 #[derive(Deserialize)]
 pub struct OpenShellBody {
-    /// Optional path to the shell binary.
+    /// Optional path to the shell binary.  Must match one of the known-safe
+    /// shells listed in `ALLOWED_SHELLS`.
     pub shell_path: Option<String>,
+}
+
+/// Validate that the given shell path is in the allowlist.
+fn validate_shell_path(path: &str) -> Result<(), String> {
+    // Normalise Windows-style back-slashes to forward slashes for
+    // case-insensitive comparison on the allowlist.
+    let normalised = path.replace('\\', "/").to_lowercase();
+    if ALLOWED_SHELLS
+        .iter()
+        .any(|a| a.to_lowercase() == normalised)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "shell_path '{}' is not in the allowlist: [{}]",
+        path,
+        ALLOWED_SHELLS.join(", ")
+    ))
 }
 
 #[derive(Deserialize)]
@@ -135,6 +170,9 @@ pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
         .route("/p2p/link", post(link_agents))
         .route("/p2p/unlink", post(unlink_agent))
         .route("/p2p/topology", get(list_topology))
+        // P2-16: Certificate revocation and CRL reload endpoints.
+        .route("/p2p/revoke", post(revoke_agent_cert))
+        .route("/p2p/reload-crl", post(reload_crl))
         // Mesh routing endpoints (Dijkstra pathfinding).
         .route("/mesh/route", get(mesh_route))
         .route("/mesh/broadcast", get(mesh_broadcast))
@@ -151,22 +189,24 @@ pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
         .route("/redirector/list", get(crate::redirector::handle_list))
         .route("/redirector/remove", post(crate::redirector::handle_remove))
         .route("/redirector/register", post(crate::redirector::handle_register))
-        .route(
-            "/redirector/agent-config/:profile",
-            get(crate::redirector::handle_agent_config),
-        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
         ))
         .with_state(state.clone());
 
-    // Redirector heartbeat endpoint — outside auth because redirectors
-    // use their redirector ID as authentication (not a bearer token).
+    // Endpoints accessible without operator bearer token.
+    // Redirector heartbeat: authenticated via redirector_secret (validated
+    // inside the handler).
+    // Agent config: authenticated via agent_shared_secret query parameter.
     let redirector_public = Router::new()
         .route(
             "/redirector/heartbeat",
             post(crate::redirector::handle_heartbeat),
+        )
+        .route(
+            "/redirector/agent-config/:profile",
+            get(crate::redirector::handle_agent_config),
         )
         .with_state(state.clone());
 
@@ -263,10 +303,35 @@ async fn open_shell(
     Path(agent_id): Path<String>,
     Json(body): Json<Option<OpenShellBody>>,
 ) -> Result<Json<OpenShellReply>, (StatusCode, String)> {
+    // P1-26: Admin-only — opening a remote shell is a destructive operation.
+    user.require_any_permission(&["admin"])?;
     let entry = state
         .find_by_agent_id(&agent_id)
         .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
     let shell_path = body.and_then(|b| b.shell_path);
+
+    // P1-13: Validate shell_path against allowlist of known-safe shells.
+    if let Some(ref sp) = shell_path {
+        if let Err(e) = validate_shell_path(sp) {
+            state.audit.record_simple(
+                &agent_id,
+                &user.id,
+                "OpenShellRejected",
+                &format!("shell_path={sp} reason={e}"),
+                common::Outcome::Failure,
+            );
+            return Err((StatusCode::BAD_REQUEST, e));
+        }
+        // Log the full shell_path value for audit trail.
+        state.audit.record_simple(
+            &agent_id,
+            &user.id,
+            "CreateShell",
+            &format!("shell_path={sp}"),
+            common::Outcome::Success,
+        );
+    }
+
     let req = CommandRequest {
         command: Command::CreateShell { shell_path },
     };
@@ -286,6 +351,8 @@ async fn shell_input(
     Path((agent_id, session_id)): Path<(String, u32)>,
     Json(req): Json<ShellInputRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    // P1-26: Admin-only — injecting shell input is a destructive operation.
+    user.require_any_permission(&["admin"])?;
     let entry = state
         .find_by_agent_id(&agent_id)
         .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
@@ -424,9 +491,11 @@ pub fn sign_mesh_certificate(
     compartment: Option<&str>,
 ) -> common::MeshCertificate {
     use common::p2p_proto::MESH_CERT_LIFETIME_SECS;
+    // P2-15: unwrap_or(0) — practically infallible, avoids panic on
+    // misconfigured clocks.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("time went backwards")
+        .unwrap_or(std::time::Duration::from_secs(0))
         .as_secs();
     let mut cert = common::MeshCertificate {
         agent_id_hash: common::hash_agent_id(agent_id),
@@ -452,9 +521,27 @@ async fn push_module(
     Path(agent_id): Path<String>,
     Json(req): Json<PushModuleRequest>,
 ) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    // P1-26: Admin-only — pushing a module to an agent is a destructive operation.
+    user.require_any_permission(&["admin"])?;
     let entry = state
         .find_by_agent_id(&agent_id)
         .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
+
+    // P2-12: Reject oversized modules before base64 decode.  Base64-encoded
+    // data is ~4/3 the size of the decoded bytes, so `len * 3 / 4` is a
+    // conservative upper bound on the decoded size (ignoring padding which
+    // only makes it smaller).
+    let max_module_size = state.config.max_module_size;
+    let estimated_decoded_size = (req.module_data.len() * 3) / 4;
+    if estimated_decoded_size > max_module_size {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "module data exceeds maximum allowed size ({} bytes > {} bytes)",
+                estimated_decoded_size, max_module_size
+            ),
+        ));
+    }
 
     // Decode the base64 module binary.
     let module_bytes = B64
@@ -481,7 +568,7 @@ async fn push_module(
 
     state.audit.record_simple(
         &agent_id,
-        &user.0,
+        &user.id,
         "PushModule",
         &format!(
             "PushModule(module={:?}, version={:?}, size={})",
@@ -553,7 +640,7 @@ async fn link_agents(
 
     state.audit.record_simple(
         &req.child_agent_id,
-        &user.0,
+        &user.id,
         "LinkAgents",
         &format!(
             "parent={}, child={}, transport={}, addr={}",
@@ -591,7 +678,7 @@ async fn unlink_agent(
 
     state.audit.record_simple(
         &req.agent_id,
-        &user.0,
+        &user.id,
         "UnlinkAgent",
         &format!("unlink agent_id={}", req.agent_id),
         Outcome::Success,
@@ -616,6 +703,95 @@ async fn list_topology(State(state): State<Arc<AppState>>) -> Json<TopologyReply
         })
         .collect();
     Json(TopologyReply { nodes })
+}
+
+// ── P2-16: Certificate revocation and CRL reload ────────────────────────
+
+/// Request body for `POST /api/p2p/revoke`.
+#[derive(serde::Deserialize)]
+struct RevokeAgentRequest {
+    /// The `agent_id` to revoke.  Its SHA-256 hash is added to the
+    /// `revoked_certificates` set so future P2P link handshakes are rejected.
+    agent_id: String,
+}
+
+/// `POST /api/p2p/revoke`
+///
+/// Revoke an agent's mesh certificate.  The `agent_id` is hashed and the
+/// digest is stored in the `revoked_certificates` set.  Any agent whose
+/// `agent_id_hash` appears in the set will be rejected during P2P link
+/// handshake and have existing links terminated.
+async fn revoke_agent_cert(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    axum::Json(body): axum::Json<RevokeAgentRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Only authenticated operators with "admin" permission may revoke certs.
+    if !user.permissions.contains(&"admin".to_string()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "insufficient permissions: 'admin' required".into(),
+        ));
+    }
+    let hash = {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(body.agent_id.as_bytes());
+        let arr: [u8; 32] = hasher.finalize().into();
+        arr
+    };
+    let already_revoked = state.revoked_certificates.contains(&hash);
+    state.revoked_certificates.insert(hash);
+    tracing::info!(
+        agent_id = %body.agent_id,
+        already_revoked,
+        operator = %user.id,
+        "agent certificate revoked via API"
+    );
+    Ok(Json(serde_json::json!({
+        "status": "revoked",
+        "agent_id": body.agent_id,
+        "already_revoked": already_revoked,
+    })))
+}
+
+/// `POST /api/p2p/reload-crl`
+///
+/// Reload the CRL from the configured `mtls_crl_path`.  Requires admin
+/// permission.  Returns the number of revoked serials loaded.
+async fn reload_crl(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !user.permissions.contains(&"admin".to_string()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "insufficient permissions: 'admin' required".into(),
+        ));
+    }
+    let crl_path = state
+        .config
+        .mtls_crl_path
+        .as_ref()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "mtls_crl_path not configured".into()))?
+        .clone();
+    let verifier = state
+        .mtls_verifier
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "mTLS CRL verifier not available (no CN/OU/CRL configured at startup)".into()))?;
+    let count = crate::tls::reload_crl_on_verifier(&verifier, &crl_path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("CRL reload failed: {e}")))?;
+    tracing::info!(
+        count,
+        operator = %user.id,
+        "CRL reloaded via API"
+    );
+    Ok(Json(serde_json::json!({
+        "status": "reloaded",
+        "revoked_serial_count": count,
+    })))
 }
 
 // ── Mesh routing endpoints ──────────────────────────────────────────────
@@ -729,7 +905,7 @@ async fn mesh_connect(
 
     state.audit.record_simple(
         &req.agent_id,
-        &user.0,
+        &user.id,
         &format!("mesh connect to {}", req.target_agent_id),
         "mesh connect command dispatched",
         Outcome::Success,
@@ -772,7 +948,7 @@ async fn mesh_disconnect(
 
     state.audit.record_simple(
         &req.agent_id,
-        &user.0,
+        &user.id,
         &format!("mesh disconnect from {}", req.target_agent_id),
         "mesh disconnect command dispatched",
         Outcome::Success,
@@ -854,9 +1030,11 @@ struct KillSwitchRequest {
 
 async fn mesh_kill_switch(
     State(state): State<Arc<AppState>>,
-    Extension(_user): Extension<AuthenticatedUser>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<KillSwitchRequest>,
 ) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    // P1-26: Admin-only — kill switch is the most destructive operation.
+    user.require_any_permission(&["admin"])?;
     let cmd = Command::MeshKillSwitch;
     let mut sent = 0;
     let mut errors = 0;
@@ -916,9 +1094,11 @@ struct QuarantineRequest {
 
 async fn mesh_quarantine(
     State(state): State<Arc<AppState>>,
-    Extension(_user): Extension<AuthenticatedUser>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<QuarantineRequest>,
 ) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    // P1-26: Admin-only — quarantining a mesh node is a destructive operation.
+    user.require_any_permission(&["admin"])?;
     let entry = state
         .find_by_agent_id(&req.agent_id)
         .ok_or((
@@ -964,9 +1144,11 @@ struct ClearQuarantineRequest {
 
 async fn mesh_clear_quarantine(
     State(state): State<Arc<AppState>>,
-    Extension(_user): Extension<AuthenticatedUser>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<ClearQuarantineRequest>,
 ) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    // P1-26: Write-level — clearing quarantine modifies mesh state.
+    user.require_any_permission(&["write", "admin"])?;
     let entry = state
         .find_by_agent_id(&req.agent_id)
         .ok_or((
@@ -1009,9 +1191,11 @@ struct SetCompartmentRequest {
 
 async fn mesh_set_compartment(
     State(state): State<Arc<AppState>>,
-    Extension(_user): Extension<AuthenticatedUser>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<SetCompartmentRequest>,
 ) -> Result<Json<CommandReply>, (StatusCode, String)> {
+    // P1-26: Write-level — setting compartments modifies mesh state.
+    user.require_any_permission(&["write", "admin"])?;
     let entry = state
         .find_by_agent_id(&req.agent_id)
         .ok_or((
@@ -1087,7 +1271,7 @@ async fn send_command_by_agent_id(
     let inner_msg = Message::TaskRequest {
         task_id: task_id.clone(),
         command: req.command,
-        operator_id: Some(user.0.clone()),
+        operator_id: Some(user.id.clone()),
     };
 
     // Serialize the innermost C2 message.
@@ -1137,7 +1321,7 @@ async fn send_command_by_agent_id(
     if first_hop_entry.tx.send(p2p_msg).await.is_err() {
         state.audit.record_simple(
             &agent_id,
-            &user.0,
+            &user.id,
             cmd_label_str,
             "P2P relay send failed — first hop disconnected",
             Outcome::Failure,
@@ -1150,7 +1334,7 @@ async fn send_command_by_agent_id(
 
     state.audit.record_simple(
         &agent_id,
-        &user.0,
+        &user.id,
         cmd_label_str,
         &format!(
             "command relayed via P2P chain ({} hops, first={})",
@@ -1202,21 +1386,24 @@ async fn dispatch_command(
     state.pending.insert(task_id.clone(), tx);
 
     let cmd_label = command_label(&req.command);
-    let cmd_detail = serde_json::to_string(&req.command).unwrap_or_default();
+    // P1-27: Sanitize the command before writing to the audit log so that
+    // sensitive fields (shell input, passwords, file contents) are never
+    // persisted in cleartext.
+    let cmd_detail = sanitize_command_for_audit(&req.command);
     let is_morph_now = matches!(req.command, Command::MorphNow { .. });
     let connection_id = entry.connection_id.clone();
 
     let request = Message::TaskRequest {
         task_id: task_id.clone(),
         command: req.command,
-        operator_id: Some(user.0.clone()),
+        operator_id: Some(user.id.clone()),
     };
 
     if entry.tx.send(request).await.is_err() {
         state.pending.remove(&task_id);
         state
             .audit
-            .record_simple(&agent_id, &user.0, cmd_label, &cmd_detail, Outcome::Failure);
+            .record_simple(&agent_id, &user.id, cmd_label, &cmd_detail, Outcome::Failure);
         return Err((StatusCode::BAD_GATEWAY, "agent disconnected".into()));
     }
 
@@ -1238,7 +1425,7 @@ async fn dispatch_command(
             }
             state
                 .audit
-                .record_simple(&agent_id, &user.0, cmd_label, &cmd_detail, Outcome::Success);
+                .record_simple(&agent_id, &user.id, cmd_label, &cmd_detail, Outcome::Success);
             Ok(Json(CommandReply {
                 task_id,
                 outcome: "ok",
@@ -1249,7 +1436,7 @@ async fn dispatch_command(
         Ok(Ok(Err(err))) => {
             state
                 .audit
-                .record_simple(&agent_id, &user.0, cmd_label, &cmd_detail, Outcome::Failure);
+                .record_simple(&agent_id, &user.id, cmd_label, &cmd_detail, Outcome::Failure);
             Ok(Json(CommandReply {
                 task_id,
                 outcome: "error",
@@ -1268,7 +1455,7 @@ async fn dispatch_command(
             state.pending.remove(&task_id);
             state.audit.record_simple(
                 &agent_id,
-                &user.0,
+                &user.id,
                 cmd_label,
                 &format!("{cmd_detail} [timeout]"),
                 Outcome::Failure,
@@ -1278,6 +1465,38 @@ async fn dispatch_command(
                 "agent did not respond in time".into(),
             ))
         }
+    }
+}
+
+/// P1-27: Produce an audit-safe representation of a [`Command`], redacting
+/// any fields that may contain secrets or sensitive data (shell input,
+/// passwords, file contents, credential material).  Non-sensitive variants
+/// fall through to a default `Debug`-style representation via serde.
+fn sanitize_command_for_audit(cmd: &Command) -> String {
+    match cmd {
+        Command::ShellInput { session_id, data } => {
+            format!("ShellInput {{ session_id: {session_id}, data: [{} bytes redacted] }}", data.len())
+        }
+        Command::WriteFile { path, content } => {
+            format!("WriteFile {{ path: {path}, content: [{} bytes redacted] }}", content.len())
+        }
+        Command::MakeToken { username, domain, logon_type, .. } => {
+            format!("MakeToken {{ username: {username}, domain: {domain}, logon_type: {logon_type}, password: [redacted] }}")
+        }
+        Command::PsExec { target_host, command, username, .. } => {
+            format!("PsExec {{ target_host: {target_host}, command: {command}, username: {username:?}, password: [redacted] }}")
+        }
+        Command::WmiExec { target_host, command, username, .. } => {
+            format!("WmiExec {{ target_host: {target_host}, command: {command}, username: {username:?}, password: [redacted] }}")
+        }
+        Command::DcomExec { target_host, command, username, .. } => {
+            format!("DcomExec {{ target_host: {target_host}, command: {command}, username: {username:?}, password: [redacted] }}")
+        }
+        Command::WinRmExec { target_host, command, username, .. } => {
+            format!("WinRmExec {{ target_host: {target_host}, command: {command}, username: {username:?}, password: [redacted] }}")
+        }
+        // All other variants are safe to serialize as-is.
+        _ => serde_json::to_string(cmd).unwrap_or_else(|_| format!("{cmd:?}")),
     }
 }
 
@@ -1293,6 +1512,7 @@ fn command_label(c: &Command) -> &'static str {
         Command::ExecutePlugin { .. } => "ExecutePlugin",
         Command::Shutdown => "Shutdown",
         Command::DiscoverNetwork => "DiscoverNetwork",
+        Command::NetworkDiscovery { .. } => "NetworkDiscovery",
         Command::CaptureScreen => "CaptureScreen",
         Command::SimulateKey { .. } => "SimulateKey",
         Command::SimulateMouse { .. } => "SimulateMouse",
@@ -1356,6 +1576,32 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
+    // P1-29: Reject cross-origin WebSocket upgrades.  The dashboard is
+    // served from the same origin, so the browser will send a matching
+    // Origin header.  Direct agent connections don't send Origin at all,
+    // which is also acceptable.
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        let host = headers
+            .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        // Accept if the origin's host matches the request host, or if
+        // the origin is localhost (development).  Strip scheme prefix.
+        let origin_host = origin
+            .strip_prefix("https://")
+            .or_else(|| origin.strip_prefix("http://"))
+            .unwrap_or(origin);
+        let origin_host = origin_host.split(':').next().unwrap_or(origin_host);
+        let request_host = host.split(':').next().unwrap_or(host);
+        let allowed = origin_host == request_host
+            || origin_host == "localhost"
+            || origin_host == "127.0.0.1";
+        if !allowed {
+            tracing::warn!(%origin, "WebSocket rejected: disallowed Origin header");
+            return (StatusCode::FORBIDDEN, "disallowed origin").into_response();
+        }
+    }
+
     // Browsers can't attach `Authorization` to a WebSocket handshake,
     // so the dashboard sends the bearer token as a subprotocol value
     // of the form `bearer.<token>`. Validate it here in constant time
@@ -1374,23 +1620,32 @@ async fn ws_handler(
 
     // 1. Try the multi-operator store.
     if let Some(operator_id) = state.authenticate_operator(&token) {
-        let subprotocol = format!("bearer.{}", token);
+        // P1-12: Generate a random session ID instead of echoing the real
+        // bearer token in the Sec-WebSocket-Protocol response header.
+        let session_id = uuid::Uuid::new_v4().to_string();
+        state.ws_sessions.insert(session_id.clone(), operator_id);
+        let subprotocol = format!("bearer.{}", session_id);
         return ws
             .protocols([subprotocol])
-            .on_upgrade(move |sock| ws_loop(sock, state, operator_id));
+            .on_upgrade(move |sock| ws_loop(sock, state, session_id));
     }
 
-    // 2. Fallback: legacy single admin token.
-    let ok: bool = token.as_bytes().ct_eq(state.admin_token.as_bytes()).into();
+    // 2. Fallback: legacy single admin token — hash and compare.
+    let presented_hash = crate::config::OperatorRecord::hash_token(token);
+    let ok: bool = presented_hash
+        .as_bytes()
+        .ct_eq(state.admin_token_hash.as_bytes())
+        .into();
     if !ok {
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
 
-    // Echo the chosen subprotocol back so the browser accepts the
-    // upgrade (otherwise the handshake fails).
-    let subprotocol = format!("bearer.{}", token);
+    // Echo a random session ID instead of the real token.
+    let session_id = uuid::Uuid::new_v4().to_string();
+    state.ws_sessions.insert(session_id.clone(), "admin".to_string());
+    let subprotocol = format!("bearer.{}", session_id);
     ws.protocols([subprotocol])
-        .on_upgrade(move |sock| ws_loop(sock, state, "admin".into()))
+        .on_upgrade(move |sock| ws_loop(sock, state, session_id))
 }
 
 fn extract_bearer_subprotocol(header: &str) -> Option<String> {
@@ -1407,7 +1662,15 @@ enum DashboardEvent {
     Audit { event: common::AuditEvent },
 }
 
-async fn ws_loop(mut socket: WebSocket, state: Arc<AppState>, operator_id: String) {
+async fn ws_loop(mut socket: WebSocket, state: Arc<AppState>, session_id: String) {
+    // Resolve the single-use session ID to the actual operator ID,
+    // then remove it so it can't be replayed.
+    let operator_id = state
+        .ws_sessions
+        .remove(&session_id)
+        .map(|(_, id)| id)
+        .unwrap_or_else(|| "unknown".to_string());
+
     let mut audit_rx = state.audit.subscribe();
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     // Log the WebSocket connection with operator attribution.

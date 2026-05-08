@@ -1066,23 +1066,30 @@ mod runtime_rewrite {
             unwind_info_address: u32,
         }
 
-        extern "system" {
-            /// Returns a pointer to the RUNTIME_FUNCTION covering `control_pc`,
-            /// or NULL if none exists (e.g., leaf functions with no unwind info).
-            fn RtlLookupFunctionEntry(
-                control_pc: u64,
-                image_base: *mut u64,
-                history_table: *mut std::ffi::c_void,
-            ) -> *const RuntimeFunction;
-        }
+        type FnRtlLookupFunctionEntry = unsafe extern "system" fn(
+            u64,
+            *mut u64,
+            *mut std::ffi::c_void,
+        ) -> *const RuntimeFunction;
+
+        static FN: std::sync::OnceLock<Option<FnRtlLookupFunctionEntry>> =
+            std::sync::OnceLock::new();
+        let fn_ptr = FN.get_or_init(|| unsafe {
+            // RtlLookupFunctionEntry lives in ntdll.
+            let ntdll = pe_resolve::get_module_handle_by_hash(
+                pe_resolve::HASH_NTDLL_DLL,
+            )?;
+            let addr = pe_resolve::get_proc_address_by_hash(
+                ntdll,
+                pe_resolve::hash_str(b"RtlLookupFunctionEntry"),
+            )?;
+            Some(std::mem::transmute::<usize, FnRtlLookupFunctionEntry>(addr))
+        });
 
         unsafe {
+            let f = (*fn_ptr)?;
             let mut image_base: u64 = 0;
-            let rf = RtlLookupFunctionEntry(
-                addr as u64,
-                &mut image_base,
-                std::ptr::null_mut(),
-            );
+            let rf = f(addr as u64, &mut image_base, std::ptr::null_mut());
             if rf.is_null() {
                 return None;
             }
@@ -1147,19 +1154,45 @@ mod runtime_rewrite {
         }
         #[cfg(windows)]
         unsafe {
-            extern "system" {
-                fn GetModuleHandleA(name: *const i8) -> *mut std::ffi::c_void;
-                fn GetProcAddress(
-                    h: *mut std::ffi::c_void,
-                    name: *const i8,
-                ) -> *mut std::ffi::c_void;
-            }
-            let h = GetModuleHandleA(std::ptr::null());
+            // Resolve GetModuleHandleA + GetProcAddress via PEB walking
+            // to avoid static IAT entries for kernel32.
+            type FnGetModuleHandleA = unsafe extern "system" fn(*const i8) -> *mut std::ffi::c_void;
+            type FnGetProcAddress = unsafe extern "system" fn(*mut std::ffi::c_void, *const i8) -> *mut std::ffi::c_void;
+
+            static FN_GMHA: std::sync::OnceLock<Option<FnGetModuleHandleA>> =
+                std::sync::OnceLock::new();
+            static FN_GPA: std::sync::OnceLock<Option<FnGetProcAddress>> =
+                std::sync::OnceLock::new();
+
+            let gpa = *FN_GPA.get_or_init(|| unsafe {
+                let k32 = pe_resolve::get_module_handle_by_hash(
+                    pe_resolve::HASH_KERNEL32_DLL,
+                )?;
+                let addr = pe_resolve::get_proc_address_by_hash(
+                    k32,
+                    pe_resolve::hash_str(b"GetProcAddress"),
+                )?;
+                Some(std::mem::transmute::<usize, FnGetProcAddress>(addr))
+            });
+
+            let gmha = *FN_GMHA.get_or_init(|| unsafe {
+                let k32 = pe_resolve::get_module_handle_by_hash(
+                    pe_resolve::HASH_KERNEL32_DLL,
+                )?;
+                let addr = pe_resolve::get_proc_address_by_hash(
+                    k32,
+                    pe_resolve::hash_str(b"GetModuleHandleA"),
+                )?;
+                Some(std::mem::transmute::<usize, FnGetModuleHandleA>(addr))
+            });
+
+            let (gmha, gpa) = (gmha?, gpa?);
+            let h = gmha(std::ptr::null());
             if h.is_null() {
                 return None;
             }
             let cname = std::ffi::CString::new(_name).ok()?;
-            let addr = GetProcAddress(h, cname.as_ptr());
+            let addr = gpa(h, cname.as_ptr());
             if addr.is_null() {
                 None
             } else {
@@ -1177,17 +1210,29 @@ mod runtime_rewrite {
 
     #[cfg(windows)]
     unsafe fn make_writable(addr: usize, len: usize) -> Result<ProtSnapshot, String> {
-        extern "system" {
-            fn VirtualProtect(
-                addr: *mut std::ffi::c_void,
-                size: usize,
-                new_protect: u32,
-                old: *mut u32,
-            ) -> i32;
-        }
+        type FnVirtualProtect = unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            usize,
+            u32,
+            *mut u32,
+        ) -> i32;
+
+        static FN: std::sync::OnceLock<Option<FnVirtualProtect>> = std::sync::OnceLock::new();
+        let fn_ptr = FN.get_or_init(|| unsafe {
+            let k32 = pe_resolve::get_module_handle_by_hash(
+                pe_resolve::HASH_KERNEL32_DLL,
+            )?;
+            let addr = pe_resolve::get_proc_address_by_hash(
+                k32,
+                pe_resolve::hash_str(b"VirtualProtect"),
+            )?;
+            Some(std::mem::transmute::<usize, FnVirtualProtect>(addr))
+        });
+
+        let f = fn_ptr.ok_or("VirtualProtect not found")?;
         const PAGE_EXECUTE_READWRITE: u32 = 0x40;
         let mut old = 0u32;
-        if VirtualProtect(addr as *mut _, len, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+        if f(addr as *mut _, len, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
             return Err("VirtualProtect(RWX) failed".into());
         }
         Ok(ProtSnapshot(old))
@@ -1199,16 +1244,28 @@ mod runtime_rewrite {
         len: usize,
         old: &mut ProtSnapshot,
     ) -> Result<(), String> {
-        extern "system" {
-            fn VirtualProtect(
-                addr: *mut std::ffi::c_void,
-                size: usize,
-                new_protect: u32,
-                old: *mut u32,
-            ) -> i32;
-        }
+        type FnVirtualProtect = unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            usize,
+            u32,
+            *mut u32,
+        ) -> i32;
+
+        static FN: std::sync::OnceLock<Option<FnVirtualProtect>> = std::sync::OnceLock::new();
+        let fn_ptr = FN.get_or_init(|| unsafe {
+            let k32 = pe_resolve::get_module_handle_by_hash(
+                pe_resolve::HASH_KERNEL32_DLL,
+            )?;
+            let addr = pe_resolve::get_proc_address_by_hash(
+                k32,
+                pe_resolve::hash_str(b"VirtualProtect"),
+            )?;
+            Some(std::mem::transmute::<usize, FnVirtualProtect>(addr))
+        });
+
+        let f = fn_ptr.ok_or("VirtualProtect not found")?;
         let mut tmp = 0u32;
-        if VirtualProtect(addr as *mut _, len, old.0, &mut tmp) == 0 {
+        if f(addr as *mut _, len, old.0, &mut tmp) == 0 {
             return Err("VirtualProtect(restore) failed".into());
         }
         Ok(())
@@ -1216,15 +1273,29 @@ mod runtime_rewrite {
 
     #[cfg(windows)]
     unsafe fn flush_icache(addr: usize, len: usize) {
-        extern "system" {
-            fn FlushInstructionCache(
-                h: *mut std::ffi::c_void,
-                addr: *const std::ffi::c_void,
-                size: usize,
-            ) -> i32;
-            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        type FnFlushInstructionCache = unsafe extern "system" fn(
+            *mut std::ffi::c_void,
+            *const std::ffi::c_void,
+            usize,
+        ) -> i32;
+
+        static FN: std::sync::OnceLock<Option<FnFlushInstructionCache>> =
+            std::sync::OnceLock::new();
+        let fn_ptr = FN.get_or_init(|| unsafe {
+            let k32 = pe_resolve::get_module_handle_by_hash(
+                pe_resolve::HASH_KERNEL32_DLL,
+            )?;
+            let addr = pe_resolve::get_proc_address_by_hash(
+                k32,
+                pe_resolve::hash_str(b"FlushInstructionCache"),
+            )?;
+            Some(std::mem::transmute::<usize, FnFlushInstructionCache>(addr))
+        });
+
+        if let Some(f) = *fn_ptr {
+            // GetCurrentProcess() always returns (-1) — use the pseudohandle directly.
+            f(-1isize as *mut std::ffi::c_void, addr as *const _, len);
         }
-        FlushInstructionCache(GetCurrentProcess(), addr as *const _, len);
     }
 
     #[cfg(unix)]

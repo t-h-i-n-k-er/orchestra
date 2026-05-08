@@ -80,6 +80,13 @@ unsafe fn get_last_error() -> u32 {
 const CREATE_SUSPENDED: u32 = 0x00000004;
 
 /// SECTION_ALL_ACCESS.
+///
+/// P2-33: This grants full access to the NT section object used for the
+/// transacted injection.  Unlike PROCESS_ALL_ACCESS, this is not a process
+/// handle — it is a section handle used for shared memory mapping.  Full
+/// access is required because we need to create the section, map views into
+/// both the local and remote processes, and write payload data through it.
+/// Narrowing this would break the transacted injection flow.
 const SECTION_ALL_ACCESS: u64 = 0x000F_001F;
 
 /// SEC_COMMIT.
@@ -104,6 +111,11 @@ const SYNCHRONIZE: u32 = 0x00100000;
 const STANDARD_RIGHTS_REQUIRED: u32 = 0x000F0000;
 
 /// TRANSACTION_ALL_ACCESS.
+///
+/// P2-33: Full access to the NT transaction object.  Required because we
+/// create, commit, and roll back transactions as part of the transacted
+/// injection flow.  This operates on a transaction object, not a process
+/// handle, so the risk profile is different from PROCESS_ALL_ACCESS.
 const TRANSACTION_ALL_ACCESS: u32 = STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x3F;
 
 /// FILE_SUPERSEDE — create or supersede the file.

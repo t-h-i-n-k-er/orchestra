@@ -236,6 +236,10 @@ pub struct RegisterResponse {
 #[derive(Deserialize)]
 pub struct HeartbeatRequest {
     pub id: String,
+    /// Shared secret for authenticating the heartbeat.  Must match
+    /// `redirector_secret` in the server config when that is set.
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -312,6 +316,16 @@ pub async fn handle_heartbeat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, (StatusCode, String)> {
+    // Validate the redirector shared secret when configured.
+    if let Some(ref expected) = state.config.redirector_secret {
+        let presented = req.secret.as_deref().unwrap_or("");
+        if presented != expected {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "invalid or missing redirector secret".to_string(),
+            ));
+        }
+    }
     let entry = state
         .redirector_state
         .heartbeat(&req.id)
@@ -346,10 +360,26 @@ pub async fn handle_remove(
 
 /// Return the redirector chain configuration for agents using a specific
 /// profile. This is called by agents at startup to discover their redirectors.
+///
+/// Authentication: agents must present the `agent_shared_secret` in the
+/// `X-Agent-Secret` header.  This prevents unauthenticated parties from
+/// enumerating redirector infrastructure.
 pub async fn handle_agent_config(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(profile): axum::extract::Path<String>,
-) -> Json<AgentConfigResponse> {
+    headers: axum::http::HeaderMap,
+) -> Result<Json<AgentConfigResponse>, (StatusCode, String)> {
+    // Validate agent shared secret.
+    let presented = headers
+        .get("x-agent-secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if presented != state.config.agent_shared_secret {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing agent secret".to_string(),
+        ));
+    }
     let entries = state.redirector_state.healthy_for_profile(&profile);
     let configs = entries
         .into_iter()
@@ -360,9 +390,9 @@ pub async fn handle_agent_config(
             front_domain: e.front_domain,
         })
         .collect();
-    Json(AgentConfigResponse {
+    Ok(Json(AgentConfigResponse {
         redirectors: configs,
-    })
+    }))
 }
 
 // ── Stale detection background task ──────────────────────────────────────────

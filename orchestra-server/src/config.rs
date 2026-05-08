@@ -10,13 +10,28 @@ use std::path::PathBuf;
 ///
 /// Each operator has their own bearer token, which is stored as a SHA-256
 /// hash and compared in constant time during authentication.
+///
+/// # Security note (P2-14)
+///
+/// The config file should be readable only by the server process
+/// (`chmod 0600`).  Prefer `token_hash` over `token` in production so
+/// that the plaintext bearer is never written to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorConfig {
     /// Human-readable name (shown in audit logs and the dashboard).
     pub name: String,
-    /// Bearer token presented by this operator.  Stored as a SHA-256 hex
-    /// digest at load time — the plaintext is never retained.
-    pub token: String,
+    /// Bearer token presented by this operator.  Hashed at load time — the
+    /// plaintext is never retained in memory.  **Prefer `token_hash` in
+    /// production.**
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Pre-hashed bearer token (SHA-256 hex digest, prefixed with
+    /// `sha256:`).  When present, `token` is ignored and this value is
+    /// used directly, avoiding any plaintext token on disk.
+    ///
+    /// Generate with: `echo -n 'your-secret' | sha256sum | awk '{print "sha256:"$1}'`
+    #[serde(default)]
+    pub token_hash: Option<String>,
     /// Comma-separated permission flags.  Currently informational; all
     /// authenticated operators have full access.  Reserved for future RBAC.
     #[serde(default)]
@@ -58,11 +73,29 @@ impl OperatorRecord {
     }
 
     /// Build an `OperatorRecord` from a config entry, assigning the given id.
+    ///
+    /// If `cfg.token_hash` starts with `sha256:` the remainder is used
+    /// directly as the stored hash (P2-14: pre-hashed token support).
+    /// Otherwise `cfg.token` is hashed at load time (legacy plaintext path).
     pub fn from_config(id: &str, cfg: &OperatorConfig) -> Self {
+        let hash = if let Some(ref prehashed) = cfg.token_hash {
+            if let Some(hex_digest) = prehashed.strip_prefix("sha256:") {
+                hex_digest.to_string()
+            } else {
+                // Treat the value as a raw hex digest if the prefix is missing.
+                prehashed.clone()
+            }
+        } else if let Some(ref plaintext) = cfg.token {
+            Self::hash_token(plaintext)
+        } else {
+            // Neither field provided — this operator will never authenticate.
+            // Use a sentinel hash that won't match any real token.
+            Self::hash_token("")
+        };
         Self {
             id: id.to_string(),
             name: cfg.name.clone(),
-            token_hash: Self::hash_token(&cfg.token),
+            token_hash: hash,
             permissions: cfg.permissions.clone(),
             last_seen: std::sync::atomic::AtomicU64::new(0),
         }
@@ -88,6 +121,12 @@ pub struct ServerConfig {
     pub admin_token: String,
     /// Path to a JSON-Lines audit log (created if missing, append-only).
     pub audit_log_path: PathBuf,
+    /// Base64-encoded 32-byte HMAC key for audit log integrity.  When set,
+    /// this key is used directly.  When absent, a random key is generated on
+    /// first run and persisted alongside the audit log as
+    /// `<audit_log_path>.key`.  **Never derive this from `admin_token`.**
+    #[serde(default)]
+    pub audit_hmac_key: Option<String>,
     /// Optional TLS certificate (PEM). If `None`, a self-signed cert is
     /// generated in-memory at startup and printed to the log.
     pub tls_cert_path: Option<PathBuf>,
@@ -136,6 +175,12 @@ pub struct ServerConfig {
     /// non-empty, the client cert's OU must appear in this list.
     #[serde(default)]
     pub mtls_allowed_ous: Vec<String>,
+    /// P2-16: Path to a PEM-encoded Certificate Revocation List (CRL) for
+    /// the mTLS CA.  When set, any client certificate whose serial number
+    /// appears in the CRL is rejected during the TLS handshake.  Reload the
+    /// CRL at runtime via the `POST /api/p2p/reload-crl` endpoint.
+    #[serde(default)]
+    pub mtls_crl_path: Option<PathBuf>,
     // ── Module signing ──────────────────────────────────────────────────
     /// Ed25519 signing key for module binaries.  Base64-encoded 32-byte
     /// seed (the same format produced by `keygen --module-signing-key`).
@@ -155,6 +200,10 @@ pub struct ServerConfig {
     /// Defaults to a `modules` subdirectory of `builds_output_dir`.
     #[serde(default = "default_modules_dir")]
     pub modules_dir: PathBuf,
+    /// P2-12: Maximum decoded module size in bytes.  Requests exceeding this
+    /// limit are rejected before base64 decoding.  Defaults to 50 MB.
+    #[serde(default = "default_max_module_size")]
+    pub max_module_size: usize,
     // ── Multi-operator support ─────────────────────────────────────────
     /// Named operators loaded from the `[operators]` TOML map.
     /// Each entry key becomes the operator ID; the sub-table contains
@@ -202,6 +251,11 @@ pub struct ServerConfig {
     /// Path to a single malleable C2 profile file (backward compat).
     #[serde(default)]
     pub profile_path: Option<PathBuf>,
+    /// Shared secret that redirectors must present in heartbeat requests.
+    /// If not set, heartbeats are accepted without authentication (legacy mode).
+    /// **In production, always set this to a strong random value.**
+    #[serde(default)]
+    pub redirector_secret: Option<String>,
 }
 
 fn default_builds_dir() -> PathBuf {
@@ -210,6 +264,10 @@ fn default_builds_dir() -> PathBuf {
 
 fn default_modules_dir() -> PathBuf {
     default_builds_dir().join("modules")
+}
+/// P2-12: Default maximum module size — 50 MB.
+fn default_max_module_size() -> usize {
+    50 * 1024 * 1024
 }
 fn default_build_retention_days() -> u32 {
     7
@@ -267,16 +325,20 @@ impl Default for ServerConfig {
             mtls_ca_cert_path: None,
             mtls_allowed_cns: Vec::new(),
             mtls_allowed_ous: Vec::new(),
+            mtls_crl_path: None,
             operators: HashMap::new(),
             module_signing_key: None,
             module_aes_key: None,
             modules_dir: default_modules_dir(),
+            max_module_size: default_max_module_size(),
             smb_relay_enabled: false,
             smb_relay_pipe_name: default_smb_relay_pipe_name(),
             smb_relay_max_instances: default_smb_relay_max_instances(),
             http_c2_addr: default_http_c2_addr(),
             profile_dir: None,
             profile_path: None,
+            audit_hmac_key: None,
+            redirector_secret: None,
         }
     }
 }

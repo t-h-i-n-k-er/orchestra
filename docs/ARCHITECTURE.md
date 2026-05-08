@@ -190,31 +190,38 @@ pub fn handle_command(
 ) -> Result<String, String>
 ```
 
-Each command handler is a separate function in `handlers.rs` or a dedicated module. The 40+ commands include:
+Each command handler is a separate function in `handlers.rs` or a dedicated module. The 70+ commands include:
 
 | Category | Commands |
 |----------|----------|
-| **Core** | `Ping`, `GetSystemInfo`, `Shutdown`, `ReloadConfig` |
+| **Core** | `Ping`, `GetSystemInfo`, `Shutdown`, `ReloadConfig`, `RunApprovedScript` |
 | **Filesystem** | `ListDirectory`, `ReadFile`, `WriteFile` |
-| **Shell** | `StartShell`, `ShellInput`, `ShellOutput`, `CloseShell` |
 | **Modules** | `DeployModule`, `ExecutePlugin`, `ListPlugins`, `UnloadPlugin`, `GetPluginInfo`, `DownloadModule`, `ExecutePluginBinary` |
-| **Discovery** | `DiscoverNetwork`, `ListProcesses`, `JobStatus` |
+| **Process** | `ListProcesses`, `MigrateAgent`, `JobStatus` |
+| **Discovery** | `DiscoverNetwork`, `NetworkDiscovery` (ARP scan, ping sweep, TCP port scan, reverse DNS, AD SRV) |
 | **Remote Assist** | `CaptureScreen`, `SimulateKey`, `SimulateMouse` |
 | **HCI Research** | `StartHciLogging`, `StopHciLogging`, `GetHciLogBuffer` |
 | **Persistence** | `EnablePersistence`, `DisablePersistence` |
-| **Injection** | `MigrateAgent` |
-| **Evasion** | `SetReencodeSeed`, `MorphNow`, `SyscallEmulationToggle`, `CetStatus` |
-| **Token** | `MakeToken`, `StealToken`, `Rev2Self`, `GetSystem` |
-| **Forensic Cleanup** | `CleanPrefetch`, `DisablePrefetch`, `RestorePrefetch` |
+| **Injection — Unified** | `UnifiedInject { target_process, payload, technique, evade }` — all 15 techniques via string-based selection (`"auto"`, `"ProcessHollow"`, `"ThreadPool"`, `"ThreadPool:Work"`, etc.) |
+| **Injection — Legacy** | `TransactedHollow { target_process, payload, etw_blinding }`, `DelayedStomp { target_pid, payload, delay_secs }`, `InjectSideLoad { pid, payload, export_config }` |
+| **Code Morphing** | `SetReencodeSeed`, `MorphNow` |
+| **Evasion** | `SyscallEmulationToggle`, `CetStatus`, `UnhookNtdll` (KnownDlls re-fetch + disk fallback), `AmsiBypassMode { mode }` (Hwbp / MemoryPatch / WriteRaid / Auto) |
+| **EDR Bypass Transform** | `EvasionTransformScan`, `EvasionTransformRun`, `EdrBypassStatus` |
+| **Token Manipulation** | `MakeToken`, `StealToken`, `Rev2Self`, `GetSystem` |
+| **Token Impersonation** | `ImpersonatePipe`, `RevertToken`, `ListTokens` |
+| **Forensic Cleanup** | `CleanPrefetch`, `DisablePrefetch`, `RestorePrefetch`, `Timestomp`, `TimestompDirectory`, `CleanUsn`, `SyncTimestamps` |
 | **Lateral** | `PsExec`, `WmiExec`, `DcomExec`, `WinRmExec` |
 | **P2P** | `LinkAgents`, `UnlinkAgent`, `ListTopology`, `LinkTo`, `Unlink`, `ListLinks` |
 | **Mesh** | `MeshConnect`, `MeshDisconnect`, `MeshKillSwitch`, `MeshQuarantine`, `MeshClearQuarantine`, `MeshSetCompartment` |
 | **.NET/BOF** | `ExecuteAssembly`, `ExecuteBOF` |
-| **Interactive Shell** | `CreateShell`, `ShellInput`, `ShellOutput`, `ShellClose`, `ShellList`, `ShellResize` |
+| **Interactive Shell** | `CreateShell`, `ShellInput`, `ShellClose`, `ShellList`, `ShellResize` |
 | **Surveillance** | `Screenshot`, `KeyloggerStart`, `KeyloggerDump`, `KeyloggerStop`, `ClipboardMonitorStart`, `ClipboardMonitorDump`, `ClipboardMonitorStop`, `ClipboardGet` |
-| **Browser Data** | `BrowserData` (Chrome, Edge, Firefox — credentials + cookies) |
-| **Credential Access** | `HarvestLSASS` (no dump file — incremental memory reading) |
-| **Evasion** | `UnhookNtdll` (KnownDlls re-fetch + disk fallback) |
+| **Browser Data** | `BrowserData { browser, data_type }` (Chrome/Edge/Firefox — credentials/cookies/all) |
+| **Credential Access** | `HarvestLSASS` (incremental memory reading — no dump file), `HarvestLSA { method }` (Untrusted/SspInject/Auto), `LSAWhispererStatus`, `LSAWhispererStop` |
+| **Kernel Callback** | `KernelCallbackScan`, `KernelCallbackNuke { drivers }`, `KernelCallbackRestore` |
+| **Sleep** | `SetSleepVariant { variant }` ("cronus" / "ekko") |
+| **Evanesco** | `EvanescoStatus`, `EvanescoSetThreshold { idle_ms }` |
+| **Sandbox** | `SandboxCheck` — weighted indicator breakdown with total score and threshold |
 
 ---
 
@@ -1179,25 +1186,87 @@ Time: 0h          4h          4h+δ         4h+δ+30s
 
 ---
 
-## Injection Selection Logic
+## Unified Injection Engine (`injection_engine.rs`)
 
-The unified injection engine (`injection_engine.rs`) automatically selects the optimal injection technique based on the target environment. When `default_technique` is set to `"auto"`, the engine follows this priority ranking:
+The unified injection engine provides a single framework for all injection techniques with automatic selection, EDR reconnaissance, fallback chains, and ETW evasion.
 
-### Technique Priority (Highest → Lowest)
+### Technique Taxonomy — `InjectionTechnique` Enum (15 Variants)
 
-| Priority | Technique | Selection Criteria |
-|----------|-----------|-------------------|
-| 1 | **Transacted Hollowing** | Preferred for stealth; fileless on NTFS; no disk artifacts |
-| 2 | **Delayed Module Stomp** | EDR timing-heuristic bypass; randomized delay before stomp |
-| 3 | **Module Stomping** | Legitimate signed DLL .text overwriting; good against basic EDR |
-| 4 | **Process Hollowing** | Classic technique; well-understood; good compatibility |
-| 5 | **EarlyBird APC** | Best for process creation context; before main thread starts |
-| 6 | **ThreadPool Injection** | No new threads created; leverages existing thread pool |
-| 7 | **Callback Injection** | 12 API options; no explicit thread creation; callback-based |
-| 8 | **Section Mapping** | No WriteProcessMemory; dual-mapped section |
-| 9 | **Fiber Injection** | No thread creation; fiber context switch |
-| 10 | **Thread Hijacking** | Suspends existing thread; rewrites RIP |
-| 11 | **Context-Only** | No shellcode; pure context manipulation |
+| Variant | Description | Sub-variants |
+|---------|-------------|-------------|
+| `ProcessHollow` | Classic process hollowing (unmap + rewrite) | — |
+| `ModuleStomp` | Overwrite loaded DLL `.text` section | — |
+| `EarlyBirdApc` | Queue APC before main thread starts | — |
+| `ThreadHijack` | Suspend + redirect RIP | — |
+| `ThreadPool { variant }` | PoolParty — leverage existing thread pool | 8: `Work`, `WorkerFactory`, `Timer`, `IoCompletion`, `Wait`, `Alpc`, `Direct`, `AsyncIo` |
+| `FiberInject` | Fiber creation + context switch | — |
+| `ContextOnly` | CONTEXT-only RIP/RSP redirect (no alloc triad) | — |
+| `WaitingThreadHijack { target_pid, target_tid }` | Stack return-address overwrite on waiting thread | — |
+| `CallbackInjection { target_pid, api }` | Callback-based, no explicit thread creation | 12 APIs: `EnumSystemLocalesA`, `EnumWindows`, `EnumChildWindows`, `EnumDesktopWindows`, `CreateTimerQueueTimer`, `EnumTimeFormatsA`, `EnumResourceTypesW`, `EnumFontFamilies`, `CertEnumSystemStore`, `SHEnumerateUnreadMailAccounts`, `EnumerateLoadedModules`, `CopyFileEx` |
+| `SectionMapping { target_pid, exec_method, enhanced }` | `NtCreateSection` + dual `NtMapViewOfSection`; no `WriteProcessMemory` | exec_method: `Apc`, `Thread`, `Callback`; `enhanced` = double-mapped |
+| `NtSetInfoProcess { target_pid }` | `ProcessReadWriteVm` (0x6A) write bypass | — |
+| `TransactedHollowing` | NTFS transaction-based hollowing with ETW blinding | — |
+| `DelayedModuleStomp` | Load DLL, wait 8–15 s, then stomp | — |
+
+### Public API
+
+```rust
+pub struct InjectionConfig {
+    pub technique: Option<InjectionTechnique>,  // None = auto-select
+    pub target_process: String,
+    pub payload: Vec<u8>,
+    pub prefer_same_arch: bool,
+    pub evade_etw: bool,
+    pub timeout_ms: u32,
+}
+
+pub struct InjectionHandle {
+    pub target_pid: u32,
+    pub technique_used: InjectionTechnique,
+    pub injected_base_addr: usize,
+    pub payload_size: usize,
+    pub sleep_enrolled: bool,
+    // private: process_handle, thread_handle, sleep_stub_addr
+}
+
+pub fn inject(config: InjectionConfig) -> Result<InjectionHandle, InjectionError>
+pub fn evasiveness_inject(config: InjectionConfig) -> Result<InjectionHandle, InjectionError>
+pub fn parse_technique(name: &str) -> Result<InjectionTechnique, String>
+```
+
+### EDR Reconnaissance (`evasiveness_inject`)
+
+When `evade_etw` is enabled, the engine performs pre-injection reconnaissance:
+
+1. **ETW status check** — Tests whether `EtwEventWrite` is patched (in-agent) to decide if remote ETW blinding is needed
+2. **Target process classification** — Identifies the target binary to select context-appropriate techniques
+3. **EDR timing heuristic detection** — Adjusts delays and technique selection based on observed EDR scan patterns
+4. **Sleep enrollment** — Injected payload pages are optionally enrolled with `sleep_obfuscation` for memory encryption during agent dormancy
+
+### Technique String Parser (`parse_technique`)
+
+The `UnifiedInject` command accepts technique names as strings to keep the `common` crate platform-independent:
+
+| String | Resolved Technique |
+|--------|--------------------|
+| `"auto"` or omitted | `None` (auto-select) |
+| `"ProcessHollow"` | `ProcessHollow` |
+| `"ModuleStomp"` | `ModuleStomp` |
+| `"EarlyBirdApc"` | `EarlyBirdApc` |
+| `"ThreadHijack"` | `ThreadHijack` |
+| `"ThreadPool"` | `ThreadPool { variant: None }` |
+| `"ThreadPool:Work"` | `ThreadPool { variant: Some(Work) }` |
+| `"FiberInject"` | `FiberInject` |
+| `"ContextOnly"` | `ContextOnly` |
+| `"WaitingThreadHijack"` | `WaitingThreadHijack { .. }` |
+| `"CallbackInjection"` | `CallbackInjection { api: None }` |
+| `"CallbackInjection:EnumSystemLocalesA"` | `CallbackInjection { api: Some(EnumSystemLocalesA) }` |
+| `"SectionMapping"` | `SectionMapping { enhanced: false, .. }` |
+| `"SectionMapping:Enhanced"` | `SectionMapping { enhanced: true }` |
+| `"SectionMapping:Direct"` | `SectionMapping { exec_method: Some(Direct) }` |
+| `"NtSetInfoProcess"` | `NtSetInfoProcess { .. }` |
+| `"TransactedHollowing"` | `TransactedHollowing` |
+| `"DelayedModuleStomp"` | `DelayedModuleStomp` |
 
 ### Auto-Selection Decision Tree
 
@@ -1226,15 +1295,25 @@ The unified injection engine (`injection_engine.rs`) automatically selects the o
 └────────────────┘
 ```
 
-### Technique Selection Overrides
+### Technique Priority Ranking (Auto-Select)
 
+Default ranking when `technique` is `None`:
+
+```
+WaitingThreadHijack > ContextOnly > SectionMapping > NtSetInfoProcess >
+CallbackInjection > ThreadPool > EarlyBirdApc > ThreadHijack >
+FiberInject > ProcessHollow > DelayedModuleStomp > ModuleStomp
+```
+
+Context-specific overrides:
 | Condition | Override |
 |-----------|----------|
-| `default_technique != "auto"` | Use specified technique directly |
-| Target process is `svchost.exe` | Prefer ThreadPool or Callback (service context) |
-| Target process is `explorer.exe` | Prefer Module Stomping (user context) |
-| CET detected and enabled | Avoid Thread Hijacking and Context-Only |
+| Target is `svchost.exe` | Prefer ThreadPool or Callback (service context) |
+| Target is `explorer.exe` | Prefer ModuleStomping (user context) |
+| CET detected and enabled | Avoid ThreadHijack and ContextOnly |
 | Specified technique fails | Fall through to next priority |
+| `TransactedHollowing` feature enabled | Ranked above standard ProcessHollow |
+| `DelayedStomp` feature enabled | Ranked above standard ModuleStomp |
 
 ---
 
@@ -2275,6 +2354,173 @@ After waking from sleep obfuscation, the agent performs a post-wake hook detecti
 ```
 
 This is critical because EDR products may hook ntdll syscall stubs **while the agent is dormant** during sleep obfuscation. Without this check, the agent would wake up and immediately use hooked stubs.
+
+---
+
+---
+
+## IAT Hygiene Architecture
+
+The agent avoids import table entries for all security-sensitive APIs. No `LoadLibrary` / `GetProcAddress` calls appear in the import table. Instead, all API resolution uses the `pe_resolve` crate with compile-time hash constants.
+
+### `pe_resolve` Crate
+
+A `#![no_std]` crate providing PE export resolution by hash. No external dependencies.
+
+**Hash algorithm**: Case-insensitive rotational hash — rotate-right 13 bits, XOR in each byte. Build-time seed ensures per-build unique hash values.
+
+```
+hash = SEED
+for each byte b in name:
+    hash = hash.rotate_right(13) ^ to_lowercase(b)
+```
+
+| Function | Purpose |
+|----------|---------|
+| `hash_str(bytes: &[u8]) -> u32` | Hash UTF-8 DLL export name |
+| `hash_wstr(bytes: &[u16]) -> u32` | Hash UTF-16 module name from PEB |
+| `get_module_handle_by_hash(hash) -> Option<usize>` | PEB InMemoryOrderModuleList walk |
+| `get_proc_address_by_hash(base, hash) -> Option<usize>` | PE export directory name/ordinal lookup |
+| Forwarded export resolution | Follows `NTDLL.RtlNtStatusToDosError`-style forwarders up to 8 levels deep |
+| Address-range validation | Rejects stale RVAs outside `SizeOfImage` bounds |
+
+### Compile-Time Hash Utilities (`pe_resolve_macros.rs`)
+
+`const fn` mirrors of the runtime hash algorithms, enabling compile-time hash constants:
+
+```rust
+pub const fn hash_str_const(s: &[u8]) -> u32   // mirrors pe_resolve::hash_str
+pub const fn hash_wstr_const(w: &[u16]) -> u32  // mirrors pe_resolve::hash_wstr
+```
+
+### `resolve_api!` Macro
+
+Declares a lazily-resolved function pointer in a `OnceLock` static. The PEB walk and hash lookup happen exactly once per symbol; subsequent calls return the cached pointer.
+
+```rust
+// Usage — resolves NtClose from ntdll.dll via PEB walking:
+let nt_close = resolve_api!(
+    NT_CLOSE,                                          // static name
+    pe_resolve::hash_str(b"ntdll.dll\0"),              // DLL hash
+    "NtClose",                                         // export name
+    unsafe extern "system" fn(Handle) -> NTSTATUS      // signature
+);
+```
+
+### `dynamic_fn!` Macro
+
+Declares a lazily-resolved function pointer with deferred resolution. Used by `token_impersonation.rs` and other modules that need batch resolution:
+
+```rust
+// Declare:
+dynamic_fn!(GET_TOKEN_INFORMATION, b"advapi32.dll\0", b"GetTokenInformation\0",
+            unsafe extern "system" fn(HANDLE, DWORD, LPVOID, DWORD, *mut DWORD) -> i32);
+
+// Resolve on first use:
+let fn_ptr = resolve_fn(&GET_TOKEN_INFORMATION, b"advapi32.dll\0", b"GetTokenInformation\0");
+```
+
+### IAT-Free Modules
+
+These agent modules resolve ALL API calls via `pe_resolve`, `resolve_api!`, or `dynamic_fn!`:
+
+| Module | APIs Resolved |
+|--------|---------------|
+| `injection_engine.rs` | `NtOpenProcess`, `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, `NtProtectVirtualMemory`, `NtCreateThreadEx`, `NtClose`, `NtFreeVirtualMemory`, `NtQueryVirtualMemory` |
+| `lsass_harvest.rs` | `NtOpenProcess`, `NtReadVirtualMemory`, `NtClose` |
+| `lsa_whisperer.rs` | `LsaConnectUntrusted`, `LsaCallAuthenticationPackage`, `LsaLookupAuthenticationPackage`, `LsaRegisterLogonProcess`, `LsaDeregisterLogonProcess`, `LsaFreeReturnBuffer` |
+| `token_impersonation.rs` | `GetTokenInformation`, `ConvertSidToStringSidA`, `LookupAccountSidA`, `RevertToSelf`, `ConnectNamedPipe`, `CreateNamedPipeA`, `ImpersonateNamedPipeClient` |
+| `kernel_callback/` | All NT API calls via `nt_syscall` |
+| `edr_bypass_transform.rs` | `NtProtectVirtualMemory`, `NtFlushInstructionCache` via `nt_syscall` |
+| `forensic_cleanup/` | `NtCreateFile`, `NtQueryDirectoryFile`, `NtDeleteFile`, `NtCreateSection`, `NtMapViewOfSection`, `NtFsControlFile`, `NtOpenKey`, `NtSetValueKey` |
+
+---
+
+## HKDF-SHA256 Key Hierarchy
+
+HKDF-SHA256 is used throughout the codebase for key derivation. The `info` parameter ensures domain separation — the same IKM produces different output keys for different purposes.
+
+| Context | IKM | Salt | Info | Output |
+|---------|-----|------|------|--------|
+| **Per-message encryption** | PSK | Random 32-byte salt per message | `"orchestra-v2"` | 32-byte AES-256-GCM key |
+| **Forward secrecy session** | X25519 ECDH shared secret | `HKDF(PSK, "orchestra-fs-hkdf-salt")` | `"orchestra-forward-secret-v1"` | 32-byte session key |
+| **HMAC auth key** | PSK | — | `"orchestra-hmac-auth-key"` | HMAC-SHA256 key |
+| **P2P link key** | X25519 shared | `None` | `"orchestra-p2p-link-key"` | 32-byte link encryption key |
+| **DLL side-load payload** | Build-time seed | `enc_str!("ORCHESTRA_HKDF_SALT")` | `"orchestra-dll-sideload"` | 32-byte XChaCha20-Poly1305 key |
+| **Sleep obfuscation** | Master key | — | `"orchestra-sleep-v1"` | Sleep encryption key |
+| **Sleep key rotation** | Previous key input | — | `"orchestra-key-rotate"` | New sleep key |
+| **Optimizer dead-code values** | `STUB_SEED` | `None` | `index.to_le_bytes()` | 8-byte dead-code value |
+| **BYOVD driver XOR key** | Session key | Session salt | `"orchestra-driver-key"` | 32-byte XOR key |
+
+### CryptoSession
+
+```rust
+pub struct CryptoSession {
+    inner: RwLock<CryptoInner>,              // AES-256-GCM cipher + key
+    salt: RwLock<[u8; 32]>,                  // HKDF salt
+    pre_shared_secret: Option<LockedSecret>,  // mlock + zeroize-on-drop
+    op_counter: AtomicU64,                    // re-key every 10,000 ops
+}
+
+pub fn from_shared_secret(key: &[u8]) -> Self;
+pub fn from_shared_secret_with_salt(key: &[u8], salt: &[u8]) -> Self;
+pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8>;
+pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError>;
+```
+
+**Counter-based nonces**: 4-byte random prefix + 8-byte monotonic counter. Eliminates per-message randomness dependence while guaranteeing uniqueness.
+
+**LockedSecret**: Wraps key material with `mlock`/`VirtualLock` (prevent swapping) and `zeroize` on drop.
+
+---
+
+## DLL Side-Loading (`injection/dll_sideload.rs`)
+
+Encrypted payload side-loading that masquerades as a legitimate DLL:
+
+### Architecture
+
+1. **Build time** (`orchestra-side-load-gen`): Generates a DLL with a legitimate-looking export table. The payload is encrypted with ChaCha20.
+2. **Runtime** (`injection/dll_sideload.rs`): Agent receives the encrypted payload via `InjectSideLoad` command.
+3. **Key derivation**: `HKDF-SHA256(build_seed, salt, "orchestra-dll-sideload")` → 32-byte XChaCha20-Poly1305 key.
+4. **Execution**: Decrypt → `NtOpenProcess` → `NtAllocateVirtualMemory(RW)` → `NtWriteVirtualMemory` → `NtProtectVirtualMemory(RX)` → `NtCreateThreadEx`.
+5. **Export forwarding**: Patches export table entries to forward to the real target DLL resolved via PEB walk.
+
+### Runtime Command
+
+```
+Command::InjectSideLoad { pid: u32, payload: Vec<u8>, export_config: ExportConfig }
+```
+
+`ExportConfig` specifies `forward_target` DLL and named/ordinal exports to patch.
+
+---
+
+## Workspace Crate Overview
+
+| Crate | Purpose |
+|-------|---------|
+| **agent** | Implant — multi-transport C2, sleep obfuscation, injection engine, plugin support |
+| **common** | Shared protocol types, crypto (`CryptoSession`, `Message`, `Command`), config |
+| **builder** | Profile-driven agent build pipeline with PE artifact diversification |
+| **orchestra-server** | Control Center — axum-based management plane with malleable profile support |
+| **console** | Operator CLI for direct agent connection (TCP PSK or mTLS) |
+| **optimizer** | x86-64 binary diversification (NOP, scheduling, substitution, dead-code) |
+| **code_transform** | x86-64 instruction-level transformation (opaque predicates, CFF, virtualization) |
+| **code_transform_macro** | Attribute proc-macro for `#[code_transform]` |
+| **junk_macro** | Proc-macro for compile-time junk code generation |
+| **string_crypt** | Compile-time string encryption proc-macros (`encrypt_string!`, `encrypt_bytes!`) |
+| **pe_resolve** | `#![no_std]` PE export resolution via API hashing (PEB walking) |
+| **nt_syscall** | Direct NT syscall wrappers with SSN resolution (Halo's Gate, SSDT fallback) |
+| **hollowing** | Process hollowing, module stomping, and shellcode injection primitives |
+| **module_loader** | Dynamic module loading (`memfd_create` on Linux, manual PE map on Windows) |
+| **launcher** | In-memory agent launcher (`memfd_create` + `execve` on Linux — no disk writes) |
+| **payload-packager** | AES-256-GCM encrypted payload packaging with polymorphic mode |
+| **shellcode_packager** | PE-to-shellcode converter with relocation and import resolution |
+| **keygen** | Cryptographic key/certificate generation utility (AES keys, Ed25519 keypairs) |
+| **redirector** | HTTP reverse proxy for C2 traffic with cover-content serving and mTLS |
+| **orchestra-side-load-gen** | Side-loading DLL payload generator (standalone, minimal deps) |
+| **dev-server** | Local development server for testing agent builds |
 
 ---
 

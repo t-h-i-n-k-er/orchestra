@@ -9,11 +9,13 @@
 //!
 //! **Security properties**
 //!
-//! * The PSK authenticates the exchanged public keys via HMAC-SHA256, binding
-//!   the key exchange to the pre-shared secret.  Only parties holding the PSK
-//!   can produce or verify valid MACs, preventing MITM even if the TLS channel
-//!   is somehow intercepted.
-//! * The PSK is used as the HKDF salt, meaning a future PSK compromise does
+//! * The PSK is used to derive a domain-separated HMAC key (via HKDF with
+//!   info `"orchestra-hmac-auth-key"`) that authenticates the exchanged
+//!   public keys, binding the key exchange to the pre-shared secret.  Only
+//!   parties holding the PSK can produce or verify valid MACs, preventing
+//!   MITM even if the TLS channel is somehow intercepted.
+//! * A second sub-key derived from the PSK (info `"orchestra-fs-hkdf-salt"`)
+//!   is used as the HKDF salt, meaning a future PSK compromise does
 //!   **not** expose past session ciphertexts (those require the ephemeral
 //!   private keys which are securely erased after the exchange).
 //!
@@ -23,24 +25,33 @@
 //! by a 32-byte HMAC-SHA256 tag.  The HMAC is computed as:
 //!
 //! ```text
-//! tag = HMAC-SHA256(key=psk, msg=local_pubkey || remote_pubkey)
+//! hmac_key = HKDF-Expand(ikm=psk, info="orchestra-hmac-auth-key")
+//! tag = HMAC-SHA256(key=hmac_key, msg=local_pubkey || remote_pubkey)
 //! ```
+//!
+//! P1-04: The HMAC key is now a domain-separated sub-key derived from the PSK
+//! via HKDF, not the raw PSK.  This prevents cross-protocol attacks from
+//! reusing the same key material for different purposes.
 //!
 //! The sender orders the public keys canonically so both sides compute the
 //! same tag: the **client's** public key comes first in the concatenation.
 //!
 //! After both sides have verified the peer's tag, session key derivation
-//! proceeds as before:
+//! proceeds:
 //!
 //! ```text
-//! session_key = HKDF-SHA256(ikm=ECDH_shared, salt=psk, info="orchestra-forward-secret-v1")[..32]
+//! fs_salt  = HKDF-Expand(ikm=psk, info="orchestra-fs-hkdf-salt")
+//! session_key = HKDF-SHA256(ikm=ECDH_shared, salt=fs_salt, info="orchestra-forward-secret-v1")[..32]
 //! ```
 
-use crate::{CryptoSession, KEY_LEN};
+use crate::{CryptoSession, LockedSecret, KEY_LEN};
 use anyhow::Result;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Mutex;
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
@@ -53,12 +64,44 @@ const HMAC_TAG_LEN: usize = 32;
 /// Wire message: 32-byte public key + 32-byte HMAC tag.
 const MSG_LEN: usize = 32 + HMAC_TAG_LEN;
 
-/// Compute the authentication tag: `HMAC-SHA256(psk, client_pub || server_pub)`.
+// ── P1-04: Domain-separated sub-key derivation ─────────────────────────────
+//
+// The PSK was previously used directly as (1) the HMAC-SHA256 key for ECDH
+// authentication, (2) the HKDF IKM for session-key derivation in
+// CryptoSession::from_shared_secret, and (3) the HKDF salt in forward-secrecy
+// negotiation.  Using the same key material for multiple cryptographic
+// purposes without domain separation is a cryptographic misuse.
+//
+// We now derive two purpose-specific sub-keys from the PSK via HKDF-Expand
+// with distinct info strings so the keys are cryptographically independent.
+
+/// Derive the HMAC authentication sub-key from the PSK.
+fn derive_hmac_key(psk: &[u8]) -> [u8; 32] {
+    let hkdf = Hkdf::<Sha256>::new(None, psk);
+    let mut key = [0u8; 32];
+    hkdf.expand(b"orchestra-hmac-auth-key", &mut key)
+        .expect("HKDF expand for HMAC key must succeed");
+    key
+}
+
+/// Derive the HKDF salt sub-key from the PSK for forward-secrecy key
+/// derivation.  This replaces using the raw PSK as the HKDF salt.
+fn derive_fs_salt(psk: &[u8]) -> [u8; 32] {
+    let hkdf = Hkdf::<Sha256>::new(None, psk);
+    let mut salt = [0u8; 32];
+    hkdf.expand(b"orchestra-fs-hkdf-salt", &mut salt)
+        .expect("HKDF expand for FS salt must succeed");
+    salt
+}
+
+/// Compute the authentication tag: `HMAC-SHA256(derived_hmac_key, client_pub || server_pub)`.
 ///
-/// The ordering is canonical — client pubkey always first — so both sides
-/// produce the same tag.
+/// P1-04: The HMAC key is now a domain-separated sub-key derived from the PSK
+/// via HKDF, not the raw PSK itself.  The ordering is canonical — client pubkey
+/// always first — so both sides produce the same tag.
 fn compute_auth_tag(psk: &[u8], client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; HMAC_TAG_LEN] {
-    let mut mac = HmacSha256::new_from_slice(psk)
+    let hmac_key = derive_hmac_key(psk);
+    let mut mac = HmacSha256::new_from_slice(&hmac_key)
         .expect("HMAC accepts any key length");
     mac.update(client_pub);
     mac.update(server_pub);
@@ -150,12 +193,17 @@ pub async fn negotiate_session_key<S: AsyncRead + AsyncWrite + Unpin>(
         cli_pub
     };
 
-    // ── Key derivation (unchanged) ──────────────────────────────────────
+    // ── Key derivation ──────────────────────────────────────────────────
     let peer_public = PublicKey::from(peer_pub_bytes);
     let shared = our_secret.diffie_hellman(&peer_public);
 
-    // HKDF: salt = PSK, IKM = ECDH shared secret.
-    let h = Hkdf::<Sha256>::new(Some(&psk_buf), shared.as_bytes());
+    // P1-04: Use a domain-separated sub-key as the HKDF salt instead of
+    // the raw PSK, so the PSK is never used directly as a cryptographic
+    // parameter in more than one context.
+    let fs_salt = derive_fs_salt(&psk_buf);
+
+    // HKDF: salt = derived FS salt, IKM = ECDH shared secret.
+    let h = Hkdf::<Sha256>::new(Some(&fs_salt), shared.as_bytes());
 
     // Zeroize the local PSK copy now that key derivation is complete.
     use zeroize::Zeroize;
@@ -179,5 +227,192 @@ fn hmac_verify(expected: &[u8; HMAC_TAG_LEN], actual: &[u8]) -> bool {
     match actual.len().cmp(&HMAC_TAG_LEN) {
         Ordering::Equal => diff == 0,
         _ => false,
+    }
+}
+
+// ── P1-21: PSK Rotation ─────────────────────────────────────────────────────
+//
+// The PSK is used for the lifetime of the deployment without rotation.
+// If the PSK is compromised, all past and future sessions are at risk.
+// The PSK rotation mechanism derives a new PSK from the old one using HKDF
+// with a monotonic rotation counter, ensuring forward secrecy at the PSK
+// level.
+//
+// ## Protocol
+//
+// 1. After N sessions or M hours (configurable), the server derives a new
+//    PSK: `new_psk = HKDF(ikm=old_psk, info="orchestra-psk-rotation-v1::<counter>")`.
+// 2. The new PSK is distributed to connected agents via the existing
+//    encrypted channel (inside a `Command::RotatePsk` message).
+// 3. Both sides update their stored PSK atomically.
+// 4. Future session negotiations use the new PSK.
+//
+// Because the rotation is one-way (HKDF is not invertible), compromise of
+// the current PSK does not allow recovery of previous PSKs.
+
+/// Default number of sessions after which PSK rotation is triggered.
+pub const PSK_ROTATION_SESSIONS: u64 = 1000;
+
+/// Default interval (in seconds) after which PSK rotation is triggered.
+pub const PSK_ROTATION_INTERVAL_SECS: u64 = 3600 * 24; // 24 hours
+
+/// Derive a rotated PSK from the old PSK and a monotonic rotation counter.
+///
+/// Uses HKDF-SHA256 with domain-separated info string so each rotation
+/// produces a cryptographically independent key.  The derivation is one-way:
+/// knowing `new_psk` does not allow recovering `old_psk`.
+///
+/// ```text
+/// new_psk = HKDF-Expand(ikm=old_psk, salt=rotation_counter_be, info="orchestra-psk-rotation-v1")[:32]
+/// ```
+pub fn derive_rotated_psk(old_psk: &[u8], rotation_counter: u64) -> [u8; 32] {
+    let salt = rotation_counter.to_be_bytes();
+    let hkdf = Hkdf::<Sha256>::new(Some(&salt), old_psk);
+    let mut new_psk = [0u8; 32];
+    hkdf.expand(b"orchestra-psk-rotation-v1", &mut new_psk)
+        .expect("HKDF expand for PSK rotation must succeed");
+    new_psk
+}
+
+/// State machine for PSK rotation tracking.
+///
+/// Thread-safe: the session counter uses atomic operations and the timestamp
+/// is protected by a Mutex (only consulted on rotation checks, not on every
+/// session).
+pub struct PskRotationState {
+    /// Monotonic rotation counter — incremented each time a new PSK is derived.
+    rotation_counter: AtomicU64,
+    /// Number of sessions established since the last rotation.
+    sessions_since_rotation: AtomicU64,
+    /// Instant of the last rotation (protected by Mutex to avoid
+    /// `Instant` not being `Send` on some platforms).
+    last_rotation: Mutex<Instant>,
+    /// The current PSK, wrapped in LockedSecret for mlock + zeroize-on-drop.
+    current_psk: Mutex<LockedSecret>,
+    /// Threshold: rotate after this many sessions.
+    session_threshold: u64,
+    /// Threshold: rotate after this many seconds have elapsed.
+    interval_secs: u64,
+}
+
+impl PskRotationState {
+    /// Create a new rotation state with the given initial PSK and thresholds.
+    pub fn new(
+        initial_psk: &[u8],
+        session_threshold: u64,
+        interval_secs: u64,
+    ) -> Self {
+        Self {
+            rotation_counter: AtomicU64::new(0),
+            sessions_since_rotation: AtomicU64::new(0),
+            last_rotation: Mutex::new(Instant::now()),
+            current_psk: Mutex::new(LockedSecret::new(initial_psk)),
+            session_threshold,
+            interval_secs,
+        }
+    }
+
+    /// Create with default thresholds (1000 sessions or 24 hours).
+    pub fn new_default(initial_psk: &[u8]) -> Self {
+        Self::new(initial_psk, PSK_ROTATION_SESSIONS, PSK_ROTATION_INTERVAL_SECS)
+    }
+
+    /// Record that a new session has been established.
+    /// Returns `true` if a PSK rotation should be triggered.
+    pub fn record_session(&self) -> bool {
+        let count = self.sessions_since_rotation.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+
+        // Check session threshold.
+        if count >= self.session_threshold {
+            return true;
+        }
+
+        // Check time threshold.
+        if let Ok(last) = self.last_rotation.lock() {
+            if last.elapsed().as_secs() >= self.interval_secs {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Perform PSK rotation: derive a new PSK from the current one using
+    /// HKDF with the rotation counter.  Returns the new rotation counter.
+    ///
+    /// The caller is responsible for distributing the new PSK to connected
+    /// agents via the encrypted channel.
+    pub fn rotate(&self) -> u64 {
+        let new_counter = self.rotation_counter.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+
+        let mut new_psk_bytes = {
+            let psk = self.current_psk.lock().unwrap();
+            derive_rotated_psk(psk.as_bytes(), new_counter)
+        };
+
+        // Replace the PSK (LockedSecret zeroizes the old one on drop).
+        {
+            let mut psk = self.current_psk.lock().unwrap();
+            *psk = LockedSecret::new(&new_psk_bytes);
+        }
+
+        // Reset session counter and timestamp.
+        self.sessions_since_rotation.store(0, AtomicOrdering::Relaxed);
+        if let Ok(mut last) = self.last_rotation.lock() {
+            *last = Instant::now();
+        }
+
+        log::info!(
+            "PSK rotated: counter={}, new_psk_prefix={:02x}{:02x}...",
+            new_counter,
+            new_psk_bytes[0],
+            new_psk_bytes[1]
+        );
+
+        // Zeroize the local copy of the new PSK bytes.
+        use zeroize::Zeroize;
+        new_psk_bytes.zeroize();
+
+        new_counter
+    }
+
+    /// Get a reference to the current PSK bytes for session negotiation.
+    ///
+    /// The returned guard keeps the Mutex locked so the PSK cannot be
+    /// rotated while a negotiation is in progress.
+    pub fn current_psk(&self) -> std::sync::MutexGuard<'_, LockedSecret> {
+        self.current_psk.lock().unwrap()
+    }
+
+    /// Get the current rotation counter.
+    pub fn rotation_counter(&self) -> u64 {
+        self.rotation_counter.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Apply an externally-received PSK rotation (e.g. from the server).
+    /// Increments the rotation counter and replaces the PSK.
+    pub fn apply_rotation(&self, new_psk: &[u8], expected_counter: u64) -> bool {
+        let current = self.rotation_counter.load(AtomicOrdering::SeqCst);
+        if expected_counter <= current {
+            log::warn!(
+                "ignoring PSK rotation with stale counter {} (current: {})",
+                expected_counter,
+                current
+            );
+            return false;
+        }
+
+        {
+            let mut psk = self.current_psk.lock().unwrap();
+            *psk = LockedSecret::new(new_psk);
+        }
+        self.rotation_counter.store(expected_counter, AtomicOrdering::SeqCst);
+        self.sessions_since_rotation.store(0, AtomicOrdering::Relaxed);
+        if let Ok(mut last) = self.last_rotation.lock() {
+            *last = Instant::now();
+        }
+
+        log::info!("PSK rotation applied: counter={}", expected_counter);
+        true
     }
 }

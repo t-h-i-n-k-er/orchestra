@@ -45,6 +45,11 @@ pub struct AgentEntry {
     pub mesh_certificate: Option<common::MeshCertificate>,
     /// Compartment assigned to this agent (operator-configured).
     pub compartment: Option<String>,
+    /// P2-17: The client certificate identity (CN) extracted during the
+    /// mTLS handshake.  When set, the agent's self-reported `agent_id`
+    /// must match this identity, binding the logical agent identity to
+    /// its cryptographic credential.
+    pub cert_identity: Option<String>,
 }
 
 /// JSON-friendly snapshot of an agent for the dashboard.
@@ -134,7 +139,10 @@ pub struct AppState {
     pub audit: Arc<AuditLog>,
     /// Legacy single-admin token kept for backward compat and as a fallback
     /// when no `[operators]` section is defined in the config.
-    pub admin_token: String,
+    /// Stored as a SHA-256 hash (hex-encoded) so the plaintext never resides
+    /// in memory after initialisation.  Compare with
+    /// `OperatorRecord::hash_token(presented)` using constant-time equality.
+    pub admin_token_hash: String,
     /// Per-operator records keyed by operator ID.  Populated at startup from
     /// the `[operators]` TOML section.  When empty, the legacy `admin_token`
     /// is used instead.
@@ -158,8 +166,19 @@ pub struct AppState {
     /// whose `agent_id_hash` appears in this set will be rejected during
     /// P2P link handshake and have existing links terminated.
     pub revoked_certificates: DashSet<[u8; 32]>,
-    /// Rate limiter for authentication endpoints (brute-force protection).
-    pub auth_rate_limiter: crate::auth::RateLimiter,
+    /// P2-16: Reference to the mTLS CnOuVerifier (if mTLS is enabled with
+    /// CN/OU restrictions or CRL).  Allows runtime CRL reload via the API
+    /// without restarting the server.
+    pub mtls_verifier: std::sync::RwLock<Option<std::sync::Arc<crate::tls::CnOuVerifier>>>,
+    /// Per-IP rate limiter for authentication endpoints (brute-force
+    /// protection).  Each IP gets its own sliding window of ~10 attempts
+    /// per 5 minutes.
+    pub auth_rate_limiters: crate::auth::PerIpRateLimiter,
+    /// One-time session IDs for WebSocket authentication.  Maps a random
+    /// session UUID to the authenticated operator ID.  Prevents the real
+    /// bearer token from being echoed in the `Sec-WebSocket-Protocol`
+    /// response header (visible to proxies and browser dev tools).
+    pub ws_sessions: DashMap<String, String>,
 }
 
 impl AppState {
@@ -181,11 +200,16 @@ impl AppState {
                 "loaded operator credentials from config"
             );
         }
+        // P1-17: Hash the admin token at construction so the plaintext
+        // never persists in the AppState.
+        let admin_token_hash = crate::config::OperatorRecord::hash_token(&admin_token);
+        drop(admin_token); // ensure the plaintext is dropped
+
         Self {
             registry: DashMap::new(),
             pending: DashMap::new(),
             audit,
-            admin_token,
+            admin_token_hash,
             operators,
             command_timeout_secs,
             config,
@@ -194,19 +218,25 @@ impl AppState {
             redirector_state: RedirectorState::new(),
             mesh_controller: RwLock::new(crate::mesh_controller::MeshController::new()),
             revoked_certificates: DashSet::new(),
-            auth_rate_limiter: crate::auth::RateLimiter::new(
-                100,                                     // max attempts
+            mtls_verifier: std::sync::RwLock::new(None),
+            auth_rate_limiters: crate::auth::PerIpRateLimiter::new(
+                10,                                     // max attempts per IP
                 std::time::Duration::from_secs(60 * 5),  // per 5-minute window
             ),
+            ws_sessions: DashMap::new(),
         }
     }
 
     /// Look up a bearer token against the operator store.  Returns the
-    /// operator ID on match, or `None` if no operator matched.
+    /// operator ID and permissions on match, or `None` if no operator matched.
     ///
     /// Comparison is constant-time: the presented token is hashed with
     /// SHA-256, then compared against each stored hash with `subtle::ct_eq`.
-    pub fn authenticate_operator(&self, presented_token: &str) -> Option<String> {
+    ///
+    /// P1-26: Now returns `(String, Vec<String>)` carrying the operator's
+    /// permission set so that `require_bearer` can embed it in the
+    /// `AuthenticatedUser` extension.
+    pub fn authenticate_operator(&self, presented_token: &str) -> Option<(String, Vec<String>)> {
         let presented_hash = OperatorRecord::hash_token(presented_token);
         for (_id, op) in &self.operators {
             let ok: bool = presented_hash.as_bytes().ct_eq(op.token_hash.as_bytes()).into();
@@ -219,7 +249,7 @@ impl AppState {
                     now,
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                return Some(op.id.clone());
+                return Some((op.id.clone(), op.permissions.clone()));
             }
         }
         None

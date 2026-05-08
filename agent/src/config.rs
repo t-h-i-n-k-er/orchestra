@@ -29,7 +29,13 @@ use tokio::sync::RwLock;
 
 type HmacSha256 = Hmac<Sha256>;
 
+// P1-25: Compile-time secrets via option_env! are baked into the binary and
+// recoverable via `strings` or reverse engineering.  These are now only
+// available in debug/test builds.  Release builds MUST provide secrets
+// through runtime environment variables.
+#[cfg(debug_assertions)]
 const BAKED_SHARED_SECRET: Option<&str> = option_env!("ORCHESTRA_C_SECRET");
+#[cfg(debug_assertions)]
 const BAKED_CONFIG_HMAC: Option<&str> = option_env!("ORCHESTRA_CONFIG_HMAC");
 
 // Dependency note: this module expects `hmac` and `hex` in agent/Cargo.toml.
@@ -42,21 +48,22 @@ static LAST_CONFIG: once_cell::sync::Lazy<StdRwLock<Option<Config>>> =
 
 /// Thread-safe handle to the agent configuration.
 ///
-/// Wrapped in `Arc<RwLock<Config>>` to allow shared ownership and concurrent
+/// Wrapped in `Arc<RwLock<Config>>` for shared ownership and concurrent
 /// read access with exclusive write access during hot-reloads.
 pub type ConfigHandle = Arc<RwLock<Config>>;
 
-fn resolve_shared_secret() -> Option<String> {
-    let runtime = std::env::var("ORCHESTRA_SECRET")
+/// P1-24: Resolve the HMAC key for config integrity checking.
+///
+/// Only the runtime `ORCHESTRA_SECRET` environment variable is used.  If
+/// it is not set, config integrity checking is disabled with a warning.
+///
+/// P1-25: The compile-time baked secret is no longer used here (or anywhere)
+/// in release builds to prevent secret extraction from the binary.
+fn resolve_hmac_key() -> Option<String> {
+    std::env::var("ORCHESTRA_SECRET")
         .ok()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    if cfg!(debug_assertions) {
-        runtime.or_else(|| BAKED_SHARED_SECRET.map(str::to_string))
-    } else {
-        BAKED_SHARED_SECRET.map(str::to_string).or(runtime)
-    }
+        .filter(|s| !s.is_empty())
 }
 
 fn resolve_expected_config_hmac() -> Option<String> {
@@ -65,10 +72,16 @@ fn resolve_expected_config_hmac() -> Option<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    if cfg!(debug_assertions) {
+    // P1-25: In release builds, only the runtime env var is accepted.
+    // In debug builds, fall back to the compile-time baked value for
+    // developer convenience.
+    #[cfg(debug_assertions)]
+    {
         runtime.or_else(|| BAKED_CONFIG_HMAC.map(str::to_string))
-    } else {
-        BAKED_CONFIG_HMAC.map(str::to_string).or(runtime)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        runtime
     }
 }
 
@@ -134,25 +147,38 @@ pub fn config_path() -> PathBuf {
         .join("agent.toml")
 }
 
-fn compute_config_hmac(raw_toml: &[u8]) -> Result<[u8; 32]> {
-    let key_material = resolve_shared_secret().ok_or_else(|| {
-        anyhow::anyhow!(
-            "ORCHESTRA_SECRET environment variable not set — config HMAC cannot be computed. \
-             Set ORCHESTRA_SECRET before running the agent."
-        )
-    })?;
+fn compute_config_hmac(raw_toml: &[u8]) -> Result<Option<[u8; 32]>> {
+    let key_material = match resolve_hmac_key() {
+        Some(k) => k,
+        None => {
+            tracing::warn!(
+                "No runtime HMAC key (ORCHESTRA_SECRET) available — \
+                 config HMAC computation skipped.  Config integrity checking \
+                 is disabled."
+            );
+            return Ok(None);
+        }
+    };
     let mut mac = HmacSha256::new_from_slice(key_material.as_bytes())
         .expect("HMAC key length is valid");
     mac.update(raw_toml);
-    Ok(mac.finalize().into_bytes().into())
+    Ok(Some(mac.finalize().into_bytes().into()))
 }
 
-fn verify_config_hmac(config_bytes: &[u8], expected_hmac: &str) -> Result<bool> {
-    let key_material = resolve_shared_secret().ok_or_else(|| {
-        anyhow::anyhow!(
-            "shared secret is not configured; cannot verify config HMAC"
-        )
-    })?;
+fn verify_config_hmac(config_bytes: &[u8], expected_hmac: &str) -> Result<Option<bool>> {
+    let key_material = match resolve_hmac_key() {
+        Some(k) => k,
+        None => {
+            // P1-24: No HMAC key available — cannot verify integrity.
+            // Return None so callers skip the check rather than failing.
+            tracing::warn!(
+                "No runtime HMAC key (ORCHESTRA_SECRET) available — \
+                 config HMAC verification skipped.  Config integrity checking \
+                 is disabled."
+            );
+            return Ok(None);
+        }
+    };
 
     let expected_bytes = hex::decode(expected_hmac.trim())
         .with_context(|| "config HMAC is not valid hex")?;
@@ -160,7 +186,7 @@ fn verify_config_hmac(config_bytes: &[u8], expected_hmac: &str) -> Result<bool> 
     let mut mac = HmacSha256::new_from_slice(key_material.as_bytes())
         .with_context(|| "failed to initialize HMAC verifier")?;
     mac.update(config_bytes);
-    Ok(mac.verify_slice(&expected_bytes).is_ok())
+    Ok(Some(mac.verify_slice(&expected_bytes).is_ok()))
 }
 
 /// Compute and append an HMAC-SHA256 tag to the configuration file.
@@ -176,7 +202,16 @@ pub fn append_config_hmac(config_path: &std::path::Path) -> anyhow::Result<()> {
         .filter(|l| !l.starts_with("# hmac = "))
         .collect::<Vec<_>>()
         .join("\n");
-    let hmac_bytes = compute_config_hmac(content.as_bytes())?;
+    let hmac_bytes = match compute_config_hmac(content.as_bytes())? {
+        Some(bytes) => bytes,
+        None => {
+            tracing::warn!(
+                "No HMAC key available — config HMAC tag not appended to {}",
+                config_path.display()
+            );
+            return Ok(());
+        }
+    };
     let hmac_hex = hex::encode(hmac_bytes);
     let signed = format!("{}\n# hmac = {}\n", content, hmac_hex);
     std::fs::write(config_path, signed)?;
@@ -222,26 +257,22 @@ pub fn load_config() -> Result<Config> {
     };
 
     if let Some(expected_hmac) = hmac_tag {
-        match verify_config_hmac(content_for_parse.as_bytes(), expected_hmac) {
-            Ok(true) => {}
-            Ok(false) => {
+        match verify_config_hmac(content_for_parse.as_bytes(), expected_hmac)? {
+            // P1-24: None means no HMAC key available — skip check.
+            None => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "Config HMAC verification skipped — no runtime HMAC key available"
+                );
+            }
+            Some(true) => {}
+            Some(false) => {
                 tracing::warn!(
                     path = %path.display(),
                     "config integrity verification failed for embedded hmac tag"
                 );
                 anyhow::bail!(
                     "Config integrity check failed: HMAC mismatch for {}",
-                    path.display()
-                );
-            }
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "config integrity verification failed for embedded hmac tag"
-                );
-                anyhow::bail!(
-                    "Config integrity check failed: HMAC verification error for {}",
                     path.display()
                 );
             }
@@ -271,26 +302,22 @@ pub fn load_config() -> Result<Config> {
     let config: Config = toml::from_str(&content_for_parse)?;
 
     if let Some(expected_hmac) = resolve_expected_config_hmac() {
-        match verify_config_hmac(content_for_parse.as_bytes(), &expected_hmac) {
-            Ok(true) => {}
-            Ok(false) => {
+        match verify_config_hmac(content_for_parse.as_bytes(), &expected_hmac)? {
+            // P1-24: None means no HMAC key available — skip check.
+            None => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "ORCHESTRA_CONFIG_HMAC verification skipped — no runtime HMAC key available"
+                );
+            }
+            Some(true) => {}
+            Some(false) => {
                 tracing::error!(
                     path = %path.display(),
                     "config integrity verification failed for ORCHESTRA_CONFIG_HMAC; aborting"
                 );
                 anyhow::bail!(
                     "Config integrity check failed: ORCHESTRA_CONFIG_HMAC mismatch for {}",
-                    path.display()
-                );
-            }
-            Err(err) => {
-                tracing::error!(
-                    path = %path.display(),
-                    error = %err,
-                    "config integrity verification errored for ORCHESTRA_CONFIG_HMAC; aborting"
-                );
-                anyhow::bail!(
-                    "Config integrity check failed: ORCHESTRA_CONFIG_HMAC verification error for {}",
                     path.display()
                 );
             }

@@ -23,6 +23,7 @@ memmap2 = "0.9.10"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["memoryapi", "processthreadsapi", "libloaderapi"] }
+pe_resolve = { path = "../pe_resolve" }
 
 [dev-dependencies]
 criterion = "0.5"

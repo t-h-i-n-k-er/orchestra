@@ -342,7 +342,10 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
 }
 
 /// P2-14: Verify that the certificate's SAN or CN matches the expected server name.
-fn verify_cert_hostname_rustls021(der: &[u8], server_name: &rustls_0_21::ServerName) -> bool {
+///
+/// P1-06: Made `pub(crate)` so `c2_doh::FingerprintVerifier` can reuse the
+/// same hostname validation logic instead of duplicating DER parsing.
+pub(crate) fn verify_cert_hostname_rustls021(der: &[u8], server_name: &rustls_0_21::ServerName) -> bool {
     let expected = match server_name {
         rustls_0_21::ServerName::DnsName(dns) => dns.as_ref().to_ascii_lowercase(),
         _ => return true, // IP address or other — skip hostname check

@@ -915,6 +915,32 @@ pub fn sandbox_probability_score(metrics: &SandboxMetrics) -> u32 {
     std::cmp::min(score, 100)
 }
 
+/// Collect raw sandbox metrics without computing the final score.
+/// Used by the unified scoring pipeline in `env_check.rs` to push
+/// individual `SandboxIndicator`s from each metric.
+pub fn collect_raw_metrics() -> SandboxMetrics {
+    #[cfg(target_os = "linux")]
+    let desktop_richness_score = match check_desktop_windows() {
+        Some(score) => score,
+        None => {
+            warn!(
+                "env_check_sandbox: desktop window score unavailable due to restricted /proc permissions; using neutral contribution"
+            );
+            0
+        }
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let desktop_richness_score = check_desktop_windows();
+
+    SandboxMetrics {
+        mouse_movement_score: check_mouse_movement(),
+        desktop_richness_score,
+        uptime_score: check_system_uptime_artifacts(),
+        hardware_plausibility_score: check_hardware_plausibility(),
+    }
+}
+
 /// Run all sandbox heuristics and return a combined probability score (0–100).
 ///
 /// Higher scores indicate a greater likelihood of a sandbox environment.

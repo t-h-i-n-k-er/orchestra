@@ -2,6 +2,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use chrono::{Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -61,6 +62,9 @@ pub struct JobState {
     pub error: Option<String>,
     /// Unix timestamp (seconds) when the job transitioned to Running.
     pub started_at: u64,
+    /// P1-28: Operator ID that enqueued the build, used for ownership checks
+    /// on status / download endpoints.
+    pub operator: String,
 }
 
 pub struct BuildJob {
@@ -127,7 +131,8 @@ pub fn init_build_queue(workers: usize, build_dir: PathBuf, retention_days: u32)
                     move || execute_build_safely(jid, req, operator, server_build_dir, map2)
                 })
                 .await
-                .unwrap();
+                // P2-15: propagate JoinError instead of panicking.
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("build task panicked: {e}")));
 
                 let (outcome_str, fs_path, error) = match res {
                     Ok(path) => ("Completed", Some(path), None),
@@ -230,6 +235,39 @@ pub async fn handle_build(
         }
     }
 
+    // P1-14: Reject build targets that point to private/internal IPs (SSRF).
+    if let Err(e) = validate_host_not_private(&req.host) {
+        state.audit.record_simple(
+            "BUILDER",
+            &user.id,
+            "BuildRejected",
+            &format!("host={} reason={}", req.host, e),
+            common::Outcome::Failure,
+        );
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(BuildResponse {
+                job_id: None,
+                log: None,
+                status: None,
+                error: Some(e.to_string()),
+            }),
+        ));
+    }
+
+    // P1-15: Reject unsupported OS/arch values (TOML injection prevention).
+    if let Err(e) = validate_target_os_arch(&req.os, &req.arch) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(BuildResponse {
+                job_id: None,
+                log: None,
+                status: None,
+                error: Some(e.to_string()),
+            }),
+        ));
+    }
+
     // Initialize lazily if not done
     if JOB_SENDER.get().is_none() {
         // As a fallback to avoid crash if not properly initialized in main
@@ -240,14 +278,36 @@ pub async fn handle_build(
 
     state.audit.record_simple(
         "BUILDER",
-        &user.0,
+        &user.id,
         "EnqueueBuild",
         &format!("job_id={job_id}"),
         common::Outcome::Success,
     );
 
-    let sender = JOB_SENDER.get().unwrap();
-    let map = JOB_MAP.get().unwrap();
+    let sender = JOB_SENDER.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(BuildResponse {
+                job_id: None,
+                log: None,
+                status: Some("Failed".into()),
+                error: Some("build queue not initialized".into()),
+            }),
+        )
+    })?;
+    let map = JOB_MAP.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(BuildResponse {
+                job_id: None,
+                log: None,
+                status: Some("Failed".into()),
+                error: Some("build queue not initialized".into()),
+            }),
+        )
+    })?;
+
+    let operator_id = user.id.clone();
 
     {
         let mut m = map.lock().unwrap();
@@ -259,6 +319,7 @@ pub async fn handle_build(
                 output_path: None,
                 error: None,
                 started_at: 0,
+                operator: operator_id,
             },
         );
     }
@@ -267,7 +328,7 @@ pub async fn handle_build(
         .send(BuildJob {
             job_id: job_id.clone(),
             req,
-            operator: user.0,
+            operator: user.id,
             server_build_dir: state.config.builds_output_dir.clone(), // Get from app state
             state_ref: state.clone(),
         })
@@ -301,10 +362,19 @@ pub async fn handle_build(
 
 pub async fn handle_build_status(
     axum::extract::Path(job_id): axum::extract::Path<String>,
+    axum::extract::Extension(user): axum::extract::Extension<AuthenticatedUser>,
 ) -> Result<Json<BuildResponse>, (StatusCode, String)> {
     if let Some(map) = JOB_MAP.get() {
         let m = map.lock().unwrap();
         if let Some(s) = m.get(&job_id) {
+            // P1-28: Only the operator who enqueued the build (or an admin)
+            // may view its status and logs.
+            if s.operator != user.id && !user.has_permission("admin") {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "you are not the owner of this build job".into(),
+                ));
+            }
             return Ok(Json(BuildResponse {
                 job_id: Some(job_id),
                 log: Some(s.log.clone()),
@@ -332,7 +402,9 @@ fn execute_build_safely(
         }
     };
 
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve workspace root from CARGO_MANIFEST_DIR"))?;
     let temp_dir = tempfile::tempdir()?;
     let tmp_path = temp_dir.path();
 
@@ -485,6 +557,7 @@ fn build_profile_from_request(
     req: &BuildRequest,
 ) -> anyhow::Result<builder::config::PayloadConfig> {
     validate_cert_pin(&req.pin)?;
+    validate_target_os_arch(&req.os, &req.arch)?;
 
     let c2_addr = format!("{}:{}", req.host, req.port);
     let mut features = vec!["outbound-c".to_string()];
@@ -532,6 +605,37 @@ fn build_profile_from_request(
     })
 }
 
+/// Allowed target operating systems for builds.
+const ALLOWED_OS: &[&str] = &["linux", "windows", "macos"];
+
+/// Allowed target architectures for builds.
+const ALLOWED_ARCH: &[&str] = &["x86_64", "aarch64"];
+
+/// Validate that the requested OS and arch are on the strict whitelist.
+///
+/// This prevents an operator from injecting arbitrary strings into the
+/// generated TOML build profile (e.g. setting `os` to a path traversal or
+/// shell metacharacter payload).
+fn validate_target_os_arch(os: &str, arch: &str) -> anyhow::Result<()> {
+    let os_lower = os.to_lowercase();
+    if !ALLOWED_OS.contains(&os_lower.as_str()) {
+        anyhow::bail!(
+            "unsupported target OS '{}'; allowed values: {}",
+            os,
+            ALLOWED_OS.join(", ")
+        );
+    }
+    let arch_lower = arch.to_lowercase();
+    if !ALLOWED_ARCH.contains(&arch_lower.as_str()) {
+        anyhow::bail!(
+            "unsupported target architecture '{}'; allowed values: {}",
+            arch,
+            ALLOWED_ARCH.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn validate_cert_pin(pin: &str) -> anyhow::Result<()> {
     let pin = pin.trim();
     if pin.len() != 64 || !pin.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -542,12 +646,95 @@ fn validate_cert_pin(pin: &str) -> anyhow::Result<()> {
 
 fn validate_seed(seed_hex: &str) -> anyhow::Result<()> {
     let s = seed_hex.trim().trim_start_matches("0x");
-    if s.len() > 16 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+    if s.is_empty() || s.len() > 16 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         anyhow::bail!(
             "seed must be a hex-encoded u64 (up to 16 hex characters, e.g. 'a1b2c3d4e5f6a7b8')"
         );
     }
     Ok(())
+}
+
+/// Validate that the build target host does not resolve to a private or
+/// internal IP address.  Prevents SSRF attacks that could reach cloud
+/// instance metadata endpoints (e.g. 169.254.169.254) or internal services.
+fn validate_host_not_private(host: &str) -> anyhow::Result<()> {
+    // Try to parse as an IP address first.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_private_or_reserved(&ip) {
+            anyhow::bail!(
+                "host '{}' resolves to a private/reserved IP address; \
+                 build targets must use public infrastructure addresses",
+                host
+            );
+        }
+        return Ok(());
+    }
+
+    // If it's a hostname, perform a DNS lookup and check all results.
+    // Use tokio's blocking spawn since we're in an async context but
+    // std::net::ToSocketAddrs is blocking.
+    let host_owned = host.to_string();
+    let addrs: Vec<IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&format!("{host_owned}:0"))
+        .map(|addrs| addrs.map(|a| a.ip()).collect())
+        .unwrap_or_default();
+
+    if addrs.is_empty() {
+        // Can't resolve — let it through and let the build fail naturally,
+        // or reject if you prefer strict validation.
+        tracing::warn!(host = %host, "could not resolve build host; allowing with warning");
+        return Ok(());
+    }
+
+    for ip in &addrs {
+        if is_private_or_reserved(ip) {
+            anyhow::bail!(
+                "host '{}' resolves to private/reserved IP {}; \
+                 build targets must use public infrastructure addresses",
+                host,
+                ip
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Check whether an IP address falls into a private, loopback, link-local,
+/// or other reserved range that should not be used as a build target.
+fn is_private_or_reserved(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            // Loopback: 127.0.0.0/8
+            v4.is_loopback()
+            // Link-local: 169.254.0.0/16  (includes AWS IMDS 169.254.169.254)
+            || v4.is_link_local()
+            // RFC 1918 private: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+            || v4.is_private()
+            // Broadcast / unspecified
+            || v4.is_broadcast() || v4.is_unspecified()
+            // IETF protocol assignments: 192.0.0.0/24
+            || matches!(v4.octets(), [192, 0, 0, ..])
+            // TEST-NET-1/2/3: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+            || matches!(v4.octets(), [192, 0, 2, ..])
+            || matches!(v4.octets(), [198, 51, 100, ..])
+            || matches!(v4.octets(), [203, 0, 113, ..])
+            // Carrier-grade NAT: 100.64.0.0/10
+            || matches!(v4.octets(), [100, 64..=127, ..])
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+            || v6.is_unspecified()
+            // IPv6 link-local: fe80::/10
+            || is_ipv6_link_local(v6)
+            // IPv6 unique local: fc00::/7
+            || matches!(v6.segments()[0] & 0xfe00, 0xfc00)
+        }
+    }
+}
+
+/// Check if an IPv6 address is in the link-local range fe80::/10.
+fn is_ipv6_link_local(v6: &Ipv6Addr) -> bool {
+    let segments = v6.segments();
+    (segments[0] & 0xffc0) == 0xfe80
 }
 
 fn copy_workspace_for_build(src_root: &Path, dst_root: &Path) -> anyhow::Result<()> {
@@ -589,6 +776,8 @@ fn copy_path_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
 
 pub async fn handle_download(
     axum::extract::Path(job_id): axum::extract::Path<String>,
+    axum::extract::Extension(user): axum::extract::Extension<AuthenticatedUser>,
+    State(app_state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, StatusCode> {
     if !job_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
         return Err(StatusCode::BAD_REQUEST);
@@ -599,6 +788,10 @@ pub async fn handle_download(
         let Some(state) = m.get(&job_id) else {
             return Err(StatusCode::NOT_FOUND);
         };
+        // P1-28: Only the build owner (or an admin) may download the artifact.
+        if state.operator != user.id && !user.has_permission("admin") {
+            return Err(StatusCode::FORBIDDEN);
+        }
         if state.status != "Completed" {
             return Err(StatusCode::NOT_FOUND);
         }
@@ -607,6 +800,29 @@ pub async fn handle_download(
         None
     }
     .ok_or(StatusCode::NOT_FOUND)?;
+
+    // P2-13: Re-validate at read time that the stored output_path is within
+    // the configured builds directory using canonicalization.  This prevents
+    // a tampered / stale JobState from tricking the server into reading an
+    // arbitrary file on disk (path traversal).
+    {
+        let canon_file = std::path::Path::new(&file_path)
+            .canonicalize()
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        let canon_builds = app_state
+            .config
+            .builds_output_dir
+            .canonicalize()
+            .unwrap_or_else(|_| app_state.config.builds_output_dir.clone());
+        if !canon_file.starts_with(&canon_builds) {
+            tracing::error!(
+                "P2-13: download path '{}' escapes builds dir '{}'",
+                canon_file.display(),
+                canon_builds.display()
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
 
     let file = tokio::fs::read(&file_path)
         .await

@@ -52,10 +52,10 @@
 
 #![cfg(all(windows, feature = "syscall-emulation"))]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use log::{debug, warn};
 // Type-only imports — no function imports to avoid IAT entries.
@@ -95,9 +95,33 @@ fn win32_to_ntstatus(error_code: DWORD) -> i32 {
 // These are the "emulated" wrappers that intentionally call kernel32
 // to disguise the call stack.
 
-/// Cache of resolved kernel32 function addresses (name → address).
-/// Populated lazily on first resolution and never evicted.
-static KERNEL32_CACHE: OnceLock<Mutex<HashMap<Vec<u8>, usize>>> = OnceLock::new();
+// ── Per-function OnceLock caches (P2-20) ─────────────────────────────────────
+//
+// Each kernel32 function resolved by this module has its own OnceLock<usize>.
+// On first call the address is resolved via PEB walking + export table hash,
+// validated against kernel32's VA range, and stored.  Subsequent calls are
+// lock-free — no Mutex, no HashMap lookup, no repeated hash computation.
+
+macro_rules! cached_k32_fn {
+    ($($name:ident => $sym:literal),* $(,)?) => {
+        $(
+            static $name: OnceLock<usize> = OnceLock::new();
+        )*
+    };
+}
+
+cached_k32_fn! {
+    ADDR_GET_LAST_ERROR => b"GetLastError\0",
+    ADDR_WRITE_PROCESS_MEMORY => b"WriteProcessMemory\0",
+    ADDR_READ_PROCESS_MEMORY => b"ReadProcessMemory\0",
+    ADDR_VIRTUAL_ALLOC_EX => b"VirtualAllocEx\0",
+    ADDR_VIRTUAL_FREE_EX => b"VirtualFreeEx\0",
+    ADDR_VIRTUAL_PROTECT_EX => b"VirtualProtectEx\0",
+    ADDR_CREATE_REMOTE_THREAD => b"CreateRemoteThread\0",
+    ADDR_OPEN_PROCESS => b"OpenProcess\0",
+    ADDR_CLOSE_HANDLE => b"CloseHandle\0",
+    ADDR_VIRTUAL_QUERY_EX => b"VirtualQueryEx\0",
+}
 
 /// Read `SizeOfImage` from the PE optional header at `base`.
 ///
@@ -121,20 +145,14 @@ unsafe fn get_module_size(base: usize) -> Option<usize> {
     Some(*((opt_header + 0x38) as *const u32) as usize)
 }
 
-/// Dynamically resolve a kernel32 export by name.
+/// Resolve a kernel32 export, storing the result in the supplied OnceLock.
 ///
-/// Returns `None` if the module or function cannot be found, or if the
-/// resolved address falls outside kernel32's VA range (possible PEB
-/// tampering / hook).  Results are cached in a process-wide `OnceLock`
-/// map so that subsequent calls for the same function name return
-/// immediately without re-resolving.
-fn resolve_kernel32_fn(name: &[u8]) -> Option<usize> {
-    // Fast-path: check the cache first.
-    let cache = KERNEL32_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock() {
-        if let Some(&addr) = guard.get(name) {
-            return Some(addr);
-        }
+/// On first call the function is resolved via PEB walking + export table hash,
+/// validated against kernel32's VA range, and cached.  Subsequent calls return
+/// the cached value immediately — no Mutex, no HashMap, no repeated hashing.
+fn resolve_cached(lock: &'static OnceLock<usize>, name: &[u8]) -> Option<usize> {
+    if let Some(&addr) = lock.get() {
+        return Some(addr);
     }
 
     // Slow-path: resolve via PEB walking + export table hash.
@@ -159,18 +177,15 @@ fn resolve_kernel32_fn(name: &[u8]) -> Option<usize> {
         }
     }
 
-    // Store in cache for future calls.
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(name.to_vec(), addr);
-    }
-
+    // Store — if another thread beat us, its value is just as good.
+    let _ = lock.set(addr);
     Some(addr)
 }
 
 /// Dynamically resolved `GetLastError`.
 unsafe fn dynamic_get_last_error() -> DWORD {
     type FnGetLastError = unsafe extern "system" fn() -> DWORD;
-    match resolve_kernel32_fn(b"GetLastError\0") {
+    match resolve_cached(&ADDR_GET_LAST_ERROR, b"GetLastError\0") {
         Some(addr) => {
             let f: FnGetLastError = std::mem::transmute(addr as *mut _);
             f()
@@ -190,7 +205,7 @@ unsafe fn dynamic_write_process_memory(
     type FnWriteProcessMemory = unsafe extern "system" fn(
         HANDLE, *mut std::ffi::c_void, *const std::ffi::c_void, SIZE_T, *mut SIZE_T,
     ) -> BOOL;
-    match resolve_kernel32_fn(b"WriteProcessMemory\0") {
+    match resolve_cached(&ADDR_WRITE_PROCESS_MEMORY, b"WriteProcessMemory\0") {
         Some(addr) => {
             let f: FnWriteProcessMemory = std::mem::transmute(addr as *mut _);
             f(h_process, lp_base_address, lp_buffer, n_size, lp_number_of_bytes_written)
@@ -210,7 +225,7 @@ unsafe fn dynamic_read_process_memory(
     type FnReadProcessMemory = unsafe extern "system" fn(
         HANDLE, *const std::ffi::c_void, *mut std::ffi::c_void, SIZE_T, *mut SIZE_T,
     ) -> BOOL;
-    match resolve_kernel32_fn(b"ReadProcessMemory\0") {
+    match resolve_cached(&ADDR_READ_PROCESS_MEMORY, b"ReadProcessMemory\0") {
         Some(addr) => {
             let f: FnReadProcessMemory = std::mem::transmute(addr as *mut _);
             f(h_process, lp_base_address, lp_buffer, n_size, lp_number_of_bytes_read)
@@ -230,7 +245,7 @@ unsafe fn dynamic_virtual_alloc_ex(
     type FnVirtualAllocEx = unsafe extern "system" fn(
         HANDLE, LPVOID, SIZE_T, DWORD, DWORD,
     ) -> LPVOID;
-    match resolve_kernel32_fn(b"VirtualAllocEx\0") {
+    match resolve_cached(&ADDR_VIRTUAL_ALLOC_EX, b"VirtualAllocEx\0") {
         Some(addr) => {
             let f: FnVirtualAllocEx = std::mem::transmute(addr as *mut _);
             f(h_process, lp_address, dw_size, fl_allocation_type, fl_protect)
@@ -249,7 +264,7 @@ unsafe fn dynamic_virtual_free_ex(
     type FnVirtualFreeEx = unsafe extern "system" fn(
         HANDLE, LPVOID, SIZE_T, DWORD,
     ) -> BOOL;
-    match resolve_kernel32_fn(b"VirtualFreeEx\0") {
+    match resolve_cached(&ADDR_VIRTUAL_FREE_EX, b"VirtualFreeEx\0") {
         Some(addr) => {
             let f: FnVirtualFreeEx = std::mem::transmute(addr as *mut _);
             f(h_process, lp_address, dw_size, dw_free_type)
@@ -269,7 +284,7 @@ unsafe fn dynamic_virtual_protect_ex(
     type FnVirtualProtectEx = unsafe extern "system" fn(
         HANDLE, LPVOID, SIZE_T, DWORD, *mut DWORD,
     ) -> BOOL;
-    match resolve_kernel32_fn(b"VirtualProtectEx\0") {
+    match resolve_cached(&ADDR_VIRTUAL_PROTECT_EX, b"VirtualProtectEx\0") {
         Some(addr) => {
             let f: FnVirtualProtectEx = std::mem::transmute(addr as *mut _);
             f(h_process, lp_address, dw_size, fl_new_protect, lpfl_old_protect)
@@ -293,7 +308,7 @@ unsafe fn dynamic_create_remote_thread(
         Option<unsafe extern "system" fn(*mut std::ffi::c_void) -> DWORD>,
         *mut std::ffi::c_void, DWORD, *mut DWORD,
     ) -> HANDLE;
-    match resolve_kernel32_fn(b"CreateRemoteThread\0") {
+    match resolve_cached(&ADDR_CREATE_REMOTE_THREAD, b"CreateRemoteThread\0") {
         Some(addr) => {
             let f: FnCreateRemoteThread = std::mem::transmute(addr as *mut _);
             f(h_process, lp_thread_attributes, dw_stack_size, lp_start_address, lp_parameter, dw_creation_flags, lp_thread_id)
@@ -309,7 +324,7 @@ unsafe fn dynamic_open_process(
     dw_process_id: DWORD,
 ) -> HANDLE {
     type FnOpenProcess = unsafe extern "system" fn(DWORD, BOOL, DWORD) -> HANDLE;
-    match resolve_kernel32_fn(b"OpenProcess\0") {
+    match resolve_cached(&ADDR_OPEN_PROCESS, b"OpenProcess\0") {
         Some(addr) => {
             let f: FnOpenProcess = std::mem::transmute(addr as *mut _);
             f(dw_desired_access, b_inherit_handle, dw_process_id)
@@ -321,7 +336,7 @@ unsafe fn dynamic_open_process(
 /// Dynamically resolved `CloseHandle`.
 unsafe fn dynamic_close_handle(h_object: HANDLE) -> BOOL {
     type FnCloseHandle = unsafe extern "system" fn(HANDLE) -> BOOL;
-    match resolve_kernel32_fn(b"CloseHandle\0") {
+    match resolve_cached(&ADDR_CLOSE_HANDLE, b"CloseHandle\0") {
         Some(addr) => {
             let f: FnCloseHandle = std::mem::transmute(addr as *mut _);
             f(h_object)
@@ -340,7 +355,7 @@ unsafe fn dynamic_virtual_query_ex(
     type FnVirtualQueryEx = unsafe extern "system" fn(
         HANDLE, *const std::ffi::c_void, *mut MEMORY_BASIC_INFORMATION, SIZE_T,
     ) -> SIZE_T;
-    match resolve_kernel32_fn(b"VirtualQueryEx\0") {
+    match resolve_cached(&ADDR_VIRTUAL_QUERY_EX, b"VirtualQueryEx\0") {
         Some(addr) => {
             let f: FnVirtualQueryEx = std::mem::transmute(addr as *mut _);
             f(h_process, lp_address, lp_buffer, dw_length)
