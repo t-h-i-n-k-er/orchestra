@@ -30,7 +30,7 @@
 //! On non-Windows platforms this module compiles to a no-op stub that logs a
 //! warning when `run()` is called.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 #[cfg(windows)]
 use tokio::net::TcpStream;
 
@@ -40,15 +40,15 @@ use tokio::net::TcpStream;
 mod imp {
     use super::*;
     use std::io;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
+
+    type PipeHandle = winapi::shared::ntdef::HANDLE;
 
     // Maximum frame size (must match agent_link and transport.rs).
     const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
     /// Read one length-prefixed frame from a synchronous file handle.
     fn read_frame_sync(
-        handle: *mut std::ffi::c_void,
+        handle: PipeHandle,
         buf: &mut Vec<u8>,
     ) -> Result<()> {
         buf.clear();
@@ -69,7 +69,7 @@ mod imp {
 
     /// Write one length-prefixed frame to a synchronous file handle.
     fn write_frame_sync(
-        handle: *mut std::ffi::c_void,
+        handle: PipeHandle,
         data: &[u8],
     ) -> Result<()> {
         let len_bytes = (data.len() as u32).to_le_bytes();
@@ -79,7 +79,7 @@ mod imp {
     }
 
     /// Read exactly `n` bytes from a Windows file handle (blocking).
-    fn read_exact_sync(handle: *mut std::ffi::c_void, buf: &mut [u8]) -> Result<()> {
+    pub(super) fn read_exact_sync(handle: PipeHandle, buf: &mut [u8]) -> Result<()> {
         let mut filled = 0;
         while filled < buf.len() {
             let mut bytes_read: u32 = 0;
@@ -107,7 +107,7 @@ mod imp {
     }
 
     /// Write all bytes to a Windows file handle (blocking).
-    fn write_all_sync(handle: *mut std::ffi::c_void, data: &[u8]) -> Result<()> {
+    pub(super) fn write_all_sync(handle: PipeHandle, data: &[u8]) -> Result<()> {
         let mut written = 0;
         while written < data.len() {
             let mut bytes_written: u32 = 0;
@@ -135,7 +135,11 @@ mod imp {
     }
 
     /// Create a single named-pipe instance and wait for a client to connect.
-    fn create_and_wait_pipe(pipe_name: &str, out_size: u32, in_size: u32) -> Result<*mut std::ffi::c_void> {
+    pub(super) fn create_and_wait_pipe(
+        pipe_name: &str,
+        out_size: u32,
+        in_size: u32,
+    ) -> Result<usize> {
         let wide_name: Vec<u16> = pipe_name
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -144,8 +148,7 @@ mod imp {
         let handle = unsafe {
             winapi::um::namedpipeapi::CreateNamedPipeW(
                 wide_name.as_ptr() as *const _,
-                winapi::um::winbase::PIPE_ACCESS_DUPLEX
-                    | winapi::um::winbase::FILE_FLAG_OVERLAPPED,
+                winapi::um::winbase::PIPE_ACCESS_DUPLEX,
                 winapi::um::winbase::PIPE_TYPE_BYTE
                     | winapi::um::winbase::PIPE_READMODE_BYTE
                     | winapi::um::winbase::PIPE_WAIT,
@@ -177,11 +180,12 @@ mod imp {
             }
         }
 
-        Ok(handle)
+        Ok(handle as usize)
     }
 
     /// Close a named-pipe handle.
-    fn close_pipe(handle: *mut std::ffi::c_void) {
+    pub(super) fn close_pipe(handle: usize) {
+        let handle = handle as PipeHandle;
         unsafe { winapi::um::handleapi::CloseHandle(handle) };
     }
 
@@ -228,8 +232,6 @@ async fn run_windows(
     max_instances: u32,
     agent_addr: std::net::SocketAddr,
 ) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     // Full pipe path: \\.\pipe\<name>
     let full_pipe_name = if pipe_name.starts_with(r"\\") {
         pipe_name.to_string()
@@ -261,12 +263,13 @@ async fn run_windows(
         tracing::info!("smb_relay: client connected to pipe");
 
         // Bridge this pipe connection to the agent TCP listener.
+        let handle_raw = handle as usize;
         let agent_addr_c = agent_addr;
         tokio::spawn(async move {
-            if let Err(e) = bridge_connection(handle, agent_addr_c).await {
+            if let Err(e) = bridge_connection(handle_raw, agent_addr_c).await {
                 tracing::warn!("smb_relay: pipe bridge ended: {e}");
             }
-            imp::close_pipe(handle);
+            imp::close_pipe(handle_raw);
         });
     }
 }
@@ -280,7 +283,7 @@ async fn run_windows(
 ///   them to the pipe handle (blocking).
 #[cfg(windows)]
 async fn bridge_connection(
-    pipe_handle: *mut std::ffi::c_void,
+    pipe_handle_raw: usize,
     agent_addr: std::net::SocketAddr,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -295,7 +298,7 @@ async fn bridge_connection(
     let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(64);
 
     // Pipe → TCP: spawn_blocking reads frames, sends them via channel.
-    let pipe_read_handle = pipe_handle;
+    let pipe_read_handle_raw = pipe_handle_raw;
     let pipe_to_tcp = tokio::spawn(async move {
         while let Some(frame) = frame_rx.recv().await {
             // Write the frame (length prefix + payload) to the TCP socket.
@@ -308,6 +311,7 @@ async fn bridge_connection(
 
     // Blocking task: read frames from the pipe and send to the channel.
     let pipe_reader = tokio::task::spawn_blocking(move || {
+        let pipe_read_handle = pipe_read_handle_raw as winapi::shared::ntdef::HANDLE;
         loop {
             let mut len_buf = [0u8; 4];
             if let Err(e) = imp::read_exact_sync(pipe_read_handle, &mut len_buf) {
@@ -365,8 +369,9 @@ async fn bridge_connection(
     });
 
     // Blocking task: write frames from TCP to the pipe.
-    let pipe_write_handle = pipe_handle;
+    let pipe_write_handle_raw = pipe_handle_raw;
     let pipe_writer = tokio::task::spawn_blocking(move || {
+        let pipe_write_handle = pipe_write_handle_raw as winapi::shared::ntdef::HANDLE;
         let mut rx = write_rx;
         while let Some(frame) = rx.blocking_recv() {
             if let Err(e) = imp::write_all_sync(pipe_write_handle, &frame) {

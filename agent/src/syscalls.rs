@@ -1,8 +1,7 @@
 //! Direct/Indirect syscalls for Windows and Linux.
 #![cfg(all(
     any(windows, target_os = "linux"),
-    any(target_arch = "x86_64", target_arch = "aarch64"),
-    feature = "direct-syscalls"
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 
 use anyhow::Result;
@@ -15,13 +14,13 @@ use std::arch::asm;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[cfg(windows)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 #[cfg(windows)]
 use std::collections::HashMap;
 
 #[cfg(windows)]
-static CLEAN_NTDLL: OnceLock<usize> = OnceLock::new();
+static CLEAN_NTDLL: RwLock<Option<usize>> = RwLock::new(None);
 
 /// Per-call SSN cache: function name → (ssn, gadget_addr, pe_timestamp).
 /// The third element is the `TimeDateStamp` from the PE header of the clean
@@ -692,32 +691,40 @@ pub fn get_syscall_id(func_name: &str) -> Result<SyscallTarget> {
         return Ok(SyscallTarget { ssn, gadget_addr });
     }
 
-    let base = *CLEAN_NTDLL.get_or_init(|| {
-        match map_clean_ntdll() {
-            Ok(b) => {
-                // Capture the PE timestamp for cross-reference validation.
-                let ts = unsafe { read_pe_timestamp(b) };
-                CACHED_TIMESTAMP.store(ts, Ordering::Release);
-                // Also cache the build number.
-                let _ = get_build_number();
-                log::debug!(
-                    "syscalls: clean ntdll mapped at {:#x} (timestamp={:#010x}, build={})",
-                    b, ts, BUILD_NUMBER.load(Ordering::Acquire)
-                );
+    let base = {
+        let guard = CLEAN_NTDLL.read().unwrap();
+        if let Some(&b) = guard.as_ref().filter(|&&b| b != 0) {
+            b
+        } else {
+            drop(guard); // release read lock before write
+            let mut guard = CLEAN_NTDLL.write().unwrap();
+            // Double-check after acquiring write lock
+            if let Some(&b) = guard.as_ref().filter(|&&b| b != 0) {
                 b
-            }
-            Err(e) => {
-                // Do NOT call process::exit — a hooked or unavailable stub
-                // should degrade gracefully.  Callers already use `?` so the
-                // returned Err below propagates without crashing the agent.
-                log::warn!(
-                    "get_syscall_id: could not map clean ntdll.dll: {e}; \
-                     direct-syscall SSN resolution will fail for this session"
-                );
-                0 // sentinel: mapping unavailable
+            } else {
+                match map_clean_ntdll() {
+                    Ok(b) => {
+                        let ts = unsafe { read_pe_timestamp(b) };
+                        CACHED_TIMESTAMP.store(ts, Ordering::Release);
+                        let _ = get_build_number();
+                        log::debug!(
+                            "syscalls: clean ntdll mapped at {:#x} (timestamp={:#010x}, build={})",
+                            b, ts, BUILD_NUMBER.load(Ordering::Acquire)
+                        );
+                        *guard = Some(b);
+                        b
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "get_syscall_id: could not map clean ntdll.dll: {e}; \
+                             direct-syscall SSN resolution will fail for this session"
+                        );
+                        0
+                    }
+                }
             }
         }
-    });
+    };
     if base == 0 {
         return Err(anyhow!(
             "clean ntdll mapping unavailable; cannot resolve SSN for '{func_name}'"
@@ -762,6 +769,11 @@ pub fn invalidate_syscall_cache() {
         cache.lock().unwrap().clear();
     }
     CACHED_TIMESTAMP.store(0, Ordering::Release);
+    // Reset the clean ntdll mapping so get_syscall_id will re-map from
+    // disk on next access.
+    if let Ok(mut guard) = CLEAN_NTDLL.write() {
+        *guard = None;
+    }
     log::debug!("syscalls: cache invalidated — re-map on next access");
 }
 
@@ -919,32 +931,115 @@ unsafe fn read_pe_timestamp(base: usize) -> u32 {
 
 /// Return the expected SSN range for `func_name` on the given build.
 #[cfg(windows)]
-fn expected_ssn_range(func_name: &str, _build: u32) -> Option<(u32, u32)> {
-    let ranges: &[(&str, u32, u32)] = &[
-        ("NtAllocateVirtualMemory",    0x0010, 0x0028),
-        ("NtProtectVirtualMemory",     0x0030, 0x0058),
-        ("NtWriteVirtualMemory",       0x0028, 0x0040),
-        ("NtReadVirtualMemory",        0x0028, 0x0042),
-        ("NtCreateThreadEx",           0x0038, 0x0060),
-        ("NtOpenProcess",              0x0020, 0x0038),
-        ("NtOpenThread",               0x0020, 0x0036),
-        ("NtClose",                    0x0002, 0x0010),
-        ("NtQueryVirtualMemory",       0x0018, 0x0030),
-        ("NtQuerySystemInformation",   0x0028, 0x0044),
-        ("NtMapViewOfSection",         0x0018, 0x0028),
-        ("NtUnmapViewOfSection",       0x0018, 0x002A),
-        ("NtCreateSection",            0x0038, 0x0052),
-        ("NtOpenFile",                 0x0020, 0x0038),
-        ("NtReadFile",                 0x0002, 0x000C),
-        ("NtSetInformationProcess",    0x0028, 0x0040),
-        ("NtFreeVirtualMemory",        0x0010, 0x0028),
-        ("NtQueueApcThread",           0x0038, 0x0056),
-        ("NtSetContextThread",         0x0038, 0x0056),
-        ("NtGetContextThread",         0x0038, 0x0056),
+/// Return the expected SSN range for `func_name` on the given Windows build.
+///
+/// Windows NT syscall numbers shift between major releases.  The table below
+/// provides build-specific ranges covering Windows 10 (builds 10240–19045)
+/// and Windows 11 (builds 22000–26100+).  When the current build falls within
+/// a known bracket the corresponding range is returned; otherwise the
+/// broadest (most permissive) range is used as a safety net.
+fn expected_ssn_range(func_name: &str, build: u32) -> Option<(u32, u32)> {
+    // (build_lo, build_hi, &[(name, lo, hi), …])
+    //
+    // SSN values sourced from public ntdll export tables:
+    //   • Win10 1507 (10240) through 22H2 (19045)
+    //   • Win11 21H2 (22000) through 24H2 (26100)
+    const TABLE: &[(
+        u32,
+        u32,
+        &[(&str, u32, u32)],
+    )] = &[
+        // ── Windows 10 (builds 10240 – 19045) ─────────────────────────
+        (
+            10240,
+            19045,
+            &[
+                ("NtAllocateVirtualMemory",    0x0010, 0x0020),
+                ("NtProtectVirtualMemory",     0x0030, 0x0050),
+                ("NtWriteVirtualMemory",       0x0028, 0x003A),
+                ("NtReadVirtualMemory",        0x0028, 0x003C),
+                ("NtCreateThreadEx",           0x0038, 0x0050),
+                ("NtOpenProcess",              0x0020, 0x0026),
+                ("NtOpenThread",               0x0020, 0x0024),
+                ("NtClose",                    0x0002, 0x000F),
+                ("NtQueryVirtualMemory",       0x0018, 0x0026),
+                ("NtQuerySystemInformation",   0x0028, 0x0036),
+                ("NtMapViewOfSection",         0x0018, 0x0026),
+                ("NtUnmapViewOfSection",       0x0018, 0x0028),
+                ("NtCreateSection",            0x0038, 0x004A),
+                ("NtOpenFile",                 0x0020, 0x0034),
+                ("NtReadFile",                 0x0002, 0x0006),
+                ("NtSetInformationProcess",    0x0028, 0x0030),
+                ("NtFreeVirtualMemory",        0x0010, 0x001C),
+                ("NtQueueApcThread",           0x0038, 0x0048),
+                ("NtSetContextThread",         0x0038, 0x0048),
+                ("NtGetContextThread",         0x0038, 0x0048),
+            ],
+        ),
+        // ── Windows 11 (builds 22000 – 26100+) ────────────────────────
+        (
+            22000,
+            99999,
+            &[
+                ("NtAllocateVirtualMemory",    0x0018, 0x0028),
+                ("NtProtectVirtualMemory",     0x0040, 0x0058),
+                ("NtWriteVirtualMemory",       0x0030, 0x0040),
+                ("NtReadVirtualMemory",        0x0030, 0x0042),
+                ("NtCreateThreadEx",           0x0048, 0x0060),
+                ("NtOpenProcess",              0x0024, 0x0038),
+                ("NtOpenThread",               0x0024, 0x0036),
+                ("NtClose",                    0x0004, 0x0010),
+                ("NtQueryVirtualMemory",       0x0020, 0x0030),
+                ("NtQuerySystemInformation",   0x0030, 0x0044),
+                ("NtMapViewOfSection",         0x0020, 0x0028),
+                ("NtUnmapViewOfSection",       0x0020, 0x002A),
+                ("NtCreateSection",            0x0048, 0x0052),
+                ("NtOpenFile",                 0x0028, 0x0038),
+                ("NtReadFile",                 0x0004, 0x000C),
+                ("NtSetInformationProcess",    0x0030, 0x0040),
+                ("NtFreeVirtualMemory",        0x0014, 0x0028),
+                ("NtQueueApcThread",           0x0048, 0x0056),
+                ("NtSetContextThread",         0x0048, 0x0056),
+                ("NtGetContextThread",         0x0048, 0x0056),
+            ],
+        ),
     ];
-    ranges.iter().find_map(|&(name, lo, hi)| {
-        if name == func_name { Some((lo, hi)) } else { None }
-    })
+
+    // Find the matching build bracket.
+    let bracket = TABLE
+        .iter()
+        .find(|&&(lo, hi, _)| build >= lo && build <= hi)
+        .map(|&(_, _, entries)| entries);
+
+    match bracket {
+        Some(entries) => entries.iter().find_map(|&(name, lo, hi)| {
+            if name == func_name {
+                Some((lo, hi))
+            } else {
+                None
+            }
+        }),
+        // Unknown build: return the union of all ranges (most permissive)
+        // so we only warn when the SSN is truly outlandish.
+        None => {
+            // Collect the min-lo / max-hi across all brackets for this func.
+            let mut merged_lo = u32::MAX;
+            let mut merged_hi = 0u32;
+            for &(_blo, _bhi, entries) in TABLE.iter() {
+                for &(name, lo, hi) in entries.iter() {
+                    if name == func_name {
+                        merged_lo = merged_lo.min(lo);
+                        merged_hi = merged_hi.max(hi);
+                    }
+                }
+            }
+            if merged_lo <= merged_hi {
+                Some((merged_lo, merged_hi))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1014,8 +1109,8 @@ fn resolve_ntcontinue_ssn() -> u32 {
     // initialisation path as get_syscall_id.  If it hasn't been mapped yet
     // we cannot proceed without risking deadlock (we may be called from a
     // context where map_clean_ntdll has not run).
-    let base = match CLEAN_NTDLL.get() {
-        Some(&b) if b != 0 => b,
+    let base = match CLEAN_NTDLL.read().ok().and_then(|g| *g).filter(|&b| b != 0) {
+        Some(b) => b,
         _ => {
             // Fall back to the loaded (potentially hooked) ntdll export.
             // If it is hooked the SSN will still be correct because the
@@ -1189,7 +1284,15 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             });
 
         #[cfg(not(feature = "stack-spoof"))]
-        let chain: Option<crate::stack_db::ResolvedChain> = None;
+        struct ChainFrame {
+            return_addr: usize,
+        }
+        #[cfg(not(feature = "stack-spoof"))]
+        struct ResolvedChain {
+            frames: Vec<ChainFrame>,
+        }
+        #[cfg(not(feature = "stack-spoof"))]
+        let chain: Option<ResolvedChain> = None;
 
         // Determine the effective "top of chain" spoof frame for the jmp-based
         // path.  This is the first (bottom) frame of the chain — the one the
@@ -1592,18 +1695,32 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
     };
 
     unsafe {
-        let ntdll_base = *CLEAN_NTDLL.get_or_init(|| {
-            match map_clean_ntdll() {
-                Ok(b) => b,
-                Err(e) => {
-                    log::warn!(
-                        "map_clean_dll: could not map clean ntdll.dll: {e}; \
-                         clean API resolution will fail for this session"
-                    );
-                    0
+        let ntdll_base = {
+            let guard = CLEAN_NTDLL.read().unwrap();
+            if let Some(base) = *guard {
+                base
+            } else {
+                drop(guard);
+                let mut guard = CLEAN_NTDLL.write().unwrap();
+                if let Some(base) = *guard {
+                    base
+                } else {
+                    match map_clean_ntdll() {
+                        Ok(b) => {
+                            *guard = Some(b);
+                            b
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "map_clean_dll: could not map clean ntdll.dll: {e}; \
+                                 clean API resolution will fail for this session"
+                            );
+                            0
+                        }
+                    }
                 }
             }
-        });
+        };
         if ntdll_base == 0 {
             return Err(anyhow!("clean ntdll mapping unavailable; cannot map clean '{dll_name}'"));
         }
@@ -2396,7 +2513,7 @@ macro_rules! clean_call {
 ///
 /// # Example
 /// ```rust,ignore
-/// let fd = syscall!("openat", libc::AT_FDCWD, path_ptr, libc::O_RDONLY)?;
+/// let fd = crate::syscall!("openat", libc::AT_FDCWD, path_ptr, libc::O_RDONLY)?;
 /// ```
 macro_rules! syscall {
     ($func_name:expr $(, $args:expr)* $(,)?) => {{
@@ -3730,7 +3847,7 @@ mod linux_direct_syscall_tests {
 
     #[test]
     fn linux_syscall_macro_getpid_matches_libc() {
-        let direct = syscall!("getpid").expect("syscall! getpid should succeed") as libc::pid_t;
+        let direct = crate::syscall!("getpid").expect("syscall! getpid should succeed") as libc::pid_t;
         let libc_pid = unsafe { libc::getpid() };
         assert_eq!(direct, libc_pid, "syscall! pid must match libc getpid");
     }

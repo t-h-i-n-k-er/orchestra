@@ -47,7 +47,7 @@ pub mod deploy;
 pub mod discover;
 pub mod overwrite;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use common::CryptoSession;
 
 // ── Shared VA→PA translation ───────────────────────────────────────────────

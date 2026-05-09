@@ -375,17 +375,17 @@ async fn main() -> Result<()> {
 
     // HTTP C2 listener (malleable profile-aware).
     if !profile_manager.profile_names().await.is_empty() {
-        let http_c2_state = HttpC2State {
-            profile_manager: profile_manager.clone(),
-            app_state: state.clone(),
+        let http_c2_state = HttpC2State::new(
+            profile_manager.clone(),
+            state.clone(),
             // P1-16: C2 rate limiter — 200 requests per 60 seconds per IP.
             // Much more permissive than the auth limiter since legitimate
             // agents poll the C2 channel at their configured sleep interval.
-            c2_rate_limiter: Arc::new(PerIpRateLimiter::new(
+            Arc::new(PerIpRateLimiter::new(
                 200,
                 std::time::Duration::from_secs(60),
             )),
-        };
+        );
         let http_c2_addr = cfg.http_c2_addr;
         let router = orchestra_server::http_c2::build_router(http_c2_state);
         tokio::spawn(async move {

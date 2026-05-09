@@ -43,6 +43,8 @@ pub struct AgentEntry {
     pub text_hash: Option<String>,
     /// Server-issued mesh certificate for this agent (set on check-in).
     pub mesh_certificate: Option<common::MeshCertificate>,
+    /// Last mesh Ed25519 public key reported by the agent heartbeat.
+    pub mesh_public_key: Option<[u8; 32]>,
     /// Compartment assigned to this agent (operator-configured).
     pub compartment: Option<String>,
     /// P2-17: The client certificate identity (CN) extracted during the

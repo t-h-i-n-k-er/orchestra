@@ -1099,7 +1099,7 @@ fn shadow_stack_offset_for_build(build: u32) -> Option<usize> {
 fn get_kernel_base() -> Option<u64> {
     let mut buf_size: u32 = 0;
     unsafe {
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtQuerySystemInformation",
             11u32, // SystemModuleInformation
             0 as *mut u8,
@@ -1115,7 +1115,7 @@ fn get_kernel_base() -> Option<u64> {
     let mut buffer: Vec<u8> = vec![0u8; buf_size as usize + 4096];
     let mut return_length: u32 = 0;
     let status = unsafe {
-        syscall!(
+        crate::syscall!(
             "NtQuerySystemInformation",
             11u32,
             buffer.as_mut_ptr(),

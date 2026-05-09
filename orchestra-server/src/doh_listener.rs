@@ -164,6 +164,7 @@ impl DohRuntime {
                 morph_seed,
                 text_hash: None,
                 mesh_certificate: None,
+                mesh_public_key: None,
                 compartment: None,
                 cert_identity: None,
             },
@@ -456,7 +457,7 @@ impl DohRuntime {
                 agent_id,
                 status,
                 timestamp: _,
-                mesh_public_key: _,
+                mesh_public_key,
             } => {
                 if self
                     .app
@@ -475,6 +476,7 @@ impl DohRuntime {
                     entry.agent_id = agent_id;
                     entry.hostname = status;
                     entry.last_seen = now_secs();
+                    entry.mesh_public_key = mesh_public_key;
                 }
             }
             Message::TaskResponse { task_id, result, .. } => {

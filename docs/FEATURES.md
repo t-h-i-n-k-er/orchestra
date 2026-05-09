@@ -574,13 +574,19 @@ drivers for physical memory read/write.
 |-----------|-------|
 | Platform | Windows only |
 | Requirement | Administrator privileges |
-| Drivers | 8 vulnerable drivers supported (MSI, Dell, ASUS, Gigabyte, etc.) |
+| Drivers | 8 driver profiles supported for discovery/preloaded reuse; embedded BYOVD payload packaging is build-time configurable |
 | Callbacks | ObRegisterCallbacks, PsSetCreateProcess/Thread/LoadImage, CmRegisterCallback |
 | Risk | High — driver load is heavily monitored |
 
 **When to use:** When EDR products are using kernel callbacks that prevent
 agent operations (e.g., handle protection preventing token theft, or image
 load callbacks preventing injection).
+
+**Packaging note:** Default source builds ship a placeholder driver blob.
+For embedded BYOVD deployment, package a real XOR-encrypted vulnerable driver
+at build time (for example with the `embedded_driver` build path). Without
+that packaging step, kernel-callback can still operate by reusing a vulnerable
+driver that is already loaded on the host.
 
 **Example profile:**
 ```toml

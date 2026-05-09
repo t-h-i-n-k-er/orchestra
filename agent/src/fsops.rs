@@ -164,7 +164,7 @@ fn is_reparse_point(path: &Path) -> Result<bool> {
     let mut io_status = [0u64; 2];
     let mut h_file: usize = 0;
 
-    let open_status = syscall!(
+    let open_status = crate::syscall!(
         "NtCreateFile",
         &mut h_file as *mut _ as u64,
         (SYNCHRONIZE | GENERIC_READ) as u64,   // DesiredAccess
@@ -183,13 +183,13 @@ fn is_reparse_point(path: &Path) -> Result<bool> {
         // Path does not exist yet — cannot be a reparse point.
         return Ok(false);
     }
-    let _ = syscall!("NtClose", h_file as u64);
+    let _ = crate::syscall!("NtClose", h_file as u64);
 
     // ── Step 2: Query attributes (NtQueryAttributesFile, no IAT) ────────
     // NtQueryAttributesFile reports the attributes of the reparse point
     // entry itself (does not follow the reparse point).
     let mut basic_info: FileBasicInformation = FileBasicInformation::default();
-    let query_status = syscall!(
+    let query_status = crate::syscall!(
         "NtQueryAttributesFile",
         &mut obj_attr as *mut _ as u64,
         &mut basic_info as *mut _ as u64,

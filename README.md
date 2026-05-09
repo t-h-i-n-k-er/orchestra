@@ -1,11 +1,11 @@
 # Orchestra
 
-A cross-platform, operationally secure command-and-control framework built in Rust. Orchestra provides a malleable C2 pipeline, a unified injection engine with twelve techniques, advanced sleep obfuscation with post-wake NTDLL hook re-check, in-process .NET assembly and BOF execution, browser credential extraction (including Chrome v20 DPAPI padding-oracle bypass), LSASS harvesting, LSA SSP credential extraction (Credential Guard bypass), token-only impersonation, kernel callback overwrite (BYOVD), CET/shadow-stack bypass, syscall emulation, EDR bypass transformation, forensic cleanup (Prefetch/MFT/USN), interactive shell sessions, P2P mesh networking, and a standalone redirector binary — all designed for red-team operations requiring granular control over network signatures, memory forensics resistance, and payload delivery.
+A cross-platform, operationally secure command-and-control framework built in Rust. Orchestra provides a malleable C2 pipeline, a Windows-only unified injection engine with twelve techniques, advanced sleep obfuscation with post-wake NTDLL hook re-check, in-process .NET assembly and BOF execution, browser credential extraction (including Chrome v20 DPAPI padding-oracle bypass), LSASS harvesting, LSA SSP credential extraction (Credential Guard bypass), token-only impersonation, kernel callback overwrite (BYOVD), CET/shadow-stack bypass, syscall emulation, EDR bypass transformation, forensic cleanup (Prefetch/MFT/USN), interactive shell sessions, P2P mesh networking, and a standalone redirector binary — all designed for red-team operations requiring granular control over network signatures, memory forensics resistance, and payload delivery.
 
 | | |
 |---|---|
 | **Language** | Rust 2021 edition |
-| **Targets** | `x86_64-pc-windows-gnu`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` |
+| **Targets** | `x86_64-pc-windows-gnu`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin` |
 | **License** | Proprietary |
 
 ---
@@ -119,7 +119,8 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 | **Delayed Module Stomp** | ✅ | — | — | EDR timing-heuristic bypass: load DLL → randomized delay → stomp |
 | **EarlyBird APC Injection** | ✅ | — | — | QueueUserAPC before thread resumes |
 | **Thread Hijacking** | ✅ | — | — | Suspend → rewrite RIP → resume |
-| **Unified Injection Engine** | ✅ | ✅ | — | Auto-selects technique based on EDR recon; 12-technique fallback chain |
+| **Linux Ptrace Injector** | — | ✅* | — | `linux_inject` supports `x86_64` only; other Linux architectures return unsupported |
+| **Unified Injection Engine** | ✅ | — | — | Auto-selects technique based on EDR recon; 12-technique fallback chain (Windows-only runtime) |
 | **Pre-Injection EDR Reconnaissance** | ✅ | — | — | Module enumeration, integrity check, architecture verification |
 | **ThreadPool Injection** (8 variants) | ✅ | — | — | `TpAllocWork`, `TpPostWork`, `CreateTimerQueueTimer`, etc. |
 | **Fiber Injection** | ✅ | — | — | `CreateFiber` → `SwitchToFiber` |
@@ -586,7 +587,9 @@ enabled = false
 
 ## Injection Engine
 
-The unified injection engine (`injection_engine.rs`) provides a single API for injecting payloads into target processes with automatic technique selection, EDR reconnaissance, and fallback chains.
+The unified injection engine (`injection_engine.rs`) is Windows-only at runtime and provides a single API for injecting payloads into target processes with automatic technique selection, EDR reconnaissance, and fallback chains.
+
+On Linux, injection support is provided by the `linux_inject` path and is currently limited to `x86_64` targets. Non-`x86_64` Linux builds report injector unavailability instead of attempting unsupported register/context operations.
 
 ### Techniques
 

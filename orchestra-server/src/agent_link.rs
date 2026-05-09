@@ -295,6 +295,7 @@ async fn handle_agent(
                     morph_seed,
                     text_hash: None,
                     mesh_certificate: None,
+                    mesh_public_key,
                     compartment: None,
                     cert_identity: cert_identity.clone(),
                 };
@@ -683,22 +684,38 @@ async fn handle_agent(
                 // Agent is requesting a certificate renewal.  Re-issue if
                 // the signing key is available.
                 if state.config.module_signing_key.is_some() {
-                    let agent_id = state
+                    let (agent_id, compartment, heartbeat_pk, cert_pk) = state
                         .registry
                         .get(&conn_id)
-                        .map(|e| e.agent_id.clone())
+                        .map(|e| {
+                            (
+                                e.agent_id.clone(),
+                                e.compartment.clone(),
+                                e.mesh_public_key,
+                                e.mesh_certificate.as_ref().map(|c| c.public_key),
+                            )
+                        })
                         .unwrap_or_default();
+
+                    let public_key = heartbeat_pk
+                        .filter(|pk| *pk != [0u8; 32])
+                        .or_else(|| cert_pk.filter(|pk| *pk != [0u8; 32]));
+
+                    let Some(public_key) = public_key else {
+                        tracing::warn!(
+                            connection_id = %conn_id,
+                            agent_id = %agent_id,
+                            "mesh certificate renewal skipped: no valid non-zero mesh public key"
+                        );
+                        continue;
+                    };
+
                     match crate::api::load_signing_key(&state) {
                         Ok(signing_key) => {
-                            let placeholder_pk = [0u8; 32];
-                            let compartment = state
-                                .registry
-                                .get(&conn_id)
-                                .and_then(|e| e.compartment.clone());
                             let cert = crate::api::sign_mesh_certificate(
                                 &signing_key,
                                 &agent_id,
-                                &placeholder_pk,
+                                &public_key,
                                 compartment.as_deref(),
                             );
                             tracing::info!(

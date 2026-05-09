@@ -67,7 +67,7 @@ mod win_resolve {
                 if m.is_null() {
                     return None;
                 }
-                m
+                m as usize
             }
         };
         let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)?;
@@ -248,6 +248,7 @@ unsafe fn reg_enum_subkey_names(key: *mut std::ffi::c_void) -> Vec<String> {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            std::ptr::null_mut(),
         );
         if status != 0 {
             break; // ERROR_NO_MORE_ITEMS (259) or error
@@ -345,7 +346,10 @@ impl EnvReport {
     /// * `refuse_when_debugged`: if `true`, an attached debugger triggers refusal.
     /// * `refuse_in_vm`: if `true`, a positive `vm_detected` also triggers refusal.
     /// * `sandbox_score_threshold`: if `Some(n)`, a `sandbox_score >= n` also
-    ///   triggers refusal.  Pass `None` to leave the sandbox score informational.
+    ///   triggers refusal.  When no corroborating non-heuristic signal is
+    ///   present, a protective floor of 60 is applied to avoid aggressive
+    ///   refusal on legitimate fresh/headless hosts.
+    ///   Pass `None` to leave the sandbox score informational.
     pub fn should_refuse(
         &self,
         refuse_when_debugged: bool,
@@ -362,7 +366,16 @@ impl EnvReport {
             return true;
         }
         if let Some(threshold) = sandbox_score_threshold {
-            if self.sandbox_score >= threshold {
+            let corroborated = self.vm_detected
+                || self.debugger_present
+                || self.tracer_process_found
+                || self.timing_anomaly_detected;
+            let effective_threshold = if corroborated {
+                threshold
+            } else {
+                threshold.max(60)
+            };
+            if self.sandbox_score >= effective_threshold {
                 return true;
             }
         }
@@ -617,12 +630,53 @@ fn is_container_environment() -> bool {
 
     // cgroup membership: all major container runtimes place processes under
     // a cgroup hierarchy whose path contains a recognisable token.
+    //
+    // NOTE: `containerd` alone is ambiguous — systemd uses containerd
+    // internally for Flatpak, snap, and other sandboxing on bare-metal hosts.
+    // When `containerd` is the *only* matched token, we additionally require
+    // a container namespace marker (`/.dockerenv`, `CONTAINER` env var, or
+    // PID namespace isolation) before concluding this is a real container.
     const CONTAINER_CGROUP_TOKENS: &[&str] =
         &["docker", "lxc", "kubepods", "containerd", "crio", "cri-containerd"];
+    const UNAMBIGUOUS_TOKENS: &[&str] =
+        &["docker", "lxc", "kubepods", "crio", "cri-containerd"];
     if let Ok(content) = std::fs::read_to_string("/proc/1/cgroup") {
         let lower = content.to_ascii_lowercase();
-        if CONTAINER_CGROUP_TOKENS.iter().any(|t| lower.contains(t)) {
-            return true;
+        let matched: Vec<&str> = CONTAINER_CGROUP_TOKENS
+            .iter()
+            .copied()
+            .filter(|t| lower.contains(t))
+            .collect();
+        if !matched.is_empty() {
+            // If only `containerd` matched (which systemd uses for Flatpak/
+            // snap sandboxing on bare metal), verify with a secondary check.
+            let only_containerd =
+                matched.len() == 1 && matched[0] == "containerd";
+            if !only_containerd {
+                return true;
+            }
+            // containerd-only: confirm we are actually inside a container
+            // namespace by checking PID 1's cgroup inode or the presence
+            // of /.dockerenv.
+            if std::path::Path::new("/.dockerenv").exists()
+                || std::env::var_os("CONTAINER").is_some()
+            {
+                return true;
+            }
+            // Last check: if our PID namespace differs from the init
+            // namespace, we are in a container even if only containerd
+            // appeared in cgroup.
+            if let Ok(self_cgroup) =
+                std::fs::read_to_string("/proc/self/cgroup")
+            {
+                let self_lower = self_cgroup.to_ascii_lowercase();
+                if self_lower.contains("docker")
+                    || self_lower.contains("kubepods")
+                    || self_lower.contains("crio")
+                {
+                    return true;
+                }
+            }
         }
     }
 
@@ -695,7 +749,12 @@ fn is_expected_hypervisor() -> bool {
             return true;
         }
         // GCP bare-metal: board_vendor or board_name may contain the tag.
-        if board_vendor.contains("google") && board_name.contains("google") {
+        // Exclude Chromebooks: board_vendor/board_name both contain "Google"
+        // on Chrome OS devices, but the product_name will contain "Chromebook"
+        // or "Chromebox" rather than a GCP-specific identifier.
+        if board_vendor.contains("google") && board_name.contains("google")
+            && !product_name.contains("chrome")
+        {
             return true;
         }
 
@@ -794,8 +853,17 @@ fn is_expected_hypervisor() -> bool {
             // This covers WSL2, Credential Guard, Device Guard, and Windows
             // Sandbox — all of which set the CPUID hypervisor bit on an
             // otherwise bare-metal Windows host.
-            if mfr.contains("microsoft corporation") && !prod.contains("virtual machine") {
-                log::debug!("env_check: Microsoft manufacturer without VM product name — likely physical Windows with Hyper-V features");
+            //
+            // We additionally verify that the CPUID hypervisor bit is actually
+            // set before suppressing VM detection — on a genuine physical host
+            // without Hyper-V enabled, the manufacturer check alone would be
+            // too broad (it would suppress detection on any Microsoft-branded
+            // hardware running in an unlikely nested-virtualisation scenario).
+            if mfr.contains("microsoft corporation")
+                && !prod.contains("virtual machine")
+                && cpuid_hypervisor_bit()
+            {
+                log::debug!("env_check: Microsoft manufacturer without VM product name + CPUID hypervisor bit set — likely physical Windows with Hyper-V features");
                 return true;
             }
         }
@@ -1516,7 +1584,14 @@ pub fn collect_indicators() -> Vec<common::SandboxIndicator> {
 
     // ── 1. CPUID hypervisor bit ─────────────────────────────────────────
     if cpuid_hypervisor_bit() {
-        let weight = if cloud_confirmed { 0 } else { 30 };
+        // Reduce weight when cloud is not confirmed — on legitimate cloud VMs
+        // where IMDS is firewalled and the provider is not in the expected
+        // hypervisor list, the CPUID bit alone is an unreliable signal.
+        // Full weight (30) is reserved for cases where cloud context is
+        // confirmed, which means the bit is expected and carries no weight
+        // anyway.  In all other cases, use a reduced weight (15) to avoid
+        // false positives on niche cloud providers.
+        let weight = if cloud_confirmed { 0 } else { 15 };
         indicators.push(common::SandboxIndicator {
             category: "hypervisor".to_string(),
             detail: "CPUID hypervisor bit set".to_string(),
@@ -1550,56 +1625,77 @@ pub fn collect_indicators() -> Vec<common::SandboxIndicator> {
     // ── 3. MAC prefix indicators ────────────────────────────────────────
     mac_prefix_indicators(&mut indicators);
 
-    // ── 4. Sandbox heuristics (mouse, desktop, uptime, hardware) ────────
-    if let Ok(score) = sandbox::evaluate_sandbox() {
-        if score > 0 {
-            // Add sandbox metrics as individual indicators with appropriate weights.
-            let metrics = sandbox::collect_raw_metrics();
-            if metrics.mouse_movement_score > 0 {
-                indicators.push(common::SandboxIndicator {
-                    category: "timing".to_string(),
-                    detail: format!(
-                        "Low mouse activity (score={})",
-                        metrics.mouse_movement_score
-                    ),
-                    weight: (metrics.mouse_movement_score as u32) * 5 / 20 * 30,
-                    source: "mouse".to_string(),
-                });
+    // ── 3b. Reduce generic indicator weights when cloud is not confirmed ─
+    // On legitimate cloud VMs where IMDS is firewalled and the provider
+    // isn't in the expected hypervisor list, DMI and MAC indicators are
+    // generic (e.g., "QEMU detected in DMI" on a KVM-based cloud host).
+    // Reduce their weights from 25/20 to 10 to prevent false positives
+    // where CPUID(15) + DMI(25) = 40 > threshold 30.
+    if !cloud_confirmed {
+        for indicator in indicators.iter_mut() {
+            if indicator.source == "dmi" && indicator.weight == 25 {
+                indicator.weight = 10;
             }
-            if metrics.desktop_richness_score > 0 {
-                indicators.push(common::SandboxIndicator {
-                    category: "desktop".to_string(),
-                    detail: format!(
-                        "Few desktop windows (score={})",
-                        metrics.desktop_richness_score
-                    ),
-                    weight: (metrics.desktop_richness_score as u32) * 3 / 20 * 25,
-                    source: "desktop".to_string(),
-                });
-            }
-            if metrics.uptime_score > 0 {
-                indicators.push(common::SandboxIndicator {
-                    category: "uptime".to_string(),
-                    detail: format!(
-                        "Low uptime / few temp artifacts (score={})",
-                        metrics.uptime_score
-                    ),
-                    weight: (metrics.uptime_score as u32) * 2 / 20 * 25,
-                    source: "uptime".to_string(),
-                });
-            }
-            if metrics.hardware_plausibility_score > 0 {
-                indicators.push(common::SandboxIndicator {
-                    category: "hardware".to_string(),
-                    detail: format!(
-                        "Hardware below plausibility thresholds (score={})",
-                        metrics.hardware_plausibility_score
-                    ),
-                    weight: metrics.hardware_plausibility_score as u32,
-                    source: "hardware".to_string(),
-                });
+            if indicator.source == "mac" && indicator.weight == 20 {
+                indicator.weight = 10;
             }
         }
+    }
+
+    // ── 4. Sandbox heuristics (mouse, desktop, uptime, hardware) ────────
+    // Keep indicator contributions consistent with env_check_sandbox's
+    // capped scoring model:
+    //   mouse=min(score*5,30), desktop=min(score*3,25),
+    //   uptime=min(score*2,25), hardware=min(score,20)
+    let metrics = sandbox::collect_raw_metrics();
+    let mouse_weight = std::cmp::min((metrics.mouse_movement_score as u32) * 5, 30);
+    let desktop_weight = std::cmp::min((metrics.desktop_richness_score as u32) * 3, 25);
+    let uptime_weight = std::cmp::min((metrics.uptime_score as u32) * 2, 25);
+    let hardware_weight = std::cmp::min(metrics.hardware_plausibility_score as u32, 20);
+
+    if mouse_weight > 0 {
+        indicators.push(common::SandboxIndicator {
+            category: "timing".to_string(),
+            detail: format!(
+                "Low mouse activity (score={})",
+                metrics.mouse_movement_score
+            ),
+            weight: mouse_weight,
+            source: "mouse".to_string(),
+        });
+    }
+    if desktop_weight > 0 {
+        indicators.push(common::SandboxIndicator {
+            category: "desktop".to_string(),
+            detail: format!(
+                "Few desktop windows (score={})",
+                metrics.desktop_richness_score
+            ),
+            weight: desktop_weight,
+            source: "desktop".to_string(),
+        });
+    }
+    if uptime_weight > 0 {
+        indicators.push(common::SandboxIndicator {
+            category: "uptime".to_string(),
+            detail: format!(
+                "Low uptime / few temp artifacts (score={})",
+                metrics.uptime_score
+            ),
+            weight: uptime_weight,
+            source: "uptime".to_string(),
+        });
+    }
+    if hardware_weight > 0 {
+        indicators.push(common::SandboxIndicator {
+            category: "hardware".to_string(),
+            detail: format!(
+                "Hardware below plausibility thresholds (score={})",
+                metrics.hardware_plausibility_score
+            ),
+            weight: hardware_weight,
+            source: "hardware".to_string(),
+        });
     }
 
     // ── 5. Timing anomaly ───────────────────────────────────────────────
@@ -1665,6 +1761,14 @@ pub fn evaluate_sandbox_score(
     });
 
     let total_weight: u32 = indicators.iter().map(|i| i.weight).sum();
+    let heuristic_weight: u32 = indicators
+        .iter()
+        .filter(|i| matches!(i.source.as_str(), "mouse" | "desktop" | "uptime" | "hardware"))
+        .map(|i| i.weight)
+        .sum();
+    let has_vm_artifact_signal = indicators
+        .iter()
+        .any(|i| matches!(i.source.as_str(), "cpuid" | "dmi" | "registry" | "mac" | "imds"));
 
     // Adaptive threshold (mirrors the original detect_vm logic).
     let hypervisor_bit_set = indicators.iter().any(|i| {
@@ -1688,9 +1792,29 @@ pub fn evaluate_sandbox_score(
         30
     };
 
-    let threshold = threshold.max(if high_threshold_mode { 30 } else { 0 });
+    // Make "high threshold mode" materially stricter. The previous
+    // threshold.max(30) had no effect because the adaptive base threshold is
+    // already >= 30.
+    let threshold = if high_threshold_mode {
+        threshold.max(45)
+    } else {
+        threshold
+    };
 
     let is_sandbox = total_weight >= threshold;
+
+    // Heuristic-only medium scores are noisy on legitimate fresh/headless
+    // environments. Require high-confidence heuristics (>=70) when there is
+    // no VM artifact signal.
+    let is_sandbox = if is_sandbox && !has_vm_artifact_signal && heuristic_weight < 70 {
+        log::info!(
+            "env_check: suppressing medium heuristic-only VM classification \
+             (heuristic_weight={heuristic_weight}, total_weight={total_weight}, threshold={threshold})"
+        );
+        false
+    } else {
+        is_sandbox
+    };
 
     // Defence-in-depth: never flag based solely on the CPUID hypervisor bit.
     let hypervisor_only = indicators.iter().any(|i| i.weight > 0)
@@ -2392,7 +2516,7 @@ fn mac_prefix_indicators(indicators: &mut Vec<common::SandboxIndicator>) {
 
     // Only push indicators when majority-vote threshold is met.
     if majority(virtual_count, total) {
-        for (nic_name, vendor) in virtual_nics {
+        for (nic_name, vendor) in &virtual_nics {
             indicators.push(common::SandboxIndicator {
                 category: "mac_prefix".to_string(),
                 detail: format!("Virtual OUI ({vendor}) on {nic_name}"),
@@ -2477,9 +2601,9 @@ fn windows_mac_prefix_counts(
         let mut virtual_count = 0usize;
         let mut adapter = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES;
         while !adapter.is_null() {
-            let phy_len = (*adapter).PhysicalAddressLength as usize;
+            let phy_len = (*adapter).physical_address_length as usize;
             if phy_len >= 3 {
-                let mac = &(&(*adapter).PhysicalAddress)[..phy_len];
+                let mac = &(&(*adapter).physical_address)[..phy_len];
                 let prefix = [mac[0], mac[1], mac[2]];
                 if !excluded_prefixes.contains(&prefix) {
                     total += 1;
@@ -2488,7 +2612,7 @@ fn windows_mac_prefix_counts(
                     }
                 }
             }
-            adapter = (*adapter).Next;
+            adapter = (*adapter).next;
         }
         (virtual_count, total)
     }
@@ -2996,6 +3120,91 @@ mod tests {
         assert!(!r.should_refuse(false, false, None));
         assert!(!r.should_refuse(false, false, Some(81)));
         assert!(r.should_refuse(false, false, Some(80)));
+    }
+
+    #[test]
+    fn sandbox_score_threshold_without_corroboration_uses_floor() {
+        let mut r = EnvReport::default();
+        r.sandbox_score = 55;
+        assert!(
+            !r.should_refuse(false, false, Some(30)),
+            "without corroboration, threshold floor should suppress moderate heuristic-only score"
+        );
+
+        r.sandbox_score = 60;
+        assert!(
+            r.should_refuse(false, false, Some(30)),
+            "without corroboration, threshold floor should still refuse at very high score"
+        );
+    }
+
+    #[test]
+    fn sandbox_score_threshold_with_corroboration_uses_operator_value() {
+        let mut r = EnvReport::default();
+        r.timing_anomaly_detected = true;
+        r.sandbox_score = 35;
+        assert!(
+            r.should_refuse(false, false, Some(30)),
+            "with corroboration, configured threshold should apply directly"
+        );
+    }
+
+    #[test]
+    fn heuristic_only_medium_indicators_do_not_trigger_vm_detection() {
+        let indicators = vec![
+            common::SandboxIndicator {
+                category: "timing".to_string(),
+                detail: "Low mouse activity".to_string(),
+                weight: 30,
+                source: "mouse".to_string(),
+            },
+            common::SandboxIndicator {
+                category: "desktop".to_string(),
+                detail: "Few desktop windows".to_string(),
+                weight: 25,
+                source: "desktop".to_string(),
+            },
+            common::SandboxIndicator {
+                category: "uptime".to_string(),
+                detail: "Low uptime".to_string(),
+                weight: 10,
+                source: "uptime".to_string(),
+            },
+        ];
+        let (is_sandbox, _ind) = evaluate_sandbox_score(&indicators);
+        assert!(
+            !is_sandbox,
+            "medium heuristic-only indicators should be informational"
+        );
+    }
+
+    #[test]
+    fn heuristic_only_high_indicators_still_trigger_vm_detection() {
+        let indicators = vec![
+            common::SandboxIndicator {
+                category: "timing".to_string(),
+                detail: "Low mouse activity".to_string(),
+                weight: 30,
+                source: "mouse".to_string(),
+            },
+            common::SandboxIndicator {
+                category: "desktop".to_string(),
+                detail: "Few desktop windows".to_string(),
+                weight: 25,
+                source: "desktop".to_string(),
+            },
+            common::SandboxIndicator {
+                category: "uptime".to_string(),
+                detail: "Low uptime".to_string(),
+                weight: 20,
+                source: "uptime".to_string(),
+            },
+        ];
+        let (is_sandbox, _ind) = evaluate_sandbox_score(&indicators);
+        assert!(
+            is_sandbox,
+            "very high heuristic-only score should still classify as sandbox"
+        );
     }
 
     // ── Strict domain matching ────────────────────────────────────────────────

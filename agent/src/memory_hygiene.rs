@@ -289,7 +289,7 @@ unsafe fn nt_query_system_information(
 
 /// Call NtClose via pe_resolve (or nt_syscall).
 unsafe fn nt_close(handle: usize) -> Option<i32> {
-    let result = syscall!("NtClose", handle);
+    let result = crate::syscall!("NtClose", handle);
     result.ok()
 }
 
@@ -810,6 +810,7 @@ pub unsafe fn scrub_handle_table() {
 
     let mut buf_len: u32 = 0x10000; // Start with 64 KB.
     let mut ret_len: u32 = 0;
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC0000004u32 as i32;
 
     loop {
         let mut buf: Vec<u8> = Vec::with_capacity(buf_len as usize);
@@ -827,7 +828,7 @@ pub unsafe fn scrub_handle_table() {
                 process_handle_entries(&buf, image_base);
                 break;
             }
-            Some(0xC0000004) | None => {
+            Some(STATUS_INFO_LENGTH_MISMATCH) | None => {
                 // STATUS_INFO_LENGTH_MISMATCH or resolution failed — grow buffer.
                 if buf_len > 0x1000000 {
                     // 16 MB safety limit.

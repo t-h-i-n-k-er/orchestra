@@ -495,7 +495,36 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         size_of_headers.min(dll_bytes.len()),
     );
 
-    // 2. Copy sections
+    // 2. Validate section layout: reject PEs with overlapping virtual ranges.
+    //    Overlapping sections are either corrupt or a crafted PE that could
+    //    trigger memory corruption when sections are mapped on top of each other.
+    {
+        let mut ranges: Vec<(usize, usize, &str)> = Vec::new();
+        for section in &pe.sections {
+            let va = section.virtual_address as usize;
+            let vs = section.virtual_size as usize;
+            if vs == 0 {
+                continue;
+            }
+            let name = section.name().unwrap_or("???");
+            let end = va.checked_add(vs).ok_or_else(|| anyhow!(
+                "PE section '{}' virtual range overflow (va={:#x}, vs={:#x})",
+                name, va, vs
+            ))?;
+            // Check against all previously seen ranges.
+            for &(prev_va, prev_end, prev_name) in &ranges {
+                if va < prev_end && end > prev_va {
+                    return Err(anyhow!(
+                        "PE sections '{}' [{:#x}..{:#x}) and '{}' [{:#x}..{:#x}) overlap",
+                        prev_name, prev_va, prev_end, name, va, end
+                    ));
+                }
+            }
+            ranges.push((va, end, name));
+        }
+    }
+
+    // 3. Copy sections
     for section in &pe.sections {
         let raw_offset = section.pointer_to_raw_data as usize;
         let raw_size = section.size_of_raw_data as usize;
@@ -517,6 +546,7 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
 
     // 3. Process imports
     let mut loaded_modules: HashMap<&str, *mut c_void> = HashMap::new();
+
     for import in &pe.imports {
         let dll_name = import.dll;
         if !loaded_modules.contains_key(dll_name) {
@@ -562,7 +592,7 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         [IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT]
     {
         if delay_dir.virtual_address != 0 && delay_dir.size > 0 {
-            let image_size = optional_header.size_of_image as usize;
+            let image_size = optional_header.windows_fields.size_of_image as usize;
             let mut desc_va = delay_dir.virtual_address as usize;
 
             loop {
@@ -587,25 +617,29 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                 // Validate that addresses are RVAs (grAttrs bit 0 set).  Old-style
                 // VAs (grAttrs bit 0 clear) are not supported on modern x64 images.
                 if grattrs & 0x1 == 0 {
-                    tracing::warn!(
-                        "manual_map: delay-import descriptor at rva {:#x} uses legacy VA format; skipping",
+                    return Err(anyhow!(
+                        "manual_map: delay-import descriptor at rva {:#x} uses unsupported legacy VA format",
                         desc_va
-                    );
-                    desc_va += DELAY_DESCR_SIZE;
-                    continue;
+                    ));
                 }
 
                 // Resolve DLL name from the mapped image.
                 if dll_name_rva >= image_size {
-                    desc_va += DELAY_DESCR_SIZE;
-                    continue;
+                    return Err(anyhow!(
+                        "manual_map: delay-import descriptor at rva {:#x} has out-of-range DLL name RVA {:#x}",
+                        desc_va,
+                        dll_name_rva
+                    ));
                 }
                 let dll_name_ptr = base_ptr.add(dll_name_rva) as *const i8;
                 let dll_name = std::ffi::CStr::from_ptr(dll_name_ptr)
                     .to_str()
                     .unwrap_or("");
                 if dll_name.is_empty() {
-                    break;
+                    return Err(anyhow!(
+                        "manual_map: delay-import descriptor at rva {:#x} has empty DLL name",
+                        desc_va
+                    ));
                 }
 
                 // Find or load the DLL.
@@ -614,12 +648,10 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                     if handle.is_null() {
                         handle = load_via_ldr(dll_name);
                         if handle.is_null() {
-                            tracing::warn!(
-                                "manual_map: delay-import: failed to load {}; skipping descriptor",
+                            return Err(anyhow!(
+                                "manual_map: delay-import: failed to load dependent module {}",
                                 dll_name
-                            );
-                            desc_va += DELAY_DESCR_SIZE;
-                            continue;
+                            ));
                         }
                     }
                     loaded_modules.insert(dll_name, handle);
@@ -644,8 +676,12 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
 
                 let thunk_base_rva = if int_rva != 0 { int_rva } else { iat_rva };
                 if thunk_base_rva == 0 || iat_rva == 0 {
-                    desc_va += DELAY_DESCR_SIZE;
-                    continue;
+                    return Err(anyhow!(
+                        "manual_map: delay-import descriptor for {} has invalid thunk/IAT RVAs (INT={:#x}, IAT={:#x})",
+                        dll_name,
+                        int_rva,
+                        iat_rva
+                    ));
                 }
 
                 let mut slot_idx = 0usize;
@@ -673,24 +709,32 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                         // Named import: RVA to IMAGE_IMPORT_BY_NAME (+2 bytes hint, then name).
                         let ibn_rva = (thunk_val & rva_mask) as usize;
                         if ibn_rva + 2 >= image_size {
-                            slot_idx += 1;
-                            continue;
+                            return Err(anyhow!(
+                                "manual_map: delay-import: {}!slot-{} has out-of-range IMAGE_IMPORT_BY_NAME RVA {:#x}",
+                                dll_name,
+                                slot_idx,
+                                ibn_rva
+                            ));
                         }
                         let name_ptr = base_ptr.add(ibn_rva + 2) as *const i8;
                         let func_name = std::ffi::CStr::from_ptr(name_ptr)
                             .to_str()
                             .unwrap_or("");
                         if func_name.is_empty() {
-                            slot_idx += 1;
-                            continue;
+                            return Err(anyhow!(
+                                "manual_map: delay-import: {}!slot-{} has empty import name",
+                                dll_name,
+                                slot_idx
+                            ));
                         }
                         get_proc_address_manual(dll_handle, func_name)
                     };
                     if proc_addr.is_null() {
-                        tracing::warn!(
-                            "manual_map: delay-import: {}!slot-{} unresolved; leaving slot empty",
-                            dll_name, slot_idx
-                        );
+                        return Err(anyhow!(
+                            "manual_map: delay-import: {}!slot-{} unresolved; aborting load to avoid null IAT slot",
+                            dll_name,
+                            slot_idx
+                        ));
                     } else {
                         // Write the resolved address into the IAT slot.
                         // Use the correct slot width for the image's PE format.
@@ -989,30 +1033,35 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                     // P2-18: Resolve RtlAddFunctionTable from ntdll at runtime.
                     let ntdll_base = pe_resolve::get_module_handle_by_hash(
                         pe_resolve::hash_str(b"ntdll.dll\0"),
-                    );
-                    if let Some(base) = ntdll_base {
-                        let fn_addr = pe_resolve::get_proc_address_by_hash(
-                            base,
-                            pe_resolve::hash_str(b"RtlAddFunctionTable\0"),
-                        );
-                        if let Some(addr) = fn_addr {
-                            let rtl_add_fn_table: extern "system" fn(
-                                *const RuntimeFunction,
-                                u32,
-                                u64,
-                            ) -> u8 = std::mem::transmute(addr);
-                            rtl_add_fn_table(pdata_ptr, entry_count, image_base as u64);
-                        } else {
-                            tracing::warn!(
-                                "P2-18: failed to resolve RtlAddFunctionTable from ntdll; \
-                                 exception handling in mapped DLL may not work"
-                            );
-                        }
-                    } else {
-                        tracing::warn!(
-                            "P2-18: failed to resolve ntdll base; \
-                             exception handling in mapped DLL may not work"
-                        );
+                    )
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "P2-18: failed to resolve ntdll base while registering .pdata for unwind metadata"
+                        )
+                    })?;
+
+                    let fn_addr = pe_resolve::get_proc_address_by_hash(
+                        ntdll_base,
+                        pe_resolve::hash_str(b"RtlAddFunctionTable\0"),
+                    )
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "P2-18: failed to resolve RtlAddFunctionTable from ntdll; cannot safely load mapped DLL with .pdata"
+                        )
+                    })?;
+
+                    let rtl_add_fn_table: extern "system" fn(
+                        *const RuntimeFunction,
+                        u32,
+                        u64,
+                    ) -> u8 = std::mem::transmute(fn_addr);
+
+                    let registered = rtl_add_fn_table(pdata_ptr, entry_count, image_base as u64);
+                    if registered == 0 {
+                        return Err(anyhow!(
+                            "P2-18: RtlAddFunctionTable returned FALSE for .pdata registration (entries={}); aborting load",
+                            entry_count
+                        ));
                     }
                 }
                 break;
@@ -1020,13 +1069,20 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         }
     }
 
-    // 6. Call entry point
-    let entry_point_addr =
-        image_base.add(optional_header.standard_fields.address_of_entry_point as usize);
-    let entry_point: extern "system" fn(*mut c_void, u32, *mut c_void) -> bool =
-        std::mem::transmute(entry_point_addr);
-    if !entry_point(image_base, DLL_PROCESS_ATTACH, std::ptr::null_mut()) {
-        return Err(anyhow!("DLL entry point failed"));
+    // 6. Call entry point when present.
+    // Some PE images intentionally set AddressOfEntryPoint to 0.
+    let entry_rva = optional_header.standard_fields.address_of_entry_point as usize;
+    if entry_rva != 0 {
+        let entry_point_addr = image_base.add(entry_rva);
+        let entry_point: extern "system" fn(*mut c_void, u32, *mut c_void) -> bool =
+            std::mem::transmute(entry_point_addr);
+        if !entry_point(image_base, DLL_PROCESS_ATTACH, std::ptr::null_mut()) {
+            return Err(anyhow!("DLL entry point failed"));
+        }
+    } else {
+        tracing::debug!(
+            "manual_map_local: mapped image has AddressOfEntryPoint=0; skipping DllMain call"
+        );
     }
 
     _guard.success = true;
@@ -1298,7 +1354,7 @@ unsafe fn resolve_remote_export(
             n as u64,
             &mut bytes_read as *mut _ as u64,
         );
-        if status.map_or(true, |s| s < 0) || bytes_read != n {
+        if status.as_ref().map_or(true, |s| *s < 0) || bytes_read != n {
             return Err(anyhow!(
                 "resolve_remote_export: NtReadVirtualMemory at {addr:#x} len={n} failed: status={:?}",
                 status
@@ -1448,7 +1504,7 @@ pub unsafe fn load_dll_in_remote_process(
     target_process: winapi::um::winnt::HANDLE,
     dll_bytes: &[u8],
 ) -> Result<*mut c_void> {
-    let pe = PE::parse(dll_bytes)?
+    let pe = PE::parse(dll_bytes)?;
     let opt = pe
         .header
         .optional_header
@@ -1542,7 +1598,7 @@ pub unsafe fn load_dll_in_remote_process(
         (MEM_COMMIT | MEM_RESERVE) as u64,
         PAGE_READWRITE as u64,
     );
-    if alloc_status.map_or(true, |s| s < 0) || remote_base.is_null() {
+    if alloc_status.as_ref().map_or(true, |s| *s < 0) || remote_base.is_null() {
         return Err(anyhow!(
             "NtAllocateVirtualMemory(remote) failed: status={:?}",
             alloc_status
@@ -1561,7 +1617,7 @@ pub unsafe fn load_dll_in_remote_process(
                 prot as u64,
                 old as *mut _ as u64,
             );
-            if status.map_or(true, |s| s < 0) {
+            if status.as_ref().map_or(true, |s| *s < 0) {
                 return Err(anyhow!(
                     "NtProtectVirtualMemory failed (status={:?})",
                     status
@@ -1603,7 +1659,7 @@ pub unsafe fn load_dll_in_remote_process(
             &mut restore_dummy,
         );
 
-        if status.map_or(true, |s| s < 0) || written != data.len() {
+        if status.as_ref().map_or(true, |s| *s < 0) || written != data.len() {
             return Err(anyhow!(
                 "NtWriteVirtualMemory failed at rva {rva:#x} (status={:?}, written={written:#x}, expected={:#x})",
                 status,
@@ -1616,6 +1672,34 @@ pub unsafe fn load_dll_in_remote_process(
     // ── Step 2: copy PE headers ────────────────────────────────────────────
     let header_size = opt.windows_fields.size_of_headers as usize;
     write_remote(0, &dll_bytes[..header_size.min(dll_bytes.len())])?;
+
+    // ── Step 2b: validate section layout ───────────────────────────────────
+    // Reject PEs with overlapping virtual ranges — they are either corrupt
+    // or crafted to trigger memory corruption when mapped.
+    {
+        let mut ranges: Vec<(usize, usize, &str)> = Vec::new();
+        for section in &pe.sections {
+            let va = section.virtual_address as usize;
+            let vs = section.virtual_size as usize;
+            if vs == 0 {
+                continue;
+            }
+            let name = section.name().unwrap_or("???");
+            let end = va.checked_add(vs).ok_or_else(|| anyhow!(
+                "PE section '{}' virtual range overflow (va={:#x}, vs={:#x})",
+                name, va, vs
+            ))?;
+            for &(prev_va, prev_end, prev_name) in &ranges {
+                if va < prev_end && end > prev_va {
+                    return Err(anyhow!(
+                        "PE sections '{}' [{:#x}..{:#x}) and '{}' [{:#x}..{:#x}) overlap",
+                        prev_name, prev_va, prev_end, name, va, end
+                    ));
+                }
+            }
+            ranges.push((va, end, name));
+        }
+    }
 
     // ── Step 3: copy sections ──────────────────────────────────────────────
     for section in &pe.sections {
@@ -1767,7 +1851,7 @@ pub unsafe fn load_dll_in_remote_process(
                     reloc_size as u64,
                     &mut bytes_read as *mut _ as u64,
                 );
-                if reloc_read_status.map_or(true, |s| s < 0) || bytes_read != reloc_size {
+                if reloc_read_status.as_ref().map_or(true, |s| *s < 0) || bytes_read != reloc_size {
                     return Err(anyhow!(
                         "NtReadVirtualMemory for reloc directory failed: status={:?}",
                         reloc_read_status
@@ -1801,7 +1885,7 @@ pub unsafe fn load_dll_in_remote_process(
                                 let mut buf = [0u8; 8];
                                 let mut n = 0usize;
                                 let src = (remote_base as usize + field_rva) as u64;
-                                let _ = nt_syscall::syscall!(
+                                let read_status = nt_syscall::syscall!(
                                     "NtReadVirtualMemory",
                                     target_process as u64,
                                     src,
@@ -1809,6 +1893,14 @@ pub unsafe fn load_dll_in_remote_process(
                                     8u64,
                                     &mut n as *mut _ as u64,
                                 );
+                                if read_status.as_ref().map_or(true, |s| *s < 0) || n != 8 {
+                                    return Err(anyhow!(
+                                        "NtReadVirtualMemory(reloc DIR64 @ {:#x}) failed: status={:?}, read={}",
+                                        field_rva,
+                                        read_status,
+                                        n
+                                    ));
+                                }
                                 let val = i64::from_le_bytes(buf);
                                 let patched = (val as isize + base_delta).to_le_bytes();
                                 write_remote(field_rva, &patched)?;
@@ -1818,7 +1910,7 @@ pub unsafe fn load_dll_in_remote_process(
                                 let mut buf = [0u8; 4];
                                 let mut n = 0usize;
                                 let src = (remote_base as usize + field_rva) as u64;
-                                let _ = nt_syscall::syscall!(
+                                let read_status = nt_syscall::syscall!(
                                     "NtReadVirtualMemory",
                                     target_process as u64,
                                     src,
@@ -1826,6 +1918,14 @@ pub unsafe fn load_dll_in_remote_process(
                                     4u64,
                                     &mut n as *mut _ as u64,
                                 );
+                                if read_status.as_ref().map_or(true, |s| *s < 0) || n != 4 {
+                                    return Err(anyhow!(
+                                        "NtReadVirtualMemory(reloc HIGHLOW @ {:#x}) failed: status={:?}, read={}",
+                                        field_rva,
+                                        read_status,
+                                        n
+                                    ));
+                                }
                                 let val = i32::from_le_bytes(buf);
                                 let patched =
                                     ((val as isize + base_delta) as i32).to_le_bytes();
@@ -1861,6 +1961,12 @@ pub unsafe fn load_dll_in_remote_process(
     //   Use the Toolhelp module map to obtain each DLL's actual remote base,
     //   then read its export table via ReadProcessMemory to find function RVAs.
     //   This ensures every IAT entry holds a valid remote-process address.
+    let iat_entry_size = if opt.standard_fields.magic == 0x20B {
+        std::mem::size_of::<u64>()
+    } else {
+        std::mem::size_of::<u32>()
+    };
+
     for import in &pe.imports {
         let proc_addr: usize = if let Some(ref rmod) = remote_module_map {
             // Safe path: resolve from the remote process's actual module base.
@@ -1873,13 +1979,13 @@ pub unsafe fn load_dll_in_remote_process(
                     import.name
                 )
             })?;
-            resolve_remote_export(target_process, remote_dll_base, import.name.as_str())?
+            resolve_remote_export(target_process, remote_dll_base, import.name.as_ref())?
         } else {
             // Fast path: resolve locally via PEB walk + clean export table.
             // M-26: avoid hookable GetModuleHandleA / GetProcAddress IAT entries.
             let dll_name_cstr = std::ffi::CString::new(import.dll)
                 .map_err(|_| anyhow!("import DLL name contains NUL: {}", import.dll))?;
-            let fn_name_cstr = std::ffi::CString::new(import.name.as_str())
+            let fn_name_cstr = std::ffi::CString::new(import.name.as_ref())
                 .map_err(|_| anyhow!("import function name contains NUL: {}", import.name))?;
 
             let dll_hash = pe_resolve::hash_str(dll_name_cstr.to_bytes_with_nul());
@@ -1903,8 +2009,19 @@ pub unsafe fn load_dll_in_remote_process(
         };
 
         // Write the resolved function pointer into the remote IAT slot.
-        let iat_addr_bytes = (proc_addr as usize).to_le_bytes();
-        write_remote(import.rva, &iat_addr_bytes)?;
+        if iat_entry_size == std::mem::size_of::<u64>() {
+            let iat_addr_bytes = (proc_addr as u64).to_le_bytes();
+            write_remote(import.rva, &iat_addr_bytes)?;
+        } else {
+            let proc_addr32 = u32::try_from(proc_addr).map_err(|_| {
+                anyhow!(
+                    "remote_manual_map: import '{}' from '{}' resolved above 32-bit range: {proc_addr:#x}",
+                    import.name,
+                    import.dll
+                )
+            })?;
+            write_remote(import.rva, &proc_addr32.to_le_bytes())?;
+        }
     }
 
     // ── Step 4c: flush instruction cache ─────────────────────────────────
@@ -2191,7 +2308,7 @@ pub unsafe fn load_dll_in_remote_process(
             (MEM_COMMIT | MEM_RESERVE) as u64,
             PAGE_READWRITE as u64,
         );
-        if stub_alloc_status.map_or(true, |s| s < 0) || stub_mem.is_null() {
+        if stub_alloc_status.as_ref().map_or(true, |s| *s < 0) || stub_mem.is_null() {
             return Err(anyhow!(
                 "NtAllocateVirtualMemory for DllMain stub failed: status={:?}",
                 stub_alloc_status
@@ -2200,7 +2317,7 @@ pub unsafe fn load_dll_in_remote_process(
 
         // Write stub bytes via NtWriteVirtualMemory dispatched through nt_syscall.
         let mut written = 0usize;
-        let _ = nt_syscall::syscall!(
+        let write_status = nt_syscall::syscall!(
             "NtWriteVirtualMemory",
             target_process as u64,
             stub_mem as u64,
@@ -2208,12 +2325,20 @@ pub unsafe fn load_dll_in_remote_process(
             stub.len() as u64,
             &mut written as *mut _ as u64,
         );
+        if write_status.as_ref().map_or(true, |s| *s < 0) || written != stub.len() {
+            return Err(anyhow!(
+                "NtWriteVirtualMemory for DllMain stub failed: status={:?}, wrote={}, expected={}",
+                write_status,
+                written,
+                stub.len()
+            ));
+        }
 
         // Make the stub executable (RX only — no need for write after writing).
         let mut prot_base = stub_mem;
         let mut prot_size = stub.len();
         let mut old_prot = 0u32;
-        let _ = nt_syscall::syscall!(
+        let protect_status = nt_syscall::syscall!(
             "NtProtectVirtualMemory",
             target_process as u64,
             &mut prot_base as *mut _ as u64,
@@ -2221,6 +2346,12 @@ pub unsafe fn load_dll_in_remote_process(
             PAGE_EXECUTE_READ as u64,
             &mut old_prot as *mut _ as u64,
         );
+        if protect_status.as_ref().map_or(true, |s| *s < 0) {
+            return Err(anyhow!(
+                "NtProtectVirtualMemory for DllMain stub failed: status={:?}",
+                protect_status
+            ));
+        }
 
         // M-27: Use NtCreateThreadEx via nt_syscall::syscall! instead of
         // hookable CreateRemoteThread.  The syscall! macro resolves the SSN
@@ -2241,7 +2372,7 @@ pub unsafe fn load_dll_in_remote_process(
             0u64,                                  // MaximumStackSize
             std::ptr::null_mut::<c_void>() as u64, // AttributeList
         );
-        if status.map_or(true, |s| s < 0) || h_thread.is_null() {
+        if status.as_ref().map_or(true, |s| *s < 0) || h_thread.is_null() {
             return Err(anyhow!(
                 "NtCreateThreadEx for DllMain stub failed: {:?}",
                 status

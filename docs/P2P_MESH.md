@@ -93,16 +93,17 @@ configuration time via the `mesh_mode` field:
 
 ### Frame Header
 
-All P2P frames share a common 10-byte header:
+All P2P frames share a common 18-byte header:
 
 ```
-┌──────────────┬─────────────┬───────────────┬─────────────────┐
-│ type (1B)    │ link_id (4B)│ payload_len   │ payload         │
-│ P2pFrameType │   LE        │ (4B) LE       │ (payload_len B) │
-└──────────────┴─────────────┴───────────────┴─────────────────┘
+┌──────────────┬──────────────┬─────────────┬──────────────┬───────────────┬─────────────────┐
+│ type (1B)    │ reserved (1B)│ link_id (4B)│ sequence (8B)│ payload_len   │ payload         │
+│ P2pFrameType │   MUST=0     │     LE      │      LE      │    (4B) LE    │ (payload_len B) │
+└──────────────┴──────────────┴─────────────┴──────────────┴───────────────┴─────────────────┘
 ```
 
-- `type` and `link_id` are **not encrypted** (routing header).
+- `type`, `link_id`, `sequence`, and `payload_len` are **not encrypted**
+   (routing/anti-replay header).
 - `payload` is encrypted with the per-link ChaCha20-Poly1305 key
   (nonce ‖ ciphertext ‖ tag).
 
@@ -110,26 +111,30 @@ All P2P frames share a common 10-byte header:
 
 | Value | Name | Direction | Purpose |
 |-------|------|-----------|---------|
-| `0x30` | `LinkRequest` | Child → Parent | Initiate a new P2P link |
-| `0x31` | `LinkAccept` | Parent → Child | Accept link request (includes parent's X25519 pubkey) |
-| `0x32` | `LinkReject` | Parent → Child | Reject link request (includes reason code) |
-| `0x33` | `Heartbeat` | Bidirectional | Keep-alive + latency probe |
-| `0x34` | `Disconnect` | Bidirectional | Graceful link teardown |
-| `0x35` | `DataForward` | Child → Parent | Relay data toward C2 server |
-| `0x36` | `CertificateRevocation` | Server → Agents | Revoke a mesh certificate |
-| `0x37` | `QuarantineReport` | Agent → Server | Report a quarantined agent |
+| `0x01` | `LinkRequest` | Child → Parent | Initiate a new P2P link |
+| `0x02` | `LinkAccept` | Parent → Child | Accept link request (includes parent's X25519 pubkey) |
+| `0x03` | `LinkReject` | Parent → Child | Reject link request (includes reason code) |
+| `0x04` | `LinkHeartbeat` | Bidirectional | Keep-alive + latency probe |
+| `0x05` | `LinkDisconnect` | Bidirectional | Graceful link teardown |
+| `0x10` | `DataForward` | Child ↔ Parent | Relay encrypted C2 payloads |
+| `0x11` | `DataAck` | Bidirectional | Acknowledge forwarded data |
+| `0x20` | `TopologyReport` | Child → Parent/Server | Report direct child links |
 | `0x38` | `KeyRotation` | Initiator → Responder | Start per-link key rotation |
 | `0x39` | `KeyRotationAck` | Responder → Initiator | Acknowledge key rotation |
-| `0x3A` | `RouteUpdate` | Bidirectional | Distance-vector route advertisement |
-| `0x3B` | `RouteProbe` | Bidirectional | Measure link latency/hops |
-| `0x3C` | `RouteProbeReply` | Bidirectional | Reply to route probe |
-| `0x3D` | `DataAck` | Bidirectional | Acknowledge data delivery |
-| `0x3E` | `TopologyReport` | Agent → Server | Report mesh topology |
-| `0x3F` | `BandwidthProbe` | Bidirectional | Measure available bandwidth |
+| `0x30` | `RouteUpdate` | Bidirectional | Distance-vector route advertisement |
+| `0x31` | `RouteProbe` | Bidirectional | Probe route to destination |
+| `0x32` | `RouteProbeReply` | Bidirectional | Reply to route probe |
+| `0x33` | `PeerDiscovery` | Server/Parent → Agent | Peer-discovery directive |
+| `0x34` | `BandwidthProbe` | Bidirectional | Measure available bandwidth |
+| `0x35` | `LinkFailureReport` | Agent → Parent/Server | Report dead link + metrics |
+| `0x36` | `CertificateRevocation` | Server → Agents | Revoke a mesh certificate |
+| `0x37` | `QuarantineReport` | Agent → Server | Report a quarantined agent |
+| `0x40` | `MeshDataForward` | Bidirectional relay path | Onion-style mesh forwarding |
+| `0x41` | `RouteTooDeep` | Relay → origin path | Max-hop guardrail error |
 
 ### Frame Payload Formats
 
-#### LinkRequest (`0x30`)
+#### LinkRequest (`0x01`)
 
 ```
 ┌──────────────────┬────────────────────┬──────────────────────┐
@@ -138,7 +143,7 @@ All P2P frames share a common 10-byte header:
 └──────────────────┴────────────────────┴──────────────────────┘
 ```
 
-#### LinkAccept (`0x31`)
+#### LinkAccept (`0x02`)
 
 ```
 ┌──────────────────────────┐
@@ -152,7 +157,7 @@ shared_secret = X25519(our_secret, their_public)
 link_key = HKDF-SHA256(salt=None, ikm=shared_secret, info="orchestra-p2p-link-key")
 ```
 
-#### LinkReject (`0x32`)
+#### LinkReject (`0x03`)
 
 ```
 ┌──────────────┐
@@ -199,32 +204,38 @@ link_key = HKDF-SHA256(salt=None, ikm=shared_secret, info="orchestra-p2p-link-ke
 └──────────────────────────────────┴──────────────┴──────────────────┘
 ```
 
-#### RouteUpdate (`0x3A`)
+#### RouteUpdate (`0x30`)
 
 ```
-┌─────────────────┬──────────────────────────────────────────┐
-│ entry_count (1B)│ RouteEntry × entry_count                 │
-│                 │ [dest(4B) | next_hop(4B) | hops(1B) |    │
-│                 │  quality(4B f32)]                        │
-└─────────────────┴──────────────────────────────────────────┘
+┌─────────────────┬──────────────────────────────────────────────┐
+│ entry_count (2B)│ RouteEntry × entry_count                     │
+│      LE         │ [destination(4B LE) | next_hop(4B LE) |     │
+│                 │  hop_count(1B) | route_quality(4B f32 LE)]  │
+└─────────────────┴──────────────────────────────────────────────┘
 ```
 
-#### RouteProbe / RouteProbeReply (`0x3B` / `0x3C`)
+#### RouteProbe / RouteProbeReply (`0x31` / `0x32`)
 
 ```
-┌──────────────┬──────────────┬───────────────────┐
-│ probe_id(4B) │ sender(4B)   │ hop_count(1B)     │
-│     LE       │    LE        │                   │
-└──────────────┴──────────────┴───────────────────┘
+RouteProbe payload:
+┌─────────────────────┐
+│ destination (4B LE) │
+└─────────────────────┘
+
+RouteProbeReply payload:
+┌──────────────────────┬────────────────┬──────────────┬────────────────────────┐
+│ destination (4B LE)  │ next_hop (4B LE) │ hop_count (1B) │ route_quality (4B LE) │
+└──────────────────────┴────────────────┴──────────────┴────────────────────────┘
 ```
 
-#### BandwidthProbe (`0x3F`)
+#### BandwidthProbe (`0x34`)
 
 ```
-┌──────────────┬─────────────────────────────────┐
-│ probe_id(4B) │ payload (variable, 1–16 KiB)    │
-│     LE       │                                 │
-└──────────────┴─────────────────────────────────┘
+┌───────────────────────────────────────────────┐
+│ random padding bytes (variable, up to 16 MiB) │
+└───────────────────────────────────────────────┘
+
+The sender measures RTT/throughput from the echoed payload bytes.
 ```
 
 ---

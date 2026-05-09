@@ -19,14 +19,13 @@ fn resolve_fn<T>(lock: &OnceLock<Option<T>>, dll_bytes: &[u8], fn_bytes: &[u8]) 
 where
     T: Copy,
 {
-    lock.get_or_init(|| unsafe {
+    *lock.get_or_init(|| unsafe {
         let dll_hash = pe_resolve::hash_str(dll_bytes);
         let dll_base = pe_resolve::get_module_handle_by_hash(dll_hash)?;
         let fn_hash = pe_resolve::hash_str(fn_bytes);
         let addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
-        Some(std::mem::transmute::<usize, T>(addr))
+        Some(std::mem::transmute_copy(&addr))
     })
-    .and_then(|&opt| opt)
 }
 
 #[cfg(windows)]
@@ -48,7 +47,7 @@ static DELETE_TIMER_QUEUE_TIMER: OnceLock<Option<unsafe extern "system" fn(HANDL
 static ENUM_SYSTEM_LOCALES_EX: OnceLock<Option<unsafe extern "system" fn(Option<extern "system" fn(*mut u16, u32, LPARAM) -> BOOL>, u32, LPARAM, *mut std::ffi::c_void) -> BOOL>> = OnceLock::new();
 
 #[cfg(windows)]
-static ENUM_CHILD_WINDOWS: OnceLock<Option<unsafe extern "system" fn(HANDLE, Option<extern "system" fn(winapi::shared::windef::HWND, LPARAM) -> BOOL>, LPARAM) -> BOOL>> = OnceLock::new();
+static ENUM_CHILD_WINDOWS: OnceLock<Option<unsafe extern "system" fn(winapi::shared::windef::HWND, Option<extern "system" fn(winapi::shared::windef::HWND, LPARAM) -> BOOL>, LPARAM) -> BOOL>> = OnceLock::new();
 
 #[cfg(windows)]
 static FIND_WINDOW_A: OnceLock<Option<unsafe extern "system" fn(*const i8, *const i8) -> winapi::shared::windef::HWND>> = OnceLock::new();

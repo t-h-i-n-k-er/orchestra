@@ -111,13 +111,18 @@ struct KernelModuleEntry {
     full_path_name: [u8; 256],
 }
 
+#[inline(always)]
+fn ntstatus_or_default(status: Result<i32>) -> i32 {
+    status.unwrap_or(-1)
+}
+
 /// Get the kernel base address via NtQuerySystemInformation.
 fn get_kernel_base() -> Result<u64> {
     let mut buf_size: u32 = 0;
 
     // First call: get required buffer size.
     unsafe {
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtQuerySystemInformation",
             11u32, // SystemModuleInformation
             0 as *mut u8,
@@ -133,15 +138,15 @@ fn get_kernel_base() -> Result<u64> {
     let mut buffer: Vec<u8> = vec![0u8; buf_size as usize + 4096];
     let mut return_length: u32 = 0;
 
-    let status = unsafe {
-        syscall!(
+    let status = ntstatus_or_default(unsafe {
+        crate::syscall!(
             "NtQuerySystemInformation",
             11u32,
             buffer.as_mut_ptr(),
             buffer.len(),
             &mut return_length as *mut u32
         )
-    };
+    });
 
     if status != 0 {
         bail!("NtQuerySystemInformation failed: 0x{:08X}", status);
@@ -380,7 +385,7 @@ fn identify_module(driver: &super::driver_db::VulnerableDriver, device_handle: u
     let mut buf_size: u32 = 0;
 
     unsafe {
-        let _ = syscall!(
+        let _ = crate::syscall!(
             "NtQuerySystemInformation",
             11u32,
             0 as *mut u8,
@@ -392,15 +397,15 @@ fn identify_module(driver: &super::driver_db::VulnerableDriver, device_handle: u
     let mut buffer: Vec<u8> = vec![0u8; buf_size as usize + 4096];
     let mut return_length: u32 = 0;
 
-    let status = unsafe {
-        syscall!(
+    let status = ntstatus_or_default(unsafe {
+        crate::syscall!(
             "NtQuerySystemInformation",
             11u32,
             buffer.as_mut_ptr(),
             buffer.len(),
             &mut return_length as *mut u32
         )
-    };
+    });
 
     if status != 0 {
         return Ok("unknown".to_string());

