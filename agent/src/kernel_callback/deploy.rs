@@ -759,11 +759,62 @@ pub unsafe fn read_physical_memory(
             }
             Ok(())
         }
-        DriverMapping::MmioMapping | DriverMapping::PortIo => {
-            bail!(
-                "Driver mapping type {:?} not yet supported for physical memory read",
-                driver.mapping_type
-            );
+        DriverMapping::MmioMapping => {
+            // MMIO drivers use MmMapIoSpace internally.  The IOCTL input is:
+            //   [physical_address: u64, size: u32, direction: u32]
+            // direction: 0 = read, 1 = write.  Read data is returned in
+            // the output buffer.
+            let mut input = [0u8; 20];
+            input[0..8].copy_from_slice(&physical_address.to_le_bytes());
+            input[8..12].copy_from_slice(&(buffer.len() as u32).to_le_bytes());
+            input[12..16].copy_from_slice(&0u32.to_le_bytes()); // direction = read
+
+            let mut iosb = IoStatusBlock::default();
+            let status = ntstatus_or_default(crate::syscall!(
+                "NtDeviceIoControlFile",
+                device_handle as u64,
+                0u64, 0u64, 0u64,
+                &mut iosb as *mut _ as u64,
+                driver.read_ioctl as u64,
+                input.as_ptr() as u64,
+                input.len() as u64,
+                buffer.as_mut_ptr() as u64,
+                buffer.len() as u64
+            ));
+            if status != 0 {
+                bail!(
+                    "MMIO read failed at 0x{:016X}: 0x{:08X}",
+                    physical_address, status
+                );
+            }
+            Ok(())
+        }
+        DriverMapping::PortIo => {
+            // PortIO drivers use READ_PORT_BUFFER_UCHAR internally.
+            // The IOCTL input is: [port: u16, count: u32].
+            let mut input = [0u8; 8];
+            input[0..2].copy_from_slice(&(physical_address as u16).to_le_bytes()); // port
+            input[2..6].copy_from_slice(&(buffer.len() as u32).to_le_bytes());     // count
+
+            let mut iosb = IoStatusBlock::default();
+            let status = ntstatus_or_default(crate::syscall!(
+                "NtDeviceIoControlFile",
+                device_handle as u64,
+                0u64, 0u64, 0u64,
+                &mut iosb as *mut _ as u64,
+                driver.read_ioctl as u64,
+                input.as_ptr() as u64,
+                input.len() as u64,
+                buffer.as_mut_ptr() as u64,
+                buffer.len() as u64
+            ));
+            if status != 0 {
+                bail!(
+                    "PortIO read failed at port 0x{:04X}: 0x{:08X}",
+                    physical_address as u16, status
+                );
+            }
+            Ok(())
         }
     }
 }
@@ -812,11 +863,60 @@ pub unsafe fn write_physical_memory(
             }
             Ok(())
         }
-        DriverMapping::MmioMapping | DriverMapping::PortIo => {
-            bail!(
-                "Driver mapping type {:?} not yet supported for physical memory write",
-                driver.mapping_type
-            );
+        DriverMapping::MmioMapping => {
+            // MMIO write: same input layout as read but direction = 1,
+            // followed by the data bytes.
+            let mut input = vec![0u8; 20 + data.len()];
+            input[0..8].copy_from_slice(&physical_address.to_le_bytes());
+            input[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            input[12..16].copy_from_slice(&1u32.to_le_bytes()); // direction = write
+            input[20..].copy_from_slice(data);
+
+            let mut iosb = IoStatusBlock::default();
+            let status = ntstatus_or_default(crate::syscall!(
+                "NtDeviceIoControlFile",
+                device_handle as u64,
+                0u64, 0u64, 0u64,
+                &mut iosb as *mut _ as u64,
+                driver.write_ioctl as u64,
+                input.as_ptr() as u64,
+                input.len() as u64,
+                0u64, 0u64
+            ));
+            if status != 0 {
+                bail!(
+                    "MMIO write failed at 0x{:016X}: 0x{:08X}",
+                    physical_address, status
+                );
+            }
+            Ok(())
+        }
+        DriverMapping::PortIo => {
+            // PortIO write: [port: u16, count: u32] in input, data in output
+            // buffer (some drivers use the output buffer for write data).
+            let mut input = vec![0u8; 8 + data.len()];
+            input[0..2].copy_from_slice(&(physical_address as u16).to_le_bytes()); // port
+            input[2..6].copy_from_slice(&(data.len() as u32).to_le_bytes());     // count
+            input[8..].copy_from_slice(data);
+
+            let mut iosb = IoStatusBlock::default();
+            let status = ntstatus_or_default(crate::syscall!(
+                "NtDeviceIoControlFile",
+                device_handle as u64,
+                0u64, 0u64, 0u64,
+                &mut iosb as *mut _ as u64,
+                driver.write_ioctl as u64,
+                input.as_ptr() as u64,
+                input.len() as u64,
+                0u64, 0u64
+            ));
+            if status != 0 {
+                bail!(
+                    "PortIO write failed at port 0x{:04X}: 0x{:08X}",
+                    physical_address as u16, status
+                );
+            }
+            Ok(())
         }
     }
 }

@@ -117,11 +117,11 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
 
     // ── Tier 2: Reference only (not embedded) ─────────────────────────
 
-    // NOTE: Only `PhysicalMemory`-type drivers are currently supported by
-    // deploy.rs.  `PortIo` and `MmioMapping` drivers will fail at runtime.
-    // AsIO.sys and AsIO2.sys were removed because they use `PortIo` mapping
-    // which has no handler.  Re-add with a handler when PortIo support is
-    // implemented.
+    // All three mapping types (PhysicalMemory, MmioMapping, PortIo) are now
+    // supported by deploy.rs.  MmioMapping uses {addr, size, direction} IOCTLs;
+    // PortIo uses {port, count} IOCTLs.
+    // AsIO.sys and AsIO2.sys can be re-added with PortIo mapping when a verified
+    // SHA-256 hash is available.
 
     // BdKit.sys was removed: no verified SHA-256 hash was found after exhaustive
     // public search (LOLDrivers, VirusTotal, KDU, Elastic, KeServiceDescriptorTable,
