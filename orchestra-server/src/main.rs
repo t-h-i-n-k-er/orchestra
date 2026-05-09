@@ -154,16 +154,18 @@ async fn main() -> Result<()> {
             let base_url = format!("https://{}", cfg.http_addr);
             let client = {
                 let builder = reqwest::Client::builder();
-                if cfg!(debug_assertions) && cli.allow_insecure_redirector {
+                #[cfg(debug_assertions)]
+                let builder = if cli.allow_insecure_redirector {
                     tracing::warn!(
                         "WARNING: Redirector TLS certificate verification is DISABLED. \
                          This makes the server vulnerable to MITM attacks. \
                          Use --redirector-cert-fingerprint for secure pinning instead."
                     );
+                    builder.danger_accept_invalid_certs(true)
+                } else {
                     builder
-                        .danger_accept_invalid_certs(true)
-                        .build()?
-                } else if let Some(ref fingerprint) = cli.redirector_cert_fingerprint {
+                };
+                if let Some(ref fingerprint) = cli.redirector_cert_fingerprint {
                     // Pin the redirector certificate by SHA-256 fingerprint.
                     let verifier = common::tls_transport::PinnedCertVerifier::from_hex(fingerprint)?;
                     tracing::info!(
