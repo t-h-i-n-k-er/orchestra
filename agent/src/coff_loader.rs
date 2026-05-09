@@ -319,48 +319,271 @@ unsafe extern "C" fn beacon_data_extract(parser: *mut BeaconDataParser, size: *m
     ptr
 }
 
-/// `BeaconPrintf(type, fmt, ...)` — formatted output to the callback buffer.
-/// We ignore `type` (CS uses it to distinguish output types) and just format.
+/// Expand a printf-style format string using a flat array of 64-bit variadic arguments.
 ///
-/// # Known Limitation — Variadic Arguments (P2-30)
+/// Supports: `%d` (i32), `%i` (i32), `%s` (C string ptr), `%x` (u32 hex),
+/// `%p` (pointer), `%ld` (i64), `%lx` (u64 hex), `%%` (literal percent).
 ///
-/// Rust cannot safely access C variadic arguments.  `VaList` is
-/// platform-fragile and unstable.  This function emits the format string
-/// *literally* without %-expansion, so BOFs using `BeaconPrintf` with
-/// format specifiers like `%d`, `%s`, `%x`, `%p` will produce garbled or
-/// incomplete output.
-///
-/// **Workarounds**:
-/// - BOFs should prefer `BeaconOutput` with a pre-formatted buffer.
-/// - Alternatively, use `BeaconOutputPrintf` (non-variadic wrapper).
-/// - A future improvement could implement minimal `%d`/`%s`/`%x`/`%p`
-///   expansion by parsing the format string and extracting arguments from
-///   the stack / registers (x64 calling convention: first 4 args in
-///   RCX, RDX, R8, R9; remainder on stack).  This is non-trivial and
-///   platform-specific.
-/// - The `cvt` crate provides C variadic argument access but adds a
-///   dependency and has its own platform limitations.
-unsafe extern "C" fn beacon_printf(_typ: i32, fmt: *const i8) -> i32 {
+/// On Windows x64, the caller's variadic args arrive in r8, r9, and on the
+/// stack at [rsp+0x28], [rsp+0x30], ….  The public wrappers pass these as
+/// explicit `u64` parameters which the x64 ABI places in those exact
+/// registers / stack slots.
+unsafe fn expand_format(fmt: *const i8, args: &[u64]) -> Vec<u8> {
     if fmt.is_null() {
-        return 0;
+        return Vec::new();
     }
     let fmt_str = std::ffi::CStr::from_ptr(fmt);
-    let bytes = fmt_str.to_bytes();
-    append_output(bytes);
-    append_output(b"\n");
-    0
+    let fmt_bytes = fmt_str.to_bytes();
+    let mut output = Vec::with_capacity(fmt_bytes.len() * 2);
+    let mut arg_idx = 0usize;
+    let mut i = 0;
+    while i < fmt_bytes.len() {
+        if fmt_bytes[i] == b'%' && i + 1 < fmt_bytes.len() {
+            let spec = fmt_bytes[i + 1];
+            match spec {
+                b'd' | b'i' => {
+                    if arg_idx < args.len() {
+                        let val = args[arg_idx] as i32;
+                        let mut buf = [0u8; 12]; // -2147483648 = 11 chars + NUL
+                        let written = fmt_i32(&mut buf, val);
+                        output.extend_from_slice(&buf[..written]);
+                        arg_idx += 1;
+                    }
+                    i += 2;
+                }
+                b's' => {
+                    if arg_idx < args.len() {
+                        let ptr = args[arg_idx] as *const i8;
+                        if !ptr.is_null() {
+                            if let Ok(s) = std::ffi::CStr::from_ptr(ptr).to_str() {
+                                output.extend_from_slice(s.as_bytes());
+                            }
+                        }
+                        arg_idx += 1;
+                    }
+                    i += 2;
+                }
+                b'x' => {
+                    if arg_idx < args.len() {
+                        let val = args[arg_idx] as u32;
+                        let mut buf = [0u8; 8];
+                        let written = format_u32_hex(&mut buf, val);
+                        output.extend_from_slice(&buf[..written]);
+                        arg_idx += 1;
+                    }
+                    i += 2;
+                }
+                b'p' => {
+                    if arg_idx < args.len() {
+                        let val = args[arg_idx];
+                        // "0x" prefix + 16 hex chars
+                        output.extend_from_slice(b"0x");
+                        let mut buf = [0u8; 16];
+                        format_u64_hex_padded(&mut buf, val);
+                        output.extend_from_slice(&buf);
+                        arg_idx += 1;
+                    }
+                    i += 2;
+                }
+                b'%' => {
+                    output.push(b'%');
+                    i += 2;
+                }
+                b'l' => {
+                    // %ld or %lx
+                    if i + 2 < fmt_bytes.len() {
+                        let next = fmt_bytes[i + 2];
+                        match next {
+                            b'd' => {
+                                if arg_idx < args.len() {
+                                    let val = args[arg_idx] as i64;
+                                    let mut buf = [0u8; 21]; // -9223372036854775808
+                                    let written = fmt_i64(&mut buf, val);
+                                    output.extend_from_slice(&buf[..written]);
+                                    arg_idx += 1;
+                                }
+                                i += 3;
+                            }
+                            b'x' => {
+                                if arg_idx < args.len() {
+                                    let val = args[arg_idx] as u64;
+                                    let mut buf = [0u8; 16];
+                                    format_u64_hex_padded(&mut buf, val);
+                                    output.extend_from_slice(&buf);
+                                    arg_idx += 1;
+                                }
+                                i += 3;
+                            }
+                            _ => {
+                                output.push(b'%');
+                                output.push(spec);
+                                i += 2;
+                            }
+                        }
+                    } else {
+                        output.push(b'%');
+                        output.push(spec);
+                        i += 2;
+                    }
+                }
+                _ => {
+                    output.push(b'%');
+                    output.push(spec);
+                    i += 2;
+                }
+            }
+        } else {
+            output.push(fmt_bytes[i]);
+            i += 1;
+        }
+    }
+    output
 }
 
-/// `BeaconOutputPrintf(type, fmt, ...)` — alias for BeaconPrintf.
-unsafe extern "C" fn beacon_output_printf(_typ: i32, fmt: *const i8) -> i32 {
-    if fmt.is_null() {
-        return 0;
+/// Write lower-case hex for `val` into `buf` (no padding, no prefix).
+/// Returns the number of bytes written.
+fn format_u32_hex(buf: &mut [u8; 8], mut val: u32) -> usize {
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
     }
-    let fmt_str = std::ffi::CStr::from_ptr(fmt);
-    let bytes = fmt_str.to_bytes();
-    append_output(bytes);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut tmp = [0u8; 8];
+    let mut pos = 0;
+    while val > 0 {
+        tmp[pos] = HEX[(val & 0xF) as usize];
+        val >>= 4;
+        pos += 1;
+    }
+    // Reverse into buf
+    for j in 0..pos {
+        buf[j] = tmp[pos - 1 - j];
+    }
+    pos
+}
+
+/// Write 16-char zero-padded lower-case hex for `val` into `buf`.
+fn format_u64_hex_padded(buf: &mut [u8; 16], val: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for i in 0..16 {
+        buf[15 - i] = HEX[((val >> (i * 4)) & 0xF) as usize];
+    }
+}
+
+/// Write signed decimal for `val` into `buf`. Returns byte count written.
+fn fmt_i32(buf: &mut [u8; 12], mut val: i32) -> usize {
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let neg = val < 0;
+    let mut pos = 0;
+    let mut digits = [0u8; 11];
+    if neg {
+        val = val.wrapping_neg(); // handles i32::MIN correctly
+    }
+    while val > 0 {
+        digits[pos] = b'0' + (val % 10) as u8;
+        val /= 10;
+        pos += 1;
+    }
+    let mut out = 0;
+    if neg {
+        buf[out] = b'-';
+        out += 1;
+    }
+    for j in (0..pos).rev() {
+        buf[out] = digits[j];
+        out += 1;
+    }
+    out
+}
+
+/// Write signed decimal for `val` into `buf`. Returns byte count written.
+fn fmt_i64(buf: &mut [u8; 21], mut val: i64) -> usize {
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let neg = val < 0;
+    let mut pos = 0;
+    let mut digits = [0u8; 20];
+    if neg {
+        val = val.wrapping_neg(); // handles i64::MIN correctly
+    }
+    while val > 0 {
+        digits[pos] = b'0' + (val % 10) as u8;
+        val /= 10;
+        pos += 1;
+    }
+    let mut out = 0;
+    if neg {
+        buf[out] = b'-';
+        out += 1;
+    }
+    for j in (0..pos).rev() {
+        buf[out] = digits[j];
+        out += 1;
+    }
+    out
+}
+
+/// Maximum number of variadic args we capture from the x64 calling convention.
+///
+/// `BeaconPrintf(typ, fmt, ...)` — `typ` is rcx, `fmt` is rdx, so variadic
+/// args start at the 3rd position: r8, r9, then stack slots [rsp+0x28],
+/// [rsp+0x30], [rsp+0x38], [rsp+0x40].  We accept 8 explicit `u64` params
+/// after `fmt` to cover typical BOF usage; the ABI guarantees they arrive
+/// in the correct registers / stack slots.
+const MAX_VA_ARGS: usize = 8;
+
+/// `BeaconPrintf(type, fmt, ...)` — formatted output to the callback buffer.
+///
+/// Expands `%d`, `%i`, `%s`, `%x`, `%p`, `%ld`, `%lx`, `%%` specifiers
+/// using variadic arguments extracted from the Windows x64 calling convention.
+///
+/// The ABI passes the first 4 integer/pointer args in rcx, rdx, r8, r9 and
+/// additional args on the stack at [rsp+0x28], [rsp+0x30], etc.  By declaring
+/// explicit `u64` parameters beyond `fmt`, the compiler places them in r8, r9,
+/// and the correct stack slots — giving us a va_list equivalent without
+/// `unsafe` variadic intrinsics.
+unsafe extern "system" fn beacon_printf(
+    typ: i32,
+    fmt: *const i8,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+    a10: u64,
+) -> i32 {
+    let args: [u64; MAX_VA_ARGS] = [a3, a4, a5, a6, a7, a8, a9, a10];
+    let output = expand_format(fmt, &args);
+    append_output(&output);
     append_output(b"\n");
-    0
+    typ
+}
+
+/// `BeaconOutputPrintf(type, fmt, ...)` — formatted output, identical to BeaconPrintf.
+unsafe extern "system" fn beacon_output_printf(
+    typ: i32,
+    fmt: *const i8,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+    a10: u64,
+) -> i32 {
+    let args: [u64; MAX_VA_ARGS] = [a3, a4, a5, a6, a7, a8, a9, a10];
+    let output = expand_format(fmt, &args);
+    append_output(&output);
+    append_output(b"\n");
+    typ
 }
 
 /// `BeaconOutput(type, data, len)` — raw output callback.
