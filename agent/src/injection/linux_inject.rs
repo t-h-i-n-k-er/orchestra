@@ -206,7 +206,11 @@ fn is_child_process(pid: libc::pid_t) -> bool {
     let our_pid = std::process::id();
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("PPid:") {
-            return rest.trim().parse::<u32>().map(|ppid| ppid == our_pid).unwrap_or(false);
+            return rest
+                .trim()
+                .parse::<u32>()
+                .map(|ppid| ppid == our_pid)
+                .unwrap_or(false);
         }
     }
     false

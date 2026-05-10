@@ -93,7 +93,9 @@ impl PeImage {
         // DOS header
         let dos_magic = u16_from_le(data, 0);
         if dos_magic != DOS_MAGIC {
-            return Err(anyhow!("not a valid PE file: bad DOS magic (got 0x{dos_magic:04X})"));
+            return Err(anyhow!(
+                "not a valid PE file: bad DOS magic (got 0x{dos_magic:04X})"
+            ));
         }
         let e_lfanew = u32_from_le(data, 60) as usize;
 
@@ -118,11 +120,22 @@ impl PeImage {
         let is_pe64 = match opt_magic {
             OPT_MAGIC_PE32_PLUS => true,
             OPT_MAGIC_PE32 => false,
-            _ => return Err(anyhow!("unsupported optional header magic: 0x{opt_magic:04X}")),
+            _ => {
+                return Err(anyhow!(
+                    "unsupported optional header magic: 0x{opt_magic:04X}"
+                ))
+            }
         };
 
-        let (image_base, entry_point_rva, image_size, section_alignment, file_alignment,
-             size_of_headers, num_data_dirs) = if is_pe64 {
+        let (
+            image_base,
+            entry_point_rva,
+            image_size,
+            section_alignment,
+            file_alignment,
+            size_of_headers,
+            num_data_dirs,
+        ) = if is_pe64 {
             // PE32+ layout
             let entry = u32_from_le(data, opt_offset + 16);
             let image_base = u64_from_le(data, opt_offset + 24);
@@ -131,7 +144,15 @@ impl PeImage {
             let image_sz = u32_from_le(data, opt_offset + 56);
             let headers_sz = u32_from_le(data, opt_offset + 60);
             let num_dd = u32_from_le(data, opt_offset + 108) as usize;
-            (image_base, entry, image_sz, section_align, file_align, headers_sz, num_dd)
+            (
+                image_base,
+                entry,
+                image_sz,
+                section_align,
+                file_align,
+                headers_sz,
+                num_dd,
+            )
         } else {
             // PE32 layout
             let entry = u32_from_le(data, opt_offset + 16);
@@ -141,7 +162,15 @@ impl PeImage {
             let image_sz = u32_from_le(data, opt_offset + 56);
             let headers_sz = u32_from_le(data, opt_offset + 60);
             let num_dd = u32_from_le(data, opt_offset + 92) as usize;
-            (image_base, entry, image_sz, section_align, file_align, headers_sz, num_dd)
+            (
+                image_base,
+                entry,
+                image_sz,
+                section_align,
+                file_align,
+                headers_sz,
+                num_dd,
+            )
         };
 
         // Data directories
@@ -185,8 +214,8 @@ impl PeImage {
             .context("failed to parse relocations")?;
 
         // Parse imports (data directory index 1 = IMAGE_DIRECTORY_ENTRY_IMPORT)
-        let imports = parse_imports(data, &data_directories, is_pe64)
-            .context("failed to parse imports")?;
+        let imports =
+            parse_imports(data, &data_directories, is_pe64).context("failed to parse imports")?;
 
         Ok(Self {
             raw: data.to_vec(),
@@ -240,9 +269,8 @@ fn parse_relocations(
         return Ok(Vec::new());
     }
 
-    let reloc_off = rva_to_offset(data, reloc_rva).ok_or_else(|| {
-        anyhow!("cannot resolve relocation directory RVA 0x{reloc_rva:08X}")
-    })?;
+    let reloc_off = rva_to_offset(data, reloc_rva)
+        .ok_or_else(|| anyhow!("cannot resolve relocation directory RVA 0x{reloc_rva:08X}"))?;
 
     let mut relocs = Vec::new();
     let mut pos = reloc_off as usize;
@@ -285,20 +313,15 @@ fn parse_relocations(
 
 // ── Import parsing ───────────────────────────────────────────────────────────
 
-fn parse_imports(
-    data: &[u8],
-    data_dirs: &[(u32, u32)],
-    is_pe64: bool,
-) -> Result<Vec<ImportDll>> {
+fn parse_imports(data: &[u8], data_dirs: &[(u32, u32)], is_pe64: bool) -> Result<Vec<ImportDll>> {
     // Data directory index 1 = IMPORT
     let (import_rva, import_size) = data_dirs.get(1).copied().unwrap_or((0, 0));
     if import_rva == 0 || import_size == 0 {
         return Ok(Vec::new());
     }
 
-    let import_off = rva_to_offset(data, import_rva).ok_or_else(|| {
-        anyhow!("cannot resolve import directory RVA 0x{import_rva:08X}")
-    })?;
+    let import_off = rva_to_offset(data, import_rva)
+        .ok_or_else(|| anyhow!("cannot resolve import directory RVA 0x{import_rva:08X}"))?;
 
     let mut dlls = Vec::new();
     let mut desc_pos = import_off as usize;
@@ -350,18 +373,25 @@ fn parse_imports(
             }
 
             // Calculate the IAT slot RVA for this function
-            let iat_slot_rva = iat_rva + ((thunk_pos - rva_to_offset(data, thunk_rva).unwrap() as usize) as u32);
+            let iat_slot_rva =
+                iat_rva + ((thunk_pos - rva_to_offset(data, thunk_rva).unwrap() as usize) as u32);
 
             // Check ordinal flag (bit 63 for PE64, bit 31 for PE32)
             let ordinal_flag = if is_pe64 { 1u64 << 63 } else { 1u64 << 31 };
             if thunk_val & ordinal_flag != 0 {
                 let ordinal = (thunk_val & 0xFFFF) as u16;
-                functions.push(ImportFunc::ByOrdinal { ordinal, thunk_rva: iat_slot_rva });
+                functions.push(ImportFunc::ByOrdinal {
+                    ordinal,
+                    thunk_rva: iat_slot_rva,
+                });
             } else {
                 let hint_name_rva = (thunk_val & 0x7FFFFFFF) as u32;
                 let name = read_cstring_at_rva(data, hint_name_rva.wrapping_add(2))
                     .unwrap_or_else(|| format!("ord_{}", thunk_val & 0xFFFF));
-                functions.push(ImportFunc::ByName { name, thunk_rva: iat_slot_rva });
+                functions.push(ImportFunc::ByName {
+                    name,
+                    thunk_rva: iat_slot_rva,
+                });
             }
 
             thunk_pos += thunk_size;
@@ -394,8 +424,14 @@ fn u32_from_le(data: &[u8], offset: usize) -> u32 {
 
 fn u64_from_le(data: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes([
-        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-        data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
     ])
 }
 
@@ -478,40 +514,52 @@ mod tests {
 
         // COFF header (20 bytes)
         pe.extend_from_slice(&0x8664u16.to_le_bytes()); // Machine: AMD64
-        pe.extend_from_slice(&0u16.to_le_bytes());      // NumberOfSections
-        pe.extend_from_slice(&0u32.to_le_bytes());      // TimeDateStamp
-        pe.extend_from_slice(&0u32.to_le_bytes());      // PointerToSymbolTable
-        pe.extend_from_slice(&0u32.to_le_bytes());      // NumberOfSymbols
-        pe.extend_from_slice(&240u16.to_le_bytes());    // SizeOfOptionalHeader
+        pe.extend_from_slice(&0u16.to_le_bytes()); // NumberOfSections
+        pe.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
+        pe.extend_from_slice(&0u32.to_le_bytes()); // PointerToSymbolTable
+        pe.extend_from_slice(&0u32.to_le_bytes()); // NumberOfSymbols
+        pe.extend_from_slice(&240u16.to_le_bytes()); // SizeOfOptionalHeader
         pe.extend_from_slice(&0x0022u16.to_le_bytes()); // Characteristics
 
         // Optional header PE32+ (240 bytes)
         pe.extend_from_slice(&0x020Bu16.to_le_bytes()); // Magic: PE32+
         pe.push(14); // MajorLinkerVersion
-        pe.push(0);  // MinorLinkerVersion
+        pe.push(0); // MinorLinkerVersion
         pe.extend(&[0u8; 232]); // Pad rest of optional header with zeros
-        // Fill in key fields at their offsets:
-        // DOS header: 64 bytes, PE sig: 4 bytes, COFF header: 20 bytes
-        // opt_offset = 64 + 4 + 20 = 88
+                                // Fill in key fields at their offsets:
+                                // DOS header: 64 bytes, PE sig: 4 bytes, COFF header: 20 bytes
+                                // opt_offset = 64 + 4 + 20 = 88
         let opt_start = 88;
         // AddressOfEntryPoint at opt+16
         let off = opt_start + 16;
-        if off + 4 <= pe.len() { pe[off..off+4].copy_from_slice(&0x1000u32.to_le_bytes()); }
+        if off + 4 <= pe.len() {
+            pe[off..off + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        }
         // ImageBase at opt+24
         let off = opt_start + 24;
-        if off + 8 <= pe.len() { pe[off..off+8].copy_from_slice(&0x140000000u64.to_le_bytes()); }
+        if off + 8 <= pe.len() {
+            pe[off..off + 8].copy_from_slice(&0x140000000u64.to_le_bytes());
+        }
         // SectionAlignment at opt+32
         let off = opt_start + 32;
-        if off + 4 <= pe.len() { pe[off..off+4].copy_from_slice(&0x1000u32.to_le_bytes()); }
+        if off + 4 <= pe.len() {
+            pe[off..off + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+        }
         // FileAlignment at opt+36
         let off = opt_start + 36;
-        if off + 4 <= pe.len() { pe[off..off+4].copy_from_slice(&0x200u32.to_le_bytes()); }
+        if off + 4 <= pe.len() {
+            pe[off..off + 4].copy_from_slice(&0x200u32.to_le_bytes());
+        }
         // SizeOfImage at opt+56
         let off = opt_start + 56;
-        if off + 4 <= pe.len() { pe[off..off+4].copy_from_slice(&0x4000u32.to_le_bytes()); }
+        if off + 4 <= pe.len() {
+            pe[off..off + 4].copy_from_slice(&0x4000u32.to_le_bytes());
+        }
         // SizeOfHeaders at opt+60
         let off = opt_start + 60;
-        if off + 4 <= pe.len() { pe[off..off+4].copy_from_slice(&0x200u32.to_le_bytes()); }
+        if off + 4 <= pe.len() {
+            pe[off..off + 4].copy_from_slice(&0x200u32.to_le_bytes());
+        }
 
         // Pad to match declared SizeOfOptionalHeader
         while pe.len() < opt_start + 240 {

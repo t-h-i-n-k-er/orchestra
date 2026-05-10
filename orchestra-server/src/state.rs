@@ -11,6 +11,7 @@
 use crate::audit::AuditLog;
 use crate::config::{OperatorRecord, ServerConfig};
 use crate::redirector::RedirectorState;
+use chrono::{DateTime, Utc};
 use common::{LockedSecret, Message};
 use dashmap::{DashMap, DashSet};
 use rand::RngCore;
@@ -18,7 +19,6 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
-use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot, RwLock};
 
 /// One connected agent.  `connection_id` is assigned by the server on accept.
@@ -232,7 +232,7 @@ impl AppState {
             mtls_verifier: std::sync::RwLock::new(None),
             auth_rate_limiters: crate::auth::PerIpRateLimiter::new(
                 10,                                     // max attempts per IP
-                std::time::Duration::from_secs(60 * 5),  // per 5-minute window
+                std::time::Duration::from_secs(60 * 5), // per 5-minute window
             ),
             ws_sessions: DashMap::new(),
         }
@@ -250,16 +250,17 @@ impl AppState {
     pub fn authenticate_operator(&self, presented_token: &str) -> Option<(String, Vec<String>)> {
         let presented_hash = OperatorRecord::hash_token(presented_token);
         for (_id, op) in &self.operators {
-            let ok: bool = presented_hash.as_bytes().ct_eq(op.token_hash.as_bytes()).into();
+            let ok: bool = presented_hash
+                .as_bytes()
+                .ct_eq(op.token_hash.as_bytes())
+                .into();
             if ok {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
-                op.last_seen.store(
-                    now,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                op.last_seen
+                    .store(now, std::sync::atomic::Ordering::Relaxed);
                 return Some((op.id.clone(), op.permissions.clone()));
             }
         }
@@ -534,11 +535,7 @@ impl AppState {
             } else {
                 agent_id
             };
-            let shape = if node.depth == 0 {
-                "box"
-            } else {
-                "ellipse"
-            };
+            let shape = if node.depth == 0 { "box" } else { "ellipse" };
             dot.push_str(&format!(
                 "    \"{aid}\" [shape={shape}, label=\"{label_short}\\nd={d}\\nchildren={nc}\"];\n",
                 aid = agent_id,
@@ -559,10 +556,7 @@ impl AppState {
                 }
                 None => {
                     // Directly connected to server.
-                    dot.push_str(&format!(
-                        "    SERVER -> \"{aid}\";\n",
-                        aid = agent_id,
-                    ));
+                    dot.push_str(&format!("    SERVER -> \"{aid}\";\n", aid = agent_id,));
                 }
             }
         }
@@ -576,11 +570,7 @@ impl AppState {
         let topo = self.topology.read().await;
         let total_nodes = topo.nodes.len();
         let max_depth = topo.nodes.values().map(|n| n.depth).max().unwrap_or(0);
-        let direct_agents = topo
-            .nodes
-            .values()
-            .filter(|n| n.parent.is_none())
-            .count();
+        let direct_agents = topo.nodes.values().filter(|n| n.parent.is_none()).count();
         let total_edges: usize = topo.nodes.values().map(|n| n.children.len()).sum();
         let total_peer_links = topo.child_link_map.len();
         let recent_failures = topo.link_failures.len();

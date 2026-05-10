@@ -37,9 +37,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(dead_code)]
 
-mod pe;
-mod x86;
 mod emitter;
 mod package;
+mod pe;
+mod x86;
 
 pub use package::{package, ShellcodeConfig};

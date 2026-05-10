@@ -57,12 +57,19 @@ mod win_resolve {
     }
 
     /// Resolve a function pointer from a DLL, loading it if not already present.
-    pub unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) -> Option<T> {
+    pub unsafe fn resolve_api_or_load<T>(
+        dll_wide: &[u16],
+        dll_hash: u32,
+        fn_hash: u32,
+    ) -> Option<T> {
         let module = match pe_resolve::get_module_handle_by_hash(dll_hash) {
             Some(m) => m,
             None => {
                 let load_library_w: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
-                    resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"LoadLibraryW\0"))?;
+                    resolve_api(
+                        pe_resolve::HASH_KERNEL32_DLL,
+                        pe_resolve::hash_str(b"LoadLibraryW\0"),
+                    )?;
                 let m = load_library_w(dll_wide.as_ptr());
                 if m.is_null() {
                     return None;
@@ -75,34 +82,43 @@ mod win_resolve {
     }
 
     // ── DLL wide strings & hashes ──────────────────────────────────────────────
-    pub const USER32_DLL_W: &[u16] = &['u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+    pub const USER32_DLL_W: &[u16] = &[
+        'u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16,
+        'd' as u16, 'l' as u16, 'l' as u16, 0,
+    ];
     pub const HASH_USER32_DLL: u32 = hash_wstr_const(USER32_DLL_W);
 
-    pub const ADVAPI32_DLL_W: &[u16] = &['a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+    pub const ADVAPI32_DLL_W: &[u16] = &[
+        'a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16,
+        '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    ];
     pub const HASH_ADVAPI32_DLL: u32 = hash_wstr_const(ADVAPI32_DLL_W);
 
-    pub const IPHLPAPI_DLL_W: &[u16] = &['i' as u16, 'p' as u16, 'h' as u16, 'l' as u16, 'p' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+    pub const IPHLPAPI_DLL_W: &[u16] = &[
+        'i' as u16, 'p' as u16, 'h' as u16, 'l' as u16, 'p' as u16, 'a' as u16, 'p' as u16,
+        'i' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+    ];
     pub const HASH_IPHLPAPI_DLL: u32 = hash_wstr_const(IPHLPAPI_DLL_W);
 
     // ── API hash constants (kernel32) ──────────────────────────────────────────
     pub const HASH_GLOBALMEMORYSTATUSEX: u32 = hash_str_const(b"GlobalMemoryStatusEx\0");
-    pub const HASH_GETSYSTEMINFO: u32       = hash_str_const(b"GetSystemInfo\0");
-    pub const HASH_GETTICKCOUNT64: u32      = hash_str_const(b"GetTickCount64\0");
-    pub const HASH_ISDEBUGGERPRESENT: u32   = hash_str_const(b"IsDebuggerPresent\0");
-    pub const HASH_GETSYSTEMTIMES: u32      = hash_str_const(b"GetSystemTimes\0");
+    pub const HASH_GETSYSTEMINFO: u32 = hash_str_const(b"GetSystemInfo\0");
+    pub const HASH_GETTICKCOUNT64: u32 = hash_str_const(b"GetTickCount64\0");
+    pub const HASH_ISDEBUGGERPRESENT: u32 = hash_str_const(b"IsDebuggerPresent\0");
+    pub const HASH_GETSYSTEMTIMES: u32 = hash_str_const(b"GetSystemTimes\0");
     pub const HASH_GETDISKFREESPACEEXW: u32 = hash_str_const(b"GetDiskFreeSpaceExW\0");
 
     // ── API hash constants (user32) ────────────────────────────────────────────
-    pub const HASH_GETCURSORPOS: u32          = hash_str_const(b"GetCursorPos\0");
-    pub const HASH_ENUMWINDOWS: u32           = hash_str_const(b"EnumWindows\0");
-    pub const HASH_ISWINDOWVISIBLE: u32       = hash_str_const(b"IsWindowVisible\0");
-    pub const HASH_GETWINDOWTEXTLENGTHW: u32   = hash_str_const(b"GetWindowTextLengthW\0");
+    pub const HASH_GETCURSORPOS: u32 = hash_str_const(b"GetCursorPos\0");
+    pub const HASH_ENUMWINDOWS: u32 = hash_str_const(b"EnumWindows\0");
+    pub const HASH_ISWINDOWVISIBLE: u32 = hash_str_const(b"IsWindowVisible\0");
+    pub const HASH_GETWINDOWTEXTLENGTHW: u32 = hash_str_const(b"GetWindowTextLengthW\0");
 
     // ── API hash constants (advapi32) ──────────────────────────────────────────
-    pub const HASH_REGOPENKEYEXW: u32   = hash_str_const(b"RegOpenKeyExW\0");
+    pub const HASH_REGOPENKEYEXW: u32 = hash_str_const(b"RegOpenKeyExW\0");
     pub const HASH_REGQUERYVALUEEXW: u32 = hash_str_const(b"RegQueryValueExW\0");
-    pub const HASH_REGCLOSEKEY: u32     = hash_str_const(b"RegCloseKey\0");
-    pub const HASH_REGENUMKEYEXW: u32   = hash_str_const(b"RegEnumKeyExW\0");
+    pub const HASH_REGCLOSEKEY: u32 = hash_str_const(b"RegCloseKey\0");
+    pub const HASH_REGENUMKEYEXW: u32 = hash_str_const(b"RegEnumKeyExW\0");
 
     // ── API hash constants (iphlpapi) ──────────────────────────────────────────
     pub const HASH_GETADAPTERSADDRESSES: u32 = hash_str_const(b"GetAdaptersAddresses\0");
@@ -111,26 +127,67 @@ mod win_resolve {
 
     // kernel32
     pub type FnGlobalMemoryStatusEx = unsafe extern "system" fn(*mut MemoryStatusEx) -> i32;
-    pub type FnGetSystemInfo        = unsafe extern "system" fn(*mut SystemInfo);
-    pub type FnGetTickCount64       = unsafe extern "system" fn() -> u64;
-    pub type FnIsDebuggerPresent    = unsafe extern "system" fn() -> i32;
-    pub type FnGetSystemTimes       = unsafe extern "system" fn(*mut crate::win_types::FILETIME, *mut crate::win_types::FILETIME, *mut crate::win_types::FILETIME) -> i32;
-    pub type FnGetDiskFreeSpaceExW  = unsafe extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32;
+    pub type FnGetSystemInfo = unsafe extern "system" fn(*mut SystemInfo);
+    pub type FnGetTickCount64 = unsafe extern "system" fn() -> u64;
+    pub type FnIsDebuggerPresent = unsafe extern "system" fn() -> i32;
+    pub type FnGetSystemTimes = unsafe extern "system" fn(
+        *mut crate::win_types::FILETIME,
+        *mut crate::win_types::FILETIME,
+        *mut crate::win_types::FILETIME,
+    ) -> i32;
+    pub type FnGetDiskFreeSpaceExW =
+        unsafe extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32;
 
     // user32
-    pub type FnGetCursorPos        = unsafe extern "system" fn(*mut crate::win_types::POINT) -> i32;
-    pub type FnEnumWindows         = unsafe extern "system" fn(Option<unsafe extern "system" fn(crate::win_types::HWND, crate::win_types::LPARAM) -> crate::win_types::BOOL>, crate::win_types::LPARAM) -> i32;
-    pub type FnIsWindowVisible     = unsafe extern "system" fn(crate::win_types::HWND) -> i32;
+    pub type FnGetCursorPos = unsafe extern "system" fn(*mut crate::win_types::POINT) -> i32;
+    pub type FnEnumWindows = unsafe extern "system" fn(
+        Option<
+            unsafe extern "system" fn(
+                crate::win_types::HWND,
+                crate::win_types::LPARAM,
+            ) -> crate::win_types::BOOL,
+        >,
+        crate::win_types::LPARAM,
+    ) -> i32;
+    pub type FnIsWindowVisible = unsafe extern "system" fn(crate::win_types::HWND) -> i32;
     pub type FnGetWindowTextLengthW = unsafe extern "system" fn(crate::win_types::HWND) -> i32;
 
     // advapi32
-    pub type FnRegOpenKeyExW   = unsafe extern "system" fn(*mut std::ffi::c_void, *const u16, u32, u32, *mut *mut std::ffi::c_void) -> i32;
-    pub type FnRegQueryValueExW = unsafe extern "system" fn(*mut std::ffi::c_void, *const u16, *mut u32, *mut u32, *mut u8, *mut u32) -> i32;
-    pub type FnRegCloseKey     = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
-    pub type FnRegEnumKeyExW   = unsafe extern "system" fn(*mut std::ffi::c_void, u32, *mut u16, *mut u32, *mut std::ffi::c_void, *mut u32, *mut std::ffi::c_void, *mut std::ffi::c_void) -> i32;
+    pub type FnRegOpenKeyExW = unsafe extern "system" fn(
+        *mut std::ffi::c_void,
+        *const u16,
+        u32,
+        u32,
+        *mut *mut std::ffi::c_void,
+    ) -> i32;
+    pub type FnRegQueryValueExW = unsafe extern "system" fn(
+        *mut std::ffi::c_void,
+        *const u16,
+        *mut u32,
+        *mut u32,
+        *mut u8,
+        *mut u32,
+    ) -> i32;
+    pub type FnRegCloseKey = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+    pub type FnRegEnumKeyExW = unsafe extern "system" fn(
+        *mut std::ffi::c_void,
+        u32,
+        *mut u16,
+        *mut u32,
+        *mut std::ffi::c_void,
+        *mut u32,
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+    ) -> i32;
 
     // iphlpapi
-    pub type FnGetAdaptersAddresses = unsafe extern "system" fn(u32, u32, *mut std::ffi::c_void, *mut crate::win_types::IP_ADAPTER_ADDRESSES, *mut u32) -> u32;
+    pub type FnGetAdaptersAddresses = unsafe extern "system" fn(
+        u32,
+        u32,
+        *mut std::ffi::c_void,
+        *mut crate::win_types::IP_ADAPTER_ADDRESSES,
+        *mut u32,
+    ) -> u32;
 
     // ── Static atomics for EnumWindows callback ────────────────────────────────
     pub static ISWINDOWVISIBLE_PTR: AtomicU64 = AtomicU64::new(0);
@@ -149,7 +206,10 @@ mod win_resolve {
 /// Open a registry sub-key via dynamically resolved `RegOpenKeyExW`.
 /// Returns the raw key handle on success.
 #[cfg(windows)]
-unsafe fn reg_open_subkey(parent: *mut std::ffi::c_void, sub_key: &str) -> Option<*mut std::ffi::c_void> {
+unsafe fn reg_open_subkey(
+    parent: *mut std::ffi::c_void,
+    sub_key: &str,
+) -> Option<*mut std::ffi::c_void> {
     let reg_open: win_resolve::FnRegOpenKeyExW = win_resolve::resolve_api_or_load(
         win_resolve::ADVAPI32_DLL_W,
         win_resolve::HASH_ADVAPI32_DLL,
@@ -158,13 +218,7 @@ unsafe fn reg_open_subkey(parent: *mut std::ffi::c_void, sub_key: &str) -> Optio
     let mut wide: Vec<u16> = sub_key.encode_utf16().collect();
     wide.push(0);
     let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
-    let status = reg_open(
-        parent,
-        wide.as_ptr(),
-        0,
-        win_resolve::KEY_READ,
-        &mut handle,
-    );
+    let status = reg_open(parent, wide.as_ptr(), 0, win_resolve::KEY_READ, &mut handle);
     if status == win_resolve::ERROR_SUCCESS as i32 {
         Some(handle)
     } else {
@@ -533,8 +587,11 @@ fn linux_is_debugger_present() -> bool {
 #[cfg(windows)]
 fn windows_is_debugger_present() -> bool {
     let is_debugger_present: win_resolve::FnIsDebuggerPresent = unsafe {
-        win_resolve::resolve_api(pe_resolve::HASH_KERNEL32_DLL, win_resolve::HASH_ISDEBUGGERPRESENT)
-            .expect("IsDebuggerPresent not found")
+        win_resolve::resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            win_resolve::HASH_ISDEBUGGERPRESENT,
+        )
+        .expect("IsDebuggerPresent not found")
     };
     if unsafe { is_debugger_present() } != 0 {
         return true;
@@ -636,10 +693,15 @@ fn is_container_environment() -> bool {
     // When `containerd` is the *only* matched token, we additionally require
     // a container namespace marker (`/.dockerenv`, `CONTAINER` env var, or
     // PID namespace isolation) before concluding this is a real container.
-    const CONTAINER_CGROUP_TOKENS: &[&str] =
-        &["docker", "lxc", "kubepods", "containerd", "crio", "cri-containerd"];
-    const UNAMBIGUOUS_TOKENS: &[&str] =
-        &["docker", "lxc", "kubepods", "crio", "cri-containerd"];
+    const CONTAINER_CGROUP_TOKENS: &[&str] = &[
+        "docker",
+        "lxc",
+        "kubepods",
+        "containerd",
+        "crio",
+        "cri-containerd",
+    ];
+    const UNAMBIGUOUS_TOKENS: &[&str] = &["docker", "lxc", "kubepods", "crio", "cri-containerd"];
     if let Ok(content) = std::fs::read_to_string("/proc/1/cgroup") {
         let lower = content.to_ascii_lowercase();
         let matched: Vec<&str> = CONTAINER_CGROUP_TOKENS
@@ -650,8 +712,7 @@ fn is_container_environment() -> bool {
         if !matched.is_empty() {
             // If only `containerd` matched (which systemd uses for Flatpak/
             // snap sandboxing on bare metal), verify with a secondary check.
-            let only_containerd =
-                matched.len() == 1 && matched[0] == "containerd";
+            let only_containerd = matched.len() == 1 && matched[0] == "containerd";
             if !only_containerd {
                 return true;
             }
@@ -666,9 +727,7 @@ fn is_container_environment() -> bool {
             // Last check: if our PID namespace differs from the init
             // namespace, we are in a container even if only containerd
             // appeared in cgroup.
-            if let Ok(self_cgroup) =
-                std::fs::read_to_string("/proc/self/cgroup")
-            {
+            if let Ok(self_cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
                 let self_lower = self_cgroup.to_ascii_lowercase();
                 if self_lower.contains("docker")
                     || self_lower.contains("kubepods")
@@ -752,7 +811,8 @@ fn is_expected_hypervisor() -> bool {
         // Exclude Chromebooks: board_vendor/board_name both contain "Google"
         // on Chrome OS devices, but the product_name will contain "Chromebook"
         // or "Chromebox" rather than a GCP-specific identifier.
-        if board_vendor.contains("google") && board_name.contains("google")
+        if board_vendor.contains("google")
+            && board_name.contains("google")
             && !product_name.contains("chrome")
         {
             return true;
@@ -803,11 +863,20 @@ fn is_expected_hypervisor() -> bool {
 
     #[cfg(windows)]
     {
-        if let Some(key) = unsafe { reg_open_subkey(win_resolve::HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\BIOS") } {
-            let manufacturer = unsafe { reg_read_string(key, "SystemManufacturer") }.unwrap_or_default();
+        if let Some(key) = unsafe {
+            reg_open_subkey(
+                win_resolve::HKEY_LOCAL_MACHINE,
+                "HARDWARE\\DESCRIPTION\\System\\BIOS",
+            )
+        } {
+            let manufacturer =
+                unsafe { reg_read_string(key, "SystemManufacturer") }.unwrap_or_default();
             let product = unsafe { reg_read_string(key, "SystemProductName") }.unwrap_or_default();
-            let board_mfr = unsafe { reg_read_string(key, "BaseBoardManufacturer") }.unwrap_or_default();
-            unsafe { reg_close_key(key); }
+            let board_mfr =
+                unsafe { reg_read_string(key, "BaseBoardManufacturer") }.unwrap_or_default();
+            unsafe {
+                reg_close_key(key);
+            }
             let mfr = manufacturer.to_ascii_lowercase();
             let prod = product.to_ascii_lowercase();
             let board = board_mfr.to_ascii_lowercase();
@@ -978,9 +1047,7 @@ fn is_expected_hypervisor() -> bool {
                 }
 
                 if timed_out {
-                    log::debug!(
-                        "env_check: is_expected_hypervisor ioreg -l timed out after 2s"
-                    );
+                    log::debug!("env_check: is_expected_hypervisor ioreg -l timed out after 2s");
                 }
             }
         }
@@ -991,10 +1058,7 @@ fn is_expected_hypervisor() -> bool {
             .output()
         {
             let stdout = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
-            if stdout.contains("vmware")
-                || stdout.contains("parallels")
-                || stdout.contains("ec2")
-            {
+            if stdout.contains("vmware") || stdout.contains("parallels") || stdout.contains("ec2") {
                 return true;
             }
         }
@@ -1124,43 +1188,42 @@ fn is_cloud_instance() -> bool {
             }
         };
 
-        let validate_metadata_response =
-            |buf: &[u8], n: usize, allow_auth_only: bool| -> bool {
-                if !buf.starts_with(b"HTTP/1.") || n < 12 {
+        let validate_metadata_response = |buf: &[u8], n: usize, allow_auth_only: bool| -> bool {
+            if !buf.starts_with(b"HTTP/1.") || n < 12 {
+                return false;
+            }
+
+            let status = &buf[9..12];
+            if allow_auth_only {
+                if !matches!(status, b"200" | b"400" | b"401") {
                     return false;
                 }
+            } else if status != b"200" {
+                return false;
+            }
 
-                let status = &buf[9..12];
-                if allow_auth_only {
-                    if !matches!(status, b"200" | b"400" | b"401") {
+            // For HTTP 200 responses, reject HTML/captive-portal bodies and
+            // require at least one known IMDS key when a body is present.
+            if status == b"200" && n > 16 {
+                let header_end = buf[..n]
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| p + 4);
+                if let Some(body_start) = header_end {
+                    let body = &buf[body_start..n];
+                    if body.starts_with(b"<") || body.starts_with(b"<!") {
                         return false;
                     }
-                } else if status != b"200" {
-                    return false;
-                }
-
-                // For HTTP 200 responses, reject HTML/captive-portal bodies and
-                // require at least one known IMDS key when a body is present.
-                if status == b"200" && n > 16 {
-                    let header_end = buf[..n]
-                        .windows(4)
-                        .position(|w| w == b"\r\n\r\n")
-                        .map(|p| p + 4);
-                    if let Some(body_start) = header_end {
-                        let body = &buf[body_start..n];
-                        if body.starts_with(b"<") || body.starts_with(b"<!") {
-                            return false;
-                        }
-                        let body_str = String::from_utf8_lossy(body);
-                        let known_keys = ["ami-id", "instance-id", "hostname", "local-ipv4"];
-                        if !known_keys.iter().any(|k| body_str.contains(k)) {
-                            return false;
-                        }
+                    let body_str = String::from_utf8_lossy(body);
+                    let known_keys = ["ami-id", "instance-id", "hostname", "local-ipv4"];
+                    if !known_keys.iter().any(|k| body_str.contains(k)) {
+                        return false;
                     }
                 }
+            }
 
-                true
-            };
+            true
+        };
 
         // IMDSv1 attempt first.
         let imds_v1_success = {
@@ -1246,7 +1309,9 @@ fn is_cloud_instance() -> bool {
                 }
             };
 
-            let t = String::from_utf8_lossy(&buf[header_end..n]).trim().to_string();
+            let t = String::from_utf8_lossy(&buf[header_end..n])
+                .trim()
+                .to_string();
             if t.is_empty() {
                 log_probe_failure("IMDSv2 token response", &"empty token body");
                 return false;
@@ -1346,8 +1411,7 @@ fn fetch_cloud_instance_id() -> Option<String> {
 
     // IMDSv1 instance-id request.
     if let Some(mut stream) = open_stream() {
-        let req =
-            b"GET /latest/meta-data/instance-id HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n";
+        let req = b"GET /latest/meta-data/instance-id HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n";
         if stream.write_all(req).is_ok() {
             let mut buf = [0u8; 256];
             if let Ok(n) = stream.read(&mut buf) {
@@ -1373,7 +1437,9 @@ fn fetch_cloud_instance_id() -> Option<String> {
             return None;
         }
         let header_end = buf[..n].windows(4).position(|w| w == b"\r\n\r\n")? + 4;
-        let t = String::from_utf8_lossy(&buf[header_end..n]).trim().to_string();
+        let t = String::from_utf8_lossy(&buf[header_end..n])
+            .trim()
+            .to_string();
         if t.is_empty() {
             return None;
         }
@@ -1485,8 +1551,11 @@ pub fn get_ram_gb() -> u64 {
     #[cfg(windows)]
     unsafe {
         let global_memory_status_ex: win_resolve::FnGlobalMemoryStatusEx =
-            win_resolve::resolve_api(pe_resolve::HASH_KERNEL32_DLL, win_resolve::HASH_GLOBALMEMORYSTATUSEX)
-                .expect("GlobalMemoryStatusEx not found");
+            win_resolve::resolve_api(
+                pe_resolve::HASH_KERNEL32_DLL,
+                win_resolve::HASH_GLOBALMEMORYSTATUSEX,
+            )
+            .expect("GlobalMemoryStatusEx not found");
         let mut mem: win_resolve::MemoryStatusEx = std::mem::zeroed();
         mem.dw_length = std::mem::size_of::<win_resolve::MemoryStatusEx>() as u32;
         if global_memory_status_ex(&mut mem) != 0 {
@@ -1520,8 +1589,11 @@ pub fn get_uptime_secs() -> u64 {
     #[cfg(windows)]
     {
         let get_tick_count_64: win_resolve::FnGetTickCount64 = unsafe {
-            win_resolve::resolve_api(pe_resolve::HASH_KERNEL32_DLL, win_resolve::HASH_GETTICKCOUNT64)
-                .expect("GetTickCount64 not found")
+            win_resolve::resolve_api(
+                pe_resolve::HASH_KERNEL32_DLL,
+                win_resolve::HASH_GETTICKCOUNT64,
+            )
+            .expect("GetTickCount64 not found")
         };
         unsafe { get_tick_count_64() / 1000 }
     }
@@ -1551,7 +1623,6 @@ pub fn detect_vm() -> bool {
     let indicators = collect_indicators();
     let (is_sandbox, _) = evaluate_sandbox_score(&indicators);
     is_sandbox
-
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1753,30 +1824,37 @@ pub fn collect_indicators() -> Vec<common::SandboxIndicator> {
 pub fn evaluate_sandbox_score(
     indicators: &[common::SandboxIndicator],
 ) -> (bool, Vec<common::SandboxIndicator>) {
-    let cloud_hypervisor = indicators.iter().any(|i| {
-        i.category == "cloud_bios" && i.detail.contains("DMI/registry")
-    });
-    let cloud_imds = indicators.iter().any(|i| {
-        i.category == "cloud_bios" && i.detail.contains("IMDS")
-    });
+    let cloud_hypervisor = indicators
+        .iter()
+        .any(|i| i.category == "cloud_bios" && i.detail.contains("DMI/registry"));
+    let cloud_imds = indicators
+        .iter()
+        .any(|i| i.category == "cloud_bios" && i.detail.contains("IMDS"));
 
     let total_weight: u32 = indicators.iter().map(|i| i.weight).sum();
     let heuristic_weight: u32 = indicators
         .iter()
-        .filter(|i| matches!(i.source.as_str(), "mouse" | "desktop" | "uptime" | "hardware"))
+        .filter(|i| {
+            matches!(
+                i.source.as_str(),
+                "mouse" | "desktop" | "uptime" | "hardware"
+            )
+        })
         .map(|i| i.weight)
         .sum();
-    let has_vm_artifact_signal = indicators
-        .iter()
-        .any(|i| matches!(i.source.as_str(), "cpuid" | "dmi" | "registry" | "mac" | "imds"));
+    let has_vm_artifact_signal = indicators.iter().any(|i| {
+        matches!(
+            i.source.as_str(),
+            "cpuid" | "dmi" | "registry" | "mac" | "imds"
+        )
+    });
 
     // Adaptive threshold (mirrors the original detect_vm logic).
-    let hypervisor_bit_set = indicators.iter().any(|i| {
-        i.category == "hypervisor" && i.detail.contains("CPUID")
-    });
-    let likely_legitimate_server = hypervisor_bit_set
-        && get_ram_gb() > 4
-        && get_uptime_secs() > 24 * 3600;
+    let hypervisor_bit_set = indicators
+        .iter()
+        .any(|i| i.category == "hypervisor" && i.detail.contains("CPUID"));
+    let likely_legitimate_server =
+        hypervisor_bit_set && get_ram_gb() > 4 && get_uptime_secs() > 24 * 3600;
 
     let high_threshold_mode = crate::config::load_config()
         .map(|c| c.malleable_profile.vm_detection_high_threshold_mode)
@@ -1929,13 +2007,43 @@ fn linux_dmi_indicates_vm_detailed(indicators: &mut Vec<common::SandboxIndicator
         "/sys/class/dmi/id/bios_vendor",
     ];
     let needles = [
-        (String::from_utf8_lossy(&string_crypt::enc_str!("qemu")).trim_end_matches('\0').to_string(), "QEMU"),
-        (String::from_utf8_lossy(&string_crypt::enc_str!("kvm")).trim_end_matches('\0').to_string(), "KVM"),
-        (String::from_utf8_lossy(&string_crypt::enc_str!("vmware")).trim_end_matches('\0').to_string(), "VMware"),
-        (String::from_utf8_lossy(&string_crypt::enc_str!("virtualbox")).trim_end_matches('\0').to_string(), "VirtualBox"),
+        (
+            String::from_utf8_lossy(&string_crypt::enc_str!("qemu"))
+                .trim_end_matches('\0')
+                .to_string(),
+            "QEMU",
+        ),
+        (
+            String::from_utf8_lossy(&string_crypt::enc_str!("kvm"))
+                .trim_end_matches('\0')
+                .to_string(),
+            "KVM",
+        ),
+        (
+            String::from_utf8_lossy(&string_crypt::enc_str!("vmware"))
+                .trim_end_matches('\0')
+                .to_string(),
+            "VMware",
+        ),
+        (
+            String::from_utf8_lossy(&string_crypt::enc_str!("virtualbox"))
+                .trim_end_matches('\0')
+                .to_string(),
+            "VirtualBox",
+        ),
         ("vbox".to_string(), "VirtualBox"),
-        (String::from_utf8_lossy(&string_crypt::enc_str!("xen")).trim_end_matches('\0').to_string(), "Xen"),
-        (String::from_utf8_lossy(&string_crypt::enc_str!("hyperv")).trim_end_matches('\0').to_string(), "Hyper-V"),
+        (
+            String::from_utf8_lossy(&string_crypt::enc_str!("xen"))
+                .trim_end_matches('\0')
+                .to_string(),
+            "Xen",
+        ),
+        (
+            String::from_utf8_lossy(&string_crypt::enc_str!("hyperv"))
+                .trim_end_matches('\0')
+                .to_string(),
+            "Hyper-V",
+        ),
         ("innotek".to_string(), "VirtualBox (innotek)"),
     ];
     let mut ms_vendor = false;
@@ -2170,12 +2278,16 @@ fn windows_registry_indicates_vm() -> bool {
                 if let Some(v) = unsafe { reg_read_string(key, value) } {
                     let upper = v.to_ascii_uppercase();
                     if needles.iter().any(|n| upper.contains(n)) {
-                        unsafe { reg_close_key(key); }
+                        unsafe {
+                            reg_close_key(key);
+                        }
                         return true;
                     }
                 }
             }
-            unsafe { reg_close_key(key); }
+            unsafe {
+                reg_close_key(key);
+            }
         }
     }
     false
@@ -2185,7 +2297,12 @@ fn windows_registry_indicates_vm() -> bool {
 /// `SandboxIndicator`s instead of returning a boolean.
 #[cfg(windows)]
 fn windows_registry_indicates_vm_detailed(indicators: &mut Vec<common::SandboxIndicator>) -> bool {
-    let needles = [("VBOX", "VirtualBox"), ("VMWARE", "VMware"), ("QEMU", "QEMU"), ("XEN", "Xen")];
+    let needles = [
+        ("VBOX", "VirtualBox"),
+        ("VMWARE", "VMware"),
+        ("QEMU", "QEMU"),
+        ("XEN", "Xen"),
+    ];
     let mut found = false;
     for path in [
         "HARDWARE\\DESCRIPTION\\System",
@@ -2203,7 +2320,9 @@ fn windows_registry_indicates_vm_detailed(indicators: &mut Vec<common::SandboxIn
                         if upper.contains(needle) {
                             indicators.push(common::SandboxIndicator {
                                 category: "hypervisor".to_string(),
-                                detail: format!("{label} detected in registry HKLM\\{path}\\{value}"),
+                                detail: format!(
+                                    "{label} detected in registry HKLM\\{path}\\{value}"
+                                ),
                                 weight: 25,
                                 source: "registry".to_string(),
                             });
@@ -2212,7 +2331,9 @@ fn windows_registry_indicates_vm_detailed(indicators: &mut Vec<common::SandboxIn
                     }
                 }
             }
-            unsafe { reg_close_key(key); }
+            unsafe {
+                reg_close_key(key);
+            }
         }
     }
     found
@@ -2221,7 +2342,9 @@ fn windows_registry_indicates_vm_detailed(indicators: &mut Vec<common::SandboxIn
 /// Detailed version of [`macos_system_profiler_indicates_vm`] that pushes
 /// individual `SandboxIndicator`s instead of returning a boolean.
 #[cfg(target_os = "macos")]
-fn macos_system_profiler_indicates_vm_detailed(indicators: &mut Vec<common::SandboxIndicator>) -> bool {
+fn macos_system_profiler_indicates_vm_detailed(
+    indicators: &mut Vec<common::SandboxIndicator>,
+) -> bool {
     let mut found = false;
 
     // sysctl hw.model
@@ -2352,8 +2475,7 @@ fn mac_prefix_indicates_vm() -> bool {
     // On Windows use GetAdaptersAddresses to read physical MAC addresses.
     #[cfg(windows)]
     {
-        let (virtual_count, total) =
-            windows_mac_prefix_counts(virtual_prefixes, excluded_prefixes);
+        let (virtual_count, total) = windows_mac_prefix_counts(virtual_prefixes, excluded_prefixes);
         if majority(virtual_count, total) {
             return true;
         }
@@ -2385,8 +2507,8 @@ fn mac_prefix_indicates_vm() -> bool {
                         //   => raw offset from sdl = 8 + sdl_nlen
                         const SDL_DATA_OFFSET: isize = 8;
                         let sdl_nlen = (*sdl).sdl_nlen as isize;
-                        let mac_ptr = (sdl as *const u8)
-                            .offset(SDL_DATA_OFFSET + sdl_nlen) as *const u8;
+                        let mac_ptr =
+                            (sdl as *const u8).offset(SDL_DATA_OFFSET + sdl_nlen) as *const u8;
                         let alen = (*sdl).sdl_alen as usize;
                         if alen >= 3 {
                             let mac = std::slice::from_raw_parts(mac_ptr, 3);
@@ -2428,8 +2550,13 @@ fn mac_prefix_indicators(indicators: &mut Vec<common::SandboxIndicator>) {
         [0x00, 0x1C, 0x42],   // Parallels
     ];
     let virtual_labels: &[&str] = &[
-        "VirtualBox", "VMware", "VMware", "Hyper-V/Azure",
-        "KVM/QEMU", "Xen", "Parallels",
+        "VirtualBox",
+        "VMware",
+        "VMware",
+        "Hyper-V/Azure",
+        "KVM/QEMU",
+        "Xen",
+        "Parallels",
     ];
     let excluded_prefixes: &[[u8; 3]] = &[
         [0x00, 0x50, 0xB6], // ASIX Electronics
@@ -2456,12 +2583,16 @@ fn mac_prefix_indicators(indicators: &mut Vec<common::SandboxIndicator>) {
                 let name = entry.file_name().to_string_lossy().to_string();
                 let addr_path = entry.path().join("address");
                 if let Ok(addr) = std::fs::read_to_string(&addr_path) {
-                    let bytes: Vec<u8> = addr.trim().split(':')
+                    let bytes: Vec<u8> = addr
+                        .trim()
+                        .split(':')
                         .filter_map(|h| u8::from_str_radix(h, 16).ok())
                         .collect();
                     if bytes.len() >= 3 {
                         let prefix = [bytes[0], bytes[1], bytes[2]];
-                        if excluded_prefixes.contains(&prefix) { continue; }
+                        if excluded_prefixes.contains(&prefix) {
+                            continue;
+                        }
                         total += 1;
                         if let Some(idx) = virtual_prefixes.iter().position(|p| *p == prefix) {
                             virtual_count += 1;
@@ -2499,10 +2630,17 @@ fn mac_prefix_indicators(indicators: &mut Vec<common::SandboxIndicator>) {
                             let prefix = [mac[0], mac[1], mac[2]];
                             if !excluded_prefixes.contains(&prefix) {
                                 total += 1;
-                                if let Some(idx) = virtual_prefixes.iter().position(|p| *p == prefix) {
+                                if let Some(idx) =
+                                    virtual_prefixes.iter().position(|p| *p == prefix)
+                                {
                                     virtual_count += 1;
-                                    let ifname = std::ffi::CStr::from_ptr((*sdl).sdl_data.as_ptr() as *const libc::c_char);
-                                    virtual_nics.push((ifname.to_string_lossy().to_string(), virtual_labels[idx]));
+                                    let ifname = std::ffi::CStr::from_ptr(
+                                        (*sdl).sdl_data.as_ptr() as *const libc::c_char
+                                    );
+                                    virtual_nics.push((
+                                        ifname.to_string_lossy().to_string(),
+                                        virtual_labels[idx],
+                                    ));
                                 }
                             }
                         }
@@ -2528,9 +2666,7 @@ fn mac_prefix_indicators(indicators: &mut Vec<common::SandboxIndicator>) {
         if virtual_nics.is_empty() && virtual_count > 0 {
             indicators.push(common::SandboxIndicator {
                 category: "mac_prefix".to_string(),
-                detail: format!(
-                    "{virtual_count}/{total} NICs have virtual OUI (majority vote)"
-                ),
+                detail: format!("{virtual_count}/{total} NICs have virtual OUI (majority vote)"),
                 weight: 20,
                 source: "mac".to_string(),
             });
@@ -2568,7 +2704,8 @@ fn windows_mac_prefix_counts(
             win_resolve::IPHLPAPI_DLL_W,
             win_resolve::HASH_IPHLPAPI_DLL,
             win_resolve::HASH_GETADAPTERSADDRESSES,
-        ).expect("GetAdaptersAddresses not found")
+        )
+        .expect("GetAdaptersAddresses not found")
     };
 
     unsafe {
@@ -2702,9 +2839,7 @@ fn is_tracer_process_running() -> bool {
 
             scanned += 1;
             if scanned > 200 {
-                log::debug!(
-                    "env_check: /proc tracer scan reached 200-process limit; stopping"
-                );
+                log::debug!("env_check: /proc tracer scan reached 200-process limit; stopping");
                 break;
             }
 
@@ -2722,7 +2857,9 @@ fn is_tracer_process_running() -> bool {
                     proc_name = Some(name.trim());
                 } else if let Some(uid_field) = line.strip_prefix("Uid:") {
                     // Uid: real  effective  saved  fs
-                    proc_uid = uid_field.split_whitespace().next()
+                    proc_uid = uid_field
+                        .split_whitespace()
+                        .next()
                         .and_then(|s| s.parse::<u32>().ok());
                 }
                 if proc_name.is_some() && proc_uid.is_some() {
@@ -2783,8 +2920,11 @@ fn detect_timing_anomaly() -> bool {
     {
         use crate::win_types::FILETIME;
         let get_system_times: win_resolve::FnGetSystemTimes = unsafe {
-            win_resolve::resolve_api(pe_resolve::HASH_KERNEL32_DLL, win_resolve::HASH_GETSYSTEMTIMES)
-                .expect("GetSystemTimes not found")
+            win_resolve::resolve_api(
+                pe_resolve::HASH_KERNEL32_DLL,
+                win_resolve::HASH_GETSYSTEMTIMES,
+            )
+            .expect("GetSystemTimes not found")
         };
         let mut idle = FILETIME {
             dw_low_date_time: 0,
@@ -2801,8 +2941,9 @@ fn detect_timing_anomaly() -> bool {
         unsafe {
             get_system_times(&mut idle, &mut kernel, &mut user);
         }
-        let to_u64 =
-            |ft: FILETIME| -> u64 { ((ft.dw_high_date_time as u64) << 32) | ft.dw_low_date_time as u64 };
+        let to_u64 = |ft: FILETIME| -> u64 {
+            ((ft.dw_high_date_time as u64) << 32) | ft.dw_low_date_time as u64
+        };
         let idle0 = to_u64(idle);
         std::thread::sleep(std::time::Duration::from_millis(50));
         let mut idle2 = FILETIME {
@@ -2946,9 +3087,16 @@ fn current_domain() -> Option<String> {
 
 #[cfg(windows)]
 fn windows_computer_domain() -> Option<String> {
-    let key = unsafe { reg_open_subkey(win_resolve::HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters") }?;
+    let key = unsafe {
+        reg_open_subkey(
+            win_resolve::HKEY_LOCAL_MACHINE,
+            "SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters",
+        )
+    }?;
     let domain = unsafe { reg_read_string(key, "Domain") }?;
-    unsafe { reg_close_key(key); }
+    unsafe {
+        reg_close_key(key);
+    }
     if domain.is_empty() {
         None
     } else {
@@ -2965,7 +3113,12 @@ fn windows_computer_domain() -> Option<String> {
 /// as the effective domain for `validate_domain` comparison.
 #[cfg(windows)]
 fn windows_aad_domain() -> Option<String> {
-    let join_info = unsafe { reg_open_subkey(win_resolve::HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\CloudDomainJoin\\JoinInfo") }?;
+    let join_info = unsafe {
+        reg_open_subkey(
+            win_resolve::HKEY_LOCAL_MACHINE,
+            "SYSTEM\\CurrentControlSet\\Control\\CloudDomainJoin\\JoinInfo",
+        )
+    }?;
     // Enumerate tenant subkeys (each is a GUID-formatted key).
     for name in unsafe { reg_enum_subkey_names(join_info) } {
         if let Some(subkey) = unsafe { reg_open_subkey(join_info, &name) } {
@@ -2973,8 +3126,12 @@ fn windows_aad_domain() -> Option<String> {
             if let Some(email) = unsafe { reg_read_string(subkey, "UserEmail") } {
                 if let Some(domain_part) = email.splitn(2, '@').nth(1) {
                     if !domain_part.is_empty() {
-                        unsafe { reg_close_key(subkey); }
-                        unsafe { reg_close_key(join_info); }
+                        unsafe {
+                            reg_close_key(subkey);
+                        }
+                        unsafe {
+                            reg_close_key(join_info);
+                        }
                         return Some(domain_part.to_string());
                     }
                 }
@@ -2982,15 +3139,23 @@ fn windows_aad_domain() -> Option<String> {
             // Fall back to TenantId as an opaque tenant identifier.
             if let Some(tenant) = unsafe { reg_read_string(subkey, "TenantId") } {
                 if !tenant.is_empty() {
-                    unsafe { reg_close_key(subkey); }
-                    unsafe { reg_close_key(join_info); }
+                    unsafe {
+                        reg_close_key(subkey);
+                    }
+                    unsafe {
+                        reg_close_key(join_info);
+                    }
                     return Some(tenant);
                 }
             }
-            unsafe { reg_close_key(subkey); }
+            unsafe {
+                reg_close_key(subkey);
+            }
         }
     }
-    unsafe { reg_close_key(join_info); }
+    unsafe {
+        reg_close_key(join_info);
+    }
     None
 }
 
@@ -3214,7 +3379,10 @@ mod tests {
     fn strict_domain_match_is_case_insensitive() {
         assert!(validate_domain_pair("CORP.EXAMPLE.COM", "corp.example.com"));
         assert!(validate_domain_pair("corp.example.com", "CORP.EXAMPLE.COM"));
-        assert!(!validate_domain_pair("corp.example.com", "other.example.com"));
+        assert!(!validate_domain_pair(
+            "corp.example.com",
+            "other.example.com"
+        ));
         // Empty required domain should never match (not configured).
         assert!(!validate_domain_pair("corp.example.com", ""));
     }
@@ -3223,7 +3391,10 @@ mod tests {
     #[test]
     fn strict_domain_does_not_match_subdomain() {
         // "workstation.corp.example.com" is not the same as "corp.example.com".
-        assert!(!validate_domain_pair("workstation.corp.example.com", "corp.example.com"));
+        assert!(!validate_domain_pair(
+            "workstation.corp.example.com",
+            "corp.example.com"
+        ));
     }
 
     fn validate_domain_pair(observed: &str, required: &str) -> bool {
@@ -3287,18 +3458,24 @@ mod tests {
     #[test]
     fn cloud_ci_environment_does_not_auto_refuse() {
         let report = EnvReport {
-            vm_detected: true,     // Cloud hypervisor detected.
-            sandbox_score: 45,     // Moderate score from headless probe.
-            domain_match: None,    // No domain requirement configured.
+            vm_detected: true,  // Cloud hypervisor detected.
+            sandbox_score: 45,  // Moderate score from headless probe.
+            domain_match: None, // No domain requirement configured.
             ..EnvReport::default()
         };
-        assert!(!report.should_refuse(false, false, None),
-            "cloud/CI vm_detected=true must not refuse with default policy");
-        assert!(!report.should_refuse(false, false, Some(60)),
-            "sandbox score 45 must not trigger threshold 60");
+        assert!(
+            !report.should_refuse(false, false, None),
+            "cloud/CI vm_detected=true must not refuse with default policy"
+        );
+        assert!(
+            !report.should_refuse(false, false, Some(60)),
+            "sandbox score 45 must not trigger threshold 60"
+        );
         // Only refuses if both flags are explicitly set.
-        assert!(report.should_refuse(false, true, None),
-            "refuse_in_vm=true must still refuse");
+        assert!(
+            report.should_refuse(false, true, None),
+            "refuse_in_vm=true must still refuse"
+        );
     }
 
     // ── macOS headless / CI ───────────────────────────────────────────────────
@@ -3315,9 +3492,14 @@ mod tests {
         let score = sandbox::evaluate_sandbox().unwrap_or(0);
         // We can't assert an exact value (depends on uptime/hw of the runner),
         // but a headless system should not exceed the strict threshold 60.
-        let report = EnvReport { sandbox_score: score, ..EnvReport::default() };
-        assert!(!report.should_refuse(false, false, Some(60)),
-            "headless macOS sandbox score {score} should not exceed threshold 60");
+        let report = EnvReport {
+            sandbox_score: score,
+            ..EnvReport::default()
+        };
+        assert!(
+            !report.should_refuse(false, false, Some(60)),
+            "headless macOS sandbox score {score} should not exceed threshold 60"
+        );
     }
 }
 

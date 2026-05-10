@@ -52,9 +52,7 @@ pub fn flatten_control_flow(code: &[u8], rng: &mut ChaCha8Rng) -> Vec<u8> {
     let (state_reg32, state_reg64) = match pick_state_register(&instructions) {
         Some(r) => r,
         None => {
-            log::debug!(
-                "cfflatten: no free state register in R8D-R15D; returning input unchanged"
-            );
+            log::debug!("cfflatten: no free state register in R8D-R15D; returning input unchanged");
             return code.to_vec();
         }
     };
@@ -382,8 +380,8 @@ fn emit_state_write_guarded(
     popfq.set_ip(next_extra());
     out.push(popfq);
 
-    let mut mov_state =
-        Instruction::with2(Code::Mov_r32_imm32, state_reg32, state_id as i32).expect("MOV state, imm32");
+    let mut mov_state = Instruction::with2(Code::Mov_r32_imm32, state_reg32, state_id as i32)
+        .expect("MOV state, imm32");
     mov_state.set_ip(next_extra());
     out.push(mov_state);
 }
@@ -450,14 +448,76 @@ fn is_unconditional_terminator(inst: &Instruction) -> bool {
 fn pick_state_register(instructions: &[Instruction]) -> Option<(Register, Register)> {
     // Candidate state registers in preferred order.
     const CANDIDATES: &[(Register, Register, [Register; 4])] = &[
-        (Register::R15D, Register::R15, [Register::R15, Register::R15D, Register::R15W, Register::R15L]),
-        (Register::R14D, Register::R14, [Register::R14, Register::R14D, Register::R14W, Register::R14L]),
-        (Register::R13D, Register::R13, [Register::R13, Register::R13D, Register::R13W, Register::R13L]),
-        (Register::R12D, Register::R12, [Register::R12, Register::R12D, Register::R12W, Register::R12L]),
-        (Register::R11D, Register::R11, [Register::R11, Register::R11D, Register::R11W, Register::R11L]),
-        (Register::R10D, Register::R10, [Register::R10, Register::R10D, Register::R10W, Register::R10L]),
-        (Register::R9D, Register::R9, [Register::R9, Register::R9D, Register::R9W, Register::R9L]),
-        (Register::R8D, Register::R8, [Register::R8, Register::R8D, Register::R8W, Register::R8L]),
+        (
+            Register::R15D,
+            Register::R15,
+            [
+                Register::R15,
+                Register::R15D,
+                Register::R15W,
+                Register::R15L,
+            ],
+        ),
+        (
+            Register::R14D,
+            Register::R14,
+            [
+                Register::R14,
+                Register::R14D,
+                Register::R14W,
+                Register::R14L,
+            ],
+        ),
+        (
+            Register::R13D,
+            Register::R13,
+            [
+                Register::R13,
+                Register::R13D,
+                Register::R13W,
+                Register::R13L,
+            ],
+        ),
+        (
+            Register::R12D,
+            Register::R12,
+            [
+                Register::R12,
+                Register::R12D,
+                Register::R12W,
+                Register::R12L,
+            ],
+        ),
+        (
+            Register::R11D,
+            Register::R11,
+            [
+                Register::R11,
+                Register::R11D,
+                Register::R11W,
+                Register::R11L,
+            ],
+        ),
+        (
+            Register::R10D,
+            Register::R10,
+            [
+                Register::R10,
+                Register::R10D,
+                Register::R10W,
+                Register::R10L,
+            ],
+        ),
+        (
+            Register::R9D,
+            Register::R9,
+            [Register::R9, Register::R9D, Register::R9W, Register::R9L],
+        ),
+        (
+            Register::R8D,
+            Register::R8,
+            [Register::R8, Register::R8D, Register::R8W, Register::R8L],
+        ),
     ];
 
     for &(reg32, reg64, family) in CANDIDATES {

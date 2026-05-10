@@ -24,8 +24,8 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 
 use crate::substitute_aarch64::{
-    classify, finalize, is_pcrel_data, is_terminator, pc_rel_branch_disp,
-    BranchKind, Item, ItemKind, SyntheticTarget,
+    classify, finalize, is_pcrel_data, is_terminator, pc_rel_branch_disp, BranchKind, Item,
+    ItemKind, SyntheticTarget,
 };
 
 // ─── ARM64 instruction encoding helpers ────────────────────────────────────
@@ -346,8 +346,10 @@ fn split_into_basic_blocks(raw_words: &[u32]) -> Vec<BasicBlock> {
             }
         }
         // Conditional branches, BL, and BLR fall through.
-        if matches!(kind, BranchKind::PcRelCond | BranchKind::PcRelBL | BranchKind::BlrIndirect)
-            && i + 1 < n
+        if matches!(
+            kind,
+            BranchKind::PcRelCond | BranchKind::PcRelBL | BranchKind::BlrIndirect
+        ) && i + 1 < n
         {
             is_leader[i + 1] = true;
         }
@@ -389,8 +391,7 @@ fn all_direct_targets_internal(
         match kind {
             BranchKind::PcRelB => {
                 if let Some(disp) = pc_rel_branch_disp(last) {
-                    let target_off =
-                        ((last_idx as i64) * 4 + disp as i64) as u32;
+                    let target_off = ((last_idx as i64) * 4 + disp as i64) as u32;
                     if !off_to_block.contains_key(&target_off) {
                         return false;
                     }
@@ -398,8 +399,7 @@ fn all_direct_targets_internal(
             }
             BranchKind::PcRelCond => {
                 if let Some(disp) = pc_rel_branch_disp(last) {
-                    let target_off =
-                        ((last_idx as i64) * 4 + disp as i64) as u32;
+                    let target_off = ((last_idx as i64) * 4 + disp as i64) as u32;
                     if !off_to_block.contains_key(&target_off) {
                         return false;
                     }
@@ -454,27 +454,23 @@ fn lower_block(
 
     // Lower the terminator.
     match last_kind {
-        BranchKind::PcRelCond => {
-            lower_conditional_branch(
-                last_raw,
-                last_idx,
-                block,
-                off_to_block,
-                state_ids,
-                state_reg,
-                &mut items,
-            )
-        }
-        BranchKind::PcRelB => {
-            lower_unconditional_branch(
-                last_raw,
-                last_idx,
-                off_to_block,
-                state_ids,
-                state_reg,
-                &mut items,
-            )
-        }
+        BranchKind::PcRelCond => lower_conditional_branch(
+            last_raw,
+            last_idx,
+            block,
+            off_to_block,
+            state_ids,
+            state_reg,
+            &mut items,
+        ),
+        BranchKind::PcRelB => lower_unconditional_branch(
+            last_raw,
+            last_idx,
+            off_to_block,
+            state_ids,
+            state_reg,
+            &mut items,
+        ),
         BranchKind::Ret | BranchKind::BrIndirect => {
             // Preserve RET and BR as-is.
             items.push(Item {
@@ -755,14 +751,8 @@ mod tests {
     #[test]
     fn empty_and_misaligned_passthrough() {
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        assert_eq!(
-            flatten_control_flow(&[], &mut rng),
-            Vec::<u8>::new()
-        );
-        assert_eq!(
-            flatten_control_flow(&[1, 2, 3], &mut rng),
-            vec![1, 2, 3]
-        );
+        assert_eq!(flatten_control_flow(&[], &mut rng), Vec::<u8>::new());
+        assert_eq!(flatten_control_flow(&[1, 2, 3], &mut rng), vec![1, 2, 3]);
     }
 
     #[test]

@@ -19,8 +19,10 @@ impl Injector for RemoteThreadInjector {
             PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
             PROCESS_VM_WRITE,
         };
-        let access_mask = PROCESS_VM_OPERATION | PROCESS_VM_WRITE
-            | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION;
+        let access_mask = PROCESS_VM_OPERATION
+            | PROCESS_VM_WRITE
+            | PROCESS_CREATE_THREAD
+            | PROCESS_QUERY_INFORMATION;
 
         crate::injection::nt_create_thread_inject(pid, payload, access_mask, "RemoteThread")
     }

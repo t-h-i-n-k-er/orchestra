@@ -68,9 +68,15 @@ async fn soak_handler_dispatch() {
                     path: "/tmp".into(),
                 },
             ] {
-                let _ =
-                    agent::handlers::handle_command(crypto.clone(), config.clone(), cmd, "admin", out_tx.clone(), p2p_mesh.clone())
-                        .await;
+                let _ = agent::handlers::handle_command(
+                    crypto.clone(),
+                    config.clone(),
+                    cmd,
+                    "admin",
+                    out_tx.clone(),
+                    p2p_mesh.clone(),
+                )
+                .await;
                 iterations += 1;
             }
 

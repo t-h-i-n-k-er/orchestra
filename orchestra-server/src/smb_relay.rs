@@ -30,9 +30,9 @@
 //! On non-Windows platforms this module compiles to a no-op stub that logs a
 //! warning when `run()` is called.
 
-use anyhow::Result;
 #[cfg(windows)]
 use anyhow::anyhow;
+use anyhow::Result;
 #[cfg(windows)]
 use tokio::net::TcpStream;
 
@@ -51,10 +51,7 @@ mod imp {
 
     /// Read one length-prefixed frame from a synchronous file handle.
     #[allow(dead_code)]
-    fn read_frame_sync(
-        handle: PipeHandle,
-        buf: &mut Vec<u8>,
-    ) -> Result<()> {
+    fn read_frame_sync(handle: PipeHandle, buf: &mut Vec<u8>) -> Result<()> {
         buf.clear();
 
         // Read 4-byte length prefix.
@@ -73,10 +70,7 @@ mod imp {
 
     /// Write one length-prefixed frame to a synchronous file handle.
     #[allow(dead_code)]
-    fn write_frame_sync(
-        handle: PipeHandle,
-        data: &[u8],
-    ) -> Result<()> {
+    fn write_frame_sync(handle: PipeHandle, data: &[u8]) -> Result<()> {
         let len_bytes = (data.len() as u32).to_le_bytes();
         write_all_sync(handle, &len_bytes)?;
         write_all_sync(handle, data)?;
@@ -145,10 +139,7 @@ mod imp {
         out_size: u32,
         in_size: u32,
     ) -> Result<usize> {
-        let wide_name: Vec<u16> = pipe_name
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
+        let wide_name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
 
         let handle = unsafe {
             winapi::um::namedpipeapi::CreateNamedPipeW(
@@ -287,10 +278,7 @@ async fn run_windows(
 /// - **tcp_to_pipe**: reads frames from the TCP socket (async) and writes
 ///   them to the pipe handle (blocking).
 #[cfg(windows)]
-async fn bridge_connection(
-    pipe_handle_raw: usize,
-    agent_addr: std::net::SocketAddr,
-) -> Result<()> {
+async fn bridge_connection(pipe_handle_raw: usize, agent_addr: std::net::SocketAddr) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
 
@@ -387,12 +375,7 @@ async fn bridge_connection(
     });
 
     // Wait for any direction to finish (both will when one side closes).
-    let _ = tokio::try_join!(
-        pipe_to_tcp,
-        pipe_reader,
-        tcp_reader,
-        pipe_writer,
-    );
+    let _ = tokio::try_join!(pipe_to_tcp, pipe_reader, tcp_reader, pipe_writer,);
 
     Ok(())
 }

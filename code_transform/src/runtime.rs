@@ -87,12 +87,7 @@ mod linux_impl {
     /// # Safety
     /// Caller must ensure `fn_ptr` points to a valid function and no thread
     /// is executing it concurrently.
-    unsafe fn patch_in_place(
-        fn_ptr: *mut u8,
-        fn_len: usize,
-        transformed: &[u8],
-        page_size: usize,
-    ) {
+    unsafe fn patch_in_place(fn_ptr: *mut u8, fn_len: usize, transformed: &[u8], page_size: usize) {
         use libc::{mprotect, PROT_EXEC, PROT_READ, PROT_WRITE};
 
         let page_start = (fn_ptr as usize) & !(page_size - 1);
@@ -105,7 +100,11 @@ mod linux_impl {
 
         // NOP-pad any remaining bytes from the old body.
         if transformed.len() < fn_len {
-            std::ptr::write_bytes(fn_ptr.add(transformed.len()), 0x90, fn_len - transformed.len());
+            std::ptr::write_bytes(
+                fn_ptr.add(transformed.len()),
+                0x90,
+                fn_len - transformed.len(),
+            );
         }
 
         mprotect(page_start as *mut _, mmap_len, PROT_READ | PROT_EXEC);

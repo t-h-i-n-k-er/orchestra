@@ -19,21 +19,23 @@
 //!                             legal_copyright, comments, file_version_name,
 //!                             clone_from)
 
-use builder::pe_artifact_kit;
 use builder::config::VersionInfoConfig;
+use builder::pe_artifact_kit;
 use std::env;
 use std::fs;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <input_pe> <output_pe> [--strip-signature] [--strip-debug] \
+        eprintln!(
+            "Usage: {} <input_pe> <output_pe> [--strip-signature] [--strip-debug] \
                   [--manifest <preset>] [--icon <path>] [--version-info <json>]",
-                  args[0]);
+            args[0]
+        );
         std::process::exit(1);
     }
 
-    let input_path  = &args[1];
+    let input_path = &args[1];
     let output_path = &args[2];
 
     // Parse optional flags.
@@ -46,8 +48,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
-            "--strip-signature" => { strip_signature = true; }
-            "--strip-debug"     => { strip_debug = true; }
+            "--strip-signature" => {
+                strip_signature = true;
+            }
+            "--strip-debug" => {
+                strip_debug = true;
+            }
             "--manifest" => {
                 i += 1;
                 if i >= args.len() {
@@ -72,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 version_info = Some(
                     serde_json::from_str(&args[i])
-                        .map_err(|e| format!("Invalid --version-info JSON: {e}"))?
+                        .map_err(|e| format!("Invalid --version-info JSON: {e}"))?,
                 );
             }
             other => {

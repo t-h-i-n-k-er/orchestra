@@ -45,9 +45,7 @@ fn write_u32_le(buf: &mut [u8], off: usize, val: u32) {
 
 /// Returns `(pe_offset, file_header_offset, optional_header_offset,
 ///          sections_table_offset, num_sections, is_pe32_plus)`.
-fn parse_pe_offsets(
-    buf: &[u8],
-) -> Result<(usize, usize, usize, usize, usize, bool)> {
+fn parse_pe_offsets(buf: &[u8]) -> Result<(usize, usize, usize, usize, usize, bool)> {
     let pe = PE::parse(buf).context("Failed to parse PE header")?;
     let pe_off = pe.header.dos_header.pe_pointer as usize;
     let fh_off = pe_off + 4;
@@ -137,11 +135,11 @@ pub fn remove_rich_header(buf: &mut Vec<u8>) {
     // We use common MSVC product/comp IDs that appear in real binaries.
     // Each entry is 8 bytes: comp_id(u16) | prod_id(u16) | count(u32), all XOR'd.
     let entries: &[(u16, u16, u32)] = &[
-        (0x0001, 0x0000, 3),   // Import0 (linker)
-        (0x0159, 0x0001, 38),  // CVTRES (res converter, VS 14.0+)
-        (0x8002, 0x0001, 1),   // LINK (linker)
-        (0x8009, 0x0001, 1),   // LINK (alt)
-        (0xF1AD, 0x0001, 2),   // Unknown object
+        (0x0001, 0x0000, 3),  // Import0 (linker)
+        (0x0159, 0x0001, 38), // CVTRES (res converter, VS 14.0+)
+        (0x8002, 0x0001, 1),  // LINK (linker)
+        (0x8009, 0x0001, 1),  // LINK (alt)
+        (0xF1AD, 0x0001, 2),  // Unknown object
     ];
 
     let mut rich = Vec::with_capacity(pe_off - dos_stub_end);
@@ -403,8 +401,7 @@ pub fn replace_pdb_path(buf: &mut Vec<u8>) {
                             // Clear old path.
                             buf[path_start..path_end.min(buf_len)].fill(0);
                             // Write new path.
-                            buf[path_start..path_start + pdb_path.len()]
-                                .copy_from_slice(pdb_path);
+                            buf[path_start..path_start + pdb_path.len()].copy_from_slice(pdb_path);
                         }
                     }
                 }
@@ -566,17 +563,17 @@ fn build_vs_versioninfo(cfg: &VersionInfoConfig) -> Vec<u8> {
     let mut fixed = Vec::with_capacity(52);
     fixed.extend_from_slice(&0xFEEF04BDu32.to_le_bytes()); // dwSignature
     fixed.extend_from_slice(&0x00010000u32.to_le_bytes()); // dwStrucVersion
-    fixed.extend_from_slice(&fv_ms.to_le_bytes());         // dwFileVersionMS
-    fixed.extend_from_slice(&fv_ls.to_le_bytes());         // dwFileVersionLS
-    fixed.extend_from_slice(&pv_ms.to_le_bytes());         // dwProductVersionMS
-    fixed.extend_from_slice(&pv_ls.to_le_bytes());         // dwProductVersionLS
-    fixed.extend_from_slice(&0u32.to_le_bytes());          // dwFileFlagsMask
-    fixed.extend_from_slice(&0u32.to_le_bytes());          // dwFileFlags
+    fixed.extend_from_slice(&fv_ms.to_le_bytes()); // dwFileVersionMS
+    fixed.extend_from_slice(&fv_ls.to_le_bytes()); // dwFileVersionLS
+    fixed.extend_from_slice(&pv_ms.to_le_bytes()); // dwProductVersionMS
+    fixed.extend_from_slice(&pv_ls.to_le_bytes()); // dwProductVersionLS
+    fixed.extend_from_slice(&0u32.to_le_bytes()); // dwFileFlagsMask
+    fixed.extend_from_slice(&0u32.to_le_bytes()); // dwFileFlags
     fixed.extend_from_slice(&0x00040004u32.to_le_bytes()); // dwFileOS (Windows NT)
     fixed.extend_from_slice(&0x00000001u32.to_le_bytes()); // dwFileType (Application)
-    fixed.extend_from_slice(&0u32.to_le_bytes());          // dwFileSubtype
-    fixed.extend_from_slice(&0u32.to_le_bytes());          // dwFileDateMS
-    fixed.extend_from_slice(&0u32.to_le_bytes());          // dwFileDateLS
+    fixed.extend_from_slice(&0u32.to_le_bytes()); // dwFileSubtype
+    fixed.extend_from_slice(&0u32.to_le_bytes()); // dwFileDateMS
+    fixed.extend_from_slice(&0u32.to_le_bytes()); // dwFileDateLS
     assert_eq!(fixed.len(), 52);
 
     // Helper: build a leaf String entry.
@@ -593,12 +590,16 @@ fn build_vs_versioninfo(cfg: &VersionInfoConfig) -> Vec<u8> {
         let header_len = 6 + key_bytes.len();
         let total_unpadded = header_len + val_utf16.len();
         // Pad total to 4-byte boundary.
-        let pad = if total_unpadded % 4 != 0 { 4 - total_unpadded % 4 } else { 0 };
+        let pad = if total_unpadded % 4 != 0 {
+            4 - total_unpadded % 4
+        } else {
+            0
+        };
         let total = total_unpadded + pad;
         let mut out = Vec::with_capacity(total);
-        out.extend_from_slice(&(total as u16).to_le_bytes());    // wLength
-        out.extend_from_slice(&w_value_len.to_le_bytes());       // wValueLength
-        out.extend_from_slice(&1u16.to_le_bytes());              // wType = 1 (text)
+        out.extend_from_slice(&(total as u16).to_le_bytes()); // wLength
+        out.extend_from_slice(&w_value_len.to_le_bytes()); // wValueLength
+        out.extend_from_slice(&1u16.to_le_bytes()); // wType = 1 (text)
         out.extend_from_slice(&key_bytes);
         out.extend_from_slice(&val_utf16);
         out.resize(total, 0);
@@ -628,8 +629,8 @@ fn build_vs_versioninfo(cfg: &VersionInfoConfig) -> Vec<u8> {
     let st_total = st_header_len + strings_data.len();
     let mut string_table: Vec<u8> = Vec::with_capacity(st_total);
     string_table.extend_from_slice(&(st_total as u16).to_le_bytes()); // wLength
-    string_table.extend_from_slice(&0u16.to_le_bytes());              // wValueLength (0 for container)
-    string_table.extend_from_slice(&1u16.to_le_bytes());              // wType = 1
+    string_table.extend_from_slice(&0u16.to_le_bytes()); // wValueLength (0 for container)
+    string_table.extend_from_slice(&1u16.to_le_bytes()); // wType = 1
     string_table.extend_from_slice(&st_key);
     string_table.extend_from_slice(&strings_data);
 
@@ -639,8 +640,8 @@ fn build_vs_versioninfo(cfg: &VersionInfoConfig) -> Vec<u8> {
     let sfi_total = sfi_header_len + string_table.len();
     let mut sfi: Vec<u8> = Vec::with_capacity(sfi_total);
     sfi.extend_from_slice(&(sfi_total as u16).to_le_bytes()); // wLength
-    sfi.extend_from_slice(&0u16.to_le_bytes());               // wValueLength
-    sfi.extend_from_slice(&1u16.to_le_bytes());               // wType = 1
+    sfi.extend_from_slice(&0u16.to_le_bytes()); // wValueLength
+    sfi.extend_from_slice(&1u16.to_le_bytes()); // wType = 1
     sfi.extend_from_slice(&sfi_key);
     sfi.extend_from_slice(&string_table);
 
@@ -651,8 +652,8 @@ fn build_vs_versioninfo(cfg: &VersionInfoConfig) -> Vec<u8> {
     let var_total = var_header_len + 4;
     let mut var: Vec<u8> = Vec::with_capacity(var_total);
     var.extend_from_slice(&(var_total as u16).to_le_bytes()); // wLength
-    var.extend_from_slice(&4u16.to_le_bytes());               // wValueLength (4 bytes)
-    var.extend_from_slice(&0u16.to_le_bytes());               // wType = 0 (binary)
+    var.extend_from_slice(&4u16.to_le_bytes()); // wValueLength (4 bytes)
+    var.extend_from_slice(&0u16.to_le_bytes()); // wType = 0 (binary)
     var.extend_from_slice(&var_key);
     var.extend_from_slice(&translation_val);
 
@@ -661,8 +662,8 @@ fn build_vs_versioninfo(cfg: &VersionInfoConfig) -> Vec<u8> {
     let vfi_total = vfi_header_len + var.len();
     let mut vfi: Vec<u8> = Vec::with_capacity(vfi_total);
     vfi.extend_from_slice(&(vfi_total as u16).to_le_bytes()); // wLength
-    vfi.extend_from_slice(&0u16.to_le_bytes());               // wValueLength
-    vfi.extend_from_slice(&1u16.to_le_bytes());               // wType = 1
+    vfi.extend_from_slice(&0u16.to_le_bytes()); // wValueLength
+    vfi.extend_from_slice(&1u16.to_le_bytes()); // wType = 1
     vfi.extend_from_slice(&vfi_key);
     vfi.extend_from_slice(&var);
 
@@ -674,10 +675,10 @@ fn build_vs_versioninfo(cfg: &VersionInfoConfig) -> Vec<u8> {
     let root_total = root_header_len + 52 + sfi.len() + vfi.len();
     let mut root: Vec<u8> = Vec::with_capacity(root_total);
     root.extend_from_slice(&(root_total as u16).to_le_bytes()); // wLength
-    root.extend_from_slice(&52u16.to_le_bytes());               // wValueLength = sizeof(VS_FIXEDFILEINFO)
-    root.extend_from_slice(&0u16.to_le_bytes());                // wType = 0 (binary value)
-    root.extend_from_slice(&root_key);                          // szKey (UTF-16LE, padded)
-    root.extend_from_slice(&fixed);                             // VS_FIXEDFILEINFO
+    root.extend_from_slice(&52u16.to_le_bytes()); // wValueLength = sizeof(VS_FIXEDFILEINFO)
+    root.extend_from_slice(&0u16.to_le_bytes()); // wType = 0 (binary value)
+    root.extend_from_slice(&root_key); // szKey (UTF-16LE, padded)
+    root.extend_from_slice(&fixed); // VS_FIXEDFILEINFO
     root.extend_from_slice(&sfi);
     root.extend_from_slice(&vfi);
 
@@ -697,7 +698,8 @@ fn manifest_xml(preset_or_custom: &str) -> String {
       </requestedPrivileges>
     </security>
   </trustInfo>
-</assembly>"#.to_string(),
+</assembly>"#
+            .to_string(),
         "highestAvailable" => r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
@@ -707,7 +709,8 @@ fn manifest_xml(preset_or_custom: &str) -> String {
       </requestedPrivileges>
     </security>
   </trustInfo>
-</assembly>"#.to_string(),
+</assembly>"#
+            .to_string(),
         "asInvoker" => r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
@@ -717,7 +720,8 @@ fn manifest_xml(preset_or_custom: &str) -> String {
       </requestedPrivileges>
     </security>
   </trustInfo>
-</assembly>"#.to_string(),
+</assembly>"#
+            .to_string(),
         // Treat anything else as a literal XML string.
         custom => custom.to_string(),
     }
@@ -744,7 +748,9 @@ fn parse_ico(ico_bytes: &[u8]) -> Result<Vec<IcoImage>> {
     let image_type = read_u16_le(ico_bytes, 2);
     let count = read_u16_le(ico_bytes, 4) as usize;
     if reserved != 0 || image_type != 1 {
-        return Err(anyhow!("Not a valid ICO file (reserved={reserved}, type={image_type})"));
+        return Err(anyhow!(
+            "Not a valid ICO file (reserved={reserved}, type={image_type})"
+        ));
     }
     if 6 + count * 16 > ico_bytes.len() {
         return Err(anyhow!("ICO directory truncated"));
@@ -832,7 +838,8 @@ impl ResourceSectionBuilder {
         // Total level-3 directories (one per name per type, but we count each name).
         let _n_level3_dirs: usize = tree.values().map(|names| names.len()).sum();
         // Total leaves.
-        let _total_leaves: usize = tree.values()
+        let _total_leaves: usize = tree
+            .values()
             .flat_map(|names| names.values().map(|langs| langs.len()))
             .sum();
 
@@ -862,7 +869,12 @@ impl ResourceSectionBuilder {
                 let mut lang_entries: Vec<(u32, usize)> = Vec::new();
                 for (&lang_id, data) in langs {
                     let idx = leaves.len();
-                    leaves.push(Leaf { _type_id: type_id, _name_id: name_id, _lang_id: lang_id, data: data.clone() });
+                    leaves.push(Leaf {
+                        _type_id: type_id,
+                        _name_id: name_id,
+                        _lang_id: lang_id,
+                        data: data.clone(),
+                    });
                     lang_entries.push((lang_id, idx));
                 }
                 name_entries.push((name_id, lang_entries));
@@ -875,13 +887,18 @@ impl ResourceSectionBuilder {
         // L1 dir: 16 + 8 * n_types
         let l1_size = 16 + 8 * type_entries.len();
         // L2 dirs: one per type.
-        let l2_sizes: Vec<usize> = type_entries.iter()
+        let l2_sizes: Vec<usize> = type_entries
+            .iter()
             .map(|(_, names)| 16 + 8 * names.len())
             .collect();
         // L3 dirs: one per (type, name) pair.
-        let l3_sizes: Vec<Vec<usize>> = type_entries.iter()
+        let l3_sizes: Vec<Vec<usize>> = type_entries
+            .iter()
             .map(|(_, names)| {
-                names.iter().map(|(_, langs)| 16 + 8 * langs.len()).collect()
+                names
+                    .iter()
+                    .map(|(_, langs)| 16 + 8 * langs.len())
+                    .collect()
             })
             .collect();
 
@@ -937,7 +954,11 @@ impl ResourceSectionBuilder {
             match last_leaf {
                 Some(i) => {
                     let end = leaf_offsets[i] + leaves[i].data.len();
-                    if end % 4 != 0 { end + (4 - end % 4) } else { end }
+                    if end % 4 != 0 {
+                        end + (4 - end % 4)
+                    } else {
+                        end
+                    }
                 }
                 None => data_blob_base,
             }
@@ -949,9 +970,9 @@ impl ResourceSectionBuilder {
         // IMAGE_RESOURCE_DIRECTORY header: Characteristics(4), TimeDateStamp(4),
         // MajorVersion(2), MinorVersion(2), NumberOfNamedEntries(2), NumberOfIdEntries(2)
         let write_dir_header = |buf: &mut Vec<u8>, off: usize, n_id: u16| {
-            write_u32_le(buf, off, 0);      // Characteristics
-            write_u32_le(buf, off + 4, 0);  // TimeDateStamp
-            write_u16_le(buf, off + 8, 0);  // MajorVersion
+            write_u32_le(buf, off, 0); // Characteristics
+            write_u32_le(buf, off + 4, 0); // TimeDateStamp
+            write_u16_le(buf, off + 8, 0); // MajorVersion
             write_u16_le(buf, off + 10, 0); // MinorVersion
             write_u16_le(buf, off + 12, 0); // NumberOfNamedEntries
             write_u16_le(buf, off + 14, n_id); // NumberOfIdEntries
@@ -973,7 +994,11 @@ impl ResourceSectionBuilder {
             for (ni, (name_id, _)) in names.iter().enumerate() {
                 let entry_off = l2_off + 16 + ni * 8;
                 write_u32_le(&mut out, entry_off, *name_id);
-                write_u32_le(&mut out, entry_off + 4, l3_offs[ti][ni] as u32 | 0x8000_0000);
+                write_u32_le(
+                    &mut out,
+                    entry_off + 4,
+                    l3_offs[ti][ni] as u32 | 0x8000_0000,
+                );
             }
         }
 
@@ -987,7 +1012,11 @@ impl ResourceSectionBuilder {
                     let entry_off = l3_off + 16 + li * 8;
                     write_u32_le(&mut out, entry_off, *lang_id);
                     // Points to IMAGE_RESOURCE_DATA_ENTRY (no high bit set).
-                    write_u32_le(&mut out, entry_off + 4, (data_entry_base + leaf_idx_counter * 16) as u32);
+                    write_u32_le(
+                        &mut out,
+                        entry_off + 4,
+                        (data_entry_base + leaf_idx_counter * 16) as u32,
+                    );
                     leaf_idx_counter += 1;
                 }
             }
@@ -997,10 +1026,10 @@ impl ResourceSectionBuilder {
         for (i, leaf) in leaves.iter().enumerate() {
             let de_off = data_entry_base + i * 16;
             let data_rva = section_rva + leaf_offsets[i] as u32;
-            write_u32_le(&mut out, de_off, data_rva);          // OffsetToData (RVA)
+            write_u32_le(&mut out, de_off, data_rva); // OffsetToData (RVA)
             write_u32_le(&mut out, de_off + 4, leaf.data.len() as u32); // Size
-            write_u32_le(&mut out, de_off + 8, 0);             // CodePage
-            write_u32_le(&mut out, de_off + 12, 0);            // Reserved
+            write_u32_le(&mut out, de_off + 8, 0); // CodePage
+            write_u32_le(&mut out, de_off + 12, 0); // Reserved
         }
 
         // Write leaf data blobs.
@@ -1051,7 +1080,11 @@ fn inject_rsrc_section(buf: &mut Vec<u8>, builder: &ResourceSectionBuilder) -> R
             let s = sec_off + i * 40;
             if s + 40 <= buf.len() {
                 let ro = read_u32_le(buf, s + 20) as usize;
-                if ro > 0 { Some(ro) } else { None }
+                if ro > 0 {
+                    Some(ro)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -1071,15 +1104,15 @@ fn inject_rsrc_section(buf: &mut Vec<u8>, builder: &ResourceSectionBuilder) -> R
         buf.resize(new_sec_hdr_off + 40, 0);
     }
     buf[new_sec_hdr_off..new_sec_hdr_off + 8].copy_from_slice(b".rsrc\x00\x00\x00");
-    write_u32_le(buf, new_sec_hdr_off + 8, virt_size);              // VirtualSize
-    write_u32_le(buf, new_sec_hdr_off + 12, new_va);                // VirtualAddress
-    write_u32_le(buf, new_sec_hdr_off + 16, raw_size);              // SizeOfRawData
-    write_u32_le(buf, new_sec_hdr_off + 20, raw_off);               // PointerToRawData
-    write_u32_le(buf, new_sec_hdr_off + 24, 0);                     // PointerToRelocations
-    write_u32_le(buf, new_sec_hdr_off + 28, 0);                     // PointerToLinenumbers
-    write_u16_le(buf, new_sec_hdr_off + 32, 0);                     // NumberOfRelocations
-    write_u16_le(buf, new_sec_hdr_off + 34, 0);                     // NumberOfLinenumbers
-    write_u32_le(buf, new_sec_hdr_off + 36, 0x4000_0040u32);        // Characteristics: initialized data + read
+    write_u32_le(buf, new_sec_hdr_off + 8, virt_size); // VirtualSize
+    write_u32_le(buf, new_sec_hdr_off + 12, new_va); // VirtualAddress
+    write_u32_le(buf, new_sec_hdr_off + 16, raw_size); // SizeOfRawData
+    write_u32_le(buf, new_sec_hdr_off + 20, raw_off); // PointerToRawData
+    write_u32_le(buf, new_sec_hdr_off + 24, 0); // PointerToRelocations
+    write_u32_le(buf, new_sec_hdr_off + 28, 0); // PointerToLinenumbers
+    write_u16_le(buf, new_sec_hdr_off + 32, 0); // NumberOfRelocations
+    write_u16_le(buf, new_sec_hdr_off + 34, 0); // NumberOfLinenumbers
+    write_u32_le(buf, new_sec_hdr_off + 36, 0x4000_0040u32); // Characteristics: initialized data + read
 
     // Update NumberOfSections in COFF header.
     write_u16_le(buf, fh_off + 2, (n_sec + 1) as u16);
@@ -1104,7 +1137,9 @@ fn inject_rsrc_section(buf: &mut Vec<u8>, builder: &ResourceSectionBuilder) -> R
 }
 
 fn align_up(val: usize, align: usize) -> usize {
-    if align == 0 { return val; }
+    if align == 0 {
+        return val;
+    }
     (val + align - 1) & !(align - 1)
 }
 
@@ -1148,8 +1183,8 @@ pub fn inject_version_info(buf: &mut Vec<u8>, cfg: &VersionInfoConfig) -> Result
 
 /// Inject RT_ICON (3) and RT_GROUP_ICON (14) resources from a .ico file.
 pub fn inject_icon(buf: &mut Vec<u8>, ico_path: &str) -> Result<()> {
-    let ico_bytes = std::fs::read(ico_path)
-        .with_context(|| format!("Failed to read icon file: {ico_path}"))?;
+    let ico_bytes =
+        std::fs::read(ico_path).with_context(|| format!("Failed to read icon file: {ico_path}"))?;
     let images = parse_ico(&ico_bytes).context("Failed to parse ICO file")?;
     if images.is_empty() {
         return Err(anyhow!("ICO file contains no images"));
@@ -1227,23 +1262,37 @@ fn extract_version_info_blob(pe_bytes: &[u8]) -> Result<Vec<u8>> {
     let n_total = n_named + n_id;
     for i in 0..n_total {
         let entry_off = 16 + i * 8;
-        if entry_off + 8 > rsrc.len() { break; }
+        if entry_off + 8 > rsrc.len() {
+            break;
+        }
         let type_id = read_u32_le(rsrc, entry_off);
-        if type_id != 16 { continue; } // RT_VERSION
+        if type_id != 16 {
+            continue;
+        } // RT_VERSION
         let sub_off = (read_u32_le(rsrc, entry_off + 4) & 0x7FFF_FFFF) as usize;
         // L2: name entries for this type.
-        if sub_off + 16 > rsrc.len() { break; }
+        if sub_off + 16 > rsrc.len() {
+            break;
+        }
         let n2_named = read_u16_le(rsrc, sub_off + 12) as usize;
         let n2_id = read_u16_le(rsrc, sub_off + 14) as usize;
         let n2 = n2_named + n2_id;
-        if n2 == 0 { break; }
+        if n2 == 0 {
+            break;
+        }
         let l2_entry_off = sub_off + 16;
-        if l2_entry_off + 8 > rsrc.len() { break; }
+        if l2_entry_off + 8 > rsrc.len() {
+            break;
+        }
         let l3_dir_off = (read_u32_le(rsrc, l2_entry_off + 4) & 0x7FFF_FFFF) as usize;
         // L3: language entry.
-        if l3_dir_off + 24 > rsrc.len() { break; }
+        if l3_dir_off + 24 > rsrc.len() {
+            break;
+        }
         let data_entry_off = read_u32_le(rsrc, l3_dir_off + 20) as usize; // first lang entry offset
-        if data_entry_off + 16 > rsrc.len() { break; }
+        if data_entry_off + 16 > rsrc.len() {
+            break;
+        }
         let data_rva = read_u32_le(rsrc, data_entry_off);
         let data_size = read_u32_le(rsrc, data_entry_off + 4) as usize;
         let data_file_off = rva_to_file_offset(pe_bytes, data_rva)
@@ -1268,10 +1317,12 @@ fn jitter_version_build(blob: &mut Vec<u8>) {
         return;
     };
     // dwFileVersionLS is at sig_off + 12.
-    if sig_off + 16 > blob.len() { return; }
+    if sig_off + 16 > blob.len() {
+        return;
+    }
     let fv_ls = read_u32_le(blob, sig_off + 12);
     let build = ((fv_ls >> 16) & 0xFFFF) as u16;
-    let rev   = (fv_ls & 0xFFFF) as u16;
+    let rev = (fv_ls & 0xFFFF) as u16;
     let mut rng = thread_rng();
     let delta: u16 = rng.gen_range(1..=99);
     let new_build = build.wrapping_add(delta);
@@ -1281,9 +1332,13 @@ fn jitter_version_build(blob: &mut Vec<u8>) {
     if sig_off + 24 <= blob.len() {
         let pv_ls = read_u32_le(blob, sig_off + 20);
         let p_build = ((pv_ls >> 16) & 0xFFFF) as u16;
-        let p_rev   = (pv_ls & 0xFFFF) as u16;
+        let p_rev = (pv_ls & 0xFFFF) as u16;
         let new_p_build = p_build.wrapping_add(delta);
-        write_u32_le(blob, sig_off + 20, ((new_p_build as u32) << 16) | (p_rev as u32));
+        write_u32_le(
+            blob,
+            sig_off + 20,
+            ((new_p_build as u32) << 16) | (p_rev as u32),
+        );
     }
 }
 
@@ -1370,7 +1425,9 @@ pub fn apply_all(buf: &mut Vec<u8>, cfg: &PayloadConfig) -> Result<()> {
     }
 
     // 11. Inject manifest.
-    let manifest = cfg.custom_manifest.as_deref()
+    let manifest = cfg
+        .custom_manifest
+        .as_deref()
         .or(cfg.manifest_preset.as_deref());
     if let Some(m) = manifest {
         inject_manifest(buf, m).context("artifact kit: manifest injection failed")?;
@@ -1426,13 +1483,13 @@ mod tests {
         // COFF header: Machine=x86(0x14c), NumberOfSections=1, SizeOfOptionalHeader=0xE0
         buf[pe_off + 4] = 0x4C;
         buf[pe_off + 5] = 0x01; // Machine = IMAGE_FILE_MACHINE_I386
-        buf[pe_off + 6] = 1;    // NumberOfSections = 1
+        buf[pe_off + 6] = 1; // NumberOfSections = 1
         buf[pe_off + 20] = 0xE0; // SizeOfOptionalHeader = 224 (PE32)
-        // Optional header: Magic=0x10B (PE32)
+                                 // Optional header: Magic=0x10B (PE32)
         let oh = pe_off + 24;
         buf[oh] = 0x0B;
         buf[oh + 1] = 0x01; // PE32
-        // SizeOfHeaders at oh+60
+                            // SizeOfHeaders at oh+60
         write_u32_le(&mut buf, oh + 60, 0x200);
         // SizeOfImage at oh+56
         write_u32_le(&mut buf, oh + 56, 0x1000);
@@ -1446,10 +1503,10 @@ mod tests {
         let sec = pe_off + 4 + 20 + 0xE0;
         // .text section
         buf[sec..sec + 5].copy_from_slice(b".text");
-        write_u32_le(&mut buf, sec + 8, 0x100);   // VirtualSize
+        write_u32_le(&mut buf, sec + 8, 0x100); // VirtualSize
         write_u32_le(&mut buf, sec + 12, 0x1000); // VirtualAddress
-        write_u32_le(&mut buf, sec + 16, 0x200);  // SizeOfRawData
-        write_u32_le(&mut buf, sec + 20, 0x200);  // PointerToRawData
+        write_u32_le(&mut buf, sec + 16, 0x200); // SizeOfRawData
+        write_u32_le(&mut buf, sec + 20, 0x200); // PointerToRawData
         buf
     }
 
@@ -1469,8 +1526,14 @@ mod tests {
         let mut pe = make_minimal_pe();
         let before = pe.len();
         add_entropy_padding(&mut pe);
-        assert!(pe.len() > before + 1023, "entropy padding should add ≥1024 bytes");
-        assert!(pe.len() < before + 4097, "entropy padding should add <4096 bytes");
+        assert!(
+            pe.len() > before + 1023,
+            "entropy padding should add ≥1024 bytes"
+        );
+        assert!(
+            pe.len() < before + 4097,
+            "entropy padding should add <4096 bytes"
+        );
     }
 
     #[test]
@@ -1497,7 +1560,10 @@ mod tests {
             clone_from: None,
         };
         let blob = build_vs_versioninfo(&cfg);
-        assert!(blob.len() > 52, "VS_VERSIONINFO blob should be larger than the fixed-info alone");
+        assert!(
+            blob.len() > 52,
+            "VS_VERSIONINFO blob should be larger than the fixed-info alone"
+        );
         // Must start with wLength (non-zero) followed by wValueLength=52.
         let w_len = u16::from_le_bytes([blob[0], blob[1]]);
         let w_val_len = u16::from_le_bytes([blob[2], blob[3]]);
@@ -1525,15 +1591,23 @@ mod tests {
             c_server_secret: None,
             server_cert_fingerprint: None,
             features: vec![],
+            transport: crate::config::PayloadTransport::Tls,
+            transport_settings: crate::config::TransportSettings::default(),
             output_name: None,
             package: "agent".to_string(),
             bin_name: None,
+            output_format: crate::config::PayloadFormat::Exe,
+            sleep_ms: None,
+            jitter: None,
+            kill_date: None,
             version_info: None,
             icon_path: None,
             manifest_preset: None,
             custom_manifest: None,
             strip_signature: false,
             strip_debug: false,
+            module_aes_key: None,
+            driver_path: None,
         };
         let mut buf = b"ELF binary data here".to_vec();
         let original = buf.clone();
@@ -1545,7 +1619,10 @@ mod tests {
     fn manifest_xml_presets_are_valid() {
         for preset in &["asInvoker", "requireAdministrator", "highestAvailable"] {
             let xml = manifest_xml(preset);
-            assert!(xml.contains(preset), "preset {preset} should appear in output XML");
+            assert!(
+                xml.contains(preset),
+                "preset {preset} should appear in output XML"
+            );
         }
     }
 }

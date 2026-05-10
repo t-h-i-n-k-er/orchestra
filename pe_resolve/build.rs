@@ -50,7 +50,14 @@ fn main() {
         "LsaDeregisterLogonProcess",
         "LsaFreeReturnBuffer",
     ];
-    let dlls = ["ntdll.dll", "amsi.dll", "kernel32.dll", "crypt32.dll", "ncrypt.dll", "secur32.dll"];
+    let dlls = [
+        "ntdll.dll",
+        "amsi.dll",
+        "kernel32.dll",
+        "crypt32.dll",
+        "ncrypt.dll",
+        "secur32.dll",
+    ];
 
     let mut rs = format!("pub const SEED: u32 = {:#x};\n", seed);
     for api in apis {

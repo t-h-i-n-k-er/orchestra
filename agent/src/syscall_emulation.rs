@@ -77,10 +77,10 @@ const STATUS_NOT_SUPPORTED: i32 = 0xC00000BB_u32 as i32;
 fn win32_to_ntstatus(error_code: DWORD) -> i32 {
     match error_code {
         0 => STATUS_SUCCESS,
-        5 => STATUS_ACCESS_DENIED,          // ERROR_ACCESS_DENIED
-        6 => STATUS_INVALID_HANDLE,         // ERROR_INVALID_HANDLE
-        87 => STATUS_INVALID_PARAMETER,     // ERROR_INVALID_PARAMETER
-        998 => STATUS_ACCESS_DENIED,        // ERROR_NOACCESS
+        5 => STATUS_ACCESS_DENIED,      // ERROR_ACCESS_DENIED
+        6 => STATUS_INVALID_HANDLE,     // ERROR_INVALID_HANDLE
+        87 => STATUS_INVALID_PARAMETER, // ERROR_INVALID_PARAMETER
+        998 => STATUS_ACCESS_DENIED,    // ERROR_NOACCESS
         code => {
             debug!(
                 "syscall_emulation: unmapped Win32 error {code}, returning STATUS_NOT_SUPPORTED"
@@ -203,12 +203,22 @@ unsafe fn dynamic_write_process_memory(
     lp_number_of_bytes_written: *mut SIZE_T,
 ) -> BOOL {
     type FnWriteProcessMemory = unsafe extern "system" fn(
-        HANDLE, *mut std::ffi::c_void, *const std::ffi::c_void, SIZE_T, *mut SIZE_T,
+        HANDLE,
+        *mut std::ffi::c_void,
+        *const std::ffi::c_void,
+        SIZE_T,
+        *mut SIZE_T,
     ) -> BOOL;
     match resolve_cached(&ADDR_WRITE_PROCESS_MEMORY, b"WriteProcessMemory\0") {
         Some(addr) => {
             let f: FnWriteProcessMemory = std::mem::transmute::<usize, FnWriteProcessMemory>(addr);
-            f(h_process, lp_base_address, lp_buffer, n_size, lp_number_of_bytes_written)
+            f(
+                h_process,
+                lp_base_address,
+                lp_buffer,
+                n_size,
+                lp_number_of_bytes_written,
+            )
         }
         None => 0,
     }
@@ -223,12 +233,22 @@ unsafe fn dynamic_read_process_memory(
     lp_number_of_bytes_read: *mut SIZE_T,
 ) -> BOOL {
     type FnReadProcessMemory = unsafe extern "system" fn(
-        HANDLE, *const std::ffi::c_void, *mut std::ffi::c_void, SIZE_T, *mut SIZE_T,
+        HANDLE,
+        *const std::ffi::c_void,
+        *mut std::ffi::c_void,
+        SIZE_T,
+        *mut SIZE_T,
     ) -> BOOL;
     match resolve_cached(&ADDR_READ_PROCESS_MEMORY, b"ReadProcessMemory\0") {
         Some(addr) => {
             let f: FnReadProcessMemory = std::mem::transmute::<usize, FnReadProcessMemory>(addr);
-            f(h_process, lp_base_address, lp_buffer, n_size, lp_number_of_bytes_read)
+            f(
+                h_process,
+                lp_base_address,
+                lp_buffer,
+                n_size,
+                lp_number_of_bytes_read,
+            )
         }
         None => 0,
     }
@@ -242,13 +262,18 @@ unsafe fn dynamic_virtual_alloc_ex(
     fl_allocation_type: DWORD,
     fl_protect: DWORD,
 ) -> LPVOID {
-    type FnVirtualAllocEx = unsafe extern "system" fn(
-        HANDLE, LPVOID, SIZE_T, DWORD, DWORD,
-    ) -> LPVOID;
+    type FnVirtualAllocEx =
+        unsafe extern "system" fn(HANDLE, LPVOID, SIZE_T, DWORD, DWORD) -> LPVOID;
     match resolve_cached(&ADDR_VIRTUAL_ALLOC_EX, b"VirtualAllocEx\0") {
         Some(addr) => {
             let f: FnVirtualAllocEx = std::mem::transmute::<usize, FnVirtualAllocEx>(addr);
-            f(h_process, lp_address, dw_size, fl_allocation_type, fl_protect)
+            f(
+                h_process,
+                lp_address,
+                dw_size,
+                fl_allocation_type,
+                fl_protect,
+            )
         }
         None => std::ptr::null_mut(),
     }
@@ -261,9 +286,7 @@ unsafe fn dynamic_virtual_free_ex(
     dw_size: SIZE_T,
     dw_free_type: DWORD,
 ) -> BOOL {
-    type FnVirtualFreeEx = unsafe extern "system" fn(
-        HANDLE, LPVOID, SIZE_T, DWORD,
-    ) -> BOOL;
+    type FnVirtualFreeEx = unsafe extern "system" fn(HANDLE, LPVOID, SIZE_T, DWORD) -> BOOL;
     match resolve_cached(&ADDR_VIRTUAL_FREE_EX, b"VirtualFreeEx\0") {
         Some(addr) => {
             let f: FnVirtualFreeEx = std::mem::transmute::<usize, FnVirtualFreeEx>(addr);
@@ -281,13 +304,18 @@ unsafe fn dynamic_virtual_protect_ex(
     fl_new_protect: DWORD,
     lpfl_old_protect: *mut DWORD,
 ) -> BOOL {
-    type FnVirtualProtectEx = unsafe extern "system" fn(
-        HANDLE, LPVOID, SIZE_T, DWORD, *mut DWORD,
-    ) -> BOOL;
+    type FnVirtualProtectEx =
+        unsafe extern "system" fn(HANDLE, LPVOID, SIZE_T, DWORD, *mut DWORD) -> BOOL;
     match resolve_cached(&ADDR_VIRTUAL_PROTECT_EX, b"VirtualProtectEx\0") {
         Some(addr) => {
             let f: FnVirtualProtectEx = std::mem::transmute::<usize, FnVirtualProtectEx>(addr);
-            f(h_process, lp_address, dw_size, fl_new_protect, lpfl_old_protect)
+            f(
+                h_process,
+                lp_address,
+                dw_size,
+                fl_new_protect,
+                lpfl_old_protect,
+            )
         }
         None => 0,
     }
@@ -304,14 +332,26 @@ unsafe fn dynamic_create_remote_thread(
     lp_thread_id: *mut DWORD,
 ) -> HANDLE {
     type FnCreateRemoteThread = unsafe extern "system" fn(
-        HANDLE, LPVOID, SIZE_T,
+        HANDLE,
+        LPVOID,
+        SIZE_T,
         Option<unsafe extern "system" fn(*mut std::ffi::c_void) -> DWORD>,
-        *mut std::ffi::c_void, DWORD, *mut DWORD,
+        *mut std::ffi::c_void,
+        DWORD,
+        *mut DWORD,
     ) -> HANDLE;
     match resolve_cached(&ADDR_CREATE_REMOTE_THREAD, b"CreateRemoteThread\0") {
         Some(addr) => {
             let f: FnCreateRemoteThread = std::mem::transmute::<usize, FnCreateRemoteThread>(addr);
-            f(h_process, lp_thread_attributes, dw_stack_size, lp_start_address, lp_parameter, dw_creation_flags, lp_thread_id)
+            f(
+                h_process,
+                lp_thread_attributes,
+                dw_stack_size,
+                lp_start_address,
+                lp_parameter,
+                dw_creation_flags,
+                lp_thread_id,
+            )
         }
         None => std::ptr::null_mut(),
     }
@@ -353,7 +393,10 @@ unsafe fn dynamic_virtual_query_ex(
     dw_length: SIZE_T,
 ) -> SIZE_T {
     type FnVirtualQueryEx = unsafe extern "system" fn(
-        HANDLE, *const std::ffi::c_void, *mut MEMORY_BASIC_INFORMATION, SIZE_T,
+        HANDLE,
+        *const std::ffi::c_void,
+        *mut MEMORY_BASIC_INFORMATION,
+        SIZE_T,
     ) -> SIZE_T;
     match resolve_cached(&ADDR_VIRTUAL_QUERY_EX, b"VirtualQueryEx\0") {
         Some(addr) => {
@@ -375,7 +418,10 @@ static USE_EMULATION: AtomicBool = AtomicBool::new(true);
 pub fn set_emulation_enabled(enabled: bool) {
     let prev = USE_EMULATION.swap(enabled, Ordering::SeqCst);
     if prev != enabled {
-        debug!("syscall_emulation: emulation {}", if enabled { "enabled" } else { "disabled" });
+        debug!(
+            "syscall_emulation: emulation {}",
+            if enabled { "enabled" } else { "disabled" }
+        );
     }
 }
 
@@ -496,19 +542,21 @@ pub fn emulate_nt_write_virtual_memory(
         }
 
         let err = unsafe { dynamic_get_last_error() };
-        debug!(
-            "syscall_emulation: WriteProcessMemory failed with Win32 error {err}"
-        );
+        debug!("syscall_emulation: WriteProcessMemory failed with Win32 error {err}");
 
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
         // Let the caller (dispatch/macro) handle the indirect syscall fallback.
-        return Err(anyhow::anyhow!("NtWriteVirtualMemory: kernel32 path failed with Win32 error {err}"));
+        return Err(anyhow::anyhow!(
+            "NtWriteVirtualMemory: kernel32 path failed with Win32 error {err}"
+        ));
     }
 
     // Emulation not active for this function — caller should use direct syscall.
-    Err(anyhow::anyhow!("NtWriteVirtualMemory: emulation not active"))
+    Err(anyhow::anyhow!(
+        "NtWriteVirtualMemory: emulation not active"
+    ))
 }
 
 /// Emulate `NtReadVirtualMemory` via `ReadProcessMemory`.
@@ -557,15 +605,15 @@ pub fn emulate_nt_read_virtual_memory(
         }
 
         let err = unsafe { dynamic_get_last_error() };
-        debug!(
-            "syscall_emulation: ReadProcessMemory failed with Win32 error {err}"
-        );
+        debug!("syscall_emulation: ReadProcessMemory failed with Win32 error {err}");
 
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
         // Let the caller (dispatch/macro) handle the indirect syscall fallback.
-        return Err(anyhow::anyhow!("NtReadVirtualMemory: kernel32 path failed with Win32 error {err}"));
+        return Err(anyhow::anyhow!(
+            "NtReadVirtualMemory: kernel32 path failed with Win32 error {err}"
+        ));
     }
 
     // Emulation not active for this function — caller should use direct syscall.
@@ -597,7 +645,8 @@ pub fn emulate_nt_allocate_virtual_memory(
 ) -> anyhow::Result<i32> {
     let config = get_config();
 
-    if is_emulation_enabled() && should_emulate("NtAllocateVirtualMemory") && config.prefer_kernel32 {
+    if is_emulation_enabled() && should_emulate("NtAllocateVirtualMemory") && config.prefer_kernel32
+    {
         debug!("syscall_emulation: NtAllocateVirtualMemory → VirtualAllocEx");
 
         // Read the desired size from the caller's region_size pointer.
@@ -639,19 +688,21 @@ pub fn emulate_nt_allocate_virtual_memory(
         }
 
         let err = unsafe { dynamic_get_last_error() };
-        debug!(
-            "syscall_emulation: VirtualAllocEx failed with Win32 error {err}"
-        );
+        debug!("syscall_emulation: VirtualAllocEx failed with Win32 error {err}");
 
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
         // Let the caller (dispatch/macro) handle the indirect syscall fallback.
-        return Err(anyhow::anyhow!("NtAllocateVirtualMemory: kernel32 path failed with Win32 error {err}"));
+        return Err(anyhow::anyhow!(
+            "NtAllocateVirtualMemory: kernel32 path failed with Win32 error {err}"
+        ));
     }
 
     // Emulation not active for this function — caller should use direct syscall.
-    Err(anyhow::anyhow!("NtAllocateVirtualMemory: emulation not active"))
+    Err(anyhow::anyhow!(
+        "NtAllocateVirtualMemory: emulation not active"
+    ))
 }
 
 /// Emulate `NtFreeVirtualMemory` via `VirtualFreeEx`.
@@ -690,12 +741,7 @@ pub fn emulate_nt_free_virtual_memory(
         };
 
         let result = unsafe {
-            dynamic_virtual_free_ex(
-                process_handle as HANDLE,
-                addr,
-                size,
-                free_type as DWORD,
-            )
+            dynamic_virtual_free_ex(process_handle as HANDLE, addr, size, free_type as DWORD)
         };
 
         if result != 0 {
@@ -703,15 +749,15 @@ pub fn emulate_nt_free_virtual_memory(
         }
 
         let err = unsafe { dynamic_get_last_error() };
-        debug!(
-            "syscall_emulation: VirtualFreeEx failed with Win32 error {err}"
-        );
+        debug!("syscall_emulation: VirtualFreeEx failed with Win32 error {err}");
 
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
         // Let the caller (dispatch/macro) handle the indirect syscall fallback.
-        return Err(anyhow::anyhow!("NtFreeVirtualMemory: kernel32 path failed with Win32 error {err}"));
+        return Err(anyhow::anyhow!(
+            "NtFreeVirtualMemory: kernel32 path failed with Win32 error {err}"
+        ));
     }
 
     // Emulation not active for this function — caller should use direct syscall.
@@ -741,7 +787,8 @@ pub fn emulate_nt_protect_virtual_memory(
 ) -> anyhow::Result<i32> {
     let config = get_config();
 
-    if is_emulation_enabled() && should_emulate("NtProtectVirtualMemory") && config.prefer_kernel32 {
+    if is_emulation_enabled() && should_emulate("NtProtectVirtualMemory") && config.prefer_kernel32
+    {
         debug!("syscall_emulation: NtProtectVirtualMemory → VirtualProtectEx");
 
         let addr = if base_address != 0 {
@@ -785,19 +832,21 @@ pub fn emulate_nt_protect_virtual_memory(
         }
 
         let err = unsafe { dynamic_get_last_error() };
-        debug!(
-            "syscall_emulation: VirtualProtectEx failed with Win32 error {err}"
-        );
+        debug!("syscall_emulation: VirtualProtectEx failed with Win32 error {err}");
 
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
         // Let the caller (dispatch/macro) handle the indirect syscall fallback.
-        return Err(anyhow::anyhow!("NtProtectVirtualMemory: kernel32 path failed with Win32 error {err}"));
+        return Err(anyhow::anyhow!(
+            "NtProtectVirtualMemory: kernel32 path failed with Win32 error {err}"
+        ));
     }
 
     // Emulation not active for this function — caller should use direct syscall.
-    Err(anyhow::anyhow!("NtProtectVirtualMemory: emulation not active"))
+    Err(anyhow::anyhow!(
+        "NtProtectVirtualMemory: emulation not active"
+    ))
 }
 
 /// Emulate `NtCreateThreadEx` via `CreateRemoteThread`.
@@ -889,15 +938,15 @@ pub fn emulate_nt_create_thread_ex(
         }
 
         let err = unsafe { dynamic_get_last_error() };
-        debug!(
-            "syscall_emulation: CreateRemoteThread failed with Win32 error {err}"
-        );
+        debug!("syscall_emulation: CreateRemoteThread failed with Win32 error {err}");
 
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
         // Let the caller (dispatch/macro) handle the indirect syscall fallback.
-        return Err(anyhow::anyhow!("NtCreateThreadEx: kernel32 path failed with Win32 error {err}"));
+        return Err(anyhow::anyhow!(
+            "NtCreateThreadEx: kernel32 path failed with Win32 error {err}"
+        ));
     }
 
     // Emulation not active for this function — caller should use direct syscall.
@@ -955,15 +1004,15 @@ pub fn emulate_nt_open_process(
         }
 
         let err = unsafe { dynamic_get_last_error() };
-        debug!(
-            "syscall_emulation: OpenProcess failed with Win32 error {err}"
-        );
+        debug!("syscall_emulation: OpenProcess failed with Win32 error {err}");
 
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
         // Let the caller (dispatch/macro) handle the indirect syscall fallback.
-        return Err(anyhow::anyhow!("NtOpenProcess: kernel32 path failed with Win32 error {err}"));
+        return Err(anyhow::anyhow!(
+            "NtOpenProcess: kernel32 path failed with Win32 error {err}"
+        ));
     }
 
     // Emulation not active for this function — caller should use direct syscall.
@@ -992,15 +1041,15 @@ pub fn emulate_nt_close(handle: u64) -> anyhow::Result<i32> {
         }
 
         let err = unsafe { dynamic_get_last_error() };
-        debug!(
-            "syscall_emulation: CloseHandle failed with Win32 error {err}"
-        );
+        debug!("syscall_emulation: CloseHandle failed with Win32 error {err}");
 
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
         // Let the caller (dispatch/macro) handle the indirect syscall fallback.
-        return Err(anyhow::anyhow!("NtClose: kernel32 path failed with Win32 error {err}"));
+        return Err(anyhow::anyhow!(
+            "NtClose: kernel32 path failed with Win32 error {err}"
+        ));
     }
 
     // Emulation not active for this function — caller should use direct syscall.
@@ -1067,7 +1116,8 @@ pub fn emulate_nt_query_virtual_memory(
         if result != 0 {
             // Copy the result to the caller's buffer if it's large enough.
             if memory_information != 0
-                && memory_information_length as usize >= std::mem::size_of::<MEMORY_BASIC_INFORMATION>()
+                && memory_information_length as usize
+                    >= std::mem::size_of::<MEMORY_BASIC_INFORMATION>()
             {
                 let out_ptr = memory_information as *mut MEMORY_BASIC_INFORMATION;
                 unsafe {
@@ -1084,19 +1134,21 @@ pub fn emulate_nt_query_virtual_memory(
         }
 
         let err = unsafe { dynamic_get_last_error() };
-        debug!(
-            "syscall_emulation: VirtualQueryEx failed with Win32 error {err}"
-        );
+        debug!("syscall_emulation: VirtualQueryEx failed with Win32 error {err}");
 
         if !config.fallback_to_indirect {
             return Ok(win32_to_ntstatus(err));
         }
         // Let the caller (dispatch/macro) handle the indirect syscall fallback.
-        return Err(anyhow::anyhow!("NtQueryVirtualMemory: kernel32 path failed with Win32 error {err}"));
+        return Err(anyhow::anyhow!(
+            "NtQueryVirtualMemory: kernel32 path failed with Win32 error {err}"
+        ));
     }
 
     // Emulation not active for this function — caller should use direct syscall.
-    Err(anyhow::anyhow!("NtQueryVirtualMemory: emulation not active"))
+    Err(anyhow::anyhow!(
+        "NtQueryVirtualMemory: emulation not active"
+    ))
 }
 
 // ── Convenience re-exports for indirect-syscall fallback ─────────────────────
@@ -1105,11 +1157,11 @@ pub fn emulate_nt_query_virtual_memory(
 // directly as a pass-through to the underlying crate::syscalls indirect syscall
 // infrastructure.
 
+pub use crate::syscalls::do_syscall;
 /// Direct access to `crate::syscalls` for callers that need the raw indirect
 /// syscall path.  These use the shared SSN cache and clean ntdll mapping for
 /// consistency across the agent.
 pub use crate::syscalls::get_syscall_id;
-pub use crate::syscalls::do_syscall;
 
 // ── Integration helpers ──────────────────────────────────────────────────────
 
@@ -1186,25 +1238,21 @@ pub fn dispatch(name: &str, args: &[u64]) -> anyhow::Result<i32> {
             if args.len() < 5 {
                 return Err(anyhow::anyhow!("NtWriteVirtualMemory requires 5 arguments"));
             }
-            emulate_nt_write_virtual_memory(
-                args[0], args[1], args[2], args[3], args[4],
-            )
+            emulate_nt_write_virtual_memory(args[0], args[1], args[2], args[3], args[4])
         }
         "NtReadVirtualMemory" => {
             if args.len() < 5 {
                 return Err(anyhow::anyhow!("NtReadVirtualMemory requires 5 arguments"));
             }
-            emulate_nt_read_virtual_memory(
-                args[0], args[1], args[2], args[3], args[4],
-            )
+            emulate_nt_read_virtual_memory(args[0], args[1], args[2], args[3], args[4])
         }
         "NtAllocateVirtualMemory" => {
             if args.len() < 6 {
-                return Err(anyhow::anyhow!("NtAllocateVirtualMemory requires 6 arguments"));
+                return Err(anyhow::anyhow!(
+                    "NtAllocateVirtualMemory requires 6 arguments"
+                ));
             }
-            emulate_nt_allocate_virtual_memory(
-                args[0], args[1], args[2], args[3], args[4], args[5],
-            )
+            emulate_nt_allocate_virtual_memory(args[0], args[1], args[2], args[3], args[4], args[5])
         }
         "NtFreeVirtualMemory" => {
             if args.len() < 4 {
@@ -1214,28 +1262,26 @@ pub fn dispatch(name: &str, args: &[u64]) -> anyhow::Result<i32> {
         }
         "NtProtectVirtualMemory" => {
             if args.len() < 5 {
-                return Err(anyhow::anyhow!("NtProtectVirtualMemory requires 5 arguments"));
+                return Err(anyhow::anyhow!(
+                    "NtProtectVirtualMemory requires 5 arguments"
+                ));
             }
-            emulate_nt_protect_virtual_memory(
-                args[0], args[1], args[2], args[3], args[4],
-            )
+            emulate_nt_protect_virtual_memory(args[0], args[1], args[2], args[3], args[4])
         }
         "NtCreateThreadEx" => {
             if args.len() < 11 {
                 return Err(anyhow::anyhow!("NtCreateThreadEx requires 11 arguments"));
             }
             emulate_nt_create_thread_ex(
-                args[0], args[1], args[2], args[3], args[4], args[5],
-                args[6], args[7], args[8], args[9], args[10],
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+                args[9], args[10],
             )
         }
         "NtQueryVirtualMemory" => {
             if args.len() < 6 {
                 return Err(anyhow::anyhow!("NtQueryVirtualMemory requires 6 arguments"));
             }
-            emulate_nt_query_virtual_memory(
-                args[0], args[1], args[2], args[3], args[4], args[5],
-            )
+            emulate_nt_query_virtual_memory(args[0], args[1], args[2], args[3], args[4], args[5])
         }
         other => Err(anyhow::anyhow!("unknown emulated syscall: {}", other)),
     }

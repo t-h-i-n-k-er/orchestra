@@ -50,7 +50,13 @@ impl Default for ShellcodeConfig {
 /// Returns an error if the input is not a valid PE file or if the PE
 /// contains unsupported features.
 pub fn package(pe_bytes: &[u8], seed: u64) -> Result<Vec<u8>> {
-    package_with_config(pe_bytes, &ShellcodeConfig { seed, ..Default::default() })
+    package_with_config(
+        pe_bytes,
+        &ShellcodeConfig {
+            seed,
+            ..Default::default()
+        },
+    )
 }
 
 /// Convert a PE binary into shellcode with full configuration.
@@ -59,9 +65,7 @@ pub fn package_with_config(pe_bytes: &[u8], config: &ShellcodeConfig) -> Result<
     let pe = PeImage::parse(pe_bytes)?;
 
     if !pe.is_pe64 {
-        anyhow::bail!(
-            "PE32 (32-bit) images are not yet supported — only PE32+ (64-bit)"
-        );
+        anyhow::bail!("PE32 (32-bit) images are not yet supported — only PE32+ (64-bit)");
     }
 
     if pe.relocations.is_empty() && pe.imports.is_empty() {
@@ -131,11 +135,11 @@ mod tests {
 
         // COFF header
         pe.extend_from_slice(&0x8664u16.to_le_bytes()); // Machine: AMD64
-        pe.extend_from_slice(&1u16.to_le_bytes());      // NumberOfSections
-        pe.extend_from_slice(&0u32.to_le_bytes());      // TimeDateStamp
-        pe.extend_from_slice(&0u32.to_le_bytes());      // PointerToSymbolTable
-        pe.extend_from_slice(&0u32.to_le_bytes());      // NumberOfSymbols
-        pe.extend_from_slice(&240u16.to_le_bytes());    // SizeOfOptionalHeader
+        pe.extend_from_slice(&1u16.to_le_bytes()); // NumberOfSections
+        pe.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
+        pe.extend_from_slice(&0u32.to_le_bytes()); // PointerToSymbolTable
+        pe.extend_from_slice(&0u32.to_le_bytes()); // NumberOfSymbols
+        pe.extend_from_slice(&240u16.to_le_bytes()); // SizeOfOptionalHeader
         pe.extend_from_slice(&0x0022u16.to_le_bytes()); // Characteristics
 
         let opt_off = pe.len();
@@ -175,7 +179,11 @@ mod tests {
         let reloc_rva = 0x2000u32;
         let reloc_size = 16u32;
         w(&mut pe, opt_off + 112 + 5 * 8, &reloc_rva.to_le_bytes());
-        w(&mut pe, opt_off + 112 + 5 * 8 + 4, &reloc_size.to_le_bytes());
+        w(
+            &mut pe,
+            opt_off + 112 + 5 * 8 + 4,
+            &reloc_size.to_le_bytes(),
+        );
 
         // Pad optional header to declared size
         while pe.len() < opt_off + 240 {
@@ -183,20 +191,20 @@ mod tests {
         }
 
         // Section header: .text
-        pe.extend_from_slice(b".text\0\0\0");          // Name
+        pe.extend_from_slice(b".text\0\0\0"); // Name
         pe.extend_from_slice(&0x1000u32.to_le_bytes()); // VirtualSize
         pe.extend_from_slice(&0x1000u32.to_le_bytes()); // VirtualAddress
-        pe.extend_from_slice(&0x200u32.to_le_bytes());  // SizeOfRawData
-        pe.extend_from_slice(&0x200u32.to_le_bytes());  // PointerToRawData
-        pe.extend(&[0u8; 12]);                           // relocs, linenums
+        pe.extend_from_slice(&0x200u32.to_le_bytes()); // SizeOfRawData
+        pe.extend_from_slice(&0x200u32.to_le_bytes()); // PointerToRawData
+        pe.extend(&[0u8; 12]); // relocs, linenums
         pe.extend_from_slice(&0x60000020u32.to_le_bytes()); // Characteristics
 
         // Section header: .reloc
         pe.extend_from_slice(b".reloc\0\0");
-        pe.extend_from_slice(&0x200u32.to_le_bytes());  // VirtualSize
+        pe.extend_from_slice(&0x200u32.to_le_bytes()); // VirtualSize
         pe.extend_from_slice(&0x2000u32.to_le_bytes()); // VirtualAddress
-        pe.extend_from_slice(&0x200u32.to_le_bytes());  // SizeOfRawData
-        pe.extend_from_slice(&0x400u32.to_le_bytes());  // PointerToRawData
+        pe.extend_from_slice(&0x200u32.to_le_bytes()); // SizeOfRawData
+        pe.extend_from_slice(&0x400u32.to_le_bytes()); // PointerToRawData
         pe.extend(&[0u8; 12]);
         pe.extend_from_slice(&0x42000040u32.to_le_bytes()); // Characteristics
 
@@ -213,9 +221,9 @@ mod tests {
         // "mov rax, 0x140001000; ret" — contains an absolute address that needs reloc
         // 48 B8 00 10 00 40 01 00 00 00  C3
         let code: &[u8] = &[
-            0x48, 0xB8,                                         // mov rax, imm64
-            0x00, 0x10, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00,   // = 0x140001000
-            0xC3,                                                // ret
+            0x48, 0xB8, // mov rax, imm64
+            0x00, 0x10, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00, // = 0x140001000
+            0xC3, // ret
         ];
         pe.extend_from_slice(code);
         // Pad to section size
@@ -226,9 +234,9 @@ mod tests {
         // .reloc raw data at offset 0x400
         // Reloc block: VirtualAddress=0x1000, SizeOfBlock=16
         pe.extend_from_slice(&0x1000u32.to_le_bytes()); // PageRVA
-        pe.extend_from_slice(&16u32.to_le_bytes());      // BlockSize (8 header + 2*4 entries)
-        // Entries: DIR64 at offset 2 (the imm64 in the mov rax instruction)
-        // DIR64 = type=10, offset=2 → (10 << 12) | 2 = 0xA002
+        pe.extend_from_slice(&16u32.to_le_bytes()); // BlockSize (8 header + 2*4 entries)
+                                                    // Entries: DIR64 at offset 2 (the imm64 in the mov rax instruction)
+                                                    // DIR64 = type=10, offset=2 → (10 << 12) | 2 = 0xA002
         pe.extend_from_slice(&0xA002u16.to_le_bytes());
         // Padding entry
         pe.extend_from_slice(&0x0000u16.to_le_bytes());
@@ -260,7 +268,10 @@ mod tests {
         assert!(result.is_ok(), "package should succeed");
         let shellcode = result.unwrap();
         // Should be at least as large as the PE image
-        assert!(shellcode.len() > 0x3000, "shellcode should be larger than PE image");
+        assert!(
+            shellcode.len() > 0x3000,
+            "shellcode should be larger than PE image"
+        );
     }
 
     #[test]

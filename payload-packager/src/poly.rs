@@ -57,9 +57,9 @@ use sha2::Sha256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolyScheme {
-    AesCtrStream   = 0,
+    AesCtrStream = 0,
     ChaCha20Stream = 2, // Was LfsrStream — replaced due to M-37 8-bit leak
-    RawStub        = 3, // M-3: per-build register-allocated machine-code stub
+    RawStub = 3,        // M-3: per-build register-allocated machine-code stub
 }
 
 impl PolyScheme {
@@ -196,7 +196,11 @@ pub fn poly_serialize(blob: &PolyBlob, seed: u64) -> Vec<u8> {
     let padding: Vec<u8> = (0..pad_len).map(|_| rng.gen::<u8>()).collect();
 
     let encode_u32 = |v: u32| -> [u8; 4] {
-        if use_le { v.to_le_bytes() } else { v.to_be_bytes() }
+        if use_le {
+            v.to_le_bytes()
+        } else {
+            v.to_be_bytes()
+        }
     };
 
     let mut out = Vec::with_capacity(
@@ -298,13 +302,21 @@ pub fn poly_emit_stub(blob: &PolyBlob) -> String {
 
     // Split PSK: psk_mask XOR psk_b = hkdf_psk
     let psk_mask: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
-    let psk_b: Vec<u8> = hkdf_psk.iter().zip(psk_mask.iter()).map(|(p, m)| p ^ m).collect();
+    let psk_b: Vec<u8> = hkdf_psk
+        .iter()
+        .zip(psk_mask.iter())
+        .map(|(p, m)| p ^ m)
+        .collect();
     let psk_a_literal = byte_array_literal(&psk_mask);
     let psk_b_literal = byte_array_literal(&psk_b);
 
     // Split salt: salt_mask XOR salt_b = hkdf_salt
     let salt_mask: Vec<u8> = (0..16).map(|_| rng.gen()).collect();
-    let salt_b: Vec<u8> = hkdf_salt.iter().zip(salt_mask.iter()).map(|(s, m)| s ^ m).collect();
+    let salt_b: Vec<u8> = hkdf_salt
+        .iter()
+        .zip(salt_mask.iter())
+        .map(|(s, m)| s ^ m)
+        .collect();
     let salt_a_literal = byte_array_literal(&salt_mask);
     let salt_b_literal = byte_array_literal(&salt_b);
 
@@ -404,12 +416,7 @@ fn aes256_expand_key(key: &[u8; 32]) -> [u32; 60] {
 
     let mut w = [0u32; 60];
     for i in 0..8 {
-        w[i] = u32::from_be_bytes([
-            key[i * 4],
-            key[i * 4 + 1],
-            key[i * 4 + 2],
-            key[i * 4 + 3],
-        ]);
+        w[i] = u32::from_be_bytes([key[i * 4], key[i * 4 + 1], key[i * 4 + 2], key[i * 4 + 3]]);
     }
 
     for i in 8..60 {
@@ -570,35 +577,70 @@ fn aes256_ctr_stream(data: &[u8], key_material: &[u8]) -> Vec<u8> {
 ///
 /// Key: 32 bytes.  Nonce: 12 bytes (bytes 32–43 of `key`, zero-padded if shorter).
 fn chacha20_stream(data: &[u8], key: &[u8]) -> Vec<u8> {
-    assert!(key.len() >= 32, "ChaCha20 requires at least 32 bytes of key material");
+    assert!(
+        key.len() >= 32,
+        "ChaCha20 requires at least 32 bytes of key material"
+    );
 
     fn qr(mut a: u32, mut b: u32, mut c: u32, mut d: u32) -> (u32, u32, u32, u32) {
-        a = a.wrapping_add(b); d ^= a; d = d.rotate_left(16);
-        c = c.wrapping_add(d); b ^= c; b = b.rotate_left(12);
-        a = a.wrapping_add(b); d ^= a; d = d.rotate_left(8);
-        c = c.wrapping_add(d); b ^= c; b = b.rotate_left(7);
+        a = a.wrapping_add(b);
+        d ^= a;
+        d = d.rotate_left(16);
+        c = c.wrapping_add(d);
+        b ^= c;
+        b = b.rotate_left(12);
+        a = a.wrapping_add(b);
+        d ^= a;
+        d = d.rotate_left(8);
+        c = c.wrapping_add(d);
+        b ^= c;
+        b = b.rotate_left(7);
         (a, b, c, d)
     }
 
     fn chacha20_block(state: &[u32; 16]) -> [u8; 64] {
         let mut w = *state;
         for _ in 0..10 {
-            let (w0,w4,w8,w12) = qr(w[0],w[4],w[8],w[12]);
-            w[0]=w0; w[4]=w4; w[8]=w8; w[12]=w12;
-            let (w1,w5,w9,w13) = qr(w[1],w[5],w[9],w[13]);
-            w[1]=w1; w[5]=w5; w[9]=w9; w[13]=w13;
-            let (w2,w6,w10,w14) = qr(w[2],w[6],w[10],w[14]);
-            w[2]=w2; w[6]=w6; w[10]=w10; w[14]=w14;
-            let (w3,w7,w11,w15) = qr(w[3],w[7],w[11],w[15]);
-            w[3]=w3; w[7]=w7; w[11]=w11; w[15]=w15;
-            let (w0,w5,w10,w15) = qr(w[0],w[5],w[10],w[15]);
-            w[0]=w0; w[5]=w5; w[10]=w10; w[15]=w15;
-            let (w1,w6,w11,w12) = qr(w[1],w[6],w[11],w[12]);
-            w[1]=w1; w[6]=w6; w[11]=w11; w[12]=w12;
-            let (w2,w7,w8,w13) = qr(w[2],w[7],w[8],w[13]);
-            w[2]=w2; w[7]=w7; w[8]=w8; w[13]=w13;
-            let (w3,w4,w9,w14) = qr(w[3],w[4],w[9],w[14]);
-            w[3]=w3; w[4]=w4; w[9]=w9; w[14]=w14;
+            let (w0, w4, w8, w12) = qr(w[0], w[4], w[8], w[12]);
+            w[0] = w0;
+            w[4] = w4;
+            w[8] = w8;
+            w[12] = w12;
+            let (w1, w5, w9, w13) = qr(w[1], w[5], w[9], w[13]);
+            w[1] = w1;
+            w[5] = w5;
+            w[9] = w9;
+            w[13] = w13;
+            let (w2, w6, w10, w14) = qr(w[2], w[6], w[10], w[14]);
+            w[2] = w2;
+            w[6] = w6;
+            w[10] = w10;
+            w[14] = w14;
+            let (w3, w7, w11, w15) = qr(w[3], w[7], w[11], w[15]);
+            w[3] = w3;
+            w[7] = w7;
+            w[11] = w11;
+            w[15] = w15;
+            let (w0, w5, w10, w15) = qr(w[0], w[5], w[10], w[15]);
+            w[0] = w0;
+            w[5] = w5;
+            w[10] = w10;
+            w[15] = w15;
+            let (w1, w6, w11, w12) = qr(w[1], w[6], w[11], w[12]);
+            w[1] = w1;
+            w[6] = w6;
+            w[11] = w11;
+            w[12] = w12;
+            let (w2, w7, w8, w13) = qr(w[2], w[7], w[8], w[13]);
+            w[2] = w2;
+            w[7] = w7;
+            w[8] = w8;
+            w[13] = w13;
+            let (w3, w4, w9, w14) = qr(w[3], w[4], w[9], w[14]);
+            w[3] = w3;
+            w[4] = w4;
+            w[9] = w9;
+            w[14] = w14;
         }
         let mut output = [0u8; 64];
         for i in 0..16 {
@@ -638,10 +680,22 @@ fn chacha20_stream(data: &[u8], key: &[u8]) -> Vec<u8> {
     for &byte in data {
         if keystream_pos >= 64 {
             let state: [u32; 16] = [
-                constants[0], constants[1], constants[2], constants[3],
-                key_words[0], key_words[1], key_words[2], key_words[3],
-                key_words[4], key_words[5], key_words[6], key_words[7],
-                counter, nonce_words[0], nonce_words[1], nonce_words[2],
+                constants[0],
+                constants[1],
+                constants[2],
+                constants[3],
+                key_words[0],
+                key_words[1],
+                key_words[2],
+                key_words[3],
+                key_words[4],
+                key_words[5],
+                key_words[6],
+                key_words[7],
+                counter,
+                nonce_words[0],
+                nonce_words[1],
+                nonce_words[2],
             ];
             keystream = chacha20_block(&state);
             keystream_pos = 0;
@@ -730,12 +784,7 @@ fn emit_reconstruct_key_fn(
 
 // ── Stub body emitters ────────────────────────────────────────────────────────
 
-fn emit_aes_ctr_body(
-    v_ct: &str,
-    v_key: &str,
-    v_out: &str,
-    rng: &mut impl Rng,
-) -> String {
+fn emit_aes_ctr_body(v_ct: &str, v_key: &str, v_out: &str, rng: &mut impl Rng) -> String {
     let mut suf = || format!("{:04x}", rng.gen::<u16>());
     let v_sbox = format!("sbox_{}", suf());
     let v_xtime = format!("xt_{}", suf());
@@ -871,24 +920,19 @@ fn emit_aes_ctr_body(
     )
 }
 
-fn emit_chacha20_body(
-    v_ct: &str,
-    v_key: &str,
-    v_out: &str,
-    rng: &mut impl Rng,
-) -> String {
+fn emit_chacha20_body(v_ct: &str, v_key: &str, v_out: &str, rng: &mut impl Rng) -> String {
     let mut suf = || format!("{:04x}", rng.gen::<u16>());
-    let v_qr     = format!("qr_{}",   suf());
-    let v_block  = format!("blk_{}",  suf());
-    let v_state  = format!("st_{}",   suf());
-    let v_work   = format!("w_{}",    suf());
-    let v_ctr    = format!("ctr_{}",  suf());
-    let v_npos   = format!("npos_{}", suf());
-    let v_ks     = format!("ks_{}",   suf());
-    let v_b      = format!("b_{}",    suf());
-    let v_kwords = format!("kw_{}",   suf());
-    let v_nwords = format!("nw_{}",   suf());
-    let v_consts = format!("cst_{}",  suf());
+    let v_qr = format!("qr_{}", suf());
+    let v_block = format!("blk_{}", suf());
+    let v_state = format!("st_{}", suf());
+    let v_work = format!("w_{}", suf());
+    let v_ctr = format!("ctr_{}", suf());
+    let v_npos = format!("npos_{}", suf());
+    let v_ks = format!("ks_{}", suf());
+    let v_b = format!("b_{}", suf());
+    let v_kwords = format!("kw_{}", suf());
+    let v_nwords = format!("nw_{}", suf());
+    let v_consts = format!("cst_{}", suf());
 
     if rng.gen_bool(0.5) {
         // Style A: inline QR operations, no helper functions
@@ -1034,7 +1078,11 @@ mod tests {
 
         let decode_u32 = |b: &[u8]| -> usize {
             let arr: [u8; 4] = b.try_into().unwrap();
-            if use_le { u32::from_le_bytes(arr) as usize } else { u32::from_be_bytes(arr) as usize }
+            if use_le {
+                u32::from_le_bytes(arr) as usize
+            } else {
+                u32::from_be_bytes(arr) as usize
+            }
         };
 
         let key_len_off = 6 + pad_len;
@@ -1077,12 +1125,18 @@ mod tests {
             let serialized = poly_serialize(&blob, seed);
             let flags = serialized[5];
             let pad_len = (flags >> 2) as usize;
-            if pad_len != 0 { continue; }  // re-try on padding builds
+            if pad_len != 0 {
+                continue;
+            } // re-try on padding builds
             let use_le = (flags & 1) != 0;
 
             let decode_u32 = |b: &[u8]| -> usize {
                 let arr: [u8; 4] = b.try_into().unwrap();
-                if use_le { u32::from_le_bytes(arr) as usize } else { u32::from_be_bytes(arr) as usize }
+                if use_le {
+                    u32::from_le_bytes(arr) as usize
+                } else {
+                    u32::from_be_bytes(arr) as usize
+                }
             };
             // key_len field starts at offset 6.
             assert_eq!(decode_u32(&serialized[6..10]), 44);

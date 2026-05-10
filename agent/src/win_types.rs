@@ -492,7 +492,11 @@ impl Default for CONTEXT {
 /// IUnknown vtable (minimal — only the three IUnknown methods).
 #[repr(C)]
 pub struct IUnknownVtbl {
-    pub query_interface: unsafe extern "system" fn(*mut std::ffi::c_void, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
+    pub query_interface: unsafe extern "system" fn(
+        *mut std::ffi::c_void,
+        REFIID,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
     pub add_ref: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
     pub release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
 }
@@ -534,18 +538,18 @@ pub const MAX_ADAPTER_ADDRESS_LENGTH: usize = 8;
 /// but we only read PhysicalAddress, PhysicalAddressLength, and Next.
 #[repr(C)]
 pub struct IP_ADAPTER_ADDRESSES {
-    _union: u64,                          // u (Alignment / Length+IfIndex)
-    pub next: *mut IP_ADAPTER_ADDRESSES,   // Next
-    _adapter_name: PSTR,                   // AdapterName
-    _first_unicast: *mut std::ffi::c_void, // FirstUnicastAddress
-    _first_anycast: *mut std::ffi::c_void, // FirstAnycastAddress
+    _union: u64,                             // u (Alignment / Length+IfIndex)
+    pub next: *mut IP_ADAPTER_ADDRESSES,     // Next
+    _adapter_name: PSTR,                     // AdapterName
+    _first_unicast: *mut std::ffi::c_void,   // FirstUnicastAddress
+    _first_anycast: *mut std::ffi::c_void,   // FirstAnycastAddress
     _first_multicast: *mut std::ffi::c_void, // FirstMulticastAddress
-    _first_dns: *mut std::ffi::c_void,    // FirstDnsServerAddress
-    _dns_suffix: PWSTR,                   // DnsSuffix
-    _description: PWSTR,                  // Description
-    _friendly_name: PWSTR,                // FriendlyName
+    _first_dns: *mut std::ffi::c_void,       // FirstDnsServerAddress
+    _dns_suffix: PWSTR,                      // DnsSuffix
+    _description: PWSTR,                     // Description
+    _friendly_name: PWSTR,                   // FriendlyName
     pub physical_address: [UCHAR; MAX_ADAPTER_ADDRESS_LENGTH], // PhysicalAddress
-    pub physical_address_length: ULONG,   // PhysicalAddressLength
+    pub physical_address_length: ULONG,      // PhysicalAddressLength
 }
 
 // ── Handle constants ────────────────────────────────────────────────────────

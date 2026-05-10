@@ -92,26 +92,27 @@ impl ShellSession {
         let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let buf_clone = buffer.clone();
         let running_clone = is_running.clone();
-        let reader_thread = std::thread::Builder::new()
-            .name("bg-reader".into())
-            .spawn(move || {
-                let mut chunk = [0u8; READ_CHUNK];
-                loop {
-                    if !running_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    match reader.read(&mut chunk) {
-                        Ok(0) => break, // EOF
-                        Ok(n) => {
-                            if let Ok(mut b) = buf_clone.lock() {
-                                b.extend_from_slice(&chunk[..n]);
-                            }
+        let reader_thread =
+            std::thread::Builder::new()
+                .name("bg-reader".into())
+                .spawn(move || {
+                    let mut chunk = [0u8; READ_CHUNK];
+                    loop {
+                        if !running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
+                        match reader.read(&mut chunk) {
+                            Ok(0) => break, // EOF
+                            Ok(n) => {
+                                if let Ok(mut b) = buf_clone.lock() {
+                                    b.extend_from_slice(&chunk[..n]);
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(_) => break,
+                        }
                     }
-                }
-            })?;
+                })?;
 
         Ok(Self {
             writer,

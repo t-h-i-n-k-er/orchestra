@@ -144,10 +144,7 @@ const HASH_CONSTANT_PAIRS: [(u32, u32); 6] = [
 /// POPFQ
 /// ```
 #[cfg(target_arch = "x86_64")]
-fn number_theoretic(
-    rng: &mut impl Rng,
-    next_extra: &mut impl FnMut() -> u64,
-) -> Vec<Instruction> {
+fn number_theoretic(rng: &mut impl Rng, next_extra: &mut impl FnMut() -> u64) -> Vec<Instruction> {
     let odd = ODD_CONSTANTS[rng.gen::<usize>() % ODD_CONSTANTS.len()] as i32;
     let mut out: Vec<Instruction> = Vec::with_capacity(12);
 
@@ -167,26 +164,22 @@ fn number_theoretic(
     out.push(push_r11);
 
     // MOV R10D, odd_constant
-    let mut mov_odd =
-        Instruction::with2(Code::Mov_r32_imm32, Register::R10D, odd).unwrap();
+    let mut mov_odd = Instruction::with2(Code::Mov_r32_imm32, Register::R10D, odd).unwrap();
     mov_odd.set_ip(next_extra());
     out.push(mov_odd);
 
     // MOV R11D, 1
-    let mut mov_one =
-        Instruction::with2(Code::Mov_r32_imm32, Register::R11D, 1).unwrap();
+    let mut mov_one = Instruction::with2(Code::Mov_r32_imm32, Register::R11D, 1).unwrap();
     mov_one.set_ip(next_extra());
     out.push(mov_one);
 
     // IMUL R10D, R11D (r32, rm32 form)
-    let mut imul = Instruction::with2(Code::Imul_r32_rm32, Register::R10D, Register::R11D)
-        .unwrap();
+    let mut imul = Instruction::with2(Code::Imul_r32_rm32, Register::R10D, Register::R11D).unwrap();
     imul.set_ip(next_extra());
     out.push(imul);
 
     // TEST R10D, 1
-    let mut test =
-        Instruction::with2(Code::Test_rm32_r32, Register::R10D, Register::R10D).unwrap();
+    let mut test = Instruction::with2(Code::Test_rm32_r32, Register::R10D, Register::R10D).unwrap();
     test.set_ip(next_extra());
     out.push(test);
 
@@ -282,32 +275,27 @@ fn quadratic_discriminant(
     out.push(push_r11);
 
     // MOV R10D, b
-    let mut mov_b =
-        Instruction::with2(Code::Mov_r32_imm32, Register::R10D, b).unwrap();
+    let mut mov_b = Instruction::with2(Code::Mov_r32_imm32, Register::R10D, b).unwrap();
     mov_b.set_ip(next_extra());
     out.push(mov_b);
 
     // IMUL R10D, R10D (b²)
-    let mut imul = Instruction::with2(Code::Imul_r32_rm32, Register::R10D, Register::R10D)
-        .unwrap();
+    let mut imul = Instruction::with2(Code::Imul_r32_rm32, Register::R10D, Register::R10D).unwrap();
     imul.set_ip(next_extra());
     out.push(imul);
 
     // MOV R11D, 4ac
-    let mut mov_ac =
-        Instruction::with2(Code::Mov_r32_imm32, Register::R11D, four_ac).unwrap();
+    let mut mov_ac = Instruction::with2(Code::Mov_r32_imm32, Register::R11D, four_ac).unwrap();
     mov_ac.set_ip(next_extra());
     out.push(mov_ac);
 
     // SUB R10D, R11D (b² − 4ac)
-    let mut sub =
-        Instruction::with2(Code::Sub_r32_rm32, Register::R10D, Register::R11D).unwrap();
+    let mut sub = Instruction::with2(Code::Sub_r32_rm32, Register::R10D, Register::R11D).unwrap();
     sub.set_ip(next_extra());
     out.push(sub);
 
     // TEST R10D, R10D (sets SF=0 since result > 0)
-    let mut test =
-        Instruction::with2(Code::Test_rm32_r32, Register::R10D, Register::R10D).unwrap();
+    let mut test = Instruction::with2(Code::Test_rm32_r32, Register::R10D, Register::R10D).unwrap();
     test.set_ip(next_extra());
     out.push(test);
 
@@ -359,10 +347,7 @@ fn quadratic_discriminant(
 /// POPFQ
 /// ```
 #[cfg(target_arch = "x86_64")]
-fn bit_manipulation(
-    rng: &mut impl Rng,
-    next_extra: &mut impl FnMut() -> u64,
-) -> Vec<Instruction> {
+fn bit_manipulation(rng: &mut impl Rng, next_extra: &mut impl FnMut() -> u64) -> Vec<Instruction> {
     let pow2 = POW2_CONSTANTS[rng.gen::<usize>() % POW2_CONSTANTS.len()] as i32;
     let mut out: Vec<Instruction> = Vec::with_capacity(12);
 
@@ -382,8 +367,7 @@ fn bit_manipulation(
     out.push(push_r11);
 
     // MOV R10D, pow2
-    let mut mov_pow2 =
-        Instruction::with2(Code::Mov_r32_imm32, Register::R10D, pow2).unwrap();
+    let mut mov_pow2 = Instruction::with2(Code::Mov_r32_imm32, Register::R10D, pow2).unwrap();
     mov_pow2.set_ip(next_extra());
     out.push(mov_pow2);
 
@@ -391,8 +375,7 @@ fn bit_manipulation(
     // MOV R11D, R10D  then DEC R11D.
     // LEA with 32-bit ops on 64-bit registers needs care.
     // Simpler: MOV R11D, pow2-1 directly.
-    let mut mov_p1 =
-        Instruction::with2(Code::Mov_r32_imm32, Register::R11D, pow2 - 1).unwrap();
+    let mut mov_p1 = Instruction::with2(Code::Mov_r32_imm32, Register::R11D, pow2 - 1).unwrap();
     mov_p1.set_ip(next_extra());
     out.push(mov_p1);
 
@@ -449,10 +432,7 @@ fn bit_manipulation(
 /// POPFQ
 /// ```
 #[cfg(target_arch = "x86_64")]
-fn hash_based(
-    rng: &mut impl Rng,
-    next_extra: &mut impl FnMut() -> u64,
-) -> Vec<Instruction> {
+fn hash_based(rng: &mut impl Rng, next_extra: &mut impl FnMut() -> u64) -> Vec<Instruction> {
     let (c, _) = HASH_CONSTANT_PAIRS[rng.gen::<usize>() % HASH_CONSTANT_PAIRS.len()];
     let double_c = (c as u64).wrapping_add(c as u64) as u32;
     let mut out: Vec<Instruction> = Vec::with_capacity(12);
@@ -473,19 +453,16 @@ fn hash_based(
     out.push(push_r11);
 
     // MOV R10D, C
-    let mut mov_c =
-        Instruction::with2(Code::Mov_r32_imm32, Register::R10D, c as i32).unwrap();
+    let mut mov_c = Instruction::with2(Code::Mov_r32_imm32, Register::R10D, c as i32).unwrap();
     mov_c.set_ip(next_extra());
     out.push(mov_c);
 
     // ADD R10D, C  (use register form: MOV R11D, C; ADD R10D, R11D)
-    let mut mov_c2 =
-        Instruction::with2(Code::Mov_r32_imm32, Register::R11D, c as i32).unwrap();
+    let mut mov_c2 = Instruction::with2(Code::Mov_r32_imm32, Register::R11D, c as i32).unwrap();
     mov_c2.set_ip(next_extra());
     out.push(mov_c2);
 
-    let mut add_c =
-        Instruction::with2(Code::Add_r32_rm32, Register::R10D, Register::R11D).unwrap();
+    let mut add_c = Instruction::with2(Code::Add_r32_rm32, Register::R10D, Register::R11D).unwrap();
     add_c.set_ip(next_extra());
     out.push(add_c);
 
@@ -550,10 +527,7 @@ fn hash_based(
 /// POPFQ
 /// ```
 #[cfg(target_arch = "x86_64")]
-fn shift_and_mask(
-    rng: &mut impl Rng,
-    next_extra: &mut impl FnMut() -> u64,
-) -> Vec<Instruction> {
+fn shift_and_mask(rng: &mut impl Rng, next_extra: &mut impl FnMut() -> u64) -> Vec<Instruction> {
     // Valid shift amounts (1..30 to stay well within 32-bit range).
     let shift: i32 = (rng.gen::<u8>() % 28 + 1) as i32;
     let mut out: Vec<Instruction> = Vec::with_capacity(12);
@@ -569,8 +543,7 @@ fn shift_and_mask(
     out.push(push_r10);
 
     // MOV R10D, 1
-    let mut mov_one =
-        Instruction::with2(Code::Mov_r32_imm32, Register::R10D, 1).unwrap();
+    let mut mov_one = Instruction::with2(Code::Mov_r32_imm32, Register::R10D, 1).unwrap();
     mov_one.set_ip(next_extra());
     out.push(mov_one);
 
@@ -585,8 +558,7 @@ fn shift_and_mask(
     out.push(shr);
 
     // CMP R10D, 1
-    let mut cmp_one =
-        Instruction::with2(Code::Cmp_rm32_imm8, Register::R10D, 1).unwrap();
+    let mut cmp_one = Instruction::with2(Code::Cmp_rm32_imm8, Register::R10D, 1).unwrap();
     cmp_one.set_ip(next_extra());
     out.push(cmp_one);
 
@@ -631,10 +603,7 @@ fn shift_and_mask(
 /// POPFQ
 /// ```
 #[cfg(target_arch = "x86_64")]
-fn xor_avalanche(
-    rng: &mut impl Rng,
-    next_extra: &mut impl FnMut() -> u64,
-) -> Vec<Instruction> {
+fn xor_avalanche(rng: &mut impl Rng, next_extra: &mut impl FnMut() -> u64) -> Vec<Instruction> {
     // Generate a random-looking 64-bit constant (but the actual value doesn't
     // matter since x⊕x = 0 for all x).
     let val = rng.gen::<u64>();
@@ -651,20 +620,17 @@ fn xor_avalanche(
     out.push(push_r10);
 
     // MOV R10, val (64-bit immediate)
-    let mut mov_val =
-        Instruction::with2(Code::Mov_r64_imm64, Register::R10, val as i64).unwrap();
+    let mut mov_val = Instruction::with2(Code::Mov_r64_imm64, Register::R10, val as i64).unwrap();
     mov_val.set_ip(next_extra());
     out.push(mov_val);
 
     // XOR R10, R10 → 0
-    let mut xor_op =
-        Instruction::with2(Code::Xor_r64_rm64, Register::R10, Register::R10).unwrap();
+    let mut xor_op = Instruction::with2(Code::Xor_r64_rm64, Register::R10, Register::R10).unwrap();
     xor_op.set_ip(next_extra());
     out.push(xor_op);
 
     // TEST R10, R10 → ZF=1
-    let mut test =
-        Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).unwrap();
+    let mut test = Instruction::with2(Code::Test_rm64_r64, Register::R10, Register::R10).unwrap();
     test.set_ip(next_extra());
     out.push(test);
 
@@ -822,8 +788,8 @@ fn aarch64_eor_zero(_rng: &mut impl Rng) -> Vec<u32> {
     // EOR X16, X16, X16  → X16 = 0
     // CBNZ X16, #+4      → not taken (X16 == 0)
     vec![
-        enc_eor_x(16, 16, 16),  // X16 = X16 XOR X16 = 0
-        enc_cbnz_x(16, 1),      // CBNZ X16, #4 (skip 1 insn = never taken)
+        enc_eor_x(16, 16, 16), // X16 = X16 XOR X16 = 0
+        enc_cbnz_x(16, 1),     // CBNZ X16, #4 (skip 1 insn = never taken)
     ]
 }
 
@@ -832,8 +798,8 @@ fn aarch64_eor_zero(_rng: &mut impl Rng) -> Vec<u32> {
 /// `SUB X16, X16, X16` → X16 = 0.  Same effect, different opcode.
 fn aarch64_sub_zero(_rng: &mut impl Rng) -> Vec<u32> {
     vec![
-        enc_sub_x(16, 16, 16),  // X16 = X16 - X16 = 0
-        enc_cbnz_x(16, 1),      // CBNZ X16, #4 (never taken)
+        enc_sub_x(16, 16, 16), // X16 = X16 - X16 = 0
+        enc_cbnz_x(16, 1),     // CBNZ X16, #4 (never taken)
     ]
 }
 
@@ -847,9 +813,9 @@ fn aarch64_and_mask(_rng: &mut impl Rng) -> Vec<u32> {
     // Actually, AND X16, X16, X16 when X16 = 1 → X16 = 1 (non-zero).
     // CBZ X16 is never taken.
     vec![
-        enc_movz_x(16, 1),      // X16 = 1
-        enc_and_x(16, 16, 16),  // X16 = X16 AND X16 = 1 (non-zero)
-        enc_cbz_x(16, 1),       // CBZ X16, #4 (never taken since X16 = 1)
+        enc_movz_x(16, 1),     // X16 = 1
+        enc_and_x(16, 16, 16), // X16 = X16 AND X16 = 1 (non-zero)
+        enc_cbz_x(16, 1),      // CBZ X16, #4 (never taken since X16 = 1)
     ]
 }
 
@@ -868,8 +834,8 @@ fn aarch64_mul_odd_tbnz(rng: &mut impl Rng) -> Vec<u32> {
     // B with imm26 = +1 means offset = +4 bytes (skip 1 instruction)
     vec![
         enc_movz_x(16, odd as u32 & 0xFFFF), // X16 = odd
-        enc_tbnz(16, 0, 2),                   // TBNZ X16, #0, #+8 (always taken)
-        0x1400_0001,                           // B #+4 (dead code)
+        enc_tbnz(16, 0, 2),                  // TBNZ X16, #0, #+8 (always taken)
+        0x1400_0001,                         // B #+4 (dead code)
     ]
 }
 
@@ -918,9 +884,9 @@ fn aarch64_mul_odd_tbnz(rng: &mut impl Rng) -> Vec<u32> {
 /// The ORR instruction looks like a register move but preserves zero.
 fn aarch64_orr_self(_rng: &mut impl Rng) -> Vec<u32> {
     vec![
-        enc_eor_x(16, 16, 16),  // X16 = 0
-        enc_mov_x(16, 16),      // X16 = X16 (MOV alias; still 0)
-        enc_cbnz_x(16, 1),      // CBNZ X16, #4 (never taken)
+        enc_eor_x(16, 16, 16), // X16 = 0
+        enc_mov_x(16, 16),     // X16 = X16 (MOV alias; still 0)
+        enc_cbnz_x(16, 1),     // CBNZ X16, #4 (never taken)
     ]
 }
 
@@ -938,7 +904,7 @@ fn aarch64_hash_constants(rng: &mut impl Rng) -> Vec<u32> {
     let sum_small = c1_small.wrapping_add(c2_small) & 0xFFF;
 
     vec![
-        enc_movz_x(16, c1_small),        // X16 = c1
+        enc_movz_x(16, c1_small),         // X16 = c1
         enc_add_x_imm(16, 16, c2_small),  // X16 = c1 + c2
         enc_sub_x_imm(16, 16, sum_small), // X16 = c1 + c2 - (c1+c2) = 0
         enc_cbnz_x(16, 1),                // CBNZ X16, #4 (never taken)
@@ -1000,8 +966,12 @@ pub fn apply_opaque_predicates(code: &[u8], rng: &mut impl Rng) -> Vec<u8> {
         let inst = &instructions[i];
         if matches!(
             inst.code(),
-            Code::Retnq | Code::Retnd | Code::Ud2 | Code::Int3
-                | Code::Jmp_rel32_64 | Code::Jmp_rel8_64
+            Code::Retnq
+                | Code::Retnd
+                | Code::Ud2
+                | Code::Int3
+                | Code::Jmp_rel32_64
+                | Code::Jmp_rel8_64
         ) && i + 1 < instructions.len()
         {
             is_leader[i + 1] = true;

@@ -38,8 +38,8 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 
 use crate::substitute_aarch64::{
-    classify, finalize, is_pcrel_data, is_terminator, pc_rel_branch_disp,
-    BranchKind, Item, ItemKind, SyntheticTarget,
+    classify, finalize, is_pcrel_data, is_terminator, pc_rel_branch_disp, BranchKind, Item,
+    ItemKind, SyntheticTarget,
 };
 
 /// Encode an unconditional `B` with a placeholder displacement of 0.
@@ -175,8 +175,10 @@ pub fn reorder_blocks(code: &[u8], rng: &mut impl Rng) -> Vec<u8> {
         // Conditional branches and BL also fall through, but the
         // fall-through instruction is the *next* one — mark it as leader so
         // it can be reordered independently from the current block.
-        if matches!(kind, BranchKind::PcRelCond | BranchKind::PcRelBL | BranchKind::BlrIndirect)
-            && i + 1 < n
+        if matches!(
+            kind,
+            BranchKind::PcRelCond | BranchKind::PcRelBL | BranchKind::BlrIndirect
+        ) && i + 1 < n
         {
             is_leader[i + 1] = true;
         }
@@ -310,13 +312,16 @@ mod tests {
     }
 
     fn from_le(bytes: &[u8]) -> Vec<u32> {
-        bytes.chunks_exact(4)
+        bytes
+            .chunks_exact(4)
             .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
             .collect()
     }
 
     const RET_X30: u32 = 0xD65F_03C0;
-    fn movz(rd: u32) -> u32 { 0xD280_0000 | rd }
+    fn movz(rd: u32) -> u32 {
+        0xD280_0000 | rd
+    }
 
     #[test]
     fn empty_and_misaligned_passthrough() {
@@ -372,10 +377,13 @@ mod tests {
             assert_eq!(words[0], movz(0), "seed={s}: entry must remain MOVZ X0");
 
             // Count CBNZ XZR predicates (mask out imm19 in bits[23:5]).
-            let n_pred = words.iter().filter(|&&w| {
-                // CBNZ Xt with sf=1: opcode bits[31:24]=0xB5; Rt bits[4:0]=31.
-                (w & 0xFF00_001F) == 0xB500_001F
-            }).count();
+            let n_pred = words
+                .iter()
+                .filter(|&&w| {
+                    // CBNZ Xt with sf=1: opcode bits[31:24]=0xB5; Rt bits[4:0]=31.
+                    (w & 0xFF00_001F) == 0xB500_001F
+                })
+                .count();
             assert_eq!(n_pred, 1, "seed={s}: expected exactly one opaque predicate");
 
             let n_ret = words.iter().filter(|&&w| w == RET_X30).count();
@@ -406,14 +414,21 @@ mod tests {
             let words = from_le(&out);
 
             // The B.NE must still target the RET in the new layout.
-            let bne_pos = words.iter()
+            let bne_pos = words
+                .iter()
                 .position(|&w| (w & 0xFF00_0010) == 0x5400_0000)
                 .expect("B.NE must survive");
             let disp = pc_rel_branch_disp(words[bne_pos]).unwrap();
             let target_byte = (bne_pos as i64) * 4 + disp as i64;
-            let ret_pos = words.iter().position(|&w| w == RET_X30).expect("RET must survive");
-            assert_eq!(target_byte as usize, ret_pos * 4,
-                "seed={s}: B.NE (idx {bne_pos}, disp {disp}) must land on RET (idx {ret_pos})");
+            let ret_pos = words
+                .iter()
+                .position(|&w| w == RET_X30)
+                .expect("RET must survive");
+            assert_eq!(
+                target_byte as usize,
+                ret_pos * 4,
+                "seed={s}: B.NE (idx {bne_pos}, disp {disp}) must land on RET (idx {ret_pos})"
+            );
 
             // There must be at least one explicit unconditional B inserted as
             // a fall-through link OR the original blocks ended up adjacent;

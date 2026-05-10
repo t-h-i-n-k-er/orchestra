@@ -166,7 +166,10 @@ static CACHED_MFT_LAYOUT: std::sync::OnceLock<MftLayout> = std::sync::OnceLock::
 /// Return the MFT record size from the cached layout.
 /// Falls back to `DEFAULT_MFT_RECORD_SIZE` if layout hasn't been built yet.
 fn get_mft_record_size() -> usize {
-    CACHED_MFT_LAYOUT.get().map(|l| l.record_size).unwrap_or(DEFAULT_MFT_RECORD_SIZE)
+    CACHED_MFT_LAYOUT
+        .get()
+        .map(|l| l.record_size)
+        .unwrap_or(DEFAULT_MFT_RECORD_SIZE)
 }
 
 /// Return the cached MFT layout, building it on first call.
@@ -175,16 +178,12 @@ fn get_mft_record_size() -> usize {
 /// then reads MFT record 0 to parse its non-resident $DATA attribute and
 /// extract the VCN→LCN data runs.  Falls back to a contiguous layout using
 /// the MFT start LCN from the boot sector if data run parsing fails.
-unsafe fn get_mft_layout(
-    volume_handle: *mut std::ffi::c_void,
-) -> &'static MftLayout {
+unsafe fn get_mft_layout(volume_handle: *mut std::ffi::c_void) -> &'static MftLayout {
     CACHED_MFT_LAYOUT.get_or_init(|| build_mft_layout(volume_handle))
 }
 
 /// Build the MFT layout by reading the boot sector and parsing data runs.
-unsafe fn build_mft_layout(
-    volume_handle: *mut std::ffi::c_void,
-) -> MftLayout {
+unsafe fn build_mft_layout(volume_handle: *mut std::ffi::c_void) -> MftLayout {
     // ── Step 1: Read NTFS boot sector (first 512 bytes) ────────────
     let mut boot = [0u8; 512];
     let bytes_per_cluster = match nt_read_file(volume_handle, &mut boot, Some(0)) {
@@ -207,8 +206,8 @@ unsafe fn build_mft_layout(
     // MFT start LCN is at offset +0x30 in the boot sector (8 bytes, signed).
     let mft_start_lcn = if boot.len() >= 0x38 {
         i64::from_le_bytes([
-            boot[0x30], boot[0x31], boot[0x32], boot[0x33],
-            boot[0x34], boot[0x35], boot[0x36], boot[0x37],
+            boot[0x30], boot[0x31], boot[0x32], boot[0x33], boot[0x34], boot[0x35], boot[0x36],
+            boot[0x37],
         ])
     } else {
         0
@@ -217,10 +216,14 @@ unsafe fn build_mft_layout(
     // ── Step 2: Read MFT record 0 from the correct offset ──────────
     let mft_record_0_offset = mft_start_lcn * (bytes_per_cluster as i64);
     let mut record_buf = vec![0u8; 4096]; // max possible MFT record size
-    let record_size = match nt_read_file(volume_handle, &mut record_buf, Some(mft_record_0_offset)) {
+    let record_size = match nt_read_file(volume_handle, &mut record_buf, Some(mft_record_0_offset))
+    {
         Ok(n) if n >= 0x20 && record_buf[0..4] == MFT_RECORD_SIGNATURE => {
             let allocated = u32::from_le_bytes([
-                record_buf[0x1C], record_buf[0x1D], record_buf[0x1E], record_buf[0x1F],
+                record_buf[0x1C],
+                record_buf[0x1D],
+                record_buf[0x1E],
+                record_buf[0x1F],
             ]) as usize;
             if allocated >= 512 && allocated <= 4096 && (allocated & 0x1FF) == 0 {
                 log::debug!("timestamps: detected MFT record size = {}", allocated);
@@ -250,12 +253,16 @@ unsafe fn build_mft_layout(
                 r
             }
             _ => {
-                log::warn!("timestamps: failed to parse $DATA data runs, using contiguous fallback");
+                log::warn!(
+                    "timestamps: failed to parse $DATA data runs, using contiguous fallback"
+                );
                 contiguous_fallback(mft_start_lcn)
             }
         }
     } else {
-        log::warn!("timestamps: failed to remove fixup from MFT record 0, using contiguous fallback");
+        log::warn!(
+            "timestamps: failed to remove fixup from MFT record 0, using contiguous fallback"
+        );
         contiguous_fallback(mft_start_lcn)
     };
 
@@ -296,15 +303,19 @@ fn parse_mft_data_runs(record: &[u8], _bytes_per_cluster: u64) -> Option<Vec<Mft
             break;
         }
         let attr_type = u32::from_le_bytes([
-            record[offset], record[offset + 1],
-            record[offset + 2], record[offset + 3],
+            record[offset],
+            record[offset + 1],
+            record[offset + 2],
+            record[offset + 3],
         ]);
         if attr_type == ATTR_TYPE_END || attr_type == 0 {
             break;
         }
         let total_length = u32::from_le_bytes([
-            record[offset + 4], record[offset + 5],
-            record[offset + 6], record[offset + 7],
+            record[offset + 4],
+            record[offset + 5],
+            record[offset + 6],
+            record[offset + 7],
         ]) as usize;
         if total_length == 0 {
             break;
@@ -327,9 +338,8 @@ fn parse_mft_data_runs(record: &[u8], _bytes_per_cluster: u64) -> Option<Vec<Mft
             if offset + 0x1A > record.len() {
                 return None;
             }
-            let data_runs_offset = u16::from_le_bytes([
-                record[offset + 0x18], record[offset + 0x19],
-            ]) as usize;
+            let data_runs_offset =
+                u16::from_le_bytes([record[offset + 0x18], record[offset + 0x19]]) as usize;
 
             let runs_start = offset + data_runs_offset;
             if runs_start >= record.len() {
@@ -425,9 +435,11 @@ fn resolve_mft_byte_offset(record_number: i64) -> Option<i64> {
                 return None; // sparse run — record shouldn't be here
             }
             let byte_within_cluster = byte_within_mft % (layout.bytes_per_cluster as i64);
-            return Some(run.lcn * (layout.bytes_per_cluster as i64)
-                + (vcn - run.start_vcn) * (layout.bytes_per_cluster as i64)
-                + byte_within_cluster);
+            return Some(
+                run.lcn * (layout.bytes_per_cluster as i64)
+                    + (vcn - run.start_vcn) * (layout.bytes_per_cluster as i64)
+                    + byte_within_cluster,
+            );
         }
     }
     None // VCN not found in any data run
@@ -441,8 +453,12 @@ const MAX_USN_ITERATIONS: usize = 20;
 
 /// Default NTFS volume for MFT raw access.
 const DEFAULT_VOLUME_NT: &[u16] = &[
-    b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16,
-    b'C' as u16, b':' as u16,
+    b'\\' as u16,
+    b'?' as u16,
+    b'?' as u16,
+    b'\\' as u16,
+    b'C' as u16,
+    b':' as u16,
     0,
 ];
 
@@ -648,13 +664,13 @@ unsafe fn nt_open_file(
         desired_access as u64,
         &mut obj_attrs as *mut _ as u64,
         &mut iosb as *mut _ as u64,
-        0u64,                                          // AllocationSize
-        0u64,                                          // FileAttributes
+        0u64, // AllocationSize
+        0u64, // FileAttributes
         (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE) as u64,
         create_disposition as u64,
         create_options as u64,
-        0u64,                                          // EaBuffer
-        0u64,                                          // EaLength
+        0u64, // EaBuffer
+        0u64, // EaLength
     )
     .map_err(|e| format!("nt_syscall resolution for NtCreateFile: {e}"))?;
 
@@ -733,9 +749,7 @@ unsafe fn nt_set_basic_info(
 }
 
 /// Query file internal information (MFT index number) via NtQueryInformationFile.
-unsafe fn nt_query_internal_info(
-    file_handle: *mut std::ffi::c_void,
-) -> Result<i64, String> {
+unsafe fn nt_query_internal_info(file_handle: *mut std::ffi::c_void) -> Result<i64, String> {
     let mut info = FileInternalInformation::default();
     let mut iosb = IoStatusBlock::default();
 
@@ -770,14 +784,14 @@ unsafe fn nt_read_file(
     let status = crate::syscall!(
         "NtReadFile",
         file_handle as u64,
-        0u64,                              // Event
-        0u64,                              // ApcRoutine
-        0u64,                              // ApcContext
+        0u64, // Event
+        0u64, // ApcRoutine
+        0u64, // ApcContext
         &mut iosb as *mut _ as u64,
         buffer.as_mut_ptr() as u64,
         buffer.len() as u64,
         &mut byte_offset as *mut _ as u64,
-        0u64,                              // Key
+        0u64, // Key
     )
     .map_err(|e| format!("nt_syscall resolution for NtReadFile: {e}"))?;
 
@@ -802,14 +816,14 @@ unsafe fn nt_write_file(
     let status = crate::syscall!(
         "NtWriteFile",
         file_handle as u64,
-        0u64,                              // Event
-        0u64,                              // ApcRoutine
-        0u64,                              // ApcContext
+        0u64, // Event
+        0u64, // ApcRoutine
+        0u64, // ApcContext
         &mut iosb as *mut _ as u64,
         buffer.as_ptr() as u64,
         buffer.len() as u64,
         &mut byte_offset as *mut _ as u64,
-        0u64,                              // Key
+        0u64, // Key
     )
     .map_err(|e| format!("nt_syscall resolution for NtWriteFile: {e}"))?;
 
@@ -836,9 +850,9 @@ unsafe fn nt_fs_control_file(
     let status = crate::syscall!(
         "NtFsControlFile",
         file_handle as u64,
-        0u64,                              // Event
-        0u64,                              // ApcRoutine
-        0u64,                              // ApcContext
+        0u64, // Event
+        0u64, // ApcRoutine
+        0u64, // ApcContext
         &mut iosb as *mut _ as u64,
         fs_control_code as u64,
         input_buffer as u64,
@@ -859,9 +873,7 @@ unsafe fn nt_fs_control_file(
 
 /// Enumerate files in a directory via NtQueryDirectoryFile (indirect syscall).
 /// Returns a vector of file names (UTF-16 strings, without null terminator).
-unsafe fn nt_enumerate_files(
-    dir_handle: *mut std::ffi::c_void,
-) -> Result<Vec<Vec<u16>>, String> {
+unsafe fn nt_enumerate_files(dir_handle: *mut std::ffi::c_void) -> Result<Vec<Vec<u16>>, String> {
     let mut results = Vec::new();
     let buf_size: usize = 4096;
     let mut buffer = vec![0u8; buf_size];
@@ -872,16 +884,16 @@ unsafe fn nt_enumerate_files(
         let status = crate::syscall!(
             "NtQueryDirectoryFile",
             dir_handle as u64,
-            0u64,                              // Event
-            0u64,                              // ApcRoutine
-            0u64,                              // ApcContext
+            0u64, // Event
+            0u64, // ApcRoutine
+            0u64, // ApcContext
             &mut iosb as *mut _ as u64,
             buffer.as_mut_ptr() as u64,
             buf_size as u64,
-            1u64,   // FileDirectoryInformation (class = 1)
-            0u64,   // ReturnSingleEntry = FALSE
-            0u64,   // FileName (null = resume)
-            0u64,   // RestartScan = FALSE
+            1u64, // FileDirectoryInformation (class = 1)
+            0u64, // ReturnSingleEntry = FALSE
+            0u64, // FileName (null = resume)
+            0u64, // RestartScan = FALSE
         )
         .map_err(|e| format!("nt_syscall resolution for NtQueryDirectoryFile: {e}"))?;
 
@@ -921,11 +933,21 @@ unsafe fn nt_enumerate_files(
             //   +0x3C: FileNameLength (u32)
             //   +0x40: FileName[1] (u16)
             let entry_ptr = buffer.as_ptr().add(offset);
-            let next_entry_offset = u32::from_le_bytes(std::slice::from_raw_parts(entry_ptr.add(0), 4).try_into().unwrap());
-            let file_name_length = u32::from_le_bytes(std::slice::from_raw_parts(entry_ptr.add(0x3C), 4).try_into().unwrap()) as usize;
+            let next_entry_offset = u32::from_le_bytes(
+                std::slice::from_raw_parts(entry_ptr.add(0), 4)
+                    .try_into()
+                    .unwrap(),
+            );
+            let file_name_length = u32::from_le_bytes(
+                std::slice::from_raw_parts(entry_ptr.add(0x3C), 4)
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
             let file_name_offset = 0x40usize;
 
-            if file_name_length > 0 && offset + file_name_offset + file_name_length <= bytes_returned {
+            if file_name_length > 0
+                && offset + file_name_offset + file_name_length <= bytes_returned
+            {
                 let name_ptr = entry_ptr.add(file_name_offset) as *const u16;
                 let name_len = file_name_length / 2;
                 let name_slice = std::slice::from_raw_parts(name_ptr, name_len);
@@ -1046,10 +1068,8 @@ fn find_mft_attribute(record: &[u8], attr_type: u32) -> Option<(usize, usize, us
                     record[offset + 0x12],
                     record[offset + 0x13],
                 ]) as usize;
-                let content_offset = u16::from_le_bytes([
-                    record[offset + 0x14],
-                    record[offset + 0x15],
-                ]) as usize;
+                let content_offset =
+                    u16::from_le_bytes([record[offset + 0x14], record[offset + 0x15]]) as usize;
                 return Some((offset, content_offset, content_length));
             }
             // Non-resident $FILE_NAME is extremely rare; skip.
@@ -1093,10 +1113,8 @@ fn remove_mft_fixup(record: &mut [u8]) -> Result<(), String> {
             break;
         }
 
-        let current_value = u16::from_le_bytes([
-            record[sector_boundary],
-            record[sector_boundary + 1],
-        ]);
+        let current_value =
+            u16::from_le_bytes([record[sector_boundary], record[sector_boundary + 1]]);
 
         // Verify the signature matches.
         if current_value != signature {
@@ -1273,7 +1291,9 @@ unsafe fn write_mft_record(
     if bytes_written < record.len() {
         return Err(format!(
             "Short write on MFT record {}: wrote {} bytes, expected {}",
-            mft_record_number, bytes_written, record.len()
+            mft_record_number,
+            bytes_written,
+            record.len()
         ));
     }
 
@@ -1283,9 +1303,7 @@ unsafe fn write_mft_record(
 // ── USN Journal cleanup ──────────────────────────────────────────────────
 
 /// Read the current USN journal ID from the volume.
-unsafe fn query_usn_journal_id(
-    volume_handle: *mut std::ffi::c_void,
-) -> Result<u64, String> {
+unsafe fn query_usn_journal_id(volume_handle: *mut std::ffi::c_void) -> Result<u64, String> {
     // FSCTL_QUERY_USN_JOURNAL = 0x000900F4
     let mut output = [0u8; 64];
     let _iosb = nt_fs_control_file(
@@ -1307,8 +1325,7 @@ unsafe fn query_usn_journal_id(
     //   +0x30: AllocationDelta (u64)
     if output.len() >= 8 {
         Ok(u64::from_le_bytes([
-            output[0], output[1], output[2], output[3],
-            output[4], output[5], output[6], output[7],
+            output[0], output[1], output[2], output[3], output[4], output[5], output[6], output[7],
         ]))
     } else {
         Err("USN journal query returned insufficient data".to_string())
@@ -1387,8 +1404,14 @@ unsafe fn find_usn_entries_for_file(
 
         // First 8 bytes = next USN.
         current_usn = i64::from_le_bytes([
-            journal_buf[0], journal_buf[1], journal_buf[2], journal_buf[3],
-            journal_buf[4], journal_buf[5], journal_buf[6], journal_buf[7],
+            journal_buf[0],
+            journal_buf[1],
+            journal_buf[2],
+            journal_buf[3],
+            journal_buf[4],
+            journal_buf[5],
+            journal_buf[6],
+            journal_buf[7],
         ]);
 
         if current_usn == 0 {
@@ -1399,7 +1422,11 @@ unsafe fn find_usn_entries_for_file(
         let mut record_offset: usize = 8;
         while record_offset + 32 < bytes_returned {
             let rec_ptr = journal_buf.as_ptr().add(record_offset);
-            let record_length = u32::from_le_bytes(std::slice::from_raw_parts(rec_ptr, 4).try_into().unwrap_or([0u8; 4])) as usize;
+            let record_length = u32::from_le_bytes(
+                std::slice::from_raw_parts(rec_ptr, 4)
+                    .try_into()
+                    .unwrap_or([0u8; 4]),
+            ) as usize;
 
             if record_length == 0 || record_offset + record_length > bytes_returned {
                 break;
@@ -1407,8 +1434,16 @@ unsafe fn find_usn_entries_for_file(
 
             // Parse the common fields.
             if record_length >= 32 {
-                let file_ref = u64::from_le_bytes(std::slice::from_raw_parts(rec_ptr.add(8), 8).try_into().unwrap_or([0u8; 8]));
-                let usn = i64::from_le_bytes(std::slice::from_raw_parts(rec_ptr.add(24), 8).try_into().unwrap_or([0u8; 8]));
+                let file_ref = u64::from_le_bytes(
+                    std::slice::from_raw_parts(rec_ptr.add(8), 8)
+                        .try_into()
+                        .unwrap_or([0u8; 8]),
+                );
+                let usn = i64::from_le_bytes(
+                    std::slice::from_raw_parts(rec_ptr.add(24), 8)
+                        .try_into()
+                        .unwrap_or([0u8; 8]),
+                );
 
                 // Compare with target — mask off the sequence number (lower 48 bits = record number).
                 let ref_record_number = file_ref & 0x0000FFFFFFFFFFFF;
@@ -1450,7 +1485,7 @@ unsafe fn clean_usn_entries(
             &mut iosb as *mut _ as u64,
             FSCTL_WRITE_USN_CLOSE as u64,
             &target_file_ref as *const u64 as *mut std::ffi::c_void as u64,
-            8u64,  // input size
+            8u64, // input size
             std::ptr::null_mut::<std::ffi::c_void>(),
             0u64,
         )
@@ -1461,12 +1496,17 @@ unsafe fn clean_usn_entries(
         } else {
             log::debug!(
                 "timestamps: FSCTL_WRITE_USN_CLOSE returned NTSTATUS {:#010X} for USN {}",
-                status as u32, usn
+                status as u32,
+                usn
             );
         }
     }
 
-    log::debug!("timestamps: cleaned {} USN journal entries for file ref {:#018X}", cleaned, target_file_ref);
+    log::debug!(
+        "timestamps: cleaned {} USN journal entries for file ref {:#018X}",
+        cleaned,
+        target_file_ref
+    );
     Ok(cleaned)
 }
 
@@ -1506,7 +1546,10 @@ unsafe fn recreate_usn_journal(volume_handle: *mut std::ffi::c_void) -> Result<(
         0,
     );
 
-    log::debug!("timestamps: recreated USN journal (old ID={:#018X})", journal_id);
+    log::debug!(
+        "timestamps: recreated USN journal (old ID={:#018X})",
+        journal_id
+    );
     Ok(())
 }
 
@@ -1530,11 +1573,7 @@ pub fn init_from_config(cfg: &TimestampConfig) {
 
 /// Check if the module is initialised and enabled.
 pub fn is_enabled() -> bool {
-    INITIALIZED.load(Ordering::Acquire)
-        && CONFIG
-            .get()
-            .map(|c| c.enabled)
-            .unwrap_or(false)
+    INITIALIZED.load(Ordering::Acquire) && CONFIG.get().map(|c| c.enabled).unwrap_or(false)
 }
 
 /// Timestomp a single file: set all 8 timestamps (4 in $SI + 4 in $FN)
@@ -1556,7 +1595,9 @@ pub unsafe fn timestomp_file(file_path: &[u16], reference_path: &[u16]) -> Resul
         FILE_OPEN,
         FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
     )?;
-    defer!({ let _ = nt_close(ref_handle); });
+    defer!({
+        let _ = nt_close(ref_handle);
+    });
 
     let ref_info = nt_query_basic_info(ref_handle)?;
     log::debug!(
@@ -1573,7 +1614,9 @@ pub unsafe fn timestomp_file(file_path: &[u16], reference_path: &[u16]) -> Resul
         FILE_OPEN,
         FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
     )?;
-    defer!({ let _ = nt_close(target_handle); });
+    defer!({
+        let _ = nt_close(target_handle);
+    });
 
     // Build the new basic info with cover timestamps.
     let mut new_info = FileBasicInformation {
@@ -1595,7 +1638,10 @@ pub unsafe fn timestomp_file(file_path: &[u16], reference_path: &[u16]) -> Resul
     if sync_fn {
         // Get the MFT record number for the target file.
         let mft_record_number = nt_query_internal_info(target_handle)?;
-        log::debug!("timestamps: target MFT record number = {}", mft_record_number);
+        log::debug!(
+            "timestamps: target MFT record number = {}",
+            mft_record_number
+        );
 
         // Open the volume handle for raw MFT access.
         let volume_handle = nt_open_file(
@@ -1607,7 +1653,9 @@ pub unsafe fn timestomp_file(file_path: &[u16], reference_path: &[u16]) -> Resul
 
         // Best-effort: if volume open fails, skip $FN patching.
         if !volume_handle.is_null() {
-            defer!({ let _ = nt_close(volume_handle); });
+            defer!({
+                let _ = nt_close(volume_handle);
+            });
 
             match patch_fn_via_mft(
                 volume_handle,
@@ -1618,7 +1666,9 @@ pub unsafe fn timestomp_file(file_path: &[u16], reference_path: &[u16]) -> Resul
                 ref_info.last_access_time,
             ) {
                 Ok(true) => log::debug!("timestamps: patched $FILE_NAME timestamps via MFT"),
-                Ok(false) => log::warn!("timestamps: could not patch $FILE_NAME (attribute not found or out of bounds)"),
+                Ok(false) => log::warn!(
+                    "timestamps: could not patch $FILE_NAME (attribute not found or out of bounds)"
+                ),
                 Err(e) => log::warn!("timestamps: $FILE_NAME patch failed: {}", e),
             }
 
@@ -1636,7 +1686,10 @@ pub unsafe fn timestomp_file(file_path: &[u16], reference_path: &[u16]) -> Resul
         }
     }
 
-    log::info!("timestamps: timestomp complete for {}", wide_to_string(file_path));
+    log::info!(
+        "timestamps: timestomp complete for {}",
+        wide_to_string(file_path)
+    );
     Ok(())
 }
 
@@ -1682,14 +1735,19 @@ unsafe fn patch_fn_via_mft(
 /// # Arguments
 /// * `dir_path` — Directory path in NT format.
 /// * `reference_path` — Reference file whose timestamps will be used.
-pub unsafe fn timestomp_directory(dir_path: &[u16], reference_path: &[u16]) -> Result<usize, String> {
+pub unsafe fn timestomp_directory(
+    dir_path: &[u16],
+    reference_path: &[u16],
+) -> Result<usize, String> {
     let dir_handle = nt_open_file(
         dir_path,
         GENERIC_READ | SYNCHRONIZE,
         FILE_OPEN,
         FILE_SYNCHRONOUS_IO_NONALERT | 0x00000001, // FILE_DIRECTORY_FILE
     )?;
-    defer!({ let _ = nt_close(dir_handle); });
+    defer!({
+        let _ = nt_close(dir_handle);
+    });
 
     let files = nt_enumerate_files(dir_handle)?;
     let mut stomped = 0usize;
@@ -1722,7 +1780,9 @@ pub unsafe fn timestomp_directory(dir_path: &[u16], reference_path: &[u16]) -> R
 
     log::info!(
         "timestamps: directory timestomp complete for {} ({} files, {} errors)",
-        dir_str, stomped, errors
+        dir_str,
+        stomped,
+        errors
     );
     Ok(stomped)
 }
@@ -1742,7 +1802,9 @@ pub unsafe fn clean_usn_journal(volume: &[u16]) -> Result<(), String> {
         FILE_OPEN,
         FILE_SYNCHRONOUS_IO_NONALERT,
     )?;
-    defer!({ let _ = nt_close(volume_handle); });
+    defer!({
+        let _ = nt_close(volume_handle);
+    });
 
     // Try the clean approach: write close records for all recent entries.
     // We don't have a specific file ref, so we attempt a full journal cleanup
@@ -1825,12 +1887,18 @@ mod tests {
     #[test]
     fn test_ensure_nt_path() {
         // Already NT path.
-        let nt: Vec<u16> = "\\??\\C:\\test.dll".encode_utf16().chain(std::iter::once(0)).collect();
+        let nt: Vec<u16> = "\\??\\C:\\test.dll"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let result = ensure_nt_path(&nt);
         assert_eq!(wide_to_string(&result), wide_to_string(&nt));
 
         // Non-NT path gets prefix added.
-        let plain: Vec<u16> = "C:\\test.dll".encode_utf16().chain(std::iter::once(0)).collect();
+        let plain: Vec<u16> = "C:\\test.dll"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let result = ensure_nt_path(&plain);
         let s = wide_to_string(&result);
         assert!(s.starts_with("\\???"));
@@ -1920,19 +1988,35 @@ mod tests {
         let fn_content_start = offset + 24;
         // Verify all 4 timestamps were written correctly.
         assert_eq!(
-            i64::from_le_bytes(record[fn_content_start + 0x08..fn_content_start + 0x10].try_into().unwrap()),
+            i64::from_le_bytes(
+                record[fn_content_start + 0x08..fn_content_start + 0x10]
+                    .try_into()
+                    .unwrap()
+            ),
             creation
         );
         assert_eq!(
-            i64::from_le_bytes(record[fn_content_start + 0x10..fn_content_start + 0x18].try_into().unwrap()),
+            i64::from_le_bytes(
+                record[fn_content_start + 0x10..fn_content_start + 0x18]
+                    .try_into()
+                    .unwrap()
+            ),
             last_write
         );
         assert_eq!(
-            i64::from_le_bytes(record[fn_content_start + 0x18..fn_content_start + 0x20].try_into().unwrap()),
+            i64::from_le_bytes(
+                record[fn_content_start + 0x18..fn_content_start + 0x20]
+                    .try_into()
+                    .unwrap()
+            ),
             change
         );
         assert_eq!(
-            i64::from_le_bytes(record[fn_content_start + 0x20..fn_content_start + 0x28].try_into().unwrap()),
+            i64::from_le_bytes(
+                record[fn_content_start + 0x20..fn_content_start + 0x28]
+                    .try_into()
+                    .unwrap()
+            ),
             last_access
         );
     }
@@ -1981,7 +2065,10 @@ mod tests {
         apply_mft_fixup(&mut record).unwrap();
 
         // Sector boundaries should have the new signature.
-        let new_sig = u16::from_le_bytes([record[fixup_offset as usize], record[fixup_offset as usize + 1]]);
+        let new_sig = u16::from_le_bytes([
+            record[fixup_offset as usize],
+            record[fixup_offset as usize + 1],
+        ]);
         let sec1_val = u16::from_le_bytes([record[sec1_boundary], record[sec1_boundary + 1]]);
         let sec2_val = u16::from_le_bytes([record[sec2_boundary], record[sec2_boundary + 1]]);
         assert_eq!(sec1_val, new_sig);

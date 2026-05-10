@@ -168,9 +168,7 @@ impl RedirectorState {
         let threshold = now.saturating_sub(self.stale_timeout_secs);
         let mut stale_ids = Vec::new();
         for mut entry in self.redirectors.iter_mut() {
-            if entry.health == RedirectorHealth::Healthy
-                && entry.last_heartbeat < threshold
-            {
+            if entry.health == RedirectorHealth::Healthy && entry.last_heartbeat < threshold {
                 tracing::warn!(
                     id = %entry.id,
                     url = %entry.url,
@@ -283,7 +281,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/redirector/heartbeat", post(handle_heartbeat))
         .route("/redirector/list", get(handle_list))
         .route("/redirector/remove", post(handle_remove))
-        .route("/redirector/agent-config/:profile", get(handle_agent_config))
+        .route(
+            "/redirector/agent-config/:profile",
+            get(handle_agent_config),
+        )
         .with_state(state)
 }
 
@@ -296,12 +297,18 @@ pub async fn handle_register(
         return Err((StatusCode::BAD_REQUEST, "url is required".to_string()));
     }
     if req.profile_name.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "profile_name is required".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "profile_name is required".to_string(),
+        ));
     }
 
-    let entry = state
-        .redirector_state
-        .register(req.url, req.profile_name, req.external_addr, req.front_domain);
+    let entry = state.redirector_state.register(
+        req.url,
+        req.profile_name,
+        req.external_addr,
+        req.front_domain,
+    );
 
     Ok((
         StatusCode::OK,
@@ -336,9 +343,7 @@ pub async fn handle_heartbeat(
     }))
 }
 
-pub async fn handle_list(
-    State(state): State<Arc<AppState>>,
-) -> Json<ListResponse> {
+pub async fn handle_list(State(state): State<Arc<AppState>>) -> Json<ListResponse> {
     Json(ListResponse {
         redirectors: state.redirector_state.list(),
     })
@@ -375,7 +380,11 @@ pub async fn handle_agent_config(
         .get("x-agent-secret")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !bool::from(presented.as_bytes().ct_eq(state.agent_shared_secret.as_bytes())) {
+    if !bool::from(
+        presented
+            .as_bytes()
+            .ct_eq(state.agent_shared_secret.as_bytes()),
+    ) {
         return Err((
             StatusCode::UNAUTHORIZED,
             "invalid or missing agent secret".to_string(),

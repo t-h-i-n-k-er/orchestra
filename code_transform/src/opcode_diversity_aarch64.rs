@@ -262,10 +262,7 @@ fn apply_register_rename(words: &mut [u32], rng: &mut impl Rng) {
     // Choose a new register from the pool that isn't the same and isn't used.
     let new_candidates: Vec<u32> = RENAME_POOL
         .iter()
-        .filter(|&&r| {
-            r != old_reg
-                && !words.iter().any(|&w| reg_appears(w, r))
-        })
+        .filter(|&&r| r != old_reg && !words.iter().any(|&w| reg_appears(w, r)))
         .copied()
         .collect();
 

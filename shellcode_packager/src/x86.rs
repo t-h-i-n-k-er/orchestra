@@ -68,9 +68,15 @@ impl Emitter {
     /// Emit REX prefix (optional, with W=1) — always emits for clarity.
     fn rex_w_rx(&mut self, r: u8, x: u8, b: u8) {
         let mut rex = 0x48u8; // REX.W
-        if r >= 8 { rex |= 0x04; }
-        if x >= 8 { rex |= 0x02; }
-        if b >= 8 { rex |= 0x01; }
+        if r >= 8 {
+            rex |= 0x04;
+        }
+        if x >= 8 {
+            rex |= 0x02;
+        }
+        if b >= 8 {
+            rex |= 0x01;
+        }
         self.emit_byte(rex);
     }
 
@@ -218,8 +224,12 @@ impl Emitter {
         let need_rex = a >= 8 || b >= 8;
         if need_rex {
             let mut rex = 0x40u8;
-            if a >= 8 { rex |= 0x04; }
-            if b >= 8 { rex |= 0x01; }
+            if a >= 8 {
+                rex |= 0x04;
+            }
+            if b >= 8 {
+                rex |= 0x01;
+            }
             self.emit_byte(rex);
         }
         self.emit_byte(0x85);
@@ -347,8 +357,12 @@ impl Emitter {
         let need_rex = a >= 8 || b >= 8;
         if need_rex {
             let mut rex = 0x40u8;
-            if a >= 8 { rex |= 0x04; }
-            if b >= 8 { rex |= 0x01; }
+            if a >= 8 {
+                rex |= 0x04;
+            }
+            if b >= 8 {
+                rex |= 0x01;
+            }
             self.emit_byte(rex);
         }
         self.emit_byte(0x31);
@@ -498,7 +512,7 @@ mod tests {
         // mov rax, imm64: REX.W + B8 + 8 bytes
         assert_eq!(code[2], 0x48); // REX.W
         assert_eq!(code[3], 0xB8); // mov rax, imm64
-        // ret = 0xC3
+                                   // ret = 0xC3
         let ret_off = code.len() - 1;
         assert_eq!(code[ret_off], 0xC3);
     }

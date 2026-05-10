@@ -238,7 +238,7 @@ The automated EDR bypass transformation engine scans agent `.text` sections at r
 
 ### Usage
 
-Enabled via the `evade-edr-transform` feature flag. The transformation runs:
+Enabled via the `evasion-transform` feature flag. The transformation runs:
 - At agent initialization, before command dispatch begins
 - After each sleep obfuscation wake cycle (post-NTDLL re-check)
 - On-demand via the `edr_transform` command from the server

@@ -23,8 +23,8 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -40,7 +40,11 @@ fn transform_encode(t: TransformType, input: &[u8], mask_stride: u32) -> Vec<u8>
         TransformType::Base64 => B64.encode(input).into_bytes(),
         TransformType::Base64Url => B64URL.encode(input).into_bytes(),
         TransformType::Mask => {
-            let key = if mask_stride > 0 { mask_stride as u8 } else { 0x42 };
+            let key = if mask_stride > 0 {
+                mask_stride as u8
+            } else {
+                0x42
+            };
             input.iter().map(|b| b ^ key).collect()
         }
         TransformType::Netbios => netbios_encode(input, false),
@@ -58,7 +62,11 @@ fn transform_decode(t: TransformType, input: &[u8], mask_stride: u32) -> Result<
             .decode(input)
             .map_err(|e| anyhow!("base64url decode: {}", e)),
         TransformType::Mask => {
-            let key = if mask_stride > 0 { mask_stride as u8 } else { 0x42 };
+            let key = if mask_stride > 0 {
+                mask_stride as u8
+            } else {
+                0x42
+            };
             Ok(input.iter().map(|b| b ^ key).collect())
         }
         TransformType::Netbios => netbios_decode(input, false),
@@ -154,7 +162,11 @@ impl TransactionTransformer {
     pub fn decode_client(&self, data: &[u8]) -> Result<Vec<u8>> {
         let rest = strip_prefix(data, self.config.client.prepend.as_bytes());
         let core = strip_suffix(rest, self.config.client.append.as_bytes());
-        transform_decode(self.config.client.transform, core, self.config.client.mask_stride)
+        transform_decode(
+            self.config.client.transform,
+            core,
+            self.config.client.mask_stride,
+        )
     }
 
     /// Encode data for the server → client direction.
@@ -177,7 +189,11 @@ impl TransactionTransformer {
     pub fn decode_server(&self, data: &[u8]) -> Result<Vec<u8>> {
         let rest = strip_prefix(data, self.config.server.prepend.as_bytes());
         let core = strip_suffix(rest, self.config.server.append.as_bytes());
-        transform_decode(self.config.server.transform, core, self.config.server.mask_stride)
+        transform_decode(
+            self.config.server.transform,
+            core,
+            self.config.server.mask_stride,
+        )
     }
 
     /// Get a random URI for this transaction.
@@ -210,16 +226,22 @@ impl TransactionTransformer {
     ///
     /// Returns a `TransformError` on failure for fine-grained error handling.
     pub fn transform_inbound(&self, raw: &[u8]) -> std::result::Result<Vec<u8>, TransformError> {
-        let rest = strip_prefix_checked(raw, self.config.client.prepend.as_bytes())
-            .ok_or(TransformError::PrependMismatch {
+        let rest = strip_prefix_checked(raw, self.config.client.prepend.as_bytes()).ok_or(
+            TransformError::PrependMismatch {
                 expected: self.config.client.prepend.len(),
-            })?;
-        let core = strip_suffix_checked(rest, self.config.client.append.as_bytes())
-            .ok_or(TransformError::AppendMismatch {
+            },
+        )?;
+        let core = strip_suffix_checked(rest, self.config.client.append.as_bytes()).ok_or(
+            TransformError::AppendMismatch {
                 expected: self.config.client.append.len(),
-            })?;
-        transform_decode(self.config.client.transform, core, self.config.client.mask_stride)
-            .map_err(|e| TransformError::DecodeFailed(e.to_string()))
+            },
+        )?;
+        transform_decode(
+            self.config.client.transform,
+            core,
+            self.config.client.mask_stride,
+        )
+        .map_err(|e| TransformError::DecodeFailed(e.to_string()))
     }
 
     /// Encode the session identifier using the metadata config.
@@ -248,9 +270,9 @@ impl TransactionTransformer {
         let bytes = encoded.as_bytes();
         let decoded = match self.metadata_config.transform {
             TransformType::None => bytes.to_vec(),
-            TransformType::Base64 => B64.decode(bytes).map_err(|e| {
-                TransformError::MetadataExtraction(format!("base64 decode: {}", e))
-            })?,
+            TransformType::Base64 => B64
+                .decode(bytes)
+                .map_err(|e| TransformError::MetadataExtraction(format!("base64 decode: {}", e)))?,
             TransformType::Base64Url => B64URL.decode(bytes).map_err(|e| {
                 TransformError::MetadataExtraction(format!("base64url decode: {}", e))
             })?,
@@ -304,10 +326,7 @@ impl TransactionTransformer {
                     .get(key)
                     .or_else(|| headers.get(&key.to_lowercase()))
                     .ok_or_else(|| {
-                        TransformError::MetadataExtraction(format!(
-                            "header '{}' not found",
-                            key
-                        ))
+                        TransformError::MetadataExtraction(format!("header '{}' not found", key))
                     })
                     .and_then(|v| self.decode_metadata(v.trim()))
             }
@@ -391,10 +410,7 @@ impl TransactionTransformer {
 
     /// Get the content type from the profile headers, if configured.
     pub fn content_type(&self) -> Option<&str> {
-        self.config
-            .headers
-            .get("Content-Type")
-            .map(|s| s.as_str())
+        self.config.headers.get("Content-Type").map(|s| s.as_str())
     }
 
     /// Get a reference to the metadata config.
@@ -417,7 +433,10 @@ fn strip_prefix<'a>(data: &'a [u8], prefix: &[u8]) -> &'a [u8] {
 }
 
 fn strip_suffix<'a>(data: &'a [u8], suffix: &[u8]) -> &'a [u8] {
-    if !suffix.is_empty() && data.len() >= suffix.len() && &data[data.len() - suffix.len()..] == suffix {
+    if !suffix.is_empty()
+        && data.len() >= suffix.len()
+        && &data[data.len() - suffix.len()..] == suffix
+    {
         &data[..data.len() - suffix.len()]
     } else {
         data
@@ -644,7 +663,9 @@ impl ProfileManager {
             tracing::info!("malleable profile reloaded from {:?}", path);
             Ok(())
         } else {
-            Err(anyhow!("no profile path set — cannot reload default profile"))
+            Err(anyhow!(
+                "no profile path set — cannot reload default profile"
+            ))
         }
     }
 
@@ -727,11 +748,7 @@ impl MultiProfileManager {
                 match MalleableProfile::from_file(&path) {
                     Ok(profile) => {
                         let name = profile.profile.name.clone();
-                        tracing::info!(
-                            "loaded malleable profile '{}' from {:?}",
-                            name,
-                            path
-                        );
+                        tracing::info!("loaded malleable profile '{}' from {:?}", name, path);
 
                         // Record file modification time.
                         if let Ok(metadata) = std::fs::metadata(&path) {
@@ -832,11 +849,7 @@ impl MultiProfileManager {
     ///
     /// The session gets a snapshot of the profile at creation time, so
     /// subsequent hot-reloads do not disrupt active sessions.
-    pub async fn create_session(
-        &self,
-        profile_name: &str,
-        session_id: &str,
-    ) -> Result<()> {
+    pub async fn create_session(&self, profile_name: &str, session_id: &str) -> Result<()> {
         let profile = {
             let guard = self.profiles.read().await;
             guard
@@ -926,21 +939,13 @@ impl MultiProfileManager {
                 match MalleableProfile::from_file(&path) {
                     Ok(profile) => {
                         let name = profile.profile.name.clone();
-                        tracing::info!(
-                            "hot-reloaded malleable profile '{}' from {:?}",
-                            name,
-                            path
-                        );
+                        tracing::info!("hot-reloaded malleable profile '{}' from {:?}", name, path);
                         let mut profiles = self.profiles.write().await;
                         profiles.insert(name, profile);
                         reloaded += 1;
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "hot-reload failed for {:?}: {}",
-                            path,
-                            e
-                        );
+                        tracing::warn!("hot-reload failed for {:?}: {}", path, e);
                     }
                 }
             }
@@ -992,17 +997,16 @@ impl MultiProfileManager {
                 .ok_or_else(|| anyhow!("profile '{}' not found", profile_name))?
         };
 
-        let config = match transaction_type {
-            "http_get" => profile
-                .http_get
-                .clone()
-                .ok_or_else(|| anyhow!("http_get not configured in profile '{}'", profile_name))?,
-            "http_post" => profile
-                .http_post
-                .clone()
-                .ok_or_else(|| anyhow!("http_post not configured in profile '{}'", profile_name))?,
-            other => anyhow::bail!("unknown transaction type: {}", other),
-        };
+        let config =
+            match transaction_type {
+                "http_get" => profile.http_get.clone().ok_or_else(|| {
+                    anyhow!("http_get not configured in profile '{}'", profile_name)
+                })?,
+                "http_post" => profile.http_post.clone().ok_or_else(|| {
+                    anyhow!("http_post not configured in profile '{}'", profile_name)
+                })?,
+                other => anyhow::bail!("unknown transaction type: {}", other),
+            };
 
         Ok(TransactionTransformer::with_session_store(
             config,
@@ -1108,7 +1112,8 @@ pub fn validate_profile(path: &Path) -> ValidationReport {
         warnings.push("no SSL certificate pin configured — agent will accept any cert".to_string());
     }
     if profile.global.user_agent.contains("Mozilla") {
-        warnings.push("user agent looks like a real browser — consider a less common one".to_string());
+        warnings
+            .push("user agent looks like a real browser — consider a less common one".to_string());
     }
     if !matches!(
         profile.dns.encoding.as_str(),

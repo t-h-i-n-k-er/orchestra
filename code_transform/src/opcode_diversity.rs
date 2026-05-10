@@ -86,9 +86,7 @@ pub fn apply(code: &[u8], rng: &mut impl Rng) -> Vec<u8> {
         for (i, inst) in working.iter().enumerate() {
             // The IP of the next instruction in the original stream — used as
             // the fall-through target when inverting a conditional branch.
-            let next_ip = instructions
-                .get(block_range.start + i + 1)
-                .map(|n| n.ip());
+            let next_ip = instructions.get(block_range.start + i + 1).map(|n| n.ip());
 
             // Rule 4: invert Jcc (50 % probability)
             if inst.is_jcc_short_or_near() {
@@ -359,12 +357,7 @@ fn apply_register_rename(block: &[Instruction], rng: &mut impl Rng) -> Vec<Instr
         Register::R14,
         Register::R15,
     ];
-    const RAX_TO_RDX: [Register; 4] = [
-        Register::RAX,
-        Register::RBX,
-        Register::RCX,
-        Register::RDX,
-    ];
+    const RAX_TO_RDX: [Register; 4] = [Register::RAX, Register::RBX, Register::RCX, Register::RDX];
 
     // Old candidate: R8–R15 that are proven local scratch.
     let old_candidates: Vec<Register> = R8_TO_R15
@@ -625,8 +618,7 @@ fn find_basic_blocks(instructions: &[Instruction]) -> Vec<std::ops::Range<usize>
     leaders.insert(instructions[0].ip()); // entry is always a leader
 
     for (i, inst) in instructions.iter().enumerate() {
-        let is_branch =
-            inst.is_jcc_short_or_near() || inst.is_jmp_short_or_near();
+        let is_branch = inst.is_jcc_short_or_near() || inst.is_jmp_short_or_near();
         let is_term = is_hard_terminator(inst.code());
 
         if is_branch {
@@ -731,10 +723,7 @@ mod tests {
         assert!(result.is_some(), "should produce a SUB instruction");
         let sub_inst = result.unwrap();
         assert!(
-            matches!(
-                sub_inst.code(),
-                Code::Sub_rm64_imm8 | Code::Sub_rm64_imm32
-            ),
+            matches!(sub_inst.code(), Code::Sub_rm64_imm8 | Code::Sub_rm64_imm32),
             "result must be SUB rm64, imm: got {:?}",
             sub_inst.code()
         );
@@ -792,14 +781,14 @@ mod tests {
         let orig: &[u8] = &[
             0x48, 0xC7, 0xC0, 0x64, 0x00, 0x00, 0x00, // MOV RAX, 100
             0x48, 0x83, 0xC0, 0x25, // ADD RAX, 37
-            0xC3,                   // RET
+            0xC3, // RET
         ];
         // Transformed: MOV RAX, 100; SUB RAX, -37; RET
         //   48 83 E8 DB           - SUB RAX, -37  (0xDB = -37 as i8)
         let xfm: &[u8] = &[
             0x48, 0xC7, 0xC0, 0x64, 0x00, 0x00, 0x00, // MOV RAX, 100
             0x48, 0x83, 0xE8, 0xDB, // SUB RAX, -37
-            0xC3,                   // RET
+            0xC3, // RET
         ];
         let orig_result = unsafe { run_code(orig) };
         let xfm_result = unsafe { run_code(xfm) };
@@ -1038,7 +1027,7 @@ mod tests {
         // MOV RAX, 1; RET
         let code: &[u8] = &[
             0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00, // MOV RAX, 1
-            0xC3,                                       // RET
+            0xC3, // RET
         ];
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         let out = apply(code, &mut rng);

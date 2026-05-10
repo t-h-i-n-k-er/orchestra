@@ -3,6 +3,7 @@
 //! hex digest computed over that exact JSON line.  On read, every pair is
 //! verified and tampered entries are flagged.
 
+use base64::Engine as _;
 use common::{AuditEvent, Outcome};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -10,7 +11,6 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use base64::Engine as _;
 use tokio::sync::broadcast;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -60,7 +60,10 @@ impl AuditLog {
                 .decode(b64)
                 .map_err(|e| anyhow::anyhow!("invalid base64 in audit_hmac_key: {e}"))?;
             if key.len() != 32 {
-                anyhow::bail!("audit_hmac_key must be exactly 32 bytes (got {})", key.len());
+                anyhow::bail!(
+                    "audit_hmac_key must be exactly 32 bytes (got {})",
+                    key.len()
+                );
             }
             return Ok(key);
         }
@@ -70,7 +73,9 @@ impl AuditLog {
             let b64 = std::fs::read_to_string(key_path)?;
             let key = base64::engine::general_purpose::STANDARD
                 .decode(b64.trim())
-                .map_err(|e| anyhow::anyhow!("corrupt audit key file {}: {e}", key_path.display()))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("corrupt audit key file {}: {e}", key_path.display())
+                })?;
             if key.len() != 32 {
                 anyhow::bail!(
                     "audit key file must contain exactly 32 bytes (got {})",
@@ -220,7 +225,9 @@ impl AuditLog {
                     // silently dropping them.
                     tracing::error!(
                         "[audit] TAMPERED ENTRY DETECTED: agent_id={}, user={}, details={}",
-                        event.agent_id, event.user, event.details
+                        event.agent_id,
+                        event.user,
+                        event.details
                     );
                     let mut tampered_event = event;
                     tampered_event.details = format!("[TAMPERED] {}", tampered_event.details);
@@ -238,9 +245,7 @@ impl AuditLog {
                         action: "AuditTamperDetected".into(),
                         details: format!(
                             "HMAC mismatch for entry: agent_id={}, user={}, action={}",
-                            tampered_event.agent_id,
-                            tampered_event.user,
-                            tampered_event.action
+                            tampered_event.agent_id, tampered_event.user, tampered_event.action
                         ),
                         outcome: Outcome::Failure,
                         tampered: false,

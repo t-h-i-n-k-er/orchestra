@@ -11,9 +11,9 @@ use axum::{
 use dashmap::DashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
 use crate::state::AppState;
@@ -133,11 +133,18 @@ impl PerIpRateLimiter {
 /// `127.0.0.1` if neither is available.
 pub fn extract_client_ip(req: &Request<axum::body::Body>) -> IpAddr {
     // 1. Try ConnectInfo (AXUM direct-connect socket address).
-    if let Some(ci) = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>() {
+    if let Some(ci) = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+    {
         return ci.0.ip();
     }
     // 2. Try X-Forwarded-For (reverse-proxy scenario).
-    if let Some(xff) = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+    if let Some(xff) = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+    {
         if let Some(first) = xff.split(',').next() {
             if let Ok(ip) = first.trim().parse::<IpAddr>() {
                 return ip;
@@ -167,8 +174,10 @@ pub async fn require_bearer(
 
     // 1. Try the multi-operator store (constant-time SHA-256 hash comparison).
     if let Some((operator_id, permissions)) = state.authenticate_operator(presented) {
-        req.extensions_mut()
-            .insert(AuthenticatedUser { id: operator_id, permissions });
+        req.extensions_mut().insert(AuthenticatedUser {
+            id: operator_id,
+            permissions,
+        });
         return Ok(next.run(req).await);
     }
 
@@ -181,11 +190,10 @@ pub async fn require_bearer(
         .into();
     if ok {
         // P1-26: Legacy admin token gets full admin permissions.
-        req.extensions_mut()
-            .insert(AuthenticatedUser {
-                id: "admin".into(),
-                permissions: vec!["read".into(), "write".into(), "admin".into()],
-            });
+        req.extensions_mut().insert(AuthenticatedUser {
+            id: "admin".into(),
+            permissions: vec!["read".into(), "write".into(), "admin".into()],
+        });
         return Ok(next.run(req).await);
     }
 

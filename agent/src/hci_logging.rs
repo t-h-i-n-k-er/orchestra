@@ -209,18 +209,12 @@ fn check_consent() -> bool {
 /// Helper: record a key event from any listener thread.
 fn record_key_event(buffer: &Arc<Mutex<VecDeque<HciEvent>>>, pressed: bool) {
     let timestamp = Utc::now().timestamp_micros() as u64;
-    add_log_event(
-        buffer,
-        HciEvent::Keyboard(KeyEvent { timestamp, pressed }),
-    );
+    add_log_event(buffer, HciEvent::Keyboard(KeyEvent { timestamp, pressed }));
 }
 
 // ── macOS listener ─────────────────────────────────────────────────────────
 #[cfg(target_os = "macos")]
-fn hci_listen_macos(
-    logging_flag: Arc<AtomicBool>,
-    buffer_handle: Arc<Mutex<VecDeque<HciEvent>>>,
-) {
+fn hci_listen_macos(logging_flag: Arc<AtomicBool>, buffer_handle: Arc<Mutex<VecDeque<HciEvent>>>) {
     use std::ffi::c_void;
     use std::os::raw::c_ulong;
 
@@ -232,13 +226,13 @@ fn hci_listen_macos(
         type FnCFRunLoopGetCurrentAndRetain = unsafe extern "C" fn() -> *mut c_void;
         type FnCFRunLoopRun = unsafe extern "C" fn();
         type FnCGEventTapCreate = unsafe extern "C" fn(
-            tap: u32,       // kCGHIDEventTap = 0
-            place: u32,     // kCGHeadInsertEventTap = 0
-            options: u32,   // kCGEventTapOptionListenOnly = 1
+            tap: u32,                    // kCGHIDEventTap = 0
+            place: u32,                  // kCGHeadInsertEventTap = 0
+            options: u32,                // kCGEventTapOptionListenOnly = 1
             events_of_interest: c_ulong, // CGEventMask bitfield
             callback: unsafe extern "C" fn(
                 proxy: *mut c_void,
-                etype: u32, // CGEventType
+                etype: u32,         // CGEventType
                 event: *mut c_void, // CGEventRef
                 user_info: *mut c_void,
             ) -> *mut c_void,
@@ -260,8 +254,7 @@ fn hci_listen_macos(
         const CG_EVENT_KEY_DOWN: u32 = 10;
         const CG_EVENT_KEY_UP: u32 = 11;
         // CGEventMask forKeyDown | keyUp
-        let event_mask: c_ulong =
-            (1u64 << CG_EVENT_KEY_DOWN) | (1u64 << CG_EVENT_KEY_UP);
+        let event_mask: c_ulong = (1u64 << CG_EVENT_KEY_DOWN) | (1u64 << CG_EVENT_KEY_UP);
 
         // Raw callback: invoked by CoreGraphics on the CFRunLoop thread.
         extern "C" fn macos_key_callback(
@@ -297,8 +290,14 @@ fn hci_listen_macos(
         let ctx_ptr = Box::into_raw(ctx) as *mut c_void;
 
         // Resolve CoreGraphics framework path dynamically.
-        let cg_path = std::ffi::CString::new("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics").unwrap();
-        let cf_path = std::ffi::CString::new("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation").unwrap();
+        let cg_path = std::ffi::CString::new(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+        )
+        .unwrap();
+        let cf_path = std::ffi::CString::new(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+        )
+        .unwrap();
 
         let cg_handle = libc::dlopen(cg_path.as_ptr(), libc::RTLD_NOW);
         let cf_handle = libc::dlopen(cf_path.as_ptr(), libc::RTLD_NOW);
@@ -340,7 +339,10 @@ fn hci_listen_macos(
         };
 
         let cf_mach_port_create_rl_source: FnCFMachPortCreateRunLoopSource = {
-            let sym = libc::dlsym(cf_handle, b"CFMachPortCreateRunLoopSource\0".as_ptr() as *const i8);
+            let sym = libc::dlsym(
+                cf_handle,
+                b"CFMachPortCreateRunLoopSource\0".as_ptr() as *const i8,
+            );
             if sym.is_null() {
                 tracing::error!("[hci-logging] macOS: CFMachPortCreateRunLoopSource not found");
                 LISTENER_STARTED.store(false, Ordering::SeqCst);
@@ -473,7 +475,10 @@ fn hci_listen_windows(
         // Resolve all needed APIs via pe_resolve (no static IAT).
         let user32 = pe_resolve::get_module_handle_by_hash(hash_wstr_const(
             // user32.dll as UTF-16
-            &['u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0],
+            &[
+                'u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16,
+                'd' as u16, 'l' as u16, 'l' as u16, 0,
+            ],
         ))
         .expect("hci-logging: user32.dll not found");
 
@@ -491,30 +496,37 @@ fn hci_listen_windows(
         let ctx_raw = Box::into_raw(ctx) as *mut std::ffi::c_void;
         WIN_HCI_CTX.store(ctx_raw, Ordering::SeqCst);
 
-        let set_hook: unsafe extern "system" fn(i32, unsafe extern "system" fn(i32, usize, isize) -> isize, *mut std::ffi::c_void, u32) -> isize =
-            std::mem::transmute(
-                pe_resolve::get_proc_address_by_hash(user32, hash_str_const(b"SetWindowsHookExW\0"))
-                    .expect("hci-logging: SetWindowsHookExW resolution failed"),
-            );
+        let set_hook: unsafe extern "system" fn(
+            i32,
+            unsafe extern "system" fn(i32, usize, isize) -> isize,
+            *mut std::ffi::c_void,
+            u32,
+        ) -> isize = std::mem::transmute(
+            pe_resolve::get_proc_address_by_hash(user32, hash_str_const(b"SetWindowsHookExW\0"))
+                .expect("hci-logging: SetWindowsHookExW resolution failed"),
+        );
         let get_message: unsafe extern "system" fn(*mut std::ffi::c_void, isize, u32, u32) -> i32 =
             std::mem::transmute(
                 pe_resolve::get_proc_address_by_hash(user32, hash_str_const(b"GetMessageW\0"))
                     .expect("hci-logging: GetMessageW resolution failed"),
             );
-        let unhook: unsafe extern "system" fn(isize) -> i32 =
-            std::mem::transmute(
-                pe_resolve::get_proc_address_by_hash(user32, hash_str_const(b"UnhookWindowsHookEx\0"))
-                    .expect("hci-logging: UnhookWindowsHookEx resolution failed"),
-            );
+        let unhook: unsafe extern "system" fn(isize) -> i32 = std::mem::transmute(
+            pe_resolve::get_proc_address_by_hash(user32, hash_str_const(b"UnhookWindowsHookEx\0"))
+                .expect("hci-logging: UnhookWindowsHookEx resolution failed"),
+        );
 
-        let kernel32 = pe_resolve::get_module_handle_by_hash(hash_wstr_const(
-            &['k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0],
-        ))
+        let kernel32 = pe_resolve::get_module_handle_by_hash(hash_wstr_const(&[
+            'k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16,
+            '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+        ]))
         .expect("hci-logging: kernel32.dll not found");
         let get_module: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
             std::mem::transmute(
-                pe_resolve::get_proc_address_by_hash(kernel32, hash_str_const(b"GetModuleHandleW\0"))
-                    .expect("hci-logging: GetModuleHandleW resolution failed"),
+                pe_resolve::get_proc_address_by_hash(
+                    kernel32,
+                    hash_str_const(b"GetModuleHandleW\0"),
+                )
+                .expect("hci-logging: GetModuleHandleW resolution failed"),
             );
 
         let h_module = get_module(std::ptr::null());
@@ -545,10 +557,7 @@ fn hci_listen_windows(
 
 // ── Linux listener: evdev polling ─────────────────────────────────────────
 #[cfg(target_os = "linux")]
-fn hci_listen_linux(
-    logging_flag: Arc<AtomicBool>,
-    buffer_handle: Arc<Mutex<VecDeque<HciEvent>>>,
-) {
+fn hci_listen_linux(logging_flag: Arc<AtomicBool>, buffer_handle: Arc<Mutex<VecDeque<HciEvent>>>) {
     use std::fs::File;
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
@@ -708,7 +717,8 @@ pub fn start_logging() -> Result<(), String> {
                                 MacOsTapHealth::Enabled => {
                                     warned_disabled = false;
                                 }
-                                MacOsTapHealth::CreationFailedDisabled | MacOsTapHealth::Disabled => {
+                                MacOsTapHealth::CreationFailedDisabled
+                                | MacOsTapHealth::Disabled => {
                                     if !warned_disabled {
                                         log::warn!(
                                             "hci_logging: macOS CGEventTap was disabled at runtime - \
@@ -900,17 +910,24 @@ fn get_active_window_title() -> Result<String, String> {
         }
 
         // No Wayland compositor interface was reachable.
-        return Err("Wayland session detected but no compositor IPC is available (tried gdbus/qdbus)".to_string());
+        return Err(
+            "Wayland session detected but no compositor IPC is available (tried gdbus/qdbus)"
+                .to_string(),
+        );
     }
 
     // X11 path: use xdotool if available.
     if !on_x11 {
-        return Err("No display available (DISPLAY and WAYLAND_DISPLAY are both unset)".to_string());
+        return Err(
+            "No display available (DISPLAY and WAYLAND_DISPLAY are both unset)".to_string(),
+        );
     }
 
     // Check that xdotool is installed before attempting to call it.
     if !command_available("xdotool") {
-        return Err("xdotool not found on PATH; install it to enable X11 window-title tracking".to_string());
+        return Err(
+            "xdotool not found on PATH; install it to enable X11 window-title tracking".to_string(),
+        );
     }
 
     // Use a thread-based timeout so we don't depend on the GNU `timeout`
@@ -946,9 +963,14 @@ fn get_active_window_title() -> Result<String, String> {
             Some(m) => m,
             None => {
                 let load_fn: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
-                    resolve_api(pe_resolve::HASH_KERNEL32_DLL, hash_str_const(b"LoadLibraryW\0"))?;
+                    resolve_api(
+                        pe_resolve::HASH_KERNEL32_DLL,
+                        hash_str_const(b"LoadLibraryW\0"),
+                    )?;
                 let m = load_fn(dll_wide.as_ptr()) as usize;
-                if m == 0 { return None; }
+                if m == 0 {
+                    return None;
+                }
                 m
             }
         };
@@ -961,7 +983,10 @@ fn get_active_window_title() -> Result<String, String> {
         Some(std::mem::transmute_copy(&addr))
     }
 
-    const USER32_DLL_W: &[u16] = &['u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+    const USER32_DLL_W: &[u16] = &[
+        'u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16,
+        'd' as u16, 'l' as u16, 'l' as u16, 0,
+    ];
     const HASH_USER32_DLL: u32 = hash_wstr_const(USER32_DLL_W);
     const HASH_GETFOREGROUNDWINDOW: u32 = hash_str_const(b"GetForegroundWindow\0");
     const HASH_GETWINDOWTEXTW: u32 = hash_str_const(b"GetWindowTextW\0");
@@ -970,12 +995,11 @@ fn get_active_window_title() -> Result<String, String> {
     type FnGetWindowTextW = unsafe extern "system" fn(*mut std::ffi::c_void, *mut u16, i32) -> i32;
 
     unsafe {
-        let get_fg: FnGetForegroundWindow = resolve_api_or_load(
-            USER32_DLL_W, HASH_USER32_DLL, HASH_GETFOREGROUNDWINDOW,
-        ).ok_or("GetForegroundWindow not found")?;
-        let get_wtext: FnGetWindowTextW = resolve_api(
-            HASH_USER32_DLL, HASH_GETWINDOWTEXTW,
-        ).ok_or("GetWindowTextW not found")?;
+        let get_fg: FnGetForegroundWindow =
+            resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETFOREGROUNDWINDOW)
+                .ok_or("GetForegroundWindow not found")?;
+        let get_wtext: FnGetWindowTextW =
+            resolve_api(HASH_USER32_DLL, HASH_GETWINDOWTEXTW).ok_or("GetWindowTextW not found")?;
 
         let hwnd = get_fg();
         if hwnd.is_null() {

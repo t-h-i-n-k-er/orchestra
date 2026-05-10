@@ -41,7 +41,7 @@ they own or are explicitly authorized to manage. The threat model focuses on:
 | EDR hooking `ImpersonateNamedPipeClient` | `token-impersonation` feature: SetThreadToken or NtSetInformationThread via indirect syscalls |
 | Forensic timeline analysis via Prefetch .pf files | `forensic-cleanup` feature: patch/delete .pf files, disable Prefetch service, clean USN journal entries |
 | EDR kernel callbacks blocking agent operations | `kernel-callback` feature: BYOVD driver load → overwrite callback function pointers (8 vulnerable drivers supported) |
-| EDR signature detection on agent .text section | `evade-edr-transform` feature: runtime scan + 5 semantic-preserving code transforms |
+| EDR signature detection on agent .text section | `evasion-transform` feature: runtime scan + 5 semantic-preserving code transforms |
 | NTFS forensic artifacts from injection | `transacted-hollowing` feature: NTFS transaction-backed sections, never committed to disk |
 | EDR timing heuristic detecting module stomping | `delayed-stomp` feature: randomized delay between DLL load and .text overwrite |
 | Credential Guard preventing credential harvesting | `lsa-whisperer` feature: SSP installation receives plaintext before hashing, bypasses Credential Guard |
@@ -392,7 +392,7 @@ The following issues were identified and resolved during the security audit:
 | 28 | EDR hooks on `ImpersonateNamedPipeClient` detect pipe impersonation | `token-impersonation` feature: SetThreadToken/NtSetInformationThread via indirect syscalls, token cache with auto-revert | High |
 | 29 | Forensic timeline analysis via Prefetch .pf files reveals execution history | `forensic-cleanup` feature: patch .pf headers (preferred), delete .pf files, disable Prefetch service, clean USN journal entries; all NT API calls via indirect syscalls | High |
 | 30 | EDR kernel callbacks block agent operations (handle protection, image load monitoring) | `kernel-callback` feature: BYOVD with 8 vulnerable drivers; overwrites callback return pointers to null/stub | High |
-| 31 | EDR signature-based detection of agent .text section | `evade-edr-transform` feature: runtime .text scan + 5 semantic-preserving transforms (register rename, instruction swap, block reorder, NOP sled, constant fold) | Medium |
+| 31 | EDR signature-based detection of agent .text section | `evasion-transform` feature: runtime .text scan + 5 semantic-preserving transforms (register rename, instruction swap, block reorder, NOP sled, constant fold) | Medium |
 | 32 | NTFS disk artifacts from process hollowing | `transacted-hollowing` feature: NTFS transaction-backed sections never committed to disk; fake provider GUIDs for ETW blinding | High |
 | 33 | EDR timing heuristic detects module stomping via load→modify timing | `delayed-stomp` feature: randomized 5–30s delay between DLL load and .text overwrite | Medium |
 | 34 | Credential Guard prevents LSASS-based credential harvesting | `lsa-whisperer` feature: custom SSP installation intercepts plaintext credentials before hashing; bypasses Credential Guard and RunAsPPL | High |

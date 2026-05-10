@@ -33,8 +33,10 @@ impl Injector for NtCreateThreadInjector {
             PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
             PROCESS_VM_WRITE,
         };
-        let access_mask = PROCESS_VM_OPERATION | PROCESS_VM_WRITE
-            | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION;
+        let access_mask = PROCESS_VM_OPERATION
+            | PROCESS_VM_WRITE
+            | PROCESS_CREATE_THREAD
+            | PROCESS_QUERY_INFORMATION;
 
         crate::injection::nt_create_thread_inject(pid, payload, access_mask, "NtCreateThread")
     }
@@ -43,6 +45,8 @@ impl Injector for NtCreateThreadInjector {
 #[cfg(not(windows))]
 impl Injector for NtCreateThreadInjector {
     fn inject(&self, _pid: u32, _payload: &[u8]) -> Result<()> {
-        Err(anyhow!("NtCreateThread injection only supported on Windows"))
+        Err(anyhow!(
+            "NtCreateThread injection only supported on Windows"
+        ))
     }
 }

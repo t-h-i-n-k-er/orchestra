@@ -38,9 +38,9 @@
 #![cfg(windows)]
 
 use anyhow::anyhow;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
-use std::collections::HashMap;
 
 // ─── Syscall target ────────────────────────────────────────────────────────
 
@@ -186,10 +186,13 @@ pub fn validate_cache() -> anyhow::Result<usize> {
         if loaded_ts != 0 && loaded_ts != cached_ts {
             log::warn!(
                 "nt_syscall: timestamp mismatch — loaded={:#010x} cached={:#010x}; invalidating",
-                loaded_ts, cached_ts
+                loaded_ts,
+                cached_ts
             );
             invalidate_syscall_cache();
-            return Err(anyhow!("nt_syscall: ntdll timestamp changed — cache invalidated"));
+            return Err(anyhow!(
+                "nt_syscall: ntdll timestamp changed — cache invalidated"
+            ));
         }
     }
 
@@ -224,7 +227,9 @@ pub fn validate_cache() -> anyhow::Result<usize> {
     if any_stale {
         drop(cache_lock);
         invalidate_syscall_cache();
-        return Err(anyhow!("nt_syscall: stale SSNs detected by probe — cache invalidated"));
+        return Err(anyhow!(
+            "nt_syscall: stale SSNs detected by probe — cache invalidated"
+        ));
     }
 
     // Validate against build-number range table.
@@ -331,30 +336,34 @@ fn expected_ssn_range(func_name: &str, _build: u32) -> Option<(u32, u32)> {
     // variation.  The SSN space for Nt* functions on modern Windows spans
     // roughly 0x000–0x300.
     let ranges: &[(&str, u32, u32)] = &[
-        ("NtAllocateVirtualMemory",    0x0010, 0x0028),
-        ("NtProtectVirtualMemory",     0x0030, 0x0058),
-        ("NtWriteVirtualMemory",       0x0028, 0x0040),
-        ("NtReadVirtualMemory",        0x0028, 0x0042),
-        ("NtCreateThreadEx",           0x0038, 0x0060),
-        ("NtOpenProcess",              0x0020, 0x0038),
-        ("NtOpenThread",               0x0020, 0x0036),
-        ("NtClose",                    0x0002, 0x0010),
-        ("NtQueryVirtualMemory",       0x0018, 0x0030),
-        ("NtQuerySystemInformation",   0x0028, 0x0044),
-        ("NtMapViewOfSection",         0x0018, 0x0028),
-        ("NtUnmapViewOfSection",       0x0018, 0x002A),
-        ("NtCreateSection",            0x0038, 0x0052),
-        ("NtOpenFile",                 0x0020, 0x0038),
-        ("NtReadFile",                 0x0002, 0x000C),
-        ("NtSetInformationProcess",    0x0028, 0x0040),
-        ("NtFreeVirtualMemory",        0x0010, 0x0028),
-        ("NtQueueApcThread",           0x0038, 0x0056),
-        ("NtSetContextThread",         0x0038, 0x0056),
-        ("NtGetContextThread",         0x0038, 0x0056),
+        ("NtAllocateVirtualMemory", 0x0010, 0x0028),
+        ("NtProtectVirtualMemory", 0x0030, 0x0058),
+        ("NtWriteVirtualMemory", 0x0028, 0x0040),
+        ("NtReadVirtualMemory", 0x0028, 0x0042),
+        ("NtCreateThreadEx", 0x0038, 0x0060),
+        ("NtOpenProcess", 0x0020, 0x0038),
+        ("NtOpenThread", 0x0020, 0x0036),
+        ("NtClose", 0x0002, 0x0010),
+        ("NtQueryVirtualMemory", 0x0018, 0x0030),
+        ("NtQuerySystemInformation", 0x0028, 0x0044),
+        ("NtMapViewOfSection", 0x0018, 0x0028),
+        ("NtUnmapViewOfSection", 0x0018, 0x002A),
+        ("NtCreateSection", 0x0038, 0x0052),
+        ("NtOpenFile", 0x0020, 0x0038),
+        ("NtReadFile", 0x0002, 0x000C),
+        ("NtSetInformationProcess", 0x0028, 0x0040),
+        ("NtFreeVirtualMemory", 0x0010, 0x0028),
+        ("NtQueueApcThread", 0x0038, 0x0056),
+        ("NtSetContextThread", 0x0038, 0x0056),
+        ("NtGetContextThread", 0x0038, 0x0056),
     ];
 
     ranges.iter().find_map(|&(name, lo, hi)| {
-        if name == func_name { Some((lo, hi)) } else { None }
+        if name == func_name {
+            Some((lo, hi))
+        } else {
+            None
+        }
     })
 }
 
@@ -390,7 +399,10 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
     // We need NtOpenProcess with SYSTEM process PID (4).
     let sys_open = get_bootstrap_ssn("NtOpenProcess")?;
     let sys_read = get_bootstrap_ssn("NtReadVirtualMemory")?;
-    let sys_close = get_bootstrap_ssn("NtClose").unwrap_or(SyscallTarget { ssn: 0, gadget_addr: 0 });
+    let sys_close = get_bootstrap_ssn("NtClose").unwrap_or(SyscallTarget {
+        ssn: 0,
+        gadget_addr: 0,
+    });
 
     let mut h_system: *mut winapi::ctypes::c_void = std::ptr::null_mut();
     let pid: u32 = 4; // System process
@@ -422,7 +434,10 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
     );
 
     if status < 0 || h_system.is_null() {
-        log::warn!("nt_syscall: SSDT — cannot open System process (NTSTATUS {:#010x})", status as u32);
+        log::warn!(
+            "nt_syscall: SSDT — cannot open System process (NTSTATUS {:#010x})",
+            status as u32
+        );
         return None;
     }
 
@@ -435,12 +450,19 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
         fn drop(&mut self) {
             if !self.handle.is_null() && self.close.ssn != 0 {
                 unsafe {
-                    do_syscall(self.close.ssn, self.close.gadget_addr, &[self.handle as u64]);
+                    do_syscall(
+                        self.close.ssn,
+                        self.close.gadget_addr,
+                        &[self.handle as u64],
+                    );
                 }
             }
         }
     }
-    let _guard = SystemHandleGuard { handle: h_system, close: sys_close };
+    let _guard = SystemHandleGuard {
+        handle: h_system,
+        close: sys_close,
+    };
 
     // Step 3: Read the kernel export table to find KeServiceDescriptorTable.
     //
@@ -461,7 +483,8 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
     let target_export_rva = resolve_kernel_export_rva(kernel_base, func_name, h_system, sys_read)?;
 
     // Step 4: Locate KeServiceDescriptorTable in the kernel export table.
-    let ssdt_rva = resolve_kernel_export_rva(kernel_base, "KeServiceDescriptorTable", h_system, sys_read)?;
+    let ssdt_rva =
+        resolve_kernel_export_rva(kernel_base, "KeServiceDescriptorTable", h_system, sys_read)?;
 
     // Step 5: Read the SYSTEM_SERVICE_TABLE (first 16 bytes at SSDT RVA).
     // struct SYSTEM_SERVICE_TABLE {
@@ -481,7 +504,7 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
             ssdt_addr as u64,                 // BaseAddress
             sst_buf.as_mut_ptr() as u64,      // Buffer
             sst_buf.len() as u64,             // NumberOfBytesToRead
-            &mut bytes_read as *mut _ as u64,  // NumberOfBytesRead
+            &mut bytes_read as *mut _ as u64, // NumberOfBytesRead
         ],
     );
     if read_status < 0 || bytes_read < 24 {
@@ -498,7 +521,8 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
     if service_table_base == 0 || number_of_services == 0 || number_of_services > 0x1000 {
         log::warn!(
             "nt_syscall: SSDT — invalid ServiceTableBase={:#x} or NumberOfServices={}",
-            service_table_base, number_of_services
+            service_table_base,
+            number_of_services
         );
         return None;
     }
@@ -511,11 +535,11 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
         sys_read.ssn,
         sys_read.gadget_addr,
         &[
-            h_system as u64,                     // ProcessHandle
-            service_table_base as u64,            // BaseAddress
-            offset_table.as_mut_ptr() as u64,     // Buffer
-            table_size as u64,                    // NumberOfBytesToRead
-            &mut bytes_read as *mut _ as u64,      // NumberOfBytesRead
+            h_system as u64,                  // ProcessHandle
+            service_table_base as u64,        // BaseAddress
+            offset_table.as_mut_ptr() as u64, // Buffer
+            table_size as u64,                // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64, // NumberOfBytesRead
         ],
     );
     if read_status < 0 || bytes_read != table_size {
@@ -541,7 +565,8 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
             if gadget != 0 {
                 log::info!(
                     "nt_syscall: SSDT resolved {} → SSN={} (verified via kernel SSDT)",
-                    func_name, i
+                    func_name,
+                    i
                 );
                 return Some(SyscallTarget {
                     ssn: i as u32,
@@ -551,7 +576,11 @@ unsafe fn resolve_via_ssdt(func_name: &str) -> Option<SyscallTarget> {
         }
     }
 
-    log::warn!("nt_syscall: SSDT — target {} not found in {} SSDT entries", func_name, number_of_services);
+    log::warn!(
+        "nt_syscall: SSDT — target {} not found in {} SSDT entries",
+        func_name,
+        number_of_services
+    );
     None
 }
 
@@ -576,14 +605,16 @@ unsafe fn resolve_kernel_export_rva(
             kernel_base as u64,               // BaseAddress
             dos_buf.as_mut_ptr() as u64,      // Buffer
             dos_buf.len() as u64,             // NumberOfBytesToRead
-            &mut bytes_read as *mut _ as u64,  // NumberOfBytesRead
+            &mut bytes_read as *mut _ as u64, // NumberOfBytesRead
         ],
     );
     if status < 0 || bytes_read < dos_buf.len() {
         return None;
     }
     let e_magic = u16::from_le_bytes(dos_buf[0..2].try_into().unwrap());
-    if e_magic != 0x5A4D { return None; }
+    if e_magic != 0x5A4D {
+        return None;
+    }
     let e_lfanew = i32::from_le_bytes(dos_buf[60..64].try_into().unwrap()) as usize;
 
     // Read the NT headers signature + FILE_HEADER.
@@ -594,18 +625,20 @@ unsafe fn resolve_kernel_export_rva(
         sys_read.ssn,
         sys_read.gadget_addr,
         &[
-            h_system as u64,                         // ProcessHandle
-            (kernel_base + nt_offset) as u64,        // BaseAddress
-            nt_buf.as_mut_ptr() as u64,              // Buffer
-            nt_buf.len() as u64,                     // NumberOfBytesToRead
-            &mut bytes_read as *mut _ as u64,         // NumberOfBytesRead
+            h_system as u64,                  // ProcessHandle
+            (kernel_base + nt_offset) as u64, // BaseAddress
+            nt_buf.as_mut_ptr() as u64,       // Buffer
+            nt_buf.len() as u64,              // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64, // NumberOfBytesRead
         ],
     );
     if status < 0 || bytes_read < nt_buf.len() {
         return None;
     }
     let sig = u32::from_le_bytes(nt_buf[0..4].try_into().unwrap());
-    if sig != 0x4550 { return None; } // "PE\0\0"
+    if sig != 0x4550 {
+        return None;
+    } // "PE\0\0"
     let size_of_optional_header = u16::from_le_bytes(nt_buf[20..22].try_into().unwrap()) as usize;
 
     // Read the optional header to get the export directory RVA.
@@ -616,11 +649,11 @@ unsafe fn resolve_kernel_export_rva(
         sys_read.ssn,
         sys_read.gadget_addr,
         &[
-            h_system as u64,                         // ProcessHandle
-            (kernel_base + opt_offset) as u64,       // BaseAddress
-            opt_buf.as_mut_ptr() as u64,             // Buffer
-            opt_buf.len() as u64,                    // NumberOfBytesToRead
-            &mut bytes_read as *mut _ as u64,         // NumberOfBytesRead
+            h_system as u64,                   // ProcessHandle
+            (kernel_base + opt_offset) as u64, // BaseAddress
+            opt_buf.as_mut_ptr() as u64,       // Buffer
+            opt_buf.len() as u64,              // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64,  // NumberOfBytesRead
         ],
     );
     if status < 0 || bytes_read < size_of_optional_header {
@@ -631,10 +664,22 @@ unsafe fn resolve_kernel_export_rva(
     // DataDirectory[0] (export table) is at offset 112 for PE32+,
     // offset 96 for PE32.
     let dd_export_off = if magic == 0x020B { 112 } else { 96 };
-    if dd_export_off + 8 > opt_buf.len() { return None; }
-    let export_rva = u32::from_le_bytes(opt_buf[dd_export_off..dd_export_off + 4].try_into().unwrap()) as usize;
-    let export_size = u32::from_le_bytes(opt_buf[dd_export_off + 4..dd_export_off + 8].try_into().unwrap()) as usize;
-    if export_rva == 0 || export_size == 0 { return None; }
+    if dd_export_off + 8 > opt_buf.len() {
+        return None;
+    }
+    let export_rva = u32::from_le_bytes(
+        opt_buf[dd_export_off..dd_export_off + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let export_size = u32::from_le_bytes(
+        opt_buf[dd_export_off + 4..dd_export_off + 8]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    if export_rva == 0 || export_size == 0 {
+        return None;
+    }
 
     // Read the IMAGE_EXPORT_DIRECTORY (40 bytes).
     let mut export_dir_buf = [0u8; 40];
@@ -643,18 +688,21 @@ unsafe fn resolve_kernel_export_rva(
         sys_read.ssn,
         sys_read.gadget_addr,
         &[
-            h_system as u64,                             // ProcessHandle
-            (kernel_base + export_rva) as u64,           // BaseAddress
-            export_dir_buf.as_mut_ptr() as u64,          // Buffer
-            40u64,                                       // NumberOfBytesToRead
-            &mut bytes_read as *mut _ as u64,             // NumberOfBytesRead
+            h_system as u64,                    // ProcessHandle
+            (kernel_base + export_rva) as u64,  // BaseAddress
+            export_dir_buf.as_mut_ptr() as u64, // Buffer
+            40u64,                              // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64,   // NumberOfBytesRead
         ],
     );
-    if status < 0 || bytes_read < 40 { return None; }
+    if status < 0 || bytes_read < 40 {
+        return None;
+    }
 
     let num_names = u32::from_le_bytes(export_dir_buf[24..28].try_into().unwrap()) as usize;
     let addr_of_names = u32::from_le_bytes(export_dir_buf[32..36].try_into().unwrap()) as usize;
-    let addr_of_name_ordinals = u32::from_le_bytes(export_dir_buf[36..40].try_into().unwrap()) as usize;
+    let addr_of_name_ordinals =
+        u32::from_le_bytes(export_dir_buf[36..40].try_into().unwrap()) as usize;
     let addr_of_functions = u32::from_le_bytes(export_dir_buf[28..32].try_into().unwrap()) as usize;
 
     // Read the name pointer table.
@@ -665,14 +713,16 @@ unsafe fn resolve_kernel_export_rva(
         sys_read.ssn,
         sys_read.gadget_addr,
         &[
-            h_system as u64,                              // ProcessHandle
-            (kernel_base + addr_of_names) as u64,         // BaseAddress
-            name_table.as_mut_ptr() as u64,               // Buffer
-            name_table_size as u64,                       // NumberOfBytesToRead
-            &mut bytes_read as *mut _ as u64,              // NumberOfBytesRead
+            h_system as u64,                      // ProcessHandle
+            (kernel_base + addr_of_names) as u64, // BaseAddress
+            name_table.as_mut_ptr() as u64,       // Buffer
+            name_table_size as u64,               // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64,     // NumberOfBytesRead
         ],
     );
-    if status < 0 || bytes_read < name_table_size { return None; }
+    if status < 0 || bytes_read < name_table_size {
+        return None;
+    }
 
     // Search for the export name using binary search (kernel exports are sorted).
     let name_bytes = export_name.as_bytes();
@@ -682,9 +732,8 @@ unsafe fn resolve_kernel_export_rva(
 
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let name_rva = u32::from_le_bytes(
-            name_table[mid * 4..mid * 4 + 4].try_into().unwrap()
-        ) as usize;
+        let name_rva =
+            u32::from_le_bytes(name_table[mid * 4..mid * 4 + 4].try_into().unwrap()) as usize;
 
         // Read up to 128 bytes of the name for comparison.
         let mut name_buf = [0u8; 128];
@@ -693,11 +742,11 @@ unsafe fn resolve_kernel_export_rva(
             sys_read.ssn,
             sys_read.gadget_addr,
             &[
-                h_system as u64,                          // ProcessHandle
-                (kernel_base + name_rva) as u64,          // BaseAddress
-                name_buf.as_mut_ptr() as u64,             // Buffer
-                128u64,                                   // NumberOfBytesToRead
-                &mut bytes_read as *mut _ as u64,          // NumberOfBytesRead
+                h_system as u64,                  // ProcessHandle
+                (kernel_base + name_rva) as u64,  // BaseAddress
+                name_buf.as_mut_ptr() as u64,     // Buffer
+                128u64,                           // NumberOfBytesToRead
+                &mut bytes_read as *mut _ as u64, // NumberOfBytesRead
             ],
         );
 
@@ -723,14 +772,16 @@ unsafe fn resolve_kernel_export_rva(
         sys_read.ssn,
         sys_read.gadget_addr,
         &[
-            h_system as u64,                                          // ProcessHandle
-            (kernel_base + addr_of_name_ordinals + idx * 2) as u64,   // BaseAddress
-            ordinal_buf.as_mut_ptr() as u64,                          // Buffer
-            2u64,                                                     // NumberOfBytesToRead
-            &mut bytes_read as *mut _ as u64,                          // NumberOfBytesRead
+            h_system as u64,                                        // ProcessHandle
+            (kernel_base + addr_of_name_ordinals + idx * 2) as u64, // BaseAddress
+            ordinal_buf.as_mut_ptr() as u64,                        // Buffer
+            2u64,                                                   // NumberOfBytesToRead
+            &mut bytes_read as *mut _ as u64,                       // NumberOfBytesRead
         ],
     );
-    if status < 0 || bytes_read < 2 { return None; }
+    if status < 0 || bytes_read < 2 {
+        return None;
+    }
     let ordinal = u16::from_le_bytes(ordinal_buf) as usize;
 
     // Read the function RVA.
@@ -744,10 +795,12 @@ unsafe fn resolve_kernel_export_rva(
             (kernel_base + addr_of_functions + ordinal * 4) as u64, // BaseAddress
             func_buf.as_mut_ptr() as u64,                           // Buffer
             4u64,                                                   // NumberOfBytesToRead
-            &mut bytes_read as *mut _ as u64,                        // NumberOfBytesRead
+            &mut bytes_read as *mut _ as u64,                       // NumberOfBytesRead
         ],
     );
-    if status < 0 || bytes_read < 4 { return None; }
+    if status < 0 || bytes_read < 4 {
+        return None;
+    }
     let func_rva = u32::from_le_bytes(func_buf) as usize;
 
     // Check for forwarded export (RVA within export directory).
@@ -792,9 +845,9 @@ unsafe fn query_kernel_base() -> Option<usize> {
         sys_query.ssn,
         sys_query.gadget_addr,
         &[
-            SYSTEM_MODULE_INFORMATION as u64, // SystemInformationClass
-            0u64,                              // SystemInformation (NULL)
-            0u64,                              // SystemInformationLength
+            SYSTEM_MODULE_INFORMATION as u64,    // SystemInformationClass
+            0u64,                                // SystemInformation (NULL)
+            0u64,                                // SystemInformationLength
             &mut return_length as *mut _ as u64, // ReturnLength
         ],
     );
@@ -837,15 +890,15 @@ unsafe fn query_kernel_base() -> Option<usize> {
     #[repr(C)]
     #[allow(non_camel_case_types)]
     struct RtlProcessModuleInformation {
-        section: [u64; 2],     // +0x00  IMAGE_INFO (16 bytes on x64)
-        mapped_base: u64,      // +0x10
-        image_base: u64,       // +0x18  — what we want
-        image_size: u32,       // +0x20
-        flags: u32,            // +0x24
-        load_order_index: u16, // +0x28
-        init_order_index: u16, // +0x2A
-        load_count: u16,       // +0x2C
-        offset_to_file_name: u16, // +0x2E
+        section: [u64; 2],         // +0x00  IMAGE_INFO (16 bytes on x64)
+        mapped_base: u64,          // +0x10
+        image_base: u64,           // +0x18  — what we want
+        image_size: u32,           // +0x20
+        flags: u32,                // +0x24
+        load_order_index: u16,     // +0x28
+        init_order_index: u16,     // +0x2A
+        load_count: u16,           // +0x2C
+        offset_to_file_name: u16,  // +0x2E
         full_path_name: [u8; 256], // +0x30
     }
 
@@ -883,9 +936,8 @@ unsafe fn query_kernel_base() -> Option<usize> {
     if image_base_off + 8 > buf.len() {
         return None;
     }
-    let kernel_base = usize::from_le_bytes(
-        buf[image_base_off..image_base_off + 8].try_into().ok()?
-    );
+    let kernel_base =
+        usize::from_le_bytes(buf[image_base_off..image_base_off + 8].try_into().ok()?);
 
     // Verify it's the kernel by checking the name.
     // OffsetToFileName is at struct offset 0x2E (46) on x64.
@@ -903,7 +955,9 @@ unsafe fn query_kernel_base() -> Option<usize> {
         return Some(kernel_base); // Trust it without name verification.
     }
     let file_name_offset = u16::from_le_bytes(
-        buf[name_offset_field_off..name_offset_field_off + 2].try_into().unwrap_or([0; 2])
+        buf[name_offset_field_off..name_offset_field_off + 2]
+            .try_into()
+            .unwrap_or([0; 2]),
     ) as usize;
     let name_start = full_path_name_off + file_name_offset;
     if name_start + 12 <= buf.len() {
@@ -1056,9 +1110,14 @@ unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<S
                 if let Some(inferred) = t.ssn.checked_sub(delta as u32) {
                     log::debug!(
                         "nt_syscall::halo_gate: SSN {} inferred for {:#x} (upper+{})",
-                        inferred, target_addr, delta
+                        inferred,
+                        target_addr,
+                        delta
                     );
-                    return Some(SyscallTarget { ssn: inferred, gadget_addr: t.gadget_addr });
+                    return Some(SyscallTarget {
+                        ssn: inferred,
+                        gadget_addr: t.gadget_addr,
+                    });
                 }
             }
         }
@@ -1067,15 +1126,21 @@ unsafe fn infer_ssn_halo_gate(ntdll_base: usize, target_addr: usize) -> Option<S
                 let inferred = t.ssn + delta as u32;
                 log::debug!(
                     "nt_syscall::halo_gate: SSN {} inferred for {:#x} (lower-{})",
-                    inferred, target_addr, delta
+                    inferred,
+                    target_addr,
+                    delta
                 );
-                return Some(SyscallTarget { ssn: inferred, gadget_addr: t.gadget_addr });
+                return Some(SyscallTarget {
+                    ssn: inferred,
+                    gadget_addr: t.gadget_addr,
+                });
             }
         }
     }
     log::warn!(
         "nt_syscall::halo_gate: could not infer SSN for {:#x} within {} neighbours",
-        target_addr, MAX_DELTA
+        target_addr,
+        MAX_DELTA
     );
     None
 }
@@ -1097,14 +1162,20 @@ unsafe fn scan_text_for_syscall_gadget(ntdll_base: usize) -> Option<usize> {
     // immediately follow the optional header in the PE layout:
     //   offset = signature(4) + FILE_HEADER(20) + SizeOfOptionalHeader
     let p_sections = (nt as *const _ as usize
-        + 4 + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
+        + 4
+        + std::mem::size_of::<winapi::um::winnt::IMAGE_FILE_HEADER>()
         + nt.FileHeader.SizeOfOptionalHeader as usize)
         as *const IMAGE_SECTION_HEADER;
 
     for i in 0..nt.FileHeader.NumberOfSections {
         let section = &*p_sections.add(i as usize);
         let name = &section.Name;
-        if name[0] == b'.' && name[1] == b't' && name[2] == b'e' && name[3] == b'x' && name[4] == b't' {
+        if name[0] == b'.'
+            && name[1] == b't'
+            && name[2] == b'e'
+            && name[3] == b'x'
+            && name[4] == b't'
+        {
             let start = ntdll_base + section.VirtualAddress as usize;
             let size = *section.Misc.VirtualSize() as usize;
             let code = std::slice::from_raw_parts(start as *const u8, size);
@@ -1134,10 +1205,7 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
         let func_addr = pe_resolve::get_proc_address_by_hash(ntdll_base, target_hash)?;
 
         let prologue = std::slice::from_raw_parts(func_addr as *const u8, 2);
-        let is_hooked = !(
-            (prologue[0] == 0x4C && prologue[1] == 0x8B)
-            || prologue[0] == 0xB8
-        );
+        let is_hooked = !((prologue[0] == 0x4C && prologue[1] == 0x8B) || prologue[0] == 0xB8);
 
         if !is_hooked {
             if let Some(t) = parse_syscall_stub(func_addr) {
@@ -1171,22 +1239,17 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
                             "nt_syscall: ntdll unhook succeeded, retrying SSN for {func_name}"
                         );
                         // Re-fetch the (now clean) stub address and parse it.
-                        let ntdll_base2 = pe_resolve::get_module_handle_by_hash(
-                            pe_resolve::HASH_NTDLL_DLL,
-                        )?;
-                        let func_addr2 = pe_resolve::get_proc_address_by_hash(
-                            ntdll_base2,
-                            target_hash,
-                        )?;
+                        let ntdll_base2 =
+                            pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
+                        let func_addr2 =
+                            pe_resolve::get_proc_address_by_hash(ntdll_base2, target_hash)?;
                         if let Some(t) = parse_syscall_stub(func_addr2) {
                             return Some(t);
                         }
                         // If parse_syscall_stub still fails, try Halo's Gate one more time.
                         infer_ssn_halo_gate(ntdll_base2, func_addr2)?
                     } else {
-                        log::error!(
-                            "nt_syscall: ntdll unhook callback failed for {func_name}"
-                        );
+                        log::error!("nt_syscall: ntdll unhook callback failed for {func_name}");
                         return None;
                     }
                 } else {
@@ -1201,7 +1264,10 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
 
         if is_hooked {
             if let Some(gadget_addr) = scan_text_for_syscall_gadget(ntdll_base) {
-                return Some(SyscallTarget { ssn: ssn_target.ssn, gadget_addr });
+                return Some(SyscallTarget {
+                    ssn: ssn_target.ssn,
+                    gadget_addr,
+                });
             }
             log::warn!(
                 "nt_syscall: {func_name}: no clean gadget found in .text; \
@@ -1240,8 +1306,7 @@ fn map_clean_ntdll() -> anyhow::Result<usize> {
         obj_name.Buffer = ntdll_path.as_mut_ptr();
 
         let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-        obj_attr.Length =
-            std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
         obj_attr.ObjectName = &mut obj_name;
         obj_attr.Attributes = 0x40; // OBJ_CASE_INSENSITIVE
 
@@ -1256,12 +1321,15 @@ fn map_clean_ntdll() -> anyhow::Result<usize> {
                 0x80100000u64, // SYNCHRONIZE | FILE_READ_DATA
                 &mut obj_attr as *mut _ as u64,
                 io_status.as_mut_ptr() as u64,
-                1u64,  // FILE_SHARE_READ
+                1u64,    // FILE_SHARE_READ
                 0x20u64, // FILE_SYNCHRONOUS_IO_NONALERT
             ],
         );
         if s < 0 {
-            return Err(anyhow!("nt_syscall: NtOpenFile(ntdll) NTSTATUS {:#010x}", s as u32));
+            return Err(anyhow!(
+                "nt_syscall: NtOpenFile(ntdll) NTSTATUS {:#010x}",
+                s as u32
+            ));
         }
 
         let mut h_section: *mut winapi::ctypes::c_void = std::ptr::null_mut();
@@ -1273,14 +1341,17 @@ fn map_clean_ntdll() -> anyhow::Result<usize> {
                 0x000F_001Fu64, // SECTION_ALL_ACCESS
                 0u64,
                 0u64,
-                0x20u64,       // PAGE_EXECUTE_READ
+                0x20u64,        // PAGE_EXECUTE_READ
                 0x0100_0000u64, // SEC_IMAGE
                 h_file as u64,
             ],
         );
         pe_resolve::close_handle(h_file as *mut core::ffi::c_void);
         if s < 0 {
-            return Err(anyhow!("nt_syscall: NtCreateSection(ntdll) NTSTATUS {:#010x}", s as u32));
+            return Err(anyhow!(
+                "nt_syscall: NtCreateSection(ntdll) NTSTATUS {:#010x}",
+                s as u32
+            ));
         }
 
         let mut base_addr: *mut winapi::ctypes::c_void = std::ptr::null_mut();
@@ -1303,7 +1374,10 @@ fn map_clean_ntdll() -> anyhow::Result<usize> {
         );
         pe_resolve::close_handle(h_section as *mut core::ffi::c_void);
         if s < 0 || base_addr.is_null() {
-            return Err(anyhow!("nt_syscall: NtMapViewOfSection(ntdll) NTSTATUS {:#010x}", s as u32));
+            return Err(anyhow!(
+                "nt_syscall: NtMapViewOfSection(ntdll) NTSTATUS {:#010x}",
+                s as u32
+            ));
         }
 
         Ok(base_addr as usize)
@@ -1352,12 +1426,16 @@ pub fn init_syscall_infrastructure() -> anyhow::Result<()> {
 
             log::debug!(
                 "nt_syscall: clean ntdll mapped at {:#x} (timestamp={:#010x}, build={})",
-                base, ts, BUILD_NUMBER.load(Ordering::Acquire)
+                base,
+                ts,
+                BUILD_NUMBER.load(Ordering::Acquire)
             );
             Ok(())
         }
         Err(e) => {
-            log::warn!("nt_syscall: clean ntdll mapping failed: {e}; falling back to bootstrap mode");
+            log::warn!(
+                "nt_syscall: clean ntdll mapping failed: {e}; falling back to bootstrap mode"
+            );
             Err(e)
         }
     }
@@ -1381,8 +1459,9 @@ pub fn get_syscall_id(func_name: &str) -> anyhow::Result<SyscallTarget> {
     let clean_base = CLEAN_NTDLL.read().ok().and_then(|g| *g).filter(|&b| b != 0);
     let target = match clean_base {
         Some(base) => unsafe { read_export_ssn(base, func_name) }?,
-        None => get_bootstrap_ssn(func_name)
-            .ok_or_else(|| anyhow!("nt_syscall: bootstrap SSN resolution failed for '{func_name}'"))?,
+        None => get_bootstrap_ssn(func_name).ok_or_else(|| {
+            anyhow!("nt_syscall: bootstrap SSN resolution failed for '{func_name}'")
+        })?,
     };
 
     // Validate against versioned SSN range table.
@@ -1399,23 +1478,30 @@ pub fn get_syscall_id(func_name: &str) -> anyhow::Result<SyscallTarget> {
                 if let Some(ssdt_target) = unsafe { resolve_via_ssdt(func_name) } {
                     cache.lock().unwrap().insert(
                         func_name.to_string(),
-                        (ssdt_target.ssn, ssdt_target.gadget_addr, CACHED_TIMESTAMP.load(Ordering::Acquire)),
+                        (
+                            ssdt_target.ssn,
+                            ssdt_target.gadget_addr,
+                            CACHED_TIMESTAMP.load(Ordering::Acquire),
+                        ),
                     );
                     return Ok(ssdt_target);
                 }
                 // SSDT failed too — use what we have but log a warning.
-                log::warn!("nt_syscall: SSDT fallback failed; using resolved SSN despite range mismatch");
+                log::warn!(
+                    "nt_syscall: SSDT fallback failed; using resolved SSN despite range mismatch"
+                );
             }
         }
     }
 
-    cache
-        .lock()
-        .unwrap()
-        .insert(
-            func_name.to_string(),
-            (target.ssn, target.gadget_addr, CACHED_TIMESTAMP.load(Ordering::Acquire)),
-        );
+    cache.lock().unwrap().insert(
+        func_name.to_string(),
+        (
+            target.ssn,
+            target.gadget_addr,
+            CACHED_TIMESTAMP.load(Ordering::Acquire),
+        ),
+    );
     Ok(target)
 }
 

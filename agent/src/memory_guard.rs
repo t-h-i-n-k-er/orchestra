@@ -161,10 +161,7 @@ fn maybe_advance_scheme() {
         let old = SCHEME_INDEX.load(Ordering::Relaxed);
         SCHEME_INDEX.store((old + 1) % (table.len() as u32), Ordering::Relaxed);
         CYCLE_COUNTER.store(0, Ordering::Relaxed);
-        tracing::debug!(
-            "[memory-guard] scheme advanced to {:?}",
-            current_scheme()
-        );
+        tracing::debug!("[memory-guard] scheme advanced to {:?}", current_scheme());
     }
 }
 
@@ -261,13 +258,15 @@ fn decrypt_region(
             let mut combined = Vec::with_capacity(buf.len() + 16);
             combined.extend_from_slice(buf);
             combined.extend_from_slice(tag);
-            let pt = cipher.decrypt(aead_nonce, combined.as_slice()).map_err(|_| {
-                anyhow::anyhow!(
-                    "[memory-guard] AES-256-GCM tag mismatch for \
+            let pt = cipher
+                .decrypt(aead_nonce, combined.as_slice())
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "[memory-guard] AES-256-GCM tag mismatch for \
                      region '{}': memory may have been tampered with",
-                    label
-                )
-            })?;
+                        label
+                    )
+                })?;
             buf.copy_from_slice(&pt);
             Ok(())
         }
@@ -395,9 +394,8 @@ pub fn lock() -> Result<KeyHandle> {
             // SAFETY: We hold the registry mutex; no other code accesses the region.
             let buf = unsafe { std::slice::from_raw_parts_mut(region.ptr, region.len) };
 
-            let (nonce, nonce_len, tag) =
-                encrypt_region(scheme, &key_bytes, buf)
-                    .map_err(|e| anyhow::anyhow!("{} for region '{}'", e, region.label))?;
+            let (nonce, nonce_len, tag) = encrypt_region(scheme, &key_bytes, buf)
+                .map_err(|e| anyhow::anyhow!("{} for region '{}'", e, region.label))?;
 
             region.scheme = scheme;
             region.nonce = nonce;
@@ -446,7 +444,14 @@ pub fn unlock(handle: KeyHandle) -> Result<()> {
             // SAFETY: We hold the registry mutex; no other code accesses the region.
             let buf = unsafe { std::slice::from_raw_parts_mut(region.ptr, region.len) };
 
-            decrypt_region(region.scheme, &key_bytes, nonce_valid, tag_valid, buf, region.label)?;
+            decrypt_region(
+                region.scheme,
+                &key_bytes,
+                nonce_valid,
+                tag_valid,
+                buf,
+                region.label,
+            )?;
 
             region.locked = false;
             region.nonce.zeroize();
@@ -490,7 +495,14 @@ pub fn rotate_key(handle: KeyHandle) -> Result<KeyHandle> {
             let tag_valid = &region.tag[..region.scheme.tag_len()];
 
             let buf = unsafe { std::slice::from_raw_parts_mut(region.ptr, region.len) };
-            decrypt_region(region.scheme, &old_key, nonce_valid, tag_valid, buf, region.label)?;
+            decrypt_region(
+                region.scheme,
+                &old_key,
+                nonce_valid,
+                tag_valid,
+                buf,
+                region.label,
+            )?;
             // Region is now plaintext but we leave locked=true because we're
             // about to re-encrypt immediately.
         }
@@ -735,11 +747,7 @@ impl LockedKeyPage {
             }
         } else {
             unsafe {
-                libc::mprotect(
-                    self.ptr as *mut _,
-                    self.page_size,
-                    libc::PROT_READ,
-                );
+                libc::mprotect(self.ptr as *mut _, self.page_size, libc::PROT_READ);
                 std::ptr::copy_nonoverlapping(self.ptr, key.as_mut_ptr(), 32);
                 libc::mprotect(self.ptr as *mut _, self.page_size, libc::PROT_NONE);
             }

@@ -19,8 +19,10 @@ impl Injector for EarlyBirdInjector {
             PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
             PROCESS_VM_WRITE,
         };
-        let access_mask =
-            PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION;
+        let access_mask = PROCESS_VM_OPERATION
+            | PROCESS_VM_WRITE
+            | PROCESS_CREATE_THREAD
+            | PROCESS_QUERY_INFORMATION;
 
         // Reuse the common NtCreateThreadEx pipeline until a dedicated APC-only
         // implementation is selected by configuration.

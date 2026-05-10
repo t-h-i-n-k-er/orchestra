@@ -610,10 +610,7 @@ where
             ));
         }
         if header[0] != TLS_CONTENT_TYPE_APPLICATION_DATA {
-            return Err(anyhow!(
-                "unexpected TLS content type: 0x{:02x}",
-                header[0]
-            ));
+            return Err(anyhow!("unexpected TLS content type: 0x{:02x}", header[0]));
         }
         if header[1] != TLS_VERSION_HI || header[2] != TLS_VERSION_LO {
             return Err(anyhow!(

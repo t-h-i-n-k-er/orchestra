@@ -1010,22 +1010,49 @@ curl -X POST https://c2.example.com/api/mesh/broadcast \
 
 ### Agent Build-Time Features
 
-| Feature | Description |
-|---------|-------------|
-| `http-transport` | Enable HTTP/S malleable C2 transport |
-| `doh-transport` | Enable DNS-over-HTTPS C2 transport |
-| `ssh-transport` | Enable SSH subsystem C2 transport |
-| `smb-pipe-transport` | Enable SMB named pipe C2 transport |
-| `outbound-c` | Enable outbound connection mode (agent dials server) |
-| `direct-syscalls` | Enable direct/indirect syscall infrastructure |
-| `memory-guard` | Enable heap region encryption during sleep |
-| `self-reencode` | Enable runtime metamorphic re-encoding |
-| `network-discovery` | Enable ARP scan, ping sweep, port scan |
-| `persistence` | Enable cross-platform persistence mechanisms |
-| `remote-assist` | Enable screen capture and input simulation |
-| `hci-research` | Enable keyboard and window title logging |
-| `p2p-tcp` | Enable peer-to-peer TCP mesh networking |
-| `hot-reload` | Enable configuration hot-reload via file watcher |
+| Feature | Purpose |
+|---------|---------|
+| `browser-data` | Browser stored-data recovery |
+| `cet-bypass` | CET/shadow-stack bypass support |
+| `delayed-stomp` | Delayed module-stomp injection |
+| `dev` | Development build toggles |
+| `direct-syscalls` | Direct/indirect syscall infrastructure |
+| `doh-transport` | DNS-over-HTTPS C2 transport |
+| `embedded_driver` | Embedded driver payload packaging |
+| `env-validation` | Environment validation checks |
+| `etw-check` | ETW auto-logger detection |
+| `evanesco` | Continuous memory hiding |
+| `evasion-transform` | Runtime EDR signature transformation |
+| `forensic-cleanup` | Prefetch/MFT/USN evidence cleanup |
+| `forward-secrecy` | X25519 session key agreement |
+| `hci-research` | HCI telemetry capture |
+| `hot-reload` | Configuration hot reload |
+| `http-transport` | HTTP/S malleable C2 transport |
+| `hwbp-amsi` | Hardware-breakpoint AMSI/ETW bypass mode |
+| `kernel-callback` | Kernel callback overwrite support |
+| `lsa-whisperer` | LSA Whisperer support |
+| `manual-map` | Reflective/manual module mapping |
+| `memory-guard` | Heap region encryption during idle windows |
+| `module-signatures` | Signed module verification |
+| `network-discovery` | ARP scan, ping sweep, port scan |
+| `outbound-c` | Outbound agent connection mode |
+| `p2p-tcp` | Peer-to-peer TCP mesh networking |
+| `perf-optimize` | Performance optimization toggles |
+| `persistence` | Cross-platform persistence mechanisms |
+| `ppid-spoofing` | Parent-process ID spoofing support |
+| `remote-assist` | Screen capture and input simulation |
+| `self-reencode` | Runtime metamorphic re-encoding |
+| `smb-pipe-transport` | SMB named pipe C2 transport |
+| `ssh-transport` | SSH subsystem C2 transport |
+| `stack-spoof` | Call-stack spoofing support |
+| `stealth` | Stealth feature bundle |
+| `surveillance` | Screenshot, keylogger, and clipboard monitoring |
+| `syscall-emulation` | User-mode syscall emulation |
+| `token-impersonation` | Token-only impersonation support |
+| `traffic-normalization` | Traffic normalization toggles |
+| `transacted-hollowing` | NTFS transaction-backed hollowing |
+| `unsafe-runtime-rewrite` | Runtime rewrite support |
+| `write-raid-amsi` | Write-raid AMSI bypass mode |
 
 ### Environment Variables
 
@@ -1127,7 +1154,7 @@ cargo build --release --package orchestra-server
 # Build agent for Windows (with HTTP transport + full evasion suite)
 cargo build --release --package agent \
     --target x86_64-pc-windows-gnu \
-    --features "http-transport,outbound-c,direct-syscalls,memory-guard,stack-spoof,cet-bypass,token-impersonation,forensic-cleanup,write-raid-amsi,syscall-emulation,evanesco,evade-edr-transform"
+    --features "http-transport,outbound-c,direct-syscalls,memory-guard,stack-spoof,cet-bypass,token-impersonation,forensic-cleanup,write-raid-amsi,syscall-emulation,evanesco,evasion-transform"
 
 # Build agent for Linux
 cargo build --release --package agent \

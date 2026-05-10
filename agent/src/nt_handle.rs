@@ -59,8 +59,7 @@ impl NtHandle {
 impl Drop for NtHandle {
     fn drop(&mut self) {
         if self.is_valid() {
-            let status =
-                unsafe { crate::syscalls::syscall_NtClose(self.0 as u64) };
+            let status = unsafe { crate::syscalls::syscall_NtClose(self.0 as u64) };
             if status != 0 {
                 log::warn!(
                     "NtHandle::drop: NtClose({:#x}) returned status {:#x}",

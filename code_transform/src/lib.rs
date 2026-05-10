@@ -27,7 +27,6 @@
 //! Functions that contain inline assembly must be excluded by the caller before
 //! passing their machine code to these routines.
 
-pub mod runtime;
 #[cfg(target_arch = "x86_64")]
 pub mod cfflatten;
 #[cfg(target_arch = "x86_64")]
@@ -36,6 +35,7 @@ pub mod opcode_diversity;
 pub mod regalloc;
 #[cfg(target_arch = "x86_64")]
 pub mod reorder;
+pub mod runtime;
 #[cfg(target_arch = "x86_64")]
 pub mod substitute;
 #[cfg(all(target_arch = "x86_64", feature = "virtualize"))]
@@ -56,15 +56,15 @@ mod virtualize {
 pub mod opaque_predicates;
 
 #[cfg(target_arch = "aarch64")]
-pub mod substitute_aarch64;
-#[cfg(target_arch = "aarch64")]
-pub mod reorder_aarch64;
-#[cfg(target_arch = "aarch64")]
 pub mod cfflatten_aarch64;
 #[cfg(target_arch = "aarch64")]
 pub mod opcode_diversity_aarch64;
 #[cfg(target_arch = "aarch64")]
 pub mod regalloc_aarch64;
+#[cfg(target_arch = "aarch64")]
+pub mod reorder_aarch64;
+#[cfg(target_arch = "aarch64")]
+pub mod substitute_aarch64;
 
 #[cfg(target_arch = "x86_64")]
 use rand::SeedableRng;

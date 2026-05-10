@@ -12,10 +12,7 @@ use axum::{
 };
 use axum_server::accept::Accept;
 use common::{CryptoSession, Message, PROTOCOL_VERSION};
-use dashmap::{
-    mapref::entry::Entry,
-    DashMap,
-};
+use dashmap::{mapref::entry::Entry, DashMap};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -479,7 +476,9 @@ impl DohRuntime {
                     entry.mesh_public_key = mesh_public_key;
                 }
             }
-            Message::TaskResponse { task_id, result, .. } => {
+            Message::TaskResponse {
+                task_id, result, ..
+            } => {
                 if let Some((_, sender)) = self.app.pending.remove(&task_id) {
                     let _ = sender.send(result);
                 }
@@ -569,7 +568,8 @@ struct DohTlsAcceptor {
     inner: TlsAcceptor,
 }
 
-type DohTlsAcceptFuture<S> = Pin<Box<dyn Future<Output = io::Result<(TlsStream<TcpStream>, S)>> + Send>>;
+type DohTlsAcceptFuture<S> =
+    Pin<Box<dyn Future<Output = io::Result<(TlsStream<TcpStream>, S)>> + Send>>;
 
 impl<S> Accept<TcpStream, S> for DohTlsAcceptor
 where
@@ -790,7 +790,8 @@ pub async fn run(
     let stale_after = doh_session_timeout();
     let sweep_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(DOH_SESSION_SWEEP_INTERVAL_SECS));
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(DOH_SESSION_SWEEP_INTERVAL_SECS));
         loop {
             interval.tick().await;
             let removed = sweep_state.cleanup_stale_sessions(stale_after);
@@ -996,8 +997,7 @@ fn parse_dns_wire_query(packet: &[u8]) -> Result<WireQuestion> {
         if idx + len > packet.len() {
             return Err(anyhow!("truncated qname label"));
         }
-        let label = std::str::from_utf8(&packet[idx..idx + len])?
-            .to_ascii_lowercase();
+        let label = std::str::from_utf8(&packet[idx..idx + len])?.to_ascii_lowercase();
         labels.push(label);
         idx += len;
     }
@@ -1099,8 +1099,7 @@ fn is_hex(s: &str) -> bool {
 
 fn is_base32_fragment(s: &str) -> bool {
     !s.is_empty()
-        && s
-            .bytes()
+        && s.bytes()
             .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'2'..=b'7'))
 }
 

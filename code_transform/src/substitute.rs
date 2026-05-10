@@ -119,10 +119,8 @@ pub fn apply_substitutions(code: &[u8], rng: &mut impl Rng) -> Vec<u8> {
 /// Try to replace `MOV r64/r32, 0` with `XOR r32, r32`.
 fn try_xor_for_mov_zero(inst: &Instruction) -> Option<Instruction> {
     let code = inst.code();
-    let is_mov_zero = matches!(
-        code,
-        Code::Mov_r64_imm64 | Code::Mov_r32_imm32
-    ) && inst.immediate64() == 0;
+    let is_mov_zero =
+        matches!(code, Code::Mov_r64_imm64 | Code::Mov_r32_imm32) && inst.immediate64() == 0;
 
     if !is_mov_zero {
         return None;
@@ -387,6 +385,9 @@ mod tests {
                 break;
             }
         }
-        assert!(fired, "Rule 2 dead-code pair should fire at least once in 128 seeds");
+        assert!(
+            fired,
+            "Rule 2 dead-code pair should fire at least once in 128 seeds"
+        );
     }
 }

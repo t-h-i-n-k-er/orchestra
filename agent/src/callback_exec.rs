@@ -29,28 +29,71 @@ where
 }
 
 #[cfg(windows)]
-static CREATE_THREADPOOL_WORK: OnceLock<Option<unsafe extern "system" fn(Option<extern "system" fn(PTP_CALLBACK_INSTANCE, PVOID, PTP_WORK)>, PVOID, *mut std::ffi::c_void) -> PTP_WORK>> = OnceLock::new();
+static CREATE_THREADPOOL_WORK: OnceLock<
+    Option<
+        unsafe extern "system" fn(
+            Option<extern "system" fn(PTP_CALLBACK_INSTANCE, PVOID, PTP_WORK)>,
+            PVOID,
+            *mut std::ffi::c_void,
+        ) -> PTP_WORK,
+    >,
+> = OnceLock::new();
 
 #[cfg(windows)]
-static SUBMIT_THREADPOOL_WORK: OnceLock<Option<unsafe extern "system" fn(PTP_WORK)>> = OnceLock::new();
+static SUBMIT_THREADPOOL_WORK: OnceLock<Option<unsafe extern "system" fn(PTP_WORK)>> =
+    OnceLock::new();
 
 #[cfg(windows)]
-static CLOSE_THREADPOOL_WORK: OnceLock<Option<unsafe extern "system" fn(PTP_WORK)>> = OnceLock::new();
+static CLOSE_THREADPOOL_WORK: OnceLock<Option<unsafe extern "system" fn(PTP_WORK)>> =
+    OnceLock::new();
 
 #[cfg(windows)]
-static CREATE_TIMER_QUEUE_TIMER: OnceLock<Option<unsafe extern "system" fn(*mut HANDLE, HANDLE, Option<extern "system" fn(PVOID, winapi::um::winnt::BOOLEAN)>, PVOID, u32, u32, u32) -> BOOL>> = OnceLock::new();
+static CREATE_TIMER_QUEUE_TIMER: OnceLock<
+    Option<
+        unsafe extern "system" fn(
+            *mut HANDLE,
+            HANDLE,
+            Option<extern "system" fn(PVOID, winapi::um::winnt::BOOLEAN)>,
+            PVOID,
+            u32,
+            u32,
+            u32,
+        ) -> BOOL,
+    >,
+> = OnceLock::new();
 
 #[cfg(windows)]
-static DELETE_TIMER_QUEUE_TIMER: OnceLock<Option<unsafe extern "system" fn(HANDLE, HANDLE, HANDLE) -> BOOL>> = OnceLock::new();
+static DELETE_TIMER_QUEUE_TIMER: OnceLock<
+    Option<unsafe extern "system" fn(HANDLE, HANDLE, HANDLE) -> BOOL>,
+> = OnceLock::new();
 
 #[cfg(windows)]
-static ENUM_SYSTEM_LOCALES_EX: OnceLock<Option<unsafe extern "system" fn(Option<extern "system" fn(*mut u16, u32, LPARAM) -> BOOL>, u32, LPARAM, *mut std::ffi::c_void) -> BOOL>> = OnceLock::new();
+static ENUM_SYSTEM_LOCALES_EX: OnceLock<
+    Option<
+        unsafe extern "system" fn(
+            Option<extern "system" fn(*mut u16, u32, LPARAM) -> BOOL>,
+            u32,
+            LPARAM,
+            *mut std::ffi::c_void,
+        ) -> BOOL,
+    >,
+> = OnceLock::new();
 
 #[cfg(windows)]
-static ENUM_CHILD_WINDOWS: OnceLock<Option<unsafe extern "system" fn(winapi::shared::windef::HWND, Option<extern "system" fn(winapi::shared::windef::HWND, LPARAM) -> BOOL>, LPARAM) -> BOOL>> = OnceLock::new();
+static ENUM_CHILD_WINDOWS: OnceLock<
+    Option<
+        unsafe extern "system" fn(
+            winapi::shared::windef::HWND,
+            Option<extern "system" fn(winapi::shared::windef::HWND, LPARAM) -> BOOL>,
+            LPARAM,
+        ) -> BOOL,
+    >,
+> = OnceLock::new();
 
 #[cfg(windows)]
-static FIND_WINDOW_A: OnceLock<Option<unsafe extern "system" fn(*const i8, *const i8) -> winapi::shared::windef::HWND>> = OnceLock::new();
+static FIND_WINDOW_A: OnceLock<
+    Option<unsafe extern "system" fn(*const i8, *const i8) -> winapi::shared::windef::HWND>,
+> = OnceLock::new();
 
 pub enum CallbackType {
     ThreadpoolWork,
@@ -70,7 +113,11 @@ extern "system" fn threadpool_callback(
         closure();
     }
     if !work.is_null() {
-        if let Some(close_fn) = resolve_fn(&CLOSE_THREADPOOL_WORK, b"kernel32.dll\0", b"CloseThreadpoolWork\0") {
+        if let Some(close_fn) = resolve_fn(
+            &CLOSE_THREADPOOL_WORK,
+            b"kernel32.dll\0",
+            b"CloseThreadpoolWork\0",
+        ) {
             unsafe { close_fn(work) };
         } else {
             log::warn!("callback_exec: CloseThreadpoolWork not resolved, leaking work object");
@@ -85,10 +132,18 @@ where
 {
     let closure: Box<Box<dyn FnOnce() + Send>> = Box::new(Box::new(f));
     let context = Box::into_raw(closure) as PVOID;
-    let create_fn = resolve_fn(&CREATE_THREADPOOL_WORK, b"kernel32.dll\0", b"CreateThreadpoolWork\0")
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve CreateThreadpoolWork dynamically"))?;
-    let submit_fn = resolve_fn(&SUBMIT_THREADPOOL_WORK, b"kernel32.dll\0", b"SubmitThreadpoolWork\0")
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve SubmitThreadpoolWork dynamically"))?;
+    let create_fn = resolve_fn(
+        &CREATE_THREADPOOL_WORK,
+        b"kernel32.dll\0",
+        b"CreateThreadpoolWork\0",
+    )
+    .ok_or_else(|| anyhow::anyhow!("failed to resolve CreateThreadpoolWork dynamically"))?;
+    let submit_fn = resolve_fn(
+        &SUBMIT_THREADPOOL_WORK,
+        b"kernel32.dll\0",
+        b"SubmitThreadpoolWork\0",
+    )
+    .ok_or_else(|| anyhow::anyhow!("failed to resolve SubmitThreadpoolWork dynamically"))?;
     unsafe {
         let work = create_fn(Some(threadpool_callback), context, std::ptr::null_mut());
         if work.is_null() {
@@ -175,7 +230,11 @@ extern "system" fn timer_queue_callback(
     }
     // Delete the one-shot timer to release its kernel object.
     if h != 0 {
-        if let Some(delete_fn) = resolve_fn(&DELETE_TIMER_QUEUE_TIMER, b"kernel32.dll\0", b"DeleteTimerQueueTimer\0") {
+        if let Some(delete_fn) = resolve_fn(
+            &DELETE_TIMER_QUEUE_TIMER,
+            b"kernel32.dll\0",
+            b"DeleteTimerQueueTimer\0",
+        ) {
             unsafe {
                 delete_fn(std::ptr::null_mut(), h as HANDLE, std::ptr::null_mut());
             }
@@ -195,8 +254,12 @@ where
         timer_handle: std::sync::atomic::AtomicUsize::new(0),
         closure: std::sync::Mutex::new(Some(Box::new(f) as Box<dyn FnOnce() + Send>)),
     });
-    let create_timer_fn = resolve_fn(&CREATE_TIMER_QUEUE_TIMER, b"kernel32.dll\0", b"CreateTimerQueueTimer\0")
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve CreateTimerQueueTimer dynamically"))?;
+    let create_timer_fn = resolve_fn(
+        &CREATE_TIMER_QUEUE_TIMER,
+        b"kernel32.dll\0",
+        b"CreateTimerQueueTimer\0",
+    )
+    .ok_or_else(|| anyhow::anyhow!("failed to resolve CreateTimerQueueTimer dynamically"))?;
     let ctx_ptr = Box::into_raw(ctx);
     unsafe {
         let mut handle: HANDLE = std::ptr::null_mut();
@@ -248,8 +311,12 @@ pub fn execute_enum_system_locales<F>(f: F) -> Result<(), anyhow::Error>
 where
     F: FnOnce() + Send + 'static,
 {
-    let enum_fn = resolve_fn(&ENUM_SYSTEM_LOCALES_EX, b"kernel32.dll\0", b"EnumSystemLocalesEx\0")
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve EnumSystemLocalesEx dynamically"))?;
+    let enum_fn = resolve_fn(
+        &ENUM_SYSTEM_LOCALES_EX,
+        b"kernel32.dll\0",
+        b"EnumSystemLocalesEx\0",
+    )
+    .ok_or_else(|| anyhow::anyhow!("failed to resolve EnumSystemLocalesEx dynamically"))?;
     let closure: Box<Box<dyn FnOnce() + Send>> = Box::new(Box::new(f));
     let lparam = Box::into_raw(closure) as LPARAM;
     unsafe {

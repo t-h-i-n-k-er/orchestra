@@ -193,8 +193,12 @@ fn emit_mov_dword_indirect(e: &mut Emitter, base: u8, src: u8) {
     let need_rex = base >= 8 || src >= 8;
     if need_rex {
         let mut rex = 0x40u8;
-        if src >= 8 { rex |= 0x04; }
-        if base >= 8 { rex |= 0x01; }
+        if src >= 8 {
+            rex |= 0x04;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
         e.emit_byte(rex);
     }
     e.emit_byte(0x89);
@@ -224,14 +228,14 @@ fn build_resolver_function() -> Vec<u8> {
     e.mov_r64_r64(Emitter::R15, Emitter::RDX);
 
     // ── PEB walk: find DLL by hash ────────────────────────────────────
-    emit_gs_load(&mut e, Emitter::RAX, 0x60);         // PEB
-    emit_load_indirect(&mut e, Emitter::RAX, Emitter::RAX, 0x18);  // Ldr
-    emit_load_indirect(&mut e, Emitter::RAX, Emitter::RAX, 0x20);  // InMemoryOrderModuleList
-    e.mov_r64_r64(Emitter::RDI, Emitter::RAX);         // list head
+    emit_gs_load(&mut e, Emitter::RAX, 0x60); // PEB
+    emit_load_indirect(&mut e, Emitter::RAX, Emitter::RAX, 0x18); // Ldr
+    emit_load_indirect(&mut e, Emitter::RAX, Emitter::RAX, 0x20); // InMemoryOrderModuleList
+    e.mov_r64_r64(Emitter::RDI, Emitter::RAX); // list head
 
     // ── Module loop ───────────────────────────────────────────────────
     let mod_loop = e.len();
-    emit_load_indirect(&mut e, Emitter::RAX, Emitter::RAX, 0);     // Flink
+    emit_load_indirect(&mut e, Emitter::RAX, Emitter::RAX, 0); // Flink
 
     e.cmp_r64_imm32(Emitter::RAX, 0);
     let (jz_ret0_a, jz_ret0_a_end) = e.forward_je();
@@ -239,12 +243,12 @@ fn build_resolver_function() -> Vec<u8> {
     let (jz_ret0_b, jz_ret0_b_end) = e.forward_je();
 
     // Hash module name: length at [rax+0x48], buffer at [rax+0x50]
-    emit_load_indirect(&mut e, Emitter::RSI, Emitter::RAX, 0x48);  // name byte length
-    emit_load_indirect(&mut e, Emitter::RBX, Emitter::RAX, 0x50);  // name buffer
+    emit_load_indirect(&mut e, Emitter::RSI, Emitter::RAX, 0x48); // name byte length
+    emit_load_indirect(&mut e, Emitter::RBX, Emitter::RAX, 0x50); // name buffer
 
-    e.xor_r32_r32(Emitter::R8, Emitter::R8);   // hash = 0
-    e.xor_r32_r32(Emitter::R9, Emitter::R9);   // i = 0
-    e.shr_r64_imm8(Emitter::RSI, 1);            // char_count = byte_len / 2
+    e.xor_r32_r32(Emitter::R8, Emitter::R8); // hash = 0
+    e.xor_r32_r32(Emitter::R9, Emitter::R9); // i = 0
+    e.shr_r64_imm8(Emitter::RSI, 1); // char_count = byte_len / 2
 
     // Check for empty name
     e.cmp_r64_imm32(Emitter::RSI, 0);
@@ -255,9 +259,21 @@ fn build_resolver_function() -> Vec<u8> {
     let (hash_done_jmp, hash_done_jmp_end) = e.forward_jbe();
 
     // Load u16 char at buf[i*2]
-    emit_load_u16_at_index(&mut e, Emitter::RBX, Emitter::R9, Emitter::R10, Emitter::RCX);
+    emit_load_u16_at_index(
+        &mut e,
+        Emitter::RBX,
+        Emitter::R9,
+        Emitter::R10,
+        Emitter::RCX,
+    );
     emit_uppercase_16(&mut e, Emitter::RCX);
-    emit_ror13_add(&mut e, Emitter::R8, Emitter::RCX, Emitter::R10, Emitter::R11);
+    emit_ror13_add(
+        &mut e,
+        Emitter::R8,
+        Emitter::RCX,
+        Emitter::R10,
+        Emitter::R11,
+    );
     e.inc_r64(Emitter::R9);
 
     // jmp hash_loop
@@ -302,22 +318,22 @@ fn build_resolver_function() -> Vec<u8> {
 
     // ── Name hash resolution ──────────────────────────────────────────
     // Parse export directory
-    emit_load_indirect(&mut e, Emitter::RAX, Emitter::RBX, 0x3C);  // e_lfanew
-    e.add_r64_r64(Emitter::RAX, Emitter::RBX);                       // NT headers
-    e.add_r64_imm32(Emitter::RAX, 24 + 112);                         // &export_dir_rva
-    emit_load_indirect(&mut e, Emitter::RAX, Emitter::RAX, 0);       // export dir RVA
+    emit_load_indirect(&mut e, Emitter::RAX, Emitter::RBX, 0x3C); // e_lfanew
+    e.add_r64_r64(Emitter::RAX, Emitter::RBX); // NT headers
+    e.add_r64_imm32(Emitter::RAX, 24 + 112); // &export_dir_rva
+    emit_load_indirect(&mut e, Emitter::RAX, Emitter::RAX, 0); // export dir RVA
     e.cmp_r64_imm32(Emitter::RAX, 0);
     let (no_export_jmp, no_export_jmp_end) = e.forward_je();
 
-    e.add_r64_r64(Emitter::RAX, Emitter::RBX);  // export_dir addr
-    e.mov_r64_r64(Emitter::RSI, Emitter::RAX);  // rsi = export_dir
+    e.add_r64_r64(Emitter::RAX, Emitter::RBX); // export_dir addr
+    e.mov_r64_r64(Emitter::RSI, Emitter::RAX); // rsi = export_dir
 
-    emit_load_indirect(&mut e, Emitter::R11, Emitter::RSI, 24);     // NumberOfNames
-    emit_load_indirect(&mut e, Emitter::R10, Emitter::RSI, 32);     // AddressOfNames RVA
-    e.add_r64_r64(Emitter::R10, Emitter::RBX);                       // abs
-    emit_load_indirect(&mut e, Emitter::RDI, Emitter::RSI, 28);     // AddressOfFunctions RVA
+    emit_load_indirect(&mut e, Emitter::R11, Emitter::RSI, 24); // NumberOfNames
+    emit_load_indirect(&mut e, Emitter::R10, Emitter::RSI, 32); // AddressOfNames RVA
+    e.add_r64_r64(Emitter::R10, Emitter::RBX); // abs
+    emit_load_indirect(&mut e, Emitter::RDI, Emitter::RSI, 28); // AddressOfFunctions RVA
     e.add_r64_r64(Emitter::RDI, Emitter::RBX);
-    emit_load_indirect(&mut e, Emitter::R8, Emitter::RSI, 36);      // AddressOfNameOrdinals RVA
+    emit_load_indirect(&mut e, Emitter::R8, Emitter::RSI, 36); // AddressOfNameOrdinals RVA
     e.add_r64_r64(Emitter::R8, Emitter::RBX);
 
     e.xor_r32_r32(Emitter::R9, Emitter::R9); // i = 0
@@ -328,11 +344,11 @@ fn build_resolver_function() -> Vec<u8> {
 
     // Load name RVA: rax = names[i]
     e.mov_r64_r64(Emitter::RAX, Emitter::R9);
-    e.add_r64_r64(Emitter::RAX, Emitter::RAX);  // *2
-    e.add_r64_r64(Emitter::RAX, Emitter::RAX);  // *4
-    e.add_r64_r64(Emitter::RAX, Emitter::R10);  // &names[i]
+    e.add_r64_r64(Emitter::RAX, Emitter::RAX); // *2
+    e.add_r64_r64(Emitter::RAX, Emitter::RAX); // *4
+    e.add_r64_r64(Emitter::RAX, Emitter::R10); // &names[i]
     emit_load_indirect(&mut e, Emitter::RAX, Emitter::RAX, 0);
-    e.add_r64_r64(Emitter::RAX, Emitter::RBX);  // name string
+    e.add_r64_r64(Emitter::RAX, Emitter::RBX); // name string
 
     // Hash export name (ASCII)
     e.xor_r32_r32(Emitter::RDX, Emitter::RDX); // hash = 0
@@ -350,7 +366,13 @@ fn build_resolver_function() -> Vec<u8> {
     let (name_hash_done_jmp, name_hash_done_jmp_end) = e.forward_je();
 
     emit_uppercase_8(&mut e, Emitter::RAX);
-    emit_ror13_add(&mut e, Emitter::RDX, Emitter::RAX, Emitter::RSI, Emitter::R12);
+    emit_ror13_add(
+        &mut e,
+        Emitter::RDX,
+        Emitter::RAX,
+        Emitter::RSI,
+        Emitter::R12,
+    );
     e.inc_r64(Emitter::RCX);
 
     let p = e.jmp_rel32_placeholder();
@@ -366,8 +388,8 @@ fn build_resolver_function() -> Vec<u8> {
 
     // Found! Get ordinal: ordinal = ordinals[i]
     e.mov_r64_r64(Emitter::RAX, Emitter::R9);
-    e.add_r64_r64(Emitter::RAX, Emitter::RAX);  // *2
-    e.add_r64_r64(Emitter::RAX, Emitter::R8);   // &ordinals[i]
+    e.add_r64_r64(Emitter::RAX, Emitter::RAX); // *2
+    e.add_r64_r64(Emitter::RAX, Emitter::R8); // &ordinals[i]
     e.rex_w(0, Emitter::RAX);
     e.emit_byte(0x0F);
     e.emit_byte(0xB7); // MOVZX r32, r/m16
@@ -375,9 +397,9 @@ fn build_resolver_function() -> Vec<u8> {
     e.emit_byte(0x00);
 
     // function_rva = functions[ordinal]
-    e.add_r64_r64(Emitter::RAX, Emitter::RAX);  // *2
-    e.add_r64_r64(Emitter::RAX, Emitter::RAX);  // *4
-    e.add_r64_r64(Emitter::RAX, Emitter::RDI);  // &functions[ordinal]
+    e.add_r64_r64(Emitter::RAX, Emitter::RAX); // *2
+    e.add_r64_r64(Emitter::RAX, Emitter::RAX); // *4
+    e.add_r64_r64(Emitter::RAX, Emitter::RDI); // &functions[ordinal]
     emit_load_indirect(&mut e, Emitter::RAX, Emitter::RAX, 0);
     e.add_r64_r64(Emitter::RAX, Emitter::RBX);
 
@@ -393,7 +415,11 @@ fn build_resolver_function() -> Vec<u8> {
 
     // ── name_mismatch: i++ ────────────────────────────────────────────
     let name_mismatch_label = e.len();
-    e.patch_rel32(name_mismatch_jmp, name_mismatch_label, name_mismatch_jmp_end);
+    e.patch_rel32(
+        name_mismatch_jmp,
+        name_mismatch_label,
+        name_mismatch_jmp_end,
+    );
     e.inc_r64(Emitter::R9);
     let p = e.jmp_rel32_placeholder();
     e.patch_rel32(p, export_loop, e.len());
@@ -410,12 +436,20 @@ fn build_resolver_function() -> Vec<u8> {
 
     // ── ordinal_resolve ───────────────────────────────────────────────
     let ordinal_resolve_label = e.len();
-    e.patch_rel32(ordinal_resolve_jmp, ordinal_resolve_label, ordinal_resolve_jmp_end);
+    e.patch_rel32(
+        ordinal_resolve_jmp,
+        ordinal_resolve_label,
+        ordinal_resolve_jmp_end,
+    );
     emit_ordinal_resolver(&mut e, ret_label);
 
     // ── hash_mismatch: continue module loop ───────────────────────────
     let hash_mismatch_label = e.len();
-    e.patch_rel32(hash_mismatch_jmp, hash_mismatch_label, hash_mismatch_jmp_end);
+    e.patch_rel32(
+        hash_mismatch_jmp,
+        hash_mismatch_label,
+        hash_mismatch_jmp_end,
+    );
     let p = e.jmp_rel32_placeholder();
     e.patch_rel32(p, mod_loop, e.len());
 
@@ -495,10 +529,10 @@ fn emit_ordinal_resolver(mut e: &mut Emitter, ret_label: usize) {
 /// 32-bit absolute offset with a segment override in 64-bit long mode.
 fn emit_gs_load(e: &mut Emitter, reg: u8, offset: u32) {
     e.emit_byte(0x65); // GS segment override
-    e.rex_w(reg, 0);   // REX.W + R bit for target register (no B/M needed)
+    e.rex_w(reg, 0); // REX.W + R bit for target register (no B/M needed)
     e.emit_byte(0x8B); // MOV r64, r/m64
     e.emit_byte(Emitter::modrm(0, reg, 4)); // mod=00, rm=100 → SIB follows
-    e.emit_byte(Emitter::sib(0, 4, 5));     // scale=0, index=100(none), base=101(disp32)
+    e.emit_byte(Emitter::sib(0, 4, 5)); // scale=0, index=100(none), base=101(disp32)
     e.emit_u32_le(offset);
 }
 

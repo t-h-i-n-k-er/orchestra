@@ -150,8 +150,14 @@ fn main() {
         &dest,
         format!(
             "pub const STUB_SEED: [u8; 8] = [{}, {}, {}, {}, {}, {}, {}, {}];\n",
-            seed_bytes[0], seed_bytes[1], seed_bytes[2], seed_bytes[3],
-            seed_bytes[4], seed_bytes[5], seed_bytes[6], seed_bytes[7],
+            seed_bytes[0],
+            seed_bytes[1],
+            seed_bytes[2],
+            seed_bytes[3],
+            seed_bytes[4],
+            seed_bytes[5],
+            seed_bytes[6],
+            seed_bytes[7],
         ),
     )
     .unwrap();

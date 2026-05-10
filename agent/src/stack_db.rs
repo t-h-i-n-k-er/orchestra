@@ -380,9 +380,7 @@ unsafe fn resolve_all_templates() -> Vec<ResolvedChain> {
 
         for &(module_name, function_name) in template.iter() {
             match resolve_ret_gadget(module_name, function_name) {
-                Some(addr) => frames.push(ChainFrame {
-                    return_addr: addr,
-                }),
+                Some(addr) => frames.push(ChainFrame { return_addr: addr }),
                 None => {
                     log::debug!(
                         "stack_db: template {} — could not resolve {}!{}",
@@ -465,7 +463,11 @@ pub fn build_chain() -> Option<ResolvedChain> {
 
     let idx = next_chain_index(guard.len());
     let chain = guard[idx].clone();
-    log::trace!("stack_db: selected cached chain {} ({} frames)", idx, chain.frames.len());
+    log::trace!(
+        "stack_db: selected cached chain {} ({} frames)",
+        idx,
+        chain.frames.len()
+    );
     Some(chain)
 }
 
@@ -570,11 +572,7 @@ pub fn frame_buffer_slots(n_chain_frames: usize, n_stack_args: usize) -> usize {
 /// # Returns
 ///
 /// The index of the continuation slot (so the asm block can write to it).
-pub fn populate_frame_buffer(
-    buf: &mut [u64],
-    chain: &ResolvedChain,
-    stack_args: &[u64],
-) -> usize {
+pub fn populate_frame_buffer(buf: &mut [u64], chain: &ResolvedChain, stack_args: &[u64]) -> usize {
     let n_frames = chain.frames.len();
     let cont_idx = n_frames;
 
@@ -610,12 +608,12 @@ fn is_executable_address(addr: usize) -> bool {
         let mut return_len: usize = 0;
         let status = crate::syscall!(
             "NtQueryVirtualMemory",
-            -1i64 as u64,                                      // NtCurrentProcess()
-            addr as u64,                                       // BaseAddress
-            0u64,                                              // MemoryBasicInformation
-            &mut mbi as *mut _ as u64,                         // Buffer
+            -1i64 as u64,                                           // NtCurrentProcess()
+            addr as u64,                                            // BaseAddress
+            0u64,                                                   // MemoryBasicInformation
+            &mut mbi as *mut _ as u64,                              // Buffer
             std::mem::size_of::<MEMORY_BASIC_INFORMATION>() as u64, // Length
-            &mut return_len as *mut _ as u64,                  // ReturnLength
+            &mut return_len as *mut _ as u64,                       // ReturnLength
         );
         if status.is_err() || status.unwrap() < 0 {
             return false;

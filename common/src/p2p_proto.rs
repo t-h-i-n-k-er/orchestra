@@ -174,15 +174,13 @@ impl P2pFrame {
             ));
         }
 
-        let frame_type = P2pFrameType::from_u8(data[0]).ok_or_else(|| {
-            format!("unknown P2P frame type: 0x{:02X}", data[0])
-        })?;
+        let frame_type = P2pFrameType::from_u8(data[0])
+            .ok_or_else(|| format!("unknown P2P frame type: 0x{:02X}", data[0]))?;
 
         // data[1] is reserved — skip.
         let link_id = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
         let sequence = u64::from_le_bytes([
-            data[6], data[7], data[8], data[9],
-            data[10], data[11], data[12], data[13],
+            data[6], data[7], data[8], data[9], data[10], data[11], data[12], data[13],
         ]);
         let payload_len = u32::from_le_bytes([data[14], data[15], data[16], data[17]]);
 
@@ -316,10 +314,7 @@ pub fn serialize_route_probe(destination: u32) -> Vec<u8> {
 /// Deserialize a `RouteProbe` payload.
 pub fn deserialize_route_probe(data: &[u8]) -> Result<u32, String> {
     if data.len() < 4 {
-        return Err(format!(
-            "RouteProbe payload too short: {} < 4",
-            data.len()
-        ));
+        return Err(format!("RouteProbe payload too short: {} < 4", data.len()));
     }
     Ok(u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
 }
@@ -339,7 +334,6 @@ pub fn deserialize_route_probe_reply(data: &[u8]) -> Result<RouteEntry, String> 
 // ══════════════════════════════════════════════════════════════════════════
 // PeerDiscovery serialization
 // ══════════════════════════════════════════════════════════════════════════
-
 
 /// A target agent to connect to, as specified in a `PeerDiscovery` frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -535,21 +529,39 @@ impl LinkFailureReportData {
         let link_type = data[offset];
         offset += 1;
         let uptime_secs = u64::from_le_bytes([
-            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-            data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
         ]);
         offset += 8;
         let latency_ms = u32::from_le_bytes([
-            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
         ]);
         offset += 4;
         let packet_loss = f32::from_le_bytes([
-            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
         ]);
         offset += 4;
         let bandwidth_bps = u64::from_le_bytes([
-            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-            data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
         ]);
         Ok(Self {
             dead_peer_id,
@@ -712,7 +724,10 @@ impl MeshRoutingBlob {
             return Err("MeshRoutingBlob: truncated payload_len".to_string());
         }
         let payload_len = u32::from_le_bytes([
-            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
         ]) as usize;
         offset += 4;
         if data.len() < offset + payload_len {
@@ -935,11 +950,17 @@ impl EnhancedTopologyReport {
             let link_type = data[offset];
             offset += 1;
             let quality = f32::from_le_bytes([
-                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
             ]);
             offset += 4;
             let latency_ms = u32::from_le_bytes([
-                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
             ]);
             offset += 4;
             peers.push(TopologyPeerEntry {

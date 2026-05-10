@@ -40,7 +40,9 @@ async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
     let agent_port = agent_listener.local_addr().unwrap().port();
     {
         let state_a = state.clone();
-        let secret = Arc::new(common::LockedSecret::new(cfg.agent_shared_secret.as_bytes()));
+        let secret = Arc::new(common::LockedSecret::new(
+            cfg.agent_shared_secret.as_bytes(),
+        ));
         // Generate a proper self-signed cert so the agent listener TLS config is valid.
         let agent_tls = {
             let cert =

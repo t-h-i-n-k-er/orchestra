@@ -58,12 +58,29 @@ macro_rules! defer {
 
 /// Prefetch directory path (NT path format for NtCreateFile).
 const PREFETCH_DIR_NT: &[u16] = &[
-    b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16,
-    b'C' as u16, b':' as u16, b'\\' as u16,
-    b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16,
-    b'o' as u16, b'w' as u16, b's' as u16, b'\\' as u16,
-    b'P' as u16, b'r' as u16, b'e' as u16, b'f' as u16,
-    b'e' as u16, b't' as u16, b'c' as u16, b'h' as u16,
+    b'\\' as u16,
+    b'?' as u16,
+    b'?' as u16,
+    b'\\' as u16,
+    b'C' as u16,
+    b':' as u16,
+    b'\\' as u16,
+    b'W' as u16,
+    b'i' as u16,
+    b'n' as u16,
+    b'd' as u16,
+    b'o' as u16,
+    b'w' as u16,
+    b's' as u16,
+    b'\\' as u16,
+    b'P' as u16,
+    b'r' as u16,
+    b'e' as u16,
+    b'f' as u16,
+    b'e' as u16,
+    b't' as u16,
+    b'c' as u16,
+    b'h' as u16,
     0,
 ];
 
@@ -114,8 +131,7 @@ const FILE_DELETE_ON_CLOSE: u32 = 0x00001000;
 const FILE_DIRECTORY_FILE: u32 = 0x00000001;
 
 /// Section access masks.
-const SECTION_ALL_ACCESS: u32 =
-    STANDARD_RIGHTS_REQUIRED | 0x0000000F; // SECTION_QUERY..SECTION_MAP_EXECUTE
+const SECTION_ALL_ACCESS: u32 = STANDARD_RIGHTS_REQUIRED | 0x0000000F; // SECTION_QUERY..SECTION_MAP_EXECUTE
 
 /// Section inheritance.
 const SEC_COMMIT: u32 = 0x08000000;
@@ -129,37 +145,129 @@ const KEY_SET_VALUE: u32 = 0x0002;
 /// Prefetch registry path.
 const PREFETCH_REG_KEY_NT: &[u16] = &[
     b'\\' as u16,
-    b'R' as u16, b'e' as u16, b'g' as u16, b'i' as u16, b's' as u16, b't' as u16, b'r' as u16,
-    b'y' as u16, b'\\' as u16,
-    b'M' as u16, b'a' as u16, b'c' as u16, b'h' as u16, b'i' as u16, b'n' as u16, b'e' as u16,
+    b'R' as u16,
+    b'e' as u16,
+    b'g' as u16,
+    b'i' as u16,
+    b's' as u16,
+    b't' as u16,
+    b'r' as u16,
+    b'y' as u16,
     b'\\' as u16,
-    b'S' as u16, b'Y' as u16, b'S' as u16, b'T' as u16, b'E' as u16, b'M' as u16,
+    b'M' as u16,
+    b'a' as u16,
+    b'c' as u16,
+    b'h' as u16,
+    b'i' as u16,
+    b'n' as u16,
+    b'e' as u16,
     b'\\' as u16,
-    b'C' as u16, b'u' as u16, b'r' as u16, b'r' as u16, b'e' as u16, b'n' as u16, b't' as u16,
-    b'C' as u16, b'o' as u16, b'n' as u16, b't' as u16, b'r' as u16, b'o' as u16, b'l' as u16,
-    b'S' as u16, b'e' as u16, b't' as u16, b'\\' as u16,
-    b'C' as u16, b'o' as u16, b'n' as u16, b't' as u16, b'r' as u16, b'o' as u16, b'l' as u16,
+    b'S' as u16,
+    b'Y' as u16,
+    b'S' as u16,
+    b'T' as u16,
+    b'E' as u16,
+    b'M' as u16,
     b'\\' as u16,
-    b'S' as u16, b'e' as u16, b's' as u16, b's' as u16, b'i' as u16, b'o' as u16, b'n' as u16,
+    b'C' as u16,
+    b'u' as u16,
+    b'r' as u16,
+    b'r' as u16,
+    b'e' as u16,
+    b'n' as u16,
+    b't' as u16,
+    b'C' as u16,
+    b'o' as u16,
+    b'n' as u16,
+    b't' as u16,
+    b'r' as u16,
+    b'o' as u16,
+    b'l' as u16,
+    b'S' as u16,
+    b'e' as u16,
+    b't' as u16,
+    b'\\' as u16,
+    b'C' as u16,
+    b'o' as u16,
+    b'n' as u16,
+    b't' as u16,
+    b'r' as u16,
+    b'o' as u16,
+    b'l' as u16,
+    b'\\' as u16,
+    b'S' as u16,
+    b'e' as u16,
+    b's' as u16,
+    b's' as u16,
+    b'i' as u16,
+    b'o' as u16,
+    b'n' as u16,
     b' ' as u16,
-    b'M' as u16, b'a' as u16, b'n' as u16, b'a' as u16, b'g' as u16, b'e' as u16, b'r' as u16,
+    b'M' as u16,
+    b'a' as u16,
+    b'n' as u16,
+    b'a' as u16,
+    b'g' as u16,
+    b'e' as u16,
+    b'r' as u16,
     b'\\' as u16,
-    b'M' as u16, b'e' as u16, b'm' as u16, b'o' as u16, b'r' as u16, b'y' as u16,
+    b'M' as u16,
+    b'e' as u16,
+    b'm' as u16,
+    b'o' as u16,
+    b'r' as u16,
+    b'y' as u16,
     b' ' as u16,
-    b'M' as u16, b'a' as u16, b'n' as u16, b'a' as u16, b'g' as u16, b'e' as u16, b'm' as u16,
-    b'e' as u16, b'n' as u16, b't' as u16,
+    b'M' as u16,
+    b'a' as u16,
+    b'n' as u16,
+    b'a' as u16,
+    b'g' as u16,
+    b'e' as u16,
+    b'm' as u16,
+    b'e' as u16,
+    b'n' as u16,
+    b't' as u16,
     b'\\' as u16,
-    b'P' as u16, b'r' as u16, b'e' as u16, b'f' as u16, b'e' as u16, b't' as u16, b'c' as u16,
-    b'h' as u16, b'P' as u16, b'a' as u16, b'r' as u16, b'a' as u16, b'm' as u16, b'e' as u16,
-    b't' as u16, b'e' as u16, b'r' as u16, b's' as u16,
+    b'P' as u16,
+    b'r' as u16,
+    b'e' as u16,
+    b'f' as u16,
+    b'e' as u16,
+    b't' as u16,
+    b'c' as u16,
+    b'h' as u16,
+    b'P' as u16,
+    b'a' as u16,
+    b'r' as u16,
+    b'a' as u16,
+    b'm' as u16,
+    b'e' as u16,
+    b't' as u16,
+    b'e' as u16,
+    b'r' as u16,
+    b's' as u16,
     0,
 ];
 
 /// Registry value name for EnablePrefetcher.
 const ENABLE_PREFETCHER_NAME: &[u16] = &[
-    b'E' as u16, b'n' as u16, b'a' as u16, b'b' as u16, b'l' as u16, b'e' as u16,
-    b'P' as u16, b'r' as u16, b'e' as u16, b'f' as u16, b'e' as u16, b't' as u16,
-    b'c' as u16, b'h' as u16, b'e' as u16, b'r' as u16,
+    b'E' as u16,
+    b'n' as u16,
+    b'a' as u16,
+    b'b' as u16,
+    b'l' as u16,
+    b'e' as u16,
+    b'P' as u16,
+    b'r' as u16,
+    b'e' as u16,
+    b'f' as u16,
+    b'e' as u16,
+    b't' as u16,
+    b'c' as u16,
+    b'h' as u16,
+    b'e' as u16,
+    b'r' as u16,
     0,
 ];
 
@@ -185,8 +293,7 @@ static CONFIG: OnceLock<PrefetchConfig> = OnceLock::new();
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Saved EnablePrefetcher value for restore.
-static SAVED_PREFETCHER_VALUE: std::sync::Mutex<Option<u32>> =
-    std::sync::Mutex::new(None);
+static SAVED_PREFETCHER_VALUE: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
 
 // ── NT structure definitions ─────────────────────────────────────────────
 //
@@ -321,10 +428,10 @@ struct PfHeader {
     /// Version-specific magic / signature.  For MAM format this is the
     /// version number stored as a little-endian u32 preceded by "MAM" in
     /// earlier bytes.  We read the raw bytes and validate.
-    signature: [u8; 4],     // offset 0: "MAM\0"
-    version: u32,           // offset 4
-    _padding: [u8; 8],      // offset 8: unknown / padding
-    run_count: u32,         // offset 16 (approximate, varies by version)
+    signature: [u8; 4], // offset 0: "MAM\0"
+    version: u32,      // offset 4
+    _padding: [u8; 8], // offset 8: unknown / padding
+    run_count: u32,    // offset 16 (approximate, varies by version)
 }
 
 /// Offsets for PF header fields vary by version.  We define them here.
@@ -382,13 +489,13 @@ unsafe fn nt_open_directory(path: &[u16]) -> Result<*mut std::ffi::c_void, Strin
         (GENERIC_READ | SYNCHRONIZE) as u64,
         &mut obj_attrs as *mut _ as u64,
         &mut iosb as *mut _ as u64,
-        0u64,                                          // AllocationSize
-        0u64,                                          // FileAttributes
+        0u64, // AllocationSize
+        0u64, // FileAttributes
         (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE) as u64,
         FILE_OPEN as u64,
         (FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT) as u64,
-        0u64,                                          // EaBuffer
-        0u64,                                          // EaLength
+        0u64, // EaBuffer
+        0u64, // EaLength
     )
     .map_err(|e| format!("nt_syscall resolution for NtCreateFile(directory): {e}"))?;
 
@@ -482,9 +589,7 @@ unsafe fn nt_close(handle: *mut std::ffi::c_void) -> Result<(), String> {
 
 /// Enumerate files in a directory via NtQueryDirectoryFile (indirect syscall).
 /// Returns a vector of file names (UTF-16 strings, without null terminator).
-unsafe fn nt_enumerate_files(
-    dir_handle: *mut std::ffi::c_void,
-) -> Result<Vec<Vec<u16>>, String> {
+unsafe fn nt_enumerate_files(dir_handle: *mut std::ffi::c_void) -> Result<Vec<Vec<u16>>, String> {
     let mut results = Vec::new();
     let buf_size: usize = 4096;
     let mut buffer = vec![0u8; buf_size];
@@ -502,15 +607,15 @@ unsafe fn nt_enumerate_files(
         let status = crate::syscall!(
             "NtQueryDirectoryFile",
             dir_handle as u64,
-            0u64,                                          // Event
-            0u64,                                          // ApcRoutine
-            0u64,                                          // ApcContext
+            0u64, // Event
+            0u64, // ApcRoutine
+            0u64, // ApcContext
             &mut iosb as *mut _ as u64,
             buffer.as_mut_ptr() as u64,
             buf_size as u64,
-            1u64,   // FileDirectoryInformation (class = 1)
-            0u64,   // ReturnSingleEntry = FALSE
-            0u64,   // FileName (null = resume)
+            1u64,         // FileDirectoryInformation (class = 1)
+            0u64,         // ReturnSingleEntry = FALSE
+            0u64,         // FileName (null = resume)
             restart_scan, // RestartScan
         )
         .map_err(|e| format!("nt_syscall resolution for NtQueryDirectoryFile: {e}"))?;
@@ -542,7 +647,10 @@ unsafe fn nt_enumerate_files(
 
             // Extract the file name (UTF-16, variable-length).
             let name_len = entry.file_name_length as usize;
-            if name_len > 0 && offset + std::mem::size_of::<FileDirectoryInformation>() - 2 + name_len <= bytes_returned {
+            if name_len > 0
+                && offset + std::mem::size_of::<FileDirectoryInformation>() - 2 + name_len
+                    <= bytes_returned
+            {
                 let name_ptr = &entry.file_name as *const u16;
                 let name_slice = std::slice::from_raw_parts(name_ptr, name_len / 2);
                 results.push(name_slice.to_vec());
@@ -565,11 +673,8 @@ unsafe fn nt_delete_file(path: &[u16]) -> Result<(), String> {
     let mut obj_name = make_unicode_string(&mut path_vec);
     let mut obj_attrs = ObjectAttributes::new(&mut obj_name);
 
-    let status = crate::syscall!(
-        "NtDeleteFile",
-        &mut obj_attrs as *mut _ as u64,
-    )
-    .map_err(|e| format!("nt_syscall resolution for NtDeleteFile: {e}"))?;
+    let status = crate::syscall!("NtDeleteFile", &mut obj_attrs as *mut _ as u64,)
+        .map_err(|e| format!("nt_syscall resolution for NtDeleteFile: {e}"))?;
 
     if status != STATUS_SUCCESS {
         return Err(format!(
@@ -604,9 +709,9 @@ unsafe fn nt_map_file(
         &mut section_handle as *mut _ as u64,
         SECTION_ALL_ACCESS as u64,
         &mut obj_attrs as *mut _ as u64,
-        0u64,                           // MaximumSize (null = file size)
-        PAGE_READWRITE as u64,          // SectionPageProtection
-        SEC_COMMIT as u64,              // AllocationAttributes
+        0u64,                  // MaximumSize (null = file size)
+        PAGE_READWRITE as u64, // SectionPageProtection
+        SEC_COMMIT as u64,     // AllocationAttributes
         file_handle as u64,
     )
     .map_err(|e| format!("nt_syscall resolution for NtCreateSection: {e}"))?;
@@ -627,14 +732,14 @@ unsafe fn nt_map_file(
     let map_status = crate::syscall!(
         "NtMapViewOfSection",
         section_handle as u64,
-        (-1isize) as u64,              // NtCurrentProcess()
+        (-1isize) as u64, // NtCurrentProcess()
         &mut base as *mut _ as u64,
-        0u64,                           // ZeroBits
-        0u64,                           // CommitSize
-        0u64,                           // SectionOffset (null)
+        0u64, // ZeroBits
+        0u64, // CommitSize
+        0u64, // SectionOffset (null)
         &mut view_size as *mut _ as u64,
-        1u64,                           // ViewShare
-        0u64,                           // AllocationType
+        1u64, // ViewShare
+        0u64, // AllocationType
         PAGE_READWRITE as u64,
     )
     .map_err(|e| format!("nt_syscall resolution for NtMapViewOfSection: {e}"))?;
@@ -657,7 +762,7 @@ unsafe fn nt_unmap_view(base: *mut std::ffi::c_void) -> Result<(), String> {
     }
     let status = crate::syscall!(
         "NtUnmapViewOfSection",
-        (-1isize) as u64,              // NtCurrentProcess()
+        (-1isize) as u64, // NtCurrentProcess()
         base as u64,
     )
     .map_err(|e| format!("nt_syscall resolution for NtUnmapViewOfSection: {e}"))?;
@@ -709,10 +814,10 @@ unsafe fn nt_set_value_key_dword(
         "NtSetValueKey",
         key_handle as u64,
         &mut value_name_str as *mut _ as u64,
-        0u64,                           // TitleIndex (reserved)
-        4u64,                           // Type = REG_DWORD
+        0u64, // TitleIndex (reserved)
+        4u64, // Type = REG_DWORD
         &value as *const u32 as u64,
-        4u64,                           // DataSize
+        4u64, // DataSize
     )
     .map_err(|e| format!("nt_syscall resolution for NtSetValueKey: {e}"))?;
 
@@ -744,7 +849,7 @@ unsafe fn nt_query_value_key_dword(
         "NtQueryValueKey",
         key_handle as u64,
         &mut value_name_str as *mut _ as u64,
-        2u64,   // KeyValuePartialInformation
+        2u64, // KeyValuePartialInformation
         buffer.as_mut_ptr() as u64,
         buf_size as u64,
         &mut result_len as *mut _ as u64,
@@ -763,9 +868,7 @@ unsafe fn nt_query_value_key_dword(
     if result_len < 12 {
         return Err("NtQueryValueKey returned too few bytes".to_string());
     }
-    let dword_val = u32::from_le_bytes([
-        buffer[8], buffer[9], buffer[10], buffer[11],
-    ]);
+    let dword_val = u32::from_le_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]);
     Ok(dword_val)
 }
 
@@ -783,9 +886,9 @@ unsafe fn nt_fs_control_file(
     let status = crate::syscall!(
         "NtFsControlFile",
         file_handle as u64,
-        0u64,                              // Event
-        0u64,                              // ApcRoutine
-        0u64,                              // ApcContext
+        0u64, // Event
+        0u64, // ApcRoutine
+        0u64, // ApcContext
         &mut iosb as *mut _ as u64,
         fs_control_code as u64,
         input_buffer as u64,
@@ -810,7 +913,10 @@ unsafe fn nt_fs_control_file(
 /// PF files are named "EXECUTABLE-HASH.pf" where HASH is a 8-char hex hash.
 /// Returns the executable name portion (e.g. "CMD" from "CMD-12345678.pf").
 fn exe_name_from_pf_filename(filename: &str) -> Option<String> {
-    if !filename.to_uppercase().ends_with(PF_EXTENSION.to_uppercase().as_str()) {
+    if !filename
+        .to_uppercase()
+        .ends_with(PF_EXTENSION.to_uppercase().as_str())
+    {
         return None;
     }
     // Strip .pf extension.
@@ -833,9 +939,7 @@ fn exe_name_from_pf_filename(filename: &str) -> Option<String> {
 fn pf_matches_exe(pf_filename: &str, target_exe: &str) -> bool {
     let target_upper = target_exe.to_uppercase();
     // Strip .exe extension from target if present.
-    let target_name = target_upper
-        .strip_suffix(".EXE")
-        .unwrap_or(&target_upper);
+    let target_name = target_upper.strip_suffix(".EXE").unwrap_or(&target_upper);
 
     match exe_name_from_pf_filename(pf_filename) {
         Some(name) => name == target_name,
@@ -931,12 +1035,17 @@ fn patch_pf_header(data: &mut [u8], version: u32) -> Result<(), String> {
     if rc_off + 4 <= data.len() {
         // Sanity check: run count should be reasonable (< 10000)
         let current_rc = u32::from_le_bytes([
-            data[rc_off], data[rc_off + 1], data[rc_off + 2], data[rc_off + 3],
+            data[rc_off],
+            data[rc_off + 1],
+            data[rc_off + 2],
+            data[rc_off + 3],
         ]);
         if current_rc > 10000 {
             log::warn!(
                 "prefetch: run count at offset {:#x} looks invalid ({}) for version {}, skipping",
-                rc_off, current_rc, version
+                rc_off,
+                current_rc,
+                version
             );
         } else {
             data[rc_off..rc_off + 4].copy_from_slice(&[0u8; 4]);
@@ -948,13 +1057,21 @@ fn patch_pf_header(data: &mut [u8], version: u32) -> Result<(), String> {
         // Sanity check: timestamp should be a reasonable FILETIME
         // (after year 2000 = 125911584000000000 and before year 2100 = 492384576000000000)
         let ts_val = u64::from_le_bytes([
-            data[ts_off], data[ts_off + 1], data[ts_off + 2], data[ts_off + 3],
-            data[ts_off + 4], data[ts_off + 5], data[ts_off + 6], data[ts_off + 7],
+            data[ts_off],
+            data[ts_off + 1],
+            data[ts_off + 2],
+            data[ts_off + 3],
+            data[ts_off + 4],
+            data[ts_off + 5],
+            data[ts_off + 6],
+            data[ts_off + 7],
         ]);
         if ts_val != 0 && (ts_val < 125911584000000000 || ts_val > 492384576000000000) {
             log::warn!(
                 "prefetch: timestamp at offset {:#x} looks invalid ({}) for version {}, skipping",
-                ts_off, ts_val, version
+                ts_off,
+                ts_val,
+                version
             );
         } else {
             data[ts_off..ts_off + 8].copy_from_slice(&[0u8; 8]);
@@ -996,9 +1113,7 @@ fn patch_pf_header(data: &mut [u8], version: u32) -> Result<(), String> {
 /// Returns the `UsnJournalID` field from `USN_JOURNAL_DATA`.  If the volume
 /// has no USN journal (e.g. FAT32), the underlying call fails and we return
 /// an error so the caller can skip USN cleanup gracefully.
-unsafe fn query_usn_journal_id(
-    volume_handle: *mut std::ffi::c_void,
-) -> Result<u64, String> {
+unsafe fn query_usn_journal_id(volume_handle: *mut std::ffi::c_void) -> Result<u64, String> {
     let mut output = [0u8; 64]; // USN_JOURNAL_DATA is 56 bytes
     nt_fs_control_file(
         volume_handle,
@@ -1018,8 +1133,7 @@ unsafe fn query_usn_journal_id(
     //   +0x28: MaximumSize (u64)
     //   +0x30: AllocationDelta (u64)
     Ok(u64::from_le_bytes([
-        output[0], output[1], output[2], output[3],
-        output[4], output[5], output[6], output[7],
+        output[0], output[1], output[2], output[3], output[4], output[5], output[6], output[7],
     ]))
 }
 
@@ -1070,7 +1184,8 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
         Err(e) => {
             log::debug!(
                 "prefetch: could not query USN journal ID on {}: {}",
-                volume_letter, e
+                volume_letter,
+                e
             );
             let _ = nt_close(handle);
             return Ok(()); // Non-fatal: no USN journal on this volume.
@@ -1081,10 +1196,8 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
     let journal_buf_size: usize = 65536;
     let mut journal_buf = vec![0u8; journal_buf_size];
     let mut read_data = ReadUsnJournalData {
-        start_usn: 0,         // Start from beginning
-        reason_mask: USN_REASON_DATA_OVERWRITE
-            | USN_REASON_FILE_CREATE
-            | USN_REASON_FILE_DELETE,
+        start_usn: 0, // Start from beginning
+        reason_mask: USN_REASON_DATA_OVERWRITE | USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE,
         return_only_on_close: 0,
         timeout: 0,
         bytes_to_wait_for: 0,
@@ -1108,7 +1221,8 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
     let mut usn_entries_found = 0usize;
     let mut current_usn: i64 = 0;
 
-    for _ in 0..10 { // Limit iterations to prevent infinite loops
+    for _ in 0..10 {
+        // Limit iterations to prevent infinite loops
         let mut iosb2 = IoStatusBlock::default();
         read_data.start_usn = current_usn;
 
@@ -1129,7 +1243,10 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
 
         if read_status != STATUS_SUCCESS {
             // Non-fatal.
-            log::debug!("prefetch: USN journal read returned NTSTATUS {:#010X}", read_status as u32);
+            log::debug!(
+                "prefetch: USN journal read returned NTSTATUS {:#010X}",
+                read_status as u32
+            );
             break;
         }
 
@@ -1140,16 +1257,24 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
 
         // First 8 bytes of the output is the next USN.
         current_usn = i64::from_le_bytes([
-            journal_buf[0], journal_buf[1], journal_buf[2], journal_buf[3],
-            journal_buf[4], journal_buf[5], journal_buf[6], journal_buf[7],
+            journal_buf[0],
+            journal_buf[1],
+            journal_buf[2],
+            journal_buf[3],
+            journal_buf[4],
+            journal_buf[5],
+            journal_buf[6],
+            journal_buf[7],
         ]);
 
         // Parse USN records starting at offset 8.
         let mut offset = 8usize;
         while offset + 8 < bytes_returned {
             let record_len = u32::from_le_bytes([
-                journal_buf[offset], journal_buf[offset + 1],
-                journal_buf[offset + 2], journal_buf[offset + 3],
+                journal_buf[offset],
+                journal_buf[offset + 1],
+                journal_buf[offset + 2],
+                journal_buf[offset + 3],
             ]);
             if record_len == 0 || offset + record_len as usize > bytes_returned {
                 break;
@@ -1157,19 +1282,17 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
 
             // Check if this record references our .pf file.
             // We check the filename field if present.
-            let major = u16::from_le_bytes([
-                journal_buf[offset + 4], journal_buf[offset + 5],
-            ]);
+            let major = u16::from_le_bytes([journal_buf[offset + 4], journal_buf[offset + 5]]);
             if major >= 2 && major <= 4 {
                 let fn_len_off = offset + 56; // approximate offset for file_name_length
                 let fn_off_off = offset + 58; // approximate offset for file_name_offset
                 if fn_len_off + 4 <= bytes_returned && fn_off_off + 2 <= bytes_returned {
-                    let fn_len = u16::from_le_bytes([
-                        journal_buf[fn_len_off], journal_buf[fn_len_off + 1],
-                    ]) as usize;
-                    let fn_off = u16::from_le_bytes([
-                        journal_buf[fn_off_off], journal_buf[fn_off_off + 1],
-                    ]) as usize;
+                    let fn_len =
+                        u16::from_le_bytes([journal_buf[fn_len_off], journal_buf[fn_len_off + 1]])
+                            as usize;
+                    let fn_off =
+                        u16::from_le_bytes([journal_buf[fn_off_off], journal_buf[fn_off_off + 1]])
+                            as usize;
 
                     if fn_len > 0 && offset + fn_off + fn_len <= bytes_returned {
                         let record_fn: Vec<u16> = (0..fn_len / 2)
@@ -1244,7 +1367,10 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
 
     let _ = nt_close(handle);
 
-    log::debug!("prefetch: USN journal cleanup found {} matching entries", usn_entries_found);
+    log::debug!(
+        "prefetch: USN journal cleanup found {} matching entries",
+        usn_entries_found
+    );
     Ok(())
 }
 
@@ -1270,17 +1396,17 @@ unsafe fn patch_pf_file(pf_nt_path: &[u16]) -> Result<(), String> {
     }
 
     if view_size == 0 || view_size > MAX_PF_SIZE {
-        return Err(format!(
-            "patch_pf_file: invalid view size {}",
-            view_size
-        ));
+        return Err(format!("patch_pf_file: invalid view size {}", view_size));
     }
 
     let data = std::slice::from_raw_parts_mut(base as *mut u8, view_size);
 
     // Validate header.
     let version = validate_pf_header(data).ok_or_else(|| {
-        format!("patch_pf_file: invalid PF header in {}", wide_to_string(pf_nt_path))
+        format!(
+            "patch_pf_file: invalid PF header in {}",
+            wide_to_string(pf_nt_path)
+        )
     })?;
 
     // Patch the header.
@@ -1330,7 +1456,10 @@ unsafe fn restore_prefetch_service(value: u32) -> Result<(), String> {
 
     if let Err(e) = nt_set_value_key_dword(key_handle, ENABLE_PREFETCHER_NAME, value) {
         let _ = nt_close(key_handle);
-        return Err(format!("Failed to restore EnablePrefetcher to {}: {}", value, e));
+        return Err(format!(
+            "Failed to restore EnablePrefetcher to {}: {}",
+            value, e
+        ));
     }
 
     let _ = nt_close(key_handle);
@@ -1403,10 +1532,7 @@ pub fn clean_prefetch(exe_name: &str) -> Result<String, String> {
             Ok(old_val) => {
                 let mut saved = SAVED_PREFETCHER_VALUE.lock().unwrap();
                 *saved = Some(old_val);
-                summary.push_str(&format!(
-                    "Disabled Prefetch service (was {}). ",
-                    old_val
-                ));
+                summary.push_str(&format!("Disabled Prefetch service (was {}). ", old_val));
             }
             Err(e) => {
                 errors.push(format!("Failed to disable Prefetch service: {}", e));
@@ -1496,10 +1622,7 @@ pub fn clean_prefetch(exe_name: &str) -> Result<String, String> {
     }
 
     // Build result summary.
-    summary.push_str(&format!(
-        "Cleaned {} .pf file(s). ",
-        cleaned_count
-    ));
+    summary.push_str(&format!("Cleaned {} .pf file(s). ", cleaned_count));
     if !errors.is_empty() {
         summary.push_str(&format!("Errors: {} ", errors.len()));
         for e in &errors {

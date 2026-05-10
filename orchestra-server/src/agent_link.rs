@@ -68,7 +68,10 @@ pub async fn run(
             .context("building mTLS ServerConfig for agent listener")?;
         // P2-16: Store the CnOuVerifier reference for runtime CRL reload.
         if let Some(v) = verifier {
-            *state.mtls_verifier.write().unwrap_or_else(|p| p.into_inner()) = Some(v);
+            *state
+                .mtls_verifier
+                .write()
+                .unwrap_or_else(|p| p.into_inner()) = Some(v);
         }
         cfg
     } else {
@@ -148,8 +151,8 @@ async fn handle_agent(
         let (_, server_conn) = tls_stream.get_ref();
         match server_conn.peer_certificates().and_then(|c| c.first()) {
             Some(cert_der) => {
-                let cn = crate::tls::extract_cn(cert_der)
-                    .unwrap_or_else(|| "<unparseable>".to_string());
+                let cn =
+                    crate::tls::extract_cn(cert_der).unwrap_or_else(|| "<unparseable>".to_string());
                 tracing::info!(
                     connection_id = %connection_id,
                     %peer,
@@ -406,7 +409,9 @@ async fn handle_agent(
                     }
                 }
             }
-            Message::TaskResponse { task_id, result, .. } => {
+            Message::TaskResponse {
+                task_id, result, ..
+            } => {
                 if let Some((_, sender)) = state.pending.remove(&task_id) {
                     let _ = sender.send(result);
                 } else {
@@ -459,21 +464,26 @@ async fn handle_agent(
                 // Reject module_id with characters outside the strict
                 // allowlist (alphanumeric, hyphen, underscore).  This
                 // blocks direct traversal like "../../etc/passwd".
-                if !module_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+                if !module_id
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                {
                     tracing::warn!(
                         connection_id = %conn_id,
                         %module_id,
                         "module_id contains invalid characters — rejecting"
                     );
-                    let _ = tx.send(Message::ModuleResponse {
-                        module_id: module_id.clone(),
-                        encrypted_blob: Vec::new(),
-                    }).await;
+                    let _ = tx
+                        .send(Message::ModuleResponse {
+                            module_id: module_id.clone(),
+                            encrypted_blob: Vec::new(),
+                        })
+                        .await;
                     continue;
                 }
 
-                let module_path = std::path::Path::new(module_dir)
-                    .join(format!("{module_id}.{ext}"));
+                let module_path =
+                    std::path::Path::new(module_dir).join(format!("{module_id}.{ext}"));
 
                 // Canonicalize both the resolved path and the modules
                 // directory, then verify the file stays within the
@@ -488,10 +498,12 @@ async fn handle_agent(
                             "module file not found: {}",
                             module_path.display()
                         );
-                        let _ = tx.send(Message::ModuleResponse {
-                            module_id: module_id.clone(),
-                            encrypted_blob: Vec::new(),
-                        }).await;
+                        let _ = tx
+                            .send(Message::ModuleResponse {
+                                module_id: module_id.clone(),
+                                encrypted_blob: Vec::new(),
+                            })
+                            .await;
                         continue;
                     }
                 };
@@ -504,10 +516,12 @@ async fn handle_agent(
                         %module_id,
                         "module path escapes modules_dir — rejecting"
                     );
-                    let _ = tx.send(Message::ModuleResponse {
-                        module_id: module_id.clone(),
-                        encrypted_blob: Vec::new(),
-                    }).await;
+                    let _ = tx
+                        .send(Message::ModuleResponse {
+                            module_id: module_id.clone(),
+                            encrypted_blob: Vec::new(),
+                        })
+                        .await;
                     continue;
                 }
 
@@ -535,7 +549,8 @@ async fn handle_agent(
                     let encrypted_blob = crypto.encrypt(&signed);
 
                     Ok::<Vec<u8>, anyhow::Error>(encrypted_blob)
-                })().await;
+                })()
+                .await;
 
                 let resp = match result {
                     Ok(blob) => Message::ModuleResponse {
@@ -564,10 +579,7 @@ async fn handle_agent(
                     );
                 }
             }
-            Message::P2pTopologyReport {
-                agent_id,
-                children,
-            } => {
+            Message::P2pTopologyReport { agent_id, children } => {
                 // ── P2P topology update ────────────────────────────────
                 // An agent (directly connected or relayed through parents)
                 // reports its child links.  Update the server-side topology
@@ -580,7 +592,10 @@ async fn handle_agent(
                 );
                 state.update_topology(&agent_id, &children).await;
             }
-            Message::P2pForward { child_link_id, data } => {
+            Message::P2pForward {
+                child_link_id,
+                data,
+            } => {
                 // ── P2P forwarded data from child → server ─────────────
                 // A child agent sent data (e.g. a TaskResponse) through its
                 // parent relay chain.  Parse the inner message and handle
@@ -636,15 +651,17 @@ async fn handle_agent(
                     bandwidth_bps,
                     "received P2P link failure report"
                 );
-                state.record_link_failure(
-                    &agent_id,
-                    &dead_peer_id,
-                    link_type,
-                    uptime_secs,
-                    latency_ms,
-                    packet_loss,
-                    bandwidth_bps,
-                ).await;
+                state
+                    .record_link_failure(
+                        &agent_id,
+                        &dead_peer_id,
+                        link_type,
+                        uptime_secs,
+                        latency_ms,
+                        packet_loss,
+                        bandwidth_bps,
+                    )
+                    .await;
             }
             Message::P2pEnhancedTopologyReport {
                 agent_id,
@@ -747,7 +764,9 @@ async fn handle_agent(
                     }
                 }
             }
-            Message::MeshCertificateRevocation { revoked_agent_id_hash } => {
+            Message::MeshCertificateRevocation {
+                revoked_agent_id_hash,
+            } => {
                 // An agent reports a certificate revocation from the mesh.
                 tracing::warn!(
                     connection_id = %conn_id,

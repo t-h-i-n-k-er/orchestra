@@ -22,7 +22,9 @@
 //! [`SubstitutionPass`], and [`DeadCodePass`].
 
 // Optimizer
-use iced_x86::{Code, Decoder, DecoderOptions, Encoder, FlowControl, Instruction, OpKind, Register};
+use iced_x86::{
+    Code, Decoder, DecoderOptions, Encoder, FlowControl, Instruction, OpKind, Register,
+};
 use rand::seq::SliceRandom;
 use rand::{thread_rng, Rng};
 
@@ -192,11 +194,7 @@ pub fn apply_passes_to_binary(binary: &[u8]) -> Result<Vec<u8>, String> {
             const SHF_EXECINSTR: u64 = 0x4;
             elf.section_headers
                 .iter()
-                .filter(|s| {
-                    s.sh_flags & SHF_EXECINSTR != 0
-                        && s.sh_size > 0
-                        && s.sh_offset > 0
-                })
+                .filter(|s| s.sh_flags & SHF_EXECINSTR != 0 && s.sh_size > 0 && s.sh_offset > 0)
                 .map(|s| (s.sh_offset as usize, s.sh_size as usize, s.sh_addr))
                 .collect()
         }
@@ -249,8 +247,6 @@ pub fn apply_passes_to_binary(binary: &[u8]) -> Result<Vec<u8>, String> {
     tracing::info!("diversify: applied passes to {patched} executable section(s)");
     Ok(out)
 }
-
-
 
 /// NOP insertion pass: randomly inserts multi-byte NOPs (`0F 1F /0`)
 /// between instructions at ~10% density.
@@ -563,19 +559,13 @@ fn build_resource_set(ins: &Instruction) -> ResourceSet {
 fn code_is_push(code: Code) -> bool {
     matches!(
         code,
-        Code::Push_r64
-            | Code::Push_rm64
-            | Code::Pushw_imm8
-            | Code::Pushd_imm32
+        Code::Push_r64 | Code::Push_rm64 | Code::Pushw_imm8 | Code::Pushd_imm32
     )
 }
 
 /// Check if an instruction code is a POP variant.
 fn code_is_pop(code: Code) -> bool {
-    matches!(
-        code,
-        Code::Pop_r64 | Code::Pop_rm64
-    )
+    matches!(code, Code::Pop_r64 | Code::Pop_rm64)
 }
 
 /// Check if two resource sets have a dependency that prevents reordering.
@@ -716,9 +706,7 @@ fn schedule_block(block: &mut [Instruction]) {
 
         // Sort ready instructions by height (descending), then by original
         // position (ascending) for stability within equal priority.
-        ready.sort_by(|&a, &b| {
-            height[b].cmp(&height[a]).then_with(|| a.cmp(&b))
-        });
+        ready.sort_by(|&a, &b| height[b].cmp(&height[a]).then_with(|| a.cmp(&b)));
 
         // Among instructions with the same top priority, pick randomly.
         let top_priority = height[ready[0]];
@@ -995,8 +983,7 @@ mod runtime_rewrite {
         });
 
         // Snapshot the current bytes
-        let original =
-            unsafe { std::slice::from_raw_parts(addr as *const u8, span) }.to_vec();
+        let original = unsafe { std::slice::from_raw_parts(addr as *const u8, span) }.to_vec();
         // Apply optimizer passes
         let mut new_bytes = apply_passes(&original);
         // If the new code is longer than the original span, refuse — we cannot
@@ -1070,15 +1057,14 @@ mod runtime_rewrite {
             u64,
             *mut u64,
             *mut std::ffi::c_void,
-        ) -> *const RuntimeFunction;
+        )
+            -> *const RuntimeFunction;
 
         static FN: std::sync::OnceLock<Option<FnRtlLookupFunctionEntry>> =
             std::sync::OnceLock::new();
         let fn_ptr = FN.get_or_init(|| unsafe {
             // RtlLookupFunctionEntry lives in ntdll.
-            let ntdll = pe_resolve::get_module_handle_by_hash(
-                pe_resolve::HASH_NTDLL_DLL,
-            )?;
+            let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
             let addr = pe_resolve::get_proc_address_by_hash(
                 ntdll,
                 pe_resolve::hash_str(b"RtlLookupFunctionEntry"),
@@ -1157,7 +1143,10 @@ mod runtime_rewrite {
             // Resolve GetModuleHandleA + GetProcAddress via PEB walking
             // to avoid static IAT entries for kernel32.
             type FnGetModuleHandleA = unsafe extern "system" fn(*const i8) -> *mut std::ffi::c_void;
-            type FnGetProcAddress = unsafe extern "system" fn(*mut std::ffi::c_void, *const i8) -> *mut std::ffi::c_void;
+            type FnGetProcAddress = unsafe extern "system" fn(
+                *mut std::ffi::c_void,
+                *const i8,
+            ) -> *mut std::ffi::c_void;
 
             static FN_GMHA: std::sync::OnceLock<Option<FnGetModuleHandleA>> =
                 std::sync::OnceLock::new();
@@ -1165,9 +1154,7 @@ mod runtime_rewrite {
                 std::sync::OnceLock::new();
 
             let gpa = *FN_GPA.get_or_init(|| unsafe {
-                let k32 = pe_resolve::get_module_handle_by_hash(
-                    pe_resolve::HASH_KERNEL32_DLL,
-                )?;
+                let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
                 let addr = pe_resolve::get_proc_address_by_hash(
                     k32,
                     pe_resolve::hash_str(b"GetProcAddress"),
@@ -1176,9 +1163,7 @@ mod runtime_rewrite {
             });
 
             let gmha = *FN_GMHA.get_or_init(|| unsafe {
-                let k32 = pe_resolve::get_module_handle_by_hash(
-                    pe_resolve::HASH_KERNEL32_DLL,
-                )?;
+                let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
                 let addr = pe_resolve::get_proc_address_by_hash(
                     k32,
                     pe_resolve::hash_str(b"GetModuleHandleA"),
@@ -1210,22 +1195,14 @@ mod runtime_rewrite {
 
     #[cfg(windows)]
     unsafe fn make_writable(addr: usize, len: usize) -> Result<ProtSnapshot, String> {
-        type FnVirtualProtect = unsafe extern "system" fn(
-            *mut std::ffi::c_void,
-            usize,
-            u32,
-            *mut u32,
-        ) -> i32;
+        type FnVirtualProtect =
+            unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32, *mut u32) -> i32;
 
         static FN: std::sync::OnceLock<Option<FnVirtualProtect>> = std::sync::OnceLock::new();
         let fn_ptr = FN.get_or_init(|| unsafe {
-            let k32 = pe_resolve::get_module_handle_by_hash(
-                pe_resolve::HASH_KERNEL32_DLL,
-            )?;
-            let addr = pe_resolve::get_proc_address_by_hash(
-                k32,
-                pe_resolve::hash_str(b"VirtualProtect"),
-            )?;
+            let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+            let addr =
+                pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"VirtualProtect"))?;
             Some(std::mem::transmute::<usize, FnVirtualProtect>(addr))
         });
 
@@ -1244,22 +1221,14 @@ mod runtime_rewrite {
         len: usize,
         old: &mut ProtSnapshot,
     ) -> Result<(), String> {
-        type FnVirtualProtect = unsafe extern "system" fn(
-            *mut std::ffi::c_void,
-            usize,
-            u32,
-            *mut u32,
-        ) -> i32;
+        type FnVirtualProtect =
+            unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32, *mut u32) -> i32;
 
         static FN: std::sync::OnceLock<Option<FnVirtualProtect>> = std::sync::OnceLock::new();
         let fn_ptr = FN.get_or_init(|| unsafe {
-            let k32 = pe_resolve::get_module_handle_by_hash(
-                pe_resolve::HASH_KERNEL32_DLL,
-            )?;
-            let addr = pe_resolve::get_proc_address_by_hash(
-                k32,
-                pe_resolve::hash_str(b"VirtualProtect"),
-            )?;
+            let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
+            let addr =
+                pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"VirtualProtect"))?;
             Some(std::mem::transmute::<usize, FnVirtualProtect>(addr))
         });
 
@@ -1273,18 +1242,13 @@ mod runtime_rewrite {
 
     #[cfg(windows)]
     unsafe fn flush_icache(addr: usize, len: usize) {
-        type FnFlushInstructionCache = unsafe extern "system" fn(
-            *mut std::ffi::c_void,
-            *const std::ffi::c_void,
-            usize,
-        ) -> i32;
+        type FnFlushInstructionCache =
+            unsafe extern "system" fn(*mut std::ffi::c_void, *const std::ffi::c_void, usize) -> i32;
 
         static FN: std::sync::OnceLock<Option<FnFlushInstructionCache>> =
             std::sync::OnceLock::new();
         let fn_ptr = FN.get_or_init(|| unsafe {
-            let k32 = pe_resolve::get_module_handle_by_hash(
-                pe_resolve::HASH_KERNEL32_DLL,
-            )?;
+            let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
             let addr = pe_resolve::get_proc_address_by_hash(
                 k32,
                 pe_resolve::hash_str(b"FlushInstructionCache"),
@@ -1481,7 +1445,10 @@ mod tests {
         let rs_mov = build_resource_set(&mov);
         let rs_add = build_resource_set(&add);
 
-        assert!(has_dependency(&rs_mov, &rs_add), "RAW: ADD reads RAX written by MOV");
+        assert!(
+            has_dependency(&rs_mov, &rs_add),
+            "RAW: ADD reads RAX written by MOV"
+        );
     }
 
     #[test]
@@ -1505,7 +1472,10 @@ mod tests {
         let rs_add = build_resource_set(&add);
         let rs_mov = build_resource_set(&mov);
 
-        assert!(has_dependency(&rs_add, &rs_mov), "WAR: MOV writes RAX which ADD reads");
+        assert!(
+            has_dependency(&rs_add, &rs_mov),
+            "WAR: MOV writes RAX which ADD reads"
+        );
     }
 
     #[test]
@@ -1527,8 +1497,7 @@ mod tests {
     #[test]
     fn test_memory_dependency_store_load() {
         // MOV [RAX], RBX  →  MOV RCX, [RAX]  (store then load from same address)
-        let store =
-            Instruction::with2(Code::Mov_rm64_r64, Register::RAX, Register::RBX).unwrap();
+        let store = Instruction::with2(Code::Mov_rm64_r64, Register::RAX, Register::RBX).unwrap();
         // This actually encodes as MOV RAX, RBX — for a proper memory operand
         // test, let's use a different approach: just check that two memory
         // operations with at least one write have a dependency.
@@ -1667,10 +1636,7 @@ mod tests {
             .position(|i| i.code() == Code::Mov_r64_imm64 && i.immediate64() == 2)
             .unwrap();
 
-        assert!(
-            mov_rax_pos < ret_pos,
-            "MOV RAX must be before RET"
-        );
+        assert!(mov_rax_pos < ret_pos, "MOV RAX must be before RET");
         assert!(
             ret_pos < mov_rbx_pos,
             "RET must be before MOV RBX (block boundary)"

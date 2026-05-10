@@ -15,7 +15,9 @@ pub const fn hash_str_const(s: &[u8]) -> u32 {
     let mut i = 0;
     while i < s.len() {
         let b = s[i];
-        if b == 0 { break; }
+        if b == 0 {
+            break;
+        }
         hash = hash.rotate_right(13) ^ (b.to_ascii_lowercase() as u32);
         i += 1;
     }
@@ -28,7 +30,9 @@ pub const fn hash_wstr_const(w: &[u16]) -> u32 {
     let mut i = 0;
     while i < w.len() {
         let c = w[i];
-        if c == 0 { break; }
+        if c == 0 {
+            break;
+        }
         let lo = (c as u8).to_ascii_lowercase();
         let hi = ((c >> 8) as u8).to_ascii_lowercase();
         hash = hash.rotate_right(13) ^ (lo as u32);
@@ -71,14 +75,20 @@ macro_rules! resolve_api {
         let fn_ptr = $var.get_or_init(|| unsafe {
             let base = match pe_resolve::get_module_handle_by_hash($dll_hash) {
                 Some(b) => b,
-                None => { log::error!("resolve_api: module hash {:#x} not found", $dll_hash); return None; }
+                None => {
+                    log::error!("resolve_api: module hash {:#x} not found", $dll_hash);
+                    return None;
+                }
             };
             let addr = match pe_resolve::get_proc_address_by_hash(
                 base,
                 pe_resolve::hash_str(concat!($fn_name, "\0").as_bytes()),
             ) {
                 Some(a) => a,
-                None => { log::error!("resolve_api: {} not found", $fn_name); return None; }
+                None => {
+                    log::error!("resolve_api: {} not found", $fn_name);
+                    return None;
+                }
             };
             Some(std::mem::transmute::<usize, $ty>(addr))
         });

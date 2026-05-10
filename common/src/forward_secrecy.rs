@@ -99,10 +99,13 @@ fn derive_fs_salt(psk: &[u8]) -> [u8; 32] {
 /// P1-04: The HMAC key is now a domain-separated sub-key derived from the PSK
 /// via HKDF, not the raw PSK itself.  The ordering is canonical — client pubkey
 /// always first — so both sides produce the same tag.
-fn compute_auth_tag(psk: &[u8], client_pub: &[u8; 32], server_pub: &[u8; 32]) -> [u8; HMAC_TAG_LEN] {
+fn compute_auth_tag(
+    psk: &[u8],
+    client_pub: &[u8; 32],
+    server_pub: &[u8; 32],
+) -> [u8; HMAC_TAG_LEN] {
     let hmac_key = derive_hmac_key(psk);
-    let mut mac = HmacSha256::new_from_slice(&hmac_key)
-        .expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(&hmac_key).expect("HMAC accepts any key length");
     mac.update(client_pub);
     mac.update(server_pub);
     mac.finalize().into_bytes().into()
@@ -162,7 +165,9 @@ pub async fn negotiate_session_key<S: AsyncRead + AsyncWrite + Unpin>(
         // Verify server's tag.
         let expected_tag = compute_auth_tag(&psk_buf, &our_pub_bytes, &srv_pub);
         if !hmac_verify(&expected_tag, srv_tag) {
-            anyhow::bail!("forward secrecy: server HMAC verification failed — PSK mismatch or MITM");
+            anyhow::bail!(
+                "forward secrecy: server HMAC verification failed — PSK mismatch or MITM"
+            );
         }
 
         // Step 3: Send our tag (client's tag).
@@ -187,7 +192,9 @@ pub async fn negotiate_session_key<S: AsyncRead + AsyncWrite + Unpin>(
         stream.read_exact(&mut cli_tag).await?;
         let expected_tag = compute_auth_tag(&psk_buf, &cli_pub, &our_pub_bytes);
         if !hmac_verify(&expected_tag, &cli_tag) {
-            anyhow::bail!("forward secrecy: client HMAC verification failed — PSK mismatch or MITM");
+            anyhow::bail!(
+                "forward secrecy: client HMAC verification failed — PSK mismatch or MITM"
+            );
         }
 
         cli_pub
@@ -210,7 +217,7 @@ pub async fn negotiate_session_key<S: AsyncRead + AsyncWrite + Unpin>(
     psk_buf.zeroize();
     let mut session_key = [0u8; KEY_LEN];
     h.expand(crate::hkdf_info::FS_SESSION, &mut session_key)
-        .map_err(|_| anyhow::anyhow!("HKDF expand failed (output too long)") )?;
+        .map_err(|_| anyhow::anyhow!("HKDF expand failed (output too long)"))?;
 
     Ok(CryptoSession::from_key(session_key))
 }
@@ -247,7 +254,9 @@ pub fn negotiate_session_key_blocking<S: std::io::Read + std::io::Write>(
         // Verify server's tag.
         let expected_tag = compute_auth_tag(&psk_buf, &our_pub_bytes, &srv_pub);
         if !hmac_verify(&expected_tag, srv_tag) {
-            anyhow::bail!("forward secrecy: server HMAC verification failed — PSK mismatch or MITM");
+            anyhow::bail!(
+                "forward secrecy: server HMAC verification failed — PSK mismatch or MITM"
+            );
         }
 
         // Step 3: Send our tag.
@@ -274,7 +283,9 @@ pub fn negotiate_session_key_blocking<S: std::io::Read + std::io::Write>(
         stream.read_exact(&mut cli_tag)?;
         let expected_tag = compute_auth_tag(&psk_buf, &cli_pub, &our_pub_bytes);
         if !hmac_verify(&expected_tag, &cli_tag) {
-            anyhow::bail!("forward secrecy: client HMAC verification failed — PSK mismatch or MITM");
+            anyhow::bail!(
+                "forward secrecy: client HMAC verification failed — PSK mismatch or MITM"
+            );
         }
 
         cli_pub
@@ -291,7 +302,7 @@ pub fn negotiate_session_key_blocking<S: std::io::Read + std::io::Write>(
 
     let mut session_key = [0u8; KEY_LEN];
     h.expand(crate::hkdf_info::FS_SESSION, &mut session_key)
-        .map_err(|_| anyhow::anyhow!("HKDF expand failed (output too long)") )?;
+        .map_err(|_| anyhow::anyhow!("HKDF expand failed (output too long)"))?;
 
     Ok(CryptoSession::from_key(session_key))
 }
@@ -391,11 +402,7 @@ impl PskRotationState {
     /// after a rotation so that in-flight negotiations can complete.
     pub const DEFAULT_TRANSITION_WINDOW_SECS: u64 = 300; // 5 minutes
 
-    pub fn new(
-        initial_psk: &[u8],
-        session_threshold: u64,
-        interval_secs: u64,
-    ) -> Self {
+    pub fn new(initial_psk: &[u8], session_threshold: u64, interval_secs: u64) -> Self {
         Self {
             rotation_counter: AtomicU64::new(0),
             sessions_since_rotation: AtomicU64::new(0),
@@ -411,13 +418,20 @@ impl PskRotationState {
 
     /// Create with default thresholds (1000 sessions or 24 hours).
     pub fn new_default(initial_psk: &[u8]) -> Self {
-        Self::new(initial_psk, PSK_ROTATION_SESSIONS, PSK_ROTATION_INTERVAL_SECS)
+        Self::new(
+            initial_psk,
+            PSK_ROTATION_SESSIONS,
+            PSK_ROTATION_INTERVAL_SECS,
+        )
     }
 
     /// Record that a new session has been established.
     /// Returns `true` if a PSK rotation should be triggered.
     pub fn record_session(&self) -> bool {
-        let count = self.sessions_since_rotation.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        let count = self
+            .sessions_since_rotation
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            + 1;
 
         // Check session threshold.
         if count >= self.session_threshold {
@@ -467,7 +481,8 @@ impl PskRotationState {
         }
 
         // Reset session counter and timestamp.
-        self.sessions_since_rotation.store(0, AtomicOrdering::Relaxed);
+        self.sessions_since_rotation
+            .store(0, AtomicOrdering::Relaxed);
         if let Ok(mut last) = self.last_rotation.lock() {
             *last = Instant::now();
         }
@@ -528,8 +543,10 @@ impl PskRotationState {
             *rt = Instant::now();
         }
 
-        self.rotation_counter.store(expected_counter, AtomicOrdering::SeqCst);
-        self.sessions_since_rotation.store(0, AtomicOrdering::Relaxed);
+        self.rotation_counter
+            .store(expected_counter, AtomicOrdering::SeqCst);
+        self.sessions_since_rotation
+            .store(0, AtomicOrdering::Relaxed);
         if let Ok(mut last) = self.last_rotation.lock() {
             *last = Instant::now();
         }

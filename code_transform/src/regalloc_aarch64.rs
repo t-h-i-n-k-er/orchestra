@@ -116,8 +116,10 @@ fn build_blocks(words: &[u32]) -> Vec<BasicBlock> {
             is_leader[i + 1] = true;
         }
         // Conditional branches and BL have fallthrough.
-        if matches!(kind, BranchKind::PcRelCond | BranchKind::PcRelBL | BranchKind::BlrIndirect)
-            && i + 1 < n
+        if matches!(
+            kind,
+            BranchKind::PcRelCond | BranchKind::PcRelBL | BranchKind::BlrIndirect
+        ) && i + 1 < n
         {
             is_leader[i + 1] = true;
         }
@@ -134,17 +136,11 @@ fn build_blocks(words: &[u32]) -> Vec<BasicBlock> {
     let mut start = 0;
     for i in 1..n {
         if is_leader[i] {
-            blocks.push(BasicBlock {
-                start,
-                end: i,
-            });
+            blocks.push(BasicBlock { start, end: i });
             start = i;
         }
     }
-    blocks.push(BasicBlock {
-        start,
-        end: n,
-    });
+    blocks.push(BasicBlock { start, end: n });
     blocks
 }
 
@@ -159,7 +155,10 @@ fn block_successors(block: &BasicBlock, words: &[u32]) -> Vec<usize> {
     let kind = classify(last);
 
     // Fallthrough (for non-unconditional-branch terminators).
-    if !matches!(kind, BranchKind::PcRelB | BranchKind::Ret | BranchKind::BrIndirect) {
+    if !matches!(
+        kind,
+        BranchKind::PcRelB | BranchKind::Ret | BranchKind::BrIndirect
+    ) {
         if block.end < n {
             succs.push(block.end);
         }
@@ -208,7 +207,10 @@ fn pc_rel_branch_disp_internal(raw: u32) -> Option<i64> {
 /// Check if an instruction is CBZ/CBNZ/TBZ/TBNZ (reads a test register).
 fn is_cb_tb(raw: u32) -> bool {
     let masked = raw & 0x7F00_0000;
-    matches!(masked, 0x3400_0000 | 0x3500_0000 | 0x3600_0000 | 0x3700_0000)
+    matches!(
+        masked,
+        0x3400_0000 | 0x3500_0000 | 0x3600_0000 | 0x3700_0000
+    )
 }
 
 /// Compute the set of registers *used* (read) by the instruction.
@@ -335,7 +337,7 @@ fn has_rm_field(raw: u32) -> bool {
         0x03 | 0x13 | // Logical (immediate)
         0x06 | 0x16 | // MOVK/MOVZ — no, these are immediate
         0x0C | 0x4C | // Conditional select
-        0x0E | 0x4E   // Data processing 2 source
+        0x0E | 0x4E // Data processing 2 source
     )
 }
 
@@ -362,7 +364,7 @@ fn writes_rd(raw: u32) -> bool {
         0x11 | 0x51 |               // ADD immediate (MOV alias)
         0x91 | 0xD1 |               // ADD/SUB immediate 64-bit
         0x12 | 0x52 | 0x92 | 0xD2 | // MOVZ/MOVK 32/64-bit
-        0x13 | 0x53 | 0x93 | 0xD3   // MOVN/ORR immediate
+        0x13 | 0x53 | 0x93 | 0xD3 // MOVN/ORR immediate
     )
 }
 
@@ -548,14 +550,8 @@ mod tests {
     #[test]
     fn empty_and_misaligned_passthrough() {
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        assert_eq!(
-            reallocate_registers(&[], &mut rng),
-            Vec::<u8>::new()
-        );
-        assert_eq!(
-            reallocate_registers(&[1, 2, 3], &mut rng),
-            vec![1, 2, 3]
-        );
+        assert_eq!(reallocate_registers(&[], &mut rng), Vec::<u8>::new());
+        assert_eq!(reallocate_registers(&[1, 2, 3], &mut rng), vec![1, 2, 3]);
     }
 
     #[test]

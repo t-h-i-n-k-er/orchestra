@@ -212,6 +212,8 @@ pub struct GlobalConfig {
     pub user_agent: String,
     pub jitter: u8,
     pub sleep_time: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_time_ms: Option<u64>,
     #[serde(default = "default_dns_idle")]
     pub dns_idle: String,
     #[serde(default)]
@@ -228,6 +230,7 @@ impl Default for GlobalConfig {
             user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36".to_string(),
             jitter: 0,
             sleep_time: 60,
+            sleep_time_ms: None,
             dns_idle: "0.0.0.0".to_string(),
             dns_sleep: 0,
         }
@@ -294,7 +297,8 @@ impl HttpTransformConfig {
     /// Apply the full transform pipeline: prepend + encode(payload) + append.
     pub fn apply(&self, payload: &[u8]) -> Vec<u8> {
         let encoded = if self.mask_stride > 0 {
-            self.transform.encode_with_mask_stride(payload, self.mask_stride)
+            self.transform
+                .encode_with_mask_stride(payload, self.mask_stride)
         } else {
             self.transform.encode(payload)
         };
@@ -309,7 +313,10 @@ impl HttpTransformConfig {
     pub fn reverse(&self, data: &[u8]) -> Result<Vec<u8>> {
         // Strip prepend.
         let pre_bytes = self.prepend.as_bytes();
-        let rest = if !pre_bytes.is_empty() && data.len() >= pre_bytes.len() && &data[..pre_bytes.len()] == pre_bytes {
+        let rest = if !pre_bytes.is_empty()
+            && data.len() >= pre_bytes.len()
+            && &data[..pre_bytes.len()] == pre_bytes
+        {
             &data[pre_bytes.len()..]
         } else {
             data
@@ -317,7 +324,10 @@ impl HttpTransformConfig {
 
         // Strip append.
         let app_bytes = self.append.as_bytes();
-        let core = if !app_bytes.is_empty() && rest.len() >= app_bytes.len() && &rest[rest.len() - app_bytes.len()..] == app_bytes {
+        let core = if !app_bytes.is_empty()
+            && rest.len() >= app_bytes.len()
+            && &rest[rest.len() - app_bytes.len()..] == app_bytes
+        {
             &rest[..rest.len() - app_bytes.len()]
         } else {
             rest
@@ -325,7 +335,8 @@ impl HttpTransformConfig {
 
         // Decode the transform.
         if self.mask_stride > 0 {
-            self.transform.decode_with_mask_stride(core, self.mask_stride)
+            self.transform
+                .decode_with_mask_stride(core, self.mask_stride)
         } else {
             self.transform.decode(core)
         }
@@ -642,11 +653,15 @@ impl MalleableProfile {
     /// Returns a random duration between `sleep_time * (1 - jitter%)` and
     /// `sleep_time * (1 + jitter%)`.
     pub fn jittered_sleep(&self) -> std::time::Duration {
-        let base = self.global.sleep_time as f64;
+        let base = self
+            .global
+            .sleep_time_ms
+            .map(|ms| ms as f64 / 1000.0)
+            .unwrap_or(self.global.sleep_time as f64);
         let jitter_frac = self.global.jitter as f64 / 100.0;
         let factor = 1.0 + (rand::thread_rng().gen_range(-1.0..1.0) * jitter_frac);
-        let effective = (base * factor).max(0.0) as u64;
-        std::time::Duration::from_secs(effective)
+        let effective = (base * factor).max(0.0);
+        std::time::Duration::from_secs_f64(effective)
     }
 
     /// Get the full SNI hostname for TLS connections.
@@ -813,6 +828,7 @@ impl Default for MalleableProfile {
                 user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36".to_string(),
                 jitter: 15,
                 sleep_time: 60,
+                sleep_time_ms: None,
                 dns_idle: "0.0.0.0".to_string(),
                 dns_sleep: 0,
             },
@@ -918,7 +934,10 @@ pub(crate) fn netbios_encode(input: &[u8], uppercase: bool) -> Vec<u8> {
 /// NetBIOS decode: two ASCII characters per byte.
 pub(crate) fn netbios_decode(input: &[u8], uppercase: bool) -> Result<Vec<u8>> {
     if input.len() % 2 != 0 {
-        return Err(anyhow!("netbios input length must be even, got {}", input.len()));
+        return Err(anyhow!(
+            "netbios input length must be even, got {}",
+            input.len()
+        ));
     }
     let base = if uppercase { b'A' } else { b'a' };
     let mut out = Vec::with_capacity(input.len() / 2);
@@ -1319,18 +1338,49 @@ verb = "GET"
     }
 
     #[test]
+    fn jittered_sleep_uses_millisecond_interval_when_present() {
+        let mut profile = MalleableProfile::default();
+        profile.global.sleep_time = 60;
+        profile.global.sleep_time_ms = Some(1_250);
+        profile.global.jitter = 0;
+
+        assert_eq!(
+            profile.jittered_sleep(),
+            std::time::Duration::from_millis(1_250)
+        );
+    }
+
+    #[test]
     fn transform_type_from_str() {
-        assert_eq!(TransformType::from_str_ci("base64").unwrap(), TransformType::Base64);
-        assert_eq!(TransformType::from_str_ci("Base64").unwrap(), TransformType::Base64);
-        assert_eq!(TransformType::from_str_ci("MASK").unwrap(), TransformType::Mask);
+        assert_eq!(
+            TransformType::from_str_ci("base64").unwrap(),
+            TransformType::Base64
+        );
+        assert_eq!(
+            TransformType::from_str_ci("Base64").unwrap(),
+            TransformType::Base64
+        );
+        assert_eq!(
+            TransformType::from_str_ci("MASK").unwrap(),
+            TransformType::Mask
+        );
         assert!(TransformType::from_str_ci("invalid").is_err());
     }
 
     #[test]
     fn delivery_method_from_str() {
-        assert_eq!(DeliveryMethod::from_str_ci("cookie").unwrap(), DeliveryMethod::Cookie);
-        assert_eq!(DeliveryMethod::from_str_ci("uri-append").unwrap(), DeliveryMethod::UriAppend);
-        assert_eq!(DeliveryMethod::from_str_ci("HEADER").unwrap(), DeliveryMethod::Header);
+        assert_eq!(
+            DeliveryMethod::from_str_ci("cookie").unwrap(),
+            DeliveryMethod::Cookie
+        );
+        assert_eq!(
+            DeliveryMethod::from_str_ci("uri-append").unwrap(),
+            DeliveryMethod::UriAppend
+        );
+        assert_eq!(
+            DeliveryMethod::from_str_ci("HEADER").unwrap(),
+            DeliveryMethod::Header
+        );
         assert!(DeliveryMethod::from_str_ci("invalid").is_err());
     }
 
@@ -1338,7 +1388,9 @@ verb = "GET"
     fn mask_encode_decode_with_stride() {
         let data = b"stride test";
         let encoded = TransformType::Mask.encode_with_mask_stride(data, 13);
-        let decoded = TransformType::Mask.decode_with_mask_stride(&encoded, 13).unwrap();
+        let decoded = TransformType::Mask
+            .decode_with_mask_stride(&encoded, 13)
+            .unwrap();
         assert_eq!(decoded, data);
     }
 }

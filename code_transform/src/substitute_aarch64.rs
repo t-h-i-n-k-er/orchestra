@@ -96,7 +96,11 @@ pub(crate) fn pc_rel_branch_disp(raw: u32) -> Option<i32> {
 /// responsible for ensuring the new layout keeps every branch within the
 /// encoding width of its instruction class.
 pub(crate) fn rewrite_branch_disp(raw: u32, new_disp_bytes: i32) -> u32 {
-    debug_assert_eq!(new_disp_bytes & 0x3, 0, "branch displacement must be 4-byte aligned");
+    debug_assert_eq!(
+        new_disp_bytes & 0x3,
+        0,
+        "branch displacement must be 4-byte aligned"
+    );
     let imm = new_disp_bytes >> 2;
 
     let top6 = raw >> 26;
@@ -151,8 +155,10 @@ pub(crate) fn classify(raw: u32) -> BranchKind {
         return BranchKind::PcRelCond;
     }
     let masked = raw & 0x7F00_0000;
-    if masked == 0x3400_0000 || masked == 0x3500_0000
-        || masked == 0x3600_0000 || masked == 0x3700_0000
+    if masked == 0x3400_0000
+        || masked == 0x3500_0000
+        || masked == 0x3600_0000
+        || masked == 0x3700_0000
     {
         return BranchKind::PcRelCond;
     }
@@ -175,7 +181,10 @@ pub(crate) fn classify(raw: u32) -> BranchKind {
 /// Returns true for instructions that end a basic block (control does not
 /// fall through to the next instruction).
 pub(crate) fn is_terminator(kind: BranchKind) -> bool {
-    matches!(kind, BranchKind::PcRelB | BranchKind::BrIndirect | BranchKind::Ret)
+    matches!(
+        kind,
+        BranchKind::PcRelB | BranchKind::BrIndirect | BranchKind::Ret
+    )
 }
 
 // ── Length-preserving substitution detectors / encoders ──────────────────────
@@ -332,7 +341,9 @@ pub fn apply_substitutions(code: &[u8], rng: &mut impl Rng) -> Vec<u8> {
         .enumerate()
         .map(|(i, b)| Item {
             raw: u32::from_le_bytes(b.try_into().unwrap()),
-            kind: ItemKind::Original { orig_offset: (i * 4) as u32 },
+            kind: ItemKind::Original {
+                orig_offset: (i * 4) as u32,
+            },
         })
         .collect();
 
@@ -401,7 +412,8 @@ mod tests {
     }
 
     fn from_le(bytes: &[u8]) -> Vec<u32> {
-        bytes.chunks_exact(4)
+        bytes
+            .chunks_exact(4)
             .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
             .collect()
     }
@@ -442,14 +454,20 @@ mod tests {
                 replaced_any = true;
             }
         }
-        assert!(replaced_any, "NOP substitution should fire for at least one seed in [0,32)");
+        assert!(
+            replaced_any,
+            "NOP substitution should fire for at least one seed in [0,32)"
+        );
     }
 
     #[test]
     fn empty_and_misaligned_input_passthrough() {
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         assert_eq!(apply_substitutions(&[], &mut rng), Vec::<u8>::new());
-        assert_eq!(apply_substitutions(&[0x00, 0x01, 0x02], &mut rng), vec![0x00, 0x01, 0x02]);
+        assert_eq!(
+            apply_substitutions(&[0x00, 0x01, 0x02], &mut rng),
+            vec![0x00, 0x01, 0x02]
+        );
     }
 
     #[test]
@@ -474,18 +492,25 @@ mod tests {
             let words = from_le(&out);
 
             // Locate the RET in the new layout.
-            let ret_pos = words.iter().position(|&w| w == ret_x30)
+            let ret_pos = words
+                .iter()
+                .position(|&w| w == ret_x30)
                 .expect("RET must survive the transform");
 
             // Locate the (only) unconditional B in the new layout.
-            let b_pos = words.iter().position(|&w| classify(w) == BranchKind::PcRelB)
+            let b_pos = words
+                .iter()
+                .position(|&w| classify(w) == BranchKind::PcRelB)
                 .expect("B must survive the transform");
 
             // Decode the B's target and verify it points at the RET.
             let disp = pc_rel_branch_disp(words[b_pos]).unwrap();
             let target_byte_offset = (b_pos as i64) * 4 + disp as i64;
-            assert_eq!(target_byte_offset as usize, ret_pos * 4,
-                "seed={s}: B at idx {b_pos} with disp {disp} should land on RET at idx {ret_pos}");
+            assert_eq!(
+                target_byte_offset as usize,
+                ret_pos * 4,
+                "seed={s}: B at idx {b_pos} with disp {disp} should land on RET at idx {ret_pos}"
+            );
         }
     }
 
@@ -500,8 +525,11 @@ mod tests {
             let mut rng = ChaCha8Rng::seed_from_u64(s);
             let out = apply_substitutions(&input, &mut rng);
             // No insertion → output length must equal input length.
-            assert_eq!(out.len(), input.len(),
-                "seed={s}: insertion must be disabled when ADRP is present");
+            assert_eq!(
+                out.len(),
+                input.len(),
+                "seed={s}: insertion must be disabled when ADRP is present"
+            );
         }
     }
 
@@ -523,7 +551,10 @@ mod tests {
             for &d in &[-1024i32, -4, 0, 4, 4096, 16384] {
                 let rebuilt = rewrite_branch_disp(base, d);
                 let decoded = pc_rel_branch_disp(rebuilt).expect("must decode");
-                assert_eq!(decoded, d, "round-trip failed for base 0x{base:08X} disp {d}");
+                assert_eq!(
+                    decoded, d,
+                    "round-trip failed for base 0x{base:08X} disp {d}"
+                );
             }
         }
     }

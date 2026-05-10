@@ -87,8 +87,9 @@ fn main() -> Result<()> {
 
             let parsed_seed: Option<u64> = match seed.as_deref() {
                 Some(hex) => Some(
-                    u64::from_str_radix(hex.trim_start_matches("0x"), 16)
-                        .context("seed must be a valid hex-encoded u64 (e.g. 0xa1b2c3d4e5f6a7b8)")?,
+                    u64::from_str_radix(hex.trim_start_matches("0x"), 16).context(
+                        "seed must be a valid hex-encoded u64 (e.g. 0xa1b2c3d4e5f6a7b8)",
+                    )?,
                 ),
                 None => None,
             };

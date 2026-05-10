@@ -50,10 +50,10 @@ use async_trait::async_trait;
 use common::config::{MalleableProfile, SshAuthConfig};
 use common::{CryptoSession, Message, Transport};
 use log::info;
-use subtle::ConstantTimeEq;
 use russh::client;
 use russh_keys::key::PublicKey;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Duration;
 
@@ -159,7 +159,9 @@ impl SshTransport {
             .ssh_host
             .as_deref()
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("ssh-transport: ssh_host not configured in malleable profile"))?;
+            .ok_or_else(|| {
+                anyhow!("ssh-transport: ssh_host not configured in malleable profile")
+            })?;
 
         let port = profile.ssh_port.unwrap_or(22);
 
@@ -171,10 +173,9 @@ impl SshTransport {
                 anyhow!("ssh-transport: ssh_username not configured in malleable profile")
             })?;
 
-        let auth_cfg = profile
-            .ssh_auth
-            .as_ref()
-            .ok_or_else(|| anyhow!("ssh-transport: ssh_auth not configured in malleable profile"))?;
+        let auth_cfg = profile.ssh_auth.as_ref().ok_or_else(|| {
+            anyhow!("ssh-transport: ssh_auth not configured in malleable profile")
+        })?;
 
         // Build a conservative client config: 5-minute inactivity timeout,
         // keepalive every 60 seconds so NAT mappings stay alive.
@@ -229,26 +230,33 @@ impl SshTransport {
                     #[cfg(windows)]
                     {
                         if let Ok(agent_socket) = std::env::var("SSH_AUTH_SOCK") {
-                            match russh_keys::agent::client::AgentClient::connect_named_pipe(&agent_socket).await {
+                            match russh_keys::agent::client::AgentClient::connect_named_pipe(
+                                &agent_socket,
+                            )
+                            .await
+                            {
                                 Ok(client) => client.dynamic(),
                                 Err(e) => {
                                     log::warn!(
                                         "ssh-transport: SSH_AUTH_SOCK named pipe connection failed ({}), falling back to Pageant",
                                         e
                                     );
-                                    russh_keys::agent::client::AgentClient::connect_pageant().await.dynamic()
+                                    russh_keys::agent::client::AgentClient::connect_pageant()
+                                        .await
+                                        .dynamic()
                                 }
                             }
                         } else {
-                            russh_keys::agent::client::AgentClient::connect_pageant().await.dynamic()
+                            russh_keys::agent::client::AgentClient::connect_pageant()
+                                .await
+                                .dynamic()
                         }
                     }
                 };
 
-                let identities = agent_client
-                    .request_identities()
-                    .await
-                    .map_err(|e| anyhow!("ssh-transport: failed to enumerate ssh-agent identities: {e}"))?;
+                let identities = agent_client.request_identities().await.map_err(|e| {
+                    anyhow!("ssh-transport: failed to enumerate ssh-agent identities: {e}")
+                })?;
 
                 if identities.is_empty() {
                     return Err(anyhow!(
@@ -305,7 +313,12 @@ impl SshTransport {
         channel
             .request_subsystem(true, common::ioc::IOC_SSH_SUBSYSTEM)
             .await
-            .map_err(|e| anyhow!("ssh-transport: subsystem '{}' rejected: {e}", common::ioc::IOC_SSH_SUBSYSTEM))?;
+            .map_err(|e| {
+                anyhow!(
+                    "ssh-transport: subsystem '{}' rejected: {e}",
+                    common::ioc::IOC_SSH_SUBSYSTEM
+                )
+            })?;
 
         info!("ssh-transport: session channel ready, performing X25519 ECDH key exchange");
 
@@ -343,23 +356,27 @@ impl SshTransport {
     /// each channel gets a fresh forward-secret session key.
     async fn reopen_channel(&mut self) -> Result<()> {
         if self.session.is_closed() {
-            return Err(anyhow!("ssh-transport: session closed, cannot reopen channel"));
+            return Err(anyhow!(
+                "ssh-transport: session closed, cannot reopen channel"
+            ));
         }
         let channel = self.session.channel_open_session().await?;
         channel
             .request_subsystem(true, common::ioc::IOC_SSH_SUBSYSTEM)
             .await
-            .map_err(|e| anyhow!("ssh-transport: subsystem '{}' reopen rejected: {e}", common::ioc::IOC_SSH_SUBSYSTEM))?;
+            .map_err(|e| {
+                anyhow!(
+                    "ssh-transport: subsystem '{}' reopen rejected: {e}",
+                    common::ioc::IOC_SSH_SUBSYSTEM
+                )
+            })?;
 
         // Convert to stream and perform a fresh ECDH exchange.
         let mut stream = channel.into_stream();
-        self.crypto_session = common::forward_secrecy::negotiate_session_key(
-            &mut stream,
-            &self.psk,
-            true,
-        )
-        .await
-        .map_err(|e| anyhow!("ssh-transport: ECDH key exchange on reopen failed: {e}"))?;
+        self.crypto_session =
+            common::forward_secrecy::negotiate_session_key(&mut stream, &self.psk, true)
+                .await
+                .map_err(|e| anyhow!("ssh-transport: ECDH key exchange on reopen failed: {e}"))?;
 
         self.stream = stream;
         self.recv_buf.clear();
@@ -397,9 +414,7 @@ impl Transport for SshTransport {
         match self.stream.write_all(&frame).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                log::info!(
-                    "ssh-transport: send failed ({e:#}), attempting channel reopen"
-                );
+                log::info!("ssh-transport: send failed ({e:#}), attempting channel reopen");
                 self.reopen_channel().await?;
                 // Retry the write on the fresh channel.
                 self.stream
@@ -474,9 +489,7 @@ impl Transport for SshTransport {
                 }
                 Err(e) => {
                     // Read error — attempt reopen before giving up.
-                    log::info!(
-                        "ssh-transport: recv read error ({e:#}), attempting channel reopen"
-                    );
+                    log::info!("ssh-transport: recv read error ({e:#}), attempting channel reopen");
                     match self.reopen_channel().await {
                         Ok(()) => continue, // Channel reopened, keep receiving.
                         Err(reopen_err) => {
@@ -510,9 +523,6 @@ impl Drop for SshTransport {
 /// P1-05: The PSK is no longer used directly as the session key.
 /// Instead, an X25519 ECDH key exchange is performed over the SSH
 /// channel to derive a forward-secret session key.
-pub async fn new_transport(
-    profile: &MalleableProfile,
-    secret: &str,
-) -> Result<SshTransport> {
+pub async fn new_transport(profile: &MalleableProfile, secret: &str) -> Result<SshTransport> {
     SshTransport::new(profile, secret.as_bytes()).await
 }

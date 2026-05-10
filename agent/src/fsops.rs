@@ -26,10 +26,10 @@
 
 use anyhow::{anyhow, Result};
 use common::config::Config;
-use std::path::{Component, Path, PathBuf};
-use tokio::fs as afs;
 #[cfg(unix)]
 use libc;
+use std::path::{Component, Path, PathBuf};
+use tokio::fs as afs;
 
 /// A single directory entry returned by [`list_directory`].
 #[derive(serde::Serialize)]
@@ -108,8 +108,6 @@ fn canonicalize_existing(path: &Path) -> Result<PathBuf> {
 /// On non-Windows platforms this is always `Ok(false)`.
 #[cfg(windows)]
 fn is_reparse_point(path: &Path) -> Result<bool> {
-    
-
     // ── NT constants (no winapi function imports → no IAT entries) ───────
     const OBJ_CASE_INSENSITIVE: u32 = 0x00000040;
     const SYNCHRONIZE: u32 = 0x00100000;
@@ -143,7 +141,10 @@ fn is_reparse_point(path: &Path) -> Result<bool> {
     } else {
         format!(r"\??\{}", win32_str)
     };
-    let mut wide: Vec<u16> = nt_path_str.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut wide: Vec<u16> = nt_path_str
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
 
     // ── Step 1: Open the file (NtCreateFile, no IAT) ────────────────────
     // Opening with FILE_OPEN_REPARSE_POINT prevents following the reparse
@@ -167,16 +168,17 @@ fn is_reparse_point(path: &Path) -> Result<bool> {
     let open_status = crate::syscall!(
         "NtCreateFile",
         &mut h_file as *mut _ as u64,
-        (SYNCHRONIZE | GENERIC_READ) as u64,   // DesiredAccess
-        &mut obj_attr as *mut _ as u64,         // ObjectAttributes
-        io_status.as_mut_ptr() as u64,          // IoStatusBlock
-        0u64,                                   // AllocationSize
-        0u64,                                   // FileAttributes
+        (SYNCHRONIZE | GENERIC_READ) as u64, // DesiredAccess
+        &mut obj_attr as *mut _ as u64,      // ObjectAttributes
+        io_status.as_mut_ptr() as u64,       // IoStatusBlock
+        0u64,                                // AllocationSize
+        0u64,                                // FileAttributes
         (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE) as u64, // ShareAccess
-        FILE_OPEN as u64,                       // CreateDisposition
-        (FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT) as u64, // CreateOptions
-        0u64,                                   // EaBuffer
-        0u64,                                   // EaLength
+        FILE_OPEN as u64,                    // CreateDisposition
+        (FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT)
+            as u64, // CreateOptions
+        0u64,                                // EaBuffer
+        0u64,                                // EaLength
     );
 
     if open_status.is_err() || open_status.unwrap() < 0 || h_file == 0 {
@@ -453,8 +455,7 @@ mod tests {
         // The victim file must NOT have been overwritten.
         let contents = std::fs::read(&victim).unwrap();
         assert_eq!(
-            contents,
-            b"original",
+            contents, b"original",
             "victim file must not be overwritten via symlink"
         );
     }

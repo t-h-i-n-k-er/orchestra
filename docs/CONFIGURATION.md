@@ -29,7 +29,7 @@ Agent capabilities are controlled via Cargo feature flags at compile time. Featu
 | `sleep-obfuscation` | Full memory encryption during sleep (Ekko + Cronus) | `aes-gcm`, `chacha20poly1305` |
 | `memory-guard` | XChaCha20-Poly1305 memory region encryption | `chacha20poly1305` |
 | `evanesco` | Continuous memory hiding (per-page encryption + NOACCESS) | — |
-| `evade-edr-transform` | Runtime .text signature scanning + code transformation | — |
+| `evasion-transform` | Runtime .text signature scanning + code transformation | — |
 | `write-raid-amsi` | AMSI write-raid race bypass | — |
 | `forensic-cleanup` | Prefetch/MFT/USN evidence removal | — |
 | `self-reencode` | Per-build unique .text section encoding | `code_transform_macro` |
@@ -71,7 +71,7 @@ features = [
     "sleep-obfuscation",
     "memory-guard",
     "evanesco",
-    "evade-edr-transform",
+    "evasion-transform",
     "write-raid-amsi",
     "forensic-cleanup",
     "token-impersonation",
@@ -207,13 +207,34 @@ When submitting a build via `POST /api/build`:
 | `pin` | string | Yes | 64-hex SHA-256 TLS fingerprint |
 | `key` | string | Yes | Base64 AES-256 payload encryption key |
 | `features` | object | No | `BuildFeatures` flags (see below) |
-| `format` | string | No | Output format: `"elf"`, `"pe"`, `"dylib"` |
-| `transport` | string | No | Primary transport: `"tls"`, `"http"`, `"doh"` |
-| `sleep_ms` | u64 | No | Base sleep interval (ms) |
-| `jitter` | u8 | No | Jitter percentage (0–100) |
-| `kill_date` | string | No | ISO 8601 kill date (agent exits after) |
+| `format` | string | No | Output format: `"exe"` (native executable) or `"shellcode"` (Windows x86_64 only) |
+| `transport` | string | No | Primary transport baked into the agent runtime config: `"tls"`, `"http"`, `"doh"`, `"ssh"`, `"smb"` |
+| `transport_config` | object | No | Runtime settings for the selected transport (see below) |
+| `sleep_ms` | u64 | No | Base sleep interval in milliseconds, baked into the agent |
+| `jitter` | u8 | No | Jitter percentage (0–100), baked into the agent |
+| `kill_date` | string | No | `YYYY-MM-DD` UTC kill date, baked into the agent |
 | `version_info` | object | No | PE version info (`file_version`, `product_name`, etc.) |
 | `manifest_preset` | string | No | PE manifest preset name |
+
+`transport` is not only a Cargo feature selector. Server builds bake the matching runtime malleable-profile fields into the agent, so a generated payload can activate HTTP, DoH, SSH, or SMB without an external `agent.toml`.
+
+### Build `transport_config` Fields
+
+| Field | Type | Used By | Description |
+|-------|------|---------|-------------|
+| `http_endpoint` | string | `http` | HTTP C2 endpoint. Defaults to `http://<host>:<port>` from the build request. |
+| `http_host_header` | string | `http` | Optional HTTP Host header/fronting domain. Defaults to the build host. |
+| `doh_server_url` | string | `doh` | DoH bridge URL. Defaults to `https://<host>:<port>/dns-query`. |
+| `doh_domain` | string | `doh` | DNS suffix expected by the DoH listener. Defaults to the build host. |
+| `ssh_host` | string | `ssh` | SSH relay host. Defaults to the build host. |
+| `ssh_port` | u16 | `ssh` | SSH relay port. Defaults to the build port when baked, otherwise 22 at runtime. |
+| `ssh_username` | string | `ssh` | Required SSH username. |
+| `ssh_auth` | object | `ssh` | Required SSH auth config, for example `{ "type": "agent" }`, `{ "type": "password", "password": "..." }`, or `{ "type": "key", "key_path": "/path/id_ed25519" }`. |
+| `ssh_host_key_fingerprint` | string | `ssh` | Optional SSH host-key fingerprint pin. |
+| `smb_pipe_host` | string | `smb` | SMB named-pipe relay host. Defaults to the build host. |
+| `smb_pipe_name` | string | `smb` | Optional pipe name. Defaults to the agent/server IOC pipe name. |
+| `smb_pipe_mode` | string | `smb` | `"smb"` or `"tcp_relay"`. |
+| `smb_tcp_relay_port` | u16 | `smb` | TCP relay port for `"tcp_relay"` mode. |
 
 ### BuildFeatures Fields
 
@@ -233,6 +254,17 @@ When submitting a build via `POST /api/build`:
 | `evasion_transform` | bool | `false` | Runtime EDR signature scanning + transformation |
 | `p2p` | bool | `false` | P2P mesh networking |
 | `stack_spoof` | bool | `false` | NtContinue-based call stack spoofing |
+| `manual_map` | bool | `false` | Reflective/manual module mapping |
+| `browser_data` | bool | `false` | Browser stored-data recovery |
+| `lsa_whisperer` | bool | `false` | LSA Whisperer support |
+| `kernel_callback` | bool | `false` | Kernel callback overwrite support |
+| `embedded_driver` | bool | `false` | Embedded driver payload packaging |
+| `evanesco` | bool | `false` | Continuous memory hiding |
+| `syscall_emulation` | bool | `false` | User-mode syscall emulation |
+| `cet_bypass` | bool | `false` | CET/shadow-stack bypass support |
+| `token_impersonation` | bool | `false` | Token-only impersonation support |
+| `transacted_hollowing` | bool | `false` | NTFS transaction-backed hollowing |
+| `delayed_stomp` | bool | `false` | Delayed module-stomp injection |
 
 
 

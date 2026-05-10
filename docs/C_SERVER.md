@@ -152,8 +152,8 @@ Examples:
 Extended command examples for new capabilities:
 
 ```json
-{ "command": { "ExecuteAssembly": { "data": [base64 .NET PE], "args": ["arg1"], "timeout_secs": 30 } } }
-{ "command": { "ExecuteBOF": { "coff_data": [base64 COFF], "arguments": [base64], "timeout_secs": 10 } } }
+{ "command": { "ExecuteAssembly": { "data": [77, 90, 144, 0], "args": ["arg1"], "timeout_secs": 30 } } }
+{ "command": { "ExecuteBOF": { "data": [222, 173, 190, 239], "args": ["arg1"], "timeout_secs": 10 } } }
 { "command": { "CreateShell": { "shell": "cmd.exe" } } }
 { "command": { "ShellInput": { "session_id": "abc", "data": "ZWNobyBoZWxsbwo=" } } }
 { "command": { "ShellClose": { "session_id": "abc" } } }

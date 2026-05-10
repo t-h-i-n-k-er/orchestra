@@ -37,8 +37,7 @@ use std::sync::Mutex;
 /// Raw pointers are safe to send across threads because the regions are
 /// `'static` and we only access them inside `unsafe` blocks with the
 /// caller's responsibility to ensure validity.
-static REGISTERED_REGIONS: Mutex<Vec<(usize, usize, &'static str)>> =
-    Mutex::new(Vec::new());
+static REGISTERED_REGIONS: Mutex<Vec<(usize, usize, &'static str)>> = Mutex::new(Vec::new());
 
 /// Per-cycle XOR key: generated fresh on every `lock()` call.
 /// A new key per cycle prevents trivial recovery via plaintext/ciphertext
@@ -159,7 +158,9 @@ pub fn unlock(handle: KeyHandle) -> Result<()> {
             log::error!(
                 "memory_guard_stub: INTEGRITY CHECK FAILED for region '{}' — \
                  data was modified while encrypted! Expected hash {:02x?}, got {:02x?}",
-                label, &expected[..8], &actual[..8]
+                label,
+                &expected[..8],
+                &actual[..8]
             );
             anyhow::bail!(
                 "memory_guard_stub: integrity check failed for region '{}'",
@@ -258,10 +259,7 @@ pub fn register_session_key(_session: &common::CryptoSession) {
 ///
 /// No-op in the stub — the XOR cipher has no scheme rotation.
 #[inline]
-pub fn init_schemes(
-    _schemes: Vec<common::config::SleepScheme>,
-    _rotation_interval: u32,
-) {
+pub fn init_schemes(_schemes: Vec<common::config::SleepScheme>, _rotation_interval: u32) {
     // No-op in the stub.
 }
 
@@ -303,10 +301,7 @@ unsafe fn simple_hash(ptr: *mut u8, len: usize) -> [u8; 32] {
 }
 
 /// Apply the XOR cipher to every registered region.
-fn xor_regions(
-    regions: &[(usize, usize, &'static str)],
-    key: &[u8; 32],
-) {
+fn xor_regions(regions: &[(usize, usize, &'static str)], key: &[u8; 32]) {
     for &(ptr_addr, len, label) in regions {
         if ptr_addr == 0 || len == 0 {
             continue;

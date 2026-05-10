@@ -40,9 +40,20 @@ control which Cargo feature gates are activated in the resulting binary:
 | `doh_transport` | `doh-transport` | DNS-over-HTTPS C2 |
 | `ssh_transport` | `ssh-transport` | SSH subsystem C2 |
 | `smb_pipe_transport` | `smb-pipe-transport` | SMB named pipe C2 |
-| `evasion_transform` | `evade-edr-transform` | Runtime EDR signature transform |
+| `evasion_transform` | `evasion-transform` | Runtime EDR signature transform |
 | `p2p` | `p2p-tcp` | P2P mesh networking |
 | `stack_spoof` | `stack-spoof` | NtContinue call stack spoofing |
+| `manual_map` | `manual-map` | Reflective/manual module mapping |
+| `browser_data` | `browser-data` | Browser stored-data recovery |
+| `lsa_whisperer` | `lsa-whisperer` | LSA Whisperer support |
+| `kernel_callback` | `kernel-callback` | Kernel callback overwrite support |
+| `embedded_driver` | `embedded_driver` | Embedded driver payload packaging |
+| `evanesco` | `evanesco` | Continuous memory hiding |
+| `syscall_emulation` | `syscall-emulation` | User-mode syscall emulation |
+| `cet_bypass` | `cet-bypass` | CET/shadow-stack bypass support |
+| `token_impersonation` | `token-impersonation` | Token-only impersonation support |
+| `transacted_hollowing` | `transacted-hollowing` | NTFS transaction-backed hollowing |
+| `delayed_stomp` | `delayed-stomp` | Delayed module-stomp injection |
 
 ---
 
@@ -604,7 +615,7 @@ features = ["outbound-c", "evanesco"]
 
 ---
 
-### `evade-edr-transform`
+### `evasion-transform`
 
 **Default: no** | **Windows only**
 
@@ -628,7 +639,7 @@ transformations to evade EDR signature-based detection.
 
 **Example profile:**
 ```toml
-features = ["outbound-c", "evade-edr-transform"]
+features = ["outbound-c", "evasion-transform"]
 ```
 
 ---

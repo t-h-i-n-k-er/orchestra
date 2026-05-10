@@ -36,13 +36,18 @@ fn cert_fingerprint(pem_bytes: &[u8]) -> Option<String> {
     let start = text.find("-----BEGIN CERTIFICATE-----")?;
     let rest = &text[start + 27..];
     let end = rest.find("-----END CERTIFICATE-----")?;
-    let b64: String = rest[..end]
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    let der = base64::engine::general_purpose::STANDARD.decode(&b64).ok()?;
+    let b64: String = rest[..end].chars().filter(|c| !c.is_whitespace()).collect();
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(&b64)
+        .ok()?;
     let digest = Sha256::digest(&der);
-    Some(digest.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(""))
+    Some(
+        digest
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(""),
+    )
 }
 
 pub async fn build(cert: Option<&Path>, key: Option<&Path>) -> Result<RustlsConfig> {
@@ -238,19 +243,15 @@ impl rustls::server::danger::ClientCertVerifier for CnOuVerifier {
         end_entity: &rustls::pki_types::CertificateDer<'_>,
         intermediates: &[rustls::pki_types::CertificateDer<'_>],
         now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<
-        rustls::server::danger::ClientCertVerified,
-        rustls::Error,
-    > {
+    ) -> std::result::Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         // Delegate chain trust to WebPkiClientVerifier first.
         self.inner
             .verify_client_cert(end_entity, intermediates, now)?;
 
         // CN restriction.
         if !self.allowed_cns.is_empty() {
-            let cn = extract_cn(end_entity).ok_or_else(|| {
-                rustls::Error::General("client cert CN extraction failed".into())
-            })?;
+            let cn = extract_cn(end_entity)
+                .ok_or_else(|| rustls::Error::General("client cert CN extraction failed".into()))?;
             if !self.allowed_cns.iter().any(|a| *a == cn) {
                 return Err(rustls::Error::General(
                     format!("client cert CN '{cn}' not in mtls_allowed_cns").into(),
@@ -260,9 +261,8 @@ impl rustls::server::danger::ClientCertVerifier for CnOuVerifier {
 
         // OU restriction.
         if !self.allowed_ous.is_empty() {
-            let ou = extract_ou(end_entity).ok_or_else(|| {
-                rustls::Error::General("client cert OU extraction failed".into())
-            })?;
+            let ou = extract_ou(end_entity)
+                .ok_or_else(|| rustls::Error::General("client cert OU extraction failed".into()))?;
             if !self.allowed_ous.iter().any(|a| *a == ou) {
                 return Err(rustls::Error::General(
                     format!("client cert OU '{ou}' not in mtls_allowed_ous").into(),
@@ -273,7 +273,10 @@ impl rustls::server::danger::ClientCertVerifier for CnOuVerifier {
         // P2-16: CRL-based revocation check.  If a CRL is loaded, reject
         // any client certificate whose serial number appears in the list.
         if let Ok(serial) = extract_cert_serial(end_entity) {
-            let revoked = self.revoked_serials.read().unwrap_or_else(|p| p.into_inner());
+            let revoked = self
+                .revoked_serials
+                .read()
+                .unwrap_or_else(|p| p.into_inner());
             if revoked.iter().any(|r| *r == serial) {
                 return Err(rustls::Error::General(
                     format!("client cert serial {serial} is revoked (CRL)").into(),
@@ -312,7 +315,10 @@ impl rustls::server::danger::ClientCertVerifier for CnOuVerifier {
 pub fn reload_crl_on_verifier(verifier: &CnOuVerifier, pem_path: &Path) -> anyhow::Result<usize> {
     let serials = load_crl_serials(pem_path)?;
     let count = serials.len();
-    let mut guard = verifier.revoked_serials.write().unwrap_or_else(|p| p.into_inner());
+    let mut guard = verifier
+        .revoked_serials
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
     *guard = serials;
     Ok(count)
 }
@@ -327,7 +333,8 @@ fn load_crl_serials(pem_path: &Path) -> anyhow::Result<Vec<String>> {
     let mut rest = text;
     while let Some(s) = rest.find("-----BEGIN X509 CRL-----") {
         let body = &rest[s + "-----BEGIN X509 CRL-----".len()..];
-        let e = body.find("-----END X509 CRL-----")
+        let e = body
+            .find("-----END X509 CRL-----")
             .context("malformed CRL PEM: missing END marker")?;
         let b64: String = body[..e].chars().filter(|c| !c.is_whitespace()).collect();
         let der = base64::engine::general_purpose::STANDARD
@@ -422,12 +429,16 @@ fn extract_cert_serial(cert: &rustls::pki_types::CertificateDer<'_>) -> anyhow::
     //   }
     // }
     // Outer SEQUENCE
-    if der.len() < 4 || der[0] != 0x30 { anyhow::bail!("not a valid certificate DER"); }
+    if der.len() < 4 || der[0] != 0x30 {
+        anyhow::bail!("not a valid certificate DER");
+    }
     let (outer_len, outer_hl) = read_asn1_length(&der[1..]);
     let _ = outer_len;
     let mut i = 1 + outer_hl;
     // Inner SEQUENCE (TBSCertificate)
-    if i >= der.len() || der[i] != 0x30 { anyhow::bail!("no TBSCertificate SEQUENCE"); }
+    if i >= der.len() || der[i] != 0x30 {
+        anyhow::bail!("no TBSCertificate SEQUENCE");
+    }
     let (tbs_len, tbs_hl) = read_asn1_length(&der[i + 1..]);
     let _ = tbs_len;
     let tbs_start = i + 1 + tbs_hl;
@@ -438,10 +449,14 @@ fn extract_cert_serial(cert: &rustls::pki_types::CertificateDer<'_>) -> anyhow::
         i += 1 + ver_hl + ver_len;
     }
     // Serial number INTEGER
-    if i >= der.len() || der[i] != 0x02 { anyhow::bail!("serial number not found"); }
+    if i >= der.len() || der[i] != 0x02 {
+        anyhow::bail!("serial number not found");
+    }
     let (sn_len, sn_hl) = read_asn1_length(&der[i + 1..]);
     let sn_start = i + 1 + sn_hl;
-    if sn_start + sn_len > der.len() { anyhow::bail!("serial number truncated"); }
+    if sn_start + sn_len > der.len() {
+        anyhow::bail!("serial number truncated");
+    }
     let serial_bytes = &der[sn_start..sn_start + sn_len];
     Ok(serial_bytes.iter().map(|b| format!("{:02x}", b)).collect())
 }
@@ -467,22 +482,29 @@ fn extract_cert_serial(cert: &rustls::pki_types::CertificateDer<'_>) -> anyhow::
 /// retain a reference to the verifier for runtime CRL reload (P2-16).
 pub fn build_agent_tls_config(
     server_cfg: &crate::config::ServerConfig,
-) -> anyhow::Result<(std::sync::Arc<rustls::ServerConfig>, Option<std::sync::Arc<CnOuVerifier>>)> {
+) -> anyhow::Result<(
+    std::sync::Arc<rustls::ServerConfig>,
+    Option<std::sync::Arc<CnOuVerifier>>,
+)> {
     use anyhow::Context as _;
 
     // ── 1. Load CA certificate(s) ─────────────────────────────────────────
-    let ca_path = server_cfg
-        .mtls_ca_cert_path
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("mtls_enabled = true requires mtls_ca_cert_path to be set"))?;
+    let ca_path = server_cfg.mtls_ca_cert_path.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("mtls_enabled = true requires mtls_ca_cert_path to be set")
+    })?;
     let ca_pem = std::fs::read(ca_path)
         .with_context(|| format!("reading mTLS CA cert from {}", ca_path.display()))?;
     let mut roots = rustls::RootCertStore::empty();
     for cert in parse_pem_certs(&ca_pem)? {
-        roots.add(cert).context("adding CA cert to mTLS root store")?;
+        roots
+            .add(cert)
+            .context("adding CA cert to mTLS root store")?;
     }
     if roots.is_empty() {
-        anyhow::bail!("no certificates found in mtls_ca_cert_path {}", ca_path.display());
+        anyhow::bail!(
+            "no certificates found in mtls_ca_cert_path {}",
+            ca_path.display()
+        );
     }
 
     // ── 2. Build client cert verifier ─────────────────────────────────────
@@ -490,13 +512,14 @@ pub fn build_agent_tls_config(
         .build()
         .map_err(|e| anyhow::anyhow!("WebPkiClientVerifier build: {e:?}"))?;
 
-    let cnou_verifier: Option<std::sync::Arc<CnOuVerifier>> =
-        if !server_cfg.mtls_allowed_cns.is_empty()
-            || !server_cfg.mtls_allowed_ous.is_empty()
-            || server_cfg.mtls_crl_path.is_some()
-        {
-            // P2-16: Load CRL serials if a CRL path is configured.
-            let revoked_serials = match &server_cfg.mtls_crl_path {
+    let cnou_verifier: Option<std::sync::Arc<CnOuVerifier>> = if !server_cfg
+        .mtls_allowed_cns
+        .is_empty()
+        || !server_cfg.mtls_allowed_ous.is_empty()
+        || server_cfg.mtls_crl_path.is_some()
+    {
+        // P2-16: Load CRL serials if a CRL path is configured.
+        let revoked_serials = match &server_cfg.mtls_crl_path {
                 Some(crl_path) => load_crl_serials(crl_path)
                     .unwrap_or_else(|e| {
                         tracing::warn!(path = %crl_path.display(), error = %e, "CRL load failed; proceeding with empty revocation list");
@@ -504,20 +527,21 @@ pub fn build_agent_tls_config(
                     }),
                 None => Vec::new(),
             };
-            Some(std::sync::Arc::new(CnOuVerifier {
-                inner: wv.clone(),
-                allowed_cns: server_cfg.mtls_allowed_cns.clone(),
-                allowed_ous: server_cfg.mtls_allowed_ous.clone(),
-                revoked_serials: std::sync::RwLock::new(revoked_serials),
-            }))
-        } else {
-            None
-        };
-
-    let verifier: std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier> = match &cnou_verifier {
-        Some(v) => v.clone() as std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>,
-        None => wv,
+        Some(std::sync::Arc::new(CnOuVerifier {
+            inner: wv.clone(),
+            allowed_cns: server_cfg.mtls_allowed_cns.clone(),
+            allowed_ous: server_cfg.mtls_allowed_ous.clone(),
+            revoked_serials: std::sync::RwLock::new(revoked_serials),
+        }))
+    } else {
+        None
     };
+
+    let verifier: std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier> =
+        match &cnou_verifier {
+            Some(v) => v.clone() as std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>,
+            None => wv,
+        };
 
     // ── 3. Load server certificate and key ────────────────────────────────
     let cert_path = server_cfg.tls_cert_path.as_ref().ok_or_else(|| {
@@ -558,4 +582,3 @@ pub fn build_agent_tls_config(
 
     Ok((std::sync::Arc::new(cfg), cnou_verifier))
 }
-

@@ -16,9 +16,7 @@ mod exec_tests {
     /// pointer to the start of that page.  The caller is responsible for
     /// munmap-ing the returned pointer when done.
     unsafe fn alloc_exec_page(code: &[u8]) -> *mut u8 {
-        use libc::{
-            mmap, mprotect, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE,
-        };
+        use libc::{mmap, mprotect, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
         let page_size: usize = 4096;
         let len = ((code.len() + page_size - 1) / page_size) * page_size;
 
@@ -68,7 +66,7 @@ mod exec_tests {
         0x48, 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00, // MOV rax, 0
         0x48, 0x03, 0xC7, // ADD rax, rdi
         0x48, 0x03, 0xC7, // ADD rax, rdi
-        0xC3,             // RET
+        0xC3, // RET
     ];
 
     /// Machine code with a conditional branch (two basic blocks), for testing
@@ -89,11 +87,11 @@ mod exec_tests {
     ///   C3                       RET
     const BRANCH_CODE: &[u8] = &[
         0x48, 0x85, 0xFF, // TEST rdi, rdi
-        0x74, 0x05,       // JZ +5 (→ byte 10 = start of MOV rax, 99)
+        0x74, 0x05, // JZ +5 (→ byte 10 = start of MOV rax, 99)
         0x48, 0x8D, 0x47, 0x01, // LEA rax, [rdi+1]
-        0xC3,             // RET
+        0xC3, // RET
         0x48, 0xC7, 0xC0, 0x63, 0x00, 0x00, 0x00, // MOV rax, 99
-        0xC3,             // RET
+        0xC3, // RET
     ];
 
     /// Verify that the byte sequence in BRANCH_CODE is well-formed by

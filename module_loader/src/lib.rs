@@ -35,11 +35,11 @@ use anyhow::{anyhow, Result};
 use common::CryptoSession;
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 #[cfg(not(windows))]
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::sync::Arc;
 use tracing::info;
 
 /// Manual PE-map loader (Windows only, requires the `manual-map` feature).
@@ -119,7 +119,13 @@ pub struct PluginVTableExt {
     /// is owned by the plugin and must be freed with `free_metadata`.
     /// On success returns 0 and writes a heap-allocated buffer.
     /// On error returns non-zero.
-    pub get_metadata: Option<unsafe extern "C" fn(this: *mut PluginObject, out_ptr: *mut *mut u8, out_len: *mut usize) -> i32>,
+    pub get_metadata: Option<
+        unsafe extern "C" fn(
+            this: *mut PluginObject,
+            out_ptr: *mut *mut u8,
+            out_len: *mut usize,
+        ) -> i32,
+    >,
 
     /// Free a metadata string previously returned by `get_metadata`.
     pub free_metadata: Option<unsafe extern "C" fn(ptr: *mut u8, len: usize)>,
@@ -128,13 +134,15 @@ pub struct PluginVTableExt {
     /// arbitrary bytes as output.  On success returns 0 and writes a
     /// heap-allocated buffer into `*out_ptr` / `*out_len`.  The caller must
     /// free it via `free_binary_result`.  On error returns non-zero.
-    pub execute_binary: Option<unsafe extern "C" fn(
-        this: *mut PluginObject,
-        in_ptr: *const u8,
-        in_len: usize,
-        out_ptr: *mut *mut u8,
-        out_len: *mut usize,
-    ) -> i32>,
+    pub execute_binary: Option<
+        unsafe extern "C" fn(
+            this: *mut PluginObject,
+            in_ptr: *const u8,
+            in_len: usize,
+            out_ptr: *mut *mut u8,
+            out_len: *mut usize,
+        ) -> i32,
+    >,
 
     /// Free a binary result buffer previously written by `execute_binary`.
     pub free_binary_result: Option<unsafe extern "C" fn(ptr: *mut u8, len: usize)>,
@@ -297,13 +305,24 @@ impl Plugin for FfiPlugin {
         let mut out_ptr: *mut u8 = std::ptr::null_mut();
         let mut out_len: usize = 0;
         let rc = unsafe {
-            execute_fn(self.obj, input.as_ptr(), input.len(), &mut out_ptr, &mut out_len)
+            execute_fn(
+                self.obj,
+                input.as_ptr(),
+                input.len(),
+                &mut out_ptr,
+                &mut out_len,
+            )
         };
         if rc != 0 {
-            return Err(anyhow!("plugin execute_binary() returned error code {}", rc));
+            return Err(anyhow!(
+                "plugin execute_binary() returned error code {}",
+                rc
+            ));
         }
         if out_ptr.is_null() {
-            return Err(anyhow!("plugin execute_binary() returned a null output buffer"));
+            return Err(anyhow!(
+                "plugin execute_binary() returned a null output buffer"
+            ));
         }
         let bytes = unsafe { std::slice::from_raw_parts(out_ptr, out_len).to_vec() };
         if let Some(free_fn) = vtable.free_binary_result {
@@ -337,11 +356,17 @@ impl Drop for FfiPlugin {
     }
 }
 
-fn initialized_plugin(plugin_ptr: *mut PluginObject, ext: Option<*const PluginVTableExt>) -> Result<Box<dyn Plugin>> {
+fn initialized_plugin(
+    plugin_ptr: *mut PluginObject,
+    ext: Option<*const PluginVTableExt>,
+) -> Result<Box<dyn Plugin>> {
     if plugin_ptr.is_null() {
         return Err(anyhow!("_create_plugin() returned a null pointer"));
     }
-    let plugin = Box::new(FfiPlugin { obj: plugin_ptr, ext }) as Box<dyn Plugin>;
+    let plugin = Box::new(FfiPlugin {
+        obj: plugin_ptr,
+        ext,
+    }) as Box<dyn Plugin>;
     plugin.init()?;
     Ok(plugin)
 }
@@ -396,7 +421,11 @@ pub fn load_plugin(
     // P0-15: In release builds, module-signatures without strict-module-key
     // silently falls back to a compile-time key that an attacker could patch.
     // Panic immediately so operators notice the misconfiguration at startup.
-    #[cfg(all(feature = "module-signatures", not(feature = "strict-module-key"), not(debug_assertions)))]
+    #[cfg(all(
+        feature = "module-signatures",
+        not(feature = "strict-module-key"),
+        not(debug_assertions)
+    ))]
     {
         panic!(
             "module-signatures requires strict-module-key in release builds. \
@@ -421,11 +450,9 @@ pub fn load_plugin(
         let (signature_bytes, module_bytes) = decrypted_blob.split_at(64);
         let signature = Signature::from_bytes(signature_bytes.try_into()?);
         let pub_key_bytes: [u8; 32] = if let Some(b64) = verify_key {
-            let raw = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                b64.trim(),
-            )
-            .map_err(|e| anyhow!("module_verify_key is not valid base64: {e}"))?;
+            let raw =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64.trim())
+                    .map_err(|e| anyhow!("module_verify_key is not valid base64: {e}"))?;
             raw.try_into()
                 .map_err(|_| anyhow!("module_verify_key must be exactly 32 bytes"))?
         } else {
@@ -598,9 +625,7 @@ pub fn load_plugin(
     // 4. Try to resolve optional extended vtable symbol.
     let ext: Option<*const PluginVTableExt> = unsafe {
         library
-            .get::<unsafe extern "C" fn() -> *const PluginVTableExt>(
-                b"_get_plugin_vtable_ext\0",
-            )
+            .get::<unsafe extern "C" fn() -> *const PluginVTableExt>(b"_get_plugin_vtable_ext\0")
             .ok()
             .map(|sym| sym())
     };
@@ -624,8 +649,8 @@ mod tests {
     /// scope so it can NEVER leak into a non-test build.
     #[cfg(feature = "module-signatures")]
     const MODULE_TEST_SIGNING_SEED: [u8; 32] = [
-        0x3, 0x6a, 0x2e, 0x3c, 0x3a, 0x3e, 0x5c, 0x1d, 0x5a, 0x4, 0x1b, 0x2, 0x1d, 0x5e, 0x4, 0x4, 0x4,
-        0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+        0x3, 0x6a, 0x2e, 0x3c, 0x3a, 0x3e, 0x5c, 0x1d, 0x5a, 0x4, 0x1b, 0x2, 0x1d, 0x5e, 0x4, 0x4,
+        0x4, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
     ];
 
     // This test requires the `hello_plugin` to be built first.
@@ -718,8 +743,8 @@ mod tests {
         let plugin_bytes = fs::read(plugin_path).unwrap();
         let session = CryptoSession::from_shared_secret(b"test-key");
         let encrypted_blob = session.encrypt(&plugin_bytes);
-        let plugin =
-            load_plugin(&encrypted_blob, &session, None).expect("Failed to load plugin with manual map");
+        let plugin = load_plugin(&encrypted_blob, &session, None)
+            .expect("Failed to load plugin with manual map");
         let result = plugin
             .execute("ManualMap")
             .expect("Plugin execution failed");

@@ -189,7 +189,10 @@ pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
         // Redirector management endpoints (authed for operator use).
         .route("/redirector/list", get(crate::redirector::handle_list))
         .route("/redirector/remove", post(crate::redirector::handle_remove))
-        .route("/redirector/register", post(crate::redirector::handle_register))
+        .route(
+            "/redirector/register",
+            post(crate::redirector::handle_register),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
@@ -259,10 +262,7 @@ async fn list_agents_mesh(State(state): State<Arc<AppState>>) -> Json<Vec<MeshAg
         .iter()
         .map(|a| {
             let node = mesh.get_node(&a.agent_id);
-            let directly_connected = node
-                .as_ref()
-                .map(|n| n.directly_connected)
-                .unwrap_or(true); // If not in mesh graph, assume direct
+            let directly_connected = node.as_ref().map(|n| n.directly_connected).unwrap_or(true); // If not in mesh graph, assume direct
 
             let hop_count = node.as_ref().map(|n| n.hop_count).unwrap_or(0);
             let link_count = node.as_ref().map(|n| n.link_count).unwrap_or(0);
@@ -338,8 +338,12 @@ async fn open_shell(
     };
     let reply = dispatch_command(state, user, entry, req).await?;
     let output = reply.0.output.unwrap_or_default();
-    let info: common::ShellInfo = serde_json::from_str(&output)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to parse shell info: {e}")))?;
+    let info: common::ShellInfo = serde_json::from_str(&output).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to parse shell info: {e}"),
+        )
+    })?;
     Ok(Json(OpenShellReply {
         session_id: info.session_id,
         info,
@@ -417,8 +421,12 @@ async fn shell_list(
     };
     let reply = dispatch_command(state, user, entry, req).await?;
     let output = reply.0.output.unwrap_or_default();
-    let list: Vec<common::ShellInfo> = serde_json::from_str(&output)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to parse shell list: {e}")))?;
+    let list: Vec<common::ShellInfo> = serde_json::from_str(&output).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to parse shell list: {e}"),
+        )
+    })?;
     Ok(Json(list))
 }
 
@@ -427,10 +435,7 @@ async fn shell_list(
 /// The signature covers `SHA-256(module_bytes) || module_bytes` so that
 /// the verifier can check both integrity and authenticity in one shot.
 /// Returns `[64-byte Ed25519 signature][module_bytes]`.
-pub fn sign_module(
-    signing_key: &ed25519_dalek::SigningKey,
-    module_bytes: &[u8],
-) -> Vec<u8> {
+pub fn sign_module(signing_key: &ed25519_dalek::SigningKey, module_bytes: &[u8]) -> Vec<u8> {
     // Compute SHA-256(module_bytes) || module_bytes.
     let hash = Sha256::digest(module_bytes);
     let mut msg = Vec::with_capacity(32 + module_bytes.len());
@@ -445,40 +450,46 @@ pub fn sign_module(
 }
 
 /// Load the Ed25519 signing key from server config (base64-encoded 32-byte seed).
-pub fn load_signing_key(state: &AppState) -> Result<ed25519_dalek::SigningKey, (StatusCode, String)> {
-    let b64 = state
-        .config
-        .module_signing_key
-        .as_ref()
-        .ok_or((
+pub fn load_signing_key(
+    state: &AppState,
+) -> Result<ed25519_dalek::SigningKey, (StatusCode, String)> {
+    let b64 = state.config.module_signing_key.as_ref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "module_signing_key not configured on server".into(),
+    ))?;
+    let bytes = B64.decode(b64).map_err(|_| {
+        (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "module_signing_key not configured on server".into(),
-        ))?;
-    let bytes = B64
-        .decode(b64)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "module_signing_key is not valid base64".into()))?;
-    let seed: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "module_signing_key must be exactly 32 bytes".into()))?;
+            "module_signing_key is not valid base64".into(),
+        )
+    })?;
+    let seed: [u8; 32] = bytes.try_into().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "module_signing_key must be exactly 32 bytes".into(),
+        )
+    })?;
     Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
 }
 
 /// Load the module AES key from server config and build a `CryptoSession`.
 pub fn load_module_crypto(state: &AppState) -> Result<CryptoSession, (StatusCode, String)> {
-    let b64 = state
-        .config
-        .module_aes_key
-        .as_ref()
-        .ok_or((
+    let b64 = state.config.module_aes_key.as_ref().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "module_aes_key not configured on server".into(),
+    ))?;
+    let bytes = B64.decode(b64).map_err(|_| {
+        (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "module_aes_key not configured on server".into(),
-        ))?;
-    let bytes = B64
-        .decode(b64)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "module_aes_key is not valid base64".into()))?;
-    let key: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "module_aes_key must be exactly 32 bytes".into()))?;
+            "module_aes_key is not valid base64".into(),
+        )
+    })?;
+    let key: [u8; 32] = bytes.try_into().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "module_aes_key must be exactly 32 bytes".into(),
+        )
+    })?;
     Ok(CryptoSession::from_key(key))
 }
 
@@ -547,9 +558,12 @@ async fn push_module(
     }
 
     // Decode the base64 module binary.
-    let module_bytes = B64
-        .decode(&req.module_data)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "module_data is not valid base64".into()))?;
+    let module_bytes = B64.decode(&req.module_data).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "module_data is not valid base64".into(),
+        )
+    })?;
 
     // Sign the module.
     let signing_key = load_signing_key(&state)?;
@@ -631,15 +645,13 @@ async fn link_agents(
         },
     };
 
-    let entry = state
-        .find_by_agent_id(&req.child_agent_id)
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            format!(
-                "child agent '{}' must be directly connected to issue LinkAgents",
-                req.child_agent_id
-            ),
-        ))?;
+    let entry = state.find_by_agent_id(&req.child_agent_id).ok_or((
+        StatusCode::NOT_FOUND,
+        format!(
+            "child agent '{}' must be directly connected to issue LinkAgents",
+            req.child_agent_id
+        ),
+    ))?;
 
     state.audit.record_simple(
         &req.child_agent_id,
@@ -669,15 +681,13 @@ async fn unlink_agent(
         },
     };
 
-    let entry = state
-        .find_by_agent_id(&req.agent_id)
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            format!(
-                "agent '{}' not found or not directly connected",
-                req.agent_id
-            ),
-        ))?;
+    let entry = state.find_by_agent_id(&req.agent_id).ok_or((
+        StatusCode::NOT_FOUND,
+        format!(
+            "agent '{}' not found or not directly connected",
+            req.agent_id
+        ),
+    ))?;
 
     state.audit.record_simple(
         &req.agent_id,
@@ -766,16 +776,30 @@ async fn reload_crl(
         .config
         .mtls_crl_path
         .as_ref()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "mtls_crl_path not configured".into()))?
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "mtls_crl_path not configured".into(),
+            )
+        })?
         .clone();
     let verifier = state
         .mtls_verifier
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .clone()
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "mTLS CRL verifier not available (no CN/OU/CRL configured at startup)".into()))?;
-    let count = crate::tls::reload_crl_on_verifier(&verifier, &crl_path)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("CRL reload failed: {e}")))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "mTLS CRL verifier not available (no CN/OU/CRL configured at startup)".into(),
+            )
+        })?;
+    let count = crate::tls::reload_crl_on_verifier(&verifier, &crl_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("CRL reload failed: {e}"),
+        )
+    })?;
     tracing::info!(
         count,
         operator = %user.id,
@@ -829,9 +853,7 @@ async fn mesh_route(
 /// `GET /api/mesh/broadcast`
 ///
 /// Compute broadcast routes from the server to all reachable agents.
-async fn mesh_broadcast(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+async fn mesh_broadcast(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let mesh = state.mesh_controller.read().await;
     let routes = mesh.broadcast_routes();
 
@@ -879,12 +901,10 @@ async fn mesh_connect(
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<MeshConnectRequest>,
 ) -> Result<Json<CommandReply>, (StatusCode, String)> {
-    let entry = state
-        .find_by_agent_id(&req.agent_id)
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            format!("agent '{}' not found", req.agent_id),
-        ))?;
+    let entry = state.find_by_agent_id(&req.agent_id).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("agent '{}' not found", req.agent_id),
+    ))?;
 
     let cmd = common::Command::MeshConnect {
         target_agent_id: req.target_agent_id.clone(),
@@ -892,9 +912,7 @@ async fn mesh_connect(
         target_addr: req.target_addr.clone(),
     };
 
-    let cmd_req = CommandRequest {
-        command: cmd,
-    };
+    let cmd_req = CommandRequest { command: cmd };
 
     state.audit.record_simple(
         &req.agent_id,
@@ -924,20 +942,16 @@ async fn mesh_disconnect(
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<MeshDisconnectRequest>,
 ) -> Result<Json<CommandReply>, (StatusCode, String)> {
-    let entry = state
-        .find_by_agent_id(&req.agent_id)
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            format!("agent '{}' not found", req.agent_id),
-        ))?;
+    let entry = state.find_by_agent_id(&req.agent_id).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("agent '{}' not found", req.agent_id),
+    ))?;
 
     let cmd = common::Command::MeshDisconnect {
         target_agent_id: req.target_agent_id.clone(),
     };
 
-    let cmd_req = CommandRequest {
-        command: cmd,
-    };
+    let cmd_req = CommandRequest { command: cmd };
 
     state.audit.record_simple(
         &req.agent_id,
@@ -953,9 +967,7 @@ async fn mesh_disconnect(
 /// `GET /api/mesh/topology`
 ///
 /// Return the full mesh topology with nodes and edges.
-async fn mesh_topology(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+async fn mesh_topology(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let mesh = state.mesh_controller.read().await;
     let topo = mesh.topology();
 
@@ -1001,9 +1013,7 @@ async fn mesh_topology(
 /// `GET /api/mesh/stats`
 ///
 /// Return mesh statistics.
-async fn mesh_stats(
-    State(state): State<Arc<AppState>>,
-) -> Json<crate::mesh_controller::MeshStats> {
+async fn mesh_stats(State(state): State<Arc<AppState>>) -> Json<crate::mesh_controller::MeshStats> {
     let mesh = state.mesh_controller.read().await;
     Json(mesh.stats())
 }
@@ -1033,12 +1043,14 @@ async fn mesh_kill_switch(
     let mut errors = 0;
 
     let targets: Vec<_> = if let Some(ref agent_id) = req.agent_id {
-        state.find_by_agent_id(agent_id)
+        state
+            .find_by_agent_id(agent_id)
             .map(|e| (e.agent_id.clone(), e.tx.clone()))
             .into_iter()
             .collect()
     } else {
-        state.registry
+        state
+            .registry
             .iter()
             .map(|e| (e.agent_id.clone(), e.tx.clone()))
             .collect()
@@ -1046,11 +1058,14 @@ async fn mesh_kill_switch(
 
     for (agent_id, tx) in targets {
         let task_id = uuid::Uuid::new_v4().to_string();
-        match tx.send(Message::TaskRequest {
-            task_id,
-            command: cmd.clone(),
-            operator_id: None,
-        }).await {
+        match tx
+            .send(Message::TaskRequest {
+                task_id,
+                command: cmd.clone(),
+                operator_id: None,
+            })
+            .await
+        {
             Ok(()) => {
                 tracing::info!(agent_id = %agent_id, "mesh kill switch sent");
                 sent += 1;
@@ -1092,12 +1107,10 @@ async fn mesh_quarantine(
 ) -> Result<Json<CommandReply>, (StatusCode, String)> {
     // P1-26: Admin-only — quarantining a mesh node is a destructive operation.
     user.require_any_permission(&["admin"])?;
-    let entry = state
-        .find_by_agent_id(&req.agent_id)
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            format!("no agent with agent_id '{}'", req.agent_id),
-        ))?;
+    let entry = state.find_by_agent_id(&req.agent_id).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("no agent with agent_id '{}'", req.agent_id),
+    ))?;
 
     let task_id = uuid::Uuid::new_v4().to_string();
     entry
@@ -1111,7 +1124,12 @@ async fn mesh_quarantine(
             operator_id: None,
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("send failed: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("send failed: {e}"),
+            )
+        })?;
 
     tracing::info!(
         agent_id = %req.agent_id,
@@ -1142,12 +1160,10 @@ async fn mesh_clear_quarantine(
 ) -> Result<Json<CommandReply>, (StatusCode, String)> {
     // P1-26: Write-level — clearing quarantine modifies mesh state.
     user.require_any_permission(&["write", "admin"])?;
-    let entry = state
-        .find_by_agent_id(&req.agent_id)
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            format!("no agent with agent_id '{}'", req.agent_id),
-        ))?;
+    let entry = state.find_by_agent_id(&req.agent_id).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("no agent with agent_id '{}'", req.agent_id),
+    ))?;
 
     let task_id = uuid::Uuid::new_v4().to_string();
     entry
@@ -1160,7 +1176,12 @@ async fn mesh_clear_quarantine(
             operator_id: None,
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("send failed: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("send failed: {e}"),
+            )
+        })?;
 
     tracing::info!(agent_id = %req.agent_id, "mesh clear-quarantine command sent");
 
@@ -1189,12 +1210,10 @@ async fn mesh_set_compartment(
 ) -> Result<Json<CommandReply>, (StatusCode, String)> {
     // P1-26: Write-level — setting compartments modifies mesh state.
     user.require_any_permission(&["write", "admin"])?;
-    let entry = state
-        .find_by_agent_id(&req.agent_id)
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            format!("no agent with agent_id '{}'", req.agent_id),
-        ))?;
+    let entry = state.find_by_agent_id(&req.agent_id).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("no agent with agent_id '{}'", req.agent_id),
+    ))?;
 
     // Update the server-side entry too.
     let conn_id = entry.connection_id.clone();
@@ -1213,7 +1232,12 @@ async fn mesh_set_compartment(
             operator_id: None,
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("send failed: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("send failed: {e}"),
+            )
+        })?;
 
     tracing::info!(
         agent_id = %req.agent_id,
@@ -1247,13 +1271,10 @@ async fn send_command_by_agent_id(
 
     // Not directly connected — check if the agent is reachable through
     // the P2P relay chain.
-    let route = state
-        .route_to_agent(&agent_id)
-        .await
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            format!("no agent with agent_id '{agent_id}' (direct or via P2P relay)"),
-        ))?;
+    let route = state.route_to_agent(&agent_id).await.ok_or((
+        StatusCode::NOT_FOUND,
+        format!("no agent with agent_id '{agent_id}' (direct or via P2P relay)"),
+    ))?;
 
     // The route is: [(directly_connected_agent, link_id), ..., (last_parent, link_id)]
     // Build the routing blob from inside out:
@@ -1296,14 +1317,10 @@ async fn send_command_by_agent_id(
 
     // Send the outermost P2pToChild to the directly-connected agent.
     let first_hop_agent_id = route[0].0.clone();
-    let first_hop_entry = state
-        .find_by_agent_id(&first_hop_agent_id)
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            format!(
-                "first-hop agent '{first_hop_agent_id}' is no longer connected"
-            ),
-        ))?;
+    let first_hop_entry = state.find_by_agent_id(&first_hop_agent_id).ok_or((
+        StatusCode::NOT_FOUND,
+        format!("first-hop agent '{first_hop_agent_id}' is no longer connected"),
+    ))?;
 
     let first_link_id = route[0].1;
     let p2p_msg = Message::P2pToChild {
@@ -1394,9 +1411,13 @@ async fn dispatch_command(
 
     if entry.tx.send(request).await.is_err() {
         state.pending.remove(&task_id);
-        state
-            .audit
-            .record_simple(&agent_id, &user.id, cmd_label, &cmd_detail, Outcome::Failure);
+        state.audit.record_simple(
+            &agent_id,
+            &user.id,
+            cmd_label,
+            &cmd_detail,
+            Outcome::Failure,
+        );
         return Err((StatusCode::BAD_GATEWAY, "agent disconnected".into()));
     }
 
@@ -1416,9 +1437,13 @@ async fn dispatch_command(
                     "MorphNow completed — .text hash recorded"
                 );
             }
-            state
-                .audit
-                .record_simple(&agent_id, &user.id, cmd_label, &cmd_detail, Outcome::Success);
+            state.audit.record_simple(
+                &agent_id,
+                &user.id,
+                cmd_label,
+                &cmd_detail,
+                Outcome::Success,
+            );
             Ok(Json(CommandReply {
                 task_id,
                 outcome: "ok",
@@ -1427,9 +1452,13 @@ async fn dispatch_command(
             }))
         }
         Ok(Ok(Err(err))) => {
-            state
-                .audit
-                .record_simple(&agent_id, &user.id, cmd_label, &cmd_detail, Outcome::Failure);
+            state.audit.record_simple(
+                &agent_id,
+                &user.id,
+                cmd_label,
+                &cmd_detail,
+                Outcome::Failure,
+            );
             Ok(Json(CommandReply {
                 task_id,
                 outcome: "error",
@@ -1468,24 +1497,55 @@ async fn dispatch_command(
 fn sanitize_command_for_audit(cmd: &Command) -> String {
     match cmd {
         Command::ShellInput { session_id, data } => {
-            format!("ShellInput {{ session_id: {session_id}, data: [{} bytes redacted] }}", data.len())
+            format!(
+                "ShellInput {{ session_id: {session_id}, data: [{} bytes redacted] }}",
+                data.len()
+            )
         }
         Command::WriteFile { path, content } => {
-            format!("WriteFile {{ path: {path}, content: [{} bytes redacted] }}", content.len())
+            format!(
+                "WriteFile {{ path: {path}, content: [{} bytes redacted] }}",
+                content.len()
+            )
         }
-        Command::MakeToken { username, domain, logon_type, .. } => {
+        Command::MakeToken {
+            username,
+            domain,
+            logon_type,
+            ..
+        } => {
             format!("MakeToken {{ username: {username}, domain: {domain}, logon_type: {logon_type}, password: [redacted] }}")
         }
-        Command::PsExec { target_host, command, username, .. } => {
+        Command::PsExec {
+            target_host,
+            command,
+            username,
+            ..
+        } => {
             format!("PsExec {{ target_host: {target_host}, command: {command}, username: {username:?}, password: [redacted] }}")
         }
-        Command::WmiExec { target_host, command, username, .. } => {
+        Command::WmiExec {
+            target_host,
+            command,
+            username,
+            ..
+        } => {
             format!("WmiExec {{ target_host: {target_host}, command: {command}, username: {username:?}, password: [redacted] }}")
         }
-        Command::DcomExec { target_host, command, username, .. } => {
+        Command::DcomExec {
+            target_host,
+            command,
+            username,
+            ..
+        } => {
             format!("DcomExec {{ target_host: {target_host}, command: {command}, username: {username:?}, password: [redacted] }}")
         }
-        Command::WinRmExec { target_host, command, username, .. } => {
+        Command::WinRmExec {
+            target_host,
+            command,
+            username,
+            ..
+        } => {
             format!("WinRmExec {{ target_host: {target_host}, command: {command}, username: {username:?}, password: [redacted] }}")
         }
         // All other variants are safe to serialize as-is.
@@ -1587,9 +1647,8 @@ async fn ws_handler(
             .unwrap_or(origin);
         let origin_host = origin_host.split(':').next().unwrap_or(origin_host);
         let request_host = host.split(':').next().unwrap_or(host);
-        let allowed = origin_host == request_host
-            || origin_host == "localhost"
-            || origin_host == "127.0.0.1";
+        let allowed =
+            origin_host == request_host || origin_host == "localhost" || origin_host == "127.0.0.1";
         if !allowed {
             tracing::warn!(%origin, "WebSocket rejected: disallowed Origin header");
             return (StatusCode::FORBIDDEN, "disallowed origin").into_response();
@@ -1636,7 +1695,9 @@ async fn ws_handler(
 
     // Echo a random session ID instead of the real token.
     let session_id = uuid::Uuid::new_v4().to_string();
-    state.ws_sessions.insert(session_id.clone(), "admin".to_string());
+    state
+        .ws_sessions
+        .insert(session_id.clone(), "admin".to_string());
     let subprotocol = format!("bearer.{}", session_id);
     ws.protocols([subprotocol])
         .on_upgrade(move |sock| ws_loop(sock, state, session_id))
@@ -1729,7 +1790,8 @@ async fn get_server_fingerprint(
     let cert_path = state.config.tls_cert_path.as_ref().ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
-            "no TLS certificate path configured; server may be using an ephemeral self-signed cert".into(),
+            "no TLS certificate path configured; server may be using an ephemeral self-signed cert"
+                .into(),
         )
     })?;
 
@@ -1742,9 +1804,8 @@ async fn get_server_fingerprint(
 
     // Parse the first PEM block and compute its SHA-256 fingerprint.
     let pem_str = String::from_utf8_lossy(&pem_bytes);
-    let fingerprint = compute_cert_fingerprint_from_pem(&pem_str).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, e)
-    })?;
+    let fingerprint = compute_cert_fingerprint_from_pem(&pem_str)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({ "fingerprint": fingerprint })))
 }

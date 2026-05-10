@@ -96,7 +96,7 @@ fn arp_scan_cmd() -> Result<Vec<ArpEntry>, String> {
     // enumeration (e.g. sysctl NET_RT_FLAGS on macOS/BSD) to eliminate the
     // subprocess entirely on non-Linux Unix.
     let output = crate::process_spoof::execute_command("arp", &["-a"], true)
-        .map_err(|e| format!("failed to run arp -a: {e}"))?;;
+        .map_err(|e| format!("failed to run arp -a: {e}"))?;
     if !output.status.success() {
         return Err(format!("arp -a exited with status {}", output.status));
     }
@@ -409,9 +409,9 @@ mod dns_windows {
     #[repr(C)]
     #[derive(Copy, Clone)]
     union DNS_RECORD_DATA {
-        ptr_name: *mut u16,     // DNS_TYPE_PTR
-        srv: DnsSrvData,       // DNS_TYPE_SRV
-        padding: [u8; 16],     // enough for any variant
+        ptr_name: *mut u16, // DNS_TYPE_PTR
+        srv: DnsSrvData,    // DNS_TYPE_SRV
+        padding: [u8; 16],  // enough for any variant
     }
 
     #[repr(C)]
@@ -447,7 +447,9 @@ mod dns_windows {
                 f(records, 0);
             }
             None => {
-                log::warn!("[net_discovery] could not resolve DnsRecordListFree — leaking DNS records");
+                log::warn!(
+                    "[net_discovery] could not resolve DnsRecordListFree — leaking DNS records"
+                );
             }
         }
     }
@@ -476,12 +478,12 @@ mod dns_windows {
         options: u32,
     ) -> Result<*mut DNS_RECORD, String> {
         type FnDnsQueryW = unsafe extern "system" fn(
-            *const u16,        // Name
-            u16,               // Type
-            u32,               // Options
-            *mut c_void,       // Extra
+            *const u16,           // Name
+            u16,                  // Type
+            u32,                  // Options
+            *mut c_void,          // Extra
             *mut *mut DNS_RECORD, // Result
-            *mut *mut c_void,  // Reserved
+            *mut *mut c_void,     // Reserved
         ) -> i32;
 
         let dns_query_w: FnDnsQueryW = resolve_dnsapi_fn(b"DnsQuery_W\0")
@@ -507,7 +509,10 @@ mod dns_windows {
     /// Resolve the reverse DNS (PTR) name for an IP address using DnsQuery_W.
     pub fn reverse_dns_lookup(ip: IpAddr) -> Result<Option<String>, String> {
         let ptr_domain = format_reverse_ptr(&ip);
-        let ptr_wide: Vec<u16> = ptr_domain.encode_utf16().chain(std::iter::once(0)).collect();
+        let ptr_wide: Vec<u16> = ptr_domain
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         let records = unsafe { dns_query_raw(&ptr_wide, DNS_TYPE_PTR, DNS_QUERY_NO_LOCAL_NAME) };
 
@@ -555,12 +560,11 @@ mod dns_windows {
             let svc_str = svc.to_string();
             let svc_wide: Vec<u16> = svc_str.encode_utf16().chain(std::iter::once(0)).collect();
 
-            let records = match unsafe {
-                dns_query_raw(&svc_wide, DNS_TYPE_SRV, DNS_QUERY_NO_LOCAL_NAME)
-            } {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+            let records =
+                match unsafe { dns_query_raw(&svc_wide, DNS_TYPE_SRV, DNS_QUERY_NO_LOCAL_NAME) } {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
 
             if records.is_null() {
                 continue;
@@ -674,8 +678,7 @@ mod dns_unix {
     /// P2-22: Run a command with a 10-second timeout using spawn + wait_with_output.
     fn run_with_timeout(mut cmd: std::process::Command) -> Result<std::process::Output, String> {
         use std::process::Stdio;
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return Err(format!("spawn failed: {}", e)),
@@ -685,13 +688,14 @@ mod dns_unix {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    let output = child.wait_with_output().unwrap_or_else(|_| {
-                        std::process::Output {
-                            status,
-                            stdout: Vec::new(),
-                            stderr: Vec::new(),
-                        }
-                    });
+                    let output =
+                        child
+                            .wait_with_output()
+                            .unwrap_or_else(|_| std::process::Output {
+                                status,
+                                stdout: Vec::new(),
+                                stderr: Vec::new(),
+                            });
                     return Ok(output);
                 }
                 Ok(None) => {
@@ -719,9 +723,13 @@ mod dns_unix {
 /// `host` command-line tool.
 pub fn reverse_dns_lookup(ip: IpAddr) -> Result<Option<String>, String> {
     #[cfg(target_os = "windows")]
-    { dns_windows::reverse_dns_lookup(ip) }
+    {
+        dns_windows::reverse_dns_lookup(ip)
+    }
     #[cfg(not(target_os = "windows"))]
-    { dns_unix::reverse_dns_lookup(ip) }
+    {
+        dns_unix::reverse_dns_lookup(ip)
+    }
 }
 
 /// Enumerate DNS SRV records for common Active Directory service names in a
@@ -734,9 +742,13 @@ pub fn reverse_dns_lookup(ip: IpAddr) -> Result<Option<String>, String> {
 /// platforms, falls back to `dig` / `nslookup`.
 pub fn ad_srv_discovery(domain: &str) -> Result<Vec<(String, String, u16)>, String> {
     #[cfg(target_os = "windows")]
-    { dns_windows::ad_srv_discovery(domain) }
+    {
+        dns_windows::ad_srv_discovery(domain)
+    }
     #[cfg(not(target_os = "windows"))]
-    { dns_unix::ad_srv_discovery(domain) }
+    {
+        dns_unix::ad_srv_discovery(domain)
+    }
 }
 
 #[cfg(test)]

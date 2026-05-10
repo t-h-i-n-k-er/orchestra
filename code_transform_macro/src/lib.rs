@@ -7,16 +7,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::process::Command;
 use std::sync::OnceLock;
-use syn::{
-    parse_macro_input,
-    visit::Visit,
-    FnArg,
-    ItemFn,
-    Macro,
-    Pat,
-    ReturnType,
-    Type,
-};
+use syn::{parse_macro_input, visit::Visit, FnArg, ItemFn, Macro, Pat, ReturnType, Type};
 
 // ─── ASM detection ────────────────────────────────────────────────────────────
 
@@ -124,14 +115,22 @@ fn compile_helper_obj(func: &ItemFn) -> Result<std::path::PathBuf, String> {
 
     let temp_dir = std::env::temp_dir().join(unique);
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
-        return Err(format!("failed to create temp dir {}: {}", temp_dir.display(), e));
+        return Err(format!(
+            "failed to create temp dir {}: {}",
+            temp_dir.display(),
+            e
+        ));
     }
 
     let src_path = temp_dir.join("input.rs");
     let obj_path = temp_dir.join("input.o");
     let src = helper_source(func);
     if let Err(e) = std::fs::write(&src_path, src) {
-        return Err(format!("failed to write temp source {}: {}", src_path.display(), e));
+        return Err(format!(
+            "failed to write temp source {}: {}",
+            src_path.display(),
+            e
+        ));
     }
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
@@ -221,7 +220,9 @@ fn parse_objdump_bytes(obj: &std::path::Path) -> Result<Vec<u8>, String> {
     }
 
     if bytes.is_empty() {
-        return Err("could not find function bytes for symbol __ct_target in objdump output".to_string());
+        return Err(
+            "could not find function bytes for symbol __ct_target in objdump output".to_string(),
+        );
     }
 
     if let Some(ret_pos) = bytes.iter().position(|&b| b == 0xC3) {
@@ -242,8 +243,7 @@ fn extract_and_transform(func: &ItemFn, seed: u64) -> Result<Vec<u8>, String> {
     }
     if !transformed.iter().any(|&b| b == 0xC3) {
         return Err(
-            "transformed function bytes do not contain a RET (0xC3); refusing to emit"
-                .to_string(),
+            "transformed function bytes do not contain a RET (0xC3); refusing to emit".to_string(),
         );
     }
     Ok(transformed)

@@ -804,6 +804,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "shellcode_packager",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",

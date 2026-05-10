@@ -38,7 +38,10 @@ mod tests {
             !IOC_DNS_BEACON.is_empty(),
             "DNS beacon prefix must not be empty"
         );
-        assert!(!IOC_DNS_TASK.is_empty(), "DNS task prefix must not be empty");
+        assert!(
+            !IOC_DNS_TASK.is_empty(),
+            "DNS task prefix must not be empty"
+        );
     }
 
     #[test]
@@ -92,9 +95,7 @@ mod tests {
     #[test]
     fn ssh_subsystem_is_alphanumeric() {
         assert!(
-            IOC_SSH_SUBSYSTEM
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric()),
+            IOC_SSH_SUBSYSTEM.chars().all(|c| c.is_ascii_alphanumeric()),
             "SSH subsystem must be alphanumeric: {IOC_SSH_SUBSYSTEM}"
         );
     }
