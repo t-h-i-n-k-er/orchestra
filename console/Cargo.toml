@@ -14,7 +14,7 @@ anyhow = { workspace = true }
 base64 = { workspace = true }
 uuid = { version = "1.0", features = ["v4"] }
 serde_json = "1.0"
-rustls = "0.23.38"
-tokio-rustls = "0.26.4"
+rustls = { version = "0.23.38", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2.2.0"
 rcgen = "0.14.7"

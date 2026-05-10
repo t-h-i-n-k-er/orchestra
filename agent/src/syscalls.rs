@@ -107,9 +107,9 @@ static LINUX_SYSCALL_CACHE: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::ne
 // detect seccomp-blocked syscalls and return a graceful error instead of
 // crashing.
 
-/// Thread-local flag set by the SIGSYS handler when seccomp blocks a syscall.
 #[cfg(all(target_os = "linux", feature = "direct-syscalls"))]
 thread_local! {
+    // Thread-local flag set by the SIGSYS handler when seccomp blocks a syscall.
     static SECCOMP_BLOCKED: std::cell::Cell<bool> = std::cell::Cell::new(false);
 }
 
@@ -141,7 +141,7 @@ pub fn install_sigsys_handler() {
     use std::mem;
 
     let mut sa: libc::sigaction = unsafe { mem::zeroed() };
-    sa.sa_sigaction = sigsys_handler as usize;
+    sa.sa_sigaction = sigsys_handler as *const () as usize;
     // SA_SIGINFO: receive siginfo_t and ucontext in the handler.
     // SA_RESTART: restart interrupted syscalls that aren't the blocked one.
     sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
@@ -2582,7 +2582,7 @@ pub unsafe fn do_syscall(ssn: u32, args: &[u64]) -> Result<u64, i32> {
             6 => {
                 std::arch::asm!("syscall", in("rax") ssn as u64, in("rdi") args[0], in("rsi") args[1], in("rdx") args[2], in("r10") args[3], in("r8") args[4], in("r9") args[5], lateout("rax") ret, lateout("rcx") _, lateout("r11") _)
             }
-            _ => panic!("too many syscall arguments"),
+            _ => return Err(libc::EINVAL),
         }
 
         // Check whether seccomp blocked this syscall (SIGSYS delivered).
@@ -3547,21 +3547,39 @@ pub fn find_jmp_rbx_gadget() -> usize {
         as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
     let size = unsafe { (*nt_headers).OptionalHeader.SizeOfImage } as usize;
     let code = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
-    for i in 0..size.saturating_sub(1) {
-        if code[i] == 0xff && code[i + 1] == 0xe3 {
-            let candidate = base + i;
-            // M-30: Verify the 2-byte gadget doesn't straddle a page boundary
-            // and the memory is committed + executable.
-            if unsafe { gadget_is_valid(candidate, 2) } {
-                return candidate;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        for i in 0..size.saturating_sub(1) {
+            if code[i] == 0xff && code[i + 1] == 0xe3 {
+                let candidate = base + i;
+                // M-30: Verify the 2-byte gadget doesn't straddle a page boundary
+                // and the memory is committed + executable.
+                if unsafe { gadget_is_valid(candidate, 2) } {
+                    return candidate;
+                }
+                // If validation fails, continue searching for another match.
             }
-            // If validation fails, continue searching for another match.
         }
     }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        for i in (0..size.saturating_sub(3)).step_by(4) {
+            let word = u32::from_le_bytes([code[i], code[i + 1], code[i + 2], code[i + 3]]);
+            if word == 0xD61F_0200 {
+                let candidate = base + i;
+                if unsafe { gadget_is_valid(candidate, 4) } {
+                    return candidate;
+                }
+            }
+        }
+    }
+
     0
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 #[doc(hidden)]
 #[inline(never)]
 /// Cross-reference:
@@ -3685,6 +3703,83 @@ pub unsafe fn spoof_call(
         out("r8")  _, out("r9")  _, out("r10") _, out("r11") _,
         out("r14") _, out("r15") _,
         out("rsi") _, out("rdi") _,
+    );
+    status
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+#[doc(hidden)]
+#[inline(never)]
+/// ARM64 stack-spoofing call using a system-module `br x16` gadget.
+pub unsafe fn spoof_call(
+    api_addr: usize,
+    gadget_addr: usize,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    stack_args: &[u64],
+) -> u64 {
+    let effective_gadget = {
+        let tls_addr = get_spoof_ret();
+        if tls_addr != 0 {
+            tls_addr
+        } else {
+            gadget_addr
+        }
+    };
+
+    let status: u64;
+    let nstack = stack_args.len();
+    let stack_ptr = stack_args.as_ptr();
+
+    std::arch::asm!(
+        "stp x19, x20, [sp, #-16]!",
+        "mov x19, sp",
+        "adr x16, 42f",
+        "mov x20, x30",
+
+        "lsl x9, {nstack}, #3",
+        "add x9, x9, #15",
+        "and x9, x9, #0xfffffffffffffff0",
+        "sub sp, sp, x9",
+
+        "cbz {nstack}, 41f",
+        "mov x10, {nstack}",
+        "mov x11, {stack_ptr}",
+        "mov x12, sp",
+        "40:",
+        "ldr x13, [x11], #8",
+        "str x13, [x12], #8",
+        "subs x10, x10, #1",
+        "b.ne 40b",
+
+        "41:",
+        "mov x0, {a1}",
+        "mov x1, {a2}",
+        "mov x2, {a3}",
+        "mov x3, {a4}",
+        "mov x9, {api}",
+        "mov x30, {gadget}",
+        "br x9",
+
+        "42:",
+        "mov sp, x19",
+        "mov x30, x20",
+        "ldp x19, x20, [sp], #16",
+
+        api        = in(reg) api_addr,
+        gadget     = in(reg) effective_gadget,
+        nstack     = in(reg) nstack,
+        stack_ptr  = in(reg) stack_ptr,
+        a1         = in(reg) arg1,
+        a2         = in(reg) arg2,
+        a3         = in(reg) arg3,
+        a4         = in(reg) arg4,
+        lateout("x0") status,
+        out("x1") _, out("x2") _, out("x3") _,
+        out("x9") _, out("x10") _, out("x11") _, out("x12") _, out("x13") _,
+        out("x16") _,
     );
     status
 }
@@ -3870,5 +3965,12 @@ mod linux_direct_syscall_tests {
             crate::syscall!("getpid").expect("syscall! getpid should succeed") as libc::pid_t;
         let libc_pid = unsafe { libc::getpid() };
         assert_eq!(direct, libc_pid, "syscall! pid must match libc getpid");
+    }
+
+    #[test]
+    fn linux_do_syscall_rejects_too_many_args() {
+        let target = get_syscall_id("getpid").expect("getpid syscall id should resolve");
+        let err = unsafe { do_syscall(target.ssn, &[0, 1, 2, 3, 4, 5, 6]) }.unwrap_err();
+        assert_eq!(err, libc::EINVAL);
     }
 }

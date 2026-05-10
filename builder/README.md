@@ -38,14 +38,24 @@ orchestra-builder setup --auto-install
 install hints when anything is missing:
 
 - `cargo` and `rustup`
-- A working C toolchain (`cc` / `cl.exe`) and `pkg-config`
-- `mingw-w64` (on Linux hosts) for cross-compiling Windows binaries
-- The Rust targets `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-gnu`,
-  and `x86_64-apple-darwin`
+- A working host C toolchain (`cc` / `cl.exe`) and `pkg-config`
+- `mingw-w64` on Linux hosts for Windows GNU builds and Windows headers used
+  by the MSVC Zig wrappers
+- `zig` on Linux hosts when building checked Darwin, Windows MSVC, or Linux
+  ARM64 targets that include C build scripts such as `ring`
+- The Rust targets `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+  `x86_64-pc-windows-gnu`, `aarch64-pc-windows-msvc`,
+  `x86_64-apple-darwin`, and `aarch64-apple-darwin`
 
 The builder *never* runs `sudo` automatically. System-package commands are
 printed for you to copy-paste; only `rustup target add` is run automatically
 (and only with `--auto-install`, after a `y/N` confirmation prompt).
+
+The profile-to-target mapping is currently `windows/x86_64` →
+`x86_64-pc-windows-gnu` and `windows/aarch64` →
+`aarch64-pc-windows-msvc`. The workspace also checks
+`x86_64-pc-windows-msvc`; add that Rust target manually when you need the
+MSVC x64 build outside the Builder profile flow.
 
 ## 2. Create a profile
 

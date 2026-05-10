@@ -50,6 +50,7 @@ use iced_x86::{Code, Instruction, Register};
 const SENTINEL_IP_BASE: u64 = 0xFFFD_0000_0000_0000;
 
 /// Number of x86_64 predicate families.
+#[cfg(target_arch = "x86_64")]
 const NUM_X86_FAMILIES: u8 = 6;
 
 /// Number of AArch64 predicate families.
@@ -111,9 +112,11 @@ pub fn opaque_predicate_aarch64(rng: &mut impl Rng) -> Vec<u32> {
 const ODD_CONSTANTS: [u32; 8] = [3, 5, 7, 11, 13, 17, 19, 23];
 
 // Helper: known-power-of-2 constants for bit-manipulation predicates.
+#[cfg(target_arch = "x86_64")]
 const POW2_CONSTANTS: [u32; 6] = [1, 2, 4, 8, 16, 32];
 
 // Helper: known constant pairs for hash-based predicates (sum cancels out).
+#[cfg(target_arch = "x86_64")]
 const HASH_CONSTANT_PAIRS: [(u32, u32); 6] = [
     (0xDEAD_BEEF, 0xDEAD_BEEF), // sum - sum = 0
     (0x1234_5678, 0x1234_5678),

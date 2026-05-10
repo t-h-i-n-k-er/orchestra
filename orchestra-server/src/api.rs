@@ -73,6 +73,8 @@ const ALLOWED_SHELLS: &[&str] = &[
     "pwsh.exe",
 ];
 
+const DASHBOARD_WS_PROTOCOL: &str = "orchestra.dashboard.v1";
+
 #[derive(Deserialize)]
 pub struct OpenShellBody {
     /// Optional path to the shell binary.  Must match one of the known-safe
@@ -1655,10 +1657,12 @@ async fn ws_handler(
         }
     }
 
-    // Browsers can't attach `Authorization` to a WebSocket handshake,
-    // so the dashboard sends the bearer token as a subprotocol value
-    // of the form `bearer.<token>`. Validate it here in constant time
-    // before accepting the upgrade.
+    // Browsers can't attach `Authorization` to a WebSocket handshake, so the
+    // dashboard includes a `bearer.<token>` subprotocol for authentication and
+    // also offers `DASHBOARD_WS_PROTOCOL` as the actual negotiated protocol.
+    // Validate the token in constant time before accepting the upgrade, then
+    // select only the stable dashboard protocol so the bearer token is never
+    // echoed in the response header.
     let presented = headers
         .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|v| v.to_str().ok())
@@ -1673,13 +1677,10 @@ async fn ws_handler(
 
     // 1. Try the multi-operator store.
     if let Some((operator_id, _permissions)) = state.authenticate_operator(&token) {
-        // P1-12: Generate a random session ID instead of echoing the real
-        // bearer token in the Sec-WebSocket-Protocol response header.
         let session_id = uuid::Uuid::new_v4().to_string();
         state.ws_sessions.insert(session_id.clone(), operator_id);
-        let subprotocol = format!("bearer.{}", session_id);
         return ws
-            .protocols([subprotocol])
+            .protocols([DASHBOARD_WS_PROTOCOL])
             .on_upgrade(move |sock| ws_loop(sock, state, session_id));
     }
 
@@ -1693,13 +1694,11 @@ async fn ws_handler(
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
 
-    // Echo a random session ID instead of the real token.
     let session_id = uuid::Uuid::new_v4().to_string();
     state
         .ws_sessions
         .insert(session_id.clone(), "admin".to_string());
-    let subprotocol = format!("bearer.{}", session_id);
-    ws.protocols([subprotocol])
+    ws.protocols([DASHBOARD_WS_PROTOCOL])
         .on_upgrade(move |sock| ws_loop(sock, state, session_id))
 }
 

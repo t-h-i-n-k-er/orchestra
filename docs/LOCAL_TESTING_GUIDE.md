@@ -18,8 +18,8 @@ This guide walks you through deploying the Orchestra C2 server and agent on a
 | Requirement | Install |
 |---|---|
 | Rust toolchain (nightly or stable) | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
-| `openssl` | `sudo apt install openssl` |
-| `pkg-config` / `libssl-dev` | `sudo apt install pkg-config libssl-dev` |
+| `openssl` CLI | `sudo apt install openssl` (certificate generation only) |
+| `pkg-config` | Optional for host packages that need it; default TLS builds use Rustls/ring and do not require `libssl-dev` |
 | X11 dev libraries (for `remote-assist`) | `sudo apt install libx11-dev libxrandr-dev libxext-dev` |
 | `libclang` (for `zbus` bindgen, Wayland screenshot) | `sudo apt install libclang-dev` |
 

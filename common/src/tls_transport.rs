@@ -492,11 +492,10 @@ fn cert_validity_period(der: &[u8]) -> Option<(i64, i64)> {
 ///
 /// # Runtime guard (P2-08)
 ///
-/// Every method on this type fires a runtime `debug_assert!` that `cfg!(test)`
-/// is true, so a stray production code-path cannot silently bypass certificate
-/// verification.  (A `debug_assert` is used so that `--release` builds compiled
-/// from test code still pass; the compile-time `#[cfg]` gate remains the
-/// primary barrier.)
+/// This type is available only to crate unit tests or to callers that
+/// explicitly opt into the `dangerous-tls` feature. Integration tests in
+/// downstream crates use that feature because their dependencies are compiled
+/// as normal library builds, not with `cfg(test)` enabled for this crate.
 #[doc(hidden)]
 #[derive(Debug)]
 #[cfg(any(test, feature = "dangerous-tls"))]
@@ -512,10 +511,9 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // P2-08: Guard against production use.
         debug_assert!(
-            cfg!(test),
-            "NoCertificateVerification must never be used outside of test builds"
+            cfg!(test) || cfg!(feature = "dangerous-tls"),
+            "NoCertificateVerification requires test builds or the dangerous-tls feature"
         );
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
@@ -527,8 +525,8 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
         _dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         debug_assert!(
-            cfg!(test),
-            "NoCertificateVerification must never be used outside of test builds"
+            cfg!(test) || cfg!(feature = "dangerous-tls"),
+            "NoCertificateVerification requires test builds or the dangerous-tls feature"
         );
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
@@ -540,8 +538,8 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
         _dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         debug_assert!(
-            cfg!(test),
-            "NoCertificateVerification must never be used outside of test builds"
+            cfg!(test) || cfg!(feature = "dangerous-tls"),
+            "NoCertificateVerification requires test builds or the dangerous-tls feature"
         );
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }

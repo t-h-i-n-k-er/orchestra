@@ -409,7 +409,8 @@ If `\KnownDlls` is blocked by EDR, the agent reads `C:\Windows\System32\ntdll.dl
 
 ### Indirect Syscall Dispatch
 
-For maximum evasion, the agent uses indirect syscalls that dispatch through `NtContinue`:
+For maximum evasion, the Windows x86_64 agent uses indirect syscalls that can
+dispatch through `NtContinue`:
 
 1. Build a multi-frame fake call chain from the `stack_db` module
 2. Push `NtContinue` context with the target syscall's SSN in RAX
@@ -439,6 +440,10 @@ The `stack_db` module (gated behind `stack-spoof` + x86_64) builds and maintains
 **Shadow-stack/CET compatibility**: Spoofed frames are placed between the NtContinue return and the target syscall gadget — they never cross the `syscall; ret` boundary, so CET shadow-stack verification is not affected.
 
 **Fallback**: When no multi-frame chain resolves, falls back to a single-frame `NtQuerySystemTime` spoof (legacy behavior). When NtContinue's SSN is unavailable, uses a jmp-based single-frame path.
+
+On Windows ARM64, syscall dispatch follows the ARM64 register ABI (`x0`-`x7`
+arguments, `x8` SSN) and uses architecture-native call/branch gadgets instead
+of x64 `RIP`/`RSP` frame construction.
 
 ### SSN Resolution Functions
 
@@ -834,11 +839,13 @@ cycles to avoid corrupting ciphertext).
 
 #### HWBP AMSI (`amsi_defense.rs` — HWBP mode)
 
-Uses hardware breakpoints (DR0/DR1) with a Vectored Exception Handler:
+Uses hardware breakpoints with a Vectored Exception Handler. The register set
+is architecture-specific: DR0/DR1/DR7 on Windows x86_64, and BVR/BCR slots on
+Windows ARM64.
 
 1. `AddVectoredExceptionHandler(1, amsi_veh_handler)` — Register VEH as first handler
-2. `SetThreadContext` — Set DR0 to address of `AmsiScanBuffer`, DR1 to `AmsiScanString`
-3. Set DR7 to enable DR0/DR1 as execute breakpoints
+2. `SetThreadContext` — Set execute breakpoints on `AmsiScanBuffer` and `AmsiScanString`
+3. Enable the selected breakpoint slots in the architecture's context state
 4. When AMSI is called, the CPU triggers a breakpoint exception
 5. The VEH handler intercepts the exception, sets `RAX = S_OK` (0) and `Result = AmsiResult::AMSI_RESULT_CLEAN`
 6. Execution continues as if the scan returned clean
@@ -1331,10 +1338,10 @@ The unified injection engine provides a single framework for all injection techn
 | `ProcessHollow` | Classic process hollowing (unmap + rewrite) | — |
 | `ModuleStomp` | Overwrite loaded DLL `.text` section | — |
 | `EarlyBirdApc` | Queue APC before main thread starts | — |
-| `ThreadHijack` | Suspend + redirect RIP | — |
+| `ThreadHijack` | Suspend + redirect instruction pointer | — |
 | `ThreadPool { variant }` | PoolParty — leverage existing thread pool | 8: `Work`, `WorkerFactory`, `Timer`, `IoCompletion`, `Wait`, `Alpc`, `Direct`, `AsyncIo` |
 | `FiberInject` | Fiber creation + context switch | — |
-| `ContextOnly` | CONTEXT-only RIP/RSP redirect (no alloc triad) | — |
+| `ContextOnly` | CONTEXT-only IP/SP redirect with restore trampoline (no new remote thread) | — |
 | `WaitingThreadHijack { target_pid, target_tid }` | Stack return-address overwrite on waiting thread | — |
 | `CallbackInjection { target_pid, api }` | Callback-based, no explicit thread creation | 12 APIs: `EnumSystemLocalesA`, `EnumWindows`, `EnumChildWindows`, `EnumDesktopWindows`, `CreateTimerQueueTimer`, `EnumTimeFormatsA`, `EnumResourceTypesW`, `EnumFontFamilies`, `CertEnumSystemStore`, `SHEnumerateUnreadMailAccounts`, `EnumerateLoadedModules`, `CopyFileEx` |
 | `SectionMapping { target_pid, exec_method, enhanced }` | `NtCreateSection` + dual `NtMapViewOfSection`; no `WriteProcessMemory` | exec_method: `Apc`, `Thread`, `Callback`; `enhanced` = double-mapped |
@@ -1550,10 +1557,17 @@ mod evasion;        // AMSI, ETW patching
 mod nt_syscall;     // SSN resolution, Halo's Gate
 ```
 
-The workspace compiles cleanly on all three platforms via `cargo check --workspace`:
-- **Linux**: Full agent features, all tests pass
-- **Windows**: Full agent features, injection, evasion, syscalls
-- **macOS**: Core features, persistence, remote-assist
+The workspace compiles cleanly with `cargo check --workspace --all-targets`
+on the host and with target checks for `x86_64-pc-windows-gnu`,
+`x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`,
+`aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, and
+`aarch64-apple-darwin`:
+- **Linux**: Full agent features, all tests pass on the host target; ARM64
+   cross-check uses the configured Zig C wrapper.
+- **Windows**: Full agent features, injection, evasion, and syscalls check on
+   GNU x64 plus MSVC x64/ARM64.
+- **macOS**: Core features, persistence, and remote-assist code paths check on
+   x64 and ARM64 via the Darwin Zig wrappers.
 
 ---
 

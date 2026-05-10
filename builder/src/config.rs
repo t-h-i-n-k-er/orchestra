@@ -106,11 +106,10 @@ pub struct PayloadConfig {
     /// Path to an XOR-encrypted vulnerable driver binary to embed when the
     /// `embedded_driver` Cargo feature is enabled.
     ///
-    /// This path is forwarded to the agent build as `ORCHESTRA_DRIVER_PATH`.
-    /// The file must already be XOR-encrypted with the HKDF session key
-    /// (see `resources/placeholder_driver.xor` for the format).  When absent
-    /// the agent still compiles with `embedded_driver` but runtime deployment
-    /// fails with a clear error — no silent placeholder is deployed.
+    /// This path is validated by the builder and forwarded to the agent build
+    /// as `ORCHESTRA_DRIVER_PATH`. The file must already be XOR-encrypted with
+    /// the HKDF session key. When absent, unreadable, empty, or equal to the
+    /// placeholder payload, `embedded_driver` builds fail at build time.
     #[serde(default)]
     pub driver_path: Option<String>,
 }
@@ -582,7 +581,7 @@ pub fn cmd_configure(name: Option<String>) -> Result<()> {
         module_aes_key: None,
         driver_path: None,
     };
-    Ok(())
+    save_profile(&name, &profile)
 }
 
 /// Read all feature flags from `agent/Cargo.toml`.

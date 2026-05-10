@@ -149,6 +149,53 @@ fn forward_trimmed_env(source: &str, target: &str) {
     }
 }
 
+fn configured_driver_path() -> Option<String> {
+    std::env::var("SYS_DRIVER_PATH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("ORCHESTRA_DRIVER_PATH")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .map(|v| v.trim().to_string())
+}
+
+fn validate_embedded_driver_path(path: &str) -> std::path::PathBuf {
+    let manifest_dir = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"),
+    );
+    let raw_path = std::path::PathBuf::from(path);
+    let resolved = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        manifest_dir.join(raw_path)
+    };
+
+    let driver_bytes = std::fs::read(&resolved).unwrap_or_else(|e| {
+        panic!(
+            "embedded_driver requires SYS_DRIVER_PATH or ORCHESTRA_DRIVER_PATH to point to a readable XOR-encrypted driver file: {} ({e})",
+            resolved.display()
+        )
+    });
+    assert!(
+        !driver_bytes.is_empty(),
+        "embedded_driver driver payload is empty: {}",
+        resolved.display()
+    );
+
+    let placeholder_path = manifest_dir.join("resources/placeholder_driver.xor");
+    if let Ok(placeholder_bytes) = std::fs::read(&placeholder_path) {
+        assert!(
+            driver_bytes != placeholder_bytes,
+            "embedded_driver cannot use the placeholder driver payload: {}",
+            resolved.display()
+        );
+    }
+
+    resolved
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=ORCHESTRA_KEY");
     println!("cargo:rerun-if-env-changed=ORCHESTRA_NONCE");
@@ -241,19 +288,21 @@ fn main() {
     }
 
     // Optional embedded driver path wiring for `embedded_driver` builds.
-    // We intentionally do not fail the build when absent so all-features CI
-    // checks can compile deterministically without environment wiring.
-    let configured_driver_path = std::env::var("SYS_DRIVER_PATH")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| {
-            std::env::var("ORCHESTRA_DRIVER_PATH")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-        });
+    // When the feature is enabled, fail at build time unless a real payload is
+    // provided so runtime deployment never silently falls back to placeholders.
+    let configured_driver_path = configured_driver_path();
+    if std::env::var_os("CARGO_FEATURE_EMBEDDED_DRIVER").is_some()
+        && configured_driver_path.is_none()
+    {
+        panic!(
+            "embedded_driver requires SYS_DRIVER_PATH or ORCHESTRA_DRIVER_PATH to point to an XOR-encrypted driver file"
+        );
+    }
 
     if let Some(path) = configured_driver_path {
-        println!("cargo:rustc-env=SYS_DRIVER_PATH={}", path);
+        let resolved = validate_embedded_driver_path(&path);
+        println!("cargo:rerun-if-changed={}", resolved.display());
+        println!("cargo:rustc-env=SYS_DRIVER_PATH={}", resolved.display());
         println!("cargo:rustc-cfg=has_sys_driver_path");
     }
 

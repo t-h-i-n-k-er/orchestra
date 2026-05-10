@@ -39,7 +39,7 @@ Orchestra provides three AMSI bypass strategies with different tradeoffs:
 
 | Strategy | Mechanism | Persistence | Detection Risk | Stability |
 |----------|-----------|-------------|----------------|-----------|
-| **HWBP** (Hardware Breakpoints) | Sets DR6/DR7 debug register on `AmsiScanBuffer` | Process lifetime | Low — no memory modification | High — VEH handles exceptions cleanly |
+| **HWBP** (Hardware Breakpoints) | Sets architecture-native execute breakpoints on AMSI entry points | Process lifetime | Low — no memory modification | High — VEH handles exceptions cleanly |
 | **Memory Patch** | Patches `AmsiScanBuffer` prologue to return `AMSI_RESULT_CLEAN` | Process lifetime | Medium — memory integrity checks detect | High — simple patch |
 | **Write-Raid** | Data-only race on `AmsiInitFailed` flag | Transient (race window) | Very Low — no code/permission/breakpoint changes | Medium — requires precise timing |
 
@@ -163,7 +163,7 @@ When using direct syscalls, the agent validates SSNs using a three-tier approach
 
 Orchestra provides two stack spoofing strategies:
 
-### NtContinue-Based Spoofing (Original)
+### NtContinue-Based Spoofing (x86_64)
 
 Uses `NtContinue` to replace the call stack with a fake chain of legitimate Windows API calls:
 
@@ -173,6 +173,9 @@ Uses `NtContinue` to replace the call stack with a fake chain of legitimate Wind
 4. Original stack is preserved in encrypted memory for restoration
 
 **Limitation**: On CET-enabled systems, `NtContinue` updates the shadow stack, which can be detected.
+
+Windows ARM64 uses the ARM64 `CONTEXT` fields (`PC`, `SP`, and frame pointer)
+for clean-call/context redirection paths rather than x64 register fields.
 
 ### Unwind-Aware Stack Spoofing (Cronus-Enhanced)
 

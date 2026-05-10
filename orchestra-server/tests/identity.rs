@@ -145,6 +145,23 @@ impl FakeAgent {
         let plain = self.session.decrypt(&buf).unwrap();
         bincode::deserialize(&plain).unwrap()
     }
+
+    async fn recv_operator_task(&mut self) -> (String, Command, Option<String>) {
+        loop {
+            match self.recv().await {
+                Message::TaskRequest {
+                    command: Command::SetReencodeSeed { .. },
+                    ..
+                } => continue,
+                Message::TaskRequest {
+                    task_id,
+                    command,
+                    operator_id,
+                } => return (task_id, command, operator_id),
+                other => panic!("unexpected message to agent: {other:?}"),
+            }
+        }
+    }
 }
 
 fn http_client() -> reqwest::Client {
@@ -269,16 +286,8 @@ async fn command_routed_by_connection_id_reaches_correct_agent() {
 
     // Only agent_a should receive the TaskRequest.
     let agent_a_handle = tokio::spawn(async move {
-        let req = agent_a.recv().await;
-        let task_id = match req {
-            Message::TaskRequest {
-                task_id, command, ..
-            } => {
-                assert!(matches!(command, Command::Ping));
-                task_id
-            }
-            other => panic!("unexpected message to agent_a: {other:?}"),
-        };
+        let (task_id, command, _) = agent_a.recv_operator_task().await;
+        assert!(matches!(command, Command::Ping));
         agent_a
             .send(&Message::TaskResponse {
                 task_id,
@@ -330,31 +339,21 @@ async fn operator_id_appears_in_agent_audit_log() {
         .send();
 
     let agent_handle = tokio::spawn(async move {
-        let req = agent.recv().await;
-        match req {
-            Message::TaskRequest {
+        let (task_id, command, operator_id) = agent.recv_operator_task().await;
+        assert!(matches!(command, Command::Ping));
+        // The server's admin user is "admin" (the AuthenticatedUser identity).
+        assert_eq!(
+            operator_id.as_deref(),
+            Some("admin"),
+            "operator_id must be propagated in TaskRequest"
+        );
+        agent
+            .send(&Message::TaskResponse {
                 task_id,
-                operator_id,
-                command,
-                ..
-            } => {
-                assert!(matches!(command, Command::Ping));
-                // The server's admin user is "admin" (the AuthenticatedUser identity).
-                assert_eq!(
-                    operator_id.as_deref(),
-                    Some("admin"),
-                    "operator_id must be propagated in TaskRequest"
-                );
-                agent
-                    .send(&Message::TaskResponse {
-                        task_id,
-                        result: Ok("pong".into()),
-                        result_data: None,
-                    })
-                    .await;
-            }
-            other => panic!("unexpected message: {other:?}"),
-        }
+                result: Ok("pong".into()),
+                result_data: None,
+            })
+            .await;
     });
 
     let resp = cmd_fut.await.unwrap();

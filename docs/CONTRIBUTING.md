@@ -12,8 +12,11 @@ process.
 
 - **Rust** 1.76+ (stable) — [rustup.rs](https://rustup.rs)
 - **C compiler** — `gcc`/`clang` (Linux/macOS), Visual Studio Build Tools (Windows)
-- **OpenSSL** development headers
-- **pkg-config**
+- **OpenSSL CLI** — used by certificate-generation scripts; default Rustls/ring
+  builds do not require OpenSSL development headers
+- **pkg-config** — optional for host packages that need it
+- **Zig** — required for the repository-configured Darwin, Windows MSVC, and
+  Linux ARM64 cross-target C build scripts on Linux hosts
 - **Git**
 
 ### Clone and build
@@ -62,10 +65,11 @@ ORCHESTRA_MODULE_AES_KEY='af1FhprLnRzj8ZZyJmmNBaTQabNS8jGt4nbNCbzrKjw=' \
 
 ## Testing
 
-### Run all tests
+### Run all tests and checks
 
 ```sh
 cargo test --workspace
+cargo check --workspace --all-targets
 ```
 
 ### Run tests for a specific crate
@@ -170,8 +174,10 @@ a PR.
 
 - Every new feature must include unit tests.
 - Bug fixes must include regression tests.
-- Platform-specific code must compile (but not necessarily pass tests) on all
-  platforms — gate with `#[cfg]` and `#[ignore]` where needed.
+- Platform-specific code must compile without warnings on the checked matrix:
+  host, `x86_64-pc-windows-gnu`, `x86_64-pc-windows-msvc`,
+  `aarch64-pc-windows-msvc`, `aarch64-unknown-linux-gnu`,
+  `x86_64-apple-darwin`, and `aarch64-apple-darwin`.
 
 ### Commit messages
 
@@ -186,16 +192,20 @@ a PR.
 1. **Fork** the repository and create a feature branch.
 2. **Write** your changes with appropriate tests.
 3. **Run** the full test suite: `cargo test --workspace`.
-4. **Run** clippy: `cargo clippy --workspace -- -D warnings`.
-5. **Run** formatter: `cargo fmt --all -- --check`.
-6. **Commit** with a clear message describing the change.
-7. **Push** to your fork and open a pull request against `main`.
+4. **Run** the all-target host check: `cargo check --workspace --all-targets`.
+5. **Run** clippy: `cargo clippy --workspace -- -D warnings`.
+6. **Run** formatter: `cargo fmt --all -- --check`.
+7. **Commit** with a clear message describing the change.
+8. **Push** to your fork and open a pull request against `main`.
 
 ### CI checks
 
 All PRs must pass:
 
 - `cargo test --workspace` on Linux
+- `cargo check --workspace --all-targets` on Linux
+- Target checks for Windows GNU/MSVC, Linux ARM64, and Darwin x64/ARM64 when
+  code touches platform-specific modules or shared build dependencies
 - `cargo clippy --workspace -- -D warnings`
 - `cargo fmt --all -- --check`
 - `cargo audit`

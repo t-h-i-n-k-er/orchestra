@@ -354,14 +354,13 @@ static EMBEDDED_DRIVER_BYTES: &[u8] = PLACEHOLDER_DRIVER_BYTES;
 ///     cargo build --features embedded_driver
 /// ```
 ///
-/// If no driver path is configured, we fall back to the placeholder bytes so
-/// all-features CI builds remain reproducible; runtime deployment is still
-/// gated by `embedded_payload_is_configured()`.
 #[cfg(all(feature = "embedded_driver", has_sys_driver_path))]
 static EMBEDDED_DRIVER_BYTES: &[u8] = include_bytes!(env!("SYS_DRIVER_PATH"));
 
 #[cfg(all(feature = "embedded_driver", not(has_sys_driver_path)))]
-static EMBEDDED_DRIVER_BYTES: &[u8] = PLACEHOLDER_DRIVER_BYTES;
+compile_error!(
+    "embedded_driver requires SYS_DRIVER_PATH or ORCHESTRA_DRIVER_PATH to point to an XOR-encrypted driver file"
+);
 
 #[inline]
 fn embedded_payload_is_configured() -> bool {

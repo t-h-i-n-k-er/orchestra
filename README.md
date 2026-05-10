@@ -5,7 +5,7 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 | | |
 |---|---|
 | **Language** | Rust 2021 edition |
-| **Targets** | `x86_64-pc-windows-gnu`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin` |
+| **Targets** | `x86_64-pc-windows-gnu`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin` |
 | **License** | Proprietary |
 
 ---
@@ -107,8 +107,8 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 
 | Capability | Windows | Linux | macOS | Notes |
 |------------|:-------:|:-----:|:-----:|-------|
-| **Indirect Syscalls** (call r11 / Halo's Gate) | ✅ | — | — | `direct-syscalls` feature; clean ntdll mapping for SSN resolution |
-| **HWBP AMSI Bypass** (DR0/DR1 VEH) | ✅ | — | — | Vectored Exception Handler with hardware breakpoints |
+| **Indirect / Direct Syscalls** | ✅ | ✅* | — | Windows NT dispatch with clean ntdll SSN resolution; Linux direct helper fails closed on unsupported arities |
+| **HWBP AMSI Bypass** | ✅ | — | — | Vectored Exception Handler with architecture-native hardware breakpoints |
 | **Memory Patch AMSI Bypass** (E_INVALIDARG) | ✅ | — | — | `NtProtectVirtualMemory` syscall, COM hijack fallback |
 | **ETW Patching** (NtProtectVirtualMemory) | ✅ | — | — | Patches `EtwEventWrite`, `EtwEventWriteEx`, `NtTraceEvent` |
 | **XChaCha20-Poly1305 Memory Guard** | ✅ | ✅ | ✅ | `memory-guard` feature; XMM14/XMM15 key stash on Windows |
@@ -118,13 +118,13 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 | **Transacted Hollowing** (NTFS fileless) | ✅ | — | — | NTFS transaction-backed section, ETW blinding, fake provider GUIDs |
 | **Delayed Module Stomp** | ✅ | — | — | EDR timing-heuristic bypass: load DLL → randomized delay → stomp |
 | **EarlyBird APC Injection** | ✅ | — | — | QueueUserAPC before thread resumes |
-| **Thread Hijacking** | ✅ | — | — | Suspend → rewrite RIP → resume |
+| **Thread Hijacking** | ✅ | — | — | Suspend → rewrite instruction pointer → resume |
 | **Linux Ptrace Injector** | — | ✅* | — | `linux_inject` supports `x86_64` only; other Linux architectures return unsupported |
 | **Unified Injection Engine** | ✅ | — | — | Auto-selects technique based on EDR recon; 12-technique fallback chain (Windows-only runtime) |
 | **Pre-Injection EDR Reconnaissance** | ✅ | — | — | Module enumeration, integrity check, architecture verification |
 | **ThreadPool Injection** (8 variants) | ✅ | — | — | `TpAllocWork`, `TpPostWork`, `CreateTimerQueueTimer`, etc. |
 | **Fiber Injection** | ✅ | — | — | `CreateFiber` → `SwitchToFiber` |
-| **Context-Only Injection** | ✅ | — | — | `SetThreadContext` RIP rewrite (no shellcode) |
+| **Context-Only Injection** | ✅ | — | — | `SetThreadContext` IP/SP rewrite with restore trampoline; no new remote thread |
 | **Section Mapping Injection** | ✅ | — | — | `NtCreateSection` + `NtMapViewOfSection` dual-mapping |
 | **Callback Injection** (12 APIs) | ✅ | — | — | `EnumChildWindows`, `CreateTimerQueueTimer`, etc. |
 | **User-Mode Syscall Emulation** | ✅ | — | — | Routes Nt* calls through kernel32/advapi32; invisible to ntdll hooks |
@@ -182,11 +182,18 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 # Install Rust toolchain
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Add Windows cross-compilation target
-rustup target add x86_64-pc-windows-gnu
+# Add common cross-compilation targets
+rustup target add \
+  x86_64-pc-windows-gnu x86_64-pc-windows-msvc aarch64-pc-windows-msvc \
+  x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+  x86_64-apple-darwin aarch64-apple-darwin
 
-# Install MinGW cross-compiler (Linux host)
+# Install MinGW for Windows GNU builds and Windows headers on Linux hosts
 sudo apt install mingw-w64  # Debian/Ubuntu
+
+# Install Zig for the checked Darwin, Windows MSVC, and Linux ARM64 C build scripts
+# (use your package manager or a release from https://ziglang.org/download/)
+zig version
 ```
 
 ### Build the Server
@@ -1145,8 +1152,8 @@ When used behind a CDN (CloudFront, Akamai, etc.), domain fronting:
 ### Build Commands
 
 ```bash
-# Full workspace check
-cargo check --workspace
+# Full workspace check, including tests/benches/examples
+cargo check --workspace --all-targets
 
 # Build server (release)
 cargo build --release --package orchestra-server
@@ -1177,6 +1184,10 @@ cargo build --release --package launcher
 # Run all tests
 cargo test --workspace
 
+# Focused regressions for parallel proc-macro tests and Linux direct syscalls
+cargo test -p junk_macro --lib
+cargo test -p agent --lib --features direct-syscalls linux_direct_syscall_tests
+
 # Test specific crate
 cargo test --package agent --features http-transport
 cargo test --package common
@@ -1203,15 +1214,26 @@ cargo test --package orchestra-server
 
 ```bash
 # Install targets
-rustup target add x86_64-pc-windows-gnu
-rustup target add x86_64-unknown-linux-gnu
-rustup target add aarch64-unknown-linux-gnu
+rustup target add x86_64-pc-windows-gnu x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+rustup target add x86_64-apple-darwin aarch64-apple-darwin
 
-# Install MinGW (Windows cross-compile on Linux)
+# Install MinGW for Windows GNU and header-backed MSVC wrapper builds on Linux
 sudo apt install mingw-w64
 
-# Install aarch64 toolchain (ARM64 cross-compile)
-sudo apt install gcc-aarch64-linux-gnu
+# Install Zig.  .cargo/config.toml points Cargo's cc-rs environment at
+# scripts/zig-cc-darwin.sh, scripts/zig-cc-windows-msvc.sh, and
+# scripts/zig-cc-linux.sh for Darwin, Windows MSVC, and Linux ARM64 targets.
+zig version
+
+# Verified warning-free checks used for release validation
+cargo check --workspace --all-targets
+cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+cargo check --workspace --all-targets --target x86_64-pc-windows-msvc
+cargo check --workspace --all-targets --target aarch64-pc-windows-msvc
+cargo check --workspace --all-targets --target aarch64-unknown-linux-gnu
+cargo check --workspace --all-targets --target x86_64-apple-darwin
+cargo check --workspace --all-targets --target aarch64-apple-darwin
 ```
 
 ### Development Scripts

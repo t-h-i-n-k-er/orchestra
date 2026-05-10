@@ -487,6 +487,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                 );
             }
 
+            #[cfg(target_arch = "x86_64")]
             Ok(())
         }
     }

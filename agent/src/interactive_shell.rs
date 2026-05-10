@@ -921,7 +921,7 @@ fn spawn_shell_process(shell_path: &str) -> Result<(PlatformProcess, PlatformPip
 
                 // Exec the shell.
                 let shell_c = std::ffi::CString::new(shell_path).unwrap_or_default();
-                let args: [*const i8; 2] = [shell_c.as_ptr(), std::ptr::null()];
+                let args: [*const libc::c_char; 2] = [shell_c.as_ptr(), std::ptr::null()];
                 libc::execv(shell_c.as_ptr(), args.as_ptr());
                 // If execv returns, it failed.
                 libc::_exit(1);

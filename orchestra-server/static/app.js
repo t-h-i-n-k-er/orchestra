@@ -3,6 +3,7 @@
 
 (() => {
   const $ = (id) => document.getElementById(id);
+  const DASHBOARD_WS_PROTOCOL = "orchestra.dashboard.v1";
   let token = sessionStorage.getItem("oc_token") || "";
   let ws = null;
 
@@ -159,12 +160,12 @@
   function openWs() {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     // Browsers don't allow custom headers on WebSocket, so we pass the token
-    // via the Sec-WebSocket-Protocol handshake header. The server's ws_handler
-    // (orchestra-server/src/api.rs) extracts the value beginning with
+    // via the Sec-WebSocket-Protocol handshake header while negotiating a
+    // stable dashboard protocol. The server extracts the value beginning with
     // "bearer." and validates it in constant time before completing the
     // upgrade; an unknown or missing token causes a 401 response.
     try {
-      ws = new WebSocket(proto + "//" + location.host + "/api/ws", ["bearer." + token]);
+      ws = new WebSocket(proto + "//" + location.host + "/api/ws", [DASHBOARD_WS_PROTOCOL, "bearer." + token]);
       ws.onmessage = (ev) => {
         try {
           const m = JSON.parse(ev.data);

@@ -5,3 +5,17 @@ CXX_x86_64_apple_darwin={ value="scripts/zig-cxx-darwin.sh", relative=true }
 AR_x86_64_apple_darwin="zig ar"
 RANLIB_x86_64_apple_darwin="zig ranlib"
 AWS_LC_SYS_NO_JITTER_ENTROPY_x86_64_apple_darwin="1"
+CC_aarch64_apple_darwin={ value="scripts/zig-cc-darwin.sh", relative=true }
+CXX_aarch64_apple_darwin={ value="scripts/zig-cxx-darwin.sh", relative=true }
+AR_aarch64_apple_darwin="zig ar"
+RANLIB_aarch64_apple_darwin="zig ranlib"
+AWS_LC_SYS_NO_JITTER_ENTROPY_aarch64_apple_darwin="1"
+CC_x86_64_pc_windows_msvc={ value="scripts/zig-cc-windows-msvc.sh", relative=true }
+CXX_x86_64_pc_windows_msvc={ value="scripts/zig-cxx-windows-msvc.sh", relative=true }
+AR_x86_64_pc_windows_msvc={ value="scripts/zig-lib-windows-msvc.sh", relative=true }
+CC_aarch64_pc_windows_msvc={ value="scripts/zig-cc-windows-msvc.sh", relative=true }
+CXX_aarch64_pc_windows_msvc={ value="scripts/zig-cxx-windows-msvc.sh", relative=true }
+AR_aarch64_pc_windows_msvc={ value="scripts/zig-lib-windows-msvc.sh", relative=true }
+CC_aarch64_unknown_linux_gnu={ value="scripts/zig-cc-linux.sh", relative=true }
+CXX_aarch64_unknown_linux_gnu={ value="scripts/zig-cxx-linux.sh", relative=true }
+AR_aarch64_unknown_linux_gnu="zig ar"

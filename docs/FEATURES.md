@@ -269,20 +269,22 @@ features = ["outbound-c", "stealth"]
 
 ### `direct-syscalls`
 
-**Default: no** | **Windows only**
+**Default: no** | **Windows + Linux**
 
-Uses direct syscall invocation (bypassing the IAT) for Windows API calls.
-Avoids API hooks set by security products.
+Uses direct syscall invocation for supported platforms. On Windows this covers
+NT syscall dispatch with clean ntdll SSN resolution; on Linux it exposes the
+native direct-syscall helper used by the agent.
 
 | Attribute | Value |
 |-----------|-------|
-| Platform | Windows x86_64 + aarch64 |
+| Platform | Windows x86_64/aarch64; Linux x86_64/aarch64 |
 | Requirements | Inline assembly support |
-| aarch64 note | >6-arg syscalls return `EINVAL` (fail-closed) |
+| Linux arity guard | More than six Linux syscall arguments return `EINVAL` instead of panicking |
 
 **Implementation:**
-- x86_64: inline asm with explicit register bindings and clobbers
-- aarch64: register-passed syscall convention, 6-arg max (architectural limit)
+- Windows x86_64: inline asm with explicit register bindings and clobbers
+- Windows aarch64: register-passed syscall convention using x0-x7 plus x8 SSN
+- Linux x86_64/aarch64: native ABI helpers with fail-closed argument validation
 
 ---
 
@@ -982,14 +984,16 @@ features = ["outbound-c", "write-raid-amsi"]
 
 **Default: no** | **Windows only**
 
-Uses hardware breakpoints (DR0/DR1) via a Vectored Exception Handler to bypass
-AMSI without modifying any code pages. When this feature is **not** enabled,
-the agent falls back to the memory-patch AMSI bypass.
+Uses architecture-native hardware breakpoints via a Vectored Exception Handler
+to bypass AMSI without modifying any code pages. On Windows x86_64 this uses
+DR0/DR1/DR7; on Windows ARM64 it uses BVR/BCR breakpoint slots. When this
+feature is **not** enabled, the agent falls back to the memory-patch AMSI
+bypass.
 
 | Attribute | Value |
 |-----------|-------|
 | Platform | Windows only |
-| Method | DR0/DR1 execute breakpoints on `AmsiScanBuffer` / `AmsiScanString` |
+| Method | Execute breakpoints on `AmsiScanBuffer` / `AmsiScanString` |
 | VEH handler | Returns `S_OK` + `AMSI_RESULT_CLEAN` |
 | Stealth | No code page modifications — invisible to memory integrity checks |
 
@@ -1101,7 +1105,7 @@ microarchitecture-specific dispatch.
 | `smb-pipe-transport` | — | ✅ | — |
 | `traffic-normalization` | ✅ | ✅ | ✅ |
 | `stealth` | ✅ | ✅ | ✅ |
-| `direct-syscalls` | — | ✅ | — |
+| `direct-syscalls` | ✅ | ✅ | — |
 | `stack-spoof` | — | ✅ | — |
 | `manual-map` | — | ✅ | — |
 | `env-validation` | ✅ | ✅ | ✅ |

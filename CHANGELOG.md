@@ -6,6 +6,19 @@ All notable changes to Orchestra are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Linux direct syscall arity handling** — Direct syscall helpers now return
+  `EINVAL` instead of panicking when called with too many arguments.
+- **Parallel test reliability** — `junk_macro` seed-sensitive tests are isolated
+  from process-global environment races.
+- **Cross-target checks** — Workspace checks are warning-free on host,
+  Linux ARM64, Windows GNU x64, Windows MSVC x64/ARM64, and macOS x64/ARM64
+  with the repository Zig wrapper configuration.
+- **Windows ARM64 parity** — Context manipulation, hardware-breakpoint state,
+  clean-call spoofing, LSASS PID lookup, and module-stomp loader stubs use
+  ARM64-native registers and instruction encodings.
+
 ### Feature Categories
 
 | Category | Features |
@@ -531,7 +544,8 @@ All notable changes to Orchestra are documented here.
 - **ThreadPool injection** — 8 sub-variants: `TpAllocWork`, `TpPostWork`,
   `CreateTimerQueueTimer`, `RegisterWaitForSingleObject`, and more.
 - **Fiber injection** — `CreateFiber` → `SwitchToFiber`.
-- **Context-only injection** — `SetThreadContext` RIP rewrite without shellcode.
+- **Context-only injection** — `SetThreadContext` instruction-pointer rewrite
+  with payload delivery and a restore trampoline; no new remote thread.
 - **Section mapping injection** — `NtCreateSection` + `NtMapViewOfSection` dual-mapping.
 - **Callback injection** — 12 Windows API callbacks (EnumChildWindows,
   CreateTimerQueueTimer, EnumSystemLocales, etc.).

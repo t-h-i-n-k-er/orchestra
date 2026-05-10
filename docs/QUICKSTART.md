@@ -27,8 +27,9 @@ Install the following before starting:
 | **Git** | System package manager |
 | **Rust** (stable) | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` (Unix) or [rustup.rs](https://rustup.rs) (Windows) |
 | **C compiler** | `gcc`/`clang` (Unix), Visual Studio Build Tools (Windows) |
-| **OpenSSL** | `apt install libssl-dev` / `brew install openssl` / Windows installer |
-| **pkg-config** | `apt install pkg-config` / `brew install pkg-config` |
+| **OpenSSL CLI** | `apt install openssl` / `brew install openssl` / Windows installer; used by certificate-generation scripts |
+| **pkg-config** | Optional for host packages that need it; default TLS builds use Rustls/ring and do not require `libssl-dev` |
+| **Zig** | Required for the checked Darwin, Windows MSVC, and Linux ARM64 cross-target C build scripts on Linux hosts |
 
 > **Tip:** The quickstart script checks for Rust and offers to install it. It
 > also verifies the build toolchain, so you can just run it and follow any
@@ -408,7 +409,8 @@ To build for a platform different from your host:
 
 ```sh
 # Install the target
-rustup target add x86_64-pc-windows-gnu
+rustup target add x86_64-pc-windows-gnu x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+rustup target add aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin
 
 # Build the agent for Windows from Linux
 cargo build --release -p agent --target x86_64-pc-windows-gnu \
@@ -419,16 +421,17 @@ cargo build --release -p agent --target x86_64-pc-windows-gnu \
 ./target/release/orchestra-builder build my_agent
 ```
 
-For Windows cross-compilation from Linux without `mingw-w64`, the setup wizard
-automatically falls back to `cargo-zigbuild`. See [ARCHITECTURE.md](ARCHITECTURE.md)
-for transport-level details.
+For Windows GNU builds from Linux, install `mingw-w64`. For Windows MSVC,
+Darwin, and Linux ARM64 targets with C build scripts, the repository's
+`.cargo/config.toml` uses the Zig wrapper scripts in `scripts/`; keep `zig` on
+`PATH`. See [ARCHITECTURE.md](ARCHITECTURE.md) for transport-level details.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `cargo` not found | Rust not installed | Run `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
-| Build fails with linker error | Missing C toolchain for target | Install `mingw-w64` (Windows) or Xcode CLI Tools (macOS) |
+| Build fails with linker error | Missing C toolchain for target | Install `mingw-w64` for Windows GNU or `zig` for the configured Darwin/MSVC/Linux ARM64 wrappers |
 | Agent exits with `connection refused` | Server not running or wrong port | Start the Control Center; verify `agent_addr` matches profile's `c2_address` |
 | `AES-GCM authentication failed` | PSK mismatch | Regenerate profile and server config together with `quickstart.sh` |
 | TLS handshake failure | Certificate mismatch | Regenerate certs with `./scripts/generate-certs.sh` and update fingerprint |

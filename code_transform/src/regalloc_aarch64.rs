@@ -67,6 +67,7 @@ fn ra_field(raw: u32) -> u32 {
 }
 
 /// Check if register `reg` appears in any of the common register fields.
+#[cfg(test)]
 fn reg_appears(raw: u32, reg: u32) -> bool {
     rd_field(raw) == reg || rn_field(raw) == reg || rm_field(raw) == reg || ra_field(raw) == reg
 }

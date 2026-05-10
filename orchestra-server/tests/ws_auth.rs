@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::http::{HeaderValue, Uri};
 
 const SECRET: &str = "ws-test-secret";
 const TOKEN: &str = "ws-test-admin-token";
+const DASHBOARD_WS_PROTOCOL: &str = "orchestra.dashboard.v1";
 
 async fn start_server(tmp: &tempfile::TempDir) -> (u16, u16) {
     let cfg = ServerConfig {
@@ -98,7 +99,7 @@ fn ws_request(
     let headers = req.headers_mut();
     headers.insert(
         "Sec-WebSocket-Protocol",
-        HeaderValue::from_str(&format!("bearer.{token}")).unwrap(),
+        HeaderValue::from_str(&format!("{DASHBOARD_WS_PROTOCOL}, bearer.{token}")).unwrap(),
     );
     headers.insert(
         "Sec-WebSocket-Key",
@@ -249,7 +250,7 @@ async fn ws_accepts_valid_token_and_delivers_snapshot() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let req = ws_request(http_port, TOKEN);
-    let (mut ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
+    let (mut ws, resp) = tokio_tungstenite::connect_async_tls_with_config(
         req,
         None,
         false,
@@ -257,6 +258,13 @@ async fn ws_accepts_valid_token_and_delivers_snapshot() {
     )
     .await
     .expect("valid token must produce a successful handshake");
+    assert_eq!(
+        resp.headers()
+            .get("Sec-WebSocket-Protocol")
+            .and_then(|v| v.to_str().ok()),
+        Some(DASHBOARD_WS_PROTOCOL),
+        "server must select the offered dashboard protocol without echoing the bearer token"
+    );
 
     let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
         .await

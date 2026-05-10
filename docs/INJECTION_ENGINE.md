@@ -19,7 +19,7 @@ The injection engine (`agent/src/injection/` — Windows, gated by `#[cfg(target
 | **Thread Hijacking** | Very High | Medium | High | Avoiding new thread creation |
 | **ThreadPool Injection** (8 variants) | Very High | Medium | High | Avoiding thread creation entirely |
 | **Fiber Injection** | Very High | Medium | High | Legitimate execution context |
-| **Context-Only Injection** | Very High | Medium | Low | Quick RIP redirect, no shellcode |
+| **Context-Only Injection** | Very High | Medium | Low | Quick instruction-pointer redirect with restore trampoline |
 | **Section Mapping Injection** | Very High | High | Medium | Dual-mapped shared sections |
 | **Callback Injection** (12 APIs) | Very High | Medium | Medium | Legitimate API callback dispatch |
 
@@ -37,7 +37,7 @@ pub struct ProcessRecon {
     pub name: String,
     pub is_protected: bool,     // Protected Process Light
     pub is_elevated: bool,      // Running as SYSTEM/Admin
-    pub arch: Arch,             // x86 or x64
+   pub arch: String,           // normalized process architecture
     pub module_count: usize,
     pub has_edr_modules: bool,  // Known EDR DLLs detected
     pub edr_names: Vec<String>, // Names of detected EDR modules
@@ -45,8 +45,6 @@ pub struct ProcessRecon {
     pub session_id: u32,
     pub integrity_level: IntegrityLevel,
 }
-
-pub enum Arch { X86, X64 }
 
 pub enum IntegrityLevel {
     Low,
@@ -188,7 +186,7 @@ After hollowing:
 9. NtWriteVirtualMemory(process_handle, image_base_offset, &base_address)
    → Update PEB ImageBaseAddress to new base
 
-10. SetThreadContext(thread_handle, {RIP: new_entry_point})
+10. SetThreadContext(thread_handle, {IP: new_entry_point})
     → Redirect execution to payload entry point
 
 11. NtResumeThread(thread_handle)
@@ -242,7 +240,7 @@ Like standard process hollowing, but uses an NTFS transaction to make the payloa
 8. NtMapViewOfSection(section_handle, target_process, PAGE_EXECUTE_READ)
    → remote_base (payload mapped into target as RX)
 
-9. SetThreadContext(thread_handle, {RIP: remote_base + entry_point})
+9. SetThreadContext(thread_handle, {IP: remote_base + entry_point})
    → Redirect execution
 
 10. NtRollbackTransaction(transaction_handle)
@@ -526,7 +524,7 @@ Hijacks an existing thread in the target process by modifying its context (regis
 9. GetThreadContext(thread_handle, &context)
    → Save original context
 
-10. context.Rip = alloc_base
+10. context instruction pointer = alloc_base
     → Set instruction pointer to payload
 
 11. SetThreadContext(thread_handle, &context)
@@ -656,10 +654,11 @@ The engine automatically selects the variant based on target process reconnaissa
 
 ### 9. Context-Only Injection
 
-Performs a minimal thread-context hijack without injecting any shellcode.
-The attacker-supplied function address is written directly into the RIP
-register of a suspended thread. No memory allocation, no write, no protection
-change — only a `CONTEXT` structure modification.
+Performs a minimal thread-context hijack without creating a new remote thread.
+The engine snapshots a suitable thread, writes the payload plus an
+architecture-native restore trampoline to stack space or executable slack, and
+redirects the thread's instruction pointer through `SetThreadContext`. On x64
+the helper uses RIP/RSP/RBP; on ARM64 it uses PC/SP/FP.
 
 #### Syscall Sequence
 
@@ -670,7 +669,7 @@ change — only a `CONTEXT` structure modification.
 2. NtGetContextThread(thread_handle, &context)
    → Save original context
 
-3. context.Rip = payload_address  (already in process memory)
+3. context instruction pointer = payload_address
    → Redirect execution
 
 4. NtSetContextThread(thread_handle, &context)

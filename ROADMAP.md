@@ -59,7 +59,8 @@ This document describes where the project is going next.
 - ✅ **Mutual TLS for agent channel**: server-side mTLS enforcement with
   configurable allowed CNs and OUs.
 - ✅ **Stack spoofing**: `stack-spoof` feature for spoofing user-mode
-  call stacks during indirect syscall dispatch on Windows x86-64.
+  call stacks during indirect syscall dispatch on Windows x86-64; clean-call
+  spoofing also has a Windows ARM64 branch-gadget path.
 - ✅ **Hot-reload**: `hot-reload` feature enables runtime config
   hot-reload via the `notify` crate.
 
@@ -108,8 +109,9 @@ This document describes where the project is going next.
 - ✅ **Halo's Gate unhook callback** — `nt_syscall::set_halo_gate_fallback()`
   registers agent's unhook function; automatic unhook on Halo's Gate failure.
 - ✅ **Feature flags for new capabilities** — `surveillance` (Windows, dep:image),
-  `browser-data` (Windows), `hwbp-amsi` (Windows, DR0/DR1 VEH),
-  `write-raid-amsi` (Windows, data-only race condition, preferred AMSI bypass).
+  `browser-data` (Windows), `hwbp-amsi` (Windows, architecture-native hardware
+  breakpoint VEH), `write-raid-amsi` (Windows, data-only race condition,
+  preferred AMSI bypass).
 
 ---
 

@@ -16,9 +16,9 @@ tracing-subscriber = { workspace = true }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 toml = { workspace = true }
 axum = { version = "0.7", features = ["http1"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 tower-http = { version = "0.5", features = ["cors"] }
 # P2-09: Direct rustls dependency for building mTLS ServerConfig with
 # client-certificate verification.
-rustls = "0.23"
+rustls = { version = "0.23.38", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 rustls-pemfile = "2"

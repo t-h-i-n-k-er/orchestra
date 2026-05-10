@@ -44,6 +44,17 @@ fn current_pid() -> u32 {
     }
 }
 
+/// Return the current process ID by reading the TEB directly.
+/// Windows ARM64 keeps the TEB pointer in X18; ClientId.UniqueProcess is at +0x40.
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn current_pid() -> u32 {
+    unsafe {
+        let teb: *mut u8;
+        std::arch::asm!("mov {}, x18", out(reg) teb);
+        ((teb as *const usize).add(0x40 / std::mem::size_of::<usize>())).read() as u32
+    }
+}
+
 // ── NTSTATUS helpers ───────────────────────────────────────────────────────
 
 #[inline]

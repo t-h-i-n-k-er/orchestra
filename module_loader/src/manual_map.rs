@@ -4,6 +4,7 @@
 use anyhow::{anyhow, Result};
 use goblin::pe::PE;
 use std::collections::HashMap;
+use std::ops::Range;
 // Use winapi's c_void throughout to avoid type mismatches with winapi return values.
 use winapi::ctypes::c_void;
 use winapi::shared::ntdef::{LIST_ENTRY, UNICODE_STRING};
@@ -19,6 +20,45 @@ use winapi::um::winnt::{
 
 /// Minimal thread access for injection: THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION.
 const THREAD_INJECT_ACCESS: u64 = 0x1A02;
+
+fn checked_image_range(start: usize, size: usize, image_size: usize) -> Option<Range<usize>> {
+    let end = start.checked_add(size)?;
+    if start <= image_size && end <= image_size {
+        Some(start..end)
+    } else {
+        None
+    }
+}
+
+fn checked_rva_range(rva: u32, size: u32, image_size: usize) -> Option<Range<usize>> {
+    checked_image_range(rva as usize, size as usize, image_size)
+}
+
+fn checked_table_range(
+    rva: u32,
+    count: usize,
+    elem_size: usize,
+    image_size: usize,
+) -> Option<Range<usize>> {
+    checked_image_range(rva as usize, count.checked_mul(elem_size)?, image_size)
+}
+
+unsafe fn bounded_c_string_from_rva<'a>(
+    base: *const u8,
+    rva: u32,
+    upper_bound: usize,
+) -> Option<&'a [u8]> {
+    let start = rva as usize;
+    if start >= upper_bound {
+        return None;
+    }
+    for pos in start..upper_bound {
+        if *base.add(pos) == 0 {
+            return Some(std::slice::from_raw_parts(base.add(start), pos - start));
+        }
+    }
+    None
+}
 
 // RUNTIME_FUNCTION (IMAGE_RUNTIME_FUNCTION_ENTRY) – 12 bytes, x64 only.
 #[cfg(target_arch = "x86_64")]
@@ -190,6 +230,9 @@ unsafe fn get_proc_address_by_ordinal_manual(module: *mut c_void, ordinal: u16) 
     if dos_header.e_magic != 0x5A4D {
         return std::ptr::null_mut();
     }
+    if dos_header.e_lfanew < 0 {
+        return std::ptr::null_mut();
+    }
     let e_lfanew = dos_header.e_lfanew as usize;
 
     #[cfg(target_arch = "x86")]
@@ -209,6 +252,11 @@ unsafe fn get_proc_address_by_ordinal_manual(module: *mut c_void, ordinal: u16) 
     if export_dir_rva == 0 {
         return std::ptr::null_mut();
     }
+    let image_size = nt_headers.OptionalHeader.SizeOfImage as usize;
+    let export_range = match checked_rva_range(export_dir_rva, export_dir_size, image_size) {
+        Some(range) if range.len() >= std::mem::size_of::<IMAGE_EXPORT_DIRECTORY>() => range,
+        _ => return std::ptr::null_mut(),
+    };
     let export_dir = &*(base.add(export_dir_rva as usize) as *const IMAGE_EXPORT_DIRECTORY);
     // OrdinalBase: the lowest ordinal exported by this module.
     // index into AddressOfFunctions = ordinal - OrdinalBase
@@ -220,8 +268,17 @@ unsafe fn get_proc_address_by_ordinal_manual(module: *mut c_void, ordinal: u16) 
     if index >= export_dir.NumberOfFunctions as usize {
         return std::ptr::null_mut();
     }
+    let funcs_range = match checked_table_range(
+        export_dir.AddressOfFunctions,
+        export_dir.NumberOfFunctions as usize,
+        std::mem::size_of::<u32>(),
+        image_size,
+    ) {
+        Some(range) => range,
+        None => return std::ptr::null_mut(),
+    };
     let funcs = std::slice::from_raw_parts(
-        base.add(export_dir.AddressOfFunctions as usize) as *const u32,
+        base.add(funcs_range.start) as *const u32,
         export_dir.NumberOfFunctions as usize,
     );
     let func_rva = funcs[index];
@@ -232,13 +289,12 @@ unsafe fn get_proc_address_by_ordinal_manual(module: *mut c_void, ordinal: u16) 
     // Forwarded export check: if func_rva falls within the export directory
     // range, the bytes at func_rva are a null-terminated ASCII forwarder
     // string of the form "ModuleName.FunctionName" (or "ModuleName.#Ordinal").
-    if func_rva >= export_dir_rva && func_rva < export_dir_rva + export_dir_size {
-        let fwd_ptr = base.add(func_rva as usize) as *const u8;
-        let mut fwd_len = 0;
-        while *fwd_ptr.add(fwd_len) != 0 {
-            fwd_len += 1;
-        }
-        let fwd_slice = std::slice::from_raw_parts(fwd_ptr, fwd_len);
+    let func_rva_usize = func_rva as usize;
+    if export_range.contains(&func_rva_usize) {
+        let fwd_slice = match bounded_c_string_from_rva(base, func_rva, export_range.end) {
+            Some(slice) => slice,
+            None => return std::ptr::null_mut(),
+        };
         if let Ok(fwd_str) = std::str::from_utf8(fwd_slice) {
             if let Some(dot) = fwd_str.find('.') {
                 let target_mod = &fwd_str[..dot];
@@ -261,6 +317,10 @@ unsafe fn get_proc_address_by_ordinal_manual(module: *mut c_void, ordinal: u16) 
                 }
             }
         }
+        return std::ptr::null_mut();
+    }
+
+    if func_rva_usize >= image_size {
         return std::ptr::null_mut();
     }
 
@@ -296,6 +356,9 @@ unsafe fn get_proc_address_manual(module: *mut c_void, proc_name: &str) -> *mut 
     if dos_header.e_magic != 0x5A4D {
         return std::ptr::null_mut();
     }
+    if dos_header.e_lfanew < 0 {
+        return std::ptr::null_mut();
+    }
 
     let e_lfanew = dos_header.e_lfanew as usize;
 
@@ -318,43 +381,76 @@ unsafe fn get_proc_address_manual(module: *mut c_void, proc_name: &str) -> *mut 
         // No export directory — cannot resolve this function manually.
         return std::ptr::null_mut();
     }
+    let image_size = nt_headers.OptionalHeader.SizeOfImage as usize;
+    let export_range = match checked_rva_range(export_dir_rva, export_dir_size, image_size) {
+        Some(range) if range.len() >= std::mem::size_of::<IMAGE_EXPORT_DIRECTORY>() => range,
+        _ => return std::ptr::null_mut(),
+    };
 
     let export_dir = &*(base.add(export_dir_rva as usize) as *const IMAGE_EXPORT_DIRECTORY);
+    let names_range = match checked_table_range(
+        export_dir.AddressOfNames,
+        export_dir.NumberOfNames as usize,
+        std::mem::size_of::<u32>(),
+        image_size,
+    ) {
+        Some(range) => range,
+        None => return std::ptr::null_mut(),
+    };
+    let funcs_range = match checked_table_range(
+        export_dir.AddressOfFunctions,
+        export_dir.NumberOfFunctions as usize,
+        std::mem::size_of::<u32>(),
+        image_size,
+    ) {
+        Some(range) => range,
+        None => return std::ptr::null_mut(),
+    };
+    let ords_range = match checked_table_range(
+        export_dir.AddressOfNameOrdinals,
+        export_dir.NumberOfNames as usize,
+        std::mem::size_of::<u16>(),
+        image_size,
+    ) {
+        Some(range) => range,
+        None => return std::ptr::null_mut(),
+    };
     let names = std::slice::from_raw_parts(
-        base.add(export_dir.AddressOfNames as usize) as *const u32,
+        base.add(names_range.start) as *const u32,
         export_dir.NumberOfNames as usize,
     );
     let funcs = std::slice::from_raw_parts(
-        base.add(export_dir.AddressOfFunctions as usize) as *const u32,
+        base.add(funcs_range.start) as *const u32,
         export_dir.NumberOfFunctions as usize,
     );
     let ords = std::slice::from_raw_parts(
-        base.add(export_dir.AddressOfNameOrdinals as usize) as *const u16,
+        base.add(ords_range.start) as *const u16,
         export_dir.NumberOfNames as usize,
     );
 
     for i in 0..export_dir.NumberOfNames as usize {
         let name_rva = names[i];
-        let name_ptr = base.add(name_rva as usize) as *const u8;
-        let mut len = 0;
-        while *name_ptr.add(len) != 0 {
-            len += 1;
-        }
-        let name_slice = std::slice::from_raw_parts(name_ptr, len);
+        let name_slice = match bounded_c_string_from_rva(base, name_rva, image_size) {
+            Some(slice) => slice,
+            None => return std::ptr::null_mut(),
+        };
         if let Ok(n) = std::str::from_utf8(name_slice) {
             if n == proc_name {
-                let func_rva = funcs[ords[i] as usize];
+                let func_index = ords[i] as usize;
+                if func_index >= funcs.len() {
+                    return std::ptr::null_mut();
+                }
+                let func_rva = funcs[func_index];
                 if func_rva != 0 {
-                    let addr = base.add(func_rva as usize) as *mut c_void;
-                    if func_rva >= export_dir_rva && func_rva < export_dir_rva + export_dir_size {
+                    let func_rva_usize = func_rva as usize;
+                    if export_range.contains(&func_rva_usize) {
                         // Forwarded export: bytes at func_rva are a null-terminated ASCII
                         // string of the form "ModuleName.FunctionName".
-                        let fwd_ptr = base.add(func_rva as usize) as *const u8;
-                        let mut fwd_len = 0;
-                        while *fwd_ptr.add(fwd_len) != 0 {
-                            fwd_len += 1;
-                        }
-                        let fwd_slice = std::slice::from_raw_parts(fwd_ptr, fwd_len);
+                        let fwd_slice =
+                            match bounded_c_string_from_rva(base, func_rva, export_range.end) {
+                                Some(slice) => slice,
+                                None => return std::ptr::null_mut(),
+                            };
                         if let Ok(fwd_str) = std::str::from_utf8(fwd_slice) {
                             if let Some(dot) = fwd_str.find('.') {
                                 let target_mod = &fwd_str[..dot];
@@ -371,7 +467,10 @@ unsafe fn get_proc_address_manual(module: *mut c_void, proc_name: &str) -> *mut 
                         }
                         return std::ptr::null_mut();
                     }
-                    return addr;
+                    if func_rva_usize >= image_size {
+                        return std::ptr::null_mut();
+                    }
+                    return base.add(func_rva_usize) as *mut c_void;
                 }
             }
         }
@@ -540,7 +639,10 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         if raw_size == 0 {
             continue;
         }
-        if raw_offset.saturating_add(raw_size) > dll_bytes.len() {
+        let raw_end = raw_offset
+            .checked_add(raw_size)
+            .ok_or_else(|| anyhow!("PE section raw data range overflow"))?;
+        if raw_end > dll_bytes.len() {
             return Err(anyhow!(
                 "PE section data (offset {:#x} + size {:#x}) exceeds DLL buffer length {}; PE is corrupt",
                 raw_offset,
@@ -548,6 +650,16 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
                 dll_bytes.len()
             ));
         }
+        checked_image_range(section.virtual_address as usize, raw_size, image_size).ok_or_else(
+            || {
+                anyhow!(
+                    "PE section virtual data (rva {:#x} + size {:#x}) exceeds image size {}; PE is corrupt",
+                    section.virtual_address,
+                    raw_size,
+                    image_size
+                )
+            },
+        )?;
         let dest = image_base.add(section.virtual_address as usize);
         let src = dll_bytes.as_ptr().add(raw_offset);
         std::ptr::copy_nonoverlapping(src, dest as *mut u8, raw_size);
@@ -575,7 +687,22 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
         }
         // Width-aware IAT write: PE32+ uses 8-byte thunks, PE32 uses 4-byte.
         let is_pe32_plus = optional_header.standard_fields.magic == 0x020B;
-        let thunk_ref = image_base.add(import.rva);
+        let thunk_size = if is_pe32_plus {
+            std::mem::size_of::<u64>()
+        } else {
+            std::mem::size_of::<u32>()
+        };
+        let thunk_range =
+            checked_image_range(import.rva, thunk_size, image_size).ok_or_else(|| {
+                anyhow!(
+                    "manual_map: import thunk for {}!{} at rva {:#x} exceeds image size {}",
+                    dll_name,
+                    import.name,
+                    import.rva,
+                    image_size
+                )
+            })?;
+        let thunk_ref = image_base.add(thunk_range.start);
         if is_pe32_plus {
             *(thunk_ref as *mut u64) = proc_addr as u64;
         } else {
@@ -606,7 +733,7 @@ pub unsafe fn load_dll_in_memory(dll_bytes: &[u8]) -> Result<*mut c_void> {
 
             loop {
                 // Bounds check for the descriptor itself.
-                if desc_va + DELAY_DESCR_SIZE > image_size {
+                if checked_image_range(desc_va, DELAY_DESCR_SIZE, image_size).is_none() {
                     break;
                 }
 

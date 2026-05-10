@@ -273,6 +273,8 @@ fn build_tls_config(cli: &Cli) -> Result<rustls::ClientConfig> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
 
     // --- Build transport -------------------------------------------------------

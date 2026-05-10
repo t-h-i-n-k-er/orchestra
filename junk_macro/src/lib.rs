@@ -365,8 +365,7 @@ fn choose_k(rng: &mut rand::rngs::StdRng, n: usize, k: usize) -> Vec<usize> {
 ///
 /// Every build produces different pattern selections and constants, driven by
 /// `ORCHESTRA_JUNK_SEED` or the build timestamp.
-fn expansion() -> TokenStream2 {
-    let seed: u64 = get_seed();
+fn expansion_with_seed(seed: u64) -> TokenStream2 {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
     // Select 3-5 pattern categories at random.
@@ -385,6 +384,10 @@ fn expansion() -> TokenStream2 {
             #( #blocks )*
         }
     }
+}
+
+fn expansion() -> TokenStream2 {
+    expansion_with_seed(get_seed())
 }
 
 #[proc_macro]
@@ -643,6 +646,25 @@ pub fn junk_barrier(attr: TokenStream, item: TokenStream) -> TokenStream {
 mod tests {
     use super::*;
 
+    fn with_junk_seed<T>(seed: &str, f: impl FnOnce() -> T) -> T {
+        static JUNK_SEED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        let _guard = JUNK_SEED_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("ORCHESTRA_JUNK_SEED");
+        std::env::set_var("ORCHESTRA_JUNK_SEED", seed);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match previous {
+            Some(value) => std::env::set_var("ORCHESTRA_JUNK_SEED", value),
+            None => std::env::remove_var("ORCHESTRA_JUNK_SEED"),
+        }
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     fn fixed_rng(seed: u64) -> rand::rngs::StdRng {
         rand::rngs::StdRng::seed_from_u64(seed)
     }
@@ -662,9 +684,7 @@ mod tests {
     fn expansion_produces_multiple_pattern_blocks() {
         // With a fixed seed, the expansion must contain at least 3 pattern
         // blocks (each starts with `static _JK_S_`).
-        std::env::set_var("ORCHESTRA_JUNK_SEED", "9999");
-        let tokens = expansion().to_string();
-        std::env::remove_var("ORCHESTRA_JUNK_SEED");
+        let tokens = expansion_with_seed(9999).to_string();
         let block_count = tokens.matches("_JK_S_").count();
         assert!(
             block_count >= 3,
@@ -675,18 +695,13 @@ mod tests {
 
     #[test]
     fn expansion_seed_env_var_is_reproducible() {
-        // Use a unique seed value to avoid interference from parallel tests
-        // that might also set/remove this env var.
-        std::env::set_var("ORCHESTRA_JUNK_SEED", "77777777");
-        let seed_val = get_seed();
+        let (seed_val, a, b) = with_junk_seed("77777777", || {
+            let seed_val = get_seed();
+            let a = expansion().to_string();
+            let b = expansion().to_string();
+            (seed_val, a, b)
+        });
         assert_eq!(seed_val, 77777777, "get_seed must honour env var");
-
-        // Create RNGs with the same seed to verify the expansion logic is
-        // deterministic (the expansion() function itself calls get_seed(), so
-        // as long as the env var is set, two calls should match).
-        let a = expansion().to_string();
-        let b = expansion().to_string();
-        std::env::remove_var("ORCHESTRA_JUNK_SEED");
         assert_eq!(
             a, b,
             "fixed ORCHESTRA_JUNK_SEED must produce deterministic output"
@@ -896,11 +911,8 @@ mod tests {
 
     #[test]
     fn expansion_varies_across_seeds() {
-        std::env::set_var("ORCHESTRA_JUNK_SEED", "100");
-        let a = expansion().to_string();
-        std::env::set_var("ORCHESTRA_JUNK_SEED", "200");
-        let b = expansion().to_string();
-        std::env::remove_var("ORCHESTRA_JUNK_SEED");
+        let a = expansion_with_seed(100).to_string();
+        let b = expansion_with_seed(200).to_string();
         assert_ne!(
             a, b,
             "different seeds must yield different expansion output"
