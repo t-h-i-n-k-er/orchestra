@@ -25,7 +25,6 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -885,7 +884,7 @@ unsafe fn process_handle_entries(buf: &[u8], image_base: usize) {
 
     let pid = std::process::id() as usize;
     let mut closed_count = 0u32;
-    let mut swapped_count = 0u32;
+    let swapped_count = 0u32;
 
     for i in 0..num_handles {
         let offset = header_size + (i * entry_size);

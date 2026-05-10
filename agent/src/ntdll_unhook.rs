@@ -31,7 +31,6 @@
 
 #![cfg(windows)]
 
-use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -697,7 +696,7 @@ unsafe fn unhook_via_disk() -> anyhow::Result<usize> {
     }
 
     // ── Step 3: Parse PE headers to find .text section ───────────────────
-    let (raw_offset, raw_size, text_rva, text_vsize) =
+    let (raw_offset, raw_size, _text_rva, _text_vsize) =
         find_text_section_from_file(&file_buf)
             .ok_or_else(|| anyhow::anyhow!("could not find .text in on-disk ntdll"))?;
 

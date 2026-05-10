@@ -184,15 +184,16 @@ pub struct ResolvedChain {
 
 /// Lazily-resolved pointer to `RtlLookupFunctionEntry`.  Avoids re-resolving
 /// on every call to `has_valid_unwind_info`.
-static RTL_LOOKUP_FN_ENTRY: OnceLock<usize> = OnceLock::new();
+static RTL_LOOKUP_FN_ENTRY: OnceLock<Option<usize>> = OnceLock::new();
 
 /// Resolve `RtlLookupFunctionEntry` from ntdll and cache the pointer.
 fn get_rtl_lookup() -> Option<usize> {
-    Some(*RTL_LOOKUP_FN_ENTRY.get_or_init(|| unsafe {
-        let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)?;
-        let hash = pe_resolve::hash_str(b"RtlLookupFunctionEntry\0");
-        pe_resolve::get_proc_address_by_hash(ntdll_base, hash)
-    }))
+    *RTL_LOOKUP_FN_ENTRY.get_or_init(|| unsafe {
+        pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL).and_then(|ntdll_base| {
+            let hash = pe_resolve::hash_str(b"RtlLookupFunctionEntry\0");
+            pe_resolve::get_proc_address_by_hash(ntdll_base, hash)
+        })
+    })
 }
 
 // ── Unwind metadata validation ──────────────────────────────────────────────

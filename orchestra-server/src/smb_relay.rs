@@ -30,7 +30,9 @@
 //! On non-Windows platforms this module compiles to a no-op stub that logs a
 //! warning when `run()` is called.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
+#[cfg(windows)]
+use anyhow::anyhow;
 #[cfg(windows)]
 use tokio::net::TcpStream;
 
@@ -44,9 +46,11 @@ mod imp {
     type PipeHandle = winapi::shared::ntdef::HANDLE;
 
     // Maximum frame size (must match agent_link and transport.rs).
+    #[allow(dead_code)]
     const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
     /// Read one length-prefixed frame from a synchronous file handle.
+    #[allow(dead_code)]
     fn read_frame_sync(
         handle: PipeHandle,
         buf: &mut Vec<u8>,
@@ -68,6 +72,7 @@ mod imp {
     }
 
     /// Write one length-prefixed frame to a synchronous file handle.
+    #[allow(dead_code)]
     fn write_frame_sync(
         handle: PipeHandle,
         data: &[u8],

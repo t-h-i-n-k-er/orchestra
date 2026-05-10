@@ -348,6 +348,7 @@ fn initialized_plugin(plugin_ptr: *mut PluginObject, ext: Option<*const PluginVT
 
 /// Convenience wrapper: load a plugin and return it as a [`LoadedPlugin`] with
 /// metadata and timestamp.
+#[allow(dead_code)]
 fn loaded_plugin_with_metadata(
     plugin_ptr: *mut PluginObject,
     ext: Option<*const PluginVTableExt>,

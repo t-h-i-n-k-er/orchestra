@@ -1,6 +1,5 @@
 //! Internal test harness for evasion functionality.
 //! Runs on development systems to ensure OPSEC features are working properly.
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
 fn test_clean_ntdll_mapping() {
@@ -43,7 +42,7 @@ fn test_sleep_encryption_clears_memory() {
 #[test]
 fn test_amsi_bypass_no_patch() {
     // Ensure amsi.dll bytes are not patched in memory
-    let amsi_buffer = vec![0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08]; // Original bytes
+    let _amsi_buffer = vec![0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08]; // Original bytes
     let patched = false;
     assert!(
         !patched,

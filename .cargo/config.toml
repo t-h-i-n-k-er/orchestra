@@ -1,2 +1,7 @@
 [env]
 PKG_CONFIG_PATH=".pkgconfig"
+CC_x86_64_apple_darwin={ value="scripts/zig-cc-darwin.sh", relative=true }
+CXX_x86_64_apple_darwin={ value="scripts/zig-cxx-darwin.sh", relative=true }
+AR_x86_64_apple_darwin="zig ar"
+RANLIB_x86_64_apple_darwin="zig ranlib"
+AWS_LC_SYS_NO_JITTER_ENTROPY_x86_64_apple_darwin="1"

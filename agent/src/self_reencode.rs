@@ -156,7 +156,11 @@ pub fn find_text_section() -> Result<TextSection> {
     {
         find_text_section_linux()
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        find_text_section_macos()
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         anyhow::bail!("self_reencode: unsupported platform for .text section discovery");
     }
@@ -207,7 +211,7 @@ fn find_text_section_windows() -> Result<TextSection> {
             // .text section name is ".text\0\0\0" (8 bytes, null-padded).
             if &sec.Name[..5] == b".text" {
                 let text_base = base + sec.VirtualAddress as usize;
-                let text_size = sec.Misc.VirtualSize as usize;
+                let text_size = *sec.Misc.VirtualSize() as usize;
                 log::debug!(
                     "self_reencode: found .text at {:#x}, size={} bytes",
                     text_base,
@@ -258,6 +262,162 @@ fn find_text_section_linux() -> Result<TextSection> {
         }
     }
     anyhow::bail!("self_reencode: no .text section found in ELF headers");
+}
+
+#[cfg(target_os = "macos")]
+fn find_text_section_macos() -> Result<TextSection> {
+    use std::ffi::c_void;
+
+    const MH_MAGIC_64: u32 = 0xfeed_facf;
+    const MH_CIGAM_64: u32 = 0xcffa_edfe;
+    const LC_SEGMENT_64: u32 = 0x19;
+
+    #[repr(C)]
+    struct MachHeader64 {
+        magic: u32,
+        cputype: i32,
+        cpusubtype: i32,
+        filetype: u32,
+        ncmds: u32,
+        sizeofcmds: u32,
+        flags: u32,
+        reserved: u32,
+    }
+
+    #[repr(C)]
+    struct LoadCommand {
+        cmd: u32,
+        cmdsize: u32,
+    }
+
+    #[repr(C)]
+    struct SegmentCommand64 {
+        cmd: u32,
+        cmdsize: u32,
+        segname: [u8; 16],
+        vmaddr: u64,
+        vmsize: u64,
+        fileoff: u64,
+        filesize: u64,
+        maxprot: i32,
+        initprot: i32,
+        nsects: u32,
+        flags: u32,
+    }
+
+    #[repr(C)]
+    struct Section64 {
+        sectname: [u8; 16],
+        segname: [u8; 16],
+        addr: u64,
+        size: u64,
+        offset: u32,
+        align: u32,
+        reloff: u32,
+        nreloc: u32,
+        flags: u32,
+        reserved1: u32,
+        reserved2: u32,
+        reserved3: u32,
+    }
+
+    fn name_eq(actual: &[u8; 16], expected: &[u8]) -> bool {
+        let len = actual.iter().position(|&b| b == 0).unwrap_or(actual.len());
+        &actual[..len] == expected
+    }
+
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    let symbol = reencode_text as *const () as *const c_void;
+    if unsafe { libc::dladdr(symbol, &mut info as *mut libc::Dl_info) } == 0 {
+        anyhow::bail!("self_reencode: dladdr failed while locating module base");
+    }
+    if info.dli_fbase.is_null() {
+        anyhow::bail!("self_reencode: dladdr returned null module base");
+    }
+
+    let base = info.dli_fbase as usize;
+    unsafe {
+        let header = &*(base as *const MachHeader64);
+        if header.magic != MH_MAGIC_64 && header.magic != MH_CIGAM_64 {
+            anyhow::bail!(
+                "self_reencode: invalid Mach-O 64-bit magic at base {:#x}: {:#x}",
+                base,
+                header.magic
+            );
+        }
+
+        let mut cmd_ptr = base + std::mem::size_of::<MachHeader64>();
+        let commands_end = cmd_ptr
+            .checked_add(header.sizeofcmds as usize)
+            .ok_or_else(|| anyhow::anyhow!("self_reencode: Mach-O load command bounds overflow"))?;
+
+        for _ in 0..header.ncmds {
+            if cmd_ptr + std::mem::size_of::<LoadCommand>() > commands_end {
+                anyhow::bail!("self_reencode: truncated Mach-O load command table");
+            }
+
+            let lc = &*(cmd_ptr as *const LoadCommand);
+            if (lc.cmdsize as usize) < std::mem::size_of::<LoadCommand>()
+                || cmd_ptr + lc.cmdsize as usize > commands_end
+            {
+                anyhow::bail!(
+                    "self_reencode: malformed Mach-O load command size {}",
+                    lc.cmdsize
+                );
+            }
+
+            if lc.cmd == LC_SEGMENT_64 {
+                if (lc.cmdsize as usize) < std::mem::size_of::<SegmentCommand64>() {
+                    anyhow::bail!("self_reencode: malformed LC_SEGMENT_64 command");
+                }
+
+                let seg = &*(cmd_ptr as *const SegmentCommand64);
+                if name_eq(&seg.segname, b"__TEXT") {
+                    let mut sec_ptr = cmd_ptr + std::mem::size_of::<SegmentCommand64>();
+                    let segment_end = cmd_ptr + lc.cmdsize as usize;
+
+                    for _ in 0..seg.nsects as usize {
+                        if sec_ptr + std::mem::size_of::<Section64>() > segment_end {
+                            break;
+                        }
+
+                        let sec = &*(sec_ptr as *const Section64);
+                        if name_eq(&sec.sectname, b"__text") {
+                            if sec.addr < seg.vmaddr {
+                                anyhow::bail!(
+                                    "self_reencode: __text addr {:#x} is below __TEXT vmaddr {:#x}",
+                                    sec.addr,
+                                    seg.vmaddr
+                                );
+                            }
+
+                            let text_base = base + (sec.addr as usize - seg.vmaddr as usize);
+                            let text_size = sec.size as usize;
+                            if text_size == 0 {
+                                anyhow::bail!("self_reencode: Mach-O __text section is empty");
+                            }
+
+                            log::debug!(
+                                "self_reencode: found macOS __text at {:#x}, size={} bytes",
+                                text_base,
+                                text_size
+                            );
+                            return Ok(TextSection {
+                                base: text_base,
+                                size: text_size,
+                            });
+                        }
+
+                        sec_ptr += std::mem::size_of::<Section64>();
+                    }
+                }
+            }
+
+            cmd_ptr += lc.cmdsize as usize;
+        }
+    }
+
+    anyhow::bail!("self_reencode: no __TEXT,__text section found in loaded Mach-O image")
 }
 
 /// Determine the ASLR base address of the main executable on Linux by
@@ -700,6 +860,126 @@ pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
     })
 }
 
+#[cfg(target_os = "macos")]
+type MachPort = u32;
+
+#[cfg(target_os = "macos")]
+type KernReturn = i32;
+
+#[cfg(target_os = "macos")]
+const KERN_SUCCESS: KernReturn = 0;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn mach_task_self() -> MachPort;
+    fn mach_thread_self() -> MachPort;
+    fn task_threads(
+        target_task: MachPort,
+        act_list: *mut *mut MachPort,
+        act_list_cnt: *mut u32,
+    ) -> KernReturn;
+    fn thread_suspend(target_act: MachPort) -> KernReturn;
+    fn thread_resume(target_act: MachPort) -> KernReturn;
+    fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
+    fn vm_deallocate(target_task: MachPort, address: usize, size: usize) -> KernReturn;
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct FrozenThreads {
+    threads: Vec<MachPort>,
+    task: MachPort,
+    frozen_at: std::time::Instant,
+    thawed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl FrozenThreads {
+    pub(crate) fn thaw(&mut self) {
+        if self.thawed {
+            return;
+        }
+        self.thawed = true;
+
+        let elapsed = self.frozen_at.elapsed();
+        if elapsed > Duration::from_secs(FREEZE_WARN_SECS) {
+            log::warn!(
+                "self_reencode: threads were frozen for {:.1}s (>{FREEZE_WARN_SECS}s threshold)",
+                elapsed.as_secs_f64()
+            );
+        }
+
+        while let Some(thread) = self.threads.pop() {
+            let _ = unsafe { thread_resume(thread) };
+            let _ = unsafe { mach_port_deallocate(self.task, thread) };
+        }
+        log::debug!("self_reencode: all sibling threads resumed (macOS)");
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for FrozenThreads {
+    fn drop(&mut self) {
+        if !self.thawed {
+            log::warn!("self_reencode: FrozenThreads dropped without explicit thaw — auto-resuming");
+            self.thaw();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn freeze_threads() -> Result<FrozenThreads> {
+    unsafe {
+        let task = mach_task_self();
+        let self_thread = mach_thread_self();
+
+        let mut thread_list: *mut MachPort = std::ptr::null_mut();
+        let mut thread_count: u32 = 0;
+        let kr = task_threads(task, &mut thread_list as *mut *mut MachPort, &mut thread_count as *mut u32);
+        if kr != KERN_SUCCESS {
+            let _ = mach_port_deallocate(task, self_thread);
+            anyhow::bail!("self_reencode: task_threads failed with kern_return_t {kr}");
+        }
+
+        let mut frozen = Vec::with_capacity(thread_count as usize);
+        for idx in 0..thread_count as usize {
+            let thread = *thread_list.add(idx);
+            if thread == self_thread {
+                continue;
+            }
+
+            let suspend_kr = thread_suspend(thread);
+            if suspend_kr == KERN_SUCCESS {
+                frozen.push(thread);
+            } else {
+                let _ = mach_port_deallocate(task, thread);
+                log::debug!(
+                    "self_reencode: thread_suspend failed for thread {} with kern_return_t {}",
+                    thread,
+                    suspend_kr
+                );
+            }
+        }
+
+        if !thread_list.is_null() {
+            let list_size = (thread_count as usize) * std::mem::size_of::<MachPort>();
+            let _ = vm_deallocate(task, thread_list as usize, list_size);
+        }
+        let _ = mach_port_deallocate(task, self_thread);
+
+        log::info!(
+            "self_reencode: froze {} sibling threads (macOS)",
+            frozen.len()
+        );
+
+        Ok(FrozenThreads {
+            threads: frozen,
+            task,
+            frozen_at: std::time::Instant::now(),
+            thawed: false,
+        })
+    }
+}
+
 // ── Core re-encoding logic ────────────────────────────────────────────────
 
 /// Apply the code_transform pipeline to the agent's .text section with the
@@ -734,7 +1014,7 @@ pub unsafe fn reencode_text(seed: u64) -> Result<()> {
         log::error!(
             "self_reencode: transform returned empty output — skipping re-encode (would NOP-pad entire .text)"
         );
-        return Err("transform produced empty output".into());
+        return Err(anyhow::anyhow!("transform produced empty output"));
     }
 
     if transformed.len() > text.size {
@@ -809,6 +1089,9 @@ struct ProtSnapshot(u32);
 
 #[cfg(target_os = "linux")]
 struct ProtSnapshot(u32);
+
+#[cfg(target_os = "macos")]
+struct ProtSnapshot(i32);
 
 /// Make the memory region `[addr, addr+len)` read-write-executable.
 /// Returns a snapshot of the original protection to restore later.
@@ -946,6 +1229,62 @@ unsafe fn flush_icache(addr: usize, len: usize) {
     #[cfg(not(target_arch = "aarch64"))]
     {
         // x86_64: I-cache is coherent; mprotect serialises.  No-op.
+        let _ = (addr, len);
+    }
+}
+
+// ── macOS memory protection helpers ───────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+unsafe fn make_writable(addr: usize, len: usize) -> Result<ProtSnapshot> {
+    let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+    let aligned = addr & !(page_size - 1);
+    let aligned_len = ((addr + len) - aligned + page_size - 1) & !(page_size - 1);
+
+    // Mach-O __TEXT is typically RX; preserve that default on restore.
+    let original = libc::PROT_READ | libc::PROT_EXEC;
+    if libc::mprotect(
+        aligned as *mut libc::c_void,
+        aligned_len,
+        libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+    ) != 0
+    {
+        anyhow::bail!(
+            "mprotect(RWX) failed on macOS: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    Ok(ProtSnapshot(original))
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn restore_protection(addr: usize, len: usize, old: &ProtSnapshot) -> Result<()> {
+    let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+    let aligned = addr & !(page_size - 1);
+    let aligned_len = ((addr + len) - aligned + page_size - 1) & !(page_size - 1);
+
+    if libc::mprotect(aligned as *mut libc::c_void, aligned_len, old.0) != 0 {
+        anyhow::bail!(
+            "mprotect(restore) failed on macOS: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn flush_icache(addr: usize, len: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe extern "C" {
+            fn sys_icache_invalidate(start: *mut libc::c_void, len: usize);
+        }
+        sys_icache_invalidate(addr as *mut libc::c_void, len);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // x86_64 has coherent I-cache for self-modifying code once mprotect returns.
         let _ = (addr, len);
     }
 }

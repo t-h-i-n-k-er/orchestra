@@ -273,7 +273,7 @@ fn hci_listen_macos(
             // Recover the Arc references from the user_info pointer.
             // We boxed them and leaked the box; the pointer stays valid
             // for the thread lifetime.
-            let ctx = &*(user_info as *const MacOsListenerContext);
+            let ctx = unsafe { &*(user_info as *const MacOsListenerContext) };
             let pressed = match etype {
                 CG_EVENT_KEY_DOWN => true,
                 CG_EVENT_KEY_UP => false,

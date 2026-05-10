@@ -250,7 +250,7 @@ pub fn psexec_exec(
         resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_CLOSESERVICEHANDLE)
             .expect("CloseServiceHandle resolution failed")
     };
-    let fn_open_svc: FnOpenServiceW = unsafe {
+    let _fn_open_svc: FnOpenServiceW = unsafe {
         resolve_api_or_load(ADVAPI32_DLL_W, HASH_ADVAPI32_DLL, HASH_OPENSERVICEW)
             .expect("OpenServiceW resolution failed")
     };
@@ -872,14 +872,14 @@ pub fn dcom_exec(
     let (mut server_info, _name_w) = build_co_server_info(target_host);
 
     // If credentials are provided, set up COAUTHIDENTITY in the server info.
-    let (mut auth_identity, _user_w, _pass_w, _domain_w) = if let (Some(user), Some(pass)) = (username, password) {
+    let (_auth_identity, _user_w, _pass_w, _domain_w) = if let (Some(user), Some(pass)) = (username, password) {
         let mut identity: winapi::shared::wtypesbase::COAUTHIDENTITY = unsafe { std::mem::zeroed() };
         let user_wide: Vec<u16> = user.encode_utf16().collect();
         let pass_wide: Vec<u16> = pass.encode_utf16().collect();
         // If user is "DOMAIN\user" format, split it.
         let (domain_wide, user_part): (Vec<u16>, &[u16]) = if let Some(bslash) = user.find('\\') {
             let dom: Vec<u16> = user[..bslash].encode_utf16().collect();
-            let usr: Vec<u16> = user[bslash+1..].encode_utf16().collect();
+            let _usr: Vec<u16> = user[bslash+1..].encode_utf16().collect();
             identity.Domain = dom.as_ptr() as *mut _;
             identity.DomainLength = dom.len() as u32;
             (dom, &[])

@@ -266,8 +266,8 @@ pub fn resolve_kernel_symbol(
     }
 
     // COFF header starts at +4.
-    let num_sections = u16::from_le_bytes(pe_header[6..8].try_into()?) as u32;
-    let optional_header_size = u16::from_le_bytes(pe_header[20..22].try_into()?) as u64;
+    let _num_sections = u16::from_le_bytes(pe_header[6..8].try_into()?) as u32;
+    let _optional_header_size = u16::from_le_bytes(pe_header[20..22].try_into()?) as u64;
     let _machine = u16::from_le_bytes(pe_header[4..6].try_into()?);
 
     // Export directory RVA is the first data directory (index 0) in the optional header.
@@ -381,7 +381,7 @@ pub fn resolve_kernel_symbol(
 
 /// Identify the owner module of a kernel address by checking which loaded
 /// module's address range contains it.
-fn identify_module(driver: &super::driver_db::VulnerableDriver, device_handle: usize, addr: u64) -> Result<String> {
+fn identify_module(_driver: &super::driver_db::VulnerableDriver, _device_handle: usize, addr: u64) -> Result<String> {
     let mut buf_size: u32 = 0;
 
     unsafe {

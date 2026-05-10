@@ -347,8 +347,8 @@ static PLACEHOLDER_DRIVER_BYTES: &[u8] = include_bytes!("../../resources/placeho
 /// XOR-encrypted embedded driver bytes.
 ///
 /// With `embedded_driver` disabled, this resolves to the placeholder marker.
-/// With `embedded_driver` enabled, this resolves to the payload from
-/// `SYS_DRIVER_PATH`.
+/// With `embedded_driver` enabled and a configured driver path, this resolves
+/// to the payload from `SYS_DRIVER_PATH`.
 #[cfg(not(feature = "embedded_driver"))]
 static EMBEDDED_DRIVER_BYTES: &[u8] = PLACEHOLDER_DRIVER_BYTES;
 
@@ -361,11 +361,14 @@ static EMBEDDED_DRIVER_BYTES: &[u8] = PLACEHOLDER_DRIVER_BYTES;
 ///     cargo build --features embedded_driver
 /// ```
 ///
-/// If the variable is not set, compilation will fail with an
-/// `include_bytes!` error — this is intentional (fail-fast at build time
-/// rather than silently embedding an empty payload).
-#[cfg(feature = "embedded_driver")]
+/// If no driver path is configured, we fall back to the placeholder bytes so
+/// all-features CI builds remain reproducible; runtime deployment is still
+/// gated by `embedded_payload_is_configured()`.
+#[cfg(all(feature = "embedded_driver", has_sys_driver_path))]
 static EMBEDDED_DRIVER_BYTES: &[u8] = include_bytes!(env!("SYS_DRIVER_PATH"));
+
+#[cfg(all(feature = "embedded_driver", not(has_sys_driver_path)))]
+static EMBEDDED_DRIVER_BYTES: &[u8] = PLACEHOLDER_DRIVER_BYTES;
 
 #[inline]
 fn embedded_payload_is_configured() -> bool {

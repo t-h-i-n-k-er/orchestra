@@ -1239,7 +1239,7 @@ mod tests {
 
     #[test]
     fn reject_unknown_frame_type() {
-        let mut buf = vec![0xFFu8, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let buf = vec![0xFFu8, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let err = P2pFrame::from_bytes(&buf).unwrap_err();
         assert!(err.contains("unknown P2P frame type"));
     }

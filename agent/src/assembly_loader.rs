@@ -51,14 +51,14 @@
 #![cfg(windows)]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
-use winapi::shared::guiddef::{CLSID, IID, REFIID};
+use winapi::shared::guiddef::{CLSID, REFIID};
 use winapi::shared::minwindef::{DWORD, HMODULE, LPDWORD, LPVOID, ULONG};
-use winapi::shared::ntdef::{HRESULT, LPCWSTR, LPWSTR, OBJECT_ATTRIBUTES, UNICODE_STRING};
+use winapi::shared::ntdef::{HRESULT, LPCWSTR, LPWSTR};
 use winapi::shared::winerror::S_OK;
 use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
 use winapi::um::winbase::WAIT_OBJECT_0;
@@ -1676,7 +1676,7 @@ unsafe fn execute_in_memory_internal(
         unsafe { sys_alloc_string(&wide) }
     }).collect();
 
-    let mut arg_variants: Vec<VARIANT> = arg_bstrs.iter().map(|bstr| {
+    let arg_variants: Vec<VARIANT> = arg_bstrs.iter().map(|bstr| {
         VARIANT {
             vt: VT_BSTR,
             w_reserved1: 0,
@@ -1741,7 +1741,7 @@ unsafe fn execute_in_memory_internal(
         VARIANT::from_safe_array_variant(sa_args)
     };
 
-    let mut invoke_args = [null_variant, args_variant];
+    let invoke_args = [null_variant, args_variant];
 
     // We need to run this on a separate thread for timeout enforcement.
     // Clone the raw pointers into a Send-able wrapper for the thread.
@@ -1846,7 +1846,7 @@ unsafe fn execute_in_memory_internal(
         pe_resolve::hash_str(b"CloseHandle\0"),
     ).ok_or("cannot resolve CloseHandle")?;
 
-    let timeout_ms = timeout_secs * 1000;
+    let _timeout_ms = timeout_secs * 1000;
     let mut needs_reinit = false;
 
     // Use NtWaitForSingleObject on the thread handle to enforce timeout.
@@ -2293,7 +2293,7 @@ pub unsafe fn execute(
 
     // ── Execute with timeout ────────────────────────────────────────────
     let timeout = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
-    let host = &*runtime_host;
+    let _host = &*runtime_host;
 
     let create_event_w: FnCreateEventW = resolve_api(
         pe_resolve::HASH_KERNEL32_DLL,

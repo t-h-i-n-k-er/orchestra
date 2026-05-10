@@ -143,6 +143,11 @@ pub struct ServerConfig {
     /// How long (seconds) to wait for an agent to reply before timing out a command.
     #[serde(default = "default_command_timeout")]
     pub command_timeout_secs: u64,
+    /// When `true`, builder requests targeting loopback / private addresses
+    /// are allowed.  Set to `true` only in local development environments.
+    /// Defaults to `false` to prevent SSRF in production deployments.
+    #[serde(default)]
+    pub allow_local_builds: bool,
     /// Enable the DNS-over-HTTPS bridge listener.
     #[serde(default)]
     pub doh_enabled: bool,
@@ -339,6 +344,7 @@ impl Default for ServerConfig {
             profile_path: None,
             audit_hmac_key: None,
             redirector_secret: None,
+            allow_local_builds: false,
         }
     }
 }

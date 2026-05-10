@@ -375,10 +375,10 @@ fn default_shell() -> &'static str {
 fn spawn_shell_process(
     shell_path: &str,
 ) -> Result<(PlatformProcess, PlatformPipes), String> {
-    use winapi::shared::minwindef::{DWORD, FALSE, TRUE};
-    use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+    use winapi::shared::minwindef::{DWORD, TRUE};
+    
     use winapi::um::processthreadsapi::{PROCESS_INFORMATION, STARTUPINFOW};
-    use winapi::um::winbase::{CREATE_NO_WINDOW, STARTF_USESTDHANDLES, WAIT_OBJECT_0};
+    use winapi::um::winbase::{CREATE_NO_WINDOW, STARTF_USESTDHANDLES};
     use winapi::um::winnt::HANDLE;
 
     // Dynamically resolve kernel32 functions to avoid IAT entries.

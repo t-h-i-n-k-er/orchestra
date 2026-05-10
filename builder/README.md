@@ -105,16 +105,31 @@ When the `configure` wizard detects that you have selected `outbound-c`:
 Example profile (can be created by the wizard or written by hand):
 
 ```toml
-target_os         = "linux"
-target_arch       = "x86_64"
-c2_address        = "10.0.0.5:8444"
-encryption_key    = "<base64-32-bytes>"
-c_server_secret   = "REPLACE-ME-same-as-agent_shared_secret-in-server-toml"
+target_os               = "linux"
+target_arch             = "x86_64"
+c2_address              = "10.0.0.5:8444"
+encryption_key          = "<base64-32-bytes>"
+c_server_secret         = "REPLACE-ME-same-as-agent_shared_secret-in-server-toml"
 server_cert_fingerprint = "<64-hex-sha256>"
-features          = ["outbound-c"]
-package           = "agent"
-bin_name          = "agent-standalone"
+module_aes_key          = "<base64-32-bytes>"  # required for production builds
+features                = ["outbound-c"]
+package                 = "agent"
+bin_name                = "agent-standalone"
 ```
+
+The `module_aes_key` field is a base64-encoded 32-byte AES-256 key used to
+authenticate loaded modules. It is **required** in any non-debug, non-dev agent
+build. If it is missing, the agent exits immediately at startup with:
+
+```
+ERROR: module_aes_key is required in production builds.
+```
+
+When building via the server's `POST /api/build` API, the `module_aes_key` from
+`orchestra-server.toml` is automatically propagated through the build pipeline
+(`PayloadConfig` → `ORCHESTRA_MODULE_AES_KEY` env var → `cargo:rustc-env=SYS_MODULE_KEY`
+→ `option_env!("SYS_MODULE_KEY")` in the agent). No manual configuration is needed
+when using the server API.
 
 Build:
 
@@ -154,8 +169,9 @@ The build pipeline:
    `target/<triple>/release/<package>[.exe]`.
 5. Best-effort strip with a target-compatible strip tool. Cross-target
   artifacts are not stripped with the host `strip` binary.
-6. Encrypts the binary with AES-256-GCM via `common::CryptoSession`
-   (12-byte nonce ‖ ciphertext+tag — the exact format the launcher expects).
+6. Encrypts the binary with AES-256-GCM via HKDF-SHA256 key derivation.
+   Wire format: `salt(32) ‖ nonce(12) ‖ ciphertext+tag`.
+   HKDF info constant: `b"\x01\x8c\xa3\xf2\x6b\x4d\xe7\x90\x5a\x1f\xbc\xd8\x3e\x72\x09\xaf"`.
 7. Writes `dist/<output_name>.enc` (defaults to `dist/<profile_name>.enc`).
 
 ## End-to-end verification

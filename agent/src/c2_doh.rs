@@ -111,7 +111,7 @@ impl rustls_0_21::client::ServerCertVerifier for FingerprintVerifier {
             // Constant-time comparison to prevent timing side-channel attacks
             // that could brute-force the expected fingerprint byte-by-byte.
             let expected_lower = expected.to_lowercase();
-            if !hex_fp.as_bytes().ct_eq(expected_lower.as_bytes()).into() {
+            if !bool::from(hex_fp.as_bytes().ct_eq(expected_lower.as_bytes())) {
                 log::error!(
                     "cert pinning: fingerprint mismatch — rejecting connection"
                 );

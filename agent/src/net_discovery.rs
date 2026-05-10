@@ -606,9 +606,9 @@ mod dns_unix {
     /// replacing with raw socket DNS queries or platform-native resolver
     /// APIs to eliminate subprocess spawning on all platforms.
     pub fn reverse_dns_lookup(ip: IpAddr) -> Result<Option<String>, String> {
-        let out = run_with_timeout(
-            std::process::Command::new("host").arg(ip.to_string()),
-        );
+        let mut cmd = std::process::Command::new("host");
+        cmd.arg(ip.to_string());
+        let out = run_with_timeout(cmd);
         match out {
             Ok(o) if o.status.success() => {
                 let s = String::from_utf8_lossy(&o.stdout);
@@ -646,14 +646,13 @@ mod dns_unix {
         let mut results = Vec::new();
         for svc in services {
             let svc_str = svc.to_string();
-            let out = run_with_timeout(
-                std::process::Command::new("dig")
-                    .args(&["+short", "SRV", &svc_str]),
-            ).or_else(|_| {
-                run_with_timeout(
-                    std::process::Command::new("nslookup")
-                        .args(&["-type=SRV", &svc_str]),
-                )
+            let mut dig_cmd = std::process::Command::new("dig");
+            dig_cmd.args(["+short", "SRV", svc_str.as_str()]);
+
+            let out = run_with_timeout(dig_cmd).or_else(|_| {
+                let mut nslookup_cmd = std::process::Command::new("nslookup");
+                nslookup_cmd.args(["-type=SRV", svc_str.as_str()]);
+                run_with_timeout(nslookup_cmd)
             });
             if let Ok(o) = out {
                 let s = String::from_utf8_lossy(&o.stdout);

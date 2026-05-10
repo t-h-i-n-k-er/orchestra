@@ -10,7 +10,6 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use rand::RngCore;
 use base64::Engine as _;
 use tokio::sync::broadcast;
 

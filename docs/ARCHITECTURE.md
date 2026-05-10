@@ -1039,21 +1039,155 @@ Built on `axum` 0.7 with `tokio` async runtime:
 
 | Module | Responsibility |
 |--------|---------------|
-| `api.rs` | REST API routes (dashboard, build queue, agent management) |
+| `api.rs` | REST API routes (dashboard, build queue, agent management, fingerprint) |
 | `state.rs` | `AppState` with `DashMap` for agents, modules, redirectors |
-| `config.rs` | Server configuration parsing |
+| `config.rs` | Server configuration parsing (`ServerConfig`) |
 | `malleable.rs` | `MultiProfileManager` — loads, validates, hot-reloads profiles |
 | `http_c2.rs` | HTTP C2 listener with malleable profile handling |
 | `doh_listener.rs` | DNS-over-HTTPS C2 listener |
 | `redirector.rs` | Redirector registration and health monitoring |
-| `build_handler.rs` | On-demand agent compilation |
+| `build_handler.rs` | On-demand agent compilation via build worker pool |
 | `agent_link.rs` | Agent session management |
 | `audit.rs` | JSONL audit log with HMAC-SHA256 tamper evidence |
 | `auth.rs` | Bearer token operator authentication |
-| `tls.rs` | TLS configuration and certificate management |
+| `tls.rs` | TLS configuration and certificate fingerprint computation |
 | `smb_relay.rs` | SMB named pipe relay for P2P agent chains |
 
-### Multi-Profile Manager
+### Build Pipeline
+
+The build API (`POST /api/build`) compiles an agent binary on-demand with all
+C2 parameters baked in as compile-time constants. This avoids the need for a
+runtime configuration file on the deployed agent.
+
+```
+Operator POST /api/build
+{os, arch, host, port, pin, key, features, ...}
+           │
+           ▼
+  build_handler.rs: validate request
+  resolve_and_validate_host()
+  (blocks loopback unless allow_local_builds = true)
+           │
+           ▼
+  build_profile_from_request()
+  → PayloadConfig {
+      c_server_addr     = host:port
+      c_server_secret   = agent_shared_secret  (verbatim PSK)
+      c_cert_pin        = pin (64-hex)
+      enc_key           = key (base64 AES-256)
+      module_aes_key    = server config module_aes_key
+      features          = BuildFeatures { ... }
+    }
+           │
+           ▼
+  Serialize PayloadConfig → temp profile TOML file
+  in workspace sandbox copy
+           │
+           ▼
+  cargo run -p builder --bin orchestra-builder -- build <profile>
+  with env vars:
+    ORCHESTRA_C_ADDR        = host:port
+    ORCHESTRA_C_SECRET      = PSK
+    ORCHESTRA_C_CERT_FP     = pin
+    ORCHESTRA_MODULE_AES_KEY= module_aes_key
+           │
+           ▼
+  agent/build.rs forwards each ORCHESTRA_* var:
+    cargo:rustc-env=SYS_C_ADDR=...
+    cargo:rustc-env=SYS_C_SECRET=...
+    cargo:rustc-env=SYS_C_CERT_FP=...
+    cargo:rustc-env=SYS_MODULE_KEY=...
+           │
+           ▼
+  agent binary compiled — all values baked in via option_env!()
+           │
+           ▼
+  Binary encrypted with AES-256-GCM + HKDF-SHA256
+  Wire format: salt(32) ‖ nonce(12) ‖ ciphertext
+  HKDF info: b"\x01\x8c\xa3\xf2\x6b\x4d\xe7\x90\x5a\x1f\xbc\xd8\x3e\x72\x09\xaf"
+           │
+           ▼
+  Saved to builds_output_dir/<date>_<job_id>/agent-<job_id>-<os>-<arch>.enc
+           │
+           ▼
+  Download via GET /api/build/<job_id>/download
+```
+
+### module_aes_key Propagation Chain
+
+The module AES key is a 32-byte secret that authenticates deployed modules.
+It MUST be present in production (non-debug) agent builds:
+
+```
+orchestra-server.toml
+  module_aes_key = "<base64>"
+       │
+       ▼ ServerConfig::module_aes_key
+  execute_build_safely(module_aes_key = config.module_aes_key)
+       │
+       ▼ build_profile_from_request(module_aes_key)
+  PayloadConfig { module_aes_key: Some("<base64>") }
+       │
+       ▼ builder/src/build.rs
+  env ORCHESTRA_MODULE_AES_KEY="<base64>"  passed to cargo
+       │
+       ▼ agent/build.rs
+  cargo:rustc-env=SYS_MODULE_KEY=<base64>
+       │
+       ▼ agent/src/lib.rs  option_env!("SYS_MODULE_KEY")
+  let module_aes_key: [u8; 32] = base64::decode(baked)?
+```
+
+If `module_aes_key` is not set in the server config, the built agent will fail
+at startup with a hard error (`module_aes_key is required in production builds`).
+
+### REST API Routes
+
+All routes under `/api/` require `Authorization: Bearer <admin_token>`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/agents` | List connected agents |
+| `POST` | `/api/agents/<id>/command` | Execute a command, wait for response |
+| `POST` | `/api/build` | Submit a build job |
+| `GET` | `/api/build/status/<job_id>` | Poll build status and log tail |
+| `GET` | `/api/build/<job_id>/download` | Download encrypted `.enc` payload |
+| `GET` | `/api/info/fingerprint` | Return server TLS cert SHA-256 hex fingerprint |
+| `GET` | `/api/audit` | Return audit log (JSONL) |
+| `POST` | `/api/redirector/register` | Redirector self-registration |
+| `POST` | `/api/redirector/heartbeat` | Redirector heartbeat |
+
+### Web Dashboard
+
+The operator dashboard is served as static files from `static_dir`
+(`orchestra-server/static/`) and provides a 4-tab interface:
+
+| Tab | Purpose |
+|-----|---------|
+| **Dashboard** | Live agent table, command panel (100+ commands across 10 categories) |
+| **Shell** | Interactive shell relay to selected agent |
+| **Builder** | Full agent build form: target, C2 params, feature flags, PE artifact kit |
+| **Audit Log** | Live-updating JSONL audit log with keyword filter |
+
+The Builder tab includes a "Fetch Pin" button that calls `GET /api/info/fingerprint`
+to auto-populate the TLS certificate pin field, eliminating manual SHA-256
+computation.
+
+### TLS Certificate Fingerprint
+
+`GET /api/info/fingerprint` reads the configured PEM file, parses the first
+certificate, DER-encodes it, and returns the SHA-256 hex digest:
+
+```rust
+// SHA-256 of DER body (not fingerprint of PEM text)
+let fingerprint = hex::encode(sha256::digest(&der_bytes));
+// → {"fingerprint": "9cf7a2d57b0b259e1c8e04a4f2c3721248054ea4d7bcf55ddf2247ac98883bd9"}
+```
+
+This value is used as the `pin` field in build requests and as the
+`SYS_C_CERT_FP` compile-time constant baked into the agent binary.
+
+
 
 ```rust
 pub struct MultiProfileManager {

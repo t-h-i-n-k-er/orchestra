@@ -501,7 +501,7 @@ impl Injector for ModuleStompInjector {
                             let timeout_100ns: i64 =
                                 -((LDRLOADDLL_TIMEOUT_MS as i64) * 10_000);
                             let timeout_bytes =
-                                std::mem::transmute::<i64, [u8; 8]>(timeout_100ns);
+                                i64::to_ne_bytes(timeout_100ns);
                             let wait_status = crate::syscall!(
                                 "NtWaitForSingleObject",
                                 h_thread as u64,      // Handle

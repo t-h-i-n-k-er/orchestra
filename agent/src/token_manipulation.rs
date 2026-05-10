@@ -528,7 +528,7 @@ pub fn rev2self() -> Result<String> {
 pub fn get_system() -> Result<String> {
     // First call to NtQuerySystemInformation to determine buffer size.
     let mut return_length: u32 = 0;
-    let status = unsafe {
+    let _status = unsafe {
         nt_query_system_information(
             SYSTEM_PROCESS_INFORMATION,
             std::ptr::null_mut(),

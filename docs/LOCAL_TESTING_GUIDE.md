@@ -69,10 +69,22 @@ static_dir           = "orchestra-server/static"
 tls_cert_path        = "secrets/server.crt"
 tls_key_path         = "secrets/server.key"
 command_timeout_secs = 30
+builds_output_dir    = "builds"
+allow_local_builds   = true
+module_aes_key       = "af1FhprLnRzj8ZZyJmmNBaTQabNS8jGt4nbNCbzrKjw="
 ```
 
 > **Important:** `agent_shared_secret` must match the secret baked into the
-> agent binary at build time (see step 5).
+> agent binary at build time. `module_aes_key` is **required** for production
+> (non-debug) agent builds — without it the agent exits immediately at startup.
+> `allow_local_builds = true` is needed when building agents that connect to
+> a loopback or private IP address (which is the case for local testing).
+
+Create the builds output directory:
+
+```bash
+mkdir -p builds
+```
 
 ---
 
@@ -88,14 +100,19 @@ The binary lands at `target/release/orchestra-server`.
 
 ## 5. Build the Agent (with outbound-c feature)
 
-The agent needs three **compile-time** environment variables injected via
+The agent needs four **compile-time** environment variables injected via
 `option_env!()`:
 
 | Variable | Value |
 |---|---|
 | `ORCHESTRA_C_ADDR` | `<your-ip>:8444` (the `agent_addr` from the server config) |
-| `ORCHESTRA_C_SECRET` | Must match `agent_shared_secret` in the server config |
+| `ORCHESTRA_C_SECRET` | Must match `agent_shared_secret` in the server config **verbatim** |
 | `ORCHESTRA_C_CERT_FP` | SHA-256 fingerprint of `secrets/server.crt` |
+| `ORCHESTRA_MODULE_AES_KEY` | Must match `module_aes_key` in the server config |
+
+> **Important:** `ORCHESTRA_C_SECRET` must be the exact same base64 string as
+> `agent_shared_secret` in `orchestra-server.toml`. It is NOT derived; it is
+> compared verbatim.
 
 ```bash
 # Detect your LAN IP (or use 127.0.0.1 for localhost-only testing)
@@ -109,12 +126,14 @@ CERT_FP=$(openssl x509 -in secrets/server.crt -outform DER 2>/dev/null | sha256s
 ORCHESTRA_C_ADDR=${MY_IP}:8444 \
 ORCHESTRA_C_SECRET='RvDPwz+Xl7WuOkRnE3mIJjDy9B9oDyMvUg8fYSZ2EFg=' \
 ORCHESTRA_C_CERT_FP="$CERT_FP" \
+ORCHESTRA_MODULE_AES_KEY='af1FhprLnRzj8ZZyJmmNBaTQabNS8jGt4nbNCbzrKjw=' \
 cargo build --release --bin agent-standalone --features outbound-c
 
 # ── OR ── with screen capture / remote-assist support ──
 ORCHESTRA_C_ADDR=${MY_IP}:8444 \
 ORCHESTRA_C_SECRET='RvDPwz+Xl7WuOkRnE3mIJjDy9B9oDyMvUg8fYSZ2EFg=' \
 ORCHESTRA_C_CERT_FP="$CERT_FP" \
+ORCHESTRA_MODULE_AES_KEY='af1FhprLnRzj8ZZyJmmNBaTQabNS8jGt4nbNCbzrKjw=' \
 cargo build --release --bin agent-standalone --features "outbound-c,remote-assist"
 ```
 
@@ -331,6 +350,7 @@ CERT_FP=$(openssl x509 -in secrets/server.crt -outform DER 2>/dev/null | sha256s
 ORCHESTRA_C_ADDR=${MY_IP}:8444 \
 ORCHESTRA_C_SECRET='RvDPwz+Xl7WuOkRnE3mIJjDy9B9oDyMvUg8fYSZ2EFg=' \
 ORCHESTRA_C_CERT_FP="$CERT_FP" \
+ORCHESTRA_MODULE_AES_KEY='af1FhprLnRzj8ZZyJmmNBaTQabNS8jGt4nbNCbzrKjw=' \
 cargo build --release --bin agent-standalone --features "outbound-c,remote-assist"
 ```
 

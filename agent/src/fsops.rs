@@ -108,7 +108,7 @@ fn canonicalize_existing(path: &Path) -> Result<PathBuf> {
 /// On non-Windows platforms this is always `Ok(false)`.
 #[cfg(windows)]
 fn is_reparse_point(path: &Path) -> Result<bool> {
-    use std::os::windows::ffi::OsStrExt;
+    
 
     // ── NT constants (no winapi function imports → no IAT entries) ───────
     const OBJ_CASE_INSENSITIVE: u32 = 0x00000040;

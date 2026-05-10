@@ -95,6 +95,8 @@ Use this checklist when deploying Orchestra to production.
 - [ ] Minimize enabled features to reduce attack surface
 - [ ] Enable `syscall-emulation` feature to avoid ntdll hook detection
 - [ ] Configure `emulated_functions` to include injection-related syscalls
+- [ ] Set `module_aes_key` in `orchestra-server.toml` — production agents require this; without it they exit at startup
+- [ ] Generate a fresh `module_aes_key` per deployment: `python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"`
 
 ### Build queue
 
@@ -160,9 +162,10 @@ mtls_allowed_ous   = ["OrchestraAgents"]
 | Credential | Purpose | Storage |
 |------------|---------|---------|
 | `admin_token` | Dashboard + API authentication | `orchestra-server.toml` |
-| `agent_shared_secret` | Agent PSK for AES-GCM session | `orchestra-server.toml` + agent profile |
+| `agent_shared_secret` | Agent PSK for AES-GCM session; must match `c_server_secret` baked into agent **verbatim** | `orchestra-server.toml` + agent profile |
+| `module_aes_key` | AES-256 key baked into agent for module authentication; required for all production builds | `orchestra-server.toml` |
 | `encryption_key` | Payload encryption at rest | Agent profile |
-| `c_server_secret` | Agent-to-server PSK | Agent profile (baked into binary) |
+| `c_server_secret` | Agent-to-server PSK (must equal `agent_shared_secret` verbatim) | Agent profile (baked into binary) |
 | Module signing key | Ed25519 keypair for plugin verification | Generated via `keygen` utility |
 
 ### Rotation procedure

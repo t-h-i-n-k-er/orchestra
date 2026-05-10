@@ -61,20 +61,24 @@
 `orchestra-server.toml`:
 
 ```toml
-http_addr = "0.0.0.0:8443"
-agent_addr = "0.0.0.0:8444"
-agent_shared_secret = "REPLACE-ME-32-bytes-of-entropy"
-admin_token = "REPLACE-ME-bearer-token"
-audit_log_path = "/var/log/orchestra/audit.jsonl"
-static_dir = "/usr/share/orchestra-server/static"
+http_addr            = "0.0.0.0:8443"
+agent_addr           = "0.0.0.0:8444"
+agent_shared_secret  = "REPLACE-ME-32-bytes-of-entropy"
+admin_token          = "REPLACE-ME-bearer-token"
+audit_log_path       = "secrets/orchestra-audit.jsonl"
+static_dir           = "orchestra-server/static"
 command_timeout_secs = 30
 
 # Optional: PEM TLS material (recommended for production).
 # tls_cert_path = "/etc/orchestra/server.crt"
 # tls_key_path  = "/etc/orchestra/server.key"
 
-# Optional: Async build queue.
-# builds_output_dir     = "/var/lib/orchestra/builds"
+# Build queue (required for web dashboard builder):
+builds_output_dir    = "builds"
+module_aes_key       = "REPLACE-ME-base64-32-bytes"  # required for production agent builds
+# allow_local_builds = true                           # allow loopback/private IP targets
+
+# Optional: Async build queue settings.
 # build_retention_days  = 7
 # max_concurrent_builds = 2
 
@@ -124,9 +128,10 @@ All routes under `/api/*` require `Authorization: Bearer <admin_token>`.
 | `POST` | `/api/agents/{agent_id}/command` | `{ "command": <Command> }` | Route by agent's self-reported `agent_id` (most-recently-seen wins on duplicate). |
 | `POST` | `/api/connections/{connection_id}/command` | `{ "command": <Command> }` | Unambiguous routing by server-assigned `connection_id` — use this when multiple agents share an `agent_id`. |
 | `GET`  | `/api/audit` | — | Return up to 200 most recent audit events. |
-| `POST` | `/api/build` | `{ "target": "<triple>", "features": [...] }` | Submit an async build job to the build queue. Returns `{ "build_id": "..." }`. |
+| `GET`  | `/api/info/fingerprint` | — | Returns `{ "fingerprint": "<64-hex-sha256>" }` — SHA-256 DER fingerprint of the server TLS cert. |
+| `POST` | `/api/build` | `{ "target": "<triple>", "c2_address": "...", "features": {...} }` | Submit an async build job to the build queue. Returns `{ "build_id": "..." }`. |
 | `GET`  | `/api/build/status/{id}` | — | Poll build job status (`pending` / `running` / `completed` / `failed`). |
-| `GET`  | `/api/build/{id}/download` | — | Download the completed build artifact (encrypted payload). |
+| `GET`  | `/api/build/{id}/download` | — | Download the completed build artifact (encrypted `.enc` payload). |
 | `POST` | `/api/agents/{agent_id}/shell` | `{ "shell": "bash" }` | Open an interactive PTY session on the agent. Returns `{ "session_id": "..." }`. |
 | `POST` | `/api/agents/{agent_id}/shell/{sid}/input` | `{ "data": "<base64>" }` | Write bytes to the PTY session's stdin. |
 | `GET`  | `/api/agents/{agent_id}/shell/{sid}/output` | — | Poll the PTY session's stdout/stderr buffer. |

@@ -421,12 +421,11 @@ fn extract_cert_serial(cert: &rustls::pki_types::CertificateDer<'_>) -> anyhow::
     //     ...
     //   }
     // }
-    let mut i = 0;
     // Outer SEQUENCE
     if der.len() < 4 || der[0] != 0x30 { anyhow::bail!("not a valid certificate DER"); }
     let (outer_len, outer_hl) = read_asn1_length(&der[1..]);
     let _ = outer_len;
-    i = 1 + outer_hl;
+    let mut i = 1 + outer_hl;
     // Inner SEQUENCE (TBSCertificate)
     if i >= der.len() || der[i] != 0x30 { anyhow::bail!("no TBSCertificate SEQUENCE"); }
     let (tbs_len, tbs_hl) = read_asn1_length(&der[i + 1..]);

@@ -79,6 +79,11 @@ pub struct PayloadConfig {
     /// Windows PE targets.
     #[serde(default = "default_true")]
     pub strip_debug: bool,
+    /// Optional AES-256 module decryption key (base64-encoded 32 bytes).
+    /// When set, it is passed to the agent build as `ORCHESTRA_MODULE_AES_KEY`
+    /// so the agent doesn't require an `agent.toml` for module loading.
+    #[serde(default)]
+    pub module_aes_key: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -285,9 +290,8 @@ pub fn cmd_configure(name: Option<String>) -> Result<()> {
         custom_manifest: None,
         strip_signature: true,
         strip_debug: true,
+        module_aes_key: None,
     };
-
-    save_profile(&name, &profile)?;
     Ok(())
 }
 

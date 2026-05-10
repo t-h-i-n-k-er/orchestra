@@ -30,7 +30,6 @@ use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use clap::Parser;
 use common::CryptoSession;
-use rand::seq::SliceRandom;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -664,6 +663,7 @@ fn chacha20_xor(data: &[u8], key: &[u8]) -> Vec<u8> {
 
 #[cfg(target_os = "linux")]
 fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
+    use rand::seq::SliceRandom;
     use std::ffi::CString;
     use std::io::Write;
     use std::os::unix::io::FromRawFd;
@@ -721,7 +721,7 @@ fn execute_in_memory(payload: &[u8], args: &[String]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
 
-    const MACOS_SYS_MEMFD_CREATE: libc::c_long = 518;
+    const MACOS_SYS_MEMFD_CREATE: libc::c_int = 518;
 
     fn write_payload(fd: RawFd, payload: &[u8]) -> Result<()> {
         // SAFETY: `fd` is owned by this function call and valid while `file` is alive.

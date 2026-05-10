@@ -37,6 +37,14 @@ pub fn build_agent_for_profile(cfg: &PayloadConfig, override_seed: Option<u64>) 
         }
     }
 
+    // Bake in the module AES key when provided (allows server-side builds to
+    // produce self-contained agents without requiring an agent.toml).
+    if let Some(ref module_key) = cfg.module_aes_key {
+        if !module_key.trim().is_empty() {
+            extra_env.push(("ORCHESTRA_MODULE_AES_KEY".into(), module_key.clone()));
+        }
+    }
+
     // ── Per-build seed diversification ──────────────────────────────────────
     //
     // Every build gets unique OPTIMIZER_STUB_SEED and CODE_TRANSFORM_SEED

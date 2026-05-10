@@ -209,17 +209,41 @@ impl SshTransport {
             }
 
             SshAuthConfig::Agent => {
-                let mut agent_client = russh_keys::agent::client::AgentClient::connect_env()
-                    .await
-                    .map_err(|e| match e {
-                        russh_keys::Error::EnvVar("SSH_AUTH_SOCK") => anyhow!(
-                            "ssh-transport: ssh-agent auth requires SSH_AUTH_SOCK to be set and a running ssh-agent; start ssh-agent and load a key with ssh-add"
-                        ),
-                        russh_keys::Error::BadAuthSock => anyhow!(
-                            "ssh-transport: ssh-agent auth requires a reachable socket at SSH_AUTH_SOCK; start ssh-agent and ensure SSH_AUTH_SOCK points to the agent socket"
-                        ),
-                        other => anyhow!("ssh-transport: failed to connect to ssh-agent: {other}"),
-                    })?;
+                let mut agent_client = {
+                    #[cfg(unix)]
+                    {
+                        russh_keys::agent::client::AgentClient::connect_env()
+                            .await
+                            .map_err(|e| match e {
+                                russh_keys::Error::EnvVar("SSH_AUTH_SOCK") => anyhow!(
+                                    "ssh-transport: ssh-agent auth requires SSH_AUTH_SOCK to be set and a running ssh-agent; start ssh-agent and load a key with ssh-add"
+                                ),
+                                russh_keys::Error::BadAuthSock => anyhow!(
+                                    "ssh-transport: ssh-agent auth requires a reachable socket at SSH_AUTH_SOCK; start ssh-agent and ensure SSH_AUTH_SOCK points to the agent socket"
+                                ),
+                                other => anyhow!("ssh-transport: failed to connect to ssh-agent: {other}"),
+                            })?
+                            .dynamic()
+                    }
+
+                    #[cfg(windows)]
+                    {
+                        if let Ok(agent_socket) = std::env::var("SSH_AUTH_SOCK") {
+                            match russh_keys::agent::client::AgentClient::connect_named_pipe(&agent_socket).await {
+                                Ok(client) => client.dynamic(),
+                                Err(e) => {
+                                    log::warn!(
+                                        "ssh-transport: SSH_AUTH_SOCK named pipe connection failed ({}), falling back to Pageant",
+                                        e
+                                    );
+                                    russh_keys::agent::client::AgentClient::connect_pageant().await.dynamic()
+                                }
+                            }
+                        } else {
+                            russh_keys::agent::client::AgentClient::connect_pageant().await.dynamic()
+                        }
+                    }
+                };
 
                 let identities = agent_client
                     .request_identities()

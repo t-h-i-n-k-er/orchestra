@@ -126,57 +126,115 @@ features = [
 
 ## Server Configuration (`orchestra-server.toml`)
 
-### `[server]` — Core Server Settings
+The server configuration is a **flat TOML file** (no subsections). All paths
+are relative to the working directory from which the server is launched.
+
+### Complete Field Reference
+
+| Field | Type | Default | Required | Description |
+|-------|------|---------|----------|-------------|
+| `http_addr` | string | `"0.0.0.0:8443"` | No | Operator HTTPS listener |
+| `agent_addr` | string | `"0.0.0.0:8444"` | No | Agent listener |
+| `agent_shared_secret` | string | — | **Yes** | Base64 PSK for agent authentication |
+| `admin_token` | string | — | **Yes** | Bearer token for operator API |
+| `tls_cert_path` | path | — | **Yes** | TLS certificate PEM |
+| `tls_key_path` | path | — | **Yes** | TLS private key PEM |
+| `static_dir` | path | `"orchestra-server/static"` | No | Static files for web dashboard |
+| `audit_log_path` | path | `"orchestra-audit.jsonl"` | No | Path for JSONL audit log |
+| `command_timeout_secs` | u64 | `30` | No | Max wait for agent command response |
+| `builds_output_dir` | path | `"builds"` | No | Output dir for built agent payloads |
+| `module_aes_key` | string | — | **Yes*** | Base64 AES-256 key baked into agents |
+| `allow_local_builds` | bool | `false` | No | Allow loopback/private IP in build |
+
+> \* `module_aes_key` is required for production agent builds. If omitted, the
+> server will still start but build jobs will produce agents that fail at runtime.
+
+### Example Configuration
+
+```toml
+# orchestra-server.toml
+
+# Network
+http_addr            = "0.0.0.0:8443"
+agent_addr           = "0.0.0.0:8444"
+
+# Authentication
+agent_shared_secret  = "RvDPwz+Xl7WuOkRnE3mIJjDy9B9oDyMvUg8fYSZ2EFg="
+admin_token          = "0juoV2FGURAA8lUJ8HzALnXHOKE_yvdg"
+
+# TLS
+tls_cert_path        = "secrets/server.crt"
+tls_key_path         = "secrets/server.key"
+
+# Paths
+audit_log_path       = "secrets/orchestra-audit.jsonl"
+static_dir           = "orchestra-server/static"
+builds_output_dir    = "builds"
+
+# Crypto
+module_aes_key       = "af1FhprLnRzj8ZZyJmmNBaTQabNS8jGt4nbNCbzrKjw="
+
+# Timing
+command_timeout_secs = 30
+
+# Development only — allow building agents with loopback target:
+# allow_local_builds = true
+```
+
+### Generating Credentials
+
+```bash
+# Generate 32-byte base64 secrets
+python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+
+# Or use the keygen utility
+cargo run -p keygen
+
+# Generate TLS certificate and key
+./scripts/generate-certs.sh
+```
+
+### Build Request API Fields
+
+When submitting a build via `POST /api/build`:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `os` | string | Yes | Target OS: `"linux"`, `"windows"`, `"macos"` |
+| `arch` | string | Yes | Target arch: `"x86_64"`, `"aarch64"` |
+| `host` | string | Yes | C2 host that the agent will connect to |
+| `port` | u16 | Yes | C2 port |
+| `pin` | string | Yes | 64-hex SHA-256 TLS fingerprint |
+| `key` | string | Yes | Base64 AES-256 payload encryption key |
+| `features` | object | No | `BuildFeatures` flags (see below) |
+| `format` | string | No | Output format: `"elf"`, `"pe"`, `"dylib"` |
+| `transport` | string | No | Primary transport: `"tls"`, `"http"`, `"doh"` |
+| `sleep_ms` | u64 | No | Base sleep interval (ms) |
+| `jitter` | u8 | No | Jitter percentage (0–100) |
+| `kill_date` | string | No | ISO 8601 kill date (agent exits after) |
+| `version_info` | object | No | PE version info (`file_version`, `product_name`, etc.) |
+| `manifest_preset` | string | No | PE manifest preset name |
+
+### BuildFeatures Fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `bind_addr` | string | `"0.0.0.0"` | Server bind address |
-| `port` | u16 | `8443` | HTTPS listener port |
-| `admin_token` | string | (required) | Admin authentication token |
-| `operator_token` | string | (required) | Operator authentication token |
-| `log_level` | string | `"info"` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
-| `database_path` | string | `"orchestra.db"` | SQLite database path |
-| `audit_log` | string | `"orchestra-audit.jsonl"` | Audit log file path |
+| `persistence` | bool | `false` | Cross-platform persistence |
+| `direct_syscalls` | bool | `false` | Direct/indirect syscall infrastructure |
+| `remote_assist` | bool | `false` | Screen capture, input simulation |
+| `stealth` | bool | `false` | Full stealth suite (memory guard, AMSI bypass, ETW patch) |
+| `network_discovery` | bool | `false` | ARP scan, ping sweep, port scan, reverse DNS |
+| `forensic_cleanup` | bool | `false` | Prefetch/MFT/USN evidence removal |
+| `self_reencode` | bool | `false` | Runtime metamorphic re-encoding |
+| `http_transport` | bool | `false` | HTTP/S malleable C2 transport |
+| `doh_transport` | bool | `false` | DNS-over-HTTPS C2 transport |
+| `ssh_transport` | bool | `false` | SSH subsystem C2 transport |
+| `smb_pipe_transport` | bool | `false` | SMB named pipe C2 transport |
+| `evasion_transform` | bool | `false` | Runtime EDR signature scanning + transformation |
+| `p2p` | bool | `false` | P2P mesh networking |
+| `stack_spoof` | bool | `false` | NtContinue-based call stack spoofing |
 
-### `[tls]` — TLS Configuration
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `cert_path` | string | (required) | TLS certificate path |
-| `key_path` | string | (required) | TLS private key path |
-| `min_version` | string | `"1.2"` | Minimum TLS version |
-
-### `[builder]` — Build Server Settings
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `target` | string | `"x86_64-pc-windows-gnu"` | Default build target |
-| `profile_dir` | string | `"profiles/"` | Malleable profile directory |
-| `output_dir` | string | `"builds/"` | Build output directory |
-| `signing_key` | string | `""` | Ed25519 signing key (hex) |
-
-### `[modules]` — Module Delivery
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `module_dir` | string | `"modules/"` | Module storage directory |
-| `max_module_size` | u64 | `10485760` | Maximum module size (10 MB) |
-| `verify_signatures` | bool | `true` | Verify module signatures |
-
-### `[crypto]` — Cryptographic Settings
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `session_key_rotation` | u64 | `3600` | Session key rotation interval (seconds) |
-| `forward_secrecy` | bool | `false` | Enable X25519 ECDH forward secrecy |
-
-### `[rate_limit]` — Rate Limiting
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_connections` | usize | `1000` | Maximum concurrent connections |
-| `requests_per_second` | u32 | `100` | Requests per second per agent |
-| `burst_size` | u32 | `50` | Burst allowance |
 
 ---
 
@@ -385,23 +443,35 @@ Runtime configuration is compiled into the agent at build time via the builder A
 
 ## Environment Variables
 
-### Build-Time Variables
+### Build-Time Environment Variables (Agent Build Pipeline)
 
-| Variable | Description |
-|----------|-------------|
-| `ORCHESTRA_BUILD_ID` | Unique build identifier (injected by builder) |
-| `ORCHESTRA_PROFILE` | Profile name embedded in agent binary |
-| `ORCHESTRA_C2_HOST` | C2 hostname/IP embedded in agent |
-| `ORCHESTRA_C2_PORT` | C2 port embedded in agent |
-| `ORCHESTRA_SIGNING_KEY` | Ed25519 key for module verification |
+These are set by the builder and forwarded by `agent/build.rs` as compile-time constants:
+
+| Variable | Rust constant | Description |
+|----------|---------------|-------------|
+| `ORCHESTRA_C_ADDR` | `SYS_C_ADDR` | C2 host:port baked into agent |
+| `ORCHESTRA_C_SECRET` | `SYS_C_SECRET` | PSK baked into agent (= server `agent_shared_secret`) |
+| `ORCHESTRA_C_CERT_FP` | `SYS_C_CERT_FP` | TLS fingerprint baked into agent |
+| `ORCHESTRA_MODULE_AES_KEY` | `SYS_MODULE_KEY` | Module AES-256 key baked into agent |
+
+All four are forwarded via `agent/build.rs`:
+```rust
+println!("cargo:rustc-env=SYS_C_ADDR={}", addr);
+println!("cargo:rustc-env=SYS_C_SECRET={}", secret);
+println!("cargo:rustc-env=SYS_C_CERT_FP={}", fp);
+println!("cargo:rustc-env=SYS_MODULE_KEY={}", module_key);
+```
+
+And read in `agent/src/lib.rs` / `agent/src/outbound.rs` via `option_env!("SYS_*")`.
 
 ### Server Secrets (`secrets/default.env`)
 
 | Variable | Description |
 |----------|-------------|
 | `ADMIN_TOKEN` | Server admin authentication token |
-| `OPERATOR_TOKEN` | Operator authentication token |
 | `SIGNING_KEY` | Ed25519 module signing key |
-| `DATABASE_KEY` | SQLite database encryption key |
 
-> **Note**: The server refuses to start without explicit credentials. No default credentials are provided.
+> **Note**: The server config file (`orchestra-server.toml`) is the primary source
+> of credentials. Environment variables are for CI/CD pipelines that need to
+> override specific values without modifying the file.
+

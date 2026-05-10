@@ -36,12 +36,36 @@ use std::sync::OnceLock;
 
 use common::config::{PrefetchCleanMethod, PrefetchConfig};
 
+// ── Macros (must be defined before first use in consts/functions) ───────
+
+macro_rules! defer {
+    ($($body:tt)*) => {
+        let _guard = {
+            struct DeferGuard<F: FnOnce()>(Option<F>);
+            impl<F: FnOnce()> Drop for DeferGuard<F> {
+                fn drop(&mut self) {
+                    if let Some(f) = self.0.take() {
+                        f();
+                    }
+                }
+            }
+            DeferGuard(Some(|| { $($body)* }))
+        };
+    };
+}
+
 // ── Constants ────────────────────────────────────────────────────────────
 
 /// Prefetch directory path (NT path format for NtCreateFile).
-const PREFETCH_DIR_NT: &[u16] = encode_wide!(
-    "\\??\\C:\\Windows\\Prefetch"
-);
+const PREFETCH_DIR_NT: &[u16] = &[
+    b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16,
+    b'C' as u16, b':' as u16, b'\\' as u16,
+    b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16,
+    b'o' as u16, b'w' as u16, b's' as u16, b'\\' as u16,
+    b'P' as u16, b'r' as u16, b'e' as u16, b'f' as u16,
+    b'e' as u16, b't' as u16, b'c' as u16, b'h' as u16,
+    0,
+];
 
 /// Prefetch file extension filter.
 const PF_EXTENSION: &str = ".pf";
@@ -103,12 +127,41 @@ const KEY_WRITE: u32 = 0x20006;
 const KEY_SET_VALUE: u32 = 0x0002;
 
 /// Prefetch registry path.
-const PREFETCH_REG_KEY_NT: &[u16] = encode_wide!(
-    "\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters"
-);
+const PREFETCH_REG_KEY_NT: &[u16] = &[
+    b'\\' as u16,
+    b'R' as u16, b'e' as u16, b'g' as u16, b'i' as u16, b's' as u16, b't' as u16, b'r' as u16,
+    b'y' as u16, b'\\' as u16,
+    b'M' as u16, b'a' as u16, b'c' as u16, b'h' as u16, b'i' as u16, b'n' as u16, b'e' as u16,
+    b'\\' as u16,
+    b'S' as u16, b'Y' as u16, b'S' as u16, b'T' as u16, b'E' as u16, b'M' as u16,
+    b'\\' as u16,
+    b'C' as u16, b'u' as u16, b'r' as u16, b'r' as u16, b'e' as u16, b'n' as u16, b't' as u16,
+    b'C' as u16, b'o' as u16, b'n' as u16, b't' as u16, b'r' as u16, b'o' as u16, b'l' as u16,
+    b'S' as u16, b'e' as u16, b't' as u16, b'\\' as u16,
+    b'C' as u16, b'o' as u16, b'n' as u16, b't' as u16, b'r' as u16, b'o' as u16, b'l' as u16,
+    b'\\' as u16,
+    b'S' as u16, b'e' as u16, b's' as u16, b's' as u16, b'i' as u16, b'o' as u16, b'n' as u16,
+    b' ' as u16,
+    b'M' as u16, b'a' as u16, b'n' as u16, b'a' as u16, b'g' as u16, b'e' as u16, b'r' as u16,
+    b'\\' as u16,
+    b'M' as u16, b'e' as u16, b'm' as u16, b'o' as u16, b'r' as u16, b'y' as u16,
+    b' ' as u16,
+    b'M' as u16, b'a' as u16, b'n' as u16, b'a' as u16, b'g' as u16, b'e' as u16, b'm' as u16,
+    b'e' as u16, b'n' as u16, b't' as u16,
+    b'\\' as u16,
+    b'P' as u16, b'r' as u16, b'e' as u16, b'f' as u16, b'e' as u16, b't' as u16, b'c' as u16,
+    b'h' as u16, b'P' as u16, b'a' as u16, b'r' as u16, b'a' as u16, b'm' as u16, b'e' as u16,
+    b't' as u16, b'e' as u16, b'r' as u16, b's' as u16,
+    0,
+];
 
 /// Registry value name for EnablePrefetcher.
-const ENABLE_PREFETCHER_NAME: &[u16] = encode_wide!("EnablePrefetcher");
+const ENABLE_PREFETCHER_NAME: &[u16] = &[
+    b'E' as u16, b'n' as u16, b'a' as u16, b'b' as u16, b'l' as u16, b'e' as u16,
+    b'P' as u16, b'r' as u16, b'e' as u16, b'f' as u16, b'e' as u16, b't' as u16,
+    b'c' as u16, b'h' as u16, b'e' as u16, b'r' as u16,
+    0,
+];
 
 /// FSCTL codes for USN journal operations.
 const FSCTL_QUERY_USN_JOURNAL: u32 = 0x000900F4;
@@ -240,27 +293,6 @@ struct UsnRecordV4 {
     file_name_length: u16,
     file_name_offset: u16,
     file_name: [u16; 1], // variable-length
-}
-
-// ── Macro to encode Rust string as UTF-16 with null terminator ─────────
-
-macro_rules! encode_wide {
-    ($s:expr) => {{
-        const _INPUT: &str = $s;
-        const _LEN: usize = _INPUT.len();
-        const _OUTPUT: &[u16; _LEN + 1] = {
-            let mut buf = [0u16; _LEN + 1];
-            let bytes = _INPUT.as_bytes();
-            let mut i = 0;
-            while i < _LEN {
-                buf[i] = bytes[i] as u16;
-                i += 1;
-            }
-            buf[_LEN] = 0u16;
-            &buf
-        };
-        _OUTPUT
-    }};
 }
 
 // ── Helper: wide string from Rust string ─────────────────────────────────
@@ -1069,6 +1101,7 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
+        .copied()
         .collect();
 
     // Read journal entries in a loop.
@@ -1151,10 +1184,17 @@ unsafe fn clean_usn_for_pf(pf_path: &[u16], volume_letter: &str) -> Result<(), S
 
                         // Check if this filename matches our .pf file.
                         if record_fn.len() >= pf_name_wide.len() {
+                            let upper_ascii_u16 = |v: u16| {
+                                if (b'a' as u16..=b'z' as u16).contains(&v) {
+                                    v - 32
+                                } else {
+                                    v
+                                }
+                            };
                             let tail_matches = record_fn[record_fn.len() - pf_name_wide.len()..]
                                 .iter()
                                 .zip(pf_name_wide.iter())
-                                .all(|(&a, &b)| a.to_ascii_uppercase() == b.to_ascii_uppercase());
+                                .all(|(&a, &b)| upper_ascii_u16(a) == upper_ascii_u16(b));
 
                             if tail_matches {
                                 // Found a matching entry. Write a USN close record to
@@ -1584,21 +1624,6 @@ pub fn shutdown() {
 
     INITIALIZED.store(false, Ordering::SeqCst);
     log::info!("prefetch: module shut down");
-}
-
-// ── Defer macro (simple scope guard) ─────────────────────────────────────
-
-macro_rules! defer {
-    ($($body:stmt);+ $(;)?) => {
-        struct _DeferGuard<F: FnMut()>(core::mem::ManuallyDrop<F>);
-        impl<F: FnMut()> Drop for _DeferGuard<F> {
-            fn drop(&mut self) {
-                let mut f = unsafe { core::mem::ManuallyDrop::take(&mut self.0) };
-                f();
-            }
-        }
-        let _guard = _DeferGuard(core::mem::ManuallyDrop::new(|| { $($body);+ }));
-    };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

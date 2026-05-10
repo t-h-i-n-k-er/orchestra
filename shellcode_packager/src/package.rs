@@ -75,7 +75,7 @@ pub fn package_with_config(pe_bytes: &[u8], config: &ShellcodeConfig) -> Result<
         seed: config.seed,
         ..Default::default()
     };
-    #[cfg_attr(feature = "obfuscate", allow(unused_mut))]
+    #[allow(unused_mut)]
     let mut blob = emit_loader(&pe, &emitter_config)?;
 
     // Optionally apply code_transform to the loader portion

@@ -21,7 +21,7 @@
 //!   PsLoadedModuleList for anti-forensic cleanup
 
 use super::deploy::{self, DeployedDriver};
-use super::discover::{CallbackInfo, CallbackListType, ScanResult};
+use super::discover::{CallbackInfo, CallbackListType};
 use super::driver_db::VulnerableDriver;
 use anyhow::{bail, Context, Result};
 use once_cell::sync::Lazy;

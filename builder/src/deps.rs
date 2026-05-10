@@ -58,6 +58,7 @@ const RUST_TARGETS: &[&str] = &[
 
 /// macOS cross-compilation targets — these require more than just a Rust
 /// target installation when cross-compiling from Linux or Windows.
+#[cfg(not(target_os = "macos"))]
 const MACOS_TARGETS: &[&str] = &["x86_64-apple-darwin", "aarch64-apple-darwin"];
 
 /// Entry point for `builder setup` command.

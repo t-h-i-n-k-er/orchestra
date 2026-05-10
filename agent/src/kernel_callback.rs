@@ -48,7 +48,6 @@ pub mod discover;
 pub mod overwrite;
 
 use anyhow::{bail, Context, Result};
-use common::CryptoSession;
 
 // ── Shared VA→PA translation ───────────────────────────────────────────────
 // Used by both `discover` and `overwrite` sub-modules to avoid duplicating

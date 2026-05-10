@@ -1,5 +1,5 @@
 #[cfg(windows)]
-use winapi::shared::minwindef::{BOOL, FALSE, LPARAM, TRUE};
+use winapi::shared::minwindef::{BOOL, FALSE, LPARAM};
 #[cfg(windows)]
 use winapi::shared::ntdef::HANDLE;
 #[cfg(windows)]

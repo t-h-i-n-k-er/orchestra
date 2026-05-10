@@ -145,6 +145,58 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ORCHESTRA_KEY");
     println!("cargo:rerun-if-env-changed=ORCHESTRA_NONCE");
     println!("cargo:rerun-if-env-changed=CODE_TRANSFORM_SEED");
+    println!("cargo:rerun-if-env-changed=SYS_DRIVER_PATH");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_DRIVER_PATH");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_C_ADDR");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_C_SECRET");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_C_CERT_FP");
+    println!("cargo:rerun-if-env-changed=ORCHESTRA_MODULE_AES_KEY");
+    println!("cargo:rustc-check-cfg=cfg(has_sys_driver_path)");
+
+    // ── C2 address / secret / cert fingerprint baking ───────────────────────
+    // The Builder sets ORCHESTRA_C_ADDR, ORCHESTRA_C_SECRET, and
+    // ORCHESTRA_C_CERT_FP.  Forward them to the compile-time env vars that
+    // the agent sources (SYS_C_ADDR, SYS_C_SECRET, SYS_C_CERT_FP).
+    if let Ok(addr) = std::env::var("ORCHESTRA_C_ADDR") {
+        if !addr.trim().is_empty() {
+            println!("cargo:rustc-env=SYS_C_ADDR={}", addr.trim());
+        }
+    }
+    if let Ok(secret) = std::env::var("ORCHESTRA_C_SECRET") {
+        if !secret.trim().is_empty() {
+            println!("cargo:rustc-env=SYS_C_SECRET={}", secret.trim());
+        }
+    }
+    if let Ok(fp) = std::env::var("ORCHESTRA_C_CERT_FP") {
+        if !fp.trim().is_empty() {
+            println!("cargo:rustc-env=SYS_C_CERT_FP={}", fp.trim());
+        }
+    }
+    // ── Module AES key baking ─────────────────────────────────────────────────
+    // When the server-side build injects ORCHESTRA_MODULE_AES_KEY, bake it in
+    // so the agent doesn't require an agent.toml at runtime for module loading.
+    if let Ok(module_key) = std::env::var("ORCHESTRA_MODULE_AES_KEY") {
+        if !module_key.trim().is_empty() {
+            println!("cargo:rustc-env=SYS_MODULE_KEY={}", module_key.trim());
+        }
+    }
+
+    // Optional embedded driver path wiring for `embedded_driver` builds.
+    // We intentionally do not fail the build when absent so all-features CI
+    // checks can compile deterministically without environment wiring.
+    let configured_driver_path = std::env::var("SYS_DRIVER_PATH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("ORCHESTRA_DRIVER_PATH")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        });
+
+    if let Some(path) = configured_driver_path {
+        println!("cargo:rustc-env=SYS_DRIVER_PATH={}", path);
+        println!("cargo:rustc-cfg=has_sys_driver_path");
+    }
 
     // ── CODE_TRANSFORM_SEED ─────────────────────────────────────────────────
     // Used by the `#[code_transform]` attribute macro to drive the

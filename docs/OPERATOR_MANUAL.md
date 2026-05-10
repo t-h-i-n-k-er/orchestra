@@ -32,18 +32,24 @@ orchestra-server --config /etc/orchestra/production.toml
 ### Server Configuration (`orchestra-server.toml`)
 
 ```toml
-[server]
-bind_addr = "0.0.0.0:8443"
-admin_token = "admin-secret-token-here"
-agent_shared_secret = "agent-psk-here"
-tls_cert = "certs/server.crt"
-tls_key = "certs/server.key"
-audit_log = "audit.jsonl"
-profile_dir = "profiles/"
-build_dir = "builds/"
-max_agents = 1000
-heartbeat_timeout_secs = 300
+http_addr            = "0.0.0.0:8443"
+agent_addr           = "0.0.0.0:8444"
+agent_shared_secret  = "<base64-secret>"
+admin_token          = "<bearer-token>"
+audit_log_path       = "secrets/orchestra-audit.jsonl"
+static_dir           = "orchestra-server/static"
+tls_cert_path        = "secrets/server.crt"
+tls_key_path         = "secrets/server.key"
+command_timeout_secs = 30
+builds_output_dir    = "builds"
+module_aes_key       = "<base64-32-bytes>"  # required for production agents
+# allow_local_builds = true                 # allow loopback/private IP (local testing)
 ```
+
+> The `module_aes_key` field is **required** for production agent builds.
+> Without it, built agents exit immediately at startup.
+> See [FEATURES.md](FEATURES.md#module_aes_key--module-authentication-key) for the
+> full propagation chain.
 
 ### Server CLI
 
@@ -66,18 +72,49 @@ Options:
 
 ### Building an Agent
 
+The recommended way to build agents is via the web dashboard's **Builder** tab or the REST API:
+
 ```bash
-# Build with default profile
-orchestra-server build --profile default
+# Via REST API
+curl -sk -X POST \
+  -H "Authorization: Bearer <admin_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target": "x86_64-unknown-linux-gnu",
+    "c2_address": "10.0.0.5:8444",
+    "format": "elf",
+    "transport": "https",
+    "features": {
+      "http_transport": true,
+      "direct_syscalls": false,
+      "persistence": false
+    }
+  }' \
+  'https://127.0.0.1:8443/api/build'
 
-# Build with specific features
-orchestra-server build --profile linkedin --features "http-transport,memory-guard,direct-syscalls"
+# Poll job status
+curl -sk -H "Authorization: Bearer <admin_token>" \
+  'https://127.0.0.1:8443/api/build/status/<build_id>'
 
-# Build for specific target
-orchestra-server build --profile linkedin --target x86_64-pc-windows-gnu
+# Download artifact (encrypted .enc payload)
+curl -sk -H "Authorization: Bearer <admin_token>" \
+  -o agent.enc \
+  'https://127.0.0.1:8443/api/build/<build_id>/download'
+```
 
-# Build with custom output
-orchestra-server build --profile linkedin --output /tmp/agent.exe
+Or directly via the builder CLI (for offline/dev builds):
+
+```bash
+# Build with a specific profile
+cargo run -p builder --bin orchestra-builder -- build <profile_name>
+
+# Build for specific target with features
+ORCHESTRA_C_ADDR=10.0.0.5:8444 \
+ORCHESTRA_C_SECRET='<agent_shared_secret>' \
+ORCHESTRA_C_CERT_FP='<cert_fingerprint>' \
+ORCHESTRA_MODULE_AES_KEY='<module_aes_key>' \
+cargo build --release --bin agent-standalone \
+  --features "outbound-c,persistence,network-discovery"
 ```
 
 ### Agent Feature Flags

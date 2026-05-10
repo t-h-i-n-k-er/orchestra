@@ -102,14 +102,24 @@ Then open `https://127.0.0.1:8443/` in a browser.
 ```toml
 http_addr              = "0.0.0.0:8443"        # Dashboard HTTPS listener
 agent_addr             = "0.0.0.0:8444"        # Agent TLS listener
-agent_shared_secret    = "<32-bytes-hex>"       # PSK for agent authentication
+agent_shared_secret    = "<base64-secret>"      # PSK for agent authentication
 admin_token            = "<bearer-token>"       # Dashboard + API auth token
-audit_log_path         = "/var/log/orchestra/audit.jsonl"
-static_dir             = "/usr/share/orchestra-server/static"
+audit_log_path         = "secrets/orchestra-audit.jsonl"
+static_dir             = "orchestra-server/static"
 command_timeout_secs   = 30
 ```
 
-### TLS configuration
+### Build queue (required if using web dashboard builder)
+
+```toml
+builds_output_dir    = "builds"             # Relative to workspace root
+module_aes_key       = "<base64-32-bytes>"  # AES-256 key baked into every built agent (required for production agents)
+# allow_local_builds = true                 # Allow loopback/private IP targets (local testing only)
+```
+
+The `module_aes_key` is propagated automatically: server → `PayloadConfig` →
+`ORCHESTRA_MODULE_AES_KEY` env → `cargo:rustc-env=SYS_MODULE_KEY` → agent binary.
+Production agents fail to start without it.
 
 ```toml
 # Recommended for production — supply real certificates:
@@ -185,7 +195,13 @@ All routes under `/api/*` require `Authorization: Bearer <admin_token>`.
 | `POST` | `/api/agents/{agent_id}/command` | Send command by agent's self-reported ID (most-recently-seen on duplicates). |
 | `POST` | `/api/connections/{connection_id}/command` | Send command by server-assigned connection ID (unambiguous). |
 
-### Command dispatch
+### Server info
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/info/fingerprint` | Returns `{ "fingerprint": "<64-hex-sha256>" }` — the SHA-256 DER fingerprint of the server TLS certificate. Used by the Builder tab's "Fetch Pin" button. |
+
+### Build queue
 
 The `Command` JSON shape matches `serde_json::to_value(common::Command)`:
 

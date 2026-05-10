@@ -84,6 +84,7 @@ pub fn randomize_timestamp(buf: &mut Vec<u8>) {
 }
 
 /// Zero the TimeDateStamp field (legacy API preserved for compatibility).
+#[allow(dead_code)]
 pub fn zero_timestamp(buf: &mut Vec<u8>) {
     let Ok((_, fh_off, _, _, _, _)) = parse_pe_offsets(buf) else {
         return;

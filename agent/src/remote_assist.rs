@@ -380,7 +380,7 @@ unsafe fn resolve_api_or_load<T>(dll_wide: &[u16], dll_hash: u32, fn_hash: u32) 
             if m.is_null() {
                 return Err(anyhow!("LoadLibraryW failed for DLL (hash 0x{:08X})", dll_hash));
             }
-            m
+            m as usize
         }
     };
     let addr = pe_resolve::get_proc_address_by_hash(module, fn_hash)

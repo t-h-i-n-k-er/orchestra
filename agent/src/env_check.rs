@@ -14,7 +14,7 @@ use std::path::Path;
 // ── pe_resolve helpers (Windows) ──────────────────────────────────────────────
 #[cfg(windows)]
 mod win_resolve {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
 
     // ── Local type definitions (avoiding IAT-producing winapi imports) ──────
 
@@ -2001,7 +2001,7 @@ fn macos_system_profiler_indicates_vm() -> bool {
             || model.contains(
                 String::from_utf8_lossy(&string_crypt::enc_str!("vmware"))
                     .trim_end_matches('\0')
-                    .to_string(),
+                    .trim(),
             )
         {
             is_vm = true;
@@ -2242,7 +2242,7 @@ fn macos_system_profiler_indicates_vm_detailed(indicators: &mut Vec<common::Sand
         } else if model.contains(
             String::from_utf8_lossy(&string_crypt::enc_str!("vmware"))
                 .trim_end_matches('\0')
-                .to_string(),
+                .trim(),
         ) {
             indicators.push(common::SandboxIndicator {
                 category: "hypervisor".to_string(),
@@ -2383,10 +2383,10 @@ fn mac_prefix_indicates_vm() -> bool {
                         //   offset_of!(sockaddr_dl, sdl_data) = 8 on macOS x86-64/arm64
                         //   MAC starts at sdl_data[sdl_nlen]
                         //   => raw offset from sdl = 8 + sdl_nlen
-                        const SDl_DATA_OFFSET: isize = 8;
+                        const SDL_DATA_OFFSET: isize = 8;
                         let sdl_nlen = (*sdl).sdl_nlen as isize;
                         let mac_ptr = (sdl as *const u8)
-                            .offset(SDl_DATA_OFFSET + sdl_nlen) as *const u8;
+                            .offset(SDL_DATA_OFFSET + sdl_nlen) as *const u8;
                         let alen = (*sdl).sdl_alen as usize;
                         if alen >= 3 {
                             let mac = std::slice::from_raw_parts(mac_ptr, 3);

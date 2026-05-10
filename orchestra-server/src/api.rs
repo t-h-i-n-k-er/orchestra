@@ -151,6 +151,7 @@ pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
             post(send_command_by_connection_id),
         )
         .route("/audit", get(recent_audit))
+        .route("/info/fingerprint", get(get_server_fingerprint))
         .route("/build", post(crate::build_handler::handle_build))
         .route(
             "/build/status/:id",
@@ -1713,4 +1714,63 @@ async fn send_snapshot(socket: &mut WebSocket, state: &AppState) -> Result<(), a
     };
     let text = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
     socket.send(WsMessage::Text(text)).await
+}
+
+/// `GET /api/info/fingerprint`
+///
+/// Returns the SHA-256 fingerprint of the server's TLS certificate.
+/// Used by the builder UI's "Fetch from Server" button so operators
+/// don't have to manually copy the pin.
+async fn get_server_fingerprint(
+    State(state): State<Arc<AppState>>,
+    Extension(_user): Extension<AuthenticatedUser>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Try to read the configured cert path.
+    let cert_path = state.config.tls_cert_path.as_ref().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "no TLS certificate path configured; server may be using an ephemeral self-signed cert".into(),
+        )
+    })?;
+
+    let pem_bytes = std::fs::read(cert_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read cert file: {e}"),
+        )
+    })?;
+
+    // Parse the first PEM block and compute its SHA-256 fingerprint.
+    let pem_str = String::from_utf8_lossy(&pem_bytes);
+    let fingerprint = compute_cert_fingerprint_from_pem(&pem_str).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, e)
+    })?;
+
+    Ok(Json(serde_json::json!({ "fingerprint": fingerprint })))
+}
+
+fn compute_cert_fingerprint_from_pem(pem: &str) -> Result<String, String> {
+    // Find the base64 body between BEGIN/END CERTIFICATE markers.
+    let begin = pem
+        .find("-----BEGIN CERTIFICATE-----")
+        .ok_or_else(|| "no BEGIN CERTIFICATE marker found".to_string())?;
+    let end = pem
+        .find("-----END CERTIFICATE-----")
+        .ok_or_else(|| "no END CERTIFICATE marker found".to_string())?;
+
+    let b64_body: String = pem[begin + "-----BEGIN CERTIFICATE-----".len()..end]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    let der = B64
+        .decode(&b64_body)
+        .map_err(|e| format!("failed to decode certificate DER: {e}"))?;
+
+    let fingerprint = Sha256::digest(&der)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    Ok(fingerprint)
 }

@@ -519,7 +519,7 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
 
 #[cfg(windows)]
 fn map_clean_ntdll() -> Result<usize> {
-    use std::os::windows::ffi::OsStrExt;
+    
 
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     let sys_ntopenfile =
@@ -1292,7 +1292,7 @@ unsafe fn do_syscall_inner(ssn: u32, gadget_addr: usize, args: &[u64]) -> i32 {
             frames: Vec<ChainFrame>,
         }
         #[cfg(not(feature = "stack-spoof"))]
-        let chain: Option<ResolvedChain> = None;
+        let _chain: Option<ResolvedChain> = None;
 
         // Determine the effective "top of chain" spoof frame for the jmp-based
         // path.  This is the first (bottom) frame of the chain — the one the
@@ -1689,10 +1689,7 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
         return Ok(base);
     }
 
-    use winapi::um::winnt::{
-        FILE_SHARE_READ, GENERIC_READ, PAGE_EXECUTE_READ, SECTION_MAP_EXECUTE, SECTION_MAP_READ,
-        SEC_IMAGE,
-    };
+    
 
     unsafe {
         let ntdll_base = {
@@ -1738,7 +1735,7 @@ pub fn map_clean_dll(dll_name: &str) -> Result<usize> {
 
         let sys_ntopenfile = get_syscall_id("NtOpenFile")?;
 
-        use std::os::windows::ffi::OsStrExt;
+        
         let mut nt_path = format!(r"\??\{}", path_str)
             .encode_utf16()
             .chain(std::iter::once(0))

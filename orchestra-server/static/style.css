@@ -194,14 +194,14 @@ pre {
 .warn    { color: var(--warn); }
 
 /* ── Builder panel card ────────────────────────────────────────── */
-.card {
+.card, .builder-section {
   background: var(--bg2);
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 1rem 1.25rem;
   margin-bottom: 1rem;
 }
-.card strong { display: block; margin-bottom: 0.5rem; color: var(--muted); font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.06em; }
+.card strong, .builder-section strong { display: block; margin-bottom: 0.5rem; color: var(--muted); font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.06em; }
 
 /* Builder grid */
 #tab-builder > div:first-of-type {

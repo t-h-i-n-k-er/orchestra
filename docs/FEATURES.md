@@ -16,6 +16,76 @@ Or directly with Cargo:
 cargo build -p agent --features "outbound-c,persistence" --bin agent-standalone
 ```
 
+When building via the web dashboard or REST API, features are specified in the
+`BuildFeatures` object of the build request. See [CONFIGURATION.md](CONFIGURATION.md)
+for the full `BuildFeatures` field reference.
+
+---
+
+## Build API Feature Flags
+
+These map to `BuildFeatures` fields in the `POST /api/build` request body and
+control which Cargo feature gates are activated in the resulting binary:
+
+| API field | Cargo feature | Description |
+|-----------|---------------|-------------|
+| `persistence` | `persistence` | Cross-platform persistence |
+| `direct_syscalls` | `direct-syscalls` | Direct/indirect syscall infrastructure |
+| `remote_assist` | `remote-assist` | Screen capture, input simulation |
+| `stealth` | `stealth` | Full stealth bundle (memory guard, AMSI, ETW) |
+| `network_discovery` | `network-discovery` | ARP scan, ping sweep, port scan |
+| `forensic_cleanup` | `forensic-cleanup` | Prefetch/MFT/USN evidence removal |
+| `self_reencode` | `self-reencode` | Metamorphic re-encoding |
+| `http_transport` | `http-transport` | HTTP/S malleable C2 |
+| `doh_transport` | `doh-transport` | DNS-over-HTTPS C2 |
+| `ssh_transport` | `ssh-transport` | SSH subsystem C2 |
+| `smb_pipe_transport` | `smb-pipe-transport` | SMB named pipe C2 |
+| `evasion_transform` | `evade-edr-transform` | Runtime EDR signature transform |
+| `p2p` | `p2p-tcp` | P2P mesh networking |
+| `stack_spoof` | `stack-spoof` | NtContinue call stack spoofing |
+
+---
+
+## module_aes_key — Module Authentication Key
+
+The `module_aes_key` is a 32-byte AES-256 key that authenticates loaded
+modules. It is **required in production (non-debug, non-dev) builds**. Without
+it, the agent exits immediately after startup with:
+
+```
+ERROR: module_aes_key is required in production builds.
+```
+
+### Propagation Chain
+
+```
+Server config: module_aes_key = "<base64>"
+    ↓ (server passes to build worker)
+PayloadConfig.module_aes_key = Some("<base64>")
+    ↓ (builder/src/build.rs)
+env ORCHESTRA_MODULE_AES_KEY="<base64>"
+    ↓ (agent/build.rs)
+cargo:rustc-env=SYS_MODULE_KEY=<base64>
+    ↓ (agent/src/lib.rs)
+option_env!("SYS_MODULE_KEY")  →  let module_aes_key: [u8; 32]
+```
+
+### Generating the Key
+
+```bash
+python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+# → af1FhprLnRzj8ZZyJmmNBaTQabNS8jGt4nbNCbzrKjw=
+```
+
+Add the output to `orchestra-server.toml`:
+
+```toml
+module_aes_key = "af1FhprLnRzj8ZZyJmmNBaTQabNS8jGt4nbNCbzrKjw="
+```
+
+The server will automatically include this key in every agent build via the
+`ORCHESTRA_MODULE_AES_KEY` → `SYS_MODULE_KEY` compile-time chain.
+
 ---
 
 ## Transport Features
@@ -30,8 +100,9 @@ automatically and reconnects on disconnection with exponential back-off
 
 | Attribute | Value |
 |-----------|-------|
-| Profile fields | `c2_address`, `c_server_secret`, `server_cert_fingerprint` |
-| Baked env vars | `ORCHESTRA_C_ADDR`, `ORCHESTRA_C_SECRET`, `ORCHESTRA_C_CERT_FP` |
+| Profile fields | `c2_address`, `c_server_secret`, `server_cert_fingerprint`, `module_aes_key` |
+| Baked env vars | `ORCHESTRA_C_ADDR`, `ORCHESTRA_C_SECRET`, `ORCHESTRA_C_CERT_FP`, `ORCHESTRA_MODULE_AES_KEY` |
+| Rust constants | `SYS_C_ADDR`, `SYS_C_SECRET`, `SYS_C_CERT_FP`, `SYS_MODULE_KEY` |
 | Required for | Production deployments |
 | Conflicts with | None |
 

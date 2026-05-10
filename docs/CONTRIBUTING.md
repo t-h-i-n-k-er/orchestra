@@ -42,12 +42,21 @@ cargo run -p orchestra-server -- \
     --admin-token devtoken --agent-secret devsecret
 
 # In another terminal, build and run a debug agent:
-ORCHESTRA_C=127.0.0.1:8444 ORCHESTRA_SECRET=devsecret \
+# (ORCHESTRA_MODULE_AES_KEY is required for production/release builds;
+#  dev builds with the `dev` feature skip this check)
+ORCHESTRA_C=127.0.0.1:8444 \
+ORCHESTRA_SECRET=devsecret \
+ORCHESTRA_MODULE_AES_KEY='af1FhprLnRzj8ZZyJmmNBaTQabNS8jGt4nbNCbzrKjw=' \
     cargo run -p agent --bin agent-standalone --features outbound-c
 
 # Or use the dev helper:
 ./scripts/dev-start.sh
 ```
+
+> **Note**: When building through the server's `POST /api/build` API (web dashboard
+> Builder tab), the `module_aes_key` from `orchestra-server.toml` is automatically
+> forwarded via the `ORCHESTRA_MODULE_AES_KEY` → `SYS_MODULE_KEY` compile-time chain.
+> No manual configuration is needed for API-driven builds.
 
 ---
 

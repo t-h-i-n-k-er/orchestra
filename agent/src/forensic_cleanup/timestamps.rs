@@ -37,6 +37,24 @@ use std::sync::OnceLock;
 
 use common::config::TimestampConfig;
 
+// ── Macros (must be defined before first use in consts/functions) ───────
+
+macro_rules! defer {
+    ($($body:tt)*) => {
+        let _guard = {
+            struct DeferGuard<F: FnOnce()>(Option<F>);
+            impl<F: FnOnce()> Drop for DeferGuard<F> {
+                fn drop(&mut self) {
+                    if let Some(f) = self.0.take() {
+                        f();
+                    }
+                }
+            }
+            DeferGuard(Some(|| { $($body)* }))
+        };
+    };
+}
+
 // ── Constants ────────────────────────────────────────────────────────────
 
 /// NTSTATUS success codes.
@@ -422,7 +440,11 @@ const USN_JOURNAL_BUF_SIZE: usize = 65536;
 const MAX_USN_ITERATIONS: usize = 20;
 
 /// Default NTFS volume for MFT raw access.
-const DEFAULT_VOLUME_NT: &[u16] = encode_wide!("\\??\\C:");
+const DEFAULT_VOLUME_NT: &[u16] = &[
+    b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16,
+    b'C' as u16, b':' as u16,
+    0,
+];
 
 // ── Internal state ───────────────────────────────────────────────────────
 
@@ -546,27 +568,6 @@ struct DeleteUsnJournalData {
     delete_flags: u32,
 }
 
-// ── Macro to encode Rust string as UTF-16 with null terminator ─────────
-
-macro_rules! encode_wide {
-    ($s:expr) => {{
-        const _INPUT: &str = $s;
-        const _LEN: usize = _INPUT.len();
-        const _OUTPUT: &[u16; _LEN + 1] = {
-            let mut buf = [0u16; _LEN + 1];
-            let bytes = _INPUT.as_bytes();
-            let mut i = 0;
-            while i < _LEN {
-                buf[i] = bytes[i] as u16;
-                i += 1;
-            }
-            buf[_LEN] = 0u16;
-            &buf
-        };
-        _OUTPUT
-    }};
-}
-
 // ── Helper: wide string from Rust string ─────────────────────────────────
 
 /// Build a null-terminated UTF-16 vector from a Rust string.
@@ -602,8 +603,14 @@ fn to_nt_path(path: &str) -> Vec<u16> {
 fn ensure_nt_path(path: &[u16]) -> Vec<u16> {
     // Check if path already starts with \??\  or \??\
     if path.len() >= 4 {
-        let starts_with_nt = (path[0] == '\\' && path[1] == '?' && path[2] == '?' && path[3] == '\\')
-            || (path[0] == '\\' && path[1] == 'D' && path[2] == 'e' && path[3] == 'v');
+        let starts_with_nt = (path[0] == b'\\' as u16
+            && path[1] == b'?' as u16
+            && path[2] == b'?' as u16
+            && path[3] == b'\\' as u16)
+            || (path[0] == b'\\' as u16
+                && path[1] == b'D' as u16
+                && path[2] == b'e' as u16
+                && path[3] == b'v' as u16);
         if starts_with_nt {
             return path.to_vec();
         }
@@ -614,24 +621,6 @@ fn ensure_nt_path(path: &[u16]) -> Vec<u16> {
     result.extend_from_slice(path);
     result.push(0);
     result
-}
-
-// ── defer! macro (scope-guard, same as prefetch.rs) ────────────────────
-
-/// RAII-style defer for cleanup.  Executes the closure when the guard drops.
-/// Self-contained scope guard — no external crate dependency.
-/// Matches the pattern used throughout forensic_cleanup.
-macro_rules! defer {
-    ($($body:stmt);+ $(;)?) => {
-        struct _DeferGuard<F: FnMut()>(core::mem::ManuallyDrop<F>);
-        impl<F: FnMut()> Drop for _DeferGuard<F> {
-            fn drop(&mut self) {
-                let mut f = unsafe { core::mem::ManuallyDrop::take(&mut self.0) };
-                f();
-            }
-        }
-        let _guard = _DeferGuard(core::mem::ManuallyDrop::new(|| { $($body);+ }));
-    };
 }
 
 // ── Indirect syscall wrappers ────────────────────────────────────────────

@@ -107,7 +107,7 @@ mod nt_pipe {
         obj_attrs.ObjectName = &mut name_str;
         obj_attrs.Attributes = OBJ_CASE_INSENSITIVE;
 
-        let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
+        let mut iosb: crate::win_types::IO_STATUS_BLOCK = std::mem::zeroed();
         let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
 
         let status = crate::syscall!(
@@ -140,7 +140,7 @@ mod nt_pipe {
         handle: *mut std::ffi::c_void,
         buf: &mut [u8],
     ) -> Result<usize> {
-        let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
+        let mut iosb: crate::win_types::IO_STATUS_BLOCK = std::mem::zeroed();
         let status = crate::syscall!(
             "NtReadFile",
             handle as u64,
@@ -161,7 +161,7 @@ mod nt_pipe {
                 status as u32
             ));
         }
-        Ok(iosb.Information as usize)
+        Ok(iosb.information as usize)
     }
 
     /// Write bytes to a file handle via `NtWriteFile` (NT direct syscall).
@@ -169,7 +169,7 @@ mod nt_pipe {
         handle: *mut std::ffi::c_void,
         buf: &[u8],
     ) -> Result<usize> {
-        let mut iosb: winapi::shared::ntdef::IO_STATUS_BLOCK = std::mem::zeroed();
+        let mut iosb: crate::win_types::IO_STATUS_BLOCK = std::mem::zeroed();
         let status = crate::syscall!(
             "NtWriteFile",
             handle as u64,
@@ -190,7 +190,7 @@ mod nt_pipe {
                 status as u32
             ));
         }
-        Ok(iosb.Information as usize)
+        Ok(iosb.information as usize)
     }
 
     /// Close a handle via `NtClose` (NT direct syscall).
@@ -425,18 +425,19 @@ impl SmbPipeTransport {
             match unsafe { nt_pipe::open_pipe(&pipe_path) } {
                 Ok(handle) => {
                     info!("smb-pipe: pipe opened successfully on attempt {attempt}");
-                    let mut pipe_handle = nt_pipe::NtPipeHandle::new(handle);
-
+                    let pipe_handle = nt_pipe::NtPipeHandle::new(handle);
                     // Perform the ECDH exchange in a blocking thread
                     // because NtPipeHandle uses synchronous NT syscalls.
                     info!("smb-pipe: performing X25519 ECDH key exchange");
                     let psk_owned = psk.to_vec();
-                    let session = tokio::task::spawn_blocking(move || {
-                        common::forward_secrecy::negotiate_session_key_blocking(
+                    let (pipe_handle, session) = tokio::task::spawn_blocking(move || {
+                        let mut pipe_handle = pipe_handle;
+                        let session = common::forward_secrecy::negotiate_session_key_blocking(
                             &mut pipe_handle,
                             &psk_owned,
                             true, // client sends first
-                        )
+                        )?;
+                        Ok::<(nt_pipe::NtPipeHandle, CryptoSession), anyhow::Error>((pipe_handle, session))
                     })
                     .await
                     .map_err(|e| anyhow!("smb-pipe: ECDH task panicked: {e}"))?
@@ -485,6 +486,7 @@ impl SmbPipeTransport {
         _host: &str,
         _pipe_name: &str,
         _psk: &[u8],
+        _kill_date: String,
     ) -> Result<Self> {
         Err(anyhow!(
             "smb-pipe: SMB direct mode is only supported on Windows; \
