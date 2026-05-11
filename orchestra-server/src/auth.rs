@@ -160,9 +160,7 @@ pub async fn require_bearer(
     mut req: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // Per-IP rate limiting.
     let client_ip = extract_client_ip(&req);
-    state.auth_rate_limiters.check(&client_ip)?;
 
     let header_val = req
         .headers()
@@ -197,5 +195,8 @@ pub async fn require_bearer(
         return Ok(next.run(req).await);
     }
 
+    // Only failed bearer attempts consume the auth limiter. Authenticated
+    // dashboard polling and command requests should not lock out the operator.
+    state.auth_rate_limiters.check(&client_ip)?;
     Err(StatusCode::UNAUTHORIZED)
 }

@@ -812,9 +812,7 @@ async fn handle_agent(
             } => {
                 // ── Interactive shell output stream ────────────────────
                 // Asynchronous output from a persistent shell process.
-                // Log for operator awareness; in a full implementation
-                // this would be forwarded to connected operator consoles
-                // via a WebSocket / SSE stream.
+                // Buffer output for operator polling via the REST API.
                 let stream_name = match stream {
                     common::ShellStream::Stdout => "stdout",
                     common::ShellStream::Stderr => "stderr",
@@ -832,6 +830,22 @@ async fn handle_agent(
                     .get(&conn_id)
                     .map(|e| e.agent_id.clone())
                     .unwrap_or_else(|| conn_id.clone());
+                // Push to the shell output buffer so the operator dashboard
+                // can retrieve it via GET /api/agents/:id/shell/:sid/output.
+                let buffer_key = (reporting_agent.clone(), session_id);
+                let entry = state
+                    .shell_output_buffers
+                    .entry(buffer_key)
+                    .or_insert_with(|| {
+                        std::sync::Mutex::new(std::collections::VecDeque::with_capacity(256))
+                    });
+                if let Ok(mut q) = entry.lock() {
+                    q.push_back(data.clone());
+                    // Cap at 2000 chunks to avoid unbounded memory growth.
+                    while q.len() > 2000 {
+                        q.pop_front();
+                    }
+                }
                 state.audit.record(common::AuditEvent {
                     timestamp: now_secs(),
                     agent_id: reporting_agent,

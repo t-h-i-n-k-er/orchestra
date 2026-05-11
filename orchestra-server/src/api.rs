@@ -42,6 +42,12 @@ pub struct OpenShellReply {
     pub info: common::ShellInfo,
 }
 
+#[derive(Serialize)]
+pub struct ShellOutputReply {
+    /// Base64-encoded accumulated output from the shell session.
+    pub data: String,
+}
+
 #[derive(Deserialize)]
 pub struct ShellInputRequest {
     /// Text to write to the shell's stdin pipe.  A newline is appended
@@ -165,6 +171,7 @@ pub fn router(state: Arc<AppState>, static_dir: std::path::PathBuf) -> Router {
         )
         .route("/agents/:id/shell", post(open_shell))
         .route("/agents/:id/shell/:sid/input", post(shell_input))
+        .route("/agents/:id/shell/:sid/output", get(shell_output))
         .route("/agents/:id/shell/:sid/close", post(shell_close))
         .route("/agents/:id/shell/:sid/resize", post(shell_resize))
         .route("/agents/:id/shells", get(shell_list))
@@ -363,10 +370,19 @@ async fn shell_input(
     let entry = state
         .find_by_agent_id(&agent_id)
         .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
+    // The dashboard encodes keystrokes as base64 to safely transport binary
+    // terminal escape sequences over JSON.  Decode here before forwarding.
+    let decoded_bytes = B64.decode(req.data.as_bytes()).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid base64 shell input: {e}"),
+        )
+    })?;
+    let text = String::from_utf8_lossy(&decoded_bytes).into_owned();
     let cmd_req = CommandRequest {
         command: Command::ShellInput {
             session_id,
-            data: req.data,
+            data: text,
         },
     };
     let _ = dispatch_command(state, user, entry, cmd_req).await?;
@@ -385,7 +401,11 @@ async fn shell_close(
     let cmd_req = CommandRequest {
         command: Command::ShellClose { session_id },
     };
-    let _ = dispatch_command(state, user, entry, cmd_req).await?;
+    let _ = dispatch_command(state.clone(), user, entry, cmd_req).await?;
+    // Clean up the output buffer for this session.
+    state
+        .shell_output_buffers
+        .remove(&(agent_id.clone(), session_id));
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -430,6 +450,33 @@ async fn shell_list(
         )
     })?;
     Ok(Json(list))
+}
+
+/// Drain the shell output buffer for a session and return accumulated output
+/// as a base64-encoded JSON payload.  The frontend polls this endpoint at
+/// ~250 ms intervals and writes the decoded bytes into the xterm.js terminal.
+async fn shell_output(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((agent_id, session_id)): Path<(String, u32)>,
+) -> Result<Json<ShellOutputReply>, (StatusCode, String)> {
+    user.require_any_permission(&["admin"])?;
+    // Verify the agent exists.
+    state
+        .find_by_agent_id(&agent_id)
+        .ok_or((StatusCode::NOT_FOUND, "no agent with that agent_id".into()))?;
+
+    let key = (agent_id, session_id);
+    let mut raw = String::new();
+    if let Some(entry) = state.shell_output_buffers.get(&key) {
+        if let Ok(mut q) = entry.lock() {
+            while let Some(chunk) = q.pop_front() {
+                raw.push_str(&chunk);
+            }
+        }
+    }
+    let data = B64.encode(raw.as_bytes());
+    Ok(Json(ShellOutputReply { data }))
 }
 
 /// Sign a module binary with Ed25519.

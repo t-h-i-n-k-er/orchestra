@@ -4,18 +4,20 @@
 <meta charset="utf-8">
 <title>Orchestra Control Center</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="/style.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
 </head>
 <body>
 <h1>Orchestra Control Center</h1>
-<p class="muted">Self-hosted management plane for enterprise device orchestration.</p>
+<p class="subtitle">Self-hosted management plane for enterprise device orchestration.</p>
 
 <section id="login">
   <h2>Sign in</h2>
   <div class="row">
     <input id="token" type="password" placeholder="Admin bearer token" style="flex:1">
-    <button id="login-btn">Connect</button>
+    <button id="login-btn" class="primary">Connect</button>
   </div>
   <p id="login-err" class="err"></p>
 </section>

@@ -185,6 +185,10 @@ pub struct AppState {
     /// bearer token from being echoed in the `Sec-WebSocket-Protocol`
     /// response header (visible to proxies and browser dev tools).
     pub ws_sessions: DashMap<String, String>,
+    /// Shell output buffers keyed by (agent_id, session_id).
+    /// Accumulates output from agent `Message::ShellOutput` events for
+    /// operator polling via GET /api/agents/:id/shell/:sid/output.
+    pub shell_output_buffers: DashMap<(String, u32), std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
 impl AppState {
@@ -235,6 +239,7 @@ impl AppState {
                 std::time::Duration::from_secs(60 * 5), // per 5-minute window
             ),
             ws_sessions: DashMap::new(),
+            shell_output_buffers: DashMap::new(),
         }
     }
 

