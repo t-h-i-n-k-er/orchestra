@@ -634,7 +634,7 @@ fn schedule_block(block: &mut [Instruction]) {
     }
 
     // Step 1: Build resource sets.
-    let resources: Vec<ResourceSet> = block.iter().map(|ins| build_resource_set(ins)).collect();
+    let resources: Vec<ResourceSet> = block.iter().map(build_resource_set).collect();
 
     // Step 2: Build dependency DAG.
     // deps[i] = set of indices that instruction i depends on (predecessors).
@@ -696,8 +696,8 @@ fn schedule_block(block: &mut [Instruction]) {
         if ready.is_empty() {
             // Deadlock — should not happen with a valid DAG, but fall back to
             // appending remaining instructions in original order.
-            for i in 0..n {
-                if !already_scheduled[i] {
+            for (i, scheduled_flag) in already_scheduled.iter().enumerate() {
+                if !scheduled_flag {
                     scheduled.push(i);
                 }
             }

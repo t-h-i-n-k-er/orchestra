@@ -6,56 +6,87 @@ Complete TOML configuration reference for Orchestra agent, server, and malleable
 
 ## Agent Feature Flags
 
-Agent capabilities are controlled via Cargo feature flags at compile time. Features are organized by category:
+Agent capabilities are controlled via Cargo feature flags at compile time. The
+authoritative manifest is `agent/Cargo.toml`; this section mirrors the current
+feature names used by the builder and server.
 
 ### Transport Features
 
-| Feature | Description | Dependencies |
-|---------|-------------|--------------|
-| `http-transport` | HTTP/HTTPS C2 transport | `reqwest` |
-| `smb-transport` | Named pipe C2 transport (SMB) | Windows API |
-| `dns-transport` | DNS C2 transport | `trust-dns-client` |
+| Feature | Description | Dependencies / Notes |
+|---------|-------------|----------------------|
+| `outbound-c` | Standalone agent dials the Control Center using baked C2 address and PSK | — |
+| `http-transport` | HTTP/S malleable-profile transport | `reqwest` |
 | `doh-transport` | DNS-over-HTTPS C2 transport | `reqwest` |
-| `outbound-c` | Outbound connection support | — |
+| `ssh-transport` | SSH subsystem/channel C2 transport | `russh`, `russh-keys` |
+| `smb-pipe-transport` | SMB named-pipe transport, with `tcp_relay` mode for relays | Windows named pipe path; TCP relay mode is cross-platform at the relay edge |
+| `p2p-tcp` | Peer-to-peer TCP mesh networking | — |
+| `forward-secrecy` | X25519 + HKDF session key agreement | `common/forward-secrecy` |
+| `traffic-normalization` | Wire-level traffic shaping profiles | `common::normalized_transport` |
 
-### Stealth Features
+### Stealth and Evasion Features
 
-| Feature | Description | Dependencies |
-|---------|-------------|--------------|
-| `direct-syscalls` | Direct syscall dispatch (bypass ntdll hooks) | `nt_syscall` |
-| `syscall-emulation` | Route Nt* calls through kernel32/advapi32 | — |
-| `stack-spoof` | NtContinue-based call stack spoofing | Windows API |
-| `cet-bypass` | CET/shadow-stack bypass (3 strategies) | — |
-| `sleep-obfuscation` | Full memory encryption during sleep (Ekko + Cronus) | `aes-gcm`, `chacha20poly1305` |
-| `memory-guard` | XChaCha20-Poly1305 memory region encryption | `chacha20poly1305` |
-| `evanesco` | Continuous memory hiding (per-page encryption + NOACCESS) | — |
-| `evasion-transform` | Runtime .text signature scanning + code transformation | — |
-| `write-raid-amsi` | AMSI write-raid race bypass | — |
-| `forensic-cleanup` | Prefetch/MFT/USN evidence removal | — |
-| `self-reencode` | Per-build unique .text section encoding | `code_transform_macro` |
+| Feature | Description | Dependencies / Notes |
+|---------|-------------|----------------------|
+| `direct-syscalls` | Dynamic NT syscall infrastructure and indirect dispatch | — |
+| `syscall-emulation` | User-mode kernel32/advapi32 fallbacks for configured Nt* operations | Implies `direct-syscalls` |
+| `stack-spoof` | NtContinue-based call stack spoofing | Implies `direct-syscalls`; Windows x86_64 |
+| `trampoline-spoof` | Multi-frame trampoline stack spoofing | Implies `direct-syscalls`; Windows x86_64 |
+| `cfg-bypass` | Control Flow Guard bypass helpers | Implies `direct-syscalls`; Windows x86_64 |
+| `cet-bypass` | CET/shadow-stack bypass support | Implies `direct-syscalls`; Windows |
+| `seh-anti-debug` | SEH/VEH anti-debugging strategies | Windows |
+| `page-fault-exec` | PAGE_NOACCESS/page-fault driven execution | Windows x86_64 |
+| `memory-guard` | XChaCha20/AES-GCM/ChaCha20 encryption for sensitive regions while idle | `chacha20poly1305`, `aes-gcm` |
+| `thread-ctx-encrypt` | Thread CONTEXT, stack pointer, and TLS encryption during sleep | Windows |
+| `evanesco` | Continuous memory hiding with encrypted/PAGE_NOACCESS pages | Windows |
+| `evasion-transform` | Runtime `.text` signature scanning and transformation | Implies `self-reencode` |
+| `self-reencode` | Periodic metamorphic `.text` re-encoding | `code_transform`, `goblin` |
+| `write-raid-amsi` | AMSI data-only write-raid race bypass | Windows |
+| `hwbp-amsi` | Hardware-breakpoint AMSI/ETW bypass path | Windows |
+| `hw-bp-hook` | General-purpose DR0-DR3 hardware-breakpoint hook framework | Implies `direct-syscalls`; Windows x86_64 |
+| `etw-check` | ETW auto-logger enumeration via registry | Windows |
+| `kernel-callback` | BYOVD kernel callback overwrite support | Implies `direct-syscalls`; Windows |
+| `embedded_driver` | Embed an encrypted vulnerable driver payload | Requires `ORCHESTRA_DRIVER_PATH` when enabled |
+| `forensic-cleanup` | Prefetch/MFT/USN evidence cleanup | Implies `direct-syscalls`; Windows |
+| `adaptive-timing` | Learns traffic timing and adapts callback schedule | Cross-platform |
+| `wsl2-evasion` | WSL2 execution/relay evasion helpers | Windows |
+| `ebpf` | Linux eBPF evasion loader and graceful-degradation path | Implies `direct-syscalls`; Linux |
+| `unsafe-runtime-rewrite` | Optimizer runtime rewrite support | `optimizer/unsafe-runtime-rewrite` |
+| `stealth` | Bundle feature enabling `direct-syscalls`, `unsafe-runtime-rewrite`, `memory-guard`, and `ppid-spoofing` | Meta-feature |
 
 ### Capability Features
 
-| Feature | Description | Dependencies |
-|---------|-------------|--------------|
-| `token-impersonation` | Thread-level token impersonation (encrypted cache) | Windows API |
-| `browser-data` | Browser credential extraction (Chrome, Edge, Firefox) | Windows DPAPI |
-| `lsass-harvest` | LSASS credential harvesting (indirect syscalls) | `direct-syscalls` |
-| `persistence` | Cross-platform persistence mechanisms | — |
-| `network-discovery` | Network enumeration and discovery | — |
-| `remote-assist` | Remote desktop/assistance capabilities | — |
-| `hci-research` | Human-computer interaction research | — |
-| `evdev` | Linux evdev input device access | Linux |
-| `surveillance` | Screenshot, keylogger, clipboard capture | Platform-specific |
-| `interactive-shell` | Interactive shell sessions (cmd/sh/zsh) | — |
-
-### Build Features
-
-| Feature | Description | Dependencies |
-|---------|-------------|--------------|
-| `static-build` | Fully static linking (no runtime deps) | `musl` or `mingw-static` |
-| `optimize-size` | Optimize for binary size (`opt-level = 'z'`) | — |
-| `debug-build` | Include debug symbols and logging | — |
+| Feature | Description | Dependencies / Notes |
+|---------|-------------|----------------------|
+| `persistence` | Registry/startup/WMI/COM plus macOS LaunchAgent/Daemon, cron, and Linux systemd/profile mechanisms | Cross-platform module with platform gates |
+| `wmi-persistence` | COM-based WMI permanent event subscriptions | Windows |
+| `office-addin` | Office add-in persistence through OneDrive-synced add-in paths | Windows |
+| `com-hijack` | Registry-free COM hijack via activation contexts | Windows |
+| `uefi-persistence` | UEFI NVRAM/ESP/driver persistence framework | `uefi-persistence` crate |
+| `network-discovery` | ARP, ping, port, and DNS discovery operations | — |
+| `remote-assist` | Screen capture and input simulation | `enigo`, `image`, Linux `x11cap`, platform gates |
+| `hci-research` | Consent-gated HCI timing telemetry; Linux uses built-in evdev polling | `chrono`, `twox-hash` |
+| `surveillance` | Screenshot, keylogger, clipboard monitoring | `image`; platform-gated implementations |
+| `browser-data` | Chrome/Edge/Firefox stored-data recovery | Windows |
+| `lsa-whisperer` | LSA SSP-interface credential extraction | Implies `outbound-c`; Windows |
+| `token-impersonation` | Token-only impersonation with process-local token cache and auto-revert | Implies `direct-syscalls`; Windows |
+| `kerberos-relay` | Kerberos relay via COM cross-session activation | Windows |
+| `dpapi-backup` | DPAPI domain backup key retrieval and secret decryption | Windows |
+| `shadow-credentials` | AD Shadow Credentials abuse | Windows |
+| `s4u-abuse` | Kerberos S4U2Self/S4U2Proxy abuse | Windows |
+| `lolbin-xwizard` | xwizard.exe and alternate LOLBIN dispatchers | Windows |
+| `vss-pivot` | VSS-backed SAM/SYSTEM/NTDS reads and parsing | Windows |
+| `entra-ptc` | Entra ID pass-the-certificate JWT flow | `ring`; cross-platform |
+| `manual-map` | Reflective/manual module mapping through `module_loader` | `module_loader/manual-map` |
+| `reflective-loader` | NT section-based reflective DLL loading | Implies `direct-syscalls`; Windows x86_64 |
+| `transacted-hollowing` | NTFS transaction-backed process hollowing | Implies `direct-syscalls`; Windows |
+| `delayed-stomp` | Delayed module-stomp injection | Implies `direct-syscalls`; Windows |
+| `phantom-dll-hollow` | Section-backed phantom DLL hollowing | Implies `direct-syscalls`; Windows x86_64 |
+| `coop` | Counterfeit Object-Oriented Programming chains | Windows x86_64 |
+| `module-signatures` | Ed25519 module signature verification | `common/module-signatures` |
+| `hot-reload` | Agent runtime config hot-reload watcher | `notify` |
+| `env-validation` | Environment validation gates | — |
+| `perf-optimize` | Performance optimization toggles | — |
+| `dev` | Development build toggles | — |
 
 ### Recommended Feature Combinations
 
@@ -67,15 +98,19 @@ features = [
     "direct-syscalls",
     "syscall-emulation",
     "stack-spoof",
+    "trampoline-spoof",
+    "cfg-bypass",
     "cet-bypass",
-    "sleep-obfuscation",
     "memory-guard",
     "evanesco",
     "evasion-transform",
+    "self-reencode",
     "write-raid-amsi",
     "forensic-cleanup",
     "token-impersonation",
-    "self-reencode",
+    "transacted-hollowing",
+    "delayed-stomp",
+    "phantom-dll-hollow",
 ]
 ```
 
@@ -86,11 +121,9 @@ features = [
     "outbound-c",
     "direct-syscalls",
     "stack-spoof",
-    "sleep-obfuscation",
     "memory-guard",
     "token-impersonation",
     "browser-data",
-    "interactive-shell",
 ]
 ```
 
@@ -102,13 +135,11 @@ features = [
     "direct-syscalls",
     "stack-spoof",
     "cet-bypass",
-    "sleep-obfuscation",
     "memory-guard",
     "write-raid-amsi",
     "token-impersonation",
     "browser-data",
-    "lsass-harvest",
-    "interactive-shell",
+    "lsa-whisperer",
     "forensic-cleanup",
 ]
 ```
@@ -118,7 +149,10 @@ features = [
 features = [
     "http-transport",
     "outbound-c",
-    "interactive-shell",
+    "doh-transport",
+    "p2p-tcp",
+    "network-discovery",
+    "hci-research",
 ]
 ```
 
@@ -133,18 +167,43 @@ are relative to the working directory from which the server is launched.
 
 | Field | Type | Default | Required | Description |
 |-------|------|---------|----------|-------------|
-| `http_addr` | string | `"0.0.0.0:8443"` | No | Operator HTTPS listener |
-| `agent_addr` | string | `"0.0.0.0:8444"` | No | Agent listener |
-| `agent_shared_secret` | string | — | **Yes** | Base64 PSK for agent authentication |
-| `admin_token` | string | — | **Yes** | Bearer token for operator API |
-| `tls_cert_path` | path | — | **Yes** | TLS certificate PEM |
-| `tls_key_path` | path | — | **Yes** | TLS private key PEM |
+| `http_addr` | string | `"127.0.0.1:8443"` | No | Operator HTTPS listener |
+| `agent_addr` | string | `"127.0.0.1:8444"` | No | Agent AES-TCP listener |
+| `agent_shared_secret` | string | `"change-me-pre-shared-secret"` | Production | PSK for agent authentication |
+| `agent_traffic_profile` | string | unset | No | Optional normalized transport profile, e.g. `"tls"` |
+| `admin_token` | string | `"change-me-admin-token"` | Production | Legacy bearer token for operator API |
 | `static_dir` | path | `"orchestra-server/static"` | No | Static files for web dashboard |
 | `audit_log_path` | path | `"orchestra-audit.jsonl"` | No | Path for JSONL audit log |
+| `audit_hmac_key` | string | generated/persisted if absent | No | Base64 HMAC key for audit-log integrity |
+| `tls_cert_path` | path | unset | No | TLS certificate PEM; self-signed cert is generated in memory when absent |
+| `tls_key_path` | path | unset | No | TLS private key PEM |
 | `command_timeout_secs` | u64 | `30` | No | Max wait for agent command response |
-| `builds_output_dir` | path | `"builds"` | No | Output dir for built agent payloads |
-| `module_aes_key` | string | — | **Yes*** | Base64 AES-256 key baked into agents |
+| `builds_output_dir` | path | `"/var/lib/orchestra/builds"` | No | Output dir for built agent payloads |
+| `build_retention_days` | u32 | `7` | No | Retention window for old build artifacts |
+| `max_concurrent_builds` | usize | `1` | No | Build worker concurrency |
+| `module_aes_key` | string | unset | Production* | Base64 AES-256 module key baked into agents |
+| `module_signing_key` | string | unset | No | Base64 Ed25519 signing seed for module signatures |
+| `modules_dir` | path | `"/var/lib/orchestra/builds/modules"` | No | Module blob lookup directory |
+| `max_module_size` | usize | `52428800` | No | Maximum decoded module size in bytes |
 | `allow_local_builds` | bool | `false` | No | Allow loopback/private IP in build |
+| `doh_enabled` | bool | `false` | No | Enable DNS-over-HTTPS bridge listener |
+| `doh_listen_addr` | string | `"127.0.0.1:8445"` | No | DoH listener bind address |
+| `doh_domain` | string | `"c2.example.com"` | No | Expected DoH query suffix |
+| `doh_beacon_sentinel` | string | `"1.2.3.4"` | No | A-query value indicating tasking is available |
+| `doh_idle_ip` | string | `"104.18.5.22"` | No | Benign-looking idle A-query response |
+| `mtls_enabled` | bool | `false` | No | Require client certs on the agent channel |
+| `mtls_ca_cert_path` | path | unset | If mTLS enabled | Agent-client certificate CA |
+| `mtls_allowed_cns` | string[] | `[]` | No | Allowed client certificate CN values |
+| `mtls_allowed_ous` | string[] | `[]` | No | Allowed client certificate OU values |
+| `mtls_crl_path` | path | unset | No | PEM CRL path for revoked agent certificates |
+| `operators` | table | `{}` | No | Named operators with `name`, `token` or `token_hash`, and permissions |
+| `smb_relay_enabled` | bool | `false` | No | Enable server-side named-pipe/TCP relay bridge |
+| `smb_relay_pipe_name` | string | generated IOC pipe name | No | Named pipe to create on Windows relays |
+| `smb_relay_max_instances` | u32 | `4` | No | Maximum concurrent pipe instances |
+| `http_c2_addr` | string | `"127.0.0.1:8446"` | No | Malleable HTTP C2 listener |
+| `profile_dir` | path | unset | No | Directory of server malleable profiles, watched every 30 seconds |
+| `profile_path` | path | unset | No | Single server malleable profile file, backward compatibility |
+| `redirector_secret` | string | unset | Production | Shared secret for redirector heartbeats |
 
 > \* `module_aes_key` is required for production agent builds. If omitted, the
 > server will still start but build jobs will produce agents that fail at runtime.
@@ -173,6 +232,31 @@ builds_output_dir    = "builds"
 
 # Crypto
 module_aes_key       = "af1FhprLnRzj8ZZyJmmNBaTQabNS8jGt4nbNCbzrKjw="
+
+# Optional integrity/signing
+# audit_hmac_key      = "<base64-32-byte-key>"
+# module_signing_key  = "<base64-ed25519-seed>"
+
+# Optional listeners and relays
+# doh_enabled         = false
+# doh_listen_addr     = "127.0.0.1:8445"
+# http_c2_addr        = "127.0.0.1:8446"
+# profile_dir         = "profiles/malleable"
+# smb_relay_enabled   = false
+# redirector_secret   = "<strong-random-secret>"
+
+# Optional mTLS for the agent channel
+# mtls_enabled        = false
+# mtls_ca_cert_path   = "secrets/agent-ca.pem"
+# mtls_allowed_cns    = ["agent.example.com"]
+# mtls_allowed_ous    = ["OrchestraAgents"]
+# mtls_crl_path       = "secrets/agent-ca.crl"
+
+# Optional multi-operator records
+# [operators.alice]
+# name = "Alice"
+# token_hash = "sha256:<hex-digest>"
+# permissions = ["operator"]
 
 # Timing
 command_timeout_secs = 30
@@ -282,43 +366,43 @@ name = "stealth-cloudfront"
 author = "operator"
 description = "Cloudfront-fronted stealth profile"
 
-[global]
+[profile.global]
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 jitter = 37
 sleep_time = 45
 dns_idle = "0.0.0.0"
 dns_sleep = 0
 
-[ssl]
+[profile.ssl]
 enabled = true
 cert_pin = ""
 ja3_fingerprint = ""
 sni = "d1k2s3c4.cloudfront.net"
 
-[http_get]
+[profile.http_get]
 uri = ["/api/v1/feed", "/api/v1/notifications", "/api/v2/timeline"]
 verb = "GET"
 
-[http_get.client]
+[profile.http_get.client]
 prepend = ""
 append = ""
 transform = "Base64"
 
-[http_get.metadata]
+[profile.http_get.metadata]
 delivery = "Cookie"
 key = "__cf_bm"
 transform = "Base64"
 
-[http_post]
+[profile.http_post]
 uri = ["/api/v1/upload", "/api/v2/media", "/api/v1/attachments"]
 verb = "POST"
 
-[http_post.client]
+[profile.http_post.client]
 prepend = ""
 append = ""
 transform = "Base64"
 
-[http_post.output]
+[profile.http_post.output]
 delivery = "Body"
 key = ""
 transform = "Base64"
@@ -332,43 +416,43 @@ name = "speed-internal"
 author = "operator"
 description = "Internal network speed profile"
 
-[global]
+[profile.global]
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 jitter = 10
 sleep_time = 5
 dns_idle = "0.0.0.0"
 dns_sleep = 0
 
-[ssl]
+[profile.ssl]
 enabled = true
 cert_pin = ""
 ja3_fingerprint = ""
 sni = ""
 
-[http_get]
+[profile.http_get]
 uri = ["/status", "/health", "/ping"]
 verb = "GET"
 
-[http_get.client]
+[profile.http_get.client]
 prepend = ""
 append = ""
 transform = "None"
 
-[http_get.metadata]
+[profile.http_get.metadata]
 delivery = "Header"
 key = "X-Request-Id"
 transform = "Base64"
 
-[http_post]
+[profile.http_post]
 uri = ["/submit", "/data", "/update"]
 verb = "POST"
 
-[http_post.client]
+[profile.http_post.client]
 prepend = ""
 append = ""
 transform = "None"
 
-[http_post.output]
+[profile.http_post.output]
 delivery = "Body"
 key = ""
 transform = "None"
@@ -382,12 +466,12 @@ name = "dns-covert"
 author = "operator"
 description = "DNS-only C2 profile"
 
-[global]
+[profile.global]
 user_agent = ""
 jitter = 20
 sleep_time = 30
 
-[dns]
+[profile.dns]
 enabled = true
 beacon = "cdn.{suffix}"
 get_A = "api.{suffix}"
@@ -397,7 +481,7 @@ max_txt_size = 252
 dns_suffix = "example.com"
 encoding = "base64url"
 
-[dns.headers]
+[profile.dns.headers]
 doh_server = "https://dns.google/dns-query"
 doh_method = "POST"
 ```
@@ -423,53 +507,96 @@ doh_method = "POST"
 
 ## Agent Runtime Configuration
 
-Runtime configuration is compiled into the agent at build time via the builder API or CLI. Key parameters:
+At runtime the agent loads `~/.config/sysd/agent.toml` (or
+`./.config/sysd/agent.toml` if no home directory is available). If the file is
+absent, `common::config::Config::default()` is used and then build-time overrides
+from the builder (`SYS_C_*`, sleep/jitter/kill-date, transport settings) are
+applied. When the `hot-reload` feature is compiled in, changes to `agent.toml`
+and `agent.toml.sha256` are watched and applied with a 500 ms debounce.
 
-### Sleep Configuration
+### Top-Level Agent Fields
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `sleep_time` | u64 | From profile | Base sleep interval (seconds) |
-| `jitter` | u8 | From profile | Random jitter percentage (0–100) |
-| `sleep_technique` | string | `"ekko"` | Sleep technique: `ekko`, `cronus`, `thread` |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `sleep` | table | `SleepConfig::default()` | Sleep method, interval, jitter, working hours, and sleep-mask scheme rotation |
+| `malleable-profile` | table | defaults | Runtime transport hints: HTTP/DoH/SSH/SMB endpoints, host header, kill date, cloud/VM controls |
+| `exec-strategy` | enum | `indirect` | `indirect`, `direct`, `fallback`, or `kernel-proxy` |
+| `allowed-paths` | string[] | platform defaults | File-system paths allowed for file operations |
+| `heartbeat-interval-secs` | u64 | `30` | Agent heartbeat interval |
+| `persistence-enabled` | bool | `false` | Global persistence toggle |
+| `module-repo-url` | string | default repository URL | Remote module repository |
+| `module-aes-key` | string | unset | Base64 AES-256-GCM module decryption key; legacy alias: `module_signing_key` |
+| `module-verify-key` | string | unset | Base64 Ed25519 public key for module signature verification |
+| `module-cache-dir` | string | platform cache path | Pre-staged module cache directory |
+| `traffic-profile` | enum | `none` | Wire traffic normalization profile |
+| `required-domain` | string | unset | Refuse startup unless the host is joined to this DNS domain |
+| `refuse-in-vm` | bool | `false` | Refuse startup when VM/sandbox checks trip |
+| `refuse-when-debugged` | bool | `false` | Refuse startup when a debugger is attached |
+| `sandbox-score-threshold` | u32 | unset | Refuse startup when sandbox score meets/exceeds this threshold |
+| `server-cert-fingerprint` | string | unset | SHA-256 TLS certificate pin for outbound mode |
+| `port-scan-concurrency` | usize | default | Network discovery concurrency |
+| `port-scan-timeout-ms` | u64 | default | Network discovery connect timeout |
+| `persistence` | table | all default mechanisms | Per-platform persistence mechanism toggles and IoC overrides |
+| `etw-patch-method` | enum | `direct` | `direct`, `hwbp`, or `hw-bp-hook` |
+| `p2p-heartbeat-interval-secs` | u64 | `30` | P2P link heartbeat interval |
+| `reencode-interval-secs` | u64 | `14400` | Periodic self-reencoding interval |
+| `injection` | table | defaults | Module-stomp DLL candidate and exclusion configuration |
+| `evanesco` | table | defaults | Continuous memory hiding scan/idle thresholds |
+| `browser-c4-timeout-secs` | u64 | `60` | Chrome App-Bound Encryption C4 timeout |
+| `lsa-whisperer` | table | defaults | LSA Whisperer timeout/buffer/auto-inject settings |
+| `syscall` | table | defaults | SSN cache validation and resolution strategy |
+| `evasion-transform` | table | defaults | Runtime signature scan interval, max transforms, entropy threshold |
+| `transacted-hollowing` | table | defaults | NTFS transaction hollowing controls |
+| `delayed-stomp` | table | defaults | Delayed module-stomp controls |
+| `syscall-emulation` | table | defaults | Kernel32/advapi32 syscall emulation controls |
+| `cet-bypass` | table | defaults | CET/shadow-stack bypass controls |
+| `token-impersonation` | table | defaults | Token-only impersonation strategy, cache, and auto-revert |
+| `prefetch` | table | defaults | Prefetch cleanup method and USN cleanup controls |
+| `timestamps` | table | defaults | MFT timestamp sync and USN/$LogFile cleanup controls |
 
-### Injection Configuration
+### Common Runtime Sections
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `default_technique` | string | `"auto"` | Default injection technique or `"auto"` for auto-selection |
-| `spawnto` | string | `"C:\\Windows\\System32\\svchost.exe"` | Sacrificial process for injection |
-| `ppid_spoof` | bool | `false` | Spoof parent process ID |
+```toml
+[sleep]
+method = "standard"              # ekko | foliage | cronus | hardware-timer | standard
+base-interval-secs = 30
+jitter-percent = 20
+sleep-mask-enabled = false
+mask-rotation-interval-secs = 300
+mask-rotation-schemes = ["xchacha20-poly1305"]
 
-### Evasion Configuration
+[malleable-profile]
+user-agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+uri = "/api/v1/update"
+host-header = "cdn.example.com"
+cdn-relay = false
+dns-over-https = false
+direct-c2-endpoint = ""
+doh-server-url = "https://c2.example.com/dns-query"
+doh-beacon-sentinel = "1.2.3.4"
+kill-date = ""
+dns-prefix = "<generated default>"
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `amsi_method` | string | `"hwbp"` | AMSI bypass: `hwbp`, `patch`, `write-raid` |
-| `etw_patch` | bool | `true` | Patch ETW event providers |
-| `unhook_ntdll` | bool | `true` | Unhook ntdll from KnownDlls |
-| `syscall_strategy` | string | `"auto"` | Syscall strategy: `auto`, `direct`, `emulate`, `standard` |
-| `spoof_stack` | bool | `true` | Enable call stack spoofing |
-| `cet_strategy` | string | `"auto"` | CET bypass strategy: `auto`, `disable`, `compatible`, `veh` |
-| `edr_transform` | bool | `false` | Enable runtime EDR signature transformation |
-| `evanesco` | bool | `false` | Enable continuous memory hiding |
+[malleable-profile.ssh-auth]
+type = "agent"                   # key | password | agent
 
-### Forensics Configuration
+[syscall]
+validate-interval = 100
+ssn-resolution-method = "hybrid"  # halo-gate | exception-based | hybrid
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `cleanup_prefetch` | bool | `true` | Remove prefetch evidence on execution |
-| `cleanup_usn` | bool | `true` | Clean USN journal entries |
-| `cleanup_timestamps` | bool | `true` | Synchronize MFT timestamps |
-| `disable_prefetch_service` | bool | `false` | Disable Prefetch service (requires Admin) |
+[token-impersonation]
+enabled = true
+prefer-set-thread-token = true
+cache-tokens = true
+auto-revert-on-task-complete = true
 
-### Impersonation Configuration
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `cache_tokens` | bool | `true` | Cache stolen tokens (encrypted) |
-| `auto_revert` | bool | `true` | Auto-revert token after each command |
-| `max_cached_tokens` | usize | `10` | Maximum cached tokens |
+[prefetch]
+enabled = true
+auto-clean-after-injection = true
+method = "patch"                 # delete | patch | disable-service
+restore-service-after = true
+clean-usn-journal = true
+```
 
 ---
 

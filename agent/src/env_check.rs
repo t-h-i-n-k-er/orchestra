@@ -1621,7 +1621,7 @@ pub fn get_uptime_secs() -> u64 {
 pub fn detect_vm() -> bool {
     // Delegate to the unified scoring pipeline.
     let indicators = collect_indicators();
-    let (is_sandbox, _) = evaluate_sandbox_score(&indicators);
+    let (is_sandbox, _, _) = evaluate_sandbox_score(&indicators);
     is_sandbox
 }
 
@@ -1807,6 +1807,18 @@ pub fn collect_indicators() -> Vec<common::SandboxIndicator> {
         });
     }
 
+    // ── 8. Hardware Performance Counter fingerprint (x86_64) ──────────
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    if let Some(hpc) = env_check_hpc::hpc_indicator() {
+        indicators.push(hpc);
+    }
+
+    // ── 9. Instruction-granularity RDTSC timing (x86_64) ────────────────
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    if let Some(rdtsc) = env_check_rdtsc::instruction_timing_indicator() {
+        indicators.push(rdtsc);
+    }
+
     indicators
 }
 
@@ -1819,11 +1831,11 @@ pub fn collect_indicators() -> Vec<common::SandboxIndicator> {
 /// - When one cloud check fires: threshold = 30
 /// - No cloud signal: threshold = 30, raised to 40 for likely-legitimate servers
 ///
-/// Returns `(is_sandbox, indicators)` where `is_sandbox` is true when the
-/// summed weights exceed the threshold.
+/// Returns `(is_sandbox, threshold, indicators)` where `is_sandbox` is true
+/// when the summed weights exceed `threshold`.
 pub fn evaluate_sandbox_score(
     indicators: &[common::SandboxIndicator],
-) -> (bool, Vec<common::SandboxIndicator>) {
+) -> (bool, u32, Vec<common::SandboxIndicator>) {
     let cloud_hypervisor = indicators
         .iter()
         .any(|i| i.category == "cloud_bios" && i.detail.contains("DMI/registry"));
@@ -1917,7 +1929,7 @@ pub fn evaluate_sandbox_score(
         );
     }
 
-    (is_sandbox, indicators.to_vec())
+    (is_sandbox, threshold, indicators.to_vec())
 }
 
 fn cpuid_hypervisor_bit() -> bool {
@@ -3336,7 +3348,7 @@ mod tests {
                 source: "uptime".to_string(),
             },
         ];
-        let (is_sandbox, _ind) = evaluate_sandbox_score(&indicators);
+        let (is_sandbox, _, _ind) = evaluate_sandbox_score(&indicators);
         assert!(
             !is_sandbox,
             "medium heuristic-only indicators should be informational"
@@ -3365,7 +3377,7 @@ mod tests {
                 source: "uptime".to_string(),
             },
         ];
-        let (is_sandbox, _ind) = evaluate_sandbox_score(&indicators);
+        let (is_sandbox, _, _ind) = evaluate_sandbox_score(&indicators);
         assert!(
             is_sandbox,
             "very high heuristic-only score should still classify as sandbox"
@@ -3506,4 +3518,22 @@ mod tests {
 /// Combined sandbox heuristics implementation (Prompt 6)
 pub mod sandbox {
     include!("env_check_sandbox.rs");
+}
+
+/// Hardware Performance Counter (HPC) fingerprinting for VM / emulation
+/// detection.  Uses the `RDPMC` instruction to measure physical CPU events
+/// (cache misses, branch mispredictions, micro-ops retired) that cannot be
+/// accurately replicated by VMs and emulators.  x86_64 only.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+pub mod env_check_hpc {
+    include!("env_check_hpc.rs");
+}
+
+/// Instruction-granularity RDTSC timing for single-step debugging and
+/// instruction-level emulation detection.  Measures cycle counts of
+/// individual instructions (NOP, MOV, CPUID, RDTSC) and flags statistical
+/// anomalies that indicate per-instrumentation overhead.  x86_64 only.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+pub mod env_check_rdtsc {
+    include!("env_check_rdtsc.rs");
 }

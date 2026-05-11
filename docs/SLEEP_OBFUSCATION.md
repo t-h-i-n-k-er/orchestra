@@ -441,7 +441,7 @@ fn encrypt_remote_payload(
 The base sleep interval is configured in the malleable profile:
 
 ```toml
-[global]
+[profile.global]
 sleep_time = 60  # seconds
 jitter = 37      # percent (0-100)
 ```

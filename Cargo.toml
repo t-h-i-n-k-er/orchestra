@@ -23,6 +23,7 @@ members = [
     "code_transform_macro",
     "nt_syscall",
     "shellcode_packager",
+    "uefi-persistence",
 ]
 
 [workspace.package]

@@ -19,24 +19,26 @@ Profiles are loaded from TOML files in the `profiles/` directory. The server wat
 
 ## Profile File Structure
 
-A profile is a TOML file with the following top-level sections:
+A server malleable profile is a TOML file with a root `[profile]` metadata table
+and nested `[profile.*]` configuration tables. This matches the current
+`common::malleable_types::MalleableProfile::from_toml` parser.
 
 ```toml
-[profile]           # Metadata
-[global]            # Global settings (UA, timing)
-[ssl]               # TLS configuration
-[http_get]          # HTTP GET transaction (beacon)
-[http_get.headers]  # GET request headers
-[http_get.metadata] # GET data delivery (agent → server)
-[http_get.client]   # GET client-side transforms
-[http_get.server]   # GET server-side transforms
-[http_post]         # HTTP POST transaction (task results)
-[http_post.headers] # POST request headers
-[http_post.output]  # POST data delivery (agent → server)
-[http_post.client]  # POST client-side transforms
-[http_post.server]  # POST server-side transforms
-[dns]               # DNS C2 configuration
-[dns.headers]       # DNS-over-HTTPS configuration
+[profile]                  # Metadata
+[profile.global]           # Global settings (UA, timing)
+[profile.ssl]              # TLS configuration
+[profile.http_get]         # HTTP GET transaction (beacon)
+[profile.http_get.headers] # GET request headers
+[profile.http_get.metadata] # GET data delivery (agent -> server)
+[profile.http_get.client]  # GET client-side transforms
+[profile.http_get.server]  # GET server-side transforms
+[profile.http_post]        # HTTP POST transaction (task results)
+[profile.http_post.headers] # POST request headers
+[profile.http_post.output] # POST data delivery (agent -> server)
+[profile.http_post.client] # POST client-side transforms
+[profile.http_post.server] # POST server-side transforms
+[profile.dns]              # DNS C2 configuration
+[profile.dns.headers]      # DNS-over-HTTPS configuration
 ```
 
 ---
@@ -61,7 +63,7 @@ description = "LinkedIn API traffic mimic"
 
 ---
 
-### `[global]` — Global Settings
+### `[profile.global]` — Global Settings
 
 | Key | Type | Required | Default | Description |
 |-----|------|----------|---------|-------------|
@@ -83,7 +85,7 @@ description = "LinkedIn API traffic mimic"
 
 Example:
 ```toml
-[global]
+[profile.global]
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 jitter = 37
 sleep_time = 60
@@ -91,7 +93,7 @@ sleep_time = 60
 
 ---
 
-### `[ssl]` — TLS Configuration
+### `[profile.ssl]` — TLS Configuration
 
 | Key | Type | Required | Default | Description |
 |-----|------|----------|---------|-------------|
@@ -110,7 +112,7 @@ openssl x509 -in server.crt -fingerprint -sha256 -noout
 
 Use in profile (hex, no colons, lowercase):
 ```toml
-[ssl]
+[profile.ssl]
 cert_pin = "aabbccdd..."
 ```
 
@@ -125,7 +127,7 @@ The JA3 fingerprint is a 32-character MD5 hash of the TLS Client Hello parameter
 
 ---
 
-### `[http_get]` — HTTP GET Transaction
+### `[profile.http_get]` — HTTP GET Transaction
 
 Controls how the agent sends beacon requests (checking for new tasks).
 
@@ -136,24 +138,24 @@ Controls how the agent sends beacon requests (checking for new tasks).
 
 Example:
 ```toml
-[http_get]
+[profile.http_get]
 uri = ["/api/v1/status", "/api/v1/health", "/api/v2/check"]
 verb = "GET"
 ```
 
-#### `[http_get.headers]`
+#### `[profile.http_get.headers]`
 
 HTTP headers sent with every GET request:
 
 ```toml
-[http_get.headers]
+[profile.http_get.headers]
 Accept = "application/json"
 Connection = "keep-alive"
 Cache-Control = "no-cache"
 Pragma = "no-cache"
 ```
 
-#### `[http_get.metadata]`
+#### `[profile.http_get.metadata]`
 
 Controls how the agent sends its beacon data (session ID, capabilities) to the server in GET requests.
 
@@ -172,7 +174,7 @@ Controls how the agent sends its beacon data (session ID, capabilities) to the s
 | `Header` | Custom header | `X-Custom: <base64_data>` |
 | `Body` | HTTP body | Body contains `<base64_data>` |
 
-#### `[http_get.client]`
+#### `[profile.http_get.client]`
 
 Transforms applied to **outgoing** data (agent → server) in GET requests:
 
@@ -183,7 +185,7 @@ Transforms applied to **outgoing** data (agent → server) in GET requests:
 | `transform` | string | no | `"None"` | Encoding transform |
 | `mask_stride` | u32 | no | `0` | XOR stride for Mask transform |
 
-#### `[http_get.server]`
+#### `[profile.http_get.server]`
 
 Transforms applied to **incoming** data (server → agent) in GET responses:
 
@@ -196,7 +198,7 @@ Transforms applied to **incoming** data (server → agent) in GET responses:
 
 ---
 
-### `[http_post]` — HTTP POST Transaction
+### `[profile.http_post]` — HTTP POST Transaction
 
 Controls how the agent sends task results back to the server.
 
@@ -205,15 +207,15 @@ Controls how the agent sends task results back to the server.
 | `uri` | string[] | yes | `[]` | List of URI paths; one is randomly selected per request |
 | `verb` | string | no | `"POST"` | HTTP method (must be `"POST"` for this section) |
 
-#### `[http_post.headers]`
+#### `[profile.http_post.headers]`
 
 ```toml
-[http_post.headers]
+[profile.http_post.headers]
 Content-Type = "application/json"
 Accept = "application/json"
 ```
 
-#### `[http_post.output]`
+#### `[profile.http_post.output]`
 
 Controls how the agent sends task result data in POST requests.
 
@@ -223,7 +225,7 @@ Controls how the agent sends task result data in POST requests.
 | `key` | string | no | `"session"` | Header/Cookie key (when delivery is Header or Cookie) |
 | `transform` | string | no | `"Base64"` | Transform applied before delivery |
 
-#### `[http_post.client]`
+#### `[profile.http_post.client]`
 
 Transforms applied to outgoing task result data:
 
@@ -234,7 +236,7 @@ Transforms applied to outgoing task result data:
 | `transform` | string | no | `"None"` | Encoding transform |
 | `mask_stride` | u32 | no | `0` | XOR stride for Mask transform |
 
-#### `[http_post.server]`
+#### `[profile.http_post.server]`
 
 Transforms applied to incoming data in POST responses ( acknowledgments from server):
 
@@ -246,7 +248,7 @@ Transforms applied to incoming data in POST responses ( acknowledgments from ser
 
 ---
 
-### `[dns]` — DNS C2 Configuration
+### `[profile.dns]` — DNS C2 Configuration
 
 | Key | Type | Required | Default | Description |
 |-----|------|----------|---------|-------------|
@@ -267,7 +269,7 @@ Transforms applied to incoming data in POST responses ( acknowledgments from ser
 | `base32` | `A-Z2-7=` | 62.5% | Case-insensitive DNS-safe |
 | `base64url` | `A-Za-z0-9-` | 75% | URL-safe Base64 (no `=` padding) |
 
-#### `[dns.headers]` — DoH Configuration
+#### `[profile.dns.headers]` — DoH Configuration
 
 | Key | Type | Required | Default | Description |
 |-----|------|----------|---------|-------------|
@@ -284,7 +286,7 @@ Transforms applied to incoming data in POST responses ( acknowledgments from ser
 
 Example DNS configuration:
 ```toml
-[dns]
+[profile.dns]
 enabled = true
 beacon = "cdn.{DATA}.example.com"
 get_A = "a.{DATA}.example.com"
@@ -293,7 +295,7 @@ post = "data.{DATA}.example.com"
 dns_suffix = "example.com"
 encoding = "base64url"
 
-[dns.headers]
+[profile.dns.headers]
 doh_server = "https://dns.google/dns-query"
 doh_method = "POST"
 ```
@@ -429,7 +431,7 @@ The server validates profiles on load. Common validation errors:
 
 | Error | Cause | Fix |
 |-------|-------|-----|
-| `missing required field: uri` | `[http_get]` or `[http_post]` has no `uri` | Add at least one URI |
+| `empty uri list` | `[profile.http_get]` or `[profile.http_post]` has no `uri` | Add at least one URI |
 | `invalid transform: XYZ` | Unknown transform name | Use: None, Base64, Base64Url, Mask, Netbios, NetbiosU |
 | `invalid delivery: XYZ` | Unknown delivery method | Use: Cookie, UriAppend, Header, Body |
 | `mask_stride requires Mask transform` | `mask_stride` set without `transform = "Mask"` | Set `transform = "Mask"` or remove `mask_stride` |
@@ -450,7 +452,7 @@ orchestra-server validate-profile --path profiles/my-profile.toml
 The Orchestra server can serve multiple profiles simultaneously:
 
 1. Place multiple `.toml` files in the `profiles/` directory
-2. Each profile's `[profile].name` must be unique
+2. Each profile's `profile.name` value must be unique
 3. The server loads all profiles at startup
 4. Agents are assigned a profile at build time
 5. Hot-reload detects new/changed/removed profiles

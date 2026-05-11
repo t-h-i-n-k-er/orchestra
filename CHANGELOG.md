@@ -91,7 +91,7 @@ All notable changes to Orchestra are documented here.
   2. **Impersonation thread** (fallback) — Spawns helper thread for
      `ConnectNamedPipe` + `ImpersonateNamedPipeClient`; main thread extracts
      token via `NtOpenThreadToken` on the helper.
-- **Encrypted token cache** — Duplicated tokens stored in `HashMap` with
+- **Token cache** — Duplicated tokens stored in `HashMap` with
   user/domain/SID metadata for reuse across operations.
 - **Auto-revert** — Optionally reverts impersonation after each C2 task.
 - **Integration** — `lsass_harvest` checks cached token first; P2P SMB pipe
@@ -115,7 +115,7 @@ All notable changes to Orchestra are documented here.
 - **Background re-encryption thread** — Scans all tracked pages every
   `scan_interval_ms` (default 50 ms) and re-encrypts any page that has been
   idle longer than `idle_threshold_ms` (default 100 ms).
-- **Sleep-obfuscation integration** — `encrypt_all()` is called during
+- **Sleep obfuscation integration** — `encrypt_all()` is called during
   `secure_sleep` to sweep all pages; `decrypt_minimum()` restores the bare
   minimum on wake.  XChaCha20-Poly1305 is still used for the full sleep sweep,
   RC4 for per-page continuous encryption.
@@ -208,7 +208,7 @@ All notable changes to Orchestra are documented here.
   `invalidate_syscall_cache()` API which clears the SSN cache and marks the
   clean ntdll mapping as stale, forcing re-resolution from the unhooked ntdll.
 - **Periodic validation** — Agent main loop calls `validate_cache()` every N
-  iterations (configurable via `syscall.validate_interval`, default 100).
+  iterations (configurable via `[syscall].validate-interval`, default 100).
   Failed validation triggers automatic cache invalidation and re-mapping.
 - **New public API**:
   - `nt_syscall::invalidate_syscall_cache()` — full cache + mapping reset
@@ -218,7 +218,7 @@ All notable changes to Orchestra are documented here.
   - `agent::syscalls::validate_cache() -> Result<usize>` — same for agent
   - `agent::syscalls::get_build_number() -> u32` — same for agent
 - **New config struct** — `SyscallConfig` in `common/src/config.rs` with
-  `validate_interval: u32` (default 100).
+  `validate-interval` (default 100).
 - **Upgraded modules**: `nt_syscall/src/lib.rs`, `agent/src/syscalls.rs`,
   `agent/src/ntdll_unhook.rs`, `agent/src/lib.rs`, `common/src/config.rs`.
 - **No new feature flag** — upgrade to the existing `direct-syscalls` feature.
@@ -344,15 +344,15 @@ All notable changes to Orchestra are documented here.
   `NtResumeThread`, minimizing the window of blinded ETW.
 - **Auto-selection ranking** — `TransactedHollowing` inserted above standard
   `ProcessHollow` in all 4 auto-selection branches (svchost, explorer,
-  service, default). Configurable `prefer_over_hollowing` flag.
+  service, default). Configurable `prefer-over-hollowing` flag.
 - **All syscalls through existing indirect syscall infrastructure** —
   `get_syscall_id` + `do_syscall` for NtCreateSection, NtMapViewOfSection,
   NtUnmapViewOfSection, NtWriteVirtualMemory, NtReadVirtualMemory,
   NtResumeThread, NtQueryInformationProcess.
 - **Configurable** — `TransactedHollowingConfig` with `enabled` (default true),
-  `prefer_over_hollowing` (default true), `etw_blinding` (default true),
-  `rollback_timeout_ms` (default 5000). Configured in TOML under
-  `[injection.transacted_hollowing]`.
+  `prefer-over-hollowing` (default true), `etw-blinding` (default true),
+  `rollback-timeout-ms` (default 5000). Configured in TOML under
+  `[transacted-hollowing]`.
 - **Runtime command** — `TransactedHollow { target_process, payload,
   etw_blinding }` returns JSON with pid, base_addr, technique, payload_size.
 - **Feature flag** — `transacted-hollowing = ["direct-syscalls"]` in
@@ -390,11 +390,11 @@ All notable changes to Orchestra are documented here.
   completion.
 - **Auto-selection ranking** — `DelayedModuleStomp` inserted above standard
   `ModuleStomp` in all four `auto_select_techniques()` branches when the
-  feature is enabled.  Configurable `prefer_over_stomp` (default true).
+  feature is enabled.  Configurable `prefer-over-stomp` (default true).
 - **Configurable** — `DelayedStompConfig` with `enabled` (default true),
-  `min_delay_secs` (default 8), `max_delay_secs` (default 15),
-  `sacrificial_dlls` (30 candidates), `prefer_over_stomp` (default true).
-  New `[injection.delayed_stomp]` section in agent TOML config.
+  `min-delay-secs` (default 8), `max-delay-secs` (default 15),
+  `sacrificial-dlls` (30 candidates), `prefer-over-stomp` (default true).
+  New `[delayed-stomp]` section in agent TOML config.
 - **Runtime command** — `DelayedStomp { target_pid, payload, delay_secs }`
   returns JSON with status, target_pid, dll_name, dll_base, delay_secs.
 - **Feature flag** — `delayed-stomp = ["direct-syscalls"]` in
@@ -421,7 +421,7 @@ All notable changes to Orchestra are documented here.
 - **Runtime-switchable** — New `AmsiBypassMode` command allows switching
   between Write-Raid, HWBP, and Memory-Patch strategies without rebuilding.
   `Auto` mode selects the best available (write-raid > hwbp > memory-patch).
-- **Sleep-obfuscation integration** — Race thread automatically pauses during
+- **Sleep obfuscation integration** — Race thread automatically pauses during
   `secure_sleep` memory encryption cycles to prevent ciphertext corruption.
 - **Feature flag** — `write-raid-amsi = []` in `agent/Cargo.toml`.
 - **Shared types** — `AmsiBypassMode` enum added to `common/src/lib.rs`.

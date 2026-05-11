@@ -279,10 +279,10 @@ Unlike Ekko/Cronus which only hide memory during sleep, Evanesco continuously hi
 3. No period of extended visibility — pages are only decrypted for microseconds
 4. Makes memory scanning extremely difficult — the agent appears as a collection of `PAGE_NOACCESS` regions
 
-| Strategy | Memory Visibility | Detection Risk | Performance Impact | Feature Flag |
+| Strategy | Memory Visibility | Detection Risk | Performance Impact | Configuration |
 |----------|-------------------|----------------|-------------------|--------------|
-| **Ekko** | Hidden during sleep | Medium (timer artifacts) | Low | `sleep-obfuscation` |
-| **Cronus** | Hidden during sleep | Low (NT timer) | Low | `sleep-obfuscation` |
+| **Ekko** | Hidden during sleep | Medium (timer artifacts) | Low | `[sleep].method = "ekko"` |
+| **Cronus** | Hidden during sleep | Low (NT timer) | Low | `[sleep].method = "cronus"` |
 | **Evanesco** | Hidden at all times | Very Low | Medium (page faults) | `evanesco` |
 
 ---

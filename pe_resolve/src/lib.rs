@@ -260,11 +260,21 @@ unsafe fn _get_proc_address_by_hash_depth(
     None
 }
 
+/// No-op stub for non-Windows targets.
+///
+/// # Safety
+///
+/// Safe to call on non-Windows targets (returns `None` immediately).
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 pub unsafe fn get_module_handle_by_hash(_target_hash: u32) -> Option<usize> {
     None
 }
 
+/// No-op stub for non-Windows targets.
+///
+/// # Safety
+///
+/// Safe to call on non-Windows targets (returns `None` immediately).
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 pub unsafe fn get_proc_address_by_hash(_dll_base: usize, _target_hash: u32) -> Option<usize> {
     None
@@ -437,6 +447,11 @@ pub unsafe fn close_handle(handle: *mut core::ffi::c_void) {
     }
 }
 
+/// No-op stub for non-Windows targets.
+///
+/// # Safety
+///
+/// Safe to call on non-Windows targets (no-op immediately).
 #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
 pub unsafe fn close_handle(_handle: *mut core::ffi::c_void) {
     // No-op on non-Windows targets; CloseHandle is a Windows-only concept.

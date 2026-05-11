@@ -56,13 +56,6 @@ impl Injector for LinuxPtraceInjector {
 
         let _attach = AttachGuard::attach(target_pid)?;
 
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            return Err(anyhow!(
-                "LinuxPtraceInjector currently supports x86_64 only"
-            ));
-        }
-
         #[cfg(target_arch = "x86_64")]
         {
             let original_regs = ptrace_getregs(target_pid)?;
@@ -122,6 +115,75 @@ impl Injector for LinuxPtraceInjector {
                 pid
             );
             Ok(())
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let original_regs = ptrace_getregs_arm64(target_pid)?;
+            let staged_len = if self.restore_after {
+                payload
+                    .len()
+                    .checked_add(ARM64_RESTORE_TRAMPOLINE_LEN)
+                    .ok_or_else(|| anyhow!("LinuxPtraceInjector: payload length overflow"))?
+            } else {
+                payload.len()
+            };
+
+            let remote_addr = remote_mmap_rw_arm64(target_pid, staged_len, &original_regs)?;
+
+            write_payload(target_pid, remote_addr, payload)?;
+
+            let (entry_pc, expected_break_pc) = if self.restore_after {
+                let trampoline_addr = remote_addr
+                    .checked_add(payload.len())
+                    .ok_or_else(|| anyhow!("LinuxPtraceInjector: trampoline address overflow"))?;
+                let trampoline = build_arm64_restore_trampoline(remote_addr);
+                write_payload(target_pid, trampoline_addr, &trampoline)?;
+                (
+                    trampoline_addr as u64,
+                    Some((trampoline_addr + ARM64_RESTORE_TRAMPOLINE_LEN) as u64),
+                )
+            } else {
+                (remote_addr as u64, None)
+            };
+
+            remote_mprotect_rx_arm64(target_pid, remote_addr, staged_len, &original_regs)?;
+
+            let mut exec_regs = original_regs;
+            exec_regs.pc = entry_pc;
+            ptrace_setregs_arm64(target_pid, &exec_regs)?;
+
+            if let Some(expected_pc) = expected_break_pc {
+                ptrace_continue_and_wait(target_pid)?;
+
+                let stopped_regs = ptrace_getregs_arm64(target_pid)?;
+                if stopped_regs.pc != expected_pc {
+                    ptrace_setregs_arm64(target_pid, &original_regs)?;
+                    return Err(anyhow!(
+                        "LinuxPtraceInjector: restore breakpoint mismatch (expected PC=0x{:x}, got PC=0x{:x})",
+                        expected_pc,
+                        stopped_regs.pc
+                    ));
+                }
+
+                ptrace_setregs_arm64(target_pid, &original_regs)?;
+            }
+
+            log::info!(
+                "LinuxPtraceInjector: staged {} bytes at 0x{:x} in pid {}",
+                staged_len,
+                remote_addr,
+                pid
+            );
+            Ok(())
+        }
+
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let _ = (self, payload);
+            Err(anyhow!(
+                "LinuxPtraceInjector: unsupported architecture"
+            ))
         }
     }
 }
@@ -412,6 +474,242 @@ fn ptrace_setregs(pid: libc::pid_t, regs: &libc::user_regs_struct) -> Result<()>
             std::io::Error::last_os_error()
         ));
     }
+    Ok(())
+}
+
+// ── ARM64 register access via PTRACE_GETREGSET / PTRACE_SETREGSET ─────────────
+//
+// On aarch64 Linux, PTRACE_GETREGS/SETREGS are not available.  Instead we use
+// PTRACE_GETREGSET with NT_PRSTATUS to retrieve a `user_pt_regs` struct.
+
+/// ARM64 general-purpose register state captured via `PTRACE_GETREGSET`.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
+struct Arm64Regs {
+    /// x0–x30 (31 general-purpose registers).
+    regs: [u64; 31],
+    /// Stack pointer.
+    sp: u64,
+    /// Program counter (instruction pointer).
+    pc: u64,
+    /// Processor state.
+    pstate: u64,
+}
+
+/// `PTRACE_GETREGSET` — not exposed by the `libc` crate on all platforms.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const PTRACE_GETREGSET: libc::c_uint = 0x4204;
+
+/// `PTRACE_SETREGSET` — not exposed by the `libc` crate on all platforms.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const PTRACE_SETREGSET: libc::c_uint = 0x4205;
+
+/// `NT_PRSTATUS` — note type for the general-purpose register set.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const NT_PRSTATUS: libc::c_ulong = 1;
+
+/// ARM64 Linux syscall numbers.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod arm64_sys {
+    pub const MMAP: u64 = 222;
+    pub const MPROTECT: u64 = 226;
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn ptrace_getregs_arm64(pid: libc::pid_t) -> Result<Arm64Regs> {
+    let mut regs: Arm64Regs = unsafe { std::mem::zeroed() };
+    let mut iov = libc::iovec {
+        iov_base: &mut regs as *mut Arm64Regs as *mut libc::c_void,
+        iov_len: std::mem::size_of::<Arm64Regs>(),
+    };
+    let rc = unsafe {
+        libc::ptrace(
+            PTRACE_GETREGSET,
+            pid,
+            NT_PRSTATUS as *mut libc::c_void,
+            &mut iov as *mut libc::iovec,
+        )
+    };
+    if rc == -1 {
+        return Err(anyhow!(
+            "LinuxPtraceInjector: PTRACE_GETREGSET failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(regs)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn ptrace_setregs_arm64(pid: libc::pid_t, regs: &Arm64Regs) -> Result<()> {
+    let mut iov = libc::iovec {
+        iov_base: regs as *const Arm64Regs as *mut libc::c_void,
+        iov_len: std::mem::size_of::<Arm64Regs>(),
+    };
+    let rc = unsafe {
+        libc::ptrace(
+            PTRACE_SETREGSET,
+            pid,
+            NT_PRSTATUS as *mut libc::c_void,
+            &mut iov as *mut libc::iovec,
+        )
+    };
+    if rc == -1 {
+        return Err(anyhow!(
+            "LinuxPtraceInjector: PTRACE_SETREGSET failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// ARM64 patch guard: overwrites 4 bytes at PC with `svc #0` (syscall).
+/// On aarch64 the syscall instruction is `svc #0` = `0xD4000001` (little-endian: `01 00 00 D4`).
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+struct PcPatchGuard {
+    pid: libc::pid_t,
+    pc: usize,
+    original_word: libc::c_long,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+impl PcPatchGuard {
+    fn install(pid: libc::pid_t, pc: usize) -> Result<Self> {
+        let original_word = ptrace_peek_data(pid, pc)?;
+        // svc #0 = 0xD4000001.  On aarch64 instructions are always 4 bytes
+        // and always aligned, so we patch the low 4 bytes of the 8-byte word.
+        let patched = (original_word as u64 & 0xFFFF_FFFF_0000_0000) | 0xD400_0001;
+        ptrace_poke_data(pid, pc, patched as libc::c_long)?;
+        Ok(Self {
+            pid,
+            pc,
+            original_word,
+        })
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+impl Drop for PcPatchGuard {
+    fn drop(&mut self) {
+        let _ = ptrace_poke_data(self.pid, self.pc, self.original_word);
+    }
+}
+
+/// ARM64 trampoline length: 16 bytes.
+///
+/// ```text
+/// ldr x0, [pc, #8]    ; load shellcode address from literal pool
+/// br  x0               ; branch to shellcode
+/// brk #0               ; breakpoint (reached after shellcode returns)
+/// .quad shellcode_addr  ; literal pool: 8-byte address
+/// ```
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const ARM64_RESTORE_TRAMPOLINE_LEN: usize = 16;
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn build_arm64_restore_trampoline(shellcode_addr: usize) -> [u8; ARM64_RESTORE_TRAMPOLINE_LEN] {
+    let mut trampoline = [0u8; ARM64_RESTORE_TRAMPOLINE_LEN];
+    // ldr x0, [pc, #8] = 0x58000040
+    let ldr_x0: u32 = 0x5800_0040;
+    trampoline[0..4].copy_from_slice(&ldr_x0.to_le_bytes());
+    // br x0 = 0xD61F0000
+    let br_x0: u32 = 0xD61F_0000;
+    trampoline[4..8].copy_from_slice(&br_x0.to_le_bytes());
+    // brk #0 = 0xD4200000
+    let brk0: u32 = 0xD420_0000;
+    trampoline[8..12].copy_from_slice(&brk0.to_le_bytes());
+    // literal pool: shellcode address
+    trampoline[12..16].copy_from_slice(&(shellcode_addr as u64).to_le_bytes());
+    trampoline
+}
+
+/// Allocate RW memory in the target process via remote `mmap` syscall on ARM64.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn remote_mmap_rw_arm64(
+    pid: libc::pid_t,
+    requested_len: usize,
+    original_regs: &Arm64Regs,
+) -> Result<usize> {
+    let page_size = {
+        let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if ps > 0 { ps as usize } else { 4096 }
+    };
+    let min_len = requested_len.max(1);
+    let alloc_len = ((min_len + page_size - 1) / page_size) * page_size;
+
+    let pc = original_regs.pc as usize;
+    let _patch = PcPatchGuard::install(pid, pc)?;
+
+    let mut mmap_regs = *original_regs;
+    mmap_regs.regs[8] = arm64_sys::MMAP;          // x8 = syscall number
+    mmap_regs.regs[0] = 0;                         // x0 = addr (NULL)
+    mmap_regs.regs[1] = alloc_len as u64;           // x1 = length
+    mmap_regs.regs[2] = (libc::PROT_READ | libc::PROT_WRITE) as u64; // x2 = prot
+    mmap_regs.regs[3] = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u64; // x3 = flags
+    mmap_regs.regs[4] = u64::MAX;                   // x4 = fd (-1)
+    mmap_regs.regs[5] = 0;                          // x5 = offset
+
+    ptrace_setregs_arm64(pid, &mmap_regs)?;
+    ptrace_continue_and_wait(pid)?;
+
+    let post_regs = ptrace_getregs_arm64(pid)?;
+    ptrace_setregs_arm64(pid, original_regs)?;
+
+    let mmap_result = post_regs.regs[0] as i64;
+    if mmap_result < 0 {
+        return Err(anyhow!(
+            "LinuxPtraceInjector: remote mmap syscall failed with {}",
+            mmap_result
+        ));
+    }
+
+    Ok(post_regs.regs[0] as usize)
+}
+
+/// Change memory protection to RX in the target process via remote `mprotect` on ARM64.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn remote_mprotect_rx_arm64(
+    pid: libc::pid_t,
+    remote_addr: usize,
+    requested_len: usize,
+    original_regs: &Arm64Regs,
+) -> Result<()> {
+    let page_size = {
+        let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if ps > 0 { ps as usize } else { 4096 }
+    };
+    let min_len = requested_len.max(1);
+    let aligned_start = remote_addr & !(page_size - 1);
+    let end_addr = remote_addr
+        .checked_add(min_len)
+        .ok_or_else(|| anyhow!("LinuxPtraceInjector: mprotect range overflow"))?;
+    let aligned_end = ((end_addr + page_size - 1) / page_size) * page_size;
+    let prot_len = aligned_end
+        .checked_sub(aligned_start)
+        .ok_or_else(|| anyhow!("LinuxPtraceInjector: invalid mprotect range"))?;
+
+    let pc = original_regs.pc as usize;
+    let _patch = PcPatchGuard::install(pid, pc)?;
+
+    let mut mprotect_regs = *original_regs;
+    mprotect_regs.regs[8] = arm64_sys::MPROTECT;   // x8 = syscall number
+    mprotect_regs.regs[0] = aligned_start as u64;    // x0 = addr
+    mprotect_regs.regs[1] = prot_len as u64;         // x1 = length
+    mprotect_regs.regs[2] = (libc::PROT_READ | libc::PROT_EXEC) as u64; // x2 = prot
+
+    ptrace_setregs_arm64(pid, &mprotect_regs)?;
+    ptrace_continue_and_wait(pid)?;
+
+    let post_regs = ptrace_getregs_arm64(pid)?;
+    ptrace_setregs_arm64(pid, original_regs)?;
+
+    let mprotect_result = post_regs.regs[0] as i64;
+    if mprotect_result < 0 {
+        return Err(anyhow!(
+            "LinuxPtraceInjector: remote mprotect syscall failed with {}",
+            mprotect_result
+        ));
+    }
+
     Ok(())
 }
 

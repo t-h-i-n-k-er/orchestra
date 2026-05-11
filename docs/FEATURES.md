@@ -55,6 +55,38 @@ control which Cargo feature gates are activated in the resulting binary:
 | `transacted_hollowing` | `transacted-hollowing` | NTFS transaction-backed hollowing |
 | `delayed_stomp` | `delayed-stomp` | Delayed module-stomp injection |
 
+### Additional Cargo-Only Feature Flags
+
+These flags exist in `agent/Cargo.toml` and can be enabled through Cargo or a
+profile `features = [...]` list. They are not separate fields in the current
+`BuildFeatures` request object unless listed above.
+
+| Cargo feature | Description |
+|---------------|-------------|
+| `etw-check` | Pre-injection ETW auto-logger enumeration via registry APIs |
+| `thread-ctx-encrypt` | Encrypt thread CONTEXT, stack pointer, and TLS data during sleep obfuscation |
+| `phantom-dll-hollow` | Section-backed phantom DLL hollowing; implies `direct-syscalls` |
+| `seh-anti-debug` | SEH/VEH anti-debugging and anti-trace strategies |
+| `kerberos-relay` | Kerberos relay through COM cross-session activation |
+| `dpapi-backup` | DPAPI domain backup-key retrieval and blob decryption |
+| `shadow-credentials` | AD Shadow Credentials via `msDS-KeyCredentialLink` and PKINIT |
+| `s4u-abuse` | Kerberos S4U2Self/S4U2Proxy delegation abuse |
+| `lolbin-xwizard` | COM scriptlet execution through xwizard.exe and fallback LOLBINs |
+| `wsl2-evasion` | WSL2 execution, relay, and graceful degradation helpers |
+| `com-hijack` | Registry-free COM hijack through activation contexts |
+| `vss-pivot` | Volume Shadow Copy access for locked files such as SAM, SYSTEM, and NTDS.dit |
+| `office-addin` | Office add-in persistence through OneDrive-synced add-in paths |
+| `wmi-persistence` | COM-based WMI permanent event subscriptions |
+| `uefi-persistence` | UEFI NVRAM/ESP persistence support through the workspace UEFI crate |
+| `ebpf` | Linux eBPF process/file/network hiding; implies `direct-syscalls` |
+| `trampoline-spoof` | Multi-frame trampoline stack spoofing; implies `direct-syscalls` |
+| `cfg-bypass` | Control Flow Guard bypass strategies; implies `direct-syscalls` |
+| `adaptive-timing` | Learned callback timing model that degrades to standard jitter |
+| `reflective-loader` | Section-based reflective DLL loading; implies `direct-syscalls` |
+| `page-fault-exec` | PAGE_NOACCESS/page-fault driven execution for encrypted payload pages |
+| `coop` | Counterfeit Object-Oriented Programming chain construction |
+| `entra-ptc` | Entra ID pass-the-certificate OAuth2 flow; implies `ring` |
+
 ---
 
 ## module_aes_key — Module Authentication Key
@@ -420,16 +452,16 @@ EDR and forensic tools parse these files to build execution timelines.
 **Automatic cleanup:**
 - Hooks into `TransactedHollow` and `DelayedStomp` injection handlers
 - Cleans .pf evidence for injected process after injection completes
-- Configurable via `auto_clean_after_injection = true`
+- Configurable via `auto-clean-after-injection = true`
 
 **Config section:**
 ```toml
 [prefetch]
 enabled = true
-auto_clean_after_injection = true
+auto-clean-after-injection = true
 method = "patch"        # "delete", "patch", "disable-service"
-restore_service_after = true
-clean_usn_journal = true
+restore-service-after = true
+clean-usn-journal = true
 ```
 
 ---
@@ -849,6 +881,9 @@ Collects anonymized user interaction telemetry: key press timing (not
 characters), active window titles, stored in a fixed-size in-memory ring
 buffer.
 
+On Linux, the implementation uses evdev polling internally; there is no
+separate `evdev` Cargo feature.
+
 | Attribute | Value |
 |-----------|-------|
 | Platform | All |
@@ -865,19 +900,6 @@ buffer.
 ```toml
 features = ["outbound-c", "hci-research"]
 ```
-
----
-
-### `evdev`
-
-**Default: no** | **Linux only**
-
-Enables evdev-based input event capture on Linux for HCI research.
-
-| Attribute | Value |
-|-----------|-------|
-| Platform | Linux only |
-| Related to | `hci-research` |
 
 ---
 
@@ -960,7 +982,7 @@ return `AMSI_RESULT_CLEAN`. This is the most stealthy AMSI bypass available:
 - **Zero `VirtualProtect` calls** — no page-protection changes on EDR radar
 - **Zero hardware breakpoints** — DR0–DR7 remain clean
 - **Data-only** — writes blend with normal AMSI internal state updates
-- **Sleep-obfuscation aware** — race thread pauses during memory encryption
+- **Sleep obfuscation aware** — race thread pauses during memory encryption
 
 The bypass can be enabled/disabled at runtime via the `AmsiBypassMode` command.
 In `Auto` mode, Write-Raid is preferred over HWBP and memory-patch strategies.
@@ -1000,6 +1022,30 @@ bypass.
 **Example profile:**
 ```toml
 features = ["outbound-c", "hwbp-amsi"]
+```
+
+---
+
+### `hw-bp-hook`
+
+**Default: no** | **Windows x86_64 only** | **Requires `direct-syscalls`**
+
+Enables the general-purpose hardware-breakpoint hook framework. It manages up
+to four DR0–DR3 slots through a Vectored Exception Handler and dispatches
+per-slot callbacks without modifying the target function bytes. Current
+integrations include AMSI bypass and ETW suppression, with fallback to inline
+patching when no debug registers are available.
+
+| Attribute | Value |
+|-----------|-------|
+| Platform | Windows x86_64 only |
+| Method | DR0–DR3 execute breakpoints + VEH callback dispatch |
+| Dependency | `direct-syscalls` |
+| Stealth | No target function byte modification while slots are available |
+
+**Example profile:**
+```toml
+features = ["outbound-c", "hw-bp-hook"]
 ```
 
 ---
@@ -1117,10 +1163,10 @@ microarchitecture-specific dispatch.
 | `network-discovery` | ✅ | ✅ | ✅ |
 | `remote-assist` | ✅ | ✅ | ⚠️ |
 | `hci-research` | ✅ | ✅ | ✅ |
-| `evdev` | ✅ | — | — |
 | `surveillance` | — | ✅ | — |
 | `browser-data` | — | ✅ | — |
 | `hwbp-amsi` | — | ✅ | — |
+| `hw-bp-hook` | — | ✅ | — |
 | `write-raid-amsi` | — | ✅ | — |
 
 ### Common feature combinations

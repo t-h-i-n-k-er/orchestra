@@ -176,15 +176,22 @@ pub fn poly_wrap(plaintext: &[u8]) -> PolyBlob {
 /// is encoded in bits 2–7 of the flags byte.
 pub fn poly_serialize(blob: &PolyBlob, seed: u64) -> Vec<u8> {
     let mut rng = rand::thread_rng();
+    let use_le: bool = rng.gen_bool(0.5);
+    let pad_len: u8 = rng.gen_range(0u8..=16u8);
+    poly_serialize_with_params(blob, seed, use_le, pad_len)
+}
+
+/// Deterministic variant of [`poly_serialize`] that takes explicit endianness
+/// and padding length instead of drawing them from `thread_rng()`.
+///
+/// Useful for tests that need to assert exact byte offsets.
+pub fn poly_serialize_with_params(blob: &PolyBlob, seed: u64, use_le: bool, pad_len: u8) -> Vec<u8> {
+    let mut rng = rand::thread_rng();
 
     // Build the per-build magic — must not equal b"POLY" (0x504f4c59).
     let magic = seed_magic(seed);
 
-    // Randomly choose endianness for the two length fields.
-    let use_le: bool = rng.gen_bool(0.5);
-
     // Random padding length: 0–16 bytes between the flags byte and key_len.
-    let pad_len: u8 = rng.gen_range(0u8..=16u8);
     let has_padding = pad_len > 0;
 
     // Flags byte:
@@ -1114,43 +1121,36 @@ mod tests {
     #[test]
     fn poly_serialize_v2_big_endian_roundtrip() {
         // Verify that a BE-serialized v2 blob has the expected layout.
+        // Use poly_serialize_with_params to guarantee big-endian, no padding,
+        // making the layout fully deterministic.
         let blob = PolyBlob {
             scheme: PolyScheme::ChaCha20Stream,
             key: vec![0xAAu8; 44],
             ciphertext: vec![0xBBu8; 32],
         };
-        // Try up to 64 seeds until we get one without padding (pad_len==0),
-        // making the layout easy to assert deterministically.
-        for seed in 0u64..64 {
-            let serialized = poly_serialize(&blob, seed);
-            let flags = serialized[5];
-            let pad_len = (flags >> 2) as usize;
-            if pad_len != 0 {
-                continue;
-            } // re-try on padding builds
-            let use_le = (flags & 1) != 0;
+        let seed = 42u64;
+        let use_le = false; // big-endian
+        let pad_len = 0u8;  // no padding
+        let serialized = poly_serialize_with_params(&blob, seed, use_le, pad_len);
 
-            let decode_u32 = |b: &[u8]| -> usize {
-                let arr: [u8; 4] = b.try_into().unwrap();
-                if use_le {
-                    u32::from_le_bytes(arr) as usize
-                } else {
-                    u32::from_be_bytes(arr) as usize
-                }
-            };
-            // key_len field starts at offset 6.
-            assert_eq!(decode_u32(&serialized[6..10]), 44);
-            // key bytes follow.
-            assert_eq!(&serialized[10..54], vec![0xAAu8; 44].as_slice());
-            // ct_len field.
-            assert_eq!(decode_u32(&serialized[54..58]), 32);
-            // ciphertext bytes.
-            assert_eq!(&serialized[58..90], vec![0xBBu8; 32].as_slice());
-            // Total length.
-            assert_eq!(serialized.len(), 4 + 1 + 1 + 0 + 4 + 44 + 4 + 32);
-            return;
-        }
-        panic!("could not find a seed producing pad_len==0 within 64 attempts");
+        let flags = serialized[5];
+        let use_le_flag = (flags & 1) != 0;
+        assert!(!use_le_flag, "expected big-endian flags");
+
+        let decode_u32 = |b: &[u8]| -> usize {
+            let arr: [u8; 4] = b.try_into().unwrap();
+            u32::from_be_bytes(arr) as usize
+        };
+        // key_len field starts at offset 6.
+        assert_eq!(decode_u32(&serialized[6..10]), 44);
+        // key bytes follow.
+        assert_eq!(&serialized[10..54], vec![0xAAu8; 44].as_slice());
+        // ct_len field.
+        assert_eq!(decode_u32(&serialized[54..58]), 32);
+        // ciphertext bytes.
+        assert_eq!(&serialized[58..90], vec![0xBBu8; 32].as_slice());
+        // Total length.
+        assert_eq!(serialized.len(), 4 + 1 + 1 + 0 + 4 + 44 + 4 + 32);
     }
 
     #[test]

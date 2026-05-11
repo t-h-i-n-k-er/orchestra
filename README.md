@@ -1,6 +1,6 @@
 # Orchestra
 
-A cross-platform, operationally secure command-and-control framework built in Rust. Orchestra provides a malleable C2 pipeline, a Windows-only unified injection engine with twelve techniques, advanced sleep obfuscation with post-wake NTDLL hook re-check, in-process .NET assembly and BOF execution, browser credential extraction (including Chrome v20 DPAPI padding-oracle bypass), LSASS harvesting, LSA SSP credential extraction (Credential Guard bypass), token-only impersonation, kernel callback overwrite (BYOVD), CET/shadow-stack bypass, syscall emulation, EDR bypass transformation, forensic cleanup (Prefetch/MFT/USN), interactive shell sessions, P2P mesh networking, and a standalone redirector binary — all designed for red-team operations requiring granular control over network signatures, memory forensics resistance, and payload delivery.
+A cross-platform, operationally secure command-and-control framework built in Rust. Orchestra provides a malleable C2 pipeline, a Windows-only unified injection engine with 15 technique variants, advanced sleep obfuscation with post-wake NTDLL hook re-check, in-process .NET assembly and BOF execution, browser credential extraction (including Chrome v20 DPAPI padding-oracle bypass), LSASS harvesting, LSA SSP credential extraction (Credential Guard bypass), token-only impersonation, kernel callback overwrite (BYOVD), CET/shadow-stack bypass, syscall emulation, EDR bypass transformation, forensic cleanup (Prefetch/MFT/USN), interactive shell sessions, P2P mesh networking, and a standalone redirector binary — all designed for red-team operations requiring granular control over network signatures, memory forensics resistance, and payload delivery.
 
 | | |
 |---|---|
@@ -78,7 +78,7 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 
 | Crate | Type | Purpose |
 |-------|------|---------|
-| `agent` | lib + bin | Implant: C2 transports, evasion (AMSI/ETW/syscall emulation/CET/EDR transform), injection (12 techniques), sleep obfuscation, forensic cleanup, persistence, .NET/BOF exec, browser data, LSASS/LSA harvest, token impersonation, kernel callback, surveillance, shells, lateral movement |
+| `agent` | lib + bin | Implant: C2 transports, evasion (AMSI/ETW/syscall emulation/CET/EDR transform), injection (15 technique variants), sleep obfuscation, forensic cleanup, persistence, .NET/BOF exec, browser data, LSASS/LSA harvest, token impersonation, kernel callback, surveillance, shells, lateral movement |
 | `orchestra-server` | bin | Control center: agent management, module signing, build queue, profile hot-reload |
 | `redirector` | bin | Standalone HTTP reverse proxy with cover traffic and registration |
 | `common` | lib | Wire protocol (`Message`, `Command`), `Transport` trait, crypto, config types |
@@ -132,14 +132,14 @@ A cross-platform, operationally secure command-and-control framework built in Ru
 | **AMSI Write-Raid Bypass** | ✅ | — | — | Data-only race on `AmsiInitFailed`; zero code/permission/breakpoint mods |
 | **Kernel Callback Overwrite** (BYOVD) | ✅ | — | — | 8 vulnerable drivers; ret-pointer overwrite; defeats EDR integrity checks |
 | **EDR Bypass Transformation Engine** | ✅ | — | — | Runtime .text signature scanning + 5 semantic-preserving transforms |
-| **Token-Only Impersonation** | ✅ | — | — | SetThreadToken / impersonation thread; encrypted token cache; auto-revert |
+| **Token-Only Impersonation** | ✅ | — | — | SetThreadToken / impersonation thread; process-local token cache; auto-revert |
 | **Continuous Memory Hiding** (Evanesco) | ✅ | — | — | Per-page RC4 encryption + PAGE_NOACCESS at all times, not just sleep |
 | **.NET Assembly Execution** | ✅ | — | — | In-process CLR hosting, fresh AppDomain per exec |
 | **BOF / COFF Execution** | ✅ | — | — | Beacon-compatible API, public BOF ecosystem |
 | **Interactive Shell Sessions** | ✅ | ✅ | ✅ | cmd.exe / sh / zsh with background reader threads |
 | **Browser Data Extraction** | ✅ | — | — | Chrome v20+ DPAPI padding-oracle (C4 Bomb), App-Bound Encryption, Edge, Firefox |
 | **LSASS Credential Harvesting** | ✅ | — | — | Indirect syscalls, no MiniDumpWriteDump |
-| **LSA Whisperer** (SSP Credential Extraction) | ✅ | — | — | Bypasses Credential Guard + RunAsPPL; no LSASS memory reads |
+| **LSA Whisperer** (Untrusted/SSP/Auto) | ✅ | — | — | LSA package-interface extraction with SSP injection fallback; no LSASS memory reads |
 | **Prefetch Evidence Removal** | ✅ | — | — | Patch/delete .pf files; disable service; USN journal cleanup |
 | **NTDLL Unhooking** | ✅ | — | — | `\KnownDlls` re-fetch + disk fallback, post-sleep auto-check |
 | **Dynamic SSN Validation** | ✅ | — | — | Cross-reference + probe + SSDT nuclear fallback |
@@ -310,6 +310,10 @@ cargo build --release --package redirector
 
 ### Minimal Malleable Profile
 
+The standalone `redirector` binary uses a minimal top-level URI-matching
+profile parser. Full server-side malleable profiles use nested `[profile.*]`
+sections, as shown in the next section.
+
 ```toml
 [profile]
 name = "quickstart"
@@ -350,6 +354,9 @@ The malleable C2 profile system controls every aspect of the agent's network com
 
 ### TOML Schema
 
+The server and agent malleable-profile parser expects a root `[profile]` table
+with nested `[profile.*]` sections.
+
 #### `[profile]` — Profile Metadata
 
 | Field | Type | Default | Description |
@@ -358,7 +365,7 @@ The malleable C2 profile system controls every aspect of the agent's network com
 | `author` | string | `""` | Author attribution |
 | `description` | string | `""` | Profile description |
 
-#### `[global]` — Global Settings
+#### `[profile.global]` — Global Settings
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -368,7 +375,7 @@ The malleable C2 profile system controls every aspect of the agent's network com
 | `dns_idle` | string | `"0.0.0.0"` | DNS idle IP for beacon |
 | `dns_sleep` | u64 | `0` | DNS query interval |
 
-#### `[ssl]` — TLS Configuration
+#### `[profile.ssl]` — TLS Configuration
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -377,7 +384,7 @@ The malleable C2 profile system controls every aspect of the agent's network com
 | `ja3_fingerprint` | string | `""` | JA3 fingerprint for TLS client hello |
 | `sni` | string | `""` | Custom SNI hostname |
 
-#### `[http_get]` / `[http_post]` — HTTP Transactions
+#### `[profile.http_get]` / `[profile.http_post]` — HTTP Transactions
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -385,7 +392,7 @@ The malleable C2 profile system controls every aspect of the agent's network com
 | `verb` | string | `"GET"` / `"POST"` | HTTP method |
 | `headers` | map | `{}` | HTTP headers to send |
 
-Sub-tables `[http_get.client]`, `[http_get.server]`, `[http_post.client]`, `[http_post.server]`:
+Sub-tables `[profile.http_get.client]`, `[profile.http_get.server]`, `[profile.http_post.client]`, `[profile.http_post.server]`:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -394,7 +401,7 @@ Sub-tables `[http_get.client]`, `[http_get.server]`, `[http_post.client]`, `[htt
 | `transform` | string | `"None"` | Transform type: `None`, `Base64`, `Base64Url`, `Mask`, `Netbios`, `NetbiosU` |
 | `mask_stride` | u32 | `0` | Mask XOR stride (for `Mask` transform) |
 
-#### `[http_get.metadata]` / `[http_post.output]` — Data Delivery
+#### `[profile.http_get.metadata]` / `[profile.http_post.output]` — Data Delivery
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -402,7 +409,7 @@ Sub-tables `[http_get.client]`, `[http_get.server]`, `[http_post.client]`, `[htt
 | `key` | string | `"session"` | Key name for Cookie/Header/UriAppend delivery |
 | `transform` | string | `"Base64"` | Transform applied to data |
 
-#### `[dns]` — DNS C2 Configuration
+#### `[profile.dns]` — DNS C2 Configuration
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -415,7 +422,7 @@ Sub-tables `[http_get.client]`, `[http_get.server]`, `[http_post.client]`, `[htt
 | `dns_suffix` | string | `""` | DNS suffix domain |
 | `encoding` | string | `"hex"` | Encoding: `hex`, `base32`, `base64url` |
 
-#### `[dns.headers]` — DoH Configuration
+#### `[profile.dns.headers]` — DoH Configuration
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -450,60 +457,60 @@ name = "linkedin"
 author = "red-team"
 description = "Mimics LinkedIn API traffic"
 
-[global]
+[profile.global]
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 jitter = 37
 sleep_time = 60
 
-[ssl]
+[profile.ssl]
 enabled = true
 cert_pin = ""
 sni = ""
 
-[http_get]
+[profile.http_get]
 uri = ["/linkedin/li", "/voyager/api/me", "/voyager/api/growth/normInvitations"]
 verb = "GET"
 
-[http_get.headers]
+[profile.http_get.headers]
 Accept = "application/vnd.linkedin.normalized+json+2.1"
 Connection = "keep-alive"
 Referer = "https://www.linkedin.com/feed/"
 
-[http_get.metadata]
+[profile.http_get.metadata]
 delivery = "Cookie"
 key = "li_at"
 transform = "Base64"
 
-[http_get.client]
+[profile.http_get.client]
 prepend = "JSESSIONID=ajax:1234567890;"
 append = ";"
 
-[http_get.server]
+[profile.http_get.server]
 prepend = ""
 append = ""
 
-[http_post]
+[profile.http_post]
 uri = ["/voyager/api/growth/normInvitationAction", "/voyager/api/events/drilldowns"]
 verb = "POST"
 
-[http_post.headers]
+[profile.http_post.headers]
 Accept = "application/json"
 Content-Type = "application/json"
 Referer = "https://www.linkedin.com/feed/"
 
-[http_post.output]
+[profile.http_post.output]
 delivery = "Body"
 transform = "Base64"
 
-[http_post.client]
+[profile.http_post.client]
 prepend = "{\"csrfToken\":\"ajax:1234567890\",\"data\":\""
 append = "\"}"
 
-[http_post.server]
+[profile.http_post.server]
 prepend = ""
 append = ""
 
-[dns]
+[profile.dns]
 enabled = false
 ```
 
@@ -515,60 +522,60 @@ name = "cloudfront"
 author = "red-team"
 description = "CloudFront CDN profile with domain fronting and redirectors"
 
-[global]
+[profile.global]
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 jitter = 20
 sleep_time = 45
 
-[ssl]
+[profile.ssl]
 enabled = true
 cert_pin = ""
 sni = ""
 
-[http_get]
+[profile.http_get]
 uri = ["/cdn-cgi/trace", "/images/sprites/nav-sprite_global-1x-hm-dsk-reorg._CB405686684_.png"]
 verb = "GET"
 
-[http_get.headers]
+[profile.http_get.headers]
 Host = "d111111abcdef8.cloudfront.net"
 Accept = "image/webp,image/apng,image/*,*/*;q=0.8"
 Connection = "keep-alive"
 
-[http_get.metadata]
+[profile.http_get.metadata]
 delivery = "Cookie"
 key = "CloudFront-Policy"
 transform = "Base64Url"
 
-[http_get.client]
+[profile.http_get.client]
 prepend = ""
 append = ""
 
-[http_get.server]
+[profile.http_get.server]
 prepend = ""
 append = ""
 
-[http_post]
+[profile.http_post]
 uri = ["/cdn-cgi/beacon/performance", "/api/1.0/website/monitor"]
 verb = "POST"
 
-[http_post.headers]
+[profile.http_post.headers]
 Host = "d111111abcdef8.cloudfront.net"
 Content-Type = "application/octet-stream"
 Accept = "*/*"
 
-[http_post.output]
+[profile.http_post.output]
 delivery = "Body"
 transform = "Base64Url"
 
-[http_post.client]
+[profile.http_post.client]
 prepend = ""
 append = ""
 
-[http_post.server]
+[profile.http_post.server]
 prepend = ""
 append = ""
 
-[dns]
+[profile.dns]
 enabled = false
 ```
 
@@ -582,63 +589,63 @@ name = "teams"
 author = "red-team"
 description = "Mimics Microsoft Teams API traffic for corporate environments"
 
-[global]
+[profile.global]
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Teams/24100.1.0.0"
 jitter = 25
 sleep_time = 50
 
-[ssl]
+[profile.ssl]
 enabled = true
 cert_pin = ""
 sni = ""
 
-[http_get]
+[profile.http_get]
 uri = ["/v1/users/ME/conversations", "/v1/users/ME/contacts", "/api/calls/getCalls"]
 verb = "GET"
 
-[http_get.headers]
+[profile.http_get.headers]
 Accept = "application/json"
 Authorization = "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsIng1dCI6I"
 Connection = "keep-alive"
 Referer = "https://teams.microsoft.com/"
 X-Ms-Client-Version = "24100.1.0.0"
 
-[http_get.metadata]
+[profile.http_get.metadata]
 delivery = "Header"
 key = "X-Ms-Telemetry"
 transform = "Base64"
 
-[http_get.client]
+[profile.http_get.client]
 prepend = "v1/users/ME/"
 append = "/messages"
 
-[http_get.server]
+[profile.http_get.server]
 prepend = ""
 append = ""
 
-[http_post]
+[profile.http_post]
 uri = ["/v1/users/ME/conversations/48:notes/messages", "/v1/users/ME/chats/presence"]
 verb = "POST"
 
-[http_post.headers]
+[profile.http_post.headers]
 Accept = "application/json"
 Content-Type = "application/json"
 Referer = "https://teams.microsoft.com/"
 X-Ms-Client-Version = "24100.1.0.0"
 
-[http_post.output]
+[profile.http_post.output]
 delivery = "Body"
 transform = "Base64"
 
-[http_post.client]
+[profile.http_post.client]
 prepend = "{\"content\":\""
 append = "\",\"messagetype\":\"RichText/Html\"}"
 
-[http_post.server]
+[profile.http_post.server]
 prepend = ""
 append = ""
 
-[dns]
+[profile.dns]
 enabled = false
 ```
 
@@ -1019,14 +1026,21 @@ curl -X POST https://c2.example.com/api/mesh/broadcast \
 
 | Feature | Purpose |
 |---------|---------|
+| `adaptive-timing` | Adaptive callback timing based on observed traffic |
 | `browser-data` | Browser stored-data recovery |
 | `cet-bypass` | CET/shadow-stack bypass support |
+| `cfg-bypass` | Control Flow Guard bypass — bitset manipulation, CFG-valid trampolines, dispatch override |
+| `com-hijack` | Registry-free COM object hijacking via SxS manifest activation contexts |
+| `coop` | Counterfeit Object-Oriented Programming — C++ vtable dispatch chains that pass CFI/CFG checks |
 | `delayed-stomp` | Delayed module-stomp injection |
 | `dev` | Development build toggles |
 | `direct-syscalls` | Direct/indirect syscall infrastructure |
 | `doh-transport` | DNS-over-HTTPS C2 transport |
+| `dpapi-backup` | DPAPI domain backup key retrieval and secret decryption via MS-BKRP |
+| `ebpf` | Linux eBPF-based evasion support |
 | `embedded_driver` | Embedded driver payload packaging |
 | `env-validation` | Environment validation checks |
+| `entra-ptc` | Entra ID Pass-the-Certificate — OAuth2 client-credentials with RS256 JWT assertion |
 | `etw-check` | ETW auto-logger detection |
 | `evanesco` | Continuous memory hiding |
 | `evasion-transform` | Runtime EDR signature transformation |
@@ -1035,31 +1049,47 @@ curl -X POST https://c2.example.com/api/mesh/broadcast \
 | `hci-research` | HCI telemetry capture |
 | `hot-reload` | Configuration hot reload |
 | `http-transport` | HTTP/S malleable C2 transport |
+| `hw-bp-hook` | Hardware-breakpoint hook framework |
 | `hwbp-amsi` | Hardware-breakpoint AMSI/ETW bypass mode |
 | `kernel-callback` | Kernel callback overwrite support |
+| `kerberos-relay` | Kerberos relay attack via COM cross-session activation |
+| `lolbin-xwizard` | COM Scriptlet execution via xwizard.exe and alternative LOLBIN dispatchers |
 | `lsa-whisperer` | LSA Whisperer support |
 | `manual-map` | Reflective/manual module mapping |
 | `memory-guard` | Heap region encryption during idle windows |
 | `module-signatures` | Signed module verification |
 | `network-discovery` | ARP scan, ping sweep, port scan |
+| `office-addin` | Office add-in persistence via OneDrive sync — fleet-wide persistence through Microsoft sync |
 | `outbound-c` | Outbound agent connection mode |
 | `p2p-tcp` | Peer-to-peer TCP mesh networking |
+| `page-fault-exec` | Page-fault driven execution — payload pages encrypted under PAGE_NOACCESS, decrypted on fault |
 | `perf-optimize` | Performance optimization toggles |
 | `persistence` | Cross-platform persistence mechanisms |
+| `phantom-dll-hollow` | Phantom DLL hollowing — maps DLL via NtCreateSection, never written to disk |
 | `ppid-spoofing` | Parent-process ID spoofing support |
+| `reflective-loader` | NtCreateSection/NtMapViewOfSection reflective DLL loader |
 | `remote-assist` | Screen capture and input simulation |
+| `s4u-abuse` | S4U2Self/S4U2Proxy Kerberos delegation abuse — forges service tickets for arbitrary users |
 | `self-reencode` | Runtime metamorphic re-encoding |
+| `seh-anti-debug` | SEH-based anti-debugging — deeply nested VEH handler chains that crash analysis tools |
+| `shadow-credentials` | Shadow Credentials attack — Kerberos authentication via certificate added to target's msDS-KeyCredentialLink |
 | `smb-pipe-transport` | SMB named pipe C2 transport |
 | `ssh-transport` | SSH subsystem C2 transport |
 | `stack-spoof` | Call-stack spoofing support |
 | `stealth` | Stealth feature bundle |
 | `surveillance` | Screenshot, keylogger, and clipboard monitoring |
 | `syscall-emulation` | User-mode syscall emulation |
+| `thread-ctx-encrypt` | Encrypt thread context/register state during sleep |
 | `token-impersonation` | Token-only impersonation support |
 | `traffic-normalization` | Traffic normalization toggles |
+| `trampoline-spoof` | Multi-frame trampoline stack spoofing |
 | `transacted-hollowing` | NTFS transaction-backed hollowing |
 | `unsafe-runtime-rewrite` | Runtime rewrite support |
+| `uefi-persistence` | UEFI firmware-level persistence — NVRAM manipulation, ESP driver deployment, capsule delivery |
+| `vss-pivot` | VSS shadow copy pivoting — reads locked SAM/NTDS through shadow copy paths |
+| `wmi-persistence` | WMI permanent event subscriptions with encrypted cloud payloads |
 | `write-raid-amsi` | Write-raid AMSI bypass mode |
+| `wsl2-evasion` | WSL2 evasion layer — executes ELF binaries and relays C2 through WSL2 VM |
 
 ### Environment Variables
 

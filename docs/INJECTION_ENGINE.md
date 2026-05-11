@@ -14,13 +14,18 @@ The injection engine (`agent/src/injection/` — Windows, gated by `#[cfg(target
 |-----------|---------|-------------|------------|----------|
 | **Process Hollowing** | High | High | Medium | Long-lived payloads |
 | **Transacted Hollowing** | Very High | High | High | Fileless hollowing with ETW blinding |
+| **Phantom DLL Hollowing** | Very High | Medium | High | Section-backed DLL hollowing without a dropped file |
+| **Delayed Module Stomping** | Very High | High | High | Defeating module-load timing heuristics |
 | **Module Stomping** | Very High | High | High | Blending with loaded modules |
+| **Existing-Module Stomping** | Very High | Medium | Medium | Avoiding fresh image-load callbacks |
 | **Early Bird APC** | Medium | High | Low | Suspended/new processes |
 | **Thread Hijacking** | Very High | Medium | High | Avoiding new thread creation |
+| **Waiting Thread Hijack** | Very High | Medium | High | Return-address overwrite on already-waiting threads |
 | **ThreadPool Injection** (8 variants) | Very High | Medium | High | Avoiding thread creation entirely |
 | **Fiber Injection** | Very High | Medium | High | Legitimate execution context |
 | **Context-Only Injection** | Very High | Medium | Low | Quick instruction-pointer redirect with restore trampoline |
 | **Section Mapping Injection** | Very High | High | Medium | Dual-mapped shared sections |
+| **NtSetInformationProcess Write Bypass** | High | Medium | High | Avoiding `NtWriteVirtualMemory` on supported builds |
 | **Callback Injection** (12 APIs) | Very High | Medium | Medium | Legitimate API callback dispatch |
 
 ---
@@ -102,8 +107,8 @@ Known EDR module name patterns (checked case-insensitively):
                              │ No
                     ┌────────▼────────┐
                     │ EDR Detected?   │──── Yes ──► Prefer stealthy:
-                    └────────┬────────┘             ThreadPool or Fiber
-                             │ No
+                    └────────┬────────┘             WTH / ContextOnly /
+                             │ No                   SectionMapping / callbacks
                     ┌────────▼────────┐
                     │ Suspended       │──── Yes ──► Early Bird APC
                     │ process?        │             or Process Hollow
@@ -295,22 +300,27 @@ Remote ETW patching is performed on the **target** process (not the agent):
 
 ```
 WTH > ContextOnly > SectionMapping > NtSetInfoProcess > CallbackInjection
-  > TransactedHollowing > ProcessHollow > DelayedModuleStomp > ModuleStomp
-  > EarlyBirdApc > ThreadPool > ThreadHijack > FiberInject
+   > TransactedHollowing > PhantomDllHollow > ProcessHollow
+   > DelayedModuleStomp > ExistingModuleStomp > ModuleStomp
+   > EarlyBirdApc > ThreadPool > ThreadHijack > FiberInject
 ```
 
-`TransactedHollowing` is ranked above standard `ProcessHollow` because it leaves no disk artifacts. The `prefer_over_hollowing` config flag (default: true) controls this.
+Target-specific branches move a few entries to better match common process
+roles, but they all use the same 15 `InjectionTechnique` variants and the same
+fallback pipeline.
 
-`DelayedModuleStomp` is ranked above standard `ModuleStomp` because it defeats EDR timing heuristics by waiting for the initial-scan window to pass before stomping. The `prefer_over_stomp` config flag (default: true) controls this.
+`TransactedHollowing` is ranked above standard `ProcessHollow` because it leaves no disk artifacts. The `prefer-over-hollowing` config flag (default: true) controls this.
+
+`DelayedModuleStomp` is ranked above standard `ModuleStomp` because it defeats EDR timing heuristics by waiting for the initial-scan window to pass before stomping. The `prefer-over-stomp` config flag (default: true) controls this.
 
 #### Configuration
 
 ```toml
-[injection.transacted_hollowing]
+[transacted-hollowing]
 enabled = true
-prefer_over_hollowing = true
-etw_blinding = true
-rollback_timeout_ms = 5000
+prefer-over-hollowing = true
+etw-blinding = true
+rollback-timeout-ms = 5000
 ```
 
 #### Feature Flag
@@ -323,7 +333,30 @@ Requires `direct-syscalls` because it uses `get_syscall_id` + `do_syscall` for a
 
 ---
 
-### 3. Delayed Module Stomping (Delayed Module Overloading)
+### 3. Phantom DLL Hollowing (`phantom-dll-hollow` feature)
+
+Maps a DLL image through `NtCreateSection` / `NtMapViewOfSection`, creates a
+suspended host process, unmaps the host image, maps the phantom section into the
+host, fixes relocations and imports, updates the PEB image base, then resumes.
+The target process still looks backed by a legitimate on-disk executable, while
+the executed image came from an in-memory section.
+
+#### Key Properties
+
+- Uses section-based memory management instead of `VirtualAlloc` / `VirtualAllocEx`
+- Avoids dropping the phantom DLL payload to disk
+- Ranked above standard process hollowing when the feature is enabled
+- Windows x86_64 only and gated by `phantom-dll-hollow`
+
+#### Feature Flag
+
+```toml
+phantom-dll-hollow = ["direct-syscalls"]
+```
+
+---
+
+### 4. Delayed Module Stomping (Delayed Module Overloading)
 
 Two-phase variant of module stomping that defeats EDR timing heuristics. Loads a sacrificial DLL, waits for a configurable randomized delay (default 8–15 seconds), then overwrites the DLL's `.text` section with the payload.
 
@@ -393,12 +426,12 @@ Many EDR products record DLL load times and flag modules whose code changes with
 #### Configuration
 
 ```toml
-[injection.delayed_stomp]
+[delayed-stomp]
 enabled = true
 min-delay-secs = 8
 max-delay-secs = 15
 prefer-over-stomp = true
-# sacrificial-dlls = ["version.dll", "dwmapi.dll", "msctf.dll", ...]
+sacrificial-dlls = ["version.dll", "dwmapi.dll", "msctf.dll"]
 ```
 
 #### Feature Flag
@@ -409,7 +442,7 @@ delayed-stomp = ["direct-syscalls"]
 
 ---
 
-### 4. Module Stomping (Module Overloading)
+### 5. Module Stomping (Module Overloading)
 
 Loads a legitimate DLL, then overwrites its memory with the payload. The payload appears as a legitimate loaded module in the process's module list.
 
@@ -456,7 +489,22 @@ Loads a legitimate DLL, then overwrites its memory with the payload. The payload
 
 ---
 
-### 4. Early Bird APC Injection
+### 6. Existing-Module Stomping
+
+Existing-module stomping reuses a DLL that is already loaded in the target
+process. It follows the same overwrite-and-execute idea as module stomping, but
+it never calls `LoadLibrary` / `LdrLoadDll`, so there is no new image-load kernel
+callback and no new PEB loader entry to explain.
+
+#### Selection Notes
+
+- Preferred when maximum stealth is required and a suitable loaded module exists
+- Uses module enumeration plus exclusion patterns from `[injection]`
+- Falls back to normal module stomping when no already-loaded candidate is viable
+
+---
+
+### 7. Early Bird APC Injection
 
 Queues an APC to a thread in a newly created (suspended) process. The APC executes before the process's main thread starts.
 
@@ -490,7 +538,7 @@ Queues an APC to a thread in a newly created (suspended) process. The APC execut
 
 ---
 
-### 5. Thread Hijacking
+### 8. Thread Hijacking
 
 Hijacks an existing thread in the target process by modifying its context (register state) to redirect execution.
 
@@ -542,7 +590,23 @@ Hijacks an existing thread in the target process by modifying its context (regis
 
 ---
 
-### 6. ThreadPool Injection
+### 9. Waiting Thread Hijack
+
+Targets a thread that is already blocked in a kernel wait state, reads the
+thread stack to locate a return address, and overwrites that return address with
+the payload address. When the wait resolves naturally, the thread returns into
+the payload without a suspend/resume transition or direct context modification.
+
+#### Advantages
+
+- Avoids `SuspendThread` / `ResumeThread` telemetry
+- Avoids creating a new remote thread
+- Complements Context-Only injection: WTH changes a stack return address;
+   Context-Only changes register context
+
+---
+
+### 10. ThreadPool Injection
 
 Injects shellcode by queuing work items to the target process's thread pool. No new thread creation, no remote thread creation — the process's own thread pool threads execute the payload.
 
@@ -584,7 +648,7 @@ Injects shellcode by queuing work items to the target process's thread pool. No 
 
 ---
 
-### 7. Fiber Injection
+### 11. Fiber Injection
 
 Converts a thread to a fiber, creates a new fiber with the payload, and switches to it. Fibers are user-mode scheduled and don't trigger kernel thread creation alerts.
 
@@ -624,35 +688,35 @@ Converts a thread to a fiber, creates a new fiber with the payload, and switches
 
 ---
 
-### 8. ThreadPool Injection — Extended Variants
+### 10a. ThreadPool Injection — Extended Variants
 
 The ThreadPool injection technique has been expanded to **8 sub-variants**, each
 using a different thread pool work-dispatch mechanism. This variety allows the
 operator to select the variant least likely to be monitored by a given EDR product.
 
-| Variant | Dispatch API | Callback Signature | Notes |
-|---------|-------------|-------------------|-------|
-| `TpAllocWork` | `TppAllocWork` | `PTP_WORK_CALLBACK` | Classic work item |
-| `TpAllocWorkEx` | Extended alloc | `PTP_WORK_CALLBACK` | Extended parameters |
-| `TpPostWork` | `TppPostWork` | — | Post existing work |
-| `TpAllocJob` | `TppAllocJob` | `PTP_JOB_CALLBACK` | Job-based execution |
-| `TpAllocAlpcCompletion` | `TppAllocAlpcCompletion` | ALPC handler | ALPC port-based |
-| `TpAllocIoCompletion` | `TppAllocIoCompletion` | IO completion | I/O completion port |
-| `TpAllocTimer` | `TppAllocTimer` | `PTP_TIMER_CALLBACK` | Timer-triggered |
-| `TpAllocWait` | `TppAllocWait` | `PTP_WAIT_CALLBACK` | Wait-triggered |
+| Variant | Dispatch Path | Notes |
+|---------|---------------|-------|
+| `Work` | `TpAllocWork` + `TpPostWork` | Classic work item |
+| `WorkerFactory` | Worker factory pending queue | Manipulates factory work-list pointers |
+| `Timer` | `TP_TIMER` callback | Timer-triggered worker execution |
+| `IoCompletion` | `TP_IO` + IOCP packet | Completion-port dispatch |
+| `Wait` | `TP_WAIT` callback | Event/wait-triggered dispatch |
+| `Alpc` | `TP_ALPC` callback | ALPC port-based dispatch |
+| `Direct` | Fake `TP_TASK` posted to IOCP | Direct worker dispatch |
+| `AsyncIo` | `TP_DIRECT` + `NtSetIoCompletion` | Simplest async I/O callback path |
 
 #### Selection Logic
 
 The engine automatically selects the variant based on target process reconnaissance:
 
-1. If the target already has an I/O completion port → use `TpAllocIoCompletion`
-2. If the target has ALPC ports → use `TpAllocAlpcCompletion`
-3. If the target has timer objects → use `TpAllocTimer`
-4. Default: `TpAllocWork` (most common, least suspicious)
+1. If the target already has an I/O completion port → use `IoCompletion` or `AsyncIo`
+2. If the target has ALPC ports → use `Alpc`
+3. If the target has timer objects → use `Timer`
+4. Default: `Work` (most common, broadest compatibility)
 
 ---
 
-### 9. Context-Only Injection
+### 12. Context-Only Injection
 
 Performs a minimal thread-context hijack without creating a new remote thread.
 The engine snapshots a suitable thread, writes the payload plus an
@@ -688,7 +752,7 @@ the helper uses RIP/RSP/RBP; on ARM64 it uses PC/SP/FP.
 
 ---
 
-### 10. Section Mapping Injection
+### 13. Section Mapping Injection
 
 Creates a shared section object (via `NtCreateSection`), maps it into both the
 agent and the target process, and writes the payload via the local mapping.
@@ -727,7 +791,23 @@ The target process accesses it via the remote mapping. This avoids
 
 ---
 
-### 10. Callback Injection (12 APIs)
+### 14. NtSetInformationProcess Write Bypass
+
+Uses the undocumented `ProcessReadWriteVm` (`0x6A`) information class through
+`NtSetInformationProcess` to copy payload bytes into the target via the kernel's
+memory-copy path. On unsupported builds it falls back to `ProcessVmOperation`
+(`0x6B`) or the indirect-syscall `NtWriteVirtualMemory` path.
+
+#### Advantages
+
+- Avoids the standard `NtWriteVirtualMemory` cross-process write signal on
+   supported Windows 10/11 builds
+- Keeps execution inside the same unified auto-selection and fallback pipeline
+- Uses indirect syscall infrastructure for all NT API calls
+
+---
+
+### 15. Callback Injection (12 APIs)
 
 Abuses legitimate Windows API functions that accept function-pointer callbacks.
 The payload address is supplied as the callback; when the API invokes it, the
@@ -737,23 +817,23 @@ payload executes in the context of the calling thread.
 |---|-----|---------|---------------|
 | 1 | `EnumChildWindows` | Window enumeration | `WNDENUMPROC` |
 | 2 | `EnumSystemLocalesA` | Locale enumeration | `LOCALE_ENUMPROC` |
-| 3 | `EnumSystemLocalesW` | Locale enumeration (wide) | `LOCALE_ENUMPROC` |
+| 3 | `EnumWindows` | Top-level window enumeration | `WNDENUMPROC` |
 | 4 | `EnumDesktopWindows` | Desktop window enumeration | `WNDENUMPROC` |
-| 5 | `EnumFontsA` | Font enumeration | `FONTENUMPROCA` |
-| 6 | `EnumFontsW` | Font enumeration (wide) | `FONTENUMPROCW` |
-| 7 | `EnumDisplayMonitors` | Display enumeration | `MONITORENUMPROC` |
-| 8 | `EnumResourceTypesA` | Resource type enumeration | `ENUMRESTYPEPROC` |
-| 9 | `EnumResourceTypesW` | Resource type enumeration (wide) | `ENUMRESTYPEPROC` |
-| 10 | `CreateTimerQueueTimer` | Timer expiry | `WAITORTIMERCALLBACK` |
-| 11 | `EnumClipboardFormats` | Clipboard format enumeration | `CLIPBOARDENUMPROC` |
-| 12 | `EnumThreadWindows` | Thread window enumeration | `WNDENUMPROC` |
+| 5 | `CreateTimerQueueTimer` | One-shot timer callback | `WAITORTIMERCALLBACK` |
+| 6 | `EnumTimeFormatsA` | Locale time-format enumeration | `TIMEFMT_ENUMPROCA` |
+| 7 | `EnumResourceTypesW` | Resource type enumeration | `ENUMRESTYPEPROC` |
+| 8 | `EnumFontFamilies` | Font-family enumeration | `FONTENUMPROC` |
+| 9 | `CertEnumSystemStore` | Certificate store enumeration | `PFN_CERT_ENUM_SYSTEM_STORE` |
+| 10 | `SHEnumerateUnreadMailAccounts` | Shell unread-mail enumeration | `SHENUMUNREADMAILACCOUNTS` |
+| 11 | `EnumerateLoadedModules` | DbgHelp module enumeration | `PENUMLOADED_MODULES_CALLBACK64` |
+| 12 | `CopyFileEx` | Copy progress callback | `LPPROGRESS_ROUTINE` |
 
 #### Selection Logic
 
-1. If a desktop/window exists in the target → prefer window-based callbacks (1, 4, 12)
-2. If GUI resources are available → prefer `EnumDisplayMonitors`, `EnumFonts`
-3. If no GUI → use `EnumSystemLocales`, `EnumResourceTypes`, `EnumClipboardFormats`
-4. For delayed execution → use `CreateTimerQueueTimer`
+1. If a desktop/window exists in the target → prefer window-based callbacks
+2. If GUI resources are available → prefer font and desktop enumeration paths
+3. If no GUI → use locale, resource, certificate-store, or DbgHelp callbacks
+4. For timer-based dispatch → use `CreateTimerQueueTimer`
 
 #### Advantages
 

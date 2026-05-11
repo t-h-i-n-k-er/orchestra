@@ -72,11 +72,13 @@ dependencies = [
  "common",
  "criterion 0.8.2",
  "ctr 0.10.0",
+ "digest",
  "directories",
  "dirs",
  "ed25519-dalek",
  "enigo",
  "futures-util",
+ "getrandom 0.2.17",
  "goblin 0.7.1",
  "hex",
  "hkdf",
@@ -87,6 +89,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "log",
+ "md-5",
  "module_loader",
  "notify",
  "nt_syscall",
@@ -97,6 +100,7 @@ dependencies = [
  "rand 0.8.6",
  "rcgen 0.14.7",
  "reqwest 0.11.27",
+ "ring",
  "russh",
  "russh-keys",
  "rustls 0.21.12",
@@ -105,6 +109,7 @@ dependencies = [
  "rustls-pemfile 2.2.0",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "string_crypt",
  "subtle",
@@ -117,6 +122,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "twox-hash",
+ "uefi-persistence",
  "url",
  "uuid",
  "winapi",
@@ -3062,6 +3068,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
+
+[[package]]
 name = "md5"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5909,6 +5925,21 @@ dependencies = [
  "memoffset",
  "tempfile",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "uefi-persistence"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "winapi",
 ]
 
 [[package]]

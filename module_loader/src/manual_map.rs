@@ -165,6 +165,20 @@ unsafe fn get_module_handle_peb(module_name: &str) -> *mut c_void {
         p as *mut PEB
     };
 
+    // ARM64 Windows: TEB is in x18, PEB pointer is at offset 0x30 within TEB.
+    // NtCurrentTeb() returns the TEB base via x18, and the PEB pointer
+    // lives at TEB+0x30 (ProcessEnvironmentBlock field).
+    #[cfg(target_arch = "aarch64")]
+    let peb: *mut PEB = {
+        let teb: *mut c_void;
+        std::arch::asm!("mov {}, x18", out(reg) teb);
+        let peb_ptr = teb.add(0x30) as *mut *mut PEB;
+        if peb_ptr.is_null() {
+            return std::ptr::null_mut();
+        }
+        *peb_ptr
+    };
+
     if peb.is_null() || (*peb).Ldr.is_null() {
         return std::ptr::null_mut();
     }
@@ -238,6 +252,8 @@ unsafe fn get_proc_address_by_ordinal_manual(module: *mut c_void, ordinal: u16) 
     #[cfg(target_arch = "x86")]
     use winapi::um::winnt::IMAGE_NT_HEADERS32 as IMAGE_NT_HEADERS;
     #[cfg(target_arch = "x86_64")]
+    use winapi::um::winnt::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
+    #[cfg(target_arch = "aarch64")]
     use winapi::um::winnt::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
 
     let nt_headers = &*(base.add(e_lfanew) as *const IMAGE_NT_HEADERS);
@@ -365,6 +381,8 @@ unsafe fn get_proc_address_manual(module: *mut c_void, proc_name: &str) -> *mut 
     #[cfg(target_arch = "x86")]
     use winapi::um::winnt::IMAGE_NT_HEADERS32 as IMAGE_NT_HEADERS;
     #[cfg(target_arch = "x86_64")]
+    use winapi::um::winnt::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
+    #[cfg(target_arch = "aarch64")]
     use winapi::um::winnt::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
 
     let nt_headers = &*(base.add(e_lfanew) as *const IMAGE_NT_HEADERS);

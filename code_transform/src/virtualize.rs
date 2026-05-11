@@ -972,73 +972,308 @@ fn emit_handler(
         }
 
         VmOp::MovRegReg => {
-            // Load dst idx → eax, src idx → ecx
-            load_reg_idx!(out); // eax = dst reg idx
-            let _dst_idx_holder_ip = next_ip();
-            // Save dst idx: mov r8d, eax (r8 is free — not used by interpreter)
-            // Actually r8 is a parameter (register file). Let's use RSI as temp.
-            // Wait, RSI holds bytecode length (R13). We saved it.
-            // Use stack or RAX/RCX carefully.
+            // Copy value from reg[src] to reg[dst].
+            // Bytecode: [opcode] [dst_idx] [src_idx]
+            //
+            // Strategy:
+            //   1. Load dst idx → eax, shl 3, push rax (save dst*8)
+            //   2. Load src idx → eax, shl 3
+            //   3. mov rax, [rbx + rax]  (load src value)
+            //   4. pop rcx (restore dst*8)
+            //   5. mov [rbx + rcx], rax  (store to dst)
 
-            // Actually let's use a simpler approach:
-            // 1. Load dst idx → eax
-            // 2. shl eax, 3 (multiply by 8)
-            // 3. Load src idx → ecx
-            // 4. shl ecx, 3
-            // 5. mov rdi, [rbx + rcx]  (load src value)
-            // 6. mov [rbx + rax], rdi  (store to dst)
+            // Load dst register index
+            load_reg_idx!(out); // eax = dst reg index
 
-            // shl eax, 3
-            let mut shl_eax = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
-            shl_eax.set_ip(next_ip());
-            out.push(shl_eax);
+            // shl eax, 3 (dst * 8 for qword array offset)
+            let mut shl1 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            shl1.set_ip(next_ip());
+            out.push(shl1);
 
-            // Load src idx → ecx
-            load_reg_idx!(out); // eax gets clobbered! Need to save dst.
+            // Save dst*8 on the stack
+            let mut push_dst = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            push_dst.set_ip(next_ip());
+            out.push(push_dst);
 
-            // Let's restructure. Save dst idx to a different register.
-            // RDI is free (we copied it to R12). Use RDI for dst_idx*8.
-            // Actually we can't — we're inside the interpreter.
+            // Load src register index
+            load_reg_idx!(out); // eax = src reg index
 
-            // Better approach: save dst reg index with a push/pop pair.
-            // Or: compute dst*8 first, push rax, load src, compute src*8, load value, pop rax, store.
+            // shl eax, 3 (src * 8)
+            let mut shl2 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            shl2.set_ip(next_ip());
+            out.push(shl2);
 
-            // This is getting complex. Let's just emit it inline.
-            // Reset and try again with a cleaner approach.
+            // mov rax, [rbx + rax] — load value from src slot
+            let mut load_src = Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_index(Register::RBX, Register::RAX),
+            )
+            .unwrap();
+            load_src.set_ip(next_ip());
+            out.push(load_src);
 
-            // We already emitted some instructions above for this handler.
-            // Let's take a step back. The issue is that we have limited scratch
-            // registers. Let's use RAX for temp, RCX for second temp, and
-            // save/restore via push/pop.
+            // pop rcx — restore dst*8
+            let mut pop_dst = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            pop_dst.set_ip(next_ip());
+            out.push(pop_dst);
 
-            // For now, just emit a simple stub that jumps to dispatch.
-            // A production implementation would carefully juggle registers.
-            // We'll emit the minimal working interpreter skeleton.
+            // mov [rbx + rcx], rax — store value to dst slot
+            let mut store_dst = Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_index(Register::RBX, Register::RCX),
+                Register::RAX,
+            )
+            .unwrap();
+            store_dst.set_ip(next_ip());
+            out.push(store_dst);
+
             jmp_dispatch!(out);
         }
 
-        // For the initial implementation, emit a dispatch jump for all handlers.
-        // The full register-shuffling handlers will be completed iteratively.
-        // The important part is the framework: opcode table, bytecode format,
-        // interpreter structure, and pipeline integration.
         VmOp::MovRegImm => {
-            // Load dst idx, load 8-byte imm, store to reg file.
-            load_reg_idx!(out); // dst idx
-            load_imm64!(out, Register::RAX); // 8-byte immediate (reuse same encoding)
+            // Store 8-byte immediate to reg[dst].
+            // Bytecode: [opcode] [dst_idx] [imm64]
+            //
+            // Strategy:
+            //   1. Load dst idx → eax, shl 3, push rax (save dst*8)
+            //   2. Load 8-byte imm → rax
+            //   3. pop rcx (restore dst*8)
+            //   4. mov [rbx + rcx], rax (store imm to dst slot)
+
+            // Load dst register index
+            load_reg_idx!(out); // eax = dst reg index
+
+            // shl eax, 3
+            let mut shl1 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            shl1.set_ip(next_ip());
+            out.push(shl1);
+
+            // Save dst*8 on the stack
+            let mut push_dst = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            push_dst.set_ip(next_ip());
+            out.push(push_dst);
+
+            // Load 8-byte immediate value
+            load_imm64!(out, Register::RAX); // rax = immediate value
+
+            // pop rcx — restore dst*8
+            let mut pop_dst = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            pop_dst.set_ip(next_ip());
+            out.push(pop_dst);
+
+            // mov [rbx + rcx], rax — store imm to dst slot
+            let mut store_dst = Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_index(Register::RBX, Register::RCX),
+                Register::RAX,
+            )
+            .unwrap();
+            store_dst.set_ip(next_ip());
+            out.push(store_dst);
+
             jmp_dispatch!(out);
         }
 
         VmOp::Add | VmOp::Sub | VmOp::And | VmOp::Or | VmOp::Xor | VmOp::Shl | VmOp::Shr => {
-            // Two register operands.
-            load_reg_idx!(out); // dst
-            load_reg_idx!(out); // src
+            // Two-register ALU operation: dst = dst OP src
+            // Bytecode: [opcode] [dst_idx] [src_idx]
+            //
+            // Strategy:
+            //   1. Load dst idx → eax, shl 3, push rax (save dst*8)
+            //   2. Load src idx → eax, shl 3
+            //   3. mov rax, [rbx + rax] — load src value → rax
+            //   4. pop rcx — restore dst*8
+            //   5. For commutative ops (Add/And/Or/Xor): op [rbx+rcx], rax
+            //      For non-commutative (Sub/Shl/Shr): load dst first, then op
+            //
+            // For simplicity we use a uniform approach:
+            //   1. push dst*8
+            //   2. compute src*8, load src → rax
+            //   3. pop dst*8 → rcx
+            //   4. load dst → rdx: mov rdx, [rbx+rcx]
+            //   5. Perform op on rdx with rax
+            //   6. Store rdx → [rbx+rcx]
+            // This works uniformly for all ops.
+
+            let op = *self; // capture which VmOp we are
+
+            // Load dst register index
+            load_reg_idx!(out); // eax = dst reg index
+
+            // shl eax, 3
+            let mut shl1 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            shl1.set_ip(next_ip());
+            out.push(shl1);
+
+            // Save dst*8 on the stack
+            let mut push_dst = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            push_dst.set_ip(next_ip());
+            out.push(push_dst);
+
+            // Load src register index
+            load_reg_idx!(out); // eax = src reg index
+
+            // shl eax, 3
+            let mut shl2 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            shl2.set_ip(next_ip());
+            out.push(shl2);
+
+            // mov rax, [rbx + rax] — load src value
+            let mut load_src = Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_index(Register::RBX, Register::RAX),
+            )
+            .unwrap();
+            load_src.set_ip(next_ip());
+            out.push(load_src);
+
+            // Save src value
+            let mut push_src = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            push_src.set_ip(next_ip());
+            out.push(push_src);
+
+            // pop rcx — restore dst*8
+            let mut pop_dst = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            pop_dst.set_ip(next_ip());
+            out.push(pop_dst);
+
+            // mov rdx, [rbx + rcx] — load dst value
+            let mut load_dst = Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RDX,
+                MemoryOperand::with_base_index(Register::RBX, Register::RCX),
+            )
+            .unwrap();
+            load_dst.set_ip(next_ip());
+            out.push(load_dst);
+
+            // pop rax — restore src value
+            let mut pop_src = Instruction::with1(Code::Pop_r64, Register::RAX).unwrap();
+            pop_src.set_ip(next_ip());
+            out.push(pop_src);
+
+            // Perform the ALU operation: rdx OP= rax
+            match op {
+                VmOp::Add => {
+                    let mut alu = Instruction::with2(Code::Add_r64_rm64, Register::RDX, Register::RAX).unwrap();
+                    alu.set_ip(next_ip());
+                    out.push(alu);
+                }
+                VmOp::Sub => {
+                    let mut alu = Instruction::with2(Code::Sub_r64_rm64, Register::RDX, Register::RAX).unwrap();
+                    alu.set_ip(next_ip());
+                    out.push(alu);
+                }
+                VmOp::And => {
+                    let mut alu = Instruction::with2(Code::And_r64_rm64, Register::RDX, Register::RAX).unwrap();
+                    alu.set_ip(next_ip());
+                    out.push(alu);
+                }
+                VmOp::Or => {
+                    let mut alu = Instruction::with2(Code::Or_r64_rm64, Register::RDX, Register::RAX).unwrap();
+                    alu.set_ip(next_ip());
+                    out.push(alu);
+                }
+                VmOp::Xor => {
+                    let mut alu = Instruction::with2(Code::Xor_r64_rm64, Register::RDX, Register::RAX).unwrap();
+                    alu.set_ip(next_ip());
+                    out.push(alu);
+                }
+                VmOp::Shl => {
+                    // Shift dst by cl (low byte of src). Use rcx for shift count.
+                    // rax already has src value; move low byte to cl.
+                    let mut mov_cl = Instruction::with2(Code::Mov_cl_r8, Register::CL, Register::AL).unwrap();
+                    mov_cl.set_ip(next_ip());
+                    out.push(mov_cl);
+                    let mut alu = Instruction::with1(Code::Shl_r64_cl, Register::RDX).unwrap();
+                    alu.set_ip(next_ip());
+                    out.push(alu);
+                }
+                VmOp::Shr => {
+                    let mut mov_cl = Instruction::with2(Code::Mov_cl_r8, Register::CL, Register::AL).unwrap();
+                    mov_cl.set_ip(next_ip());
+                    out.push(mov_cl);
+                    let mut alu = Instruction::with1(Code::Shr_r64_cl, Register::RDX).unwrap();
+                    alu.set_ip(next_ip());
+                    out.push(alu);
+                }
+                _ => unreachable!(),
+            }
+
+            // mov [rbx + rcx], rdx — store result back to dst slot
+            let mut store = Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_index(Register::RBX, Register::RCX),
+                Register::RDX,
+            )
+            .unwrap();
+            store.set_ip(next_ip());
+            out.push(store);
+
             jmp_dispatch!(out);
         }
 
         VmOp::Cmp => {
-            // Two register operands.
-            load_reg_idx!(out); // a
-            load_reg_idx!(out); // b
+            // Compare reg[a] with reg[b], set RFLAGS.
+            // Bytecode: [opcode] [a_idx] [b_idx]
+            //
+            // Strategy:
+            //   1. Load a idx → eax, shl 3, push rax (save a*8)
+            //   2. Load b idx → eax, shl 3
+            //   3. mov rax, [rbx + rax] — load b value → rax
+            //   4. pop rcx — restore a*8
+            //   5. cmp [rbx + rcx], rax — compare a with b, sets RFLAGS
+            // RFLAGS is now set for the subsequent Jcc handler.
+
+            // Load a register index
+            load_reg_idx!(out); // eax = a reg index
+
+            // shl eax, 3
+            let mut shl1 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            shl1.set_ip(next_ip());
+            out.push(shl1);
+
+            // Save a*8 on the stack
+            let mut push_a = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            push_a.set_ip(next_ip());
+            out.push(push_a);
+
+            // Load b register index
+            load_reg_idx!(out); // eax = b reg index
+
+            // shl eax, 3
+            let mut shl2 = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            shl2.set_ip(next_ip());
+            out.push(shl2);
+
+            // mov rax, [rbx + rax] — load b value
+            let mut load_b = Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_index(Register::RBX, Register::RAX),
+            )
+            .unwrap();
+            load_b.set_ip(next_ip());
+            out.push(load_b);
+
+            // pop rcx — restore a*8
+            let mut pop_a = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            pop_a.set_ip(next_ip());
+            out.push(pop_a);
+
+            // cmp [rbx + rcx], rax — compare reg[a] with reg[b]
+            // This sets RFLAGS for the Jcc handler that follows.
+            let mut cmp = Instruction::with2(
+                Code::Cmp_rm64_r64,
+                MemoryOperand::with_base_index(Register::RBX, Register::RCX),
+                Register::RAX,
+            )
+            .unwrap();
+            cmp.set_ip(next_ip());
+            out.push(cmp);
+
             jmp_dispatch!(out);
         }
 
@@ -1054,28 +1289,288 @@ fn emit_handler(
         }
 
         VmOp::Jcc => {
-            // Load condition byte, load 4-byte offset.
-            load_reg_idx!(out); // condition byte (read as reg idx)
-            load_imm32!(out, Register::RAX); // offset → rax
-                                             // For now, always take the branch. A full implementation would
-                                             // check the flags.
-                                             // mov r14, rax
-            let mut mov_pc =
-                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX).unwrap();
-            mov_pc.set_ip(next_ip());
-            out.push(mov_pc);
+            // Load condition code (0=Z, 1=NZ, 2=L, 3=GE, 4=G, 5=LE),
+            // load 4-byte branch target offset.
+            //
+            // Strategy: the preceding VmOp::Cmp set RFLAGS. We must
+            // save them BEFORE any subsequent comparison clobbers them.
+            // Then dispatch on condition code and apply the saved flags
+            // to decide whether to take the branch.
+            //
+            //   1. pushfq                    ; save RFLAGS from Cmp
+            //   2. load condition code → eax
+            //   3. load branch target  → rcx
+            //   4. switch on condition code → decide taken/not-taken
+            //   5. popfq (clean up saved flags)
+
+            // pushfq — save RFLAGS
+            let mut pushfq = Instruction::with(Code::Pushfq);
+            pushfq.set_ip(next_ip());
+            out.push(pushfq);
+
+            load_reg_idx!(out); // condition code → eax
+            load_imm32!(out, Register::RCX); // branch target → rcx
+
+            // Save branch target and condition code on stack so they
+            // survive the popfq below.
+            // push rcx (branch target)
+            let mut push_target = Instruction::with1(Code::Push_r64, Register::RCX).unwrap();
+            push_target.set_ip(next_ip());
+            out.push(push_target);
+            // push rax (condition code)
+            let mut push_cc = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            push_cc.set_ip(next_ip());
+            out.push(push_cc);
+
+            // popfq — restore RFLAGS from Cmp so conditional jumps work
+            let mut popfq = Instruction::with(Code::Popfq);
+            popfq.set_ip(next_ip());
+            out.push(popfq);
+
+            // Restore condition code: pop rax
+            let mut pop_cc = Instruction::with1(Code::Pop_r64, Register::RAX).unwrap();
+            pop_cc.set_ip(next_ip());
+            out.push(pop_cc);
+
+            // Now RFLAGS hold the Cmp result and eax = condition code.
+            // We need to emit conditional jumps based on the condition code.
+            // Approach: for each condition code value, compare and jump to
+            // a handler that tests the right flag combination.
+            //
+            // Since we can only do one conditional jump per flag state,
+            // we emit a cascade:
+            //   cmp eax, 0  →  je  check_zf_set    ; ZF=1
+            //   cmp eax, 1  →  je  check_zf_clear   ; ZF=0
+            //   cmp eax, 2  →  je  check_sf_ne_of   ; SF!=OF
+            //   cmp eax, 3  →  je  check_sf_eq_of   ; SF==OF
+            //   cmp eax, 4  →  je  check_zf_clear_and_sf_eq_of ; ZF=0 && SF==OF
+            //   cmp eax, 5  →  je  check_zf_set_or_sf_ne_of    ; ZF=1 || SF!=OF
+            //   jmp not_taken (fall through)
+
+            // Condition 0: ZF=1 (JE/JZ)
+            let mut cmp0 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 0i32).unwrap();
+            cmp0.set_ip(next_ip());
+            out.push(cmp0);
+            let mut je0 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64).unwrap();
+            je0.set_ip(next_ip());
+            out.push(je0);
+            let je0_idx = out.len() - 1;
+
+            // Condition 1: ZF=0 (JNE/JNZ)
+            let mut cmp1 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 1i32).unwrap();
+            cmp1.set_ip(next_ip());
+            out.push(cmp1);
+            let mut je1 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64).unwrap();
+            je1.set_ip(next_ip());
+            out.push(je1);
+            let je1_idx = out.len() - 1;
+
+            // Condition 2: SF!=OF (JL)
+            let mut cmp2 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 2i32).unwrap();
+            cmp2.set_ip(next_ip());
+            out.push(cmp2);
+            let mut je2 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64).unwrap();
+            je2.set_ip(next_ip());
+            out.push(je2);
+            let je2_idx = out.len() - 1;
+
+            // Condition 3: SF==OF (JGE)
+            let mut cmp3 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 3i32).unwrap();
+            cmp3.set_ip(next_ip());
+            out.push(cmp3);
+            let mut je3 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64).unwrap();
+            je3.set_ip(next_ip());
+            out.push(je3);
+            let je3_idx = out.len() - 1;
+
+            // Condition 4: ZF=0 && SF==OF (JG)
+            let mut cmp4 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 4i32).unwrap();
+            cmp4.set_ip(next_ip());
+            out.push(cmp4);
+            let mut je4 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64).unwrap();
+            je4.set_ip(next_ip());
+            out.push(je4);
+            let je4_idx = out.len() - 1;
+
+            // Condition 5: ZF=1 || SF!=OF (JLE)
+            let mut cmp5 = Instruction::with2(Code::Cmp_rm32_imm8, Register::EAX, 5i32).unwrap();
+            cmp5.set_ip(next_ip());
+            out.push(cmp5);
+            let mut je5 = Instruction::with_branch(Code::Je_rel32_64, 0xFFFE_FFFF_u64).unwrap();
+            je5.set_ip(next_ip());
+            out.push(je5);
+            let je5_idx = out.len() - 1;
+
+            // Fall-through: unknown condition or not taken.
+            // Pop the saved branch target and continue.
+            let not_taken_ip = next_ip();
+            let mut pop_discard = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            pop_discard.set_ip(next_ip());
+            out.push(pop_discard);
             jmp_dispatch!(out);
+
+            // ── Condition handler pads ──
+            // Each pad: test the restored RFLAGS with the appropriate
+            // conditional jump. If taken → pop target, set PC.
+            // If not taken → pop target, continue.
+
+            // Pad 0: JE/JZ (ZF=1)
+            let pad0_ip = next_ip();
+            let mut jz0 = Instruction::with_branch(Code::Jne_rel32_64, not_taken_ip).unwrap();
+            jz0.set_ip(next_ip());
+            out.push(jz0);
+            // taken path: pop rcx (target), mov r14, rcx
+            let mut pop0 = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            pop0.set_ip(next_ip());
+            out.push(pop0);
+            let mut set_pc0 =
+                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX).unwrap();
+            set_pc0.set_ip(next_ip());
+            out.push(set_pc0);
+            jmp_dispatch!(out);
+
+            // Pad 1: JNE/JNZ (ZF=0)
+            let pad1_ip = next_ip();
+            let mut jnz1 = Instruction::with_branch(Code::Je_rel32_64, not_taken_ip).unwrap();
+            jnz1.set_ip(next_ip());
+            out.push(jnz1);
+            let mut pop1 = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            pop1.set_ip(next_ip());
+            out.push(pop1);
+            let mut set_pc1 =
+                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX).unwrap();
+            set_pc1.set_ip(next_ip());
+            out.push(set_pc1);
+            jmp_dispatch!(out);
+
+            // Pad 2: JL (SF!=OF)
+            let pad2_ip = next_ip();
+            let mut jl2 = Instruction::with_branch(Code::Jge_rel32_64, not_taken_ip).unwrap();
+            jl2.set_ip(next_ip());
+            out.push(jl2);
+            let mut pop2 = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            pop2.set_ip(next_ip());
+            out.push(pop2);
+            let mut set_pc2 =
+                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX).unwrap();
+            set_pc2.set_ip(next_ip());
+            out.push(set_pc2);
+            jmp_dispatch!(out);
+
+            // Pad 3: JGE (SF==OF)
+            let pad3_ip = next_ip();
+            let mut jge3 = Instruction::with_branch(Code::Jl_rel32_64, not_taken_ip).unwrap();
+            jge3.set_ip(next_ip());
+            out.push(jge3);
+            let mut pop3 = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            pop3.set_ip(next_ip());
+            out.push(pop3);
+            let mut set_pc3 =
+                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX).unwrap();
+            set_pc3.set_ip(next_ip());
+            out.push(set_pc3);
+            jmp_dispatch!(out);
+
+            // Pad 4: JG (ZF=0 && SF==OF) — use JLE as inverted test
+            let pad4_ip = next_ip();
+            let mut jg4 = Instruction::with_branch(Code::Jle_rel32_64, not_taken_ip).unwrap();
+            jg4.set_ip(next_ip());
+            out.push(jg4);
+            let mut pop4 = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            pop4.set_ip(next_ip());
+            out.push(pop4);
+            let mut set_pc4 =
+                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX).unwrap();
+            set_pc4.set_ip(next_ip());
+            out.push(set_pc4);
+            jmp_dispatch!(out);
+
+            // Pad 5: JLE (ZF=1 || SF!=OF) — use JG as inverted test
+            let pad5_ip = next_ip();
+            let mut jle5 = Instruction::with_branch(Code::Jg_rel32_64, not_taken_ip).unwrap();
+            jle5.set_ip(next_ip());
+            out.push(jle5);
+            let mut pop5 = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            pop5.set_ip(next_ip());
+            out.push(pop5);
+            let mut set_pc5 =
+                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RCX).unwrap();
+            set_pc5.set_ip(next_ip());
+            out.push(set_pc5);
+            jmp_dispatch!(out);
+
+            // Fix up all the JE jumps from the condition-code comparisons
+            // to point to their respective handler pads.
+            out[je0_idx].set_near_branch64(pad0_ip);
+            out[je1_idx].set_near_branch64(pad1_ip);
+            out[je2_idx].set_near_branch64(pad2_ip);
+            out[je3_idx].set_near_branch64(pad3_ip);
+            out[je4_idx].set_near_branch64(pad4_ip);
+            out[je5_idx].set_near_branch64(pad5_ip);
         }
 
         VmOp::Push => {
-            load_reg_idx!(out);
-            // TODO: load value from reg file, push to stack
+            // Load register index, compute address in reg file,
+            // load the 8-byte value, push it onto the virtual stack.
+            load_reg_idx!(out); // reg index → eax
+
+            // shl eax, 3 (reg_index * 8)
+            let mut shl = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            shl.set_ip(next_ip());
+            out.push(shl);
+
+            // mov rax, qword [rbx + rax]  (load value from reg file)
+            let mut load_val = Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_index(Register::RBX, Register::RAX),
+            )
+            .unwrap();
+            load_val.set_ip(next_ip());
+            out.push(load_val);
+
+            // push rax (push value onto virtual stack)
+            let mut push = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            push.set_ip(next_ip());
+            out.push(push);
+
             jmp_dispatch!(out);
         }
 
         VmOp::Pop => {
-            load_reg_idx!(out);
-            // TODO: pop from stack, store to reg file
+            // Pop 8 bytes from virtual stack, store to register file slot.
+            load_reg_idx!(out); // reg index → eax
+
+            // Save reg index: push rax
+            let mut save_idx = Instruction::with1(Code::Push_r64, Register::RAX).unwrap();
+            save_idx.set_ip(next_ip());
+            out.push(save_idx);
+
+            // pop rcx (pop value from stack → rcx)
+            let mut pop_val = Instruction::with1(Code::Pop_r64, Register::RCX).unwrap();
+            pop_val.set_ip(next_ip());
+            out.push(pop_val);
+
+            // Restore reg index: pop rax
+            let mut restore_idx = Instruction::with1(Code::Pop_r64, Register::RAX).unwrap();
+            restore_idx.set_ip(next_ip());
+            out.push(restore_idx);
+
+            // shl eax, 3 (reg_index * 8)
+            let mut shl = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            shl.set_ip(next_ip());
+            out.push(shl);
+
+            // mov qword [rbx + rax], rcx  (store to reg file)
+            let mut store = Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_index(Register::RBX, Register::RAX),
+                Register::RCX,
+            )
+            .unwrap();
+            store.set_ip(next_ip());
+            out.push(store);
+
             jmp_dispatch!(out);
         }
 
@@ -1091,18 +1586,103 @@ fn emit_handler(
         }
 
         VmOp::Call => {
-            load_imm32!(out, Register::RAX);
-            // TODO: push return address, set PC
+            // Load 4-byte target offset, push return address (current PC),
+            // then set PC to target.
+            load_imm32!(out, Register::RAX); // target offset → rax
+
+            // Push return address (current R14 = PC after this instruction)
+            // onto the virtual stack. R14 already points past the operands.
+            let mut push_ret = Instruction::with1(Code::Push_r64, Register::R14).unwrap();
+            push_ret.set_ip(next_ip());
+            out.push(push_ret);
+
+            // Set PC to target: mov r14, rax
+            let mut mov_pc =
+                Instruction::with2(Code::Mov_r64_rm64, Register::R14, Register::RAX).unwrap();
+            mov_pc.set_ip(next_ip());
+            out.push(mov_pc);
+
             jmp_dispatch!(out);
         }
 
         VmOp::Not | VmOp::Neg => {
-            load_reg_idx!(out);
+            // Load register index, apply NOT (bitwise complement) or
+            // NEG (two's complement negation) to the 8-byte slot.
+            load_reg_idx!(out); // reg index → eax
+
+            // shl eax, 3 (reg_index * 8)
+            let mut shl = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            shl.set_ip(next_ip());
+            out.push(shl);
+
+            // Determine which operation to emit based on the VmOp variant.
+            // We check at codegen time, not runtime.
+            let is_not = matches!(op, VmOp::Not);
+
+            // not/neg qword [rbx + rax]
+            let code = if is_not {
+                Code::Not_rm64
+            } else {
+                Code::Neg_rm64
+            };
+            let mut alu = Instruction::with1(
+                code,
+                MemoryOperand::with_base_index(Register::RBX, Register::RAX),
+            )
+            .unwrap();
+            alu.set_ip(next_ip());
+            out.push(alu);
+
             jmp_dispatch!(out);
         }
 
         VmOp::Inc | VmOp::Dec => {
-            load_reg_idx!(out);
+            // Load register index, apply INC (increment) or DEC (decrement)
+            // to the 8-byte slot in the register file.
+            load_reg_idx!(out); // reg index → eax
+
+            // shl eax, 3 (reg_index * 8)
+            let mut shl = Instruction::with2(Code::Shl_rm32_imm8, Register::EAX, 3i32).unwrap();
+            shl.set_ip(next_ip());
+            out.push(shl);
+
+            // Determine which operation to emit.
+            let is_inc = matches!(op, VmOp::Inc);
+
+            let code = if is_inc {
+                Code::Inc_rm64
+            } else {
+                Code::Dec_rm64
+            };
+            // inc/dec qword [rbx + rax]
+            // Note: Inc/Dec with memory operand needs the full encoding.
+            // We use the register form: load → inc/dec → store.
+            //
+            // mov rcx, qword [rbx + rax]
+            let mut load = Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RCX,
+                MemoryOperand::with_base_index(Register::RBX, Register::RAX),
+            )
+            .unwrap();
+            load.set_ip(next_ip());
+            out.push(load);
+
+            // inc/dec rcx
+            let mut alu = Instruction::with1(code, Register::RCX).unwrap();
+            alu.set_ip(next_ip());
+            out.push(alu);
+
+            // mov qword [rbx + rax], rcx
+            let mut store = Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_index(Register::RBX, Register::RAX),
+                Register::RCX,
+            )
+            .unwrap();
+            store.set_ip(next_ip());
+            out.push(store);
+
             jmp_dispatch!(out);
         }
     }

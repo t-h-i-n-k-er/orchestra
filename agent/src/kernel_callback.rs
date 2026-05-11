@@ -46,6 +46,7 @@ pub mod deploy;
 pub mod discover;
 pub mod driver_db;
 pub mod overwrite;
+pub mod proxy;
 
 use anyhow::{bail, Context, Result};
 
@@ -206,7 +207,7 @@ const DTB_OFFSETS: &[(u32, usize)] = &[
 ///
 /// Returns the offset from the highest entry whose build ≤ the requested
 /// build, or `None` if the build is older than the minimum known entry.
-fn dtb_offset_for_build(build: u32) -> Option<usize> {
+pub fn dtb_offset_for_build(build: u32) -> Option<usize> {
     let mut best: Option<usize> = None;
     for &(b, off) in DTB_OFFSETS {
         if b <= build {

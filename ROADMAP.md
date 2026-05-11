@@ -35,8 +35,12 @@ This document describes where the project is going next.
 - ✅ **enigo `x11rb` backend**: eliminated `libxdo-dev` system dependency on
   Linux for remote-assist builds.
 - ✅ **`x11cap` vendor patch**: stable-Rust-compatible fork using `NonNull<T>`.
-- ✅ **`cargo test --workspace --all-features`** passes cleanly on Linux.
-- ✅ **`cargo clippy --workspace --all-features -- -D warnings`** zero warnings.
+- ✅ **`cargo test --workspace --all-features`** passes cleanly on Linux
+  (note: `--all-features` includes `embedded_driver`, which requires the
+  `SYS_DRIVER_PATH` or `ORCHESTRA_DRIVER_PATH` environment variable to point
+  to a valid XOR-encrypted `.sys` driver; set either variable before building).
+- ✅ **`cargo clippy --workspace --all-features -- -D warnings`** zero warnings
+  (same `embedded_driver` caveat applies).
 - ✅ **`cargo fmt --all`** workspace fully formatted.
 - ✅ **HMAC-SHA256 signed audit events**: each JSONL entry is paired with
   an HMAC tag; tampered records are flagged on read. Key derived from
@@ -100,8 +104,10 @@ This document describes where the project is going next.
   keylogger (WH_KEYBOARD_LL), clipboard monitoring, all stored in ChaCha20-Poly1305
   encrypted ring buffers. Gated by `surveillance` feature.
 - ✅ **Injection engine expansion** — ThreadPool (8 sub-variants), Fiber,
-  Context-Only, Section Mapping, Callback (12 APIs) injection techniques.
-  Total: 12 techniques in the unified injection engine.
+  Context-Only, Section Mapping, NtSetInformationProcess write bypass,
+  Waiting Thread Hijack, Transacted Hollowing, Delayed/Existing Module Stomp,
+  Phantom DLL Hollowing, and Callback (12 APIs) techniques. Total: 15
+  `InjectionTechnique` variants in the unified injection engine.
 - ✅ **Token manipulation commands** — `MakeToken`, `StealToken`, `Rev2Self`,
   `GetSystem` with thread-safe impersonation.
 - ✅ **Lateral movement commands** — `PsExec`, `WmiExec`, `DcomExec`, `WinRmExec`.

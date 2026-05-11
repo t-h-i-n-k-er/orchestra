@@ -218,6 +218,39 @@ pub struct GlobalConfig {
     pub dns_idle: String,
     #[serde(default)]
     pub dns_sleep: u64,
+
+    // ── Adaptive timing configuration ──────────────────────────────────
+
+    /// Enable the adaptive C2 timing engine.  When `true`, the agent
+    /// learns the target network's traffic patterns and adjusts its
+    /// callback timing to blend in, replacing the simple fixed-percentage
+    /// jitter approach.  When `false` (the default), the legacy
+    /// `jittered_sleep()` method is used.
+    #[serde(default)]
+    pub adaptive_timing_enabled: bool,
+
+    /// Duration in seconds that the adaptive timer spends in the Learning
+    /// phase before transitioning to Active.  During learning, the timer
+    /// collects traffic observations and builds a statistical model.
+    /// Default: 300 (5 minutes).
+    #[serde(default = "default_adaptive_timing_learning_period")]
+    pub adaptive_timing_learning_period: u64,
+
+    /// Maximum deviation from the base interval as a fraction (0.0–1.0).
+    /// Controls how far the adaptive timer may drift from the configured
+    /// `sleep_time`.  A value of 0.0 means no deviation (fixed interval);
+    /// 1.0 means the timer may halve or double the interval.
+    /// Default: 0.5.
+    #[serde(default = "default_adaptive_timing_max_deviation")]
+    pub adaptive_timing_max_deviation: f64,
+}
+
+fn default_adaptive_timing_learning_period() -> u64 {
+    300
+}
+
+fn default_adaptive_timing_max_deviation() -> f64 {
+    0.5
 }
 
 fn default_dns_idle() -> String {
@@ -233,6 +266,9 @@ impl Default for GlobalConfig {
             sleep_time_ms: None,
             dns_idle: "0.0.0.0".to_string(),
             dns_sleep: 0,
+            adaptive_timing_enabled: false,
+            adaptive_timing_learning_period: 300,
+            adaptive_timing_max_deviation: 0.5,
         }
     }
 }
@@ -831,6 +867,9 @@ impl Default for MalleableProfile {
                 sleep_time_ms: None,
                 dns_idle: "0.0.0.0".to_string(),
                 dns_sleep: 0,
+                adaptive_timing_enabled: false,
+                adaptive_timing_learning_period: 300,
+                adaptive_timing_max_deviation: 0.5,
             },
             ssl: SslConfig {
                 enabled: true,

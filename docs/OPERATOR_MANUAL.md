@@ -185,38 +185,38 @@ name = "my-operation"
 author = "operator-1"
 description = "Custom profile for Operation X"
 
-[global]
+[profile.global]
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 jitter = 37
 sleep_time = 45
 
-[http_get]
+[profile.http_get]
 uri = ["/api/v2/notifications", "/api/v2/feed"]
 verb = "GET"
 
-[http_get.headers]
+[profile.http_get.headers]
 Accept = "application/json"
 Connection = "keep-alive"
 
-[http_get.metadata]
+[profile.http_get.metadata]
 delivery = "Cookie"
 key = "session_token"
 transform = "Base64"
 
-[http_get.client]
+[profile.http_get.client]
 prepend = "JSESSIONID="
 append = ";"
 transform = "Base64"
 
-[http_post]
+[profile.http_post]
 uri = ["/api/v2/events", "/api/v2/analytics"]
 verb = "POST"
 
-[http_post.headers]
+[profile.http_post.headers]
 Content-Type = "application/json"
 Accept = "application/json"
 
-[http_post.output]
+[profile.http_post.output]
 delivery = "Body"
 transform = "Base64"
 ```

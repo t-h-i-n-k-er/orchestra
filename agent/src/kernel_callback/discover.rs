@@ -117,7 +117,10 @@ fn ntstatus_or_default(status: Result<i32>) -> i32 {
 }
 
 /// Get the kernel base address via NtQuerySystemInformation.
-fn get_kernel_base() -> Result<u64> {
+///
+/// Public so other sub-modules (e.g. proxy) can resolve kernel symbols
+/// without running a full callback scan.
+pub fn get_kernel_base() -> Result<u64> {
     let mut buf_size: u32 = 0;
 
     // First call: get required buffer size.

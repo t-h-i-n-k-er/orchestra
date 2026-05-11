@@ -1060,19 +1060,88 @@ unsafe fn restore_protection(base: usize, size: usize, original: u32) -> Result<
     Ok(())
 }
 
-/// Linux stub for make_region_writable.
+/// Linux implementation of make_region_writable using mprotect.
 #[cfg(not(windows))]
 unsafe fn make_region_writable(base: usize, size: usize) -> Result<u32> {
-    // On Linux, .text is typically writable when we need it (mprotect).
-    // For now, return a sentinel.
-    let _ = (base, size);
-    Ok(0x20) // PAGE_EXECUTE_READ
+    use std::io;
+    // Query current protection by reading /proc/self/maps.
+    let maps = std::fs::read_to_string("/proc/self/maps")
+        .map_err(|e| anyhow::anyhow!("edr_bypass_transform: failed to read /proc/self/maps: {e}"))?;
+
+    // Find the mapping that contains `base`.
+    let mut original_protect: u32 = 0x05; // PROT_READ|PROT_EXEC default for .text
+    for line in maps.lines() {
+        // Format: start-end perms ...
+        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let addr_range: Vec<&str> = parts[0].splitn(2, '-').collect();
+        if addr_range.len() != 2 {
+            continue;
+        }
+        if let (Ok(start), Ok(end)) = (
+            usize::from_str_radix(addr_range[0], 16),
+            usize::from_str_radix(addr_range[1], 16),
+        ) {
+            if base >= start && base < end {
+                let perms = parts[1].as_bytes();
+                let mut prot: u32 = 0;
+                if perms.len() >= 1 && perms[0] == b'r' { prot |= 0x1; } // PROT_READ
+                if perms.len() >= 2 && perms[1] == b'w' { prot |= 0x2; } // PROT_WRITE
+                if perms.len() >= 3 && perms[2] == b'x' { prot |= 0x4; } // PROT_EXEC
+                original_protect = prot;
+                break;
+            }
+        }
+    }
+
+    // Make the region read-write (keep exec off to avoid RWX pages).
+    const PROT_READ: u32 = 0x1;
+    const PROT_WRITE: u32 = 0x2;
+    let new_prot = PROT_READ | PROT_WRITE;
+
+    // Align to page boundary.
+    let page_size = 4096usize;
+    let aligned_base = base & !(page_size - 1);
+    let aligned_end = (base + size + page_size - 1) & !(page_size - 1);
+    let aligned_size = aligned_end - aligned_base;
+
+    let ret = libc::mprotect(aligned_base as *mut std::ffi::c_void, aligned_size, new_prot as i32);
+    if ret != 0 {
+        bail!(
+            "edr_bypass_transform: mprotect(RW) failed for {:x}-{:x}: {}",
+            aligned_base,
+            aligned_end,
+            io::Error::last_os_error()
+        );
+    }
+    Ok(original_protect)
 }
 
-/// Linux stub for restore_protection.
+/// Linux implementation of restore_protection using mprotect.
 #[cfg(not(windows))]
 unsafe fn restore_protection(base: usize, size: usize, original: u32) -> Result<()> {
-    let _ = (base, size, original);
+    use std::io;
+    // Align to page boundary.
+    let page_size = 4096usize;
+    let aligned_base = base & !(page_size - 1);
+    let aligned_end = (base + size + page_size - 1) & !(page_size - 1);
+    let aligned_size = aligned_end - aligned_base;
+
+    let ret = libc::mprotect(
+        aligned_base as *mut std::ffi::c_void,
+        aligned_size,
+        original as i32,
+    );
+    if ret != 0 {
+        bail!(
+            "edr_bypass_transform: mprotect(restore) failed for {:x}-{:x}: {}",
+            aligned_base,
+            aligned_end,
+            io::Error::last_os_error()
+        );
+    }
     Ok(())
 }
 

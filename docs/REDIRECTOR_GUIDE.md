@@ -187,6 +187,11 @@ The redirector uses the malleable profile's URI patterns to distinguish agent tr
 
 ### Profile URI Examples
 
+The standalone redirector only needs URI patterns and currently parses them
+from top-level `[http_get]` and `[http_post]` tables. Full server-side
+malleable C2 profiles use nested `[profile.http_get]` and
+`[profile.http_post]` tables.
+
 ```toml
 # LinkedIn profile
 [http_get]

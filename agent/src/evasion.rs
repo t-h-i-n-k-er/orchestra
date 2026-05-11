@@ -788,6 +788,29 @@ pub unsafe fn setup_etw_patch(
             #[cfg(windows)]
             setup_hardware_breakpoints();
         }
+        EtwPatchMethod::HwBpHook => {
+            // General-purpose hw-bp-hook framework (invisible hooks via Dr0–Dr3).
+            // Falls back to direct patching if the feature is not compiled in or
+            // if all debug register slots are occupied.
+            #[cfg(all(windows, feature = "hw-bp-hook", target_arch = "x86_64"))]
+            {
+                if crate::hw_bp_hook::install_etw_bypass() {
+                    log::debug!("etw_patch: hw-bp-hook ETW bypass installed");
+                } else {
+                    log::warn!("etw_patch: hw-bp-hook ETW bypass failed; falling back to direct patch");
+                    if let Err(e) = crate::etw_patch::patch_etw_with_mode(mode) {
+                        log::warn!("etw_patch: direct patch fallback also failed: {}", e);
+                    }
+                }
+            }
+            #[cfg(not(all(windows, feature = "hw-bp-hook", target_arch = "x86_64")))]
+            {
+                log::warn!("etw_patch: HwBpHook method requested but hw-bp-hook feature not compiled; falling back to direct patch");
+                if let Err(e) = crate::etw_patch::patch_etw_with_mode(mode) {
+                    log::warn!("etw_patch: direct patch fallback failed: {}", e);
+                }
+            }
+        }
     }
 }
 

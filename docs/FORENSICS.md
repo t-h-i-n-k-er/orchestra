@@ -41,7 +41,7 @@ Windows Prefetch (`%SystemRoot%\Prefetch\*.pf`) records application execution hi
 1. **Enumerate Prefetch Files**: Scans `C:\Windows\Prefetch\` for any `.pf` files referencing:
    - The agent binary name
    - The launcher binary name
-   - The sacrificial process (spawnto)
+   - The configured sacrificial process
    - Any executed modules or tools
 
 2. **Patch Prefetch Data**: For each matching `.pf` file:
@@ -53,10 +53,11 @@ Windows Prefetch (`%SystemRoot%\Prefetch\*.pf`) records application execution hi
 
 3. **Delete if Necessary**: If patching would leave forensic artifacts, the file is deleted entirely.
 
-4. **Disable Prefetch Service** (optional): When `disable_prefetch_service` is `true`:
+4. **Disable Prefetch Service** (optional): When `[prefetch].method = "disable-service"`:
    - Sets `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters\EnablePrefetcher` to `0`
    - Stops the `SysMain` service (which manages prefetch)
    - Prevents future prefetch evidence collection
+   - Restores the original service state afterward when `[prefetch].restore-service-after = true`
 
 ### Stage 2: MFT Timestamp Synchronization
 
@@ -204,7 +205,7 @@ After all disk-based cleanup, memory hygiene ensures no forensic evidence remain
 | **Thread Start Scrub** | (default) | Thread start addresses | Low |
 | **Handle Table Scrub** | (default) | Suspicious handle entries | Low |
 | **Memory Hygiene** | (default) | In-memory forensic artifacts | Very Low |
-| **Sleep Obfuscation** | `sleep-obfuscation` | Memory content during sleep | Low |
+| **Sleep Obfuscation** | `[sleep]` + `memory-guard` | Memory content during sleep | Low |
 | **Evanesco** | `evanesco` | Memory content at all times | Low |
 | **String Encryption** | `string_crypt` | Compile-time string artifacts | Very Low |
 | **Binary Diversification** | `junk_macro` + `optimizer` | Binary signature IoCs | Very Low |

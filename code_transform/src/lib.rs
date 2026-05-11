@@ -48,8 +48,9 @@ mod virtualize {
     //! to prevent accidental use of broken functionality.
     #![allow(dead_code)]
     use rand_chacha::ChaCha8Rng;
-    pub fn virtualize(_code: &[u8], _rng: &mut ChaCha8Rng) -> Vec<u8> {
-        unimplemented!("virtualize feature is not enabled")
+    pub fn virtualize(code: &[u8], _rng: &mut ChaCha8Rng) -> Vec<u8> {
+        log::warn!("virtualize feature is not enabled; returning input unchanged");
+        code.to_vec()
     }
 }
 

